@@ -1,0 +1,15 @@
+[package]
+name = "tabminer"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "genesis"
+path = "tools/genesis.rs"
+
+[dependencies]
+heed = { version = "0.20", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = true
