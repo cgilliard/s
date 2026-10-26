@@ -32,6 +32,7 @@ use crate::chain::{BlockStatement, ProofVerifier};
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
 use crate::ext::Fp4;
+use crate::hash_table::HashTableAir;
 use crate::merkle::Digest;
 use crate::poseidon2::{DIGEST, Fp, P, WIDTH};
 use crate::recursion::{Compiler, dummy_proof};
@@ -245,7 +246,8 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
                 c.hash_scalars(rec, SEGMENT_PUBLIC);
                 let out = c.squeeze_digest();
                 c.assert_block(at(pubv, PUB_OUTPUT), out, DIGEST);
-                c.verify_stark(&[(&VmAir, Some(pubv))], &params.outer, &node_prefix, pubv, VM_PUBLIC, &np.proof);
+                let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
+                c.verify_stark(&tables, &params.outer, &node_prefix, pubv, VM_PUBLIC, &np.proof);
             }
         }
         recs.push(rec);
@@ -383,7 +385,7 @@ fn signed(x: Fp) -> i64 {
 
 /// The shape of a node: its children (a child with no children of its own
 /// is a segment proof), the segments under it, and the program digest and
-/// height a node of this shape has.
+/// table heights a node of this shape has.
 #[derive(Clone, Debug)]
 pub struct Shape {
     pub children: Vec<Shape>,
@@ -391,6 +393,8 @@ pub struct Shape {
     pub segments: usize,
     pub digest: Digest,
     pub log_n: usize,
+    /// Log height of the node's hash table.
+    pub hash_log_n: usize,
 }
 
 impl Shape {
@@ -420,7 +424,13 @@ pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
 
 fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap<Vec<usize>, Shape>) -> Shape {
     if k == 1 && !root {
-        return Shape { children: vec![], segments: 1, digest: [Fp::ZERO; DIGEST], log_n: params.segment_log_n };
+        return Shape {
+            children: vec![],
+            segments: 1,
+            digest: [Fp::ZERO; DIGEST],
+            log_n: params.segment_log_n,
+            hash_log_n: 0,
+        };
     }
     let sizes = if k <= params.fan_in { vec![1; k] } else { split(k, params.fan_in) };
     let key: Vec<usize> = std::iter::once(usize::from(root)).chain(sizes.iter().copied()).collect();
@@ -438,7 +448,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
         .map(|c| NodeProof {
             record: segment_dummy.public,
             digest: c.digest,
-            proof: dummy_proof(&[(&VmAir, c.log_n)], &params.outer, VM_PUBLIC),
+            proof: dummy_proof(&[(&VmAir, c.log_n), (&HashTableAir, c.hash_log_n)], &params.outer, VM_PUBLIC),
         })
         .collect();
     let mut nd = node_dummies.iter();
@@ -454,6 +464,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
         segments: k,
         digest: prog.digest(params.outer.log_blowup),
         log_n: prog.height().trailing_zeros() as usize,
+        hash_log_n: VmAir::hash_height(&prog).trailing_zeros() as usize,
     };
     memo.insert(key, shape.clone());
     shape
@@ -503,11 +514,12 @@ fn prove_node(params: &AggregatorParams, shape: &Shape, segments: &[SegmentProof
         Output::Statement(s) => s.digest(),
     };
     let c = compile_node(params, &children, output);
-    let trace = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
+    let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
     let pre = c.prog.preprocess(params.outer.log_blowup);
     assert_eq!(pre.root(), shape.digest, "node program differs from the planned shape");
     let public = VmAir::public_values(&pre.root(), &out_digest);
-    let proof = stark::prove_with(&params.outer, &VmAir, &trace, Some(&pre), &public, &mut outer_transcript());
+    let tables = VmAir::tables(&trace, &hashes, &pre);
+    let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
     NodeProof { record, digest: shape.digest, proof }
 }
 
@@ -546,7 +558,7 @@ pub fn verify_block(
     let proof = stark::Proof::from_bytes(r.0).ok_or(AggregateError::Malformed)?;
     let digest = root_digest(k);
     let public = VmAir::public_values(&digest, &statement.digest());
-    stark::verify_with(&params.outer, &VmAir, Some(&digest), &public, &proof, &mut outer_transcript())
+    stark::verify_tables(&params.outer, &VmAir::specs(&digest), &public, &proof, &mut outer_transcript())
         .map_err(|_| AggregateError::Rejected)
 }
 
@@ -749,7 +761,7 @@ mod tests {
                 return "s".into();
             }
             let kids: Vec<String> = s.children.iter().map(show).collect();
-            format!("2^{}[{}]", s.log_n, kids.join(" "))
+            format!("2^{}/2^{}[{}]", s.log_n, s.hash_log_n, kids.join(" "))
         }
         for k in [1, 2, 4, 5, 8, 12, 16] {
             println!("{k:2} segments: {}", show(&plan(&AggregatorParams::MAINNET, k)));
@@ -812,7 +824,14 @@ mod tests {
             let np = NodeProof {
                 record: seg.public,
                 digest: [Fp::ZERO; DIGEST],
-                proof: dummy_proof(&[(&VmAir, leaf.height().trailing_zeros() as usize)], &params.outer, VM_PUBLIC),
+                proof: dummy_proof(
+                    &[
+                        (&VmAir, leaf.height().trailing_zeros() as usize),
+                        (&HashTableAir, VmAir::hash_height(&leaf).trailing_zeros() as usize),
+                    ],
+                    &params.outer,
+                    VM_PUBLIC,
+                ),
             };
             let c = compile_node(&params, &[Child::Node(&np)], Output::Record);
             println!(
@@ -869,6 +888,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "proves a mainnet segment and a node over it; run with --release"]
+    fn mainnet_node_timing() {
+        let s = setup("node-timing", &[30], 30);
+        let params = AggregatorParams::MAINNET;
+        let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
+        let c = compile_node(&params, &[Child::Segment(&seg)], Output::Record);
+        let out = record_digest(&combine_records(&[seg.public]));
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+            let pre = c.prog.preprocess(params.outer.log_blowup);
+            eprintln!("  trace + program: {:?}", t.elapsed());
+            let public = VmAir::public_values(&pre.root(), &out);
+            let tables = VmAir::tables(&trace, &hashes, &pre);
+            let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
+            println!(
+                "node 2^{} + 2^{} hashes: {:?}, {} bytes",
+                trace.height().trailing_zeros(),
+                hashes.height().trailing_zeros(),
+                t.elapsed(),
+                proof.to_bytes().len()
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "proves mainnet-sized segments and nodes; run with --release"]
     fn mainnet_rate_timing() {
         let s = setup("rates", &[30], 30);
@@ -885,17 +930,19 @@ mod tests {
             let seg_time = t.elapsed();
             let c = compile_node(&params, &[Child::Segment(&seg)], Output::Record);
             let t = std::time::Instant::now();
-            let trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+            let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
             let pre = c.prog.preprocess(params.outer.log_blowup);
             let out = record_digest(&combine_records(&[seg.public]));
             let public = VmAir::public_values(&pre.root(), &out);
-            let proof = stark::prove_with(&params.outer, &VmAir, &trace, Some(&pre), &public, &mut outer_transcript());
+            let tables = VmAir::tables(&trace, &hashes, &pre);
+            let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
             let node_time = t.elapsed();
             println!(
-                "{name}: segment 2^{} in {seg_time:?} ({} bytes); node over it 2^{} in {node_time:?} ({} bytes)",
+                "{name}: segment 2^{} in {seg_time:?} ({} bytes); node over it 2^{} + 2^{} hashes in {node_time:?} ({} bytes)",
                 params.segment_log_n,
                 seg.proof.to_bytes().len(),
                 c.prog.height().trailing_zeros(),
+                hashes.height().trailing_zeros(),
                 proof.to_bytes().len()
             );
         }

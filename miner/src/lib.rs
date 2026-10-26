@@ -10,6 +10,7 @@ pub mod ext;
 pub mod field;
 pub mod fri;
 pub mod hash_machine;
+pub mod hash_table;
 pub mod inflate;
 pub mod merkle;
 pub mod ntt;

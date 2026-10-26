@@ -56,8 +56,8 @@ use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
 use crate::ntt::{
     MULTIPLICATIVE_GENERATOR, coset_intt_ext, coset_ntt, coset_ntt_ext, intt, log2_strict, root_of_unity,
 };
-use crate::parallel::{par_chunks_mut, par_map, par_map_min};
-use crate::poseidon2::Fp;
+use crate::parallel::{par_chunks_mut, par_map, par_map_min, par_map_with};
+use crate::poseidon2::{Fp, zeroed_vec};
 use crate::recursion::Expr;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,33 @@ pub struct LookupTerm<F> {
     pub values: Vec<F>,
 }
 
+/// Output buffers of a [`Builder`], kept between rows so that evaluating
+/// an AIR on many rows does not allocate per row.
+pub(crate) struct Scratch<F> {
+    constraints: Vec<F>,
+    /// Lookup terms; only the first `num_lookups` are current, the rest
+    /// keep their value buffers for reuse.
+    lookups: Vec<LookupTerm<F>>,
+    num_lookups: usize,
+    marks: Vec<(usize, &'static str)>,
+}
+
+impl<F> Default for Scratch<F> {
+    fn default() -> Self {
+        Scratch { constraints: Vec::new(), lookups: Vec::new(), num_lookups: 0, marks: Vec::new() }
+    }
+}
+
+impl<F> Scratch<F> {
+    pub(crate) fn constraints(&self) -> &[F] {
+        &self.constraints
+    }
+
+    pub(crate) fn terms(&self) -> &[LookupTerm<F>] {
+        &self.lookups[..self.num_lookups]
+    }
+}
+
 /// Collects constraint evaluations and lookup terms for one row pair.
 pub struct Builder<'a, F: Field> {
     local: &'a [F],
@@ -83,13 +110,26 @@ pub struct Builder<'a, F: Field> {
     is_first_row: F,
     is_last_row: F,
     is_transition: F,
-    constraints: Vec<F>,
-    lookups: Vec<LookupTerm<F>>,
-    marks: Vec<(usize, &'static str)>,
+    out: Scratch<F>,
 }
 
 impl<'a, F: Field> Builder<'a, F> {
     pub(crate) fn new(local: &'a [F], next: &'a [F], pre: (&'a [F], &'a [F]), public: &'a [F], sel: (F, F, F)) -> Self {
+        Self::with_scratch(local, next, pre, public, sel, Scratch::default())
+    }
+
+    /// A builder writing into reused buffers, which it clears.
+    fn with_scratch(
+        local: &'a [F],
+        next: &'a [F],
+        pre: (&'a [F], &'a [F]),
+        public: &'a [F],
+        sel: (F, F, F),
+        mut out: Scratch<F>,
+    ) -> Self {
+        out.constraints.clear();
+        out.num_lookups = 0;
+        out.marks.clear();
         Builder {
             local,
             next,
@@ -99,16 +139,14 @@ impl<'a, F: Field> Builder<'a, F> {
             is_first_row: sel.0,
             is_last_row: sel.1,
             is_transition: sel.2,
-            constraints: Vec::new(),
-            lookups: Vec::new(),
-            marks: Vec::new(),
+            out,
         }
     }
 
     /// Labels the constraints emitted from here on, for diagnostics from
     /// [`check_constraints`]. Has no effect on proving.
     pub fn mark(&mut self, label: &'static str) {
-        self.marks.push((self.constraints.len(), label));
+        self.out.marks.push((self.out.constraints.len(), label));
     }
 
     pub fn local(&self) -> &'a [F] {
@@ -136,12 +174,14 @@ impl<'a, F: Field> Builder<'a, F> {
 
     /// Constraints and lookup terms collected so far (for compilers).
     pub(crate) fn into_parts(self) -> (Vec<F>, Vec<LookupTerm<F>>) {
-        (self.constraints, self.lookups)
+        let mut out = self.out;
+        out.lookups.truncate(out.num_lookups);
+        (out.constraints, out.lookups)
     }
 
     /// Requires `c == 0` on every row.
     pub fn assert_zero(&mut self, c: F) {
-        self.constraints.push(c);
+        self.out.constraints.push(c);
     }
 
     pub fn assert_eq(&mut self, a: F, b: F) {
@@ -172,7 +212,17 @@ impl<'a, F: Field> Builder<'a, F> {
     /// running sum, a receive subtracts it. Values and multiplicity must be
     /// built from columns and constants only.
     pub fn lookup(&mut self, send: bool, multiplicity: F, values: &[F]) {
-        self.lookups.push(LookupTerm { send, multiplicity, values: values.to_vec() });
+        let out = &mut self.out;
+        if out.num_lookups < out.lookups.len() {
+            let term = &mut out.lookups[out.num_lookups];
+            term.send = send;
+            term.multiplicity = multiplicity;
+            term.values.clear();
+            term.values.extend_from_slice(values);
+        } else {
+            out.lookups.push(LookupTerm { send, multiplicity, values: values.to_vec() });
+        }
+        out.num_lookups += 1;
     }
 }
 
@@ -536,25 +586,41 @@ pub fn log_quotient_degree(max_constraint_degree: usize) -> usize {
     (usize::BITS - (q - 1).leading_zeros()) as usize
 }
 
-/// Lookup challenges.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Lookup challenges, with the powers of `delta` that denominators use.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupChallenges {
     pub gamma: Fp4,
     pub delta: Fp4,
+    /// `delta^1 .. delta^DELTA_POWERS`.
+    delta_powers: Vec<Fp4>,
 }
 
+const DELTA_POWERS: usize = 32;
+
 impl LookupChallenges {
+    pub fn new(gamma: Fp4, delta: Fp4) -> LookupChallenges {
+        let delta_powers = powers(delta, DELTA_POWERS + 1)[1..].to_vec();
+        LookupChallenges { gamma, delta, delta_powers }
+    }
+
     fn sample(ch: &mut Challenger) -> LookupChallenges {
-        LookupChallenges { gamma: ch.sample_ext(), delta: ch.sample_ext() }
+        let gamma = ch.sample_ext();
+        let delta = ch.sample_ext();
+        LookupChallenges::new(gamma, delta)
     }
 
     /// `gamma + sum delta^(k+1) values[k]`.
     fn denominator<F: Field>(&self, values: &[F]) -> Fp4 {
         let mut acc = self.gamma;
-        let mut pow = self.delta;
-        for v in values {
-            acc += v.mul_ext(pow);
-            pow *= self.delta;
+        for (v, pow) in values.iter().zip(&self.delta_powers) {
+            acc += v.mul_ext(*pow);
+        }
+        if values.len() > DELTA_POWERS {
+            let mut pow = self.delta_powers[DELTA_POWERS - 1];
+            for v in &values[DELTA_POWERS..] {
+                pow *= self.delta;
+                acc += v.mul_ext(pow);
+            }
         }
         acc
     }
@@ -571,7 +637,22 @@ pub(crate) fn evaluate<F: EvalField>(
 ) -> (Vec<F>, Vec<LookupTerm<F>>) {
     let mut b = Builder::new(local, next, pre, public, sel);
     F::eval_air(air, &mut b);
-    (b.constraints, b.lookups)
+    b.into_parts()
+}
+
+/// Evaluates the AIR at one row pair into reused buffers.
+pub(crate) fn evaluate_into<F: EvalField>(
+    air: &dyn DynAir,
+    local: &[F],
+    next: &[F],
+    pre: (&[F], &[F]),
+    public: &[F],
+    sel: (F, F, F),
+    scratch: &mut Scratch<F>,
+) {
+    let mut b = Builder::with_scratch(local, next, pre, public, sel, std::mem::take(scratch));
+    F::eval_air(air, &mut b);
+    *scratch = b.out;
 }
 
 /// Number of lookup constraints for `terms` lookup terms: one inverse check
@@ -588,54 +669,40 @@ pub(crate) fn shape(air: &dyn DynAir, public: &[Fp]) -> (usize, usize) {
     (c.len(), t.len())
 }
 
-/// Lookup constraints for one row, in order: inverse checks, running-sum
-/// transition, first-row zero, last-row total. `aux_local`/`aux_next` are
-/// the extension values: inverses then the running sum; `total` is the
-/// table's lookup total.
-fn lookup_constraints<F: Field>(
-    ch: &LookupChallenges,
-    total: Fp4,
-    terms: &[LookupTerm<F>],
-    aux_local: &[Fp4],
-    aux_next: &[Fp4],
-    sel: (Fp4, Fp4, Fp4),
-) -> Vec<Fp4> {
-    let t = terms.len();
-    let mut out = Vec::with_capacity(t + 3);
-    let mut contrib = Fp4::ZERO;
-    for (k, term) in terms.iter().enumerate() {
-        let inv = aux_local[k];
-        out.push(inv * ch.denominator(&term.values) - Fp4::ONE);
-        let c = term.multiplicity.mul_ext(inv);
-        if term.send { contrib += c } else { contrib -= c }
-    }
-    let s = aux_local[t];
-    let s_next = aux_next[t];
-    out.push(sel.2 * (s_next - s - contrib));
-    out.push(sel.0 * s);
-    out.push(sel.1 * (s + contrib - total));
-    out
-}
-
 /// Combines main constraints and lookup constraints with powers of alpha.
+/// The lookup constraints, in order: one inverse check per term
+/// (`inverse * denominator = 1`), the running-sum transition, the running
+/// sum starting at zero, and the last row reaching the table's lookup
+/// `total`. `aux_local`/`aux_next` are the extension values: inverses then
+/// the running sum.
 fn combine<F: Field>(
     constraints: &[F],
     terms: &[LookupTerm<F>],
     aux_local: &[Fp4],
     aux_next: &[Fp4],
-    sel_ext: (Fp4, Fp4, Fp4),
+    sel: (Fp4, Fp4, Fp4),
     lookup: Option<(&LookupChallenges, Fp4)>,
     alpha_powers: &[Fp4],
 ) -> Fp4 {
     let mut acc = Fp4::ZERO;
-    let mut powers = alpha_powers.iter();
-    for c in constraints {
-        acc += c.mul_ext(*powers.next().expect("alpha powers"));
+    for (c, a) in constraints.iter().zip(alpha_powers) {
+        acc += c.mul_ext(*a);
     }
     if let Some((ch, total)) = lookup {
-        for c in lookup_constraints(ch, total, terms, aux_local, aux_next, sel_ext) {
-            acc += c * *powers.next().expect("alpha powers");
+        let a = &alpha_powers[constraints.len()..];
+        let t = terms.len();
+        let mut contrib = Fp4::ZERO;
+        for (k, term) in terms.iter().enumerate() {
+            let inv = aux_local[k];
+            acc += (inv * ch.denominator(&term.values) - Fp4::ONE) * a[k];
+            let c = term.multiplicity.mul_ext(inv);
+            if term.send { contrib += c } else { contrib -= c }
         }
+        let s = aux_local[t];
+        let s_next = aux_next[t];
+        acc += sel.2 * (s_next - s - contrib) * a[t];
+        acc += sel.0 * s * a[t + 1];
+        acc += sel.1 * (s + contrib - total) * a[t + 2];
     }
     acc
 }
@@ -792,7 +859,7 @@ impl Preprocessed {
         let w = table.width;
         let log_n = log2_strict(table.height());
         let big_n = table.height() << log_blowup;
-        let mut lde = vec![Fp::ZERO; big_n * w];
+        let mut lde = zeroed_vec(big_n * w);
         let ext: Vec<(Vec<Fp>, Vec<Fp>)> =
             par_map_min(w, 1, |k| lde_column(table.column(k), big_n, MULTIPLICATIVE_GENERATOR));
         let (coeffs, evals): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
@@ -853,10 +920,7 @@ pub fn check_tables(
     tables: &[(&dyn DynAir, &Trace, Option<&Trace>)],
     public: &[Fp],
 ) -> Result<(), (usize, (usize, usize, &'static str))> {
-    let ch = LookupChallenges {
-        gamma: Fp4::from_u32(0x1234_5678),
-        delta: Fp4([Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)]),
-    };
+    let ch = LookupChallenges::new(Fp4::from_u32(0x1234_5678), Fp4([Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)]));
     let mut sum = Fp4::ZERO;
     for (t, (air, trace, pre)) in tables.iter().enumerate() {
         let n = trace.height();
@@ -871,11 +935,11 @@ pub fn check_tables(
             );
             let mut b = Builder::new(trace.row(i), trace.row(next), (pre_row(i), pre_row(next)), public, sel);
             air.eval_fp(&mut b);
-            if let Some(k) = b.constraints.iter().position(|c| *c != Fp::ZERO) {
-                let label = b.marks.iter().rev().find(|(at, _)| *at <= k).map(|(_, l)| *l).unwrap_or("");
+            if let Some(k) = b.out.constraints.iter().position(|c| *c != Fp::ZERO) {
+                let label = b.out.marks.iter().rev().find(|(at, _)| *at <= k).map(|(_, l)| *l).unwrap_or("");
                 return Err((t, (i, k, label)));
             }
-            for term in &b.lookups {
+            for term in b.out.terms() {
                 let d = ch.denominator(&term.values);
                 let Some(inv) = d.inverse() else {
                     return Err((t, (i, 0, "lookup denominator zero")));
@@ -929,38 +993,49 @@ fn build_aux(
     let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.table.row(i)) };
     let width = terms + 1;
     let mut aux = vec![Fp4::ZERO; n * width];
-    let rows: Vec<(Vec<Fp4>, Vec<Fp4>)> = par_map(n, |i| {
-        let (_, row_terms) = evaluate(
-            air,
-            trace.row(i),
-            trace.row((i + 1) % n),
-            (pre_row(i), pre_row((i + 1) % n)),
-            public,
-            (Fp::ZERO, Fp::ZERO, Fp::ZERO),
-        );
-        assert_eq!(row_terms.len(), terms, "lookup term count varies between rows");
-        let denoms: Vec<Fp4> = row_terms.iter().map(|t| ch.denominator(&t.values)).collect();
-        let mults: Vec<Fp4> = row_terms
-            .iter()
-            .map(|t| if t.send { Fp4::from_base(t.multiplicity) } else { -Fp4::from_base(t.multiplicity) })
-            .collect();
-        (denoms, mults)
-    });
-    let mut denoms = Vec::with_capacity(n * terms);
-    let mut mults = Vec::with_capacity(n * terms);
-    for (d, m) in rows {
-        denoms.extend(d);
-        mults.extend(m);
-    }
-    let invs = par_batch_inverse(&denoms);
-    let mut sum = Fp4::ZERO;
-    for i in 0..n {
-        aux[i * width + terms] = sum;
-        for k in 0..terms {
-            let inv = invs[i * terms + k];
-            aux[i * width + k] = inv;
-            sum += mults[i * terms + k] * inv;
+    // Denominators and signed multiplicities of every term, row by row.
+    const ROWS: usize = 256;
+    let mut dm = vec![(Fp4::ZERO, Fp::ZERO); n * terms];
+    par_chunks_mut(&mut dm, ROWS * terms, |c, chunk| {
+        let mut scratch = Scratch::default();
+        for (r, out) in chunk.chunks_exact_mut(terms).enumerate() {
+            let i = c * ROWS + r;
+            evaluate_into(
+                air,
+                trace.row(i),
+                trace.row((i + 1) % n),
+                (pre_row(i), pre_row((i + 1) % n)),
+                public,
+                (Fp::ZERO, Fp::ZERO, Fp::ZERO),
+                &mut scratch,
+            );
+            assert_eq!(scratch.terms().len(), terms, "lookup term count varies between rows");
+            for (o, t) in out.iter_mut().zip(scratch.terms()) {
+                *o = (ch.denominator(&t.values), if t.send { t.multiplicity } else { -t.multiplicity });
+            }
         }
+    });
+    let (denoms, mults): (Vec<Fp4>, Vec<Fp>) = dm.into_iter().unzip();
+    let invs = par_batch_inverse(&denoms);
+    // Inverses, and each row's contribution in the running-sum column,
+    // which the prefix sums then replace.
+    par_chunks_mut(&mut aux, ROWS * width, |c, chunk| {
+        for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
+            let i = c * ROWS + r;
+            let mut contrib = Fp4::ZERO;
+            for k in 0..terms {
+                let inv = invs[i * terms + k];
+                row[k] = inv;
+                contrib += inv.mul_base(&mults[i * terms + k]);
+            }
+            row[terms] = contrib;
+        }
+    });
+    let mut sum = Fp4::ZERO;
+    for row in aux.chunks_exact_mut(width) {
+        let contrib = row[terms];
+        row[terms] = sum;
+        sum += contrib;
     }
     (aux, sum)
 }
@@ -1038,7 +1113,7 @@ impl Committed {
     /// table.
     fn new(width: usize, big_n: usize, shift: Fp, column: impl Fn(usize) -> Vec<Fp> + Sync) -> Committed {
         let mut coeffs: Vec<Vec<Fp>> = Vec::with_capacity(width);
-        let mut rows = vec![Fp::ZERO; big_n * width];
+        let mut rows = zeroed_vec(big_n * width);
         let batch = crate::parallel::threads() * 4;
         for first in (0..width).step_by(batch) {
             let cols = (first + batch).min(width) - first;
@@ -1137,27 +1212,29 @@ fn commit_quotient(
     let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| (ch, total));
     let lde = &t.trace.rows;
 
-    let mut quotient: Vec<Fp4> = par_map(big_n, |i| {
+    let mut quotient: Vec<Fp4> = par_map_with(big_n, Scratch::default, |scratch, i| {
         let zh = z_h[i % period];
         let first = zh.mul(&denom_inv[2 * i]);
         let last = zh.mul(&denom_inv[2 * i + 1]);
         let transition = xs[i].sub(&g_inv);
         let next_i = (i + period) % big_n;
-        let (constraints, terms) = evaluate(
+        evaluate_into(
             air,
             &lde[i * w..(i + 1) * w],
             &lde[next_i * w..(next_i + 1) * w],
             (t.pre_row(i), t.pre_row(next_i)),
             public,
             (first, last, transition),
+            scratch,
         );
+        let (constraints, terms) = (scratch.constraints(), scratch.terms());
         let (aux_l, aux_n): (&[Fp4], &[Fp4]) = if aux_ext_w > 0 {
             (&aux_lde[i * aux_ext_w..(i + 1) * aux_ext_w], &aux_lde[next_i * aux_ext_w..(next_i + 1) * aux_ext_w])
         } else {
             (&empty, &empty)
         };
         let sel_ext = (Fp4::from_base(first), Fp4::from_base(last), Fp4::from_base(transition));
-        let c = combine(&constraints, &terms, aux_l, aux_n, sel_ext, lookup, alpha_powers);
+        let c = combine(constraints, terms, aux_l, aux_n, sel_ext, lookup, alpha_powers);
         c.mul_base(&z_h_inv[i % period])
     });
     timer.lap("quotient eval");
@@ -1172,10 +1249,13 @@ fn commit_quotient(
         (c, e)
     });
     let (coeffs, chunk_evals): (Vec<Vec<Fp4>>, Vec<Vec<Fp4>>) = chunks.into_iter().unzip();
-    let chunk_lde: Vec<Fp4> = par_map(big_n, |i| (0..num_chunks).map(|j| chunk_evals[j][i]).collect::<Vec<Fp4>>())
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut chunk_lde = vec![Fp4::ZERO; big_n * num_chunks];
+    par_chunks_mut(&mut chunk_lde, 1 << 12, |c, part| {
+        for (r, v) in part.iter_mut().enumerate() {
+            let at = (c << 12) + r;
+            *v = chunk_evals[at % num_chunks][at / num_chunks];
+        }
+    });
     drop(chunk_evals);
     let rows: Vec<Fp> = ext_row(&chunk_lde);
     timer.lap("quotient lde");
@@ -1270,30 +1350,24 @@ pub fn prove_tables(
         let ch = LookupChallenges::sample(challenger);
         for t in states.iter_mut().filter(|t| t.num_terms > 0) {
             let (aux, total) = build_aux(t.input.air, t.input.trace, t.input.pre, public, &ch, t.num_terms);
+            timer.lap("aux build");
             let ext_w = t.aux_ext_w();
             let n = 1usize << t.log_n;
             let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, |j| {
                 let (e, k) = (j / DEGREE, j % DEGREE);
                 (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
             });
-            let aux_w = committed.width;
-            let aux_lde: Vec<Fp4> = par_map(t.big_n(log_blowup), |i| {
-                let row = &committed.rows[i * aux_w..(i + 1) * aux_w];
-                (0..ext_w).map(|e| Fp4(core::array::from_fn(|k| row[e * DEGREE + k]))).collect::<Vec<Fp4>>()
-            })
-            .into_iter()
-            .flatten()
-            .collect();
+            let aux_lde = ext_from_row(&committed.rows);
             challenger.observe_digest(&committed.tree.root());
             challenger.observe_ext(&total);
             t.aux = Some((committed, aux_lde, total));
+            timer.lap("aux commit");
         }
         debug_assert!(
             states.iter().filter_map(|t| t.aux.as_ref()).fold(Fp4::ZERO, |a, (_, _, s)| a + *s).is_zero(),
             "lookup terms do not cancel: the traces violate a multiset relation"
         );
         lookup_ch = Some(ch);
-        timer.lap("aux");
     }
 
     // 3. Constraint combinations and quotients.

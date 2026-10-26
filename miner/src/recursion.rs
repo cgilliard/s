@@ -375,6 +375,8 @@ impl Compiler {
         }
         let d = self.digest;
         self.digest = if right { compress(&s, &d) } else { compress(&d, &s) };
+        // The machine only absorbs right after a start or an absorb.
+        self.sponge = None;
     }
 
     fn squeeze(&mut self) -> Addr {
@@ -1199,8 +1201,18 @@ pub fn output_digest(public: &[Fp]) -> [Fp; DIGEST] {
 mod tests {
     use super::*;
     use crate::challenger::Challenger;
-    use crate::stark::{Trace, check_constraints_with, prove, prove_with, verify, verify_with};
+    use crate::hash_table::HashTableAir;
+    use crate::stark::{Trace, check_tables, prove, prove_tables, verify, verify_tables};
     use crate::vm_air::{ExecError, VmAir};
+
+    /// Checks the machine and hash table traces of a verifier program.
+    fn check_program(c: &Compiler, public: &[Fp]) {
+        let (vm, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(public));
+        let table = c.prog.table();
+        assert_eq!(check_tables(&[(&VmAir, &vm, Some(&table)), (&HashTableAir, &hashes, None)], &vm_public), Ok(()));
+        println!("verifier trace: {} rows, {} hash rows", vm.height(), hashes.height());
+    }
 
     /// Fibonacci inner AIR (as in the STARK tests).
     struct Fibonacci;
@@ -1309,10 +1321,7 @@ mod tests {
         assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
 
         // The verifier trace satisfies the machine's constraints.
-        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&public));
-        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
-        println!("verifier trace: {} rows", vm_trace.height());
+        check_program(&c, &public);
     }
 
     #[test]
@@ -1330,9 +1339,7 @@ mod tests {
         bad.tables[0].aux_at_zeta[1] += Fp4::ONE;
         let cb = compile_verifier(&PermAir, &INNER, &[], &bad);
         assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
-        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&[]));
-        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
+        check_program(&c, &[]);
     }
 
     /// Sends its column once per row.
@@ -1370,7 +1377,7 @@ mod tests {
 
     #[test]
     fn verifier_program_handles_several_tables() {
-        use crate::stark::{TableInput, TableSpec, prove_tables, verify_tables};
+        use crate::stark::{TableInput, TableSpec};
         let tall = Trace::new((0..32).map(|i| Fp::new(3 + i % 4)).collect(), 1);
         let recv = Trace::new((0..4u32).flat_map(|i| [Fp::new(3 + i), Fp::new(8), Fp::new(1 << i)]).collect(), 3);
         let tables = [
@@ -1408,9 +1415,7 @@ mod tests {
         let cb = compile(&bad);
         assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
 
-        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&[]));
-        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
+        check_program(&c, &[]);
     }
 
     #[test]
@@ -1419,21 +1424,24 @@ mod tests {
         let (trace, public) = fib_trace(3);
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
         let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
-        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let (vm_trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
         let outer = StarkConfig { log_blowup: 1, num_queries: 20 };
         let pre = c.prog.preprocess(outer.log_blowup);
         let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
         let t = std::time::Instant::now();
-        let outer_proof = prove_with(&outer, &VmAir, &vm_trace, Some(&pre), &vm_public, &mut outer_tr());
+        let tables = VmAir::tables(&vm_trace, &hashes, &pre);
+        let outer_proof = prove_tables(&outer, &tables, &vm_public, &mut outer_tr());
         println!(
-            "outer proof over {} rows: {:?}, {} bytes",
+            "outer proof over {} rows and {} hash rows: {:?}, {} bytes",
             vm_trace.height(),
+            hashes.height(),
             t.elapsed(),
             outer_proof.to_bytes().len()
         );
-        assert_eq!(verify_with(&outer, &VmAir, Some(&pre.root()), &vm_public, &outer_proof, &mut outer_tr()), Ok(()));
+        let root = pre.root();
+        assert_eq!(verify_tables(&outer, &VmAir::specs(&root), &vm_public, &outer_proof, &mut outer_tr()), Ok(()));
         let mut bad = vm_public.clone();
         bad[0] += Fp::ONE;
-        assert!(verify_with(&outer, &VmAir, Some(&pre.root()), &bad, &outer_proof, &mut outer_tr()).is_err());
+        assert!(verify_tables(&outer, &VmAir::specs(&root), &bad, &outer_proof, &mut outer_tr()).is_err());
     }
 }

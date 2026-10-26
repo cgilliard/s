@@ -53,6 +53,38 @@ pub fn par_map_min<T: Send, F: Fn(usize) -> T + Sync>(n: usize, min_per_thread: 
     out
 }
 
+/// As [`par_map`], with per-thread state made by `init` and passed to
+/// every call (scratch buffers, say).
+pub fn par_map_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T + Sync>(
+    n: usize,
+    init: I,
+    f: F,
+) -> Vec<T> {
+    let ranges = ranges(n, MIN_PARALLEL);
+    if ranges.len() <= 1 {
+        let mut state = init();
+        return (0..n).map(|i| f(&mut state, i)).collect();
+    }
+    let (f, init) = (&f, &init);
+    let parts: Vec<Vec<T>> = std::thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .map(|r| {
+                s.spawn(move || {
+                    let mut state = init();
+                    r.map(|i| f(&mut state, i)).collect::<Vec<T>>()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
+    });
+    let mut out = Vec::with_capacity(n);
+    for p in parts {
+        out.extend(p);
+    }
+    out
+}
+
 /// Runs `f(chunk_index, chunk)` over `data.chunks_mut(chunk)` in parallel.
 pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], chunk: usize, f: F) {
     assert!(chunk > 0);

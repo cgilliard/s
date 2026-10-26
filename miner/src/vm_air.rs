@@ -1,5 +1,6 @@
 //! A straight-line machine for verifier programs: Fp4 arithmetic, hashing
-//! and a write-once memory, as an AIR on the hash machine with lookups.
+//! and a write-once memory, as an AIR with lookups, proved together with
+//! the [`crate::hash_table`] that performs its permutations.
 //!
 //! A program is a list of instructions executed one per row in order. Every
 //! value lives in a write-once memory of `Fp4` words addressed by small
@@ -36,24 +37,26 @@
 //! Scalars are words whose last three components are zero; the hashing
 //! instructions enforce that on what they read. Public values: the program
 //! digest (8) and the output digest (8).
+//!
+//! Hashing instructions (`SpongeStart`, `Absorb`, `Compress`) send their
+//! operands and the resulting digest to the hash table, numbered by a
+//! counter of hashing instructions; the digest register holds the result
+//! of the last one for `Squeeze` and `AssertPublic`. An absorb continues
+//! the sponge of the hashing instruction just before it, which must be a
+//! start or an absorb.
 
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use crate::hash_machine::{
-    COL_ABSORB, COL_ACC, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_DIR, COL_LOAD, COL_PASS, COL_START, HashTraceBuilder,
-    NUM_COLS as HM_COLS, eval_hash_machine,
-};
+use crate::hash_table::{HashOp, HashTableAir, KIND_ABSORB, KIND_COMPRESS, message};
 use crate::merkle::Digest;
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute};
-use crate::poseidon2_air::COL_INPUT;
-use crate::stark::{Air, Builder, Preprocessed, Trace};
+use crate::stark::{Air, Builder, Preprocessed, TableInput, TableSpec, Trace};
 
 pub type Addr = u32;
 
 const FIELDS: usize = 6;
 const READS: usize = 9;
 const WRITES: usize = 9;
-const BITS: usize = 31;
 const W_EXT: Fp = Fp::new(11);
 
 // ---- preprocessed columns (opcode order) ----
@@ -76,14 +79,17 @@ pub const P_F: usize = P_DONE + 1; // [FIELDS]
 pub const PRE_WIDTH: usize = P_F + FIELDS;
 
 // ---- main columns ----
-pub const C_READ: usize = HM_COLS; // [READS][4]
+pub const C_READ: usize = 0; // [READS][4]
 pub const C_WRITE: usize = C_READ + READS * DEGREE; // [WRITES][4]
 pub const C_MULT: usize = C_WRITE + WRITES * DEGREE; // [WRITES]
-pub const C_BITS: usize = C_MULT + WRITES; // [BITS]
-pub const C_T3: usize = C_BITS + BITS;
-/// Running sponge state, so absorbs may be separated by other instructions.
-pub const R_SP: usize = C_T3 + 1; // [WIDTH]
-pub const NUM_COLS: usize = R_SP + WIDTH;
+/// Products of the top bits of a decomposition, for its range check.
+pub const C_T2: usize = C_MULT + WRITES;
+pub const C_T3: usize = C_T2 + 1;
+/// Digest of the last hashing instruction up to this row.
+pub const C_ACC: usize = C_T3 + 1; // [DIGEST]
+/// Number of hashing instructions before this row.
+pub const C_HASHES: usize = C_ACC + DIGEST;
+pub const NUM_COLS: usize = C_HASHES + 1;
 
 pub const PUB_PROGRAM: usize = 0;
 pub const PUB_OUTPUT: usize = DIGEST;
@@ -418,10 +424,10 @@ impl Air for VmAir {
 
     #[allow(clippy::needless_range_loop)]
     fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
-        eval_hash_machine(b);
         let l = b.local();
         let n = b.next();
         let p = b.preprocessed();
+        let pn = b.preprocessed_next();
         let public = b.public();
         let one = F::ONE;
         let zero = F::ZERO;
@@ -442,22 +448,19 @@ impl Air for VmAir {
         let t_squeeze = p[P_SQUEEZE];
         let t_apub = p[P_ASSERT_PUB];
         let f: [F; FIELDS] = core::array::from_fn(|i| p[P_F + i]);
-        // machine op mapping: absorbs continue the running sponge register,
-        // so they are machine starts with a constrained input.
-        b.assert_eq(l[COL_START], t_sstart + t_absorb);
-        b.assert_zero(l[COL_ABSORB]);
-        b.assert_eq(l[COL_COMPRESS], t_compress);
-        b.assert_eq(l[COL_PASS], one - t_sstart - t_absorb - t_compress);
-        b.assert_zero(l[COL_LOAD]);
-        b.assert_zero(l[COL_CHAIN]);
-        // sponge register: output after a start/absorb, copied otherwise
-        let sp_rows = t_sstart + t_absorb;
-        for j in 0..WIDTH {
-            b.when_transition(sp_rows * (n[R_SP + j] - l[crate::poseidon2_air::COL_OUTPUT + j]));
-            b.when_transition((one - sp_rows) * (n[R_SP + j] - l[R_SP + j]));
-        }
+
+        // ---- hashing counter and digest register ----
+        b.mark("hashing");
+        let t_hash = t_sstart + t_absorb + t_compress;
+        let t_hash_next = pn[P_SSTART] + pn[P_ABSORB] + pn[P_COMPRESS];
+        b.when_first_row(l[C_HASHES]);
+        b.when_transition(n[C_HASHES] - l[C_HASHES] - t_hash);
         for i in 0..DIGEST {
-            b.assert_zero(t_apub * (l[COL_ACC + i] - public[PUB_OUTPUT + i]));
+            // Zero until the first hash, set by hashing rows through their
+            // message, carried by all others.
+            b.when_first_row((one - t_hash) * l[C_ACC + i]);
+            b.when_transition((one - t_hash_next) * (n[C_ACC + i] - l[C_ACC + i]));
+            b.assert_zero(t_apub * (l[C_ACC + i] - public[PUB_OUTPUT + i]));
         }
 
         let read = |k: usize, c: usize| l[C_READ + k * DEGREE + c];
@@ -490,28 +493,24 @@ impl Air for VmAir {
             let values = [addr, read(k, 0), read(k, 1), read(k, 2), read(k, 3)];
             b.lookup(false, used, &values);
         }
-        // Hashing instructions read scalars.
+        // Hashing instructions read scalars, and send them with the
+        // capacity (starts) or direction bit (compresses) and the resulting
+        // digest to the hash table. The direction is component `comp` of
+        // the dir word.
         for k in 0..8 {
             for c in 1..DEGREE {
                 b.assert_zero(block_ops * read(k, c));
             }
-            b.assert_zero(t_absorb * (l[COL_INPUT + k] - l[R_SP + k] - read(k, 0)));
-            b.assert_zero(t_absorb * (l[COL_INPUT + RATE + k] - l[R_SP + RATE + k]));
-            b.assert_zero(t_compress * (l[COL_DATA + k] - read(k, 0)));
-            b.assert_zero(t_sstart * (l[COL_INPUT + k] - read(k, 0)));
         }
-        let cap0 = f[1];
-        b.assert_zero(t_sstart * (l[COL_INPUT + RATE] - cap0));
-        for i in 1..RATE {
-            b.assert_zero(t_sstart * l[COL_INPUT + RATE + i]);
-        }
-        // Compress direction: component `comp` of the dir word.
+        let kind = t_sstart + t_absorb.scale(Fp::new(KIND_ABSORB)) + t_compress.scale(Fp::new(KIND_COMPRESS));
+        let cap = t_sstart * f[1];
         let mut dir = zero;
         for c in 0..DEGREE {
             dir += f[2 + c] * read(8, c);
         }
-        b.assert_zero(t_compress * (l[COL_DIR] - dir));
-        b.assert_zero((one - t_compress) * l[COL_DIR]);
+        let data: [F; RATE] = core::array::from_fn(|k| read(k, 0));
+        let digest: [F; DIGEST] = core::array::from_fn(|k| l[C_ACC + k]);
+        b.lookup(true, t_hash, &message(l[C_HASHES], kind, cap, dir, data, digest));
         // AssertEq
         for c in 0..DEGREE {
             b.assert_zero(t_assert * (read(0, c) - read(1, c)));
@@ -524,7 +523,6 @@ impl Air for VmAir {
         let single_w = t_const + t_input + t_muladd + t_select;
         let single_addr = t_const * f[4] + t_input * f[0] + t_muladd * f[3] + t_select * f[5];
         let prod = ext_mul(&rv(0), &rv(1));
-        let bits: [F; BITS] = core::array::from_fn(|i| l[C_BITS + i]);
         // InputDot: acc_out = acc + sum_k in_k * pow_k.
         let mut dot: [F; DEGREE] = rv(8);
         for k in 0..8 {
@@ -551,9 +549,7 @@ impl Air for VmAir {
                     b.assert_zero(t_dot * (w - dot[c]));
                     continue;
                 }
-                let bit = bits.get(4 * k + c).copied().unwrap_or(zero);
-                b.assert_zero(t_decomp * (w - bit));
-                let acc_c = if c == 0 { l[COL_ACC + k] } else { zero };
+                let acc_c = if c == 0 { l[C_ACC + k] } else { zero };
                 b.assert_zero(t_squeeze * (w - acc_c));
                 if k == 0 {
                     b.assert_zero(t_const * (w - f[c]));
@@ -565,19 +561,28 @@ impl Air for VmAir {
         }
 
         // ---- decomposition ----
+        // The 31 bits are the components of the eight written words; the
+        // 32nd component is zero.
         b.mark("decompose");
+        let bit = |i: usize| write(i / DEGREE, i % DEGREE);
         let mut value = zero;
         let mut low27 = zero;
-        for (i, bit) in bits.iter().enumerate() {
-            b.assert_zero(*bit * *bit - *bit);
-            value += *bit * pow2::<F>(i);
+        for i in 0..32 {
+            b.assert_zero(t_decomp * (bit(i) * bit(i) - bit(i)));
+            if i < 31 {
+                value += bit(i) * pow2::<F>(i);
+            }
             if i < 27 {
-                low27 += *bit * pow2::<F>(i);
+                low27 += bit(i) * pow2::<F>(i);
             }
         }
-        let t3 = l[C_T3];
-        b.assert_eq(t3, bits[30] * bits[29] * bits[28]);
-        b.assert_zero(t3 * bits[27] * low27);
+        b.assert_zero(t_decomp * bit(31));
+        // Canonical: if bits 27..31 are all set the low bits are zero. The
+        // products are forced to zero on other rows.
+        let (t2, t3) = (l[C_T2], l[C_T3]);
+        b.assert_eq(t2, t_decomp * bit(30) * bit(29));
+        b.assert_eq(t3, t2 * bit(28));
+        b.assert_zero(t3 * bit(27) * low27);
         b.assert_zero(t_decomp * (read(0, 0) - value));
         for c in 1..DEGREE {
             b.assert_zero(t_decomp * read(0, c));
@@ -608,6 +613,9 @@ pub enum ExecError {
         addr: Addr,
     },
     NotEnoughInputs,
+    /// An absorb not right after a start or absorb, or a compress before
+    /// any hashing.
+    HashOrder(usize),
 }
 
 /// Result of running a program natively.
@@ -616,8 +624,10 @@ pub struct Execution {
     pub mem: Vec<Option<Fp4>>,
     /// Digest at the `AssertPublic` instruction, if any.
     pub output_digest: Option<[Fp; DIGEST]>,
-    /// Sponge register after the last instruction.
-    pub final_sponge: [Fp; WIDTH],
+    /// The permutations, in order.
+    pub hashes: Vec<HashOp>,
+    /// Digest of the last hashing instruction.
+    pub digest: [Fp; DIGEST],
 }
 
 struct Machine<'a> {
@@ -678,27 +688,27 @@ impl VmAir {
         Ok(exec)
     }
 
-    /// Executes and records rows when `rows` is given.
+    /// Executes, and fills the rows of the main trace (given the read
+    /// counts of every address) when `rows` is given.
     fn run(
         program: &Program,
         inputs: &[Fp4],
-        mut rows: Option<(&mut HashTraceBuilder, &[u32])>,
+        mut rows: Option<(&mut Vec<Fp>, &[u32])>,
     ) -> Result<(Execution, Vec<u32>), ExecError> {
         let mut m = Machine { inputs, next_input: 0, mem: Vec::new(), reads: Vec::new() };
         let mut output_digest = None;
-        let mut current_digest = [Fp::ZERO; DIGEST];
-        // Value of the sponge register entering the current row.
-        let mut sp_reg = [Fp::ZERO; WIDTH];
-        // Running sponge state, tracked natively (the trace builder, when
-        // present, computes the same values row by row).
+        let mut digest = [Fp::ZERO; DIGEST];
+        let mut hashes: Vec<HashOp> = Vec::new();
+        // State after the last hashing instruction, when that was a start or
+        // an absorb (which an absorb continues).
         let mut sponge: Option<[Fp; WIDTH]> = None;
         for (pc, ins) in program.instrs.iter().enumerate() {
             // Values this row writes (slot, address, word).
             let mut writes: Vec<(usize, Addr, Fp4)> = Vec::new();
             let mut read_vals: Vec<Fp4> = Vec::new();
             let mut bits_val: Option<u32> = None;
-            let mut hash_op: Option<(usize, [Fp; WIDTH])> = None; // (kind, data) kind 0 start 1 absorb 2 compress
-            let mut dir_bit = false;
+            let mut hash_op: Option<HashOp> = None;
+            let hash_index = hashes.len();
             match *ins {
                 Instr::Const { imm, out } => {
                     m.write(pc, out, imm)?;
@@ -774,84 +784,59 @@ impl VmAir {
                     let mut input = [Fp::ZERO; WIDTH];
                     input[..RATE].copy_from_slice(&block);
                     input[RATE] = cap0;
-                    hash_op = Some((0, input));
+                    let out = permute(input);
+                    sponge = Some(out);
+                    digest.copy_from_slice(&out[..DIGEST]);
+                    hash_op = Some(HashOp::Start { data: block, cap: cap0 });
                 }
                 Instr::Absorb { data } => {
                     let block = m.read_block(pc, data)?;
                     read_vals.extend(block.iter().map(|x| Fp4::from_base(*x)));
-                    let mut input = [Fp::ZERO; WIDTH];
-                    input[..RATE].copy_from_slice(&block);
-                    hash_op = Some((1, input));
+                    let mut st = sponge.ok_or(ExecError::HashOrder(pc))?;
+                    for (x, y) in st.iter_mut().zip(&block) {
+                        *x = x.add(y);
+                    }
+                    let out = permute(st);
+                    sponge = Some(out);
+                    digest.copy_from_slice(&out[..DIGEST]);
+                    hash_op = Some(HashOp::Absorb { data: block });
                 }
                 Instr::Compress { sib, dir, comp } => {
-                    let block = m.read_block(pc, sib)?;
-                    read_vals.extend(block.iter().map(|x| Fp4::from_base(*x)));
+                    if hashes.is_empty() {
+                        return Err(ExecError::HashOrder(pc));
+                    }
+                    let sibling = m.read_block(pc, sib)?;
+                    read_vals.extend(sibling.iter().map(|x| Fp4::from_base(*x)));
                     let d = m.read(pc, dir)?;
                     read_vals.push(d);
-                    dir_bit = d.0[comp as usize] == Fp::ONE;
-                    let mut input = [Fp::ZERO; WIDTH];
-                    input[..RATE].copy_from_slice(&block);
-                    hash_op = Some((2, input));
+                    let right = d.0[comp as usize] == Fp::ONE;
+                    let mut st = [Fp::ZERO; WIDTH];
+                    let (lo, hi) = if right { (&sibling, &digest) } else { (&digest, &sibling) };
+                    st[..DIGEST].copy_from_slice(lo);
+                    st[DIGEST..].copy_from_slice(hi);
+                    let out = permute(st);
+                    sponge = None;
+                    digest.copy_from_slice(&out[..DIGEST]);
+                    hash_op = Some(HashOp::Compress { sibling, right });
                 }
                 Instr::Squeeze { out } => {
-                    for (k, d) in current_digest.iter().enumerate() {
+                    for (k, d) in digest.iter().enumerate() {
                         let v = Fp4::from_base(*d);
                         m.write(pc, out + k as Addr, v)?;
                         writes.push((k, out + k as Addr, v));
                     }
                 }
                 Instr::AssertPublic => {
-                    output_digest = Some(current_digest);
+                    output_digest = Some(digest);
                 }
             }
-            // Advance the native sponge. An absorb's full permutation input is
-            // the register state plus the block.
-            let mut absorb_input = [Fp::ZERO; WIDTH];
-            match hash_op {
-                Some((0, input)) => sponge = Some(permute(input)),
-                Some((1, input)) => {
-                    let mut st = sponge.expect("absorb without a running sponge");
-                    for (x, y) in st.iter_mut().zip(&input[..RATE]) {
-                        *x = x.add(y);
-                    }
-                    absorb_input = st;
-                    sponge = Some(permute(st));
-                }
-                Some((2, input)) => {
-                    let mut st = [Fp::ZERO; WIDTH];
-                    let sib: [Fp; DIGEST] = input[..DIGEST].try_into().unwrap();
-                    if dir_bit {
-                        st[..DIGEST].copy_from_slice(&sib);
-                        st[DIGEST..].copy_from_slice(&current_digest);
-                    } else {
-                        st[..DIGEST].copy_from_slice(&current_digest);
-                        st[DIGEST..].copy_from_slice(&sib);
-                    }
-                    sponge = Some(permute(st));
-                }
-                _ => {}
-            }
-            if hash_op.is_some() {
-                current_digest.copy_from_slice(&sponge.unwrap()[..DIGEST]);
-            }
-            if let Some((ref mut b, counts)) = rows {
-                match hash_op {
-                    Some((0, input)) => {
-                        b.start(input);
-                    }
-                    Some((1, _)) => {
-                        b.start(absorb_input);
-                    }
-                    Some((2, input)) => {
-                        b.compress(input[..RATE].try_into().unwrap(), dir_bit);
-                    }
-                    _ => {
-                        b.pass();
-                    }
-                }
-                debug_assert_eq!(b.acc(), current_digest);
-                let row = b.last_row_mut();
-                row[R_SP..R_SP + WIDTH].copy_from_slice(&sp_reg);
+            hashes.extend(hash_op);
+            if let Some((ref mut trace, counts)) = rows {
+                let at = trace.len();
+                trace.resize(at + NUM_COLS, Fp::ZERO);
+                let row = &mut trace[at..];
+                row[C_HASHES] = Fp::new(hash_index as u32);
+                row[C_ACC..C_ACC + DIGEST].copy_from_slice(&digest);
                 for (k, v) in read_vals.iter().enumerate() {
                     row[C_READ + k * DEGREE..C_READ + (k + 1) * DEGREE].copy_from_slice(&v.0);
                 }
@@ -860,35 +845,54 @@ impl VmAir {
                     row[C_MULT + slot] = Fp::new(counts[*addr as usize]);
                 }
                 if let Some(v) = bits_val {
-                    for i in 0..BITS {
-                        row[C_BITS + i] = Fp::new((v >> i) & 1);
-                    }
-                    row[C_T3] = Fp::new(((v >> 28) & 7 == 7) as u32);
+                    let t2 = (v >> 30) & (v >> 29) & 1;
+                    row[C_T2] = Fp::new(t2);
+                    row[C_T3] = Fp::new(t2 & (v >> 28) & 1);
                 }
-            }
-            if matches!(hash_op, Some((0, _)) | Some((1, _))) {
-                sp_reg = sponge.unwrap();
             }
         }
         let reads = m.reads.clone();
-        Ok((Execution { mem: m.mem, output_digest, final_sponge: sp_reg }, reads))
+        Ok((Execution { mem: m.mem, output_digest, hashes, digest }, reads))
     }
 
-    /// Builds the trace for `program` on `inputs`, of height
-    /// [`Program::height`].
-    pub fn generate_trace(program: &Program, inputs: &[Fp4]) -> Result<Trace, ExecError> {
+    /// Builds the traces for `program` on `inputs`: the machine's, of
+    /// height [`Program::height`], and its hash table's.
+    pub fn generate_trace(program: &Program, inputs: &[Fp4]) -> Result<(Trace, Trace), ExecError> {
         // First pass: read counts for the write multiplicities.
         let (_, counts) = Self::run(program, inputs, None)?;
-        let mut b = HashTraceBuilder::new(NUM_COLS);
-        let (exec, _) = Self::run(program, inputs, Some((&mut b, &counts)))?;
-        let sp = exec.final_sponge;
         let n = program.height();
-        while b.len() < n {
-            b.pass();
-            let row = b.last_row_mut();
-            row[R_SP..R_SP + WIDTH].copy_from_slice(&sp);
+        let mut rows = Vec::with_capacity(n * NUM_COLS);
+        let (exec, _) = Self::run(program, inputs, Some((&mut rows, &counts)))?;
+        let mut done = [Fp::ZERO; NUM_COLS];
+        done[C_ACC..C_ACC + DIGEST].copy_from_slice(&exec.digest);
+        done[C_HASHES] = Fp::new(exec.hashes.len() as u32);
+        while rows.len() < n * NUM_COLS {
+            rows.extend_from_slice(&done);
         }
-        Ok(b.finish())
+        Ok((Trace::new(rows, NUM_COLS), HashTableAir::generate_trace(&exec.hashes)))
+    }
+
+    /// Height of the hash table for `program`.
+    pub fn hash_height(program: &Program) -> usize {
+        let hashes = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::SpongeStart { .. } | Instr::Absorb { .. } | Instr::Compress { .. }))
+            .count();
+        hashes.max(2).next_power_of_two()
+    }
+
+    /// The two tables of a machine proof, from [`VmAir::generate_trace`].
+    pub fn tables<'a>(main: &'a Trace, hashes: &'a Trace, program: &'a Preprocessed) -> [TableInput<'a>; 2] {
+        [
+            TableInput { air: &VmAir, trace: main, pre: Some(program) },
+            TableInput { air: &HashTableAir, trace: hashes, pre: None },
+        ]
+    }
+
+    /// The tables a verifier of a machine proof expects.
+    pub fn specs(program_digest: &Digest) -> [TableSpec<'_>; 2] {
+        [TableSpec { air: &VmAir, pre_root: Some(program_digest) }, TableSpec { air: &HashTableAir, pre_root: None }]
     }
 
     pub fn public_values(program_digest: &Digest, output_digest: &[Fp; DIGEST]) -> Vec<Fp> {
@@ -905,7 +909,7 @@ mod tests {
     use crate::challenger::Challenger;
     use crate::merkle::{MerkleTree, hash_row};
     use crate::poseidon2::hash;
-    use crate::stark::{StarkConfig, check_constraints_with, measure_degree, prove_with, verify_with};
+    use crate::stark::{StarkConfig, check_tables, measure_degree, prove_tables, verify_tables};
     use crate::test_util::Rng;
 
     fn tr() -> Challenger {
@@ -1012,7 +1016,8 @@ mod tests {
     #[test]
     fn layout_and_degree() {
         assert_eq!(measure_degree(&VmAir, NUM_PUBLIC), 3);
-        const { assert!(NUM_COLS < 500) };
+        assert_eq!(measure_degree(&HashTableAir, NUM_PUBLIC), 3);
+        assert_eq!(NUM_COLS, 92);
     }
 
     #[test]
@@ -1020,15 +1025,28 @@ mod tests {
         let mut rng = Rng::new(70);
         let (p, inputs, out) = sample_program(&mut rng);
         assert_eq!(p.num_inputs(), inputs.len());
-        let trace = VmAir::generate_trace(&p, &inputs).unwrap();
+        let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();
         assert_eq!(trace.height(), p.height());
+        assert_eq!(hashes.height(), VmAir::hash_height(&p));
         let table = p.table();
         let public = VmAir::public_values(&p.digest(1), &out);
-        assert_eq!(check_constraints_with(&VmAir, &trace, Some(&table), &public), Ok(()));
+        let check = |trace: &Trace, hashes: &Trace, table: &Trace, public: &[Fp]| {
+            check_tables(&[(&VmAir, trace, Some(table)), (&HashTableAir, hashes, None)], public)
+        };
+        assert_eq!(check(&trace, &hashes, &table, &public), Ok(()));
         // Wrong output digest.
         let mut bad = public.clone();
         bad[PUB_OUTPUT + 7] += Fp::ONE;
-        assert!(check_constraints_with(&VmAir, &trace, Some(&table), &bad).is_err());
+        assert!(check(&trace, &hashes, &table, &bad).is_err());
+        // A different permutation result, or hashes out of order.
+        let mut bad = hashes.clone();
+        bad.values[crate::hash_table::NUM_COLS + crate::hash_machine::COL_ACC] += Fp::ONE;
+        assert!(check(&trace, &bad, &table, &public).is_err());
+        let w = crate::hash_table::NUM_COLS;
+        let mut bad = hashes.clone();
+        let (r0, r1) = bad.values.split_at_mut(2 * w);
+        r0[w..].swap_with_slice(&mut r1[..w]);
+        assert!(check(&trace, &bad, &table, &public).is_err());
         // A wrong witness fails an assertion natively.
         let mut wrong = inputs.clone();
         wrong[1] += Fp4::ONE;
@@ -1038,16 +1056,28 @@ mod tests {
         let r = p.instrs.iter().position(|i| matches!(i, Instr::MulAdd { .. })).unwrap();
         let mut bad = trace.clone();
         bad.values[r * width + C_READ] += Fp::ONE;
-        assert!(check_constraints_with(&VmAir, &bad, Some(&table), &public).is_err());
+        assert!(check(&bad, &hashes, &table, &public).is_err());
         // A different program (one changed field) rejects the same trace.
         let mut other = table.clone();
         other.values[r * PRE_WIDTH + P_F] += Fp::ONE;
-        assert!(check_constraints_with(&VmAir, &trace, Some(&other), &public).is_err());
+        assert!(check(&trace, &hashes, &other, &public).is_err());
         // A dot-product row with a wrong accumulator.
         let r = p.instrs.iter().position(|i| matches!(i, Instr::InputDot { .. })).unwrap();
         let mut bad = trace.clone();
         bad.values[r * width + C_WRITE + 8 * DEGREE] += Fp::ONE;
-        assert!(check_constraints_with(&VmAir, &bad, Some(&table), &public).is_err());
+        assert!(check(&bad, &hashes, &table, &public).is_err());
+        // A decomposition with a flipped bit, or of a non-canonical value.
+        let r = p.instrs.iter().position(|i| matches!(i, Instr::Decompose { .. })).unwrap();
+        let mut bad = trace.clone();
+        bad.values[r * width + C_WRITE] = Fp::ONE - bad.values[r * width + C_WRITE];
+        assert!(check(&bad, &hashes, &table, &public).is_err());
+        // An absorb after a compress has no sponge to continue.
+        let mut q = Program::new();
+        let blk = q.input8();
+        q.sponge_start(blk, Fp::ZERO);
+        q.compress(blk, blk, 0);
+        q.absorb(blk);
+        assert_eq!(VmAir::execute(&q, &[Fp4::ZERO; 8]).err(), Some(ExecError::HashOrder(3)));
     }
 
     #[test]
@@ -1055,19 +1085,20 @@ mod tests {
         let config = StarkConfig { log_blowup: 1, num_queries: 16 };
         let mut rng = Rng::new(71);
         let (p, inputs, out) = sample_program(&mut rng);
-        let trace = VmAir::generate_trace(&p, &inputs).unwrap();
+        let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();
         let pre = p.preprocess(config.log_blowup);
         let public = VmAir::public_values(&pre.root(), &out);
-        let proof = prove_with(&config, &VmAir, &trace, Some(&pre), &public, &mut tr());
-        assert_eq!(verify_with(&config, &VmAir, Some(&pre.root()), &public, &proof, &mut tr()), Ok(()));
+        let proof = prove_tables(&config, &VmAir::tables(&trace, &hashes, &pre), &public, &mut tr());
+        let root = pre.root();
+        assert_eq!(verify_tables(&config, &VmAir::specs(&root), &public, &proof, &mut tr()), Ok(()));
         let mut bad = public.clone();
         bad[PUB_OUTPUT] += Fp::ONE;
-        assert!(verify_with(&config, &VmAir, Some(&pre.root()), &bad, &proof, &mut tr()).is_err());
+        assert!(verify_tables(&config, &VmAir::specs(&root), &bad, &proof, &mut tr()).is_err());
         // Against another program's digest.
         let mut q = p.clone();
         q.assert_eq(0, 0);
         let other = q.digest(config.log_blowup);
         assert_ne!(other, pre.root());
-        assert!(verify_with(&config, &VmAir, Some(&other), &public, &proof, &mut tr()).is_err());
+        assert!(verify_tables(&config, &VmAir::specs(&other), &public, &proof, &mut tr()).is_err());
     }
 }

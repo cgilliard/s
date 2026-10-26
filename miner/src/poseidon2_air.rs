@@ -171,18 +171,14 @@ impl Air for Poseidon2Air {
         let row = b.local();
         let mut state: [F; WIDTH] = row[COL_INPUT..COL_INPUT + WIDTH].try_into().unwrap();
         let mut k = 0;
-        let mut pending = Vec::with_capacity(2 * (2 * HALF_FULL_ROUNDS * WIDTH + ROUNDS_P));
         walk(&mut state, |x| {
             let (c3, c7) = Self::sbox_cols(k);
             let (x3, x7) = (row[c3], row[c7]);
-            pending.push(x3 - x * x * x);
-            pending.push(x7 - x3 * x3 * x);
+            b.assert_zero(x3 - x * x * x);
+            b.assert_zero(x7 - x3 * x3 * x);
             k += 1;
             x7
         });
-        for c in pending {
-            b.assert_zero(c);
-        }
         for (i, s) in state.iter().enumerate() {
             b.assert_eq(row[COL_OUTPUT + i], *s);
         }

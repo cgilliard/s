@@ -56,6 +56,15 @@ const fn mont_reduce(x: u64) -> u32 {
     if t >= P { t - P } else { t }
 }
 
+/// `n` zeros, from zeroed memory rather than a fill loop: large buffers
+/// then cost no pass over memory until they are written.
+pub fn zeroed_vec(n: usize) -> Vec<Fp> {
+    let mut v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+    // SAFETY: `Fp` is `repr(transparent)` over `u32`, so the allocation has
+    // the right layout, and the all-zero word is `Fp::ZERO`.
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr().cast::<Fp>(), v.len(), v.capacity()) }
+}
+
 impl Fp {
     /// The raw Montgomery word, for vectorized arithmetic.
     #[inline(always)]
