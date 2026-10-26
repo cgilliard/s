@@ -112,14 +112,73 @@ fn transform(v: &mut [Fp], root: Fp) {
         let twiddles = &table[offset..offset + half];
         for start in (0..n).step_by(len) {
             let (lo, hi) = v[start..start + len].split_at_mut(half);
-            for ((a, b), w) in lo.iter_mut().zip(hi.iter_mut()).zip(twiddles) {
-                let t = b.mul(w);
-                *b = a.sub(&t);
-                *a = a.add(&t);
-            }
+            butterflies(lo, hi, twiddles);
         }
         offset += half;
         len <<= 1;
+    }
+}
+
+/// `(a, b) <- (a + w b, a - w b)` elementwise.
+#[inline]
+fn butterflies(lo: &mut [Fp], hi: &mut [Fp], twiddles: &[Fp]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if lo.len() >= 8 {
+        use crate::packed::{add, load_fp, mul, store_fp, sub};
+        for ((a, b), w) in lo.chunks_exact_mut(8).zip(hi.chunks_exact_mut(8)).zip(twiddles.chunks_exact(8)) {
+            let (va, t) = (load_fp(a), mul(load_fp(b), load_fp(w)));
+            store_fp(a, add(va, t));
+            store_fp(b, sub(va, t));
+        }
+        return;
+    }
+    for ((a, b), w) in lo.iter_mut().zip(hi.iter_mut()).zip(twiddles) {
+        let t = b.mul(w);
+        *b = a.sub(&t);
+        *a = a.add(&t);
+    }
+}
+
+/// `v[i] *= s[i]`.
+#[inline]
+fn scale(v: &mut [Fp], s: &[Fp]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use crate::packed::{load_fp, mul, store_fp};
+        let whole = v.len() / 8 * 8;
+        let (head, tail) = v.split_at_mut(whole);
+        for (x, c) in head.chunks_exact_mut(8).zip(s.chunks_exact(8)) {
+            store_fp(x, mul(load_fp(x), load_fp(c)));
+        }
+        for (x, c) in tail.iter_mut().zip(&s[whole..]) {
+            *x = x.mul(c);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    for (x, c) in v.iter_mut().zip(s) {
+        *x = x.mul(c);
+    }
+}
+
+/// `v[i] *= c`.
+#[inline]
+fn scale_const(v: &mut [Fp], c: Fp) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use crate::packed::{load_fp, mul, splat_fp, store_fp};
+        let vc = splat_fp(c);
+        let whole = v.len() / 8 * 8;
+        let (head, tail) = v.split_at_mut(whole);
+        for x in head.chunks_exact_mut(8) {
+            store_fp(x, mul(load_fp(x), vc));
+        }
+        for x in tail {
+            *x = x.mul(&c);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    for x in v.iter_mut() {
+        *x = x.mul(&c);
     }
 }
 
@@ -138,17 +197,13 @@ pub fn intt(v: &mut [Fp]) {
     let root = root_of_unity(log2_strict(n)).inverse().unwrap();
     transform(v, root);
     let inv_n = Fp::new(n as u32).inverse().unwrap();
-    for x in v.iter_mut() {
-        *x = x.mul(&inv_n);
-    }
+    scale_const(v, inv_n);
 }
 
 /// Coefficients to evaluations on the coset `shift * H`.
 pub fn coset_ntt(v: &mut [Fp], shift: Fp) {
     let pows = power_table(shift, v.len());
-    for (x, s) in v.iter_mut().zip(pows.iter()) {
-        *x = x.mul(s);
-    }
+    scale(v, &pows);
     ntt(v);
 }
 
@@ -157,9 +212,7 @@ pub fn coset_intt(v: &mut [Fp], shift: Fp) {
     intt(v);
     let inv = shift.inverse().expect("shift must be non-zero");
     let pows = power_table(inv, v.len());
-    for (x, s) in v.iter_mut().zip(pows.iter()) {
-        *x = x.mul(s);
-    }
+    scale(v, &pows);
 }
 
 fn map_components(v: &mut [Fp4], f: impl Fn(&mut [Fp])) {

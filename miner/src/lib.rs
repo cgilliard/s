@@ -13,6 +13,8 @@ pub mod hash_machine;
 pub mod inflate;
 pub mod merkle;
 pub mod ntt;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub mod packed;
 pub mod parallel;
 pub mod poseidon2;
 pub mod poseidon2_air;

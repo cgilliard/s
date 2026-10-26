@@ -44,6 +44,7 @@ const R2: u32 = 1_172_168_163;
 
 /// An element of the BabyBear field, in Montgomery form.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
 pub struct Fp(u32);
 
 /// Montgomery reduction of `x < p * 2^32`: returns `x * 2^-32 mod p`, reduced.
@@ -56,6 +57,20 @@ const fn mont_reduce(x: u64) -> u32 {
 }
 
 impl Fp {
+    /// The raw Montgomery word, for vectorized arithmetic.
+    #[inline(always)]
+    pub(crate) const fn to_mont(self) -> u32 {
+        self.0
+    }
+
+    /// From a raw Montgomery word below `p`.
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) const fn from_mont(x: u32) -> Fp {
+        debug_assert!(x < P);
+        Fp(x)
+    }
+
     /// The additive identity.
     pub const ZERO: Fp = Fp(0);
     /// The multiplicative identity.
@@ -894,7 +909,17 @@ fn batch_internal(s: &mut BatchState) {
 }
 
 /// Permutes `LANES` states at once.
+#[inline]
 pub fn permute_batch(s: &mut BatchState) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    avx2::permute_batch(s);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    permute_batch_scalar(s);
+}
+
+/// Portable [`permute_batch`], on arrays the compiler may vectorize.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
+fn permute_batch_scalar(s: &mut BatchState) {
     batch_external(s);
     for rc in RC_EXTERNAL_INITIAL.iter() {
         for (x, c) in s.iter_mut().zip(rc) {
@@ -911,6 +936,83 @@ pub fn permute_batch(s: &mut BatchState) {
             *x = lane_pow7(&lane_add_const(x, c.0));
         }
         batch_external(s);
+    }
+}
+
+/// AVX2 permutation of eight states, one per 32-bit lane, on
+/// [`crate::packed`] arithmetic (bit-identical to the scalar path).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2 {
+    use super::{BatchState, INTERNAL_DIAG, RC_EXTERNAL_FINAL, RC_EXTERNAL_INITIAL, RC_INTERNAL, WIDTH};
+    use crate::packed::{V, add, load, mul, splat, store};
+
+    #[inline(always)]
+    fn pow7(a: V) -> V {
+        let x2 = mul(a, a);
+        let x4 = mul(x2, x2);
+        let x6 = mul(x4, x2);
+        mul(x6, a)
+    }
+
+    #[inline(always)]
+    fn external(s: &mut [V; WIDTH]) {
+        for x in s.chunks_exact_mut(4) {
+            let t01 = add(x[0], x[1]);
+            let t23 = add(x[2], x[3]);
+            let t0123 = add(t01, t23);
+            let t01123 = add(t0123, x[1]);
+            let t01233 = add(t0123, x[3]);
+            let x0d = add(x[0], x[0]);
+            let x2d = add(x[2], x[2]);
+            x[3] = add(t01233, x0d);
+            x[1] = add(t01123, x2d);
+            x[0] = add(t01123, t01);
+            x[2] = add(t01233, t23);
+        }
+        let mut col = [s[0], s[1], s[2], s[3]];
+        for i in 4..WIDTH {
+            col[i % 4] = add(col[i % 4], s[i]);
+        }
+        for (i, x) in s.iter_mut().enumerate() {
+            *x = add(*x, col[i % 4]);
+        }
+    }
+
+    #[inline(always)]
+    fn internal(s: &mut [V; WIDTH]) {
+        let mut sum = s[0];
+        for x in &s[1..] {
+            sum = add(sum, *x);
+        }
+        for (x, d) in s.iter_mut().zip(&INTERNAL_DIAG) {
+            *x = add(mul(*x, splat(d.0)), sum);
+        }
+    }
+
+    #[inline(always)]
+    fn full_round(s: &mut [V; WIDTH], rc: &[super::Fp; WIDTH]) {
+        for (x, c) in s.iter_mut().zip(rc) {
+            *x = pow7(add(*x, splat(c.0)));
+        }
+        external(s);
+    }
+
+    pub fn permute_batch(state: &mut BatchState) {
+        let mut s: [V; WIDTH] = core::array::from_fn(|i| load(&state[i]));
+        external(&mut s);
+        for rc in RC_EXTERNAL_INITIAL.iter() {
+            full_round(&mut s, rc);
+        }
+        for rc in RC_INTERNAL.iter() {
+            s[0] = pow7(add(s[0], splat(rc.0)));
+            internal(&mut s);
+        }
+        for rc in RC_EXTERNAL_FINAL.iter() {
+            full_round(&mut s, rc);
+        }
+        for (row, v) in state.iter_mut().zip(&s) {
+            store(row, *v);
+        }
     }
 }
 
@@ -986,6 +1088,27 @@ mod batch_tests {
         // Empty rows.
         let empty: [&[Fp]; LANES] = [&[]; LANES];
         assert!(hash_batch(empty).iter().all(|d| *d == hash(&[])));
+    }
+
+    #[test]
+    fn vector_permutation_matches_portable() {
+        let mut x = 0x1234_5678u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x % P
+        };
+        for _ in 0..50 {
+            let mut a: BatchState = core::array::from_fn(|_| core::array::from_fn(|_| next()));
+            // Extremes too: zero and p - 1.
+            a[1][3] = 0;
+            a[2][5] = P - 1;
+            let mut b = a;
+            permute_batch(&mut a);
+            permute_batch_scalar(&mut b);
+            assert_eq!(a, b);
+        }
     }
 
     #[test]
