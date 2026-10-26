@@ -211,6 +211,51 @@ impl Dataset {
         Dataset { params, items }
     }
 
+    /// Loads a dataset saved by [`Dataset::save`], or generates and saves
+    /// it. A loaded file is accepted if it has the right size and a few
+    /// items spread through it match the text.
+    pub fn load_or_generate(seed: &SeedText, path: &std::path::Path) -> std::io::Result<Dataset> {
+        let params = *seed.params();
+        if let Ok(bytes) = std::fs::read(path)
+            && let Some(d) = Self::from_bytes(params, &bytes)
+        {
+            let n = d.items.len();
+            if (0..8).map(|k| k * (n - 1) / 7).all(|i| d.items[i] == seed.calc_dataset_item(i)) {
+                return Ok(d);
+            }
+        }
+        let d = Self::generate(seed);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, d.to_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(d)
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.items.len() * WIDTH * 4);
+        for item in &self.items {
+            for x in item {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    fn from_bytes(params: PowParams, bytes: &[u8]) -> Option<Dataset> {
+        if bytes.len() != params.dataset_items() * WIDTH * 4 {
+            return None;
+        }
+        let mut items = Vec::with_capacity(params.dataset_items());
+        for chunk in bytes.chunks_exact(WIDTH * 4) {
+            let mut item = [Fp::ZERO; WIDTH];
+            for (x, b) in item.iter_mut().zip(chunk.chunks_exact(4)) {
+                *x = Fp::from_le_bytes(b.try_into().unwrap())?;
+            }
+            items.push(item);
+        }
+        Some(Dataset { params, items })
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }

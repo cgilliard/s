@@ -213,6 +213,8 @@ mod tests {
 
     const POW: PowParams = PowParams { log_dataset_items: 8, parents: 32, accesses: 64 };
     const GENESIS_TIME: u64 = 1_700_000_000;
+    /// Segment proofs in these tests, verified directly by the node.
+    const STARK: StarkConfig = StarkConfig { log_blowup: 1, num_queries: 20 };
 
     fn params() -> ChainParams {
         ChainParams {
@@ -225,7 +227,7 @@ mod tests {
             median_time_window: 11,
             initial_subsidy: 50,
             halving_interval: 1000,
-            stark: StarkConfig { log_blowup: 1, num_queries: 20 },
+            aggregator: crate::aggregate::AggregatorParams::MAINNET,
         }
     }
 
@@ -242,7 +244,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_garbage() {
-        let v = StarkVerifier { config: params().stark };
+        let v = StarkVerifier { config: STARK };
         let body = Body::default();
         let st = BlockStatement {
             height: 1,
@@ -254,7 +256,7 @@ mod tests {
         };
         assert!(!v.verify(&st, &[]));
         assert!(!v.verify(&st, &[1, 2, 3]));
-        assert_eq!(verify_block(&params().stark, &st, &encode(&[])), Err(AggregateError::NoSegments));
+        assert_eq!(verify_block(&STARK, &st, &encode(&[])), Err(AggregateError::NoSegments));
     }
 
     #[test]
@@ -264,7 +266,7 @@ mod tests {
         let p = params();
         let seed = seed();
         let dataset = Dataset::generate(&seed);
-        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: p.stark }).unwrap();
+        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK }).unwrap();
 
         // Genesis pays A, B and D.
         let mut a = key(1);
@@ -316,7 +318,7 @@ mod tests {
         };
         assert_eq!(segments.len(), 2);
         let t = std::time::Instant::now();
-        let proof = prove_block(&p.stark, &segments);
+        let proof = prove_block(&STARK, &segments);
         println!("2 segments in parallel: {} bytes in {:?}", proof.len(), t.elapsed());
         let decoded = decode(&proof).unwrap();
         assert_eq!(decoded.len(), 2);
@@ -371,7 +373,7 @@ mod tests {
         // the STARK check fails on that index.
         let mut cross = proofs.clone();
         cross[1].proof = proofs[0].proof.clone();
-        assert_eq!(verify_block(&p.stark, &st, &encode(&cross)), Err(AggregateError::SegmentRejected { index: 1 }));
+        assert_eq!(verify_block(&STARK, &st, &encode(&cross)), Err(AggregateError::SegmentRejected { index: 1 }));
 
         // Block 2 with a stale proof is rejected by the chain; a fresh one applies.
         let reward2 =
@@ -388,7 +390,7 @@ mod tests {
             chain.apply_block(&Block { header: h2, body: stale }, GENESIS_TIME + 1300),
             Err(ChainError::BadProof)
         ));
-        let good = body_from_segments(&seg2, prove_block(&p.stark, &seg2));
+        let good = body_from_segments(&seg2, prove_block(&STARK, &seg2));
         let h2 = mine(&good, GENESIS_TIME + 1200);
         chain.apply_block(&Block { header: h2, body: good }, GENESIS_TIME + 1300).unwrap();
         assert_eq!(chain.tip().unwrap().unwrap().height, 2);

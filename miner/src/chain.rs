@@ -34,10 +34,10 @@ use heed::byteorder::BigEndian;
 use heed::types::{Bytes, Str, U32};
 use heed::{Database, Env, RoTxn, RwTxn};
 
+use crate::aggregate::AggregatorParams;
 use crate::block::{Block, Body, BodyError, Header};
 use crate::difficulty::{Asert, U256};
 use crate::pow::{Digest, PowParams, SeedText, Target};
-use crate::stark::StarkConfig;
 use crate::state_tree::{EMPTY, open_env};
 use crate::utxo::{self, UtxoSet};
 
@@ -60,7 +60,7 @@ pub struct ChainParams {
     /// Blocks between halvings of the subsidy.
     pub halving_interval: u32,
     /// Parameters of the block validity proof.
-    pub stark: StarkConfig,
+    pub aggregator: AggregatorParams,
 }
 
 impl ChainParams {
@@ -74,8 +74,7 @@ impl ChainParams {
         median_time_window: 11,
         initial_subsidy: 50 * 100_000_000,
         halving_interval: 210_000,
-        // Rate 1/4 and 50 queries: about 100 bits of FRI soundness.
-        stark: StarkConfig { log_blowup: 2, num_queries: 50 },
+        aggregator: AggregatorParams::MAINNET,
     };
 
     /// Subsidy paid by the block at `height`.
@@ -242,6 +241,10 @@ impl<V: ProofVerifier> Chain<V> {
 
     pub fn params(&self) -> &ChainParams {
         &self.params
+    }
+
+    pub fn verifier(&self) -> &V {
+        &self.verifier
     }
 
     pub fn utxo(&self) -> &UtxoSet {
@@ -526,7 +529,7 @@ mod tests {
             median_time_window: 11,
             initial_subsidy: 50,
             halving_interval: 10,
-            stark: StarkConfig { log_blowup: 1, num_queries: 20 },
+            aggregator: AggregatorParams::MAINNET,
         }
     }
 

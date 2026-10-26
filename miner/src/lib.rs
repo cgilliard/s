@@ -27,6 +27,7 @@ pub mod state_tree;
 pub mod transaction;
 pub mod utxo;
 pub mod vm_air;
+pub mod wallet;
 pub mod xmss;
 pub mod xmss_air;
 

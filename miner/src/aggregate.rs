@@ -484,15 +484,36 @@ pub enum AggregateError {
     Rejected,
 }
 
+/// A step of [`prove_block_with`], reported as it completes.
+#[derive(Clone, Copy, Debug)]
+pub enum Progress {
+    /// Segment `index` of `count` is proven.
+    Segment { index: usize, count: usize, elapsed: std::time::Duration },
+    /// A node over `segments` segments is proven; `root` for the last one.
+    Node { segments: usize, log_n: usize, hash_log_n: usize, root: bool, elapsed: std::time::Duration },
+}
+
 /// Proves one node of the tree over `segments[..shape.segments]`.
-fn prove_node(params: &AggregatorParams, shape: &Shape, segments: &[SegmentProof], output: Output<'_>) -> NodeProof {
+fn prove_node(
+    params: &AggregatorParams,
+    shape: &Shape,
+    segments: &[SegmentProof],
+    output: Output<'_>,
+    progress: &(dyn Fn(Progress) + Sync),
+) -> NodeProof {
     let mut nodes: Vec<Option<NodeProof>> = Vec::with_capacity(shape.children.len());
     let mut at = 0;
     for child in &shape.children {
         let slice = &segments[at..at + child.segments];
         at += child.segments;
-        nodes.push(if child.is_segment() { None } else { Some(prove_node(params, child, slice, Output::Record)) });
+        nodes.push(if child.is_segment() {
+            None
+        } else {
+            Some(prove_node(params, child, slice, Output::Record, progress))
+        });
     }
+    let t = std::time::Instant::now();
+    let root = matches!(output, Output::Statement(_));
     let mut at = 0;
     let children: Vec<Child<'_>> = shape
         .children
@@ -520,21 +541,56 @@ fn prove_node(params: &AggregatorParams, shape: &Shape, segments: &[SegmentProof
     let public = VmAir::public_values(&pre.root(), &out_digest);
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
+    progress(Progress::Node {
+        segments: shape.segments,
+        log_n: shape.log_n,
+        hash_log_n: shape.hash_log_n,
+        root,
+        elapsed: t.elapsed(),
+    });
     NodeProof { record, digest: shape.digest, proof }
 }
 
 /// Proves a block: segments in parallel, then the tree. The segments must
 /// each fit `params.segment_log_n` rows.
 pub fn prove_block(params: &AggregatorParams, statement: &Statement, segments: &[SegmentWitness]) -> Vec<u8> {
-    let proofs: Vec<SegmentProof> = std::thread::scope(|s| {
-        let handles: Vec<_> = segments
-            .iter()
-            .map(|w| s.spawn(move || prove_segment_padded(&params.segment, w, params.segment_log_n)))
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("segment prover panicked")).collect()
+    prove_block_with(params, &plan(params, segments.len()), statement, segments, segments.len(), &|_| {})
+}
+
+/// As [`prove_block`], with the tree `shape` already planned for
+/// `segments.len()`, at most `jobs` segment provers at a time (each is
+/// itself parallel, and a mainnet segment prover holds about a gigabyte),
+/// and `progress` called after every segment and node.
+pub fn prove_block_with(
+    params: &AggregatorParams,
+    shape: &Shape,
+    statement: &Statement,
+    segments: &[SegmentWitness],
+    jobs: usize,
+    progress: &(dyn Fn(Progress) + Sync),
+) -> Vec<u8> {
+    assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
+    let count = segments.len();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Mutex<Option<SegmentProof>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..jobs.clamp(1, count.max(1)) {
+            s.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= count {
+                        break;
+                    }
+                    let t = std::time::Instant::now();
+                    let p = prove_segment_padded(&params.segment, &segments[index], params.segment_log_n);
+                    progress(Progress::Segment { index, count, elapsed: t.elapsed() });
+                    *done[index].lock().unwrap() = Some(p);
+                }
+            });
+        }
     });
-    let shape = plan(params, proofs.len());
-    let root = prove_node(params, &shape, &proofs, Output::Statement(statement));
+    let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress);
     let bytes = root.proof.to_bytes();
     let mut w = Writer::with_capacity(bytes.len() + 4);
     w.u32(proofs.len() as u32);
@@ -562,25 +618,30 @@ pub fn verify_block(
         .map_err(|_| AggregateError::Rejected)
 }
 
-/// Verifies block proofs with the aggregator, caching root digests per
+/// Verifies block proofs with the aggregator, caching the planned tree per
 /// segment count.
 pub struct AggregateVerifier {
     pub params: AggregatorParams,
-    digests: Mutex<HashMap<usize, Digest>>,
+    shapes: Mutex<HashMap<usize, Shape>>,
 }
 
 impl AggregateVerifier {
     pub fn new(params: AggregatorParams) -> AggregateVerifier {
-        AggregateVerifier { params, digests: Mutex::new(HashMap::new()) }
+        AggregateVerifier { params, shapes: Mutex::new(HashMap::new()) }
+    }
+
+    /// The planned tree for `k` segments.
+    pub fn shape(&self, k: usize) -> Shape {
+        if let Some(s) = self.shapes.lock().unwrap().get(&k) {
+            return s.clone();
+        }
+        let s = plan(&self.params, k);
+        self.shapes.lock().unwrap().insert(k, s.clone());
+        s
     }
 
     pub fn digest(&self, k: usize) -> Digest {
-        if let Some(d) = self.digests.lock().unwrap().get(&k) {
-            return *d;
-        }
-        let d = plan(&self.params, k).digest;
-        self.digests.lock().unwrap().insert(k, d);
-        d
+        self.shape(k).digest
     }
 
     pub fn verify_statement(&self, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
