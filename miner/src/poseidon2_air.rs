@@ -259,7 +259,7 @@ mod tests {
             c
         };
         let proof = prove(&config, &Poseidon2Air, &trace, &[], &mut tr());
-        assert_eq!(proof.quotient_at_zeta_q.len(), 2);
+        assert_eq!(proof.tables[0].quotient_at_zeta_q.len(), 2);
         assert_eq!(verify(&config, &Poseidon2Air, &[], &proof, &mut tr()), Ok(()));
 
         // A trace claiming a wrong output does not verify.

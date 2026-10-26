@@ -58,6 +58,7 @@ use crate::ntt::{
 };
 use crate::parallel::{par_chunks_mut, par_map, par_map_min};
 use crate::poseidon2::Fp;
+use crate::recursion::Expr;
 
 // ---------------------------------------------------------------------------
 // AIR interface
@@ -198,6 +199,71 @@ pub trait Air: Sync {
     fn eval<F: Field>(&self, builder: &mut Builder<'_, F>);
 }
 
+/// An [`Air`] behind a trait object, so that the tables of one proof can
+/// have different AIR types. Implemented for every `Air`.
+pub trait DynAir: Sync {
+    fn air_width(&self) -> usize;
+    fn air_degree(&self) -> usize;
+    fn air_preprocessed_width(&self) -> usize;
+    fn eval_fp(&self, b: &mut Builder<'_, Fp>);
+    fn eval_fp4(&self, b: &mut Builder<'_, Fp4>);
+    fn eval_deg(&self, b: &mut Builder<'_, Deg>);
+    fn eval_expr(&self, b: &mut Builder<'_, Expr>);
+}
+
+impl<A: Air> DynAir for A {
+    fn air_width(&self) -> usize {
+        self.width()
+    }
+    fn air_degree(&self) -> usize {
+        self.max_constraint_degree()
+    }
+    fn air_preprocessed_width(&self) -> usize {
+        self.preprocessed_width()
+    }
+    fn eval_fp(&self, b: &mut Builder<'_, Fp>) {
+        self.eval(b)
+    }
+    fn eval_fp4(&self, b: &mut Builder<'_, Fp4>) {
+        self.eval(b)
+    }
+    fn eval_deg(&self, b: &mut Builder<'_, Deg>) {
+        self.eval(b)
+    }
+    fn eval_expr(&self, b: &mut Builder<'_, Expr>) {
+        self.eval(b)
+    }
+}
+
+/// Fields a [`DynAir`] can be evaluated over.
+pub trait EvalField: Field {
+    fn eval_air(air: &dyn DynAir, b: &mut Builder<'_, Self>);
+}
+
+impl EvalField for Fp {
+    fn eval_air(air: &dyn DynAir, b: &mut Builder<'_, Fp>) {
+        air.eval_fp(b)
+    }
+}
+
+impl EvalField for Fp4 {
+    fn eval_air(air: &dyn DynAir, b: &mut Builder<'_, Fp4>) {
+        air.eval_fp4(b)
+    }
+}
+
+impl EvalField for Deg {
+    fn eval_air(air: &dyn DynAir, b: &mut Builder<'_, Deg>) {
+        air.eval_deg(b)
+    }
+}
+
+impl EvalField for Expr {
+    fn eval_air(air: &dyn DynAir, b: &mut Builder<'_, Expr>) {
+        air.eval_expr(b)
+    }
+}
+
 /// Row-major trace matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trace {
@@ -244,7 +310,7 @@ impl StarkConfig {
     }
 }
 
-/// Openings of the committed matrices at one queried domain index.
+/// Openings of one table's committed matrices at one queried index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryOpening {
     pub trace_row: Vec<Fp>,
@@ -257,12 +323,42 @@ pub struct QueryOpening {
     pub quotient_path: Vec<Digest>,
 }
 
+impl QueryOpening {
+    fn write(&self, w: &mut Writer) {
+        w.fp_vec(&self.trace_row);
+        w.digest_vec(&self.trace_path);
+        w.fp_vec(&self.aux_row);
+        w.digest_vec(&self.aux_path);
+        w.fp_vec(&self.pre_row);
+        w.digest_vec(&self.pre_path);
+        w.fp_vec(&self.quotient_row);
+        w.digest_vec(&self.quotient_path);
+    }
+
+    fn read(r: &mut Reader) -> Option<QueryOpening> {
+        Some(QueryOpening {
+            trace_row: r.fp_vec()?,
+            trace_path: r.digest_vec()?,
+            aux_row: r.fp_vec()?,
+            aux_path: r.digest_vec()?,
+            pre_row: r.fp_vec()?,
+            pre_path: r.digest_vec()?,
+            quotient_row: r.fp_vec()?,
+            quotient_path: r.digest_vec()?,
+        })
+    }
+}
+
+/// The part of a proof that belongs to one table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Proof {
+pub struct TableProof {
     pub log_n: usize,
     pub trace_root: Digest,
     /// Present when the AIR declares lookups.
     pub aux_root: Option<Digest>,
+    /// The table's total of its lookup terms (zero without lookups). The
+    /// totals of all tables must add up to zero.
+    pub lookup_sum: Fp4,
     pub quotient_root: Digest,
     pub trace_at_zeta: Vec<Fp4>,
     pub trace_at_zeta_next: Vec<Fp4>,
@@ -273,41 +369,86 @@ pub struct Proof {
     pub pre_at_zeta: Vec<Fp4>,
     pub pre_at_zeta_next: Vec<Fp4>,
     pub quotient_at_zeta_q: Vec<Fp4>,
-    pub fri: FriProof,
-    pub openings: Vec<QueryOpening>,
 }
 
-impl Proof {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(1 << 16);
+impl TableProof {
+    /// The out-of-domain openings, in transcript order.
+    pub fn opened(&self) -> [&Vec<Fp4>; 7] {
+        [
+            &self.trace_at_zeta,
+            &self.trace_at_zeta_next,
+            &self.aux_at_zeta,
+            &self.aux_at_zeta_next,
+            &self.pre_at_zeta,
+            &self.pre_at_zeta_next,
+            &self.quotient_at_zeta_q,
+        ]
+    }
+
+    fn write(&self, w: &mut Writer) {
         w.u32(self.log_n as u32);
         w.digest(&self.trace_root);
         match &self.aux_root {
             Some(r) => {
                 w.u32(1);
                 w.digest(r);
+                w.fp4(&self.lookup_sum);
             }
             None => w.u32(0),
         }
         w.digest(&self.quotient_root);
-        w.fp4_vec(&self.trace_at_zeta);
-        w.fp4_vec(&self.trace_at_zeta_next);
-        w.fp4_vec(&self.aux_at_zeta);
-        w.fp4_vec(&self.aux_at_zeta_next);
-        w.fp4_vec(&self.pre_at_zeta);
-        w.fp4_vec(&self.pre_at_zeta_next);
-        w.fp4_vec(&self.quotient_at_zeta_q);
+        for v in self.opened() {
+            w.fp4_vec(v);
+        }
+    }
+
+    fn read(r: &mut Reader) -> Option<TableProof> {
+        let log_n = r.u32()? as usize;
+        let trace_root = r.digest()?;
+        let (aux_root, lookup_sum) = match r.u32()? {
+            0 => (None, Fp4::ZERO),
+            1 => (Some(r.digest()?), r.fp4()?),
+            _ => return None,
+        };
+        Some(TableProof {
+            log_n,
+            trace_root,
+            aux_root,
+            lookup_sum,
+            quotient_root: r.digest()?,
+            trace_at_zeta: r.fp4_vec()?,
+            trace_at_zeta_next: r.fp4_vec()?,
+            aux_at_zeta: r.fp4_vec()?,
+            aux_at_zeta_next: r.fp4_vec()?,
+            pre_at_zeta: r.fp4_vec()?,
+            pre_at_zeta_next: r.fp4_vec()?,
+            quotient_at_zeta_q: r.fp4_vec()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proof {
+    /// One part per table, tallest table first.
+    pub tables: Vec<TableProof>,
+    pub fri: FriProof,
+    /// For every FRI query, one opening per table.
+    pub openings: Vec<Vec<QueryOpening>>,
+}
+
+impl Proof {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(1 << 16);
+        w.u32(self.tables.len() as u32);
+        for t in &self.tables {
+            t.write(&mut w);
+        }
         self.fri.write(&mut w);
         w.u32(self.openings.len() as u32);
-        for o in &self.openings {
-            w.fp_vec(&o.trace_row);
-            w.digest_vec(&o.trace_path);
-            w.fp_vec(&o.aux_row);
-            w.digest_vec(&o.aux_path);
-            w.fp_vec(&o.pre_row);
-            w.digest_vec(&o.pre_path);
-            w.fp_vec(&o.quotient_row);
-            w.digest_vec(&o.quotient_path);
+        for q in &self.openings {
+            for o in q {
+                o.write(&mut w);
+            }
         }
         w.finish()
     }
@@ -315,54 +456,21 @@ impl Proof {
     /// Parses a proof; the whole slice must be consumed.
     pub fn from_bytes(bytes: &[u8]) -> Option<Proof> {
         let mut r = Reader(bytes);
-        let log_n = r.u32()? as usize;
-        let trace_root = r.digest()?;
-        let aux_root = match r.u32()? {
-            0 => None,
-            1 => Some(r.digest()?),
-            _ => return None,
-        };
-        let quotient_root = r.digest()?;
-        let trace_at_zeta = r.fp4_vec()?;
-        let trace_at_zeta_next = r.fp4_vec()?;
-        let aux_at_zeta = r.fp4_vec()?;
-        let aux_at_zeta_next = r.fp4_vec()?;
-        let pre_at_zeta = r.fp4_vec()?;
-        let pre_at_zeta_next = r.fp4_vec()?;
-        let quotient_at_zeta_q = r.fp4_vec()?;
+        let nt = r.len(64)?;
+        if nt == 0 {
+            return None;
+        }
+        let tables = (0..nt).map(|_| TableProof::read(&mut r)).collect::<Option<Vec<_>>>()?;
         let fri = FriProof::read(&mut r)?;
-        let n = r.len(4)?;
-        let mut openings = Vec::with_capacity(n);
-        for _ in 0..n {
-            openings.push(QueryOpening {
-                trace_row: r.fp_vec()?,
-                trace_path: r.digest_vec()?,
-                aux_row: r.fp_vec()?,
-                aux_path: r.digest_vec()?,
-                pre_row: r.fp_vec()?,
-                pre_path: r.digest_vec()?,
-                quotient_row: r.fp_vec()?,
-                quotient_path: r.digest_vec()?,
-            });
+        let nq = r.len(4)?;
+        let mut openings = Vec::with_capacity(nq);
+        for _ in 0..nq {
+            openings.push((0..nt).map(|_| QueryOpening::read(&mut r)).collect::<Option<Vec<_>>>()?);
         }
         if !r.is_empty() {
             return None;
         }
-        Some(Proof {
-            log_n,
-            trace_root,
-            aux_root,
-            quotient_root,
-            trace_at_zeta,
-            trace_at_zeta_next,
-            aux_at_zeta,
-            aux_at_zeta_next,
-            pre_at_zeta,
-            pre_at_zeta_next,
-            quotient_at_zeta_q,
-            fri,
-            openings,
-        })
+        Some(Proof { tables, fri, openings })
     }
 }
 
@@ -370,12 +478,21 @@ impl Proof {
 pub enum VerifyError {
     Shape,
     ConstraintIdentity,
+    /// The tables' lookup totals do not cancel.
+    LookupSum,
     Fri(FriError),
-    InvalidTraceOpening { query: usize },
-    InvalidAuxOpening { query: usize },
-    InvalidPreprocessedOpening { query: usize },
-    InvalidQuotientOpening { query: usize },
-    DeepMismatch { query: usize },
+    InvalidTraceOpening {
+        query: usize,
+    },
+    InvalidAuxOpening {
+        query: usize,
+    },
+    InvalidPreprocessedOpening {
+        query: usize,
+    },
+    InvalidQuotientOpening {
+        query: usize,
+    },
 }
 
 impl core::fmt::Display for VerifyError {
@@ -383,6 +500,7 @@ impl core::fmt::Display for VerifyError {
         match self {
             VerifyError::Shape => f.write_str("stark proof has the wrong shape"),
             VerifyError::ConstraintIdentity => f.write_str("constraints do not hold at the out-of-domain point"),
+            VerifyError::LookupSum => f.write_str("lookup totals of the tables do not cancel"),
             VerifyError::Fri(e) => write!(f, "{e}"),
             VerifyError::InvalidTraceOpening { query } => {
                 write!(f, "query {query}: invalid trace opening")
@@ -395,9 +513,6 @@ impl core::fmt::Display for VerifyError {
             }
             VerifyError::InvalidQuotientOpening { query } => {
                 write!(f, "query {query}: invalid quotient opening")
-            }
-            VerifyError::DeepMismatch { query } => {
-                write!(f, "query {query}: deep value does not match fri input")
             }
         }
     }
@@ -446,8 +561,8 @@ impl LookupChallenges {
 }
 
 /// Evaluates the AIR at one row pair.
-pub(crate) fn evaluate<F: Field, A: Air>(
-    air: &A,
+pub(crate) fn evaluate<F: EvalField>(
+    air: &dyn DynAir,
     local: &[F],
     next: &[F],
     pre: (&[F], &[F]),
@@ -455,7 +570,7 @@ pub(crate) fn evaluate<F: Field, A: Air>(
     sel: (F, F, F),
 ) -> (Vec<F>, Vec<LookupTerm<F>>) {
     let mut b = Builder::new(local, next, pre, public, sel);
-    air.eval(&mut b);
+    F::eval_air(air, &mut b);
     (b.constraints, b.lookups)
 }
 
@@ -466,18 +581,20 @@ pub(crate) fn num_lookup_constraints(terms: usize) -> usize {
 }
 
 /// Counts constraints and lookup terms an AIR emits (on an all-zero row pair).
-pub(crate) fn shape<A: Air>(air: &A, public: &[Fp]) -> (usize, usize) {
-    let zeros = vec![Fp::ZERO; air.width()];
-    let pre = vec![Fp::ZERO; air.preprocessed_width()];
+pub(crate) fn shape(air: &dyn DynAir, public: &[Fp]) -> (usize, usize) {
+    let zeros = vec![Fp::ZERO; air.air_width()];
+    let pre = vec![Fp::ZERO; air.air_preprocessed_width()];
     let (c, t) = evaluate(air, &zeros, &zeros, (&pre, &pre), public, (Fp::ZERO, Fp::ZERO, Fp::ZERO));
     (c.len(), t.len())
 }
 
 /// Lookup constraints for one row, in order: inverse checks, running-sum
-/// transition, first-row zero, last-row zero. `aux_local`/`aux_next` are the
-/// extension values: inverses then the running sum.
+/// transition, first-row zero, last-row total. `aux_local`/`aux_next` are
+/// the extension values: inverses then the running sum; `total` is the
+/// table's lookup total.
 fn lookup_constraints<F: Field>(
     ch: &LookupChallenges,
+    total: Fp4,
     terms: &[LookupTerm<F>],
     aux_local: &[Fp4],
     aux_next: &[Fp4],
@@ -496,7 +613,7 @@ fn lookup_constraints<F: Field>(
     let s_next = aux_next[t];
     out.push(sel.2 * (s_next - s - contrib));
     out.push(sel.0 * s);
-    out.push(sel.1 * (s + contrib));
+    out.push(sel.1 * (s + contrib - total));
     out
 }
 
@@ -507,7 +624,7 @@ fn combine<F: Field>(
     aux_local: &[Fp4],
     aux_next: &[Fp4],
     sel_ext: (Fp4, Fp4, Fp4),
-    ch: Option<&LookupChallenges>,
+    lookup: Option<(&LookupChallenges, Fp4)>,
     alpha_powers: &[Fp4],
 ) -> Fp4 {
     let mut acc = Fp4::ZERO;
@@ -515,8 +632,8 @@ fn combine<F: Field>(
     for c in constraints {
         acc += c.mul_ext(*powers.next().expect("alpha powers"));
     }
-    if let Some(ch) = ch {
-        for c in lookup_constraints(ch, terms, aux_local, aux_next, sel_ext) {
+    if let Some((ch, total)) = lookup {
+        for c in lookup_constraints(ch, total, terms, aux_local, aux_next, sel_ext) {
             acc += c * *powers.next().expect("alpha powers");
         }
     }
@@ -561,6 +678,25 @@ fn ext_from_base_openings(opened: &[Fp4]) -> Vec<Fp4> {
         .collect()
 }
 
+/// The coset `shift * H` of the `2^log_n`-th roots of unity, in order.
+fn coset_points(shift: Fp, log_n: usize) -> Vec<Fp> {
+    let omega = root_of_unity(log_n);
+    let mut v = Vec::with_capacity(1 << log_n);
+    let mut x = shift;
+    for _ in 0..1usize << log_n {
+        v.push(x);
+        x = x.mul(&omega);
+    }
+    v
+}
+
+/// Coset of the evaluation domain of a table whose domain has `2^log_m`
+/// points, in a proof whose largest domain has `2^log_big`: the coset the
+/// FRI folding of the largest domain reaches at that size.
+fn table_shift(log_big: usize, log_m: usize) -> Fp {
+    MULTIPLICATIVE_GENERATOR.pow(1u64 << (log_big - log_m))
+}
+
 /// Out-of-domain openings: trace at zeta and g zeta, aux at zeta and g zeta,
 /// quotient chunks at zeta_q.
 /// DEEP combination `sum_k beta^k (row_k - opened_k) / (x - point_k)`,
@@ -568,7 +704,9 @@ fn ext_from_base_openings(opened: &[Fp4]) -> Vec<Fp4> {
 /// opened values are folded into constants once, and the openings at `g
 /// zeta` reuse the row sum at `zeta` scaled by a power of `beta`.
 /// Beta power offsets: trace at zeta, trace at g zeta, aux at both,
-/// preprocessed at both, then the quotient chunks.
+/// preprocessed at both, then the quotient chunks. Later tables continue
+/// the powers: their combination is scaled by `beta^offset`, the number of
+/// openings of the tables before them.
 struct Deep {
     w: usize,
     aux_w: usize,
@@ -587,8 +725,8 @@ struct Deep {
 }
 
 impl Deep {
-    fn new(beta: Fp4, openings: Openings<'_>) -> Deep {
-        let (t_z, t_zn, a_z, a_zn, p_z, p_zn, q_zq) = openings;
+    fn new(beta: Fp4, t: &TableProof) -> Deep {
+        let [t_z, t_zn, a_z, a_zn, p_z, p_zn, q_zq] = t.opened();
         let (w, aux_w, pre_w, chunks) = (t_z.len(), a_z.len(), p_z.len(), q_zq.len());
         let beta_powers = powers(beta, 2 * w + 2 * aux_w + 2 * pre_w + chunks);
         let dot = |from: usize, vals: &[Fp4]| -> Fp4 {
@@ -612,6 +750,11 @@ impl Deep {
         }
     }
 
+    /// Number of openings this table contributes.
+    fn len(&self) -> usize {
+        self.beta_powers.len()
+    }
+
     fn value(&self, rows: Rows<'_>, inv_z: Fp4, inv_zn: Fp4, inv_q: Fp4) -> Fp4 {
         let (trace_row, aux_row, pre_row, quotient_row) = rows;
         let (w, aux_w, pre_w) = (self.w, self.aux_w, self.pre_w);
@@ -630,7 +773,6 @@ impl Deep {
     }
 }
 
-type Openings<'a> = (&'a [Fp4], &'a [Fp4], &'a [Fp4], &'a [Fp4], &'a [Fp4], &'a [Fp4], &'a [Fp4]);
 type Rows<'a> = (&'a [Fp], &'a [Fp], &'a [Fp], &'a [Fp4]);
 
 /// A committed fixed table: the low-degree extension and Merkle tree of
@@ -675,8 +817,11 @@ fn eval_base_polys_at(polys: &[Vec<Fp>], x: Fp4) -> Vec<Fp4> {
     par_map_min(polys.len(), 1, |k| polys[k].iter().zip(&xp).fold(Fp4::ZERO, |acc, (c, p)| acc + p.mul_base(c)))
 }
 
-fn observe_setup(challenger: &mut Challenger, log_n: usize, public: &[Fp]) {
-    challenger.observe(Fp::from_u32(log_n as u32));
+/// Binds the table heights and public values.
+fn observe_setup(challenger: &mut Challenger, log_ns: &[usize], public: &[Fp]) {
+    for log_n in log_ns {
+        challenger.observe(Fp::from_u32(*log_n as u32));
+    }
     challenger.observe(Fp::from_u32(public.len() as u32));
     challenger.observe_slice(public);
 }
@@ -698,38 +843,50 @@ pub fn check_constraints_with<A: Air>(
     pre: Option<&Trace>,
     public: &[Fp],
 ) -> Result<(), (usize, usize, &'static str)> {
-    let n = trace.height();
-    let empty: Vec<Fp> = Vec::new();
-    let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.row(i)) };
+    check_tables(&[(air, trace, pre)], public).map_err(|(_, e)| e)
+}
+
+/// [`check_constraints`] over several tables whose lookup terms must cancel
+/// together. Errors carry the index of the offending table.
+#[allow(clippy::type_complexity)]
+pub fn check_tables(
+    tables: &[(&dyn DynAir, &Trace, Option<&Trace>)],
+    public: &[Fp],
+) -> Result<(), (usize, (usize, usize, &'static str))> {
     let ch = LookupChallenges {
         gamma: Fp4::from_u32(0x1234_5678),
         delta: Fp4([Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(11)]),
     };
     let mut sum = Fp4::ZERO;
-    for i in 0..n {
-        let next = (i + 1) % n;
-        let sel = (
-            if i == 0 { Fp::ONE } else { Fp::ZERO },
-            if i == n - 1 { Fp::ONE } else { Fp::ZERO },
-            if i == n - 1 { Fp::ZERO } else { Fp::ONE },
-        );
-        let mut b = Builder::new(trace.row(i), trace.row(next), (pre_row(i), pre_row(next)), public, sel);
-        air.eval(&mut b);
-        if let Some(k) = b.constraints.iter().position(|c| *c != Fp::ZERO) {
-            let label = b.marks.iter().rev().find(|(at, _)| *at <= k).map(|(_, l)| *l).unwrap_or("");
-            return Err((i, k, label));
-        }
-        for term in &b.lookups {
-            let d = ch.denominator(&term.values);
-            let Some(inv) = d.inverse() else {
-                return Err((i, 0, "lookup denominator zero"));
-            };
-            let c = term.multiplicity.mul_ext(inv);
-            if term.send { sum += c } else { sum -= c }
+    for (t, (air, trace, pre)) in tables.iter().enumerate() {
+        let n = trace.height();
+        let empty: Vec<Fp> = Vec::new();
+        let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.row(i)) };
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let sel = (
+                if i == 0 { Fp::ONE } else { Fp::ZERO },
+                if i == n - 1 { Fp::ONE } else { Fp::ZERO },
+                if i == n - 1 { Fp::ZERO } else { Fp::ONE },
+            );
+            let mut b = Builder::new(trace.row(i), trace.row(next), (pre_row(i), pre_row(next)), public, sel);
+            air.eval_fp(&mut b);
+            if let Some(k) = b.constraints.iter().position(|c| *c != Fp::ZERO) {
+                let label = b.marks.iter().rev().find(|(at, _)| *at <= k).map(|(_, l)| *l).unwrap_or("");
+                return Err((t, (i, k, label)));
+            }
+            for term in &b.lookups {
+                let d = ch.denominator(&term.values);
+                let Some(inv) = d.inverse() else {
+                    return Err((t, (i, 0, "lookup denominator zero")));
+                };
+                let c = term.multiplicity.mul_ext(inv);
+                if term.send { sum += c } else { sum -= c }
+            }
         }
     }
     if sum != Fp4::ZERO {
-        return Err((usize::MAX, 0, "lookup sum"));
+        return Err((tables.len() - 1, (usize::MAX, 0, "lookup sum")));
     }
     Ok(())
 }
@@ -740,8 +897,12 @@ pub fn check_constraints_with<A: Air>(
 /// Lookup terms count as degree `max(values) + 1` and `multiplicity + 2`.
 /// Must not exceed `air.max_constraint_degree()`.
 pub fn measure_degree<A: Air>(air: &A, num_public: usize) -> usize {
-    let cols = vec![Deg(1); air.width()];
-    let pre = vec![Deg(1); air.preprocessed_width()];
+    measure_degree_dyn(air, num_public)
+}
+
+fn measure_degree_dyn(air: &dyn DynAir, num_public: usize) -> usize {
+    let cols = vec![Deg(1); air.air_width()];
+    let pre = vec![Deg(1); air.air_preprocessed_width()];
     let public = vec![Deg(0); num_public];
     let (constraints, terms) = evaluate(air, &cols, &cols, (&pre, &pre), &public, (Deg(1), Deg(1), Deg(0)));
     let mut max = constraints.iter().map(|d| d.0 as usize).max().unwrap_or(0);
@@ -753,15 +914,16 @@ pub fn measure_degree<A: Air>(air: &A, num_public: usize) -> usize {
 }
 
 /// Builds the auxiliary trace (row-major extension values: inverses then
-/// the running sum) for `trace` under the given challenges.
-fn build_aux<A: Air>(
-    air: &A,
+/// the running sum) for `trace` under the given challenges, and returns it
+/// with the table's lookup total.
+fn build_aux(
+    air: &dyn DynAir,
     trace: &Trace,
     pre: Option<&Preprocessed>,
     public: &[Fp],
     ch: &LookupChallenges,
     terms: usize,
-) -> Vec<Fp4> {
+) -> (Vec<Fp4>, Fp4) {
     let n = trace.height();
     let empty: Vec<Fp> = Vec::new();
     let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.table.row(i)) };
@@ -800,16 +962,13 @@ fn build_aux<A: Air>(
             sum += mults[i * terms + k] * inv;
         }
     }
-    debug_assert!(sum.is_zero(), "lookup terms do not cancel: trace violates a multiset relation");
-    aux
+    (aux, sum)
 }
 
 // ---------------------------------------------------------------------------
 // Prover
 // ---------------------------------------------------------------------------
 
-/// Interpolates a base column over `H` and evaluates it on the coset of
-/// size `big_n`; returns the coefficients and the evaluations.
 /// Batch inversion in parallel chunks.
 fn par_batch_inverse<F: Field + Send + Sync>(xs: &[F]) -> Vec<F> {
     const CHUNK: usize = 1 << 14;
@@ -852,6 +1011,8 @@ fn scatter_columns(lde: &mut [Fp], w: usize, first: usize, cols: &[Vec<Fp>]) {
     });
 }
 
+/// Interpolates a base column over `H` and evaluates it on the coset of
+/// size `big_n`; returns the coefficients and the evaluations.
 fn lde_column(col: Vec<Fp>, big_n: usize, shift: Fp) -> (Vec<Fp>, Vec<Fp>) {
     let mut c = col;
     intt(&mut c);
@@ -859,6 +1020,168 @@ fn lde_column(col: Vec<Fp>, big_n: usize, shift: Fp) -> (Vec<Fp>, Vec<Fp>) {
     e.resize(big_n, Fp::ZERO);
     coset_ntt(&mut e, shift);
     (c, e)
+}
+
+/// A committed matrix: column coefficients, row-major evaluations on the
+/// coset, and the Merkle tree over the rows.
+struct Committed {
+    width: usize,
+    coeffs: Vec<Vec<Fp>>,
+    rows: Vec<Fp>,
+    tree: MerkleTree,
+}
+
+impl Committed {
+    /// Extends the `width` columns `column(k)` to `big_n` points on the
+    /// coset `shift * H` and commits to the rows. Columns are extended in
+    /// parallel batches (bounding memory) and scattered into the row-major
+    /// table.
+    fn new(width: usize, big_n: usize, shift: Fp, column: impl Fn(usize) -> Vec<Fp> + Sync) -> Committed {
+        let mut coeffs: Vec<Vec<Fp>> = Vec::with_capacity(width);
+        let mut rows = vec![Fp::ZERO; big_n * width];
+        let batch = crate::parallel::threads() * 4;
+        for first in (0..width).step_by(batch) {
+            let cols = (first + batch).min(width) - first;
+            let ext: Vec<(Vec<Fp>, Vec<Fp>)> = par_map_min(cols, 1, |k| lde_column(column(first + k), big_n, shift));
+            let (c, e): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
+            scatter_columns(&mut rows, width, first, &e);
+            coeffs.extend(c);
+        }
+        let tree = MerkleTree::from_flat(&rows, width);
+        Committed { width, coeffs, rows, tree }
+    }
+
+    fn row(&self, i: usize) -> &[Fp] {
+        &self.rows[i * self.width..(i + 1) * self.width]
+    }
+}
+
+/// One table of a proof: its AIR, trace, and the committed preprocessed
+/// table when the AIR has preprocessed columns (it must have the trace's
+/// height and the config's blowup).
+#[derive(Clone, Copy)]
+pub struct TableInput<'a> {
+    pub air: &'a dyn DynAir,
+    pub trace: &'a Trace,
+    pub pre: Option<&'a Preprocessed>,
+}
+
+/// The prover's state for one table.
+struct TableState<'a> {
+    input: TableInput<'a>,
+    log_n: usize,
+    /// Evaluation coset of the table.
+    shift: Fp,
+    num_constraints: usize,
+    num_terms: usize,
+    trace: Committed,
+    /// Auxiliary columns, their extension values per row, and the lookup
+    /// total.
+    aux: Option<(Committed, Vec<Fp4>, Fp4)>,
+}
+
+impl TableState<'_> {
+    fn big_n(&self, log_blowup: usize) -> usize {
+        1 << (self.log_n + log_blowup)
+    }
+
+    fn aux_ext_w(&self) -> usize {
+        if self.num_terms > 0 { self.num_terms + 1 } else { 0 }
+    }
+
+    fn pre_row(&self, i: usize) -> &[Fp] {
+        self.input.pre.map_or(&[], |p| p.row(i))
+    }
+
+    fn aux_row(&self, i: usize) -> &[Fp] {
+        self.aux.as_ref().map_or(&[], |(c, _, _)| c.row(i))
+    }
+}
+
+/// The committed quotient of one table.
+struct Quotient {
+    coeffs: Vec<Vec<Fp4>>,
+    /// Chunk values per point, `chunks` per row.
+    lde: Vec<Fp4>,
+    rows: Vec<Fp>,
+    tree: MerkleTree,
+    chunks: usize,
+}
+
+/// Evaluates the combined constraints of a table on its coset, divides by
+/// the vanishing polynomial, splits the quotient into chunks and commits.
+fn commit_quotient(
+    t: &TableState<'_>,
+    log_blowup: usize,
+    public: &[Fp],
+    lookup: Option<&LookupChallenges>,
+    alpha_powers: &[Fp4],
+    timer: &mut Timer,
+) -> Quotient {
+    let air = t.input.air;
+    let n = 1usize << t.log_n;
+    let big_n = t.big_n(log_blowup);
+    let w = t.trace.width;
+    let aux_ext_w = t.aux_ext_w();
+    let num_chunks = 1usize << log_quotient_degree(air.air_degree());
+    let shift = t.shift;
+    let g_inv = root_of_unity(t.log_n).inverse().unwrap();
+    let xs = coset_points(shift, t.log_n + log_blowup);
+    let period = 1usize << log_blowup;
+    let z_h: Vec<Fp> = (0..period).map(|i| xs[i].pow(n as u64).sub(&Fp::ONE)).collect();
+    let z_h_inv = batch_inverse(&z_h);
+    let denoms: Vec<Fp> = xs.iter().flat_map(|x| [x.sub(&Fp::ONE), x.sub(&g_inv)]).collect();
+    let denom_inv = batch_inverse(&denoms);
+    let empty: [Fp4; 0] = [];
+    let (aux_lde, total): (&[Fp4], Fp4) = t.aux.as_ref().map_or((&empty, Fp4::ZERO), |(_, l, s)| (&l[..], *s));
+    let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| (ch, total));
+    let lde = &t.trace.rows;
+
+    let mut quotient: Vec<Fp4> = par_map(big_n, |i| {
+        let zh = z_h[i % period];
+        let first = zh.mul(&denom_inv[2 * i]);
+        let last = zh.mul(&denom_inv[2 * i + 1]);
+        let transition = xs[i].sub(&g_inv);
+        let next_i = (i + period) % big_n;
+        let (constraints, terms) = evaluate(
+            air,
+            &lde[i * w..(i + 1) * w],
+            &lde[next_i * w..(next_i + 1) * w],
+            (t.pre_row(i), t.pre_row(next_i)),
+            public,
+            (first, last, transition),
+        );
+        let (aux_l, aux_n): (&[Fp4], &[Fp4]) = if aux_ext_w > 0 {
+            (&aux_lde[i * aux_ext_w..(i + 1) * aux_ext_w], &aux_lde[next_i * aux_ext_w..(next_i + 1) * aux_ext_w])
+        } else {
+            (&empty, &empty)
+        };
+        let sel_ext = (Fp4::from_base(first), Fp4::from_base(last), Fp4::from_base(transition));
+        let c = combine(&constraints, &terms, aux_l, aux_n, sel_ext, lookup, alpha_powers);
+        c.mul_base(&z_h_inv[i % period])
+    });
+    timer.lap("quotient eval");
+
+    // Chunks: Q(x) = sum_j x^j Q_j(x^(2^log_q)).
+    coset_intt_ext(&mut quotient, shift);
+    let chunks: Vec<(Vec<Fp4>, Vec<Fp4>)> = par_map_min(num_chunks, 1, |j| {
+        let c: Vec<Fp4> = quotient.iter().skip(j).step_by(num_chunks).copied().collect();
+        let mut e = c.clone();
+        e.resize(big_n, Fp4::ZERO);
+        coset_ntt_ext(&mut e, shift);
+        (c, e)
+    });
+    let (coeffs, chunk_evals): (Vec<Vec<Fp4>>, Vec<Vec<Fp4>>) = chunks.into_iter().unzip();
+    let chunk_lde: Vec<Fp4> = par_map(big_n, |i| (0..num_chunks).map(|j| chunk_evals[j][i]).collect::<Vec<Fp4>>())
+        .into_iter()
+        .flatten()
+        .collect();
+    drop(chunk_evals);
+    let rows: Vec<Fp> = ext_row(&chunk_lde);
+    timer.lap("quotient lde");
+    let tree = MerkleTree::from_flat(&rows, num_chunks * DEGREE);
+    timer.lap("quotient commit");
+    Quotient { coeffs, lde: chunk_lde, rows, tree, chunks: num_chunks }
 }
 
 pub fn prove<A: Air>(
@@ -883,255 +1206,206 @@ pub fn prove_with<A: Air>(
     public: &[Fp],
     challenger: &mut Challenger,
 ) -> Proof {
-    assert_eq!(trace.width, air.width(), "trace width does not match air");
-    let pre_w = air.preprocessed_width();
-    assert_eq!(pre.map_or(0, |p| p.width), pre_w, "preprocessed width does not match air");
-    if let Some(p) = pre {
-        assert_eq!(p.log_n, log2_strict(trace.height()), "preprocessed table height does not match trace");
-        assert_eq!(p.log_blowup, config.log_blowup, "preprocessed table blowup does not match config");
-    }
-    let empty: Vec<Fp> = Vec::new();
-    let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.row(i)) };
-    debug_assert!(
-        measure_degree(air, public.len()) <= air.max_constraint_degree(),
-        "air constraints exceed the declared degree"
-    );
-    let n = trace.height();
-    let log_n = log2_strict(n);
-    let log_blowup = config.log_blowup;
-    let log_q = log_quotient_degree(air.max_constraint_degree());
-    assert!(log_blowup >= log_q, "log_blowup must be at least {log_q} for this air");
-    let big_n = n << log_blowup;
-    let log_big_n = log_n + log_blowup;
-    let shift = MULTIPLICATIVE_GENERATOR;
-    let w = air.width();
-    let num_chunks = 1usize << log_q;
-    let (num_constraints, num_terms) = shape(air, public);
-    let aux_ext_w = if num_terms > 0 { num_terms + 1 } else { 0 };
-    let aux_w = aux_ext_w * DEGREE;
+    prove_tables(config, &[TableInput { air, trace, pre }], public, challenger)
+}
 
-    observe_setup(challenger, log_n, public);
-    if let Some(p) = pre {
-        challenger.observe_digest(&p.root());
+/// Proves several tables at once, tallest first. The tables share the
+/// public values, the lookup challenges (their lookup terms must cancel
+/// together, so tables can exchange messages) and one FRI proof, into
+/// which the DEEP combination of a smaller table enters at its size. Only
+/// tables of the tallest height may have preprocessed columns.
+pub fn prove_tables(
+    config: &StarkConfig,
+    tables: &[TableInput<'_>],
+    public: &[Fp],
+    challenger: &mut Challenger,
+) -> Proof {
+    assert!(!tables.is_empty(), "no tables");
+    let log_blowup = config.log_blowup;
+    let log_ns: Vec<usize> = tables.iter().map(|t| log2_strict(t.trace.height())).collect();
+    assert!(log_ns.windows(2).all(|w| w[0] >= w[1]), "tables must be ordered by height, tallest first");
+    let log_big = log_ns[0] + log_blowup;
+    for (t, &log_n) in tables.iter().zip(&log_ns) {
+        let air = t.air;
+        assert_eq!(t.trace.width, air.air_width(), "trace width does not match air");
+        assert_eq!(t.pre.map_or(0, |p| p.width), air.air_preprocessed_width(), "preprocessed width does not match air");
+        if let Some(p) = t.pre {
+            assert_eq!(p.log_n, log_n, "preprocessed table height does not match trace");
+            assert_eq!(p.log_blowup, log_blowup, "preprocessed table blowup does not match config");
+            assert_eq!(log_n, log_ns[0], "only the tallest tables may have preprocessed columns");
+        }
+        debug_assert!(
+            measure_degree_dyn(air, public.len()) <= air.air_degree(),
+            "air constraints exceed the declared degree"
+        );
+        let log_q = log_quotient_degree(air.air_degree());
+        assert!(log_blowup >= log_q, "log_blowup must be at least {log_q} for this air");
+    }
+
+    observe_setup(challenger, &log_ns, public);
+    for t in tables {
+        if let Some(p) = t.pre {
+            challenger.observe_digest(&p.root());
+        }
     }
     let mut timer = Timer::new();
 
-    // 1. Trace LDE and commitment. Columns are extended in parallel batches
-    // (bounding memory) and scattered into the row-major evaluation table.
-    let mut coeffs: Vec<Vec<Fp>> = Vec::with_capacity(w);
-    let mut lde = vec![Fp::ZERO; big_n * w];
-    let batch = crate::parallel::threads() * 4;
-    for first in (0..w).step_by(batch) {
-        let cols = (first + batch).min(w) - first;
-        let ext: Vec<(Vec<Fp>, Vec<Fp>)> = par_map_min(cols, 1, |k| lde_column(trace.column(first + k), big_n, shift));
-        let (c, e): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-        scatter_columns(&mut lde, w, first, &e);
-        coeffs.extend(c);
-    }
-    timer.lap("trace lde");
-    let trace_tree = MerkleTree::from_flat(&lde, w);
-    challenger.observe_digest(&trace_tree.root());
+    // 1. Trace LDEs and commitments.
+    let mut states: Vec<TableState<'_>> = tables
+        .iter()
+        .zip(&log_ns)
+        .map(|(input, &log_n)| {
+            let shift = table_shift(log_big, log_n + log_blowup);
+            let (num_constraints, num_terms) = shape(input.air, public);
+            let trace = Committed::new(input.trace.width, 1 << (log_n + log_blowup), shift, |k| input.trace.column(k));
+            challenger.observe_digest(&trace.tree.root());
+            TableState { input: *input, log_n, shift, num_constraints, num_terms, trace, aux: None }
+        })
+        .collect();
     timer.lap("trace commit");
 
-    // 2. Lookup challenges and auxiliary trace.
+    // 2. Lookup challenges and auxiliary traces.
     let mut lookup_ch = None;
-    let mut aux_coeffs: Vec<Vec<Fp>> = Vec::new();
-    let mut aux_lde: Vec<Fp4> = Vec::new(); // big_n x aux_ext_w
-    let mut aux_rows: Vec<Fp> = Vec::new(); // big_n x aux_w
-    let mut aux_tree = None;
-    if num_terms > 0 {
+    if states.iter().any(|t| t.num_terms > 0) {
         let ch = LookupChallenges::sample(challenger);
-        let aux = build_aux(air, trace, pre, public, &ch, num_terms);
-        timer.lap("aux build");
-        aux_rows = vec![Fp::ZERO; big_n * aux_w];
-        for first in (0..aux_w).step_by(batch) {
-            let cols = (first + batch).min(aux_w) - first;
-            let ext: Vec<(Vec<Fp>, Vec<Fp>)> = par_map_min(cols, 1, |j| {
-                let (e, k) = ((first + j) / DEGREE, (first + j) % DEGREE);
-                let col: Vec<Fp> = (0..n).map(|i| aux[i * aux_ext_w + e].0[k]).collect();
-                lde_column(col, big_n, shift)
+        for t in states.iter_mut().filter(|t| t.num_terms > 0) {
+            let (aux, total) = build_aux(t.input.air, t.input.trace, t.input.pre, public, &ch, t.num_terms);
+            let ext_w = t.aux_ext_w();
+            let n = 1usize << t.log_n;
+            let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, |j| {
+                let (e, k) = (j / DEGREE, j % DEGREE);
+                (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
             });
-            let (c, e): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-            scatter_columns(&mut aux_rows, aux_w, first, &e);
-            aux_coeffs.extend(c);
+            let aux_w = committed.width;
+            let aux_lde: Vec<Fp4> = par_map(t.big_n(log_blowup), |i| {
+                let row = &committed.rows[i * aux_w..(i + 1) * aux_w];
+                (0..ext_w).map(|e| Fp4(core::array::from_fn(|k| row[e * DEGREE + k]))).collect::<Vec<Fp4>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+            challenger.observe_digest(&committed.tree.root());
+            challenger.observe_ext(&total);
+            t.aux = Some((committed, aux_lde, total));
         }
-        aux_lde = par_map(big_n, |i| {
-            let row = &aux_rows[i * aux_w..(i + 1) * aux_w];
-            (0..aux_ext_w).map(|e| Fp4(core::array::from_fn(|k| row[e * DEGREE + k]))).collect::<Vec<Fp4>>()
-        })
-        .into_iter()
-        .flatten()
-        .collect();
-        timer.lap("aux lde");
-        let tree = MerkleTree::from_flat(&aux_rows, aux_w);
-        challenger.observe_digest(&tree.root());
-        timer.lap("aux commit");
-        aux_tree = Some(tree);
+        debug_assert!(
+            states.iter().filter_map(|t| t.aux.as_ref()).fold(Fp4::ZERO, |a, (_, _, s)| a + *s).is_zero(),
+            "lookup terms do not cancel: the traces violate a multiset relation"
+        );
         lookup_ch = Some(ch);
+        timer.lap("aux");
     }
 
-    // 3. Constraint combination and quotient.
+    // 3. Constraint combinations and quotients.
     let alpha = challenger.sample_ext();
-    let alpha_powers = powers(alpha, num_constraints + num_lookup_constraints(num_terms));
-    let g = root_of_unity(log_n);
-    let g_inv = g.inverse().unwrap();
-    let omega = root_of_unity(log_big_n);
-    let xs: Vec<Fp> = {
-        let mut v = Vec::with_capacity(big_n);
-        let mut x = shift;
-        for _ in 0..big_n {
-            v.push(x);
-            x = x.mul(&omega);
-        }
-        v
-    };
-    let period = 1usize << log_blowup;
-    let z_h: Vec<Fp> = (0..period).map(|i| xs[i].pow(n as u64).sub(&Fp::ONE)).collect();
-    let z_h_inv = batch_inverse(&z_h);
-    let denoms: Vec<Fp> = xs.iter().flat_map(|x| [x.sub(&Fp::ONE), x.sub(&g_inv)]).collect();
-    let denom_inv = batch_inverse(&denoms);
-    let empty: [Fp4; 0] = [];
-
-    let mut quotient: Vec<Fp4> = par_map(big_n, |i| {
-        let zh = z_h[i % period];
-        let first = zh.mul(&denom_inv[2 * i]);
-        let last = zh.mul(&denom_inv[2 * i + 1]);
-        let transition = xs[i].sub(&g_inv);
-        let next_i = (i + period) % big_n;
-        let (constraints, terms) = evaluate(
-            air,
-            &lde[i * w..(i + 1) * w],
-            &lde[next_i * w..(next_i + 1) * w],
-            (pre_row(i), pre_row(next_i)),
-            public,
-            (first, last, transition),
-        );
-        let (aux_l, aux_n): (&[Fp4], &[Fp4]) = if aux_ext_w > 0 {
-            (&aux_lde[i * aux_ext_w..(i + 1) * aux_ext_w], &aux_lde[next_i * aux_ext_w..(next_i + 1) * aux_ext_w])
-        } else {
-            (&empty, &empty)
-        };
-        let sel_ext = (Fp4::from_base(first), Fp4::from_base(last), Fp4::from_base(transition));
-        let c = combine(&constraints, &terms, aux_l, aux_n, sel_ext, lookup_ch.as_ref(), &alpha_powers);
-        c.mul_base(&z_h_inv[i % period])
-    });
-    timer.lap("quotient eval");
-
-    // Chunks: Q(x) = sum_j x^j Q_j(x^(2^log_q)).
-    coset_intt_ext(&mut quotient, shift);
-    let chunks: Vec<(Vec<Fp4>, Vec<Fp4>)> = par_map_min(num_chunks, 1, |j| {
-        let c: Vec<Fp4> = quotient.iter().skip(j).step_by(num_chunks).copied().collect();
-        let mut e = c.clone();
-        e.resize(big_n, Fp4::ZERO);
-        coset_ntt_ext(&mut e, shift);
-        (c, e)
-    });
-    let (chunk_coeffs, chunk_evals): (Vec<Vec<Fp4>>, Vec<Vec<Fp4>>) = chunks.into_iter().unzip();
-    let chunk_lde: Vec<Fp4> = par_map(big_n, |i| (0..num_chunks).map(|j| chunk_evals[j][i]).collect::<Vec<Fp4>>())
-        .into_iter()
-        .flatten()
+    let quotients: Vec<Quotient> = states
+        .iter()
+        .map(|t| {
+            let alpha_powers = powers(alpha, t.num_constraints + num_lookup_constraints(t.num_terms));
+            let q = commit_quotient(t, log_blowup, public, lookup_ch.as_ref(), &alpha_powers, &mut timer);
+            challenger.observe_digest(&q.tree.root());
+            q
+        })
         .collect();
-    drop(chunk_evals);
-    let chunk_rows: Vec<Fp> = ext_row(&chunk_lde);
-    timer.lap("quotient lde");
-    let quotient_tree = MerkleTree::from_flat(&chunk_rows, num_chunks * DEGREE);
-    challenger.observe_digest(&quotient_tree.root());
-    timer.lap("quotient commit");
 
     // 4. Out-of-domain openings.
     let zeta = challenger.sample_ext();
-    let zeta_next = zeta.mul_base(&g);
-    let zeta_q = zeta.exp(num_chunks as u64);
-    let trace_at_zeta = eval_base_polys_at(&coeffs, zeta);
-    let trace_at_zeta_next = eval_base_polys_at(&coeffs, zeta_next);
-    let aux_at_zeta = eval_base_polys_at(&aux_coeffs, zeta);
-    let aux_at_zeta_next = eval_base_polys_at(&aux_coeffs, zeta_next);
     let no_coeffs: Vec<Vec<Fp>> = Vec::new();
-    let pre_coeffs = pre.map_or(&no_coeffs, |p| &p.coeffs);
-    let pre_at_zeta = eval_base_polys_at(pre_coeffs, zeta);
-    let pre_at_zeta_next = eval_base_polys_at(pre_coeffs, zeta_next);
-    let quotient_at_zeta_q: Vec<Fp4> = chunk_coeffs.iter().map(|c| eval_ext_poly_at(c, zeta_q)).collect();
-    for v in trace_at_zeta
+    let parts: Vec<TableProof> = states
         .iter()
-        .chain(&trace_at_zeta_next)
-        .chain(&aux_at_zeta)
-        .chain(&aux_at_zeta_next)
-        .chain(&pre_at_zeta)
-        .chain(&pre_at_zeta_next)
-        .chain(&quotient_at_zeta_q)
-    {
-        challenger.observe_ext(v);
-    }
+        .zip(&quotients)
+        .map(|(t, q)| {
+            let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
+            let zeta_q = zeta.exp(q.chunks as u64);
+            let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _, _)| &c.coeffs);
+            let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.coeffs);
+            let part = TableProof {
+                log_n: t.log_n,
+                trace_root: t.trace.tree.root(),
+                aux_root: t.aux.as_ref().map(|(c, _, _)| c.tree.root()),
+                lookup_sum: t.aux.as_ref().map_or(Fp4::ZERO, |(_, _, s)| *s),
+                quotient_root: q.tree.root(),
+                trace_at_zeta: eval_base_polys_at(&t.trace.coeffs, zeta),
+                trace_at_zeta_next: eval_base_polys_at(&t.trace.coeffs, zeta_next),
+                aux_at_zeta: eval_base_polys_at(aux_coeffs, zeta),
+                aux_at_zeta_next: eval_base_polys_at(aux_coeffs, zeta_next),
+                pre_at_zeta: eval_base_polys_at(pre_coeffs, zeta),
+                pre_at_zeta_next: eval_base_polys_at(pre_coeffs, zeta_next),
+                quotient_at_zeta_q: q.coeffs.iter().map(|c| eval_ext_poly_at(c, zeta_q)).collect(),
+            };
+            for v in part.opened().into_iter().flatten() {
+                challenger.observe_ext(v);
+            }
+            part
+        })
+        .collect();
     timer.lap("openings");
 
-    // 5. DEEP combination and FRI.
+    // 5. DEEP combinations, summed per domain size, and FRI.
     let beta = challenger.sample_ext();
-    let deep = Deep::new(
-        beta,
-        (
-            &trace_at_zeta,
-            &trace_at_zeta_next,
-            &aux_at_zeta,
-            &aux_at_zeta_next,
-            &pre_at_zeta,
-            &pre_at_zeta_next,
-            &quotient_at_zeta_q,
-        ),
-    );
-    let mut denoms_ext: Vec<Fp4> = Vec::with_capacity(3 * big_n);
-    for x in &xs {
-        let xe = Fp4::from_base(*x);
-        denoms_ext.push(xe - zeta);
-        denoms_ext.push(xe - zeta_next);
-        denoms_ext.push(xe - zeta_q);
+    let mut inputs: Vec<Vec<Fp4>> = Vec::new();
+    let mut input_log_sizes: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for ((t, q), part) in states.iter().zip(&quotients).zip(&parts) {
+        let deep = Deep::new(beta, part);
+        let scale = beta.exp(offset as u64);
+        offset += deep.len();
+        let log_m = t.log_n + log_blowup;
+        let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
+        let zeta_q = zeta.exp(q.chunks as u64);
+        let xs = coset_points(t.shift, log_m);
+        let mut denoms: Vec<Fp4> = Vec::with_capacity(3 * xs.len());
+        for x in &xs {
+            let xe = Fp4::from_base(*x);
+            denoms.push(xe - zeta);
+            denoms.push(xe - zeta_next);
+            denoms.push(xe - zeta_q);
+        }
+        let inv = par_batch_inverse(&denoms);
+        let c = q.chunks;
+        let reduced: Vec<Fp4> = par_map(xs.len(), |i| {
+            let rows = (t.trace.row(i), t.aux_row(i), t.pre_row(i), &q.lde[i * c..(i + 1) * c]);
+            scale * deep.value(rows, inv[3 * i], inv[3 * i + 1], inv[3 * i + 2])
+        });
+        if input_log_sizes.last() == Some(&log_m) {
+            let last = inputs.last_mut().unwrap();
+            for (a, b) in last.iter_mut().zip(&reduced) {
+                *a += *b;
+            }
+        } else {
+            inputs.push(reduced);
+            input_log_sizes.push(log_m);
+        }
     }
-    let inv = par_batch_inverse(&denoms_ext);
-    let reduced: Vec<Fp4> = par_map(big_n, |i| {
-        deep.value(
-            (
-                &lde[i * w..(i + 1) * w],
-                &aux_rows[i * aux_w..(i + 1) * aux_w],
-                pre_row(i),
-                &chunk_lde[i * num_chunks..(i + 1) * num_chunks],
-            ),
-            inv[3 * i],
-            inv[3 * i + 1],
-            inv[3 * i + 2],
-        )
-    });
     timer.lap("deep");
-    let (fri_proof, indices) = fri::prove(&config.fri(), challenger, shift, reduced);
+    let (fri_proof, indices) = fri::prove(&config.fri(), challenger, MULTIPLICATIVE_GENERATOR, inputs);
     timer.lap("fri");
 
     let openings = indices
         .iter()
-        .map(|&i| QueryOpening {
-            trace_row: lde[i * w..(i + 1) * w].to_vec(),
-            trace_path: trace_tree.open(i),
-            aux_row: aux_rows[i * aux_w..(i + 1) * aux_w].to_vec(),
-            aux_path: aux_tree.as_ref().map(|t| t.open(i)).unwrap_or_default(),
-            pre_row: pre_row(i).to_vec(),
-            pre_path: pre.map(|p| p.tree.open(i)).unwrap_or_default(),
-            quotient_row: chunk_rows[i * num_chunks * DEGREE..(i + 1) * num_chunks * DEGREE].to_vec(),
-            quotient_path: quotient_tree.open(i),
+        .map(|&index| {
+            states
+                .iter()
+                .zip(&quotients)
+                .map(|(t, q)| {
+                    let i = index % t.big_n(log_blowup);
+                    let qw = q.chunks * DEGREE;
+                    QueryOpening {
+                        trace_row: t.trace.row(i).to_vec(),
+                        trace_path: t.trace.tree.open(i),
+                        aux_row: t.aux_row(i).to_vec(),
+                        aux_path: t.aux.as_ref().map(|(c, _, _)| c.tree.open(i)).unwrap_or_default(),
+                        pre_row: t.pre_row(i).to_vec(),
+                        pre_path: t.input.pre.map(|p| p.tree.open(i)).unwrap_or_default(),
+                        quotient_row: q.rows[i * qw..(i + 1) * qw].to_vec(),
+                        quotient_path: q.tree.open(i),
+                    }
+                })
+                .collect()
         })
         .collect();
 
-    Proof {
-        log_n,
-        trace_root: trace_tree.root(),
-        aux_root: aux_tree.map(|t| t.root()),
-        quotient_root: quotient_tree.root(),
-        trace_at_zeta,
-        trace_at_zeta_next,
-        aux_at_zeta,
-        aux_at_zeta_next,
-        pre_at_zeta,
-        pre_at_zeta_next,
-        quotient_at_zeta_q,
-        fri: fri_proof,
-        openings,
-    }
+    Proof { tables: parts, fri: fri_proof, openings }
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,150 +1431,213 @@ pub fn verify_with<A: Air>(
     proof: &Proof,
     challenger: &mut Challenger,
 ) -> Result<(), VerifyError> {
-    let w = air.width();
-    let pre_w = air.preprocessed_width();
-    let log_n = proof.log_n;
+    verify_tables(config, &[TableSpec { air, pre_root }], public, proof, challenger)
+}
+
+/// One table a verifier expects: its AIR and, when the AIR has
+/// preprocessed columns, the root of the committed table.
+#[derive(Clone, Copy)]
+pub struct TableSpec<'a> {
+    pub air: &'a dyn DynAir,
+    pub pre_root: Option<&'a Digest>,
+}
+
+/// Shape of one table, derived from its AIR and checked against the proof.
+struct TableShape {
+    w: usize,
+    aux_w: usize,
+    pre_w: usize,
+    chunks: usize,
+    num_constraints: usize,
+    num_terms: usize,
+}
+
+/// Verifies a proof of [`prove_tables`] for the given tables, in order.
+pub fn verify_tables(
+    config: &StarkConfig,
+    specs: &[TableSpec<'_>],
+    public: &[Fp],
+    proof: &Proof,
+    challenger: &mut Challenger,
+) -> Result<(), VerifyError> {
     let log_blowup = config.log_blowup;
-    let log_q = log_quotient_degree(air.max_constraint_degree());
-    let num_chunks = 1usize << log_q;
-    let (num_constraints, num_terms) = shape(air, public);
-    let aux_ext_w = if num_terms > 0 { num_terms + 1 } else { 0 };
-    let aux_w = aux_ext_w * DEGREE;
-    if log_n == 0 || log_n + log_blowup > 27 || log_blowup < log_q {
+    if specs.is_empty() || proof.tables.len() != specs.len() || proof.openings.len() != config.num_queries {
         return Err(VerifyError::Shape);
     }
-    let n = 1usize << log_n;
-    let log_big_n = log_n + log_blowup;
-    let shift = MULTIPLICATIVE_GENERATOR;
-    if proof.trace_at_zeta.len() != w
-        || proof.trace_at_zeta_next.len() != w
-        || proof.aux_at_zeta.len() != aux_w
-        || proof.aux_at_zeta_next.len() != aux_w
-        || proof.aux_root.is_some() != (num_terms > 0)
-        || pre_root.is_some() != (pre_w > 0)
-        || proof.pre_at_zeta.len() != pre_w
-        || proof.pre_at_zeta_next.len() != pre_w
-        || proof.quotient_at_zeta_q.len() != num_chunks
-        || proof.openings.len() != config.num_queries
-    {
+    let log_ns: Vec<usize> = proof.tables.iter().map(|t| t.log_n).collect();
+    if log_ns.windows(2).any(|w| w[0] < w[1]) {
         return Err(VerifyError::Shape);
     }
-
-    observe_setup(challenger, log_n, public);
-    if let Some(root) = pre_root {
-        challenger.observe_digest(root);
-    }
-    challenger.observe_digest(&proof.trace_root);
-    let lookup_ch = match &proof.aux_root {
-        Some(root) => {
-            let ch = LookupChallenges::sample(challenger);
-            challenger.observe_digest(root);
-            Some(ch)
-        }
-        None => None,
-    };
-    let alpha = challenger.sample_ext();
-    let alpha_powers = powers(alpha, num_constraints + num_lookup_constraints(num_terms));
-    challenger.observe_digest(&proof.quotient_root);
-    let zeta = challenger.sample_ext();
-    for v in proof
-        .trace_at_zeta
-        .iter()
-        .chain(&proof.trace_at_zeta_next)
-        .chain(&proof.aux_at_zeta)
-        .chain(&proof.aux_at_zeta_next)
-        .chain(&proof.pre_at_zeta)
-        .chain(&proof.pre_at_zeta_next)
-        .chain(&proof.quotient_at_zeta_q)
-    {
-        challenger.observe_ext(v);
-    }
-    let beta = challenger.sample_ext();
-    let deep = Deep::new(
-        beta,
-        (
-            &proof.trace_at_zeta,
-            &proof.trace_at_zeta_next,
-            &proof.aux_at_zeta,
-            &proof.aux_at_zeta_next,
-            &proof.pre_at_zeta,
-            &proof.pre_at_zeta_next,
-            &proof.quotient_at_zeta_q,
-        ),
-    );
-
-    // Constraint identity at zeta.
-    let g = root_of_unity(log_n);
-    let g_inv = g.inverse().unwrap();
-    let zeta_next = zeta.mul_base(&g);
-    let zeta_q = zeta.exp(num_chunks as u64);
-    let z_h = zeta.exp(n as u64) - Fp4::ONE;
-    let first = z_h * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
-    let last = z_h * (zeta - Fp4::from_base(g_inv)).inv().ok_or(VerifyError::ConstraintIdentity)?;
-    let transition = zeta - Fp4::from_base(g_inv);
-    let public_ext: Vec<Fp4> = public.iter().map(|x| Fp4::from_base(*x)).collect();
-    let (constraints, terms) = evaluate(
-        air,
-        &proof.trace_at_zeta,
-        &proof.trace_at_zeta_next,
-        (&proof.pre_at_zeta, &proof.pre_at_zeta_next),
-        &public_ext,
-        (first, last, transition),
-    );
-    let aux_l = ext_from_base_openings(&proof.aux_at_zeta);
-    let aux_n = ext_from_base_openings(&proof.aux_at_zeta_next);
-    let c_zeta =
-        combine(&constraints, &terms, &aux_l, &aux_n, (first, last, transition), lookup_ch.as_ref(), &alpha_powers);
-    let mut q_zeta = Fp4::ZERO;
-    let mut zeta_pow = Fp4::ONE;
-    for q in &proof.quotient_at_zeta_q {
-        q_zeta += *q * zeta_pow;
-        zeta_pow *= zeta;
-    }
-    if q_zeta * z_h != c_zeta {
-        return Err(VerifyError::ConstraintIdentity);
-    }
-
-    // FRI, then consistency of its input with the opened rows.
-    let inputs = fri::verify(&config.fri(), challenger, shift, log_big_n, &proof.fri)?;
-    let omega = root_of_unity(log_big_n);
-    for (q, ((index, claimed), opening)) in inputs.iter().zip(&proof.openings).enumerate() {
-        if opening.trace_row.len() != w
-            || opening.aux_row.len() != aux_w
-            || opening.pre_row.len() != pre_w
-            || opening.quotient_row.len() != num_chunks * DEGREE
+    let mut shapes = Vec::with_capacity(specs.len());
+    for (spec, t) in specs.iter().zip(&proof.tables) {
+        let air = spec.air;
+        let log_q = log_quotient_degree(air.air_degree());
+        let (num_constraints, num_terms) = shape(air, public);
+        let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
+        let s = TableShape {
+            w: air.air_width(),
+            aux_w,
+            pre_w: air.air_preprocessed_width(),
+            chunks: 1 << log_q,
+            num_constraints,
+            num_terms,
+        };
+        if t.log_n == 0
+            || t.log_n + log_blowup > 27
+            || log_blowup < log_q
+            || t.trace_at_zeta.len() != s.w
+            || t.trace_at_zeta_next.len() != s.w
+            || t.aux_at_zeta.len() != s.aux_w
+            || t.aux_at_zeta_next.len() != s.aux_w
+            || t.aux_root.is_some() != (num_terms > 0)
+            || (t.aux_root.is_none() && !t.lookup_sum.is_zero())
+            || spec.pre_root.is_some() != (s.pre_w > 0)
+            || (s.pre_w > 0 && t.log_n != log_ns[0])
+            || t.pre_at_zeta.len() != s.pre_w
+            || t.pre_at_zeta_next.len() != s.pre_w
+            || t.quotient_at_zeta_q.len() != s.chunks
         {
             return Err(VerifyError::Shape);
         }
-        if !merkle_verify(&proof.trace_root, log_big_n, *index, &opening.trace_row, &opening.trace_path) {
-            return Err(VerifyError::InvalidTraceOpening { query: q });
-        }
-        if let Some(root) = &proof.aux_root
-            && !merkle_verify(root, log_big_n, *index, &opening.aux_row, &opening.aux_path)
-        {
-            return Err(VerifyError::InvalidAuxOpening { query: q });
-        }
-        if let Some(root) = pre_root
-            && !merkle_verify(root, log_big_n, *index, &opening.pre_row, &opening.pre_path)
-        {
-            return Err(VerifyError::InvalidPreprocessedOpening { query: q });
-        }
-        if !merkle_verify(&proof.quotient_root, log_big_n, *index, &opening.quotient_row, &opening.quotient_path) {
-            return Err(VerifyError::InvalidQuotientOpening { query: q });
-        }
-        let x = Fp4::from_base(shift.mul(&omega.pow(*index as u64)));
-        let inv = batch_inverse(&[x - zeta, x - zeta_next, x - zeta_q]);
-        let value = deep.value(
-            (&opening.trace_row, &opening.aux_row, &opening.pre_row, &ext_from_row(&opening.quotient_row)),
-            inv[0],
-            inv[1],
-            inv[2],
-        );
-        if value != *claimed {
-            return Err(VerifyError::DeepMismatch { query: q });
+        shapes.push(s);
+    }
+    let log_big = log_ns[0] + log_blowup;
+
+    observe_setup(challenger, &log_ns, public);
+    for spec in specs {
+        if let Some(root) = spec.pre_root {
+            challenger.observe_digest(root);
         }
     }
-    Ok(())
+    for t in &proof.tables {
+        challenger.observe_digest(&t.trace_root);
+    }
+    let lookup_ch = if proof.tables.iter().any(|t| t.aux_root.is_some()) {
+        let ch = LookupChallenges::sample(challenger);
+        for t in &proof.tables {
+            if let Some(root) = &t.aux_root {
+                challenger.observe_digest(root);
+                challenger.observe_ext(&t.lookup_sum);
+            }
+        }
+        Some(ch)
+    } else {
+        None
+    };
+    if !proof.tables.iter().fold(Fp4::ZERO, |a, t| a + t.lookup_sum).is_zero() {
+        return Err(VerifyError::LookupSum);
+    }
+    let alpha = challenger.sample_ext();
+    for t in &proof.tables {
+        challenger.observe_digest(&t.quotient_root);
+    }
+    let zeta = challenger.sample_ext();
+    for t in &proof.tables {
+        for v in t.opened().into_iter().flatten() {
+            challenger.observe_ext(v);
+        }
+    }
+    let beta = challenger.sample_ext();
+
+    // Constraint identity of every table at zeta.
+    let public_ext: Vec<Fp4> = public.iter().map(|x| Fp4::from_base(*x)).collect();
+    for ((spec, t), s) in specs.iter().zip(&proof.tables).zip(&shapes) {
+        let g_inv = root_of_unity(t.log_n).inverse().unwrap();
+        let z_h = zeta.exp(1u64 << t.log_n) - Fp4::ONE;
+        let first = z_h * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let last = z_h * (zeta - Fp4::from_base(g_inv)).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let transition = zeta - Fp4::from_base(g_inv);
+        let (constraints, terms) = evaluate(
+            spec.air,
+            &t.trace_at_zeta,
+            &t.trace_at_zeta_next,
+            (&t.pre_at_zeta, &t.pre_at_zeta_next),
+            &public_ext,
+            (first, last, transition),
+        );
+        let aux_l = ext_from_base_openings(&t.aux_at_zeta);
+        let aux_n = ext_from_base_openings(&t.aux_at_zeta_next);
+        let alpha_powers = powers(alpha, s.num_constraints + num_lookup_constraints(s.num_terms));
+        let lookup = lookup_ch.as_ref().filter(|_| s.num_terms > 0).map(|ch| (ch, t.lookup_sum));
+        let c_zeta = combine(&constraints, &terms, &aux_l, &aux_n, (first, last, transition), lookup, &alpha_powers);
+        let mut q_zeta = Fp4::ZERO;
+        let mut zeta_pow = Fp4::ONE;
+        for q in &t.quotient_at_zeta_q {
+            q_zeta += *q * zeta_pow;
+            zeta_pow *= zeta;
+        }
+        if q_zeta * z_h != c_zeta {
+            return Err(VerifyError::ConstraintIdentity);
+        }
+    }
+
+    // FRI over the DEEP combinations recomputed from the opened rows.
+    let mut offset = 0usize;
+    let deeps: Vec<(Deep, Fp4)> = proof
+        .tables
+        .iter()
+        .map(|t| {
+            let d = Deep::new(beta, t);
+            let scale = beta.exp(offset as u64);
+            offset += d.len();
+            (d, scale)
+        })
+        .collect();
+    let mut log_sizes: Vec<usize> = log_ns.iter().map(|l| l + log_blowup).collect();
+    log_sizes.dedup();
+    let open = |q: usize, index: usize| -> Result<Vec<Fp4>, VerifyError> {
+        let openings = &proof.openings[q];
+        if openings.len() != specs.len() {
+            return Err(VerifyError::Shape);
+        }
+        let mut values: Vec<Fp4> = Vec::with_capacity(log_sizes.len());
+        let mut last_size = None;
+        for ((((spec, t), s), opening), (deep, scale)) in
+            specs.iter().zip(&proof.tables).zip(&shapes).zip(openings).zip(&deeps)
+        {
+            if opening.trace_row.len() != s.w
+                || opening.aux_row.len() != s.aux_w
+                || opening.pre_row.len() != s.pre_w
+                || opening.quotient_row.len() != s.chunks * DEGREE
+            {
+                return Err(VerifyError::Shape);
+            }
+            let log_m = t.log_n + log_blowup;
+            let i = index % (1 << log_m);
+            if !merkle_verify(&t.trace_root, log_m, i, &opening.trace_row, &opening.trace_path) {
+                return Err(VerifyError::InvalidTraceOpening { query: q });
+            }
+            if let Some(root) = &t.aux_root
+                && !merkle_verify(root, log_m, i, &opening.aux_row, &opening.aux_path)
+            {
+                return Err(VerifyError::InvalidAuxOpening { query: q });
+            }
+            if let Some(root) = spec.pre_root
+                && !merkle_verify(root, log_m, i, &opening.pre_row, &opening.pre_path)
+            {
+                return Err(VerifyError::InvalidPreprocessedOpening { query: q });
+            }
+            if !merkle_verify(&t.quotient_root, log_m, i, &opening.quotient_row, &opening.quotient_path) {
+                return Err(VerifyError::InvalidQuotientOpening { query: q });
+            }
+            let shift = table_shift(log_big, log_m);
+            let x = Fp4::from_base(shift.mul(&root_of_unity(log_m).pow(i as u64)));
+            let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
+            let zeta_q = zeta.exp(s.chunks as u64);
+            let inv = batch_inverse(&[x - zeta, x - zeta_next, x - zeta_q]);
+            let rows = (&opening.trace_row[..], &opening.aux_row[..], &opening.pre_row[..]);
+            let quotient = ext_from_row(&opening.quotient_row);
+            let v = *scale * deep.value((rows.0, rows.1, rows.2, &quotient), inv[0], inv[1], inv[2]);
+            if last_size == Some(log_m) {
+                *values.last_mut().unwrap() += v;
+            } else {
+                values.push(v);
+                last_size = Some(log_m);
+            }
+        }
+        Ok(values)
+    };
+    fri::verify(&config.fri(), challenger, MULTIPLICATIVE_GENERATOR, &log_sizes, &proof.fri, open)
 }
 
 #[cfg(test)]
@@ -1407,8 +1744,8 @@ mod tests {
         for log_n in [1, 3, 6] {
             let (trace, public) = fib_trace(log_n);
             let proof = prove(&CONFIG, &Fibonacci, &trace, &public, &mut transcript());
-            assert_eq!(proof.log_n, log_n);
-            assert_eq!(proof.quotient_at_zeta_q.len(), 1);
+            assert_eq!(proof.tables[0].log_n, log_n);
+            assert_eq!(proof.tables[0].quotient_at_zeta_q.len(), 1);
             assert_eq!(verify(&CONFIG, &Fibonacci, &public, &proof, &mut transcript()), Ok(()), "log_n={log_n}");
             // Wrong public value fails the constraint identity.
             let bad = vec![public[0] + Fp::ONE];
@@ -1425,7 +1762,7 @@ mod tests {
         let start = Fp::new(3);
         let trace = squaring_trace(&air, 5, start);
         let proof = prove(&CONFIG, &air, &trace, &[start], &mut transcript());
-        assert_eq!(proof.quotient_at_zeta_q.len(), 2);
+        assert_eq!(proof.tables[0].quotient_at_zeta_q.len(), 2);
         assert_eq!(verify(&CONFIG, &air, &[start], &proof, &mut transcript()), Ok(()));
         assert!(verify(&CONFIG, &air, &[start + Fp::ONE], &proof, &mut transcript()).is_err());
         let other = Squaring { k: Fp::new(6) };
@@ -1469,16 +1806,16 @@ mod tests {
 
         assert!(verify(&CONFIG, &Fibonacci, &public, &proof, &mut Challenger::new()).is_err());
         let mut p = proof.clone();
-        p.trace_at_zeta[0] += Fp4::ONE;
+        p.tables[0].trace_at_zeta[0] += Fp4::ONE;
         assert!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()).is_err());
         let mut p = proof.clone();
-        p.openings[2].trace_row[1] += Fp::ONE;
+        p.openings[2][0].trace_row[1] += Fp::ONE;
         assert_eq!(
             verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()),
             Err(VerifyError::InvalidTraceOpening { query: 2 })
         );
         let mut p = proof.clone();
-        p.openings[5].quotient_row[0] += Fp::ONE;
+        p.openings[5][0].quotient_row[0] += Fp::ONE;
         assert_eq!(
             verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()),
             Err(VerifyError::InvalidQuotientOpening { query: 5 })
@@ -1487,13 +1824,13 @@ mod tests {
         p.openings.pop();
         assert_eq!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()), Err(VerifyError::Shape));
         let mut p = proof.clone();
-        p.trace_root[0] += Fp::ONE;
+        p.tables[0].trace_root[0] += Fp::ONE;
         assert!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()).is_err());
         let mut p = proof.clone();
         p.fri.final_value += Fp4::ONE;
         assert!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()).is_err());
         let mut p = proof.clone();
-        p.log_n = 5;
+        p.tables[0].log_n = 5;
         assert!(verify(&CONFIG, &Fibonacci, &public, &p, &mut transcript()).is_err());
     }
 
@@ -1540,8 +1877,8 @@ mod tests {
         ]);
         assert_eq!(check_constraints(&RomAir, &good, &[]), Ok(()));
         let proof = prove(&CONFIG, &RomAir, &good, &[], &mut transcript());
-        assert!(proof.aux_root.is_some());
-        assert_eq!(proof.aux_at_zeta.len(), 3 * 4);
+        assert!(proof.tables[0].aux_root.is_some());
+        assert_eq!(proof.tables[0].aux_at_zeta.len(), 3 * 4);
         assert_eq!(verify(&CONFIG, &RomAir, &[], &proof, &mut transcript()), Ok(()));
         let back = Proof::from_bytes(&proof.to_bytes()).unwrap();
         assert_eq!(back, proof);
@@ -1561,14 +1898,129 @@ mod tests {
         }
         // Tampering with the auxiliary opening is caught.
         let mut p = proof.clone();
-        p.aux_at_zeta[0] += Fp4::ONE;
+        p.tables[0].aux_at_zeta[0] += Fp4::ONE;
         assert!(verify(&CONFIG, &RomAir, &[], &p, &mut transcript()).is_err());
         let mut p = proof.clone();
-        p.openings[0].aux_row[0] += Fp::ONE;
+        p.openings[0][0].aux_row[0] += Fp::ONE;
         assert_eq!(
             verify(&CONFIG, &RomAir, &[], &p, &mut transcript()),
             Err(VerifyError::InvalidAuxOpening { query: 0 })
         );
+    }
+
+    /// Sends its single column, once per row.
+    struct Sender;
+
+    impl Air for Sender {
+        fn width(&self) -> usize {
+            1
+        }
+        fn max_constraint_degree(&self) -> usize {
+            2
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            b.lookup(true, F::ONE, &[b.local()[0]]);
+        }
+    }
+
+    /// Receives `value` with multiplicity `mult`, and runs a Fibonacci
+    /// sequence over `(a, b)` so that its own row structure is checked.
+    /// Columns: `[value, mult, a, b]`.
+    struct Receiver;
+
+    impl Air for Receiver {
+        fn width(&self) -> usize {
+            4
+        }
+        fn max_constraint_degree(&self) -> usize {
+            3
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            let l = b.local();
+            let n = b.next();
+            b.lookup(false, l[1], &[l[0]]);
+            b.when_first_row(l[2]);
+            b.when_first_row(l[3] - F::ONE);
+            b.when_transition(n[2] - l[3]);
+            b.when_transition(n[3] - l[2] - l[3]);
+        }
+    }
+
+    /// A 16-row and a 4-row sender and a 4-row receiver of their values.
+    fn exchange(mults: [u32; 4]) -> (Trace, Trace, Trace) {
+        let tall = Trace::new((0..16).map(|i| Fp::new(10 + i % 4)).collect(), 1);
+        let short = Trace::new((0..4).map(|i| Fp::new(10 + i)).collect(), 1);
+        let (mut a, mut b) = (Fp::ZERO, Fp::ONE);
+        let mut values = Vec::new();
+        for (i, m) in mults.iter().enumerate() {
+            values.extend([Fp::new(10 + i as u32), Fp::new(*m), a, b]);
+            let c = a + b;
+            a = b;
+            b = c;
+        }
+        (tall, short, Trace::new(values, 4))
+    }
+
+    #[test]
+    fn tables_of_different_heights() {
+        let (tall, short, recv) = exchange([5; 4]);
+        let tables = [
+            TableInput { air: &Sender, trace: &tall, pre: None },
+            TableInput { air: &Sender, trace: &short, pre: None },
+            TableInput { air: &Receiver, trace: &recv, pre: None },
+        ];
+        let specs = [
+            TableSpec { air: &Sender, pre_root: None },
+            TableSpec { air: &Sender, pre_root: None },
+            TableSpec { air: &Receiver, pre_root: None },
+        ];
+        let checks: Vec<(&dyn DynAir, &Trace, Option<&Trace>)> =
+            vec![(&Sender, &tall, None), (&Sender, &short, None), (&Receiver, &recv, None)];
+        assert_eq!(check_tables(&checks, &[]), Ok(()));
+        let proof = prove_tables(&CONFIG, &tables, &[], &mut transcript());
+        assert_eq!(proof.tables.iter().map(|t| t.log_n).collect::<Vec<_>>(), vec![4, 2, 2]);
+        assert_eq!(verify_tables(&CONFIG, &specs, &[], &proof, &mut transcript()), Ok(()));
+        let back = Proof::from_bytes(&proof.to_bytes()).unwrap();
+        assert_eq!(back, proof);
+
+        // Tables in another order, or one missing.
+        let swapped = [specs[0], specs[2], specs[1]];
+        assert!(verify_tables(&CONFIG, &swapped, &[], &proof, &mut transcript()).is_err());
+        assert_eq!(verify_tables(&CONFIG, &specs[..2], &[], &proof, &mut transcript()), Err(VerifyError::Shape));
+        // Openings of a smaller table are checked.
+        let mut p = proof.clone();
+        p.openings[3][2].trace_row[2] += Fp::ONE;
+        assert_eq!(
+            verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()),
+            Err(VerifyError::InvalidTraceOpening { query: 3 })
+        );
+        let mut p = proof.clone();
+        p.tables[2].trace_at_zeta_next[3] += Fp4::ONE;
+        assert!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()).is_err());
+        // Moving lookup weight between tables keeps the total but breaks
+        // the last-row constraint of both.
+        let mut p = proof.clone();
+        p.tables[0].lookup_sum += Fp4::ONE;
+        p.tables[2].lookup_sum -= Fp4::ONE;
+        assert!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()).is_err());
+        let mut p = proof.clone();
+        p.tables[1].lookup_sum += Fp4::ONE;
+        assert_eq!(verify_tables(&CONFIG, &specs, &[], &p, &mut transcript()), Err(VerifyError::LookupSum));
+
+        // Messages that do not balance.
+        let (tall, short, recv) = exchange([5, 5, 4, 5]);
+        let checks: Vec<(&dyn DynAir, &Trace, Option<&Trace>)> =
+            vec![(&Sender, &tall, None), (&Sender, &short, None), (&Receiver, &recv, None)];
+        assert_eq!(check_tables(&checks, &[]), Err((2, (usize::MAX, 0, "lookup sum"))));
+        if !cfg!(debug_assertions) {
+            let tables = [
+                TableInput { air: &Sender, trace: &tall, pre: None },
+                TableInput { air: &Sender, trace: &short, pre: None },
+                TableInput { air: &Receiver, trace: &recv, pre: None },
+            ];
+            let proof = prove_tables(&CONFIG, &tables, &[], &mut transcript());
+            assert_eq!(verify_tables(&CONFIG, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
+        }
     }
 
     /// Two columns that must be permutations of each other.

@@ -20,11 +20,12 @@ use std::collections::HashMap;
 
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use crate::fri::{FriProof, QueryStep, leaf_row, round_log_arities};
+use crate::fri::{FriProof, QueryStep, injection_rounds, leaf_row, round_log_arities};
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
 use crate::stark::{
-    Air, Builder, LookupTerm, Proof, QueryOpening, StarkConfig, log_quotient_degree, num_lookup_constraints, shape,
+    Air, Builder, DynAir, LookupTerm, Proof, QueryOpening, StarkConfig, TableProof, log_quotient_degree,
+    num_lookup_constraints, shape,
 };
 use crate::vm_air::{Addr, Program};
 
@@ -519,30 +520,41 @@ impl Compiler {
 
 /// Builds the verifier program for a proof of `air` with `public` values,
 /// along with the witness for this particular proof. The output digest is
-/// the hash of the public values. For AIRs with preprocessed columns use
-/// [`Compiler::verify_stark`] directly.
+/// the hash of the public values. For AIRs with preprocessed columns or
+/// proofs over several tables use [`Compiler::verify_stark`] directly.
 pub fn compile_verifier<A: Air>(air: &A, config: &StarkConfig, public: &[Fp], proof: &Proof) -> Compiler {
     let mut c = Compiler::new();
     let pub_base = c.scalar_inputs(public);
-    c.verify_stark(air, config, &[], None, pub_base, public.len(), proof);
+    c.verify_stark(&[(air, None)], config, &[], pub_base, public.len(), proof);
     c.hash_scalars(pub_base, public.len());
     c.assert_public();
     c
 }
 
+/// Shape of one table of a proof, from its AIR.
+struct TableShape {
+    log_n: usize,
+    w: usize,
+    aux_w: usize,
+    pre_w: usize,
+    chunks: usize,
+    log_q: usize,
+    num_constraints: usize,
+    num_terms: usize,
+}
+
 impl Compiler {
-    /// Verifies `proof` for `air` inside the program. The inner public
-    /// values are the `num_public` scalars at `pub_base` (zero padded to a
-    /// multiple of eight); `prefix` holds scalars the transcript observed
-    /// before anything else (domain separators); `pre_root` is the digest
-    /// of the AIR's preprocessed table, when it has one.
-    #[allow(clippy::too_many_arguments)]
-    pub fn verify_stark<A: Air>(
+    /// Verifies `proof` inside the program. `tables` lists the AIR of each
+    /// table, tallest first, with the address of the digest of its
+    /// preprocessed table when it has one. The inner public values are the
+    /// `num_public` scalars at `pub_base` (zero padded to a multiple of
+    /// eight); `prefix` holds scalars the transcript observed before
+    /// anything else (domain separators).
+    pub fn verify_stark(
         &mut self,
-        air: &A,
+        tables: &[(&dyn DynAir, Option<Addr>)],
         config: &StarkConfig,
         prefix: &[Fp],
-        pre_root: Option<Addr>,
         pub_base: Addr,
         num_public: usize,
         proof: &Proof,
@@ -550,152 +562,202 @@ impl Compiler {
         let public: Vec<Fp> = (0..num_public).map(|i| self.val(pub_base + i as Addr).0[0]).collect();
         let public = &public[..];
         let c = self;
-        let w = air.width();
-        let pre_w = air.preprocessed_width();
-        assert_eq!(pre_root.is_some(), pre_w > 0, "preprocessed root must be given exactly when the air has one");
-        let log_n = proof.log_n;
-        let log_blowup = config.log_blowup;
-        let log_big_n = log_n + log_blowup;
-        let log_q = log_quotient_degree(air.max_constraint_degree());
-        let num_chunks = 1usize << log_q;
-        let (num_constraints, num_terms) = shape(air, public);
-        let aux_ext_w = if num_terms > 0 { num_terms + 1 } else { 0 };
-        let aux_w = aux_ext_w * DEGREE;
-        assert_eq!(proof.trace_at_zeta.len(), w);
-        assert_eq!(proof.aux_at_zeta.len(), aux_w);
-        assert_eq!(proof.pre_at_zeta.len(), pre_w);
-        assert_eq!(proof.quotient_at_zeta_q.len(), num_chunks);
+        assert_eq!(proof.tables.len(), tables.len(), "proof has the wrong number of tables");
         assert_eq!(proof.openings.len(), config.num_queries);
+        let log_blowup = config.log_blowup;
+        let shapes: Vec<TableShape> = tables
+            .iter()
+            .zip(&proof.tables)
+            .map(|((air, pre_root), tp)| {
+                let pre_w = air.air_preprocessed_width();
+                assert_eq!(
+                    pre_root.is_some(),
+                    pre_w > 0,
+                    "preprocessed root must be given exactly when the air has one"
+                );
+                let log_q = log_quotient_degree(air.air_degree());
+                let (num_constraints, num_terms) = shape(*air, public);
+                let s = TableShape {
+                    log_n: tp.log_n,
+                    w: air.air_width(),
+                    aux_w: if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 },
+                    pre_w,
+                    chunks: 1 << log_q,
+                    log_q,
+                    num_constraints,
+                    num_terms,
+                };
+                assert_eq!(tp.trace_at_zeta.len(), s.w);
+                assert_eq!(tp.aux_at_zeta.len(), s.aux_w);
+                assert_eq!(tp.pre_at_zeta.len(), s.pre_w);
+                assert_eq!(tp.quotient_at_zeta_q.len(), s.chunks);
+                s
+            })
+            .collect();
+        let log_ns: Vec<usize> = shapes.iter().map(|s| s.log_n).collect();
+        assert!(log_ns.windows(2).all(|w| w[0] >= w[1]), "tables must be ordered by height");
+        let log_big_n = log_ns[0] + log_blowup;
         let shift = MULTIPLICATIVE_GENERATOR;
 
-        // ---- inputs: commitments ----
-        let trace_root = c.scalar_inputs(&proof.trace_root);
-        let aux_root = proof.aux_root.map(|r| c.scalar_inputs(&r));
-        let quotient_root = c.scalar_inputs(&proof.quotient_root);
+        // ---- inputs: commitments and lookup totals ----
+        let trace_roots: Vec<Addr> = proof.tables.iter().map(|tp| c.scalar_inputs(&tp.trace_root)).collect();
+        let aux: Vec<Option<(Addr, Addr)>> =
+            proof.tables.iter().map(|tp| tp.aux_root.map(|r| (c.scalar_inputs(&r), c.input(tp.lookup_sum)))).collect();
+        let quotient_roots: Vec<Addr> = proof.tables.iter().map(|tp| c.scalar_inputs(&tp.quotient_root)).collect();
 
-        // ---- transcript up to the lookup challenges ----
+        // ---- transcript up to zeta ----
         let mut t = c.transcript();
         for p in prefix {
             let p = c.scalar(*p);
             c.observe(&mut t, p);
         }
-        let log_n_s = c.scalar(Fp::from_u32(log_n as u32));
+        for log_n in &log_ns {
+            let s = c.scalar(Fp::from_u32(*log_n as u32));
+            c.observe(&mut t, s);
+        }
         let npub_s = c.scalar(Fp::from_u32(public.len() as u32));
-        c.observe(&mut t, log_n_s);
         c.observe(&mut t, npub_s);
         c.observe_block(&mut t, pub_base, public.len());
-        if let Some(root) = pre_root {
-            c.observe_block(&mut t, root, DIGEST);
+        for (_, pre_root) in tables {
+            if let Some(root) = pre_root {
+                c.observe_block(&mut t, *root, DIGEST);
+            }
         }
-        c.observe_block(&mut t, trace_root, DIGEST);
-        let lookup = aux_root.map(|root| {
+        for root in &trace_roots {
+            c.observe_block(&mut t, *root, DIGEST);
+        }
+        let lookup = if aux.iter().any(Option::is_some) {
             let gamma = c.sample_word(&mut t);
             let delta = c.sample_word(&mut t);
-            c.observe_block(&mut t, root, DIGEST);
-            (gamma, delta)
-        });
+            let mut total = A_ZERO;
+            for (root, sum) in aux.iter().flatten() {
+                c.observe_block(&mut t, *root, DIGEST);
+                c.observe_word(&mut t, *sum);
+                total = c.add(total, *sum);
+            }
+            // The tables' lookup totals cancel.
+            c.assert_eq(total, A_ZERO);
+            Some((gamma, delta))
+        } else {
+            None
+        };
         let alpha = c.sample_word(&mut t);
-        c.observe_block(&mut t, quotient_root, DIGEST);
+        for root in &quotient_roots {
+            c.observe_block(&mut t, *root, DIGEST);
+        }
         let zeta = c.sample_word(&mut t);
 
         // ---- openings ----
         // Loaded as scalars eight per row, observed in place, and packed
-        // into words.
-        let groups = [
-            &proof.trace_at_zeta,
-            &proof.trace_at_zeta_next,
-            &proof.aux_at_zeta,
-            &proof.aux_at_zeta_next,
-            &proof.pre_at_zeta,
-            &proof.pre_at_zeta_next,
-            &proof.quotient_at_zeta_q,
-        ];
-        let scalars: Vec<Fp> = groups.iter().flat_map(|g| g.iter().flat_map(|v| v.0)).collect();
+        // into words: per table, the seven groups of `TableProof::opened`.
+        let scalars: Vec<Fp> = proof
+            .tables
+            .iter()
+            .flat_map(|tp| tp.opened().into_iter().flat_map(|g| g.iter().flat_map(|v| v.0)))
+            .collect();
         let base = c.scalar_inputs(&scalars);
         c.observe_block(&mut t, base, scalars.len());
         let mut next = 0usize;
-        let [trace_z, trace_zn, aux_z, aux_zn, pre_z, pre_zn, quot_zq] = groups.map(|g| {
-            (0..g.len())
-                .map(|_| {
+        let mut opened: Vec<Vec<Vec<Addr>>> = Vec::with_capacity(tables.len());
+        for tp in &proof.tables {
+            let mut groups = Vec::with_capacity(7);
+            for g in tp.opened() {
+                let mut words = Vec::with_capacity(g.len());
+                for _ in 0..g.len() {
                     let at = base + (next * DEGREE) as Addr;
                     next += 1;
-                    c.word_from_scalars(core::array::from_fn(|k| at + k as Addr))
-                })
-                .collect::<Vec<Addr>>()
-        });
+                    words.push(c.word_from_scalars(core::array::from_fn(|k| at + k as Addr)));
+                }
+                groups.push(words);
+            }
+            opened.push(groups);
+        }
         let beta = c.sample_word(&mut t);
 
-        // ---- constraint identity at zeta ----
-        let g = root_of_unity(log_n);
-        let g_inv = g.inverse().unwrap();
-        let g_s = c.scalar(g);
-        let g_inv_s = c.scalar(g_inv);
-        let zeta_next = c.mul(zeta, g_s);
-        let mut zeta_q = zeta;
-        for _ in 0..log_q {
-            zeta_q = c.mul(zeta_q, zeta_q);
+        // ---- constraint identity of every table at zeta ----
+        // `zeta_pows[k] = zeta^(2^k)`.
+        let max_log = log_ns[0].max(shapes.iter().map(|s| s.log_q).max().unwrap());
+        let mut zeta_pows = vec![zeta];
+        for k in 0..max_log {
+            let z = zeta_pows[k];
+            zeta_pows.push(c.mul(z, z));
         }
-        let mut zeta_n = zeta;
-        for _ in 0..log_n {
-            zeta_n = c.mul(zeta_n, zeta_n);
-        }
-        let z_h = c.sub(zeta_n, A_ONE);
         let d1 = c.sub(zeta, A_ONE);
         let d1_inv = c.inverse(d1);
-        let first = c.mul(z_h, d1_inv);
-        let d2 = c.sub(zeta, g_inv_s);
-        let d2_inv = c.inverse(d2);
-        let last = c.mul(z_h, d2_inv);
-        let transition = d2;
+        let mut zeta_nexts = Vec::with_capacity(tables.len());
+        for (i, ((air, _), s)) in tables.iter().zip(&shapes).enumerate() {
+            let [trace_z, trace_zn, aux_z, aux_zn, pre_z, pre_zn, quot_zq] = &opened[i][..] else { unreachable!() };
+            let g = root_of_unity(s.log_n);
+            let g_s = c.scalar(g);
+            let g_inv_s = c.scalar(g.inverse().unwrap());
+            zeta_nexts.push(c.mul(zeta, g_s));
+            let z_h = c.sub(zeta_pows[s.log_n], A_ONE);
+            let first = c.mul(z_h, d1_inv);
+            let d2 = c.sub(zeta, g_inv_s);
+            let d2_inv = c.inverse(d2);
+            let last = c.mul(z_h, d2_inv);
+            let transition = d2;
 
-        // Compile the inner constraints over Expr.
-        let local: Vec<Expr> = trace_z.iter().map(|a| Expr(*a)).collect();
-        let next: Vec<Expr> = trace_zn.iter().map(|a| Expr(*a)).collect();
-        let pre_l: Vec<Expr> = pre_z.iter().map(|a| Expr(*a)).collect();
-        let pre_n: Vec<Expr> = pre_zn.iter().map(|a| Expr(*a)).collect();
-        let pub_exprs: Vec<Expr> = (0..public.len()).map(|i| Expr(pub_base + i as Addr)).collect();
-        let owned = std::mem::replace(c, Compiler::shell());
-        CTX.with(|cell| *cell.borrow_mut() = Some(owned));
-        let (constraints, terms) = {
-            let mut b =
-                Builder::new(&local, &next, (&pre_l, &pre_n), &pub_exprs, (Expr(first), Expr(last), Expr(transition)));
-            air.eval(&mut b);
-            b.into_parts()
-        };
-        *c = CTX.with(|cell| cell.borrow_mut().take().unwrap());
-        assert_eq!(constraints.len(), num_constraints);
-        assert_eq!(terms.len(), num_terms);
+            // Compile the inner constraints over Expr.
+            let local: Vec<Expr> = trace_z.iter().map(|a| Expr(*a)).collect();
+            let next: Vec<Expr> = trace_zn.iter().map(|a| Expr(*a)).collect();
+            let pre_l: Vec<Expr> = pre_z.iter().map(|a| Expr(*a)).collect();
+            let pre_n: Vec<Expr> = pre_zn.iter().map(|a| Expr(*a)).collect();
+            let pub_exprs: Vec<Expr> = (0..public.len()).map(|i| Expr(pub_base + i as Addr)).collect();
+            let owned = std::mem::replace(c, Compiler::shell());
+            CTX.with(|cell| *cell.borrow_mut() = Some(owned));
+            let (constraints, terms) = {
+                let mut b = Builder::new(
+                    &local,
+                    &next,
+                    (&pre_l, &pre_n),
+                    &pub_exprs,
+                    (Expr(first), Expr(last), Expr(transition)),
+                );
+                air.eval_expr(&mut b);
+                b.into_parts()
+            };
+            *c = CTX.with(|cell| cell.borrow_mut().take().unwrap());
+            assert_eq!(constraints.len(), s.num_constraints);
+            assert_eq!(terms.len(), s.num_terms);
 
-        // Lookup constraints over addresses.
-        let mut all: Vec<Addr> = constraints.iter().map(|e| e.0).collect();
-        if let Some((gamma, delta)) = lookup {
-            let aux_l = reconstruct_ext(c, &aux_z);
-            let aux_n = reconstruct_ext(c, &aux_zn);
-            all.extend(lookup_constraints_addr(c, gamma, delta, &terms, &aux_l, &aux_n, (first, last, transition)));
-        }
-        assert_eq!(all.len(), num_constraints + num_lookup_constraints(num_terms));
-        let mut acc = A_ZERO;
-        let mut alpha_pow = A_ONE;
-        for (k, cst) in all.iter().enumerate() {
-            acc = c.muladd(*cst, alpha_pow, acc);
-            if k + 1 < all.len() {
-                alpha_pow = c.mul(alpha_pow, alpha);
+            // Lookup constraints over addresses.
+            let mut all: Vec<Addr> = constraints.iter().map(|e| e.0).collect();
+            if s.num_terms > 0 {
+                let (gamma, delta) = lookup.unwrap();
+                let total = aux[i].unwrap().1;
+                let aux_l = reconstruct_ext(c, aux_z);
+                let aux_n = reconstruct_ext(c, aux_zn);
+                let sel = (first, last, transition);
+                all.extend(lookup_constraints_addr(c, gamma, delta, total, &terms, &aux_l, &aux_n, sel));
             }
-        }
-        let mut q_zeta = A_ZERO;
-        let mut zeta_pow = A_ONE;
-        for (j, q) in quot_zq.iter().enumerate() {
-            q_zeta = c.muladd(*q, zeta_pow, q_zeta);
-            if j + 1 < quot_zq.len() {
-                zeta_pow = c.mul(zeta_pow, zeta);
+            assert_eq!(all.len(), s.num_constraints + num_lookup_constraints(s.num_terms));
+            let mut acc = A_ZERO;
+            let mut alpha_pow = A_ONE;
+            for (k, cst) in all.iter().enumerate() {
+                acc = c.muladd(*cst, alpha_pow, acc);
+                if k + 1 < all.len() {
+                    alpha_pow = c.mul(alpha_pow, alpha);
+                }
             }
+            let mut q_zeta = A_ZERO;
+            let mut zeta_pow = A_ONE;
+            for (j, q) in quot_zq.iter().enumerate() {
+                q_zeta = c.muladd(*q, zeta_pow, q_zeta);
+                if j + 1 < quot_zq.len() {
+                    zeta_pow = c.mul(zeta_pow, zeta);
+                }
+            }
+            let lhs = c.mul(q_zeta, z_h);
+            c.assert_eq(lhs, acc);
         }
-        let lhs = c.mul(q_zeta, z_h);
-        c.assert_eq(lhs, acc);
 
         // ---- FRI commitments ----
         let fri = &proof.fri;
-        let arities = round_log_arities(&config.fri(), log_big_n);
+        let mut log_sizes: Vec<usize> = log_ns.iter().map(|l| l + log_blowup).collect();
+        log_sizes.dedup();
+        let arities = round_log_arities(&config.fri(), &log_sizes);
+        let inject = injection_rounds(&config.fri(), &log_sizes);
         let rounds = arities.len();
         assert_eq!(fri.commitments.len(), rounds);
         let mut fri_roots = Vec::with_capacity(rounds);
@@ -733,9 +795,10 @@ impl Compiler {
         let iota_inv = c.scalar(omega_inv_pows[log_big_n - 2]);
         let fri_betas_sq: Vec<Addr> = fri_betas.iter().map(|&b| c.mul(b, b)).collect();
         // Powers of beta in one block of consecutive words, so dot products
-        // can read them eight at a time (see `stark::Deep` for the layout).
-        let (off_t, off_a, off_p, off_q) = (0, 2 * w, 2 * w + 2 * aux_w, 2 * w + 2 * aux_w + 2 * pre_w);
-        let beta_count = off_q + num_chunks;
+        // can read them eight at a time (see `stark::Deep` for the layout,
+        // the same for every table up to the table's scale).
+        let layout = |s: &TableShape| 2 * s.w + 2 * s.aux_w + 2 * s.pre_w + s.chunks;
+        let beta_count = shapes.iter().map(layout).max().unwrap();
         let beta_base = c.powers_block(beta, beta_count + RATE);
         let bp = |k: usize| beta_base + k as Addr;
         let dot = |c: &mut Compiler, from: usize, vals: &[Addr]| -> Addr {
@@ -745,14 +808,35 @@ impl Compiler {
             }
             acc
         };
-        let c_tz = dot(c, off_t, &trace_z);
-        let c_tzn = dot(c, off_t + w, &trace_zn);
-        let c_az = dot(c, off_a, &aux_z);
-        let c_azn = dot(c, off_a + aux_w, &aux_zn);
-        let c_pz = dot(c, off_p, &pre_z);
-        let c_pzn = dot(c, off_p + pre_w, &pre_zn);
-        let c_q = dot(c, off_q, &quot_zq);
-        let (beta_w, beta_aux, beta_pre) = (bp(w), bp(aux_w), bp(pre_w));
+        struct DeepConsts {
+            c_tz: Addr,
+            c_tzn: Addr,
+            c_az: Addr,
+            c_azn: Addr,
+            c_pz: Addr,
+            c_pzn: Addr,
+            c_q: Addr,
+            /// `beta^offset`, absent for the first table.
+            scale: Option<Addr>,
+        }
+        let mut offset = 0usize;
+        let mut deep = Vec::with_capacity(tables.len());
+        for (i, s) in shapes.iter().enumerate() {
+            let [trace_z, trace_zn, aux_z, aux_zn, pre_z, pre_zn, quot_zq] = &opened[i][..] else { unreachable!() };
+            let (off_a, off_p, off_q) = (2 * s.w, 2 * s.w + 2 * s.aux_w, 2 * s.w + 2 * s.aux_w + 2 * s.pre_w);
+            let scale = (offset > 0).then(|| c.pow_const(beta, offset as u64));
+            offset += layout(s);
+            deep.push(DeepConsts {
+                c_tz: dot(c, 0, trace_z),
+                c_tzn: dot(c, s.w, trace_zn),
+                c_az: dot(c, off_a, aux_z),
+                c_azn: dot(c, off_a + s.aux_w, aux_zn),
+                c_pz: dot(c, off_p, pre_z),
+                c_pzn: dot(c, off_p + s.pre_w, pre_zn),
+                c_q: dot(c, off_q, quot_zq),
+                scale,
+            });
+        }
 
         for (q, steps) in fri.queries.iter().enumerate() {
             assert_eq!(steps.len(), rounds);
@@ -766,12 +850,102 @@ impl Compiler {
             let mut x_inv = c.power_from_bits(shift_inv, bits, 0, &omega_inv_pows[..log_leaves0]);
             let x_abs = c.inverse(x_inv);
             let x = c.power_from_bits_at(x_abs, bits, log_leaves0, &omega_pows[log_leaves0..]);
-            let mut folded: Option<Addr> = None;
-            let mut claimed = A_ZERO;
+
+            // DEEP values from the opened rows, summed per domain size: each
+            // row is loaded eight scalars at a time while accumulating its
+            // beta-weighted sum. A table of a smaller domain is opened at
+            // the index's low bits, at the point `x^(2^k)`.
+            let mut values: Vec<Addr> = Vec::with_capacity(log_sizes.len());
+            let mut last_size = None;
+            let mut x_t = x;
+            let mut log_x = log_big_n;
+            for (i, s) in shapes.iter().enumerate() {
+                let opening: &QueryOpening = &proof.openings[q][i];
+                let log_m = s.log_n + log_blowup;
+                while log_x > log_m {
+                    x_t = c.mul(x_t, x_t);
+                    log_x -= 1;
+                }
+                let (off_a, off_p, off_q) = (2 * s.w, 2 * s.w + 2 * s.aux_w, 2 * s.w + 2 * s.aux_w + 2 * s.pre_w);
+                let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, bp(0));
+                let trace_path: Vec<Addr> = opening.trace_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                let root = c.merkle_root(trace_row, s.w, &trace_path, bits);
+                c.assert_digest(root, trace_roots[i]);
+                let s_a = if s.aux_w > 0 {
+                    let (row, sum) = c.row_inputs_dot(&opening.aux_row, bp(off_a));
+                    let path: Vec<Addr> = opening.aux_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                    let root = c.merkle_root(row, s.aux_w, &path, bits);
+                    c.assert_digest(root, aux[i].unwrap().0);
+                    sum
+                } else {
+                    A_ZERO
+                };
+                let s_p = if s.pre_w > 0 {
+                    let (row, sum) = c.row_inputs_dot(&opening.pre_row, bp(off_p));
+                    let path: Vec<Addr> = opening.pre_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                    let root = c.merkle_root(row, s.pre_w, &path, bits);
+                    c.assert_digest(root, tables[i].1.unwrap());
+                    sum
+                } else {
+                    A_ZERO
+                };
+                let quot_row = c.scalar_inputs(&opening.quotient_row);
+                let quot_path: Vec<Addr> = opening.quotient_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                let root = c.merkle_root(quot_row, s.chunks * DEGREE, &quot_path, bits);
+                c.assert_digest(root, quotient_roots[i]);
+                let mut s_q = A_ZERO;
+                for j in 0..s.chunks {
+                    let sc: [Addr; DEGREE] = core::array::from_fn(|k| quot_row + (j * DEGREE + k) as Addr);
+                    let word = c.word_from_scalars(sc);
+                    s_q = c.muladd(word, bp(off_q + j), s_q);
+                }
+
+                let d = &deep[i];
+                let dz = c.sub(x_t, zeta);
+                let inv_z = c.inverse(dz);
+                let dzn = c.sub(x_t, zeta_nexts[i]);
+                let inv_zn = c.inverse(dzn);
+                let dzq = c.sub(x_t, zeta_pows[s.log_q]);
+                let inv_zq = c.inverse(dzq);
+                // value = (s_t - c_tz + s_a - c_az + s_p - c_pz) / (x - zeta)
+                //       + (beta^w s_t - c_tzn + beta^aux_w s_a - c_azn + beta^pre_w s_p - c_pzn) / (x - g zeta)
+                //       + (s_q - c_q) / (x - zeta_q)
+                let at_z = c.sub(s_t, d.c_tz);
+                let at_z = c.add(at_z, s_a);
+                let at_z = c.sub(at_z, d.c_az);
+                let at_z = c.add(at_z, s_p);
+                let at_z = c.sub(at_z, d.c_pz);
+                let at_zn = c.muladd(bp(s.w), s_t, A_ZERO);
+                let at_zn = c.sub(at_zn, d.c_tzn);
+                let at_zn = c.muladd(bp(s.aux_w), s_a, at_zn);
+                let at_zn = c.sub(at_zn, d.c_azn);
+                let at_zn = c.muladd(bp(s.pre_w), s_p, at_zn);
+                let at_zn = c.sub(at_zn, d.c_pzn);
+                let at_q = c.sub(s_q, d.c_q);
+                let value = c.mul(at_z, inv_z);
+                let value = c.muladd(at_zn, inv_zn, value);
+                let value = c.muladd(at_q, inv_zq, value);
+                let value = match d.scale {
+                    Some(k) => c.mul(value, k),
+                    None => value,
+                };
+                if last_size == Some(log_m) {
+                    let prev = values.pop().unwrap();
+                    values.push(c.add(prev, value));
+                } else {
+                    values.push(value);
+                    last_size = Some(log_m);
+                }
+            }
+
+            let mut expected = values[0];
             let mut log_m = log_big_n;
             for (r, step) in steps.iter().enumerate() {
                 let la = arities[r];
                 let log_leaves = log_m - la;
+                if let Some(g) = inject.iter().position(|&ir| ir == r) {
+                    expected = c.add(expected, values[g + 1]);
+                }
                 if r > 0 {
                     // Queried point inverse times `w^pos`, where `w` has
                     // order `2^la` and its `2^j`-th power is
@@ -802,10 +976,7 @@ impl Compiler {
                     let s1 = pick(c, v[2], v[3], b0);
                     pick(c, s0, s1, b1)
                 };
-                match folded {
-                    Some(f) => c.assert_eq(at_pos, f),
-                    None => claimed = at_pos,
-                }
+                c.assert_eq(at_pos, expected);
                 // Fold, and the next round's queried point inverse.
                 let fold2 = |c: &mut Compiler, a: Addr, b: Addr, xi: Addr, beta: Addr| {
                     let sum = c.add(a, b);
@@ -816,84 +987,33 @@ impl Compiler {
                     c.muladd(beta, odd, even)
                 };
                 if la == 1 {
-                    folded = Some(fold2(c, v[0], v[1], x_inv, fri_betas[r]));
+                    expected = fold2(c, v[0], v[1], x_inv, fri_betas[r]);
                     x_inv = c.mul(x_inv, x_inv);
                 } else {
                     let g0 = fold2(c, v[0], v[2], x_inv, fri_betas[r]);
                     let xi1 = c.mul(x_inv, iota_inv);
                     let g1 = fold2(c, v[1], v[3], xi1, fri_betas[r]);
                     let x_sq = c.mul(x_inv, x_inv);
-                    folded = Some(fold2(c, g0, g1, x_sq, fri_betas_sq[r]));
+                    expected = fold2(c, g0, g1, x_sq, fri_betas_sq[r]);
                     x_inv = c.mul(x_sq, x_sq);
                 }
                 log_m = log_leaves;
             }
-            c.assert_eq(folded.unwrap(), final_value);
-
-            // DEEP value from the opened rows: each row is loaded eight
-            // scalars at a time while accumulating its beta-weighted sum.
-            let opening: &QueryOpening = &proof.openings[q];
-            let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, bp(off_t));
-            let trace_path: Vec<Addr> = opening.trace_path.iter().map(|d| c.scalar_inputs(d)).collect();
-            let root = c.merkle_root(trace_row, w, &trace_path, bits);
-            c.assert_digest(root, trace_root);
-            let s_a = if aux_w > 0 {
-                let (row, s) = c.row_inputs_dot(&opening.aux_row, bp(off_a));
-                let path: Vec<Addr> = opening.aux_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                let root = c.merkle_root(row, aux_w, &path, bits);
-                c.assert_digest(root, aux_root.unwrap());
-                s
-            } else {
-                A_ZERO
-            };
-            let s_p = if pre_w > 0 {
-                let (row, s) = c.row_inputs_dot(&opening.pre_row, bp(off_p));
-                let path: Vec<Addr> = opening.pre_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                let root = c.merkle_root(row, pre_w, &path, bits);
-                c.assert_digest(root, pre_root.unwrap());
-                s
-            } else {
-                A_ZERO
-            };
-            let quot_row = c.scalar_inputs(&opening.quotient_row);
-            let quot_path: Vec<Addr> = opening.quotient_path.iter().map(|d| c.scalar_inputs(d)).collect();
-            let root = c.merkle_root(quot_row, num_chunks * DEGREE, &quot_path, bits);
-            c.assert_digest(root, quotient_root);
-            let mut s_q = A_ZERO;
-            for j in 0..num_chunks {
-                let sc: [Addr; DEGREE] = core::array::from_fn(|k| quot_row + (j * DEGREE + k) as Addr);
-                let word = c.word_from_scalars(sc);
-                s_q = c.muladd(word, bp(off_q + j), s_q);
-            }
-
-            let dz = c.sub(x, zeta);
-            let inv_z = c.inverse(dz);
-            let dzn = c.sub(x, zeta_next);
-            let inv_zn = c.inverse(dzn);
-            let dzq = c.sub(x, zeta_q);
-            let inv_zq = c.inverse(dzq);
-            // value = (s_t - c_tz + s_a - c_az + s_p - c_pz) / (x - zeta)
-            //       + (beta^w s_t - c_tzn + beta^aux_w s_a - c_azn + beta^pre_w s_p - c_pzn) / (x - g zeta)
-            //       + (s_q - c_q) / (x - zeta_q)
-            let at_z = c.sub(s_t, c_tz);
-            let at_z = c.add(at_z, s_a);
-            let at_z = c.sub(at_z, c_az);
-            let at_z = c.add(at_z, s_p);
-            let at_z = c.sub(at_z, c_pz);
-            let at_zn = c.muladd(beta_w, s_t, A_ZERO);
-            let at_zn = c.sub(at_zn, c_tzn);
-            let at_zn = c.muladd(beta_aux, s_a, at_zn);
-            let at_zn = c.sub(at_zn, c_azn);
-            let at_zn = c.muladd(beta_pre, s_p, at_zn);
-            let at_zn = c.sub(at_zn, c_pzn);
-            let at_q = c.sub(s_q, c_q);
-            let value = c.mul(at_z, inv_z);
-            let value = c.muladd(at_zn, inv_zn, value);
-            let value = c.muladd(at_q, inv_zq, value);
-            c.assert_eq(value, claimed);
+            c.assert_eq(expected, final_value);
         }
     }
 
+    /// `base^e` by square and multiply.
+    fn pow_const(&mut self, base: Addr, e: u64) -> Addr {
+        let mut acc = A_ONE;
+        for i in (0..u64::BITS - e.leading_zeros()).rev() {
+            acc = self.mul(acc, acc);
+            if (e >> i) & 1 == 1 {
+                acc = self.mul(acc, base);
+            }
+        }
+        acc
+    }
     /// `base^0 .. base^(count-1)` at `count` consecutive fresh addresses,
     /// zero padded to a multiple of eight.
     fn powers_block(&mut self, base: Addr, count: usize) -> Addr {
@@ -959,10 +1079,12 @@ fn reconstruct_ext(c: &mut Compiler, opened: &[Addr]) -> Vec<Addr> {
 }
 
 /// Lookup constraints over addresses, mirroring `stark::lookup_constraints`.
+#[allow(clippy::too_many_arguments)]
 fn lookup_constraints_addr(
     c: &mut Compiler,
     gamma: Addr,
     delta: Addr,
+    total: Addr,
     terms: &[LookupTerm<Expr>],
     aux_l: &[Addr],
     aux_n: &[Addr],
@@ -993,56 +1115,77 @@ fn lookup_constraints_addr(
     out.push(c.mul(sel.2, d));
     out.push(c.mul(sel.0, s));
     let e = c.add(s, contrib);
+    let e = c.sub(e, total);
     out.push(c.mul(sel.1, e));
     out
 }
 
-/// A zero-filled proof of the shape `prove` produces for `air`, used to
-/// compile the verifier program without a real proof.
-pub fn dummy_proof<A: Air>(air: &A, config: &StarkConfig, log_n: usize, num_public: usize) -> Proof {
-    let w = air.width();
-    let pre_w = air.preprocessed_width();
-    let (_, num_terms) = shape(air, &vec![Fp::ZERO; num_public]);
-    let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
-    let num_chunks = 1usize << log_quotient_degree(air.max_constraint_degree());
-    let log_big_n = log_n + config.log_blowup;
-    let arities = round_log_arities(&config.fri(), log_big_n);
-    let rounds = arities.len();
+/// A zero-filled proof of the shape `prove_tables` produces for tables
+/// with the given AIRs and heights (tallest first), used to compile the
+/// verifier program without a real proof.
+pub fn dummy_proof(tables: &[(&dyn DynAir, usize)], config: &StarkConfig, num_public: usize) -> Proof {
     let z = [Fp::ZERO; DIGEST];
+    let log_blowup = config.log_blowup;
+    let shapes: Vec<(usize, usize, usize, usize, usize)> = tables
+        .iter()
+        .map(|(air, log_n)| {
+            let (_, num_terms) = shape(*air, &vec![Fp::ZERO; num_public]);
+            let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
+            let chunks = 1usize << log_quotient_degree(air.air_degree());
+            (*log_n, air.air_width(), aux_w, air.air_preprocessed_width(), chunks)
+        })
+        .collect();
+    let parts = shapes
+        .iter()
+        .map(|&(log_n, w, aux_w, pre_w, chunks)| TableProof {
+            log_n,
+            trace_root: z,
+            aux_root: (aux_w > 0).then_some(z),
+            lookup_sum: Fp4::ZERO,
+            quotient_root: z,
+            trace_at_zeta: vec![Fp4::ZERO; w],
+            trace_at_zeta_next: vec![Fp4::ZERO; w],
+            aux_at_zeta: vec![Fp4::ZERO; aux_w],
+            aux_at_zeta_next: vec![Fp4::ZERO; aux_w],
+            pre_at_zeta: vec![Fp4::ZERO; pre_w],
+            pre_at_zeta_next: vec![Fp4::ZERO; pre_w],
+            quotient_at_zeta_q: vec![Fp4::ZERO; chunks],
+        })
+        .collect();
+    let opening: Vec<QueryOpening> = shapes
+        .iter()
+        .map(|&(log_n, w, aux_w, pre_w, chunks)| {
+            let log_m = log_n + log_blowup;
+            QueryOpening {
+                trace_row: vec![Fp::ZERO; w],
+                trace_path: vec![z; log_m],
+                aux_row: vec![Fp::ZERO; aux_w],
+                aux_path: if aux_w > 0 { vec![z; log_m] } else { vec![] },
+                pre_row: vec![Fp::ZERO; pre_w],
+                pre_path: if pre_w > 0 { vec![z; log_m] } else { vec![] },
+                quotient_row: vec![Fp::ZERO; chunks * DEGREE],
+                quotient_path: vec![z; log_m],
+            }
+        })
+        .collect();
+    let mut log_sizes: Vec<usize> = shapes.iter().map(|s| s.0 + log_blowup).collect();
+    log_sizes.dedup();
+    let arities = round_log_arities(&config.fri(), &log_sizes);
     let steps: Vec<QueryStep> = arities
         .iter()
-        .scan(log_big_n, |log_m, &la| {
+        .scan(log_sizes[0], |log_m, &la| {
             *log_m -= la;
             Some(QueryStep { values: vec![Fp4::ZERO; 1 << la], path: vec![z; *log_m] })
         })
         .collect();
-    let queries = (0..config.num_queries).map(|_| steps.clone()).collect();
-    let openings = (0..config.num_queries)
-        .map(|_| QueryOpening {
-            trace_row: vec![Fp::ZERO; w],
-            trace_path: vec![z; log_big_n],
-            aux_row: vec![Fp::ZERO; aux_w],
-            aux_path: if aux_w > 0 { vec![z; log_big_n] } else { vec![] },
-            pre_row: vec![Fp::ZERO; pre_w],
-            pre_path: if pre_w > 0 { vec![z; log_big_n] } else { vec![] },
-            quotient_row: vec![Fp::ZERO; num_chunks * DEGREE],
-            quotient_path: vec![z; log_big_n],
-        })
-        .collect();
     Proof {
-        log_n,
-        trace_root: z,
-        aux_root: if aux_w > 0 { Some(z) } else { None },
-        quotient_root: z,
-        trace_at_zeta: vec![Fp4::ZERO; w],
-        trace_at_zeta_next: vec![Fp4::ZERO; w],
-        aux_at_zeta: vec![Fp4::ZERO; aux_w],
-        aux_at_zeta_next: vec![Fp4::ZERO; aux_w],
-        pre_at_zeta: vec![Fp4::ZERO; pre_w],
-        pre_at_zeta_next: vec![Fp4::ZERO; pre_w],
-        quotient_at_zeta_q: vec![Fp4::ZERO; num_chunks],
-        fri: FriProof { commitments: vec![z; rounds], final_value: Fp4::ZERO, queries },
-        openings,
+        tables: parts,
+        fri: FriProof {
+            commitments: vec![z; arities.len()],
+            final_value: Fp4::ZERO,
+            queries: vec![steps; config.num_queries],
+        },
+        openings: vec![opening; config.num_queries],
     }
 }
 
@@ -1143,18 +1286,18 @@ mod tests {
         println!("fibonacci verifier: {} instructions, {} inputs", c.prog.instrs.len(), c.inputs.len());
 
         // The program digest is independent of the proof's values.
-        let dummy = dummy_proof(&Fibonacci, &INNER, 3, 1);
+        let dummy = dummy_proof(&[(&Fibonacci, 3)], &INNER, 1);
         let c2 = compile_verifier(&Fibonacci, &INNER, &[Fp::ZERO], &dummy);
         assert_eq!(c2.prog.digest(1), c.prog.digest(1));
         assert_eq!(c2.prog.instrs.len(), c.prog.instrs.len());
 
         // A corrupted proof is rejected by the program.
         let mut bad = proof.clone();
-        bad.trace_at_zeta[0] += Fp4::ONE;
+        bad.tables[0].trace_at_zeta[0] += Fp4::ONE;
         let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
         assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
         let mut bad = proof.clone();
-        bad.openings[2].trace_row[1] += Fp::ONE;
+        bad.openings[2][0].trace_row[1] += Fp::ONE;
         let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
         assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
         let mut bad = proof.clone();
@@ -1184,9 +1327,87 @@ mod tests {
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("accepts");
         assert_eq!(exec.output_digest, Some(output_digest(&[])));
         let mut bad = proof.clone();
-        bad.aux_at_zeta[1] += Fp4::ONE;
+        bad.tables[0].aux_at_zeta[1] += Fp4::ONE;
         let cb = compile_verifier(&PermAir, &INNER, &[], &bad);
         assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
+        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&[]));
+        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
+    }
+
+    /// Sends its column once per row.
+    struct Sender;
+
+    impl Air for Sender {
+        fn width(&self) -> usize {
+            1
+        }
+        fn max_constraint_degree(&self) -> usize {
+            2
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            b.lookup(true, F::ONE, &[b.local()[0]]);
+        }
+    }
+
+    /// Receives `col0` with multiplicity `col1`; `col2` doubles each row.
+    struct Receiver;
+
+    impl Air for Receiver {
+        fn width(&self) -> usize {
+            3
+        }
+        fn max_constraint_degree(&self) -> usize {
+            3
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            let (l, n) = (b.local(), b.next());
+            b.lookup(false, l[1], &[l[0]]);
+            b.when_first_row(l[2] - F::ONE);
+            b.when_transition(n[2] - l[2] - l[2]);
+        }
+    }
+
+    #[test]
+    fn verifier_program_handles_several_tables() {
+        use crate::stark::{TableInput, TableSpec, prove_tables, verify_tables};
+        let tall = Trace::new((0..32).map(|i| Fp::new(3 + i % 4)).collect(), 1);
+        let recv = Trace::new((0..4u32).flat_map(|i| [Fp::new(3 + i), Fp::new(8), Fp::new(1 << i)]).collect(), 3);
+        let tables = [
+            TableInput { air: &Sender, trace: &tall, pre: None },
+            TableInput { air: &Receiver, trace: &recv, pre: None },
+        ];
+        let proof = prove_tables(&INNER, &tables, &[], &mut Challenger::new());
+        let specs = [TableSpec { air: &Sender, pre_root: None }, TableSpec { air: &Receiver, pre_root: None }];
+        assert_eq!(verify_tables(&INNER, &specs, &[], &proof, &mut Challenger::new()), Ok(()));
+
+        let compile = |proof: &Proof| {
+            let mut c = Compiler::new();
+            let pub_base = c.scalar_inputs(&[]);
+            c.verify_stark(&[(&Sender, None), (&Receiver, None)], &INNER, &[], pub_base, 0, proof);
+            c.hash_scalars(pub_base, 0);
+            c.assert_public();
+            c
+        };
+        let c = compile(&proof);
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("accepts");
+        assert_eq!(exec.output_digest, Some(output_digest(&[])));
+        let dummy = dummy_proof(&[(&Sender, 5), (&Receiver, 2)], &INNER, 0);
+        assert_eq!(compile(&dummy).prog.digest(1), c.prog.digest(1));
+
+        let mut bad = proof.clone();
+        bad.openings[1][1].trace_row[2] += Fp::ONE;
+        let cb = compile(&bad);
+        assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
+        let mut bad = proof.clone();
+        bad.tables[1].trace_at_zeta[2] += Fp4::ONE;
+        let cb = compile(&bad);
+        assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
+        let mut bad = proof.clone();
+        bad.tables[0].lookup_sum += Fp4::ONE;
+        let cb = compile(&bad);
+        assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
+
         let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
         let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&[]));
         assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));

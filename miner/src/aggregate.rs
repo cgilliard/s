@@ -230,8 +230,8 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
         let rec = c.scalar_inputs(&child.record().to_values());
         match child {
             Child::Segment(sp) => {
-                assert_eq!(sp.proof.log_n, params.segment_log_n, "segment proof has the wrong height");
-                c.verify_stark(&BlockAir, &params.segment, &seg_prefix, None, rec, SEGMENT_PUBLIC, &sp.proof);
+                assert_eq!(sp.proof.tables[0].log_n, params.segment_log_n, "segment proof has the wrong height");
+                c.verify_stark(&[(&BlockAir, None)], &params.segment, &seg_prefix, rec, SEGMENT_PUBLIC, &sp.proof);
             }
             Child::Node(np) => {
                 // The child's public values are its program digest, pinned
@@ -245,7 +245,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
                 c.hash_scalars(rec, SEGMENT_PUBLIC);
                 let out = c.squeeze_digest();
                 c.assert_block(at(pubv, PUB_OUTPUT), out, DIGEST);
-                c.verify_stark(&VmAir, &params.outer, &node_prefix, Some(pubv), pubv, VM_PUBLIC, &np.proof);
+                c.verify_stark(&[(&VmAir, Some(pubv))], &params.outer, &node_prefix, pubv, VM_PUBLIC, &np.proof);
             }
         }
         recs.push(rec);
@@ -430,7 +430,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
     let children: Vec<Shape> = sizes.iter().map(|&n| plan_node(params, n, false, memo)).collect();
     let segment_dummy = SegmentProof {
         public: SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap(),
-        proof: dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC),
+        proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
     };
     let node_dummies: Vec<NodeProof> = children
         .iter()
@@ -438,7 +438,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
         .map(|c| NodeProof {
             record: segment_dummy.public,
             digest: c.digest,
-            proof: dummy_proof(&VmAir, &params.outer, c.log_n, VM_PUBLIC),
+            proof: dummy_proof(&[(&VmAir, c.log_n)], &params.outer, VM_PUBLIC),
         })
         .collect();
     let mut nd = node_dummies.iter();
@@ -775,7 +775,7 @@ mod tests {
             ),
             ("2^13 segments", AggregatorParams { segment_log_n: 13, ..AggregatorParams::MAINNET }),
         ] {
-            let dummy = dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC);
+            let dummy = dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC);
             let public = SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap();
             let seg = SegmentProof { public, proof: dummy };
             let zero = Statement::zero();
@@ -805,14 +805,14 @@ mod tests {
             let params = AggregatorParams { outer, ..AggregatorParams::MAINNET };
             let seg = SegmentProof {
                 public: SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap(),
-                proof: dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC),
+                proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
             };
             let zero = Statement::zero();
             let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero)).prog;
             let np = NodeProof {
                 record: seg.public,
                 digest: [Fp::ZERO; DIGEST],
-                proof: dummy_proof(&VmAir, &params.outer, leaf.height().trailing_zeros() as usize, VM_PUBLIC),
+                proof: dummy_proof(&[(&VmAir, leaf.height().trailing_zeros() as usize)], &params.outer, VM_PUBLIC),
             };
             let c = compile_node(&params, &[Child::Node(&np)], Output::Record);
             println!(

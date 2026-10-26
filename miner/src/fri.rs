@@ -25,18 +25,25 @@
 //! `i` of the next codeword, which lives in leaf `i mod m/(a a')` at
 //! position `i / (m/(a a'))`. One opening per round therefore suffices.
 //!
-//! Queries are sampled as indices into the full input domain. The verifier
-//! returns, for every query, the input value the prover committed to at that
-//! index; the enclosing protocol must check it against its own openings (in
-//! a STARK, the trace and quotient rows at that index). Used standalone, the
-//! proof only shows that the *committed* input codeword is low degree.
+//! Several codewords of different sizes can be tested together: each
+//! smaller one, evaluated on the coset `shift^(n/m) * H_m` that the folded
+//! codeword reaches at size `m`, is added to the folded codeword at the
+//! start of the round of that size. The round arities are chosen so that
+//! every input size starts a round.
+//!
+//! Queries are sampled as indices into the full input domain. For every
+//! query the verifier asks the enclosing protocol for the input values at
+//! that index (index `i mod m` for an input of size `m`), which it must
+//! compute from its own openings (in a STARK, the DEEP combination of the
+//! trace and quotient rows there), and checks them against the committed
+//! codewords.
 
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
 use crate::ext::{DEGREE, Fp4};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
 use crate::ntt::{inv_two, log2_strict, root_of_unity};
-use crate::parallel::par_map;
+use crate::parallel::{par_chunks_mut, par_map};
 use crate::poseidon2::Fp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,33 +175,65 @@ pub(crate) fn fold_leaf(values: &[Fp4], x_inv: Fp, w_inv: Fp, beta: Fp4) -> Fp4 
     }
 }
 
-/// Log2 of the arity of each folding round for a codeword of size
-/// `2^log_n`: fours, then a final two if the round count is odd.
-pub fn round_log_arities(config: &FriConfig, log_n: usize) -> Vec<usize> {
-    assert!(log_n > config.log_blowup, "codeword must be larger than the blowup");
-    let bits = log_n - config.log_blowup;
-    let mut v = vec![2; bits / 2];
-    if bits % 2 == 1 {
-        v.push(1);
+/// Log2 of the arity of each folding round for input codewords of sizes
+/// `2^log_sizes[g]` (strictly decreasing): between consecutive sizes, and
+/// from the last one down to the blowup, fours and then a two if the bit
+/// count is odd.
+pub fn round_log_arities(config: &FriConfig, log_sizes: &[usize]) -> Vec<usize> {
+    assert!(!log_sizes.is_empty(), "no codewords");
+    let mut v = Vec::new();
+    let mut cur = log_sizes[0];
+    for &stop in log_sizes[1..].iter().chain([&config.log_blowup]) {
+        assert!(stop < cur, "codeword sizes must decrease and exceed the blowup");
+        let bits = cur - stop;
+        v.extend(std::iter::repeat_n(2, bits / 2));
+        if bits % 2 == 1 {
+            v.push(1);
+        }
+        cur = stop;
     }
     v
 }
 
-/// Number of folding rounds for a codeword of size `2^log_n`.
-pub fn num_rounds(config: &FriConfig, log_n: usize) -> usize {
-    round_log_arities(config, log_n).len()
+/// Number of folding rounds for input codewords of sizes `2^log_sizes[g]`.
+pub fn num_rounds(config: &FriConfig, log_sizes: &[usize]) -> usize {
+    round_log_arities(config, log_sizes).len()
 }
 
-/// Proves that `codeword`, the evaluations of `f` on `shift * H`, has
-/// degree below `codeword.len() >> log_blowup`. The caller's transcript
-/// must be in the same state the verifier's will be. Also returns the
-/// sampled query indices into the input domain, so the caller can open its
-/// own commitments at the same positions.
-pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codeword: Vec<Fp4>) -> (FriProof, Vec<usize>) {
-    let log_n = log2_strict(codeword.len());
-    let arities = round_log_arities(config, log_n);
+/// For every input after the first, the round at whose start it is added.
+pub fn injection_rounds(config: &FriConfig, log_sizes: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(log_sizes.len() - 1);
+    let mut log_m = log_sizes[0];
+    for (r, la) in round_log_arities(config, log_sizes).into_iter().enumerate() {
+        if out.len() + 1 < log_sizes.len() && log_sizes[out.len() + 1] == log_m {
+            out.push(r);
+        }
+        log_m -= la;
+    }
+    debug_assert_eq!(out.len() + 1, log_sizes.len());
+    out
+}
+
+/// Proves that each of `inputs` (strictly decreasing sizes) has degree
+/// below its length `>> log_blowup`, where `inputs[0]` holds evaluations on
+/// `shift * H` and an input of size `m` evaluations on `shift^(n/m) * H_m`.
+/// The caller's transcript must be in the same state the verifier's will
+/// be. Also returns the sampled query indices into the largest domain, so
+/// the caller can open its own commitments at the same positions.
+pub fn prove(
+    config: &FriConfig,
+    challenger: &mut Challenger,
+    shift: Fp,
+    inputs: Vec<Vec<Fp4>>,
+) -> (FriProof, Vec<usize>) {
+    let log_sizes: Vec<usize> = inputs.iter().map(|c| log2_strict(c.len())).collect();
+    let log_n = log_sizes[0];
+    let arities = round_log_arities(config, &log_sizes);
     let rounds = arities.len();
     assert!(log_n <= 27, "domain too large for query sampling");
+    let mut inputs = inputs.into_iter();
+    let codeword = inputs.next().unwrap();
+    let mut pending = inputs.peekable();
 
     let mut trees: Vec<MerkleTree> = Vec::with_capacity(rounds);
     let mut codewords: Vec<Vec<Fp4>> = Vec::with_capacity(rounds);
@@ -204,6 +243,13 @@ pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codewor
     let mut omega_inv = root_of_unity(log_n).inverse().unwrap();
 
     for &la in &arities {
+        if let Some(extra) = pending.next_if(|c| c.len() == cur.len()) {
+            par_chunks_mut(&mut cur, 1 << 12, |c, chunk| {
+                for (k, v) in chunk.iter_mut().enumerate() {
+                    *v += extra[(c << 12) + k];
+                }
+            });
+        }
         let arity = 1usize << la;
         let leaves = cur.len() >> la;
         let leaf = |i: usize| -> Vec<Fp4> { (0..arity).map(|k| cur[i + k * leaves]).collect() };
@@ -237,6 +283,7 @@ pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codewor
         }
     }
 
+    debug_assert!(pending.next().is_none());
     // For an honest prover the final codeword is constant. A dishonest one
     // may send anything here; the query phase is what catches it.
     let final_value = cur[0];
@@ -260,22 +307,25 @@ pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codewor
     (FriProof { commitments, final_value, queries }, indices)
 }
 
-/// Verifies a proof for a codeword of size `2^log_n` on `shift * H`.
-///
-/// On success returns, per query, the sampled input-domain index and the
-/// input value the prover committed to there. Callers that know the input
-/// independently must check those values.
-pub fn verify(
+/// Verifies a proof for input codewords of sizes `2^log_sizes[g]` (see
+/// [`prove`]). For each query, `open(query, index)` must return the input
+/// values at `index` (an index into the largest domain; the input of size
+/// `m` is read at `index mod m`), one per input, computed independently of
+/// the proof's FRI part.
+pub fn verify<E: From<FriError>>(
     config: &FriConfig,
     challenger: &mut Challenger,
     shift: Fp,
-    log_n: usize,
+    log_sizes: &[usize],
     proof: &FriProof,
-) -> Result<Vec<(usize, Fp4)>, FriError> {
-    let arities = round_log_arities(config, log_n);
+    mut open: impl FnMut(usize, usize) -> Result<Vec<Fp4>, E>,
+) -> Result<(), E> {
+    let log_n = log_sizes[0];
+    let arities = round_log_arities(config, log_sizes);
     let rounds = arities.len();
+    let inject = injection_rounds(config, log_sizes);
     if proof.commitments.len() != rounds || proof.queries.len() != config.num_queries {
-        return Err(FriError::Shape);
+        return Err(FriError::Shape.into());
     }
     let mut betas = Vec::with_capacity(rounds);
     for root in &proof.commitments {
@@ -285,11 +335,11 @@ pub fn verify(
     challenger.observe_ext(&proof.final_value);
 
     // Per-round domain parameters: round r lives on shift_r * H with
-    // `log_sizes[r]` points; `w_invs[r]` inverts its leaf root of unity.
+    // `round_log_sizes[r]` points; `w_invs[r]` inverts its leaf root of unity.
     let mut shift_invs = Vec::with_capacity(rounds);
     let mut omega_invs = Vec::with_capacity(rounds);
     let mut w_invs = Vec::with_capacity(rounds);
-    let mut log_sizes = Vec::with_capacity(rounds);
+    let mut round_log_sizes = Vec::with_capacity(rounds);
     let mut s_inv = shift.inverse().expect("non-zero shift");
     let mut w_inv = root_of_unity(log_n).inverse().unwrap();
     let mut log_m = log_n;
@@ -297,7 +347,7 @@ pub fn verify(
         shift_invs.push(s_inv);
         omega_invs.push(w_inv);
         w_invs.push(w_inv.pow(1u64 << (log_m - la)));
-        log_sizes.push(log_m);
+        round_log_sizes.push(log_m);
         for _ in 0..la {
             s_inv = s_inv.square();
             w_inv = w_inv.square();
@@ -305,42 +355,42 @@ pub fn verify(
         log_m -= la;
     }
 
-    let mut inputs = Vec::with_capacity(config.num_queries);
     for (q, steps) in proof.queries.iter().enumerate() {
         if steps.len() != rounds {
-            return Err(FriError::Shape);
+            return Err(FriError::Shape.into());
         }
         let mut index = challenger.sample_bits(log_n);
-        let query_index = index;
-        let mut folded: Option<Fp4> = None;
+        let values = open(q, index)?;
+        if values.len() != log_sizes.len() {
+            return Err(FriError::Shape.into());
+        }
+        let mut folded = values[0];
         for (r, step) in steps.iter().enumerate() {
             let la = arities[r];
             if step.values.len() != 1 << la {
-                return Err(FriError::Shape);
+                return Err(FriError::Shape.into());
             }
-            let log_leaves = log_sizes[r] - la;
+            if let Some(g) = inject.iter().position(|&ir| ir == r) {
+                folded += values[g + 1];
+            }
+            let log_leaves = round_log_sizes[r] - la;
             let leaves = 1usize << log_leaves;
             let pos = index / leaves;
             index %= leaves;
             if !merkle_verify(&proof.commitments[r], log_leaves, index, &leaf_row(&step.values), &step.path) {
-                return Err(FriError::InvalidOpening { query: q, round: r });
+                return Err(FriError::InvalidOpening { query: q, round: r }.into());
             }
-            match folded {
-                Some(f) => {
-                    if step.values[pos] != f {
-                        return Err(FriError::FoldMismatch { query: q, round: r });
-                    }
-                }
-                None => inputs.push((query_index, step.values[pos])),
+            if step.values[pos] != folded {
+                return Err(FriError::FoldMismatch { query: q, round: r }.into());
             }
             let x_inv = shift_invs[r].mul(&omega_invs[r].pow(index as u64));
-            folded = Some(fold_leaf(&step.values, x_inv, w_invs[r], betas[r]));
+            folded = fold_leaf(&step.values, x_inv, w_invs[r], betas[r]);
         }
-        if folded != Some(proof.final_value) {
-            return Err(FriError::FinalMismatch { query: q });
+        if folded != proof.final_value {
+            return Err(FriError::FinalMismatch { query: q }.into());
         }
     }
-    Ok(inputs)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -368,6 +418,17 @@ mod tests {
         v
     }
 
+    /// Verifies against the true input codewords, checking that the
+    /// queried indices are the ones the prover opened.
+    fn check(log_sizes: &[usize], shift: Fp, proof: &FriProof, inputs: &[Vec<Fp4>]) -> Result<Vec<usize>, FriError> {
+        let mut seen = Vec::new();
+        verify(&CONFIG, &mut transcript(), shift, log_sizes, proof, |_, index| {
+            seen.push(index);
+            Ok::<_, FriError>(inputs.iter().map(|c| c[index % c.len()]).collect())
+        })?;
+        Ok(seen)
+    }
+
     #[test]
     fn accepts_low_degree_codewords() {
         let mut rng = Rng::new(30);
@@ -375,19 +436,53 @@ mod tests {
             let bound = 1 << (log_n - CONFIG.log_blowup);
             let shift = MULTIPLICATIVE_GENERATOR;
             let cw = low_degree_codeword(&mut rng, log_n, bound, shift);
-            let (proof, indices) = prove(&CONFIG, &mut transcript(), shift, cw.clone());
+            let (proof, indices) = prove(&CONFIG, &mut transcript(), shift, vec![cw.clone()]);
             assert_eq!(proof.commitments.len(), (log_n - CONFIG.log_blowup).div_ceil(2));
             assert_eq!(proof.queries.len(), CONFIG.num_queries);
-            let inputs = verify(&CONFIG, &mut transcript(), shift, log_n, &proof).unwrap();
-            assert_eq!(inputs.len(), CONFIG.num_queries);
-            for (q, (index, value)) in inputs.iter().enumerate() {
-                assert_eq!(*index, indices[q]);
-                assert_eq!(*value, cw[*index], "log_n={log_n} query {q}");
-            }
+            assert_eq!(check(&[log_n], shift, &proof, &[cw]), Ok(indices));
             // Also with a smaller polynomial than the bound, and no shift.
             let cw = low_degree_codeword(&mut rng, log_n, bound / 2, Fp::ONE);
-            let (proof, _) = prove(&CONFIG, &mut transcript(), Fp::ONE, cw);
-            assert!(verify(&CONFIG, &mut transcript(), Fp::ONE, log_n, &proof).is_ok());
+            let (proof, _) = prove(&CONFIG, &mut transcript(), Fp::ONE, vec![cw.clone()]);
+            assert!(check(&[log_n], Fp::ONE, &proof, &[cw]).is_ok());
+        }
+    }
+
+    #[test]
+    fn round_schedules() {
+        assert_eq!(round_log_arities(&CONFIG, &[10]), vec![2, 2, 2, 1]);
+        assert_eq!(round_log_arities(&CONFIG, &[10, 7, 6]), vec![2, 1, 1, 2, 1]);
+        assert_eq!(injection_rounds(&CONFIG, &[10, 7, 6]), vec![2, 3]);
+        assert_eq!(injection_rounds(&CONFIG, &[10]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn injected_codewords() {
+        let mut rng = Rng::new(36);
+        let shift = MULTIPLICATIVE_GENERATOR;
+        for sizes in [vec![10, 7], vec![11, 9, 5], vec![8, 7]] {
+            let n = sizes[0];
+            let inputs: Vec<Vec<Fp4>> = sizes
+                .iter()
+                .map(|&l| {
+                    let s = shift.pow(1u64 << (n - l));
+                    low_degree_codeword(&mut rng, l, 1 << (l - CONFIG.log_blowup), s)
+                })
+                .collect();
+            let (proof, indices) = prove(&CONFIG, &mut transcript(), shift, inputs.clone());
+            assert_eq!(proof.commitments.len(), round_log_arities(&CONFIG, &sizes).len());
+            assert_eq!(check(&sizes, shift, &proof, &inputs), Ok(indices));
+            // A smaller input above its degree bound is caught.
+            let mut bad = inputs.clone();
+            let l = sizes[1];
+            let s = shift.pow(1u64 << (n - l));
+            bad[1] = low_degree_codeword(&mut rng, l, (1 << (l - CONFIG.log_blowup)) + 1, s);
+            let (proof, _) = prove(&CONFIG, &mut transcript(), shift, bad.clone());
+            assert!(check(&sizes, shift, &proof, &bad).is_err());
+            // Values that differ from the committed smaller input are caught.
+            let (proof, _) = prove(&CONFIG, &mut transcript(), shift, inputs.clone());
+            let mut other = inputs.clone();
+            other[1].iter_mut().for_each(|v| *v += Fp4::ONE);
+            assert!(check(&sizes, shift, &proof, &other).is_err());
         }
     }
 
@@ -398,8 +493,8 @@ mod tests {
         let bound = 1 << (log_n - CONFIG.log_blowup);
         let shift = MULTIPLICATIVE_GENERATOR;
         let cw = low_degree_codeword(&mut rng, log_n, bound + 1, shift);
-        let (proof, _) = prove(&CONFIG, &mut transcript(), shift, cw);
-        assert!(verify(&CONFIG, &mut transcript(), shift, log_n, &proof).is_err());
+        let (proof, _) = prove(&CONFIG, &mut transcript(), shift, vec![cw.clone()]);
+        assert!(check(&[log_n], shift, &proof, &[cw]).is_err());
     }
 
     #[test]
@@ -407,8 +502,8 @@ mod tests {
         let mut rng = Rng::new(32);
         let log_n = 8;
         let cw: Vec<Fp4> = (0..1 << log_n).map(|_| rng.fp4()).collect();
-        let (proof, _) = prove(&CONFIG, &mut transcript(), Fp::ONE, cw);
-        assert!(verify(&CONFIG, &mut transcript(), Fp::ONE, log_n, &proof).is_err());
+        let (proof, _) = prove(&CONFIG, &mut transcript(), Fp::ONE, vec![cw.clone()]);
+        assert!(check(&[log_n], Fp::ONE, &proof, &[cw]).is_err());
     }
 
     #[test]
@@ -418,35 +513,40 @@ mod tests {
         let bound = 1 << (log_n - CONFIG.log_blowup);
         let shift = MULTIPLICATIVE_GENERATOR;
         let cw = low_degree_codeword(&mut rng, log_n, bound, shift);
-        let (proof, _) = prove(&CONFIG, &mut transcript(), shift, cw);
-        assert!(verify(&CONFIG, &mut transcript(), shift, log_n, &proof).is_ok());
+        let (proof, _) = prove(&CONFIG, &mut transcript(), shift, vec![cw.clone()]);
+        let inputs = [cw.clone()];
+        assert!(check(&[log_n], shift, &proof, &inputs).is_ok());
+        let open = |_: usize, i: usize| Ok::<_, FriError>(vec![cw[i % cw.len()]]);
 
         // Different transcript prefix.
-        assert!(verify(&CONFIG, &mut Challenger::new(), shift, log_n, &proof).is_err());
+        assert!(verify(&CONFIG, &mut Challenger::new(), shift, &[log_n], &proof, open).is_err());
         // Wrong shift or size.
-        assert!(verify(&CONFIG, &mut transcript(), Fp::new(3), log_n, &proof).is_err());
+        assert!(check(&[log_n], Fp::new(3), &proof, &inputs).is_err());
         // One size up has the same round count with arity four (5 and 6
         // folding bits), so it fails at the openings; two up changes shape.
-        assert!(verify(&CONFIG, &mut transcript(), shift, log_n + 1, &proof).is_err());
-        assert_eq!(verify(&CONFIG, &mut transcript(), shift, log_n + 2, &proof).unwrap_err(), FriError::Shape);
+        assert!(check(&[log_n + 1], shift, &proof, &inputs).is_err());
+        assert_eq!(check(&[log_n + 2], shift, &proof, &inputs).unwrap_err(), FriError::Shape);
         let fewer = FriConfig { num_queries: 19, ..CONFIG };
-        assert_eq!(verify(&fewer, &mut transcript(), shift, log_n, &proof).unwrap_err(), FriError::Shape);
+        assert_eq!(verify(&fewer, &mut transcript(), shift, &[log_n], &proof, open).unwrap_err(), FriError::Shape);
+        // An input value that differs from the committed codeword.
+        let wrong = |_: usize, i: usize| Ok::<_, FriError>(vec![cw[i] + Fp4::ONE]);
+        assert_eq!(
+            verify(&CONFIG, &mut transcript(), shift, &[log_n], &proof, wrong).unwrap_err(),
+            FriError::FoldMismatch { query: 0, round: 0 }
+        );
 
         let mut p = proof.clone();
         p.final_value += Fp4::ONE;
-        assert!(verify(&CONFIG, &mut transcript(), shift, log_n, &p).is_err());
+        assert!(check(&[log_n], shift, &p, &inputs).is_err());
         let mut p = proof.clone();
         p.queries[3][1].values[0] += Fp4::ONE;
-        assert_eq!(
-            verify(&CONFIG, &mut transcript(), shift, log_n, &p).unwrap_err(),
-            FriError::InvalidOpening { query: 3, round: 1 }
-        );
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::InvalidOpening { query: 3, round: 1 });
         let mut p = proof.clone();
         p.commitments[0][0] += Fp::ONE;
-        assert!(verify(&CONFIG, &mut transcript(), shift, log_n, &p).is_err());
+        assert!(check(&[log_n], shift, &p, &inputs).is_err());
         let mut p = proof.clone();
         p.queries[0].pop();
-        assert_eq!(verify(&CONFIG, &mut transcript(), shift, log_n, &p).unwrap_err(), FriError::Shape);
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
     }
 
     #[test]
