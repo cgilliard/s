@@ -1,0 +1,1148 @@
+//! Recursive verification: compiles the STARK verifier for an inner AIR into
+//! a program for [`crate::vm_air`], computing the witness alongside.
+//!
+//! [`Compiler`] mirrors `stark::verify` step by step. Every value the
+//! verifier touches lives in the machine's memory: proof data enters as
+//! inputs, transcript samples come from squeezed sponge state, and all
+//! arithmetic is fused multiply-adds. The inner AIR's constraints are
+//! compiled by running its `eval` over [`Expr`], a field whose operations
+//! emit instructions, so any AIR can be verified without hand-written
+//! circuits. Divisions use prover-supplied inverse hints checked by a
+//! multiplication.
+//!
+//! The program depends only on the inner AIR, the STARK configuration, the
+//! trace height and the number of public values, not on the proof, so a
+//! verifier computes its digest from a zero-filled proof of the right shape
+//! ([`dummy_proof`]). The output digest commits to the inner public values.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use crate::ext::{DEGREE, Fp4};
+use crate::field::Field;
+use crate::fri::{FriProof, QueryStep, pair_row};
+use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
+use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
+use crate::stark::{
+    Air, Builder, LookupTerm, Proof, QueryOpening, StarkConfig, log_quotient_degree, num_lookup_constraints, shape,
+};
+use crate::vm_air::{Addr, Program};
+
+/// Address of a memory word, usable as a field inside an AIR's `eval`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Expr(pub Addr);
+
+const A_ZERO: Addr = 0;
+const A_ONE: Addr = 1;
+const A_MINUS_ONE: Addr = 2;
+const A_X: Addr = 3;
+
+thread_local! {
+    static CTX: RefCell<Option<Compiler>> = const { RefCell::new(None) };
+}
+
+fn with_ctx<R>(f: impl FnOnce(&mut Compiler) -> R) -> R {
+    CTX.with(|c| f(c.borrow_mut().as_mut().expect("Expr used outside of a compilation context")))
+}
+
+macro_rules! expr_binop {
+    ($tr:ident, $m:ident, $tra:ident, $ma:ident, $body:expr) => {
+        impl core::ops::$tr for Expr {
+            type Output = Expr;
+            fn $m(self, rhs: Expr) -> Expr {
+                let f: fn(&mut Compiler, Addr, Addr) -> Addr = $body;
+                Expr(with_ctx(|c| f(c, self.0, rhs.0)))
+            }
+        }
+        impl core::ops::$tra for Expr {
+            fn $ma(&mut self, rhs: Expr) {
+                *self = core::ops::$tr::$m(*self, rhs);
+            }
+        }
+    };
+}
+expr_binop!(Add, add, AddAssign, add_assign, |c, a, b| c.add(a, b));
+expr_binop!(Sub, sub, SubAssign, sub_assign, |c, a, b| c.sub(a, b));
+expr_binop!(Mul, mul, MulAssign, mul_assign, |c, a, b| c.mul(a, b));
+
+impl core::ops::Neg for Expr {
+    type Output = Expr;
+    fn neg(self) -> Expr {
+        Expr(with_ctx(|c| c.neg(self.0)))
+    }
+}
+
+impl From<Fp> for Expr {
+    fn from(x: Fp) -> Expr {
+        Expr(with_ctx(|c| c.constant(Fp4::from_base(x))))
+    }
+}
+
+impl Field for Expr {
+    const ZERO: Expr = Expr(A_ZERO);
+    const ONE: Expr = Expr(A_ONE);
+
+    fn scale(self, b: Fp) -> Expr {
+        Expr(with_ctx(|c| {
+            let k = c.constant(Fp4::from_base(b));
+            c.mul(self.0, k)
+        }))
+    }
+
+    fn mul_ext(self, _: Fp4) -> Fp4 {
+        unreachable!("mul_ext is not used inside AIR evaluation")
+    }
+
+    fn inv(self) -> Option<Expr> {
+        Some(Expr(with_ctx(|c| c.inverse(self.0))))
+    }
+}
+
+/// Replay of the Fiat-Shamir challenger inside the program.
+///
+/// The machine has one sponge register, shared with Merkle hashing, so the
+/// transcript may only be permuted while no other hashing has happened
+/// since its last permutation; `state` records what the register must hold.
+struct Transcript {
+    pending: Vec<Addr>,
+    started: bool,
+    squeezed: Option<Addr>,
+    pos: usize,
+    state: Option<[Fp; WIDTH]>,
+}
+
+/// Emits a verifier program while computing every value natively.
+pub struct Compiler {
+    pub prog: Program,
+    pub inputs: Vec<Fp4>,
+    mem: Vec<Fp4>,
+    consts: HashMap<[u32; DEGREE], Addr>,
+    sponge: Option<[Fp; WIDTH]>,
+    digest: [Fp; DIGEST],
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Compiler {
+    pub fn new() -> Compiler {
+        let mut c = Compiler {
+            prog: Program::new(),
+            inputs: Vec::new(),
+            mem: Vec::new(),
+            consts: HashMap::new(),
+            sponge: None,
+            digest: [Fp::ZERO; DIGEST],
+        };
+        assert_eq!(c.constant(Fp4::ZERO), A_ZERO);
+        assert_eq!(c.constant(Fp4::ONE), A_ONE);
+        assert_eq!(c.constant(-Fp4::ONE), A_MINUS_ONE);
+        assert_eq!(c.constant(Fp4::X), A_X);
+        c
+    }
+
+    fn set(&mut self, addr: Addr, v: Fp4) {
+        let a = addr as usize;
+        if a >= self.mem.len() {
+            self.mem.resize(a + 1, Fp4::ZERO);
+        }
+        self.mem[a] = v;
+    }
+
+    /// Records the native value of a word written by an instruction the
+    /// caller emitted directly on `prog`.
+    pub fn set_word(&mut self, addr: Addr, v: Fp4) {
+        self.set(addr, v);
+    }
+
+    /// Native value of a word.
+    pub fn val(&self, addr: Addr) -> Fp4 {
+        self.mem.get(addr as usize).copied().unwrap_or(Fp4::ZERO)
+    }
+
+    pub fn constant(&mut self, v: Fp4) -> Addr {
+        let key = v.0.map(|x| x.to_canonical());
+        if let Some(&a) = self.consts.get(&key) {
+            return a;
+        }
+        let a = self.prog.constant(v);
+        self.set(a, v);
+        self.consts.insert(key, a);
+        a
+    }
+
+    pub fn scalar(&mut self, v: Fp) -> Addr {
+        self.constant(Fp4::from_base(v))
+    }
+
+    pub fn input(&mut self, v: Fp4) -> Addr {
+        let a = self.prog.input();
+        self.inputs.push(v);
+        self.set(a, v);
+        a
+    }
+
+    /// Scalars as inputs at consecutive addresses, zero padded to a
+    /// multiple of eight.
+    pub fn scalar_inputs(&mut self, values: &[Fp]) -> Addr {
+        let blocks = values.len().div_ceil(RATE).max(1);
+        let base = self.prog.alloc((blocks * RATE) as u32);
+        for b in 0..blocks {
+            let out = base + (b * RATE) as Addr;
+            self.prog.input8_at(out);
+            for k in 0..RATE {
+                let v = Fp4::from_base(values.get(b * RATE + k).copied().unwrap_or(Fp::ZERO));
+                self.inputs.push(v);
+                self.set(out + k as Addr, v);
+            }
+        }
+        for k in values.len()..blocks * RATE {
+            self.prog.assert_eq(base + k as Addr, A_ZERO);
+        }
+        base
+    }
+
+    pub fn word_inputs(&mut self, values: &[Fp4]) -> Vec<Addr> {
+        values.iter().map(|v| self.input(*v)).collect()
+    }
+
+    pub fn muladd(&mut self, a: Addr, b: Addr, d: Addr) -> Addr {
+        let out = self.prog.muladd(a, b, d);
+        let v = self.val(a) * self.val(b) + self.val(d);
+        self.set(out, v);
+        out
+    }
+
+    pub fn mul(&mut self, a: Addr, b: Addr) -> Addr {
+        self.muladd(a, b, A_ZERO)
+    }
+
+    pub fn add(&mut self, a: Addr, b: Addr) -> Addr {
+        self.muladd(a, A_ONE, b)
+    }
+
+    pub fn sub(&mut self, a: Addr, b: Addr) -> Addr {
+        self.muladd(b, A_MINUS_ONE, a)
+    }
+
+    pub fn neg(&mut self, a: Addr) -> Addr {
+        self.muladd(a, A_MINUS_ONE, A_ZERO)
+    }
+
+    /// Inverse via a hint: the prover supplies `a^-1`, the program checks
+    /// `a * hint == 1`.
+    pub fn inverse(&mut self, a: Addr) -> Addr {
+        let hint = self.val(a).inverse().unwrap_or(Fp4::ZERO);
+        let h = self.input(hint);
+        let prod = self.mul(a, h);
+        self.prog.assert_eq(prod, A_ONE);
+        h
+    }
+
+    pub fn assert_eq(&mut self, a: Addr, b: Addr) {
+        self.prog.assert_eq(a, b);
+    }
+
+    pub fn component(&mut self, word: Addr, c: u8) -> Addr {
+        let out = self.prog.component(word, c);
+        self.set(out, Fp4::from_base(self.val(word).0[c as usize]));
+        out
+    }
+
+    /// Copies words into a fresh block of eight, zero padded.
+    fn block_of(&mut self, words: &[Addr]) -> Addr {
+        assert!(words.len() <= RATE);
+        let base = self.prog.alloc(RATE as u32);
+        for i in 0..RATE {
+            let src = words.get(i).copied().unwrap_or(A_ZERO);
+            self.prog.muladd_to(src, A_ONE, A_ZERO, base + i as Addr);
+            self.set(base + i as Addr, self.val(src));
+        }
+        base
+    }
+
+    /// `((s3 X + s2) X + s1) X + s0`.
+    fn word_from_scalars(&mut self, s: [Addr; DEGREE]) -> Addr {
+        let mut acc = s[3];
+        for k in (0..3).rev() {
+            acc = self.muladd(acc, A_X, s[k]);
+        }
+        acc
+    }
+
+    /// An empty compiler used to swap `self` into the thread-local context.
+    fn shell() -> Compiler {
+        Compiler {
+            prog: Program::new(),
+            inputs: Vec::new(),
+            mem: Vec::new(),
+            consts: HashMap::new(),
+            sponge: None,
+            digest: [Fp::ZERO; DIGEST],
+        }
+    }
+
+    /// Asserts that the scalar at `a` equals the constant `v`.
+    pub fn assert_scalar(&mut self, a: Addr, v: Fp) {
+        let k = self.scalar(v);
+        self.prog.assert_eq(a, k);
+    }
+
+    /// Asserts that `n` consecutive words at `a` and `b` are equal.
+    pub fn assert_block(&mut self, a: Addr, b: Addr, n: usize) {
+        for i in 0..n as Addr {
+            self.prog.assert_eq(a + i, b + i);
+        }
+    }
+
+    /// Hashes `len` scalars at `base` (zero padded to blocks of eight) as
+    /// `poseidon2::hash`, leaving the digest in the sponge.
+    pub fn hash_scalars(&mut self, base: Addr, len: usize) {
+        self.sponge_start(base, Fp::from_u32(len as u32));
+        for k in 1..len.div_ceil(RATE).max(1) {
+            self.absorb(base + (k * RATE) as Addr);
+        }
+    }
+
+    /// Asserts that the scalar at `a` is below `2^n` by decomposing it and
+    /// requiring bits `n..31` to be zero.
+    pub fn assert_bits_zero_from(&mut self, a: Addr, n: usize) {
+        assert!(n <= 31);
+        let bits = self.prog.decompose(a);
+        let v = self.val(a).0[0].to_canonical();
+        for k in 0..8 {
+            self.set(bits + k as Addr, Fp4(core::array::from_fn(|c| Fp::new((v >> (4 * k + c)) & 1))));
+        }
+        let mut i = n;
+        while i < 31 {
+            if i.is_multiple_of(4) && i + 4 <= 31 {
+                // A whole word of four bits at once.
+                self.prog.assert_eq(bits + (i / 4) as Addr, A_ZERO);
+                i += 4;
+            } else {
+                let b = self.bit(bits, i);
+                self.prog.assert_eq(b, A_ZERO);
+                i += 1;
+            }
+        }
+    }
+
+    /// Writes the current digest to eight fresh words.
+    pub fn squeeze_digest(&mut self) -> Addr {
+        self.squeeze()
+    }
+
+    /// Emits `AssertPublic`: the current digest is the program's output.
+    pub fn assert_public(&mut self) {
+        self.prog.assert_public();
+    }
+
+    // ---- hashing ----
+
+    fn sponge_start(&mut self, block: Addr, cap0: Fp) {
+        self.prog.sponge_start(block, cap0);
+        let mut input = [Fp::ZERO; WIDTH];
+        for (i, x) in input.iter_mut().enumerate().take(RATE) {
+            *x = self.val(block + i as Addr).0[0];
+        }
+        input[RATE] = cap0;
+        let st = permute(input);
+        self.digest.copy_from_slice(&st[..DIGEST]);
+        self.sponge = Some(st);
+    }
+
+    fn absorb(&mut self, block: Addr) {
+        self.prog.absorb(block);
+        let mut st = self.sponge.expect("absorb without a sponge");
+        for (i, x) in st.iter_mut().enumerate().take(RATE) {
+            *x = x.add(&self.val(block + i as Addr).0[0]);
+        }
+        let st = permute(st);
+        self.digest.copy_from_slice(&st[..DIGEST]);
+        self.sponge = Some(st);
+    }
+
+    fn compress_step(&mut self, sib: Addr, bits: Addr, level: usize) {
+        self.prog.compress(sib, bits + (level / 4) as Addr, (level % 4) as u8);
+        let right = self.val(bits + (level / 4) as Addr).0[level % 4] == Fp::ONE;
+        let mut s = [Fp::ZERO; DIGEST];
+        for (i, x) in s.iter_mut().enumerate() {
+            *x = self.val(sib + i as Addr).0[0];
+        }
+        let d = self.digest;
+        self.digest = if right { compress(&s, &d) } else { compress(&d, &s) };
+    }
+
+    fn squeeze(&mut self) -> Addr {
+        let out = self.prog.squeeze();
+        for i in 0..DIGEST {
+            self.set(out + i as Addr, Fp4::from_base(self.digest[i]));
+        }
+        out
+    }
+
+    /// Hashes `len` scalars at `row` (padded block) as `poseidon2::hash`,
+    /// walks the Merkle path with directions from `bits`, and returns the
+    /// root digest's address.
+    fn merkle_root(&mut self, row: Addr, len: usize, path: &[Addr], bits: Addr) -> Addr {
+        self.sponge_start(row, Fp::from_u32(len as u32));
+        let blocks = len.div_ceil(RATE).max(1);
+        for k in 1..blocks {
+            self.absorb(row + (k * RATE) as Addr);
+        }
+        for (level, sib) in path.iter().enumerate() {
+            self.compress_step(*sib, bits, level);
+        }
+        self.squeeze()
+    }
+
+    fn assert_digest(&mut self, a: Addr, b: Addr) {
+        for i in 0..DIGEST as Addr {
+            self.prog.assert_eq(a + i, b + i);
+        }
+    }
+
+    // ---- transcript ----
+
+    fn transcript(&self) -> Transcript {
+        Transcript { pending: Vec::new(), started: false, squeezed: None, pos: 0, state: None }
+    }
+
+    /// Permutes the transcript with `words` (at most eight) added to the rate.
+    fn transcript_permute(&mut self, t: &mut Transcript, words: &[Addr]) {
+        let block = self.block_of(words);
+        if t.started {
+            assert_eq!(self.sponge, t.state, "transcript sponge was clobbered by other hashing");
+            self.absorb(block);
+        } else {
+            self.sponge_start(block, Fp::ZERO);
+            t.started = true;
+        }
+        t.state = self.sponge;
+    }
+
+    fn flush(&mut self, t: &mut Transcript) {
+        let words = std::mem::take(&mut t.pending);
+        self.transcript_permute(t, &words);
+    }
+
+    fn observe(&mut self, t: &mut Transcript, scalar: Addr) {
+        t.squeezed = None;
+        t.pending.push(scalar);
+        if t.pending.len() == RATE {
+            self.flush(t);
+        }
+    }
+
+    fn observe_word(&mut self, t: &mut Transcript, word: Addr) {
+        for c in 0..DEGREE as u8 {
+            let s = self.component(word, c);
+            self.observe(t, s);
+        }
+    }
+
+    fn observe_block(&mut self, t: &mut Transcript, base: Addr, n: usize) {
+        for i in 0..n {
+            self.observe(t, base + i as Addr);
+        }
+    }
+
+    fn sample(&mut self, t: &mut Transcript) -> Addr {
+        if !t.pending.is_empty() {
+            self.flush(t);
+            t.squeezed = Some(self.squeeze());
+            t.pos = 0;
+        } else if t.squeezed.is_none() || t.pos == RATE {
+            // Permute with no new input: absorb a zero block.
+            self.transcript_permute(t, &[]);
+            t.squeezed = Some(self.squeeze());
+            t.pos = 0;
+        }
+        let a = t.squeezed.unwrap() + t.pos as Addr;
+        t.pos += 1;
+        a
+    }
+
+    fn sample_word(&mut self, t: &mut Transcript) -> Addr {
+        let s = [self.sample(t), self.sample(t), self.sample(t), self.sample(t)];
+        self.word_from_scalars(s)
+    }
+
+    /// Samples a scalar and decomposes it; returns the bits block.
+    fn sample_bits(&mut self, t: &mut Transcript) -> Addr {
+        let s = self.sample(t);
+        let bits = self.prog.decompose(s);
+        let v = self.val(s).0[0].to_canonical();
+        for k in 0..8 {
+            self.set(bits + k as Addr, Fp4(core::array::from_fn(|c| Fp::new((v >> (4 * k + c)) & 1))));
+        }
+        bits
+    }
+
+    fn bit(&mut self, bits: Addr, i: usize) -> Addr {
+        self.component(bits + (i / 4) as Addr, (i % 4) as u8)
+    }
+
+    /// `base * prod_{i < n} (1 + bit_i (c_i - 1))` for constants `c_i`.
+    fn power_from_bits(&mut self, base: Fp, bits: Addr, n: usize, cs: &[Fp]) -> Addr {
+        let mut acc = self.scalar(base);
+        for (i, ci) in cs.iter().enumerate().take(n) {
+            let b = self.bit(bits, i);
+            let k = self.scalar(*ci - Fp::ONE);
+            let t = self.muladd(b, k, A_ONE);
+            acc = self.mul(acc, t);
+        }
+        acc
+    }
+}
+
+/// Builds the verifier program for a proof of `air` with `public` values,
+/// along with the witness for this particular proof. The output digest is
+/// the hash of the public values. For AIRs with preprocessed columns use
+/// [`Compiler::verify_stark`] directly.
+pub fn compile_verifier<A: Air>(air: &A, config: &StarkConfig, public: &[Fp], proof: &Proof) -> Compiler {
+    let mut c = Compiler::new();
+    let pub_base = c.scalar_inputs(public);
+    c.verify_stark(air, config, &[], None, pub_base, public.len(), proof);
+    c.hash_scalars(pub_base, public.len());
+    c.assert_public();
+    c
+}
+
+impl Compiler {
+    /// Verifies `proof` for `air` inside the program. The inner public
+    /// values are the `num_public` scalars at `pub_base` (zero padded to a
+    /// multiple of eight); `prefix` holds scalars the transcript observed
+    /// before anything else (domain separators); `pre_root` is the digest
+    /// of the AIR's preprocessed table, when it has one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_stark<A: Air>(
+        &mut self,
+        air: &A,
+        config: &StarkConfig,
+        prefix: &[Fp],
+        pre_root: Option<Addr>,
+        pub_base: Addr,
+        num_public: usize,
+        proof: &Proof,
+    ) {
+        let public: Vec<Fp> = (0..num_public).map(|i| self.val(pub_base + i as Addr).0[0]).collect();
+        let public = &public[..];
+        let c = self;
+        let w = air.width();
+        let pre_w = air.preprocessed_width();
+        assert_eq!(pre_root.is_some(), pre_w > 0, "preprocessed root must be given exactly when the air has one");
+        let log_n = proof.log_n;
+        let log_blowup = config.log_blowup;
+        let log_big_n = log_n + log_blowup;
+        let log_q = log_quotient_degree(air.max_constraint_degree());
+        let num_chunks = 1usize << log_q;
+        let (num_constraints, num_terms) = shape(air, public);
+        let aux_ext_w = if num_terms > 0 { num_terms + 1 } else { 0 };
+        let aux_w = aux_ext_w * DEGREE;
+        assert_eq!(proof.trace_at_zeta.len(), w);
+        assert_eq!(proof.aux_at_zeta.len(), aux_w);
+        assert_eq!(proof.pre_at_zeta.len(), pre_w);
+        assert_eq!(proof.quotient_at_zeta_q.len(), num_chunks);
+        assert_eq!(proof.openings.len(), config.num_queries);
+        let shift = MULTIPLICATIVE_GENERATOR;
+
+        // ---- inputs: commitments ----
+        let trace_root = c.scalar_inputs(&proof.trace_root);
+        let aux_root = proof.aux_root.map(|r| c.scalar_inputs(&r));
+        let quotient_root = c.scalar_inputs(&proof.quotient_root);
+
+        // ---- transcript up to the lookup challenges ----
+        let mut t = c.transcript();
+        for p in prefix {
+            let p = c.scalar(*p);
+            c.observe(&mut t, p);
+        }
+        let log_n_s = c.scalar(Fp::from_u32(log_n as u32));
+        let npub_s = c.scalar(Fp::from_u32(public.len() as u32));
+        c.observe(&mut t, log_n_s);
+        c.observe(&mut t, npub_s);
+        c.observe_block(&mut t, pub_base, public.len());
+        if let Some(root) = pre_root {
+            c.observe_block(&mut t, root, DIGEST);
+        }
+        c.observe_block(&mut t, trace_root, DIGEST);
+        let lookup = aux_root.map(|root| {
+            let gamma = c.sample_word(&mut t);
+            let delta = c.sample_word(&mut t);
+            c.observe_block(&mut t, root, DIGEST);
+            (gamma, delta)
+        });
+        let alpha = c.sample_word(&mut t);
+        c.observe_block(&mut t, quotient_root, DIGEST);
+        let zeta = c.sample_word(&mut t);
+
+        // ---- openings ----
+        let trace_z = c.word_inputs(&proof.trace_at_zeta);
+        let trace_zn = c.word_inputs(&proof.trace_at_zeta_next);
+        let aux_z = c.word_inputs(&proof.aux_at_zeta);
+        let aux_zn = c.word_inputs(&proof.aux_at_zeta_next);
+        let pre_z = c.word_inputs(&proof.pre_at_zeta);
+        let pre_zn = c.word_inputs(&proof.pre_at_zeta_next);
+        let quot_zq = c.word_inputs(&proof.quotient_at_zeta_q);
+        for &wd in
+            trace_z.iter().chain(&trace_zn).chain(&aux_z).chain(&aux_zn).chain(&pre_z).chain(&pre_zn).chain(&quot_zq)
+        {
+            c.observe_word(&mut t, wd);
+        }
+        let beta = c.sample_word(&mut t);
+
+        // ---- constraint identity at zeta ----
+        let g = root_of_unity(log_n);
+        let g_inv = g.inverse().unwrap();
+        let g_s = c.scalar(g);
+        let g_inv_s = c.scalar(g_inv);
+        let zeta_next = c.mul(zeta, g_s);
+        let mut zeta_q = zeta;
+        for _ in 0..log_q {
+            zeta_q = c.mul(zeta_q, zeta_q);
+        }
+        let mut zeta_n = zeta;
+        for _ in 0..log_n {
+            zeta_n = c.mul(zeta_n, zeta_n);
+        }
+        let z_h = c.sub(zeta_n, A_ONE);
+        let d1 = c.sub(zeta, A_ONE);
+        let d1_inv = c.inverse(d1);
+        let first = c.mul(z_h, d1_inv);
+        let d2 = c.sub(zeta, g_inv_s);
+        let d2_inv = c.inverse(d2);
+        let last = c.mul(z_h, d2_inv);
+        let transition = d2;
+
+        // Compile the inner constraints over Expr.
+        let local: Vec<Expr> = trace_z.iter().map(|a| Expr(*a)).collect();
+        let next: Vec<Expr> = trace_zn.iter().map(|a| Expr(*a)).collect();
+        let pre_l: Vec<Expr> = pre_z.iter().map(|a| Expr(*a)).collect();
+        let pre_n: Vec<Expr> = pre_zn.iter().map(|a| Expr(*a)).collect();
+        let pub_exprs: Vec<Expr> = (0..public.len()).map(|i| Expr(pub_base + i as Addr)).collect();
+        let owned = std::mem::replace(c, Compiler::shell());
+        CTX.with(|cell| *cell.borrow_mut() = Some(owned));
+        let (constraints, terms) = {
+            let mut b =
+                Builder::new(&local, &next, (&pre_l, &pre_n), &pub_exprs, (Expr(first), Expr(last), Expr(transition)));
+            air.eval(&mut b);
+            b.into_parts()
+        };
+        *c = CTX.with(|cell| cell.borrow_mut().take().unwrap());
+        assert_eq!(constraints.len(), num_constraints);
+        assert_eq!(terms.len(), num_terms);
+
+        // Lookup constraints over addresses.
+        let mut all: Vec<Addr> = constraints.iter().map(|e| e.0).collect();
+        if let Some((gamma, delta)) = lookup {
+            let aux_l = reconstruct_ext(c, &aux_z);
+            let aux_n = reconstruct_ext(c, &aux_zn);
+            all.extend(lookup_constraints_addr(c, gamma, delta, &terms, &aux_l, &aux_n, (first, last, transition)));
+        }
+        assert_eq!(all.len(), num_constraints + num_lookup_constraints(num_terms));
+        let mut acc = A_ZERO;
+        let mut alpha_pow = A_ONE;
+        for (k, cst) in all.iter().enumerate() {
+            acc = c.muladd(*cst, alpha_pow, acc);
+            if k + 1 < all.len() {
+                alpha_pow = c.mul(alpha_pow, alpha);
+            }
+        }
+        let mut q_zeta = A_ZERO;
+        let mut zeta_pow = A_ONE;
+        for (j, q) in quot_zq.iter().enumerate() {
+            q_zeta = c.muladd(*q, zeta_pow, q_zeta);
+            if j + 1 < quot_zq.len() {
+                zeta_pow = c.mul(zeta_pow, zeta);
+            }
+        }
+        let lhs = c.mul(q_zeta, z_h);
+        c.assert_eq(lhs, acc);
+
+        // ---- FRI commitments ----
+        let fri = &proof.fri;
+        let rounds = log_big_n - log_blowup;
+        assert_eq!(fri.commitments.len(), rounds);
+        let mut fri_roots = Vec::with_capacity(rounds);
+        let mut fri_betas = Vec::with_capacity(rounds);
+        for root in &fri.commitments {
+            let r = c.scalar_inputs(root);
+            c.observe_block(&mut t, r, DIGEST);
+            fri_betas.push(c.sample_word(&mut t));
+            fri_roots.push(r);
+        }
+        let final_value = c.input(fri.final_value);
+        c.observe_word(&mut t, final_value);
+
+        // Query indices are sampled before any Merkle hashing: the native
+        // verifier observes nothing between queries, and the machine's sponge
+        // register is shared with the Merkle work below.
+        let query_bits: Vec<Addr> = (0..config.num_queries).map(|_| c.sample_bits(&mut t)).collect();
+
+        // ---- per-proof constants ----
+        let omega_big = root_of_unity(log_big_n);
+        let omega_inv_pows: Vec<Fp> = {
+            let mut v = Vec::with_capacity(log_big_n);
+            let mut p = omega_big.inverse().unwrap();
+            for _ in 0..log_big_n {
+                v.push(p);
+                p = p.square();
+            }
+            v
+        };
+        let shift_inv = shift.inverse().unwrap();
+        let inv2 = c.scalar(inv_two());
+        let minus_two = c.scalar(-Fp::new(2));
+        // Powers of beta in one block of consecutive words, so dot products
+        // can read them eight at a time (see `stark::Deep` for the layout).
+        let (off_t, off_a, off_p, off_q) = (0, 2 * w, 2 * w + 2 * aux_w, 2 * w + 2 * aux_w + 2 * pre_w);
+        let beta_count = off_q + num_chunks;
+        let beta_base = c.powers_block(beta, beta_count + RATE);
+        let bp = |k: usize| beta_base + k as Addr;
+        let dot = |c: &mut Compiler, from: usize, vals: &[Addr]| -> Addr {
+            let mut acc = A_ZERO;
+            for (k, v) in vals.iter().enumerate() {
+                acc = c.muladd(*v, bp(from + k), acc);
+            }
+            acc
+        };
+        let c_tz = dot(c, off_t, &trace_z);
+        let c_tzn = dot(c, off_t + w, &trace_zn);
+        let c_az = dot(c, off_a, &aux_z);
+        let c_azn = dot(c, off_a + aux_w, &aux_zn);
+        let c_pz = dot(c, off_p, &pre_z);
+        let c_pzn = dot(c, off_p + pre_w, &pre_zn);
+        let c_q = dot(c, off_q, &quot_zq);
+        let (beta_w, beta_aux, beta_pre) = (bp(w), bp(aux_w), bp(pre_w));
+
+        for (q, steps) in fri.queries.iter().enumerate() {
+            assert_eq!(steps.len(), rounds);
+            let bits = query_bits[q];
+            // Round 0 folds at x_0 = shift * omega^(i mod half); the queried
+            // point is x = (-1)^top x_0. Later rounds square, with the sign
+            // given by the position-in-pair bit.
+            let mut x_inv = c.power_from_bits(shift_inv, bits, log_big_n - 1, &omega_inv_pows);
+            let top = c.bit(bits, log_big_n - 1);
+            let sign0 = c.muladd(top, minus_two, A_ONE);
+            let x_abs = c.inverse(x_inv);
+            let x = c.mul(x_abs, sign0);
+            let mut folded: Option<Addr> = None;
+            let mut claimed = A_ZERO;
+            for (r, step) in steps.iter().enumerate() {
+                let log_half = log_big_n - 1 - r;
+                let pos = c.bit(bits, log_half);
+                if r > 0 {
+                    let sq = c.mul(x_inv, x_inv);
+                    let sign = c.muladd(pos, minus_two, A_ONE);
+                    x_inv = c.mul(sq, sign);
+                }
+                // Merkle opening of the pair, loaded as its eight scalars.
+                let row = c.scalar_inputs(&pair_row(&step.pair));
+                let pair = [
+                    c.word_from_scalars(core::array::from_fn(|k| row + k as Addr)),
+                    c.word_from_scalars(core::array::from_fn(|k| row + (DEGREE + k) as Addr)),
+                ];
+                let path: Vec<Addr> = step.path.iter().map(|d| c.scalar_inputs(d)).collect();
+                assert_eq!(path.len(), log_half);
+                let root = c.merkle_root(row, RATE, &path, bits);
+                c.assert_digest(root, fri_roots[r]);
+                let diff = c.sub(pair[1], pair[0]);
+                let at_pos = c.muladd(pos, diff, pair[0]);
+                match folded {
+                    Some(f) => c.assert_eq(at_pos, f),
+                    None => claimed = at_pos,
+                }
+                // Fold.
+                let sum = c.add(pair[0], pair[1]);
+                let even = c.mul(sum, inv2);
+                let dsub = c.sub(pair[0], pair[1]);
+                let half_d = c.mul(dsub, inv2);
+                let odd = c.mul(half_d, x_inv);
+                folded = Some(c.muladd(fri_betas[r], odd, even));
+            }
+            c.assert_eq(folded.unwrap(), final_value);
+
+            // DEEP value from the opened rows: each row is loaded eight
+            // scalars at a time while accumulating its beta-weighted sum.
+            let opening: &QueryOpening = &proof.openings[q];
+            let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, bp(off_t));
+            let trace_path: Vec<Addr> = opening.trace_path.iter().map(|d| c.scalar_inputs(d)).collect();
+            let root = c.merkle_root(trace_row, w, &trace_path, bits);
+            c.assert_digest(root, trace_root);
+            let s_a = if aux_w > 0 {
+                let (row, s) = c.row_inputs_dot(&opening.aux_row, bp(off_a));
+                let path: Vec<Addr> = opening.aux_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                let root = c.merkle_root(row, aux_w, &path, bits);
+                c.assert_digest(root, aux_root.unwrap());
+                s
+            } else {
+                A_ZERO
+            };
+            let s_p = if pre_w > 0 {
+                let (row, s) = c.row_inputs_dot(&opening.pre_row, bp(off_p));
+                let path: Vec<Addr> = opening.pre_path.iter().map(|d| c.scalar_inputs(d)).collect();
+                let root = c.merkle_root(row, pre_w, &path, bits);
+                c.assert_digest(root, pre_root.unwrap());
+                s
+            } else {
+                A_ZERO
+            };
+            let quot_row = c.scalar_inputs(&opening.quotient_row);
+            let quot_path: Vec<Addr> = opening.quotient_path.iter().map(|d| c.scalar_inputs(d)).collect();
+            let root = c.merkle_root(quot_row, num_chunks * DEGREE, &quot_path, bits);
+            c.assert_digest(root, quotient_root);
+            let mut s_q = A_ZERO;
+            for j in 0..num_chunks {
+                let sc: [Addr; DEGREE] = core::array::from_fn(|k| quot_row + (j * DEGREE + k) as Addr);
+                let word = c.word_from_scalars(sc);
+                s_q = c.muladd(word, bp(off_q + j), s_q);
+            }
+
+            let dz = c.sub(x, zeta);
+            let inv_z = c.inverse(dz);
+            let dzn = c.sub(x, zeta_next);
+            let inv_zn = c.inverse(dzn);
+            let dzq = c.sub(x, zeta_q);
+            let inv_zq = c.inverse(dzq);
+            // value = (s_t - c_tz + s_a - c_az + s_p - c_pz) / (x - zeta)
+            //       + (beta^w s_t - c_tzn + beta^aux_w s_a - c_azn + beta^pre_w s_p - c_pzn) / (x - g zeta)
+            //       + (s_q - c_q) / (x - zeta_q)
+            let at_z = c.sub(s_t, c_tz);
+            let at_z = c.add(at_z, s_a);
+            let at_z = c.sub(at_z, c_az);
+            let at_z = c.add(at_z, s_p);
+            let at_z = c.sub(at_z, c_pz);
+            let at_zn = c.muladd(beta_w, s_t, A_ZERO);
+            let at_zn = c.sub(at_zn, c_tzn);
+            let at_zn = c.muladd(beta_aux, s_a, at_zn);
+            let at_zn = c.sub(at_zn, c_azn);
+            let at_zn = c.muladd(beta_pre, s_p, at_zn);
+            let at_zn = c.sub(at_zn, c_pzn);
+            let at_q = c.sub(s_q, c_q);
+            let value = c.mul(at_z, inv_z);
+            let value = c.muladd(at_zn, inv_zn, value);
+            let value = c.muladd(at_q, inv_zq, value);
+            c.assert_eq(value, claimed);
+        }
+    }
+
+    /// `base^0 .. base^(count-1)` at `count` consecutive fresh addresses,
+    /// zero padded to a multiple of eight.
+    fn powers_block(&mut self, base: Addr, count: usize) -> Addr {
+        let padded = count.div_ceil(RATE) * RATE;
+        let block = self.prog.alloc(padded as u32);
+        self.prog.muladd_to(A_ONE, A_ONE, A_ZERO, block);
+        self.set(block, Fp4::ONE);
+        for k in 1..count {
+            let prev = block + (k - 1) as Addr;
+            self.prog.muladd_to(prev, base, A_ZERO, block + k as Addr);
+            let v = self.val(prev) * self.val(base);
+            self.set(block + k as Addr, v);
+        }
+        for k in count..padded {
+            self.prog.muladd_to(A_ZERO, A_ONE, A_ZERO, block + k as Addr);
+            self.set(block + k as Addr, Fp4::ZERO);
+        }
+        block
+    }
+
+    /// Loads `values` as scalar inputs at consecutive addresses (zero
+    /// padded to blocks of eight, pads asserted zero) while accumulating
+    /// `sum_k values[k] * mem[pows + k]`. Returns the base address and the
+    /// accumulator.
+    fn row_inputs_dot(&mut self, values: &[Fp], pows: Addr) -> (Addr, Addr) {
+        let blocks = values.len().div_ceil(RATE).max(1);
+        let base = self.prog.alloc((blocks * RATE) as u32);
+        let mut acc = A_ZERO;
+        for b in 0..blocks {
+            let out = base + (b * RATE) as Addr;
+            let pw = pows + (b * RATE) as Addr;
+            let acc_out = self.prog.input_dot_at(out, pw, acc);
+            let mut sum = self.val(acc);
+            for k in 0..RATE {
+                let v = values.get(b * RATE + k).copied().unwrap_or(Fp::ZERO);
+                let v4 = Fp4::from_base(v);
+                self.inputs.push(v4);
+                self.set(out + k as Addr, v4);
+                sum += v4 * self.val(pw + k as Addr);
+            }
+            self.set(acc_out, sum);
+            acc = acc_out;
+        }
+        for k in values.len()..blocks * RATE {
+            self.prog.assert_eq(base + k as Addr, A_ZERO);
+        }
+        (base, acc)
+    }
+}
+
+/// Extension values from base-column openings: `o0 + o1 X + o2 X^2 + o3 X^3`.
+fn reconstruct_ext(c: &mut Compiler, opened: &[Addr]) -> Vec<Addr> {
+    opened
+        .chunks_exact(DEGREE)
+        .map(|o| {
+            let mut acc = o[DEGREE - 1];
+            for k in (0..DEGREE - 1).rev() {
+                acc = c.muladd(acc, A_X, o[k]);
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Lookup constraints over addresses, mirroring `stark::lookup_constraints`.
+fn lookup_constraints_addr(
+    c: &mut Compiler,
+    gamma: Addr,
+    delta: Addr,
+    terms: &[LookupTerm<Expr>],
+    aux_l: &[Addr],
+    aux_n: &[Addr],
+    sel: (Addr, Addr, Addr),
+) -> Vec<Addr> {
+    let t = terms.len();
+    let mut out = Vec::with_capacity(t + 3);
+    let mut contrib = A_ZERO;
+    for (k, term) in terms.iter().enumerate() {
+        let inv = aux_l[k];
+        let mut denom = gamma;
+        let mut pow = delta;
+        for (i, v) in term.values.iter().enumerate() {
+            denom = c.muladd(v.0, pow, denom);
+            if i + 1 < term.values.len() {
+                pow = c.mul(pow, delta);
+            }
+        }
+        let prod = c.mul(inv, denom);
+        out.push(c.sub(prod, A_ONE));
+        let m_inv = c.mul(term.multiplicity.0, inv);
+        contrib = if term.send { c.add(contrib, m_inv) } else { c.sub(contrib, m_inv) };
+    }
+    let s = aux_l[t];
+    let s_next = aux_n[t];
+    let d = c.sub(s_next, s);
+    let d = c.sub(d, contrib);
+    out.push(c.mul(sel.2, d));
+    out.push(c.mul(sel.0, s));
+    let e = c.add(s, contrib);
+    out.push(c.mul(sel.1, e));
+    out
+}
+
+/// A zero-filled proof of the shape `prove` produces for `air`, used to
+/// compile the verifier program without a real proof.
+pub fn dummy_proof<A: Air>(air: &A, config: &StarkConfig, log_n: usize, num_public: usize) -> Proof {
+    let w = air.width();
+    let pre_w = air.preprocessed_width();
+    let (_, num_terms) = shape(air, &vec![Fp::ZERO; num_public]);
+    let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
+    let num_chunks = 1usize << log_quotient_degree(air.max_constraint_degree());
+    let log_big_n = log_n + config.log_blowup;
+    let rounds = log_big_n - config.log_blowup;
+    let z = [Fp::ZERO; DIGEST];
+    let queries = (0..config.num_queries)
+        .map(|_| (0..rounds).map(|r| QueryStep { pair: [Fp4::ZERO; 2], path: vec![z; log_big_n - 1 - r] }).collect())
+        .collect();
+    let openings = (0..config.num_queries)
+        .map(|_| QueryOpening {
+            trace_row: vec![Fp::ZERO; w],
+            trace_path: vec![z; log_big_n],
+            aux_row: vec![Fp::ZERO; aux_w],
+            aux_path: if aux_w > 0 { vec![z; log_big_n] } else { vec![] },
+            pre_row: vec![Fp::ZERO; pre_w],
+            pre_path: if pre_w > 0 { vec![z; log_big_n] } else { vec![] },
+            quotient_row: vec![Fp::ZERO; num_chunks * DEGREE],
+            quotient_path: vec![z; log_big_n],
+        })
+        .collect();
+    Proof {
+        log_n,
+        trace_root: z,
+        aux_root: if aux_w > 0 { Some(z) } else { None },
+        quotient_root: z,
+        trace_at_zeta: vec![Fp4::ZERO; w],
+        trace_at_zeta_next: vec![Fp4::ZERO; w],
+        aux_at_zeta: vec![Fp4::ZERO; aux_w],
+        aux_at_zeta_next: vec![Fp4::ZERO; aux_w],
+        pre_at_zeta: vec![Fp4::ZERO; pre_w],
+        pre_at_zeta_next: vec![Fp4::ZERO; pre_w],
+        quotient_at_zeta_q: vec![Fp4::ZERO; num_chunks],
+        fri: FriProof { commitments: vec![z; rounds], final_value: Fp4::ZERO, queries },
+        openings,
+    }
+}
+
+/// Digest the output of a verifier program commits to: the inner public
+/// values hashed with `poseidon2::hash`.
+pub fn output_digest(public: &[Fp]) -> [Fp; DIGEST] {
+    crate::poseidon2::hash(public)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::challenger::Challenger;
+    use crate::stark::{Trace, check_constraints_with, prove, prove_with, verify, verify_with};
+    use crate::vm_air::{ExecError, VmAir};
+
+    /// Fibonacci inner AIR (as in the STARK tests).
+    struct Fibonacci;
+
+    impl Air for Fibonacci {
+        fn width(&self) -> usize {
+            2
+        }
+        fn max_constraint_degree(&self) -> usize {
+            2
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            let (a0, b0) = (b.local()[0], b.local()[1]);
+            let (a1, b1) = (b.next()[0], b.next()[1]);
+            let out = b.public()[0];
+            b.when_first_row(a0);
+            b.when_first_row(b0 - F::ONE);
+            b.when_transition(a1 - b0);
+            b.when_transition(b1 - a0 - b0);
+            b.when_last_row(b0 - out);
+        }
+    }
+
+    fn fib_trace(log_n: usize) -> (Trace, Vec<Fp>) {
+        let n = 1 << log_n;
+        let mut values = Vec::with_capacity(2 * n);
+        let (mut a, mut b) = (Fp::ZERO, Fp::ONE);
+        for _ in 0..n {
+            values.push(a);
+            values.push(b);
+            let c = a + b;
+            a = b;
+            b = c;
+        }
+        let last_b = values[2 * n - 1];
+        (Trace::new(values, 2), vec![last_b])
+    }
+
+    /// Inner AIR with a lookup: column 1 is a permutation of column 0.
+    struct PermAir;
+
+    impl Air for PermAir {
+        fn width(&self) -> usize {
+            2
+        }
+        fn max_constraint_degree(&self) -> usize {
+            2
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            b.lookup(true, F::ONE, &[b.local()[0]]);
+            b.lookup(false, F::ONE, &[b.local()[1]]);
+        }
+    }
+
+    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8 };
+
+    fn inner_tr() -> Challenger {
+        let mut c = Challenger::new();
+        c.observe(Fp::new(0x77));
+        c
+    }
+
+    fn outer_tr() -> Challenger {
+        let mut c = Challenger::new();
+        c.observe(Fp::new(0x88));
+        c
+    }
+
+    #[test]
+    fn verifier_program_accepts_fibonacci_proof() {
+        let (trace, public) = fib_trace(3);
+        let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut inner_tr());
+        assert_eq!(verify(&INNER, &Fibonacci, &public, &proof, &mut inner_tr()), Ok(()));
+        // Note: the inner transcript here has a prefix (0x77) the compiled
+        // verifier does not replay; compile against a proof made with the
+        // default transcript instead.
+        let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
+        assert_eq!(verify(&INNER, &Fibonacci, &public, &proof, &mut Challenger::new()), Ok(()));
+
+        let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("verifier program accepts a valid proof");
+        assert_eq!(exec.output_digest, Some(output_digest(&public)));
+        println!("fibonacci verifier: {} instructions, {} inputs", c.prog.instrs.len(), c.inputs.len());
+
+        // The program digest is independent of the proof's values.
+        let dummy = dummy_proof(&Fibonacci, &INNER, 3, 1);
+        let c2 = compile_verifier(&Fibonacci, &INNER, &[Fp::ZERO], &dummy);
+        assert_eq!(c2.prog.digest(1), c.prog.digest(1));
+        assert_eq!(c2.prog.instrs.len(), c.prog.instrs.len());
+
+        // A corrupted proof is rejected by the program.
+        let mut bad = proof.clone();
+        bad.trace_at_zeta[0] += Fp4::ONE;
+        let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
+        assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
+        let mut bad = proof.clone();
+        bad.openings[2].trace_row[1] += Fp::ONE;
+        let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
+        assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
+        let mut bad = proof.clone();
+        bad.fri.final_value += Fp4::ONE;
+        let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
+        assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
+        // Wrong public value.
+        let cb = compile_verifier(&Fibonacci, &INNER, &[public[0] + Fp::ONE], &proof);
+        assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
+
+        // The verifier trace satisfies the machine's constraints.
+        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&public));
+        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
+        println!("verifier trace: {} rows", vm_trace.height());
+    }
+
+    #[test]
+    fn verifier_program_handles_lookups() {
+        let a = [5u32, 3, 9, 1, 7, 7, 2, 0];
+        let bperm = [7u32, 1, 0, 9, 3, 2, 7, 5];
+        let values: Vec<Fp> = a.iter().zip(&bperm).flat_map(|(x, y)| [Fp::new(*x), Fp::new(*y)]).collect();
+        let trace = Trace::new(values, 2);
+        let proof = prove(&INNER, &PermAir, &trace, &[], &mut Challenger::new());
+        assert_eq!(verify(&INNER, &PermAir, &[], &proof, &mut Challenger::new()), Ok(()));
+        let c = compile_verifier(&PermAir, &INNER, &[], &proof);
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("accepts");
+        assert_eq!(exec.output_digest, Some(output_digest(&[])));
+        let mut bad = proof.clone();
+        bad.aux_at_zeta[1] += Fp4::ONE;
+        let cb = compile_verifier(&PermAir, &INNER, &[], &bad);
+        assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
+        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let vm_public = VmAir::public_values(&c.prog.digest(1), &output_digest(&[]));
+        assert_eq!(check_constraints_with(&VmAir, &vm_trace, Some(&c.prog.table()), &vm_public), Ok(()));
+    }
+
+    #[test]
+    #[ignore = "proves a proof of a proof; run with --release"]
+    fn recursive_proof_roundtrip() {
+        let (trace, public) = fib_trace(3);
+        let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
+        let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
+        let vm_trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+        let outer = StarkConfig { log_blowup: 1, num_queries: 20 };
+        let pre = c.prog.preprocess(outer.log_blowup);
+        let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
+        let t = std::time::Instant::now();
+        let outer_proof = prove_with(&outer, &VmAir, &vm_trace, Some(&pre), &vm_public, &mut outer_tr());
+        println!(
+            "outer proof over {} rows: {:?}, {} bytes",
+            vm_trace.height(),
+            t.elapsed(),
+            outer_proof.to_bytes().len()
+        );
+        assert_eq!(verify_with(&outer, &VmAir, Some(&pre.root()), &vm_public, &outer_proof, &mut outer_tr()), Ok(()));
+        let mut bad = vm_public.clone();
+        bad[0] += Fp::ONE;
+        assert!(verify_with(&outer, &VmAir, Some(&pre.root()), &bad, &outer_proof, &mut outer_tr()).is_err());
+    }
+}
