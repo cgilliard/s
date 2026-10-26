@@ -12,13 +12,15 @@
 //! 1. The prover interpolates each column over `H`, evaluates it on `D` and
 //!    commits to the `N x w` matrix.
 //! 2. If the AIR declares lookup terms, the verifier samples `gamma, delta`
-//!    and the prover builds the auxiliary trace: for every term an inverse
-//!    of `gamma + sum delta^(k+1) v_k` and one running sum of the signed
-//!    `multiplicity * inverse` contributions. It commits to it as a second
-//!    matrix (extension columns stored as four base columns each).
+//!    and the prover builds the auxiliary trace: for every group of
+//!    [`Air::lookup_group`] terms the sum of their signed fractions
+//!    `multiplicity / (gamma + sum delta^(k+1) v_k)`, and one running sum of
+//!    those columns. It commits to it as a second matrix (extension columns
+//!    stored as four base columns each).
 //! 3. The verifier samples `alpha`. On every point of `D` the prover
-//!    evaluates the AIR constraints and the lookup constraints (inverse
-//!    checks, running-sum transition, zero at both ends), combines them as
+//!    evaluates the AIR constraints and the lookup constraints (one per
+//!    group with its denominators cleared, the running-sum transition, and
+//!    its values at both ends), combines them as
 //!    `C = sum alpha^k c_k`, and divides by `Z_H(x) = x^n - 1`. The
 //!    quotient is split into chunks of degree below `n` and committed.
 //! 4. The verifier samples `zeta`. The prover opens every trace and
@@ -46,6 +48,13 @@
 //! means the multiset of sent tuples, with multiplicities, equals the
 //! multiset of received tuples. Lookup terms must not use the row
 //! selectors, only columns and constants.
+//!
+//! A group of terms with denominators `d_i` and signed multiplicities
+//! `m_i` has one column `h` and the constraint
+//! `h * prod d_i = sum_i m_i prod_(j != i) d_j`, of degree
+//! `1 + sum deg d_i`. Larger groups mean fewer columns for a higher
+//! constraint degree. The constraint only fixes `h` when no denominator
+//! vanishes, which holds except with negligible probability over `gamma`.
 
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
@@ -246,6 +255,13 @@ pub trait Air: Sync {
         0
     }
 
+    /// Lookup terms summed per auxiliary column, in declaration order. A
+    /// group's constraint has degree one plus the degrees of its
+    /// denominators, which must fit [`Air::max_constraint_degree`].
+    fn lookup_group(&self) -> usize {
+        1
+    }
+
     fn eval<F: Field>(&self, builder: &mut Builder<'_, F>);
 }
 
@@ -255,6 +271,7 @@ pub trait DynAir: Sync {
     fn air_width(&self) -> usize;
     fn air_degree(&self) -> usize;
     fn air_preprocessed_width(&self) -> usize;
+    fn air_lookup_group(&self) -> usize;
     fn eval_fp(&self, b: &mut Builder<'_, Fp>);
     fn eval_fp4(&self, b: &mut Builder<'_, Fp4>);
     fn eval_deg(&self, b: &mut Builder<'_, Deg>);
@@ -270,6 +287,9 @@ impl<A: Air> DynAir for A {
     }
     fn air_preprocessed_width(&self) -> usize {
         self.preprocessed_width()
+    }
+    fn air_lookup_group(&self) -> usize {
+        self.lookup_group().max(1)
     }
     fn eval_fp(&self, b: &mut Builder<'_, Fp>) {
         self.eval(b)
@@ -655,10 +675,17 @@ pub(crate) fn evaluate_into<F: EvalField>(
     *scratch = b.out;
 }
 
-/// Number of lookup constraints for `terms` lookup terms: one inverse check
-/// per term plus the running-sum transition and its two boundary checks.
-pub(crate) fn num_lookup_constraints(terms: usize) -> usize {
-    if terms == 0 { 0 } else { terms + 3 }
+/// Auxiliary extension columns for `terms` lookup terms summed `group` at
+/// a time: one per group and the running sum.
+pub(crate) fn lookup_columns(terms: usize, group: usize) -> usize {
+    if terms == 0 { 0 } else { terms.div_ceil(group) + 1 }
+}
+
+/// Number of lookup constraints for `terms` lookup terms in groups of
+/// `group`: one per group plus the running-sum transition and its two
+/// boundary checks.
+pub(crate) fn num_lookup_constraints(terms: usize, group: usize) -> usize {
+    if terms == 0 { 0 } else { terms.div_ceil(group) + 3 }
 }
 
 /// Counts constraints and lookup terms an AIR emits (on an all-zero row pair).
@@ -669,40 +696,56 @@ pub(crate) fn shape(air: &dyn DynAir, public: &[Fp]) -> (usize, usize) {
     (c.len(), t.len())
 }
 
+/// Lookup settings of a table for [`combine`]: challenges, the table's
+/// lookup total and the group size.
+#[derive(Clone, Copy)]
+struct LookupArgs<'a> {
+    ch: &'a LookupChallenges,
+    total: Fp4,
+    group: usize,
+}
+
 /// Combines main constraints and lookup constraints with powers of alpha.
-/// The lookup constraints, in order: one inverse check per term
-/// (`inverse * denominator = 1`), the running-sum transition, the running
-/// sum starting at zero, and the last row reaching the table's lookup
-/// `total`. `aux_local`/`aux_next` are the extension values: inverses then
-/// the running sum.
+/// The lookup constraints, in order: one per group of terms
+/// (`h * prod d_i - sum m_i prod_(j != i) d_j`), the running-sum transition,
+/// the running sum starting at zero, and the last row reaching the table's
+/// lookup `total`. `aux_local`/`aux_next` are the extension values: the
+/// group sums then the running sum.
 fn combine<F: Field>(
     constraints: &[F],
     terms: &[LookupTerm<F>],
     aux_local: &[Fp4],
     aux_next: &[Fp4],
     sel: (Fp4, Fp4, Fp4),
-    lookup: Option<(&LookupChallenges, Fp4)>,
+    lookup: Option<LookupArgs<'_>>,
     alpha_powers: &[Fp4],
 ) -> Fp4 {
     let mut acc = Fp4::ZERO;
     for (c, a) in constraints.iter().zip(alpha_powers) {
         acc += c.mul_ext(*a);
     }
-    if let Some((ch, total)) = lookup {
+    if let Some(LookupArgs { ch, total, group }) = lookup {
         let a = &alpha_powers[constraints.len()..];
-        let t = terms.len();
+        let groups = terms.len().div_ceil(group);
         let mut contrib = Fp4::ZERO;
-        for (k, term) in terms.iter().enumerate() {
-            let inv = aux_local[k];
-            acc += (inv * ch.denominator(&term.values) - Fp4::ONE) * a[k];
-            let c = term.multiplicity.mul_ext(inv);
-            if term.send { contrib += c } else { contrib -= c }
+        for (j, members) in terms.chunks(group).enumerate() {
+            // Running numerator and denominator of the group's fractions.
+            let (mut num, mut den) = (Fp4::ZERO, Fp4::ONE);
+            for term in members {
+                let d = ch.denominator(&term.values);
+                let m = term.multiplicity.mul_ext(Fp4::ONE);
+                num = num * d + if term.send { m * den } else { -(m * den) };
+                den *= d;
+            }
+            let h = aux_local[j];
+            acc += (h * den - num) * a[j];
+            contrib += h;
         }
-        let s = aux_local[t];
-        let s_next = aux_next[t];
-        acc += sel.2 * (s_next - s - contrib) * a[t];
-        acc += sel.0 * s * a[t + 1];
-        acc += sel.1 * (s + contrib - total) * a[t + 2];
+        let s = aux_local[groups];
+        let s_next = aux_next[groups];
+        acc += sel.2 * (s_next - s - contrib) * a[groups];
+        acc += sel.0 * s * a[groups + 1];
+        acc += sel.1 * (s + contrib - total) * a[groups + 2];
     }
     acc
 }
@@ -958,8 +1001,10 @@ pub fn check_tables(
 /// Upper bound on the degree of the AIR's constraints, measured by
 /// evaluating it over [`Deg`] with every column at degree one, the row
 /// selectors at degree one and the transition selector at degree zero.
-/// Lookup terms count as degree `max(values) + 1` and `multiplicity + 2`.
-/// Must not exceed `air.max_constraint_degree()`.
+/// A group of lookup terms counts as `1 + sum deg d_i`, and as
+/// `deg m_i + sum_(j != i) deg d_j` for each member, where a denominator
+/// has the largest degree of its values. Must not exceed
+/// `air.max_constraint_degree()`.
 pub fn measure_degree<A: Air>(air: &A, num_public: usize) -> usize {
     measure_degree_dyn(air, num_public)
 }
@@ -970,16 +1015,20 @@ fn measure_degree_dyn(air: &dyn DynAir, num_public: usize) -> usize {
     let public = vec![Deg(0); num_public];
     let (constraints, terms) = evaluate(air, &cols, &cols, (&pre, &pre), &public, (Deg(1), Deg(1), Deg(0)));
     let mut max = constraints.iter().map(|d| d.0 as usize).max().unwrap_or(0);
-    for t in &terms {
-        let v = t.values.iter().map(|d| d.0 as usize).max().unwrap_or(0);
-        max = max.max(v + 1).max(t.multiplicity.0 as usize + 2);
+    for members in terms.chunks(air.air_lookup_group()) {
+        let d: Vec<usize> = members.iter().map(|t| t.values.iter().map(|d| d.0 as usize).max().unwrap_or(0)).collect();
+        let sum: usize = d.iter().sum();
+        max = max.max(1 + sum);
+        for (t, dt) in members.iter().zip(&d) {
+            max = max.max(t.multiplicity.0 as usize + sum - dt);
+        }
     }
     max
 }
 
-/// Builds the auxiliary trace (row-major extension values: inverses then
-/// the running sum) for `trace` under the given challenges, and returns it
-/// with the table's lookup total.
+/// Builds the auxiliary trace (row-major extension values: group sums
+/// then the running sum) for `trace` under the given challenges, and
+/// returns it with the table's lookup total.
 fn build_aux(
     air: &dyn DynAir,
     trace: &Trace,
@@ -991,7 +1040,9 @@ fn build_aux(
     let n = trace.height();
     let empty: Vec<Fp> = Vec::new();
     let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.table.row(i)) };
-    let width = terms + 1;
+    let group = air.air_lookup_group();
+    let groups = terms.div_ceil(group);
+    let width = groups + 1;
     let mut aux = vec![Fp4::ZERO; n * width];
     // Denominators and signed multiplicities of every term, row by row.
     const ROWS: usize = 256;
@@ -1017,24 +1068,24 @@ fn build_aux(
     });
     let (denoms, mults): (Vec<Fp4>, Vec<Fp>) = dm.into_iter().unzip();
     let invs = par_batch_inverse(&denoms);
-    // Inverses, and each row's contribution in the running-sum column,
+    // Group sums, and each row's contribution in the running-sum column,
     // which the prefix sums then replace.
     par_chunks_mut(&mut aux, ROWS * width, |c, chunk| {
         for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
             let i = c * ROWS + r;
             let mut contrib = Fp4::ZERO;
             for k in 0..terms {
-                let inv = invs[i * terms + k];
-                row[k] = inv;
-                contrib += inv.mul_base(&mults[i * terms + k]);
+                let f = invs[i * terms + k].mul_base(&mults[i * terms + k]);
+                row[k / group] += f;
+                contrib += f;
             }
-            row[terms] = contrib;
+            row[groups] = contrib;
         }
     });
     let mut sum = Fp4::ZERO;
     for row in aux.chunks_exact_mut(width) {
-        let contrib = row[terms];
-        row[terms] = sum;
+        let contrib = row[groups];
+        row[groups] = sum;
         sum += contrib;
     }
     (aux, sum)
@@ -1161,7 +1212,7 @@ impl TableState<'_> {
     }
 
     fn aux_ext_w(&self) -> usize {
-        if self.num_terms > 0 { self.num_terms + 1 } else { 0 }
+        lookup_columns(self.num_terms, self.input.air.air_lookup_group())
     }
 
     fn pre_row(&self, i: usize) -> &[Fp] {
@@ -1209,7 +1260,8 @@ fn commit_quotient(
     let denom_inv = batch_inverse(&denoms);
     let empty: [Fp4; 0] = [];
     let (aux_lde, total): (&[Fp4], Fp4) = t.aux.as_ref().map_or((&empty, Fp4::ZERO), |(_, l, s)| (&l[..], *s));
-    let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| (ch, total));
+    let group = air.air_lookup_group();
+    let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| LookupArgs { ch, total, group });
     let lde = &t.trace.rows;
 
     let mut quotient: Vec<Fp4> = par_map_with(big_n, Scratch::default, |scratch, i| {
@@ -1375,7 +1427,8 @@ pub fn prove_tables(
     let quotients: Vec<Quotient> = states
         .iter()
         .map(|t| {
-            let alpha_powers = powers(alpha, t.num_constraints + num_lookup_constraints(t.num_terms));
+            let alpha_powers =
+                powers(alpha, t.num_constraints + num_lookup_constraints(t.num_terms, t.input.air.air_lookup_group()));
             let q = commit_quotient(t, log_blowup, public, lookup_ch.as_ref(), &alpha_powers, &mut timer);
             challenger.observe_digest(&q.tree.root());
             q
@@ -1524,6 +1577,7 @@ struct TableShape {
     chunks: usize,
     num_constraints: usize,
     num_terms: usize,
+    group: usize,
 }
 
 /// Verifies a proof of [`prove_tables`] for the given tables, in order.
@@ -1547,7 +1601,8 @@ pub fn verify_tables(
         let air = spec.air;
         let log_q = log_quotient_degree(air.air_degree());
         let (num_constraints, num_terms) = shape(air, public);
-        let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
+        let group = air.air_lookup_group();
+        let aux_w = lookup_columns(num_terms, group) * DEGREE;
         let s = TableShape {
             w: air.air_width(),
             aux_w,
@@ -1555,6 +1610,7 @@ pub fn verify_tables(
             chunks: 1 << log_q,
             num_constraints,
             num_terms,
+            group,
         };
         if t.log_n == 0
             || t.log_n + log_blowup > 27
@@ -1631,8 +1687,12 @@ pub fn verify_tables(
         );
         let aux_l = ext_from_base_openings(&t.aux_at_zeta);
         let aux_n = ext_from_base_openings(&t.aux_at_zeta_next);
-        let alpha_powers = powers(alpha, s.num_constraints + num_lookup_constraints(s.num_terms));
-        let lookup = lookup_ch.as_ref().filter(|_| s.num_terms > 0).map(|ch| (ch, t.lookup_sum));
+        let alpha_powers = powers(alpha, s.num_constraints + num_lookup_constraints(s.num_terms, s.group));
+        let lookup = lookup_ch.as_ref().filter(|_| s.num_terms > 0).map(|ch| LookupArgs {
+            ch,
+            total: t.lookup_sum,
+            group: s.group,
+        });
         let c_zeta = combine(&constraints, &terms, &aux_l, &aux_n, (first, last, transition), lookup, &alpha_powers);
         let mut q_zeta = Fp4::ZERO;
         let mut zeta_pow = Fp4::ONE;
@@ -1941,7 +2001,7 @@ mod tests {
 
     #[test]
     fn rom_lookup_roundtrip() {
-        assert_eq!(measure_degree(&RomAir, 0), 3);
+        assert_eq!(measure_degree(&RomAir, 0), 2);
         let good = rom_trace(&[
             [2, 0, 1, 10], // write (1, 10) twice
             [1, 0, 2, 20], // write (2, 20) once
@@ -1980,6 +2040,44 @@ mod tests {
             verify(&CONFIG, &RomAir, &[], &p, &mut transcript()),
             Err(VerifyError::InvalidAuxOpening { query: 0 })
         );
+    }
+
+    /// [`RomAir`] with its two lookup terms summed in one column.
+    struct PairedRom;
+
+    impl Air for PairedRom {
+        fn width(&self) -> usize {
+            4
+        }
+        fn max_constraint_degree(&self) -> usize {
+            3
+        }
+        fn lookup_group(&self) -> usize {
+            2
+        }
+        fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+            RomAir.eval(b)
+        }
+    }
+
+    #[test]
+    fn paired_lookup_terms() {
+        assert_eq!(measure_degree(&PairedRom, 0), 3);
+        let good = rom_trace(&[[2, 0, 1, 10], [1, 0, 2, 20], [0, 1, 1, 10], [0, 1, 2, 20], [0, 1, 1, 10]]);
+        let proof = prove(&CONFIG, &PairedRom, &good, &[], &mut transcript());
+        // One group column and the running sum.
+        assert_eq!(proof.tables[0].aux_at_zeta.len(), 2 * 4);
+        assert_eq!(verify(&CONFIG, &PairedRom, &[], &proof, &mut transcript()), Ok(()));
+        // The unpaired verifier expects a different shape.
+        assert!(verify(&CONFIG, &RomAir, &[], &proof, &mut transcript()).is_err());
+        let mut p = proof.clone();
+        p.tables[0].aux_at_zeta[0] += Fp4::ONE;
+        assert!(verify(&CONFIG, &PairedRom, &[], &p, &mut transcript()).is_err());
+        if !cfg!(debug_assertions) {
+            let bad = rom_trace(&[[1, 0, 1, 10], [0, 1, 1, 11]]);
+            let proof = prove(&CONFIG, &PairedRom, &bad, &[], &mut transcript());
+            assert!(verify(&CONFIG, &PairedRom, &[], &proof, &mut transcript()).is_err());
+        }
     }
 
     /// Sends its single column, once per row.

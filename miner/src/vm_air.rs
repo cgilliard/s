@@ -414,8 +414,16 @@ impl Air for VmAir {
         NUM_COLS
     }
 
+    /// Lookup terms are paired: a read or write denominator has degree two
+    /// (addresses are selected by program flags), so a pair's constraint
+    /// has degree five, which takes four quotient chunks instead of two
+    /// but nearly halves the auxiliary columns.
     fn max_constraint_degree(&self) -> usize {
-        3
+        5
+    }
+
+    fn lookup_group(&self) -> usize {
+        2
     }
 
     fn preprocessed_width(&self) -> usize {
@@ -1015,7 +1023,7 @@ mod tests {
 
     #[test]
     fn layout_and_degree() {
-        assert_eq!(measure_degree(&VmAir, NUM_PUBLIC), 3);
+        assert_eq!(measure_degree(&VmAir, NUM_PUBLIC), 5);
         assert_eq!(measure_degree(&HashTableAir, NUM_PUBLIC), 3);
         assert_eq!(NUM_COLS, 92);
     }
@@ -1082,7 +1090,7 @@ mod tests {
 
     #[test]
     fn prove_and_verify_program() {
-        let config = StarkConfig { log_blowup: 1, num_queries: 16 };
+        let config = StarkConfig { log_blowup: 2, num_queries: 16 };
         let mut rng = Rng::new(71);
         let (p, inputs, out) = sample_program(&mut rng);
         let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();

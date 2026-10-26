@@ -702,7 +702,7 @@ mod tests {
         segment_log_n: 7,
         max_segments: 4,
         fan_in: 2,
-        outer: StarkConfig { log_blowup: 1, num_queries: 4 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 4 },
     };
 
     struct Setup {

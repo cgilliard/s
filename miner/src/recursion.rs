@@ -25,7 +25,7 @@ use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
 use crate::stark::{
     Air, Builder, DynAir, LookupTerm, Proof, QueryOpening, StarkConfig, TableProof, log_quotient_degree,
-    num_lookup_constraints, shape,
+    lookup_columns, num_lookup_constraints, shape,
 };
 use crate::vm_air::{Addr, Program};
 
@@ -543,6 +543,7 @@ struct TableShape {
     log_q: usize,
     num_constraints: usize,
     num_terms: usize,
+    group: usize,
 }
 
 impl Compiler {
@@ -579,15 +580,17 @@ impl Compiler {
                 );
                 let log_q = log_quotient_degree(air.air_degree());
                 let (num_constraints, num_terms) = shape(*air, public);
+                let group = air.air_lookup_group();
                 let s = TableShape {
                     log_n: tp.log_n,
                     w: air.air_width(),
-                    aux_w: if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 },
+                    aux_w: lookup_columns(num_terms, group) * DEGREE,
                     pre_w,
                     chunks: 1 << log_q,
                     log_q,
                     num_constraints,
                     num_terms,
+                    group,
                 };
                 assert_eq!(tp.trace_at_zeta.len(), s.w);
                 assert_eq!(tp.aux_at_zeta.len(), s.aux_w);
@@ -731,9 +734,10 @@ impl Compiler {
                 let aux_l = reconstruct_ext(c, aux_z);
                 let aux_n = reconstruct_ext(c, aux_zn);
                 let sel = (first, last, transition);
-                all.extend(lookup_constraints_addr(c, gamma, delta, total, &terms, &aux_l, &aux_n, sel));
+                let lk = LookupAddrs { gamma, delta, total, group: s.group };
+                all.extend(lookup_constraints_addr(c, lk, &terms, &aux_l, &aux_n, sel));
             }
-            assert_eq!(all.len(), s.num_constraints + num_lookup_constraints(s.num_terms));
+            assert_eq!(all.len(), s.num_constraints + num_lookup_constraints(s.num_terms, s.group));
             let mut acc = A_ZERO;
             let mut alpha_pow = A_ONE;
             for (k, cst) in all.iter().enumerate() {
@@ -1080,44 +1084,61 @@ fn reconstruct_ext(c: &mut Compiler, opened: &[Addr]) -> Vec<Addr> {
         .collect()
 }
 
-/// Lookup constraints over addresses, mirroring `stark::lookup_constraints`.
-#[allow(clippy::too_many_arguments)]
-fn lookup_constraints_addr(
-    c: &mut Compiler,
+/// Lookup challenges, total and group size of a table, as addresses.
+#[derive(Clone, Copy)]
+struct LookupAddrs {
     gamma: Addr,
     delta: Addr,
     total: Addr,
+    group: usize,
+}
+
+/// Lookup constraints over addresses, mirroring `stark::combine`.
+fn lookup_constraints_addr(
+    c: &mut Compiler,
+    lk: LookupAddrs,
     terms: &[LookupTerm<Expr>],
     aux_l: &[Addr],
     aux_n: &[Addr],
     sel: (Addr, Addr, Addr),
 ) -> Vec<Addr> {
-    let t = terms.len();
-    let mut out = Vec::with_capacity(t + 3);
-    let mut contrib = A_ZERO;
-    for (k, term) in terms.iter().enumerate() {
-        let inv = aux_l[k];
-        let mut denom = gamma;
-        let mut pow = delta;
-        for (i, v) in term.values.iter().enumerate() {
-            denom = c.muladd(v.0, pow, denom);
-            if i + 1 < term.values.len() {
-                pow = c.mul(pow, delta);
-            }
-        }
-        let prod = c.mul(inv, denom);
-        out.push(c.sub(prod, A_ONE));
-        let m_inv = c.mul(term.multiplicity.0, inv);
-        contrib = if term.send { c.add(contrib, m_inv) } else { c.sub(contrib, m_inv) };
+    let groups = terms.len().div_ceil(lk.group);
+    let mut out = Vec::with_capacity(groups + 3);
+    // delta^1 .. delta^max_values, shared by every denominator.
+    let longest = terms.iter().map(|t| t.values.len()).max().unwrap_or(0);
+    let mut delta_pows = Vec::with_capacity(longest);
+    for i in 0..longest {
+        delta_pows.push(if i == 0 { lk.delta } else { c.mul(delta_pows[i - 1], lk.delta) });
     }
-    let s = aux_l[t];
-    let s_next = aux_n[t];
+    let mut contrib = A_ZERO;
+    for (j, members) in terms.chunks(lk.group).enumerate() {
+        let (mut num, mut den) = (A_ZERO, A_ONE);
+        for (k, term) in members.iter().enumerate() {
+            let mut d = lk.gamma;
+            for (v, pow) in term.values.iter().zip(&delta_pows) {
+                d = c.muladd(v.0, *pow, d);
+            }
+            let m = term.multiplicity.0;
+            // num = num * d +- m * den, den = den * d; the first member
+            // starts from num = 0, den = 1.
+            let m_den = if k == 0 { m } else { c.mul(m, den) };
+            let scaled = if k == 0 { A_ZERO } else { c.mul(num, d) };
+            num = if term.send { c.add(scaled, m_den) } else { c.sub(scaled, m_den) };
+            den = if k == 0 { d } else { c.mul(den, d) };
+        }
+        let h = aux_l[j];
+        let hd = c.mul(h, den);
+        out.push(c.sub(hd, num));
+        contrib = c.add(contrib, h);
+    }
+    let s = aux_l[groups];
+    let s_next = aux_n[groups];
     let d = c.sub(s_next, s);
     let d = c.sub(d, contrib);
     out.push(c.mul(sel.2, d));
     out.push(c.mul(sel.0, s));
     let e = c.add(s, contrib);
-    let e = c.sub(e, total);
+    let e = c.sub(e, lk.total);
     out.push(c.mul(sel.1, e));
     out
 }
@@ -1132,7 +1153,7 @@ pub fn dummy_proof(tables: &[(&dyn DynAir, usize)], config: &StarkConfig, num_pu
         .iter()
         .map(|(air, log_n)| {
             let (_, num_terms) = shape(*air, &vec![Fp::ZERO; num_public]);
-            let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
+            let aux_w = lookup_columns(num_terms, air.air_lookup_group()) * DEGREE;
             let chunks = 1usize << log_quotient_degree(air.air_degree());
             (*log_n, air.air_width(), aux_w, air.air_preprocessed_width(), chunks)
         })
@@ -1425,7 +1446,7 @@ mod tests {
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
         let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
         let (vm_trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let outer = StarkConfig { log_blowup: 1, num_queries: 20 };
+        let outer = StarkConfig { log_blowup: 2, num_queries: 20 };
         let pre = c.prog.preprocess(outer.log_blowup);
         let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
         let t = std::time::Instant::now();
