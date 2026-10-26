@@ -9,15 +9,21 @@
 //! f'(x^2) = (f(x) + f(-x)) / 2 + beta * (f(x) - f(-x)) / (2x)
 //! ```
 //!
-//! halving both the domain and the degree bound. After `log_n - log_blowup`
-//! rounds the codeword must be constant; that constant is sent in the clear.
-//! The verifier then checks `num_queries` random positions: for each, it
-//! walks the rounds, verifying Merkle openings and recomputing the fold.
+//! halving both the domain and the degree bound. Rounds fold by four where
+//! they can: two binary folds in one round, the first with `beta` and the
+//! second with `beta^2`, which is the same as
+//! `f'(x^4) = f0(x^4) + beta f1(x^4) + beta^2 f2(x^4) + beta^3 f3(x^4)` for
+//! `f(X) = sum_k X^k f_k(X^4)`. When `log_n - log_blowup` is odd the last
+//! round folds by two. Once the degree bound reaches one the codeword must
+//! be constant; that constant is sent in the clear. The verifier then checks
+//! `num_queries` random positions: for each, it walks the rounds, verifying
+//! Merkle openings and recomputing the fold.
 //!
-//! Leaves store the pair `(f(x), f(-x))`: for a domain of size `m` indexed by
-//! `i`, leaf `i < m/2` holds `(c[i], c[i + m/2])`. The fold of leaf `i` lands
-//! at index `i` of the next codeword, which lives in leaf `i mod m/4` at
-//! position `i / (m/4)`. One opening per round therefore suffices.
+//! In a round of arity `a` on a domain of size `m`, leaf `i < m/a` holds
+//! `c[i + k m/a]` for `k < a`: the values at `x, w x, .., w^(a-1) x` with
+//! `w` a primitive `a`-th root of unity. The fold of leaf `i` lands at index
+//! `i` of the next codeword, which lives in leaf `i mod m/(a a')` at
+//! position `i / (m/(a a'))`. One opening per round therefore suffices.
 //!
 //! Queries are sampled as indices into the full input domain. The verifier
 //! returns, for every query, the input value the prover committed to at that
@@ -41,10 +47,11 @@ pub struct FriConfig {
     pub num_queries: usize,
 }
 
-/// One round of a query: the opened leaf pair and its Merkle path.
+/// One round of a query: the opened leaf (as many values as the round's
+/// arity) and its Merkle path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryStep {
-    pub pair: [Fp4; 2],
+    pub values: Vec<Fp4>,
     pub path: Vec<Digest>,
 }
 
@@ -66,8 +73,10 @@ impl FriProof {
         for q in &self.queries {
             w.u32(q.len() as u32);
             for step in q {
-                w.fp4(&step.pair[0]);
-                w.fp4(&step.pair[1]);
+                w.u32(step.values.len() as u32);
+                for v in &step.values {
+                    w.fp4(v);
+                }
                 w.digest_vec(&step.path);
             }
         }
@@ -82,9 +91,10 @@ impl FriProof {
             let ns = r.len(32)?;
             let mut steps = Vec::with_capacity(ns);
             for _ in 0..ns {
-                let pair = [r.fp4()?, r.fp4()?];
+                let nv = r.len(16)?;
+                let values = (0..nv).map(|_| r.fp4()).collect::<Option<Vec<_>>>()?;
                 let path = r.digest_vec()?;
-                steps.push(QueryStep { pair, path });
+                steps.push(QueryStep { values, path });
             }
             queries.push(steps);
         }
@@ -128,11 +138,9 @@ impl core::fmt::Display for FriError {
 
 impl std::error::Error for FriError {}
 
-pub(crate) fn pair_row(pair: &[Fp4; 2]) -> [Fp; 2 * DEGREE] {
-    let mut row = [Fp::ZERO; 2 * DEGREE];
-    row[..DEGREE].copy_from_slice(&pair[0].0);
-    row[DEGREE..].copy_from_slice(&pair[1].0);
-    row
+/// The scalars of a leaf, as hashed into the Merkle tree.
+pub(crate) fn leaf_row(values: &[Fp4]) -> Vec<Fp> {
+    values.iter().flat_map(|v| v.0).collect()
 }
 
 /// `f'(x^2)` from `a = f(x)`, `b = f(-x)` and `x_inv = 1/x`.
@@ -143,10 +151,38 @@ fn fold(a: Fp4, b: Fp4, x_inv: Fp, beta: Fp4) -> Fp4 {
     even.add(&beta.mul(&odd))
 }
 
+/// Folds one opened leaf: `values[k]` is the codeword at `w^k x` for `w` a
+/// primitive root of unity of order `values.len()` (two or four), with
+/// `x_inv = 1/x` and `w_inv = 1/w`.
+#[inline]
+pub(crate) fn fold_leaf(values: &[Fp4], x_inv: Fp, w_inv: Fp, beta: Fp4) -> Fp4 {
+    match values.len() {
+        2 => fold(values[0], values[1], x_inv, beta),
+        4 => {
+            // Pairs at (x, -x) and (w x, -w x), then the pair (x^2, -x^2).
+            let g0 = fold(values[0], values[2], x_inv, beta);
+            let g1 = fold(values[1], values[3], x_inv.mul(&w_inv), beta);
+            fold(g0, g1, x_inv.square(), beta.mul(&beta))
+        }
+        n => panic!("unsupported fri arity {n}"),
+    }
+}
+
+/// Log2 of the arity of each folding round for a codeword of size
+/// `2^log_n`: fours, then a final two if the round count is odd.
+pub fn round_log_arities(config: &FriConfig, log_n: usize) -> Vec<usize> {
+    assert!(log_n > config.log_blowup, "codeword must be larger than the blowup");
+    let bits = log_n - config.log_blowup;
+    let mut v = vec![2; bits / 2];
+    if bits % 2 == 1 {
+        v.push(1);
+    }
+    v
+}
+
 /// Number of folding rounds for a codeword of size `2^log_n`.
 pub fn num_rounds(config: &FriConfig, log_n: usize) -> usize {
-    assert!(log_n > config.log_blowup, "codeword must be larger than the blowup");
-    log_n - config.log_blowup
+    round_log_arities(config, log_n).len()
 }
 
 /// Proves that `codeword`, the evaluations of `f` on `shift * H`, has
@@ -156,7 +192,8 @@ pub fn num_rounds(config: &FriConfig, log_n: usize) -> usize {
 /// own commitments at the same positions.
 pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codeword: Vec<Fp4>) -> (FriProof, Vec<usize>) {
     let log_n = log2_strict(codeword.len());
-    let rounds = num_rounds(config, log_n);
+    let arities = round_log_arities(config, log_n);
+    let rounds = arities.len();
     assert!(log_n <= 27, "domain too large for query sampling");
 
     let mut trees: Vec<MerkleTree> = Vec::with_capacity(rounds);
@@ -166,32 +203,38 @@ pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codewor
     let mut shift_r = shift;
     let mut omega_inv = root_of_unity(log_n).inverse().unwrap();
 
-    for _ in 0..rounds {
-        let half = cur.len() / 2;
-        let flat: Vec<Fp> = par_map(half, |i| pair_row(&[cur[i], cur[i + half]])).into_iter().flatten().collect();
-        let tree = MerkleTree::from_flat(&flat, 2 * DEGREE);
+    for &la in &arities {
+        let arity = 1usize << la;
+        let leaves = cur.len() >> la;
+        let leaf = |i: usize| -> Vec<Fp4> { (0..arity).map(|k| cur[i + k * leaves]).collect() };
+        let flat: Vec<Fp> = par_map(leaves, |i| leaf_row(&leaf(i))).into_iter().flatten().collect();
+        let tree = MerkleTree::from_flat(&flat, arity * DEGREE);
         challenger.observe_digest(&tree.root());
         let beta = challenger.sample_ext();
 
-        // x_i = shift_r * omega^i, so 1/x_i = shift_r^-1 * omega^-i.
+        // x_i = shift_r * omega^i, so 1/x_i = shift_r^-1 * omega^-i; the
+        // leaf's root of unity is omega^leaves.
+        let w_inv = omega_inv.pow(leaves as u64);
         let shift_inv = shift_r.inverse().unwrap();
-        let omega_inv_pows = {
-            let mut v = Vec::with_capacity(half);
+        let x_invs = {
+            let mut v = Vec::with_capacity(leaves);
             let mut p = shift_inv;
-            for _ in 0..half {
+            for _ in 0..leaves {
                 v.push(p);
                 p = p.mul(&omega_inv);
             }
             v
         };
-        let next: Vec<Fp4> = par_map(half, |i| fold(cur[i], cur[i + half], omega_inv_pows[i], beta));
+        let next: Vec<Fp4> = par_map(leaves, |i| fold_leaf(&leaf(i), x_invs[i], w_inv, beta));
 
         commitments.push(tree.root());
         trees.push(tree);
         codewords.push(cur);
         cur = next;
-        shift_r = shift_r.square();
-        omega_inv = omega_inv.square();
+        for _ in 0..la {
+            shift_r = shift_r.square();
+            omega_inv = omega_inv.square();
+        }
     }
 
     // For an honest prover the final codeword is constant. A dishonest one
@@ -205,10 +248,11 @@ pub fn prove(config: &FriConfig, challenger: &mut Challenger, shift: Fp, codewor
         let mut index = challenger.sample_bits(log_n);
         indices.push(index);
         let mut steps = Vec::with_capacity(rounds);
-        for (tree, cw) in trees.iter().zip(&codewords) {
-            let half = cw.len() / 2;
-            index %= half;
-            steps.push(QueryStep { pair: [cw[index], cw[index + half]], path: tree.open(index) });
+        for ((tree, cw), &la) in trees.iter().zip(&codewords).zip(&arities) {
+            let leaves = cw.len() >> la;
+            index %= leaves;
+            let values = (0..1usize << la).map(|k| cw[index + k * leaves]).collect();
+            steps.push(QueryStep { values, path: tree.open(index) });
         }
         queries.push(steps);
     }
@@ -228,7 +272,8 @@ pub fn verify(
     log_n: usize,
     proof: &FriProof,
 ) -> Result<Vec<(usize, Fp4)>, FriError> {
-    let rounds = num_rounds(config, log_n);
+    let arities = round_log_arities(config, log_n);
+    let rounds = arities.len();
     if proof.commitments.len() != rounds || proof.queries.len() != config.num_queries {
         return Err(FriError::Shape);
     }
@@ -239,16 +284,25 @@ pub fn verify(
     }
     challenger.observe_ext(&proof.final_value);
 
-    // Per-round domain parameters: round r lives on shift^(2^r) * H_{log_n - r}.
+    // Per-round domain parameters: round r lives on shift_r * H with
+    // `log_sizes[r]` points; `w_invs[r]` inverts its leaf root of unity.
     let mut shift_invs = Vec::with_capacity(rounds);
     let mut omega_invs = Vec::with_capacity(rounds);
+    let mut w_invs = Vec::with_capacity(rounds);
+    let mut log_sizes = Vec::with_capacity(rounds);
     let mut s_inv = shift.inverse().expect("non-zero shift");
     let mut w_inv = root_of_unity(log_n).inverse().unwrap();
-    for _ in 0..rounds {
+    let mut log_m = log_n;
+    for &la in &arities {
         shift_invs.push(s_inv);
         omega_invs.push(w_inv);
-        s_inv = s_inv.square();
-        w_inv = w_inv.square();
+        w_invs.push(w_inv.pow(1u64 << (log_m - la)));
+        log_sizes.push(log_m);
+        for _ in 0..la {
+            s_inv = s_inv.square();
+            w_inv = w_inv.square();
+        }
+        log_m -= la;
     }
 
     let mut inputs = Vec::with_capacity(config.num_queries);
@@ -260,24 +314,27 @@ pub fn verify(
         let query_index = index;
         let mut folded: Option<Fp4> = None;
         for (r, step) in steps.iter().enumerate() {
-            let log_half = log_n - 1 - r;
-            let half = 1usize << log_half;
-            let prev_index = index;
-            index %= half;
-            if !merkle_verify(&proof.commitments[r], log_half, index, &pair_row(&step.pair), &step.path) {
+            let la = arities[r];
+            if step.values.len() != 1 << la {
+                return Err(FriError::Shape);
+            }
+            let log_leaves = log_sizes[r] - la;
+            let leaves = 1usize << log_leaves;
+            let pos = index / leaves;
+            index %= leaves;
+            if !merkle_verify(&proof.commitments[r], log_leaves, index, &leaf_row(&step.values), &step.path) {
                 return Err(FriError::InvalidOpening { query: q, round: r });
             }
-            let pos = prev_index / half;
             match folded {
                 Some(f) => {
-                    if step.pair[pos] != f {
+                    if step.values[pos] != f {
                         return Err(FriError::FoldMismatch { query: q, round: r });
                     }
                 }
-                None => inputs.push((query_index, step.pair[pos])),
+                None => inputs.push((query_index, step.values[pos])),
             }
             let x_inv = shift_invs[r].mul(&omega_invs[r].pow(index as u64));
-            folded = Some(fold(step.pair[0], step.pair[1], x_inv, betas[r]));
+            folded = Some(fold_leaf(&step.values, x_inv, w_invs[r], betas[r]));
         }
         if folded != Some(proof.final_value) {
             return Err(FriError::FinalMismatch { query: q });
@@ -319,7 +376,7 @@ mod tests {
             let shift = MULTIPLICATIVE_GENERATOR;
             let cw = low_degree_codeword(&mut rng, log_n, bound, shift);
             let (proof, indices) = prove(&CONFIG, &mut transcript(), shift, cw.clone());
-            assert_eq!(proof.commitments.len(), log_n - CONFIG.log_blowup);
+            assert_eq!(proof.commitments.len(), (log_n - CONFIG.log_blowup).div_ceil(2));
             assert_eq!(proof.queries.len(), CONFIG.num_queries);
             let inputs = verify(&CONFIG, &mut transcript(), shift, log_n, &proof).unwrap();
             assert_eq!(inputs.len(), CONFIG.num_queries);
@@ -368,7 +425,10 @@ mod tests {
         assert!(verify(&CONFIG, &mut Challenger::new(), shift, log_n, &proof).is_err());
         // Wrong shift or size.
         assert!(verify(&CONFIG, &mut transcript(), Fp::new(3), log_n, &proof).is_err());
-        assert_eq!(verify(&CONFIG, &mut transcript(), shift, log_n + 1, &proof).unwrap_err(), FriError::Shape);
+        // One size up has the same round count with arity four (5 and 6
+        // folding bits), so it fails at the openings; two up changes shape.
+        assert!(verify(&CONFIG, &mut transcript(), shift, log_n + 1, &proof).is_err());
+        assert_eq!(verify(&CONFIG, &mut transcript(), shift, log_n + 2, &proof).unwrap_err(), FriError::Shape);
         let fewer = FriConfig { num_queries: 19, ..CONFIG };
         assert_eq!(verify(&fewer, &mut transcript(), shift, log_n, &proof).unwrap_err(), FriError::Shape);
 
@@ -376,7 +436,7 @@ mod tests {
         p.final_value += Fp4::ONE;
         assert!(verify(&CONFIG, &mut transcript(), shift, log_n, &p).is_err());
         let mut p = proof.clone();
-        p.queries[3][1].pair[0] += Fp4::ONE;
+        p.queries[3][1].values[0] += Fp4::ONE;
         assert_eq!(
             verify(&CONFIG, &mut transcript(), shift, log_n, &p).unwrap_err(),
             FriError::InvalidOpening { query: 3, round: 1 }
@@ -402,5 +462,36 @@ mod tests {
         let f = |p: Fp| ev(&e, Fp4::from_base(p.square())) + ev(&o, Fp4::from_base(p.square())) * p;
         let got = fold(f(x), f(-x), x.inverse().unwrap(), beta);
         assert_eq!(got, ev(&e, x2) + beta * ev(&o, x2));
+    }
+
+    #[test]
+    fn fold_by_four_matches_polynomial_split() {
+        let mut rng = Rng::new(35);
+        let parts: Vec<Vec<Fp4>> = (0..4).map(|_| (0..3).map(|_| rng.fp4()).collect()).collect();
+        let x = rng.fp();
+        let beta = rng.fp4();
+        let ev = crate::ntt::eval_poly_ext;
+        // f(X) = sum_k X^k f_k(X^4).
+        let f = |p: Fp| {
+            let p4 = Fp4::from_base(p.square().square());
+            let mut acc = Fp4::ZERO;
+            let mut pk = Fp::ONE;
+            for part in &parts {
+                acc += ev(part, p4) * pk;
+                pk = pk.mul(&p);
+            }
+            acc
+        };
+        let w = root_of_unity(2);
+        let values: Vec<Fp4> = (0..4).map(|k| f(x.mul(&w.pow(k)))).collect();
+        let got = fold_leaf(&values, x.inverse().unwrap(), w.inverse().unwrap(), beta);
+        let x4 = Fp4::from_base(x.square().square());
+        let mut want = Fp4::ZERO;
+        let mut bk = Fp4::ONE;
+        for part in &parts {
+            want += ev(part, x4) * bk;
+            bk *= beta;
+        }
+        assert_eq!(got, want);
     }
 }

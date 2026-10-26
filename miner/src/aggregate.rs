@@ -64,8 +64,12 @@ pub struct AggregatorParams {
 }
 
 impl AggregatorParams {
+    /// Segments at rate 1/8 prove twice as slowly as at 1/4, in parallel,
+    /// but are about a fifth cheaper to verify, which halves the trace of a
+    /// node over them. Nodes stay at rate 1/4: their proving time doubles
+    /// at 1/8 for little gain in the node above.
     pub const MAINNET: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 2, num_queries: 50 },
+        segment: StarkConfig { log_blowup: 3, num_queries: 34 },
         segment_log_n: 15,
         max_segments: 16,
         fan_in: 4,
@@ -738,6 +742,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "plans mainnet trees; run with --release"]
+    fn mainnet_plans() {
+        fn show(s: &Shape) -> String {
+            if s.is_segment() {
+                return "s".into();
+            }
+            let kids: Vec<String> = s.children.iter().map(show).collect();
+            format!("2^{}[{}]", s.log_n, kids.join(" "))
+        }
+        for k in [1, 2, 4, 5, 8, 12, 16] {
+            println!("{k:2} segments: {}", show(&plan(&AggregatorParams::MAINNET, k)));
+        }
+    }
+
+    #[test]
     fn tree_plans() {
         assert_eq!(split(10, 4), vec![3, 3, 2, 2]);
         assert_eq!(split(5, 4), vec![3, 2]);
@@ -750,15 +769,11 @@ mod tests {
     fn aggregator_size() {
         for (name, params) in [
             ("mainnet", AggregatorParams::MAINNET),
-            ("2^13 segments", AggregatorParams { segment_log_n: 13, ..AggregatorParams::MAINNET }),
             (
-                "2^13 segments, rate 1/8, 34 queries",
-                AggregatorParams {
-                    segment: StarkConfig { log_blowup: 3, num_queries: 34 },
-                    segment_log_n: 13,
-                    ..AggregatorParams::MAINNET
-                },
+                "segments at rate 1/4, 50 queries",
+                AggregatorParams { segment: AggregatorParams::MAINNET.outer, ..AggregatorParams::MAINNET },
             ),
+            ("2^13 segments", AggregatorParams { segment_log_n: 13, ..AggregatorParams::MAINNET }),
         ] {
             let dummy = dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC);
             let public = SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap();
@@ -781,27 +796,33 @@ mod tests {
                 seg.proof.to_bytes().len()
             );
         }
-        // A node verifying one node proof of the mainnet root's height.
-        let params = AggregatorParams::MAINNET;
-        let seg = SegmentProof {
-            public: SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap(),
-            proof: dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC),
-        };
-        let zero = Statement::zero();
-        let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero)).prog;
-        let np = NodeProof {
-            record: seg.public,
-            digest: [Fp::ZERO; DIGEST],
-            proof: dummy_proof(&VmAir, &params.outer, leaf.height().trailing_zeros() as usize, VM_PUBLIC),
-        };
-        let c = compile_node(&params, &[Child::Node(&np)], Output::Record);
-        println!(
-            "mainnet: one node child of 2^{} rows = {} instructions, {} inputs, node proof {} bytes",
-            leaf.height().trailing_zeros(),
-            c.prog.instrs.len(),
-            c.inputs.len(),
-            np.proof.to_bytes().len()
-        );
+        // A node verifying one node proof of the mainnet root's height, with
+        // the outer proofs at rate 1/4 and at rate 1/8.
+        for (name, outer) in [
+            ("rate 1/4, 50 queries", AggregatorParams::MAINNET.outer),
+            ("rate 1/8, 34 queries", AggregatorParams::MAINNET.segment),
+        ] {
+            let params = AggregatorParams { outer, ..AggregatorParams::MAINNET };
+            let seg = SegmentProof {
+                public: SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap(),
+                proof: dummy_proof(&BlockAir, &params.segment, params.segment_log_n, SEGMENT_PUBLIC),
+            };
+            let zero = Statement::zero();
+            let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero)).prog;
+            let np = NodeProof {
+                record: seg.public,
+                digest: [Fp::ZERO; DIGEST],
+                proof: dummy_proof(&VmAir, &params.outer, leaf.height().trailing_zeros() as usize, VM_PUBLIC),
+            };
+            let c = compile_node(&params, &[Child::Node(&np)], Output::Record);
+            println!(
+                "mainnet node child, {name}: 2^{} rows = {} instructions, {} inputs, node proof {} bytes",
+                leaf.height().trailing_zeros(),
+                c.prog.instrs.len(),
+                c.inputs.len(),
+                np.proof.to_bytes().len()
+            );
+        }
     }
 
     #[test]
@@ -845,5 +866,38 @@ mod tests {
         let mut poor = s.statement.clone();
         poor.subsidy = 64;
         assert_eq!(v.verify_statement(&poor, &proof), Err(AggregateError::Rejected));
+    }
+
+    #[test]
+    #[ignore = "proves mainnet-sized segments and nodes; run with --release"]
+    fn mainnet_rate_timing() {
+        let s = setup("rates", &[30], 30);
+        let quarter = AggregatorParams::MAINNET.outer;
+        let eighth = AggregatorParams::MAINNET.segment;
+        for (name, segment, outer) in [
+            ("segments 1/4, nodes 1/4", quarter, quarter),
+            ("segments 1/8, nodes 1/4", eighth, quarter),
+            ("segments 1/8, nodes 1/8", eighth, eighth),
+        ] {
+            let params = AggregatorParams { segment, outer, ..AggregatorParams::MAINNET };
+            let t = std::time::Instant::now();
+            let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
+            let seg_time = t.elapsed();
+            let c = compile_node(&params, &[Child::Segment(&seg)], Output::Record);
+            let t = std::time::Instant::now();
+            let trace = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+            let pre = c.prog.preprocess(params.outer.log_blowup);
+            let out = record_digest(&combine_records(&[seg.public]));
+            let public = VmAir::public_values(&pre.root(), &out);
+            let proof = stark::prove_with(&params.outer, &VmAir, &trace, Some(&pre), &public, &mut outer_transcript());
+            let node_time = t.elapsed();
+            println!(
+                "{name}: segment 2^{} in {seg_time:?} ({} bytes); node over it 2^{} in {node_time:?} ({} bytes)",
+                params.segment_log_n,
+                seg.proof.to_bytes().len(),
+                c.prog.height().trailing_zeros(),
+                proof.to_bytes().len()
+            );
+        }
     }
 }

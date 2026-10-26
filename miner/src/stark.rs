@@ -239,7 +239,7 @@ pub struct StarkConfig {
 }
 
 impl StarkConfig {
-    fn fri(&self) -> FriConfig {
+    pub(crate) fn fri(&self) -> FriConfig {
         FriConfig { log_blowup: self.log_blowup, num_queries: self.num_queries }
     }
 }

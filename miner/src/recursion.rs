@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use crate::fri::{FriProof, QueryStep, pair_row};
+use crate::fri::{FriProof, QueryStep, leaf_row, round_log_arities};
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
 use crate::stark::{
@@ -414,6 +414,11 @@ impl Compiler {
     /// Permutes the transcript with `words` (at most eight) added to the rate.
     fn transcript_permute(&mut self, t: &mut Transcript, words: &[Addr]) {
         let block = self.block_of(words);
+        self.transcript_absorb(t, block);
+    }
+
+    /// Absorbs an existing block of eight words into the transcript.
+    fn transcript_absorb(&mut self, t: &mut Transcript, block: Addr) {
         if t.started {
             assert_eq!(self.sponge, t.state, "transcript sponge was clobbered by other hashing");
             self.absorb(block);
@@ -445,8 +450,15 @@ impl Compiler {
     }
 
     fn observe_block(&mut self, t: &mut Transcript, base: Addr, n: usize) {
-        for i in 0..n {
-            self.observe(t, base + i as Addr);
+        let mut i = 0;
+        // Whole blocks absorb in place when nothing is pending.
+        while t.pending.is_empty() && n - i >= RATE {
+            t.squeezed = None;
+            self.transcript_absorb(t, base + i as Addr);
+            i += RATE;
+        }
+        for k in i..n {
+            self.observe(t, base + k as Addr);
         }
     }
 
@@ -486,11 +498,17 @@ impl Compiler {
         self.component(bits + (i / 4) as Addr, (i % 4) as u8)
     }
 
-    /// `base * prod_{i < n} (1 + bit_i (c_i - 1))` for constants `c_i`.
-    fn power_from_bits(&mut self, base: Fp, bits: Addr, n: usize, cs: &[Fp]) -> Addr {
-        let mut acc = self.scalar(base);
-        for (i, ci) in cs.iter().enumerate().take(n) {
-            let b = self.bit(bits, i);
+    /// `base * prod_i (1 + bit_(start + i) (c_i - 1))` for constants `c_i`.
+    fn power_from_bits(&mut self, base: Fp, bits: Addr, start: usize, cs: &[Fp]) -> Addr {
+        let base = self.scalar(base);
+        self.power_from_bits_at(base, bits, start, cs)
+    }
+
+    /// As [`Self::power_from_bits`] with `base` a word in memory.
+    fn power_from_bits_at(&mut self, base: Addr, bits: Addr, start: usize, cs: &[Fp]) -> Addr {
+        let mut acc = base;
+        for (i, ci) in cs.iter().enumerate() {
+            let b = self.bit(bits, start + i);
             let k = self.scalar(*ci - Fp::ONE);
             let t = self.muladd(b, k, A_ONE);
             acc = self.mul(acc, t);
@@ -581,18 +599,30 @@ impl Compiler {
         let zeta = c.sample_word(&mut t);
 
         // ---- openings ----
-        let trace_z = c.word_inputs(&proof.trace_at_zeta);
-        let trace_zn = c.word_inputs(&proof.trace_at_zeta_next);
-        let aux_z = c.word_inputs(&proof.aux_at_zeta);
-        let aux_zn = c.word_inputs(&proof.aux_at_zeta_next);
-        let pre_z = c.word_inputs(&proof.pre_at_zeta);
-        let pre_zn = c.word_inputs(&proof.pre_at_zeta_next);
-        let quot_zq = c.word_inputs(&proof.quotient_at_zeta_q);
-        for &wd in
-            trace_z.iter().chain(&trace_zn).chain(&aux_z).chain(&aux_zn).chain(&pre_z).chain(&pre_zn).chain(&quot_zq)
-        {
-            c.observe_word(&mut t, wd);
-        }
+        // Loaded as scalars eight per row, observed in place, and packed
+        // into words.
+        let groups = [
+            &proof.trace_at_zeta,
+            &proof.trace_at_zeta_next,
+            &proof.aux_at_zeta,
+            &proof.aux_at_zeta_next,
+            &proof.pre_at_zeta,
+            &proof.pre_at_zeta_next,
+            &proof.quotient_at_zeta_q,
+        ];
+        let scalars: Vec<Fp> = groups.iter().flat_map(|g| g.iter().flat_map(|v| v.0)).collect();
+        let base = c.scalar_inputs(&scalars);
+        c.observe_block(&mut t, base, scalars.len());
+        let mut next = 0usize;
+        let [trace_z, trace_zn, aux_z, aux_zn, pre_z, pre_zn, quot_zq] = groups.map(|g| {
+            (0..g.len())
+                .map(|_| {
+                    let at = base + (next * DEGREE) as Addr;
+                    next += 1;
+                    c.word_from_scalars(core::array::from_fn(|k| at + k as Addr))
+                })
+                .collect::<Vec<Addr>>()
+        });
         let beta = c.sample_word(&mut t);
 
         // ---- constraint identity at zeta ----
@@ -665,7 +695,8 @@ impl Compiler {
 
         // ---- FRI commitments ----
         let fri = &proof.fri;
-        let rounds = log_big_n - log_blowup;
+        let arities = round_log_arities(&config.fri(), log_big_n);
+        let rounds = arities.len();
         assert_eq!(fri.commitments.len(), rounds);
         let mut fri_roots = Vec::with_capacity(rounds);
         let mut fri_betas = Vec::with_capacity(rounds);
@@ -684,19 +715,23 @@ impl Compiler {
         let query_bits: Vec<Addr> = (0..config.num_queries).map(|_| c.sample_bits(&mut t)).collect();
 
         // ---- per-proof constants ----
+        // `omega_pows[k] = omega^(2^k)` and likewise for the inverse.
         let omega_big = root_of_unity(log_big_n);
-        let omega_inv_pows: Vec<Fp> = {
+        let squarings = |mut p: Fp| -> Vec<Fp> {
             let mut v = Vec::with_capacity(log_big_n);
-            let mut p = omega_big.inverse().unwrap();
             for _ in 0..log_big_n {
                 v.push(p);
                 p = p.square();
             }
             v
         };
+        let omega_pows = squarings(omega_big);
+        let omega_inv_pows = squarings(omega_big.inverse().unwrap());
         let shift_inv = shift.inverse().unwrap();
         let inv2 = c.scalar(inv_two());
-        let minus_two = c.scalar(-Fp::new(2));
+        // Inverse of the primitive fourth root of unity, for four-way folds.
+        let iota_inv = c.scalar(omega_inv_pows[log_big_n - 2]);
+        let fri_betas_sq: Vec<Addr> = fri_betas.iter().map(|&b| c.mul(b, b)).collect();
         // Powers of beta in one block of consecutive words, so dot products
         // can read them eight at a time (see `stark::Deep` for the layout).
         let (off_t, off_a, off_p, off_q) = (0, 2 * w, 2 * w + 2 * aux_w, 2 * w + 2 * aux_w + 2 * pre_w);
@@ -722,47 +757,76 @@ impl Compiler {
         for (q, steps) in fri.queries.iter().enumerate() {
             assert_eq!(steps.len(), rounds);
             let bits = query_bits[q];
-            // Round 0 folds at x_0 = shift * omega^(i mod half); the queried
-            // point is x = (-1)^top x_0. Later rounds square, with the sign
-            // given by the position-in-pair bit.
-            let mut x_inv = c.power_from_bits(shift_inv, bits, log_big_n - 1, &omega_inv_pows);
-            let top = c.bit(bits, log_big_n - 1);
-            let sign0 = c.muladd(top, minus_two, A_ONE);
+            // In each round the queried point is the leaf's base point
+            // `x_r` times `w^pos`, with `pos` the index bits just above the
+            // leaf index. Round 0 gets `1/x_0` from the low index bits;
+            // later rounds raise the previous base point to the previous
+            // arity, which gives the queried point, and divide out `w^pos`.
+            let log_leaves0 = log_big_n - arities[0];
+            let mut x_inv = c.power_from_bits(shift_inv, bits, 0, &omega_inv_pows[..log_leaves0]);
             let x_abs = c.inverse(x_inv);
-            let x = c.mul(x_abs, sign0);
+            let x = c.power_from_bits_at(x_abs, bits, log_leaves0, &omega_pows[log_leaves0..]);
             let mut folded: Option<Addr> = None;
             let mut claimed = A_ZERO;
+            let mut log_m = log_big_n;
             for (r, step) in steps.iter().enumerate() {
-                let log_half = log_big_n - 1 - r;
-                let pos = c.bit(bits, log_half);
+                let la = arities[r];
+                let log_leaves = log_m - la;
                 if r > 0 {
-                    let sq = c.mul(x_inv, x_inv);
-                    let sign = c.muladd(pos, minus_two, A_ONE);
-                    x_inv = c.mul(sq, sign);
+                    // Queried point inverse times `w^pos`, where `w` has
+                    // order `2^la` and its `2^j`-th power is
+                    // `omega^(2^(log_big_n - la + j))`.
+                    x_inv = c.power_from_bits_at(x_inv, bits, log_leaves, &omega_pows[log_big_n - la..]);
                 }
-                // Merkle opening of the pair, loaded as its eight scalars.
-                let row = c.scalar_inputs(&pair_row(&step.pair));
-                let pair = [
-                    c.word_from_scalars(core::array::from_fn(|k| row + k as Addr)),
-                    c.word_from_scalars(core::array::from_fn(|k| row + (DEGREE + k) as Addr)),
-                ];
+                // Merkle opening of the leaf, loaded as its scalars.
+                assert_eq!(step.values.len(), 1 << la);
+                let row = c.scalar_inputs(&leaf_row(&step.values));
+                let v: Vec<Addr> = (0..1usize << la)
+                    .map(|j| c.word_from_scalars(core::array::from_fn(|k| row + (j * DEGREE + k) as Addr)))
+                    .collect();
                 let path: Vec<Addr> = step.path.iter().map(|d| c.scalar_inputs(d)).collect();
-                assert_eq!(path.len(), log_half);
-                let root = c.merkle_root(row, RATE, &path, bits);
+                assert_eq!(path.len(), log_leaves);
+                let root = c.merkle_root(row, DEGREE << la, &path, bits);
                 c.assert_digest(root, fri_roots[r]);
-                let diff = c.sub(pair[1], pair[0]);
-                let at_pos = c.muladd(pos, diff, pair[0]);
+                // The value at the queried position.
+                let b0 = c.bit(bits, log_leaves);
+                let pick = |c: &mut Compiler, lo: Addr, hi: Addr, b: Addr| {
+                    let diff = c.sub(hi, lo);
+                    c.muladd(b, diff, lo)
+                };
+                let at_pos = if la == 1 {
+                    pick(c, v[0], v[1], b0)
+                } else {
+                    let b1 = c.bit(bits, log_leaves + 1);
+                    let s0 = pick(c, v[0], v[1], b0);
+                    let s1 = pick(c, v[2], v[3], b0);
+                    pick(c, s0, s1, b1)
+                };
                 match folded {
                     Some(f) => c.assert_eq(at_pos, f),
                     None => claimed = at_pos,
                 }
-                // Fold.
-                let sum = c.add(pair[0], pair[1]);
-                let even = c.mul(sum, inv2);
-                let dsub = c.sub(pair[0], pair[1]);
-                let half_d = c.mul(dsub, inv2);
-                let odd = c.mul(half_d, x_inv);
-                folded = Some(c.muladd(fri_betas[r], odd, even));
+                // Fold, and the next round's queried point inverse.
+                let fold2 = |c: &mut Compiler, a: Addr, b: Addr, xi: Addr, beta: Addr| {
+                    let sum = c.add(a, b);
+                    let even = c.mul(sum, inv2);
+                    let dsub = c.sub(a, b);
+                    let half_d = c.mul(dsub, inv2);
+                    let odd = c.mul(half_d, xi);
+                    c.muladd(beta, odd, even)
+                };
+                if la == 1 {
+                    folded = Some(fold2(c, v[0], v[1], x_inv, fri_betas[r]));
+                    x_inv = c.mul(x_inv, x_inv);
+                } else {
+                    let g0 = fold2(c, v[0], v[2], x_inv, fri_betas[r]);
+                    let xi1 = c.mul(x_inv, iota_inv);
+                    let g1 = fold2(c, v[1], v[3], xi1, fri_betas[r]);
+                    let x_sq = c.mul(x_inv, x_inv);
+                    folded = Some(fold2(c, g0, g1, x_sq, fri_betas_sq[r]));
+                    x_inv = c.mul(x_sq, x_sq);
+                }
+                log_m = log_leaves;
             }
             c.assert_eq(folded.unwrap(), final_value);
 
@@ -942,11 +1006,17 @@ pub fn dummy_proof<A: Air>(air: &A, config: &StarkConfig, log_n: usize, num_publ
     let aux_w = if num_terms > 0 { (num_terms + 1) * DEGREE } else { 0 };
     let num_chunks = 1usize << log_quotient_degree(air.max_constraint_degree());
     let log_big_n = log_n + config.log_blowup;
-    let rounds = log_big_n - config.log_blowup;
+    let arities = round_log_arities(&config.fri(), log_big_n);
+    let rounds = arities.len();
     let z = [Fp::ZERO; DIGEST];
-    let queries = (0..config.num_queries)
-        .map(|_| (0..rounds).map(|r| QueryStep { pair: [Fp4::ZERO; 2], path: vec![z; log_big_n - 1 - r] }).collect())
+    let steps: Vec<QueryStep> = arities
+        .iter()
+        .scan(log_big_n, |log_m, &la| {
+            *log_m -= la;
+            Some(QueryStep { values: vec![Fp4::ZERO; 1 << la], path: vec![z; *log_m] })
+        })
         .collect();
+    let queries = (0..config.num_queries).map(|_| steps.clone()).collect();
     let openings = (0..config.num_queries)
         .map(|_| QueryOpening {
             trace_row: vec![Fp::ZERO; w],
