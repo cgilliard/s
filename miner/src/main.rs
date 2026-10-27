@@ -287,7 +287,7 @@ fn mine(args: &Args) -> AnyResult<()> {
             let new_state_root = utxo.root(&wtxn)?;
             wtxn.abort();
             let inputs: Vec<u64> = segments.iter().flat_map(|s| s.positions()).collect();
-            let outputs: Vec<_> = segments.iter().flat_map(|s| s.outputs()).collect();
+            let outputs: Vec<_> = segments.iter().flat_map(|s| s.commitments()).collect();
             let body = Body { inputs: inputs.clone(), outputs: outputs.clone(), proof: vec![] };
             let statement = Statement::from_block(&BlockStatement {
                 height,

@@ -25,8 +25,9 @@
 //! Genesis is installed with [`Chain::init_genesis`] and is not subject to
 //! proof-of-work or timestamp checks; its id anchors everything after it.
 //!
-//! What a node cannot check here is balance: input amounts are not on chain.
-//! That, the signatures, and the commitment preimages are the proof's job.
+//! What a node cannot check here is balance: no amount is on chain, only
+//! commitments. That, the signatures and the commitment preimages are the
+//! proof's job.
 
 use std::path::Path;
 
@@ -532,7 +533,7 @@ mod tests {
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
             // Four outputs and a short proof.
-            max_block_size: HEADER_SIZE + 12 + 4 * crate::transaction::OUTPUT_SIZE + 39,
+            max_block_size: HEADER_SIZE + 12 + 4 * crate::block::COMMITMENT_SIZE + 31,
             max_future_drift: 7200,
             median_time_window: 11,
             initial_subsidy: 50,
@@ -567,7 +568,7 @@ mod tests {
     }
 
     fn genesis_block(outputs: Vec<Output>) -> Block {
-        let body = Body { inputs: vec![], outputs, proof: vec![] };
+        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.commitment).collect(), proof: vec![] };
         // State root: compute via a throwaway chain.
         let dir = TempDir::new("genesis-scratch");
         let scratch = Chain::open(&dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
@@ -635,7 +636,7 @@ mod tests {
 
         // Block 1 spends position 0 and creates two outputs (3 and 4 would be
         // positions 2 and 3).
-        let body1 = Body { inputs: vec![0], outputs: vec![Output::new(&b, 60), Output::new(&a, 40)], proof: vec![9] };
+        let body1 = Body { inputs: vec![0], outputs: vec![Output::new(&b, 60).commitment, Output::new(&a, 40).commitment], proof: vec![9] };
         let block1 = mine(&f, body1, GENESIS_TIME + 600);
         f.chain.apply_block(&block1, GENESIS_TIME + 700).unwrap();
         assert_eq!(f.chain.tip().unwrap().unwrap().height, 1);
@@ -648,7 +649,7 @@ mod tests {
         }
 
         // Block 2 spends positions 1 and 2, with a reward-only style output.
-        let body2 = Body { inputs: vec![1, 2], outputs: vec![Output::new(&b, 200)], proof: vec![] };
+        let body2 = Body { inputs: vec![1, 2], outputs: vec![Output::new(&b, 200).commitment], proof: vec![] };
         let block2 = mine(&f, body2, GENESIS_TIME + 1200);
         f.chain.apply_block(&block2, GENESIS_TIME + 1300).unwrap();
         assert_eq!(f.chain.tip().unwrap().unwrap().height, 2);
@@ -686,7 +687,7 @@ mod tests {
         let f = open("invalid");
         let a = pk(3);
         f.chain.init_genesis(&genesis_block(vec![Output::new(&a, 1)])).unwrap();
-        let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 7)], proof: vec![] };
+        let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 7).commitment], proof: vec![] };
         let good = mine(&f, body.clone(), GENESIS_TIME + 600);
         let now = GENESIS_TIME + 700;
 
@@ -716,13 +717,13 @@ mod tests {
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::BadBodyCommitment)));
         // Wrong state root.
         let mut wrong = good.body.clone();
-        wrong.outputs.push(Output::new(&a, 8));
+        wrong.outputs.push(Output::new(&a, 8).commitment);
         let b = mine_with_root(&f, wrong, GENESIS_TIME + 600, good.header.state_root);
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::StateRootMismatch { .. })));
         // Too large.
-        let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1); 5], proof: vec![] };
+        let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1).commitment; 5], proof: vec![] };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(384))));
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(344))));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();
@@ -740,7 +741,7 @@ mod tests {
         let times = [600u64, 30, 2000, 10, 1500, 600, 5, 900, 700, 600, 600, 300];
         for (i, dt) in times.iter().enumerate() {
             t += dt;
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, i as u64 + 1)], proof: vec![] };
+            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, i as u64 + 1).commitment], proof: vec![] };
             let block = mine(&f, body, t);
             f.chain.apply_block(&block, t + 10).unwrap();
         }
@@ -792,7 +793,7 @@ mod tests {
         let tip = chain.tip().unwrap().unwrap();
         let target = chain.expected_target(&tip).unwrap();
         let make = |proof: Vec<u8>| {
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 3)], proof };
+            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 3).commitment], proof };
             let mut header = chain.template(&body, GENESIS_TIME + 600).unwrap();
             let (nonce, out) =
                 pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
@@ -821,7 +822,7 @@ mod tests {
             let f = Fixture { _dir: TempDir(PathBuf::new()), chain, dataset };
             let block = mine(
                 &f,
-                Body { inputs: vec![0], outputs: vec![Output::new(&a, 2)], proof: vec![] },
+                Body { inputs: vec![0], outputs: vec![Output::new(&a, 2).commitment], proof: vec![] },
                 GENESIS_TIME + 600,
             );
             f.chain.apply_block(&block, GENESIS_TIME + 700).unwrap();

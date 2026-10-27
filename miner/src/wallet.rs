@@ -157,14 +157,18 @@ impl Wallet {
             .collect();
         let built: Vec<(Transaction, Vec<Owned>)> = par_map_min(plans.len(), 1, |i| {
             let (coin, outs) = &plans[i];
-            let owned: Vec<Owned> = outs
+            let outputs: Vec<Output> = outs
                 .iter()
                 .map(|&(key_index, amount)| {
                     let pk = self.key(key_index).public_key();
-                    Owned { key_index, amount, commitment: commitment(&pk, amount) }
+                    Output::new(&pk, amount)
                 })
                 .collect();
-            let outputs = owned.iter().map(|o| Output { commitment: o.commitment, amount: o.amount }).collect();
+            let owned: Vec<Owned> = outputs
+                .iter()
+                .zip(outs)
+                .map(|(o, &(key_index, amount))| Owned { key_index, amount, commitment: o.commitment })
+                .collect();
             let mut key = self.key(coin.key_index);
             let pk: PublicKey = key.public_key();
             debug_assert_eq!(commitment(&pk, coin.amount), coin.commitment);
@@ -206,7 +210,7 @@ mod tests {
         let env = open_env(&dir.join("db"), 16 << 20).unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
-        utxo.add(&mut wtxn, &paid).unwrap();
+        utxo.add(&mut wtxn, &paid.commitment).unwrap();
         let coins = w.spendable(&utxo, &wtxn).unwrap();
         assert_eq!(coins.len(), 1);
         assert_eq!((coins[0].amount, coins[0].commitment), (10, paid.commitment));

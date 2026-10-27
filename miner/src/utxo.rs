@@ -22,7 +22,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::poseidon2::{DIGEST, digest_to_bytes};
 use crate::state_tree::{self, CAPACITY, Digest, Proof, StateTree};
-use crate::transaction::{Commitment, Output};
+use crate::transaction::Commitment;
 
 const COMMITMENT_BYTES: usize = DIGEST * 4;
 const INDEX_KEY_LEN: usize = COMMITMENT_BYTES + 8;
@@ -115,14 +115,15 @@ impl UtxoSet {
         Ok(self.meta.get(rtxn, META_NEXT_POSITION)?.unwrap_or(0))
     }
 
-    /// Adds `output` at the next position and returns that position.
-    pub fn add(&self, wtxn: &mut RwTxn, output: &Output) -> Result<u64> {
+    /// Adds an output's commitment at the next position and returns that
+    /// position.
+    pub fn add(&self, wtxn: &mut RwTxn, commitment: &Commitment) -> Result<u64> {
         let position = self.next_position(wtxn)?;
         if position >= CAPACITY {
             return Err(Error::Full);
         }
-        self.tree.update(wtxn, position, &output.commitment)?;
-        self.index.put(wtxn, &index_key(&output.commitment, position), &())?;
+        self.tree.update(wtxn, position, commitment)?;
+        self.index.put(wtxn, &index_key(commitment, position), &())?;
         self.meta.put(wtxn, META_NEXT_POSITION, &(position + 1))?;
         Ok(position)
     }
@@ -193,7 +194,7 @@ impl UtxoSet {
 mod tests {
     use super::*;
     use crate::state_tree::{EMPTY, empty_root, open_env};
-    use crate::transaction::Key;
+    use crate::transaction::{Key, Output};
     use crate::xmss::PublicKey;
     use std::path::PathBuf;
 
@@ -237,7 +238,7 @@ mod tests {
         assert_eq!(set.next_position(&wtxn).unwrap(), 0);
         assert_eq!(set.root(&wtxn).unwrap(), empty_root());
         for (i, o) in outs.iter().enumerate() {
-            assert_eq!(set.add(&mut wtxn, o).unwrap(), i as u64);
+            assert_eq!(set.add(&mut wtxn, &o.commitment).unwrap(), i as u64);
         }
         wtxn.commit().unwrap();
 
@@ -275,9 +276,9 @@ mod tests {
         let dup = Output::new(&a, 10);
         let other = Output::new(&a, 11);
         let mut wtxn = env.write_txn().unwrap();
-        set.add(&mut wtxn, &dup).unwrap(); // 0
-        set.add(&mut wtxn, &other).unwrap(); // 1
-        set.add(&mut wtxn, &dup).unwrap(); // 2
+        set.add(&mut wtxn, &dup.commitment).unwrap(); // 0
+        set.add(&mut wtxn, &other.commitment).unwrap(); // 1
+        set.add(&mut wtxn, &dup.commitment).unwrap(); // 2
         let root_three = set.root(&wtxn).unwrap();
         assert_eq!(set.positions(&wtxn, &dup.commitment).unwrap(), vec![0, 2]);
 
@@ -313,14 +314,14 @@ mod tests {
             let env = open_env(&dir.0, 64 << 20).unwrap();
             let mut wtxn = env.write_txn().unwrap();
             let set = UtxoSet::open(&env, &mut wtxn, "utxo").unwrap();
-            set.add(&mut wtxn, &o).unwrap();
-            set.add(&mut wtxn, &o).unwrap();
+            set.add(&mut wtxn, &o.commitment).unwrap();
+            set.add(&mut wtxn, &o.commitment).unwrap();
             root = set.root(&wtxn).unwrap();
             wtxn.commit().unwrap();
 
             let mut wtxn = env.write_txn().unwrap();
             set.spend(&mut wtxn, &o.commitment).unwrap();
-            set.add(&mut wtxn, &o).unwrap();
+            set.add(&mut wtxn, &o.commitment).unwrap();
             wtxn.abort();
         }
         let env = open_env(&dir.0, 64 << 20).unwrap();

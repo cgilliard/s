@@ -101,7 +101,7 @@ pub fn decode(bytes: &[u8]) -> Option<Vec<SegmentProof>> {
 pub fn body_from_segments(segments: &[SegmentWitness], proof: Vec<u8>) -> Body {
     Body {
         inputs: segments.iter().flat_map(|s| s.positions()).collect(),
-        outputs: segments.iter().flat_map(|s| s.outputs()).collect(),
+        outputs: segments.iter().flat_map(|s| s.commitments()).collect(),
         proof,
     }
 }
@@ -283,9 +283,9 @@ mod tests {
         let genesis_body = Body {
             inputs: vec![],
             outputs: vec![
-                Output::new(&a.public_key(), 100),
-                Output::new(&bk.public_key(), 40),
-                Output::new(&d.public_key(), 7),
+                Output::new(&a.public_key(), 100).commitment,
+                Output::new(&bk.public_key(), 40).commitment,
+                Output::new(&d.public_key(), 7).commitment,
             ],
             proof: vec![],
         };

@@ -1047,7 +1047,7 @@ mod tests {
         let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows()).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
-        let body = Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.outputs()).collect(), proof: vec![] };
+        let body = Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,

@@ -2,11 +2,15 @@
 //!
 //! # Model
 //!
-//! An output is a commitment `H(H(pubkey) || amount)` together with its
-//! cleartext `amount`, so a validator can check balances without knowing the
-//! key. To spend an output, an input reveals the `pubkey` and `amount` (from
-//! which the validator recomputes the commitment and looks the output up) and
-//! carries an XMSS signature, made with that key, over the transaction body.
+//! An output pays `amount` to the key with hash `H(pubkey)`; only its
+//! commitment `H(H(pubkey) || amount)` goes on chain. Every output uses a
+//! fresh key, so the key hash is a secret of the payer and payee and the
+//! commitment hides the amount from everyone else. To spend an output, an
+//! input reveals the `pubkey` and `amount` (from which the prover recomputes
+//! the commitment and finds the output) and carries an XMSS signature, made
+//! with that key, over the transaction body. Transactions themselves travel
+//! only to whoever proves the block; the block proof attests to them and
+//! reveals nothing about them.
 //!
 //! The body is the canonical encoding of all inputs (key and amount) and all
 //! outputs (commitment and amount), with signatures excluded, laid out in
@@ -30,7 +34,7 @@
 //! ```text
 //! transaction := u32 n_in, n_in * input, u32 n_out, n_out * output
 //! input       := pubkey (48) | amount u64 (8) | signature (2312)
-//! output      := commitment (32) | amount u64 (8)
+//! output      := key hash (32) | amount u64 (8)
 //! ```
 //!
 //! Hashing works on field elements rather than bytes: a 64-bit amount is
@@ -114,8 +118,13 @@ pub fn pubkey_hash(pk: &PublicKey) -> Digest {
 
 /// `H(H(pubkey) || amount)`, the commitment stored in an output.
 pub fn commitment(pk: &PublicKey, amount: u64) -> Commitment {
+    key_commitment(&pubkey_hash(pk), amount)
+}
+
+/// `H(key_hash || amount)`: [`commitment`] from the key's hash.
+pub fn key_commitment(key_hash: &Digest, amount: u64) -> Commitment {
     let mut input = [Fp::ZERO; DIGEST + AMOUNT_LIMBS];
-    input[..DIGEST].copy_from_slice(&pubkey_hash(pk));
+    input[..DIGEST].copy_from_slice(key_hash);
     input[DIGEST..].copy_from_slice(&amount_fps(amount));
     hash_domain(DOM_COMMITMENT, &input)
 }
@@ -143,11 +152,14 @@ pub struct Input {
     pub signature: Sig,
 }
 
-/// A newly created output.
+/// A newly created output: the recipient's key hash and the amount, which
+/// travel with the transaction, and the commitment derived from them, which
+/// is all that goes on chain.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Output {
-    pub commitment: Commitment,
+    pub key_hash: Digest,
     pub amount: u64,
+    pub commitment: Commitment,
 }
 
 /// A transaction with signed inputs.
@@ -168,12 +180,18 @@ pub struct UnsignedTransaction {
 impl Output {
     /// Creates an output paying `amount` to `pk`.
     pub fn new(pk: &PublicKey, amount: u64) -> Output {
-        Output { commitment: commitment(pk, amount), amount }
+        Output::to_key_hash(&pubkey_hash(pk), amount)
     }
 
+    /// Creates an output paying `amount` to the key with hash `key_hash`.
+    pub fn to_key_hash(key_hash: &Digest, amount: u64) -> Output {
+        Output { key_hash: *key_hash, amount, commitment: key_commitment(key_hash, amount) }
+    }
+
+    /// Key hash then amount; the commitment is recomputed on decoding.
     pub fn to_bytes(&self) -> [u8; OUTPUT_SIZE] {
         let mut out = [0u8; OUTPUT_SIZE];
-        out[..DIGEST_BYTES].copy_from_slice(&digest_to_bytes(&self.commitment));
+        out[..DIGEST_BYTES].copy_from_slice(&digest_to_bytes(&self.key_hash));
         out[DIGEST_BYTES..].copy_from_slice(&self.amount.to_le_bytes());
         out
     }
@@ -182,9 +200,9 @@ impl Output {
         if bytes.len() != OUTPUT_SIZE {
             return None;
         }
-        let commitment = digest_from_bytes(&bytes[..DIGEST_BYTES])?;
+        let key_hash = digest_from_bytes(&bytes[..DIGEST_BYTES])?;
         let (amount, _) = read_u64(&bytes[DIGEST_BYTES..])?;
-        Some(Output { commitment, amount })
+        Some(Output::to_key_hash(&key_hash, amount))
     }
 }
 

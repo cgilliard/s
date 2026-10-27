@@ -4,14 +4,14 @@
 //!
 //! # Statement
 //!
-//! Public values (92 elements):
+//! Public values (150 elements):
 //!
 //! ```text
 //! root_in[8] root_out[8]            UTXO root before and after
 //! isp_in[16] isp_out[16]            inputs sponge state before and after
 //! osp_in[16] osp_out[16]            outputs sponge state before and after
 //! pos_in(2) pos_out(2)              next output position before and after
-//! sum_in[4] sum_out[4]              16-bit limb sums of input and output amounts
+//! sum_in[6] sum_out[6]              16-bit limb sums of input and output amounts
 //! carry_in[27] carry_out[27]        transaction open across the boundary:
 //!                                   open, message[8], body sponge[16],
 //!                                   inputs left, outputs left (all zero
@@ -37,17 +37,19 @@
 //! the revealed key over the body hash of its transaction, derives the
 //! commitment `H(H(key) || amount)`, proves that commitment sits at the
 //! input's position in the current tree, and clears the leaf. For every
-//! output it appends the commitment at the next position. Positions are
-//! absorbed into the inputs sponge and outputs into the outputs sponge. Per
-//! transaction, the body sponge is rebuilt from the same registers the
-//! signatures and commitments use and must equal the signed message.
+//! output it derives the commitment `H(key_hash || amount)` from a witness
+//! key hash and appends it at the next position. Positions are absorbed
+//! into the inputs sponge and output commitments (never amounts) into the
+//! outputs sponge. Per transaction, the body sponge is rebuilt from the
+//! same registers the signatures and commitments use and must equal the
+//! signed message.
 //!
 //! # Schedule
 //!
 //! ```text
 //! tx_start | resume                         body sponge header; counters n_in, n_out
 //!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ilist old/new x 40 body_in0 body_in1
-//!   per output: olist0 olist1 body_out0 body_out1 old/new x 40
+//!   per output: ocm0 ocm1 olist body_out0 body_out1 old/new x 40
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
 //! ```
@@ -110,13 +112,14 @@ pub const T_OLD: usize = HM_COLS + 14;
 pub const T_NEW: usize = HM_COLS + 15;
 pub const T_BODY_IN0: usize = HM_COLS + 16;
 pub const T_BODY_IN1: usize = HM_COLS + 17;
-pub const T_OLIST0: usize = HM_COLS + 18;
-pub const T_OLIST1: usize = HM_COLS + 19;
-pub const T_BODY_OUT0: usize = HM_COLS + 20;
-pub const T_BODY_OUT1: usize = HM_COLS + 21;
-pub const T_DONE: usize = HM_COLS + 22;
-pub const T_RESUME: usize = HM_COLS + 23;
-const NUM_TYPES: usize = 24;
+pub const T_OCM0: usize = HM_COLS + 18;
+pub const T_OCM1: usize = HM_COLS + 19;
+pub const T_OLIST: usize = HM_COLS + 20;
+pub const T_BODY_OUT0: usize = HM_COLS + 21;
+pub const T_BODY_OUT1: usize = HM_COLS + 22;
+pub const T_DONE: usize = HM_COLS + 23;
+pub const T_RESUME: usize = HM_COLS + 24;
+const NUM_TYPES: usize = 25;
 // ---- xmss counters ----
 pub const C_MC: usize = HM_COLS + NUM_TYPES;
 pub const C_ACTIVE: usize = C_MC + 1;
@@ -202,7 +205,7 @@ pub const CARRY_LEN: usize = CARRY_OUT_LEFT + 1;
 /// Rows of one input (signature plus commitment, tree update and body).
 pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 4 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
-pub const ROWS_PER_OUTPUT: usize = 4 + 2 * DEPTH;
+pub const ROWS_PER_OUTPUT: usize = 5 + 2 * DEPTH;
 
 /// Body sponge state after a transaction's header block.
 pub fn body_init(n_in: u32, n_out: u32) -> [Fp; WIDTH] {
@@ -267,13 +270,10 @@ pub fn absorb_position(state: &mut [Fp; WIDTH], position: u64) {
     *state = permute(*state);
 }
 
-/// Absorbs one output (two blocks) into the outputs sponge.
-pub fn absorb_output(state: &mut [Fp; WIDTH], output: &Output) {
-    for (s, x) in state.iter_mut().zip(&output.commitment) {
-        *s = s.add(x);
-    }
-    *state = permute(*state);
-    for (s, x) in state.iter_mut().zip(&amount_fps(output.amount)) {
+/// Absorbs one output's commitment into the outputs sponge. Amounts stay
+/// off chain: the outputs list is commitments only.
+pub fn absorb_output(state: &mut [Fp; WIDTH], commitment: &Commitment) {
+    for (s, x) in state.iter_mut().zip(commitment) {
         *s = s.add(x);
     }
     *state = permute(*state);
@@ -288,8 +288,8 @@ pub fn inputs_state(positions: &[u64]) -> [Fp; WIDTH] {
     state
 }
 
-/// Outputs sponge state after absorbing all of a block's outputs.
-pub fn outputs_state(outputs: &[Output]) -> [Fp; WIDTH] {
+/// Outputs sponge state after absorbing all of a block's output commitments.
+pub fn outputs_state(outputs: &[Commitment]) -> [Fp; WIDTH] {
     let mut state = initial_outputs_state();
     for o in outputs {
         absorb_output(&mut state, o);
@@ -357,8 +357,9 @@ impl Air for BlockAir {
         let new_t = l[T_NEW];
         let body_in0 = l[T_BODY_IN0];
         let body_in1 = l[T_BODY_IN1];
-        let olist0 = l[T_OLIST0];
-        let olist1 = l[T_OLIST1];
+        let ocm0 = l[T_OCM0];
+        let ocm1 = l[T_OCM1];
+        let olist = l[T_OLIST];
         let body_out0 = l[T_BODY_OUT0];
         let body_out1 = l[T_BODY_OUT1];
         let done = l[T_DONE];
@@ -380,10 +381,11 @@ impl Air for BlockAir {
                 + old_t
                 + new_t
                 + body_in0
-                + olist0
+                + ocm0
+                + olist
                 + body_out0,
         );
-        b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + olist1 + body_out1);
+        b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + body_out1);
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
         b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume);
@@ -452,7 +454,7 @@ impl Air for BlockAir {
         // transaction open.
         let disp = tx_start + body_in1 + out_end + resume;
         b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
-        b.when_transition(disp * go_out * (one - nt(T_OLIST0) - nt(T_DONE)));
+        b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE)));
         b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
         // A resume is only ever the first row.
         b.when_transition(nt(T_RESUME));
@@ -508,21 +510,22 @@ impl Air for BlockAir {
         b.when_transition(smt_end * (one - is_out) * (one - nt(T_BODY_IN0)));
         b.when_transition(body_in0 * (one - nt(T_BODY_IN1)));
         // output
-        b.when_transition(olist0 * (one - nt(T_OLIST1)));
-        b.when_transition(olist1 * (one - nt(T_BODY_OUT0)));
+        b.when_transition(ocm0 * (one - nt(T_OCM1)));
+        b.when_transition(ocm1 * (one - nt(T_OLIST)));
+        b.when_transition(olist * (one - nt(T_BODY_OUT0)));
         b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
         b.when_transition(body_out1 * (one - nt(T_OLD)));
         b.when_transition(body_out1 * n[C_LEVEL]);
-        // is_out: 1 from olist0 until the output ends, 0 on inputs and tx start
-        b.assert_zero(olist0 * (one - is_out));
+        // is_out: 1 from ocm0 until the output ends, 0 on inputs and tx start
+        b.assert_zero(ocm0 * (one - is_out));
         b.assert_zero(msg_start * is_out);
         b.assert_zero(tx_start * is_out);
-        b.when_transition((one - nt(T_OLIST0) - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
+        b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
         // item counters
         b.when_transition(nt(T_MSG_START) * (n[R_IN_LEFT] - in_left + one));
         b.when_transition((one - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
-        b.when_transition(nt(T_OLIST0) * (n[R_OUT_LEFT] - out_left + one));
-        b.when_transition((one - nt(T_OLIST0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
+        b.when_transition(nt(T_OCM0) * (n[R_OUT_LEFT] - out_left + one));
+        b.when_transition((one - nt(T_OCM0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
         b.assert_zero(tx_end * in_left);
         b.assert_zero(tx_end * out_left);
         // Carries: the open transaction's state on the resume row and at
@@ -572,7 +575,7 @@ impl Air for BlockAir {
         let mut l16 = [F::ZERO; LIMBS];
         for (i, bit) in abits.iter().enumerate() {
             b.assert_zero(*bit * *bit - *bit);
-            b.when_transition((one - nt(T_MSG_START) - nt(T_OLIST0)) * (n[R_ABITS + i] - *bit));
+            b.when_transition((one - nt(T_MSG_START) - nt(T_OCM0)) * (n[R_ABITS + i] - *bit));
             if i < 30 {
                 amt_lo += *bit * pow2::<F>(i);
             } else if i < 60 {
@@ -585,7 +588,7 @@ impl Air for BlockAir {
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         for i in 0..DIGEST {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
-            b.when_transition((one - nt(T_OLIST0)) * (n[R_OCM + i] - l[R_OCM + i]));
+            b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
             // pkroot: set entering pkh0 from the tree root, else copied
             b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
             b.when_transition((one - nt(T_PKH0)) * (n[R_PKROOT + i] - l[R_PKROOT + i]));
@@ -741,11 +744,15 @@ impl Air for BlockAir {
             b.when_transition(nt(T_CM0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
             b.assert_zero(pkh0 * (l[COL_INPUT + RATE + i] - cap_pk[i]));
             b.assert_zero(cm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
+            // An output's commitment is H(key_hash || amount) with the key
+            // hash a free witness, so the amount summed is the one it hides.
+            b.assert_zero(ocm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
+            b.assert_zero(ocm1 * (l[COL_ACC + i] - l[R_OCM + i]));
             let pkh1_data = if i < PUB_SEED_LEN { pub_seed[i] } else { F::ZERO };
             b.assert_zero(pkh1 * (l[COL_DATA + i] - pkh1_data));
             let amt_block = [amt_lo, amt_mid, amt_hi, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
             b.assert_zero(cm1 * (l[COL_DATA + i] - amt_block[i]));
-            b.assert_zero(olist1 * (l[COL_DATA + i] - amt_block[i]));
+            b.assert_zero(ocm1 * (l[COL_DATA + i] - amt_block[i]));
             b.assert_zero(body_out1 * (l[COL_DATA + i] - amt_block[i]));
             let body_in1_data = [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], amt_lo, amt_mid, amt_hi, F::ZERO];
             b.assert_zero(body_in1 * (l[COL_DATA + i] - body_in1_data[i]));
@@ -753,7 +760,7 @@ impl Air for BlockAir {
         // amount sums: zero at the start of the segment, exported at the end
         for j in 0..LIMBS {
             b.when_transition(n[R_SUM_IN + j] - l[R_SUM_IN + j] - cm1 * l16[j]);
-            b.when_transition(n[R_SUM_OUT + j] - l[R_SUM_OUT + j] - olist1 * l16[j]);
+            b.when_transition(n[R_SUM_OUT + j] - l[R_SUM_OUT + j] - olist * l16[j]);
             b.when_first_row(l[R_SUM_IN + j]);
             b.when_first_row(l[R_SUM_OUT + j]);
             b.when_last_row(l[R_SUM_IN + j] - pubv(PUB_SUM_IN + j));
@@ -830,7 +837,7 @@ impl Air for BlockAir {
         b.mark("register sponges");
         let body_len = F::from_u32(8) + (in_left + out_left) * F::from_u32(16);
         let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1;
-        let osp_rows = olist0 + olist1;
+        let osp_rows = olist;
         for j in 0..WIDTH {
             b.when_transition(bsp_rows * (n[R_BSP + j] - l[COL_OUTPUT + j]));
             b.when_transition((one - bsp_rows) * (n[R_BSP + j] - l[R_BSP + j]));
@@ -860,8 +867,8 @@ impl Air for BlockAir {
             b.assert_zero(body_in0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
             b.assert_zero(body_out0 * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_OCM + i]));
             b.assert_zero(body_out0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
-            b.assert_zero(olist0 * (l[COL_INPUT + i] - l[R_OSP + i] - l[R_OCM + i]));
-            b.assert_zero(olist0 * (l[COL_INPUT + RATE + i] - l[R_OSP + RATE + i]));
+            b.assert_zero(olist * (l[COL_INPUT + i] - l[R_OSP + i] - l[R_OCM + i]));
+            b.assert_zero(olist * (l[COL_INPUT + RATE + i] - l[R_OSP + RATE + i]));
             let ilist_block = if i == 0 {
                 pos_lo
             } else if i == 1 {
@@ -1190,8 +1197,8 @@ impl SegmentWitness {
                         let o = &tx.outputs[k - n_in];
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
-                        utxo.add(wtxn, o)?;
-                        absorb_output(&mut osp, o);
+                        utxo.add(wtxn, &o.commitment)?;
+                        absorb_output(&mut osp, &o.commitment);
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
                     }
@@ -1217,6 +1224,11 @@ impl SegmentWitness {
 
     pub fn outputs(&self) -> Vec<Output> {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output)).collect()
+    }
+
+    /// The segment's output commitments, as they appear in the block.
+    pub fn commitments(&self) -> Vec<Commitment> {
+        self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.commitment)).collect()
     }
 
     /// Trace rows before padding; a trace needs at least one more.
@@ -1605,9 +1617,18 @@ impl Gen {
         r.is_out = true;
         r.out_left -= 1;
         let osp = r.osp;
-        let out = self.sponge_start(osp, o.commitment, T_OLIST0);
-        self.regs.osp = out;
-        let out = self.absorb(amt_block(o.amount), T_OLIST1);
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&o.key_hash);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_OCM0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.absorb(amt_block(o.amount), T_OCM1);
+        assert_eq!(self.b.acc(), o.commitment, "output commitment does not match its key hash and amount");
+        let out = self.sponge_start(osp, o.commitment, T_OLIST);
         self.regs.osp = out;
         for (acc, limb) in self.regs.sum_out.iter_mut().zip(limbs16(o.amount)) {
             *acc += limb.to_canonical();
@@ -1808,9 +1829,9 @@ mod tests {
         let mut bk = key(2);
         let c = key(3).public_key();
         let miner = key(4).public_key();
-        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 100)).unwrap();
-        utxo.add(&mut wtxn, &Output::new(&bk.public_key(), 50)).unwrap();
-        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 30)).unwrap();
+        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 100).commitment).unwrap();
+        utxo.add(&mut wtxn, &Output::new(&bk.public_key(), 50).commitment).unwrap();
+        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 30).commitment).unwrap();
 
         let tx1 = UnsignedTransaction::new(
             vec![(a.public_key(), 100), (bk.public_key(), 50)],
@@ -1838,7 +1859,7 @@ mod tests {
     fn layout_and_degree() {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
         assert_eq!(ROWS_PER_INPUT, 1150 + 4 + 1 + 80 + 2);
-        assert_eq!(ROWS_PER_OUTPUT, 84);
+        assert_eq!(ROWS_PER_OUTPUT, 85);
         assert_eq!(NUM_PUBLIC, 96 + 2 * 27);
     }
 
@@ -1884,7 +1905,7 @@ mod tests {
         assert_eq!(publics[1].pos_out, 7);
         assert_eq!(publics[1].root_out, expected_root);
         assert_eq!(publics[1].isp_out, inputs_state(&positions));
-        assert_eq!(publics[1].osp_out, outputs_state(&outputs));
+        assert_eq!(publics[1].osp_out, outputs_state(&outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()));
         let total_in: u128 = publics.iter().map(|p| SegmentPublic::total(&p.sum_in)).sum();
         let total_out: u128 = publics.iter().map(|p| SegmentPublic::total(&p.sum_out)).sum();
         assert_eq!(total_in, 180);
@@ -1936,7 +1957,7 @@ mod tests {
         }
         assert_eq!(publics[2].root_out, expected_root);
         assert_eq!(publics[2].isp_out, inputs_state(&positions));
-        assert_eq!(publics[2].osp_out, outputs_state(&outputs));
+        assert_eq!(publics[2].osp_out, outputs_state(&outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()));
         let total = |f: fn(&SegmentPublic) -> &[u32; LIMBS]| -> u128 {
             publics.iter().map(|p| SegmentPublic::total(f(p))).sum()
         };
@@ -2006,6 +2027,11 @@ mod tests {
         let mut greedy = w.clone();
         greedy.txs[0].inputs[0].amount += 1;
         assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&greedy)).is_err());
+        // An output whose commitment hides more than the amount counted.
+        let mut inflated = w.clone();
+        let o = &mut inflated.txs[0].outputs[0].output;
+        o.commitment = crate::transaction::key_commitment(&o.key_hash, o.amount + 1_000_000);
+        assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&inflated)).is_err());
         // A wrong message means the signature chains do not reach the key.
         let mut wrong_msg = w.clone();
         wrong_msg.txs[2].message[0] += Fp::ONE;
@@ -2015,7 +2041,12 @@ mod tests {
         let values = public.to_values();
         let width = NUM_COLS;
         let mut bad = trace.clone();
-        let r = (0..trace.height()).find(|&r| trace.values[r * width + T_OLIST1] == Fp::ONE).unwrap();
+        let r = (0..trace.height()).find(|&r| trace.values[r * width + T_BODY_OUT1] == Fp::ONE).unwrap();
+        bad.values[r * width + COL_DATA] += Fp::ONE;
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // The amount hashed into an output's commitment differs from its bits.
+        let mut bad = trace.clone();
+        let r = (0..trace.height()).find(|&r| trace.values[r * width + T_OCM1] == Fp::ONE).unwrap();
         bad.values[r * width + COL_DATA] += Fp::ONE;
         assert!(check_constraints(&BlockAir, &bad, &values).is_err());
         // A done row inserted before the last transaction ends.
