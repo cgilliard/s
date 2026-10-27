@@ -54,6 +54,53 @@ pub struct FriConfig {
     pub num_queries: usize,
     /// Proof-of-work bits ground before the queries are sampled.
     pub pow_bits: usize,
+    /// Target security of each folding challenge: before sampling it the
+    /// prover grinds [`fold_grinding`] bits, so that the round's error,
+    /// about `arity * size / |K|`, falls below `2^-commit_bits`. Zero for
+    /// no grinding.
+    pub commit_bits: usize,
+}
+
+/// `log2(p^4)` in 1/256 bits, rounded down: the size of the extension
+/// field challenges come from.
+const LOG_K_X256: i64 = 31_648;
+
+/// `log2(x)` in 1/256 bits, rounded up (computed with integers only, so
+/// every verifier derives the same grinding).
+fn log2_x256_ceil(x: u128) -> i64 {
+    assert!(x > 0);
+    let k = 127 - x.leading_zeros() as i64;
+    // The mantissa x / 2^k in [1, 2) with 62 fractional bits, rounded down.
+    let mut y: u128 = if k >= 62 { x >> (k - 62) } else { x << (62 - k) };
+    let mut frac = 0i64;
+    for _ in 0..8 {
+        y = (y * y) >> 62;
+        frac <<= 1;
+        if y >= 2 << 62 {
+            y >>= 1;
+            frac |= 1;
+        }
+    }
+    // Truncation only ever lowers the estimate; one unit covers it.
+    256 * k + frac + 1
+}
+
+/// Grinding bits that bring a challenge whose soundness error is `term /
+/// |K|` (a count of bad challenges, from Schwartz-Zippel or a proximity
+/// gap) to `target` bits of security: `ceil(target - log2(|K| / term))`,
+/// and none for a zero target.
+pub fn grinding_bits(target: usize, term: u128) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let need = target as i64 * 256 + log2_x256_ceil(term.max(1)) - LOG_K_X256;
+    if need <= 0 { 0 } else { ((need + 255) / 256) as usize }
+}
+
+/// Grinding before the folding challenge of a round of `2^log_arity`-to-1
+/// on a domain of `2^log_size` points.
+pub fn fold_grinding(config: &FriConfig, log_arity: usize, log_size: usize) -> usize {
+    grinding_bits(config.commit_bits, 1u128 << (log_arity + log_size))
 }
 
 /// One round of a query: the opened leaf (as many values as the round's
@@ -73,6 +120,9 @@ pub struct FriProof {
     /// Proof-of-work witness: observed after the final value, the next
     /// sample has `pow_bits` low zero bits. Zero when `pow_bits` is zero.
     pub pow_witness: Fp,
+    /// Per round, the witness ground before its folding challenge (see
+    /// [`fold_grinding`]); zero where the round needs none.
+    pub fold_witnesses: Vec<Fp>,
     /// `num_queries` queries, each with one step per round.
     pub queries: Vec<Vec<QueryStep>>,
 }
@@ -82,6 +132,7 @@ impl FriProof {
         w.digest_vec(&self.commitments);
         w.fp4(&self.final_value);
         w.fp(&self.pow_witness);
+        w.fp_vec(&self.fold_witnesses);
         w.u32(self.queries.len() as u32);
         for q in &self.queries {
             w.u32(q.len() as u32);
@@ -99,6 +150,7 @@ impl FriProof {
         let commitments = r.digest_vec()?;
         let final_value = r.fp4()?;
         let pow_witness = r.fp()?;
+        let fold_witnesses = r.fp_vec()?;
         let nq = r.len(1)?;
         let mut queries = Vec::with_capacity(nq);
         for _ in 0..nq {
@@ -112,7 +164,7 @@ impl FriProof {
             }
             queries.push(steps);
         }
-        Some(FriProof { commitments, final_value, pow_witness, queries })
+        Some(FriProof { commitments, final_value, pow_witness, fold_witnesses, queries })
     }
 }
 
@@ -291,6 +343,7 @@ pub fn prove(
     let mut trees: Vec<MerkleTree> = Vec::with_capacity(rounds);
     let mut codewords: Vec<Vec<Fp4>> = Vec::with_capacity(rounds);
     let mut commitments = Vec::with_capacity(rounds);
+    let mut fold_witnesses = Vec::with_capacity(rounds);
     let mut cur = codeword;
     let mut shift_r = shift;
     let mut omega_inv = root_of_unity(log_n).inverse().unwrap();
@@ -309,6 +362,7 @@ pub fn prove(
         let flat: Vec<Fp> = par_map(leaves, |i| leaf_row(&leaf(i))).into_iter().flatten().collect();
         let tree = MerkleTree::from_flat(&flat, arity * DEGREE);
         challenger.observe_digest(&tree.root());
+        fold_witnesses.push(grind(challenger, fold_grinding(config, la, log2_strict(cur.len()))));
         let beta = challenger.sample_ext();
 
         // x_i = shift_r * omega^i, so 1/x_i = shift_r^-1 * omega^-i; the
@@ -358,7 +412,7 @@ pub fn prove(
         queries.push(steps);
     }
 
-    (FriProof { commitments, final_value, pow_witness, queries }, indices)
+    (FriProof { commitments, final_value, pow_witness, fold_witnesses, queries }, indices)
 }
 
 /// Verifies a proof for input codewords of sizes `2^log_sizes[g]` (see
@@ -378,13 +432,21 @@ pub fn verify<E: From<FriError>>(
     let arities = round_log_arities(config, log_sizes);
     let rounds = arities.len();
     let inject = injection_rounds(config, log_sizes);
-    if proof.commitments.len() != rounds || proof.queries.len() != config.num_queries {
+    if proof.commitments.len() != rounds
+        || proof.fold_witnesses.len() != rounds
+        || proof.queries.len() != config.num_queries
+    {
         return Err(FriError::Shape.into());
     }
     let mut betas = Vec::with_capacity(rounds);
-    for root in &proof.commitments {
+    let mut log_m = log_n;
+    for ((root, &la), &w) in proof.commitments.iter().zip(&arities).zip(&proof.fold_witnesses) {
         challenger.observe_digest(root);
+        if !check_pow(challenger, fold_grinding(config, la, log_m), w) {
+            return Err(FriError::ProofOfWork.into());
+        }
         betas.push(challenger.sample_ext());
+        log_m -= la;
     }
     challenger.observe_ext(&proof.final_value);
     if !check_pow(challenger, config.pow_bits, proof.pow_witness) {
@@ -456,7 +518,7 @@ mod tests {
     use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_ntt_ext};
     use crate::test_util::Rng;
 
-    const CONFIG: FriConfig = FriConfig { log_blowup: 3, num_queries: 20, pow_bits: 8 };
+    const CONFIG: FriConfig = FriConfig { log_blowup: 3, num_queries: 20, pow_bits: 8, commit_bits: 0 };
 
     fn transcript() -> Challenger {
         let mut c = Challenger::new();
@@ -619,6 +681,21 @@ mod tests {
         let mut p = p;
         p.pow_witness = Fp::ONE;
         assert_eq!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).unwrap_err(), FriError::ProofOfWork);
+    }
+
+    #[test]
+    fn integer_logarithms() {
+        let p = crate::poseidon2::P as u128;
+        let exact = |x: u128| (x as f64).log2() * 256.0;
+        assert_eq!(LOG_K_X256, exact(p * p * p * p).floor() as i64);
+        for x in [1u128, 2, 3, 5, 1000, 1030 << 21, (1 << 70) + 12345, p * p * p * p, u128::MAX] {
+            let l = log2_x256_ceil(x);
+            assert!(l as f64 >= exact(x) && (l as f64) < exact(x) + 2.0, "log2({x}) = {l}/256");
+        }
+        // 2^30 bad challenges out of 2^123.6 is 93.6 bits: 113 needs 20.
+        assert_eq!(grinding_bits(113, 1 << 30), 20);
+        assert_eq!(grinding_bits(113, 1), 0);
+        assert_eq!(grinding_bits(0, 1 << 100), 0);
     }
 
     #[test]

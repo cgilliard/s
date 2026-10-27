@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn prove_and_verify_permutations() {
-        let config = StarkConfig { log_blowup: 1, num_queries: 16, pow_bits: 0, zk: false };
+        let config = StarkConfig { log_blowup: 1, num_queries: 16, pow_bits: 0, zk: false, commit_bits: 0 };
         let mut rng = Rng::new(52);
         let inputs: Vec<[Fp; WIDTH]> = (0..3).map(|_| random_state(&mut rng)).collect();
         let trace = Poseidon2Air::generate_trace(&inputs);

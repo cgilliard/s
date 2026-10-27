@@ -407,11 +407,21 @@ pub struct StarkConfig {
     /// the chunks and the last [`StarkConfig::blind_rows`] rows of every
     /// table, which must be padding.
     pub zk: bool,
+    /// Target security of every challenge before the queries (lookup,
+    /// constraint combination, out-of-domain point, batching and folding):
+    /// the prover grinds before each just enough that its soundness error
+    /// (see [`Grinding`]) falls below `2^-commit_bits`. Zero for none.
+    pub commit_bits: usize,
 }
 
 impl StarkConfig {
     pub(crate) fn fri(&self) -> FriConfig {
-        FriConfig { log_blowup: self.log_blowup, num_queries: self.num_queries, pow_bits: self.pow_bits }
+        FriConfig {
+            log_blowup: self.log_blowup,
+            num_queries: self.num_queries,
+            pow_bits: self.pow_bits,
+            commit_bits: self.commit_bits,
+        }
     }
 
     /// Rows at the end of every table that a zero-knowledge proof fills
@@ -435,6 +445,86 @@ impl StarkConfig {
     pub fn quotient_stride(&self, degree: usize) -> usize {
         1 << self.log_blowup.saturating_sub(self.log_chunks(degree))
     }
+}
+
+/// Proof-of-work bits before each challenge of a proof's commit phase up to
+/// the batching challenge (FRI grinds before its own folding challenges,
+/// see [`crate::fri::fold_grinding`]). Each round's soundness error is a
+/// count of bad challenges over `|K|`, bounded per round by:
+///
+/// - lookup challenges: the degree of the LogUp identity in `(gamma,
+///   delta)`, rows times the sum over terms of the tuple length plus one;
+/// - constraint combination: the number of constraints (powers of alpha);
+/// - out-of-domain point: the quotient's degree plus the trace length, per
+///   table;
+/// - batching: the number of opened polynomials (powers of beta, a curve
+///   of that degree) times the largest domain.
+///
+/// The grinding brings each to [`StarkConfig::commit_bits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Grinding {
+    pub lookup: usize,
+    pub alpha: usize,
+    pub zeta: usize,
+    pub beta: usize,
+}
+
+/// What [`Grinding`] needs of one table.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GrindShape {
+    pub log_n: usize,
+    /// Constraints, lookup constraints included.
+    pub constraints: usize,
+    /// Sum over lookup terms of the tuple length plus one.
+    pub lookup_weight: usize,
+    pub chunks: usize,
+    /// Opened polynomials: every committed column at two points, every
+    /// quotient chunk at one.
+    pub opened: usize,
+}
+
+impl Grinding {
+    pub(crate) fn new(config: &StarkConfig, tables: &[GrindShape], log_big: usize) -> Grinding {
+        let target = config.commit_bits;
+        let bits = |term: u128| fri::grinding_bits(target, term);
+        let lookup: u128 = tables.iter().map(|t| (t.lookup_weight as u128) << t.log_n).sum();
+        Grinding {
+            lookup: if lookup > 0 { bits(lookup) } else { 0 },
+            alpha: bits(tables.iter().map(|t| t.constraints as u128).sum()),
+            zeta: bits(tables.iter().map(|t| ((t.chunks + 1) as u128) << t.log_n).sum()),
+            beta: bits(tables.iter().map(|t| t.opened as u128).sum::<u128>() << log_big),
+        }
+    }
+}
+
+/// The [`GrindShape`] of a table of `2^log_n` rows of `air`.
+pub(crate) fn grind_shape(config: &StarkConfig, air: &dyn DynAir, log_n: usize, public: &[Fp]) -> GrindShape {
+    let (constraints, terms) = shape(air, public);
+    let chunks = 1 << config.log_chunks(table_degree(config, air, terms));
+    let zk_aux = if config.zk && terms > 0 { ZK_AUX } else { 0 };
+    let w = air.air_width() + if config.zk { ZK_COLS } else { 0 };
+    let aux_w = (lookup_columns(terms, air.air_lookup_group()) + zk_aux) * DEGREE;
+    GrindShape {
+        log_n,
+        constraints: constraints + num_constraints_lookup(config, terms, air),
+        lookup_weight: if terms > 0 { lookup_weight(air, public) } else { 0 },
+        chunks,
+        opened: 2 * (w + aux_w + air.air_preprocessed_width()) + chunks,
+    }
+}
+
+/// The grinding of a proof of `tables` (AIR and log height, tallest first).
+pub fn grinding_of(config: &StarkConfig, tables: &[(&dyn DynAir, usize)], public: &[Fp]) -> Grinding {
+    let shapes: Vec<GrindShape> = tables.iter().map(|&(air, log_n)| grind_shape(config, air, log_n, public)).collect();
+    Grinding::new(config, &shapes, tables[0].1 + config.log_blowup)
+}
+
+/// The sum over an AIR's lookup terms of the tuple length plus one.
+pub(crate) fn lookup_weight(air: &dyn DynAir, public: &[Fp]) -> usize {
+    let zeros = vec![Fp::ZERO; air.air_width()];
+    let pre = vec![Fp::ZERO; air.air_preprocessed_width()];
+    let (_, terms) = evaluate(air, &zeros, &zeros, (&pre, &pre), public, (Fp::ZERO, Fp::ZERO, Fp::ZERO));
+    terms.iter().map(|t| t.values.len() + 1).sum()
 }
 
 /// Columns a zero-knowledge proof appends to every trace, random on every
@@ -635,6 +725,10 @@ pub struct Proof {
     /// samples them itself and rejects a proof that disagrees; the encoding
     /// needs them to rebuild the Merkle paths it leaves out.
     pub query_indices: Vec<usize>,
+    /// Proof-of-work witnesses before the lookup challenges, the constraint
+    /// combination, the out-of-domain point and the batching challenge
+    /// (see [`Grinding`]); zero where none is needed.
+    pub grinding: [Fp; 4],
 }
 
 impl Proof {
@@ -701,6 +795,10 @@ impl Proof {
         w.digest_vec(&self.fri.commitments);
         w.fp4(&self.fri.final_value);
         w.fp(&self.fri.pow_witness);
+        w.fp_vec(&self.fri.fold_witnesses);
+        for g in &self.grinding {
+            w.fp(g);
+        }
         w.u32(nq as u32);
         w.u32(rounds as u32);
         for (q, steps) in self.fri.queries.iter().enumerate() {
@@ -741,6 +839,8 @@ impl Proof {
         let commitments = r.digest_vec()?;
         let final_value = r.fp4()?;
         let pow_witness = r.fp()?;
+        let fold_witnesses = r.fp_vec()?;
+        let grinding = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
         let nq = r.len(4)?;
         let rounds = r.len(0)?;
         if rounds > 32 {
@@ -772,9 +872,10 @@ impl Proof {
         }
         let mut proof = Proof {
             tables,
-            fri: FriProof { commitments, final_value, pow_witness, queries: fri_queries },
+            fri: FriProof { commitments, final_value, pow_witness, fold_witnesses, queries: fri_queries },
             openings,
             query_indices,
+            grinding,
         };
         let num_trees = 4 * nt + rounds;
         let mut heights = Vec::with_capacity(num_trees);
@@ -819,6 +920,8 @@ impl Proof {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     Shape,
+    /// A proof-of-work witness before a commit-phase challenge is wrong.
+    ProofOfWork,
     ConstraintIdentity,
     /// The tables' lookup totals do not cancel.
     LookupSum,
@@ -841,6 +944,7 @@ impl core::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             VerifyError::Shape => f.write_str("stark proof has the wrong shape"),
+            VerifyError::ProofOfWork => f.write_str("wrong proof of work before a challenge"),
             VerifyError::ConstraintIdentity => f.write_str("constraints do not hold at the out-of-domain point"),
             VerifyError::LookupSum => f.write_str("lookup totals of the tables do not cancel"),
             VerifyError::Fri(e) => write!(f, "{e}"),
@@ -1514,7 +1618,7 @@ fn table_degree(config: &StarkConfig, air: &dyn DynAir, terms: usize) -> usize {
 }
 
 /// Lookup constraints of a table with `terms` lookup terms.
-fn num_constraints_lookup(config: &StarkConfig, terms: usize, air: &dyn DynAir) -> usize {
+pub(crate) fn num_constraints_lookup(config: &StarkConfig, terms: usize, air: &dyn DynAir) -> usize {
     num_lookup_constraints(terms, air.air_lookup_group()) + if config.zk && terms > 0 { ZK_LOOKUP_CONSTRAINTS } else { 0 }
 }
 
@@ -1968,10 +2072,13 @@ pub fn prove_tables(
         })
         .collect();
     timer.lap("trace commit");
+    let grinding = grinding_of(config, &states.iter().map(|t| (t.input.air, t.log_n)).collect::<Vec<_>>(), public);
+    let mut witnesses = [Fp::ZERO; 4];
 
     // 2. Lookup challenges and auxiliary traces.
     let mut lookup_ch = None;
     if states.iter().any(|t| t.num_terms > 0) {
+        witnesses[0] = fri::grind(challenger, grinding.lookup);
         let ch = LookupChallenges::sample(challenger);
         for (k, t) in states.iter_mut().enumerate().filter(|(_, t)| t.num_terms > 0) {
             let w = t.input.air.air_width();
@@ -2003,6 +2110,7 @@ pub fn prove_tables(
     }
 
     // 3. Constraint combinations and quotients.
+    witnesses[1] = fri::grind(challenger, grinding.alpha);
     let alpha = challenger.sample_ext();
     let quotients: Vec<Quotient> = states
         .iter()
@@ -2018,6 +2126,7 @@ pub fn prove_tables(
         .collect();
 
     // 4. Out-of-domain openings.
+    witnesses[2] = fri::grind(challenger, grinding.zeta);
     let zeta = challenger.sample_ext();
     let no_coeffs: Vec<Vec<Fp>> = Vec::new();
     let parts: Vec<TableProof> = states
@@ -2051,6 +2160,7 @@ pub fn prove_tables(
     timer.lap("openings");
 
     // 5. DEEP combinations, summed per domain size, and FRI.
+    witnesses[3] = fri::grind(challenger, grinding.beta);
     let beta = challenger.sample_ext();
     let mut inputs: Vec<Vec<Fp4>> = Vec::new();
     let mut input_log_sizes: Vec<usize> = Vec::new();
@@ -2130,7 +2240,7 @@ pub fn prove_tables(
         })
         .collect();
 
-    Proof { tables: parts, fri: fri_proof, openings, query_indices: indices }
+    Proof { tables: parts, fri: fri_proof, openings, query_indices: indices, grinding: witnesses }
 }
 
 // ---------------------------------------------------------------------------
@@ -2232,6 +2342,10 @@ pub fn verify_tables(
         shapes.push(s);
     }
     let log_big = log_ns[0] + log_blowup;
+    let grinding = grinding_of(config, &specs.iter().map(|s| s.air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
+    let ground = |challenger: &mut Challenger, bits: usize, w: Fp| -> Result<(), VerifyError> {
+        if fri::check_pow(challenger, bits, w) { Ok(()) } else { Err(VerifyError::ProofOfWork) }
+    };
 
     observe_setup(challenger, &log_ns, public);
     for spec in specs {
@@ -2243,6 +2357,7 @@ pub fn verify_tables(
         challenger.observe_digest(&t.trace_root);
     }
     let lookup_ch = if proof.tables.iter().any(|t| t.aux_root.is_some()) {
+        ground(challenger, grinding.lookup, proof.grinding[0])?;
         let ch = LookupChallenges::sample(challenger);
         for t in &proof.tables {
             if let Some(root) = &t.aux_root {
@@ -2252,21 +2367,27 @@ pub fn verify_tables(
         }
         Some(ch)
     } else {
+        if proof.grinding[0] != Fp::ZERO {
+            return Err(VerifyError::ProofOfWork);
+        }
         None
     };
     if !proof.tables.iter().fold(Fp4::ZERO, |a, t| a + t.lookup_sum).is_zero() {
         return Err(VerifyError::LookupSum);
     }
+    ground(challenger, grinding.alpha, proof.grinding[1])?;
     let alpha = challenger.sample_ext();
     for t in &proof.tables {
         challenger.observe_digest(&t.quotient_root);
     }
+    ground(challenger, grinding.zeta, proof.grinding[2])?;
     let zeta = challenger.sample_ext();
     for t in &proof.tables {
         for v in t.opened().into_iter().flatten() {
             challenger.observe_ext(v);
         }
     }
+    ground(challenger, grinding.beta, proof.grinding[3])?;
     let beta = challenger.sample_ext();
 
     // Constraint identity of every table at zeta.
@@ -2463,7 +2584,7 @@ mod tests {
         Trace::new(values, 1)
     }
 
-    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0, zk: false };
+    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0, zk: false, commit_bits: 0 };
 
     fn transcript() -> Challenger {
         let mut c = Challenger::new();
@@ -2814,7 +2935,7 @@ mod tests {
         }
     }
 
-    const ZK: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 0, zk: true };
+    const ZK: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 0, zk: true, commit_bits: 0 };
 
     /// A 64-row sender and a 64-row receiver for zero-knowledge proofs:
     /// the rows before the blinding rows send `10 + i % 4`, and the
@@ -2899,6 +3020,45 @@ mod tests {
             let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
             assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
         }
+    }
+
+    #[test]
+    fn commit_phase_grinding() {
+        // A target high enough that every challenge before the queries,
+        // the lookup ones included, needs a little work.
+        let config = StarkConfig { commit_bits: 122, ..CONFIG };
+        let (tall, short, recv) = exchange([5; 4]);
+        let tables = [
+            TableInput { air: &Sender, trace: &tall, pre: None },
+            TableInput { air: &Sender, trace: &short, pre: None },
+            TableInput { air: &Receiver, trace: &recv, pre: None },
+        ];
+        let specs = [
+            TableSpec { air: &Sender, pre_root: None },
+            TableSpec { air: &Sender, pre_root: None },
+            TableSpec { air: &Receiver, pre_root: None },
+        ];
+        let g = grinding_of(&config, &[(&Sender, 4), (&Sender, 2), (&Receiver, 2)], &[]);
+        assert!(g.lookup > 0 && g.alpha > 0 && g.zeta > 0 && g.beta > g.zeta, "{g:?}");
+        let proof = prove_tables(&config, &tables, &[], &mut transcript());
+        assert_eq!(verify_tables(&config, &specs, &[], &proof, &mut transcript()), Ok(()));
+        assert!(proof.grinding.iter().all(|w| *w != Fp::ZERO));
+        assert!(crate::fri::fold_grinding(&config.fri(), 2, 6) > 0);
+        assert_eq!(Proof::from_bytes(&proof.to_bytes()).unwrap(), proof);
+        for k in 0..4 {
+            let mut p = proof.clone();
+            p.grinding[k] += Fp::ONE;
+            assert_eq!(verify_tables(&config, &specs, &[], &p, &mut transcript()), Err(VerifyError::ProofOfWork));
+        }
+        let mut p = proof.clone();
+        p.fri.fold_witnesses[0] += Fp::ONE;
+        assert_eq!(
+            verify_tables(&config, &specs, &[], &p, &mut transcript()),
+            Err(VerifyError::Fri(FriError::ProofOfWork))
+        );
+        // A proof made without the grinding does not pass.
+        let plain = prove_tables(&CONFIG, &tables, &[], &mut transcript());
+        assert!(verify_tables(&config, &specs, &[], &plain, &mut transcript()).is_err());
     }
 
     #[test]

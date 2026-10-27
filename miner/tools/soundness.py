@@ -17,7 +17,7 @@ only for the round it precedes (the queries). Two models:
 Run: python3 tools/soundness.py
 """
 
-from math import log2, sqrt
+from math import ceil, log2, sqrt
 
 P = 2013265921  # BabyBear
 LOG_K = 4 * log2(P)  # quartic extension, about 123.6
@@ -72,16 +72,17 @@ class Table:
 
     def batched(self):
         """Polynomials in the DEEP combination: each column at two points,
-        quotient chunks at one."""
-        return 2 * (self.width_committed() + self.aux_cols() + self.pre) + 4 * self.chunks()
+        quotient chunks at one (one power of beta each)."""
+        return 2 * (self.width_committed() + self.aux_cols() + self.pre) + self.chunks()
 
 
 class Proof:
-    def __init__(self, name, tables, log_blowup, queries, pow_bits, commit_pow=0):
+    def __init__(self, name, tables, log_blowup, queries, pow_bits, commit_bits=0):
         self.name, self.tables = name, tables
-        # Grinding before every challenge of the commit phase (lookup,
-        # out-of-domain, batching and folding challenges), if any.
-        self.commit_pow = commit_pow
+        # Target of every challenge before the queries: the prover grinds
+        # before each the bits its conjectured error falls short of it by
+        # (StarkConfig::commit_bits).
+        self.commit_bits = commit_bits
         self.R, self.s, self.pow = log_blowup, queries, pow_bits
         self.rho = 2.0 ** -log_blowup
         self.log_N = max(t.log_n for t in tables) + log_blowup
@@ -130,10 +131,14 @@ def bits(eps):
 
 
 def report(proof):
-    g = proof.commit_pow
+    t = proof.commit_bits
     print(f"\n## {proof.name}: rate 1/{2 ** proof.R}, {proof.s} queries, {proof.pow} grinding bits, "
-          f"{g} commit-phase grinding bits, largest domain 2^{proof.log_N}")
-    c = {k: v * 2.0 ** -(0 if k == "constraint combination" else g) for k, v in proof.rounds_conjectured().items()}
+          f"commit-phase target {t or 'none'}, largest domain 2^{proof.log_N}")
+    raw = proof.rounds_conjectured()
+    grind = {k: (max(0, ceil(t - bits(v))) if t else 0) for k, v in raw.items()}
+    c = {k: v * 2.0 ** -grind[k] for k, v in raw.items()}
+    if t:
+        print("  grinding:", ", ".join(f"{k} {g}" for k, g in grind.items()))
     q_toy = proof.query_bits("toy")
     q_cap = proof.query_bits("list-capacity")
     print("  conjectured, per round (bits):")
@@ -147,8 +152,7 @@ def report(proof):
           f"quantum about half")
     best = None
     for m in range(3, 40):
-        r = {k: v * 2.0 ** -(0 if k in ("constraint combination", "queries") else g)
-             for k, v in proof.rounds_proven(m).items()}
+        r = {k: v * 2.0 ** -grind.get(k, 0) for k, v in proof.rounds_proven(m).items()}
         b = min(bits(v) for v in r.values())
         if best is None or b > best[0]:
             best = (b, m, r)
@@ -171,4 +175,4 @@ if __name__ == "__main__":
           f"(collisions 2^{DIGEST_BITS / 2:.0f}, BCS needs digest >= 2 lambda + 3)")
     for p in params:
         report(Proof(p["name"], tables(p["tables"], p.get("zk", False)), p["log_blowup"], p["queries"], p["pow"],
-                     p.get("commit_pow", 0)))
+                     p.get("commit_bits", 0)))

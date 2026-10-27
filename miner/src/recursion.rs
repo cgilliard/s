@@ -20,12 +20,12 @@ use std::collections::HashMap;
 
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
-use crate::fri::{FriProof, QueryStep, injection_rounds, leaf_row, round_log_arities};
+use crate::fri::{FriProof, QueryStep, fold_grinding, injection_rounds, leaf_row, round_log_arities};
 use crate::merkle::Digest;
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
 use crate::stark::{
-    Air, Builder, DynAir, LookupTerm, Proof, QueryOpening, StarkConfig, TableProof, log_quotient_degree,
+    Air, Builder, DynAir, LookupTerm, Proof, QueryOpening, StarkConfig, TableProof, grinding_of, log_quotient_degree,
     lookup_columns, num_lookup_constraints, shape,
 };
 use crate::vm_air::{Addr, Program};
@@ -620,6 +620,15 @@ impl Compiler {
         let log_ns: Vec<usize> = shapes.iter().map(|s| s.log_n).collect();
         assert!(log_ns.windows(2).all(|w| w[0] >= w[1]), "tables must be ordered by height");
         let log_big_n = log_ns[0] + log_blowup;
+        let grinding =
+            grinding_of(config, &tables.iter().map(|(air, _)| *air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
+        let ground = |c: &mut Compiler, t: &mut Transcript, bits: usize, w: Fp| {
+            if bits > 0 {
+                c.check_pow(t, w, bits);
+            } else {
+                assert_eq!(w, Fp::ZERO, "proof has a proof-of-work witness where none is ground");
+            }
+        };
         let shift = MULTIPLICATIVE_GENERATOR;
 
         // ---- inputs: commitments and lookup totals ----
@@ -650,6 +659,7 @@ impl Compiler {
             c.observe_block(&mut t, *root, DIGEST);
         }
         let lookup = if aux.iter().any(Option::is_some) {
+            ground(c, &mut t, grinding.lookup, proof.grinding[0]);
             let gamma = c.sample_word(&mut t);
             let delta = c.sample_word(&mut t);
             let mut total = A_ZERO;
@@ -664,10 +674,12 @@ impl Compiler {
         } else {
             None
         };
+        ground(c, &mut t, grinding.alpha, proof.grinding[1]);
         let alpha = c.sample_word(&mut t);
         for root in &quotient_roots {
             c.observe_block(&mut t, *root, DIGEST);
         }
+        ground(c, &mut t, grinding.zeta, proof.grinding[2]);
         let zeta = c.sample_word(&mut t);
 
         // ---- openings ----
@@ -695,6 +707,7 @@ impl Compiler {
             }
             opened.push(groups);
         }
+        ground(c, &mut t, grinding.beta, proof.grinding[3]);
         let beta = c.sample_word(&mut t);
 
         // ---- constraint identity of every table at zeta ----
@@ -786,11 +799,15 @@ impl Compiler {
         assert_eq!(fri.commitments.len(), rounds);
         let mut fri_roots = Vec::with_capacity(rounds);
         let mut fri_betas = Vec::with_capacity(rounds);
-        for root in &fri.commitments {
+        assert_eq!(fri.fold_witnesses.len(), rounds);
+        let mut log_m = log_big_n;
+        for ((root, &la), &w) in fri.commitments.iter().zip(&arities).zip(&fri.fold_witnesses) {
             let r = c.scalar_inputs(root);
             c.observe_block(&mut t, r, DIGEST);
+            ground(c, &mut t, fold_grinding(&config.fri(), la, log_m), w);
             fri_betas.push(c.sample_word(&mut t));
             fri_roots.push(r);
+            log_m -= la;
         }
         let final_value = c.input(fri.final_value);
         c.observe_word(&mut t, final_value);
@@ -1223,8 +1240,10 @@ pub fn dummy_proof(tables: &[(&dyn DynAir, usize)], config: &StarkConfig, num_pu
             commitments: vec![z; arities.len()],
             final_value: Fp4::ZERO,
             pow_witness: Fp::ZERO,
+            fold_witnesses: vec![Fp::ZERO; arities.len()],
             queries: vec![steps; config.num_queries],
         },
+        grinding: [Fp::ZERO; 4],
         openings: vec![opening; config.num_queries],
         // Spread like sampled indices, so encoded sizes are realistic.
         query_indices: (0..config.num_queries)
@@ -1309,7 +1328,7 @@ mod tests {
         }
     }
 
-    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8, pow_bits: 6, zk: false };
+    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8, pow_bits: 6, zk: false, commit_bits: 0 };
 
     fn inner_tr() -> Challenger {
         let mut c = Challenger::new();
@@ -1475,7 +1494,7 @@ mod tests {
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
         let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
         let (vm_trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let outer = StarkConfig { log_blowup: 2, num_queries: 20, pow_bits: 0, zk: false };
+        let outer = StarkConfig { log_blowup: 2, num_queries: 20, pow_bits: 0, zk: false, commit_bits: 0 };
         let pre = c.prog.preprocess(&outer);
         let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
         let t = std::time::Instant::now();

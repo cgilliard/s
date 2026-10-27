@@ -86,37 +86,42 @@ pub struct AggregatorParams {
 }
 
 impl AggregatorParams {
-    /// Segments and nodes both at rate 1/4. Segments at rate 1/8 prove
-    /// twice as slowly but are cheaper to verify; with 16 bits of grinding
-    /// a leaf over four rate-1/4 segments still fits 2^18 rows (with 2^16
-    /// hashes instead of 2^15), and the tree of a full block proved in
-    /// 71 s against 84 s. Nodes at 1/8 would double their proving time for
-    /// little gain in the node above.
+    /// 112 bits of conjectured security for every proof (see SECURITY.md):
+    /// each Fiat-Shamir round has an error below 2^-113.
     ///
-    /// Both target 100 bits of conjectured security, `log_blowup` bits per
-    /// query plus 16 bits of grinding (about 2^16 permutations, 35 ms, per
-    /// proof).
+    /// - The queries give `log_blowup` bits each, plus 16 bits of grinding
+    ///   (about 35 ms). That is 116 bits for segments and nodes (rate 1/4,
+    ///   50 queries) and for the wrap (rate 1/32, 20 queries), or 114 at
+    ///   the list-decoding capacity radius left by the 2025 counterexamples
+    ///   to the proximity-gap conjectures.
+    /// - Every challenge before the queries is ground to 113 bits
+    ///   (`commit_bits`). The challenges come from a field of about 2^123.6,
+    ///   so each one's degree term costs that many bits less. The batching
+    ///   challenge needs the most: 17 bits on a segment, 21 on a node
+    ///   and 22 on the wrap.
     ///
-    /// The wrap is at rate 1/32 with 20 bits of grinding (0.5 s): 16
-    /// queries. It verifies a root of up to 2^18 rows in 2^16 rows, and
-    /// proves in about 10 s, giving a block proof of about 149 KB with
-    /// batched Merkle paths; rate 1/64 would save about a tenth of that for
-    /// twice the time and memory. It is the published proof, so it is zero
-    /// knowledge (about 1 s and 6 KB more): nothing about the block's
-    /// transactions, amounts or keys can be learned from it. The proofs
-    /// below it are witnesses of the wrap and never leave the prover.
+    /// Segments and nodes are both at rate 1/4. Segments at rate 1/8 prove
+    /// twice as slowly but are cheaper to verify, and nodes at 1/8 would
+    /// double their proving time for little gain. A full block's root
+    /// verifies four children in up to 2^19 rows, and the wrap over it
+    /// takes 2^17.
+    ///
+    /// The wrap is at rate 1/32 and is the published proof, so it is zero
+    /// knowledge: nothing about the block's transactions, amounts or keys
+    /// can be learned from it. The proofs below it are witnesses of the
+    /// wrap and never leave the prover.
     pub const MAINNET: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16, zk: false },
+        segment: StarkConfig { log_blowup: 2, num_queries: 50, pow_bits: 16, zk: false, commit_bits: 113 },
         segment_log_n: 15,
         max_segments: 1 << 14,
         fan_in: 4,
-        outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16, zk: false },
-        wrap: StarkConfig { log_blowup: 5, num_queries: 16, pow_bits: 20, zk: true },
+        outer: StarkConfig { log_blowup: 2, num_queries: 50, pow_bits: 16, zk: false, commit_bits: 113 },
+        wrap: StarkConfig { log_blowup: 5, num_queries: 20, pow_bits: 16, zk: true, commit_bits: 113 },
     };
 
     /// Rate 1/8 at the same security, for comparisons.
     #[cfg(test)]
-    const EIGHTH: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 28, pow_bits: 16, zk: false };
+    const EIGHTH: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 28, pow_bits: 16, zk: false, commit_bits: 0 };
 
     /// Rows available to transactions in one segment.
     pub fn segment_rows(&self) -> usize {
@@ -1019,12 +1024,12 @@ mod tests {
     /// Small parameters: 128-row segments hold one output-only transaction,
     /// nodes take two children.
     const SMALL: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3, zk: false },
+        segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3, zk: false, commit_bits: 110 },
         segment_log_n: 7,
         max_segments: 16,
         fan_in: 2,
-        outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5, zk: false },
-        wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4, zk: true },
+        outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5, zk: false, commit_bits: 112 },
+        wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4, zk: true, commit_bits: 112 },
     };
 
     struct Setup {
@@ -1432,13 +1437,12 @@ mod tests {
     #[test]
     #[ignore = "proves mainnet blocks under several parameter sets; run with --release"]
     fn security_configs() {
-        let cfg = |q: usize, pow: usize| StarkConfig { log_blowup: 2, num_queries: q, pow_bits: pow, zk: false };
-        let wrap = |q: usize, pow: usize| StarkConfig { log_blowup: 5, num_queries: q, pow_bits: pow, zk: true };
         let m = AggregatorParams::MAINNET;
+        let cfg = |q: usize, pow: usize| StarkConfig { num_queries: q, pow_bits: pow, commit_bits: 0, ..m.segment };
+        let wrap = |q: usize, pow: usize| StarkConfig { num_queries: q, pow_bits: pow, commit_bits: 0, ..m.wrap };
         let all = [
-            ("current", m),
-            ("q50", AggregatorParams { segment: cfg(50, 16), outer: cfg(50, 16), wrap: wrap(20, 16), ..m }),
-            ("q48p20", AggregatorParams { segment: cfg(48, 20), outer: cfg(48, 20), wrap: wrap(20, 16), ..m }),
+            ("mainnet", m),
+            ("old", AggregatorParams { segment: cfg(42, 16), outer: cfg(42, 16), wrap: wrap(16, 20), ..m }),
         ];
         let pick = std::env::var("SEC").ok();
         for (name, params) in all {
@@ -1517,6 +1521,32 @@ mod tests {
             let w = s.wrap.unwrap();
             println!("{k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
         }
+        // The grinding of the largest proof of each kind.
+        let full = plan(&m, 16);
+        let wrap = full.wrap.unwrap();
+        let hash = crate::hash_table::HashTableAir;
+        type Kind<'a> = (&'a str, StarkConfig, Vec<(&'a dyn DynAir, usize)>, usize);
+        let kinds: [Kind<'_>; 3] = [
+            ("segment", m.segment, vec![(&BlockAir, m.segment_log_n)], BLOCK_PUBLIC),
+            ("node", m.outer, vec![(&VmAir, full.log_n), (&hash, full.hash_log_n)], crate::vm_air::NUM_PUBLIC),
+            ("wrap", m.wrap, vec![(&VmAir, wrap.log_n), (&hash, wrap.hash_log_n)], crate::vm_air::NUM_PUBLIC),
+        ];
+        for (name, config, tables, num_public) in kinds {
+            let g = crate::stark::grinding_of(&config, &tables, &vec![Fp::ZERO; num_public]);
+            let mut sizes: Vec<usize> = tables.iter().map(|t| t.1 + config.log_blowup).collect();
+            sizes.dedup();
+            let fri = config.fri();
+            let mut log_m = sizes[0];
+            let folds: Vec<usize> = crate::fri::round_log_arities(&fri, &sizes)
+                .iter()
+                .map(|&la| {
+                    let b = crate::fri::fold_grinding(&fri, la, log_m);
+                    log_m -= la;
+                    b
+                })
+                .collect();
+            println!("{name} grinding: {g:?}, folds {folds:?}");
+        }
     }
 
     #[test]
@@ -1545,6 +1575,21 @@ mod tests {
         let mut bad = root.clone();
         bad.proof.openings[1][0].trace_row[3] += Fp::ONE;
         assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
+        // Proof-of-work witnesses before the batching challenge and the
+        // first fold are checked too.
+        let hash = crate::hash_table::HashTableAir;
+        let g = crate::stark::grinding_of(
+            &SMALL.outer,
+            &[(&VmAir, shape.log_n), (&hash, shape.hash_log_n)],
+            &[Fp::ZERO; crate::vm_air::NUM_PUBLIC],
+        );
+        assert!(g.beta > 0, "{g:?}");
+        let mut bad = root.clone();
+        bad.proof.grinding[3] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
+        let mut bad = root.clone();
+        bad.proof.fri.fold_witnesses[0] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
     }
 
     #[test]
@@ -1558,12 +1603,12 @@ mod tests {
         let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
             Ok(v) => {
                 let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
-                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2], zk: n.get(3) == Some(&1) }]
+                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2], zk: n.get(3) == Some(&1), commit_bits: 0 }]
             }
             Err(_) => vec![
-                StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16, zk: false },
-                StarkConfig { log_blowup: 5, num_queries: 17, pow_bits: 16, zk: false },
-                StarkConfig { log_blowup: 6, num_queries: 14, pow_bits: 16, zk: false },
+                StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16, zk: false, commit_bits: 0 },
+                StarkConfig { log_blowup: 5, num_queries: 17, pow_bits: 16, zk: false, commit_bits: 0 },
+                StarkConfig { log_blowup: 6, num_queries: 14, pow_bits: 16, zk: false, commit_bits: 0 },
             ],
         };
         for wrap in configs {
