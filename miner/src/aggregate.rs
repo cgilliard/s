@@ -27,9 +27,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::block_air::{
-    BlockAir, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_ISP_IN, PUB_ISP_OUT, PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN,
-    PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN, PUB_SUM_OUT, ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness,
-    initial_inputs_state, initial_outputs_state, inputs_state, limbs16, outputs_state,
+    BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_ISP_IN, PUB_ISP_OUT,
+    PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN, PUB_SUM_OUT,
+    ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state, inputs_state, limbs16,
+    outputs_state,
 };
 use crate::block_proof::{DOM_SEGMENT_PROOF, SegmentProof, prove_segment_padded};
 use crate::chain::{BlockStatement, ProofVerifier};
@@ -204,6 +205,8 @@ pub fn combine_records(records: &[SegmentPublic]) -> SegmentPublic {
         pos_out: last.pos_out,
         sum_in: [0; LIMBS],
         sum_out: [0; LIMBS],
+        carry_in: first.carry_in,
+        carry_out: last.carry_out,
     };
     for r in records {
         for j in 0..LIMBS {
@@ -291,6 +294,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
         c.assert_block(at(a, PUB_ISP_OUT), at(b, PUB_ISP_IN), WIDTH);
         c.assert_block(at(a, PUB_OSP_OUT), at(b, PUB_OSP_IN), WIDTH);
         c.assert_block(at(a, PUB_POS_OUT), at(b, PUB_POS_IN), 2);
+        c.assert_block(at(a, PUB_CARRY_OUT), at(b, PUB_CARRY_IN), CARRY_LEN);
     }
     let (first, last) = (recs[0], recs[k - 1]);
 
@@ -314,6 +318,8 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             copy(&mut c, at(last, PUB_OSP_OUT), PUB_OSP_OUT, WIDTH);
             copy(&mut c, at(first, PUB_POS_IN), PUB_POS_IN, 2);
             copy(&mut c, at(last, PUB_POS_OUT), PUB_POS_OUT, 2);
+            copy(&mut c, at(first, PUB_CARRY_IN), PUB_CARRY_IN, CARRY_LEN);
+            copy(&mut c, at(last, PUB_CARRY_OUT), PUB_CARRY_OUT, CARRY_LEN);
             for field in [PUB_SUM_IN, PUB_SUM_OUT] {
                 for j in 0..LIMBS {
                     let mut acc = 0;
@@ -348,6 +354,11 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.assert_block(at(last, PUB_ISP_OUT), at(st, ST_ISP), WIDTH);
             c.assert_block(at(last, PUB_OSP_OUT), at(st, ST_OSP), WIDTH);
             c.assert_block(at(last, PUB_POS_OUT), at(st, ST_POS_OUT), 2);
+            // No transaction is open at either end.
+            for i in 0..CARRY_LEN {
+                c.assert_eq(at(first, PUB_CARRY_IN + i), 0);
+                c.assert_eq(at(last, PUB_CARRY_OUT + i), 0);
+            }
 
             // Balance: sum over children of (out - in) minus the subsidy is
             // zero as an integer. Each limb difference is small, so the
@@ -806,17 +817,22 @@ mod tests {
     }
 
     fn setup(name: &str, amounts: &[u64], subsidy: u64) -> Setup {
+        let miner = key(9).public_key();
+        let s = setup_txs(name, &amounts.iter().map(|a| reward(&miner, *a)).collect::<Vec<_>>(), subsidy);
+        assert_eq!(s.segments.len(), amounts.len());
+        s
+    }
+
+    /// `txs` packed into SMALL segments, proven.
+    fn setup_txs(name: &str, txs: &[Transaction], subsidy: u64) -> Setup {
         let dir = TempDir::new(name);
         let env = open_env(&dir.0, 16 << 20).unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
-        let miner = key(9).public_key();
-        let txs: Vec<Transaction> = amounts.iter().map(|a| reward(&miner, *a)).collect();
         let prev_root = utxo.root(&wtxn).unwrap();
-        let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, SMALL.segment_rows()).unwrap();
+        let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows()).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
-        assert_eq!(segments.len(), amounts.len());
         let body = Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.outputs()).collect(), proof: vec![] };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
@@ -833,6 +849,54 @@ mod tests {
 
     fn seg_children(proofs: &[SegmentProof]) -> Vec<Child<'_>> {
         proofs.iter().map(Child::Segment).collect()
+    }
+
+    /// One reward transaction with three outputs: in 128-row segments it
+    /// spans three.
+    fn spanning_setup(name: &str) -> Setup {
+        let miner = key(9).public_key();
+        let outs = [10, 20, 25].map(|a| TxOutput::new(&miner, a)).to_vec();
+        let tx = UnsignedTransaction::new(vec![], outs).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
+        setup_txs(name, &[tx], 55)
+    }
+
+    #[test]
+    fn nodes_chain_open_transactions() {
+        let s = spanning_setup("span");
+        assert_eq!(s.proofs.len(), 3);
+        let (p0, p1, p2) = (&s.proofs[0].public, &s.proofs[1].public, &s.proofs[2].public);
+        assert!(p0.carry_out.open && p1.carry_out.open && !p2.carry_out.open);
+        assert_eq!((p0.carry_out, p1.carry_out), (p1.carry_in, p2.carry_in));
+        // A node over the first two segments chains them and exports the
+        // open transaction.
+        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Record);
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("node accepts chained open transactions");
+        let record = combine_records(&[*p0, *p1]);
+        assert!(record.carry_out.open && !record.carry_in.open);
+        assert_eq!(exec.output_digest, Some(record_digest(&record)));
+        // Out of order, the carries do not chain (nor do the roots).
+        let c = compile_node(&SMALL, &seg_children(&[s.proofs[1].clone(), s.proofs[0].clone()]), Output::Record);
+        assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
+        // A block that ends with the transaction still open is rejected by
+        // the root, though everything else about it is consistent.
+        let short = Statement {
+            new_state_root: p1.root_out,
+            outputs_state: p1.osp_out,
+            end_output_position: p1.pos_out,
+            subsidy: 30,
+            ..s.statement.clone()
+        };
+        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short));
+        assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
+    }
+
+    #[test]
+    #[ignore = "proves an aggregate; run with --release"]
+    fn spanning_transaction_roundtrip() {
+        let s = spanning_setup("span-roundtrip");
+        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        let v = AggregateVerifier::new(SMALL);
+        assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
     }
 
     #[test]

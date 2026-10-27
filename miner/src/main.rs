@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement, prove_block_with};
 use tabminer::block::{Block, Body, Header};
-use tabminer::block_air::{ROWS_PER_INPUT, ROWS_PER_OUTPUT, SegmentWitness};
+use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
@@ -198,20 +198,6 @@ fn coinbase(wallet: &mut Wallet, amount: u64) -> Transaction {
     UnsignedTransaction::new(vec![], vec![out]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap()
 }
 
-/// Segments the greedy packing of [`SegmentWitness::collect_by_rows`]
-/// needs for transactions of `rows` rows each.
-fn segments_for(rows: &[usize], max_rows: usize) -> usize {
-    let (mut segments, mut used) = (0, max_rows);
-    for &r in rows {
-        if used + r > max_rows && used > 0 {
-            segments += 1;
-            used = 0;
-        }
-        used += r;
-    }
-    segments
-}
-
 fn mine(args: &Args) -> AnyResult<()> {
     let params = ChainParams::MAINNET;
     let agg = params.aggregator;
@@ -257,8 +243,6 @@ fn mine(args: &Args) -> AnyResult<()> {
         1 << agg.wrap.log_blowup
     );
 
-    let tx_rows = 2 + ROWS_PER_INPUT + 2 * ROWS_PER_OUTPUT;
-    let coinbase_rows = 2 + ROWS_PER_OUTPUT;
     let mut mined = 0u64;
     while args.blocks == 0 || mined < args.blocks {
         let started = Instant::now();
@@ -274,12 +258,12 @@ fn mine(args: &Args) -> AnyResult<()> {
         };
         let balance = wallet.balance();
         let mut txs = vec![coinbase(&mut wallet, subsidy)];
-        let mut rows = vec![coinbase_rows];
+        // Item counts: the coinbase, then one-input, two-output splits.
+        let items = |t: usize| if t == 0 { (0, 1) } else { (1, 2) };
         let (mut n_in, mut n_out) = (0, 1);
         let mut spend = 0;
         for _ in coins.iter().take(args.txs) {
-            rows.push(tx_rows);
-            if segments_for(&rows, agg.segment_rows()) > agg.max_segments
+            if pack(spend + 2, items, agg.segment_rows()).len() > agg.max_segments
                 || n_in + 1 > params.max_inputs
                 || n_out + 2 > params.max_outputs
             {

@@ -12,15 +12,26 @@
 //! osp_in[16] osp_out[16]            outputs sponge state before and after
 //! pos_in(2) pos_out(2)              next output position before and after
 //! sum_in[4] sum_out[4]              16-bit limb sums of input and output amounts
+//! carry_in[27] carry_out[27]        transaction open across the boundary:
+//!                                   open, message[8], body sponge[16],
+//!                                   inputs left, outputs left (all zero
+//!                                   when closed)
 //! ```
 //!
 //! Segments chain by matching one segment's `*_out` to the next segment's
-//! `*_in`. The aggregator (today the node, later a recursive proof) checks
-//! that the first segment starts from the block's previous root, the
-//! initial sponge states and the block's first output position, that the
-//! last segment ends at the new root and at sponge states equal to the
-//! block's input and output lists, and that the summed balances plus the
-//! subsidy equal zero as integers.
+//! `*_in`. The aggregator checks that the first segment starts from the
+//! block's previous root, the initial sponge states, the block's first
+//! output position and no open transaction, that the last segment ends at
+//! the new root, at sponge states equal to the block's input and output
+//! lists and with no open transaction, and that the summed balances plus
+//! the subsidy equal zero as integers.
+//!
+//! A transaction may span segments: a segment can end after any item of a
+//! transaction, exporting the transaction's state as `carry_out`, and the
+//! next segment then begins with a `resume` row that takes it back from
+//! `carry_in` and continues with the next item. The message, body sponge
+//! and item counters are the only state that crosses: everything else is
+//! per item, and amounts are summed per segment.
 //!
 //! Within a segment, for every input the prover shows an XMSS signature by
 //! the revealed key over the body hash of its transaction, derives the
@@ -34,12 +45,15 @@
 //! # Schedule
 //!
 //! ```text
-//! tx_start                                  body sponge header; counters n_in, n_out
+//! tx_start | resume                         body sponge header; counters n_in, n_out
 //!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ilist old/new x 40 body_in0 body_in1
 //!   per output: olist0 olist1 body_out0 body_out1 old/new x 40
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
 //! ```
+//!
+//! A `resume` row may only be the first; the last transaction may stop
+//! after any item (straight into the done rows), leaving it open.
 //!
 //! Row types are one-hot; the order is enforced by transition constraints,
 //! with the next phase after a transaction start or an item end chosen by
@@ -99,7 +113,8 @@ pub const T_OLIST1: usize = HM_COLS + 19;
 pub const T_BODY_OUT0: usize = HM_COLS + 20;
 pub const T_BODY_OUT1: usize = HM_COLS + 21;
 pub const T_DONE: usize = HM_COLS + 22;
-const NUM_TYPES: usize = 23;
+pub const T_RESUME: usize = HM_COLS + 23;
+const NUM_TYPES: usize = 24;
 // ---- xmss counters ----
 pub const C_MC: usize = HM_COLS + NUM_TYPES;
 pub const C_ACTIVE: usize = C_MC + 1;
@@ -154,7 +169,10 @@ pub const C_OUT_ZERO: usize = C_IN_INV + 1;
 pub const C_OUT_INV: usize = C_OUT_ZERO + 1;
 pub const C_GO_OUT: usize = C_OUT_INV + 1;
 pub const C_GO_END: usize = C_GO_OUT + 1;
-pub const NUM_COLS: usize = C_GO_END + 1;
+/// One while a transaction is open: from its start (or resume) until the
+/// row after its end.
+pub const R_OPEN: usize = C_GO_END + 1;
+pub const NUM_COLS: usize = R_OPEN + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -167,12 +185,53 @@ pub const PUB_POS_IN: usize = PUB_OSP_OUT + WIDTH; // lo, hi
 pub const PUB_POS_OUT: usize = PUB_POS_IN + 2;
 pub const PUB_SUM_IN: usize = PUB_POS_OUT + 2;
 pub const PUB_SUM_OUT: usize = PUB_SUM_IN + LIMBS;
-pub const NUM_PUBLIC: usize = PUB_SUM_OUT + LIMBS;
+pub const PUB_CARRY_IN: usize = PUB_SUM_OUT + LIMBS;
+pub const PUB_CARRY_OUT: usize = PUB_CARRY_IN + CARRY_LEN;
+pub const NUM_PUBLIC: usize = PUB_CARRY_OUT + CARRY_LEN;
+
+/// Layout of a carry: open flag, message, body sponge, items left.
+pub const CARRY_OPEN: usize = 0;
+pub const CARRY_MSG: usize = 1;
+pub const CARRY_BSP: usize = CARRY_MSG + DIGEST;
+pub const CARRY_IN_LEFT: usize = CARRY_BSP + WIDTH;
+pub const CARRY_OUT_LEFT: usize = CARRY_IN_LEFT + 1;
+pub const CARRY_LEN: usize = CARRY_OUT_LEFT + 1;
 
 /// Rows of one input (signature plus commitment, tree update and body).
 pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 4 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
 pub const ROWS_PER_OUTPUT: usize = 4 + 2 * DEPTH;
+
+/// Body sponge state after a transaction's header block.
+pub fn body_init(n_in: u32, n_out: u32) -> [Fp; WIDTH] {
+    let mut input = [Fp::ZERO; WIDTH];
+    input[0] = Fp::new(n_in);
+    input[1] = Fp::new(n_out);
+    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + 16 * (n_in + n_out)));
+    permute(input)
+}
+
+fn absorb_block(state: &mut [Fp; WIDTH], block: &[Fp]) {
+    for (s, x) in state.iter_mut().zip(block) {
+        *s = s.add(x);
+    }
+    *state = permute(*state);
+}
+
+/// Absorbs one input (key root, then seed and amount) into a body sponge.
+pub fn body_absorb_input(state: &mut [Fp; WIDTH], pubkey: &PublicKey, amount: u64) {
+    absorb_block(state, &pubkey.root);
+    let mut blk = [Fp::ZERO; RATE];
+    blk[..PUB_SEED_LEN].copy_from_slice(&pubkey.pub_seed);
+    blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(amount));
+    absorb_block(state, &blk);
+}
+
+/// Absorbs one output (commitment, then amount) into a body sponge.
+pub fn body_absorb_output(state: &mut [Fp; WIDTH], output: &Output) {
+    absorb_block(state, &output.commitment);
+    absorb_block(state, &amt_block(output.amount));
+}
 
 fn pow2<F: Field>(k: usize) -> F {
     F::from_u32(1 << k)
@@ -295,6 +354,7 @@ impl Air for BlockAir {
         let body_out0 = l[T_BODY_OUT0];
         let body_out1 = l[T_BODY_OUT1];
         let done = l[T_DONE];
+        let resume = l[T_RESUME];
         let active = l[C_ACTIVE];
         b.assert_zero(active * active - active);
         b.assert_zero(active * (one - step));
@@ -318,9 +378,9 @@ impl Air for BlockAir {
         b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + olist1 + body_out1);
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
-        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done);
+        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume);
         b.assert_zero(l[COL_COMPRESS]);
-        b.when_first_row(one - tx_start);
+        b.when_first_row(one - tx_start - resume);
         b.when_last_row(one - done);
 
         // ---------------- counters and gadgets ----------------
@@ -380,10 +440,23 @@ impl Air for BlockAir {
         b.mark("schedule");
         let nt = |t: usize| n[t];
         // dispatch after tx_start, after an input (body_in1), after an output (out_end)
-        let disp = tx_start + body_in1 + out_end;
-        b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START)));
-        b.when_transition(disp * go_out * (one - nt(T_OLIST0)));
-        b.when_transition(disp * go_end * (one - nt(T_TX_END)));
+        // (and after a resume); or into the done rows, leaving the
+        // transaction open.
+        let disp = tx_start + body_in1 + out_end + resume;
+        b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
+        b.when_transition(disp * go_out * (one - nt(T_OLIST0) - nt(T_DONE)));
+        b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
+        // A resume is only ever the first row.
+        b.when_transition(nt(T_RESUME));
+        b.when_first_row(resume - pubv(PUB_CARRY_IN + CARRY_OPEN));
+        // open: one from a start or resume until the row after the end
+        let open = l[R_OPEN];
+        b.assert_zero(open * open - open);
+        b.when_first_row(one - open);
+        b.when_transition(tx_end * (n[R_OPEN] - nt(T_TX_START)));
+        b.when_transition(nt(T_TX_START) * (one - n[R_OPEN]));
+        b.when_transition((one - tx_end - nt(T_TX_START)) * (n[R_OPEN] - open));
+        b.when_last_row(open - pubv(PUB_CARRY_OUT + CARRY_OPEN));
         b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE)));
         b.when_transition(done * (one - nt(T_DONE)));
         // xmss
@@ -444,6 +517,20 @@ impl Air for BlockAir {
         b.when_transition((one - nt(T_OLIST0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
         b.assert_zero(tx_end * in_left);
         b.assert_zero(tx_end * out_left);
+        // Carries: the open transaction's state on the resume row and at
+        // the end (carried there through the done rows), zero when closed.
+        let carried = |c: usize| -> F {
+            match c {
+                CARRY_IN_LEFT => in_left,
+                CARRY_OUT_LEFT => out_left,
+                c if c < CARRY_BSP => l[R_MSG + c - CARRY_MSG],
+                c => l[R_BSP + c - CARRY_BSP],
+            }
+        };
+        for c in CARRY_MSG..CARRY_LEN {
+            b.when_first_row(resume * carried(c) - pubv(PUB_CARRY_IN + c));
+            b.when_last_row(open * carried(c) - pubv(PUB_CARRY_OUT + c));
+        }
 
         // ---------------- xmss: digit selectors rotate on load rows ----------------
         b.mark("digit selectors");
@@ -801,12 +888,73 @@ pub struct OutputWitness {
     pub siblings: [Digest; DEPTH],
 }
 
+/// The part of one transaction that a segment proves: some of its items,
+/// in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxWitness {
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<OutputWitness>,
     /// The transaction body hash, which every input signed.
     pub message: Digest,
+    /// Inputs and outputs of the transaction from this part on: all of
+    /// them when the part starts the transaction.
+    pub in_left: u32,
+    pub out_left: u32,
+    /// The body sponge state when this part resumes a transaction begun in
+    /// an earlier segment; `None` when it starts the transaction.
+    pub resume: Option<[Fp; WIDTH]>,
+    /// Whether the transaction ends in this part.
+    pub ends: bool,
+}
+
+impl TxWitness {
+    /// Trace rows of this part: a start or resume row, the items, and the
+    /// end row if it ends here.
+    pub fn num_rows(&self) -> usize {
+        1 + self.inputs.len() * ROWS_PER_INPUT + self.outputs.len() * ROWS_PER_OUTPUT + usize::from(self.ends)
+    }
+}
+
+/// A transaction left open across a segment boundary: its signed message,
+/// body sponge state and items still to come. [`Carry::CLOSED`] when none
+/// is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Carry {
+    pub open: bool,
+    pub msg: Digest,
+    pub bsp: [Fp; WIDTH],
+    pub in_left: u32,
+    pub out_left: u32,
+}
+
+impl Carry {
+    pub const CLOSED: Carry =
+        Carry { open: false, msg: [Fp::ZERO; DIGEST], bsp: [Fp::ZERO; WIDTH], in_left: 0, out_left: 0 };
+
+    fn push_values(&self, v: &mut Vec<Fp>) {
+        v.push(Fp::new(self.open as u32));
+        v.extend_from_slice(&self.msg);
+        v.extend_from_slice(&self.bsp);
+        v.push(Fp::new(self.in_left));
+        v.push(Fp::new(self.out_left));
+    }
+
+    /// Parses a carry; a closed one must be all zero.
+    fn from_values(v: &[Fp]) -> Option<Carry> {
+        let open = match v[CARRY_OPEN].to_canonical() {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let c = Carry {
+            open,
+            msg: v[CARRY_MSG..CARRY_MSG + DIGEST].try_into().unwrap(),
+            bsp: v[CARRY_BSP..CARRY_BSP + WIDTH].try_into().unwrap(),
+            in_left: v[CARRY_IN_LEFT].to_canonical(),
+            out_left: v[CARRY_OUT_LEFT].to_canonical(),
+        };
+        (open || c == Carry::CLOSED).then_some(c)
+    }
 }
 
 /// Boundary values of a segment: its public statement.
@@ -822,6 +970,8 @@ pub struct SegmentPublic {
     pub pos_out: u64,
     pub sum_in: [u32; LIMBS],
     pub sum_out: [u32; LIMBS],
+    pub carry_in: Carry,
+    pub carry_out: Carry,
 }
 
 impl SegmentPublic {
@@ -839,6 +989,8 @@ impl SegmentPublic {
         }
         v.extend(self.sum_in.iter().map(|x| Fp::new(*x)));
         v.extend(self.sum_out.iter().map(|x| Fp::new(*x)));
+        self.carry_in.push_values(&mut v);
+        self.carry_out.push_values(&mut v);
         v
     }
 
@@ -866,6 +1018,8 @@ impl SegmentPublic {
             pos_out: pos(PUB_POS_OUT)?,
             sum_in: sums(PUB_SUM_IN),
             sum_out: sums(PUB_SUM_OUT),
+            carry_in: Carry::from_values(&v[PUB_CARRY_IN..PUB_CARRY_IN + CARRY_LEN])?,
+            carry_out: Carry::from_values(&v[PUB_CARRY_OUT..PUB_CARRY_OUT + CARRY_LEN])?,
         })
     }
 
@@ -885,11 +1039,72 @@ pub struct SegmentWitness {
     pub txs: Vec<TxWitness>,
 }
 
+/// A run of one transaction's items, `start..end` in input-then-output
+/// order, placed in a segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub tx: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Trace rows of item `k` of a transaction with `n_in` inputs.
+fn item_rows(k: usize, n_in: usize) -> usize {
+    if k < n_in { ROWS_PER_INPUT } else { ROWS_PER_OUTPUT }
+}
+
+/// Packs transactions into segments of `max_rows` trace rows (one kept
+/// for padding), greedily and splitting a transaction between items when
+/// it does not fit what is left of a segment. Each segment lists its
+/// parts in order. `items(t)` gives transaction `t`'s input and output
+/// counts.
+pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize), max_rows: usize) -> Vec<Vec<Part>> {
+    let cap = max_rows - 1;
+    let mut segments = Vec::new();
+    let mut cur: Vec<Part> = Vec::new();
+    let mut rows = 0;
+    for tx in 0..num_txs {
+        let (n_in, n_out) = items(tx);
+        let n = n_in + n_out;
+        // Rows item k needs, with the end row after the last item.
+        let cost = |k: usize| item_rows(k, n_in) + usize::from(k + 1 == n);
+        let mut k = 0;
+        loop {
+            // A part needs its start (or resume) row and its first item,
+            // or the end row for an empty transaction.
+            let first = if k < n { cost(k) } else { 1 };
+            assert!(first < cap, "an item does not fit a segment of {max_rows} rows");
+            if rows + 1 + first > cap {
+                segments.push(std::mem::take(&mut cur));
+                rows = 0;
+            }
+            let start = k;
+            rows += 1;
+            while k < n && rows + cost(k) <= cap {
+                rows += item_rows(k, n_in);
+                k += 1;
+            }
+            cur.push(Part { tx, start, end: k });
+            if k == n {
+                rows += 1;
+                break;
+            }
+            segments.push(std::mem::take(&mut cur));
+            rows = 0;
+        }
+    }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
+    segments
+}
+
 impl SegmentWitness {
     /// Applies `txs` to the UTXO set inside `wtxn`, splitting them into
-    /// segments of at most `txs_per_segment` transactions and recording the
-    /// sibling paths each update needs. The caller decides whether to
-    /// commit or abort the transaction. Signatures are not checked here.
+    /// segments of at most `txs_per_segment` whole transactions and
+    /// recording the sibling paths each update needs. The caller decides
+    /// whether to commit or abort the transaction. Signatures are not
+    /// checked here.
     pub fn collect(
         utxo: &UtxoSet,
         wtxn: &mut heed::RwTxn,
@@ -897,78 +1112,95 @@ impl SegmentWitness {
         txs_per_segment: usize,
     ) -> utxo::Result<Vec<SegmentWitness>> {
         assert!(txs_per_segment > 0);
-        Self::collect_chunks(utxo, wtxn, txs.chunks(txs_per_segment).collect())
+        let parts: Vec<Part> = txs
+            .iter()
+            .enumerate()
+            .map(|(t, tx)| Part { tx: t, start: 0, end: tx.inputs.len() + tx.outputs.len() })
+            .collect();
+        Self::collect_parts(utxo, wtxn, txs, parts.chunks(txs_per_segment).map(|c| c.to_vec()).collect())
     }
 
-    /// As [`SegmentWitness::collect`], but fills segments greedily up to
-    /// `max_rows` trace rows each. A transaction that alone exceeds
-    /// `max_rows` gets a segment of its own; callers that need a fixed
-    /// height must check [`SegmentWitness::num_rows`].
+    /// As [`SegmentWitness::collect`], packed by [`pack`] into segments of
+    /// `max_rows` rows, transactions split between segments where needed.
     pub fn collect_by_rows(
         utxo: &UtxoSet,
         wtxn: &mut heed::RwTxn,
         txs: &[Transaction],
         max_rows: usize,
     ) -> utxo::Result<Vec<SegmentWitness>> {
-        let mut chunks = Vec::new();
-        let (mut start, mut rows) = (0, 0);
-        for (i, tx) in txs.iter().enumerate() {
-            let r = tx_rows(tx);
-            if i > start && rows + r > max_rows {
-                chunks.push(&txs[start..i]);
-                start = i;
-                rows = 0;
-            }
-            rows += r;
-        }
-        if start < txs.len() {
-            chunks.push(&txs[start..]);
-        }
-        Self::collect_chunks(utxo, wtxn, chunks)
+        let plan = pack(txs.len(), |t| (txs[t].inputs.len(), txs[t].outputs.len()), max_rows);
+        Self::collect_parts(utxo, wtxn, txs, plan)
     }
 
-    fn collect_chunks(
+    /// Applies the parts of `txs` in order, one segment per entry of
+    /// `segments`. A transaction's parts must be consecutive and cover its
+    /// items in order.
+    pub fn collect_parts(
         utxo: &UtxoSet,
         wtxn: &mut heed::RwTxn,
-        chunks: Vec<&[Transaction]>,
+        txs: &[Transaction],
+        segments: Vec<Vec<Part>>,
     ) -> utxo::Result<Vec<SegmentWitness>> {
         let mut isp = initial_inputs_state();
         let mut osp = initial_outputs_state();
-        let mut segments = Vec::new();
-        for chunk in chunks {
+        let mut bsp = [Fp::ZERO; WIDTH];
+        let mut out_segments = Vec::with_capacity(segments.len());
+        for parts in segments {
             let root_in = utxo.root(wtxn)?;
             let pos_in = utxo.next_position(wtxn)?;
             let (isp_in, osp_in) = (isp, osp);
-            let mut out = Vec::with_capacity(chunk.len());
-            for tx in chunk {
-                let mut inputs = Vec::with_capacity(tx.inputs.len());
-                for inp in &tx.inputs {
-                    let commitment = inp.commitment();
-                    let position = utxo.spend(wtxn, &commitment)?.ok_or(utxo::Error::CorruptIndex)?;
-                    // Siblings are unchanged by the removal, so read them after it.
-                    let proof = utxo.prove(wtxn, position)?;
-                    absorb_position(&mut isp, position);
-                    inputs.push(InputWitness {
-                        pubkey: inp.pubkey,
-                        amount: inp.amount,
-                        signature: inp.signature.clone(),
-                        position,
-                        siblings: proof.siblings,
-                    });
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                let tx = &txs[part.tx];
+                let (n_in, n_out) = (tx.inputs.len(), tx.outputs.len());
+                assert!(part.start <= part.end && part.end <= n_in + n_out, "part out of range");
+                let resume = if part.start == 0 {
+                    bsp = body_init(n_in as u32, n_out as u32);
+                    None
+                } else {
+                    Some(bsp)
+                };
+                let mut inputs = Vec::new();
+                let mut outputs = Vec::new();
+                for k in part.start..part.end {
+                    if k < n_in {
+                        let inp = &tx.inputs[k];
+                        let commitment = inp.commitment();
+                        let position = utxo.spend(wtxn, &commitment)?.ok_or(utxo::Error::CorruptIndex)?;
+                        // Siblings are unchanged by the removal, so read them after it.
+                        let proof = utxo.prove(wtxn, position)?;
+                        absorb_position(&mut isp, position);
+                        body_absorb_input(&mut bsp, &inp.pubkey, inp.amount);
+                        inputs.push(InputWitness {
+                            pubkey: inp.pubkey,
+                            amount: inp.amount,
+                            signature: inp.signature.clone(),
+                            position,
+                            siblings: proof.siblings,
+                        });
+                    } else {
+                        let o = &tx.outputs[k - n_in];
+                        let position = utxo.next_position(wtxn)?;
+                        let proof = utxo.prove(wtxn, position)?;
+                        utxo.add(wtxn, o)?;
+                        absorb_output(&mut osp, o);
+                        body_absorb_output(&mut bsp, o);
+                        outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
+                    }
                 }
-                let mut outputs = Vec::with_capacity(tx.outputs.len());
-                for o in &tx.outputs {
-                    let position = utxo.next_position(wtxn)?;
-                    let proof = utxo.prove(wtxn, position)?;
-                    utxo.add(wtxn, o)?;
-                    absorb_output(&mut osp, o);
-                    outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
-                }
-                out.push(TxWitness { inputs, outputs, message: tx.body_hash() });
+                out.push(TxWitness {
+                    inputs,
+                    outputs,
+                    message: tx.body_hash(),
+                    in_left: n_in.saturating_sub(part.start) as u32,
+                    out_left: (n_out - part.start.saturating_sub(n_in)) as u32,
+                    resume,
+                    ends: part.end == n_in + n_out,
+                });
             }
-            segments.push(SegmentWitness { root_in, isp_in, osp_in, pos_in, txs: out });
+            out_segments.push(SegmentWitness { root_in, isp_in, osp_in, pos_in, txs: out });
         }
-        Ok(segments)
+        Ok(out_segments)
     }
 
     pub fn positions(&self) -> Vec<u64> {
@@ -979,8 +1211,9 @@ impl SegmentWitness {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output)).collect()
     }
 
+    /// Trace rows before padding; a trace needs at least one more.
     pub fn num_rows(&self) -> usize {
-        self.txs.iter().map(|t| 2 + t.inputs.len() * ROWS_PER_INPUT + t.outputs.len() * ROWS_PER_OUTPUT).sum()
+        self.txs.iter().map(TxWitness::num_rows).sum()
     }
 }
 
@@ -1023,6 +1256,7 @@ struct Regs {
     opos: u64,
     in_left: u32,
     out_left: u32,
+    open: bool,
 }
 
 impl Regs {
@@ -1080,6 +1314,7 @@ impl Regs {
         row[C_OUT_INV] = if out_zero { Fp::ZERO } else { Fp::new(self.out_left).inverse().unwrap() };
         row[C_GO_OUT] = Fp::new((in_zero && !out_zero) as u32);
         row[C_GO_END] = Fp::new((in_zero && out_zero) as u32);
+        row[R_OPEN] = Fp::new(self.open as u32);
     }
 }
 
@@ -1395,7 +1630,7 @@ impl BlockAir {
     /// Trace padded to exactly `2^log_n` rows; panics if the segment needs
     /// more.
     pub fn generate_trace_padded(w: &SegmentWitness, log_n: usize) -> (Trace, SegmentPublic) {
-        assert!(w.num_rows() <= 1 << log_n, "segment of {} rows does not fit 2^{log_n}", w.num_rows());
+        assert!(w.num_rows() < 1 << log_n, "segment of {} rows does not fit 2^{log_n}", w.num_rows());
         Self::generate_trace_with(w, 1 << log_n)
     }
 
@@ -1430,37 +1665,62 @@ impl BlockAir {
             opos: w.pos_in,
             in_left: 0,
             out_left: 0,
+            open: false,
         };
         let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs };
-        for tx in &w.txs {
-            let n_in = tx.inputs.len() as u32;
-            let n_out = tx.outputs.len() as u32;
+        let mut carry_in = Carry::CLOSED;
+        let mut carry_out = Carry::CLOSED;
+        let parts = w.txs.len();
+        for (p, tx) in w.txs.iter().enumerate() {
+            let (n_in, n_out) = (tx.inputs.len() as u32, tx.outputs.len() as u32);
+            assert!(n_in <= tx.in_left && n_out <= tx.out_left, "more items than the transaction has left");
+            assert!(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
+            assert!(!tx.ends || (n_in, n_out) == (tx.in_left, tx.out_left), "a part that ends has every item left");
             g.regs.msg = tx.message;
-            g.regs.in_left = n_in;
-            g.regs.out_left = n_out;
+            g.regs.in_left = tx.in_left;
+            g.regs.out_left = tx.out_left;
             g.regs.is_out = false;
-            let mut input = [Fp::ZERO; WIDTH];
-            input[0] = Fp::new(n_in);
-            input[1] = Fp::new(n_out);
-            input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + 16 * (n_in + n_out)));
-            g.b.start(input);
-            {
-                let row = g.b.last_row_mut();
-                row[T_TX_START] = Fp::ONE;
-                g.regs.write(row);
+            g.regs.open = true;
+            match tx.resume {
+                None => {
+                    let mut input = [Fp::ZERO; WIDTH];
+                    input[0] = Fp::new(tx.in_left);
+                    input[1] = Fp::new(tx.out_left);
+                    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + 16 * (tx.in_left + tx.out_left)));
+                    g.b.start(input);
+                    let row = g.b.last_row_mut();
+                    row[T_TX_START] = Fp::ONE;
+                    g.regs.write(row);
+                    g.regs.bsp = g.b.state();
+                }
+                Some(bsp) => {
+                    assert_eq!(p, 0, "only a segment's first part may resume a transaction");
+                    g.regs.bsp = bsp;
+                    g.b.pass();
+                    let row = g.b.last_row_mut();
+                    row[T_RESUME] = Fp::ONE;
+                    g.regs.write(row);
+                    carry_in = Carry { open: true, msg: tx.message, bsp, in_left: tx.in_left, out_left: tx.out_left };
+                }
             }
-            g.regs.bsp = g.b.state();
             for inp in &tx.inputs {
                 g.input(inp);
             }
             for out in &tx.outputs {
                 g.output(out);
             }
-            assert_eq!(&g.regs.bsp[..DIGEST], &tx.message[..], "body digest does not match the signed message");
-            g.b.pass();
-            let row = g.b.last_row_mut();
-            row[T_TX_END] = Fp::ONE;
-            g.regs.write(row);
+            if tx.ends {
+                assert_eq!(&g.regs.bsp[..DIGEST], &tx.message[..], "body digest does not match the signed message");
+                g.b.pass();
+                let row = g.b.last_row_mut();
+                row[T_TX_END] = Fp::ONE;
+                g.regs.write(row);
+                g.regs.open = false;
+            } else {
+                assert_eq!(p + 1, parts, "only a segment's last part may leave a transaction open");
+                let r = &g.regs;
+                carry_out = Carry { open: true, msg: r.msg, bsp: r.bsp, in_left: r.in_left, out_left: r.out_left };
+            }
         }
         let public = SegmentPublic {
             root_in: w.root_in,
@@ -1473,8 +1733,10 @@ impl BlockAir {
             pos_out: g.regs.opos,
             sum_in: g.regs.sum_in,
             sum_out: g.regs.sum_out,
+            carry_in,
+            carry_out,
         };
-        let n = g.b.len().max(min_rows).next_power_of_two();
+        let n = (g.b.len() + 1).max(min_rows).next_power_of_two();
         while g.b.len() < n {
             g.b.pass();
             let row = g.b.last_row_mut();
@@ -1523,6 +1785,13 @@ mod tests {
     /// split into segments of `per_segment` transactions. Returns the
     /// segments, the final root, the positions and the outputs.
     fn scenario(name: &str, per_segment: usize) -> (Vec<SegmentWitness>, Digest, Vec<u64>, Vec<Output>) {
+        scenario_with(name, |utxo, wtxn, txs| SegmentWitness::collect(utxo, wtxn, txs, per_segment).unwrap())
+    }
+
+    fn scenario_with(
+        name: &str,
+        split: impl FnOnce(&UtxoSet, &mut heed::RwTxn, &[Transaction]) -> Vec<SegmentWitness>,
+    ) -> (Vec<SegmentWitness>, Digest, Vec<u64>, Vec<Output>) {
         let dir = TempDir::new(name);
         let env = open_env(&dir.0, 64 << 20).unwrap();
         let mut wtxn = env.write_txn().unwrap();
@@ -1551,7 +1820,7 @@ mod tests {
         let positions = vec![0, 1, 2];
         let outputs: Vec<Output> = txs.iter().flat_map(|t| t.outputs.clone()).collect();
 
-        let segments = SegmentWitness::collect(&utxo, &mut wtxn, &txs, per_segment).unwrap();
+        let segments = split(&utxo, &mut wtxn, &txs);
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         (segments, new_root, positions, outputs)
@@ -1562,7 +1831,7 @@ mod tests {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
         assert_eq!(ROWS_PER_INPUT, 1150 + 4 + 1 + 80 + 2);
         assert_eq!(ROWS_PER_OUTPUT, 84);
-        assert_eq!(NUM_PUBLIC, 92);
+        assert_eq!(NUM_PUBLIC, 92 + 2 * 27);
     }
 
     #[test]
@@ -1621,6 +1890,103 @@ mod tests {
         assert_eq!(p.isp_out, publics[1].isp_out);
         assert_eq!(p.osp_out, publics[1].osp_out);
         assert_eq!(SegmentPublic::total(&p.sum_out), 230);
+    }
+
+    #[test]
+    fn transactions_span_segments() {
+        // The first transaction (two inputs, two outputs) is split after
+        // its first input and after its first output.
+        let plan = vec![
+            vec![Part { tx: 0, start: 0, end: 1 }],
+            vec![Part { tx: 0, start: 1, end: 3 }],
+            vec![Part { tx: 0, start: 3, end: 4 }, Part { tx: 1, start: 0, end: 1 }, Part { tx: 2, start: 0, end: 2 }],
+        ];
+        let (segments, expected_root, positions, outputs) =
+            scenario_with("span", |utxo, wtxn, txs| SegmentWitness::collect_parts(utxo, wtxn, txs, plan).unwrap());
+        assert_eq!(segments.len(), 3);
+        let mut publics = Vec::new();
+        let mut traces = Vec::new();
+        for (k, seg) in segments.iter().enumerate() {
+            let (trace, public) = BlockAir::generate_trace(seg);
+            let values = public.to_values();
+            assert_eq!(SegmentPublic::from_values(&values), Some(public));
+            assert_eq!(check_constraints(&BlockAir, &trace, &values), Ok(()), "segment {k}");
+            publics.push(public);
+            traces.push(trace);
+        }
+        let (c01, c12) = (publics[0].carry_out, publics[1].carry_out);
+        assert_eq!(publics[0].carry_in, Carry::CLOSED);
+        assert!(c01.open && c12.open);
+        assert_eq!((c01.in_left, c01.out_left), (1, 2));
+        assert_eq!((c12.in_left, c12.out_left), (0, 1));
+        assert_eq!(publics[1].carry_in, c01);
+        assert_eq!(publics[2].carry_in, c12);
+        assert_eq!(publics[2].carry_out, Carry::CLOSED);
+        for w in publics.windows(2) {
+            assert_eq!((w[0].root_out, w[0].isp_out, w[0].osp_out), (w[1].root_in, w[1].isp_in, w[1].osp_in));
+            assert_eq!(w[0].pos_out, w[1].pos_in);
+        }
+        assert_eq!(publics[2].root_out, expected_root);
+        assert_eq!(publics[2].isp_out, inputs_state(&positions));
+        assert_eq!(publics[2].osp_out, outputs_state(&outputs));
+        let total = |f: fn(&SegmentPublic) -> &[u32; LIMBS]| -> u128 {
+            publics.iter().map(|p| SegmentPublic::total(f(p))).sum()
+        };
+        assert_eq!(total(|p| &p.sum_in) + 50, total(|p| &p.sum_out));
+
+        // Every carry value matters, on both sides.
+        let mid = &traces[1];
+        let values = publics[1].to_values();
+        for c in [CARRY_OPEN, CARRY_MSG + 2, CARRY_BSP + 11, CARRY_IN_LEFT, CARRY_OUT_LEFT] {
+            for at in [PUB_CARRY_IN, PUB_CARRY_OUT] {
+                let mut bad = values.clone();
+                bad[at + c] += Fp::ONE;
+                assert!(check_constraints(&BlockAir, mid, &bad).is_err(), "carry {at} + {c}");
+            }
+        }
+        // Claiming the open transaction closed.
+        let mut bad = values.clone();
+        bad[PUB_CARRY_OUT..PUB_CARRY_OUT + CARRY_LEN].fill(Fp::ZERO);
+        assert!(check_constraints(&BlockAir, mid, &bad).is_err());
+        // A resume row turned into a start: its header is not the carry.
+        let mut bad = mid.clone();
+        bad.values[T_RESUME] = Fp::ZERO;
+        bad.values[T_TX_START] = Fp::ONE;
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // A transaction cannot be resumed with a different message: the
+        // signatures then fail (the witness refuses to build).
+        let mut forged = segments[1].clone();
+        forged.txs[0].message[0] += Fp::ONE;
+        assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&forged)).is_err());
+    }
+
+    #[test]
+    fn packing_splits_between_items() {
+        let items = |t: usize| [(0, 1), (3, 2), (1, 2), (0, 5)][t];
+        let max_rows = 2048;
+        let plan = pack(4, items, max_rows);
+        // Parts cover every item once, in order.
+        let mut next = [0usize; 4];
+        let mut last_tx = 0;
+        for seg in &plan {
+            let mut rows = 0;
+            for p in seg {
+                assert!(p.tx >= last_tx);
+                last_tx = p.tx;
+                assert_eq!(p.start, next[p.tx]);
+                next[p.tx] = p.end;
+                let (n_in, n_out) = items(p.tx);
+                rows += 1 + (p.start..p.end).map(|k| item_rows(k, n_in)).sum::<usize>();
+                rows += usize::from(p.end == n_in + n_out);
+            }
+            assert!(rows < max_rows, "{rows}");
+        }
+        assert_eq!(next, [1, 5, 3, 5]);
+        // A segment holds one input: the second transaction's three are
+        // spread over three segments, its outputs joining the last.
+        assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 1 }]);
+        assert_eq!(plan[1], vec![Part { tx: 1, start: 1, end: 2 }]);
+        assert_eq!(plan[2][0], Part { tx: 1, start: 2, end: 5 });
     }
 
     #[test]

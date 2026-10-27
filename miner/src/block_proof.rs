@@ -16,7 +16,7 @@
 
 use crate::block::Body;
 use crate::block_air::{
-    BlockAir, LIMBS, NUM_PUBLIC, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state,
+    BlockAir, Carry, LIMBS, NUM_PUBLIC, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state,
     inputs_state, outputs_state,
 };
 use crate::chain::{BlockStatement, ProofVerifier};
@@ -131,12 +131,18 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result
         || first.public.isp_in != initial_inputs_state()
         || first.public.osp_in != initial_outputs_state()
         || first.public.pos_in != s.first_output_position
+        || first.public.carry_in != Carry::CLOSED
     {
         return Err(AggregateError::BrokenChain { index: 0 });
     }
     for (i, pair) in proofs.windows(2).enumerate() {
         let (a, b) = (&pair[0].public, &pair[1].public);
-        if a.root_out != b.root_in || a.isp_out != b.isp_in || a.osp_out != b.osp_in || a.pos_out != b.pos_in {
+        if a.root_out != b.root_in
+            || a.isp_out != b.isp_in
+            || a.osp_out != b.osp_in
+            || a.pos_out != b.pos_in
+            || a.carry_out != b.carry_in
+        {
             return Err(AggregateError::BrokenChain { index: i + 1 });
         }
     }
@@ -146,6 +152,7 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result
         || last.isp_out != inputs_state(&s.body.inputs)
         || last.osp_out != outputs_state(&s.body.outputs)
         || last.pos_out != expected_pos
+        || last.carry_out != Carry::CLOSED
     {
         return Err(AggregateError::WrongEnd);
     }
