@@ -19,9 +19,20 @@ const Z: Fp = Fp::new(1_728_404_513);
 /// Extension degree.
 pub const DEGREE: usize = 4;
 
-/// An element of `Fp4`, coefficients lowest degree first.
+/// An element of `Fp4`, coefficients lowest degree first. Laid out as its
+/// four coefficients, so a row of base values can be read as extension
+/// values in place ([`as_fp4`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
 pub struct Fp4(pub [Fp; DEGREE]);
+
+/// Base values, four per element, read as extension values.
+pub fn as_fp4(v: &[Fp]) -> &[Fp4] {
+    assert!(v.len().is_multiple_of(DEGREE), "not a whole number of extension values");
+    // SAFETY: `Fp4` is `repr(transparent)` over `[Fp; 4]`, so it has the
+    // size and alignment of four consecutive `Fp`.
+    unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<Fp4>(), v.len() / DEGREE) }
+}
 
 impl Fp4 {
     pub const ZERO: Fp4 = Fp4([Fp::ZERO; DEGREE]);

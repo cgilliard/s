@@ -58,11 +58,11 @@
 
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
-use crate::ext::{DEGREE, Fp4};
+use crate::ext::{DEGREE, Fp4, as_fp4};
 use crate::field::{Deg, Field, batch_inverse};
 use crate::fri::{self, FriConfig, FriError, FriProof, QueryStep, leaf_row};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
-use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_intt_ext, intt, lde_cosets, log2_strict, root_of_unity};
+use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_evals, coset_intt_ext, intt, lde_cosets, log2_strict, root_of_unity};
 use crate::parallel::{par_chunks_mut, par_map, par_map_min, par_map_with};
 use crate::poseidon2::{Fp, zeroed_vec};
 use crate::recursion::Expr;
@@ -886,10 +886,6 @@ fn eval_ext_poly_at(coeffs: &[Fp4], x: Fp4) -> Fp4 {
     coeffs.iter().rev().fold(Fp4::ZERO, |acc, c| acc * x + *c)
 }
 
-fn ext_row(values: &[Fp4]) -> Vec<Fp> {
-    values.iter().flat_map(|v| v.0).collect()
-}
-
 fn ext_from_row(row: &[Fp]) -> Vec<Fp4> {
     row.chunks_exact(DEGREE).map(|c| Fp4([c[0], c[1], c[2], c[3]])).collect()
 }
@@ -986,6 +982,43 @@ impl Deep {
         self.beta_powers.len()
     }
 
+    /// The combination in coefficient form, which is linear in the
+    /// columns: the sums divided by `x - zeta`, by `x - zeta g` and by `x -
+    /// zeta^chunks`, each of `n` coefficients. Evaluated at a point, with
+    /// the constants of [`Deep::constants`], they give [`Deep::value`].
+    fn polys(&self, trace: &[Vec<Fp>], aux: &[Vec<Fp>], pre: &[Vec<Fp>], quotient: &[Vec<Fp4>]) -> [Vec<Fp4>; 3] {
+        const CHUNK: usize = 4096;
+        let n = trace[0].len();
+        let bp = &self.beta_powers;
+        let (w, aux_w, pre_w) = (self.w, self.aux_w, self.pre_w);
+        let group = |cols: &[Vec<Fp>], from: usize| -> Vec<Fp4> {
+            let mut acc = vec![Fp4::ZERO; n];
+            par_chunks_mut(&mut acc, CHUNK, |c, part| {
+                for (k, col) in cols.iter().enumerate() {
+                    let weight = bp[from + k];
+                    for (a, x) in part.iter_mut().zip(&col[c * CHUNK..]) {
+                        *a += weight.mul_base(x);
+                    }
+                }
+            });
+            acc
+        };
+        let (g_t, g_a, g_p) = (group(trace, 0), group(aux, 2 * w), group(pre, 2 * w + 2 * aux_w));
+        let q_from = 2 * w + 2 * aux_w + 2 * pre_w;
+        let at_z: Vec<Fp4> = (0..n).map(|k| g_t[k] + g_a[k] + g_p[k]).collect();
+        let at_zn: Vec<Fp4> =
+            (0..n).map(|k| self.beta_w * g_t[k] + self.beta_aux * g_a[k] + self.beta_pre * g_p[k]).collect();
+        let at_q: Vec<Fp4> = (0..n)
+            .map(|k| quotient.iter().enumerate().fold(Fp4::ZERO, |acc, (j, c)| acc + bp[q_from + j] * c[k]))
+            .collect();
+        [at_z, at_zn, at_q]
+    }
+
+    /// The constants subtracted from [`Deep::polys`] at a point.
+    fn constants(&self) -> [Fp4; 3] {
+        [self.c_tz + self.c_az + self.c_pz, self.c_tzn + self.c_azn + self.c_pzn, self.c_q]
+    }
+
     fn value(&self, rows: Rows<'_>, inv_z: Fp4, inv_zn: Fp4, inv_q: Fp4) -> Fp4 {
         let (trace_row, aux_row, pre_row, quotient_row) = rows;
         let (w, aux_w, pre_w) = (self.w, self.aux_w, self.pre_w);
@@ -1013,27 +1046,23 @@ pub struct Preprocessed {
     pub log_n: usize,
     pub log_blowup: usize,
     table: Trace,
-    coeffs: Vec<Vec<Fp>>,
-    lde: Vec<Fp>,
-    tree: MerkleTree,
+    committed: Committed,
 }
 
 impl Preprocessed {
-    pub fn new(table: &Trace, log_blowup: usize) -> Preprocessed {
+    /// Commits to `table` at `log_blowup`, keeping the rows a quotient at
+    /// `stride` ([`quotient_stride`]) reads.
+    pub fn new(table: &Trace, log_blowup: usize, stride: usize) -> Preprocessed {
         let w = table.width;
         let log_n = log2_strict(table.height());
-        let big_n = table.height() << log_blowup;
-        let mut lde = zeroed_vec(big_n * w);
-        let ext: Vec<(Vec<Fp>, Vec<Fp>)> =
-            par_map_min(w, 1, |k| lde_column(table.column(k), big_n, MULTIPLICATIVE_GENERATOR));
-        let (coeffs, evals): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-        scatter_columns(&mut lde, w, 0, &evals, table.height());
-        let tree = MerkleTree::from_flat(&lde, w);
-        Preprocessed { width: w, log_n, log_blowup, table: table.clone(), coeffs, lde, tree }
+        let committed = Committed::new(w, table.height() << log_blowup, MULTIPLICATIVE_GENERATOR, Some(stride), |k| {
+            table.column(k)
+        });
+        Preprocessed { width: w, log_n, log_blowup, table: table.clone(), committed }
     }
 
     pub fn root(&self) -> Digest {
-        self.tree.root()
+        self.committed.tree.root()
     }
 
     /// The committed table.
@@ -1041,8 +1070,13 @@ impl Preprocessed {
         &self.table
     }
 
+    /// The rows a quotient reads are kept every `stride` points.
+    pub fn stride(&self) -> usize {
+        self.committed.stride.unwrap()
+    }
+
     fn row(&self, i: usize) -> &[Fp] {
-        &self.lde[i * self.width..(i + 1) * self.width]
+        self.committed.row(i)
     }
 }
 
@@ -1249,65 +1283,119 @@ impl Timer {
     }
 }
 
-/// Transposes column evaluations (each `big_n` long) into row-major `lde`
-/// (rows of `w`), columns `first..first + cols.len()`.
-fn scatter_columns(lde: &mut [Fp], w: usize, first: usize, cols: &[Vec<Fp>], n: usize) {
-    // Columns are coset-major (see `lde_cosets`): row i is entry
-    // (i mod b) * n + i / b, b = big_n / n.
-    const ROWS: usize = 256;
-    let b = cols.first().map_or(1, |c| c.len() / n);
-    par_chunks_mut(lde, ROWS * w, |c, rows| {
-        for (r, row) in rows.chunks_exact_mut(w).enumerate() {
-            let i = c * ROWS + r;
-            let at = (i % b) * n + i / b;
-            for (k, col) in cols.iter().enumerate() {
-                row[first + k] = col[at];
-            }
-        }
-    });
+/// Gap between the points a table's quotient is evaluated on: the
+/// quotient has `2^log_quotient_degree` chunks, so it is determined by its
+/// values on the sub-coset of every `stride`-th point of the extension.
+/// One below the blowup the degree needs (where no proof can be made, but
+/// a table can still be committed).
+pub fn quotient_stride(degree: usize, log_blowup: usize) -> usize {
+    1 << log_blowup.saturating_sub(log_quotient_degree(degree))
 }
 
-/// Interpolates a base column over `H` and evaluates it on the coset of
-/// size `big_n`; returns the coefficients and the evaluations, coset-major
-/// ([`lde_cosets`]).
-fn lde_column(col: Vec<Fp>, big_n: usize, shift: Fp) -> (Vec<Fp>, Vec<Fp>) {
-    let mut c = col;
-    intt(&mut c);
-    let e = lde_cosets(&c, log2_strict(big_n / c.len()), shift);
-    (c, e)
+/// Which rows of a table's trace and auxiliary extensions to keep: only
+/// those the quotient reads ([`quotient_stride`]) when there are fewer
+/// queries than cosets, since each opened row is then recomputed from the
+/// coefficients at a cost of one pass over them; otherwise every row,
+/// as the recomputation would cost more than the extension.
+fn kept_stride(config: &StarkConfig, air: &dyn DynAir) -> usize {
+    if config.num_queries >= 1 << config.log_blowup { 1 } else { quotient_stride(air.air_degree(), config.log_blowup) }
 }
 
-/// A committed matrix: column coefficients, row-major evaluations on the
-/// coset, and the Merkle tree over the rows.
+/// A committed matrix: `width` columns of `n` coefficients extended to
+/// `n << log_blowup` points on the coset `shift * H`, and the Merkle tree
+/// over the rows. The extension is computed and hashed one coset of `H_n`
+/// at a time and never held whole: only the rows on the sub-coset of every
+/// `stride`-th point are kept (the points the quotient reads; none for
+/// `None`). Other rows are recomputed from the coefficients when opened.
 struct Committed {
     width: usize,
+    log_blowup: usize,
+    shift: Fp,
+    stride: Option<usize>,
     coeffs: Vec<Vec<Fp>>,
-    rows: Vec<Fp>,
+    /// Kept rows, one block of `n` rows per kept coset `j` (`j` a multiple
+    /// of `stride`): point `j + 2^log_blowup * m` at row `m` of block
+    /// `j / stride`.
+    kept: Vec<Vec<Fp>>,
     tree: MerkleTree,
 }
 
 impl Committed {
-    /// Extends the `width` columns `column(k)` to `big_n` points on the
-    /// coset `shift * H` and commits to the rows. Columns are extended in
-    /// parallel batches (bounding memory) and scattered into the row-major
-    /// table.
-    fn new(width: usize, big_n: usize, shift: Fp, column: impl Fn(usize) -> Vec<Fp> + Sync) -> Committed {
-        let mut coeffs: Vec<Vec<Fp>> = Vec::with_capacity(width);
-        let mut rows = zeroed_vec(big_n * width);
-        let batch = crate::parallel::threads() * 4;
-        for first in (0..width).step_by(batch) {
-            let cols = (first + batch).min(width) - first;
-            let ext: Vec<(Vec<Fp>, Vec<Fp>)> = par_map_min(cols, 1, |k| lde_column(column(first + k), big_n, shift));
-            let (c, e): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-            scatter_columns(&mut rows, width, first, &e, c[0].len());
-            coeffs.extend(c);
-        }
-        let tree = MerkleTree::from_flat(&rows, width);
-        Committed { width, coeffs, rows, tree }
+    /// Interpolates the `width` columns `column(k)` (values on `H`) and
+    /// commits to their extension to `big_n` points on `shift * H`.
+    fn new(
+        width: usize,
+        big_n: usize,
+        shift: Fp,
+        stride: Option<usize>,
+        column: impl Fn(usize) -> Vec<Fp> + Sync,
+    ) -> Committed {
+        let coeffs: Vec<Vec<Fp>> = par_map_min(width, 1, |k| {
+            let mut c = column(k);
+            intt(&mut c);
+            c
+        });
+        let log_blowup = log2_strict(big_n / coeffs[0].len());
+        Self::from_coeffs(coeffs, log_blowup, shift, stride)
     }
 
+    fn from_coeffs(coeffs: Vec<Vec<Fp>>, log_blowup: usize, shift: Fp, stride: Option<usize>) -> Committed {
+        const ROWS: usize = 256;
+        let width = coeffs.len();
+        let n = coeffs[0].len();
+        let b = 1usize << log_blowup;
+        let w_big = root_of_unity(log2_strict(n) + log_blowup);
+        let mut leaves: Vec<Digest> = vec![[Fp::ZERO; crate::poseidon2::DIGEST]; n * b];
+        let mut kept = Vec::new();
+        let mut rows = zeroed_vec(n * width);
+        let mut s_j = shift;
+        for j in 0..b {
+            let cols: Vec<Vec<Fp>> = par_map_min(width, 1, |k| coset_evals(&coeffs[k], s_j));
+            par_chunks_mut(&mut rows, ROWS * width, |c, chunk| {
+                for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
+                    let m = c * ROWS + r;
+                    for (x, col) in row.iter_mut().zip(&cols) {
+                        *x = col[m];
+                    }
+                }
+            });
+            drop(cols);
+            for (m, h) in crate::merkle::leaf_hashes(&rows, width).into_iter().enumerate() {
+                leaves[j + b * m] = h;
+            }
+            if stride.is_some_and(|s| j.is_multiple_of(s)) {
+                kept.push(std::mem::replace(&mut rows, zeroed_vec(n * width)));
+            }
+            s_j = s_j.mul(&w_big);
+        }
+        let tree = MerkleTree::from_leaf_hashes(leaves);
+        Committed { width, log_blowup, shift, stride, coeffs, kept, tree }
+    }
+
+    /// Row `i`, a point of the kept sub-coset.
     fn row(&self, i: usize) -> &[Fp] {
-        &self.rows[i * self.width..(i + 1) * self.width]
+        let s = self.stride.expect("no rows kept");
+        let (b, n) = (1usize << self.log_blowup, self.coeffs[0].len());
+        let (j, m) = (i % b, i / b);
+        debug_assert!(j.is_multiple_of(s) && m < n);
+        &self.kept[j / s][m * self.width..(m + 1) * self.width]
+    }
+
+    /// Row `i` of the extension, kept or recomputed.
+    fn row_at(&self, i: usize) -> Vec<Fp> {
+        let b = 1usize << self.log_blowup;
+        if self.stride.is_some_and(|s| (i % b).is_multiple_of(s)) {
+            return self.row(i).to_vec();
+        }
+        let n = self.coeffs[0].len();
+        let x = self.shift.mul(&root_of_unity(log2_strict(n) + self.log_blowup).pow(i as u64));
+        let mut xp = Vec::with_capacity(n);
+        let mut p = Fp::ONE;
+        for _ in 0..n {
+            xp.push(p);
+            p = p.mul(&x);
+        }
+        par_map_min(self.width, 1, |k| self.coeffs[k].iter().zip(&xp).fold(Fp::ZERO, |acc, (c, p)| acc.add(&c.mul(p))))
     }
 }
 
@@ -1330,9 +1418,9 @@ struct TableState<'a> {
     num_constraints: usize,
     num_terms: usize,
     trace: Committed,
-    /// Auxiliary columns, their extension values per row, and the lookup
-    /// total.
-    aux: Option<(Committed, Vec<Fp4>, Fp4)>,
+    /// Auxiliary columns (rows of extension values as base values) and the
+    /// lookup total.
+    aux: Option<(Committed, Fp4)>,
 }
 
 impl TableState<'_> {
@@ -1349,17 +1437,16 @@ impl TableState<'_> {
     }
 
     fn aux_row(&self, i: usize) -> &[Fp] {
-        self.aux.as_ref().map_or(&[], |(c, _, _)| c.row(i))
+        self.aux.as_ref().map_or(&[], |(c, _)| c.row(i))
     }
 }
 
 /// The committed quotient of one table.
 struct Quotient {
     coeffs: Vec<Vec<Fp4>>,
-    /// Chunk values per point, `chunks` per row.
-    lde: Vec<Fp4>,
-    rows: Vec<Fp>,
-    tree: MerkleTree,
+    /// The chunks' extension, `chunks` extension values per row as base
+    /// values; no rows kept.
+    committed: Committed,
     chunks: usize,
 }
 
@@ -1376,7 +1463,6 @@ fn commit_quotient(
     let air = t.input.air;
     let n = 1usize << t.log_n;
     let big_n = t.big_n(log_blowup);
-    let w = t.trace.width;
     let aux_ext_w = t.aux_ext_w();
     let num_chunks = 1usize << log_quotient_degree(air.air_degree());
     let shift = t.shift;
@@ -1394,10 +1480,9 @@ fn commit_quotient(
     let denoms: Vec<Fp> = (0..qn).flat_map(|m| [xs[m * stride].sub(&Fp::ONE), xs[m * stride].sub(&g_inv)]).collect();
     let denom_inv = batch_inverse(&denoms);
     let empty: [Fp4; 0] = [];
-    let (aux_lde, total): (&[Fp4], Fp4) = t.aux.as_ref().map_or((&empty, Fp4::ZERO), |(_, l, s)| (&l[..], *s));
+    let total = t.aux.as_ref().map_or(Fp4::ZERO, |(_, s)| *s);
     let group = air.air_lookup_group();
     let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| LookupArgs { ch, total, group });
-    let lde = &t.trace.rows;
 
     let mut quotient: Vec<Fp4> = par_map_with(qn, Scratch::default, |scratch, m| {
         let i = m * stride;
@@ -1408,19 +1493,16 @@ fn commit_quotient(
         let next_i = (i + period) % big_n;
         evaluate_into(
             air,
-            &lde[i * w..(i + 1) * w],
-            &lde[next_i * w..(next_i + 1) * w],
+            t.trace.row(i),
+            t.trace.row(next_i),
             (t.pre_row(i), t.pre_row(next_i)),
             public,
             (first, last, transition),
             scratch,
         );
         let (constraints, terms) = (scratch.constraints(), scratch.terms());
-        let (aux_l, aux_n): (&[Fp4], &[Fp4]) = if aux_ext_w > 0 {
-            (&aux_lde[i * aux_ext_w..(i + 1) * aux_ext_w], &aux_lde[next_i * aux_ext_w..(next_i + 1) * aux_ext_w])
-        } else {
-            (&empty, &empty)
-        };
+        let (aux_l, aux_n): (&[Fp4], &[Fp4]) =
+            if aux_ext_w > 0 { (as_fp4(t.aux_row(i)), as_fp4(t.aux_row(next_i))) } else { (&empty, &empty) };
         let sel_ext = (Fp4::from_base(first), Fp4::from_base(last), Fp4::from_base(transition));
         let c = combine(constraints, terms, aux_l, aux_n, sel_ext, lookup, alpha_powers);
         c.mul_base(&z_h_inv[i % period])
@@ -1432,25 +1514,13 @@ fn commit_quotient(
     coset_intt_ext(&mut quotient, shift);
     let coeffs: Vec<Vec<Fp4>> =
         (0..num_chunks).map(|j| quotient.iter().skip(j).step_by(num_chunks).copied().collect()).collect();
-    let evals: Vec<Vec<Fp>> = par_map_min(num_chunks * DEGREE, 1, |jk| {
-        let base: Vec<Fp> = coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect();
-        lde_cosets(&base, log_blowup, shift)
-    });
-    let mut chunk_lde = vec![Fp4::ZERO; big_n * num_chunks];
-    par_chunks_mut(&mut chunk_lde, 1 << 12, |c, part| {
-        for (r, v) in part.iter_mut().enumerate() {
-            let at = (c << 12) + r;
-            let (i, j) = (at / num_chunks, at % num_chunks);
-            let e = (i % period) * n + i / period;
-            *v = Fp4(core::array::from_fn(|k| evals[j * DEGREE + k][e]));
-        }
-    });
-    drop(evals);
-    let rows: Vec<Fp> = ext_row(&chunk_lde);
+    // Rows of `num_chunks` extension values, as base values.
+    let base: Vec<Vec<Fp>> =
+        (0..num_chunks * DEGREE).map(|jk| coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect()).collect();
     timer.lap("quotient lde");
-    let tree = MerkleTree::from_flat(&rows, num_chunks * DEGREE);
+    let committed = Committed::from_coeffs(base, log_blowup, shift, None);
     timer.lap("quotient commit");
-    Quotient { coeffs, lde: chunk_lde, rows, tree, chunks: num_chunks }
+    Quotient { coeffs, committed, chunks: num_chunks }
 }
 
 pub fn prove<A: Air>(
@@ -1526,7 +1596,14 @@ pub fn prove_tables(
         .map(|(input, &log_n)| {
             let shift = table_shift(log_big, log_n + log_blowup);
             let (num_constraints, num_terms) = shape(input.air, public);
-            let trace = Committed::new(input.trace.width, 1 << (log_n + log_blowup), shift, |k| input.trace.column(k));
+            let stride = kept_stride(config, input.air);
+            if let Some(p) = input.pre {
+                let needed = quotient_stride(input.air.air_degree(), log_blowup);
+                assert!(needed.is_multiple_of(p.stride()), "preprocessed table lacks rows the quotient reads");
+            }
+            let trace = Committed::new(input.trace.width, 1 << (log_n + log_blowup), shift, Some(stride), |k| {
+                input.trace.column(k)
+            });
             challenger.observe_digest(&trace.tree.root());
             TableState { input: *input, log_n, shift, num_constraints, num_terms, trace, aux: None }
         })
@@ -1542,18 +1619,18 @@ pub fn prove_tables(
             timer.lap("aux build");
             let ext_w = t.aux_ext_w();
             let n = 1usize << t.log_n;
-            let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, |j| {
+            let stride = kept_stride(config, t.input.air);
+            let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, Some(stride), |j| {
                 let (e, k) = (j / DEGREE, j % DEGREE);
                 (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
             });
-            let aux_lde = ext_from_row(&committed.rows);
             challenger.observe_digest(&committed.tree.root());
             challenger.observe_ext(&total);
-            t.aux = Some((committed, aux_lde, total));
+            t.aux = Some((committed, total));
             timer.lap("aux commit");
         }
         debug_assert!(
-            states.iter().filter_map(|t| t.aux.as_ref()).fold(Fp4::ZERO, |a, (_, _, s)| a + *s).is_zero(),
+            states.iter().filter_map(|t| t.aux.as_ref()).fold(Fp4::ZERO, |a, (_, s)| a + *s).is_zero(),
             "lookup terms do not cancel: the traces violate a multiset relation"
         );
         lookup_ch = Some(ch);
@@ -1567,7 +1644,7 @@ pub fn prove_tables(
             let alpha_powers =
                 powers(alpha, t.num_constraints + num_lookup_constraints(t.num_terms, t.input.air.air_lookup_group()));
             let q = commit_quotient(t, log_blowup, public, lookup_ch.as_ref(), &alpha_powers, &mut timer);
-            challenger.observe_digest(&q.tree.root());
+            challenger.observe_digest(&q.committed.tree.root());
             q
         })
         .collect();
@@ -1581,14 +1658,14 @@ pub fn prove_tables(
         .map(|(t, q)| {
             let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
             let zeta_q = zeta.exp(q.chunks as u64);
-            let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _, _)| &c.coeffs);
-            let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.coeffs);
+            let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _)| &c.coeffs);
+            let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.committed.coeffs);
             let part = TableProof {
                 log_n: t.log_n,
                 trace_root: t.trace.tree.root(),
-                aux_root: t.aux.as_ref().map(|(c, _, _)| c.tree.root()),
-                lookup_sum: t.aux.as_ref().map_or(Fp4::ZERO, |(_, _, s)| *s),
-                quotient_root: q.tree.root(),
+                aux_root: t.aux.as_ref().map(|(c, _)| c.tree.root()),
+                lookup_sum: t.aux.as_ref().map_or(Fp4::ZERO, |(_, s)| *s),
+                quotient_root: q.committed.tree.root(),
                 trace_at_zeta: eval_base_polys_at(&t.trace.coeffs, zeta),
                 trace_at_zeta_next: eval_base_polys_at(&t.trace.coeffs, zeta_next),
                 aux_at_zeta: eval_base_polys_at(aux_coeffs, zeta),
@@ -1626,10 +1703,25 @@ pub fn prove_tables(
             denoms.push(xe - zeta_q);
         }
         let inv = par_batch_inverse(&denoms);
-        let c = q.chunks;
+        // The combination on coefficients, extended once per component.
+        let no_coeffs: Vec<Vec<Fp>> = Vec::new();
+        let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _)| &c.coeffs);
+        let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.committed.coeffs);
+        let polys = deep.polys(&t.trace.coeffs, aux_coeffs, pre_coeffs, &q.coeffs);
+        let ext: Vec<Vec<Fp>> = par_map_min(3 * DEGREE, 1, |pk| {
+            let base: Vec<Fp> = polys[pk / DEGREE].iter().map(|v| v.0[pk % DEGREE]).collect();
+            lde_cosets(&base, log_blowup, t.shift)
+        });
+        drop(polys);
+        let consts = deep.constants();
+        let (n, b) = (1usize << t.log_n, 1usize << log_blowup);
         let reduced: Vec<Fp4> = par_map(xs.len(), |i| {
-            let rows = (t.trace.row(i), t.aux_row(i), t.pre_row(i), &q.lde[i * c..(i + 1) * c]);
-            scale * deep.value(rows, inv[3 * i], inv[3 * i + 1], inv[3 * i + 2])
+            let e = (i % b) * n + i / b;
+            let v = |p: usize| Fp4(core::array::from_fn(|k| ext[p * DEGREE + k][e]));
+            let sum = (v(0) - consts[0]) * inv[3 * i]
+                + (v(1) - consts[1]) * inv[3 * i + 1]
+                + (v(2) - consts[2]) * inv[3 * i + 2];
+            scale * sum
         });
         if input_log_sizes.last() == Some(&log_m) {
             let last = inputs.last_mut().unwrap();
@@ -1653,16 +1745,17 @@ pub fn prove_tables(
                 .zip(&quotients)
                 .map(|(t, q)| {
                     let i = index % t.big_n(log_blowup);
-                    let qw = q.chunks * DEGREE;
+                    let aux = t.aux.as_ref().map(|(c, _)| c);
+                    let pre = t.input.pre.map(|p| &p.committed);
                     QueryOpening {
-                        trace_row: t.trace.row(i).to_vec(),
+                        trace_row: t.trace.row_at(i),
                         trace_path: t.trace.tree.open(i),
-                        aux_row: t.aux_row(i).to_vec(),
-                        aux_path: t.aux.as_ref().map(|(c, _, _)| c.tree.open(i)).unwrap_or_default(),
-                        pre_row: t.pre_row(i).to_vec(),
-                        pre_path: t.input.pre.map(|p| p.tree.open(i)).unwrap_or_default(),
-                        quotient_row: q.rows[i * qw..(i + 1) * qw].to_vec(),
-                        quotient_path: q.tree.open(i),
+                        aux_row: aux.map(|c| c.row_at(i)).unwrap_or_default(),
+                        aux_path: aux.map(|c| c.tree.open(i)).unwrap_or_default(),
+                        pre_row: pre.map(|c| c.row_at(i)).unwrap_or_default(),
+                        pre_path: pre.map(|c| c.tree.open(i)).unwrap_or_default(),
+                        quotient_row: q.committed.row_at(i),
+                        quotient_path: q.committed.tree.open(i),
                     }
                 })
                 .collect()

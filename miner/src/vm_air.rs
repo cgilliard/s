@@ -453,7 +453,11 @@ impl Program {
 
     /// The committed program for proofs at `log_blowup`.
     pub fn preprocess(&self, log_blowup: usize) -> Preprocessed {
-        Preprocessed::new(&self.table(), log_blowup)
+        Preprocessed::new(
+            &self.table(),
+            log_blowup,
+            crate::stark::quotient_stride(VmAir.max_constraint_degree(), log_blowup),
+        )
     }
 
     /// The program digest: root of the committed table.

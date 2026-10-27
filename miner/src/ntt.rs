@@ -219,12 +219,18 @@ pub fn lde_cosets(coeffs: &[Fp], log_blowup: usize, shift: Fp) -> Vec<Fp> {
     let mut out = Vec::with_capacity(n << log_blowup);
     let mut s = shift;
     for _ in 0..1usize << log_blowup {
-        let start = out.len();
-        out.extend_from_slice(coeffs);
-        coset_ntt(&mut out[start..], s);
+        out.extend(coset_evals(coeffs, s));
         s = s.mul(&w);
     }
     out
+}
+
+/// Evaluations of the polynomial with coefficients `coeffs` on the coset
+/// `shift * H` of its own size.
+pub fn coset_evals(coeffs: &[Fp], shift: Fp) -> Vec<Fp> {
+    let mut v = coeffs.to_vec();
+    coset_ntt(&mut v, shift);
+    v
 }
 
 /// Evaluations on `shift * H` to coefficients.

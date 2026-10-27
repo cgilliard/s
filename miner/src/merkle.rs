@@ -31,18 +31,7 @@ impl MerkleTree {
     /// Builds a tree over rows given as slices of a flat buffer of equal-size
     /// rows (`row_len` elements each).
     pub fn from_flat(flat: &[Fp], row_len: usize) -> MerkleTree {
-        assert!(row_len > 0 && flat.len().is_multiple_of(row_len));
-        let n = flat.len() / row_len;
-        let row = |i: usize| &flat[i * row_len..(i + 1) * row_len];
-        let leaves = if n.is_multiple_of(LANES) {
-            par_map_min(n / LANES, 128, |g| hash_batch(core::array::from_fn(|l| row(g * LANES + l))))
-                .into_iter()
-                .flatten()
-                .collect()
-        } else {
-            par_map(n, |i| hash_row(row(i)))
-        };
-        Self::from_leaf_hashes(leaves)
+        Self::from_leaf_hashes(leaf_hashes(flat, row_len))
     }
 
     pub fn from_leaf_hashes(leaves: Vec<Digest>) -> MerkleTree {
@@ -97,6 +86,21 @@ impl MerkleTree {
             i >>= 1;
         }
         path
+    }
+}
+
+/// Leaf hashes of the rows of a flat buffer of `row_len`-element rows.
+pub fn leaf_hashes(flat: &[Fp], row_len: usize) -> Vec<Digest> {
+    assert!(row_len > 0 && flat.len().is_multiple_of(row_len));
+    let n = flat.len() / row_len;
+    let row = |i: usize| &flat[i * row_len..(i + 1) * row_len];
+    if n.is_multiple_of(LANES) {
+        par_map_min(n / LANES, 128, |g| hash_batch(core::array::from_fn(|l| row(g * LANES + l))))
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        par_map(n, |i| hash_row(row(i)))
     }
 }
 
