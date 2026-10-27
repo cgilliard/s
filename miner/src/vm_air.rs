@@ -31,6 +31,7 @@
 //! | `SpongeStart`    | data, cap0                   | state = [mem[data..+8] scalars | cap0, 0, ...]    |
 //! | `Absorb`         | data                         | add mem[data..+8] into the rate, permute          |
 //! | `Compress`       | sib, dir, comp[4]            | Merkle step with sibling block and direction bit  |
+//! | `CompressIn`     | dir, comp[4]                 | as `Compress`, the sibling eight witness scalars  |
 //! | `Squeeze`        | out                          | mem[out+k] = (rate[k], 0, 0, 0)                   |
 //! | `AssertPublic`   |                              | digest == public value 8..16                      |
 //!
@@ -38,7 +39,8 @@
 //! instructions enforce that on what they read. Public values: the program
 //! digest (8) and the output digest (8).
 //!
-//! Hashing instructions (`SpongeStart`, `Absorb`, `Compress`) send their
+//! Hashing instructions (`SpongeStart`, `Absorb`, `Compress`,
+//! `CompressIn`) send their
 //! operands and the resulting digest to the hash table, numbered by a
 //! counter of hashing instructions; the digest register holds the result
 //! of the last one for `Squeeze` and `AssertPublic`. An absorb continues
@@ -71,9 +73,10 @@ pub const P_SELECT: usize = 7;
 pub const P_SSTART: usize = 8;
 pub const P_ABSORB: usize = 9;
 pub const P_COMPRESS: usize = 10;
-pub const P_SQUEEZE: usize = 11;
-pub const P_ASSERT_PUB: usize = 12;
-pub const NUM_OPS: usize = 13;
+pub const P_COMPRESS_IN: usize = 11;
+pub const P_SQUEEZE: usize = 12;
+pub const P_ASSERT_PUB: usize = 13;
+pub const NUM_OPS: usize = 14;
 pub const P_DONE: usize = NUM_OPS;
 pub const P_F: usize = P_DONE + 1; // [FIELDS]
 pub const PRE_WIDTH: usize = P_F + FIELDS;
@@ -116,18 +119,63 @@ pub fn ext_mul<F: Field>(a: &[F; DEGREE], b: &[F; DEGREE]) -> [F; DEGREE] {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Instr {
-    Const { imm: Fp4, out: Addr },
-    Input { out: Addr },
-    Input8 { out: Addr },
-    InputDot { out: Addr, pows: Addr, acc: Addr, acc_out: Addr },
-    MulAdd { a: Addr, b: Addr, d: Addr, out: Addr },
-    AssertEq { a: Addr, b: Addr },
-    Decompose { a: Addr, out: Addr },
-    Select { src: Addr, comp: u8, out: Addr },
-    SpongeStart { data: Addr, cap0: Fp },
-    Absorb { data: Addr },
-    Compress { sib: Addr, dir: Addr, comp: u8 },
-    Squeeze { out: Addr },
+    Const {
+        imm: Fp4,
+        out: Addr,
+    },
+    Input {
+        out: Addr,
+    },
+    Input8 {
+        out: Addr,
+    },
+    InputDot {
+        out: Addr,
+        pows: Addr,
+        acc: Addr,
+        acc_out: Addr,
+    },
+    MulAdd {
+        a: Addr,
+        b: Addr,
+        d: Addr,
+        out: Addr,
+    },
+    AssertEq {
+        a: Addr,
+        b: Addr,
+    },
+    Decompose {
+        a: Addr,
+        out: Addr,
+    },
+    Select {
+        src: Addr,
+        comp: u8,
+        out: Addr,
+    },
+    SpongeStart {
+        data: Addr,
+        cap0: Fp,
+    },
+    Absorb {
+        data: Addr,
+    },
+    Compress {
+        sib: Addr,
+        dir: Addr,
+        comp: u8,
+    },
+    /// A Merkle step whose sibling is the next eight witness values, not
+    /// read from memory: a sibling is unchecked data either way, and this
+    /// saves the `Input8` row that would load it.
+    CompressIn {
+        dir: Addr,
+        comp: u8,
+    },
+    Squeeze {
+        out: Addr,
+    },
     AssertPublic,
 }
 
@@ -145,6 +193,7 @@ impl Instr {
             Instr::SpongeStart { .. } => P_SSTART,
             Instr::Absorb { .. } => P_ABSORB,
             Instr::Compress { .. } => P_COMPRESS,
+            Instr::CompressIn { .. } => P_COMPRESS_IN,
             Instr::Squeeze { .. } => P_SQUEEZE,
             Instr::AssertPublic => P_ASSERT_PUB,
         }
@@ -154,7 +203,7 @@ impl Instr {
     fn num_inputs(&self) -> usize {
         match self {
             Instr::Input { .. } => 1,
-            Instr::Input8 { .. } | Instr::InputDot { .. } => 8,
+            Instr::Input8 { .. } | Instr::InputDot { .. } | Instr::CompressIn { .. } => 8,
             _ => 0,
         }
     }
@@ -201,6 +250,10 @@ impl Instr {
             Instr::Absorb { data } => f[0] = a(data),
             Instr::Compress { sib, dir, comp } => {
                 f[0] = a(sib);
+                f[1] = a(dir);
+                onehot(comp, &mut f, 2);
+            }
+            Instr::CompressIn { dir, comp } => {
                 f[1] = a(dir);
                 onehot(comp, &mut f, 2);
             }
@@ -356,6 +409,12 @@ impl Program {
         self.push(Instr::Compress { sib, dir, comp });
     }
 
+    /// Merkle step with the sibling digest taken from the next eight
+    /// witness values.
+    pub fn compress_in(&mut self, dir: Addr, comp: u8) {
+        self.push(Instr::CompressIn { dir, comp });
+    }
+
     /// Writes the current digest (rate) to eight fresh words.
     pub fn squeeze(&mut self) -> Addr {
         let out = self.alloc(8);
@@ -453,14 +512,15 @@ impl Air for VmAir {
         let t_sstart = p[P_SSTART];
         let t_absorb = p[P_ABSORB];
         let t_compress = p[P_COMPRESS];
+        let t_compress_in = p[P_COMPRESS_IN];
         let t_squeeze = p[P_SQUEEZE];
         let t_apub = p[P_ASSERT_PUB];
         let f: [F; FIELDS] = core::array::from_fn(|i| p[P_F + i]);
 
         // ---- hashing counter and digest register ----
         b.mark("hashing");
-        let t_hash = t_sstart + t_absorb + t_compress;
-        let t_hash_next = pn[P_SSTART] + pn[P_ABSORB] + pn[P_COMPRESS];
+        let t_hash = t_sstart + t_absorb + t_compress + t_compress_in;
+        let t_hash_next = pn[P_SSTART] + pn[P_ABSORB] + pn[P_COMPRESS] + pn[P_COMPRESS_IN];
         b.when_first_row(l[C_HASHES]);
         b.when_transition(n[C_HASHES] - l[C_HASHES] - t_hash);
         for i in 0..DIGEST {
@@ -496,7 +556,8 @@ impl Air for VmAir {
                 let kf = F::from_u32(k as u32);
                 (single + block_ops + t_dot, single * single_addr + block_ops * (f[0] + kf) + t_dot * (f[1] + kf))
             } else {
-                (t_compress + t_dot, t_compress * f[1] + t_dot * f[2])
+                let t_dir = t_compress + t_compress_in;
+                (t_dir + t_dot, t_dir * f[1] + t_dot * f[2])
             };
             let values = [addr, read(k, 0), read(k, 1), read(k, 2), read(k, 3)];
             b.lookup(false, used, &values);
@@ -504,13 +565,17 @@ impl Air for VmAir {
         // Hashing instructions read scalars, and send them with the
         // capacity (starts) or direction bit (compresses) and the resulting
         // digest to the hash table. The direction is component `comp` of
-        // the dir word.
+        // the dir word. A `CompressIn` reads no memory for its data: the
+        // read columns hold its witness sibling, unconstrained but scalar.
+        let data_ops = block_ops + t_compress_in;
         for k in 0..8 {
             for c in 1..DEGREE {
-                b.assert_zero(block_ops * read(k, c));
+                b.assert_zero(data_ops * read(k, c));
             }
         }
-        let kind = t_sstart + t_absorb.scale(Fp::new(KIND_ABSORB)) + t_compress.scale(Fp::new(KIND_COMPRESS));
+        let kind = t_sstart
+            + t_absorb.scale(Fp::new(KIND_ABSORB))
+            + (t_compress + t_compress_in).scale(Fp::new(KIND_COMPRESS));
         let cap = t_sstart * f[1];
         let mut dir = zero;
         for c in 0..DEGREE {
@@ -621,6 +686,8 @@ pub enum ExecError {
         addr: Addr,
     },
     NotEnoughInputs,
+    /// A `CompressIn` was given a witness value that is not a scalar.
+    NotScalarInput(usize),
     /// An absorb not right after a start or absorb, or a compress before
     /// any hashing.
     HashOrder(usize),
@@ -827,6 +894,31 @@ impl VmAir {
                     digest.copy_from_slice(&out[..DIGEST]);
                     hash_op = Some(HashOp::Compress { sibling, right });
                 }
+                Instr::CompressIn { dir, comp } => {
+                    if hashes.is_empty() {
+                        return Err(ExecError::HashOrder(pc));
+                    }
+                    let mut sibling = [Fp::ZERO; DIGEST];
+                    for x in sibling.iter_mut() {
+                        let v = m.next_input()?;
+                        if v.0[1..].iter().any(|y| !y.is_zero()) {
+                            return Err(ExecError::NotScalarInput(pc));
+                        }
+                        *x = v.0[0];
+                    }
+                    read_vals.extend(sibling.iter().map(|x| Fp4::from_base(*x)));
+                    let d = m.read(pc, dir)?;
+                    read_vals.push(d);
+                    let right = d.0[comp as usize] == Fp::ONE;
+                    let mut st = [Fp::ZERO; WIDTH];
+                    let (lo, hi) = if right { (&sibling, &digest) } else { (&digest, &sibling) };
+                    st[..DIGEST].copy_from_slice(lo);
+                    st[DIGEST..].copy_from_slice(hi);
+                    let out = permute(st);
+                    sponge = None;
+                    digest.copy_from_slice(&out[..DIGEST]);
+                    hash_op = Some(HashOp::Compress { sibling, right });
+                }
                 Instr::Squeeze { out } => {
                     for (k, d) in digest.iter().enumerate() {
                         let v = Fp4::from_base(*d);
@@ -885,7 +977,15 @@ impl VmAir {
         let hashes = program
             .instrs
             .iter()
-            .filter(|i| matches!(i, Instr::SpongeStart { .. } | Instr::Absorb { .. } | Instr::Compress { .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instr::SpongeStart { .. }
+                        | Instr::Absorb { .. }
+                        | Instr::Compress { .. }
+                        | Instr::CompressIn { .. }
+                )
+            })
             .count();
         hashes.max(2).next_power_of_two()
     }
@@ -991,10 +1091,16 @@ mod tests {
             let c = p.scalar(*e);
             p.assert_eq(leaf + i as Addr, c);
         }
+        // Levels alternate between a loaded sibling and a witness one.
         for (level, sib) in tree.open(index).iter().enumerate() {
-            let sib_addr = p.input8();
+            let (dir, comp) = (bits + (level / 4) as Addr, (level % 4) as u8);
+            if level % 2 == 0 {
+                let sib_addr = p.input8();
+                p.compress(sib_addr, dir, comp);
+            } else {
+                p.compress_in(dir, comp);
+            }
             inputs.extend(sib.iter().map(|v| Fp4::from_base(*v)));
-            p.compress(sib_addr, bits + (level / 4) as Addr, (level % 4) as u8);
         }
         let root = p.squeeze();
         for (i, e) in tree.root().iter().enumerate() {
@@ -1079,6 +1185,18 @@ mod tests {
         let mut bad = trace.clone();
         bad.values[r * width + C_WRITE] = Fp::ONE - bad.values[r * width + C_WRITE];
         assert!(check(&bad, &hashes, &table, &public).is_err());
+        // A witness sibling that differs from the hashed one.
+        let r = p.instrs.iter().position(|i| matches!(i, Instr::CompressIn { .. })).unwrap();
+        let mut bad = trace.clone();
+        bad.values[r * width + C_READ + 2 * DEGREE] += Fp::ONE;
+        assert!(check(&bad, &hashes, &table, &public).is_err());
+        let mut bad = trace.clone();
+        bad.values[r * width + C_READ + 2 * DEGREE + 1] += Fp::ONE;
+        assert!(check(&bad, &hashes, &table, &public).is_err());
+        let k = p.instrs[..r].iter().map(|i| i.num_inputs()).sum::<usize>();
+        let mut wrong = inputs.clone();
+        wrong[k + 2].0[1] = Fp::ONE;
+        assert_eq!(VmAir::execute(&p, &wrong).err(), Some(ExecError::NotScalarInput(r)));
         // An absorb after a compress has no sponge to continue.
         let mut q = Program::new();
         let blk = q.input8();

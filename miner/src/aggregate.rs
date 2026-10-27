@@ -16,7 +16,11 @@
 //! program digests, so a node knows the root digest to expect for each
 //! segment count without seeing a proof ([`plan`]).
 //!
-//! Encoding of a block proof: `u32` segment count, then the root's machine
+//! The root's proof is itself verified by one more program, the wrap
+//! ([`compile_wrap`]), proven at a lower rate with fewer queries: a much
+//! smaller proof for a fixed extra proving cost, the same for every block.
+//!
+//! Encoding of a block proof: `u32` segment count, then the wrap's machine
 //! proof.
 
 use std::collections::HashMap;
@@ -41,11 +45,19 @@ use crate::vm_air::{Addr, NUM_PUBLIC as VM_PUBLIC, PUB_OUTPUT, VmAir};
 
 /// Transcript domain separator for node (aggregate) proofs.
 const DOM_AGGREGATE_PROOF: u32 = 0x31;
+/// Transcript domain separator for the wrap proof.
+const DOM_WRAP_PROOF: u32 = 0x32;
 const MASK30: u64 = (1 << 30) - 1;
 
 fn outer_transcript() -> Challenger {
     let mut c = Challenger::new();
     c.observe(Fp::new(DOM_AGGREGATE_PROOF));
+    c
+}
+
+fn wrap_transcript() -> Challenger {
+    let mut c = Challenger::new();
+    c.observe(Fp::new(DOM_WRAP_PROOF));
     c
 }
 
@@ -62,25 +74,33 @@ pub struct AggregatorParams {
     pub fan_in: usize,
     /// STARK configuration of the node (machine) proofs.
     pub outer: StarkConfig,
+    /// STARK configuration of the wrap proof, the one a block carries.
+    pub wrap: StarkConfig,
 }
 
 impl AggregatorParams {
     /// Segments and nodes both at rate 1/4. Segments at rate 1/8 prove
     /// twice as slowly but are cheaper to verify; with 16 bits of grinding
     /// a leaf over four rate-1/4 segments still fits 2^18 rows (with 2^16
-    /// hashes instead of 2^15), and a full block proves in 71 s against
-    /// 84 s. Nodes at 1/8 would double their proving time for little gain
-    /// in the node above.
+    /// hashes instead of 2^15), and the tree of a full block proved in
+    /// 71 s against 84 s. Nodes at 1/8 would double their proving time for
+    /// little gain in the node above.
     ///
     /// Both target 100 bits of conjectured security, `log_blowup` bits per
     /// query plus 16 bits of grinding (about 2^16 permutations, 35 ms, per
     /// proof).
+    ///
+    /// The wrap is at rate 1/32 with 20 bits of grinding (0.5 s): 16
+    /// queries. It verifies a root of up to 2^18 rows in 2^16 rows, and
+    /// proves in about 17 s with 4.3 GB, giving a 182 KB block proof; rate
+    /// 1/64 would save 13% of that for twice the time and memory.
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         segment_log_n: 15,
         max_segments: 16,
         fan_in: 4,
         outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
+        wrap: StarkConfig { log_blowup: 5, num_queries: 16, pow_bits: 20 },
     };
 
     /// Rate 1/8 at the same security, for comparisons.
@@ -383,6 +403,33 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
     c
 }
 
+/// Builds the wrap program: verifies the root's machine proof (at
+/// `params.outer`) for the program `root_digest` and re-exports its output,
+/// the statement digest, so the block's proof can be a single proof at the
+/// lower rate of `params.wrap`.
+pub fn compile_wrap(
+    params: &AggregatorParams,
+    root_digest: &Digest,
+    root_proof: &stark::Proof,
+    statement: &Statement,
+) -> Compiler {
+    let mut c = Compiler::new();
+    let st = c.scalar_inputs(&statement.to_values());
+    let public = VmAir::public_values(root_digest, &statement.digest());
+    let pubv = c.scalar_inputs(&public);
+    for (i, d) in root_digest.iter().enumerate() {
+        c.assert_scalar(pubv + i as Addr, *d);
+    }
+    let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
+    let node_prefix = [Fp::new(DOM_AGGREGATE_PROOF)];
+    c.verify_stark(&tables, &params.outer, &node_prefix, pubv, VM_PUBLIC, root_proof);
+    c.hash_scalars(st, STATEMENT_LEN);
+    let out = c.squeeze_digest();
+    c.assert_block(pubv + PUB_OUTPUT as Addr, out, DIGEST);
+    c.assert_public();
+    c
+}
+
 /// Signed value of a field element, assuming it is small in magnitude.
 fn signed(x: Fp) -> i64 {
     let v = x.to_canonical() as i64;
@@ -404,6 +451,16 @@ pub struct Shape {
     pub digest: Digest,
     pub log_n: usize,
     /// Log height of the node's hash table.
+    pub hash_log_n: usize,
+    /// The wrap program over this node, for the root.
+    pub wrap: Option<Wrap>,
+}
+
+/// Program digest and table heights of the wrap over a root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wrap {
+    pub digest: Digest,
+    pub log_n: usize,
     pub hash_log_n: usize,
 }
 
@@ -429,7 +486,15 @@ fn split(k: usize, fan_in: usize) -> Vec<usize> {
 pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
     assert!(k >= 1 && k <= params.max_segments, "segment count {k} out of range");
     let mut memo: HashMap<Vec<usize>, Shape> = HashMap::new();
-    plan_node(params, k, true, &mut memo)
+    let mut root = plan_node(params, k, true, &mut memo);
+    let dummy = dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC);
+    let prog = compile_wrap(params, &root.digest, &dummy, &Statement::zero()).prog;
+    root.wrap = Some(Wrap {
+        digest: prog.digest(params.wrap.log_blowup),
+        log_n: prog.height().trailing_zeros() as usize,
+        hash_log_n: VmAir::hash_height(&prog).trailing_zeros() as usize,
+    });
+    root
 }
 
 fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap<Vec<usize>, Shape>) -> Shape {
@@ -440,6 +505,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
             digest: [Fp::ZERO; DIGEST],
             log_n: params.segment_log_n,
             hash_log_n: 0,
+            wrap: None,
         };
     }
     let sizes = if k <= params.fan_in { vec![1; k] } else { split(k, params.fan_in) };
@@ -475,6 +541,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap
         digest: prog.digest(params.outer.log_blowup),
         log_n: prog.height().trailing_zeros() as usize,
         hash_log_n: VmAir::hash_height(&prog).trailing_zeros() as usize,
+        wrap: None,
     };
     memo.insert(key, shape.clone());
     shape
@@ -501,6 +568,8 @@ pub enum Progress {
     Segment { index: usize, count: usize, elapsed: std::time::Duration },
     /// A node over `segments` segments is proven; `root` for the last one.
     Node { segments: usize, log_n: usize, hash_log_n: usize, root: bool, elapsed: std::time::Duration },
+    /// The wrap over the root is proven.
+    Wrap { log_n: usize, hash_log_n: usize, elapsed: std::time::Duration },
 }
 
 /// Proves one node of the tree over `segments[..shape.segments]`.
@@ -601,18 +670,28 @@ pub fn prove_block_with(
     });
     let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress);
-    let bytes = root.proof.to_bytes();
+    let wrap = shape.wrap.expect("shape is a planned root");
+    let t = std::time::Instant::now();
+    let c = compile_wrap(params, &shape.digest, &root.proof, statement);
+    let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
+    let pre = c.prog.preprocess(params.wrap.log_blowup);
+    assert_eq!(pre.root(), wrap.digest, "wrap program differs from the planned shape");
+    let public = VmAir::public_values(&pre.root(), &statement.digest());
+    let tables = VmAir::tables(&trace, &hashes, &pre);
+    let proof = stark::prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript());
+    progress(Progress::Wrap { log_n: wrap.log_n, hash_log_n: wrap.hash_log_n, elapsed: t.elapsed() });
+    let bytes = proof.to_bytes();
     let mut w = Writer::with_capacity(bytes.len() + 4);
     w.u32(proofs.len() as u32);
     w.0.extend_from_slice(&bytes);
     w.finish()
 }
 
-/// Verifies an encoded block proof against a statement. `root_digest`
-/// gives the planned root program digest for a segment count.
+/// Verifies an encoded block proof against a statement. `wrap_digest`
+/// gives the planned wrap program digest for a segment count.
 pub fn verify_block(
     params: &AggregatorParams,
-    root_digest: &dyn Fn(usize) -> Digest,
+    wrap_digest: &dyn Fn(usize) -> Digest,
     statement: &Statement,
     proof: &[u8],
 ) -> Result<(), AggregateError> {
@@ -622,9 +701,9 @@ pub fn verify_block(
         return Err(AggregateError::BadSegmentCount(k));
     }
     let proof = stark::Proof::from_bytes(r.0).ok_or(AggregateError::Malformed)?;
-    let digest = root_digest(k);
+    let digest = wrap_digest(k);
     let public = VmAir::public_values(&digest, &statement.digest());
-    stark::verify_tables(&params.outer, &VmAir::specs(&digest), &public, &proof, &mut outer_transcript())
+    stark::verify_tables(&params.wrap, &VmAir::specs(&digest), &public, &proof, &mut wrap_transcript())
         .map_err(|_| AggregateError::Rejected)
 }
 
@@ -650,8 +729,10 @@ impl AggregateVerifier {
         s
     }
 
+    /// The wrap program digest a `k`-segment block proof is checked
+    /// against.
     pub fn digest(&self, k: usize) -> Digest {
-        self.shape(k).digest
+        self.shape(k).wrap.expect("planned root").digest
     }
 
     pub fn verify_statement(&self, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
@@ -713,6 +794,7 @@ mod tests {
         max_segments: 4,
         fan_in: 2,
         outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5 },
+        wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4 },
     };
 
     struct Setup {
@@ -984,6 +1066,72 @@ mod tests {
                 hashes.height().trailing_zeros(),
                 t.elapsed(),
                 proof.to_bytes().len()
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_program_accepts_and_rejects() {
+        let s = setup("wrap", &[30, 25], 55);
+        let shape = plan(&SMALL, 2);
+        let root = prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement), &|_| {});
+        let c = compile_wrap(&SMALL, &shape.digest, &root.proof, &s.statement);
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
+        assert_eq!(exec.output_digest, Some(s.statement.digest()));
+        assert_eq!(c.prog.digest(SMALL.wrap.log_blowup), shape.wrap.unwrap().digest);
+        let rejects = |c: Compiler| matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_)));
+        // Another statement, another root program, a corrupted proof.
+        let mut poor = s.statement.clone();
+        poor.subsidy = 54;
+        assert!(rejects(compile_wrap(&SMALL, &shape.digest, &root.proof, &poor)));
+        let mut other = shape.digest;
+        other[0] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &other, &root.proof, &s.statement)));
+        let mut bad = root.proof.clone();
+        bad.openings[1][0].trace_row[3] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &shape.digest, &bad, &s.statement)));
+    }
+
+    #[test]
+    #[ignore = "proves a mainnet root and wraps it; run with --release"]
+    fn mainnet_wrap_timing() {
+        let s = setup("wrap-timing", &[30], 30);
+        let params = AggregatorParams::MAINNET;
+        let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
+        let shape = plan(&params, 1);
+        let root = prove_node(&params, &shape, &[seg], Output::Statement(&s.statement), &|_| {});
+        let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
+            Ok(v) => {
+                let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
+                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2] }]
+            }
+            Err(_) => vec![
+                StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16 },
+                StarkConfig { log_blowup: 5, num_queries: 17, pow_bits: 16 },
+                StarkConfig { log_blowup: 6, num_queries: 14, pow_bits: 16 },
+            ],
+        };
+        for wrap in configs {
+            let c = compile_wrap(&params, &shape.digest, &root.proof, &s.statement);
+            let t = std::time::Instant::now();
+            let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
+            let pre = c.prog.preprocess(wrap.log_blowup);
+            let public = VmAir::public_values(&pre.root(), &s.statement.digest());
+            let tables = VmAir::tables(&trace, &hashes, &pre);
+            let proof = stark::prove_tables(&wrap, &tables, &public, &mut outer_transcript());
+            let elapsed = t.elapsed();
+            let t = std::time::Instant::now();
+            let ok = stark::verify_tables(&wrap, &VmAir::specs(&pre.root()), &public, &proof, &mut outer_transcript());
+            println!(
+                "wrap at rate 1/{}, {} queries: 2^{} + 2^{} hashes, {} instructions; proven in {elapsed:?}, {} bytes; verify {:?} {:?}",
+                1 << wrap.log_blowup,
+                wrap.num_queries,
+                trace.height().trailing_zeros(),
+                hashes.height().trailing_zeros(),
+                c.prog.instrs.len(),
+                proof.to_bytes().len(),
+                ok,
+                t.elapsed()
             );
         }
     }

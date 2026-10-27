@@ -247,13 +247,14 @@ fn mine(args: &Args) -> AnyResult<()> {
     }
     let tip = chain.tip()?.unwrap();
     println!(
-        "tip at height {} ({}); segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}",
+        "tip at height {} ({}); segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",
         tip.height,
         short(&tip.hash()),
         agg.segment_log_n,
         1 << agg.segment.log_blowup,
         agg.max_segments,
-        1 << agg.outer.log_blowup
+        1 << agg.outer.log_blowup,
+        1 << agg.wrap.log_blowup
     );
 
     let tx_rows = 2 + ROWS_PER_INPUT + 2 * ROWS_PER_OUTPUT;
@@ -341,6 +342,9 @@ fn mine(args: &Args) -> AnyResult<()> {
                 if segments == 1 { "" } else { "s" },
                 secs(elapsed)
             ),
+            Progress::Wrap { log_n, hash_log_n, elapsed } => {
+                println!("  wrap (2^{log_n} + 2^{hash_log_n} rows) proven in {}", secs(elapsed))
+            }
         };
         let proof = prove_block_with(&agg, &shape, &statement, &segments, args.jobs, &report);
         let prove_time = t.elapsed();

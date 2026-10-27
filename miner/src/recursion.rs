@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use crate::ext::{DEGREE, Fp4};
 use crate::field::Field;
 use crate::fri::{FriProof, QueryStep, injection_rounds, leaf_row, round_log_arities};
+use crate::merkle::Digest;
 use crate::ntt::{MULTIPLICATIVE_GENERATOR, inv_two, root_of_unity};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress, permute};
 use crate::stark::{
@@ -366,16 +367,15 @@ impl Compiler {
         self.sponge = Some(st);
     }
 
-    fn compress_step(&mut self, sib: Addr, bits: Addr, level: usize) {
-        self.prog.compress(sib, bits + (level / 4) as Addr, (level % 4) as u8);
+    /// One Merkle level: compresses the digest register with the sibling
+    /// `sib` (witness to the instruction), on the side given by bit `level`
+    /// of `bits`.
+    fn compress_in_step(&mut self, sib: &Digest, bits: Addr, level: usize) {
+        self.prog.compress_in(bits + (level / 4) as Addr, (level % 4) as u8);
+        self.inputs.extend(sib.iter().map(|x| Fp4::from_base(*x)));
         let right = self.val(bits + (level / 4) as Addr).0[level % 4] == Fp::ONE;
-        let mut s = [Fp::ZERO; DIGEST];
-        for (i, x) in s.iter_mut().enumerate() {
-            *x = self.val(sib + i as Addr).0[0];
-        }
         let d = self.digest;
-        self.digest = if right { compress(&s, &d) } else { compress(&d, &s) };
-        // The machine only absorbs right after a start or an absorb.
+        self.digest = if right { compress(sib, &d) } else { compress(&d, sib) };
         self.sponge = None;
     }
 
@@ -390,14 +390,14 @@ impl Compiler {
     /// Hashes `len` scalars at `row` (padded block) as `poseidon2::hash`,
     /// walks the Merkle path with directions from `bits`, and returns the
     /// root digest's address.
-    fn merkle_root(&mut self, row: Addr, len: usize, path: &[Addr], bits: Addr) -> Addr {
+    fn merkle_root(&mut self, row: Addr, len: usize, path: &[Digest], bits: Addr) -> Addr {
         self.sponge_start(row, Fp::from_u32(len as u32));
         let blocks = len.div_ceil(RATE).max(1);
         for k in 1..blocks {
             self.absorb(row + (k * RATE) as Addr);
         }
         for (level, sib) in path.iter().enumerate() {
-            self.compress_step(*sib, bits, level);
+            self.compress_in_step(sib, bits, level);
         }
         self.squeeze()
     }
@@ -894,13 +894,11 @@ impl Compiler {
                 }
                 let (off_a, off_p, off_q) = (2 * s.w, 2 * s.w + 2 * s.aux_w, 2 * s.w + 2 * s.aux_w + 2 * s.pre_w);
                 let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, bp(0));
-                let trace_path: Vec<Addr> = opening.trace_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                let root = c.merkle_root(trace_row, s.w, &trace_path, bits);
+                let root = c.merkle_root(trace_row, s.w, &opening.trace_path, bits);
                 c.assert_digest(root, trace_roots[i]);
                 let s_a = if s.aux_w > 0 {
                     let (row, sum) = c.row_inputs_dot(&opening.aux_row, bp(off_a));
-                    let path: Vec<Addr> = opening.aux_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                    let root = c.merkle_root(row, s.aux_w, &path, bits);
+                    let root = c.merkle_root(row, s.aux_w, &opening.aux_path, bits);
                     c.assert_digest(root, aux[i].unwrap().0);
                     sum
                 } else {
@@ -908,16 +906,14 @@ impl Compiler {
                 };
                 let s_p = if s.pre_w > 0 {
                     let (row, sum) = c.row_inputs_dot(&opening.pre_row, bp(off_p));
-                    let path: Vec<Addr> = opening.pre_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                    let root = c.merkle_root(row, s.pre_w, &path, bits);
+                    let root = c.merkle_root(row, s.pre_w, &opening.pre_path, bits);
                     c.assert_digest(root, tables[i].1.unwrap());
                     sum
                 } else {
                     A_ZERO
                 };
                 let quot_row = c.scalar_inputs(&opening.quotient_row);
-                let quot_path: Vec<Addr> = opening.quotient_path.iter().map(|d| c.scalar_inputs(d)).collect();
-                let root = c.merkle_root(quot_row, s.chunks * DEGREE, &quot_path, bits);
+                let root = c.merkle_root(quot_row, s.chunks * DEGREE, &opening.quotient_path, bits);
                 c.assert_digest(root, quotient_roots[i]);
                 let mut s_q = A_ZERO;
                 for j in 0..s.chunks {
@@ -984,9 +980,8 @@ impl Compiler {
                 let v: Vec<Addr> = (0..1usize << la)
                     .map(|j| c.word_from_scalars(core::array::from_fn(|k| row + (j * DEGREE + k) as Addr)))
                     .collect();
-                let path: Vec<Addr> = step.path.iter().map(|d| c.scalar_inputs(d)).collect();
-                assert_eq!(path.len(), log_leaves);
-                let root = c.merkle_root(row, DEGREE << la, &path, bits);
+                assert_eq!(step.path.len(), log_leaves);
+                let root = c.merkle_root(row, DEGREE << la, &step.path, bits);
                 c.assert_digest(root, fri_roots[r]);
                 // The value at the queried position.
                 let b0 = c.bit(bits, log_leaves);
