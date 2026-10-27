@@ -30,7 +30,7 @@ use crate::block_air::{
     BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_ISP_IN, PUB_ISP_OUT,
     PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN, PUB_SUM_OUT,
     ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state, inputs_state, limbs16,
-    outputs_state,
+    limbs16_wide, outputs_state,
 };
 use crate::block_proof::{DOM_SEGMENT_PROOF, SegmentProof, prove_segment_padded};
 use crate::chain::{BlockStatement, ProofVerifier};
@@ -99,7 +99,7 @@ impl AggregatorParams {
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         segment_log_n: 15,
-        max_segments: 16,
+        max_segments: 1 << 14,
         fan_in: 4,
         outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         wrap: StarkConfig { log_blowup: 5, num_queries: 16, pow_bits: 20 },
@@ -208,13 +208,64 @@ pub fn combine_records(records: &[SegmentPublic]) -> SegmentPublic {
         carry_in: first.carry_in,
         carry_out: last.carry_out,
     };
-    for r in records {
-        for j in 0..LIMBS {
-            out.sum_in[j] += r.sum_in[j];
-            out.sum_out[j] += r.sum_out[j];
+    // Sums are normalized to 16-bit limbs, as the node program does.
+    let normal = |f: fn(&SegmentPublic) -> &[u32; LIMBS]| -> [u32; LIMBS] {
+        let total: u128 = records.iter().map(|r| SegmentPublic::total(f(r))).sum();
+        limbs16_wide(total).map(|x| x.to_canonical())
+    };
+    out.sum_in = normal(|r| &r.sum_in);
+    out.sum_out = normal(|r| &r.sum_out);
+    out
+}
+
+/// Bits of a carry when normalizing limb sums. A segment's limb sums are
+/// honest integers below `2^25` (fewer than `2^9` items of 16 bits), a
+/// node's are normalized, and a node sums at most `fan_in` records plus
+/// the subsidy, so a limb sum with its incoming carry stays well below
+/// `2^30` and its carry below `2^14`. Both sides of `s + c_in = r + 2^16
+/// c` then stay below `p`, so the field identity is an integer one.
+const CARRY_BITS: usize = 14;
+
+/// Normalizes limb sums to 16-bit limbs with hinted, range-checked
+/// carries; the top limb must fit 16 bits on its own, so the value is
+/// below `2^96`. A normalized form is unique, so two of them are equal
+/// exactly when the integers are.
+fn normalize(c: &mut Compiler, sums: &[Addr; LIMBS]) -> [Addr; LIMBS] {
+    let two16 = c.scalar(Fp::new(1 << 16));
+    let mut out = [0; LIMBS];
+    let mut carry: Option<Addr> = None;
+    for j in 0..LIMBS {
+        let d = match carry {
+            Some(cp) => c.add(sums[j], cp),
+            None => sums[j],
+        };
+        if j + 1 == LIMBS {
+            c.assert_bits_zero_from(d, 16);
+            out[j] = d;
+            break;
         }
+        let v = c.val(d).0[0].to_canonical();
+        let r = c.input(Fp4::from_base(Fp::new(v & 0xffff)));
+        let cj = c.input(Fp4::from_base(Fp::new(v >> 16)));
+        c.assert_bits_zero_from(r, 16);
+        c.assert_bits_zero_from(cj, CARRY_BITS);
+        let back = c.muladd(cj, two16, r);
+        c.assert_eq(back, d);
+        out[j] = r;
+        carry = Some(cj);
     }
     out
+}
+
+/// Limb sums of field `field` over `recs`, plus `extra` limbs if given.
+fn sum_limbs(c: &mut Compiler, recs: &[Addr], field: usize, extra: Option<Addr>) -> [Addr; LIMBS] {
+    core::array::from_fn(|j| {
+        let mut acc = extra.map_or(0, |e| e + j as Addr);
+        for &r in recs {
+            acc = c.add(acc, r + (field + j) as Addr);
+        }
+        acc
+    })
 }
 
 /// A proven node: its span record and machine proof, with the program it
@@ -254,6 +305,11 @@ pub enum Output<'a> {
 pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: Output<'_>) -> Compiler {
     let k = children.len();
     assert!(k >= 1 && k <= params.fan_in, "child count {k} out of range");
+    // The bound behind CARRY_BITS: a limb sum over the children (each at
+    // most a segment's items of 16 bits), the subsidy and a carry.
+    let items = (params.segment_rows() / ROWS_PER_OUTPUT + 1) as u64;
+    let limb_sum = ((params.fan_in as u64 * items + 1) << 16) + (1 << CARRY_BITS);
+    assert!(limb_sum >> 16 < 1 << CARRY_BITS && (1u64 << (16 + CARRY_BITS)) + limb_sum < P as u64);
     let mut c = Compiler::new();
     let at = |base: Addr, field: usize| base + field as Addr;
 
@@ -321,13 +377,11 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             copy(&mut c, at(first, PUB_CARRY_IN), PUB_CARRY_IN, CARRY_LEN);
             copy(&mut c, at(last, PUB_CARRY_OUT), PUB_CARRY_OUT, CARRY_LEN);
             for field in [PUB_SUM_IN, PUB_SUM_OUT] {
-                for j in 0..LIMBS {
-                    let mut acc = 0;
-                    for &r in &recs {
-                        acc = c.add(acc, at(r, field + j));
-                    }
-                    let v = c.val(acc);
-                    c.prog.muladd_to(acc, 1, 0, at(out, field + j));
+                let sums = sum_limbs(&mut c, &recs, field, None);
+                let limbs = normalize(&mut c, &sums);
+                for (j, &l) in limbs.iter().enumerate() {
+                    let v = c.val(l);
+                    c.prog.muladd_to(l, 1, 0, at(out, field + j));
                     c.set_word(at(out, field + j), v);
                 }
             }
@@ -360,52 +414,13 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
                 c.assert_eq(at(last, PUB_CARRY_OUT + i), 0);
             }
 
-            // Balance: sum over children of (out - in) minus the subsidy is
-            // zero as an integer. Each limb difference is small, so the
-            // carries between 16-bit limbs are hinted and range checked, and
-            // the final carry is zero.
-            //
-            // Bounds: a segment's limb sums are honest integers below
-            // `items * 2^16` where `items` is at most the rows divided by
-            // the rows per output, and a record sums at most `max_segments`
-            // of them, so the limb differences sum to `|s| < items * 2^16`
-            // with `items = max_segments * outputs + 1` (the subsidy). An
-            // honest carry satisfies `|c| <= items`, so carries are range
-            // checked to `(-2^b, 2^b)` with `items < 2^b`. The identity
-            // `s + c_prev - c * 2^16` is then below
-            // `items * 2^16 + 2^b + 2^(b + 16)` in magnitude, which must stay
-            // below `p` for field equality to imply integer equality.
-            let items = params.max_segments * (params.segment_rows() / ROWS_PER_OUTPUT) + 1;
-            let b = (usize::BITS - items.leading_zeros()) as u64;
-            let bound = ((items as u64) << 16) + (1 << b) + (1 << (b + 16));
-            assert!(bound < P as u64, "amount sums could wrap the field for these parameters");
-            let carry_offset = 1u32 << b;
-            let carry_bits = b as usize + 1;
-            let two16 = c.scalar(Fp::new(1 << 16));
-            let mut carry: Option<Addr> = None;
-            for j in 0..LIMBS {
-                let mut d = c.neg(at(st, ST_SUBSIDY + j));
-                for &r in &recs {
-                    d = c.add(d, at(r, PUB_SUM_OUT + j));
-                    d = c.sub(d, at(r, PUB_SUM_IN + j));
-                }
-                if let Some(cp) = carry {
-                    d = c.add(d, cp);
-                }
-                if j + 1 == LIMBS {
-                    c.assert_eq(d, 0);
-                    break;
-                }
-                // d == carry * 2^16, carry in (-offset, offset).
-                let dv = signed(c.val(d).0[0]);
-                let cv = dv.div_euclid(1 << 16);
-                let hint = c.input(Fp4::from_base(Fp::new((cv + carry_offset as i64).max(0) as u32)));
-                let off = c.scalar(Fp::new(carry_offset));
-                let cj = c.sub(hint, off);
-                let back = c.muladd(cj, two16, 0);
-                c.assert_eq(back, d);
-                c.assert_bits_zero_from(hint, carry_bits);
-                carry = Some(cj);
+            // Balance: the inputs plus the subsidy equal the outputs, as
+            // integers: both normalized, then compared limb by limb.
+            let ins = sum_limbs(&mut c, &recs, PUB_SUM_IN, Some(at(st, ST_SUBSIDY)));
+            let outs = sum_limbs(&mut c, &recs, PUB_SUM_OUT, None);
+            let (ins, outs) = (normalize(&mut c, &ins), normalize(&mut c, &outs));
+            for (a, b) in ins.iter().zip(&outs) {
+                c.assert_eq(*a, *b);
             }
 
             c.hash_scalars(st, STATEMENT_LEN);
@@ -442,12 +457,6 @@ pub fn compile_wrap(
     c
 }
 
-/// Signed value of a field element, assuming it is small in magnitude.
-fn signed(x: Fp) -> i64 {
-    let v = x.to_canonical() as i64;
-    if v > (P as i64) / 2 { v - P as i64 } else { v }
-}
-
 // ---------------------------------------------------------------------------
 // Tree planning
 // ---------------------------------------------------------------------------
@@ -482,23 +491,37 @@ impl Shape {
     }
 }
 
-/// Splits `k > fan_in` segments into balanced groups: as many as `fan_in`
-/// allows for parallelism, but where possible at least two segments each,
-/// since a node over one segment only adds a level. Always at least two
-/// groups, so every group is smaller than `k`.
+/// Splits `k > fan_in` segments into full subtrees of `u` segments, `u`
+/// the largest power of `fan_in` below `k`, and the remainder. Full
+/// subtrees of a size have one shape whatever `k` is, so planning a new
+/// segment count only plans the remainder's path. At most `fan_in`
+/// groups, at least two, each smaller than `k`.
 fn split(k: usize, fan_in: usize) -> Vec<usize> {
     debug_assert!(k > fan_in && fan_in >= 2);
-    let groups = (k / 2).clamp(2, fan_in);
-    let (base, extra) = (k / groups, k % groups);
-    (0..groups).map(|g| base + usize::from(g < extra)).collect()
+    let mut u = 1;
+    while u * fan_in < k {
+        u *= fan_in;
+    }
+    let mut groups = vec![u; k / u];
+    if !k.is_multiple_of(u) {
+        groups.push(k % u);
+    }
+    groups
 }
+
+/// Planned subtrees by key (root flag, child sizes), shared between plans.
+pub type PlanMemo = HashMap<Vec<usize>, Shape>;
 
 /// Plans the tree for `k` segments and computes every node's program
 /// digest by compiling it against zero-filled proofs of the right shapes.
 pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
+    plan_with(params, k, &mut PlanMemo::new())
+}
+
+/// As [`plan`], reusing and extending `memo`.
+pub fn plan_with(params: &AggregatorParams, k: usize, memo: &mut PlanMemo) -> Shape {
     assert!(k >= 1 && k <= params.max_segments, "segment count {k} out of range");
-    let mut memo: HashMap<Vec<usize>, Shape> = HashMap::new();
-    let mut root = plan_node(params, k, true, &mut memo);
+    let mut root = plan_node(params, k, true, memo);
     let dummy = dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC);
     let prog = compile_wrap(params, &root.digest, &dummy, &Statement::zero()).prog;
     root.wrap = Some(Wrap {
@@ -509,7 +532,7 @@ pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
     root
 }
 
-fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut HashMap<Vec<usize>, Shape>) -> Shape {
+fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut PlanMemo) -> Shape {
     if k == 1 && !root {
         return Shape {
             children: vec![],
@@ -723,21 +746,24 @@ pub fn verify_block(
 /// segment count.
 pub struct AggregateVerifier {
     pub params: AggregatorParams,
-    shapes: Mutex<HashMap<usize, Shape>>,
+    /// Planned roots by segment count, and the subtrees behind them.
+    plans: Mutex<(HashMap<usize, Shape>, PlanMemo)>,
 }
 
 impl AggregateVerifier {
     pub fn new(params: AggregatorParams) -> AggregateVerifier {
-        AggregateVerifier { params, shapes: Mutex::new(HashMap::new()) }
+        AggregateVerifier { params, plans: Mutex::new((HashMap::new(), PlanMemo::new())) }
     }
 
-    /// The planned tree for `k` segments.
+    /// The planned tree for `k` segments. Subtrees planned for earlier
+    /// counts are reused.
     pub fn shape(&self, k: usize) -> Shape {
-        if let Some(s) = self.shapes.lock().unwrap().get(&k) {
+        let mut plans = self.plans.lock().unwrap();
+        if let Some(s) = plans.0.get(&k) {
             return s.clone();
         }
-        let s = plan(&self.params, k);
-        self.shapes.lock().unwrap().insert(k, s.clone());
+        let s = plan_with(&self.params, k, &mut plans.1);
+        plans.0.insert(k, s.clone());
         s
     }
 
@@ -803,7 +829,7 @@ mod tests {
     const SMALL: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3 },
         segment_log_n: 7,
-        max_segments: 4,
+        max_segments: 16,
         fan_in: 2,
         outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5 },
         wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4 },
@@ -888,6 +914,29 @@ mod tests {
         };
         let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short));
         assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
+    }
+
+    #[test]
+    #[ignore = "proves a four-level tree; run with --release"]
+    fn deep_tree_roundtrip() {
+        // Nine segments at fan-in two: a full subtree of eight and one
+        // segment, with an open transaction crossing two boundaries.
+        let miner = key(9).public_key();
+        let mut txs: Vec<Transaction> = (0..6).map(|i| reward(&miner, 1 + i)).collect();
+        let outs = [5, 6, 7].map(|a| TxOutput::new(&miner, a)).to_vec();
+        txs.push(UnsignedTransaction::new(vec![], outs).sign(|_, _, _| Err::<Sig, ()>(())).unwrap());
+        let s = setup_txs("deep", &txs, 21 + 18);
+        assert_eq!(s.segments.len(), 9);
+        let shape = plan(&SMALL, 9);
+        assert_eq!(shape.children.iter().map(|c| c.segments).collect::<Vec<_>>(), vec![8, 1]);
+        let t = std::time::Instant::now();
+        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        println!("9 segments, 4 levels: {} bytes in {:?}", proof.len(), t.elapsed());
+        let v = AggregateVerifier::new(SMALL);
+        assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
+        let mut poor = s.statement.clone();
+        poor.subsidy -= 1;
+        assert_eq!(v.verify_statement(&poor, &proof), Err(AggregateError::Rejected));
     }
 
     #[test]
@@ -987,16 +1036,36 @@ mod tests {
             for k in [1, 2, 4, 5, 8, 12, 16] {
                 println!("{k:2} segments: {}", show(&plan(&params, k)));
             }
+            let mut memo = PlanMemo::new();
+            for k in [1000, 9999, 1 << 14, 1001, 12345] {
+                let t = std::time::Instant::now();
+                let fresh = plan(&params, k);
+                let alone = t.elapsed();
+                let t = std::time::Instant::now();
+                let s = plan_with(&params, k, &mut memo);
+                assert_eq!(s.wrap, fresh.wrap);
+                println!(
+                    "{k} segments: root 2^{}/2^{}, planned in {alone:?}, {:?} after the counts before",
+                    s.log_n,
+                    s.hash_log_n,
+                    t.elapsed()
+                );
+            }
         }
     }
 
     #[test]
     fn tree_plans() {
-        assert_eq!(split(10, 4), vec![3, 3, 2, 2]);
-        assert_eq!(split(5, 4), vec![3, 2]);
+        assert_eq!(split(10, 4), vec![4, 4, 2]);
+        assert_eq!(split(5, 4), vec![4, 1]);
         assert_eq!(split(16, 4), vec![4, 4, 4, 4]);
-        assert_eq!(split(17, 4), vec![5, 4, 4, 4]);
+        assert_eq!(split(17, 4), vec![16, 1]);
+        assert_eq!(split(63, 4), vec![16, 16, 16, 15]);
         assert_eq!(split(3, 2), vec![2, 1]);
+        for k in 5..300 {
+            let g = split(k, 4);
+            assert!(g.len() >= 2 && g.len() <= 4 && g.iter().sum::<usize>() == k && g.iter().all(|&n| n < k));
+        }
     }
 
     #[test]

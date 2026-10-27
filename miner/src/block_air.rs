@@ -84,7 +84,9 @@ const STEPS: usize = W - 1;
 const ELEMENTS: usize = DIGEST + 1;
 const BITS: usize = 31;
 const AMOUNT_BITS: usize = 64;
-pub const LIMBS: usize = 4;
+/// 16-bit limbs of amount sums: four hold an amount, six any sum of a
+/// block's amounts (fewer than `2^32` of them).
+pub const LIMBS: usize = 6;
 const MASK30: u64 = (1 << 30) - 1;
 const DOM_INPUTS: u32 = 0x21;
 const DOM_OUTPUTS: u32 = 0x22;
@@ -297,6 +299,12 @@ pub fn outputs_state(outputs: &[Output]) -> [Fp; WIDTH] {
 
 /// Splits a `u64` into four 16-bit limbs, least significant first.
 pub fn limbs16(v: u64) -> [Fp; LIMBS] {
+    limbs16_wide(v as u128)
+}
+
+/// As [`limbs16`] for a sum below `2^96`.
+pub fn limbs16_wide(v: u128) -> [Fp; LIMBS] {
+    assert!(v >> (16 * LIMBS) == 0, "sum out of range");
     core::array::from_fn(|j| Fp::new(((v >> (16 * j)) & 0xffff) as u32))
 }
 
@@ -1831,7 +1839,7 @@ mod tests {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
         assert_eq!(ROWS_PER_INPUT, 1150 + 4 + 1 + 80 + 2);
         assert_eq!(ROWS_PER_OUTPUT, 84);
-        assert_eq!(NUM_PUBLIC, 92 + 2 * 27);
+        assert_eq!(NUM_PUBLIC, 96 + 2 * 27);
     }
 
     #[test]

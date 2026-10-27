@@ -35,7 +35,7 @@ use heed::types::{Bytes, Str, U32};
 use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::aggregate::AggregatorParams;
-use crate::block::{Block, Body, BodyError, Header};
+use crate::block::{Block, Body, BodyError, HEADER_SIZE, Header};
 use crate::difficulty::{Asert, U256};
 use crate::pow::{Digest, PowParams, SeedText, Target};
 use crate::state_tree::{EMPTY, open_env};
@@ -49,8 +49,9 @@ pub struct ChainParams {
     pub genesis_target: U256,
     /// Easiest permitted target.
     pub max_target: U256,
-    pub max_inputs: usize,
-    pub max_outputs: usize,
+    /// Largest serialized block, header and body (input positions,
+    /// outputs and proof), in bytes. The only limit on a block's contents.
+    pub max_block_size: usize,
     /// Seconds a timestamp may lead the local clock.
     pub max_future_drift: u64,
     /// Number of past blocks whose median timestamp bounds the next.
@@ -68,8 +69,7 @@ impl ChainParams {
         pow: PowParams::MAINNET,
         genesis_target: U256([0, 0, 0, 1 << 40]), // 2^232: about 2^16 hashes per block to start
         max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
-        max_inputs: 1024,
-        max_outputs: 1024,
+        max_block_size: 2 << 20,
         max_future_drift: 2 * 3600,
         median_time_window: 11,
         initial_subsidy: 50 * 100_000_000,
@@ -137,8 +137,8 @@ pub enum ChainError {
     },
     BadProofOfWork,
     BadBodyCommitment,
-    TooManyInputs(usize),
-    TooManyOutputs(usize),
+    /// The serialized block exceeds `max_block_size` bytes.
+    TooLarge(usize),
     /// Input position holds no unspent output.
     UnknownInput(u64),
     BadProof,
@@ -170,8 +170,7 @@ impl core::fmt::Display for ChainError {
             }
             ChainError::BadProofOfWork => f.write_str("proof of work does not meet the target"),
             ChainError::BadBodyCommitment => f.write_str("header does not commit to the body"),
-            ChainError::TooManyInputs(n) => write!(f, "{n} inputs exceeds the block limit"),
-            ChainError::TooManyOutputs(n) => write!(f, "{n} outputs exceeds the block limit"),
+            ChainError::TooLarge(n) => write!(f, "block of {n} bytes exceeds the size limit"),
             ChainError::UnknownInput(p) => write!(f, "input position {p} is not an unspent output"),
             ChainError::BadProof => f.write_str("validity proof rejected"),
             ChainError::StateRootMismatch { .. } => f.write_str("state root does not match the applied body"),
@@ -367,11 +366,9 @@ impl<V: ProofVerifier> Chain<V> {
 
     fn check_body(&self, header: &Header, body: &Body) -> Result<()> {
         body.validate()?;
-        if body.inputs.len() > self.params.max_inputs {
-            return Err(ChainError::TooManyInputs(body.inputs.len()));
-        }
-        if body.outputs.len() > self.params.max_outputs {
-            return Err(ChainError::TooManyOutputs(body.outputs.len()));
+        let size = HEADER_SIZE + body.size();
+        if size > self.params.max_block_size {
+            return Err(ChainError::TooLarge(size));
         }
         if header.body_commitment != body.commitment() {
             return Err(ChainError::BadBodyCommitment);
@@ -514,6 +511,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mainnet_segments_cover_the_largest_block() {
+        // Inputs cost the most rows per byte (1237 for 5), so the block that
+        // needs the most segments is all inputs, with no proof bytes.
+        let p = ChainParams::MAINNET;
+        let n = (p.max_block_size - HEADER_SIZE - 12) / crate::block::POSITION_SIZE;
+        let segments = crate::block_air::pack(1, |_| (n, 0), p.aggregator.segment_rows()).len();
+        assert!(segments <= p.aggregator.max_segments, "{n} inputs need {segments} segments");
+        println!("{n} inputs: {segments} of {} segments", p.aggregator.max_segments);
+    }
+
     const POW: PowParams = PowParams { log_dataset_items: 8, parents: 32, accesses: 64 };
     const GENESIS_TIME: u64 = 1_700_000_000;
 
@@ -523,8 +531,8 @@ mod tests {
             // Easy: 2^240, about 2^8 hashes per block.
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
-            max_inputs: 4,
-            max_outputs: 4,
+            // Four outputs and a short proof.
+            max_block_size: HEADER_SIZE + 12 + 4 * crate::transaction::OUTPUT_SIZE + 39,
             max_future_drift: 7200,
             median_time_window: 11,
             initial_subsidy: 50,
@@ -711,10 +719,10 @@ mod tests {
         wrong.outputs.push(Output::new(&a, 8));
         let b = mine_with_root(&f, wrong, GENESIS_TIME + 600, good.header.state_root);
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::StateRootMismatch { .. })));
-        // Too many outputs.
+        // Too large.
         let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1); 5], proof: vec![] };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooManyOutputs(5))));
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(384))));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();

@@ -12,9 +12,10 @@
 //! `mine` creates the chain (an empty genesis block at the current time)
 //! and a development wallet on first use, then builds blocks on the tip:
 //! a coinbase paying the subsidy to the wallet, plus up to `--txs`
-//! transfers, each splitting one of the wallet's outputs in two. The UTXO
-//! set roughly doubles per block until the transfers fill the 16
-//! segments a block allows. Each block is proven (segments, then the
+//! transfers (368 by default, sixteen segments), each splitting one of
+//! the wallet's outputs in two, within the block size limit. The UTXO set
+//! roughly doubles per block until the transfers reach that count. Each
+//! block is proven (segments, then the
 //! aggregation tree), mined, and applied through full validation,
 //! including the proof. `--blocks 0` (the default) runs until interrupted.
 //! `--jobs` bounds how many segments are proven at once.
@@ -41,7 +42,7 @@ const USAGE: &str = "usage:
 
   --data DIR   chain and wallet directory (default ~/.tabernacle/tabminer)
   --blocks N   blocks to mine, 0 for no limit (default 0)
-  --txs N      most transfers per block (default 1000: as many as fit)
+  --txs N      most transfers per block (default 368: sixteen segments)
   --jobs N     segments proven at once (default 2)";
 
 /// LMDB map size: an upper bound on the database, reserved as address space.
@@ -64,7 +65,7 @@ fn parse_args() -> Result<Args, String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let data = home.map(|h| h.join(".tabernacle").join("tabminer")).unwrap_or_else(|| PathBuf::from("tabminer-data"));
-    let mut a = Args { command, data, blocks: 0, txs: 1000, jobs: 2 };
+    let mut a = Args { command, data, blocks: 0, txs: 368, jobs: 2 };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<u64>().map_err(|_| format!("{flag}: not a number: {v}"));
@@ -260,18 +261,17 @@ fn mine(args: &Args) -> AnyResult<()> {
         let mut txs = vec![coinbase(&mut wallet, subsidy)];
         // Item counts: the coinbase, then one-input, two-output splits.
         let items = |t: usize| if t == 0 { (0, 1) } else { (1, 2) };
-        let (mut n_in, mut n_out) = (0, 1);
+        // Size: header, body counts and outputs, input positions, and a
+        // margin for the proof.
+        let size = |spend: usize| 172 + 12 + spend * 5 + (1 + 2 * spend) * 40 + (256 << 10);
         let mut spend = 0;
         for _ in coins.iter().take(args.txs) {
             if pack(spend + 2, items, agg.segment_rows()).len() > agg.max_segments
-                || n_in + 1 > params.max_inputs
-                || n_out + 2 > params.max_outputs
+                || size(spend + 1) > params.max_block_size
             {
                 break;
             }
             spend += 1;
-            n_in += 1;
-            n_out += 2;
         }
         txs.extend(wallet.split_all(&coins[..spend], 2));
         let build_time = started.elapsed();
