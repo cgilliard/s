@@ -6,7 +6,8 @@
 //! tabminer show [--data DIR]
 //! ```
 //!
-//! With no command, `tabminer` mines.
+//! With no command, `tabminer` mines. The data directory defaults to
+//! `~/.tabernacle/tabminer` (`./tabminer-data` when `HOME` is unset).
 //!
 //! `mine` creates the chain (an empty genesis block at the current time)
 //! and a development wallet on first use, then builds blocks on the tip:
@@ -38,7 +39,7 @@ const USAGE: &str = "usage:
   tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N]
   tabminer show [--data DIR]
 
-  --data DIR   chain and wallet directory (default ./tabminer-data)
+  --data DIR   chain and wallet directory (default ~/.tabernacle/tabminer)
   --blocks N   blocks to mine, 0 for no limit (default 0)
   --txs N      most transfers per block (default 1000: as many as fit)
   --jobs N     segments proven at once (default 2)";
@@ -61,7 +62,9 @@ fn parse_args() -> Result<Args, String> {
         Some(c) if !c.starts_with('-') => it.next().unwrap(),
         _ => "mine".to_string(),
     };
-    let mut a = Args { command, data: PathBuf::from("tabminer-data"), blocks: 0, txs: 1000, jobs: 2 };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data = home.map(|h| h.join(".tabernacle").join("tabminer")).unwrap_or_else(|| PathBuf::from("tabminer-data"));
+    let mut a = Args { command, data, blocks: 0, txs: 1000, jobs: 2 };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<u64>().map_err(|_| format!("{flag}: not a number: {v}"));
