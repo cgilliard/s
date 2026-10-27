@@ -207,6 +207,26 @@ pub fn coset_ntt(v: &mut [Fp], shift: Fp) {
     ntt(v);
 }
 
+/// Evaluations of the polynomial with coefficients `coeffs` (`n` of them)
+/// on the coset `shift * H` of size `n * 2^log_blowup`, in coset-major
+/// order: entry `j * n + m` is the value at `shift * w^(j + 2^log_blowup *
+/// m)`, `w` of order `n * 2^log_blowup`. Each of the `2^log_blowup` cosets
+/// `shift * w^j * H_n` is one transform of size `n`, which stays in cache
+/// where a single transform of the full size would not.
+pub fn lde_cosets(coeffs: &[Fp], log_blowup: usize, shift: Fp) -> Vec<Fp> {
+    let n = coeffs.len();
+    let w = root_of_unity(log2_strict(n) + log_blowup);
+    let mut out = Vec::with_capacity(n << log_blowup);
+    let mut s = shift;
+    for _ in 0..1usize << log_blowup {
+        let start = out.len();
+        out.extend_from_slice(coeffs);
+        coset_ntt(&mut out[start..], s);
+        s = s.mul(&w);
+    }
+    out
+}
+
 /// Evaluations on `shift * H` to coefficients.
 pub fn coset_intt(v: &mut [Fp], shift: Fp) {
     intt(v);
@@ -269,6 +289,24 @@ mod tests {
             }
         }
         assert_eq!(INV_2 + INV_2, Fp::ONE);
+    }
+
+    #[test]
+    fn coset_split_extension_matches_one_transform() {
+        let mut rng = Rng::new(77);
+        for (log_n, log_blowup) in [(0, 2), (3, 1), (5, 3), (8, 5)] {
+            let n = 1usize << log_n;
+            let coeffs: Vec<Fp> = (0..n).map(|_| rng.fp()).collect();
+            let shift = MULTIPLICATIVE_GENERATOR;
+            let mut full = coeffs.clone();
+            full.resize(n << log_blowup, Fp::ZERO);
+            coset_ntt(&mut full, shift);
+            let split = lde_cosets(&coeffs, log_blowup, shift);
+            let b = 1usize << log_blowup;
+            for i in 0..n << log_blowup {
+                assert_eq!(split[(i % b) * n + i / b], full[i], "log_n {log_n} blowup {log_blowup} point {i}");
+            }
+        }
     }
 
     #[test]

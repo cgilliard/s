@@ -30,7 +30,7 @@
 //! proof.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::block_air::{
     BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_ISP_IN, PUB_ISP_OUT,
@@ -47,8 +47,8 @@ use crate::hash_table::HashTableAir;
 use crate::merkle::Digest;
 use crate::poseidon2::{DIGEST, Fp, P, WIDTH};
 use crate::recursion::{Compiler, dummy_proof};
-use crate::stark::{self, StarkConfig};
-use crate::vm_air::{Addr, NUM_PUBLIC as VM_PUBLIC, PUB_OUTPUT, VmAir};
+use crate::stark::{self, Preprocessed, StarkConfig};
+use crate::vm_air::{Addr, NUM_PUBLIC as VM_PUBLIC, PUB_OUTPUT, Program, VmAir};
 
 /// Transcript domain separator for node (aggregate) proofs.
 const DOM_AGGREGATE_PROOF: u32 = 0x31;
@@ -99,9 +99,9 @@ impl AggregatorParams {
     ///
     /// The wrap is at rate 1/32 with 20 bits of grinding (0.5 s): 16
     /// queries. It verifies a root of up to 2^18 rows in 2^16 rows, and
-    /// proves in about 17 s with 4.3 GB, giving a block proof of about
-    /// 145 KB with batched Merkle paths; rate 1/64 would save about a tenth
-    /// of that for twice the time and memory.
+    /// proves in about 9 s, giving a block proof of about 145 KB with
+    /// batched Merkle paths; rate 1/64 would save about a tenth of that for
+    /// twice the time and memory.
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         segment_log_n: 15,
@@ -617,7 +617,7 @@ struct Compiled {
 }
 
 impl Compiled {
-    fn of(prog: &crate::vm_air::Program, log_blowup: usize) -> Compiled {
+    fn of(prog: &Program, log_blowup: usize) -> Compiled {
         Compiled {
             digest: prog.digest(log_blowup),
             log_n: prog.height().trailing_zeros() as usize,
@@ -768,6 +768,35 @@ pub enum Progress {
     Wrap { log_n: usize, hash_log_n: usize, elapsed: std::time::Duration },
 }
 
+/// Recently used committed programs, most recent last. A program type's
+/// table is the same in every block, and committing it costs about as much
+/// as a trace column set, so the last few are kept (a few hundred MB each).
+static PROGRAMS: Mutex<Vec<(Digest, Arc<Preprocessed>)>> = Mutex::new(Vec::new());
+const CACHED_PROGRAMS: usize = 4;
+
+/// The commitment to `prog` at `log_blowup`, whose digest the plan says is
+/// `digest`; from the cache when it was committed recently.
+fn committed_program(prog: &Program, log_blowup: usize, digest: &Digest) -> Arc<Preprocessed> {
+    {
+        let mut cache = PROGRAMS.lock().unwrap();
+        if let Some(i) = cache.iter().position(|(d, _)| d == digest) {
+            let entry = cache.remove(i);
+            let pre = entry.1.clone();
+            cache.push(entry);
+            debug_assert_eq!(pre.table().values, prog.table().values, "program differs from the planned shape");
+            return pre;
+        }
+    }
+    let pre = Arc::new(prog.preprocess(log_blowup));
+    assert_eq!(pre.root(), *digest, "program differs from the planned shape");
+    let mut cache = PROGRAMS.lock().unwrap();
+    cache.push((*digest, pre.clone()));
+    if cache.len() > CACHED_PROGRAMS {
+        cache.remove(0);
+    }
+    pre
+}
+
 /// Proves one node of the tree over `segments[..shape.segments]`.
 fn prove_node(
     params: &AggregatorParams,
@@ -811,8 +840,7 @@ fn prove_node(
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
-    let pre = c.prog.preprocess(params.outer.log_blowup);
-    assert_eq!(pre.root(), shape.digest, "node program differs from the planned shape");
+    let pre = committed_program(&c.prog, params.outer.log_blowup, &shape.digest);
     let public = VmAir::public_values(&pre.root(), &out_digest);
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
@@ -870,8 +898,7 @@ pub fn prove_block_with(
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
-    let pre = c.prog.preprocess(params.wrap.log_blowup);
-    assert_eq!(pre.root(), wrap.digest, "wrap program differs from the planned shape");
+    let pre = committed_program(&c.prog, params.wrap.log_blowup, &wrap.digest);
     let public = VmAir::public_values(&pre.root(), &statement.output(&wrap.tree));
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript());

@@ -62,9 +62,7 @@ use crate::ext::{DEGREE, Fp4};
 use crate::field::{Deg, Field, batch_inverse};
 use crate::fri::{self, FriConfig, FriError, FriProof, QueryStep, leaf_row};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
-use crate::ntt::{
-    MULTIPLICATIVE_GENERATOR, coset_intt_ext, coset_ntt, coset_ntt_ext, intt, log2_strict, root_of_unity,
-};
+use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_intt_ext, intt, lde_cosets, log2_strict, root_of_unity};
 use crate::parallel::{par_chunks_mut, par_map, par_map_min, par_map_with};
 use crate::poseidon2::{Fp, zeroed_vec};
 use crate::recursion::Expr;
@@ -1029,13 +1027,18 @@ impl Preprocessed {
         let ext: Vec<(Vec<Fp>, Vec<Fp>)> =
             par_map_min(w, 1, |k| lde_column(table.column(k), big_n, MULTIPLICATIVE_GENERATOR));
         let (coeffs, evals): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-        scatter_columns(&mut lde, w, 0, &evals);
+        scatter_columns(&mut lde, w, 0, &evals, table.height());
         let tree = MerkleTree::from_flat(&lde, w);
         Preprocessed { width: w, log_n, log_blowup, table: table.clone(), coeffs, lde, tree }
     }
 
     pub fn root(&self) -> Digest {
         self.tree.root()
+    }
+
+    /// The committed table.
+    pub fn table(&self) -> &Trace {
+        &self.table
     }
 
     fn row(&self, i: usize) -> &[Fp] {
@@ -1248,26 +1251,29 @@ impl Timer {
 
 /// Transposes column evaluations (each `big_n` long) into row-major `lde`
 /// (rows of `w`), columns `first..first + cols.len()`.
-fn scatter_columns(lde: &mut [Fp], w: usize, first: usize, cols: &[Vec<Fp>]) {
+fn scatter_columns(lde: &mut [Fp], w: usize, first: usize, cols: &[Vec<Fp>], n: usize) {
+    // Columns are coset-major (see `lde_cosets`): row i is entry
+    // (i mod b) * n + i / b, b = big_n / n.
     const ROWS: usize = 256;
+    let b = cols.first().map_or(1, |c| c.len() / n);
     par_chunks_mut(lde, ROWS * w, |c, rows| {
         for (r, row) in rows.chunks_exact_mut(w).enumerate() {
             let i = c * ROWS + r;
+            let at = (i % b) * n + i / b;
             for (k, col) in cols.iter().enumerate() {
-                row[first + k] = col[i];
+                row[first + k] = col[at];
             }
         }
     });
 }
 
 /// Interpolates a base column over `H` and evaluates it on the coset of
-/// size `big_n`; returns the coefficients and the evaluations.
+/// size `big_n`; returns the coefficients and the evaluations, coset-major
+/// ([`lde_cosets`]).
 fn lde_column(col: Vec<Fp>, big_n: usize, shift: Fp) -> (Vec<Fp>, Vec<Fp>) {
     let mut c = col;
     intt(&mut c);
-    let mut e = c.clone();
-    e.resize(big_n, Fp::ZERO);
-    coset_ntt(&mut e, shift);
+    let e = lde_cosets(&c, log2_strict(big_n / c.len()), shift);
     (c, e)
 }
 
@@ -1293,7 +1299,7 @@ impl Committed {
             let cols = (first + batch).min(width) - first;
             let ext: Vec<(Vec<Fp>, Vec<Fp>)> = par_map_min(cols, 1, |k| lde_column(column(first + k), big_n, shift));
             let (c, e): (Vec<Vec<Fp>>, Vec<Vec<Fp>>) = ext.into_iter().unzip();
-            scatter_columns(&mut rows, width, first, &e);
+            scatter_columns(&mut rows, width, first, &e, c[0].len());
             coeffs.extend(c);
         }
         let tree = MerkleTree::from_flat(&rows, width);
@@ -1379,7 +1385,13 @@ fn commit_quotient(
     let period = 1usize << log_blowup;
     let z_h: Vec<Fp> = (0..period).map(|i| xs[i].pow(n as u64).sub(&Fp::ONE)).collect();
     let z_h_inv = batch_inverse(&z_h);
-    let denoms: Vec<Fp> = xs.iter().flat_map(|x| [x.sub(&Fp::ONE), x.sub(&g_inv)]).collect();
+    // The quotient has degree below `num_chunks * n`, so its values on the
+    // sub-coset of every `stride`-th point determine it: only those are
+    // evaluated. Their next rows (`period` on) are points of it too.
+    let qn = num_chunks * n;
+    let stride = big_n / qn;
+    debug_assert!(period.is_multiple_of(stride));
+    let denoms: Vec<Fp> = (0..qn).flat_map(|m| [xs[m * stride].sub(&Fp::ONE), xs[m * stride].sub(&g_inv)]).collect();
     let denom_inv = batch_inverse(&denoms);
     let empty: [Fp4; 0] = [];
     let (aux_lde, total): (&[Fp4], Fp4) = t.aux.as_ref().map_or((&empty, Fp4::ZERO), |(_, l, s)| (&l[..], *s));
@@ -1387,10 +1399,11 @@ fn commit_quotient(
     let lookup = lookup.filter(|_| t.num_terms > 0).map(|ch| LookupArgs { ch, total, group });
     let lde = &t.trace.rows;
 
-    let mut quotient: Vec<Fp4> = par_map_with(big_n, Scratch::default, |scratch, i| {
+    let mut quotient: Vec<Fp4> = par_map_with(qn, Scratch::default, |scratch, m| {
+        let i = m * stride;
         let zh = z_h[i % period];
-        let first = zh.mul(&denom_inv[2 * i]);
-        let last = zh.mul(&denom_inv[2 * i + 1]);
+        let first = zh.mul(&denom_inv[2 * m]);
+        let last = zh.mul(&denom_inv[2 * m + 1]);
         let transition = xs[i].sub(&g_inv);
         let next_i = (i + period) % big_n;
         evaluate_into(
@@ -1414,24 +1427,25 @@ fn commit_quotient(
     });
     timer.lap("quotient eval");
 
-    // Chunks: Q(x) = sum_j x^j Q_j(x^(2^log_q)).
+    // Chunks: Q(x) = sum_j x^j Q_j(x^(2^log_q)), each extended per
+    // component, coset by coset.
     coset_intt_ext(&mut quotient, shift);
-    let chunks: Vec<(Vec<Fp4>, Vec<Fp4>)> = par_map_min(num_chunks, 1, |j| {
-        let c: Vec<Fp4> = quotient.iter().skip(j).step_by(num_chunks).copied().collect();
-        let mut e = c.clone();
-        e.resize(big_n, Fp4::ZERO);
-        coset_ntt_ext(&mut e, shift);
-        (c, e)
+    let coeffs: Vec<Vec<Fp4>> =
+        (0..num_chunks).map(|j| quotient.iter().skip(j).step_by(num_chunks).copied().collect()).collect();
+    let evals: Vec<Vec<Fp>> = par_map_min(num_chunks * DEGREE, 1, |jk| {
+        let base: Vec<Fp> = coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect();
+        lde_cosets(&base, log_blowup, shift)
     });
-    let (coeffs, chunk_evals): (Vec<Vec<Fp4>>, Vec<Vec<Fp4>>) = chunks.into_iter().unzip();
     let mut chunk_lde = vec![Fp4::ZERO; big_n * num_chunks];
     par_chunks_mut(&mut chunk_lde, 1 << 12, |c, part| {
         for (r, v) in part.iter_mut().enumerate() {
             let at = (c << 12) + r;
-            *v = chunk_evals[at % num_chunks][at / num_chunks];
+            let (i, j) = (at / num_chunks, at % num_chunks);
+            let e = (i % period) * n + i / period;
+            *v = Fp4(core::array::from_fn(|k| evals[j * DEGREE + k][e]));
         }
     });
-    drop(chunk_evals);
+    drop(evals);
     let rows: Vec<Fp> = ext_row(&chunk_lde);
     timer.lap("quotient lde");
     let tree = MerkleTree::from_flat(&rows, num_chunks * DEGREE);
