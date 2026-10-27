@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn prove_and_verify_updates() {
-        let config = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0 };
+        let config = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0, zk: false };
         let (initial, updates, final_root) = run_updates("prove", &[(10, leaf(5)), (11, leaf(6)), (10, EMPTY)]);
         let (trace, _) = SmtAir::generate_trace(initial, &updates);
         assert_eq!(trace.height(), 256);

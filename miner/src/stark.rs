@@ -37,8 +37,36 @@
 //! Selectors: `is_first_row = Z_H / (x - 1)`, `is_last_row = Z_H / (x - g^-1)`
 //! and `is_transition = x - g^-1`. The first two have degree `n - 1` and
 //! count as a column when sizing the quotient; the transition selector has
-//! degree one and is absorbed by the slack in the bound. The proof is not
-//! zero-knowledge.
+//! degree one and is absorbed by the slack in the bound.
+//!
+//! # Zero knowledge
+//!
+//! With [`StarkConfig::zk`] the proof reveals nothing about the traces
+//! beyond the public values (the preprocessed tables are public anyway):
+//!
+//! - The last [`StarkConfig::blind_rows`] rows of every trace and
+//!   auxiliary trace are replaced with random values, more than the points
+//!   any column is opened at. Interpolation turns them into independent
+//!   uniform values at those points. The constraints hold on the rows
+//!   before: the vanishing polynomial is `Z_H / Z_B` with `Z_B` the product
+//!   over the blinding rows, and the boundary and transition selectors
+//!   treat the last row before them as the last row. The quotient's
+//!   degree grows by the blinding rows, so it has twice the chunks.
+//! - The chunks are contiguous runs of coefficients, `Q = sum_j x^(j L)
+//!   Q_j` with `L = n - slack`, masked with random polynomials of degree
+//!   below the slack that cancel in the sum, and opened at `zeta`.
+//! - Every table gains [`ZK_COLS`] random columns: they make the DEEP
+//!   combination, and so every FRI codeword, uniformly random, and they
+//!   carry blinding messages. Each table with lookups sends its `u` on row
+//!   0 and receives the previous table's `v` there (the running sum starts
+//!   at `1/d(u) - 1/d(v)`), so the lookup totals, otherwise a function of
+//!   the traces, are blinded while still cancelling. The messages carry
+//!   `delta^BLIND_TAG`, a power no AIR tuple reaches, so they can only
+//!   cancel each other.
+//!
+//! The recursive verifier of [`crate::recursion`] checks proofs without
+//! zero knowledge only; the final proof of a block, which is published,
+//! is the one that needs it.
 //!
 //! # Lookups
 //!
@@ -374,11 +402,134 @@ pub struct StarkConfig {
     /// bit adds one bit of security against a prover trying many
     /// transcripts.
     pub pow_bits: usize,
+    /// Zero knowledge (see the module notes): the proof reveals nothing
+    /// about the traces beyond the statement. Costs a quotient of twice
+    /// the chunks and the last [`StarkConfig::blind_rows`] rows of every
+    /// table, which must be padding.
+    pub zk: bool,
 }
 
 impl StarkConfig {
     pub(crate) fn fri(&self) -> FriConfig {
         FriConfig { log_blowup: self.log_blowup, num_queries: self.num_queries, pow_bits: self.pow_bits }
+    }
+
+    /// Rows at the end of every table that a zero-knowledge proof fills
+    /// with randomness: more than the points any column is opened at (two
+    /// out of domain, one per query).
+    pub fn blind_rows(&self) -> usize {
+        if self.zk { self.num_queries + 4 } else { 0 }
+    }
+
+    /// Degree of the random polynomials masking the quotient chunks.
+    fn chunk_slack(&self) -> usize {
+        2 * self.blind_rows()
+    }
+
+    /// Log of the number of quotient chunks of a table of this degree.
+    pub fn log_chunks(&self, degree: usize) -> usize {
+        log_quotient_degree(degree) + usize::from(self.zk)
+    }
+
+    /// [`quotient_stride`] under this configuration.
+    pub fn quotient_stride(&self, degree: usize) -> usize {
+        1 << self.log_blowup.saturating_sub(self.log_chunks(degree))
+    }
+}
+
+/// Columns a zero-knowledge proof appends to every trace, random on every
+/// row: a blinding message `u` the table sends and the message `v` it
+/// receives, which on row 0 equals the previous table's `u`. They hide the
+/// tables' lookup totals and mask the FRI codeword.
+const ZK_COLS: usize = 2 * DEGREE;
+/// Auxiliary extension columns a zero-knowledge proof appends: `1 / d(u)`
+/// and `1 / d(v)` on row 0, random elsewhere.
+const ZK_AUX: usize = 2;
+/// Lookup constraints a zero-knowledge proof adds: the two inverses.
+const ZK_LOOKUP_CONSTRAINTS: usize = 2;
+/// Blinding messages carry `delta^BLIND_TAG`, a power no AIR tuple
+/// reaches, so they can only match each other.
+const BLIND_TAG: usize = 64;
+
+/// Randomness for zero-knowledge proofs: Poseidon2 in counter mode, with
+/// feed-forward, under a key from the operating system.
+struct Rng {
+    key: [Fp; crate::poseidon2::DIGEST],
+}
+
+impl Rng {
+    fn new() -> Rng {
+        let mut bytes = [0u8; 4 * crate::poseidon2::DIGEST];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").expect("no /dev/urandom"), &mut bytes)
+            .expect("reading /dev/urandom");
+        let key = core::array::from_fn(|i| {
+            Fp::from_u64(u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()) as u64)
+        });
+        Rng { key }
+    }
+
+    /// Fills `out` with the stream of `domain`.
+    fn fill(&self, domain: u32, out: &mut [Fp]) {
+        use crate::poseidon2::{DIGEST, WIDTH, permute};
+        const CHUNK: usize = 1 << 12;
+        par_chunks_mut(out, CHUNK, |c, part| {
+            for (b, block) in part.chunks_mut(DIGEST).enumerate() {
+                let counter = (c * CHUNK / DIGEST + b) as u64;
+                let mut state = [Fp::ZERO; WIDTH];
+                state[..DIGEST].copy_from_slice(&self.key);
+                state[DIGEST] = Fp::new(domain);
+                state[DIGEST + 1] = Fp::new((counter & 0x3fff_ffff) as u32);
+                state[DIGEST + 2] = Fp::new((counter >> 30) as u32);
+                let outp = permute(state);
+                for (k, v) in block.iter_mut().enumerate() {
+                    *v = outp[k].add(&self.key[k]);
+                }
+            }
+        });
+    }
+
+    fn vec(&self, domain: u32, len: usize) -> Vec<Fp> {
+        let mut v = vec![Fp::ZERO; len];
+        self.fill(domain, &mut v);
+        v
+    }
+
+    fn ext_vec(&self, domain: u32, len: usize) -> Vec<Fp4> {
+        self.vec(domain, len * DEGREE).chunks_exact(DEGREE).map(|c| Fp4(c.try_into().unwrap())).collect()
+    }
+}
+
+/// Where a table's constraints hold: on all `n` rows, or in a
+/// zero-knowledge proof only on the rows before the blinding rows. The
+/// vanishing polynomial of those rows is `Z_H / Z_B` with `Z_B` the
+/// product over the blinding rows, and the last row the boundary
+/// selector picks and the transition selector skips is the last of them.
+#[derive(Clone, Copy)]
+struct Constrained {
+    log_n: usize,
+    blind: usize,
+}
+
+impl Constrained {
+    fn n(&self) -> usize {
+        1 << self.log_n
+    }
+
+    /// The last constrained row's point.
+    fn last_point(&self) -> Fp {
+        root_of_unity(self.log_n).pow((self.n() - self.blind - 1) as u64)
+    }
+
+    /// `Z_B(x)`.
+    fn z_blind<F: Field>(&self, x: F) -> F {
+        let g = root_of_unity(self.log_n);
+        let mut p = g.pow((self.n() - self.blind) as u64);
+        let mut acc = F::ONE;
+        for _ in 0..self.blind {
+            acc *= x - F::from(p);
+            p = p.mul(&g);
+        }
+        acc
     }
 }
 
@@ -734,6 +885,8 @@ pub struct LookupChallenges {
     pub delta: Fp4,
     /// `delta^1 .. delta^DELTA_POWERS`.
     delta_powers: Vec<Fp4>,
+    /// `delta^BLIND_TAG`.
+    delta_blind: Fp4,
 }
 
 const DELTA_POWERS: usize = 32;
@@ -741,13 +894,19 @@ const DELTA_POWERS: usize = 32;
 impl LookupChallenges {
     pub fn new(gamma: Fp4, delta: Fp4) -> LookupChallenges {
         let delta_powers = powers(delta, DELTA_POWERS + 1)[1..].to_vec();
-        LookupChallenges { gamma, delta, delta_powers }
+        LookupChallenges { gamma, delta, delta_powers, delta_blind: delta.exp(BLIND_TAG as u64) }
     }
 
     fn sample(ch: &mut Challenger) -> LookupChallenges {
         let gamma = ch.sample_ext();
         let delta = ch.sample_ext();
         LookupChallenges::new(gamma, delta)
+    }
+
+    /// Denominator of the blinding message `u`, `gamma + sum delta^(k+1)
+    /// u[k] + delta^BLIND_TAG`.
+    fn blind_denominator<F: Field>(&self, u: &[F]) -> Fp4 {
+        self.denominator(u) + self.delta_blind
     }
 
     /// `gamma + sum delta^(k+1) values[k]`.
@@ -832,6 +991,13 @@ struct LookupArgs<'a> {
 /// the running sum starting at zero, and the last row reaching the table's
 /// lookup `total`. `aux_local`/`aux_next` are the extension values: the
 /// group sums then the running sum.
+///
+/// In a zero-knowledge proof `blind` holds the row's blinding messages `u`
+/// and `v`, the auxiliary values continue with `h_u` and `h_v`, and the
+/// running sum starts at `h_u - h_v` instead of zero, with two more
+/// constraints on the first row: `h_u d(u) = 1` and `h_v d(v) = 1`. The
+/// total then also counts the message `u` sent and `v` received.
+#[allow(clippy::too_many_arguments)]
 fn combine<F: Field>(
     constraints: &[F],
     terms: &[LookupTerm<F>],
@@ -839,6 +1005,7 @@ fn combine<F: Field>(
     aux_next: &[Fp4],
     sel: (Fp4, Fp4, Fp4),
     lookup: Option<LookupArgs<'_>>,
+    blind: Option<&[F]>,
     alpha_powers: &[Fp4],
 ) -> Fp4 {
     let mut acc = Fp4::ZERO;
@@ -865,8 +1032,16 @@ fn combine<F: Field>(
         let s = aux_local[groups];
         let s_next = aux_next[groups];
         acc += sel.2 * (s_next - s - contrib) * a[groups];
-        acc += sel.0 * s * a[groups + 1];
         acc += sel.1 * (s + contrib - total) * a[groups + 2];
+        match blind {
+            None => acc += sel.0 * s * a[groups + 1],
+            Some(uv) => {
+                let (h_u, h_v) = (aux_local[groups + 1], aux_local[groups + 2]);
+                acc += sel.0 * (s - h_u + h_v) * a[groups + 1];
+                acc += sel.0 * (h_u * ch.blind_denominator(&uv[..DEGREE]) - Fp4::ONE) * a[groups + 3];
+                acc += sel.0 * (h_v * ch.blind_denominator(&uv[DEGREE..]) - Fp4::ONE) * a[groups + 4];
+            }
+        }
     }
     acc
 }
@@ -1186,9 +1361,22 @@ fn measure_degree_dyn(air: &dyn DynAir, num_public: usize) -> usize {
     max
 }
 
+/// The blinding of a table's auxiliary trace in a zero-knowledge proof.
+struct ZkAux<'a> {
+    rng: &'a Rng,
+    domain: u32,
+    /// Rows before the blinding rows.
+    real: usize,
+    /// The blinding messages `u` and `v` on row 0.
+    uv: &'a [Fp],
+}
+
 /// Builds the auxiliary trace (row-major extension values: group sums
-/// then the running sum) for `trace` under the given challenges, and
-/// returns it with the table's lookup total.
+/// then the running sum, and in a zero-knowledge proof `h_u` and `h_v`)
+/// for `trace` under the given challenges, and returns it with the
+/// table's lookup total. Only the first `air.air_width()` columns of
+/// `trace` are the AIR's. With `zk`, only the rows before the blinding
+/// rows are summed and the rest are random.
 fn build_aux(
     air: &dyn DynAir,
     trace: &Trace,
@@ -1196,25 +1384,34 @@ fn build_aux(
     public: &[Fp],
     ch: &LookupChallenges,
     terms: usize,
+    zk: Option<ZkAux<'_>>,
 ) -> (Vec<Fp4>, Fp4) {
     let n = trace.height();
+    let w = air.air_width();
+    let real = zk.as_ref().map_or(n, |z| z.real);
     let empty: Vec<Fp> = Vec::new();
     let pre_row = |i: usize| -> &[Fp] { pre.map_or(&empty[..], |p| p.table.row(i)) };
     let group = air.air_lookup_group();
     let groups = terms.div_ceil(group);
-    let width = groups + 1;
-    let mut aux = vec![Fp4::ZERO; n * width];
+    let width = groups + 1 + if zk.is_some() { ZK_AUX } else { 0 };
+    let mut aux = match &zk {
+        Some(z) => z.rng.ext_vec(z.domain, n * width),
+        None => vec![Fp4::ZERO; n * width],
+    };
+    for row in aux[..real * width].chunks_exact_mut(width) {
+        row[..=groups].fill(Fp4::ZERO);
+    }
     // Denominators and signed multiplicities of every term, row by row.
     const ROWS: usize = 256;
-    let mut dm = vec![(Fp4::ZERO, Fp::ZERO); n * terms];
+    let mut dm = vec![(Fp4::ZERO, Fp::ZERO); real * terms];
     par_chunks_mut(&mut dm, ROWS * terms, |c, chunk| {
         let mut scratch = Scratch::default();
         for (r, out) in chunk.chunks_exact_mut(terms).enumerate() {
             let i = c * ROWS + r;
             evaluate_into(
                 air,
-                trace.row(i),
-                trace.row((i + 1) % n),
+                &trace.row(i)[..w],
+                &trace.row((i + 1) % n)[..w],
                 (pre_row(i), pre_row((i + 1) % n)),
                 public,
                 (Fp::ZERO, Fp::ZERO, Fp::ZERO),
@@ -1230,7 +1427,7 @@ fn build_aux(
     let invs = par_batch_inverse(&denoms);
     // Group sums, and each row's contribution in the running-sum column,
     // which the prefix sums then replace.
-    par_chunks_mut(&mut aux, ROWS * width, |c, chunk| {
+    par_chunks_mut(&mut aux[..real * width], ROWS * width, |c, chunk| {
         for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
             let i = c * ROWS + r;
             let mut contrib = Fp4::ZERO;
@@ -1243,7 +1440,14 @@ fn build_aux(
         }
     });
     let mut sum = Fp4::ZERO;
-    for row in aux.chunks_exact_mut(width) {
+    if let Some(z) = &zk {
+        let inv = |d: Fp4| d.inv().expect("blinding message hits a pole");
+        let (h_u, h_v) = (inv(ch.blind_denominator(&z.uv[..DEGREE])), inv(ch.blind_denominator(&z.uv[DEGREE..])));
+        aux[groups + 1] = h_u;
+        aux[groups + 2] = h_v;
+        sum = h_u - h_v;
+    }
+    for row in aux[..real * width].chunks_exact_mut(width) {
         let contrib = row[groups];
         row[groups] = sum;
         sum += contrib;
@@ -1297,8 +1501,64 @@ pub fn quotient_stride(degree: usize, log_blowup: usize) -> usize {
 /// queries than cosets, since each opened row is then recomputed from the
 /// coefficients at a cost of one pass over them; otherwise every row,
 /// as the recomputation would cost more than the extension.
-fn kept_stride(config: &StarkConfig, air: &dyn DynAir) -> usize {
-    if config.num_queries >= 1 << config.log_blowup { 1 } else { quotient_stride(air.air_degree(), config.log_blowup) }
+fn kept_stride(config: &StarkConfig, degree: usize) -> usize {
+    if config.num_queries >= 1 << config.log_blowup { 1 } else { config.quotient_stride(degree) }
+}
+
+/// Degree of a table's combined constraints: its AIR's, or with zero
+/// knowledge and lookups at least that of the blinding constraints
+/// (selector, inverse and message).
+fn table_degree(config: &StarkConfig, air: &dyn DynAir, terms: usize) -> usize {
+    let d = air.air_degree();
+    if config.zk && terms > 0 { d.max(3) } else { d }
+}
+
+/// Lookup constraints of a table with `terms` lookup terms.
+fn num_constraints_lookup(config: &StarkConfig, terms: usize, air: &dyn DynAir) -> usize {
+    num_lookup_constraints(terms, air.air_lookup_group()) + if config.zk && terms > 0 { ZK_LOOKUP_CONSTRAINTS } else { 0 }
+}
+
+/// Where the quotient chunks are opened: `zeta^chunks` for interleaved
+/// chunks, `zeta` for the contiguous chunks of a zero-knowledge proof.
+fn quotient_point(config: &StarkConfig, zeta: Fp4, chunks: usize) -> Fp4 {
+    if config.zk { zeta } else { zeta.exp(chunks as u64) }
+}
+
+/// Randomness stream of table `k` for one purpose.
+fn zk_domain(k: usize, purpose: u32) -> u32 {
+    ((k as u32) << 4) | purpose
+}
+
+/// The traces of a zero-knowledge proof: each table's rows before its
+/// blinding rows, then random rows, with [`ZK_COLS`] random columns
+/// appended. Row 0 of a table's `v` repeats the `u` of the previous table
+/// with lookups (cyclically), so the blinding messages cancel.
+fn blind_traces(config: &StarkConfig, tables: &[TableInput<'_>], shapes: &[(usize, usize)], rng: &Rng) -> Vec<Trace> {
+    let blind = config.blind_rows();
+    let mut out: Vec<Trace> = tables
+        .iter()
+        .enumerate()
+        .map(|(k, t)| {
+            let (n, w) = (t.trace.height(), t.trace.width);
+            let width = w + ZK_COLS;
+            let mut values = rng.vec(zk_domain(k, 0), n * width);
+            par_chunks_mut(&mut values[..(n - blind) * width], 256 * width, |c, chunk| {
+                for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
+                    row[..w].copy_from_slice(t.trace.row(c * 256 + r));
+                }
+            });
+            Trace::new(values, width)
+        })
+        .collect();
+    let with_lookups: Vec<usize> = (0..tables.len()).filter(|&k| shapes[k].1 > 0).collect();
+    for (j, &k) in with_lookups.iter().enumerate() {
+        let prev = with_lookups[(j + with_lookups.len() - 1) % with_lookups.len()];
+        let wp = tables[prev].trace.width;
+        let u: Vec<Fp> = out[prev].row(0)[wp..wp + DEGREE].to_vec();
+        let w = tables[k].trace.width;
+        out[k].values[w + DEGREE..w + 2 * DEGREE].copy_from_slice(&u);
+    }
+    out
 }
 
 /// A committed matrix: `width` columns of `n` coefficients extended to
@@ -1413,6 +1673,12 @@ pub struct TableInput<'a> {
 struct TableState<'a> {
     input: TableInput<'a>,
     log_n: usize,
+    /// The rows the constraints hold on.
+    rows: Constrained,
+    /// [`table_degree`].
+    degree: usize,
+    /// Auxiliary extension columns.
+    aux_ext_w: usize,
     /// Evaluation coset of the table.
     shift: Fp,
     num_constraints: usize,
@@ -1429,7 +1695,7 @@ impl TableState<'_> {
     }
 
     fn aux_ext_w(&self) -> usize {
-        lookup_columns(self.num_terms, self.input.air.air_lookup_group())
+        self.aux_ext_w
     }
 
     fn pre_row(&self, i: usize) -> &[Fp] {
@@ -1452,21 +1718,32 @@ struct Quotient {
 
 /// Evaluates the combined constraints of a table on its coset, divides by
 /// the vanishing polynomial, splits the quotient into chunks and commits.
+///
+/// Without zero knowledge the chunks interleave, `Q(x) = sum_j x^j
+/// Q_j(x^chunks)`. With it they are contiguous runs of `L = n - slack`
+/// coefficients, `Q(x) = sum_j x^(j L) Q_j(x)`, each masked with random
+/// polynomials `S_j` of degree below the slack that telescope away:
+/// `Q_j + x^L S_j - S_(j-1)`, with `S_(-1) = S_(chunks-1) = 0`.
 fn commit_quotient(
     t: &TableState<'_>,
-    log_blowup: usize,
+    config: &StarkConfig,
     public: &[Fp],
     lookup: Option<&LookupChallenges>,
     alpha_powers: &[Fp4],
+    rng: Option<(&Rng, u32)>,
     timer: &mut Timer,
 ) -> Quotient {
+    let log_blowup = config.log_blowup;
     let air = t.input.air;
+    let w = air.air_width();
+    let zk = config.zk;
     let n = 1usize << t.log_n;
     let big_n = t.big_n(log_blowup);
     let aux_ext_w = t.aux_ext_w();
-    let num_chunks = 1usize << log_quotient_degree(air.air_degree());
+    let num_chunks = 1usize << config.log_chunks(t.degree);
     let shift = t.shift;
-    let g_inv = root_of_unity(t.log_n).inverse().unwrap();
+    let rows = t.rows;
+    let p_last = rows.last_point();
     let xs = coset_points(shift, t.log_n + log_blowup);
     let period = 1usize << log_blowup;
     let z_h: Vec<Fp> = (0..period).map(|i| xs[i].pow(n as u64).sub(&Fp::ONE)).collect();
@@ -1477,8 +1754,16 @@ fn commit_quotient(
     let qn = num_chunks * n;
     let stride = big_n / qn;
     debug_assert!(period.is_multiple_of(stride));
-    let denoms: Vec<Fp> = (0..qn).flat_map(|m| [xs[m * stride].sub(&Fp::ONE), xs[m * stride].sub(&g_inv)]).collect();
-    let denom_inv = batch_inverse(&denoms);
+    // Per point: 1 / Z_B (with zero knowledge), 1 / (x - 1), 1 / (x - last).
+    let z_b: Vec<Fp> = if zk { par_map(qn, |m| rows.z_blind(xs[m * stride])) } else { Vec::new() };
+    let denoms: Vec<Fp> = (0..qn)
+        .flat_map(|m| {
+            let x = xs[m * stride];
+            [x.sub(&Fp::ONE), x.sub(&p_last)]
+        })
+        .chain(z_b.iter().copied())
+        .collect();
+    let denom_inv = par_batch_inverse(&denoms);
     let empty: [Fp4; 0] = [];
     let total = t.aux.as_ref().map_or(Fp4::ZERO, |(_, s)| *s);
     let group = air.air_lookup_group();
@@ -1486,15 +1771,22 @@ fn commit_quotient(
 
     let mut quotient: Vec<Fp4> = par_map_with(qn, Scratch::default, |scratch, m| {
         let i = m * stride;
-        let zh = z_h[i % period];
-        let first = zh.mul(&denom_inv[2 * m]);
-        let last = zh.mul(&denom_inv[2 * m + 1]);
-        let transition = xs[i].sub(&g_inv);
+        // Z of the constrained rows, and its inverse.
+        let (zr, zr_inv) = if zk {
+            let zb = z_b[m];
+            (z_h[i % period].mul(&denom_inv[2 * qn + m]), zb.mul(&z_h_inv[i % period]))
+        } else {
+            (z_h[i % period], z_h_inv[i % period])
+        };
+        let first = zr.mul(&denom_inv[2 * m]);
+        let last = zr.mul(&denom_inv[2 * m + 1]);
+        let transition = xs[i].sub(&p_last);
         let next_i = (i + period) % big_n;
+        let (row, row_next) = (t.trace.row(i), t.trace.row(next_i));
         evaluate_into(
             air,
-            t.trace.row(i),
-            t.trace.row(next_i),
+            &row[..w],
+            &row_next[..w],
             (t.pre_row(i), t.pre_row(next_i)),
             public,
             (first, last, transition),
@@ -1504,16 +1796,47 @@ fn commit_quotient(
         let (aux_l, aux_n): (&[Fp4], &[Fp4]) =
             if aux_ext_w > 0 { (as_fp4(t.aux_row(i)), as_fp4(t.aux_row(next_i))) } else { (&empty, &empty) };
         let sel_ext = (Fp4::from_base(first), Fp4::from_base(last), Fp4::from_base(transition));
-        let c = combine(constraints, terms, aux_l, aux_n, sel_ext, lookup, alpha_powers);
-        c.mul_base(&z_h_inv[i % period])
+        let blind = if zk && lookup.is_some() { Some(&row[w..]) } else { None };
+        let c = combine(constraints, terms, aux_l, aux_n, sel_ext, lookup, blind, alpha_powers);
+        c.mul_base(&zr_inv)
     });
     timer.lap("quotient eval");
 
-    // Chunks: Q(x) = sum_j x^j Q_j(x^(2^log_q)), each extended per
-    // component, coset by coset.
     coset_intt_ext(&mut quotient, shift);
-    let coeffs: Vec<Vec<Fp4>> =
-        (0..num_chunks).map(|j| quotient.iter().skip(j).step_by(num_chunks).copied().collect()).collect();
+    let coeffs: Vec<Vec<Fp4>> = match rng {
+        None => {
+            // Q(x) = sum_j x^j Q_j(x^(2^log_q)).
+            (0..num_chunks).map(|j| quotient.iter().skip(j).step_by(num_chunks).copied().collect()).collect()
+        }
+        Some((rng, domain)) => {
+            let slack = config.chunk_slack();
+            let len = n - slack;
+            assert!(
+                quotient[num_chunks * len..].iter().all(|c| c.is_zero()),
+                "the constraints fail on a row before the blinding rows (are the last {} rows of the trace padding?)",
+                rows.blind
+            );
+            let masks = rng.ext_vec(domain, (num_chunks - 1) * slack);
+            (0..num_chunks)
+                .map(|j| {
+                    let mut c = quotient[j * len..(j + 1) * len].to_vec();
+                    c.resize(n, Fp4::ZERO);
+                    if j + 1 < num_chunks {
+                        for (a, m) in c[len..].iter_mut().zip(&masks[j * slack..(j + 1) * slack]) {
+                            *a += *m;
+                        }
+                    }
+                    if j > 0 {
+                        for (a, m) in c.iter_mut().zip(&masks[(j - 1) * slack..j * slack]) {
+                            *a -= *m;
+                        }
+                    }
+                    c
+                })
+                .collect()
+        }
+    };
+    drop(quotient);
     // Rows of `num_chunks` extension values, as base values.
     let base: Vec<Vec<Fp>> =
         (0..num_chunks * DEGREE).map(|jk| coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect()).collect();
@@ -1577,8 +1900,16 @@ pub fn prove_tables(
             measure_degree_dyn(air, public.len()) <= air.air_degree(),
             "air constraints exceed the declared degree"
         );
-        let log_q = log_quotient_degree(air.air_degree());
+        let degree = table_degree(config, air, shape(air, public).1);
+        let log_q = config.log_chunks(degree);
         assert!(log_blowup >= log_q, "log_blowup must be at least {log_q} for this air");
+        if config.zk {
+            let (n, d, slack) = (1usize << log_n, degree, config.chunk_slack());
+            assert!(
+                n > slack && (n - slack) << log_q > d * (n - 1) - n + config.blind_rows(),
+                "table of 2^{log_n} rows is too small for zero knowledge"
+            );
+        }
     }
 
     observe_setup(challenger, &log_ns, public);
@@ -1588,24 +1919,52 @@ pub fn prove_tables(
         }
     }
     let mut timer = Timer::new();
+    let shapes: Vec<(usize, usize)> = tables.iter().map(|t| shape(t.air, public)).collect();
+
+    // 0. Zero knowledge: random blinding rows and blinding columns.
+    let rng = config.zk.then(Rng::new);
+    let blinded: Vec<Trace> = match &rng {
+        Some(rng) => blind_traces(config, tables, &shapes, rng),
+        None => Vec::new(),
+    };
+    let tables: Vec<TableInput<'_>> = tables
+        .iter()
+        .enumerate()
+        .map(|(k, t)| TableInput { trace: blinded.get(k).unwrap_or(t.trace), ..*t })
+        .collect();
 
     // 1. Trace LDEs and commitments.
     let mut states: Vec<TableState<'_>> = tables
         .iter()
         .zip(&log_ns)
-        .map(|(input, &log_n)| {
+        .zip(&shapes)
+        .map(|((input, &log_n), &(num_constraints, num_terms))| {
             let shift = table_shift(log_big, log_n + log_blowup);
-            let (num_constraints, num_terms) = shape(input.air, public);
-            let stride = kept_stride(config, input.air);
+            let degree = table_degree(config, input.air, num_terms);
+            let stride = kept_stride(config, degree);
             if let Some(p) = input.pre {
-                let needed = quotient_stride(input.air.air_degree(), log_blowup);
+                let needed = config.quotient_stride(degree);
                 assert!(needed.is_multiple_of(p.stride()), "preprocessed table lacks rows the quotient reads");
             }
             let trace = Committed::new(input.trace.width, 1 << (log_n + log_blowup), shift, Some(stride), |k| {
                 input.trace.column(k)
             });
             challenger.observe_digest(&trace.tree.root());
-            TableState { input: *input, log_n, shift, num_constraints, num_terms, trace, aux: None }
+            let aux_ext_w = lookup_columns(num_terms, input.air.air_lookup_group())
+                + if config.zk && num_terms > 0 { ZK_AUX } else { 0 };
+            let rows = Constrained { log_n, blind: config.blind_rows() };
+            TableState {
+                input: *input,
+                log_n,
+                rows,
+                degree,
+                aux_ext_w,
+                shift,
+                num_constraints,
+                num_terms,
+                trace,
+                aux: None,
+            }
         })
         .collect();
     timer.lap("trace commit");
@@ -1614,12 +1973,19 @@ pub fn prove_tables(
     let mut lookup_ch = None;
     if states.iter().any(|t| t.num_terms > 0) {
         let ch = LookupChallenges::sample(challenger);
-        for t in states.iter_mut().filter(|t| t.num_terms > 0) {
-            let (aux, total) = build_aux(t.input.air, t.input.trace, t.input.pre, public, &ch, t.num_terms);
+        for (k, t) in states.iter_mut().enumerate().filter(|(_, t)| t.num_terms > 0) {
+            let w = t.input.air.air_width();
+            let zk = rng.as_ref().map(|rng| ZkAux {
+                rng,
+                domain: zk_domain(k, 1),
+                real: t.rows.n() - t.rows.blind,
+                uv: &t.input.trace.row(0)[w..],
+            });
+            let (aux, total) = build_aux(t.input.air, t.input.trace, t.input.pre, public, &ch, t.num_terms, zk);
             timer.lap("aux build");
             let ext_w = t.aux_ext_w();
             let n = 1usize << t.log_n;
-            let stride = kept_stride(config, t.input.air);
+            let stride = kept_stride(config, t.degree);
             let committed = Committed::new(ext_w * DEGREE, t.big_n(log_blowup), t.shift, Some(stride), |j| {
                 let (e, k) = (j / DEGREE, j % DEGREE);
                 (0..n).map(|i| aux[i * ext_w + e].0[k]).collect()
@@ -1640,10 +2006,12 @@ pub fn prove_tables(
     let alpha = challenger.sample_ext();
     let quotients: Vec<Quotient> = states
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(k, t)| {
             let alpha_powers =
-                powers(alpha, t.num_constraints + num_lookup_constraints(t.num_terms, t.input.air.air_lookup_group()));
-            let q = commit_quotient(t, log_blowup, public, lookup_ch.as_ref(), &alpha_powers, &mut timer);
+                powers(alpha, t.num_constraints + num_constraints_lookup(config, t.num_terms, t.input.air));
+            let rng = rng.as_ref().map(|r| (r, zk_domain(k, 2)));
+            let q = commit_quotient(t, config, public, lookup_ch.as_ref(), &alpha_powers, rng, &mut timer);
             challenger.observe_digest(&q.committed.tree.root());
             q
         })
@@ -1657,7 +2025,7 @@ pub fn prove_tables(
         .zip(&quotients)
         .map(|(t, q)| {
             let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
-            let zeta_q = zeta.exp(q.chunks as u64);
+            let zeta_q = quotient_point(config, zeta, q.chunks);
             let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _)| &c.coeffs);
             let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.committed.coeffs);
             let part = TableProof {
@@ -1693,7 +2061,7 @@ pub fn prove_tables(
         offset += deep.len();
         let log_m = t.log_n + log_blowup;
         let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
-        let zeta_q = zeta.exp(q.chunks as u64);
+        let zeta_q = quotient_point(config, zeta, q.chunks);
         let xs = coset_points(t.shift, log_m);
         let mut denoms: Vec<Fp4> = Vec::with_capacity(3 * xs.len());
         for x in &xs {
@@ -1829,12 +2197,13 @@ pub fn verify_tables(
     let mut shapes = Vec::with_capacity(specs.len());
     for (spec, t) in specs.iter().zip(&proof.tables) {
         let air = spec.air;
-        let log_q = log_quotient_degree(air.air_degree());
         let (num_constraints, num_terms) = shape(air, public);
+        let log_q = config.log_chunks(table_degree(config, air, num_terms));
         let group = air.air_lookup_group();
-        let aux_w = lookup_columns(num_terms, group) * DEGREE;
+        let zk_aux = if config.zk && num_terms > 0 { ZK_AUX } else { 0 };
+        let aux_w = (lookup_columns(num_terms, group) + zk_aux) * DEGREE;
         let s = TableShape {
-            w: air.air_width(),
+            w: air.air_width() + if config.zk { ZK_COLS } else { 0 },
             aux_w,
             pre_w: air.air_preprocessed_width(),
             chunks: 1 << log_q,
@@ -1843,6 +2212,7 @@ pub fn verify_tables(
             group,
         };
         if t.log_n == 0
+            || (config.zk && 1 << t.log_n <= config.chunk_slack())
             || t.log_n + log_blowup > 27
             || log_blowup < log_q
             || t.trace_at_zeta.len() != s.w
@@ -1902,35 +2272,46 @@ pub fn verify_tables(
     // Constraint identity of every table at zeta.
     let public_ext: Vec<Fp4> = public.iter().map(|x| Fp4::from_base(*x)).collect();
     for ((spec, t), s) in specs.iter().zip(&proof.tables).zip(&shapes) {
-        let g_inv = root_of_unity(t.log_n).inverse().unwrap();
-        let z_h = zeta.exp(1u64 << t.log_n) - Fp4::ONE;
-        let first = z_h * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
-        let last = z_h * (zeta - Fp4::from_base(g_inv)).inv().ok_or(VerifyError::ConstraintIdentity)?;
-        let transition = zeta - Fp4::from_base(g_inv);
+        let rows = Constrained { log_n: t.log_n, blind: config.blind_rows() };
+        let p_last = Fp4::from_base(rows.last_point());
+        // Z of the constrained rows at zeta.
+        let z_r = (zeta.exp(1u64 << t.log_n) - Fp4::ONE)
+            * rows.z_blind(zeta).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let first = z_r * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let last = z_r * (zeta - p_last).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let transition = zeta - p_last;
+        let w = spec.air.air_width();
         let (constraints, terms) = evaluate(
             spec.air,
-            &t.trace_at_zeta,
-            &t.trace_at_zeta_next,
+            &t.trace_at_zeta[..w],
+            &t.trace_at_zeta_next[..w],
             (&t.pre_at_zeta, &t.pre_at_zeta_next),
             &public_ext,
             (first, last, transition),
         );
+        if config.zk && terms.iter().any(|t| t.values.len() >= BLIND_TAG) {
+            return Err(VerifyError::Shape);
+        }
         let aux_l = ext_from_base_openings(&t.aux_at_zeta);
         let aux_n = ext_from_base_openings(&t.aux_at_zeta_next);
-        let alpha_powers = powers(alpha, s.num_constraints + num_lookup_constraints(s.num_terms, s.group));
+        let alpha_powers = powers(alpha, s.num_constraints + num_constraints_lookup(config, s.num_terms, spec.air));
         let lookup = lookup_ch.as_ref().filter(|_| s.num_terms > 0).map(|ch| LookupArgs {
             ch,
             total: t.lookup_sum,
             group: s.group,
         });
-        let c_zeta = combine(&constraints, &terms, &aux_l, &aux_n, (first, last, transition), lookup, &alpha_powers);
+        let blind = if config.zk && lookup.is_some() { Some(&t.trace_at_zeta[w..]) } else { None };
+        let c_zeta =
+            combine(&constraints, &terms, &aux_l, &aux_n, (first, last, transition), lookup, blind, &alpha_powers);
+        // Interleaved chunks step by zeta; contiguous ones by zeta^L.
+        let step = if config.zk { zeta.exp(((1usize << t.log_n) - config.chunk_slack()) as u64) } else { zeta };
         let mut q_zeta = Fp4::ZERO;
         let mut zeta_pow = Fp4::ONE;
         for q in &t.quotient_at_zeta_q {
             q_zeta += *q * zeta_pow;
-            zeta_pow *= zeta;
+            zeta_pow *= step;
         }
-        if q_zeta * z_h != c_zeta {
+        if q_zeta * z_r != c_zeta {
             return Err(VerifyError::ConstraintIdentity);
         }
     }
@@ -1990,7 +2371,7 @@ pub fn verify_tables(
             let shift = table_shift(log_big, log_m);
             let x = Fp4::from_base(shift.mul(&root_of_unity(log_m).pow(i as u64)));
             let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
-            let zeta_q = zeta.exp(s.chunks as u64);
+            let zeta_q = quotient_point(config, zeta, s.chunks);
             let inv = batch_inverse(&[x - zeta, x - zeta_next, x - zeta_q]);
             let rows = (&opening.trace_row[..], &opening.aux_row[..], &opening.pre_row[..]);
             let quotient = ext_from_row(&opening.quotient_row);
@@ -2082,7 +2463,7 @@ mod tests {
         Trace::new(values, 1)
     }
 
-    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0 };
+    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0, zk: false };
 
     fn transcript() -> Challenger {
         let mut c = Challenger::new();
@@ -2431,6 +2812,114 @@ mod tests {
             let proof = prove_tables(&CONFIG, &tables, &[], &mut transcript());
             assert_eq!(verify_tables(&CONFIG, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
         }
+    }
+
+    const ZK: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 0, zk: true };
+
+    /// A 64-row sender and a 64-row receiver for zero-knowledge proofs:
+    /// the rows before the blinding rows send `10 + i % 4`, and the
+    /// receiver takes each value with multiplicity `mults` on its first
+    /// four rows. The blinding rows hold junk the proof must ignore.
+    fn zk_exchange(mults: [u32; 4]) -> (Trace, Trace) {
+        let n = 64;
+        let real = n - ZK.blind_rows();
+        let send = Trace::new((0..n).map(|i| Fp::new(if i < real { 10 + i as u32 % 4 } else { 999 })).collect(), 1);
+        let (mut a, mut b) = (Fp::ZERO, Fp::ONE);
+        let mut values = Vec::new();
+        for i in 0..n {
+            let (v, m) = match mults.get(i) {
+                Some(&m) => (10 + i as u32, m),
+                None if i < real => (0, 0),
+                None => (7, 3),
+            };
+            values.extend([Fp::new(v), Fp::new(m), a, b]);
+            let c = a + b;
+            a = b;
+            b = c;
+        }
+        (send, Trace::new(values, 4))
+    }
+
+    #[test]
+    fn zero_knowledge_tables() {
+        let real = 64 - ZK.blind_rows();
+        let (send, recv) = zk_exchange([real as u32 / 4; 4]);
+        let tables =
+            [TableInput { air: &Sender, trace: &send, pre: None }, TableInput { air: &Receiver, trace: &recv, pre: None }];
+        let specs = [TableSpec { air: &Sender, pre_root: None }, TableSpec { air: &Receiver, pre_root: None }];
+        let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
+        assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Ok(()));
+        assert_eq!(Proof::from_bytes(&proof.to_bytes()).unwrap(), proof);
+        // Contiguous, masked chunks: twice the interleaved count of degree 3.
+        assert_eq!(proof.tables.iter().map(|t| t.quotient_at_zeta_q.len()).collect::<Vec<_>>(), vec![4, 4]);
+        assert_eq!(proof.tables[0].trace_at_zeta.len(), 1 + ZK_COLS);
+
+        // A second proof of the same statement shares nothing derived
+        // from the traces: commitments, openings and lookup totals differ.
+        let again = prove_tables(&ZK, &tables, &[], &mut transcript());
+        assert_eq!(verify_tables(&ZK, &specs, &[], &again, &mut transcript()), Ok(()));
+        for (a, b) in proof.tables.iter().zip(&again.tables) {
+            assert_ne!(a.trace_root, b.trace_root);
+            assert_ne!(a.quotient_root, b.quotient_root);
+            assert_ne!(a.lookup_sum, b.lookup_sum);
+            assert!(a.trace_at_zeta.iter().zip(&b.trace_at_zeta).all(|(x, y)| x != y));
+        }
+        assert_ne!(proof.fri.final_value, again.fri.final_value);
+        // The totals still cancel.
+        assert!((proof.tables[0].lookup_sum + proof.tables[1].lookup_sum).is_zero());
+
+        // Tampering is caught.
+        let mut p = proof.clone();
+        p.tables[1].quotient_at_zeta_q[3] += Fp4::ONE;
+        assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(VerifyError::ConstraintIdentity));
+        let mut p = proof.clone();
+        p.tables[0].trace_at_zeta[1] += Fp4::ONE;
+        assert_eq!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()), Err(VerifyError::ConstraintIdentity));
+        let mut p = proof.clone();
+        p.tables[0].lookup_sum += Fp4::ONE;
+        p.tables[1].lookup_sum -= Fp4::ONE;
+        assert!(verify_tables(&ZK, &specs, &[], &p, &mut transcript()).is_err());
+        let mut p = proof.clone();
+        p.openings[1][1].aux_row[0] += Fp::ONE;
+        assert_eq!(
+            verify_tables(&ZK, &specs, &[], &p, &mut transcript()),
+            Err(VerifyError::InvalidAuxOpening { query: 1 })
+        );
+        // A proof is only accepted under the configuration it was made in.
+        let plain = StarkConfig { zk: false, ..ZK };
+        assert_eq!(verify_tables(&plain, &specs, &[], &proof, &mut transcript()), Err(VerifyError::Shape));
+
+        // Unbalanced messages before the blinding rows are rejected.
+        if !cfg!(debug_assertions) {
+            let (send, recv) = zk_exchange([real as u32 / 4, real as u32 / 4, real as u32 / 4 - 1, real as u32 / 4]);
+            let tables = [
+                TableInput { air: &Sender, trace: &send, pre: None },
+                TableInput { air: &Receiver, trace: &recv, pre: None },
+            ];
+            let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
+            assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Err(VerifyError::LookupSum));
+        }
+    }
+
+    #[test]
+    fn zero_knowledge_rejects_bad_rows() {
+        // Fibonacci with the public value at the last row before the
+        // blinding rows; what follows is junk.
+        let (mut trace, _) = fib_trace(6);
+        let last = 63 - ZK.blind_rows();
+        let out = vec![trace.values[2 * last + 1]];
+        for v in &mut trace.values[2 * (last + 1)..] {
+            *v = Fp::new(5);
+        }
+        let proof = prove(&ZK, &Fibonacci, &trace, &out, &mut transcript());
+        assert_eq!(verify(&ZK, &Fibonacci, &out, &proof, &mut transcript()), Ok(()));
+        let wrong = vec![out[0] + Fp::ONE];
+        assert!(verify(&ZK, &Fibonacci, &wrong, &proof, &mut transcript()).is_err());
+        // A broken row before the blinding rows leaves no quotient.
+        let mut bad = trace;
+        bad.values[2 * 20] += Fp::ONE;
+        let r = std::panic::catch_unwind(|| prove(&ZK, &Fibonacci, &bad, &out, &mut transcript()));
+        assert!(r.is_err());
     }
 
     /// Two columns that must be permutations of each other.

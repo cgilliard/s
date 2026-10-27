@@ -52,7 +52,7 @@ use crate::field::Field;
 use crate::hash_table::{HashOp, HashTableAir, KIND_ABSORB, KIND_COMPRESS, message};
 use crate::merkle::Digest;
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute};
-use crate::stark::{Air, Builder, Preprocessed, TableInput, TableSpec, Trace};
+use crate::stark::{Air, Builder, Preprocessed, StarkConfig, TableInput, TableSpec, Trace};
 
 pub type Addr = u32;
 
@@ -278,6 +278,8 @@ pub struct Program {
     pub instrs: Vec<Instr>,
     next_addr: Addr,
     num_inputs: usize,
+    /// Padding rows both tables keep at their ends (see [`Program::reserve`]).
+    reserved: usize,
 }
 
 impl Program {
@@ -431,9 +433,17 @@ impl Program {
         self.instrs.len()
     }
 
-    /// Trace height: the instruction count rounded up to a power of two.
+    /// Keeps at least `rows` padding rows at the end of the machine table
+    /// and of the hash table, as a zero-knowledge proof needs (see
+    /// [`crate::stark::StarkConfig::blind_rows`]).
+    pub fn reserve(&mut self, rows: usize) {
+        self.reserved = rows;
+    }
+
+    /// Trace height: the instruction count and reserved rows rounded up
+    /// to a power of two.
     pub fn height(&self) -> usize {
-        self.instrs.len().max(2).next_power_of_two()
+        (self.instrs.len() + self.reserved).max(2).next_power_of_two()
     }
 
     /// The preprocessed table: one row per instruction, then `done` rows.
@@ -451,18 +461,14 @@ impl Program {
         Trace::new(values, PRE_WIDTH)
     }
 
-    /// The committed program for proofs at `log_blowup`.
-    pub fn preprocess(&self, log_blowup: usize) -> Preprocessed {
-        Preprocessed::new(
-            &self.table(),
-            log_blowup,
-            crate::stark::quotient_stride(VmAir.max_constraint_degree(), log_blowup),
-        )
+    /// The committed program for proofs under `config`.
+    pub fn preprocess(&self, config: &StarkConfig) -> Preprocessed {
+        Preprocessed::new(&self.table(), config.log_blowup, config.quotient_stride(VmAir.max_constraint_degree()))
     }
 
     /// The program digest: root of the committed table.
     pub fn digest(&self, log_blowup: usize) -> Digest {
-        self.preprocess(log_blowup).root()
+        Preprocessed::new(&self.table(), log_blowup, 1 << log_blowup).root()
     }
 }
 
@@ -973,7 +979,7 @@ impl VmAir {
         while rows.len() < n * NUM_COLS {
             rows.extend_from_slice(&done);
         }
-        Ok((Trace::new(rows, NUM_COLS), HashTableAir::generate_trace(&exec.hashes)))
+        Ok((Trace::new(rows, NUM_COLS), HashTableAir::generate_trace_height(&exec.hashes, Self::hash_height(program))))
     }
 
     /// Height of the hash table for `program`.
@@ -991,7 +997,7 @@ impl VmAir {
                 )
             })
             .count();
-        hashes.max(2).next_power_of_two()
+        (hashes + program.reserved).max(2).next_power_of_two()
     }
 
     /// The two tables of a machine proof, from [`VmAir::generate_trace`].
@@ -1212,11 +1218,11 @@ mod tests {
 
     #[test]
     fn prove_and_verify_program() {
-        let config = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0 };
+        let config = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0, zk: false };
         let mut rng = Rng::new(71);
         let (p, inputs, out) = sample_program(&mut rng);
         let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();
-        let pre = p.preprocess(config.log_blowup);
+        let pre = p.preprocess(&config);
         let public = VmAir::public_values(&pre.root(), &out);
         let proof = prove_tables(&config, &VmAir::tables(&trace, &hashes, &pre), &public, &mut tr());
         let root = pre.root();

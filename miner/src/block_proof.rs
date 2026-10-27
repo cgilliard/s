@@ -221,7 +221,7 @@ mod tests {
     const POW: PowParams = PowParams { log_dataset_items: 8, parents: 32, accesses: 64 };
     const GENESIS_TIME: u64 = 1_700_000_000;
     /// Segment proofs in these tests, verified directly by the node.
-    const STARK: StarkConfig = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0 };
+    const STARK: StarkConfig = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0, zk: false };
 
     fn params() -> ChainParams {
         ChainParams {

@@ -2060,7 +2060,7 @@ mod tests {
     #[test]
     #[ignore = "slow in debug builds; run with --release"]
     fn prove_and_verify_block() {
-        let config = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0 };
+        let config = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0, zk: false };
         let (segments, _, _, _) = scenario("prove", 10);
         let (trace, public) = BlockAir::generate_trace(&segments[0]);
         let public = public.to_values();

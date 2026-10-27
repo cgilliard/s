@@ -99,21 +99,24 @@ impl AggregatorParams {
     ///
     /// The wrap is at rate 1/32 with 20 bits of grinding (0.5 s): 16
     /// queries. It verifies a root of up to 2^18 rows in 2^16 rows, and
-    /// proves in about 9 s, giving a block proof of about 145 KB with
+    /// proves in about 10 s, giving a block proof of about 149 KB with
     /// batched Merkle paths; rate 1/64 would save about a tenth of that for
-    /// twice the time and memory.
+    /// twice the time and memory. It is the published proof, so it is zero
+    /// knowledge (about 1 s and 6 KB more): nothing about the block's
+    /// transactions, amounts or keys can be learned from it. The proofs
+    /// below it are witnesses of the wrap and never leave the prover.
     pub const MAINNET: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
+        segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16, zk: false },
         segment_log_n: 15,
         max_segments: 1 << 14,
         fan_in: 4,
-        outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
-        wrap: StarkConfig { log_blowup: 5, num_queries: 16, pow_bits: 20 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16, zk: false },
+        wrap: StarkConfig { log_blowup: 5, num_queries: 16, pow_bits: 20, zk: true },
     };
 
     /// Rate 1/8 at the same security, for comparisons.
     #[cfg(test)]
-    const EIGHTH: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 28, pow_bits: 16 };
+    const EIGHTH: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 28, pow_bits: 16, zk: false };
 
     /// Rows available to transactions in one segment.
     pub fn segment_rows(&self) -> usize {
@@ -545,6 +548,7 @@ pub fn compile_wrap(params: &AggregatorParams, root: &NodeProof, statement: &Sta
     let block = concat(&mut c, &words);
     c.hash_scalars(block, words.len());
     c.assert_public();
+    c.prog.reserve(params.wrap.blind_rows());
     c
 }
 
@@ -776,7 +780,7 @@ const CACHED_PROGRAMS: usize = 4;
 
 /// The commitment to `prog` at `log_blowup`, whose digest the plan says is
 /// `digest`; from the cache when it was committed recently.
-fn committed_program(prog: &Program, log_blowup: usize, digest: &Digest) -> Arc<Preprocessed> {
+fn committed_program(prog: &Program, config: &StarkConfig, digest: &Digest) -> Arc<Preprocessed> {
     {
         let mut cache = PROGRAMS.lock().unwrap();
         if let Some(i) = cache.iter().position(|(d, _)| d == digest) {
@@ -787,7 +791,7 @@ fn committed_program(prog: &Program, log_blowup: usize, digest: &Digest) -> Arc<
             return pre;
         }
     }
-    let pre = Arc::new(prog.preprocess(log_blowup));
+    let pre = Arc::new(prog.preprocess(config));
     assert_eq!(pre.root(), *digest, "program differs from the planned shape");
     let mut cache = PROGRAMS.lock().unwrap();
     cache.push((*digest, pre.clone()));
@@ -840,7 +844,7 @@ fn prove_node(
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
-    let pre = committed_program(&c.prog, params.outer.log_blowup, &shape.digest);
+    let pre = committed_program(&c.prog, &params.outer, &shape.digest);
     let public = VmAir::public_values(&pre.root(), &out_digest);
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
@@ -898,7 +902,7 @@ pub fn prove_block_with(
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
-    let pre = committed_program(&c.prog, params.wrap.log_blowup, &wrap.digest);
+    let pre = committed_program(&c.prog, &params.wrap, &wrap.digest);
     let public = VmAir::public_values(&pre.root(), &statement.output(&wrap.tree));
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript());
@@ -1015,12 +1019,12 @@ mod tests {
     /// Small parameters: 128-row segments hold one output-only transaction,
     /// nodes take two children.
     const SMALL: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3 },
+        segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3, zk: false },
         segment_log_n: 7,
         max_segments: 16,
         fan_in: 2,
-        outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5 },
-        wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5, zk: false },
+        wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4, zk: true },
     };
 
     struct Setup {
@@ -1379,7 +1383,7 @@ mod tests {
         for _ in 0..2 {
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-            let pre = c.prog.preprocess(params.outer.log_blowup);
+            let pre = c.prog.preprocess(&params.outer);
             eprintln!("  trace + program: {:?}", t.elapsed());
             let public = VmAir::public_values(&pre.root(), &out);
             let tables = VmAir::tables(&trace, &hashes, &pre);
@@ -1433,19 +1437,20 @@ mod tests {
         let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
             Ok(v) => {
                 let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
-                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2] }]
+                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2], zk: n.get(3) == Some(&1) }]
             }
             Err(_) => vec![
-                StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16 },
-                StarkConfig { log_blowup: 5, num_queries: 17, pow_bits: 16 },
-                StarkConfig { log_blowup: 6, num_queries: 14, pow_bits: 16 },
+                StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16, zk: false },
+                StarkConfig { log_blowup: 5, num_queries: 17, pow_bits: 16, zk: false },
+                StarkConfig { log_blowup: 6, num_queries: 14, pow_bits: 16, zk: false },
             ],
         };
         for wrap in configs {
-            let c = compile_wrap(&params, &root, &s.statement);
+            let mut c = compile_wrap(&params, &root, &s.statement);
+            c.prog.reserve(wrap.blind_rows());
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-            let pre = c.prog.preprocess(wrap.log_blowup);
+            let pre = c.prog.preprocess(&wrap);
             let public = VmAir::public_values(&pre.root(), &s.statement.output(&shape.wrap.unwrap().tree));
             let tables = VmAir::tables(&trace, &hashes, &pre);
             let proof = stark::prove_tables(&wrap, &tables, &public, &mut outer_transcript());
@@ -1484,7 +1489,7 @@ mod tests {
             let c = compile_node(&params, &[Child::Segment(&seg)], Output::Record);
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-            let pre = c.prog.preprocess(params.outer.log_blowup);
+            let pre = c.prog.preprocess(&params.outer);
             let out = node_output(&combine_records(&[seg.public]), &tree_digest(&[None]));
             let public = VmAir::public_values(&pre.root(), &out);
             let tables = VmAir::tables(&trace, &hashes, &pre);

@@ -579,6 +579,7 @@ impl Compiler {
         num_public: usize,
         proof: &Proof,
     ) {
+        assert!(!config.zk, "the recursive verifier checks proofs without zero knowledge");
         let public: Vec<Fp> = (0..num_public).map(|i| self.val(pub_base + i as Addr).0[0]).collect();
         let public = &public[..];
         let c = self;
@@ -1308,7 +1309,7 @@ mod tests {
         }
     }
 
-    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8, pow_bits: 6 };
+    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8, pow_bits: 6, zk: false };
 
     fn inner_tr() -> Challenger {
         let mut c = Challenger::new();
@@ -1474,8 +1475,8 @@ mod tests {
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
         let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
         let (vm_trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let outer = StarkConfig { log_blowup: 2, num_queries: 20, pow_bits: 0 };
-        let pre = c.prog.preprocess(outer.log_blowup);
+        let outer = StarkConfig { log_blowup: 2, num_queries: 20, pow_bits: 0, zk: false };
+        let pre = c.prog.preprocess(&outer);
         let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
         let t = std::time::Instant::now();
         let tables = VmAir::tables(&vm_trace, &hashes, &pre);

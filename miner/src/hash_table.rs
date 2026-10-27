@@ -104,7 +104,12 @@ impl Air for HashTableAir {
 impl HashTableAir {
     /// Rows for `ops` in order, padded with pass rows to a power of two.
     pub fn generate_trace(ops: &[HashOp]) -> Trace {
-        let n = ops.len().max(2).next_power_of_two();
+        Self::generate_trace_height(ops, ops.len().max(2).next_power_of_two())
+    }
+
+    /// [`HashTableAir::generate_trace`] padded to `n` rows.
+    pub fn generate_trace_height(ops: &[HashOp], n: usize) -> Trace {
+        assert!(n.is_power_of_two() && n >= ops.len().max(2), "hash table of {n} rows cannot hold {} ops", ops.len());
         let mut b = HashTraceBuilder::new(NUM_COLS);
         for op in ops {
             match *op {
