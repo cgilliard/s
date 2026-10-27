@@ -210,7 +210,14 @@ fn mine(args: &Args) -> AnyResult<()> {
 
     let t = Instant::now();
     let seed = SeedText::new(params.pow);
-    let dataset = Dataset::load_or_generate(&seed, &args.data.join("dataset"))?;
+    let path = args.data.join("dataset");
+    if !path.exists() {
+        println!(
+            "generating the {} MB proof-of-work dataset (once per data directory)...",
+            params.pow.dataset_bytes() >> 20
+        );
+    }
+    let dataset = Dataset::load_or_generate(&seed, &path)?;
     println!("dataset: {} MB ready in {}", params.pow.dataset_bytes() >> 20, secs(t.elapsed()));
     let chain = open_chain(args, params, seed)?;
     let mut wallet = Wallet::open(&args.data.join("wallet"))?;
