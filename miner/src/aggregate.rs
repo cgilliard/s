@@ -1398,6 +1398,127 @@ mod tests {
         }
     }
 
+    /// Mainnet-sized output-only block of `segments` full segments under
+    /// `params`: the witnesses and the statement.
+    fn full_segments(name: &str, params: &AggregatorParams, segments: usize) -> (Vec<SegmentWitness>, Statement) {
+        let miner = key(9).public_key();
+        let per = params.segment_rows() / crate::block_air::tx_rows(&reward(&miner, 1));
+        let txs: Vec<Transaction> = (0..segments * per).map(|i| reward(&miner, 1 + i as u64)).collect();
+        let subsidy: u64 = (1..=txs.len() as u64).sum();
+        let dir = TempDir::new(name);
+        let env = open_env(&dir.0, 256 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let prev_root = utxo.root(&wtxn).unwrap();
+        let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows()).unwrap();
+        let new_root = utxo.root(&wtxn).unwrap();
+        wtxn.abort();
+        assert_eq!(w.len(), segments);
+        let body = Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
+        let statement = Statement::from_block(&BlockStatement {
+            height: 1,
+            prev_state_root: prev_root,
+            new_state_root: new_root,
+            first_output_position: 0,
+            subsidy,
+            body: &body,
+        });
+        (w, statement)
+    }
+
+    /// Candidate security levels: table heights over the segment counts,
+    /// and blocks of one and sixteen full segments proven and verified.
+    /// `SEC` picks configurations by name (all by default).
+    #[test]
+    #[ignore = "proves mainnet blocks under several parameter sets; run with --release"]
+    fn security_configs() {
+        let cfg = |q: usize, pow: usize| StarkConfig { log_blowup: 2, num_queries: q, pow_bits: pow, zk: false };
+        let wrap = |q: usize, pow: usize| StarkConfig { log_blowup: 5, num_queries: q, pow_bits: pow, zk: true };
+        let m = AggregatorParams::MAINNET;
+        let all = [
+            ("current", m),
+            ("q50", AggregatorParams { segment: cfg(50, 16), outer: cfg(50, 16), wrap: wrap(20, 16), ..m }),
+            ("q48p20", AggregatorParams { segment: cfg(48, 20), outer: cfg(48, 20), wrap: wrap(20, 16), ..m }),
+        ];
+        let pick = std::env::var("SEC").ok();
+        for (name, params) in all {
+            if pick.as_ref().is_some_and(|p| !p.split(',').any(|x| x == name)) {
+                continue;
+            }
+            let bits = |c: &StarkConfig| c.num_queries * c.log_blowup + c.pow_bits;
+            println!(
+                "== {name}: segments/nodes {}+{} ({} bits), wrap {}x{}+{} ({} bits)",
+                params.outer.num_queries,
+                params.outer.pow_bits,
+                bits(&params.outer),
+                params.wrap.num_queries,
+                params.wrap.log_blowup,
+                params.wrap.pow_bits,
+                bits(&params.wrap)
+            );
+            let mut cache = PlanCache::new();
+            for k in [1, 16, 64, 1 << 14] {
+                let s = plan_with(&params, k, &mut cache);
+                let w = s.wrap.unwrap();
+                println!("  {k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
+            }
+            for k in [1, 16] {
+                let (segments, statement) = full_segments(name, &params, k);
+                let shape = plan_with(&params, k, &mut cache);
+                let t = std::time::Instant::now();
+                let times = Mutex::new(Vec::new());
+                let proof = prove_block_with(&params, &shape, &statement, &segments, 2, &|p| {
+                    times.lock().unwrap().push(format!("{p:?}"));
+                });
+                let elapsed = t.elapsed();
+                let wrap_line = times.lock().unwrap().iter().rev().find(|l| l.starts_with("Wrap")).cloned();
+                let t = std::time::Instant::now();
+                let w = shape.wrap.unwrap();
+                let ok = verify_block(&params, &|_| w, &statement, &proof);
+                println!(
+                    "  block of {k}: proven in {elapsed:.1?}, {} bytes, verified {:?} in {:.1?}; {}",
+                    proof.len(),
+                    ok,
+                    t.elapsed(),
+                    wrap_line.unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// The numbers the soundness analysis needs, per table of each proof.
+    #[test]
+    #[ignore = "prints the parameters of the soundness analysis"]
+    fn soundness_parameters() {
+        use crate::block_air::{BlockAir, NUM_PUBLIC as BLOCK_PUBLIC};
+        use crate::stark::{DynAir, evaluate, shape};
+        fn table(name: &str, air: &dyn DynAir, num_public: usize) {
+            let public = vec![Fp::ZERO; num_public];
+            let (constraints, terms) = shape(air, &public);
+            let zeros = vec![Fp::ZERO; air.air_width()];
+            let pre = vec![Fp::ZERO; air.air_preprocessed_width()];
+            let (_, t) = evaluate(air, &zeros, &zeros, (&pre, &pre), &public, (Fp::ZERO, Fp::ZERO, Fp::ZERO));
+            let max_len = t.iter().map(|t| t.values.len()).max().unwrap_or(0);
+            let lens: usize = t.iter().map(|t| t.values.len()).sum();
+            println!(
+                "{name}: width {} pre {} degree {} constraints {constraints} terms {terms} (tuple lengths sum {lens}, max {max_len}) group {}",
+                air.air_width(),
+                air.air_preprocessed_width(),
+                air.air_degree(),
+                air.air_lookup_group()
+            );
+        }
+        table("segment BlockAir", &BlockAir, BLOCK_PUBLIC);
+        table("machine VmAir", &VmAir, crate::vm_air::NUM_PUBLIC);
+        table("hash HashTableAir", &crate::hash_table::HashTableAir, crate::vm_air::NUM_PUBLIC);
+        let m = AggregatorParams::MAINNET;
+        for k in [1, 16] {
+            let s = plan(&m, k);
+            let w = s.wrap.unwrap();
+            println!("{k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
+        }
+    }
+
     #[test]
     fn wrap_program_accepts_and_rejects() {
         let s = setup("wrap", &[30, 25], 55);

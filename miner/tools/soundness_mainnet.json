@@ -1,0 +1,10 @@
+[
+  {"name": "segment", "log_blowup": 2, "queries": 42, "pow": 16,
+   "tables": [["BlockAir", 15, 716, 0, 3, 1671, 0, [], 1]]},
+  {"name": "node (largest: 2^18 + 2^16 rows)", "log_blowup": 2, "queries": 42, "pow": 16,
+   "tables": [["VmAir", 18, 92, 21, 5, 151, 19, [110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 2],
+              ["HashTableAir", 16, 338, 0, 3, 398, 1, [20], 1]]},
+  {"name": "wrap (2^16 + 2^14 rows, zero knowledge)", "log_blowup": 5, "queries": 16, "pow": 20, "zk": true,
+   "tables": [["VmAir", 16, 92, 21, 5, 151, 19, [110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 2],
+              ["HashTableAir", 14, 338, 0, 3, 398, 1, [20], 1]]}
+]
