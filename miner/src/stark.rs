@@ -60,7 +60,7 @@ use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
 use crate::ext::{DEGREE, Fp4};
 use crate::field::{Deg, Field, batch_inverse};
-use crate::fri::{self, FriConfig, FriError, FriProof};
+use crate::fri::{self, FriConfig, FriError, FriProof, QueryStep, leaf_row};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
 use crate::ntt::{
     MULTIPLICATIVE_GENERATOR, coset_intt_ext, coset_ntt, coset_ntt_ext, intt, log2_strict, root_of_unity,
@@ -397,32 +397,6 @@ pub struct QueryOpening {
     pub quotient_path: Vec<Digest>,
 }
 
-impl QueryOpening {
-    fn write(&self, w: &mut Writer) {
-        w.fp_vec(&self.trace_row);
-        w.digest_vec(&self.trace_path);
-        w.fp_vec(&self.aux_row);
-        w.digest_vec(&self.aux_path);
-        w.fp_vec(&self.pre_row);
-        w.digest_vec(&self.pre_path);
-        w.fp_vec(&self.quotient_row);
-        w.digest_vec(&self.quotient_path);
-    }
-
-    fn read(r: &mut Reader) -> Option<QueryOpening> {
-        Some(QueryOpening {
-            trace_row: r.fp_vec()?,
-            trace_path: r.digest_vec()?,
-            aux_row: r.fp_vec()?,
-            aux_path: r.digest_vec()?,
-            pre_row: r.fp_vec()?,
-            pre_path: r.digest_vec()?,
-            quotient_row: r.fp_vec()?,
-            quotient_path: r.digest_vec()?,
-        })
-    }
-}
-
 /// The part of a proof that belongs to one table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableProof {
@@ -508,20 +482,100 @@ pub struct Proof {
     pub fri: FriProof,
     /// For every FRI query, one opening per table.
     pub openings: Vec<Vec<QueryOpening>>,
+    /// The sampled query indices into the largest domain. The verifier
+    /// samples them itself and rejects a proof that disagrees; the encoding
+    /// needs them to rebuild the Merkle paths it leaves out.
+    pub query_indices: Vec<usize>,
 }
 
 impl Proof {
+    /// Every Merkle tree the proof opens, as its height and, per query,
+    /// the opened leaf's hash and path: per table its trace, auxiliary,
+    /// preprocessed and quotient trees, then the FRI rounds. An absent tree
+    /// has height zero. A query's leaf in a tree of height `h` is its index
+    /// modulo `2^h`.
+    #[allow(clippy::type_complexity)]
+    fn trees(&self) -> Vec<(usize, Vec<(Digest, &[Digest])>)> {
+        let nq = self.openings.len();
+        let mut out = Vec::new();
+        for t in 0..self.tables.len() {
+            for k in 0..4 {
+                let per_q: Vec<(Digest, &[Digest])> = (0..nq)
+                    .map(|q| {
+                        let o = &self.openings[q][t];
+                        let (row, path) = match k {
+                            0 => (&o.trace_row, &o.trace_path),
+                            1 => (&o.aux_row, &o.aux_path),
+                            2 => (&o.pre_row, &o.pre_path),
+                            _ => (&o.quotient_row, &o.quotient_path),
+                        };
+                        (
+                            if row.is_empty() {
+                                [Fp::ZERO; crate::poseidon2::DIGEST]
+                            } else {
+                                crate::merkle::hash_row(row)
+                            },
+                            &path[..],
+                        )
+                    })
+                    .collect();
+                out.push((per_q.first().map_or(0, |p| p.1.len()), per_q));
+            }
+        }
+        let rounds = self.fri.queries.first().map_or(0, |q| q.len());
+        for r in 0..rounds {
+            let per_q: Vec<(Digest, &[Digest])> = self
+                .fri
+                .queries
+                .iter()
+                .map(|q| (crate::merkle::hash_row(&leaf_row(&q[r].values)), &q[r].path[..]))
+                .collect();
+            out.push((per_q.first().map_or(0, |p| p.1.len()), per_q));
+        }
+        out
+    }
+
+    /// Encodes the proof. Merkle paths are batched per tree: a sibling
+    /// that another opening determines, or that an earlier query already
+    /// sent, is left out (see [`crate::merkle::compress_paths`]).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(1 << 16);
         w.u32(self.tables.len() as u32);
         for t in &self.tables {
             t.write(&mut w);
         }
-        self.fri.write(&mut w);
-        w.u32(self.openings.len() as u32);
-        for q in &self.openings {
-            for o in q {
-                o.write(&mut w);
+        let nq = self.openings.len();
+        assert_eq!(self.query_indices.len(), nq, "one index per query");
+        assert_eq!(self.fri.queries.len(), nq, "one fri query per opening");
+        let rounds = self.fri.queries.first().map_or(0, |q| q.len());
+        assert!(self.fri.queries.iter().all(|q| q.len() == rounds), "fri queries of one shape");
+        w.digest_vec(&self.fri.commitments);
+        w.fp4(&self.fri.final_value);
+        w.fp(&self.fri.pow_witness);
+        w.u32(nq as u32);
+        w.u32(rounds as u32);
+        for (q, steps) in self.fri.queries.iter().enumerate() {
+            w.u32(self.query_indices[q] as u32);
+            for step in steps {
+                w.fp4_vec(&step.values);
+            }
+            for o in &self.openings[q] {
+                w.fp_vec(&o.trace_row);
+                w.fp_vec(&o.aux_row);
+                w.fp_vec(&o.pre_row);
+                w.fp_vec(&o.quotient_row);
+            }
+        }
+        let trees = self.trees();
+        for (height, per_q) in &trees {
+            assert!(per_q.iter().all(|p| p.1.len() == *height), "paths of one tree have one length");
+            w.u32(*height as u32);
+        }
+        for (height, per_q) in &trees {
+            let leaves: Vec<Digest> = per_q.iter().map(|p| p.0).collect();
+            let paths: Vec<&[Digest]> = per_q.iter().map(|p| p.1).collect();
+            for d in crate::merkle::compress_paths(*height, &self.query_indices, &leaves, &paths) {
+                w.digest(&d);
             }
         }
         w.finish()
@@ -535,16 +589,81 @@ impl Proof {
             return None;
         }
         let tables = (0..nt).map(|_| TableProof::read(&mut r)).collect::<Option<Vec<_>>>()?;
-        let fri = FriProof::read(&mut r)?;
+        let commitments = r.digest_vec()?;
+        let final_value = r.fp4()?;
+        let pow_witness = r.fp()?;
         let nq = r.len(4)?;
+        let rounds = r.len(0)?;
+        if rounds > 32 {
+            return None;
+        }
+        let mut query_indices = Vec::with_capacity(nq);
+        let mut fri_queries = Vec::with_capacity(nq);
         let mut openings = Vec::with_capacity(nq);
         for _ in 0..nq {
-            openings.push((0..nt).map(|_| QueryOpening::read(&mut r)).collect::<Option<Vec<_>>>()?);
+            query_indices.push(r.u32()? as usize);
+            let steps = (0..rounds)
+                .map(|_| Some(QueryStep { values: r.fp4_vec()?, path: Vec::new() }))
+                .collect::<Option<Vec<_>>>()?;
+            fri_queries.push(steps);
+            let mut per_table = Vec::with_capacity(nt);
+            for _ in 0..nt {
+                per_table.push(QueryOpening {
+                    trace_row: r.fp_vec()?,
+                    trace_path: Vec::new(),
+                    aux_row: r.fp_vec()?,
+                    aux_path: Vec::new(),
+                    pre_row: r.fp_vec()?,
+                    pre_path: Vec::new(),
+                    quotient_row: r.fp_vec()?,
+                    quotient_path: Vec::new(),
+                });
+            }
+            openings.push(per_table);
+        }
+        let mut proof = Proof {
+            tables,
+            fri: FriProof { commitments, final_value, pow_witness, queries: fri_queries },
+            openings,
+            query_indices,
+        };
+        let num_trees = 4 * nt + rounds;
+        let mut heights = Vec::with_capacity(num_trees);
+        for _ in 0..num_trees {
+            let h = r.u32()? as usize;
+            if h > 32 {
+                return None;
+            }
+            heights.push(h);
+        }
+        let mut all_paths: Vec<Vec<Vec<Digest>>> = Vec::with_capacity(num_trees);
+        for (tree, (_, per_q)) in proof.trees().into_iter().enumerate() {
+            let leaves: Vec<Digest> = per_q.iter().map(|p| p.0).collect();
+            all_paths.push(crate::merkle::expand_paths(heights[tree], &proof.query_indices, &leaves, || r.digest())?);
         }
         if !r.is_empty() {
             return None;
         }
-        Some(Proof { tables, fri, openings })
+        let mut it = all_paths.into_iter();
+        for t in 0..nt {
+            for k in 0..4 {
+                for (q, path) in it.next().unwrap().into_iter().enumerate() {
+                    let o = &mut proof.openings[q][t];
+                    *match k {
+                        0 => &mut o.trace_path,
+                        1 => &mut o.aux_path,
+                        2 => &mut o.pre_path,
+                        _ => &mut o.quotient_path,
+                    } = path;
+                }
+            }
+        }
+        for rd in 0..rounds {
+            for (q, path) in it.next().unwrap().into_iter().enumerate() {
+                proof.fri.queries[q][rd].path = path;
+            }
+        }
+        Some(proof)
     }
 }
 
@@ -1536,7 +1655,7 @@ pub fn prove_tables(
         })
         .collect();
 
-    Proof { tables: parts, fri: fri_proof, openings }
+    Proof { tables: parts, fri: fri_proof, openings, query_indices: indices }
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,9 +1842,12 @@ pub fn verify_tables(
         .collect();
     let mut log_sizes: Vec<usize> = log_ns.iter().map(|l| l + log_blowup).collect();
     log_sizes.dedup();
+    if proof.query_indices.len() != config.num_queries {
+        return Err(VerifyError::Shape);
+    }
     let open = |q: usize, index: usize| -> Result<Vec<Fp4>, VerifyError> {
         let openings = &proof.openings[q];
-        if openings.len() != specs.len() {
+        if openings.len() != specs.len() || proof.query_indices[q] != index {
             return Err(VerifyError::Shape);
         }
         let mut values: Vec<Fp4> = Vec::with_capacity(log_sizes.len());
@@ -1930,6 +2052,11 @@ mod tests {
         let back = Proof::from_bytes(&bytes).unwrap();
         assert_eq!(back, proof);
         assert_eq!(verify(&CONFIG, &Fibonacci, &public, &back, &mut transcript()), Ok(()));
+        // A proof claiming other query indices is rejected, though it
+        // decodes.
+        let mut moved = proof.clone();
+        moved.query_indices[0] ^= 1;
+        assert_eq!(verify(&CONFIG, &Fibonacci, &public, &moved, &mut transcript()), Err(VerifyError::Shape));
         assert!(Proof::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         let mut extra = bytes.clone();
         extra.push(0);

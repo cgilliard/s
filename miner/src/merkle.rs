@@ -117,6 +117,85 @@ pub fn verify(root: &Digest, height: usize, index: usize, row: &[Fp], path: &[Di
     path.len() == height && index < (1usize << height) && root_from_path(index, row, path) == *root
 }
 
+// ---------------------------------------------------------------------------
+// Batched openings
+// ---------------------------------------------------------------------------
+
+/// Walks the paths of leaves `indices` (with hashes `leaves`) of a tree of
+/// `height` levels, level by level, and returns every path. A sibling is
+/// asked of `supply(query, level)` only when no opened leaf lies under it
+/// and it was not supplied before at that level: the others follow from
+/// the openings. Encoder and decoder share this walk, so they agree on
+/// which siblings travel.
+fn walk_paths(
+    height: usize,
+    indices: &[usize],
+    leaves: &[Digest],
+    mut supply: impl FnMut(usize, usize) -> Option<Digest>,
+) -> Option<Vec<Vec<Digest>>> {
+    use std::collections::HashMap;
+    let n = indices.len();
+    let mask = if height >= usize::BITS as usize { usize::MAX } else { (1usize << height) - 1 };
+    let mut pos: Vec<usize> = indices.iter().map(|i| i & mask).collect();
+    let mut nodes: HashMap<usize, Digest> = HashMap::with_capacity(n);
+    for (p, leaf) in pos.iter().zip(leaves) {
+        nodes.entry(*p).or_insert(*leaf);
+    }
+    let mut paths = vec![Vec::with_capacity(height); n];
+    for level in 0..height {
+        let mut sent: HashMap<usize, Digest> = HashMap::new();
+        for q in 0..n {
+            let sib = pos[q] ^ 1;
+            let d = match nodes.get(&sib).or_else(|| sent.get(&sib)) {
+                Some(d) => *d,
+                None => {
+                    let d = supply(q, level)?;
+                    sent.insert(sib, d);
+                    d
+                }
+            };
+            paths[q].push(d);
+        }
+        let mut next: HashMap<usize, Digest> = HashMap::with_capacity(n);
+        for q in 0..n {
+            let own = nodes[&pos[q]];
+            next.entry(pos[q] >> 1).or_insert_with(|| {
+                let sib = &paths[q][level];
+                if pos[q] & 1 == 0 { compress(&own, sib) } else { compress(sib, &own) }
+            });
+            pos[q] >>= 1;
+        }
+        nodes = next;
+    }
+    Some(paths)
+}
+
+/// The siblings to send for opening leaves `indices` (hashes `leaves`,
+/// paths `paths`) of one tree of `height` levels: those no other opening
+/// determines, each once, in walk order. [`expand_paths`] rebuilds the
+/// paths from them. For paths that do not belong to one tree the rebuilt
+/// paths differ, and fail verification as the originals would.
+pub fn compress_paths(height: usize, indices: &[usize], leaves: &[Digest], paths: &[&[Digest]]) -> Vec<Digest> {
+    let mut out = Vec::new();
+    walk_paths(height, indices, leaves, |q, level| {
+        let d = paths[q][level];
+        out.push(d);
+        Some(d)
+    });
+    out
+}
+
+/// Rebuilds the paths of [`compress_paths`], reading the sent siblings
+/// from `next`. `None` if `next` runs out.
+pub fn expand_paths(
+    height: usize,
+    indices: &[usize],
+    leaves: &[Digest],
+    mut next: impl FnMut() -> Option<Digest>,
+) -> Option<Vec<Vec<Digest>>> {
+    walk_paths(height, indices, leaves, |_, _| next())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +225,35 @@ mod tests {
                 assert!(!verify(&tree.root(), log_n + 1, i, row, &path));
             }
         }
+    }
+
+    #[test]
+    fn batched_paths_roundtrip() {
+        let mut rng = Rng::new(22);
+        let rows: Vec<Vec<Fp>> = (0..64).map(|_| vec![rng.fp(), rng.fp()]).collect();
+        let tree = MerkleTree::new(&rows);
+        for indices in [vec![], vec![5], vec![5, 5], vec![4, 5], vec![0, 63, 31, 32, 7, 7, 8], (0..64).collect()] {
+            let leaves: Vec<Digest> = indices.iter().map(|&i| hash_row(&rows[i])).collect();
+            let paths: Vec<Vec<Digest>> = indices.iter().map(|&i| tree.open(i)).collect();
+            let refs: Vec<&[Digest]> = paths.iter().map(|p| &p[..]).collect();
+            let sent = compress_paths(6, &indices, &leaves, &refs);
+            assert!(sent.len() <= 6 * indices.len());
+            if indices.len() == 64 {
+                assert!(sent.is_empty(), "all leaves open: nothing to send");
+            }
+            let mut it = sent.iter().copied();
+            assert_eq!(expand_paths(6, &indices, &leaves, || it.next()).unwrap(), paths, "{indices:?}");
+            assert!(it.next().is_none());
+            if !sent.is_empty() {
+                let mut short = sent[..sent.len() - 1].iter().copied();
+                assert!(expand_paths(6, &indices, &leaves, || short.next()).is_none());
+            }
+        }
+        // Two openings far apart share only the top: the siblings below it
+        // all travel.
+        let leaves = [hash_row(&rows[0]), hash_row(&rows[63])];
+        let (p0, p63) = (tree.open(0), tree.open(63));
+        assert_eq!(compress_paths(6, &[0, 63], &leaves, &[&p0, &p63]).len(), 10);
     }
 
     #[test]

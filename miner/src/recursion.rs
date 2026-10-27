@@ -1225,6 +1225,10 @@ pub fn dummy_proof(tables: &[(&dyn DynAir, usize)], config: &StarkConfig, num_pu
             queries: vec![steps; config.num_queries],
         },
         openings: vec![opening; config.num_queries],
+        // Spread like sampled indices, so encoded sizes are realistic.
+        query_indices: (0..config.num_queries)
+            .map(|q| ((q as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) as usize % (1 << log_sizes[0]))
+            .collect(),
     }
 }
 

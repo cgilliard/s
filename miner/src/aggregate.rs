@@ -92,8 +92,9 @@ impl AggregatorParams {
     ///
     /// The wrap is at rate 1/32 with 20 bits of grinding (0.5 s): 16
     /// queries. It verifies a root of up to 2^18 rows in 2^16 rows, and
-    /// proves in about 17 s with 4.3 GB, giving a 182 KB block proof; rate
-    /// 1/64 would save 13% of that for twice the time and memory.
+    /// proves in about 17 s with 4.3 GB, giving a block proof of about
+    /// 145 KB with batched Merkle paths; rate 1/64 would save about a tenth
+    /// of that for twice the time and memory.
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         segment_log_n: 15,
