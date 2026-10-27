@@ -3,18 +3,24 @@
 //! Segment proofs (see [`crate::block_proof`]) are verified by node
 //! programs for [`crate::vm_air`]. A node verifies up to `fan_in` children,
 //! each either a segment proof or the machine proof of another node, checks
-//! that the children chain, and outputs a digest of the combined span
-//! record: the same 92 values a segment exports (state roots, list sponges
-//! and output positions in and out, amount limb sums). The root node
-//! additionally binds the span to the block statement: the chain starts at
-//! the block's previous state, ends at the body's lists and new state, and
-//! the amounts balance against the subsidy, so its output digest is the
-//! statement digest.
+//! that the children chain, and outputs the digest of the combined span
+//! record (the values a segment exports: state roots, list sponges, output
+//! positions, amount sums and open-transaction carries in and out, with the
+//! sums normalized) followed by its tree digest. The root node instead
+//! binds the span to the block statement: the chain starts at the block's
+//! previous state, ends at the body's lists and new state, no transaction
+//! is open at either end, and the amounts balance against the subsidy; it
+//! outputs the digest of the statement and its tree digest.
 //!
-//! The tree shape is a function of the segment count and
-//! [`AggregatorParams`] alone, and every node program embeds its children's
-//! program digests, so a node knows the root digest to expect for each
-//! segment count without seeing a proof ([`plan`]).
+//! A node verifies a child node's proof under whatever program digest the
+//! child's public values give, and commits to it in its tree digest
+//! ([`tree_digest`]): one descriptor per child, a tag for a segment and the
+//! program and tree digests for a node. The tree digest at the top thus
+//! pins every program in the tree, and a node program depends only on its
+//! children's kinds and table heights, of which there are few (35 types
+//! cover every segment count on mainnet). [`plan`] lays out the tree for a
+//! segment count and computes its digests, compiling each program type
+//! once ([`PlanCache`]); after that, planning any count is hashing.
 //!
 //! The root's proof is itself verified by one more program, the wrap
 //! ([`compile_wrap`]), proven at a lower rate with fewer queries: a much
@@ -180,14 +186,51 @@ impl Statement {
     }
 
     /// Output digest of the root program for this statement.
-    pub fn digest(&self) -> [Fp; DIGEST] {
-        crate::poseidon2::hash(&self.to_values())
+    /// Output digest of a root whose tree digest is `tree`, and of the
+    /// wrap (see [`wrap_tree`]).
+    pub fn output(&self, tree: &Digest) -> Digest {
+        let mut v = self.to_values();
+        v.extend_from_slice(tree);
+        crate::poseidon2::hash(&v)
     }
 }
 
-/// Digest of a span record, the output of an inner node.
-pub fn record_digest(record: &SegmentPublic) -> [Fp; DIGEST] {
-    crate::poseidon2::hash(&record.to_values())
+/// Descriptor tag of a segment child.
+const SEGMENT_TAG: u32 = 0x41;
+/// Scalars per child descriptor.
+const DESCRIPTOR: usize = 2 * DIGEST;
+
+/// Tree digest of a node: the hash of one descriptor per child, a segment
+/// `[SEGMENT_TAG, 0, ..]` and a node its program digest and tree digest
+/// (`Some((digest, tree))`). It commits to every program below the node,
+/// which the node itself takes from its children's proofs unchecked.
+pub fn tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
+    let mut v = Vec::with_capacity(DESCRIPTOR * children.len());
+    for ch in children {
+        match ch {
+            None => {
+                v.push(Fp::new(SEGMENT_TAG));
+                v.extend_from_slice(&[Fp::ZERO; DESCRIPTOR - 1]);
+            }
+            Some((digest, tree)) => {
+                v.extend_from_slice(digest);
+                v.extend_from_slice(tree);
+            }
+        }
+    }
+    crate::poseidon2::hash(&v)
+}
+
+/// The wrap's tree digest: that of a node with the root as its one child.
+pub fn wrap_tree(root_digest: &Digest, root_tree: &Digest) -> Digest {
+    tree_digest(&[Some((*root_digest, *root_tree))])
+}
+
+/// Output digest of an inner node: its record and tree digest.
+pub fn node_output(record: &SegmentPublic, tree: &Digest) -> Digest {
+    let mut v = record.to_values();
+    v.extend_from_slice(tree);
+    crate::poseidon2::hash(&v)
 }
 
 /// The span covered by consecutive records: first in, last out, summed
@@ -273,7 +316,10 @@ fn sum_limbs(c: &mut Compiler, recs: &[Addr], field: usize, extra: Option<Addr>)
 #[derive(Clone, Debug)]
 pub struct NodeProof {
     pub record: SegmentPublic,
+    /// Program digest.
     pub digest: Digest,
+    /// Tree digest: the programs below.
+    pub tree: Digest,
     pub proof: stark::Proof,
 }
 
@@ -292,13 +338,26 @@ impl Child<'_> {
     }
 }
 
-/// What a node program outputs.
+/// What a node program outputs, along with its tree digest.
 pub enum Output<'a> {
-    /// The digest of the combined span record (inner nodes).
+    /// The combined span record (inner nodes).
     Record,
-    /// The digest of the block statement, after binding the span to it
-    /// (the root).
+    /// The block statement, after binding the span to it (the root).
     Statement(&'a Statement),
+}
+
+/// Copies `words` into a fresh block, zero padded to a multiple of eight,
+/// for hashing.
+fn concat(c: &mut Compiler, words: &[Addr]) -> Addr {
+    let padded = words.len().div_ceil(8).max(1) * 8;
+    let base = c.prog.alloc(padded as u32);
+    for i in 0..padded {
+        let src = words.get(i).copied().unwrap_or(0);
+        let v = c.val(src);
+        c.prog.muladd_to(src, 1, 0, base + i as Addr);
+        c.set_word(base + i as Addr, v);
+    }
+    base
 }
 
 /// Builds a node program over `children`, along with the witness.
@@ -313,35 +372,38 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
     let mut c = Compiler::new();
     let at = |base: Addr, field: usize| base + field as Addr;
 
-    // Each child: its record as inputs, then its proof.
+    // Each child: its record as inputs, then its proof; and its
+    // descriptor for the tree digest.
     let seg_prefix = [Fp::new(DOM_SEGMENT_PROOF)];
-    let node_prefix = [Fp::new(DOM_AGGREGATE_PROOF)];
     let mut recs: Vec<Addr> = Vec::with_capacity(k);
+    let mut descriptors: Vec<Addr> = Vec::with_capacity(k * DESCRIPTOR);
     for child in children {
-        let rec = c.scalar_inputs(&child.record().to_values());
         match child {
             Child::Segment(sp) => {
+                let rec = c.scalar_inputs(&child.record().to_values());
                 assert_eq!(sp.proof.tables[0].log_n, params.segment_log_n, "segment proof has the wrong height");
                 c.verify_stark(&[(&BlockAir, None)], &params.segment, &seg_prefix, rec, SEGMENT_PUBLIC, &sp.proof);
+                let tag = c.scalar(Fp::new(SEGMENT_TAG));
+                descriptors.push(tag);
+                descriptors.extend([0; DESCRIPTOR - 1]);
+                recs.push(rec);
             }
             Child::Node(np) => {
-                // The child's public values are its program digest, pinned
-                // to a constant, and its output digest, which must be the
-                // hash of the record.
-                let public = VmAir::public_values(&np.digest, &record_digest(&np.record));
-                let pubv = c.scalar_inputs(&public);
-                for (i, d) in np.digest.iter().enumerate() {
-                    c.assert_scalar(pubv + i as Addr, *d);
-                }
-                c.hash_scalars(rec, SEGMENT_PUBLIC);
-                let out = c.squeeze_digest();
-                c.assert_block(at(pubv, PUB_OUTPUT), out, DIGEST);
-                let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
-                c.verify_stark(&tables, &params.outer, &node_prefix, pubv, VM_PUBLIC, &np.proof);
+                let (rec, pubv) = verify_node_child(&mut c, params, np, |c, np| {
+                    let mut v = np.record.to_values();
+                    v.extend_from_slice(&np.tree);
+                    let rec = c.scalar_inputs(&v);
+                    (rec, SEGMENT_PUBLIC + DIGEST, node_output(&np.record, &np.tree))
+                });
+                descriptors.extend((0..DIGEST as Addr).map(|i| pubv + i));
+                descriptors.extend((0..DIGEST).map(|i| at(rec, SEGMENT_PUBLIC + i)));
+                recs.push(rec);
             }
         }
-        recs.push(rec);
     }
+    let block = concat(&mut c, &descriptors);
+    c.hash_scalars(block, descriptors.len());
+    let tree = c.squeeze_digest();
 
     // Chaining between consecutive children.
     for w in recs.windows(2) {
@@ -356,8 +418,9 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
 
     match output {
         Output::Record => {
-            // Combined record: copies of the boundary fields, summed limbs.
-            let padded = SEGMENT_PUBLIC.div_ceil(8) * 8;
+            // Combined record: copies of the boundary fields, summed limbs;
+            // then the tree digest.
+            let padded = (SEGMENT_PUBLIC + DIGEST).div_ceil(8) * 8;
             let out = c.prog.alloc(padded as u32);
             let copy = |c: &mut Compiler, src: Addr, dst: usize, n: usize| {
                 for i in 0..n {
@@ -385,11 +448,16 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
                     c.set_word(at(out, field + j), v);
                 }
             }
-            for i in SEGMENT_PUBLIC..padded {
+            for i in 0..DIGEST {
+                let v = c.val(tree + i as Addr);
+                c.prog.muladd_to(tree + i as Addr, 1, 0, at(out, SEGMENT_PUBLIC + i));
+                c.set_word(at(out, SEGMENT_PUBLIC + i), v);
+            }
+            for i in SEGMENT_PUBLIC + DIGEST..padded {
                 c.prog.muladd_to(0, 1, 0, at(out, i));
                 c.set_word(at(out, i), Fp4::ZERO);
             }
-            c.hash_scalars(out, SEGMENT_PUBLIC);
+            c.hash_scalars(out, SEGMENT_PUBLIC + DIGEST);
             c.assert_public();
         }
         Output::Statement(statement) => {
@@ -423,36 +491,59 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
                 c.assert_eq(*a, *b);
             }
 
-            c.hash_scalars(st, STATEMENT_LEN);
+            let words: Vec<Addr> =
+                (0..STATEMENT_LEN).map(|i| at(st, i)).chain((0..DIGEST).map(|i| tree + i as Addr)).collect();
+            let block = concat(&mut c, &words);
+            c.hash_scalars(block, words.len());
             c.assert_public();
         }
     }
     c
 }
 
-/// Builds the wrap program: verifies the root's machine proof (at
-/// `params.outer`) for the program `root_digest` and re-exports its output,
-/// the statement digest, so the block's proof can be a single proof at the
-/// lower rate of `params.wrap`.
-pub fn compile_wrap(
+/// Verifies a node child's machine proof under the program digest its
+/// public values claim, which the caller commits to in a tree digest.
+/// `inputs` lays out the values the child's output digest covers and
+/// returns their address, length and the expected digest. Returns that
+/// address and the child's public values.
+fn verify_node_child(
+    c: &mut Compiler,
     params: &AggregatorParams,
-    root_digest: &Digest,
-    root_proof: &stark::Proof,
-    statement: &Statement,
-) -> Compiler {
-    let mut c = Compiler::new();
-    let st = c.scalar_inputs(&statement.to_values());
-    let public = VmAir::public_values(root_digest, &statement.digest());
-    let pubv = c.scalar_inputs(&public);
-    for (i, d) in root_digest.iter().enumerate() {
-        c.assert_scalar(pubv + i as Addr, *d);
-    }
-    let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
-    let node_prefix = [Fp::new(DOM_AGGREGATE_PROOF)];
-    c.verify_stark(&tables, &params.outer, &node_prefix, pubv, VM_PUBLIC, root_proof);
-    c.hash_scalars(st, STATEMENT_LEN);
+    np: &NodeProof,
+    inputs: impl FnOnce(&mut Compiler, &NodeProof) -> (Addr, usize, Digest),
+) -> (Addr, Addr) {
+    let (base, len, output) = inputs(c, np);
+    let pubv = c.scalar_inputs(&VmAir::public_values(&np.digest, &output));
+    c.hash_scalars(base, len);
     let out = c.squeeze_digest();
     c.assert_block(pubv + PUB_OUTPUT as Addr, out, DIGEST);
+    let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
+    let node_prefix = [Fp::new(DOM_AGGREGATE_PROOF)];
+    c.verify_stark(&tables, &params.outer, &node_prefix, pubv, VM_PUBLIC, &np.proof);
+    (base, pubv)
+}
+
+/// Builds the wrap program: verifies the root's machine proof (at
+/// `params.outer`) and outputs the statement with the wrap's tree digest
+/// ([`wrap_tree`]), so the block's proof can be a single proof at the
+/// lower rate of `params.wrap`. Like every node, it depends only on the
+/// root's table heights.
+pub fn compile_wrap(params: &AggregatorParams, root: &NodeProof, statement: &Statement) -> Compiler {
+    let mut c = Compiler::new();
+    let (st, pubv) = verify_node_child(&mut c, params, root, |c, root| {
+        let mut v = statement.to_values();
+        v.extend_from_slice(&root.tree);
+        (c.scalar_inputs(&v), STATEMENT_LEN + DIGEST, statement.output(&root.tree))
+    });
+    let words: Vec<Addr> =
+        (0..DIGEST as Addr).map(|i| pubv + i).chain((0..DIGEST).map(|i| st + (STATEMENT_LEN + i) as Addr)).collect();
+    let block = concat(&mut c, &words);
+    c.hash_scalars(block, DESCRIPTOR);
+    let tree = c.squeeze_digest();
+    let words: Vec<Addr> =
+        (0..STATEMENT_LEN).map(|i| st + i as Addr).chain((0..DIGEST).map(|i| tree + i as Addr)).collect();
+    let block = concat(&mut c, &words);
+    c.hash_scalars(block, words.len());
     c.assert_public();
     c
 }
@@ -473,16 +564,20 @@ pub struct Shape {
     pub log_n: usize,
     /// Log height of the node's hash table.
     pub hash_log_n: usize,
+    /// Tree digest: the programs below ([`tree_digest`]).
+    pub tree: Digest,
     /// The wrap program over this node, for the root.
     pub wrap: Option<Wrap>,
 }
 
-/// Program digest and table heights of the wrap over a root.
+/// Program digest and table heights of the wrap over a root, and its tree
+/// digest ([`wrap_tree`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wrap {
     pub digest: Digest,
     pub log_n: usize,
     pub hash_log_n: usize,
+    pub tree: Digest,
 }
 
 impl Shape {
@@ -509,30 +604,85 @@ fn split(k: usize, fan_in: usize) -> Vec<usize> {
     groups
 }
 
-/// Planned subtrees by key (root flag, child sizes), shared between plans.
-pub type PlanMemo = HashMap<Vec<usize>, Shape>;
+/// What a node program depends on: whether it is the root, and per child
+/// whether it is a segment (`None`) or a node with the given table heights.
+type NodeType = (bool, Vec<Option<(usize, usize)>>);
 
-/// Plans the tree for `k` segments and computes every node's program
-/// digest by compiling it against zero-filled proofs of the right shapes.
-pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
-    plan_with(params, k, &mut PlanMemo::new())
+/// Program digest and table heights of a compiled program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Compiled {
+    digest: Digest,
+    log_n: usize,
+    hash_log_n: usize,
 }
 
-/// As [`plan`], reusing and extending `memo`.
-pub fn plan_with(params: &AggregatorParams, k: usize, memo: &mut PlanMemo) -> Shape {
+impl Compiled {
+    fn of(prog: &crate::vm_air::Program, log_blowup: usize) -> Compiled {
+        Compiled {
+            digest: prog.digest(log_blowup),
+            log_n: prog.height().trailing_zeros() as usize,
+            hash_log_n: VmAir::hash_height(prog).trailing_zeros() as usize,
+        }
+    }
+}
+
+/// Node and wrap programs compiled so far, by type. There are few types
+/// (child kinds and heights), so a cache warmed by a few plans makes
+/// planning any segment count a matter of hashing.
+#[derive(Default)]
+pub struct PlanCache {
+    nodes: HashMap<NodeType, Compiled>,
+    wraps: HashMap<(usize, usize), Compiled>,
+}
+
+impl PlanCache {
+    pub fn new() -> PlanCache {
+        PlanCache::default()
+    }
+
+    /// Programs compiled so far.
+    pub fn len(&self) -> usize {
+        self.nodes.len() + self.wraps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Plans the tree for `k` segments: its shape, every node's program digest
+/// and heights, and the tree digests.
+pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
+    plan_with(params, k, &mut PlanCache::new())
+}
+
+/// As [`plan`], compiling only the program types `cache` lacks.
+pub fn plan_with(params: &AggregatorParams, k: usize, cache: &mut PlanCache) -> Shape {
     assert!(k >= 1 && k <= params.max_segments, "segment count {k} out of range");
-    let mut root = plan_node(params, k, true, memo);
-    let dummy = dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC);
-    let prog = compile_wrap(params, &root.digest, &dummy, &Statement::zero()).prog;
+    let mut root = plan_node(params, k, true, cache);
+    let wrap = *cache.wraps.entry((root.log_n, root.hash_log_n)).or_insert_with(|| {
+        let dummy = NodeProof {
+            record: dummy_record(),
+            digest: [Fp::ZERO; DIGEST],
+            tree: [Fp::ZERO; DIGEST],
+            proof: dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC),
+        };
+        Compiled::of(&compile_wrap(params, &dummy, &Statement::zero()).prog, params.wrap.log_blowup)
+    });
     root.wrap = Some(Wrap {
-        digest: prog.digest(params.wrap.log_blowup),
-        log_n: prog.height().trailing_zeros() as usize,
-        hash_log_n: VmAir::hash_height(&prog).trailing_zeros() as usize,
+        digest: wrap.digest,
+        log_n: wrap.log_n,
+        hash_log_n: wrap.hash_log_n,
+        tree: wrap_tree(&root.digest, &root.tree),
     });
     root
 }
 
-fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut PlanMemo) -> Shape {
+fn dummy_record() -> SegmentPublic {
+    SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap()
+}
+
+fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCache) -> Shape {
     if k == 1 && !root {
         return Shape {
             children: vec![],
@@ -540,46 +690,57 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, memo: &mut PlanMem
             digest: [Fp::ZERO; DIGEST],
             log_n: params.segment_log_n,
             hash_log_n: 0,
+            tree: [Fp::ZERO; DIGEST],
             wrap: None,
         };
     }
     let sizes = if k <= params.fan_in { vec![1; k] } else { split(k, params.fan_in) };
-    let key: Vec<usize> = std::iter::once(usize::from(root)).chain(sizes.iter().copied()).collect();
-    if let Some(s) = memo.get(&key) {
-        return s.clone();
+    // Equal sizes plan equally; full subtrees repeat.
+    let mut children: Vec<Shape> = Vec::with_capacity(sizes.len());
+    for (i, &n) in sizes.iter().enumerate() {
+        let shape = match sizes[..i].iter().position(|&m| m == n) {
+            Some(j) => children[j].clone(),
+            None => plan_node(params, n, false, cache),
+        };
+        children.push(shape);
     }
-    let children: Vec<Shape> = sizes.iter().map(|&n| plan_node(params, n, false, memo)).collect();
-    let segment_dummy = SegmentProof {
-        public: SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap(),
-        proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
-    };
-    let node_dummies: Vec<NodeProof> = children
-        .iter()
-        .filter(|c| !c.is_segment())
-        .map(|c| NodeProof {
-            record: segment_dummy.public,
-            digest: c.digest,
-            proof: dummy_proof(&[(&VmAir, c.log_n), (&HashTableAir, c.hash_log_n)], &params.outer, VM_PUBLIC),
-        })
-        .collect();
-    let mut nd = node_dummies.iter();
-    let child_refs: Vec<Child<'_>> = children
-        .iter()
-        .map(|c| if c.is_segment() { Child::Segment(&segment_dummy) } else { Child::Node(nd.next().unwrap()) })
-        .collect();
-    let zero = Statement::zero();
-    let output = if root { Output::Statement(&zero) } else { Output::Record };
-    let prog = compile_node(params, &child_refs, output).prog;
-    let shape = Shape {
-        children,
+    let kinds: Vec<Option<(usize, usize)>> =
+        children.iter().map(|c| (!c.is_segment()).then_some((c.log_n, c.hash_log_n))).collect();
+    let compiled = *cache.nodes.entry((root, kinds.clone())).or_insert_with(|| {
+        let segment_dummy = SegmentProof {
+            public: dummy_record(),
+            proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
+        };
+        let node_dummies: Vec<NodeProof> = kinds
+            .iter()
+            .flatten()
+            .map(|&(log_n, hash_log_n)| NodeProof {
+                record: dummy_record(),
+                digest: [Fp::ZERO; DIGEST],
+                tree: [Fp::ZERO; DIGEST],
+                proof: dummy_proof(&[(&VmAir, log_n), (&HashTableAir, hash_log_n)], &params.outer, VM_PUBLIC),
+            })
+            .collect();
+        let mut nd = node_dummies.iter();
+        let child_refs: Vec<Child<'_>> = kinds
+            .iter()
+            .map(|kind| if kind.is_none() { Child::Segment(&segment_dummy) } else { Child::Node(nd.next().unwrap()) })
+            .collect();
+        let zero = Statement::zero();
+        let output = if root { Output::Statement(&zero) } else { Output::Record };
+        Compiled::of(&compile_node(params, &child_refs, output).prog, params.outer.log_blowup)
+    });
+    let descriptors: Vec<Option<(Digest, Digest)>> =
+        children.iter().map(|c| (!c.is_segment()).then_some((c.digest, c.tree))).collect();
+    Shape {
         segments: k,
-        digest: prog.digest(params.outer.log_blowup),
-        log_n: prog.height().trailing_zeros() as usize,
-        hash_log_n: VmAir::hash_height(&prog).trailing_zeros() as usize,
+        digest: compiled.digest,
+        log_n: compiled.log_n,
+        hash_log_n: compiled.hash_log_n,
+        tree: tree_digest(&descriptors),
         wrap: None,
-    };
-    memo.insert(key, shape.clone());
-    shape
+        children,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,8 +806,8 @@ fn prove_node(
     let records: Vec<SegmentPublic> = children.iter().map(|c| c.record()).collect();
     let record = combine_records(&records);
     let out_digest = match &output {
-        Output::Record => record_digest(&record),
-        Output::Statement(s) => s.digest(),
+        Output::Record => node_output(&record, &shape.tree),
+        Output::Statement(s) => s.output(&shape.tree),
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
@@ -662,7 +823,7 @@ fn prove_node(
         root,
         elapsed: t.elapsed(),
     });
-    NodeProof { record, digest: shape.digest, proof }
+    NodeProof { record, digest: shape.digest, tree: shape.tree, proof }
 }
 
 /// Proves a block: segments in parallel, then the tree. The segments must
@@ -707,11 +868,11 @@ pub fn prove_block_with(
     let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress);
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
-    let c = compile_wrap(params, &shape.digest, &root.proof, statement);
+    let c = compile_wrap(params, &root, statement);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
     let pre = c.prog.preprocess(params.wrap.log_blowup);
     assert_eq!(pre.root(), wrap.digest, "wrap program differs from the planned shape");
-    let public = VmAir::public_values(&pre.root(), &statement.digest());
+    let public = VmAir::public_values(&pre.root(), &statement.output(&wrap.tree));
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript());
     progress(Progress::Wrap { log_n: wrap.log_n, hash_log_n: wrap.hash_log_n, elapsed: t.elapsed() });
@@ -722,11 +883,12 @@ pub fn prove_block_with(
     w.finish()
 }
 
-/// Verifies an encoded block proof against a statement. `wrap_digest`
-/// gives the planned wrap program digest for a segment count.
+/// Verifies an encoded block proof against a statement. `wrap` gives the
+/// planned wrap for a segment count: the program digest the proof is
+/// checked against and the tree digest its output commits to.
 pub fn verify_block(
     params: &AggregatorParams,
-    wrap_digest: &dyn Fn(usize) -> Digest,
+    wrap: &dyn Fn(usize) -> Wrap,
     statement: &Statement,
     proof: &[u8],
 ) -> Result<(), AggregateError> {
@@ -736,9 +898,9 @@ pub fn verify_block(
         return Err(AggregateError::BadSegmentCount(k));
     }
     let proof = stark::Proof::from_bytes(r.0).ok_or(AggregateError::Malformed)?;
-    let digest = wrap_digest(k);
-    let public = VmAir::public_values(&digest, &statement.digest());
-    stark::verify_tables(&params.wrap, &VmAir::specs(&digest), &public, &proof, &mut wrap_transcript())
+    let wrap = wrap(k);
+    let public = VmAir::public_values(&wrap.digest, &statement.output(&wrap.tree));
+    stark::verify_tables(&params.wrap, &VmAir::specs(&wrap.digest), &public, &proof, &mut wrap_transcript())
         .map_err(|_| AggregateError::Rejected)
 }
 
@@ -746,35 +908,34 @@ pub fn verify_block(
 /// segment count.
 pub struct AggregateVerifier {
     pub params: AggregatorParams,
-    /// Planned roots by segment count, and the subtrees behind them.
-    plans: Mutex<(HashMap<usize, Shape>, PlanMemo)>,
+    /// Compiled program types, and the planned wrap by segment count.
+    plans: Mutex<(PlanCache, HashMap<usize, Wrap>)>,
 }
 
 impl AggregateVerifier {
     pub fn new(params: AggregatorParams) -> AggregateVerifier {
-        AggregateVerifier { params, plans: Mutex::new((HashMap::new(), PlanMemo::new())) }
+        AggregateVerifier { params, plans: Mutex::new((PlanCache::new(), HashMap::new())) }
     }
 
-    /// The planned tree for `k` segments. Subtrees planned for earlier
-    /// counts are reused.
+    /// The planned tree for `k` segments. Program types compiled for
+    /// earlier counts are reused, so once warm this only hashes.
     pub fn shape(&self, k: usize) -> Shape {
         let mut plans = self.plans.lock().unwrap();
-        if let Some(s) = plans.0.get(&k) {
-            return s.clone();
-        }
-        let s = plan_with(&self.params, k, &mut plans.1);
-        plans.0.insert(k, s.clone());
+        let s = plan_with(&self.params, k, &mut plans.0);
+        plans.1.insert(k, s.wrap.expect("planned root"));
         s
     }
 
-    /// The wrap program digest a `k`-segment block proof is checked
-    /// against.
-    pub fn digest(&self, k: usize) -> Digest {
-        self.shape(k).wrap.expect("planned root").digest
+    /// The planned wrap a `k`-segment block proof is checked against.
+    pub fn wrap(&self, k: usize) -> Wrap {
+        if let Some(w) = self.plans.lock().unwrap().1.get(&k) {
+            return *w;
+        }
+        self.shape(k).wrap.expect("planned root")
     }
 
     pub fn verify_statement(&self, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
-        verify_block(&self.params, &|k| self.digest(k), statement, proof)
+        verify_block(&self.params, &|k| self.wrap(k), statement, proof)
     }
 }
 
@@ -899,7 +1060,7 @@ mod tests {
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("node accepts chained open transactions");
         let record = combine_records(&[*p0, *p1]);
         assert!(record.carry_out.open && !record.carry_in.open);
-        assert_eq!(exec.output_digest, Some(record_digest(&record)));
+        assert_eq!(exec.output_digest, Some(node_output(&record, &tree_digest(&[None, None]))));
         // Out of order, the carries do not chain (nor do the roots).
         let c = compile_node(&SMALL, &seg_children(&[s.proofs[1].clone(), s.proofs[0].clone()]), Output::Record);
         assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
@@ -962,7 +1123,7 @@ mod tests {
             Err(ExecError::AssertionFailed(i)) => panic!("root rejected at {i}: {:?}", c.prog.instrs[i]),
             Err(e) => panic!("{e:?}"),
         };
-        assert_eq!(exec.output_digest, Some(s.statement.digest()));
+        assert_eq!(exec.output_digest, Some(s.statement.output(&tree_digest(&[None, None]))));
         println!(
             "root over 2 segments of 2^{}: {} instructions, {} inputs",
             SMALL.segment_log_n,
@@ -1017,7 +1178,7 @@ mod tests {
         let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Record);
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("valid node");
         let records: Vec<SegmentPublic> = s.proofs.iter().map(|p| p.public).collect();
-        assert_eq!(exec.output_digest, Some(record_digest(&combine_records(&records))));
+        assert_eq!(exec.output_digest, Some(node_output(&combine_records(&records), &tree_digest(&[None, None]))));
     }
 
     #[test]
@@ -1036,19 +1197,20 @@ mod tests {
             for k in [1, 2, 4, 5, 8, 12, 16] {
                 println!("{k:2} segments: {}", show(&plan(&params, k)));
             }
-            let mut memo = PlanMemo::new();
-            for k in [1000, 9999, 1 << 14, 1001, 12345] {
+            let mut cache = PlanCache::new();
+            for k in [1000, 9999, 1 << 14, 1001, 12345, 3, 77] {
                 let t = std::time::Instant::now();
                 let fresh = plan(&params, k);
                 let alone = t.elapsed();
                 let t = std::time::Instant::now();
-                let s = plan_with(&params, k, &mut memo);
+                let s = plan_with(&params, k, &mut cache);
                 assert_eq!(s.wrap, fresh.wrap);
                 println!(
-                    "{k} segments: root 2^{}/2^{}, planned in {alone:?}, {:?} after the counts before",
+                    "{k} segments: root 2^{}/2^{}, planned in {alone:?}, {:?} after the counts before ({} types)",
                     s.log_n,
                     s.hash_log_n,
-                    t.elapsed()
+                    t.elapsed(),
+                    cache.len()
                 );
             }
         }
@@ -1115,6 +1277,7 @@ mod tests {
             let np = NodeProof {
                 record: seg.public,
                 digest: [Fp::ZERO; DIGEST],
+                tree: [Fp::ZERO; DIGEST],
                 proof: dummy_proof(
                     &[
                         (&VmAir, leaf.height().trailing_zeros() as usize),
@@ -1185,7 +1348,7 @@ mod tests {
         let params = AggregatorParams::MAINNET;
         let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
         let c = compile_node(&params, &[Child::Segment(&seg)], Output::Record);
-        let out = record_digest(&combine_records(&[seg.public]));
+        let out = node_output(&combine_records(&[seg.public]), &tree_digest(&[None]));
         for _ in 0..2 {
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
@@ -1209,21 +1372,27 @@ mod tests {
         let s = setup("wrap", &[30, 25], 55);
         let shape = plan(&SMALL, 2);
         let root = prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement), &|_| {});
-        let c = compile_wrap(&SMALL, &shape.digest, &root.proof, &s.statement);
+        let c = compile_wrap(&SMALL, &root, &s.statement);
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
-        assert_eq!(exec.output_digest, Some(s.statement.digest()));
-        assert_eq!(c.prog.digest(SMALL.wrap.log_blowup), shape.wrap.unwrap().digest);
+        let wrap = shape.wrap.unwrap();
+        assert_eq!(wrap.tree, wrap_tree(&shape.digest, &tree_digest(&[None, None])));
+        assert_eq!(exec.output_digest, Some(s.statement.output(&wrap.tree)));
+        assert_eq!(c.prog.digest(SMALL.wrap.log_blowup), wrap.digest);
         let rejects = |c: Compiler| matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_)));
-        // Another statement, another root program, a corrupted proof.
+        // Another statement, another root program, another tree, a
+        // corrupted proof.
         let mut poor = s.statement.clone();
         poor.subsidy = 54;
-        assert!(rejects(compile_wrap(&SMALL, &shape.digest, &root.proof, &poor)));
-        let mut other = shape.digest;
-        other[0] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &other, &root.proof, &s.statement)));
-        let mut bad = root.proof.clone();
-        bad.openings[1][0].trace_row[3] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &shape.digest, &bad, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &root, &poor)));
+        let mut other = root.clone();
+        other.digest[0] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement)));
+        let mut other = root.clone();
+        other.tree[0] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement)));
+        let mut bad = root.clone();
+        bad.proof.openings[1][0].trace_row[3] += Fp::ONE;
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
     }
 
     #[test]
@@ -1246,11 +1415,11 @@ mod tests {
             ],
         };
         for wrap in configs {
-            let c = compile_wrap(&params, &shape.digest, &root.proof, &s.statement);
+            let c = compile_wrap(&params, &root, &s.statement);
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
             let pre = c.prog.preprocess(wrap.log_blowup);
-            let public = VmAir::public_values(&pre.root(), &s.statement.digest());
+            let public = VmAir::public_values(&pre.root(), &s.statement.output(&shape.wrap.unwrap().tree));
             let tables = VmAir::tables(&trace, &hashes, &pre);
             let proof = stark::prove_tables(&wrap, &tables, &public, &mut outer_transcript());
             let elapsed = t.elapsed();
@@ -1289,7 +1458,7 @@ mod tests {
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
             let pre = c.prog.preprocess(params.outer.log_blowup);
-            let out = record_digest(&combine_records(&[seg.public]));
+            let out = node_output(&combine_records(&[seg.public]), &tree_digest(&[None]));
             let public = VmAir::public_values(&pre.root(), &out);
             let tables = VmAir::tables(&trace, &hashes, &pre);
             let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
