@@ -68,7 +68,9 @@ impl AggregatorParams {
     /// Segments at rate 1/8 prove twice as slowly as at 1/4, in parallel,
     /// but are about a fifth cheaper to verify, which halves the trace of a
     /// node over them. Nodes stay at rate 1/4: their proving time doubles
-    /// at 1/8 for little gain in the node above.
+    /// at 1/8 for little gain in the node above. With rate 1/4 segments a
+    /// leaf over four needs 2^19 rows and 2^16 hashes instead of 2^18 and
+    /// 2^15, and a full block proved in 105 s instead of 91 s.
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 3, num_queries: 34 },
         segment_log_n: 15,
@@ -824,8 +826,12 @@ mod tests {
             let kids: Vec<String> = s.children.iter().map(show).collect();
             format!("2^{}/2^{}[{}]", s.log_n, s.hash_log_n, kids.join(" "))
         }
-        for k in [1, 2, 4, 5, 8, 12, 16] {
-            println!("{k:2} segments: {}", show(&plan(&AggregatorParams::MAINNET, k)));
+        let quarter = AggregatorParams { segment: AggregatorParams::MAINNET.outer, ..AggregatorParams::MAINNET };
+        for (name, params) in [("mainnet", AggregatorParams::MAINNET), ("segments at rate 1/4", quarter)] {
+            println!("{name}:");
+            for k in [1, 2, 4, 5, 8, 12, 16] {
+                println!("{k:2} segments: {}", show(&plan(&params, k)));
+            }
         }
     }
 
