@@ -2,9 +2,11 @@
 //! mining and proving every block locally.
 //!
 //! ```text
-//! tabminer mine [--data DIR] [--blocks N] [--txs N] [--jobs N]
+//! tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N]
 //! tabminer show [--data DIR]
 //! ```
+//!
+//! With no command, `tabminer` mines.
 //!
 //! `mine` creates the chain (an empty genesis block at the current time)
 //! and a development wallet on first use, then builds blocks on the tip:
@@ -33,7 +35,7 @@ use tabminer::wallet::Wallet;
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage:
-  tabminer mine [--data DIR] [--blocks N] [--txs N] [--jobs N]
+  tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N]
   tabminer show [--data DIR]
 
   --data DIR   chain and wallet directory (default ./tabminer-data)
@@ -53,8 +55,12 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
-    let command = it.next().ok_or("missing command")?;
+    let mut it = std::env::args().skip(1).peekable();
+    // No command, or only options, means `mine`.
+    let command = match it.peek() {
+        Some(c) if !c.starts_with('-') => it.next().unwrap(),
+        _ => "mine".to_string(),
+    };
     let mut a = Args { command, data: PathBuf::from("tabminer-data"), blocks: 0, txs: 1000, jobs: 2 };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
