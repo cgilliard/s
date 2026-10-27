@@ -65,19 +65,27 @@ pub struct AggregatorParams {
 }
 
 impl AggregatorParams {
-    /// Segments at rate 1/8 prove twice as slowly as at 1/4, in parallel,
-    /// but are about a fifth cheaper to verify, which halves the trace of a
-    /// node over them. Nodes stay at rate 1/4: their proving time doubles
-    /// at 1/8 for little gain in the node above. With rate 1/4 segments a
-    /// leaf over four needs 2^19 rows and 2^16 hashes instead of 2^18 and
-    /// 2^15, and a full block proved in 105 s instead of 91 s.
+    /// Segments and nodes both at rate 1/4. Segments at rate 1/8 prove
+    /// twice as slowly but are cheaper to verify; with 16 bits of grinding
+    /// a leaf over four rate-1/4 segments still fits 2^18 rows (with 2^16
+    /// hashes instead of 2^15), and a full block proves in 71 s against
+    /// 84 s. Nodes at 1/8 would double their proving time for little gain
+    /// in the node above.
+    ///
+    /// Both target 100 bits of conjectured security, `log_blowup` bits per
+    /// query plus 16 bits of grinding (about 2^16 permutations, 35 ms, per
+    /// proof).
     pub const MAINNET: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 3, num_queries: 34 },
+        segment: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
         segment_log_n: 15,
         max_segments: 16,
         fan_in: 4,
-        outer: StarkConfig { log_blowup: 2, num_queries: 50 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 42, pow_bits: 16 },
     };
+
+    /// Rate 1/8 at the same security, for comparisons.
+    #[cfg(test)]
+    const EIGHTH: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 28, pow_bits: 16 };
 
     /// Rows available to transactions in one segment.
     pub fn segment_rows(&self) -> usize {
@@ -700,11 +708,11 @@ mod tests {
     /// Small parameters: 128-row segments hold one output-only transaction,
     /// nodes take two children.
     const SMALL: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 1, num_queries: 4 },
+        segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3 },
         segment_log_n: 7,
         max_segments: 4,
         fan_in: 2,
-        outer: StarkConfig { log_blowup: 2, num_queries: 4 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5 },
     };
 
     struct Setup {
@@ -826,8 +834,8 @@ mod tests {
             let kids: Vec<String> = s.children.iter().map(show).collect();
             format!("2^{}/2^{}[{}]", s.log_n, s.hash_log_n, kids.join(" "))
         }
-        let quarter = AggregatorParams { segment: AggregatorParams::MAINNET.outer, ..AggregatorParams::MAINNET };
-        for (name, params) in [("mainnet", AggregatorParams::MAINNET), ("segments at rate 1/4", quarter)] {
+        let eighth = AggregatorParams { segment: AggregatorParams::EIGHTH, ..AggregatorParams::MAINNET };
+        for (name, params) in [("mainnet", AggregatorParams::MAINNET), ("segments at rate 1/8", eighth)] {
             println!("{name}:");
             for k in [1, 2, 4, 5, 8, 12, 16] {
                 println!("{k:2} segments: {}", show(&plan(&params, k)));
@@ -849,8 +857,8 @@ mod tests {
         for (name, params) in [
             ("mainnet", AggregatorParams::MAINNET),
             (
-                "segments at rate 1/4, 50 queries",
-                AggregatorParams { segment: AggregatorParams::MAINNET.outer, ..AggregatorParams::MAINNET },
+                "segments at rate 1/8, 28 queries",
+                AggregatorParams { segment: AggregatorParams::EIGHTH, ..AggregatorParams::MAINNET },
             ),
             ("2^13 segments", AggregatorParams { segment_log_n: 13, ..AggregatorParams::MAINNET }),
         ] {
@@ -878,8 +886,8 @@ mod tests {
         // A node verifying one node proof of the mainnet root's height, with
         // the outer proofs at rate 1/4 and at rate 1/8.
         for (name, outer) in [
-            ("rate 1/4, 50 queries", AggregatorParams::MAINNET.outer),
-            ("rate 1/8, 34 queries", AggregatorParams::MAINNET.segment),
+            ("rate 1/4, 42 queries", AggregatorParams::MAINNET.outer),
+            ("rate 1/8, 28 queries", AggregatorParams::EIGHTH),
         ] {
             let params = AggregatorParams { outer, ..AggregatorParams::MAINNET };
             let seg = SegmentProof {
@@ -985,7 +993,7 @@ mod tests {
     fn mainnet_rate_timing() {
         let s = setup("rates", &[30], 30);
         let quarter = AggregatorParams::MAINNET.outer;
-        let eighth = AggregatorParams::MAINNET.segment;
+        let eighth = AggregatorParams::EIGHTH;
         for (name, segment, outer) in [
             ("segments 1/4, nodes 1/4", quarter, quarter),
             ("segments 1/8, nodes 1/4", eighth, quarter),

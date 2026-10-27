@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn prove_and_verify_program() {
-        let config = StarkConfig { log_blowup: 2, num_queries: 16 };
+        let config = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0 };
         let mut rng = Rng::new(71);
         let (p, inputs, out) = sample_program(&mut rng);
         let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();

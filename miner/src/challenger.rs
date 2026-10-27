@@ -10,7 +10,7 @@
 //! lets a verifier circuit replay it.
 
 use crate::ext::{DEGREE, Fp4};
-use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute_in_place};
+use crate::poseidon2::{BatchState, DIGEST, Fp, LANES, RATE, WIDTH, permute_batch, permute_in_place};
 
 #[derive(Clone, Debug)]
 pub struct Challenger {
@@ -92,6 +92,30 @@ impl Challenger {
         assert!(bits <= 27, "at most 27 bits per sample");
         (self.sample().to_canonical() as usize) & ((1usize << bits) - 1)
     }
+
+    /// For each of `LANES` candidate values, whether observing it and then
+    /// calling `sample_bits(bits)` would return zero; the transcript is not
+    /// changed. Used to grind proof-of-work witnesses eight at a time.
+    pub fn zero_bits_after(&self, candidates: &[Fp; LANES], bits: usize) -> [bool; LANES] {
+        assert!(bits <= 27, "at most 27 bits per sample");
+        // `observe` appends to the buffer and duplexes when it fills; the
+        // sample then permutes again (no input, nothing left to squeeze).
+        let k = self.input.len();
+        let mut base = self.state;
+        for (i, x) in self.input.iter().enumerate() {
+            base[i] = base[i].add(x);
+        }
+        let mut s: BatchState = core::array::from_fn(|i| [base[i].to_mont(); LANES]);
+        for (l, w) in candidates.iter().enumerate() {
+            s[k][l] = base[k].add(w).to_mont();
+        }
+        permute_batch(&mut s);
+        if k + 1 == RATE {
+            permute_batch(&mut s);
+        }
+        let mask = (1u32 << bits) - 1;
+        core::array::from_fn(|l| Fp::from_mont(s[0][l]).to_canonical() & mask == 0)
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +154,23 @@ mod tests {
             assert!(ch.sample_bits(10) < 1024);
         }
         assert_eq!(ch.sample_bits(0), 0);
+    }
+
+    #[test]
+    fn batched_bit_check_matches_sampling() {
+        let ws: [Fp; LANES] = core::array::from_fn(|i| Fp::new(i as u32 * 7 + 3));
+        // Every buffer fill, including the one that makes `observe` duplex.
+        for pending in 0..RATE {
+            let mut ch = Challenger::new();
+            ch.observe_slice(&(0..9 + pending as u32).map(Fp::new).collect::<Vec<_>>());
+            for bits in [0, 1, 3] {
+                let got = ch.zero_bits_after(&ws, bits);
+                for (l, w) in ws.iter().enumerate() {
+                    let mut c = ch.clone();
+                    c.observe(*w);
+                    assert_eq!(got[l], c.sample_bits(bits) == 0, "pending {pending} bits {bits} lane {l}");
+                }
+            }
+        }
     }
 }

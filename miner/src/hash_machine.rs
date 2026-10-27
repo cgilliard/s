@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn prove_and_verify_linked_hashes() {
-        let config = StarkConfig { log_blowup: 1, num_queries: 16 };
+        let config = StarkConfig { log_blowup: 1, num_queries: 16, pow_bits: 0 };
         let mut rng = Rng::new(62);
         let input: Vec<Fp> = (0..30).map(|_| rng.fp()).collect();
         let mut b = HashTraceBuilder::default();

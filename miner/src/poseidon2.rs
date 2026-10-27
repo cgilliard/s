@@ -73,7 +73,6 @@ impl Fp {
     }
 
     /// From a raw Montgomery word below `p`.
-    #[cfg(test)]
     #[inline(always)]
     pub(crate) const fn from_mont(x: u32) -> Fp {
         debug_assert!(x < P);

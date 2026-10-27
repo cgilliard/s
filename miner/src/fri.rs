@@ -44,7 +44,7 @@ use crate::ext::{DEGREE, Fp4};
 use crate::merkle::{Digest, MerkleTree, verify as merkle_verify};
 use crate::ntt::{inv_two, log2_strict, root_of_unity};
 use crate::parallel::{par_chunks_mut, par_map};
-use crate::poseidon2::Fp;
+use crate::poseidon2::{Fp, LANES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FriConfig {
@@ -52,6 +52,8 @@ pub struct FriConfig {
     pub log_blowup: usize,
     /// Number of query positions checked by the verifier.
     pub num_queries: usize,
+    /// Proof-of-work bits ground before the queries are sampled.
+    pub pow_bits: usize,
 }
 
 /// One round of a query: the opened leaf (as many values as the round's
@@ -68,6 +70,9 @@ pub struct FriProof {
     pub commitments: Vec<Digest>,
     /// The constant final codeword.
     pub final_value: Fp4,
+    /// Proof-of-work witness: observed after the final value, the next
+    /// sample has `pow_bits` low zero bits. Zero when `pow_bits` is zero.
+    pub pow_witness: Fp,
     /// `num_queries` queries, each with one step per round.
     pub queries: Vec<Vec<QueryStep>>,
 }
@@ -76,6 +81,7 @@ impl FriProof {
     pub fn write(&self, w: &mut Writer) {
         w.digest_vec(&self.commitments);
         w.fp4(&self.final_value);
+        w.fp(&self.pow_witness);
         w.u32(self.queries.len() as u32);
         for q in &self.queries {
             w.u32(q.len() as u32);
@@ -92,6 +98,7 @@ impl FriProof {
     pub fn read(r: &mut Reader) -> Option<FriProof> {
         let commitments = r.digest_vec()?;
         let final_value = r.fp4()?;
+        let pow_witness = r.fp()?;
         let nq = r.len(1)?;
         let mut queries = Vec::with_capacity(nq);
         for _ in 0..nq {
@@ -105,7 +112,7 @@ impl FriProof {
             }
             queries.push(steps);
         }
-        Some(FriProof { commitments, final_value, queries })
+        Some(FriProof { commitments, final_value, pow_witness, queries })
     }
 }
 
@@ -124,6 +131,8 @@ pub enum FriError {
     FinalMismatch {
         query: usize,
     },
+    /// The proof-of-work witness does not meet `pow_bits`.
+    ProofOfWork,
 }
 
 impl core::fmt::Display for FriError {
@@ -139,11 +148,55 @@ impl core::fmt::Display for FriError {
             FriError::FinalMismatch { query } => {
                 write!(f, "fri query {query}: last fold does not match final value")
             }
+            FriError::ProofOfWork => f.write_str("fri proof-of-work witness is invalid"),
         }
     }
 }
 
 impl std::error::Error for FriError {}
+
+/// Finds the smallest witness `w` such that observing it makes the next
+/// sample's low `bits` bits zero, and leaves `challenger` past that sample
+/// as [`check_pow`] does. Candidates are tried in parallel, a batch per
+/// thread at a time. With `bits == 0` the transcript is untouched and the
+/// witness is zero.
+pub fn grind(challenger: &mut Challenger, bits: usize) -> Fp {
+    if bits == 0 {
+        return Fp::ZERO;
+    }
+    const BATCH: u32 = 1 << 12;
+    let lanes = LANES as u32;
+    let threads = crate::parallel::threads() as u32;
+    let mut start = 0u32;
+    let w = loop {
+        let hits = par_map(threads as usize, |t| {
+            let lo = start + t as u32 * BATCH;
+            (lo..lo + BATCH).step_by(LANES).find_map(|w0| {
+                let ws: [Fp; LANES] = core::array::from_fn(|l| Fp::new(w0 + l as u32));
+                let ok = challenger.zero_bits_after(&ws, bits);
+                (0..lanes).find(|&l| ok[l as usize]).map(|l| w0 + l)
+            })
+        });
+        if let Some(w) = hits.into_iter().flatten().next() {
+            break w;
+        }
+        start += threads * BATCH;
+        assert!(start < crate::poseidon2::P - threads * BATCH, "no proof-of-work witness found");
+    };
+    let w = Fp::new(w);
+    assert!(check_pow(challenger, bits, w));
+    w
+}
+
+/// Observes `witness` and checks that the next sample has `bits` low zero
+/// bits. With `bits == 0` nothing is observed and the witness must be zero.
+pub fn check_pow(challenger: &mut Challenger, bits: usize, witness: Fp) -> bool {
+    if bits == 0 {
+        return witness == Fp::ZERO;
+    }
+    challenger.observe(witness);
+    challenger.sample_bits(bits) == 0
+}
 
 /// The scalars of a leaf, as hashed into the Merkle tree.
 pub(crate) fn leaf_row(values: &[Fp4]) -> Vec<Fp> {
@@ -288,6 +341,7 @@ pub fn prove(
     // may send anything here; the query phase is what catches it.
     let final_value = cur[0];
     challenger.observe_ext(&final_value);
+    let pow_witness = grind(challenger, config.pow_bits);
 
     let mut queries = Vec::with_capacity(config.num_queries);
     let mut indices = Vec::with_capacity(config.num_queries);
@@ -304,7 +358,7 @@ pub fn prove(
         queries.push(steps);
     }
 
-    (FriProof { commitments, final_value, queries }, indices)
+    (FriProof { commitments, final_value, pow_witness, queries }, indices)
 }
 
 /// Verifies a proof for input codewords of sizes `2^log_sizes[g]` (see
@@ -333,6 +387,9 @@ pub fn verify<E: From<FriError>>(
         betas.push(challenger.sample_ext());
     }
     challenger.observe_ext(&proof.final_value);
+    if !check_pow(challenger, config.pow_bits, proof.pow_witness) {
+        return Err(FriError::ProofOfWork.into());
+    }
 
     // Per-round domain parameters: round r lives on shift_r * H with
     // `round_log_sizes[r]` points; `w_invs[r]` inverts its leaf root of unity.
@@ -399,7 +456,7 @@ mod tests {
     use crate::ntt::{MULTIPLICATIVE_GENERATOR, coset_ntt_ext};
     use crate::test_util::Rng;
 
-    const CONFIG: FriConfig = FriConfig { log_blowup: 3, num_queries: 20 };
+    const CONFIG: FriConfig = FriConfig { log_blowup: 3, num_queries: 20, pow_bits: 8 };
 
     fn transcript() -> Challenger {
         let mut c = Challenger::new();
@@ -547,6 +604,33 @@ mod tests {
         let mut p = proof.clone();
         p.queries[0].pop();
         assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::Shape);
+        // A witness that misses the proof-of-work target; and any witness
+        // but zero when no grinding is configured.
+        let mut p = proof.clone();
+        p.pow_witness += Fp::ONE;
+        if check(&[log_n], shift, &p, &inputs).is_ok() {
+            p.pow_witness += Fp::ONE;
+        }
+        assert_eq!(check(&[log_n], shift, &p, &inputs).unwrap_err(), FriError::ProofOfWork);
+        let none = FriConfig { pow_bits: 0, ..CONFIG };
+        let (p, _) = prove(&none, &mut transcript(), shift, inputs.to_vec());
+        assert_eq!(p.pow_witness, Fp::ZERO);
+        assert!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).is_ok());
+        let mut p = p;
+        p.pow_witness = Fp::ONE;
+        assert_eq!(verify(&none, &mut transcript(), shift, &[log_n], &p, open).unwrap_err(), FriError::ProofOfWork);
+    }
+
+    #[test]
+    fn grinding_finds_low_zero_bits() {
+        let mut c = transcript();
+        let w = grind(&mut c, 12);
+        let mut v = transcript();
+        assert!(check_pow(&mut v, 12, w));
+        // Both transcripts continue identically.
+        assert_eq!(c.sample(), v.sample());
+        // The witness is the smallest that works.
+        assert!((0..w.to_canonical()).all(|x| !check_pow(&mut transcript(), 12, Fp::new(x))));
     }
 
     #[test]

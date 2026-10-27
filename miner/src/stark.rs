@@ -372,11 +372,15 @@ pub struct StarkConfig {
     /// least `log2_ceil(max_constraint_degree - 1)`.
     pub log_blowup: usize,
     pub num_queries: usize,
+    /// Proof-of-work bits ground before the FRI queries are sampled; each
+    /// bit adds one bit of security against a prover trying many
+    /// transcripts.
+    pub pow_bits: usize,
 }
 
 impl StarkConfig {
     pub(crate) fn fri(&self) -> FriConfig {
-        FriConfig { log_blowup: self.log_blowup, num_queries: self.num_queries }
+        FriConfig { log_blowup: self.log_blowup, num_queries: self.num_queries, pow_bits: self.pow_bits }
     }
 }
 
@@ -1849,7 +1853,7 @@ mod tests {
         Trace::new(values, 1)
     }
 
-    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16 };
+    const CONFIG: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 16, pow_bits: 0 };
 
     fn transcript() -> Challenger {
         let mut c = Challenger::new();

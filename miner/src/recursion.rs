@@ -497,6 +497,23 @@ impl Compiler {
         bits
     }
 
+    /// Observes the proof-of-work witness and checks that the next sample's
+    /// low `pow_bits` bits are zero, as [`crate::fri::check_pow`].
+    fn check_pow(&mut self, t: &mut Transcript, witness: Fp, pow_bits: usize) {
+        assert!(pow_bits <= 27);
+        let w = self.input(Fp4::from_base(witness));
+        self.observe(t, w);
+        let bits = self.sample_bits(t);
+        // Whole words of four bits, then single bits.
+        for k in 0..pow_bits / 4 {
+            self.assert_eq(bits + k as Addr, A_ZERO);
+        }
+        for i in pow_bits / 4 * 4..pow_bits {
+            let b = self.bit(bits, i);
+            self.assert_eq(b, A_ZERO);
+        }
+    }
+
     fn bit(&mut self, bits: Addr, i: usize) -> Addr {
         self.component(bits + (i / 4) as Addr, (i % 4) as u8)
     }
@@ -776,6 +793,9 @@ impl Compiler {
         }
         let final_value = c.input(fri.final_value);
         c.observe_word(&mut t, final_value);
+        if config.pow_bits > 0 {
+            c.check_pow(&mut t, fri.pow_witness, config.pow_bits);
+        }
 
         // Query indices are sampled before any Merkle hashing: the native
         // verifier observes nothing between queries, and the machine's sponge
@@ -1206,6 +1226,7 @@ pub fn dummy_proof(tables: &[(&dyn DynAir, usize)], config: &StarkConfig, num_pu
         fri: FriProof {
             commitments: vec![z; arities.len()],
             final_value: Fp4::ZERO,
+            pow_witness: Fp::ZERO,
             queries: vec![steps; config.num_queries],
         },
         openings: vec![opening; config.num_queries],
@@ -1288,7 +1309,7 @@ mod tests {
         }
     }
 
-    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8 };
+    const INNER: StarkConfig = StarkConfig { log_blowup: 2, num_queries: 8, pow_bits: 6 };
 
     fn inner_tr() -> Challenger {
         let mut c = Challenger::new();
@@ -1335,6 +1356,14 @@ mod tests {
         assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
         let mut bad = proof.clone();
         bad.fri.final_value += Fp4::ONE;
+        let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
+        assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
+        // A proof-of-work witness that misses the target.
+        let mut bad = proof.clone();
+        bad.fri.pow_witness += Fp::ONE;
+        if verify(&INNER, &Fibonacci, &public, &bad, &mut Challenger::new()).is_ok() {
+            bad.fri.pow_witness += Fp::ONE;
+        }
         let cb = compile_verifier(&Fibonacci, &INNER, &public, &bad);
         assert!(matches!(VmAir::execute(&cb.prog, &cb.inputs), Err(ExecError::AssertionFailed(_))));
         // Wrong public value.
@@ -1446,7 +1475,7 @@ mod tests {
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
         let c = compile_verifier(&Fibonacci, &INNER, &public, &proof);
         let (vm_trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();
-        let outer = StarkConfig { log_blowup: 2, num_queries: 20 };
+        let outer = StarkConfig { log_blowup: 2, num_queries: 20, pow_bits: 0 };
         let pre = c.prog.preprocess(outer.log_blowup);
         let vm_public = VmAir::public_values(&pre.root(), &output_digest(&public));
         let t = std::time::Instant::now();
