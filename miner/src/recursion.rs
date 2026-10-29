@@ -629,8 +629,11 @@ impl Compiler {
         let log_ns: Vec<usize> = shapes.iter().map(|s| s.log_n).collect();
         assert!(log_ns.windows(2).all(|w| w[0] >= w[1]), "tables must be ordered by height");
         let log_big_n = log_ns[0] + log_blowup;
-        let grinding =
-            grinding_of(config, &tables.iter().map(|(air, _)| *air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
+        let grinding = grinding_of(
+            config,
+            &tables.iter().map(|(air, _)| *air).zip(log_ns.iter().copied()).collect::<Vec<_>>(),
+            public,
+        );
         let ground = |c: &mut Compiler, t: &mut Transcript, bits: usize, w: Fp| {
             if bits > 0 {
                 c.check_pow(t, w, bits);

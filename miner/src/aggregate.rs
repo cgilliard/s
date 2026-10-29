@@ -809,14 +809,16 @@ fn committed_program(prog: &Program, config: &StarkConfig, digest: &Digest) -> A
     pre
 }
 
-/// Proves one node of the tree over `segments[..shape.segments]`.
+/// Proves one node of the tree over `segments[..shape.segments]`; `None`
+/// if `cancel` fired.
 fn prove_node(
     params: &AggregatorParams,
     shape: &Shape,
     segments: &[SegmentProof],
     output: Output<'_>,
     progress: &(dyn Fn(Progress) + Sync),
-) -> NodeProof {
+    cancel: stark::Cancel<'_>,
+) -> Option<NodeProof> {
     let mut nodes: Vec<Option<NodeProof>> = Vec::with_capacity(shape.children.len());
     let mut at = 0;
     for child in &shape.children {
@@ -825,8 +827,11 @@ fn prove_node(
         nodes.push(if child.is_segment() {
             None
         } else {
-            Some(prove_node(params, child, slice, Output::Record, progress))
+            Some(prove_node(params, child, slice, Output::Record, progress, cancel)?)
         });
+    }
+    if cancel() {
+        return None;
     }
     let t = std::time::Instant::now();
     let root = matches!(output, Output::Statement(_));
@@ -855,7 +860,7 @@ fn prove_node(
     let pre = committed_program(&c.prog, &params.outer, &shape.digest);
     let public = VmAir::public_values(&pre.root(), &out_digest);
     let tables = VmAir::tables(&trace, &hashes, &pre);
-    let proof = stark::prove_tables(&params.outer, &tables, &public, &mut outer_transcript());
+    let proof = stark::try_prove_tables(&params.outer, &tables, &public, &mut outer_transcript(), Some(cancel)).ok()?;
     progress(Progress::Node {
         segments: shape.segments,
         log_n: shape.log_n,
@@ -863,7 +868,7 @@ fn prove_node(
         root,
         elapsed: t.elapsed(),
     });
-    NodeProof { record, digest: shape.digest, tree: shape.tree, proof }
+    Some(NodeProof { record, digest: shape.digest, tree: shape.tree, proof })
 }
 
 /// Proves a block: segments in parallel, then the tree. The segments must
@@ -884,6 +889,21 @@ pub fn prove_block_with(
     jobs: usize,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Vec<u8> {
+    prove_block_cancellable(params, shape, statement, segments, jobs, progress, &|| false).expect("no cancellation")
+}
+
+/// As [`prove_block_with`], giving up with `None` once `cancel` returns
+/// `true`: before each segment and node, and between the phases of each
+/// proof.
+pub fn prove_block_cancellable(
+    params: &AggregatorParams,
+    shape: &Shape,
+    statement: &Statement,
+    segments: &[SegmentWitness],
+    jobs: usize,
+    progress: &(dyn Fn(Progress) + Sync),
+    cancel: stark::Cancel<'_>,
+) -> Option<Vec<u8>> {
     assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
     let count = segments.len();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -893,7 +913,7 @@ pub fn prove_block_with(
             s.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if index >= count {
+                    if index >= count || cancel() {
                         break;
                     }
                     let t = std::time::Instant::now();
@@ -904,8 +924,11 @@ pub fn prove_block_with(
             });
         }
     });
+    if cancel() {
+        return None;
+    }
     let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-    let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress);
+    let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress, cancel)?;
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement);
@@ -913,13 +936,13 @@ pub fn prove_block_with(
     let pre = committed_program(&c.prog, &params.wrap, &wrap.digest);
     let public = VmAir::public_values(&pre.root(), &statement.output(&wrap.tree));
     let tables = VmAir::tables(&trace, &hashes, &pre);
-    let proof = stark::prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript());
+    let proof = stark::try_prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript(), Some(cancel)).ok()?;
     progress(Progress::Wrap { log_n: wrap.log_n, hash_log_n: wrap.hash_log_n, elapsed: t.elapsed() });
     let bytes = proof.to_bytes();
     let mut w = Writer::with_capacity(bytes.len() + 4);
     w.u32(proofs.len() as u32);
     w.0.extend_from_slice(&bytes);
-    w.finish()
+    Some(w.finish())
 }
 
 /// Verifies an encoded block proof against a statement. `wrap` gives the
@@ -1059,7 +1082,8 @@ mod tests {
         let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows()).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
-        let body = Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
+        let body =
+            Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,
@@ -1114,6 +1138,28 @@ mod tests {
         };
         let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short));
         assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
+    }
+
+    #[test]
+    fn proving_can_be_cancelled() {
+        let s = setup("cancel", &[30, 25], 55);
+        let shape = plan(&SMALL, 2);
+        let quiet = |_: Progress| {};
+        // At once: no segment is proven.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let now = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        };
+        assert!(prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &now).is_none());
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // Part way: after the segments, during the node's phases.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let later = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 6;
+        assert!(prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &later).is_none());
+        // Never: a proof as from `prove_block_with`.
+        let proof = prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &|| false).unwrap();
+        assert_eq!(AggregateVerifier::new(SMALL).verify_statement(&s.statement, &proof), Ok(()));
     }
 
     #[test]
@@ -1470,7 +1516,10 @@ mod tests {
             for k in [1, 16, 64, 1 << 14] {
                 let s = plan_with(&params, k, &mut cache);
                 let w = s.wrap.unwrap();
-                println!("  {k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}", s.log_n, s.hash_log_n, w.log_n, w.hash_log_n);
+                println!(
+                    "  {k} segments: root 2^{}/2^{}, wrap 2^{}/2^{}",
+                    s.log_n, s.hash_log_n, w.log_n, w.hash_log_n
+                );
             }
             for k in [1, 16] {
                 let (segments, statement) = full_segments(name, &params, k);
@@ -1559,7 +1608,7 @@ mod tests {
     fn wrap_program_accepts_and_rejects() {
         let s = setup("wrap", &[30, 25], 55);
         let shape = plan(&SMALL, 2);
-        let root = prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement), &|_| {});
+        let root = prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement), &|_| {}, &|| false).unwrap();
         let c = compile_wrap(&SMALL, &root, &s.statement);
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
         let wrap = shape.wrap.unwrap();
@@ -1605,11 +1654,17 @@ mod tests {
         let params = AggregatorParams::MAINNET;
         let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
         let shape = plan(&params, 1);
-        let root = prove_node(&params, &shape, &[seg], Output::Statement(&s.statement), &|_| {});
+        let root = prove_node(&params, &shape, &[seg], Output::Statement(&s.statement), &|_| {}, &|| false).unwrap();
         let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
             Ok(v) => {
                 let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
-                vec![StarkConfig { log_blowup: n[0], num_queries: n[1], pow_bits: n[2], zk: n.get(3) == Some(&1), commit_bits: 0 }]
+                vec![StarkConfig {
+                    log_blowup: n[0],
+                    num_queries: n[1],
+                    pow_bits: n[2],
+                    zk: n.get(3) == Some(&1),
+                    commit_bits: 0,
+                }]
             }
             Err(_) => vec![
                 StarkConfig { log_blowup: 4, num_queries: 21, pow_bits: 16, zk: false, commit_bits: 0 },

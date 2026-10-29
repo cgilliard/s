@@ -1564,22 +1564,32 @@ fn par_batch_inverse<F: Field + Send + Sync>(xs: &[F]) -> Vec<F> {
         .collect()
 }
 
-/// Phase timer, active when `TABMINER_TIMING` is set.
-struct Timer {
+/// Asked by a prover between phases; `true` abandons the proof.
+pub type Cancel<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// The prover's `cancel` fired; no proof was produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cancelled;
+
+/// Phase boundary: times the phase when `TABMINER_TIMING` is set, and
+/// checks for cancellation.
+struct Timer<'a> {
     on: bool,
     last: std::time::Instant,
+    cancel: Option<Cancel<'a>>,
 }
 
-impl Timer {
-    fn new() -> Timer {
-        Timer { on: std::env::var_os("TABMINER_TIMING").is_some(), last: std::time::Instant::now() }
+impl<'a> Timer<'a> {
+    fn new(cancel: Option<Cancel<'a>>) -> Timer<'a> {
+        Timer { on: std::env::var_os("TABMINER_TIMING").is_some(), last: std::time::Instant::now(), cancel }
     }
 
-    fn lap(&mut self, what: &str) {
+    fn lap(&mut self, what: &str) -> Result<(), Cancelled> {
         if self.on {
             eprintln!("  {what}: {:?}", self.last.elapsed());
             self.last = std::time::Instant::now();
         }
+        if self.cancel.is_some_and(|c| c()) { Err(Cancelled) } else { Ok(()) }
     }
 }
 
@@ -1611,7 +1621,8 @@ fn table_degree(config: &StarkConfig, air: &dyn DynAir, terms: usize) -> usize {
 
 /// Lookup constraints of a table with `terms` lookup terms.
 pub(crate) fn num_constraints_lookup(config: &StarkConfig, terms: usize, air: &dyn DynAir) -> usize {
-    num_lookup_constraints(terms, air.air_lookup_group()) + if config.zk && terms > 0 { ZK_LOOKUP_CONSTRAINTS } else { 0 }
+    num_lookup_constraints(terms, air.air_lookup_group())
+        + if config.zk && terms > 0 { ZK_LOOKUP_CONSTRAINTS } else { 0 }
 }
 
 /// Where the quotient chunks are opened: `zeta^chunks` for interleaved
@@ -1827,8 +1838,8 @@ fn commit_quotient(
     lookup: Option<&LookupChallenges>,
     alpha_powers: &[Fp4],
     rng: Option<(&Rng, u32)>,
-    timer: &mut Timer,
-) -> Quotient {
+    timer: &mut Timer<'_>,
+) -> Result<Quotient, Cancelled> {
     let log_blowup = config.log_blowup;
     let air = t.input.air;
     let w = air.air_width();
@@ -1896,7 +1907,7 @@ fn commit_quotient(
         let c = combine(constraints, terms, aux_l, aux_n, sel_ext, lookup, blind, alpha_powers);
         c.mul_base(&zr_inv)
     });
-    timer.lap("quotient eval");
+    timer.lap("quotient eval")?;
 
     coset_intt_ext(&mut quotient, shift);
     let coeffs: Vec<Vec<Fp4>> = match rng {
@@ -1936,10 +1947,10 @@ fn commit_quotient(
     // Rows of `num_chunks` extension values, as base values.
     let base: Vec<Vec<Fp>> =
         (0..num_chunks * DEGREE).map(|jk| coeffs[jk / DEGREE].iter().map(|v| v.0[jk % DEGREE]).collect()).collect();
-    timer.lap("quotient lde");
+    timer.lap("quotient lde")?;
     let committed = Committed::from_coeffs(base, log_blowup, shift, None);
-    timer.lap("quotient commit");
-    Quotient { coeffs, committed, chunks: num_chunks }
+    timer.lap("quotient commit")?;
+    Ok(Quotient { coeffs, committed, chunks: num_chunks })
 }
 
 pub fn prove<A: Air>(
@@ -1978,6 +1989,18 @@ pub fn prove_tables(
     public: &[Fp],
     challenger: &mut Challenger,
 ) -> Proof {
+    try_prove_tables(config, tables, public, challenger, None).expect("no cancellation")
+}
+
+/// [`prove_tables`] that gives up with [`Cancelled`] once `cancel` returns
+/// `true`, checked between phases (a few seconds apart at most).
+pub fn try_prove_tables(
+    config: &StarkConfig,
+    tables: &[TableInput<'_>],
+    public: &[Fp],
+    challenger: &mut Challenger,
+    cancel: Option<Cancel<'_>>,
+) -> Result<Proof, Cancelled> {
     assert!(!tables.is_empty(), "no tables");
     let log_blowup = config.log_blowup;
     let log_ns: Vec<usize> = tables.iter().map(|t| log2_strict(t.trace.height())).collect();
@@ -2014,7 +2037,7 @@ pub fn prove_tables(
             challenger.observe_digest(&p.root());
         }
     }
-    let mut timer = Timer::new();
+    let mut timer = Timer::new(cancel);
     let shapes: Vec<(usize, usize)> = tables.iter().map(|t| shape(t.air, public)).collect();
 
     // 0. Zero knowledge: random blinding rows and blinding columns.
@@ -2023,11 +2046,8 @@ pub fn prove_tables(
         Some(rng) => blind_traces(config, tables, &shapes, rng),
         None => Vec::new(),
     };
-    let tables: Vec<TableInput<'_>> = tables
-        .iter()
-        .enumerate()
-        .map(|(k, t)| TableInput { trace: blinded.get(k).unwrap_or(t.trace), ..*t })
-        .collect();
+    let tables: Vec<TableInput<'_>> =
+        tables.iter().enumerate().map(|(k, t)| TableInput { trace: blinded.get(k).unwrap_or(t.trace), ..*t }).collect();
 
     // 1. Trace LDEs and commitments.
     let mut states: Vec<TableState<'_>> = tables
@@ -2063,7 +2083,7 @@ pub fn prove_tables(
             }
         })
         .collect();
-    timer.lap("trace commit");
+    timer.lap("trace commit")?;
     let grinding = grinding_of(config, &states.iter().map(|t| (t.input.air, t.log_n)).collect::<Vec<_>>(), public);
     let mut witnesses = [Fp::ZERO; 4];
 
@@ -2081,7 +2101,7 @@ pub fn prove_tables(
                 uv: &t.input.trace.row(0)[w..],
             });
             let (aux, total) = build_aux(t.input.air, t.input.trace, t.input.pre, public, &ch, t.num_terms, zk);
-            timer.lap("aux build");
+            timer.lap("aux build")?;
             let ext_w = t.aux_ext_w();
             let n = 1usize << t.log_n;
             let stride = kept_stride(config, t.degree);
@@ -2092,7 +2112,7 @@ pub fn prove_tables(
             challenger.observe_digest(&committed.tree.root());
             challenger.observe_ext(&total);
             t.aux = Some((committed, total));
-            timer.lap("aux commit");
+            timer.lap("aux commit")?;
         }
         debug_assert!(
             states.iter().filter_map(|t| t.aux.as_ref()).fold(Fp4::ZERO, |a, (_, s)| a + *s).is_zero(),
@@ -2111,11 +2131,11 @@ pub fn prove_tables(
             let alpha_powers =
                 powers(alpha, t.num_constraints + num_constraints_lookup(config, t.num_terms, t.input.air));
             let rng = rng.as_ref().map(|r| (r, zk_domain(k, 2)));
-            let q = commit_quotient(t, config, public, lookup_ch.as_ref(), &alpha_powers, rng, &mut timer);
+            let q = commit_quotient(t, config, public, lookup_ch.as_ref(), &alpha_powers, rng, &mut timer)?;
             challenger.observe_digest(&q.committed.tree.root());
-            q
+            Ok(q)
         })
-        .collect();
+        .collect::<Result<_, Cancelled>>()?;
 
     // 4. Out-of-domain openings.
     witnesses[2] = fri::grind(challenger, grinding.zeta);
@@ -2149,7 +2169,7 @@ pub fn prove_tables(
             part
         })
         .collect();
-    timer.lap("openings");
+    timer.lap("openings")?;
 
     // 5. DEEP combinations, summed per domain size, and FRI.
     witnesses[3] = fri::grind(challenger, grinding.beta);
@@ -2198,9 +2218,9 @@ pub fn prove_tables(
             input_log_sizes.push(log_m);
         }
     }
-    timer.lap("deep");
+    timer.lap("deep")?;
     let (fri_proof, indices) = fri::prove(&config.fri(), challenger, MULTIPLICATIVE_GENERATOR, inputs);
-    timer.lap("fri");
+    timer.lap("fri")?;
 
     let openings = indices
         .iter()
@@ -2227,7 +2247,7 @@ pub fn prove_tables(
         })
         .collect();
 
-    Proof { tables: parts, fri: fri_proof, openings, query_indices: indices, grinding: witnesses }
+    Ok(Proof { tables: parts, fri: fri_proof, openings, query_indices: indices, grinding: witnesses })
 }
 
 // ---------------------------------------------------------------------------
@@ -2329,7 +2349,8 @@ pub fn verify_tables(
         shapes.push(s);
     }
     let log_big = log_ns[0] + log_blowup;
-    let grinding = grinding_of(config, &specs.iter().map(|s| s.air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
+    let grinding =
+        grinding_of(config, &specs.iter().map(|s| s.air).zip(log_ns.iter().copied()).collect::<Vec<_>>(), public);
     let ground = |challenger: &mut Challenger, bits: usize, w: Fp| -> Result<(), VerifyError> {
         if fri::check_pow(challenger, bits, w) { Ok(()) } else { Err(VerifyError::ProofOfWork) }
     };
@@ -2383,8 +2404,8 @@ pub fn verify_tables(
         let rows = Constrained { log_n: t.log_n, blind: config.blind_rows() };
         let p_last = Fp4::from_base(rows.last_point());
         // Z of the constrained rows at zeta.
-        let z_r = (zeta.exp(1u64 << t.log_n) - Fp4::ONE)
-            * rows.z_blind(zeta).inv().ok_or(VerifyError::ConstraintIdentity)?;
+        let z_r =
+            (zeta.exp(1u64 << t.log_n) - Fp4::ONE) * rows.z_blind(zeta).inv().ok_or(VerifyError::ConstraintIdentity)?;
         let first = z_r * (zeta - Fp4::ONE).inv().ok_or(VerifyError::ConstraintIdentity)?;
         let last = z_r * (zeta - p_last).inv().ok_or(VerifyError::ConstraintIdentity)?;
         let transition = zeta - p_last;
@@ -2448,8 +2469,7 @@ pub fn verify_tables(
         }
         let mut values: Vec<Fp4> = Vec::with_capacity(log_sizes.len());
         let mut last_size = None;
-        for ((((spec, t), s), opening), deep) in
-            specs.iter().zip(&proof.tables).zip(&shapes).zip(openings).zip(&deeps)
+        for ((((spec, t), s), opening), deep) in specs.iter().zip(&proof.tables).zip(&shapes).zip(openings).zip(&deeps)
         {
             if opening.trace_row.len() != s.w
                 || opening.aux_row.len() != s.aux_w
@@ -2953,8 +2973,10 @@ mod tests {
     fn zero_knowledge_tables() {
         let real = 64 - ZK.blind_rows();
         let (send, recv) = zk_exchange([real as u32 / 4; 4]);
-        let tables =
-            [TableInput { air: &Sender, trace: &send, pre: None }, TableInput { air: &Receiver, trace: &recv, pre: None }];
+        let tables = [
+            TableInput { air: &Sender, trace: &send, pre: None },
+            TableInput { air: &Receiver, trace: &recv, pre: None },
+        ];
         let specs = [TableSpec { air: &Sender, pre_root: None }, TableSpec { air: &Receiver, pre_root: None }];
         let proof = prove_tables(&ZK, &tables, &[], &mut transcript());
         assert_eq!(verify_tables(&ZK, &specs, &[], &proof, &mut transcript()), Ok(()));

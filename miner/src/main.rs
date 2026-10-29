@@ -1,52 +1,75 @@
-//! `tabminer`: runs a single-node chain on mainnet consensus parameters,
-//! mining and proving every block locally.
+//! `tabminer`: a tabernacle node that follows the network's heaviest chain
+//! and, by default, mines and proves blocks on it.
 //!
 //! ```text
-//! tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N]
+//! tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N] [--no-mine] [net options]
+//! tabminer node [--data DIR] [net options]
 //! tabminer show [--data DIR]
+//!
+//! net options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose]
 //! ```
 //!
 //! With no command, `tabminer` mines. The data directory defaults to
 //! `~/.tabernacle/tabminer` (`./tabminer-data` when `HOME` is unset).
 //!
-//! `mine` creates the chain (an empty genesis block at the current time)
-//! and a development wallet on first use, then builds blocks on the tip:
-//! a coinbase paying the subsidy to the wallet, plus up to `--txs`
-//! transfers (368 by default, sixteen segments), each splitting one of
-//! the wallet's outputs in two, within the block size limit. The UTXO set
-//! roughly doubles per block until the transfers reach that count. Each
-//! block is proven (segments, then the
-//! aggregation tree), mined, and applied through full validation,
-//! including the proof. `--blocks 0` (the default) runs until interrupted.
+//! Every command starts from the fixed mainnet genesis. `mine` and `node`
+//! listen for peers on UDP (port 7417 by default), contact the seeds and any
+//! `--peer`, sync to the chain with the most work, relay new blocks, and
+//! save the peers they found for next time.
+//!
+//! `mine` additionally builds blocks on the tip (unless `--no-mine` is
+//! given, which makes it the same as `node`): a coinbase paying the
+//! subsidy to the node's wallet (created on first use), plus up to `--txs`
+//! transfers (368 by default, sixteen segments), each splitting one of the
+//! wallet's outputs in two, within the block size limit. Each block is
+//! proven (segments, then the aggregation tree), mined, applied through
+//! full validation, and announced. If the network delivers a better tip
+//! while a block is being proven or mined, the miner drops it and starts
+//! over on the new tip. `--blocks 0` (the default) runs until interrupted.
 //! `--jobs` bounds how many segments are proven at once.
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tabminer::aggregate::{AggregateVerifier, Progress, Statement, prove_block_with};
-use tabminer::block::{Block, Body, Header};
+use tabminer::aggregate::{AggregateVerifier, Progress, Statement, prove_block_cancellable};
+use tabminer::block::{Block, Body};
 use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams};
+use tabminer::node::{Config, DEFAULT_PORT, Event, Node};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
-use tabminer::state_tree::EMPTY;
 use tabminer::transaction::{Sig, Transaction, UnsignedTransaction};
 use tabminer::wallet::Wallet;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage:
-  tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N]
+  tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N] [--no-mine] [net options]
+  tabminer node [--data DIR] [net options]
   tabminer show [--data DIR]
 
-  --data DIR   chain and wallet directory (default ~/.tabernacle/tabminer)
-  --blocks N   blocks to mine, 0 for no limit (default 0)
-  --txs N      most transfers per block (default 368: sixteen segments)
-  --jobs N     segments proven at once (default 2)";
+  --data DIR        chain and wallet directory (default ~/.tabernacle/tabminer)
+  --blocks N        blocks to mine, 0 for no limit (default 0)
+  --txs N           most transfers per block (default 368: sixteen segments)
+  --jobs N          segments proven at once (default 2)
+  --no-mine         follow the chain without mining (same as the node command)
+
+net options:
+  --listen ADDR     UDP address to listen on (default 0.0.0.0:7417)
+  --peer ADDR       a peer to contact, host:port; may repeat
+  --seed HOST:PORT  an extra seed node to resolve; may repeat
+  --verbose         log every network message handled";
 
 /// LMDB map size: an upper bound on the database, reserved as address space.
 const MAP_SIZE: usize = 4 << 30;
+
+/// How long the miner waits for the node to accept its block before moving
+/// on.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Args {
     command: String,
@@ -54,6 +77,11 @@ struct Args {
     blocks: u64,
     txs: usize,
     jobs: usize,
+    no_mine: bool,
+    listen: SocketAddr,
+    peers: Vec<SocketAddr>,
+    seeds: Vec<String>,
+    verbose: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,7 +93,18 @@ fn parse_args() -> Result<Args, String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let data = home.map(|h| h.join(".tabernacle").join("tabminer")).unwrap_or_else(|| PathBuf::from("tabminer-data"));
-    let mut a = Args { command, data, blocks: 0, txs: 368, jobs: 2 };
+    let mut a = Args {
+        command,
+        data,
+        blocks: 0,
+        txs: 368,
+        jobs: 2,
+        no_mine: false,
+        listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
+        peers: Vec::new(),
+        seeds: Vec::new(),
+        verbose: false,
+    };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<u64>().map_err(|_| format!("{flag}: not a number: {v}"));
@@ -74,6 +113,18 @@ fn parse_args() -> Result<Args, String> {
             "--blocks" => a.blocks = number(value()?)?,
             "--txs" => a.txs = number(value()?)? as usize,
             "--jobs" => a.jobs = number(value()?)?.max(1) as usize,
+            "--no-mine" => a.no_mine = true,
+            "--listen" => {
+                let v = value()?;
+                a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
+            }
+            "--peer" => {
+                let v = value()?;
+                let mut addrs = v.to_socket_addrs().map_err(|e| format!("--peer {v}: {e}"))?;
+                a.peers.push(addrs.next().ok_or(format!("--peer {v}: no address"))?);
+            }
+            "--seed" => a.seeds.push(value()?),
+            "--verbose" => a.verbose = true,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
         }
@@ -93,7 +144,9 @@ fn main() {
         }
     };
     let result = match args.command.as_str() {
+        "mine" if args.no_mine => node(&args),
         "mine" => mine(&args),
+        "node" => node(&args),
         "show" => show(&args),
         other => {
             eprintln!("error: unknown command {other}\n\n{USAGE}");
@@ -133,9 +186,32 @@ fn work_bits(target: &Target) -> f64 {
     248.0 - (t + 1.0).log2()
 }
 
-fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Chain<AggregateVerifier>> {
+fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc<Chain<AggregateVerifier>>> {
     std::fs::create_dir_all(args.data.join("chain"))?;
-    Ok(Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, AggregateVerifier::new(params.aggregator))?)
+    let chain =
+        Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, AggregateVerifier::new(params.aggregator))?;
+    chain.init_or_check_genesis()?;
+    Ok(Arc::new(chain))
+}
+
+fn net_config(args: &Args) -> Config {
+    Config {
+        listen: args.listen,
+        peers: args.peers.clone(),
+        seeds: args.seeds.clone(),
+        peers_file: Some(args.data.join("peers")),
+        verbose: args.verbose,
+    }
+}
+
+/// Starts the network node on its own thread; returns its event sender and
+/// tip-change counter.
+fn start_node(args: &Args, chain: &Arc<Chain<AggregateVerifier>>) -> AnyResult<(Sender<Event>, Arc<AtomicU64>)> {
+    let (node, tx) = Node::bind(Arc::clone(chain), net_config(args))?;
+    let tip_changes = node.tip_changes();
+    println!("listening on {}", node.local_addr()?);
+    std::thread::Builder::new().name("node".into()).spawn(move || node.run())?;
+    Ok((tx, tip_changes))
 }
 
 fn show(args: &Args) -> AnyResult<()> {
@@ -159,13 +235,36 @@ fn show(args: &Args) -> AnyResult<()> {
             body.proof.len() / 1000
         );
     }
-    println!("tip {} at height {}, state root {}", hex(&tip.hash()), tip.height, short(&tip.state_root));
+    println!(
+        "tip {} at height {}, state root {}, work 2^{:.1}",
+        hex(&tip.hash()),
+        tip.height,
+        short(&tip.state_root),
+        chain.tip_work()?.0.iter().rev().fold(0f64, |acc, l| acc * 2f64.powi(64) + *l as f64).log2()
+    );
     Ok(())
 }
 
-/// Searches nonces on every thread from a time-based start until one
-/// meets `target`. Returns the nonce, its output and the hashes tried.
-fn solve(dataset: &Dataset, header_hash: &Digest, target: &Target) -> (Nonce, PowOutput, u64) {
+fn node(args: &Args) -> AnyResult<()> {
+    let params = ChainParams::MAINNET;
+    let chain = open_chain(args, params, SeedText::new(params.pow))?;
+    let tip = chain.tip()?.ok_or("no genesis")?;
+    println!("tip at height {} ({})", tip.height, short(&tip.hash()));
+    let (node, _tx) = Node::bind(chain, net_config(args))?;
+    println!("listening on {}", node.local_addr()?);
+    node.run();
+    Ok(())
+}
+
+/// Searches nonces on every thread from a time-based start until one meets
+/// `target` or `cancel` says to stop. Returns the nonce, its output and the
+/// hashes tried.
+fn solve(
+    dataset: &Dataset,
+    header_hash: &Digest,
+    target: &Target,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Option<(Nonce, PowOutput, u64)> {
     let threads = tabminer::parallel::threads() as u64;
     let start = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0) << 8;
     let found = AtomicBool::new(false);
@@ -184,14 +283,17 @@ fn solve(dataset: &Dataset, header_hash: &Digest, target: &Target) -> (Nonce, Po
                     if target.is_met_by(&out.result) && !found.swap(true, Ordering::Relaxed) {
                         *result.lock().unwrap() = Some((nonce, out));
                     }
+                    if local % 64 == 0 && t == 0 && cancel() {
+                        found.store(true, Ordering::Relaxed);
+                    }
                     n = n.wrapping_add(threads);
                 }
                 tried.fetch_add(local, Ordering::Relaxed);
             });
         }
     });
-    let (nonce, out) = result.into_inner().unwrap().unwrap();
-    (nonce, out, tried.into_inner())
+    let (nonce, out) = result.into_inner().unwrap()?;
+    Some((nonce, out, tried.into_inner()))
 }
 
 fn coinbase(wallet: &mut Wallet, amount: u64) -> Transaction {
@@ -217,21 +319,8 @@ fn mine(args: &Args) -> AnyResult<()> {
     println!("dataset: {} MB ready in {}", params.pow.dataset_bytes() >> 20, secs(t.elapsed()));
     let chain = open_chain(args, params, seed)?;
     let mut wallet = Wallet::open(&args.data.join("wallet"))?;
+    let (events, tip_changes) = start_node(args, &chain)?;
 
-    if chain.tip()?.is_none() {
-        let body = Body { inputs: vec![], outputs: vec![], proof: vec![] };
-        let header = Header {
-            prev_hash: EMPTY,
-            height: 0,
-            timestamp: now(),
-            body_commitment: body.commitment(),
-            state_root: chain.state_root()?,
-            mix: EMPTY,
-            nonce: [0u8; 32],
-        };
-        chain.init_genesis(&Block { header, body })?;
-        println!("new chain in {}: genesis {}", args.data.display(), hex(&header.hash()));
-    }
     let tip = chain.tip()?.unwrap();
     println!(
         "tip at height {} ({}); segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",
@@ -247,6 +336,8 @@ fn mine(args: &Args) -> AnyResult<()> {
     let mut mined = 0u64;
     while args.blocks == 0 || mined < args.blocks {
         let started = Instant::now();
+        let generation = tip_changes.load(Ordering::Acquire);
+        let tip_changed = || tip_changes.load(Ordering::Acquire) != generation;
         let tip = chain.tip()?.unwrap();
         let height = tip.height + 1;
         let subsidy = params.subsidy(height);
@@ -299,11 +390,13 @@ fn mine(args: &Args) -> AnyResult<()> {
             });
             (segments, statement, inputs, outputs)
         };
-        // Record the new outputs before the block can be applied.
+        // Record the new outputs before the block can be applied. Outputs
+        // of a block that never lands are simply never spendable.
         wallet.save()?;
 
         println!(
-            "block {height}: {} txs ({} in, {} out) in {} segment{}, wallet {} in {} coins",
+            "proving block {height} on {}: {} txs ({} in, {} out) in {} segment{}, wallet {} in {} coins",
+            short(&tip.hash()),
             txs.len(),
             inputs.len(),
             outputs.len(),
@@ -330,7 +423,12 @@ fn mine(args: &Args) -> AnyResult<()> {
                 println!("  wrap (2^{log_n} + 2^{hash_log_n} rows) proven in {}", secs(elapsed))
             }
         };
-        let proof = prove_block_with(&agg, &shape, &statement, &segments, args.jobs, &report);
+        let Some(proof) =
+            prove_block_cancellable(&agg, &shape, &statement, &segments, args.jobs, &report, &tip_changed)
+        else {
+            println!("  tip changed while proving block {height}; starting over");
+            continue;
+        };
         let prove_time = t.elapsed();
 
         let body = Body { inputs, outputs, proof };
@@ -338,34 +436,48 @@ fn mine(args: &Args) -> AnyResult<()> {
         let mut header = chain.template(&body, timestamp)?;
         let target = chain.expected_target(&tip)?;
         let t = Instant::now();
-        let (nonce, out, hashes) = solve(&dataset, &header.pow_hash(), &target);
+        let Some((nonce, out, hashes)) = solve(&dataset, &header.pow_hash(), &target, &tip_changed) else {
+            println!("  tip changed while mining block {height}; starting over");
+            continue;
+        };
         let mine_time = t.elapsed();
         header.nonce = nonce;
         header.mix = out.mix;
         let block = Block { header, body };
-
-        let t = Instant::now();
-        chain.apply_block(&block, now())?;
-        let verify_time = t.elapsed();
-        mined += 1;
         println!(
-            "  mined {} after {} hashes in {} (work 2^{:.1}); accepted in {}; {} KB proof",
+            "  mined {} after {} hashes in {} (work 2^{:.1}); {} KB proof",
             short(&header.hash()),
             hashes,
             secs(mine_time),
             work_bits(&target),
-            secs(verify_time),
             block.body.proof.len() / 1000,
         );
+
+        // The node applies and announces it; wait for the tip to move.
+        let t = Instant::now();
+        events.send(Event::Mined(block))?;
+        while !tip_changed() && t.elapsed() < ACCEPT_TIMEOUT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let accepted = chain.tip()?.unwrap().hash() == header.hash();
+        if !accepted {
+            println!("  lost block {height}: {} is not the tip", short(&header.hash()));
+        }
+        mined += u64::from(accepted);
         println!(
-            "  total {} (build {}, plan {}, prove {}, mine {}, verify {})",
+            "  total {} (build {}, plan {}, prove {}, mine {}, accept {})",
             secs(started.elapsed()),
             secs(build_time),
             secs(plan_time),
             secs(prove_time),
             secs(mine_time),
-            secs(verify_time)
+            secs(t.elapsed())
         );
+    }
+    if mined > 0 {
+        // Let peers fetch the last block before the node goes away.
+        println!("done; serving peers for a few seconds");
+        std::thread::sleep(Duration::from_secs(5));
     }
     Ok(())
 }

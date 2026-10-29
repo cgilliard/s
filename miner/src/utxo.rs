@@ -169,6 +169,31 @@ impl UtxoSet {
         Ok(true)
     }
 
+    /// Restores a spent output: the inverse of [`UtxoSet::spend_at`].
+    pub fn unspend(&self, wtxn: &mut RwTxn, commitment: &Commitment, position: u64) -> Result<()> {
+        self.tree.update(wtxn, position, commitment)?;
+        self.index.put(wtxn, &index_key(commitment, position), &())?;
+        Ok(())
+    }
+
+    /// Removes the outputs appended from `first` on, which must be the
+    /// last ones added and still unspent, with `commitments` their
+    /// commitments in order; the next position becomes `first`.
+    pub fn truncate(&self, wtxn: &mut RwTxn, first: u64, commitments: &[Commitment]) -> Result<()> {
+        if self.next_position(wtxn)? != first + commitments.len() as u64 {
+            return Err(Error::CorruptIndex);
+        }
+        for (i, c) in commitments.iter().enumerate().rev() {
+            let position = first + i as u64;
+            if !self.index.delete(wtxn, &index_key(c, position))? {
+                return Err(Error::CorruptIndex);
+            }
+            self.tree.remove(wtxn, position)?;
+        }
+        self.meta.put(wtxn, META_NEXT_POSITION, &first)?;
+        Ok(())
+    }
+
     /// Commitment stored at `position`, or the empty digest if spent or
     /// never assigned.
     pub fn get(&self, rtxn: &RoTxn, position: u64) -> Result<Digest> {

@@ -60,6 +60,22 @@ impl U256 {
         self.0 == [0; 4]
     }
 
+    pub fn to_le_bytes(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (chunk, limb) in out.chunks_exact_mut(8).zip(self.0) {
+            chunk.copy_from_slice(&limb.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_le_bytes(b: &[u8; 32]) -> U256 {
+        let mut limbs = [0u64; 4];
+        for (limb, chunk) in limbs.iter_mut().zip(b.chunks_exact(8)) {
+            *limb = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        U256(limbs)
+    }
+
     /// Number of significant bits.
     pub fn bits(&self) -> u32 {
         for i in (0..4).rev() {
@@ -98,6 +114,57 @@ impl U256 {
             out[i] = lo | hi;
         }
         U256(out)
+    }
+
+    pub fn saturating_add(self, other: U256) -> U256 {
+        let mut out = [0u64; 4];
+        let mut carry = 0u64;
+        for i in 0..4 {
+            let (s, c1) = self.0[i].overflowing_add(other.0[i]);
+            let (s, c2) = s.overflowing_add(carry);
+            out[i] = s;
+            carry = u64::from(c1) + u64::from(c2);
+        }
+        if carry > 0 { U256::MAX } else { U256(out) }
+    }
+
+    /// `self - other`, which must not go negative.
+    pub fn checked_sub(self, other: U256) -> Option<U256> {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u64;
+        for i in 0..4 {
+            let (d, b1) = self.0[i].overflowing_sub(other.0[i]);
+            let (d, b2) = d.overflowing_sub(borrow);
+            out[i] = d;
+            borrow = u64::from(b1) + u64::from(b2);
+        }
+        if borrow > 0 { None } else { Some(U256(out)) }
+    }
+
+    pub fn not(self) -> U256 {
+        U256(self.0.map(|l| !l))
+    }
+
+    pub fn bit(&self, i: u32) -> bool {
+        (self.0[(i / 64) as usize] >> (i % 64)) & 1 == 1
+    }
+
+    /// `self / divisor` by long division; `divisor` must be nonzero.
+    pub fn div(self, divisor: U256) -> U256 {
+        assert!(!divisor.is_zero(), "division by zero");
+        let mut quotient = U256::ZERO;
+        let mut rem = U256::ZERO;
+        for i in (0..256).rev() {
+            rem = rem.shift_left(1);
+            if self.bit(i) {
+                rem.0[0] |= 1;
+            }
+            if rem >= divisor {
+                rem = rem.checked_sub(divisor).unwrap();
+                quotient.0[(i / 64) as usize] |= 1 << (i % 64);
+            }
+        }
+        quotient
     }
 
     /// `self * m` as five limbs (no overflow possible).

@@ -13,6 +13,8 @@ pub mod hash_machine;
 pub mod hash_table;
 pub mod inflate;
 pub mod merkle;
+pub mod net;
+pub mod node;
 pub mod ntt;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod packed;
