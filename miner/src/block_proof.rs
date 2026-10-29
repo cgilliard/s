@@ -101,7 +101,7 @@ pub fn decode(bytes: &[u8]) -> Option<Vec<SegmentProof>> {
 pub fn body_from_segments(segments: &[SegmentWitness], proof: Vec<u8>) -> Body {
     Body {
         inputs: segments.iter().flat_map(|s| s.positions()).collect(),
-        outputs: segments.iter().flat_map(|s| s.commitments()).collect(),
+        outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
         proof,
     }
 }
@@ -232,8 +232,7 @@ mod tests {
             max_block_size: 16 << 20,
             max_future_drift: 7200,
             median_time_window: 11,
-            initial_subsidy: 50,
-            halving_interval: 1000,
+            emission: &[(1000, 50)],
             aggregator: crate::aggregate::AggregatorParams::MAINNET,
         }
     }
@@ -284,9 +283,9 @@ mod tests {
         let genesis_body = Body {
             inputs: vec![],
             outputs: vec![
-                Output::new(&a.public_key(), 100).commitment,
-                Output::new(&bk.public_key(), 40).commitment,
-                Output::new(&d.public_key(), 7).commitment,
+                Output::new(&a.public_key(), 100).block_output(),
+                Output::new(&bk.public_key(), 40).block_output(),
+                Output::new(&d.public_key(), 7).block_output(),
             ],
             proof: vec![],
         };

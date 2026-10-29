@@ -14,7 +14,7 @@
 //! level `DEPTH`, index 0.
 //!
 //! Database layout: one named LMDB database mapping a 9-byte node key, the
-//! level as one byte followed by the big-endian index within that level, to
+//! level as one byte followed by the little-endian index within that level, to
 //! the 32-byte node digest.
 
 use std::path::Path;
@@ -97,7 +97,7 @@ pub fn empty_root() -> Digest {
 fn node_key(level: u8, index: u64) -> [u8; KEY_LEN] {
     let mut k = [0u8; KEY_LEN];
     k[0] = level;
-    k[1..].copy_from_slice(&index.to_be_bytes());
+    k[1..].copy_from_slice(&index.to_le_bytes());
     k
 }
 

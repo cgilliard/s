@@ -34,8 +34,12 @@
 //! ```text
 //! transaction := u32 n_in, n_in * input, u32 n_out, n_out * output
 //! input       := pubkey (48) | amount u64 (8) | signature (2312)
-//! output      := key hash (32) | amount u64 (8)
+//! output      := key hash (32) | amount u64 (8) | memo (32)
 //! ```
+//!
+//! An output's memo is eight field elements its owner's wallet fills to find
+//! the output again from its seed (see `crate::wallet`); consensus only
+//! carries it: it is signed with the body and listed with the commitment.
 //!
 //! Hashing works on field elements rather than bytes: a 64-bit amount is
 //! three limbs of 30, 30 and 4 bits, a public key is its 12 elements and a
@@ -52,6 +56,8 @@ pub type Sig = Signature<TREE_HEIGHT>;
 pub type Key = SecretKey<TREE_HEIGHT>;
 /// An output commitment `H(H(pubkey) || amount)`.
 pub type Commitment = Digest;
+/// An output's recovery memo: opaque to consensus.
+pub type Memo = Digest;
 
 /// Serialized size of a field element.
 const FP_BYTES: usize = 4;
@@ -60,7 +66,7 @@ const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
 /// Serialized size of an [`Input`].
 pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + Sig::SIZE;
 /// Serialized size of an [`Output`].
-pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8;
+pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8 + DIGEST_BYTES;
 
 pub(crate) const DOM_PUBKEY: u32 = 1;
 pub(crate) const DOM_COMMITMENT: u32 = 2;
@@ -153,13 +159,14 @@ pub struct Input {
 }
 
 /// A newly created output: the recipient's key hash and the amount, which
-/// travel with the transaction, and the commitment derived from them, which
-/// is all that goes on chain.
+/// travel with the transaction, the commitment derived from them, and the
+/// memo. The commitment and the memo are all that goes on chain.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Output {
     pub key_hash: Digest,
     pub amount: u64,
     pub commitment: Commitment,
+    pub memo: Memo,
 }
 
 /// A transaction with signed inputs.
@@ -178,21 +185,33 @@ pub struct UnsignedTransaction {
 }
 
 impl Output {
-    /// Creates an output paying `amount` to `pk`.
+    /// Creates an output paying `amount` to `pk`, with an empty memo.
     pub fn new(pk: &PublicKey, amount: u64) -> Output {
         Output::to_key_hash(&pubkey_hash(pk), amount)
     }
 
-    /// Creates an output paying `amount` to the key with hash `key_hash`.
+    /// Creates an output paying `amount` to the key with hash `key_hash`,
+    /// with an empty memo.
     pub fn to_key_hash(key_hash: &Digest, amount: u64) -> Output {
-        Output { key_hash: *key_hash, amount, commitment: key_commitment(key_hash, amount) }
+        Output::with_memo(key_hash, amount, [Fp::ZERO; DIGEST])
     }
 
-    /// Key hash then amount; the commitment is recomputed on decoding.
+    /// The part a block lists: the commitment and the memo.
+    pub fn block_output(&self) -> crate::block::BlockOutput {
+        crate::block::BlockOutput { commitment: self.commitment, memo: self.memo }
+    }
+
+    /// Creates an output with a memo.
+    pub fn with_memo(key_hash: &Digest, amount: u64, memo: Memo) -> Output {
+        Output { key_hash: *key_hash, amount, commitment: key_commitment(key_hash, amount), memo }
+    }
+
+    /// Key hash, amount, memo; the commitment is recomputed on decoding.
     pub fn to_bytes(&self) -> [u8; OUTPUT_SIZE] {
         let mut out = [0u8; OUTPUT_SIZE];
         out[..DIGEST_BYTES].copy_from_slice(&digest_to_bytes(&self.key_hash));
-        out[DIGEST_BYTES..].copy_from_slice(&self.amount.to_le_bytes());
+        out[DIGEST_BYTES..DIGEST_BYTES + 8].copy_from_slice(&self.amount.to_le_bytes());
+        out[DIGEST_BYTES + 8..].copy_from_slice(&digest_to_bytes(&self.memo));
         out
     }
 
@@ -201,8 +220,9 @@ impl Output {
             return None;
         }
         let key_hash = digest_from_bytes(&bytes[..DIGEST_BYTES])?;
-        let (amount, _) = read_u64(&bytes[DIGEST_BYTES..])?;
-        Some(Output::to_key_hash(&key_hash, amount))
+        let (amount, _) = read_u64(&bytes[DIGEST_BYTES..DIGEST_BYTES + 8])?;
+        let memo = digest_from_bytes(&bytes[DIGEST_BYTES + 8..])?;
+        Some(Output::with_memo(&key_hash, amount, memo))
     }
 }
 
@@ -236,10 +256,10 @@ impl Input {
 /// ```text
 /// [n_in, n_out, 0, 0, 0, 0, 0, 0]
 /// per input:  [root(8)] [pub_seed(4), amount lo30, mid30, hi4, 0]
-/// per output: [commitment(8)] [amount lo30, mid30, hi4, 0, 0, 0, 0, 0]
+/// per output: [commitment(8)] [amount lo30, mid30, hi4, 0, 0, 0, 0, 0] [memo(8)]
 /// ```
 pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output]) -> Vec<Fp> {
-    let mut body = Vec::with_capacity(8 + 16 * (inputs.len() + outputs.len()));
+    let mut body = Vec::with_capacity(8 + 16 * inputs.len() + 24 * outputs.len());
     body.push(Fp::from_u64(inputs.len() as u64));
     body.push(Fp::from_u64(outputs.len() as u64));
     body.extend_from_slice(&[Fp::ZERO; 6]);
@@ -253,6 +273,7 @@ pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output]) -> 
         body.extend_from_slice(&out.commitment);
         body.extend_from_slice(&amount_fps(out.amount));
         body.extend_from_slice(&[Fp::ZERO; 5]);
+        body.extend_from_slice(&out.memo);
     }
     body
 }
@@ -423,7 +444,7 @@ mod tests {
 
     #[test]
     fn sizes() {
-        assert_eq!(OUTPUT_SIZE, 40);
+        assert_eq!(OUTPUT_SIZE, 72);
         assert_eq!(INPUT_SIZE, 48 + 8 + 2312);
         assert_eq!(TREE_HEIGHT, 4);
         assert_eq!(Key::LEAVES, 16);

@@ -10,13 +10,19 @@
 //! they occupy distinct positions and [`UtxoSet::spend`] consumes the lowest
 //! one first.
 //!
-//! Three named LMDB databases live under a common prefix: `<prefix>.tree`
+//! Four named LMDB databases live under a common prefix: `<prefix>.tree`
 //! (the Merkle tree), `<prefix>.index` (commitment bytes followed by the
-//! big-endian position, no value) and `<prefix>.meta` (the counter). All
+//! little-endian position, no value), `<prefix>.memo` (position to the
+//! output's memo, for unspent outputs with a non-empty memo; what wallet
+//! recovery scans) and `<prefix>.meta` (the counter). All
 //! operations take the caller's transaction so a block can update the set
 //! and its own records atomically.
 
-use heed::byteorder::BigEndian;
+use crate::block::BlockOutput;
+use crate::poseidon2::digest_from_bytes;
+use crate::state_tree::EMPTY;
+use crate::transaction::Memo;
+use heed::byteorder::LittleEndian;
 use heed::types::{Bytes, Str, U64, Unit};
 use heed::{Database, Env, RoTxn, RwTxn};
 
@@ -77,7 +83,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 fn index_key(commitment: &Commitment, position: u64) -> [u8; INDEX_KEY_LEN] {
     let mut k = [0u8; INDEX_KEY_LEN];
     k[..COMMITMENT_BYTES].copy_from_slice(&digest_to_bytes(commitment));
-    k[COMMITMENT_BYTES..].copy_from_slice(&position.to_be_bytes());
+    k[COMMITMENT_BYTES..].copy_from_slice(&position.to_le_bytes());
     k
 }
 
@@ -86,7 +92,8 @@ fn index_key(commitment: &Commitment, position: u64) -> [u8; INDEX_KEY_LEN] {
 pub struct UtxoSet {
     tree: StateTree,
     index: Database<Bytes, Unit>,
-    meta: Database<Str, U64<BigEndian>>,
+    memos: Database<U64<LittleEndian>, Bytes>,
+    meta: Database<Str, U64<LittleEndian>>,
 }
 
 impl UtxoSet {
@@ -95,8 +102,9 @@ impl UtxoSet {
     pub fn open(env: &Env, wtxn: &mut RwTxn, prefix: &str) -> Result<UtxoSet> {
         let tree = StateTree::open(env, wtxn, &format!("{prefix}.tree"))?;
         let index = env.create_database(wtxn, Some(&format!("{prefix}.index")))?;
+        let memos = env.create_database(wtxn, Some(&format!("{prefix}.memo")))?;
         let meta = env.create_database(wtxn, Some(&format!("{prefix}.meta")))?;
-        Ok(UtxoSet { tree, index, meta })
+        Ok(UtxoSet { tree, index, memos, meta })
     }
 
     /// The underlying Merkle tree.
@@ -137,8 +145,10 @@ impl UtxoSet {
             if key.len() != INDEX_KEY_LEN {
                 return Err(Error::CorruptIndex);
             }
-            out.push(u64::from_be_bytes(key[COMMITMENT_BYTES..].try_into().unwrap()));
+            out.push(u64::from_le_bytes(key[COMMITMENT_BYTES..].try_into().unwrap()));
         }
+        // Keys are little endian, so LMDB's order is not numeric.
+        out.sort_unstable();
         Ok(out)
     }
 
@@ -166,14 +176,50 @@ impl UtxoSet {
             return Ok(false);
         }
         self.tree.remove(wtxn, position)?;
+        self.memos.delete(wtxn, &position)?;
         Ok(true)
     }
 
-    /// Restores a spent output: the inverse of [`UtxoSet::spend_at`].
-    pub fn unspend(&self, wtxn: &mut RwTxn, commitment: &Commitment, position: u64) -> Result<()> {
+    /// Restores a spent output and its memo: the inverse of
+    /// [`UtxoSet::spend_at`].
+    pub fn unspend(&self, wtxn: &mut RwTxn, commitment: &Commitment, memo: &Memo, position: u64) -> Result<()> {
         self.tree.update(wtxn, position, commitment)?;
         self.index.put(wtxn, &index_key(commitment, position), &())?;
+        self.put_memo(wtxn, position, memo)
+    }
+
+    /// Adds an output with its memo; returns its position.
+    pub fn add_output(&self, wtxn: &mut RwTxn, output: &BlockOutput) -> Result<u64> {
+        let position = self.add(wtxn, &output.commitment)?;
+        self.put_memo(wtxn, position, &output.memo)?;
+        Ok(position)
+    }
+
+    fn put_memo(&self, wtxn: &mut RwTxn, position: u64, memo: &Memo) -> Result<()> {
+        if *memo != EMPTY {
+            self.memos.put(wtxn, &position, &digest_to_bytes(memo))?;
+        }
         Ok(())
+    }
+
+    /// The memo of the unspent output at `position` (empty if it has none).
+    pub fn memo(&self, rtxn: &RoTxn, position: u64) -> Result<Memo> {
+        match self.memos.get(rtxn, &position)? {
+            None => Ok(EMPTY),
+            Some(b) => digest_from_bytes(b).ok_or(Error::CorruptIndex),
+        }
+    }
+
+    /// Every unspent output's non-empty memo with its position, in
+    /// position order.
+    pub fn memos(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Memo)>> {
+        let mut out = Vec::new();
+        for item in self.memos.iter(rtxn)? {
+            let (position, b) = item?;
+            out.push((position, digest_from_bytes(b).ok_or(Error::CorruptIndex)?));
+        }
+        out.sort_unstable_by_key(|(p, _)| *p);
+        Ok(out)
     }
 
     /// Removes the outputs appended from `first` on, which must be the
@@ -189,6 +235,7 @@ impl UtxoSet {
                 return Err(Error::CorruptIndex);
             }
             self.tree.remove(wtxn, position)?;
+            self.memos.delete(wtxn, &position)?;
         }
         self.meta.put(wtxn, META_NEXT_POSITION, &first)?;
         Ok(())

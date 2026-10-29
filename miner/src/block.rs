@@ -21,9 +21,12 @@
 //! # Body
 //!
 //! 1. Inputs: positions in the state tree of the outputs being spent, five
-//!    bytes each, in transaction order and without repeats.
-//! 2. Outputs: commitments, 32 bytes each, in the order they are appended
-//!    to the state tree.
+//!    bytes each (little endian, below 2^40), in transaction order and
+//!    without repeats.
+//! 2. Outputs: a commitment and a memo, 32 bytes each, in the order they
+//!    are appended to the state tree. The memo is opaque to consensus (its
+//!    owner's wallet uses it for recovery); the proof binds it to the
+//!    transaction that created the output.
 //! 3. The validity proof.
 //!
 //! Keys, amounts, signatures and transaction boundaries are not on chain;
@@ -34,11 +37,27 @@
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
 use crate::pow::{self, Digest, ItemSource, Nonce, PowOutput, SeedText, Target, pack_bytes};
 use crate::state_tree::CAPACITY;
-use crate::transaction::{Commitment, hash_domain};
+use crate::transaction::{Commitment, Memo, hash_domain};
 
 pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32;
 pub const POSITION_SIZE: usize = 5;
 pub const COMMITMENT_SIZE: usize = 4 * DIGEST;
+/// Serialized size of a block output: commitment and memo.
+pub const BLOCK_OUTPUT_SIZE: usize = 2 * COMMITMENT_SIZE;
+
+/// An output as a block lists it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BlockOutput {
+    pub commitment: Commitment,
+    pub memo: Memo,
+}
+
+impl From<Commitment> for BlockOutput {
+    /// An output with an empty memo.
+    fn from(commitment: Commitment) -> BlockOutput {
+        BlockOutput { commitment, memo: [Fp::ZERO; DIGEST] }
+    }
+}
 
 const DOM_POW_HASH: u32 = 0x10;
 const DOM_BLOCK_ID: u32 = 0x11;
@@ -152,8 +171,8 @@ impl std::error::Error for BodyError {}
 pub struct Body {
     /// State tree positions being spent, in transaction order, no repeats.
     pub inputs: Vec<u64>,
-    /// Commitments of the new outputs, in tree order.
-    pub outputs: Vec<Commitment>,
+    /// The new outputs, in tree order.
+    pub outputs: Vec<BlockOutput>,
     /// Validity proof.
     pub proof: Vec<u8>,
 }
@@ -183,7 +202,7 @@ impl Body {
 
     /// Commitment to inputs, outputs and proof.
     pub fn commitment(&self) -> Digest {
-        let mut v = Vec::with_capacity(2 + 2 * self.inputs.len() + DIGEST * self.outputs.len() + DIGEST);
+        let mut v = Vec::with_capacity(2 + 2 * self.inputs.len() + 2 * DIGEST * self.outputs.len() + DIGEST);
         v.push(Fp::from_u64(self.inputs.len() as u64));
         for &p in &self.inputs {
             v.push(Fp::new((p & MASK30) as u32));
@@ -191,25 +210,27 @@ impl Body {
         }
         v.push(Fp::from_u64(self.outputs.len() as u64));
         for o in &self.outputs {
-            v.extend_from_slice(o);
+            v.extend_from_slice(&o.commitment);
+            v.extend_from_slice(&o.memo);
         }
         v.extend_from_slice(&self.proof_hash());
         hash_domain(DOM_BODY, &v)
     }
 
     pub fn size(&self) -> usize {
-        12 + self.inputs.len() * POSITION_SIZE + self.outputs.len() * COMMITMENT_SIZE + self.proof.len()
+        12 + self.inputs.len() * POSITION_SIZE + self.outputs.len() * BLOCK_OUTPUT_SIZE + self.proof.len()
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.size());
         out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
         for &p in &self.inputs {
-            out.extend_from_slice(&p.to_be_bytes()[3..]);
+            out.extend_from_slice(&p.to_le_bytes()[..POSITION_SIZE]);
         }
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
-            out.extend_from_slice(&digest_to_bytes(o));
+            out.extend_from_slice(&digest_to_bytes(&o.commitment));
+            out.extend_from_slice(&digest_to_bytes(&o.memo));
         }
         out.extend_from_slice(&(self.proof.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.proof);
@@ -232,14 +253,18 @@ impl Body {
         for _ in 0..n_in {
             let b = r.take(POSITION_SIZE).ok_or(BodyError::Malformed)?;
             let mut buf = [0u8; 8];
-            buf[3..].copy_from_slice(b);
-            inputs.push(u64::from_be_bytes(buf));
+            buf[..POSITION_SIZE].copy_from_slice(b);
+            inputs.push(u64::from_le_bytes(buf));
         }
         let n_out = r.u32().ok_or(BodyError::Malformed)? as usize;
-        let mut outputs = Vec::with_capacity(n_out.min(bytes.len() / COMMITMENT_SIZE));
+        let mut outputs = Vec::with_capacity(n_out.min(bytes.len() / BLOCK_OUTPUT_SIZE));
         for _ in 0..n_out {
-            let b = r.take(COMMITMENT_SIZE).ok_or(BodyError::Malformed)?;
-            outputs.push(digest_from_bytes(b).ok_or(BodyError::Malformed)?);
+            let c = r.take(COMMITMENT_SIZE).ok_or(BodyError::Malformed)?;
+            let m = r.take(COMMITMENT_SIZE).ok_or(BodyError::Malformed)?;
+            outputs.push(BlockOutput {
+                commitment: digest_from_bytes(c).ok_or(BodyError::Malformed)?,
+                memo: digest_from_bytes(m).ok_or(BodyError::Malformed)?,
+            });
         }
         let n_proof = r.u32().ok_or(BodyError::Malformed)? as usize;
         let proof = r.take(n_proof).ok_or(BodyError::Malformed)?.to_vec();
@@ -327,11 +352,13 @@ mod tests {
         }
     }
 
-    fn outputs() -> Vec<Commitment> {
+    fn outputs() -> Vec<BlockOutput> {
         let mut seed = [0u8; 32];
         seed[0] = 9;
         let pk = Key::generate(&seed).public_key();
-        vec![Output::new(&pk, 5).commitment, Output::new(&pk, u64::MAX).commitment]
+        let memo = core::array::from_fn(|i| Fp::new(1000 + i as u32));
+        let with_memo = Output::with_memo(&crate::transaction::pubkey_hash(&pk), u64::MAX, memo);
+        vec![Output::new(&pk, 5).block_output(), with_memo.block_output()]
     }
 
     #[test]
@@ -379,7 +406,7 @@ mod tests {
 
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
-        assert_eq!(bytes.len(), 12 + 4 * 5 + 2 * 32 + 3);
+        assert_eq!(bytes.len(), 12 + 4 * 5 + 2 * 64 + 3);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
         assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(BodyError::DuplicateInput(1)));
         assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
@@ -404,7 +431,7 @@ mod tests {
         b.inputs.push(10);
         assert_ne!(b.commitment(), c);
         let mut b = base.clone();
-        b.outputs[0][0] += Fp::ONE;
+        b.outputs[0].commitment[0] += Fp::ONE;
         assert_ne!(b.commitment(), c);
         let mut b = base.clone();
         b.outputs.swap(0, 1);

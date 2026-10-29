@@ -6,6 +6,7 @@
 //! tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
 //! tabminer node [--data DIR] [options]
 //! tabminer show [--data DIR]
+//! tabminer restore [--data DIR]
 //!
 //! options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose] [--no-prompt]
 //! ```
@@ -32,9 +33,15 @@
 //! `--blocks 0` (the default) runs until `quit`. `--jobs` bounds how many
 //! segments are proven at once.
 //!
+//! The wallet is created on first run with a 12-word BIP39 phrase, shown
+//! once (and by `phrase`). `restore` rebuilds a wallet from a phrase in an
+//! empty data directory; once the node has synced, `scan` finds its
+//! outputs on chain from their memos.
+//!
 //! Payments use slate files: `send` writes one for the recipient, who
 //! answers it with `receive`; `finalize` on the sender's side signs it and
-//! pools the transaction.
+//! pools the transaction. `cancel` replaces an unconfirmed payment with
+//! one paying the inputs back, at a higher fee.
 
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -54,7 +61,7 @@ use tabminer::node::{Config, DEFAULT_PORT, Event, Node, Stats};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
-use tabminer::wallet::{Slate, State, Wallet, digest_from_hex};
+use tabminer::wallet::{Signed, Slate, State, Wallet};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -62,6 +69,7 @@ const USAGE: &str = "usage:
   tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
   tabminer node [--data DIR] [options]
   tabminer show [--data DIR]
+  tabminer restore [--data DIR]     rebuild a wallet from its 12-word phrase
 
   --data DIR        chain, wallet and log directory (default ~/.tabernacle/tabminer)
   --blocks N        blocks to mine, 0 for no limit (default 0)
@@ -79,15 +87,19 @@ const HELP: &str = "commands:
   status                    chain tip, peers, mempool, wallet totals
   peers                     known peers
   mempool                   pooled transactions
-  balance                   confirmed, pending and reserved funds
+  balance                   confirmed, pending, reserved and locked funds
   outputs                   the wallet's outputs
   send AMOUNT FEE FILE      start a payment: write a slate for the recipient
-  receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE)
+  receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
-  cancel SLATE-ID           abandon a pending slate, freeing its inputs
+  cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
+                            an unconfirmed payment with one paying its inputs back
+                            (FEE defaults to the smallest the network accepts)
   slates                    pending slates
+  sent                      unconfirmed payments that can be cancelled
+  scan                      find this wallet's outputs on chain (after a restore)
   prune                     forget unspent outputs the chain does not hold
-  seed                      show the master seed (not enough to restore funds)
+  phrase                    show the wallet's 12-word recovery phrase
   quit                      stop the node
 amounts are coins with up to eight decimals, e.g. 1.5";
 
@@ -174,6 +186,7 @@ fn main() {
         "mine" => run(&args, !args.no_mine),
         "node" => run(&args, false),
         "show" => show(&args),
+        "restore" => restore(&args),
         other => {
             eprintln!("error: unknown command {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -219,7 +232,7 @@ fn parse_coins(s: &str) -> Option<u64> {
 
 /// Expected hashes to meet `target`: `2^248 / (target + 1)`, as log2.
 fn work_bits(target: &Target) -> f64 {
-    let t = target.0.iter().fold(0f64, |acc, b| acc * 256.0 + *b as f64);
+    let t = target.0.iter().rev().fold(0f64, |acc, b| acc * 256.0 + *b as f64);
     248.0 - (t + 1.0).log2()
 }
 
@@ -273,7 +286,8 @@ fn show(args: &Args) -> AnyResult<()> {
 }
 
 fn log2_u256(w: tabminer::difficulty::U256) -> f64 {
-    w.0.iter().rev().fold(0f64, |acc, l| acc * 2f64.powi(64) + *l as f64).log2()
+    // Genesis alone has no work; show 2^0 rather than 2^-inf.
+    w.0.iter().rev().fold(0f64, |acc, l| acc * 2f64.powi(64) + *l as f64).max(1.0).log2()
 }
 
 /// Everything the prompt and the miner share.
@@ -320,7 +334,13 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         None
     };
     let chain = open_chain(args, params, seed)?;
-    let wallet = Arc::new(Wallet::open(&args.data.join("wallet"))?);
+    let (wallet, created) = Wallet::open(&args.data.join("wallet"))?;
+    if let Some(phrase) = created {
+        log::line("created a new wallet");
+        println!("\nnew wallet; its recovery phrase is:\n\n    {phrase}\n");
+        println!("write it down and keep it safe: it is the only way to restore the wallet's funds\n");
+    }
+    let wallet = Arc::new(wallet);
     let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
     let (node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), net_config(args))?;
     let stats = node.stats();
@@ -346,6 +366,25 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         stop: Arc::new(AtomicBool::new(false)),
         mining,
     });
+    // The chain ends at the schedule's final block: once the tip reaches
+    // it, the node has nothing left to do.
+    {
+        let ctx = Arc::clone(&ctx);
+        std::thread::Builder::new().name("final-block".into()).spawn(move || {
+            let last = ctx.params.final_height();
+            loop {
+                if ctx.chain.tip().ok().flatten().is_some_and(|t| t.height >= last) {
+                    let msg = format!("the chain has reached its final block, height {last}; exiting");
+                    log::line(&msg);
+                    println!("\n{msg}");
+                    // Let the node announce the block before going.
+                    std::thread::sleep(Duration::from_secs(5));
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })?;
+    }
     let miner = match dataset {
         Some(dataset) => {
             let ctx = Arc::clone(&ctx);
@@ -443,10 +482,11 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             );
             println!("mempool  {} transactions, {} KB", pool.len(), pool.bytes() / 1000);
             println!(
-                "wallet   {} confirmed, {} pending, {} reserved",
+                "wallet   {} confirmed, {} pending, {} reserved, {} locked",
                 fmt_coins(b.confirmed),
                 fmt_coins(b.pending),
-                fmt_coins(b.reserved)
+                fmt_coins(b.reserved),
+                fmt_coins(b.locked)
             );
             println!("mining   {}", if ctx.mining { "on" } else { "off" });
         }
@@ -475,9 +515,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         "balance" => {
             let rtxn = ctx.chain.env().read_txn()?;
             let b = ctx.wallet.balance(ctx.chain.utxo(), &rtxn)?;
-            println!("confirmed {}", fmt_coins(b.confirmed));
-            println!("pending   {}", fmt_coins(b.pending));
-            println!("reserved  {}", fmt_coins(b.reserved));
+            println!("confirmed {}  spendable", fmt_coins(b.confirmed));
+            println!("pending   {}  incoming, not yet on chain", fmt_coins(b.pending));
+            println!("reserved  {}  held for a slate not yet finalized", fmt_coins(b.reserved));
+            println!("locked    {}  signed, being sent, not yet confirmed", fmt_coins(b.locked));
         }
         "outputs" => {
             let rtxn = ctx.chain.env().read_txn()?;
@@ -491,14 +532,16 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     (State::Unspent, true) => "confirmed",
                     (State::Unspent, false) => "pending",
                     (State::Reserved, _) => "reserved",
-                    (State::Spent, _) => "spent",
+                    (State::Spent, true) => "locked",
+                    (State::Spent, false) => "spent",
                 };
                 println!(
-                    "key {:<6} {:>20}  {:<9}  {}  {}",
-                    o.key_index,
+                    "{}  {:>20}  {:<9}  {} signatures left{}  {}",
+                    short(&o.commitment),
                     fmt_coins(o.amount as u128),
                     state,
-                    short(&o.commitment),
+                    o.signatures_left(),
+                    if o.recovered { ", recovered" } else { "" },
                     log::timestamp_of(o.created)
                 );
             }
@@ -523,10 +566,15 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "receive" => {
             let (file, out) = match args {
-                [file] => (*file, *file),
-                [file, out] => (*file, *out),
+                [file] => (file.to_string(), format!("{file}.received")),
+                [file, out] => (file.to_string(), out.to_string()),
                 _ => return Err("usage: receive FILE [OUT]".into()),
             };
+            if out == file {
+                return Err("the answered slate must not overwrite the one received".into());
+            }
+            let file = file.as_str();
+            let out = out.as_str();
             let mut slate = read_slate(file)?;
             ctx.wallet.receive_slate(&mut slate)?;
             std::fs::write(out, slate.to_bytes())?;
@@ -542,25 +590,58 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 return Err("usage: finalize FILE".into());
             };
             let slate = read_slate(file)?;
-            let tx = ctx.wallet.finalize(&slate)?;
-            let txid = tx.txid();
-            ctx.events.send(Event::Transaction(tx))?;
-            println!("transaction {} signed and sent to the pool", short(&txid));
+            let signed = ctx.wallet.finalize(&slate)?;
+            submit(ctx, signed);
         }
         "cancel" => {
-            let [id] = args else {
-                return Err("usage: cancel SLATE-ID".into());
+            let (id, fee) = match args {
+                [id] => (*id, None),
+                [id, fee] => (*id, Some(parse_coins(fee).ok_or("bad fee")?)),
+                _ => return Err("usage: cancel ID [FEE]".into()),
             };
-            let full = ctx
-                .wallet
-                .pending_slates()?
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let slate = ctx.wallet.pending_slates()?.into_iter().map(|(s, _)| s).find(|s| hex(s).starts_with(id));
+            if let Some(slate) = slate {
+                ctx.wallet.cancel_slate(&slate)?;
+                println!("slate cancelled; its inputs are spendable again");
+                return Ok(());
+            }
+            let rtxn = ctx.chain.env().read_txn()?;
+            let sent = ctx.wallet.sent(ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            let s = sent
                 .into_iter()
-                .map(|(id, _)| id)
-                .find(|s| s.iter().map(|b| format!("{b:02x}")).collect::<String>().starts_with(id))
-                .or_else(|| digest_from_hex(id))
-                .ok_or("no pending slate starts with that id")?;
-            ctx.wallet.cancel(&full)?;
-            println!("slate cancelled; its inputs are spendable again");
+                .find(|s| hex(&digest_to_bytes(&s.txid)).starts_with(id))
+                .ok_or("no pending slate or unconfirmed payment starts with that id")?;
+            let signed = ctx.wallet.cancel_sent(&s.txid, fee)?;
+            println!(
+                "payment {} replaced; the inputs come back less a fee of {}",
+                short(&s.txid),
+                fmt_coins(signed.tx.balance() as u128)
+            );
+            submit(ctx, signed);
+        }
+        "sent" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let sent = ctx.wallet.sent(ctx.chain.utxo(), &rtxn)?;
+            if sent.is_empty() {
+                println!("no unconfirmed payments");
+            }
+            for s in sent {
+                println!(
+                    "{}  fee {}  {} inputs  {}  (cancel from {})",
+                    hex_digest(&s.txid),
+                    fmt_coins(s.fee as u128),
+                    s.inputs.len(),
+                    log::timestamp_of(s.created),
+                    fmt_coins(Wallet::min_replacement_fee(&s) as u128)
+                );
+            }
+        }
+        "scan" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let (n, total) = ctx.wallet.scan(ctx.chain.utxo(), &rtxn)?;
+            println!("found {n} outputs worth {}", fmt_coins(total));
         }
         "slates" => {
             let slates = ctx.wallet.pending_slates()?;
@@ -580,12 +661,56 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let n = ctx.wallet.prune_pending(ctx.chain.utxo(), &rtxn)?;
             println!("{n} pending outputs forgotten");
         }
-        "seed" => {
-            println!("{}", ctx.wallet.seed_hex());
-            println!("the seed derives the keys but not the amounts: back up the wallet directory");
+        "phrase" => {
+            println!("{}", ctx.wallet.phrase()?);
+            println!("anyone with these words (and the passphrase, if one was used) can take the funds");
         }
         _ => println!("unknown command {cmd}; type help"),
     }
+    Ok(())
+}
+
+fn hex_digest(d: &Digest) -> String {
+    hex(d)
+}
+
+/// Pools a signed transaction and reports it, with a warning for inputs
+/// that made their last signature.
+fn submit(ctx: &Ctx, signed: Signed) {
+    let txid = signed.tx.txid();
+    if !signed.last_signatures.is_empty() {
+        println!(
+            "warning: this was the last signature {} can make; it cannot be cancelled again",
+            if signed.last_signatures.len() == 1 { "an input" } else { "some inputs" }
+        );
+    }
+    match ctx.events.send(Event::Transaction(signed.tx)) {
+        Ok(()) => println!("transaction {} signed and sent to the pool", short(&txid)),
+        Err(_) => println!("transaction {} signed, but the node has stopped", short(&txid)),
+    }
+}
+
+/// Rebuilds a wallet from its phrase in an empty data directory.
+fn restore(args: &Args) -> AnyResult<()> {
+    let dir = args.data.join("wallet");
+    if dir.join("data.mdb").exists() {
+        return Err(format!("{} already has a wallet; restore into another --data directory", dir.display()).into());
+    }
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    print!("recovery phrase (12 words): ");
+    std::io::stdout().flush()?;
+    stdin.lock().read_line(&mut line)?;
+    let phrase = line.trim().to_string();
+    tabminer::bip39::entropy(&phrase)?;
+    let mut pass = String::new();
+    print!("passphrase (empty if none): ");
+    std::io::stdout().flush()?;
+    stdin.lock().read_line(&mut pass)?;
+    std::fs::create_dir_all(&args.data)?;
+    Wallet::restore(&dir, &phrase, pass.trim_end_matches(['\r', '\n']))?;
+    println!("wallet restored in {}", dir.display());
+    println!("start tabminer with this --data directory, wait for it to sync, then type scan");
     Ok(())
 }
 
@@ -665,6 +790,10 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         let cancel = || ctx.stop.load(Ordering::Acquire) || ctx.tip_changes.load(Ordering::Acquire) != generation;
         let tip = chain.tip()?.unwrap();
         let height = tip.height + 1;
+        if height > params.final_height() {
+            log::line("the chain has reached its final block; nothing left to mine");
+            break;
+        }
         let subsidy = params.subsidy(height);
 
         // Transactions: the reward, then the pooled ones by fee rate while
@@ -708,7 +837,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             let new_state_root = utxo.root(&wtxn)?;
             wtxn.abort();
             let inputs: Vec<u64> = segments.iter().flat_map(|s| s.positions()).collect();
-            let outputs: Vec<_> = segments.iter().flat_map(|s| s.commitments()).collect();
+            let outputs: Vec<_> = segments.iter().flat_map(|s| s.block_outputs()).collect();
             let body = Body { inputs: inputs.clone(), outputs: outputs.clone(), proof: vec![] };
             let statement = Statement::from_block(&BlockStatement {
                 height,

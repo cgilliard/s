@@ -40,22 +40,6 @@ impl U256 {
         U256([v, 0, 0, 0])
     }
 
-    pub fn from_be_bytes(b: &[u8; 32]) -> U256 {
-        let mut l = [0u64; 4];
-        for (i, chunk) in b.chunks_exact(8).enumerate() {
-            l[3 - i] = u64::from_be_bytes(chunk.try_into().unwrap());
-        }
-        U256(l)
-    }
-
-    pub fn to_be_bytes(self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-            chunk.copy_from_slice(&self.0[3 - i].to_be_bytes());
-        }
-        out
-    }
-
     pub fn is_zero(&self) -> bool {
         self.0 == [0; 4]
     }
@@ -201,13 +185,13 @@ impl Ord for U256 {
 
 impl From<Target> for U256 {
     fn from(t: Target) -> U256 {
-        U256::from_be_bytes(&t.0)
+        U256::from_le_bytes(&t.0)
     }
 }
 
 impl From<U256> for Target {
     fn from(v: U256) -> Target {
-        Target(v.to_be_bytes())
+        Target(v.to_le_bytes())
     }
 }
 
@@ -356,7 +340,7 @@ mod tests {
         assert_eq!(a.bits(), 13);
         assert_eq!(U256::ZERO.bits(), 0);
         assert!(U256::MAX > a);
-        assert_eq!(U256::from_be_bytes(&a.shift_left(100).to_be_bytes()), a.shift_left(100));
+        assert_eq!(U256::from_le_bytes(&a.shift_left(100).to_le_bytes()), a.shift_left(100));
         let t: Target = a.into();
         assert_eq!(U256::from(t), a);
     }

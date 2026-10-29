@@ -17,6 +17,7 @@ cargo build --release
 tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
 tabminer node [--data DIR] [options]
 tabminer show [--data DIR]
+tabminer restore [--data DIR]
 
 options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose] [--no-prompt]
 ```
@@ -37,21 +38,38 @@ Every node starts from the fixed mainnet genesis in `ChainParams::MAINNET`.
 
 ## Wallet
 
-Each node has a wallet in `DIR/wallet`: hierarchical one-time keys from a
-master seed, with the leaf of every key tracked durably so no XMSS leaf is
-ever reused. Nothing on chain reveals amounts or ownership, so back up the
-wallet directory, not just the seed.
+Each node has a wallet in `DIR/wallet`. It is created on first run with a
+12-word BIP39 recovery phrase, shown once in the terminal and again with
+`phrase`. Every output the wallet creates has its own one-time key, derived
+from the phrase and a random nonce, and carries a 32-byte memo on chain that
+only the phrase can read: it holds the nonce and the encrypted amount.
+
+To recover a wallet from its phrase:
+
+```
+tabminer restore --data DIR2       # asks for the phrase and an optional passphrase
+tabminer --data DIR2               # sync, then at the prompt:
+> scan                             # finds the wallet's unspent outputs from their memos
+```
+
+Each output's key has 16 one-time signing leaves. A wallet signs its own
+outputs from leaves 0 to 7 (a spend and up to seven cancellations, the last
+one flagged); outputs found by `scan` sign from leaves 8 to 15, from a random
+start, so a restored copy never signs with a leaf the original used.
 
 Payments use slate files passed between the two wallets by any channel:
 
 ```
 > send 10 0.5 /tmp/pay.slate        # sender: 10 coins, 0.5 fee; reserves inputs
-> receive /tmp/pay.slate            # recipient: adds their output
-> finalize /tmp/pay.slate           # sender: signs and pools the transaction
+> receive /tmp/pay.slate            # recipient: adds their output, writes /tmp/pay.slate.received
+> finalize /tmp/pay.slate.received  # sender: signs and pools the transaction
+> cancel ID                         # sender: replace it, before it confirms, with
+                                    # one paying the inputs back at a higher fee
 ```
 
-`balance`, `outputs`, `slates`, `cancel`, `mempool`, `peers` and `status`
-show the rest. The reward of a mined block goes to the miner's wallet.
+`balance` shows confirmed, pending (incoming), reserved (held for a slate)
+and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
+`mempool`, `peers` and `status` show the rest. The reward of a mined block goes to the miner's wallet.
 
 To try two nodes on one machine:
 

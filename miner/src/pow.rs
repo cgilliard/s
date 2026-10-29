@@ -27,6 +27,7 @@
 //! loop becomes `a * FNV_PRIME + b` in the field, and the hashes are the
 //! Poseidon2 permutation. Items are 16 field elements.
 
+use crate::difficulty::U256;
 use crate::poseidon2::{DIGEST, Fp, P, RATE, WIDTH, compress, permute_in_place};
 
 pub type Digest = [Fp; DIGEST];
@@ -339,23 +340,24 @@ pub fn hashimoto<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce)
 // Targets
 // ---------------------------------------------------------------------------
 
-/// A 248-bit big-endian target; `result <= target` passes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+/// A 248-bit target as 32 little-endian bytes (the last one zero);
+/// `result <= target` passes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Target(pub [u8; 32]);
 
-/// Packs a digest into a 248-bit big-endian integer (element 0 is the most
-/// significant 31 bits), returned as 32 bytes with the top byte zero.
-pub fn digest_to_u248_be(d: &Digest) -> [u8; 32] {
+/// The 248-bit integer a digest stands for (element 0 is the most
+/// significant 31 bits), as 32 little-endian bytes with the last one zero.
+pub fn digest_to_u248_le(d: &Digest) -> [u8; 32] {
     let mut out = [0u8; 32];
     let mut acc: u128 = 0;
     let mut bits = 0;
-    let mut pos = 32;
+    let mut pos = 0;
     for e in d.iter().rev() {
         acc |= (e.to_canonical() as u128) << bits;
         bits += 31;
         while bits >= 8 {
-            pos -= 1;
             out[pos] = (acc & 0xff) as u8;
+            pos += 1;
             acc >>= 8;
             bits -= 8;
         }
@@ -364,20 +366,20 @@ pub fn digest_to_u248_be(d: &Digest) -> [u8; 32] {
 }
 
 impl Target {
-    /// The largest possible target: every result passes.
+    /// The largest possible target, 2^248 - 1: every result passes.
     pub const MAX: Target = {
         let mut t = [0xffu8; 32];
-        t[0] = 0;
+        t[31] = 0;
         Target(t)
     };
 
     /// Target requiring `bits` leading zero bits in the 248-bit result.
     pub fn from_leading_zero_bits(bits: u32) -> Target {
         assert!(bits <= 248);
-        let mut t = [0u8; 32];
         let ones = 248 - bits;
-        for (i, byte) in t.iter_mut().enumerate().rev() {
-            let lo = (31 - i) as u32 * 8;
+        let mut t = [0u8; 32];
+        for (i, byte) in t.iter_mut().enumerate() {
+            let lo = i as u32 * 8;
             if lo + 8 <= ones {
                 *byte = 0xff;
             } else if lo < ones {
@@ -387,8 +389,24 @@ impl Target {
         Target(t)
     }
 
+    pub fn value(&self) -> U256 {
+        U256::from_le_bytes(&self.0)
+    }
+
     pub fn is_met_by(&self, result: &Digest) -> bool {
-        digest_to_u248_be(result) <= self.0
+        U256::from_le_bytes(&digest_to_u248_le(result)) <= self.value()
+    }
+}
+
+impl PartialOrd for Target {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Target {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.value().cmp(&other.value())
     }
 }
 
@@ -518,31 +536,32 @@ mod tests {
     fn targets() {
         let zero = [Fp::ZERO; DIGEST];
         let max = [Fp::new(P - 1); DIGEST];
-        assert_eq!(digest_to_u248_be(&zero), [0u8; 32]);
-        let packed = digest_to_u248_be(&max);
-        assert_eq!(packed[0], 0);
+        assert_eq!(digest_to_u248_le(&zero), [0u8; 32]);
+        let packed = digest_to_u248_le(&max);
+        assert_eq!(packed[31], 0);
         // Elements 0..4 occupy bits 124..248 of the 248-bit value; the top 16
         // bytes hold bits 128..256, so they equal that 124-bit value >> 4.
         let mut big: u128 = 0;
         for e in max.iter().take(4) {
             big = (big << 31) | e.to_canonical() as u128;
         }
-        let hi = u128::from_be_bytes(packed[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(packed[16..].try_into().unwrap());
         assert_eq!(hi, big >> 4);
         let mut lo_expected: u128 = (max[3].to_canonical() & 0xf) as u128;
         for e in max.iter().skip(4) {
             lo_expected = (lo_expected << 31) | e.to_canonical() as u128;
         }
-        assert_eq!(u128::from_be_bytes(packed[16..].try_into().unwrap()), lo_expected);
+        assert_eq!(u128::from_le_bytes(packed[..16].try_into().unwrap()), lo_expected);
 
         assert!(Target::MAX.is_met_by(&max));
         assert_eq!(Target::from_leading_zero_bits(0), Target::MAX);
         let t8 = Target::from_leading_zero_bits(8);
-        assert_eq!(t8.0[0], 0);
-        assert_eq!(t8.0[1], 0);
-        assert_eq!(t8.0[2], 0xff);
+        assert_eq!(t8.0[31], 0);
+        assert_eq!(t8.0[30], 0);
+        assert_eq!(t8.0[29], 0xff);
         let t3 = Target::from_leading_zero_bits(3);
-        assert_eq!(t3.0[1], 0x1f);
+        assert_eq!(t3.0[30], 0x1f);
+        assert!(t3 > t8 && Target::MAX > t3);
         assert!(!t8.is_met_by(&max));
         let mut small = zero;
         small[0] = Fp::new(1 << 22); // 248-8 = 240 bits => element 0 must be < 2^23

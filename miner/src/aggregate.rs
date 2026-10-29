@@ -1083,7 +1083,7 @@ mod tests {
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         let body =
-            Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
+            Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,
@@ -1468,7 +1468,7 @@ mod tests {
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         assert_eq!(w.len(), segments);
-        let body = Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.commitments()).collect(), proof: vec![] };
+        let body = Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,

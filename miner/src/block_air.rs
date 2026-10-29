@@ -39,8 +39,9 @@
 //! input's position in the current tree, and clears the leaf. For every
 //! output it derives the commitment `H(key_hash || amount)` from a witness
 //! key hash and appends it at the next position. Positions are absorbed
-//! into the inputs sponge and output commitments (never amounts) into the
-//! outputs sponge. Per transaction, the body sponge is rebuilt from the
+//! into the inputs sponge, and output commitments and memos (never amounts)
+//! into the outputs sponge. A memo is a free witness, also absorbed into
+//! the body, so the signatures cover it. Per transaction, the body sponge is rebuilt from the
 //! same registers the signatures and commitments use and must equal the
 //! signed message.
 //!
@@ -49,7 +50,7 @@
 //! ```text
 //! tx_start | resume                         body sponge header; counters n_in, n_out
 //!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ilist old/new x 40 body_in0 body_in1
-//!   per output: ocm0 ocm1 olist body_out0 body_out1 old/new x 40
+//!   per output: ocm0 ocm1 olist olist2 body_out0 body_out1 body_out2 old/new x 40
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
 //! ```
@@ -63,6 +64,7 @@
 //! follow [`crate::xmss_air`] and [`crate::smt_air`] with their public
 //! checks replaced by register plumbing.
 
+use crate::block::BlockOutput;
 use crate::field::Field;
 use crate::hash_machine::{
     COL_ABSORB, COL_ACC, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_DIR, COL_LOAD, COL_PASS, COL_START, HashTraceBuilder,
@@ -73,7 +75,7 @@ use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
 use crate::stark::{Air, Builder, Trace};
 use crate::state_tree::{DEPTH, EMPTY};
 use crate::transaction::{
-    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Output, Sig, TREE_HEIGHT, Transaction, amount_fps,
+    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Memo, Output, Sig, TREE_HEIGHT, Transaction, amount_fps,
 };
 use crate::utxo::{self, UtxoSet};
 use crate::xmss::{
@@ -119,7 +121,9 @@ pub const T_BODY_OUT0: usize = HM_COLS + 21;
 pub const T_BODY_OUT1: usize = HM_COLS + 22;
 pub const T_DONE: usize = HM_COLS + 23;
 pub const T_RESUME: usize = HM_COLS + 24;
-const NUM_TYPES: usize = 25;
+pub const T_OLIST2: usize = HM_COLS + 25;
+pub const T_BODY_OUT2: usize = HM_COLS + 26;
+const NUM_TYPES: usize = 27;
 // ---- xmss counters ----
 pub const C_MC: usize = HM_COLS + NUM_TYPES;
 pub const C_ACTIVE: usize = C_MC + 1;
@@ -177,7 +181,9 @@ pub const C_GO_END: usize = C_GO_OUT + 1;
 /// One while a transaction is open: from its start (or resume) until the
 /// row after its end.
 pub const R_OPEN: usize = C_GO_END + 1;
-pub const NUM_COLS: usize = R_OPEN + 1;
+/// The current output's memo, set entering its first row.
+pub const R_MEMO: usize = R_OPEN + 1;
+pub const NUM_COLS: usize = R_MEMO + DIGEST;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -205,14 +211,19 @@ pub const CARRY_LEN: usize = CARRY_OUT_LEFT + 1;
 /// Rows of one input (signature plus commitment, tree update and body).
 pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 4 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
-pub const ROWS_PER_OUTPUT: usize = 5 + 2 * DEPTH;
+pub const ROWS_PER_OUTPUT: usize = 7 + 2 * DEPTH;
+
+/// Body elements per input and per output (see
+/// `crate::transaction::body_elements`).
+const BODY_PER_INPUT: u32 = 16;
+const BODY_PER_OUTPUT: u32 = 24;
 
 /// Body sponge state after a transaction's header block.
 pub fn body_init(n_in: u32, n_out: u32) -> [Fp; WIDTH] {
     let mut input = [Fp::ZERO; WIDTH];
     input[0] = Fp::new(n_in);
     input[1] = Fp::new(n_out);
-    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + 16 * (n_in + n_out)));
+    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + BODY_PER_INPUT * n_in + BODY_PER_OUTPUT * n_out));
     permute(input)
 }
 
@@ -236,6 +247,7 @@ pub fn body_absorb_input(state: &mut [Fp; WIDTH], pubkey: &PublicKey, amount: u6
 pub fn body_absorb_output(state: &mut [Fp; WIDTH], output: &Output) {
     absorb_block(state, &output.commitment);
     absorb_block(state, &amt_block(output.amount));
+    absorb_block(state, &output.memo);
 }
 
 fn pow2<F: Field>(k: usize) -> F {
@@ -270,13 +282,11 @@ pub fn absorb_position(state: &mut [Fp; WIDTH], position: u64) {
     *state = permute(*state);
 }
 
-/// Absorbs one output's commitment into the outputs sponge. Amounts stay
-/// off chain: the outputs list is commitments only.
-pub fn absorb_output(state: &mut [Fp; WIDTH], commitment: &Commitment) {
-    for (s, x) in state.iter_mut().zip(commitment) {
-        *s = s.add(x);
-    }
-    *state = permute(*state);
+/// Absorbs one output's commitment, then its memo, into the outputs
+/// sponge. Amounts stay off chain.
+pub fn absorb_output(state: &mut [Fp; WIDTH], commitment: &Commitment, memo: &Memo) {
+    absorb_block(state, commitment);
+    absorb_block(state, memo);
 }
 
 /// Inputs sponge state after absorbing all of a block's positions.
@@ -288,11 +298,11 @@ pub fn inputs_state(positions: &[u64]) -> [Fp; WIDTH] {
     state
 }
 
-/// Outputs sponge state after absorbing all of a block's output commitments.
-pub fn outputs_state(outputs: &[Commitment]) -> [Fp; WIDTH] {
+/// Outputs sponge state after absorbing all of a block's outputs.
+pub fn outputs_state(outputs: &[BlockOutput]) -> [Fp; WIDTH] {
     let mut state = initial_outputs_state();
     for o in outputs {
-        absorb_output(&mut state, o);
+        absorb_output(&mut state, &o.commitment, &o.memo);
     }
     state
 }
@@ -362,6 +372,8 @@ impl Air for BlockAir {
         let olist = l[T_OLIST];
         let body_out0 = l[T_BODY_OUT0];
         let body_out1 = l[T_BODY_OUT1];
+        let olist2 = l[T_OLIST2];
+        let body_out2 = l[T_BODY_OUT2];
         let done = l[T_DONE];
         let resume = l[T_RESUME];
         let active = l[C_ACTIVE];
@@ -385,7 +397,7 @@ impl Air for BlockAir {
                 + olist
                 + body_out0,
         );
-        b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + body_out1);
+        b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2);
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
         b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume);
@@ -512,10 +524,12 @@ impl Air for BlockAir {
         // output
         b.when_transition(ocm0 * (one - nt(T_OCM1)));
         b.when_transition(ocm1 * (one - nt(T_OLIST)));
-        b.when_transition(olist * (one - nt(T_BODY_OUT0)));
+        b.when_transition(olist * (one - nt(T_OLIST2)));
+        b.when_transition(olist2 * (one - nt(T_BODY_OUT0)));
         b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
-        b.when_transition(body_out1 * (one - nt(T_OLD)));
-        b.when_transition(body_out1 * n[C_LEVEL]);
+        b.when_transition(body_out1 * (one - nt(T_BODY_OUT2)));
+        b.when_transition(body_out2 * (one - nt(T_OLD)));
+        b.when_transition(body_out2 * n[C_LEVEL]);
         // is_out: 1 from ocm0 until the output ends, 0 on inputs and tx start
         b.assert_zero(ocm0 * (one - is_out));
         b.assert_zero(msg_start * is_out);
@@ -589,6 +603,8 @@ impl Air for BlockAir {
         for i in 0..DIGEST {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
             b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
+            b.when_transition((one - nt(T_OCM0)) * (n[R_MEMO + i] - l[R_MEMO + i]));
+            b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
             // pkroot: set entering pkh0 from the tree root, else copied
             b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
             b.when_transition((one - nt(T_PKH0)) * (n[R_PKROOT + i] - l[R_PKROOT + i]));
@@ -783,11 +799,11 @@ impl Air for BlockAir {
             }
             let shifted = if i + 1 < DEPTH { pbits[i + 1] } else { F::ZERO };
             b.when_transition(new_t * (one - is_last) * (n[R_PBITS + i] - shifted));
-            b.when_transition((one - new_t - nt(T_ILIST) - body_out1) * (n[R_PBITS + i] - *bit));
+            b.when_transition((one - new_t - nt(T_ILIST) - body_out2) * (n[R_PBITS + i] - *bit));
         }
         // output position: decomposed into the path bits entering the insert
-        b.when_transition(body_out1 * (npos_lo - l[R_OPOS_LO]));
-        b.when_transition(body_out1 * (npos_hi - l[R_OPOS_HI]));
+        b.when_transition(body_out2 * (npos_lo - l[R_OPOS_LO]));
+        b.when_transition(body_out2 * (npos_hi - l[R_OPOS_HI]));
         let wrap = l[C_WRAP];
         let lo_max = F::from_u32((1u32 << 30) - 1);
         b.assert_zero(wrap * wrap - wrap);
@@ -808,14 +824,14 @@ impl Air for BlockAir {
                 (l[R_OLD + i], l[R_NEW + i], l[R_SIB + i], l[R_ROOT + i], l[COL_ACC + i], l[COL_OUTPUT + i]);
             // old: commitment entering ilist, zero entering an output insert, output after old rows
             b.when_transition(nt(T_ILIST) * (n[R_OLD + i] - acc));
-            b.when_transition(body_out1 * n[R_OLD + i]);
+            b.when_transition(body_out2 * n[R_OLD + i]);
             b.when_transition(old_t * (n[R_OLD + i] - out));
-            b.when_transition((one - old_t - nt(T_ILIST) - body_out1 - smt_end) * (n[R_OLD + i] - o));
+            b.when_transition((one - old_t - nt(T_ILIST) - body_out2 - smt_end) * (n[R_OLD + i] - o));
             // new: zero on ilist, the output commitment entering an insert, output after new rows
             b.assert_zero(ilist * nw);
-            b.when_transition(body_out1 * (n[R_NEW + i] - l[R_OCM + i]));
+            b.when_transition(body_out2 * (n[R_NEW + i] - l[R_OCM + i]));
             b.when_transition(new_t * (one - is_last) * (n[R_NEW + i] - out));
-            b.when_transition((one - new_t - body_out1 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
+            b.when_transition((one - new_t - body_out2 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
             // sibling: witness on old rows, copied to the new row
             b.when_transition(old_t * (n[R_SIB + i] - sib));
             // root
@@ -835,9 +851,9 @@ impl Air for BlockAir {
 
         // ---------------- register sponges: body, inputs, outputs ----------------
         b.mark("register sponges");
-        let body_len = F::from_u32(8) + (in_left + out_left) * F::from_u32(16);
-        let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1;
-        let osp_rows = olist;
+        let body_len = F::from_u32(8) + in_left * F::from_u32(BODY_PER_INPUT) + out_left * F::from_u32(BODY_PER_OUTPUT);
+        let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1 + body_out2;
+        let osp_rows = olist + olist2;
         for j in 0..WIDTH {
             b.when_transition(bsp_rows * (n[R_BSP + j] - l[COL_OUTPUT + j]));
             b.when_transition((one - bsp_rows) * (n[R_BSP + j] - l[R_BSP + j]));
@@ -1198,7 +1214,7 @@ impl SegmentWitness {
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
                         utxo.add(wtxn, &o.commitment)?;
-                        absorb_output(&mut osp, &o.commitment);
+                        absorb_output(&mut osp, &o.commitment, &o.memo);
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
                     }
@@ -1229,6 +1245,11 @@ impl SegmentWitness {
     /// The segment's output commitments, as they appear in the block.
     pub fn commitments(&self) -> Vec<Commitment> {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.commitment)).collect()
+    }
+
+    /// The outputs as a block lists them: commitment and memo.
+    pub fn block_outputs(&self) -> Vec<BlockOutput> {
+        self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.block_output())).collect()
     }
 
     /// Trace rows before padding; a trace needs at least one more.
@@ -1277,6 +1298,7 @@ struct Regs {
     in_left: u32,
     out_left: u32,
     open: bool,
+    memo: Memo,
 }
 
 impl Regs {
@@ -1335,6 +1357,7 @@ impl Regs {
         row[C_GO_OUT] = Fp::new((in_zero && !out_zero) as u32);
         row[C_GO_END] = Fp::new((in_zero && out_zero) as u32);
         row[R_OPEN] = Fp::new(self.open as u32);
+        row[R_MEMO..R_MEMO + DIGEST].copy_from_slice(&self.memo);
     }
 }
 
@@ -1613,6 +1636,7 @@ impl Gen {
         let o = &w.output;
         let r = &mut self.regs;
         r.ocm = o.commitment;
+        r.memo = o.memo;
         r.amount = o.amount;
         r.is_out = true;
         r.out_left -= 1;
@@ -1630,13 +1654,18 @@ impl Gen {
         assert_eq!(self.b.acc(), o.commitment, "output commitment does not match its key hash and amount");
         let out = self.sponge_start(osp, o.commitment, T_OLIST);
         self.regs.osp = out;
+        // The amount sum advances on the row after olist.
         for (acc, limb) in self.regs.sum_out.iter_mut().zip(limbs16(o.amount)) {
             *acc += limb.to_canonical();
         }
+        let out = self.absorb(o.memo, T_OLIST2);
+        self.regs.osp = out;
         let bsp = self.regs.bsp;
         let out = self.sponge_start(bsp, o.commitment, T_BODY_OUT0);
         self.regs.bsp = out;
         let out = self.absorb(amt_block(o.amount), T_BODY_OUT1);
+        self.regs.bsp = out;
+        let out = self.absorb(o.memo, T_BODY_OUT2);
         self.regs.bsp = out;
         let position = self.regs.opos;
         self.regs.old = EMPTY;
@@ -1695,6 +1724,7 @@ impl BlockAir {
             in_left: 0,
             out_left: 0,
             open: false,
+            memo: EMPTY,
         };
         let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs };
         let mut carry_in = Carry::CLOSED;
@@ -1715,7 +1745,10 @@ impl BlockAir {
                     let mut input = [Fp::ZERO; WIDTH];
                     input[0] = Fp::new(tx.in_left);
                     input[1] = Fp::new(tx.out_left);
-                    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + 16 * (tx.in_left + tx.out_left)));
+                    input[RATE..].copy_from_slice(&cap_const::<Fp>(
+                        DOM_BODY,
+                        8 + BODY_PER_INPUT * tx.in_left + BODY_PER_OUTPUT * tx.out_left,
+                    ));
                     g.b.start(input);
                     let row = g.b.last_row_mut();
                     row[T_TX_START] = Fp::ONE;
@@ -1859,7 +1892,7 @@ mod tests {
     fn layout_and_degree() {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
         assert_eq!(ROWS_PER_INPUT, 1150 + 4 + 1 + 80 + 2);
-        assert_eq!(ROWS_PER_OUTPUT, 85);
+        assert_eq!(ROWS_PER_OUTPUT, 87);
         assert_eq!(NUM_PUBLIC, 96 + 2 * 27);
     }
 
@@ -1905,7 +1938,7 @@ mod tests {
         assert_eq!(publics[1].pos_out, 7);
         assert_eq!(publics[1].root_out, expected_root);
         assert_eq!(publics[1].isp_out, inputs_state(&positions));
-        assert_eq!(publics[1].osp_out, outputs_state(&outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()));
+        assert_eq!(publics[1].osp_out, outputs_state(&outputs.iter().map(|o| o.block_output()).collect::<Vec<_>>()));
         let total_in: u128 = publics.iter().map(|p| SegmentPublic::total(&p.sum_in)).sum();
         let total_out: u128 = publics.iter().map(|p| SegmentPublic::total(&p.sum_out)).sum();
         assert_eq!(total_in, 180);
@@ -1957,7 +1990,7 @@ mod tests {
         }
         assert_eq!(publics[2].root_out, expected_root);
         assert_eq!(publics[2].isp_out, inputs_state(&positions));
-        assert_eq!(publics[2].osp_out, outputs_state(&outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()));
+        assert_eq!(publics[2].osp_out, outputs_state(&outputs.iter().map(|o| o.block_output()).collect::<Vec<_>>()));
         let total = |f: fn(&SegmentPublic) -> &[u32; LIMBS]| -> u128 {
             publics.iter().map(|p| SegmentPublic::total(f(p))).sum()
         };
@@ -2049,6 +2082,27 @@ mod tests {
         let r = (0..trace.height()).find(|&r| trace.values[r * width + T_OCM1] == Fp::ONE).unwrap();
         bad.values[r * width + COL_DATA] += Fp::ONE;
         assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // Memos: the one listed and the one signed must both be the
+        // register's, and the register cannot change within an output.
+        for ty in [T_OLIST2, T_BODY_OUT2] {
+            let mut bad = trace.clone();
+            let r = (0..trace.height()).find(|&r| trace.values[r * width + ty] == Fp::ONE).unwrap();
+            bad.values[r * width + COL_DATA + 3] += Fp::ONE;
+            assert!(check_constraints(&BlockAir, &bad, &values).is_err(), "row type {ty}");
+        }
+        let mut bad = trace.clone();
+        let r = (0..trace.height()).find(|&r| trace.values[r * width + T_BODY_OUT1] == Fp::ONE).unwrap();
+        bad.values[r * width + R_MEMO] += Fp::ONE;
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // A memo changed after signing breaks the body digest.
+        let mut swapped = w.clone();
+        swapped.txs[0].outputs[0].output.memo[0] += Fp::ONE;
+        assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&swapped)).is_err());
+        // And the listed outputs differ with the memo.
+        let o = w.txs[0].outputs[0].output;
+        let mut other = o.block_output();
+        other.memo[0] += Fp::ONE;
+        assert_ne!(outputs_state(&[o.block_output()]), outputs_state(&[other]));
         // A done row inserted before the last transaction ends.
         let mut bad = trace.clone();
         let r = (0..trace.height()).rev().find(|&r| trace.values[r * width + T_TX_END] == Fp::ONE).unwrap();

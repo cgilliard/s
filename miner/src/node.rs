@@ -758,7 +758,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Err(Reject::Known) => {}
             Err(e) => {
                 self.log(&format!("rejected transaction{}: {e}", from.map_or(String::new(), |a| format!(" from {a}"))));
-                if let Some(from) = from {
+                // Conflicts, spent or not-yet-seen inputs and a full pool
+                // happen to honest peers in races; the rest cannot.
+                let honest = matches!(e, Reject::ReplacementFee { .. } | Reject::UnknownInput(_) | Reject::Full);
+                if let Some(from) = from
+                    && !honest
+                {
                     self.peers.strike(from);
                 }
             }
@@ -833,8 +838,7 @@ mod tests {
             max_block_size: HEADER_SIZE + 12 + 4 * crate::block::COMMITMENT_SIZE + 3000,
             max_future_drift: 7200,
             median_time_window: 11,
-            initial_subsidy: 50,
-            halving_interval: 10,
+            emission: &[(1000, 50)],
             aggregator: AggregatorParams::MAINNET,
         }
     }
@@ -871,7 +875,8 @@ mod tests {
 
     /// Mines a block with one output and a padding "proof" on the tip.
     fn mine(f: &Fixture, tag: u8, timestamp: u64) -> Block {
-        let body = Body { inputs: vec![], outputs: vec![Output::new(&pk(tag), 1).commitment], proof: vec![tag; 2500] };
+        let body =
+            Body { inputs: vec![], outputs: vec![Output::new(&pk(tag), 1).block_output()], proof: vec![tag; 2500] };
         mine_body(f, body, timestamp)
     }
 
@@ -968,7 +973,11 @@ mod tests {
         t += 600;
         let b5 = mine_body(
             &a,
-            Body { inputs: vec![position], outputs: vec![Output::new(&pk(50), 1).commitment], proof: vec![5; 2500] },
+            Body {
+                inputs: vec![position],
+                outputs: vec![Output::new(&pk(50), 1).block_output()],
+                proof: vec![5; 2500],
+            },
             t,
         );
         tx_a.send(Event::Mined(b5.clone())).unwrap();
@@ -1020,7 +1029,7 @@ mod tests {
         let dir_b = TempDir::new("other-b");
         let chain_b = Chain::open(&dir_b.0.join("chain"), 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
         let genesis = {
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&pk(1), 1).commitment], proof: vec![] };
+            let body = Body { inputs: vec![], outputs: vec![Output::new(&pk(1), 1).block_output()], proof: vec![] };
             let mut header = params().genesis().header;
             header.body_commitment = body.commitment();
             header.state_root = chain_b.preview_state_root(&body).unwrap();

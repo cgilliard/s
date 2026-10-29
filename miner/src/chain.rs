@@ -47,7 +47,7 @@
 
 use std::path::Path;
 
-use heed::byteorder::BigEndian;
+use heed::byteorder::LittleEndian;
 use heed::types::{Bytes, Str, U32};
 use heed::{Database, Env, RoTxn, RwTxn};
 
@@ -57,8 +57,21 @@ use crate::difficulty::{Asert, U256};
 use crate::poseidon2::digest_from_bytes;
 use crate::pow::{Digest, PowParams, SeedText, Target};
 use crate::state_tree::{EMPTY, empty_root, open_env};
-use crate::transaction::Commitment;
+use crate::transaction::{Commitment, Memo};
 use crate::utxo::{self, UtxoSet};
+
+/// Base units per coin.
+pub const COIN: u64 = 100_000_000;
+/// Blocks per year at the ten-minute target: 144 a day.
+pub const BLOCKS_PER_YEAR: u32 = 144 * 365;
+
+/// Mainnet emission: 1500 coins a block for 3.5 years, 500 for 3.5 years,
+/// then 7 for 1000 years, 735,840,000 coins in all; then the chain ends.
+pub const MAINNET_EMISSION: &[(u32, u64)] = &[
+    (BLOCKS_PER_YEAR * 7 / 2, 1500 * COIN),
+    (BLOCKS_PER_YEAR * 7 / 2, 500 * COIN),
+    (BLOCKS_PER_YEAR * 1000, 7 * COIN),
+];
 
 /// Consensus parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,10 +91,11 @@ pub struct ChainParams {
     pub max_future_drift: u64,
     /// Number of past blocks whose median timestamp bounds the next.
     pub median_time_window: usize,
-    /// Block subsidy at height 0, in base units.
-    pub initial_subsidy: u64,
-    /// Blocks between halvings of the subsidy.
-    pub halving_interval: u32,
+    /// The emission schedule: consecutive eras of `(blocks, subsidy per
+    /// block in base units)`, starting at height 1 (genesis pays nothing).
+    /// The chain ends with the last era: a block above
+    /// [`ChainParams::final_height`] is invalid.
+    pub emission: &'static [(u32, u64)],
     /// Parameters of the block validity proof.
     pub aggregator: AggregatorParams,
 }
@@ -95,15 +109,34 @@ impl ChainParams {
         max_block_size: 2 << 20,
         max_future_drift: 2 * 3600,
         median_time_window: 11,
-        initial_subsidy: 50 * 100_000_000,
-        halving_interval: 210_000,
+        emission: MAINNET_EMISSION,
         aggregator: AggregatorParams::MAINNET,
     };
 
-    /// Subsidy paid by the block at `height`.
+    /// Subsidy paid by the block at `height`: zero for genesis and above
+    /// the final height.
     pub fn subsidy(&self, height: u32) -> u64 {
-        let halvings = height / self.halving_interval;
-        if halvings >= 64 { 0 } else { self.initial_subsidy >> halvings }
+        if height == 0 {
+            return 0;
+        }
+        let mut first = 1u64;
+        for &(blocks, subsidy) in self.emission {
+            if (height as u64) < first + blocks as u64 {
+                return subsidy;
+            }
+            first += blocks as u64;
+        }
+        0
+    }
+
+    /// Height of the last block the chain can have.
+    pub fn final_height(&self) -> u32 {
+        self.emission.iter().map(|&(blocks, _)| blocks as u64).sum::<u64>().min(u32::MAX as u64) as u32
+    }
+
+    /// Every coin the schedule creates, in base units.
+    pub fn total_supply(&self) -> u128 {
+        self.emission.iter().map(|&(blocks, subsidy)| blocks as u128 * subsidy as u128).sum()
     }
 
     /// The genesis block: empty, at `genesis_timestamp`, over the empty
@@ -173,6 +206,8 @@ pub enum ChainError {
     UnknownParent(Digest),
     /// The parent was found invalid.
     InvalidParent,
+    /// The block is above the schedule's final height: the chain has ended.
+    ChainEnded,
     /// The block was found invalid before.
     KnownInvalid,
     BadHeight {
@@ -200,6 +235,8 @@ pub enum ChainError {
     },
     /// A stored record could not be decoded.
     Corrupt(&'static str),
+    /// The data directory was written by an incompatible version.
+    OldFormat,
 }
 
 impl ChainError {
@@ -220,6 +257,7 @@ impl ChainError {
                 | ChainError::TimestampTooNew { .. }
                 | ChainError::BadBodyCommitment
                 | ChainError::Corrupt(_)
+                | ChainError::OldFormat
         )
     }
 }
@@ -235,6 +273,7 @@ impl core::fmt::Display for ChainError {
             ChainError::WrongGenesis => f.write_str("stored genesis differs from the network's"),
             ChainError::UnknownParent(_) => f.write_str("parent block is unknown"),
             ChainError::InvalidParent => f.write_str("parent block is invalid"),
+            ChainError::ChainEnded => f.write_str("the chain has reached its final block"),
             ChainError::KnownInvalid => f.write_str("block is known to be invalid"),
             ChainError::BadHeight { expected, got } => {
                 write!(f, "height {got}, expected {expected}")
@@ -252,6 +291,9 @@ impl core::fmt::Display for ChainError {
             ChainError::BadProof => f.write_str("validity proof rejected"),
             ChainError::StateRootMismatch { .. } => f.write_str("state root does not match the applied body"),
             ChainError::Corrupt(what) => write!(f, "corrupt chain record: {what}"),
+            ChainError::OldFormat => {
+                f.write_str("chain database is from an older format; delete the chain directory and resync")
+            }
         }
     }
 }
@@ -293,6 +335,9 @@ pub enum Applied {
 }
 
 const META_TIP: &str = "tip";
+const META_FORMAT: &str = "format";
+/// Version of the on-disk layout: 3 adds output memos.
+const FORMAT: u8 = 3;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -310,29 +355,33 @@ pub struct Entry {
     pub invalid: bool,
 }
 
-/// What disconnecting a block needs: the commitments its inputs held, in
-/// input order, and where its outputs started.
+/// What disconnecting a block needs: the commitments and memos its inputs
+/// held, in input order, and where its outputs started.
 struct Undo {
     first_output_position: u64,
-    spent: Vec<Commitment>,
+    spent: Vec<(Commitment, Memo)>,
 }
 
 impl Undo {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 32 * self.spent.len());
+        let mut out = Vec::with_capacity(8 + 64 * self.spent.len());
         out.extend_from_slice(&self.first_output_position.to_le_bytes());
-        for c in &self.spent {
+        for (c, m) in &self.spent {
             out.extend_from_slice(&digest_bytes(c));
+            out.extend_from_slice(&digest_bytes(m));
         }
         out
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Undo> {
         let (first, rest) = bytes.split_at_checked(8)?;
-        if rest.len() % 32 != 0 {
+        if rest.len() % 64 != 0 {
             return None;
         }
-        let spent = rest.chunks_exact(32).map(digest_from_bytes).collect::<Option<Vec<_>>>()?;
+        let spent = rest
+            .chunks_exact(64)
+            .map(|c| Some((digest_from_bytes(&c[..32])?, digest_from_bytes(&c[32..])?)))
+            .collect::<Option<Vec<_>>>()?;
         Some(Undo { first_output_position: u64::from_le_bytes(first.try_into().unwrap()), spent })
     }
 }
@@ -349,7 +398,7 @@ pub struct Chain<V: ProofVerifier> {
     /// Block id to its work (32 bytes, little endian) and status byte.
     index: Database<Bytes, Bytes>,
     undo: Database<Bytes, Bytes>,
-    by_height: Database<U32<BigEndian>, Bytes>,
+    by_height: Database<U32<LittleEndian>, Bytes>,
     meta: Database<Str, Bytes>,
 }
 
@@ -380,7 +429,13 @@ impl<V: ProofVerifier> Chain<V> {
         let index = env.create_database(&mut wtxn, Some("index"))?;
         let undo = env.create_database(&mut wtxn, Some("undo"))?;
         let by_height = env.create_database(&mut wtxn, Some("by_height"))?;
-        let meta = env.create_database(&mut wtxn, Some("meta"))?;
+        let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
+        match meta.get(&wtxn, META_FORMAT)? {
+            Some([FORMAT]) => {}
+            Some(_) => return Err(ChainError::OldFormat),
+            None if meta.get(&wtxn, META_TIP)?.is_some() => return Err(ChainError::OldFormat),
+            None => meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?,
+        }
         wtxn.commit()?;
         Ok(Chain { env, params, seed, verifier, utxo, headers, bodies, index, undo, by_height, meta })
     }
@@ -606,17 +661,18 @@ impl<V: ProofVerifier> Chain<V> {
 
     /// Spends the inputs and appends the outputs; returns the new root and
     /// the commitments the inputs held.
-    fn apply_body(&self, wtxn: &mut RwTxn, body: &Body) -> Result<(Digest, Vec<Commitment>)> {
+    fn apply_body(&self, wtxn: &mut RwTxn, body: &Body) -> Result<(Digest, Vec<(Commitment, Memo)>)> {
         let mut spent = Vec::with_capacity(body.inputs.len());
         for &pos in &body.inputs {
             let commitment = self.utxo.get(wtxn, pos)?;
+            let memo = self.utxo.memo(wtxn, pos)?;
             if commitment == EMPTY || !self.utxo.spend_at(wtxn, &commitment, pos)? {
                 return Err(ChainError::UnknownInput(pos));
             }
-            spent.push(commitment);
+            spent.push((commitment, memo));
         }
         for out in &body.outputs {
-            self.utxo.add(wtxn, out)?;
+            self.utxo.add_output(wtxn, out)?;
         }
         Ok((self.utxo.root(wtxn)?, spent))
     }
@@ -635,6 +691,9 @@ impl<V: ProofVerifier> Chain<V> {
             .ok_or(ChainError::BadHeight { expected: u32::MAX, got: header.height })?;
         if header.height != expected_height {
             return Err(ChainError::BadHeight { expected: expected_height, got: header.height });
+        }
+        if header.height > self.params.final_height() {
+            return Err(ChainError::ChainEnded);
         }
         let median = self.median_time_past(rtxn, &parent.header)?;
         if header.timestamp <= median {
@@ -773,9 +832,10 @@ impl<V: ProofVerifier> Chain<V> {
         if undo.spent.len() != body.inputs.len() {
             return Err(ChainError::Corrupt("undo record length"));
         }
-        self.utxo.truncate(wtxn, undo.first_output_position, &body.outputs)?;
-        for (&pos, c) in body.inputs.iter().zip(&undo.spent) {
-            self.utxo.unspend(wtxn, c, pos)?;
+        let commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
+        self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
+        for (&pos, (c, m)) in body.inputs.iter().zip(&undo.spent) {
+            self.utxo.unspend(wtxn, c, m, pos)?;
         }
         let parent = self
             .header_by_hash_in(wtxn, &digest_bytes(&header.prev_hash))?
@@ -911,11 +971,10 @@ mod tests {
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
             // Four outputs and a short proof.
-            max_block_size: HEADER_SIZE + 12 + 4 * crate::block::COMMITMENT_SIZE + 31,
+            max_block_size: HEADER_SIZE + 12 + 4 * crate::block::BLOCK_OUTPUT_SIZE + 31,
             max_future_drift: 7200,
             median_time_window: 11,
-            initial_subsidy: 50,
-            halving_interval: 10,
+            emission: &[(10, 50), (10, 25), (5, 12)],
             aggregator: AggregatorParams::MAINNET,
         }
     }
@@ -946,7 +1005,7 @@ mod tests {
     }
 
     fn genesis_block(outputs: Vec<Output>) -> Block {
-        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.commitment).collect(), proof: vec![] };
+        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.block_output()).collect(), proof: vec![] };
         // State root: compute via a throwaway chain.
         let dir = TempDir::new("genesis-scratch");
         let scratch = Chain::open(&dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
@@ -1016,7 +1075,7 @@ mod tests {
         // positions 2 and 3).
         let body1 = Body {
             inputs: vec![0],
-            outputs: vec![Output::new(&b, 60).commitment, Output::new(&a, 40).commitment],
+            outputs: vec![Output::new(&b, 60).block_output(), Output::new(&a, 40).block_output()],
             proof: vec![9],
         };
         let block1 = mine(&f, body1, GENESIS_TIME + 600);
@@ -1031,7 +1090,7 @@ mod tests {
         }
 
         // Block 2 spends positions 1 and 2, with a reward-only style output.
-        let body2 = Body { inputs: vec![1, 2], outputs: vec![Output::new(&b, 200).commitment], proof: vec![] };
+        let body2 = Body { inputs: vec![1, 2], outputs: vec![Output::new(&b, 200).block_output()], proof: vec![] };
         let block2 = mine(&f, body2, GENESIS_TIME + 1200);
         f.chain.apply_block(&block2, GENESIS_TIME + 1300).unwrap();
         assert_eq!(f.chain.tip().unwrap().unwrap().height, 2);
@@ -1055,13 +1114,24 @@ mod tests {
     #[test]
     fn subsidy_schedule() {
         let p = params();
-        assert_eq!(p.subsidy(0), 50);
-        assert_eq!(p.subsidy(9), 50);
-        assert_eq!(p.subsidy(10), 25);
-        assert_eq!(p.subsidy(25), 12);
-        assert_eq!(p.subsidy(10 * 70), 0);
-        assert_eq!(ChainParams::MAINNET.subsidy(0), 5_000_000_000);
-        assert_eq!(ChainParams::MAINNET.subsidy(210_000), 2_500_000_000);
+        assert_eq!(p.subsidy(0), 0);
+        assert_eq!((p.subsidy(1), p.subsidy(10)), (50, 50));
+        assert_eq!((p.subsidy(11), p.subsidy(20)), (25, 25));
+        assert_eq!((p.subsidy(21), p.subsidy(25)), (12, 12));
+        assert_eq!(p.subsidy(26), 0);
+        assert_eq!(p.final_height(), 25);
+        let m = ChainParams::MAINNET;
+        let era = 144 * 365 * 7 / 2;
+        assert_eq!(era, 183_960);
+        assert_eq!(m.subsidy(0), 0);
+        assert_eq!((m.subsidy(1), m.subsidy(era)), (1500 * COIN, 1500 * COIN));
+        assert_eq!((m.subsidy(era + 1), m.subsidy(2 * era)), (500 * COIN, 500 * COIN));
+        assert_eq!(m.subsidy(2 * era + 1), 7 * COIN);
+        assert_eq!(m.final_height(), 2 * era + 144 * 365 * 1000);
+        assert_eq!(m.final_height(), 52_927_920);
+        assert_eq!(m.subsidy(m.final_height()), 7 * COIN);
+        assert_eq!(m.subsidy(m.final_height() + 1), 0);
+        assert_eq!(m.total_supply(), 735_840_000 * COIN as u128);
     }
 
     #[test]
@@ -1069,7 +1139,7 @@ mod tests {
         let f = open("invalid");
         let a = pk(3);
         f.chain.init_genesis(&genesis_block(vec![Output::new(&a, 1)])).unwrap();
-        let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 7).commitment], proof: vec![] };
+        let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 7).block_output()], proof: vec![] };
         let good = mine(&f, body.clone(), GENESIS_TIME + 600);
         let now = GENESIS_TIME + 700;
 
@@ -1099,13 +1169,13 @@ mod tests {
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::BadBodyCommitment)));
         // Wrong state root.
         let mut wrong = good.body.clone();
-        wrong.outputs.push(Output::new(&a, 8).commitment);
+        wrong.outputs.push(Output::new(&a, 8).block_output());
         let b = mine_with_root(&f, wrong, GENESIS_TIME + 600, good.header.state_root);
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::StateRootMismatch { .. })));
         // Too large.
-        let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1).commitment; 5], proof: vec![] };
+        let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1).block_output(); 5], proof: vec![] };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(344))));
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(504))));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();
@@ -1123,7 +1193,8 @@ mod tests {
         let times = [600u64, 30, 2000, 10, 1500, 600, 5, 900, 700, 600, 600, 300];
         for (i, dt) in times.iter().enumerate() {
             t += dt;
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, i as u64 + 1).commitment], proof: vec![] };
+            let body =
+                Body { inputs: vec![], outputs: vec![Output::new(&a, i as u64 + 1).block_output()], proof: vec![] };
             let block = mine(&f, body, t);
             f.chain.apply_block(&block, t + 10).unwrap();
         }
@@ -1175,7 +1246,7 @@ mod tests {
         let tip = chain.tip().unwrap().unwrap();
         let target = chain.expected_target(&tip).unwrap();
         let make = |proof: Vec<u8>| {
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 3).commitment], proof };
+            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 3).block_output()], proof };
             let mut header = chain.template(&body, GENESIS_TIME + 600).unwrap();
             let (nonce, out) =
                 pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
@@ -1204,7 +1275,7 @@ mod tests {
             let f = Fixture { _dir: TempDir(PathBuf::new()), chain, dataset };
             let block = mine(
                 &f,
-                Body { inputs: vec![0], outputs: vec![Output::new(&a, 2).commitment], proof: vec![] },
+                Body { inputs: vec![0], outputs: vec![Output::new(&a, 2).block_output()], proof: vec![] },
                 GENESIS_TIME + 600,
             );
             f.chain.apply_block(&block, GENESIS_TIME + 700).unwrap();
@@ -1220,7 +1291,7 @@ mod tests {
 
     /// Mines a block on `f`'s tip with `body` and `timestamp`.
     fn mine_outputs(f: &Fixture, outputs: &[Output], timestamp: u64) -> Block {
-        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.commitment).collect(), proof: vec![] };
+        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.block_output()).collect(), proof: vec![] };
         mine(f, body, timestamp)
     }
 
@@ -1254,7 +1325,7 @@ mod tests {
             &a,
             Body {
                 inputs: vec![0],
-                outputs: vec![Output::new(&k, 10).commitment, Output::new(&k, 11).commitment],
+                outputs: vec![Output::new(&k, 10).block_output(), Output::new(&k, 11).block_output()],
                 proof: vec![1],
             },
             GENESIS_TIME + 600,
@@ -1267,13 +1338,13 @@ mod tests {
         // b: B1 spends position 1, B2 spends B1's output.
         let b1 = mine(
             &b,
-            Body { inputs: vec![1], outputs: vec![Output::new(&k, 20).commitment], proof: vec![2] },
+            Body { inputs: vec![1], outputs: vec![Output::new(&k, 20).block_output()], proof: vec![2] },
             GENESIS_TIME + 650,
         );
         b.chain.apply_block(&b1, GENESIS_TIME + 700).unwrap();
         let b2 = mine(
             &b,
-            Body { inputs: vec![2], outputs: vec![Output::new(&k, 21).commitment], proof: vec![3] },
+            Body { inputs: vec![2], outputs: vec![Output::new(&k, 21).block_output()], proof: vec![3] },
             GENESIS_TIME + 1250,
         );
         b.chain.apply_block(&b2, GENESIS_TIME + 1300).unwrap();
@@ -1371,7 +1442,7 @@ mod tests {
         // pass, so a stores it as a side block; connecting it fails).
         let b1 = mine_outputs(&b, &[Output::new(&k, 6)], GENESIS_TIME + 650);
         b.chain.apply_block(&b1, GENESIS_TIME + 700).unwrap();
-        let bad_body = Body { inputs: vec![], outputs: vec![Output::new(&k, 7).commitment], proof: vec![] };
+        let bad_body = Body { inputs: vec![], outputs: vec![Output::new(&k, 7).block_output()], proof: vec![] };
         let b2 = mine_with_root(&b, bad_body, GENESIS_TIME + 1250, b1.header.state_root);
         assert_eq!(a.chain.apply_block(&b1, GENESIS_TIME + 1300).unwrap(), Applied::Side);
         assert!(matches!(a.chain.apply_block(&b2, GENESIS_TIME + 1300), Err(ChainError::StateRootMismatch { .. })));
