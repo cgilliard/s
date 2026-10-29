@@ -20,14 +20,16 @@
 //! | `GetHeaders` | block locator, up to 32 ids               | `Headers`, several |
 //! | `Headers`    | up to 6 main-chain headers, oldest first  |                  |
 //! | `Inv`        | the header of a new block                 |                  |
-//! | `GetChunks`  | block id and up to 32 chunk indexes       | `Chunk`, one each |
-//! | `Chunk`      | block id, block length, index, bytes      |                  |
+//! | `TxInv`      | the id of a new transaction               |                  |
+//! | `GetChunks`  | kind, id and up to 32 chunk indexes       | `Chunk`, one each |
+//! | `Chunk`      | kind, id, object length, index, bytes     |                  |
 //!
-//! A block is fetched as [`CHUNK_BYTES`]-byte chunks of its serialization
-//! ([`crate::block::Block::to_bytes`]), pulled by the receiver in windows
-//! of [`WINDOW`] with [`Download`] tracking what arrived. A node only sends
-//! data in reply to a request and never more than the request asked for,
-//! so it cannot be used to amplify traffic.
+//! A block or transaction (the [`Kind`]) is fetched as [`CHUNK_BYTES`]-byte
+//! chunks of its serialization, pulled by the receiver in windows of
+//! [`WINDOW`] with [`Download`] tracking what arrived. A node only sends
+//! data in reply to a request, never more than the request asked for, and
+//! only to a peer that has answered one of its pings (so the address is
+//! not forged), so it cannot be used to amplify traffic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -63,6 +65,31 @@ const T_HEADERS: u8 = 6;
 const T_INV: u8 = 7;
 const T_GET_CHUNKS: u8 = 8;
 const T_CHUNK: u8 = 9;
+const T_TX_INV: u8 = 10;
+
+/// What a chunked transfer carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Block,
+    Tx,
+}
+
+impl Kind {
+    fn to_u8(self) -> u8 {
+        match self {
+            Kind::Block => 0,
+            Kind::Tx => 1,
+        }
+    }
+
+    fn from_u8(b: u8) -> Option<Kind> {
+        match b {
+            0 => Some(Kind::Block),
+            1 => Some(Kind::Tx),
+            _ => None,
+        }
+    }
+}
 
 /// What a node says about itself in `Ping` and `Pong`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,8 +114,9 @@ pub enum Message {
     GetHeaders { locator: Vec<Digest> },
     Headers(Vec<Header>),
     Inv(Header),
-    GetChunks { id: Digest, indexes: Vec<u16> },
-    Chunk { id: Digest, len: u32, index: u16, data: Vec<u8> },
+    TxInv(Digest),
+    GetChunks { kind: Kind, id: Digest, indexes: Vec<u16> },
+    Chunk { kind: Kind, id: Digest, len: u32, index: u16, data: Vec<u8> },
 }
 
 fn put_status(w: &mut Writer, s: &Status) {
@@ -171,16 +199,22 @@ impl Message {
                 w.0.push(T_INV);
                 w.0.extend_from_slice(&h.to_bytes());
             }
-            Message::GetChunks { id, indexes } => {
+            Message::TxInv(id) => {
+                w.0.push(T_TX_INV);
+                w.digest(id);
+            }
+            Message::GetChunks { kind, id, indexes } => {
                 w.0.push(T_GET_CHUNKS);
+                w.0.push(kind.to_u8());
                 w.digest(id);
                 w.0.push(indexes.len().min(WINDOW) as u8);
                 for i in indexes.iter().take(WINDOW) {
                     w.0.extend_from_slice(&i.to_le_bytes());
                 }
             }
-            Message::Chunk { id, len, index, data } => {
+            Message::Chunk { kind, id, len, index, data } => {
                 w.0.push(T_CHUNK);
+                w.0.push(kind.to_u8());
                 w.digest(id);
                 w.u32(*len);
                 w.0.extend_from_slice(&index.to_le_bytes());
@@ -222,22 +256,25 @@ impl Message {
                 Message::Headers(headers)
             }
             T_INV => Message::Inv(Header::from_bytes(r.take(HEADER_SIZE)?)?),
+            T_TX_INV => Message::TxInv(r.digest()?),
             T_GET_CHUNKS => {
+                let kind = Kind::from_u8(r.take(1)?[0])?;
                 let id = r.digest()?;
                 let n = count(&mut r, WINDOW)?;
                 let indexes = (0..n)
                     .map(|_| Some(u16::from_le_bytes(r.take(2)?.try_into().unwrap())))
                     .collect::<Option<Vec<_>>>()?;
-                Message::GetChunks { id, indexes }
+                Message::GetChunks { kind, id, indexes }
             }
             T_CHUNK => {
+                let kind = Kind::from_u8(r.take(1)?[0])?;
                 let id = r.digest()?;
                 let len = r.u32()?;
                 let index = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
                 let n = u16::from_le_bytes(r.take(2)?.try_into().unwrap()) as usize;
                 (n <= CHUNK_BYTES).then_some(())?;
                 let data = r.take(n)?.to_vec();
-                Message::Chunk { id, len, index, data }
+                Message::Chunk { kind, id, len, index, data }
             }
             _ => return None,
         };
@@ -251,13 +288,13 @@ pub fn chunk_count(len: u32) -> usize {
 }
 
 /// Chunk `index` of `bytes`, for a `Chunk` message.
-pub fn chunk_of(id: &Digest, bytes: &[u8], index: u16) -> Option<Message> {
+pub fn chunk_of(kind: Kind, id: &Digest, bytes: &[u8], index: u16) -> Option<Message> {
     let start = index as usize * CHUNK_BYTES;
     if start >= bytes.len() {
         return None;
     }
     let end = (start + CHUNK_BYTES).min(bytes.len());
-    Some(Message::Chunk { id: *id, len: bytes.len() as u32, index, data: bytes[start..end].to_vec() })
+    Some(Message::Chunk { kind, id: *id, len: bytes.len() as u32, index, data: bytes[start..end].to_vec() })
 }
 
 /// How long a download may go without a new chunk before its window is
@@ -272,6 +309,7 @@ pub const MAX_RETRIES: u32 = 8;
 /// window has arrived or when nothing has arrived for [`RETRY`].
 #[derive(Debug)]
 pub struct Download {
+    pub kind: Kind,
     pub id: Digest,
     pub from: SocketAddr,
     pub max_len: usize,
@@ -294,8 +332,9 @@ pub enum ChunkError {
 }
 
 impl Download {
-    pub fn new(id: Digest, from: SocketAddr, max_len: usize, now: Instant) -> Download {
+    pub fn new(kind: Kind, id: Digest, from: SocketAddr, max_len: usize, now: Instant) -> Download {
         Download {
+            kind,
             id,
             from,
             max_len,
@@ -411,6 +450,9 @@ pub struct Peer {
     /// Malformed or useless replies; dropped past a threshold.
     pub strikes: u32,
     pub seed: bool,
+    /// Answered one of our pings with its nonce: it really is at this
+    /// address, so it may be served data.
+    pub handshaken: bool,
 }
 
 /// The peer table.
@@ -454,7 +496,16 @@ impl Peers {
         }
         self.map.insert(
             addr,
-            Peer { addr, last_seen: None, last_ping: None, pending: None, status: None, strikes: 0, seed },
+            Peer {
+                addr,
+                last_seen: None,
+                last_ping: None,
+                pending: None,
+                status: None,
+                strikes: 0,
+                seed,
+                handshaken: false,
+            },
         );
         true
     }
@@ -484,7 +535,26 @@ impl Peers {
         }
         p.pending = None;
         p.status = Some(status);
+        p.handshaken = true;
         true
+    }
+
+    /// Whether `addr` has answered a ping of ours.
+    pub fn handshaken(&self, addr: &SocketAddr) -> bool {
+        self.map.get(addr).is_some_and(|p| p.handshaken)
+    }
+
+    /// Marks `addr` pinged now with `nonce`, if it has no ping outstanding.
+    /// Returns whether to send one.
+    pub fn ping_now(&mut self, addr: SocketAddr, nonce: u64, now: Instant) -> bool {
+        match self.map.get_mut(&addr) {
+            Some(p) if p.pending.is_none() => {
+                p.last_ping = Some(now);
+                p.pending = Some(nonce);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn strike(&mut self, addr: SocketAddr) {
@@ -495,6 +565,11 @@ impl Peers {
 
     pub fn remove(&mut self, addr: &SocketAddr) {
         self.map.remove(addr);
+    }
+
+    /// Every known peer.
+    pub fn all(&self) -> impl Iterator<Item = &Peer> {
+        self.map.values()
     }
 
     /// Peers heard from within the timeout.
@@ -627,8 +702,9 @@ mod tests {
             Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect() },
             Message::Headers((0..HEADERS_PER_MESSAGE as u32).map(header).collect()),
             Message::Inv(header(5)),
-            Message::GetChunks { id: digest(9), indexes: (0..WINDOW as u16).collect() },
-            Message::Chunk { id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
+            Message::TxInv(digest(6)),
+            Message::GetChunks { kind: Kind::Tx, id: digest(9), indexes: (0..WINDOW as u16).collect() },
+            Message::Chunk { kind: Kind::Block, id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
         ];
         for m in msgs {
             let bytes = m.encode();
@@ -650,13 +726,13 @@ mod tests {
         let bytes: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
         let id = digest(3);
         let from: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut d = Download::new(id, from, 1 << 20, now);
+        let mut d = Download::new(Kind::Block, id, from, 1 << 20, now);
         assert_eq!(d.missing(4), vec![0, 1, 2, 3]);
-        let chunk = |i: u16| match chunk_of(&id, &bytes, i) {
+        let chunk = |i: u16| match chunk_of(Kind::Block, &id, &bytes, i) {
             Some(Message::Chunk { len, index, data, .. }) => (len, index, data),
             _ => panic!(),
         };
-        assert!(chunk_of(&id, &bytes, 3).is_none());
+        assert!(chunk_of(Kind::Block, &id, &bytes, 3).is_none());
         assert_eq!(d.request(now), (0..WINDOW as u16).collect::<Vec<_>>());
         assert_eq!(d.in_flight(), WINDOW);
         assert!(d.request(now).is_empty());
@@ -678,7 +754,7 @@ mod tests {
         assert_eq!(d.in_flight(), 0);
         assert_eq!(d.assemble(), Some(bytes));
         // Too large for the chain's limit.
-        let mut small = Download::new(id, from, 100, now);
+        let mut small = Download::new(Kind::Block, id, from, 100, now);
         assert_eq!(small.insert(2500, 0, vec![0; CHUNK_BYTES], now), Err(ChunkError::Malformed));
     }
 
@@ -704,8 +780,15 @@ mod tests {
         // a answers with the right nonce, b with a wrong one.
         let nonce_a = pings.iter().find(|(p, _)| *p == a).unwrap().1;
         peers.seen(a, t0 + Duration::from_secs(1));
+        assert!(!peers.handshaken(&a));
         assert!(peers.pong(a, Status { nonce: nonce_a, ..status() }));
+        assert!(peers.handshaken(&a));
         assert!(!peers.pong(b, Status { nonce: 999, ..status() }));
+        assert!(!peers.handshaken(&b));
+        assert!(!peers.ping_now(b, 5, t0));
+        peers.pong(b, Status { nonce: pings.iter().find(|(p, _)| *p == b).unwrap().1, ..status() });
+        assert!(peers.ping_now(b, 5, t0));
+        assert!(!peers.ping_now(b, 6, t0));
         assert_eq!(peers.live_count(t0 + Duration::from_secs(2)), 1);
         assert_eq!(peers.sample(5, Some(a), t0 + Duration::from_secs(2)), Vec::<SocketAddr>::new());
         assert_eq!(peers.best_above(U256::ZERO, t0 + Duration::from_secs(2)).map(|p| p.addr), Some(a));

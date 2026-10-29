@@ -1,68 +1,95 @@
-//! `tabminer`: a tabernacle node that follows the network's heaviest chain
-//! and, by default, mines and proves blocks on it.
+//! `tabminer`: a tabernacle node with a wallet prompt. It follows the
+//! network's heaviest chain, relays blocks and transactions, and by default
+//! mines and proves blocks on it.
 //!
 //! ```text
-//! tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N] [--no-mine] [net options]
-//! tabminer node [--data DIR] [net options]
+//! tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
+//! tabminer node [--data DIR] [options]
 //! tabminer show [--data DIR]
 //!
-//! net options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose]
+//! options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose] [--no-prompt]
 //! ```
 //!
 //! With no command, `tabminer` mines. The data directory defaults to
-//! `~/.tabernacle/tabminer` (`./tabminer-data` when `HOME` is unset).
+//! `~/.tabernacle/tabminer` (`./tabminer-data` when `HOME` is unset) and
+//! holds the chain, the wallet, the peer list and `tabminer.log`.
 //!
 //! Every command starts from the fixed mainnet genesis. `mine` and `node`
-//! listen for peers on UDP (port 7417 by default), contact the seeds and any
-//! `--peer`, sync to the chain with the most work, relay new blocks, and
-//! save the peers they found for next time.
+//! listen for peers on UDP (port 7417 by default), contact the seeds and
+//! any `--peer`, sync to the chain with the most work, relay new blocks and
+//! transactions, and save the peers they found for next time. Logs go to
+//! the log file; the terminal shows a prompt for wallet and status commands
+//! (type `help`), unless `--no-prompt` sends the log to the terminal
+//! instead.
 //!
 //! `mine` additionally builds blocks on the tip (unless `--no-mine` is
-//! given, which makes it the same as `node`): a coinbase paying the
-//! subsidy to the node's wallet (created on first use), plus up to `--txs`
-//! transfers (368 by default, sixteen segments), each splitting one of the
-//! wallet's outputs in two, within the block size limit. Each block is
-//! proven (segments, then the aggregation tree), mined, applied through
-//! full validation, and announced. If the network delivers a better tip
-//! while a block is being proven or mined, the miner drops it and starts
-//! over on the new tip. `--blocks 0` (the default) runs until interrupted.
-//! `--jobs` bounds how many segments are proven at once.
+//! given, which makes it the same as `node`): the pooled transactions by
+//! fee rate, within the block limits, and a reward paying the subsidy plus
+//! their fees to the node's wallet. Each block is proven (segments, then
+//! the aggregation tree), mined, applied through full validation, and
+//! announced. If the network delivers a better tip while a block is being
+//! proven or mined, the miner drops it and starts over on the new tip.
+//! `--blocks 0` (the default) runs until `quit`. `--jobs` bounds how many
+//! segments are proven at once.
+//!
+//! Payments use slate files: `send` writes one for the recipient, who
+//! answers it with `receive`; `finalize` on the sender's side signs it and
+//! pools the transaction.
 
+use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement, prove_block_cancellable};
 use tabminer::block::{Block, Body};
 use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams};
-use tabminer::node::{Config, DEFAULT_PORT, Event, Node};
+use tabminer::log;
+use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
+use tabminer::node::{Config, DEFAULT_PORT, Event, Node, Stats};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
-use tabminer::transaction::{Sig, Transaction, UnsignedTransaction};
-use tabminer::wallet::Wallet;
+use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
+use tabminer::wallet::{Slate, State, Wallet, digest_from_hex};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage:
-  tabminer [mine] [--data DIR] [--blocks N] [--txs N] [--jobs N] [--no-mine] [net options]
-  tabminer node [--data DIR] [net options]
+  tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
+  tabminer node [--data DIR] [options]
   tabminer show [--data DIR]
 
-  --data DIR        chain and wallet directory (default ~/.tabernacle/tabminer)
+  --data DIR        chain, wallet and log directory (default ~/.tabernacle/tabminer)
   --blocks N        blocks to mine, 0 for no limit (default 0)
-  --txs N           most transfers per block (default 368: sixteen segments)
   --jobs N          segments proven at once (default 2)
   --no-mine         follow the chain without mining (same as the node command)
 
-net options:
+options:
   --listen ADDR     UDP address to listen on (default 0.0.0.0:7417)
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
-  --verbose         log every network message handled";
+  --verbose         log every network message handled
+  --no-prompt       no wallet prompt; log to the terminal instead of the file";
+
+const HELP: &str = "commands:
+  status                    chain tip, peers, mempool, wallet totals
+  peers                     known peers
+  mempool                   pooled transactions
+  balance                   confirmed, pending and reserved funds
+  outputs                   the wallet's outputs
+  send AMOUNT FEE FILE      start a payment: write a slate for the recipient
+  receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE)
+  finalize FILE             sign an answered slate and pool the transaction
+  cancel SLATE-ID           abandon a pending slate, freeing its inputs
+  slates                    pending slates
+  prune                     forget unspent outputs the chain does not hold
+  seed                      show the master seed (not enough to restore funds)
+  quit                      stop the node
+amounts are coins with up to eight decimals, e.g. 1.5";
 
 /// LMDB map size: an upper bound on the database, reserved as address space.
 const MAP_SIZE: usize = 4 << 30;
@@ -75,9 +102,9 @@ struct Args {
     command: String,
     data: PathBuf,
     blocks: u64,
-    txs: usize,
     jobs: usize,
     no_mine: bool,
+    no_prompt: bool,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
     seeds: Vec<String>,
@@ -97,9 +124,9 @@ fn parse_args() -> Result<Args, String> {
         command,
         data,
         blocks: 0,
-        txs: 368,
         jobs: 2,
         no_mine: false,
+        no_prompt: false,
         listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
         peers: Vec::new(),
         seeds: Vec::new(),
@@ -111,9 +138,9 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--data" => a.data = PathBuf::from(value()?),
             "--blocks" => a.blocks = number(value()?)?,
-            "--txs" => a.txs = number(value()?)? as usize,
             "--jobs" => a.jobs = number(value()?)?.max(1) as usize,
             "--no-mine" => a.no_mine = true,
+            "--no-prompt" => a.no_prompt = true,
             "--listen" => {
                 let v = value()?;
                 a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
@@ -144,9 +171,8 @@ fn main() {
         }
     };
     let result = match args.command.as_str() {
-        "mine" if args.no_mine => node(&args),
-        "mine" => mine(&args),
-        "node" => node(&args),
+        "mine" => run(&args, !args.no_mine),
+        "node" => run(&args, false),
         "show" => show(&args),
         other => {
             eprintln!("error: unknown command {other}\n\n{USAGE}");
@@ -180,6 +206,17 @@ fn fmt_coins(amount: u128) -> String {
     format!("{}.{:08}", amount / 100_000_000, amount % 100_000_000)
 }
 
+/// Parses coins with up to eight decimals into base units.
+fn parse_coins(s: &str) -> Option<u64> {
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty() && frac.is_empty() || frac.len() > 8 {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<8}").parse().ok()? };
+    whole.checked_mul(100_000_000)?.checked_add(frac)
+}
+
 /// Expected hashes to meet `target`: `2^248 / (target + 1)`, as log2.
 fn work_bits(target: &Target) -> f64 {
     let t = target.0.iter().fold(0f64, |acc, b| acc * 256.0 + *b as f64);
@@ -202,16 +239,6 @@ fn net_config(args: &Args) -> Config {
         peers_file: Some(args.data.join("peers")),
         verbose: args.verbose,
     }
-}
-
-/// Starts the network node on its own thread; returns its event sender and
-/// tip-change counter.
-fn start_node(args: &Args, chain: &Arc<Chain<AggregateVerifier>>) -> AnyResult<(Sender<Event>, Arc<AtomicU64>)> {
-    let (node, tx) = Node::bind(Arc::clone(chain), net_config(args))?;
-    let tip_changes = node.tip_changes();
-    println!("listening on {}", node.local_addr()?);
-    std::thread::Builder::new().name("node".into()).spawn(move || node.run())?;
-    Ok((tx, tip_changes))
 }
 
 fn show(args: &Args) -> AnyResult<()> {
@@ -240,20 +267,331 @@ fn show(args: &Args) -> AnyResult<()> {
         hex(&tip.hash()),
         tip.height,
         short(&tip.state_root),
-        chain.tip_work()?.0.iter().rev().fold(0f64, |acc, l| acc * 2f64.powi(64) + *l as f64).log2()
+        log2_u256(chain.tip_work()?)
     );
     Ok(())
 }
 
-fn node(args: &Args) -> AnyResult<()> {
+fn log2_u256(w: tabminer::difficulty::U256) -> f64 {
+    w.0.iter().rev().fold(0f64, |acc, l| acc * 2f64.powi(64) + *l as f64).log2()
+}
+
+/// Everything the prompt and the miner share.
+struct Ctx {
+    params: ChainParams,
+    chain: Arc<Chain<AggregateVerifier>>,
+    mempool: Arc<Mutex<Mempool>>,
+    wallet: Arc<Wallet>,
+    events: Sender<Event>,
+    stats: Arc<Mutex<Stats>>,
+    tip_changes: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    mining: bool,
+}
+
+/// Runs the node, the miner if `mining`, and the prompt (or waits) until
+/// `quit`.
+fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let params = ChainParams::MAINNET;
-    let chain = open_chain(args, params, SeedText::new(params.pow))?;
+    std::fs::create_dir_all(&args.data)?;
+    let log_path = args.data.join("tabminer.log");
+    log::init(Some(&log_path), args.no_prompt)?;
+    if !args.no_prompt {
+        println!("logging to {}", log_path.display());
+    }
+    log::line(&format!("tabminer starting in {}", args.data.display()));
+
+    let seed = SeedText::new(params.pow);
+    let dataset = if mining {
+        let t = Instant::now();
+        let path = args.data.join("dataset");
+        if !path.exists() {
+            let msg = format!(
+                "generating the {} MB proof-of-work dataset (once per data directory)...",
+                params.pow.dataset_bytes() >> 20
+            );
+            println!("{msg}");
+            log::line(&msg);
+        }
+        let dataset = Dataset::load_or_generate(&seed, &path)?;
+        log::line(&format!("dataset: {} MB ready in {}", params.pow.dataset_bytes() >> 20, secs(t.elapsed())));
+        Some(Arc::new(dataset))
+    } else {
+        None
+    };
+    let chain = open_chain(args, params, seed)?;
+    let wallet = Arc::new(Wallet::open(&args.data.join("wallet"))?);
+    let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
+    let (node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), net_config(args))?;
+    let stats = node.stats();
+    let tip_changes = node.tip_changes();
+    let listening = format!("listening on {}", node.local_addr()?);
+    log::line(&listening);
+    let node_thread = std::thread::Builder::new().name("node".into()).spawn(move || node.run())?;
     let tip = chain.tip()?.ok_or("no genesis")?;
-    println!("tip at height {} ({})", tip.height, short(&tip.hash()));
-    let (node, _tx) = Node::bind(chain, net_config(args))?;
-    println!("listening on {}", node.local_addr()?);
-    node.run();
+    let tip_line = format!("tip at height {} ({})", tip.height, short(&tip.hash()));
+    log::line(&tip_line);
+    if !args.no_prompt {
+        println!("{listening}; {tip_line}; type help for commands");
+    }
+
+    let ctx = Arc::new(Ctx {
+        params,
+        chain,
+        mempool,
+        wallet,
+        events: events.clone(),
+        stats,
+        tip_changes,
+        stop: Arc::new(AtomicBool::new(false)),
+        mining,
+    });
+    let miner = match dataset {
+        Some(dataset) => {
+            let ctx = Arc::clone(&ctx);
+            let (blocks, jobs) = (args.blocks, args.jobs);
+            Some(std::thread::Builder::new().name("miner".into()).spawn(move || {
+                if let Err(e) = mine(&ctx, &dataset, blocks, jobs) {
+                    log::line(&format!("miner stopped: {e}"));
+                }
+            })?)
+        }
+        None => None,
+    };
+
+    if args.no_prompt {
+        match miner {
+            // A bounded mining run ends the process, after letting peers
+            // fetch the last block.
+            Some(m) if args.blocks > 0 => {
+                m.join().ok();
+                log::line("done; serving peers for a few seconds");
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            Some(m) => {
+                m.join().ok();
+            }
+            None => loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            },
+        }
+    } else {
+        prompt(&ctx);
+        ctx.stop.store(true, Ordering::Release);
+        if let Some(m) = miner {
+            println!("stopping the miner...");
+            m.join().ok();
+        }
+    }
+    events.send(Event::Stop).ok();
+    node_thread.join().ok();
+    log::line("tabminer stopped");
     Ok(())
+}
+
+/// Reads commands from standard input until `quit` or end of input.
+fn prompt(ctx: &Ctx) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        std::io::stdout().flush().ok();
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(&cmd) = words.first() else {
+            continue;
+        };
+        if matches!(cmd, "quit" | "exit") {
+            break;
+        }
+        if let Err(e) = command(ctx, cmd, &words[1..]) {
+            println!("error: {e}");
+        }
+    }
+}
+
+fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
+    match cmd {
+        "help" => println!("{HELP}"),
+        "status" => {
+            let tip = ctx.chain.tip()?.ok_or("no genesis")?;
+            // One LMDB read transaction per thread at a time: the work is
+            // read before the one the balance needs.
+            let work = log2_u256(ctx.chain.tip_work()?);
+            let stats = ctx.stats.lock().unwrap().clone();
+            let pool = ctx.mempool.lock().unwrap();
+            let rtxn = ctx.chain.env().read_txn()?;
+            let b = ctx.wallet.balance(ctx.chain.utxo(), &rtxn)?;
+            println!(
+                "tip      height {} {} at {}, work 2^{work:.1}",
+                tip.height,
+                short(&tip.hash()),
+                log::timestamp_of(tip.timestamp)
+            );
+            println!(
+                "peers    {} live of {} known; {} downloads, {} queued, {} orphans",
+                stats.peers.iter().filter(|p| p.live).count(),
+                stats.peers.len(),
+                stats.downloads,
+                stats.wanted,
+                stats.orphans
+            );
+            println!("mempool  {} transactions, {} KB", pool.len(), pool.bytes() / 1000);
+            println!(
+                "wallet   {} confirmed, {} pending, {} reserved",
+                fmt_coins(b.confirmed),
+                fmt_coins(b.pending),
+                fmt_coins(b.reserved)
+            );
+            println!("mining   {}", if ctx.mining { "on" } else { "off" });
+        }
+        "peers" => {
+            let stats = ctx.stats.lock().unwrap().clone();
+            if stats.peers.is_empty() {
+                println!("no peers");
+            }
+            for p in &stats.peers {
+                println!(
+                    "{:<24} {:<8} {:<6} {}",
+                    p.addr,
+                    p.height.map_or("?".to_string(), |h| format!("h {h}")),
+                    if p.live { "live" } else { "silent" },
+                    if p.handshaken { "handshaken" } else { "" }
+                );
+            }
+        }
+        "mempool" => {
+            let pool = ctx.mempool.lock().unwrap();
+            println!("{} transactions, {} bytes", pool.len(), pool.bytes());
+            for e in pool.entries() {
+                println!("  {}  {} bytes  fee {}", short(&e.txid), e.size, fmt_coins(e.fee as u128));
+            }
+        }
+        "balance" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let b = ctx.wallet.balance(ctx.chain.utxo(), &rtxn)?;
+            println!("confirmed {}", fmt_coins(b.confirmed));
+            println!("pending   {}", fmt_coins(b.pending));
+            println!("reserved  {}", fmt_coins(b.reserved));
+        }
+        "outputs" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let outputs = ctx.wallet.outputs()?;
+            if outputs.is_empty() {
+                println!("no outputs");
+            }
+            for o in outputs {
+                let held = ctx.chain.utxo().contains(&rtxn, &o.commitment)?;
+                let state = match (o.state, held) {
+                    (State::Unspent, true) => "confirmed",
+                    (State::Unspent, false) => "pending",
+                    (State::Reserved, _) => "reserved",
+                    (State::Spent, _) => "spent",
+                };
+                println!(
+                    "key {:<6} {:>20}  {:<9}  {}  {}",
+                    o.key_index,
+                    fmt_coins(o.amount as u128),
+                    state,
+                    short(&o.commitment),
+                    log::timestamp_of(o.created)
+                );
+            }
+        }
+        "send" => {
+            let [amount, fee, file] = args else {
+                return Err("usage: send AMOUNT FEE FILE".into());
+            };
+            let amount = parse_coins(amount).ok_or("bad amount")?;
+            let fee = parse_coins(fee).ok_or("bad fee")?;
+            let rtxn = ctx.chain.env().read_txn()?;
+            let slate = ctx.wallet.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
+            std::fs::write(file, slate.to_bytes())?;
+            println!(
+                "slate {} written to {}: {} coins plus {} fee from {} inputs; send it to the recipient",
+                &slate.id_hex()[..16],
+                file,
+                fmt_coins(amount as u128),
+                fmt_coins(fee as u128),
+                slate.inputs.len()
+            );
+        }
+        "receive" => {
+            let (file, out) = match args {
+                [file] => (*file, *file),
+                [file, out] => (*file, *out),
+                _ => return Err("usage: receive FILE [OUT]".into()),
+            };
+            let mut slate = read_slate(file)?;
+            ctx.wallet.receive_slate(&mut slate)?;
+            std::fs::write(out, slate.to_bytes())?;
+            println!(
+                "receiving {} coins (fee {}); answered slate written to {}; return it to the sender",
+                fmt_coins(slate.amount as u128),
+                fmt_coins(slate.fee as u128),
+                out
+            );
+        }
+        "finalize" => {
+            let [file] = args else {
+                return Err("usage: finalize FILE".into());
+            };
+            let slate = read_slate(file)?;
+            let tx = ctx.wallet.finalize(&slate)?;
+            let txid = tx.txid();
+            ctx.events.send(Event::Transaction(tx))?;
+            println!("transaction {} signed and sent to the pool", short(&txid));
+        }
+        "cancel" => {
+            let [id] = args else {
+                return Err("usage: cancel SLATE-ID".into());
+            };
+            let full = ctx
+                .wallet
+                .pending_slates()?
+                .into_iter()
+                .map(|(id, _)| id)
+                .find(|s| s.iter().map(|b| format!("{b:02x}")).collect::<String>().starts_with(id))
+                .or_else(|| digest_from_hex(id))
+                .ok_or("no pending slate starts with that id")?;
+            ctx.wallet.cancel(&full)?;
+            println!("slate cancelled; its inputs are spendable again");
+        }
+        "slates" => {
+            let slates = ctx.wallet.pending_slates()?;
+            if slates.is_empty() {
+                println!("no pending slates");
+            }
+            for (id, reserved) in slates {
+                println!(
+                    "{}  {} reserved",
+                    id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    fmt_coins(reserved)
+                );
+            }
+        }
+        "prune" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let n = ctx.wallet.prune_pending(ctx.chain.utxo(), &rtxn)?;
+            println!("{n} pending outputs forgotten");
+        }
+        "seed" => {
+            println!("{}", ctx.wallet.seed_hex());
+            println!("the seed derives the keys but not the amounts: back up the wallet directory");
+        }
+        _ => println!("unknown command {cmd}; type help"),
+    }
+    Ok(())
+}
+
+fn read_slate(file: &str) -> AnyResult<Slate> {
+    let bytes = std::fs::read(Path::new(file))?;
+    Slate::from_bytes(&bytes).ok_or_else(|| format!("{file} is not a slate").into())
 }
 
 /// Searches nonces on every thread from a time-based start until one meets
@@ -296,75 +634,67 @@ fn solve(
     Some((nonce, out, tried.into_inner()))
 }
 
-fn coinbase(wallet: &mut Wallet, amount: u64) -> Transaction {
-    let out = wallet.receive(amount);
-    UnsignedTransaction::new(vec![], vec![out]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap()
+/// The block reward transaction and the wallet's new output in it.
+fn reward(wallet: &Wallet, amount: u64) -> AnyResult<(Transaction, Output)> {
+    let out = wallet.receive(amount)?;
+    Ok((UnsignedTransaction::new(vec![], vec![out]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap(), out))
 }
 
-fn mine(args: &Args) -> AnyResult<()> {
-    let params = ChainParams::MAINNET;
+/// The mining loop: builds, proves, mines and submits blocks on the tip
+/// until `blocks` are accepted (0 for no limit) or the node stops.
+fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()> {
+    let params = ctx.params;
     let agg = params.aggregator;
-    std::fs::create_dir_all(&args.data)?;
-
-    let t = Instant::now();
-    let seed = SeedText::new(params.pow);
-    let path = args.data.join("dataset");
-    if !path.exists() {
-        println!(
-            "generating the {} MB proof-of-work dataset (once per data directory)...",
-            params.pow.dataset_bytes() >> 20
-        );
-    }
-    let dataset = Dataset::load_or_generate(&seed, &path)?;
-    println!("dataset: {} MB ready in {}", params.pow.dataset_bytes() >> 20, secs(t.elapsed()));
-    let chain = open_chain(args, params, seed)?;
-    let mut wallet = Wallet::open(&args.data.join("wallet"))?;
-    let (events, tip_changes) = start_node(args, &chain)?;
-
+    let chain = &ctx.chain;
+    let wallet = &ctx.wallet;
     let tip = chain.tip()?.unwrap();
-    println!(
-        "tip at height {} ({}); segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",
+    log::line(&format!(
+        "mining from height {}; segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",
         tip.height,
-        short(&tip.hash()),
         agg.segment_log_n,
         1 << agg.segment.log_blowup,
         agg.max_segments,
         1 << agg.outer.log_blowup,
         1 << agg.wrap.log_blowup
-    );
+    ));
 
     let mut mined = 0u64;
-    while args.blocks == 0 || mined < args.blocks {
+    while !ctx.stop.load(Ordering::Acquire) && (blocks == 0 || mined < blocks) {
         let started = Instant::now();
-        let generation = tip_changes.load(Ordering::Acquire);
-        let tip_changed = || tip_changes.load(Ordering::Acquire) != generation;
+        let generation = ctx.tip_changes.load(Ordering::Acquire);
+        let cancel = || ctx.stop.load(Ordering::Acquire) || ctx.tip_changes.load(Ordering::Acquire) != generation;
         let tip = chain.tip()?.unwrap();
         let height = tip.height + 1;
         let subsidy = params.subsidy(height);
 
-        // Transactions: the coinbase, then splits of the wallet's coins
-        // while they fit the block's segments and size limits.
-        let coins = {
-            let rtxn = chain.env().read_txn()?;
-            wallet.spendable(chain.utxo(), &rtxn)?
+        // Transactions: the reward, then the pooled ones by fee rate while
+        // they fit the block's segment and size limits. Size: header, body
+        // counts, outputs, input positions and a margin for the proof.
+        let size = |ins: usize, outs: usize| 172 + 12 + ins * 5 + outs * 40 + (256 << 10);
+        let fits = |ins: usize, outs: usize, items: &dyn Fn(usize) -> (usize, usize), n: usize| {
+            pack(n, items, agg.segment_rows()).len() <= agg.max_segments && size(ins, outs) <= params.max_block_size
         };
-        let balance = wallet.balance();
-        let mut txs = vec![coinbase(&mut wallet, subsidy)];
-        // Item counts: the coinbase, then one-input, two-output splits.
-        let items = |t: usize| if t == 0 { (0, 1) } else { (1, 2) };
-        // Size: header, body counts and outputs, input positions, and a
-        // margin for the proof.
-        let size = |spend: usize| 172 + 12 + spend * 5 + (1 + 2 * spend) * 40 + (256 << 10);
-        let mut spend = 0;
-        for _ in coins.iter().take(args.txs) {
-            if pack(spend + 2, items, agg.segment_rows()).len() > agg.max_segments
-                || size(spend + 1) > params.max_block_size
-            {
-                break;
+        let pooled: Vec<Transaction> = ctx.mempool.lock().unwrap().select(|chosen| {
+            let ins: usize = chosen.iter().map(|t| t.inputs.len()).sum();
+            let outs: usize = 1 + chosen.iter().map(|t| t.outputs.len()).sum::<usize>();
+            let items =
+                |t: usize| if t == 0 { (0, 1) } else { (chosen[t - 1].inputs.len(), chosen[t - 1].outputs.len()) };
+            fits(ins, outs, &items, chosen.len() + 1)
+        });
+        let fees = Mempool::fees(&pooled);
+        let balance = {
+            let rtxn = chain.env().read_txn()?;
+            wallet.balance(chain.utxo(), &rtxn)?
+        };
+        let (reward_tx, reward_out) = reward(wallet, subsidy + fees)?;
+        // A block that never gets mined leaves no record behind.
+        let abandon = || {
+            if let Err(e) = wallet.forget(&reward_out.commitment) {
+                log::line(&format!("  forgetting the reward of block {height}: {e}"));
             }
-            spend += 1;
-        }
-        txs.extend(wallet.split_all(&coins[..spend], 2));
+        };
+        let mut txs = vec![reward_tx];
+        txs.extend(pooled);
         let build_time = started.elapsed();
 
         // Witnesses: apply the transactions in a transaction that is thrown
@@ -390,43 +720,42 @@ fn mine(args: &Args) -> AnyResult<()> {
             });
             (segments, statement, inputs, outputs)
         };
-        // Record the new outputs before the block can be applied. Outputs
-        // of a block that never lands are simply never spendable.
-        wallet.save()?;
 
-        println!(
-            "proving block {height} on {}: {} txs ({} in, {} out) in {} segment{}, wallet {} in {} coins",
+        log::line(&format!(
+            "proving block {height} on {}: {} txs ({} in, {} out, {} in fees) in {} segment{}, wallet {} confirmed",
             short(&tip.hash()),
             txs.len(),
             inputs.len(),
             outputs.len(),
+            fmt_coins(fees as u128),
             segments.len(),
             if segments.len() == 1 { "" } else { "s" },
-            fmt_coins(balance),
-            coins.len()
-        );
+            fmt_coins(balance.confirmed)
+        ));
         let t = Instant::now();
         let shape = chain.verifier().shape(segments.len());
         let plan_time = t.elapsed();
         let t = Instant::now();
         let report = |p: Progress| match p {
             Progress::Segment { index, count, elapsed } => {
-                println!("  segment {}/{count} proven in {}", index + 1, secs(elapsed))
+                log::line(&format!("  segment {}/{count} proven in {}", index + 1, secs(elapsed)))
             }
-            Progress::Node { segments, log_n, hash_log_n, root, elapsed } => println!(
+            Progress::Node { segments, log_n, hash_log_n, root, elapsed } => log::line(&format!(
                 "  {} over {segments} segment{} (2^{log_n} + 2^{hash_log_n} rows) proven in {}",
                 if root { "root node" } else { "node" },
                 if segments == 1 { "" } else { "s" },
                 secs(elapsed)
-            ),
+            )),
             Progress::Wrap { log_n, hash_log_n, elapsed } => {
-                println!("  wrap (2^{log_n} + 2^{hash_log_n} rows) proven in {}", secs(elapsed))
+                log::line(&format!("  wrap (2^{log_n} + 2^{hash_log_n} rows) proven in {}", secs(elapsed)))
             }
         };
-        let Some(proof) =
-            prove_block_cancellable(&agg, &shape, &statement, &segments, args.jobs, &report, &tip_changed)
-        else {
-            println!("  tip changed while proving block {height}; starting over");
+        let Some(proof) = prove_block_cancellable(&agg, &shape, &statement, &segments, jobs, &report, &cancel) else {
+            abandon();
+            if ctx.stop.load(Ordering::Acquire) {
+                break;
+            }
+            log::line(&format!("  tip changed while proving block {height}; starting over"));
             continue;
         };
         let prove_time = t.elapsed();
@@ -436,35 +765,46 @@ fn mine(args: &Args) -> AnyResult<()> {
         let mut header = chain.template(&body, timestamp)?;
         let target = chain.expected_target(&tip)?;
         let t = Instant::now();
-        let Some((nonce, out, hashes)) = solve(&dataset, &header.pow_hash(), &target, &tip_changed) else {
-            println!("  tip changed while mining block {height}; starting over");
+        let Some((nonce, out, hashes)) = solve(dataset, &header.pow_hash(), &target, &cancel) else {
+            abandon();
+            if ctx.stop.load(Ordering::Acquire) {
+                break;
+            }
+            log::line(&format!("  tip changed while mining block {height}; starting over"));
             continue;
         };
         let mine_time = t.elapsed();
         header.nonce = nonce;
         header.mix = out.mix;
         let block = Block { header, body };
-        println!(
+        log::line(&format!(
             "  mined {} after {} hashes in {} (work 2^{:.1}); {} KB proof",
             short(&header.hash()),
             hashes,
             secs(mine_time),
             work_bits(&target),
             block.body.proof.len() / 1000,
-        );
+        ));
 
         // The node applies and announces it; wait for the tip to move.
         let t = Instant::now();
-        events.send(Event::Mined(block))?;
-        while !tip_changed() && t.elapsed() < ACCEPT_TIMEOUT {
+        ctx.events.send(Event::Mined(block))?;
+        while !cancel() && t.elapsed() < ACCEPT_TIMEOUT {
             std::thread::sleep(Duration::from_millis(10));
         }
         let accepted = chain.tip()?.unwrap().hash() == header.hash();
         if !accepted {
-            println!("  lost block {height}: {} is not the tip", short(&header.hash()));
+            // A side block may yet win a reorganization, so its reward stays
+            // on record; a block the node did not keep at all is forgotten.
+            if chain.entry(&header.hash())?.is_some_and(|e| !e.invalid) {
+                log::line(&format!("  lost block {height}: {} is a side block, not the tip", short(&header.hash())));
+            } else {
+                abandon();
+                log::line(&format!("  lost block {height}: {} was not accepted", short(&header.hash())));
+            }
         }
         mined += u64::from(accepted);
-        println!(
+        log::line(&format!(
             "  total {} (build {}, plan {}, prove {}, mine {}, accept {})",
             secs(started.elapsed()),
             secs(build_time),
@@ -472,12 +812,7 @@ fn mine(args: &Args) -> AnyResult<()> {
             secs(prove_time),
             secs(mine_time),
             secs(t.elapsed())
-        );
-    }
-    if mined > 0 {
-        // Let peers fetch the last block before the node goes away.
-        println!("done; serving peers for a few seconds");
-        std::thread::sleep(Duration::from_secs(5));
+        ));
     }
     Ok(())
 }

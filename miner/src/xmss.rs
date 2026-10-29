@@ -419,6 +419,13 @@ impl<const H: usize> SecretKey<H> {
         self.next_index
     }
 
+    /// Moves to leaf `index`, skipping the ones before it. Used to resume a
+    /// key whose leaf count is kept elsewhere; never move backwards.
+    pub fn set_next_index(&mut self, index: u64) {
+        assert!(index <= Self::LEAVES, "leaf index beyond the tree");
+        self.next_index = index;
+    }
+
     /// Number of signatures left.
     pub fn remaining(&self) -> u64 {
         Self::LEAVES - self.next_index

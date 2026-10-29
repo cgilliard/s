@@ -16,7 +16,12 @@
 //! in a small orphan pool while the parent is fetched. A block that extends
 //! or reorganizes our main chain is announced to every live peer as an
 //! `Inv`; peers that lack it fetch it, so a new block floods the network
-//! in a few hops.
+//! in a few hops. Transactions travel the same way: a transaction that
+//! enters the [`Mempool`] is announced as a `TxInv` and fetched by id.
+//!
+//! Headers, chunks and peer lists are only served to peers that answered
+//! one of our pings, so a forged source address gets nothing back but a
+//! pong of the same size as the ping.
 //!
 //! # Seeds
 //!
@@ -27,18 +32,20 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{Block, Header};
 use crate::chain::{Applied, Chain, ChainError, ProofVerifier};
 use crate::difficulty::U256;
+use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
-    self, Download, MAX_HEADERS, Message, PROTOCOL_VERSION, Peers, Status, TARGET_PEERS, WINDOW, chunk_of,
+    self, Download, Kind, MAX_HEADERS, Message, PROTOCOL_VERSION, Peers, Status, TARGET_PEERS, WINDOW, chunk_of,
 };
 use crate::pow::Digest;
+use crate::transaction::Transaction;
 
 /// UDP port nodes listen on by default.
 pub const DEFAULT_PORT: u16 = 7417;
@@ -73,11 +80,32 @@ pub enum Event {
     Packet(SocketAddr, Vec<u8>),
     /// A block produced locally: apply it and announce it.
     Mined(Block),
+    /// A transaction made locally: pool it and announce it.
+    Transaction(Transaction),
     Stop,
+}
+
+/// A snapshot of the node for the prompt, refreshed every second.
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub peers: Vec<PeerInfo>,
+    pub downloads: usize,
+    pub wanted: usize,
+    pub orphans: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    pub addr: SocketAddr,
+    pub height: Option<u32>,
+    pub live: bool,
+    pub handshaken: bool,
 }
 
 pub struct Node<V: ProofVerifier> {
     chain: Arc<Chain<V>>,
+    mempool: Arc<Mutex<Mempool>>,
+    stats: Arc<Mutex<Stats>>,
     socket: UdpSocket,
     config: Config,
     genesis: Digest,
@@ -109,7 +137,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Binds the socket, loads and resolves peers, and starts the reader
     /// thread. The chain must have its genesis. Returns the node and the
     /// sender its loop listens on.
-    pub fn bind(chain: Arc<Chain<V>>, config: Config) -> std::io::Result<(Node<V>, Sender<Event>)> {
+    pub fn bind(
+        chain: Arc<Chain<V>>,
+        mempool: Arc<Mutex<Mempool>>,
+        config: Config,
+    ) -> std::io::Result<(Node<V>, Sender<Event>)> {
         let socket = UdpSocket::bind(config.listen)?;
         let genesis = chain
             .header_at(0)
@@ -120,7 +152,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if let Some(path) = &config.peers_file {
             let n = peers.load(path)?;
             if n > 0 {
-                println!("net: {n} saved peers");
+                crate::log::line(&format!("net: {n} saved peers"));
             }
         }
         for &p in &config.peers {
@@ -153,6 +185,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let now = Instant::now();
         let mut node = Node {
             chain,
+            mempool,
+            stats: Arc::new(Mutex::new(Stats::default())),
             socket,
             config,
             genesis,
@@ -179,6 +213,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         Arc::clone(&self.tip_changes)
     }
 
+    /// Shared snapshot of peers and transfers, refreshed every second.
+    pub fn stats(&self) -> Arc<Mutex<Stats>> {
+        Arc::clone(&self.stats)
+    }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -192,6 +231,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Event::Packet(addr, bytes)) => self.handle_packet(addr, &bytes),
                 Ok(Event::Mined(block)) => self.handle_block(block, None),
+                Ok(Event::Transaction(tx)) => self.handle_transaction(tx, None),
                 Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -207,12 +247,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn log(&self, msg: &str) {
-        println!("net: {msg}");
+        crate::log::line(&format!("net: {msg}"));
     }
 
     fn chatter(&self, msg: &str) {
         if self.config.verbose {
-            println!("net: {msg}");
+            crate::log::line(&format!("net: {msg}"));
         }
     }
 
@@ -288,6 +328,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.last_save = now;
             self.save_peers();
         }
+        let live: std::collections::HashSet<SocketAddr> = self.peers.live(now).map(|p| p.addr).collect();
+        let peers = self
+            .peers
+            .all()
+            .map(|p| PeerInfo {
+                addr: p.addr,
+                height: p.status.map(|s| s.height),
+                live: live.contains(&p.addr),
+                handshaken: p.handshaken,
+            })
+            .collect();
+        *self.stats.lock().unwrap() =
+            Stats { peers, downloads: self.downloads.len(), wanted: self.wanted.len(), orphans: self.orphans.len() };
     }
 
     /// Asks the peer with the most work for headers when nothing is in
@@ -327,18 +380,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             if self.chain.entry(&id).ok().flatten().is_some() {
                 continue;
             }
-            self.start_download(id, from, now);
+            self.start_download(Kind::Block, id, from, now);
         }
     }
 
-    fn start_download(&mut self, id: Digest, from: SocketAddr, now: Instant) {
+    fn start_download(&mut self, kind: Kind, id: Digest, from: SocketAddr, now: Instant) {
         if self.downloads.contains_key(&id) {
             return;
         }
-        let mut d = Download::new(id, from, self.chain.params().max_block_size, now);
+        let max_len = match kind {
+            Kind::Block => self.chain.params().max_block_size,
+            Kind::Tx => MAX_TX_SIZE,
+        };
+        let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
-        self.send(from, &Message::GetChunks { id, indexes });
-        self.chatter(&format!("fetching {} from {from}", short(&id)));
+        self.send(from, &Message::GetChunks { kind, id, indexes });
+        self.chatter(&format!("fetching {kind:?} {} from {from}", short(&id)));
         self.downloads.insert(id, d);
     }
 
@@ -356,7 +413,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             } else {
                 d.reset_window();
                 let indexes = d.request(now);
-                requests.push((d.from, Message::GetChunks { id: d.id, indexes }));
+                requests.push((d.from, Message::GetChunks { kind: d.kind, id: d.id, indexes }));
             }
         }
         for (to, msg) in requests {
@@ -390,6 +447,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 let reply = self.status(st.nonce);
                 self.send(addr, &Message::Pong(reply));
+                // Complete the handshake from our side at once.
+                if !self.peers.handshaken(&addr) {
+                    self.nonce = self.nonce.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let nonce = self.nonce;
+                    if self.peers.ping_now(addr, nonce, now) {
+                        let ping = self.status(nonce);
+                        self.send(addr, &Message::Ping(ping));
+                    }
+                }
                 self.consider(addr, &st, now);
             }
             Message::Pong(st) => {
@@ -409,6 +475,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.consider(addr, &st, now);
             }
             Message::GetPeers => {
+                if !self.peers.handshaken(&addr) {
+                    return;
+                }
                 self.peers.seen(addr, now);
                 let sample = self.peers.sample(net::MAX_PEERS_MESSAGE, Some(addr), now);
                 self.send(addr, &Message::Peers(sample));
@@ -422,6 +491,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
             Message::GetHeaders { locator } => {
+                if !self.peers.handshaken(&addr) {
+                    return;
+                }
                 self.peers.seen(addr, now);
                 match self.chain.headers_after(&locator, MAX_HEADERS) {
                     Ok(headers) => {
@@ -440,13 +512,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.peers.seen(addr, now);
                 self.handle_inv(addr, header, now);
             }
-            Message::GetChunks { id, indexes } => {
+            Message::TxInv(txid) => {
                 self.peers.seen(addr, now);
-                self.serve_chunks(addr, id, &indexes);
+                if !self.mempool.lock().unwrap().contains(&txid) && !self.downloads.contains_key(&txid) {
+                    self.start_download(Kind::Tx, txid, addr, now);
+                }
             }
-            Message::Chunk { id, len, index, data } => {
+            Message::GetChunks { kind, id, indexes } => {
+                if !self.peers.handshaken(&addr) {
+                    return;
+                }
                 self.peers.seen(addr, now);
-                self.handle_chunk(addr, id, len, index, data, now);
+                self.serve_chunks(addr, kind, id, &indexes);
+            }
+            Message::Chunk { kind, id, len, index, data } => {
+                self.peers.seen(addr, now);
+                self.handle_chunk(addr, kind, id, len, index, data, now);
             }
         }
     }
@@ -495,7 +576,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         match self.chain.entry(&header.prev_hash).ok().flatten() {
             Some(e) if e.invalid => {}
-            Some(_) => self.start_download(id, from, now),
+            Some(_) => self.start_download(Kind::Block, id, from, now),
             None => {
                 // Behind by more than one block: sync from this peer.
                 if self.downloads.is_empty() && self.wanted.is_empty() {
@@ -506,35 +587,50 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
-    fn serve_chunks(&mut self, to: SocketAddr, id: Digest, indexes: &[u16]) {
-        let bytes = match self.served.iter().position(|(i, _)| *i == id) {
-            Some(pos) => {
-                let entry = self.served.remove(pos).unwrap();
-                self.served.push_front(entry);
-                self.served.front().unwrap().1.clone()
-            }
-            None => match self.chain.block_by_hash(&id) {
-                Ok(Some(block)) => {
-                    let bytes = block.to_bytes();
-                    self.served.push_front((id, bytes.clone()));
-                    self.served.truncate(SERVED_CACHE);
-                    bytes
+    fn serve_chunks(&mut self, to: SocketAddr, kind: Kind, id: Digest, indexes: &[u16]) {
+        let bytes = match kind {
+            Kind::Tx => match self.mempool.lock().unwrap().get(&id) {
+                Some(tx) => tx.to_bytes(),
+                None => return,
+            },
+            Kind::Block => match self.served.iter().position(|(i, _)| *i == id) {
+                Some(pos) => {
+                    let entry = self.served.remove(pos).unwrap();
+                    self.served.push_front(entry);
+                    self.served.front().unwrap().1.clone()
                 }
-                _ => return,
+                None => match self.chain.block_by_hash(&id) {
+                    Ok(Some(block)) => {
+                        let bytes = block.to_bytes();
+                        self.served.push_front((id, bytes.clone()));
+                        self.served.truncate(SERVED_CACHE);
+                        bytes
+                    }
+                    _ => return,
+                },
             },
         };
         for &i in indexes.iter().take(WINDOW) {
-            if let Some(msg) = chunk_of(&id, &bytes, i) {
+            if let Some(msg) = chunk_of(kind, &id, &bytes, i) {
                 self.send(to, &msg);
             }
         }
     }
 
-    fn handle_chunk(&mut self, from: SocketAddr, id: Digest, len: u32, index: u16, data: Vec<u8>, now: Instant) {
+    fn handle_chunk(
+        &mut self,
+        from: SocketAddr,
+        kind: Kind,
+        id: Digest,
+        len: u32,
+        index: u16,
+        data: Vec<u8>,
+        now: Instant,
+    ) {
         let Some(d) = self.downloads.get_mut(&id) else {
             return;
         };
-        if d.from != from {
+        if d.from != from || d.kind != kind {
             return;
         }
         match d.insert(len, index, data, now) {
@@ -543,19 +639,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 if d.in_flight() <= WINDOW / 2 {
                     let indexes = d.request(now);
                     if !indexes.is_empty() {
-                        self.send(from, &Message::GetChunks { id, indexes });
+                        self.send(from, &Message::GetChunks { kind, id, indexes });
                     }
                 }
             }
             Ok(true) => {
                 let bytes = d.assemble().unwrap_or_default();
                 self.downloads.remove(&id);
-                match Block::from_bytes(&bytes) {
-                    Ok(block) if block.header.hash() == id => self.handle_block(block, Some(from)),
-                    _ => {
-                        self.log(&format!("{from} sent a malformed block for {}", short(&id)));
-                        self.peers.strike(from);
-                    }
+                match kind {
+                    Kind::Block => match Block::from_bytes(&bytes) {
+                        Ok(block) if block.header.hash() == id => self.handle_block(block, Some(from)),
+                        _ => {
+                            self.log(&format!("{from} sent a malformed block for {}", short(&id)));
+                            self.peers.strike(from);
+                        }
+                    },
+                    Kind::Tx => match Transaction::from_bytes(&bytes) {
+                        Some(tx) if tx.txid() == id => self.handle_transaction(tx, Some(from)),
+                        _ => {
+                            self.log(&format!("{from} sent a malformed transaction for {}", short(&id)));
+                            self.peers.strike(from);
+                        }
+                    },
                 }
                 self.start_downloads(now);
             }
@@ -593,6 +698,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     if from.is_none() {
                         self.log(&format!("announced block {height} to {told} peers"));
                     }
+                    self.revalidate_mempool();
                 }
                 Err(ChainError::UnknownParent(parent)) => {
                     if self.orphans.len() < MAX_ORPHANS {
@@ -601,7 +707,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     if let Some(from) = from {
                         self.chatter(&format!("orphan {} at height {height}; fetching its parent", short(&id)));
                         if self.chain.entry(&parent).ok().flatten().is_none() {
-                            self.start_download(parent, from, Instant::now());
+                            self.start_download(Kind::Block, parent, from, Instant::now());
                         }
                         if self.downloads.len() <= 1 && self.wanted.is_empty() {
                             self.request_headers(from);
@@ -625,6 +731,52 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     queue.push_back(entry);
                 }
             }
+        }
+    }
+
+    /// Pools a transaction and announces it if new.
+    fn handle_transaction(&mut self, tx: Transaction, from: Option<SocketAddr>) {
+        let result = {
+            let rtxn = match self.chain.env().read_txn() {
+                Ok(t) => t,
+                Err(e) => {
+                    self.log(&format!("mempool: {e}"));
+                    return;
+                }
+            };
+            self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), &rtxn)
+        };
+        match result {
+            Ok(txid) => {
+                let whose = from.map_or("our transaction".to_string(), |a| format!("transaction from {a}"));
+                self.log(&format!("{whose} {} pooled", short(&txid)));
+                let now = Instant::now();
+                for addr in self.peers.sample(net::MAX_PEERS, from, now) {
+                    self.send(addr, &Message::TxInv(txid));
+                }
+            }
+            Err(Reject::Known) => {}
+            Err(e) => {
+                self.log(&format!("rejected transaction{}: {e}", from.map_or(String::new(), |a| format!(" from {a}"))));
+                if let Some(from) = from {
+                    self.peers.strike(from);
+                }
+            }
+        }
+    }
+
+    /// After the tip moved: drop pooled transactions the chain has spent,
+    /// restore shelved ones a reorganization freed.
+    fn revalidate_mempool(&mut self) {
+        let Ok(rtxn) = self.chain.env().read_txn() else {
+            return;
+        };
+        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), &rtxn) {
+            Ok((gone, back)) if gone + back > 0 => {
+                self.chatter(&format!("mempool: {gone} transactions confirmed or conflicted, {back} restored"));
+            }
+            Ok(_) => {}
+            Err(e) => self.log(&format!("mempool: {e}")),
         }
     }
 
@@ -707,6 +859,10 @@ mod tests {
         Fixture { dir, chain: Arc::new(chain), dataset }
     }
 
+    fn pool() -> Arc<Mutex<Mempool>> {
+        Arc::new(Mutex::new(Mempool::new(1 << 20)))
+    }
+
     fn pk(tag: u8) -> crate::xmss::PublicKey {
         let mut s = [0u8; 32];
         s[0] = tag;
@@ -716,6 +872,10 @@ mod tests {
     /// Mines a block with one output and a padding "proof" on the tip.
     fn mine(f: &Fixture, tag: u8, timestamp: u64) -> Block {
         let body = Body { inputs: vec![], outputs: vec![Output::new(&pk(tag), 1).commitment], proof: vec![tag; 2500] };
+        mine_body(f, body, timestamp)
+    }
+
+    fn mine_body(f: &Fixture, body: Body, timestamp: u64) -> Block {
         let mut header = f.chain.template(&body, timestamp).unwrap();
         let tip = f.chain.tip().unwrap().unwrap();
         let target = f.chain.expected_target(&tip).unwrap();
@@ -761,9 +921,11 @@ mod tests {
             a.chain.apply_block(&block, now).unwrap();
             a_blocks.push(block);
         }
-        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), config(vec![], &a.dir)).unwrap();
+        let (pool_a, pool_b) = (pool(), pool());
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), Arc::clone(&pool_a), config(vec![], &a.dir)).unwrap();
         let addr_a = node_a.local_addr().unwrap();
-        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), config(vec![addr_a], &b.dir)).unwrap();
+        let (node_b, tx_b) =
+            Node::bind(Arc::clone(&b.chain), Arc::clone(&pool_b), config(vec![addr_a], &b.dir)).unwrap();
         let changes_b = node_b.tip_changes();
         let ha = std::thread::spawn(move || node_a.run());
         let hb = std::thread::spawn(move || node_b.run());
@@ -780,6 +942,42 @@ mod tests {
         assert!(wait_for_tip(&b.chain, &b4.header, 20), "b did not receive the relayed block");
         assert_eq!(a.chain.tip().unwrap().unwrap(), b4.header);
 
+        // A transaction spending block 1's output, submitted on a, reaches
+        // b's pool; a block spending that output clears both pools.
+        let spent = Output::new(&pk(1), 1);
+        let mut k = Key::generate(&{
+            let mut s = [0u8; 32];
+            s[0] = 1;
+            s
+        });
+        let tx = crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), 1)], vec![Output::new(&pk(50), 1)])
+            .sign_with(&mut k)
+            .unwrap();
+        let txid = tx.txid();
+        tx_a.send(Event::Transaction(tx)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pool_b.lock().unwrap().contains(&txid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(pool_b.lock().unwrap().contains(&txid), "transaction was not relayed");
+        assert!(pool_a.lock().unwrap().contains(&txid));
+        let position = {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            a.chain.utxo().positions(&rtxn, &spent.commitment).unwrap()[0]
+        };
+        t += 600;
+        let b5 = mine_body(
+            &a,
+            Body { inputs: vec![position], outputs: vec![Output::new(&pk(50), 1).commitment], proof: vec![5; 2500] },
+            t,
+        );
+        tx_a.send(Event::Mined(b5.clone())).unwrap();
+        assert!(wait_for_tip(&b.chain, &b5.header, 20), "b did not receive block 5");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!pool_a.lock().unwrap().contains(&txid));
+        assert!(!pool_b.lock().unwrap().contains(&txid));
+        let b4 = b5;
+
         // c mines a longer competing branch from genesis offline, then joins
         // through b only: both a and b reorganize to it.
         let c = open("sync-c");
@@ -791,7 +989,7 @@ mod tests {
         }
         let c_tip = c.chain.tip().unwrap().unwrap();
         assert!(c.chain.tip_work().unwrap() > a.chain.tip_work().unwrap());
-        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), config(vec![addr_a], &c.dir)).unwrap();
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![addr_a], &c.dir)).unwrap();
         let hc = std::thread::spawn(move || node_c.run());
         assert!(wait_for_tip(&a.chain, &c_tip, 30), "a did not reorganize to c's chain");
         assert!(wait_for_tip(&b.chain, &c_tip, 30), "b did not reorganize to c's chain");
@@ -832,9 +1030,9 @@ mod tests {
         let chain_b = Arc::new(chain_b);
         let block = mine(&a, 1, T0 + 600);
         a.chain.apply_block(&block, unix_now()).unwrap();
-        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), config(vec![], &a.dir)).unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
         let addr_a = node_a.local_addr().unwrap();
-        let (node_b, tx_b) = Node::bind(Arc::clone(&chain_b), config(vec![addr_a], &dir_b)).unwrap();
+        let (node_b, tx_b) = Node::bind(Arc::clone(&chain_b), pool(), config(vec![addr_a], &dir_b)).unwrap();
         let ha = std::thread::spawn(move || node_a.run());
         let hb = std::thread::spawn(move || node_b.run());
         std::thread::sleep(Duration::from_secs(3));

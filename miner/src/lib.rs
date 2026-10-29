@@ -12,6 +12,8 @@ pub mod fri;
 pub mod hash_machine;
 pub mod hash_table;
 pub mod inflate;
+pub mod log;
+pub mod mempool;
 pub mod merkle;
 pub mod net;
 pub mod node;
