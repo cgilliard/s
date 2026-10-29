@@ -10,9 +10,13 @@ only for the round it precedes (the queries). Two models:
   algebraic rounds (Schwartz-Zippel, list size one, the up-to-capacity
   correlated-agreement bound for batching and folding);
 * proven: the round-by-round bounds of ethSTARK Theorem 5 (from
-  BCIKS20, Johnson regime), adapted to powers instead of independent
-  coefficients (BCIKS20's curve version: error times the curve degree),
-  maximised over m.
+  BCIKS20, Johnson regime), maximised over m.
+
+The DEEP batching uses one independent coefficient per polynomial, so
+its error is the line error, once per FRI input (BCIKS20, affine
+spaces). A proof spec with "powers": true models the previous scheme,
+powers of one challenge, whose error is the line error times the number
+of polynomials (BCIKS20's curve version).
 
 Run: python3 tools/soundness.py
 """
@@ -77,8 +81,9 @@ class Table:
 
 
 class Proof:
-    def __init__(self, name, tables, log_blowup, queries, pow_bits, commit_bits=0):
+    def __init__(self, name, tables, log_blowup, queries, pow_bits, commit_bits=0, powers=False):
         self.name, self.tables = name, tables
+        self.powers = powers
         # Target of every challenge before the queries: the prover grinds
         # before each the bits its conjectured error falls short of it by
         # (StarkConfig::commit_bits).
@@ -86,6 +91,17 @@ class Proof:
         self.R, self.s, self.pow = log_blowup, queries, pow_bits
         self.rho = 2.0 ** -log_blowup
         self.log_N = max(t.log_n for t in tables) + log_blowup
+
+    def domains(self):
+        """log2 sizes of the FRI inputs, one per distinct table height."""
+        return sorted({t.log_n + self.R for t in self.tables})
+
+    def batching(self, line_error):
+        """The batching round's error, from the error of a line over a
+        domain of 2^log_m points: one line per FRI input."""
+        if self.powers:
+            return "batching (powers)", sum(t.batched() for t in self.tables) * line_error(self.log_N)
+        return "batching (independent)", sum(line_error(l) for l in self.domains())
 
     def rounds_conjectured(self):
         K = 2 ** LOG_K
@@ -95,7 +111,8 @@ class Proof:
             r["lookup challenges (LogUp)"] = lu / K
         r["constraint combination"] = sum(t.constraints + t.lookup_constraints() for t in self.tables) / K
         r["out-of-domain point (DEEP)"] = sum((t.chunks() + 1) << t.log_n for t in self.tables) / K
-        r["batching (powers)"] = sum(t.batched() for t in self.tables) * 2 ** self.log_N / K
+        name, err = self.batching(lambda log_m: 2 ** log_m / K)
+        r[name] = err
         r["FRI folding (first round)"] = 4 * 2 ** self.log_N / K
         return r
 
@@ -119,9 +136,11 @@ class Proof:
         r["constraint combination"] = ell * sum(t.constraints + t.lookup_constraints() for t in self.tables) / K
         d_max = max(t.chunks() << t.log_n for t in self.tables)
         r["out-of-domain point (DEEP)"] = (d_max + n + 4) * ell ** 2 / (K - 4 * n)
-        e3 = (m + 0.5) ** 7 * n ** 2 / (3 * rho ** 1.5 * K)
-        r["batching (powers)"] = sum(t.batched() for t in self.tables) * e3
-        r["FRI folding (first round)"] = 3 * e3 + (2 * m + 1) * (n + 1) * 4 / (K * sqrt(rho))
+        def e3(log_m):
+            return (m + 0.5) ** 7 * 4.0 ** log_m / (3 * rho ** 1.5 * K)
+        name, err = self.batching(e3)
+        r[name] = err
+        r["FRI folding (first round)"] = 3 * e3(self.log_N) + (2 * m + 1) * (n + 1) * 4 / (K * sqrt(rho))
         r["queries"] = (sqrt(rho) * (1 + 1 / (2 * m))) ** self.s * 2.0 ** -self.pow
         return r
 
@@ -175,4 +194,4 @@ if __name__ == "__main__":
           f"(collisions 2^{DIGEST_BITS / 2:.0f}, BCS needs digest >= 2 lambda + 3)")
     for p in params:
         report(Proof(p["name"], tables(p["tables"], p.get("zk", False)), p["log_blowup"], p["queries"], p["pow"],
-                     p.get("commit_bits", 0)))
+                     p.get("commit_bits", 0), p.get("powers", False)))

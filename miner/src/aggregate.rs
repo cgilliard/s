@@ -86,19 +86,22 @@ pub struct AggregatorParams {
 }
 
 impl AggregatorParams {
-    /// 112 bits of conjectured security for every proof (see SECURITY.md):
-    /// each Fiat-Shamir round has an error below 2^-113.
+    /// 120 bits of conjectured security for every proof (see SECURITY.md):
+    /// each Fiat-Shamir round has an error below 2^-121.
     ///
     /// - The queries give `log_blowup` bits each, plus 16 bits of grinding
-    ///   (about 35 ms). That is 116 bits for segments and nodes (rate 1/4,
-    ///   50 queries) and for the wrap (rate 1/32, 20 queries), or 114 at
-    ///   the list-decoding capacity radius left by the 2025 counterexamples
-    ///   to the proximity-gap conjectures.
-    /// - Every challenge before the queries is ground to 113 bits
+    ///   (about 35 ms). That is 124 bits for segments and nodes (rate 1/4,
+    ///   54 queries) and 126 for the wrap (rate 1/32, 22 queries), or 122
+    ///   and 124 at the list-decoding capacity radius left by the 2025
+    ///   counterexamples to the proximity-gap conjectures. The field caps
+    ///   the ethSTARK figure at 122.6.
+    /// - Every challenge before the queries is ground to 121 bits
     ///   (`commit_bits`). The challenges come from a field of about 2^123.6,
-    ///   so each one's degree term costs that many bits less. The batching
-    ///   challenge needs the most: 17 bits on a segment, 21 on a node
-    ///   and 22 on the wrap.
+    ///   so each one's degree term costs that many bits less. The lookup
+    ///   challenges need the most: 24 bits on a node and 22 on the wrap,
+    ///   about 8 s and 2 s. The DEEP batching uses independent
+    ///   coefficients (`stark::Deep`), so it needs 15 to 20 bits rather
+    ///   than the 25 to 30 that powers of one challenge would.
     ///
     /// Segments and nodes are both at rate 1/4. Segments at rate 1/8 prove
     /// twice as slowly but are cheaper to verify, and nodes at 1/8 would
@@ -111,12 +114,12 @@ impl AggregatorParams {
     /// can be learned from it. The proofs below it are witnesses of the
     /// wrap and never leave the prover.
     pub const MAINNET: AggregatorParams = AggregatorParams {
-        segment: StarkConfig { log_blowup: 2, num_queries: 50, pow_bits: 16, zk: false, commit_bits: 113 },
+        segment: StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 },
         segment_log_n: 15,
         max_segments: 1 << 14,
         fan_in: 4,
-        outer: StarkConfig { log_blowup: 2, num_queries: 50, pow_bits: 16, zk: false, commit_bits: 113 },
-        wrap: StarkConfig { log_blowup: 5, num_queries: 20, pow_bits: 16, zk: true, commit_bits: 113 },
+        outer: StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 },
+        wrap: StarkConfig { log_blowup: 5, num_queries: 22, pow_bits: 16, zk: true, commit_bits: 121 },
     };
 
     /// Rate 1/8 at the same security, for comparisons.
@@ -1442,6 +1445,9 @@ mod tests {
         let wrap = |q: usize, pow: usize| StarkConfig { num_queries: q, pow_bits: pow, commit_bits: 0, ..m.wrap };
         let all = [
             ("mainnet", m),
+            // Mainnet without the commit-phase grinding: its cost by difference.
+            ("plain", AggregatorParams { segment: cfg(54, 16), outer: cfg(54, 16), wrap: wrap(22, 16), ..m }),
+            ("112", AggregatorParams { segment: cfg(50, 16), outer: cfg(50, 16), wrap: wrap(20, 16), ..m }),
             ("old", AggregatorParams { segment: cfg(42, 16), outer: cfg(42, 16), wrap: wrap(16, 20), ..m }),
         ];
         let pick = std::env::var("SEC").ok();

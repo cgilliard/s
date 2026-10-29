@@ -2,7 +2,7 @@
  {
   "name": "segment (2^15 rows)",
   "log_blowup": 2,
-  "queries": 50,
+  "queries": 54,
   "pow": 16,
   "tables": [
    [
@@ -17,12 +17,12 @@
     1
    ]
   ],
-  "commit_bits": 113
+  "commit_bits": 121
  },
  {
   "name": "node (up to 2^19 + 2^17 rows)",
   "log_blowup": 2,
-  "queries": 50,
+  "queries": 54,
   "pow": 16,
   "tables": [
    [
@@ -70,12 +70,12 @@
     1
    ]
   ],
-  "commit_bits": 113
+  "commit_bits": 121
  },
  {
   "name": "wrap (up to 2^17 + 2^15 rows, zero knowledge)",
   "log_blowup": 5,
-  "queries": 20,
+  "queries": 22,
   "pow": 16,
   "zk": true,
   "tables": [
@@ -124,7 +124,7 @@
     1
    ]
   ],
-  "commit_bits": 113
+  "commit_bits": 121
  },
  {
   "name": "previous parameters: segment",
@@ -143,7 +143,8 @@
     [],
     1
    ]
-  ]
+  ],
+  "powers": true
  },
  {
   "name": "previous parameters: node (largest: 2^18 + 2^16 rows)",
@@ -195,7 +196,8 @@
     ],
     1
    ]
-  ]
+  ],
+  "powers": true
  },
  {
   "name": "previous parameters: wrap (2^16 + 2^14 rows, zero knowledge)",
@@ -248,6 +250,7 @@
     ],
     1
    ]
-  ]
+  ],
+  "powers": true
  }
 ]

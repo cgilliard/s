@@ -25,10 +25,11 @@
 //!    quotient is split into chunks of degree below `n` and committed.
 //! 4. The verifier samples `zeta`. The prover opens every trace and
 //!    auxiliary column at `zeta` and `g * zeta`, and every chunk at
-//!    `zeta_q = zeta^(2^log_quotient)`. The verifier samples `beta`.
-//! 5. Both sides form the DEEP combination over all openings; the prover
-//!    runs FRI on its evaluations over `D` and opens the committed rows at
-//!    every FRI query index.
+//!    `zeta_q = zeta^(2^log_quotient)`. The verifier samples one
+//!    independent coefficient per opened polynomial.
+//! 5. Both sides form the DEEP combination over all openings (see
+//!    [`Deep`]); the prover runs FRI on its evaluations over `D` and opens
+//!    the committed rows at every FRI query index.
 //!
 //! The verifier checks the constraint identity `Q(zeta) Z_H(zeta) = C(zeta)`
 //! from the openings, runs the FRI verifier, and recomputes the DEEP value
@@ -457,8 +458,10 @@ impl StarkConfig {
 /// - constraint combination: the number of constraints (powers of alpha);
 /// - out-of-domain point: the quotient's degree plus the trace length, per
 ///   table;
-/// - batching: the number of opened polynomials (powers of beta, a curve
-///   of that degree) times the largest domain.
+/// - batching: the domain of each FRI input, summed. The coefficients are
+///   independent, so the number of polynomials does not enter (BCIKS20's
+///   bound for affine spaces; powers of one challenge would multiply it by
+///   their count, the degree of the curve).
 ///
 /// The grinding brings each to [`StarkConfig::commit_bits`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -478,21 +481,21 @@ pub(crate) struct GrindShape {
     /// Sum over lookup terms of the tuple length plus one.
     pub lookup_weight: usize,
     pub chunks: usize,
-    /// Opened polynomials: every committed column at two points, every
-    /// quotient chunk at one.
-    pub opened: usize,
 }
 
 impl Grinding {
-    pub(crate) fn new(config: &StarkConfig, tables: &[GrindShape], log_big: usize) -> Grinding {
+    pub(crate) fn new(config: &StarkConfig, tables: &[GrindShape]) -> Grinding {
         let target = config.commit_bits;
         let bits = |term: u128| fri::grinding_bits(target, term);
         let lookup: u128 = tables.iter().map(|t| (t.lookup_weight as u128) << t.log_n).sum();
+        // One FRI input per distinct domain size (tables come tallest first).
+        let mut domains: Vec<usize> = tables.iter().map(|t| t.log_n + config.log_blowup).collect();
+        domains.dedup();
         Grinding {
             lookup: if lookup > 0 { bits(lookup) } else { 0 },
             alpha: bits(tables.iter().map(|t| t.constraints as u128).sum()),
             zeta: bits(tables.iter().map(|t| ((t.chunks + 1) as u128) << t.log_n).sum()),
-            beta: bits(tables.iter().map(|t| t.opened as u128).sum::<u128>() << log_big),
+            beta: bits(domains.iter().map(|&l| 1u128 << l).sum()),
         }
     }
 }
@@ -501,22 +504,18 @@ impl Grinding {
 pub(crate) fn grind_shape(config: &StarkConfig, air: &dyn DynAir, log_n: usize, public: &[Fp]) -> GrindShape {
     let (constraints, terms) = shape(air, public);
     let chunks = 1 << config.log_chunks(table_degree(config, air, terms));
-    let zk_aux = if config.zk && terms > 0 { ZK_AUX } else { 0 };
-    let w = air.air_width() + if config.zk { ZK_COLS } else { 0 };
-    let aux_w = (lookup_columns(terms, air.air_lookup_group()) + zk_aux) * DEGREE;
     GrindShape {
         log_n,
         constraints: constraints + num_constraints_lookup(config, terms, air),
         lookup_weight: if terms > 0 { lookup_weight(air, public) } else { 0 },
         chunks,
-        opened: 2 * (w + aux_w + air.air_preprocessed_width()) + chunks,
     }
 }
 
 /// The grinding of a proof of `tables` (AIR and log height, tallest first).
 pub fn grinding_of(config: &StarkConfig, tables: &[(&dyn DynAir, usize)], public: &[Fp]) -> Grinding {
     let shapes: Vec<GrindShape> = tables.iter().map(|&(air, log_n)| grind_shape(config, air, log_n, public)).collect();
-    Grinding::new(config, &shapes, tables[0].1 + config.log_blowup)
+    Grinding::new(config, &shapes)
 }
 
 /// The sum over an AIR's lookup terms of the tuple length plus one.
@@ -670,6 +669,12 @@ impl TableProof {
             &self.pre_at_zeta_next,
             &self.quotient_at_zeta_q,
         ]
+    }
+
+    /// Coefficients of the DEEP combination this table takes: one per
+    /// committed column and per quotient chunk (see `Deep`).
+    pub fn deep_len(&self) -> usize {
+        self.trace_at_zeta.len() + self.aux_at_zeta.len() + self.pre_at_zeta.len() + self.quotient_at_zeta_q.len()
     }
 
     fn write(&self, w: &mut Writer) {
@@ -1203,117 +1208,104 @@ fn table_shift(log_big: usize, log_m: usize) -> Fp {
     MULTIPLICATIVE_GENERATOR.pow(1u64 << (log_big - log_m))
 }
 
-/// Out-of-domain openings: trace at zeta and g zeta, aux at zeta and g zeta,
-/// quotient chunks at zeta_q.
-/// DEEP combination `sum_k beta^k (row_k - opened_k) / (x - point_k)`,
-/// arranged so each row costs base-times-extension products only: the
-/// opened values are folded into constants once, and the openings at `g
-/// zeta` reuse the row sum at `zeta` scaled by a power of `beta`.
-/// Beta power offsets: trace at zeta, trace at g zeta, aux at both,
-/// preprocessed at both, then the quotient chunks. Later tables continue
-/// the powers: their combination is scaled by `beta^offset`, the number of
-/// openings of the tables before them.
-struct Deep {
+/// Out-of-domain openings: trace, aux and preprocessed columns at zeta and
+/// g zeta, quotient chunks at zeta_q.
+/// DEEP combination with an independent coefficient `r_k` per committed
+/// polynomial: `sum_k r_k (col_k(x) - I_k(x)) / ((x - zeta)(x - g zeta))`
+/// over the columns, with `I_k` the line through the column's two
+/// openings, plus `sum_j r_j (Q_j(x) - Q_j(zeta_q)) / (x - zeta_q)` over the
+/// chunks. Each row costs one base-times-extension product per column: the
+/// lines fold into two constants, `sum_k r_k I_k(x) = c_a x + c_b`.
+/// Coefficient layout: trace columns, aux columns, preprocessed columns,
+/// then the chunks; later tables take the coefficients after the tables
+/// before them. Independent coefficients make the batching error that of
+/// a line (BCIKS20, affine spaces) rather than that of a curve of degree
+/// the number of polynomials (powers of one challenge).
+struct Deep<'a> {
     w: usize,
     aux_w: usize,
     pre_w: usize,
-    beta_powers: Vec<Fp4>,
-    beta_w: Fp4,
-    beta_aux: Fp4,
-    beta_pre: Fp4,
-    c_tz: Fp4,
-    c_tzn: Fp4,
-    c_az: Fp4,
-    c_azn: Fp4,
-    c_pz: Fp4,
-    c_pzn: Fp4,
+    coeffs: &'a [Fp4],
+    c_a: Fp4,
+    c_b: Fp4,
     c_q: Fp4,
 }
 
-impl Deep {
-    fn new(beta: Fp4, t: &TableProof) -> Deep {
+impl<'a> Deep<'a> {
+    /// `coeffs` starts at this table's coefficients and holds at least
+    /// [`TableProof::deep_len`] of them.
+    fn new(coeffs: &'a [Fp4], t: &TableProof, zeta: Fp4, zeta_next: Fp4) -> Deep<'a> {
         let [t_z, t_zn, a_z, a_zn, p_z, p_zn, q_zq] = t.opened();
-        let (w, aux_w, pre_w, chunks) = (t_z.len(), a_z.len(), p_z.len(), q_zq.len());
-        let beta_powers = powers(beta, 2 * w + 2 * aux_w + 2 * pre_w + chunks);
+        let (w, aux_w, pre_w) = (t_z.len(), a_z.len(), p_z.len());
+        let coeffs = &coeffs[..t.deep_len()];
         let dot = |from: usize, vals: &[Fp4]| -> Fp4 {
-            vals.iter().zip(&beta_powers[from..]).fold(Fp4::ZERO, |acc, (v, b)| acc + *v * *b)
+            vals.iter().zip(&coeffs[from..]).fold(Fp4::ZERO, |acc, (v, r)| acc + *v * *r)
         };
-        Deep {
-            w,
-            aux_w,
-            pre_w,
-            c_tz: dot(0, t_z),
-            c_tzn: dot(w, t_zn),
-            c_az: dot(2 * w, a_z),
-            c_azn: dot(2 * w + aux_w, a_zn),
-            c_pz: dot(2 * w + 2 * aux_w, p_z),
-            c_pzn: dot(2 * w + 2 * aux_w + pre_w, p_zn),
-            c_q: dot(2 * w + 2 * aux_w + 2 * pre_w, q_zq),
-            beta_w: beta.exp(w as u64),
-            beta_aux: beta.exp(aux_w as u64),
-            beta_pre: beta.exp(pre_w as u64),
-            beta_powers,
-        }
+        let c_z = dot(0, t_z) + dot(w, a_z) + dot(w + aux_w, p_z);
+        let c_zn = dot(0, t_zn) + dot(w, a_zn) + dot(w + aux_w, p_zn);
+        // The combined line through (zeta, c_z) and (g zeta, c_zn).
+        let c_a = (c_zn - c_z) * (zeta_next - zeta).inv().unwrap_or(Fp4::ZERO);
+        let c_b = c_z - c_a * zeta;
+        Deep { w, aux_w, pre_w, coeffs, c_a, c_b, c_q: dot(w + aux_w + pre_w, q_zq) }
     }
 
-    /// Number of openings this table contributes.
+    /// Number of coefficients this table takes.
     fn len(&self) -> usize {
-        self.beta_powers.len()
+        self.coeffs.len()
     }
 
     /// The combination in coefficient form, which is linear in the
-    /// columns: the sums divided by `x - zeta`, by `x - zeta g` and by `x -
-    /// zeta^chunks`, each of `n` coefficients. Evaluated at a point, with
-    /// the constants of [`Deep::constants`], they give [`Deep::value`].
-    fn polys(&self, trace: &[Vec<Fp>], aux: &[Vec<Fp>], pre: &[Vec<Fp>], quotient: &[Vec<Fp4>]) -> [Vec<Fp4>; 3] {
+    /// columns: the column sum (to be divided by `(x - zeta)(x - g zeta)`)
+    /// and the chunk sum (by `x - zeta_q`), each of `n` coefficients.
+    /// Evaluated at a point, less the constants of [`Deep::constants`],
+    /// they give [`Deep::value`].
+    fn polys(&self, trace: &[Vec<Fp>], aux: &[Vec<Fp>], pre: &[Vec<Fp>], quotient: &[Vec<Fp4>]) -> [Vec<Fp4>; 2] {
         const CHUNK: usize = 4096;
         let n = trace[0].len();
-        let bp = &self.beta_powers;
-        let (w, aux_w, pre_w) = (self.w, self.aux_w, self.pre_w);
-        let group = |cols: &[Vec<Fp>], from: usize| -> Vec<Fp4> {
-            let mut acc = vec![Fp4::ZERO; n];
-            par_chunks_mut(&mut acc, CHUNK, |c, part| {
-                for (k, col) in cols.iter().enumerate() {
-                    let weight = bp[from + k];
+        let r = self.coeffs;
+        let groups = [(trace, 0), (aux, self.w), (pre, self.w + self.aux_w)];
+        let mut cols = vec![Fp4::ZERO; n];
+        par_chunks_mut(&mut cols, CHUNK, |c, part| {
+            for (group, from) in groups {
+                for (k, col) in group.iter().enumerate() {
+                    let weight = r[from + k];
                     for (a, x) in part.iter_mut().zip(&col[c * CHUNK..]) {
                         *a += weight.mul_base(x);
                     }
                 }
-            });
-            acc
-        };
-        let (g_t, g_a, g_p) = (group(trace, 0), group(aux, 2 * w), group(pre, 2 * w + 2 * aux_w));
-        let q_from = 2 * w + 2 * aux_w + 2 * pre_w;
-        let at_z: Vec<Fp4> = (0..n).map(|k| g_t[k] + g_a[k] + g_p[k]).collect();
-        let at_zn: Vec<Fp4> =
-            (0..n).map(|k| self.beta_w * g_t[k] + self.beta_aux * g_a[k] + self.beta_pre * g_p[k]).collect();
+            }
+        });
+        let q_from = self.w + self.aux_w + self.pre_w;
         let at_q: Vec<Fp4> = (0..n)
-            .map(|k| quotient.iter().enumerate().fold(Fp4::ZERO, |acc, (j, c)| acc + bp[q_from + j] * c[k]))
+            .map(|k| quotient.iter().enumerate().fold(Fp4::ZERO, |acc, (j, c)| acc + r[q_from + j] * c[k]))
             .collect();
-        [at_z, at_zn, at_q]
+        [cols, at_q]
     }
 
-    /// The constants subtracted from [`Deep::polys`] at a point.
-    fn constants(&self) -> [Fp4; 3] {
-        [self.c_tz + self.c_az + self.c_pz, self.c_tzn + self.c_azn + self.c_pzn, self.c_q]
+    /// The constants subtracted from [`Deep::polys`] at the point `x`: the
+    /// combined line at `x`, and the combined chunk openings.
+    fn constants(&self, x: Fp) -> [Fp4; 2] {
+        [self.c_a.mul_base(&x) + self.c_b, self.c_q]
     }
 
-    fn value(&self, rows: Rows<'_>, inv_z: Fp4, inv_zn: Fp4, inv_q: Fp4) -> Fp4 {
+    /// The combination at `x` from the opened rows, given `1 / ((x -
+    /// zeta)(x - g zeta))` and `1 / (x - zeta_q)`.
+    fn value(&self, rows: Rows<'_>, x: Fp, inv_zzn: Fp4, inv_q: Fp4) -> Fp4 {
         let (trace_row, aux_row, pre_row, quotient_row) = rows;
-        let (w, aux_w, pre_w) = (self.w, self.aux_w, self.pre_w);
-        let bp = &self.beta_powers;
+        let r = self.coeffs;
         let base_dot =
-            |row: &[Fp], from: usize| row.iter().zip(&bp[from..]).fold(Fp4::ZERO, |acc, (v, b)| acc + b.mul_base(v));
-        let s_t = base_dot(trace_row, 0);
-        let s_a = base_dot(aux_row, 2 * w);
-        let s_p = base_dot(pre_row, 2 * w + 2 * aux_w);
-        let q_from = 2 * w + 2 * aux_w + 2 * pre_w;
-        let s_q = quotient_row.iter().zip(&bp[q_from..]).fold(Fp4::ZERO, |acc, (v, b)| acc + *v * *b);
-        (s_t - self.c_tz + s_a - self.c_az + s_p - self.c_pz) * inv_z
-            + (self.beta_w * s_t - self.c_tzn + self.beta_aux * s_a - self.c_azn + self.beta_pre * s_p - self.c_pzn)
-                * inv_zn
-            + (s_q - self.c_q) * inv_q
+            |row: &[Fp], from: usize| row.iter().zip(&r[from..]).fold(Fp4::ZERO, |acc, (v, b)| acc + b.mul_base(v));
+        let s = base_dot(trace_row, 0) + base_dot(aux_row, self.w) + base_dot(pre_row, self.w + self.aux_w);
+        let q_from = self.w + self.aux_w + self.pre_w;
+        let s_q = quotient_row.iter().zip(&r[q_from..]).fold(Fp4::ZERO, |acc, (v, b)| acc + *v * *b);
+        let [line, c_q] = self.constants(x);
+        (s - line) * inv_zzn + (s_q - c_q) * inv_q
     }
+}
+
+/// The DEEP batching coefficients: `count` independent challenges.
+fn sample_coefficients(challenger: &mut Challenger, count: usize) -> Vec<Fp4> {
+    (0..count).map(|_| challenger.sample_ext()).collect()
 }
 
 type Rows<'a> = (&'a [Fp], &'a [Fp], &'a [Fp], &'a [Fp4]);
@@ -2161,23 +2153,21 @@ pub fn prove_tables(
 
     // 5. DEEP combinations, summed per domain size, and FRI.
     witnesses[3] = fri::grind(challenger, grinding.beta);
-    let beta = challenger.sample_ext();
+    let coeffs = sample_coefficients(challenger, parts.iter().map(|p| p.deep_len()).sum());
     let mut inputs: Vec<Vec<Fp4>> = Vec::new();
     let mut input_log_sizes: Vec<usize> = Vec::new();
     let mut offset = 0usize;
     for ((t, q), part) in states.iter().zip(&quotients).zip(&parts) {
-        let deep = Deep::new(beta, part);
-        let scale = beta.exp(offset as u64);
+        let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
+        let deep = Deep::new(&coeffs[offset..], part, zeta, zeta_next);
         offset += deep.len();
         let log_m = t.log_n + log_blowup;
-        let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
         let zeta_q = quotient_point(config, zeta, q.chunks);
         let xs = coset_points(t.shift, log_m);
-        let mut denoms: Vec<Fp4> = Vec::with_capacity(3 * xs.len());
+        let mut denoms: Vec<Fp4> = Vec::with_capacity(2 * xs.len());
         for x in &xs {
             let xe = Fp4::from_base(*x);
-            denoms.push(xe - zeta);
-            denoms.push(xe - zeta_next);
+            denoms.push((xe - zeta) * (xe - zeta_next));
             denoms.push(xe - zeta_q);
         }
         let inv = par_batch_inverse(&denoms);
@@ -2186,20 +2176,17 @@ pub fn prove_tables(
         let aux_coeffs = t.aux.as_ref().map_or(&no_coeffs, |(c, _)| &c.coeffs);
         let pre_coeffs = t.input.pre.map_or(&no_coeffs, |p| &p.committed.coeffs);
         let polys = deep.polys(&t.trace.coeffs, aux_coeffs, pre_coeffs, &q.coeffs);
-        let ext: Vec<Vec<Fp>> = par_map_min(3 * DEGREE, 1, |pk| {
+        let ext: Vec<Vec<Fp>> = par_map_min(2 * DEGREE, 1, |pk| {
             let base: Vec<Fp> = polys[pk / DEGREE].iter().map(|v| v.0[pk % DEGREE]).collect();
             lde_cosets(&base, log_blowup, t.shift)
         });
         drop(polys);
-        let consts = deep.constants();
         let (n, b) = (1usize << t.log_n, 1usize << log_blowup);
         let reduced: Vec<Fp4> = par_map(xs.len(), |i| {
             let e = (i % b) * n + i / b;
             let v = |p: usize| Fp4(core::array::from_fn(|k| ext[p * DEGREE + k][e]));
-            let sum = (v(0) - consts[0]) * inv[3 * i]
-                + (v(1) - consts[1]) * inv[3 * i + 1]
-                + (v(2) - consts[2]) * inv[3 * i + 2];
-            scale * sum
+            let [line, c_q] = deep.constants(xs[i]);
+            (v(0) - line) * inv[2 * i] + (v(1) - c_q) * inv[2 * i + 1]
         });
         if input_log_sizes.last() == Some(&log_m) {
             let last = inputs.last_mut().unwrap();
@@ -2388,7 +2375,7 @@ pub fn verify_tables(
         }
     }
     ground(challenger, grinding.beta, proof.grinding[3])?;
-    let beta = challenger.sample_ext();
+    let coeffs = sample_coefficients(challenger, proof.tables.iter().map(|t| t.deep_len()).sum());
 
     // Constraint identity of every table at zeta.
     let public_ext: Vec<Fp4> = public.iter().map(|x| Fp4::from_base(*x)).collect();
@@ -2439,14 +2426,14 @@ pub fn verify_tables(
 
     // FRI over the DEEP combinations recomputed from the opened rows.
     let mut offset = 0usize;
-    let deeps: Vec<(Deep, Fp4)> = proof
+    let deeps: Vec<Deep> = proof
         .tables
         .iter()
         .map(|t| {
-            let d = Deep::new(beta, t);
-            let scale = beta.exp(offset as u64);
+            let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
+            let d = Deep::new(&coeffs[offset..], t, zeta, zeta_next);
             offset += d.len();
-            (d, scale)
+            d
         })
         .collect();
     let mut log_sizes: Vec<usize> = log_ns.iter().map(|l| l + log_blowup).collect();
@@ -2461,7 +2448,7 @@ pub fn verify_tables(
         }
         let mut values: Vec<Fp4> = Vec::with_capacity(log_sizes.len());
         let mut last_size = None;
-        for ((((spec, t), s), opening), (deep, scale)) in
+        for ((((spec, t), s), opening), deep) in
             specs.iter().zip(&proof.tables).zip(&shapes).zip(openings).zip(&deeps)
         {
             if opening.trace_row.len() != s.w
@@ -2490,13 +2477,14 @@ pub fn verify_tables(
                 return Err(VerifyError::InvalidQuotientOpening { query: q });
             }
             let shift = table_shift(log_big, log_m);
-            let x = Fp4::from_base(shift.mul(&root_of_unity(log_m).pow(i as u64)));
+            let x_base = shift.mul(&root_of_unity(log_m).pow(i as u64));
+            let x = Fp4::from_base(x_base);
             let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
             let zeta_q = quotient_point(config, zeta, s.chunks);
-            let inv = batch_inverse(&[x - zeta, x - zeta_next, x - zeta_q]);
+            let inv = batch_inverse(&[(x - zeta) * (x - zeta_next), x - zeta_q]);
             let rows = (&opening.trace_row[..], &opening.aux_row[..], &opening.pre_row[..]);
             let quotient = ext_from_row(&opening.quotient_row);
-            let v = *scale * deep.value((rows.0, rows.1, rows.2, &quotient), inv[0], inv[1], inv[2]);
+            let v = deep.value((rows.0, rows.1, rows.2, &quotient), x_base, inv[0], inv[1]);
             if last_size == Some(log_m) {
                 *values.last_mut().unwrap() += v;
             } else {
@@ -3039,7 +3027,7 @@ mod tests {
             TableSpec { air: &Receiver, pre_root: None },
         ];
         let g = grinding_of(&config, &[(&Sender, 4), (&Sender, 2), (&Receiver, 2)], &[]);
-        assert!(g.lookup > 0 && g.alpha > 0 && g.zeta > 0 && g.beta > g.zeta, "{g:?}");
+        assert!(g.lookup > 0 && g.alpha > 0 && g.zeta > 0 && g.beta > 0, "{g:?}");
         let proof = prove_tables(&config, &tables, &[], &mut transcript());
         assert_eq!(verify_tables(&config, &specs, &[], &proof, &mut transcript()), Ok(()));
         assert!(proof.grinding.iter().all(|w| *w != Fp::ZERO));

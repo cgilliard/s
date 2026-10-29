@@ -14,14 +14,14 @@ by attacking many proofs at once that it would not gain by attacking one.
 
 ## Summary
 
-The target is 112 bits of conjectured classical security for every proof:
-every Fiat-Shamir round of every proof has an error below 2^-113 per attempt.
+The target is 120 bits of conjectured classical security for every proof:
+every Fiat-Shamir round of every proof has an error below 2^-121 per attempt.
 
 | proof | queries | conjectured, every round | quantum | proven (Johnson regime) |
 |---|---|---|---|---|
-| segment (2^15 rows, rate 1/4) | 50 + 16 grinding bits | 112.0 | about 56 | 63 |
-| node (up to 2^19 + 2^17 rows, rate 1/4) | 50 + 16 | 112.1 | about 56 | 63 |
-| wrap (up to 2^17 + 2^15 rows, rate 1/32) | 20 + 16 | 112.3 | about 56 | 63 |
+| segment (2^15 rows, rate 1/4) | 54 + 16 grinding bits | 120.0 | about 60 | 68 |
+| node (up to 2^19 + 2^17 rows, rate 1/4) | 54 + 16 | 120.1 | about 60 | 67 |
+| wrap (up to 2^17 + 2^15 rows, rate 1/32) | 22 + 16 | 120.3 | about 60 | 68 |
 
 All figures are bits of classical security against a prover that may make
 2^λ hash queries. Against a quantum attacker, Grover search over transcripts
@@ -36,17 +36,18 @@ How the figures are counted:
   - the lookup challenges γ and δ;
   - the constraint combination α;
   - the out-of-domain point ζ;
-  - the batching challenge β;
+  - the DEEP batching coefficients;
   - the FRI folding challenges.
 
   Each of those has an error of degree over |K| (Schwartz–Zippel, list size
-  one). With |K| = 2^123.6 they are not negligible: at the previous
-  parameters they held the proofs to 92–95 bits. The prover therefore grinds
-  before each of them, as many bits as its error falls short of 113
+  one). With |K| = 2^123.6 they are not negligible: at the parameters of
+  2025 they held the proofs to 92–95 bits. The prover therefore grinds
+  before each of them, as many bits as its error falls short of 121
   (`StarkConfig::commit_bits`, below). The result is the smallest round minus
   one, as in the documentation's equation 19.
 - **ethSTARK formula.** The number usually quoted for STARKs counts the
-  queries only: min(grinding + R·s, log2|K|) − 1, which is 115 here.
+  queries only: min(grinding + R·s, log2|K|) − 1, which is 122.6 here, the
+  cap set by the field.
 - **Proven.** This applies the round-by-round theorem of the ethSTARK
   documentation (Theorem 5, from BCIKS20 in the Johnson regime), with the
   same grinding, maximised over its parameter m.
@@ -78,16 +79,17 @@ before the challenge in parentheses.
 
 | round | segment | node | wrap |
 |---|---|---|---|
-| lookup challenges (LogUp) | none | 113.6 (16) | 113.6 (14) |
-| constraint combination (powers of α) | 113.9 (1) | 114.5 (0) | 114.5 (0) |
-| out-of-domain point ζ (DEEP) | 113.0 (6) | 113.1 (11) | 113.3 (10) |
-| batching (powers of β) | 113.1 (17) | 113.6 (21) | 113.5 (22) |
-| FRI folding, first round (later rounds need 2 bits less each) | 113.6 (9) | 113.6 (13) | 113.6 (14) |
-| queries, toy-problem conjecture | 116.0 | 116.0 | 116.0 |
-| queries, list-decoding-capacity radius | 114.1 | 114.1 | 114.5 |
+| lookup challenges (LogUp) | none | 121.6 (24) | 121.6 (22) |
+| constraint combination (powers of α) | 121.9 (9) | 121.5 (7) | 121.5 (7) |
+| out-of-domain point ζ (DEEP) | 121.0 (14) | 121.1 (19) | 121.3 (18) |
+| batching (independent coefficients) | 121.6 (15) | 121.3 (19) | 121.3 (20) |
+| FRI folding, first round (later rounds need 2 bits less each) | 121.6 (17) | 121.6 (21) | 121.6 (22) |
+| queries, toy-problem conjecture | 124.0 | 124.0 | 126.0 |
+| queries, list-decoding-capacity radius | 122.0 | 122.0 | 124.3 |
 
-Without the grinding, the same rounds give the following bits (previous
-parameters: 42 queries, and a wrap of 16 queries plus 20 bits):
+Without grinding and with powers of one challenge for the batching, the
+same rounds gave the following bits (the parameters of 2025: 42 queries,
+and a wrap of 16 queries plus 20 bits):
 
 | round | segment | node | wrap |
 |---|---|---|---|
@@ -99,13 +101,19 @@ parameters: 42 queries, and a wrap of 16 queries plus 20 bits):
 
 What each error term counts:
 
-- **Batching** is the weakest without grinding. All committed columns are
-  combined with powers of one challenge β, as in Plonky3, rather than with
-  independent coefficients. The combination is then a curve of degree L,
-  where L is the number of opened polynomials: 1,440 for a segment, 1,030 for
-  a node and 1,118 for the wrap. BCIKS20's bound for curves multiplies the
-  line error by the curve degree, giving roughly L·|D|/|K|. That costs about
-  10 bits against |K|, and is why β needs 17 to 22 bits of grinding.
+- **Batching** uses one independent coefficient per committed column and
+  per quotient chunk, sampled from the transcript after the openings
+  (`stark::Deep`). BCIKS20's bound for affine spaces then gives the line
+  error, |D|/|K| per FRI input, whatever the number of polynomials. Each
+  column is opened at ζ and gζ through one quotient by (x − ζ)(x − gζ), so
+  a row of the recursive verifier still costs one product per column; the
+  verifier samples a few hundred extension elements more. Until this
+  change the columns were combined with powers of one challenge β, as in
+  Plonky3. The combination is then a curve of degree L, the number of
+  opened polynomials (1,440 for a segment, 1,030 for a node, 1,118 for the
+  wrap), and BCIKS20's bound for curves multiplies the line error by L.
+  That cost about 10 bits, made batching the weakest round, and at 121 bits
+  would have needed 25 to 30 bits of grinding, minutes per proof.
 - **The lookup term** is the degree of the LogUp identity in (γ, δ):
   rows × Σ(tuple length + 1), over |K|.
 - **The folding term** is arity × domain over |K|, per round.
@@ -129,8 +137,10 @@ compute the schedule with `stark::grinding_of`, and FRI computes it per round
 with `fri::fold_grinding`.
 
 The cost is 2^g permutations per challenge, about 1 s at 21 bits on the
-development laptop, all cores. Measured end to end, grinding adds about
-2.7 s to a one-segment block and about 6 s to a 16-segment block.
+development laptop, all cores. Measured end to end at 121 bits, grinding
+adds about 6 s to a one-segment block and about 78 s to a 16-segment block
+(five nodes at about 10 s each, mostly the 24 bits before the lookup
+challenges); at 113 bits it added 2.7 s and 6 s.
 
 ## The 2025 counterexamples
 
@@ -146,7 +156,7 @@ H_q(δ) = 1 − ρ. Our FRI codewords are over K, so q = 2^123.6, and that radiu
 costs very little: 1.96 instead of 2 bits per query at rate 1/4, and 4.92
 instead of 5 at rate 1/32. That is the "list-decoding capacity" row of the
 round-by-round table, 1.5 to 1.9 bits below the toy-problem figure, and
-still above the 113-bit rounds.
+still above the 121-bit rounds.
 
 Whether the O(1/log n) failures cost more in practice is not settled. Their
 constants are not known to us, so leave a few bits of margin above the
@@ -165,15 +175,18 @@ conjectured ones.
 
 ## Going further
 
-Getting past about 112 bits is held back by the batching term. It would
-need one of:
+Getting past 120 bits is held back by the field. |K| = 2^123.6 caps the
+ethSTARK figure at 122.6, and every algebraic round at 123.6 minus its
+degree, so at most two more bits are available, each doubling all the
+grinding (the lookup challenges of a node already take 8 s). Beyond that:
 
-- about 24 or more bits of grinding before β, several seconds per proof;
-- independent batching coefficients, which remove its factor L at the cost
-  of restructuring the recursive verifier's DEEP evaluation;
 - a larger extension field. The quintic extension of BabyBear, about 2^155,
   would add about 31 bits to every algebraic round, but the recursive
-  machine works in Fp4 words.
+  machine works in Fp4 words;
+- then the digest. The BCS compiler allows λ up to 122 with 247-bit
+  digests, and collisions cost 2^124. A width-24 Poseidon2 (Plonky3's other
+  BabyBear instance, 8 full and 21 partial rounds) with a 10-element digest
+  gives 310 bits.
 
 ## Measured cost
 
@@ -181,17 +194,26 @@ These measurements come from `aggregate::tests::security_configs`: mainnet
 blocks of output-only segments, proven and verified on the development
 laptop, with two segment provers at a time.
 
+The first three rows batch with powers of β (2025); the last two with
+independent coefficients.
+
 | configuration | node / wrap tables | 1-segment block | 16-segment block | proof | verify |
 |---|---|---|---|---|---|
-| previous (about 92 bits): 42 queries + 16 bits; wrap 16 + 20 | 2^18 / 2^16 | 13.4 s | 60.5 s (wrap 10.4 s) | 149–151 KB | 9.5 ms |
+| 42 queries + 16 bits; wrap 16 + 20 (about 92 bits) | 2^18 / 2^16 | 13.4 s | 60.5 s (wrap 10.4 s) | 149–151 KB | 9.5 ms |
 | 50 + 16; wrap 20 + 16; no commit grinding (about 97 bits) | 2^19 / 2^17 | 13.2 s | 77.1 s (wrap 21.9 s) | 179–189 KB | 12 ms |
-| **mainnet: 50 + 16; wrap 20 + 16; commit grinding to 113 (112 bits)** | 2^19 / 2^17 | 15.9 s | 83.4 s (wrap 21.8 s) | 177–191 KB | 12 ms |
+| 50 + 16; wrap 20 + 16; commit grinding to 113 (112 bits) | 2^19 / 2^17 | 15.9 s | 83.4 s (wrap 21.8 s) | 177–191 KB | 12 ms |
+| 54 + 16; wrap 22 + 16; no commit grinding (about 101 bits) | 2^19 / 2^17 | 23.1 s | 92.5 s (wrap 18.9 s) | 204–207 KB | 13 ms |
+| **mainnet: 54 + 16; wrap 22 + 16; commit grinding to 121 (120 bits)** | 2^19 / 2^17 | 29.0 s | 170 s (wrap 22.2 s) | 202–207 KB | 13 ms |
 
-At 50 queries, the verifier of a node with several children passes 2^18
-rows, and the wrap over it passes 2^16 rows. The wrap therefore doubles once
-a block has more than one segment, and the proof grows by about a quarter. A
-single-segment block's root still fits 2^16 rows, so its wrap does not
-double.
+The grinding dominates the step from 112 to 120 bits: each challenge needs
+8 more bits, 256 times the work, and a node's lookup challenges alone take
+2^24 permutations, about 8 s. A 16-segment block proves five nodes.
+
+At 54 queries, a node of four children still passes 2^19 rows and the wrap
+over it 2^17, as at 50. The verifier of a single segment passes 2^17 rows
+and its wrap 2^17 as well: at 50 queries that wrap fit 2^16, so the
+single-segment block's wrap doubled, from about 10 s to 22 s. The published
+proof is the wrap's, so its size hardly depends on the block.
 
 ## References
 

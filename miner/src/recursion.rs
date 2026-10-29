@@ -275,6 +275,15 @@ impl Compiler {
         acc
     }
 
+    /// [`Compiler::word_from_scalars`] into `out`.
+    fn word_from_scalars_to(&mut self, s: [Addr; DEGREE], out: Addr) {
+        let acc = self.muladd(s[3], A_X, s[2]);
+        let acc = self.muladd(acc, A_X, s[1]);
+        self.prog.muladd_to(acc, A_X, s[0], out);
+        let v = self.val(acc) * self.val(A_X) + self.val(s[0]);
+        self.set(out, v);
+    }
+
     /// An empty compiler used to swap `self` into the thread-local context.
     fn shell() -> Compiler {
         Compiler {
@@ -708,7 +717,11 @@ impl Compiler {
             opened.push(groups);
         }
         ground(c, &mut t, grinding.beta, proof.grinding[3]);
-        let beta = c.sample_word(&mut t);
+        // One independent coefficient per opened polynomial, in one block of
+        // consecutive words so dot products can read them eight at a time
+        // (see `stark::Deep` for the layout).
+        let layout = |s: &TableShape| s.w + s.aux_w + s.pre_w + s.chunks;
+        let coeff_base = c.sample_block(&mut t, shapes.iter().map(layout).sum());
 
         // ---- constraint identity of every table at zeta ----
         // `zeta_pows[k] = zeta^(2^k)`.
@@ -838,48 +851,50 @@ impl Compiler {
         // Inverse of the primitive fourth root of unity, for four-way folds.
         let iota_inv = c.scalar(omega_inv_pows[log_big_n - 2]);
         let fri_betas_sq: Vec<Addr> = fri_betas.iter().map(|&b| c.mul(b, b)).collect();
-        // Powers of beta in one block of consecutive words, so dot products
-        // can read them eight at a time (see `stark::Deep` for the layout,
-        // the same for every table up to the table's scale).
-        let layout = |s: &TableShape| 2 * s.w + 2 * s.aux_w + 2 * s.pre_w + s.chunks;
-        let beta_count = shapes.iter().map(layout).max().unwrap();
-        let beta_base = c.powers_block(beta, beta_count + RATE);
-        let bp = |k: usize| beta_base + k as Addr;
-        let dot = |c: &mut Compiler, from: usize, vals: &[Addr]| -> Addr {
-            let mut acc = A_ZERO;
+        // `acc + sum_k vals[k] * mem[from + k]`.
+        let dot = |c: &mut Compiler, acc: Addr, from: Addr, vals: &[Addr]| -> Addr {
+            let mut acc = acc;
             for (k, v) in vals.iter().enumerate() {
-                acc = c.muladd(*v, bp(from + k), acc);
+                acc = c.muladd(*v, from + k as Addr, acc);
             }
             acc
         };
+        /// Per table: where its coefficients start (trace, aux,
+        /// preprocessed, chunks), the combined line through the column
+        /// openings `sum_k r_k I_k(x) = c_a x + c_b` (as `-c_a` and `c_b`),
+        /// and the combined chunk openings.
         struct DeepConsts {
-            c_tz: Addr,
-            c_tzn: Addr,
-            c_az: Addr,
-            c_azn: Addr,
-            c_pz: Addr,
-            c_pzn: Addr,
+            r: Addr,
+            r_a: Addr,
+            r_p: Addr,
+            r_q: Addr,
+            neg_c_a: Addr,
+            c_b: Addr,
             c_q: Addr,
-            /// `beta^offset`, absent for the first table.
-            scale: Option<Addr>,
         }
         let mut offset = 0usize;
         let mut deep = Vec::with_capacity(tables.len());
         for (i, s) in shapes.iter().enumerate() {
             let [trace_z, trace_zn, aux_z, aux_zn, pre_z, pre_zn, quot_zq] = &opened[i][..] else { unreachable!() };
-            let (off_a, off_p, off_q) = (2 * s.w, 2 * s.w + 2 * s.aux_w, 2 * s.w + 2 * s.aux_w + 2 * s.pre_w);
-            let scale = (offset > 0).then(|| c.pow_const(beta, offset as u64));
+            let r = coeff_base + offset as Addr;
             offset += layout(s);
-            deep.push(DeepConsts {
-                c_tz: dot(c, 0, trace_z),
-                c_tzn: dot(c, s.w, trace_zn),
-                c_az: dot(c, off_a, aux_z),
-                c_azn: dot(c, off_a + s.aux_w, aux_zn),
-                c_pz: dot(c, off_p, pre_z),
-                c_pzn: dot(c, off_p + s.pre_w, pre_zn),
-                c_q: dot(c, off_q, quot_zq),
-                scale,
-            });
+            let r_a = r + s.w as Addr;
+            let r_p = r_a + s.aux_w as Addr;
+            let r_q = r_p + s.pre_w as Addr;
+            let c_z = dot(c, A_ZERO, r, trace_z);
+            let c_z = dot(c, c_z, r_a, aux_z);
+            let c_z = dot(c, c_z, r_p, pre_z);
+            let c_zn = dot(c, A_ZERO, r, trace_zn);
+            let c_zn = dot(c, c_zn, r_a, aux_zn);
+            let c_zn = dot(c, c_zn, r_p, pre_zn);
+            let c_q = dot(c, A_ZERO, r_q, quot_zq);
+            // The line through (zeta, c_z) and (g zeta, c_zn).
+            let d = c.sub(zeta_nexts[i], zeta);
+            let d_inv = c.inverse(d);
+            let diff = c.sub(c_z, c_zn);
+            let neg_c_a = c.mul(diff, d_inv);
+            let c_b = c.muladd(neg_c_a, zeta, c_z);
+            deep.push(DeepConsts { r, r_a, r_p, r_q, neg_c_a, c_b, c_q });
         }
 
         for (q, steps) in fri.queries.iter().enumerate() {
@@ -910,12 +925,12 @@ impl Compiler {
                     x_t = c.mul(x_t, x_t);
                     log_x -= 1;
                 }
-                let (off_a, off_p, off_q) = (2 * s.w, 2 * s.w + 2 * s.aux_w, 2 * s.w + 2 * s.aux_w + 2 * s.pre_w);
-                let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, bp(0));
+                let d = &deep[i];
+                let (trace_row, s_t) = c.row_inputs_dot(&opening.trace_row, d.r);
                 let root = c.merkle_root(trace_row, s.w, &opening.trace_path, bits);
                 c.assert_digest(root, trace_roots[i]);
                 let s_a = if s.aux_w > 0 {
-                    let (row, sum) = c.row_inputs_dot(&opening.aux_row, bp(off_a));
+                    let (row, sum) = c.row_inputs_dot(&opening.aux_row, d.r_a);
                     let root = c.merkle_root(row, s.aux_w, &opening.aux_path, bits);
                     c.assert_digest(root, aux[i].unwrap().0);
                     sum
@@ -923,7 +938,7 @@ impl Compiler {
                     A_ZERO
                 };
                 let s_p = if s.pre_w > 0 {
-                    let (row, sum) = c.row_inputs_dot(&opening.pre_row, bp(off_p));
+                    let (row, sum) = c.row_inputs_dot(&opening.pre_row, d.r_p);
                     let root = c.merkle_root(row, s.pre_w, &opening.pre_path, bits);
                     c.assert_digest(root, tables[i].1.unwrap());
                     sum
@@ -937,38 +952,29 @@ impl Compiler {
                 for j in 0..s.chunks {
                     let sc: [Addr; DEGREE] = core::array::from_fn(|k| quot_row + (j * DEGREE + k) as Addr);
                     let word = c.word_from_scalars(sc);
-                    s_q = c.muladd(word, bp(off_q + j), s_q);
+                    s_q = c.muladd(word, d.r_q + j as Addr, s_q);
                 }
 
-                let d = &deep[i];
                 let dz = c.sub(x_t, zeta);
-                let inv_z = c.inverse(dz);
                 let dzn = c.sub(x_t, zeta_nexts[i]);
-                let inv_zn = c.inverse(dzn);
+                let dzzn = c.mul(dz, dzn);
+                let inv_zzn = c.inverse(dzzn);
                 let dzq = c.sub(x_t, zeta_pows[s.log_q]);
                 let inv_zq = c.inverse(dzq);
-                // value = (s_t - c_tz + s_a - c_az + s_p - c_pz) / (x - zeta)
-                //       + (beta^w s_t - c_tzn + beta^aux_w s_a - c_azn + beta^pre_w s_p - c_pzn) / (x - g zeta)
+                // value = (s_t + s_a + s_p - c_a x - c_b) / ((x - zeta)(x - g zeta))
                 //       + (s_q - c_q) / (x - zeta_q)
-                let at_z = c.sub(s_t, d.c_tz);
-                let at_z = c.add(at_z, s_a);
-                let at_z = c.sub(at_z, d.c_az);
-                let at_z = c.add(at_z, s_p);
-                let at_z = c.sub(at_z, d.c_pz);
-                let at_zn = c.muladd(bp(s.w), s_t, A_ZERO);
-                let at_zn = c.sub(at_zn, d.c_tzn);
-                let at_zn = c.muladd(bp(s.aux_w), s_a, at_zn);
-                let at_zn = c.sub(at_zn, d.c_azn);
-                let at_zn = c.muladd(bp(s.pre_w), s_p, at_zn);
-                let at_zn = c.sub(at_zn, d.c_pzn);
+                let mut at = s_t;
+                if s.aux_w > 0 {
+                    at = c.add(at, s_a);
+                }
+                if s.pre_w > 0 {
+                    at = c.add(at, s_p);
+                }
+                let at = c.sub(at, d.c_b);
+                let at = c.muladd(d.neg_c_a, x_t, at);
                 let at_q = c.sub(s_q, d.c_q);
-                let value = c.mul(at_z, inv_z);
-                let value = c.muladd(at_zn, inv_zn, value);
+                let value = c.mul(at, inv_zzn);
                 let value = c.muladd(at_q, inv_zq, value);
-                let value = match d.scale {
-                    Some(k) => c.mul(value, k),
-                    None => value,
-                };
                 if last_size == Some(log_m) {
                     let prev = values.pop().unwrap();
                     values.push(c.add(prev, value));
@@ -1042,29 +1048,15 @@ impl Compiler {
         }
     }
 
-    /// `base^e` by square and multiply.
-    fn pow_const(&mut self, base: Addr, e: u64) -> Addr {
-        let mut acc = A_ONE;
-        for i in (0..u64::BITS - e.leading_zeros()).rev() {
-            acc = self.mul(acc, acc);
-            if (e >> i) & 1 == 1 {
-                acc = self.mul(acc, base);
-            }
-        }
-        acc
-    }
-    /// `base^0 .. base^(count-1)` at `count` consecutive fresh addresses,
-    /// zero padded to a multiple of eight.
-    fn powers_block(&mut self, base: Addr, count: usize) -> Addr {
-        let padded = count.div_ceil(RATE) * RATE;
+    /// Samples `count` words into consecutive fresh addresses, followed by
+    /// at least eight zero words so that [`Compiler::row_inputs_dot`] may
+    /// read past the end.
+    fn sample_block(&mut self, t: &mut Transcript, count: usize) -> Addr {
+        let padded = (count + RATE).div_ceil(RATE) * RATE;
         let block = self.prog.alloc(padded as u32);
-        self.prog.muladd_to(A_ONE, A_ONE, A_ZERO, block);
-        self.set(block, Fp4::ONE);
-        for k in 1..count {
-            let prev = block + (k - 1) as Addr;
-            self.prog.muladd_to(prev, base, A_ZERO, block + k as Addr);
-            let v = self.val(prev) * self.val(base);
-            self.set(block + k as Addr, v);
+        for k in 0..count {
+            let s = [self.sample(t), self.sample(t), self.sample(t), self.sample(t)];
+            self.word_from_scalars_to(s, block + k as Addr);
         }
         for k in count..padded {
             self.prog.muladd_to(A_ZERO, A_ONE, A_ZERO, block + k as Addr);
