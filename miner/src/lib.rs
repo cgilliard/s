@@ -9,6 +9,8 @@ pub mod codec;
 pub mod difficulty;
 pub mod ext;
 pub mod field;
+#[rustfmt::skip]
+pub mod genesis;
 pub mod fri;
 pub mod hash_machine;
 pub mod hash_table;

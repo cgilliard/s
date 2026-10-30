@@ -81,6 +81,10 @@ pub struct ChainParams {
     /// Timestamp of the genesis block, an empty block (see
     /// [`ChainParams::genesis`]).
     pub genesis_timestamp: u64,
+    /// The genesis header's nonce: on mainnet, the hash of the latest
+    /// Bitcoin block when genesis was made, so the chain provably did not
+    /// exist before it.
+    pub genesis_nonce: [u8; 32],
     /// Target of the block after genesis; the ASERT anchor.
     pub genesis_target: U256,
     /// Easiest permitted target.
@@ -104,8 +108,9 @@ pub struct ChainParams {
 impl ChainParams {
     pub const MAINNET: ChainParams = ChainParams {
         pow: PowParams::MAINNET,
-        genesis_timestamp: 1_767_225_600,         // 2026-01-01T00:00:00Z
-        genesis_target: U256([0, 0, 0, 1 << 40]), // 2^232: about 2^16 hashes per block to start
+        genesis_timestamp: crate::genesis::TIMESTAMP,
+        genesis_nonce: crate::genesis::BITCOIN_HASH,
+        genesis_target: U256(crate::genesis::TARGET),
         max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
         max_block_size: 2 << 20,
         max_future_drift: 2 * 3600,
@@ -141,7 +146,9 @@ impl ChainParams {
     }
 
     /// The genesis block: empty, at `genesis_timestamp`, over the empty
-    /// state tree. Every node of a network must start from the same one.
+    /// state tree, with `genesis_nonce` as its nonce (proof of work is not
+    /// checked on genesis). Every node of a network must start from the
+    /// same one.
     pub fn genesis(&self) -> Block {
         let body = Body { inputs: vec![], outputs: vec![], proof: vec![] };
         let header = Header {
@@ -151,7 +158,7 @@ impl ChainParams {
             body_commitment: body.commitment(),
             state_root: empty_root(),
             mix: EMPTY,
-            nonce: [0u8; 32],
+            nonce: self.genesis_nonce,
         };
         Block { header, body }
     }
@@ -1371,6 +1378,7 @@ mod tests {
         ChainParams {
             pow: POW,
             genesis_timestamp: GENESIS_TIME,
+            genesis_nonce: [0u8; 32],
             // Easy: 2^240, about 2^8 hashes per block.
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
@@ -2053,6 +2061,17 @@ mod tests {
         let wide_chain = wide_chain.with_max_undo(Some(2));
         assert_eq!(wide_chain.prune_undo().unwrap(), 4);
         assert_eq!(wide_chain.prune_undo().unwrap(), 0);
+    }
+
+    #[test]
+    fn mainnet_genesis_matches_the_generated_file() {
+        let g = ChainParams::MAINNET.genesis().header;
+        let id: String = crate::poseidon2::digest_to_bytes(&g.hash()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(id, crate::genesis::ID, "src/genesis.rs is out of date: regenerate it with tools/genesis.rs");
+        assert_eq!(g.timestamp, crate::genesis::TIMESTAMP);
+        let hex: String = g.nonce.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, crate::genesis::BITCOIN_HASH_HEX);
+        assert!(crate::genesis::BITCOIN_TIME <= g.timestamp, "the Bitcoin block must come first");
     }
 
     #[test]

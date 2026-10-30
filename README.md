@@ -4,6 +4,25 @@ A proof-of-work chain whose blocks carry only output commitments and a
 zero-knowledge validity proof. `miner/` holds the node, the prover and the
 wallet; `miner/SECURITY.md` analyses the proofs.
 
+## Genesis
+
+`miner/src/genesis.rs` holds mainnet's genesis, written by the genesis tool:
+
+```
+cd miner
+cargo run --release --bin genesis                      # testing: about 65,536 hashes per block
+cargo run --release --bin genesis -- --hashrate 1000000  # a launch: ten-minute blocks at 1 MH/s
+```
+
+It records the current time and the hash of the latest Bitcoin block (fetched
+from mempool.space with `curl`, or given with `--bitcoin-hash`), which goes in
+the genesis header's nonce: the chain provably did not exist before that
+Bitcoin block. `--hashrate` is the network's expected proof-of-work rate at
+launch, in hashes per second; it sets the first target so blocks average ten
+minutes from the start. Without it the target is the testing one, so blocks
+come as fast as they can be proven. Every run makes a new chain, so run it just before
+launch, rebuild, and publish the genesis id it prints.
+
 ## Build
 
 ```
@@ -34,7 +53,7 @@ mining. Both listen on UDP port 7417 by default, contact the seed nodes in
 Logs go to `DIR/tabminer.log`; the terminal shows a prompt (`help` lists
 the commands). `--no-prompt` logs to the terminal instead, for scripts.
 
-Every node starts from the fixed mainnet genesis in `ChainParams::MAINNET`.
+Every node starts from the mainnet genesis in `miner/src/genesis.rs`.
 
 ## Fast sync
 

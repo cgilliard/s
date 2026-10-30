@@ -227,6 +227,7 @@ mod tests {
         ChainParams {
             pow: POW,
             genesis_timestamp: 0,
+            genesis_nonce: [0u8; 32],
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
             max_block_size: 16 << 20,
