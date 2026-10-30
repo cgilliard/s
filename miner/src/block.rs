@@ -35,7 +35,7 @@
 //! The body commitment hashes all three.
 
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
-use crate::pow::{self, Digest, ItemSource, Nonce, PowOutput, SeedText, Target, pack_bytes};
+use crate::pow::{self, Digest, ItemSource, Nonce, PowOutput, Target, pack_bytes};
 use crate::state_tree::CAPACITY;
 use crate::transaction::{Commitment, Memo, hash_domain};
 
@@ -141,8 +141,8 @@ impl Header {
 
     /// Full proof-of-work check from the seed text: the mix must be the true
     /// mix and the result must meet the target.
-    pub fn verify_pow(&self, seed: &SeedText, target: &Target) -> bool {
-        self.quick_pow_check(target) && pow::verify(seed, &self.pow_hash(), &self.nonce, &self.mix, target)
+    pub fn verify_pow<S: pow::ItemSource>(&self, source: &S, target: &Target) -> bool {
+        self.quick_pow_check(target) && pow::verify(source, &self.pow_hash(), &self.nonce, &self.mix, target)
     }
 }
 
@@ -333,7 +333,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pow::{Dataset, PowParams, nonce_from_u64};
+    use crate::pow::{Dataset, PowParams, SeedText, nonce_from_u64};
     use crate::transaction::{Key, Output};
 
     fn d(n: u32) -> Digest {

@@ -11,12 +11,17 @@
 //!
 //! Every peer is pinged periodically and answers with its tip, its work
 //! and the lowest height from which it holds every block. Only peers that
-//! answered our own ping are believed. When one claims more work than our
-//! best header, we send it a locator; its `Headers` replies list the
-//! main-chain headers after our fork point, each checked (proof of work,
-//! difficulty, timestamps) and stored before any block is fetched. A peer
-//! that sends no header we lack within [`net::HEADER_TIMEOUT`] is not
+//! answered our own ping are believed. While any claims more work than our
+//! best header, headers are fetched in batches by height
+//! (`GetHeadersFrom`, [`MAX_HEADERS`] each), up to [`HEADER_BATCHES`] at
+//! once, each from a different such peer; complete batches are checked
+//! (proof of work, in parallel, difficulty, timestamps) and stored in
+//! order, so a slow peer delays only its share, and a batch late by
+//! [`BATCH_TIMEOUT`] goes to another peer. A batch that does not follow
+//! our best header means a fork: a locator (`GetHeaders`) finds where. A
+//! peer that sends no header we lack within [`net::HEADER_TIMEOUT`] is not
 //! believed for a while, so a false claim cannot stall the sync.
+//! Transaction announcements are ignored until the node has caught up.
 //!
 //! The blocks of the best header's branch are then fetched in parallel:
 //! up to [`MAX_DOWNLOADS`] at once, at most [`MAX_PER_PEER`] from one
@@ -91,6 +96,12 @@ pub const LOOKAHEAD: usize = 32;
 /// Transactions fetched at once, and from one peer.
 const MAX_TX_DOWNLOADS: usize = 32;
 const MAX_TX_PER_PEER: usize = 4;
+/// Header batches asked ahead of the best header, each of a different
+/// peer: [`MAX_HEADERS`] headers apiece, so about a thousand in flight.
+const HEADER_BATCHES: usize = 16;
+/// A header batch not complete by then is asked of another peer, and the
+/// slow one passed over.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// Blocks remembered with the peer that announced them.
 const MAX_SOURCES: usize = 4096;
 /// A fetched block whose parent has not arrived by then is dropped.
@@ -155,6 +166,9 @@ struct Snap {
     manifest_from: Option<SocketAddr>,
     /// Manifests the block's proof rejected so far.
     bad_manifests: u32,
+    /// Peers that did not serve something of this snapshot: perhaps they
+    /// do not keep it. Asked again only if no other can be.
+    unserved: std::collections::HashSet<SocketAddr>,
 }
 
 /// What the node's loop consumes.
@@ -167,6 +181,18 @@ pub enum Event {
     /// The applier thread has a result: nothing else to do but take it.
     Wake,
     Stop,
+}
+
+/// Headers asked of one peer by height (`GetHeadersFrom`), keyed in the
+/// node by their first height.
+struct HeaderBatch {
+    start: u32,
+    peer: SocketAddr,
+    asked: Instant,
+    /// The last height expected: the peer's height when asked, at most
+    /// [`MAX_HEADERS`] on.
+    end: u32,
+    headers: std::collections::BTreeMap<u32, Header>,
 }
 
 /// A block handed to the applier thread, with who sent it.
@@ -214,6 +240,12 @@ pub struct Node<V: ProofVerifier> {
     /// Who announced a block we may fetch: asked first, since its status
     /// may not show the block yet.
     sources: HashMap<Digest, SocketAddr>,
+    /// Header batches in flight or complete, by first height, verified in
+    /// order as the one at the best header comes in.
+    header_batches: std::collections::BTreeMap<u32, HeaderBatch>,
+    /// Header batches each peer let time out in a row: the first may be a
+    /// request that arrived before it had checked our address.
+    slow_batches: HashMap<SocketAddr, u32>,
     /// Blocks handed to the applier thread and not yet reported back.
     applying: std::collections::HashSet<Digest>,
     jobs: Option<std::sync::mpsc::Sender<Job>>,
@@ -360,6 +392,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             pending: HashMap::new(),
             sources: HashMap::new(),
             applying: std::collections::HashSet::new(),
+            header_batches: std::collections::BTreeMap::new(),
+            slow_batches: HashMap::new(),
             jobs: Some(jobs),
             outcomes,
             applier: Some(applier),
@@ -568,26 +602,134 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
     }
 
-    /// Asks for headers if a peer claims more work than our best header,
-    /// and fetches the blocks of the best header's branch.
+    /// Fetches headers while a peer claims more work than our best header,
+    /// and the blocks of the best header's branch.
     fn sync(&mut self, now: Instant) {
-        self.request_headers_if_behind(now);
+        self.pump_headers(now);
         self.start_downloads(now);
     }
 
-    fn request_headers_if_behind(&mut self, now: Instant) {
-        if self.last_header_request.is_some_and(|t| now.duration_since(t) < SYNC_INTERVAL) {
+    /// The header pipeline: verifies the complete batches at the best
+    /// header in order, gives late ones to other peers, and asks for more,
+    /// up to [`HEADER_BATCHES`] ahead, each of a different peer claiming
+    /// more work, so one slow peer slows only its own share.
+    fn pump_headers(&mut self, now: Instant) {
+        if self.mode == Mode::Snapshot {
             return;
         }
+        let late: Vec<u32> = self
+            .header_batches
+            .iter()
+            .filter(|(_, b)| !self.batch_complete(b) && now.duration_since(b.asked) >= BATCH_TIMEOUT)
+            .map(|(s, _)| *s)
+            .collect();
+        for start in late {
+            let b = self.header_batches.remove(&start).unwrap();
+            let misses = self.slow_batches.entry(b.peer).or_insert(0);
+            *misses += 1;
+            if *misses >= 2 {
+                self.chatter(&format!("{} was slow with headers again; passing it over", b.peer));
+                self.peers.fetch_failed(b.peer, now);
+                self.slow_batches.remove(&b.peer);
+            }
+        }
+        self.verify_header_batches(now);
+        let Ok(best) = self.chain.best_header() else { return };
         let ours = self.chain.best_header_work().unwrap_or(U256::ZERO);
-        let next = self.chain.tip().ok().flatten().map_or(1, |h| h.height + 1);
-        if let Some(best) = self.peers.best_source(ours, next, now).map(|p| p.addr) {
-            self.request_headers(best, now);
+        // Believable peers claiming more; if every one was passed over,
+        // those, rather than none.
+        let mut sources: Vec<(SocketAddr, u32)> =
+            self.peers.claimants(ours, now).map(|p| (p.addr, p.status.unwrap().height)).collect();
+        if sources.is_empty() {
+            sources = self
+                .peers
+                .trusted(now)
+                .filter(|p| p.status.is_some_and(|s| s.work > ours))
+                .map(|p| (p.addr, p.status.unwrap().height))
+                .collect();
+        }
+        let busy: std::collections::HashSet<SocketAddr> = self.header_batches.values().map(|b| b.peer).collect();
+        let mut free: Vec<(SocketAddr, u32)> = sources.into_iter().filter(|(a, _)| !busy.contains(a)).collect();
+        let step = MAX_HEADERS as u32;
+        let mut start = best.height + 1;
+        while self.header_batches.len() < HEADER_BATCHES && !free.is_empty() {
+            if let Some((&s, _)) = self.header_batches.range(..=start).next_back()
+                && start < s + step
+            {
+                start = s + step;
+                continue;
+            }
+            // The free peer reaching furthest past `start` takes it.
+            let Some(i) = (0..free.len()).filter(|&i| free[i].1 >= start).max_by_key(|&i| free[i].1) else {
+                break;
+            };
+            let (peer, height) = free.swap_remove(i);
+            self.send(peer, &Message::GetHeadersFrom { height: start });
+            self.peers.asked_headers(peer, now);
+            let end = height.min(start + step - 1);
+            self.header_batches.insert(
+                start,
+                HeaderBatch { start, peer, asked: now, end, headers: std::collections::BTreeMap::new() },
+            );
+            start += step;
         }
     }
 
-    /// Sends `to` our header locator; it should answer with headers we
-    /// lack within [`net::HEADER_TIMEOUT`].
+    /// Whether a batch holds every header it needs: from the best header on
+    /// to its end.
+    fn batch_complete(&self, b: &HeaderBatch) -> bool {
+        let from = self.chain.best_header().map_or(0, |h| h.height + 1);
+        (from.max(b.start)..=b.end).all(|h| b.headers.contains_key(&h))
+    }
+
+    /// Verifies and stores, in order, the complete batches that start at or
+    /// below the best header's successor.
+    fn verify_header_batches(&mut self, now: Instant) {
+        loop {
+            let Ok(best) = self.chain.best_header() else { return };
+            let Some((&start, b)) = self.header_batches.iter().next() else { return };
+            if start > best.height + 1 || !self.batch_complete(b) {
+                return;
+            }
+            let b = self.header_batches.remove(&start).unwrap();
+            let headers: Vec<Header> = b.headers.into_values().filter(|h| h.height > best.height).collect();
+            let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
+            let (new, stop) = self.chain.accept_headers(&headers, unix_now());
+            for h in headers.iter().take(new) {
+                self.note_source(h.hash(), b.peer);
+            }
+            self.slow_batches.remove(&b.peer);
+            if self.chain.best_header_work().unwrap_or(U256::ZERO) > before {
+                self.peers.headers_arrived(b.peer);
+                if let Ok(best) = self.chain.best_header() {
+                    self.chatter(&format!("headers to height {}", best.height));
+                }
+            }
+            match stop {
+                None => {}
+                // Not on our best branch: find where it forks with a
+                // locator. The batches ahead assumed our branch.
+                Some(ChainError::UnknownParent(_)) if new == 0 => {
+                    self.header_batches.clear();
+                    self.request_headers(b.peer, now);
+                    return;
+                }
+                // Clocks differ: not a fault; asked again later.
+                Some(ChainError::TimestampTooNew { .. }) => return,
+                Some(e) => {
+                    self.log(&format!("headers from {} refused: {e}", b.peer));
+                    self.peers.strike(b.peer);
+                    self.peers.fetch_failed(b.peer, now);
+                    self.header_batches.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Sends `to` our header locator, to find where its chain and ours
+    /// part; it should answer with headers we lack within
+    /// [`net::HEADER_TIMEOUT`].
     fn request_headers(&mut self, to: SocketAddr, now: Instant) {
         match self.chain.header_locator() {
             Ok(locator) => {
@@ -636,11 +778,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         {
             return Some(*a);
         }
-        self.peers
-            .holders(height, now)
-            .filter(|p| load(&p.addr) < MAX_PER_PEER)
-            .min_by_key(|p| (load(&p.addr), std::cmp::Reverse(p.status.unwrap().work)))
-            .map(|p| p.addr)
+        let pick = |passed_over: bool| {
+            self.peers
+                .trusted(now)
+                .filter(|p| {
+                    p.status.is_some_and(|s| s.oldest <= height && height <= s.height)
+                        && passed_over != self.peers.may_serve(&p.addr, now)
+                        && load(&p.addr) < MAX_PER_PEER
+                })
+                .min_by_key(|p| (load(&p.addr), std::cmp::Reverse(p.status.unwrap().work)))
+                .map(|p| p.addr)
+        };
+        // Peers passed over after a failure only if no other holds it.
+        pick(false).or_else(|| pick(true))
     }
 
     /// Remembers that `from` announced block `id`.
@@ -803,6 +953,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     Err(e) => self.log(&format!("headers: {e}")),
                 }
             }
+            Message::GetHeadersFrom { height } => {
+                self.peers.seen(addr, now);
+                match self.chain.headers_from(height, MAX_HEADERS) {
+                    Ok(headers) => {
+                        for batch in headers.chunks(net::HEADERS_PER_MESSAGE) {
+                            self.send(addr, &Message::Headers(batch.to_vec()));
+                        }
+                    }
+                    Err(e) => self.log(&format!("headers: {e}")),
+                }
+            }
             Message::Headers(headers) => {
                 self.peers.seen(addr, now);
                 self.handle_headers(addr, headers, now);
@@ -813,6 +974,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Message::TxInv(txid) => {
                 self.peers.seen(addr, now);
+                // Transactions wait until we have caught up: checked
+                // against an old state, they would mostly fail.
+                let tip_work = self.chain.tip_work().unwrap_or(U256::ZERO);
+                if self.mode != Mode::Normal || self.peers.claimants(tip_work, now).next().is_some() {
+                    return;
+                }
                 let from_peer = self.tx_downloads.values().filter(|d| d.from == addr).count();
                 if self.tx_downloads.len() < MAX_TX_DOWNLOADS
                     && from_peer < MAX_TX_PER_PEER
@@ -836,52 +1003,57 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A peer's status: if a trusted peer claims more work than our best
-    /// header, ask for headers now rather than at the next tick.
+    /// header, fetch headers now rather than at the next tick.
     fn consider(&mut self, addr: SocketAddr, st: &Status, now: Instant) {
-        if self.mode == Mode::Normal
+        if self.mode != Mode::Snapshot
             && self.peers.handshaken(&addr)
             && st.work > self.chain.best_header_work().unwrap_or(U256::ZERO)
         {
-            self.request_headers_if_behind(now);
+            self.pump_headers(now);
         }
     }
 
-    /// Checks and stores headers (proof of work, difficulty, timestamps),
-    /// asks for more while they bring something new, and in normal mode
-    /// fetches the blocks of the best branch.
+    /// Headers from `from`: into the batch it was asked for, or, if none
+    /// (a reply to a locator), checked and stored at once.
     fn handle_headers(&mut self, from: SocketAddr, headers: Vec<Header>, now: Instant) {
         if self.mode == Mode::Snapshot {
             return;
         }
-        let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
-        let mut new = 0;
-        for h in headers {
-            match self.chain.accept_header(&h, unix_now()) {
-                Ok(true) => {
-                    new += 1;
-                    self.note_source(h.hash(), from);
-                }
-                Ok(false) => {}
-                // Clocks differ: not a fault, but nothing after it fits.
-                Err(ChainError::TimestampTooNew { .. }) => break,
-                Err(e) => {
-                    self.log(&format!("header {} from {from} refused: {e}", short(&h.hash())));
+        let step = MAX_HEADERS as u32;
+        if let Some(b) = self
+            .header_batches
+            .iter_mut()
+            .find(|(s, b)| b.peer == from && headers.first().is_some_and(|h| h.height >= **s && h.height < **s + step))
+        {
+            let start = *b.0;
+            for h in headers.into_iter().filter(|h| h.height >= start && h.height < start + step) {
+                b.1.headers.insert(h.height, h);
+            }
+        } else {
+            let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
+            let (new, stop) = self.chain.accept_headers(&headers, unix_now());
+            for h in headers.iter().take(new) {
+                self.note_source(h.hash(), from);
+            }
+            match stop {
+                None | Some(ChainError::TimestampTooNew { .. }) => {}
+                Some(e) => {
+                    self.log(&format!("headers from {from} refused: {e}"));
                     self.peers.strike(from);
-                    break;
+                }
+            }
+            if self.chain.best_header_work().unwrap_or(U256::ZERO) > before {
+                self.peers.headers_arrived(from);
+                // The fork is found: the pipeline goes on from here.
+                if headers.len() == net::HEADERS_PER_MESSAGE {
+                    self.request_headers(from, now);
                 }
             }
         }
-        if new > 0 || self.chain.best_header_work().unwrap_or(U256::ZERO) > before {
-            self.peers.headers_arrived(from);
-            if let Ok(best) = self.chain.best_header() {
-                self.chatter(&format!("headers to height {}", best.height));
-            }
-            // More may follow this reply; ask again once it has arrived.
-            if self.last_header_request.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(300)) {
-                self.request_headers(from, now);
-            }
+        match self.mode {
+            Mode::Headers => self.header_sync(now),
+            _ => self.sync(now),
         }
-        self.start_downloads(now);
     }
 
     /// A block announced: its header is checked and stored before the
@@ -1185,12 +1357,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Fast sync, headers: ask the peer claiming the most work for headers
     /// after our best; once no peer claims more, pick the snapshot.
     fn header_sync(&mut self, now: Instant) {
+        self.pump_headers(now);
         let ours = self.chain.best_header_work().unwrap_or(U256::ZERO);
-        let recent = self.last_header_request.is_some_and(|t| now.duration_since(t) < SYNC_INTERVAL);
-        if let Some(best) = self.peers.best_source(ours, 0, now).map(|p| p.addr) {
-            if !recent {
-                self.request_headers(best, now);
-            }
+        if !self.header_batches.is_empty() || self.peers.claimants(ours, now).next().is_some() {
             return;
         }
         // Nobody believable claims more: done, once at least one peer has
@@ -1201,9 +1370,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.log("fast sync: no peers answered; starting from genesis");
                 self.mode = Mode::Normal;
             }
-            return;
-        }
-        if recent {
             return;
         }
         let best = match self.chain.best_header() {
@@ -1239,6 +1405,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             next_peer: 0,
             manifest_from: None,
             bad_manifests: 0,
+            unserved: std::collections::HashSet::new(),
         });
         self.mode = Mode::Snapshot;
         self.snapshot_sync(now);
@@ -1249,8 +1416,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn snapshot_peers(&self, now: Instant) -> Vec<SocketAddr> {
         let height = self.snap.as_ref().map_or(0, |s| s.target.height);
         let at = |p: &&net::Peer| p.status.is_some_and(|s| s.height >= height);
-        let fresh: Vec<SocketAddr> =
-            self.peers.trusted(now).filter(at).filter(|p| self.peers.may_serve(&p.addr, now)).map(|p| p.addr).collect();
+        let unserved = |a: &SocketAddr| self.snap.as_ref().is_some_and(|s| s.unserved.contains(a));
+        let fresh: Vec<SocketAddr> = self
+            .peers
+            .trusted(now)
+            .filter(at)
+            .filter(|p| self.peers.may_serve(&p.addr, now) && !unserved(&p.addr))
+            .map(|p| p.addr)
+            .collect();
         if !fresh.is_empty() {
             return fresh;
         }
@@ -1361,6 +1534,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.mode = Mode::Normal;
                 self.tip_changes.fetch_add(1, Ordering::Release);
                 self.revalidate_mempool();
+                self.sync(Instant::now());
             }
             Err(e) => {
                 self.snap = Some(snap);
@@ -1420,6 +1594,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         for (kind, from) in abandoned {
             self.snap_downloads.remove(&kind);
+            if let Some(s) = self.snap.as_mut() {
+                s.unserved.insert(from);
+            }
             self.chatter(&format!("fast sync: {from} did not serve {kind:?}; asking another peer"));
         }
     }
@@ -1892,6 +2069,37 @@ mod tests {
         let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![addr_b], &c.dir)).unwrap();
         let hc = std::thread::spawn(move || node_c.run());
         assert!(wait_for_tip(&c.chain, &a_tip, 30), "c did not sync from a");
+        for (tx, h) in [(tx_a, ha), (tx_b, hb), (tx_c, hc)] {
+            tx.send(Event::Stop).unwrap();
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn headers_come_in_batches_from_several_peers() {
+        // a and b hold 130 blocks: three header batches. c replays from
+        // genesis, asking both.
+        let a = open("batches-a");
+        let b = open("batches-b");
+        let now = unix_now();
+        let mut t = T0;
+        for i in 1..=130u32 {
+            t += 600;
+            let block = mine(&a, (i % 200) as u8, t);
+            a.chain.apply_block(&block, now).unwrap();
+            b.chain.apply_block(&block, now).unwrap();
+        }
+        let tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), config(vec![], &b.dir)).unwrap();
+        let peers = vec![node_a.local_addr().unwrap(), node_b.local_addr().unwrap()];
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        let c = open("batches-c");
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(peers, &c.dir)).unwrap();
+        let hc = std::thread::spawn(move || node_c.run());
+        assert!(wait_for_tip(&c.chain, &tip, 60), "c did not sync");
+        assert_eq!(c.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         for (tx, h) in [(tx_a, ha), (tx_b, hb), (tx_c, hc)] {
             tx.send(Event::Stop).unwrap();
             h.join().unwrap();

@@ -42,7 +42,7 @@ use crate::difficulty::U256;
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
@@ -66,6 +66,7 @@ const T_INV: u8 = 7;
 const T_GET_CHUNKS: u8 = 8;
 const T_CHUNK: u8 = 9;
 const T_TX_INV: u8 = 10;
+const T_GET_HEADERS_FROM: u8 = 11;
 
 /// What a chunked transfer carries. Snapshot objects are named by the
 /// block whose state they describe.
@@ -170,12 +171,29 @@ pub enum Message {
     Pong(Status),
     GetPeers,
     Peers(Vec<SocketAddr>),
-    GetHeaders { locator: Vec<Digest> },
+    GetHeaders {
+        locator: Vec<Digest>,
+    },
+    /// Main-chain headers from `height` on, up to [`MAX_HEADERS`]: several
+    /// can be asked of different peers at once, unlike `GetHeaders`.
+    GetHeadersFrom {
+        height: u32,
+    },
     Headers(Vec<Header>),
     Inv(Header),
     TxInv(Digest),
-    GetChunks { kind: Kind, id: Digest, indexes: Vec<u16> },
-    Chunk { kind: Kind, id: Digest, len: u32, index: u16, data: Vec<u8> },
+    GetChunks {
+        kind: Kind,
+        id: Digest,
+        indexes: Vec<u16>,
+    },
+    Chunk {
+        kind: Kind,
+        id: Digest,
+        len: u32,
+        index: u16,
+        data: Vec<u8>,
+    },
 }
 
 fn put_status(w: &mut Writer, s: &Status) {
@@ -249,6 +267,10 @@ impl Message {
                 w.0.push(T_GET_HEADERS);
                 w.digest_vec(&locator[..locator.len().min(MAX_LOCATOR)]);
             }
+            Message::GetHeadersFrom { height } => {
+                w.0.push(T_GET_HEADERS_FROM);
+                w.u32(*height);
+            }
             Message::Headers(headers) => {
                 w.0.push(T_HEADERS);
                 w.0.push(headers.len().min(HEADERS_PER_MESSAGE) as u8);
@@ -311,6 +333,7 @@ impl Message {
                 (locator.len() <= MAX_LOCATOR).then_some(())?;
                 Message::GetHeaders { locator }
             }
+            T_GET_HEADERS_FROM => Message::GetHeadersFrom { height: r.u32()? },
             T_HEADERS => {
                 let n = count(&mut r, HEADERS_PER_MESSAGE)?;
                 let headers = (0..n).map(|_| Header::from_bytes(r.take(HEADER_SIZE)?)).collect::<Option<Vec<_>>>()?;
@@ -1036,6 +1059,7 @@ mod tests {
             Message::Peers(vec![v4, v6]),
             Message::Peers(vec![v6; MAX_PEERS_MESSAGE]),
             Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect() },
+            Message::GetHeadersFrom { height: 123_456 },
             Message::Headers((0..HEADERS_PER_MESSAGE as u32).map(header).collect()),
             Message::Inv(header(5)),
             Message::TxInv(digest(6)),

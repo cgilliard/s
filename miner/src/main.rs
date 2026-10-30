@@ -401,7 +401,27 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     } else {
         None
     };
-    let chain = open_chain(args, params, seed)?;
+    let chain = open_chain(args, params, seed.clone())?;
+    // Header checks use the full dataset: a miner has it already; a node
+    // loads it, or builds it once in the background (checking headers
+    // from the seed text meanwhile, at tens of milliseconds each).
+    match &dataset {
+        Some(d) => chain.set_dataset(Arc::clone(d)),
+        None => {
+            let chain = Arc::clone(&chain);
+            let path = args.data.join("dataset");
+            std::thread::Builder::new().name("dataset".into()).spawn(move || {
+                let t = Instant::now();
+                match Dataset::load_or_generate(&seed, &path) {
+                    Ok(d) => {
+                        chain.set_dataset(Arc::new(d));
+                        log::line(&format!("proof-of-work dataset ready in {}", secs(t.elapsed())));
+                    }
+                    Err(e) => log::line(&format!("proof-of-work dataset: {e}; checking headers from the seed text")),
+                }
+            })?;
+        }
+    }
     let pruned = chain.prune_undo()?;
     if pruned > 0 {
         log::line(&format!("pruned {pruned} undo records beyond the last {} blocks", args.max_undo));

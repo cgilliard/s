@@ -488,6 +488,10 @@ pub struct Chain<V: ProofVerifier> {
     /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
     /// rather than walked again.
     branch: Mutex<Vec<Header>>,
+    /// The full proof-of-work dataset, once loaded or generated: checks a
+    /// header in microseconds instead of tens of milliseconds from the
+    /// seed text.
+    dataset: std::sync::RwLock<Option<std::sync::Arc<crate::pow::Dataset>>>,
 }
 
 /// Default undo window: a week of blocks.
@@ -546,6 +550,7 @@ impl<V: ProofVerifier> Chain<V> {
             snapshots,
             snapshot_spent,
             branch: Mutex::new(Vec::new()),
+            dataset: std::sync::RwLock::new(None),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
         chain.abort_snapshot()?;
@@ -850,16 +855,42 @@ impl<V: ProofVerifier> Chain<V> {
         Ok((self.utxo.root(wtxn)?, spent))
     }
 
+    /// Uses the full proof-of-work dataset for header checks from now on.
+    pub fn set_dataset(&self, dataset: std::sync::Arc<crate::pow::Dataset>) {
+        *self.dataset.write().unwrap() = Some(dataset);
+    }
+
+    /// Whether `header`'s proof of work meets `target`, from the dataset if
+    /// loaded, else from the seed text.
+    fn pow_ok(&self, header: &Header, target: &Target) -> bool {
+        if !header.quick_pow_check(target) {
+            return false;
+        }
+        match self.dataset.read().unwrap().as_deref() {
+            Some(d) => header.verify_pow(d, target),
+            None => header.verify_pow(&self.seed, target),
+        }
+    }
+
     /// Header rules (1 to 4) of a block whose parent is `parent`: returns
-    /// the block's cumulative work.
-    fn check_header(&self, rtxn: &RoTxn, block: &Block, parent: &Entry, now: u64) -> Result<U256> {
-        let work = self.check_header_rules(rtxn, &block.header, parent, now)?;
+    /// the block's cumulative work. `pow` is the proof-of-work verdict if
+    /// already known.
+    fn check_header(&self, rtxn: &RoTxn, block: &Block, parent: &Entry, now: u64, pow: Option<bool>) -> Result<U256> {
+        let work = self.check_header_rules(rtxn, &block.header, parent, now, pow)?;
         self.check_body(&block.header, &block.body)?;
         Ok(work)
     }
 
-    /// The header rules alone (1 to 3): returns the header's cumulative work.
-    fn check_header_rules(&self, rtxn: &RoTxn, header: &Header, parent: &Entry, now: u64) -> Result<U256> {
+    /// The header rules alone (1 to 3): returns the header's cumulative
+    /// work. `pow` is the proof-of-work verdict if already known.
+    fn check_header_rules(
+        &self,
+        rtxn: &RoTxn,
+        header: &Header,
+        parent: &Entry,
+        now: u64,
+        pow: Option<bool>,
+    ) -> Result<U256> {
         if parent.invalid {
             return Err(ChainError::InvalidParent);
         }
@@ -883,7 +914,7 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::TimestampTooNew { limit, got: header.timestamp });
         }
         let target = self.target_after(rtxn, &parent.header)?;
-        if !header.quick_pow_check(&target) || !header.verify_pow(&self.seed, &target) {
+        if !pow.unwrap_or_else(|| self.pow_ok(header, &target)) {
             return Err(ChainError::BadProofOfWork);
         }
         Ok(parent.work.saturating_add(ChainParams::block_work(target.into())))
@@ -919,13 +950,16 @@ impl<V: ProofVerifier> Chain<V> {
         let tip_entry = self.entry_in(&wtxn, &tip.hash())?.ok_or(ChainError::Corrupt("tip index"))?;
         let hash = header.hash();
         let id = digest_bytes(&hash);
-        if let Some(e) = self.entry_in(&wtxn, &hash)?
+        let known = self.entry_in(&wtxn, &hash)?;
+        if let Some(e) = known
             && !e.header_only
         {
             return if e.invalid { Err(ChainError::KnownInvalid) } else { Ok(Applied::Known) };
         }
         let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
-        let work = self.check_header(&wtxn, block, &parent, now)?;
+        // A header stored alone had its proof of work checked then.
+        let pow = known.map(|_| true);
+        let work = self.check_header(&wtxn, block, &parent, now, pow)?;
 
         self.headers.put(&mut wtxn, &id, &header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
@@ -1121,35 +1155,92 @@ impl<V: ProofVerifier> Chain<V> {
     /// whether it was new. A known header can still become the best one,
     /// after a branch above an invalid block was dropped.
     pub fn accept_header(&self, header: &Header, now: u64) -> Result<bool> {
-        let mut wtxn = self.env.write_txn()?;
-        let id = digest_bytes(&header.hash());
-        if let Some(e) = self.entry_in(&wtxn, &header.hash())? {
-            if e.invalid {
-                return Err(ChainError::KnownInvalid);
-            }
-            let best = self.best_header_in(&wtxn)?;
-            if e.work > self.entry_in(&wtxn, &best.hash())?.map_or(U256::ZERO, |b| b.work) {
-                self.meta.put(&mut wtxn, META_BEST_HEADER, &id)?;
-                wtxn.commit()?;
-            }
-            return Ok(false);
+        match self.accept_headers(std::slice::from_ref(header), now) {
+            (_, Some(e)) => Err(e),
+            (new, None) => Ok(new == 1),
         }
-        let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
-        let work = match self.check_header_rules(&wtxn, header, &parent, now) {
-            Ok(w) => w,
-            Err(e) => {
-                drop(wtxn);
-                return Err(e);
+    }
+
+    /// [`Chain::accept_header`] for a run of headers, each the parent of
+    /// the next or with a stored parent: their proofs of work are checked
+    /// in parallel, then the rest in order, all stored in one transaction.
+    /// Returns how many were new and the error that stopped the run, if
+    /// any; the headers before it are kept.
+    pub fn accept_headers(&self, headers: &[Header], now: u64) -> (usize, Option<ChainError>) {
+        match self.accept_headers_inner(headers, now) {
+            Ok(r) => r,
+            Err(e) => (0, Some(e)),
+        }
+    }
+
+    fn accept_headers_inner(&self, headers: &[Header], now: u64) -> Result<(usize, Option<ChainError>)> {
+        // The target of each, from its parent: the previous header of the
+        // run or a stored one. Proofs of work are then checked at once.
+        let (targets, known): (Vec<Option<Target>>, Vec<bool>) = {
+            let rtxn = self.env.read_txn()?;
+            let mut out = Vec::with_capacity(headers.len());
+            let mut known = Vec::with_capacity(headers.len());
+            for (i, h) in headers.iter().enumerate() {
+                known.push(self.headers.get(&rtxn, &digest_bytes(&h.hash()))?.is_some());
+                let parent = match i.checked_sub(1).map(|j| headers[j]).filter(|p| p.hash() == h.prev_hash) {
+                    Some(p) => Some(p),
+                    None => self.header_by_hash_in(&rtxn, &digest_bytes(&h.prev_hash))?,
+                };
+                out.push(match parent {
+                    Some(p) => Some(self.target_after(&rtxn, &p)?),
+                    None => None,
+                });
             }
+            (out, known)
         };
-        self.headers.put(&mut wtxn, &id, &header.to_bytes())?;
-        self.put_index(&mut wtxn, &id, work, STATUS_HEADER_ONLY)?;
-        let best = self.best_header_in(&wtxn)?;
-        if work > self.entry_in(&wtxn, &best.hash())?.map_or(U256::ZERO, |e| e.work) {
-            self.meta.put(&mut wtxn, META_BEST_HEADER, &id)?;
+        let dataset = self.dataset.read().unwrap().clone();
+        let seed = &self.seed;
+        let pow: Vec<bool> = crate::parallel::par_map_min(headers.len(), 1, |i| {
+            let (h, Some(t)) = (&headers[i], targets[i]) else { return false };
+            known[i]
+                || (h.quick_pow_check(&t)
+                    && match dataset.as_deref() {
+                        Some(d) => h.verify_pow(d, &t),
+                        None => h.verify_pow(seed, &t),
+                    })
+        });
+        let mut wtxn = self.env.write_txn()?;
+        let mut new = 0;
+        let mut stop = None;
+        for (h, ok) in headers.iter().zip(&pow) {
+            let id = digest_bytes(&h.hash());
+            let work = match self.entry_in(&wtxn, &h.hash())? {
+                Some(e) if e.invalid => {
+                    stop = Some(ChainError::KnownInvalid);
+                    break;
+                }
+                Some(e) => e.work,
+                None => {
+                    let Some(parent) = self.entry_in(&wtxn, &h.prev_hash)? else {
+                        stop = Some(ChainError::UnknownParent(h.prev_hash));
+                        break;
+                    };
+                    match self.check_header_rules(&wtxn, h, &parent, now, Some(*ok)) {
+                        Ok(w) => {
+                            self.headers.put(&mut wtxn, &id, &h.to_bytes())?;
+                            self.put_index(&mut wtxn, &id, w, STATUS_HEADER_ONLY)?;
+                            new += 1;
+                            w
+                        }
+                        Err(e) => {
+                            stop = Some(e);
+                            break;
+                        }
+                    }
+                }
+            };
+            let best = self.best_header_in(&wtxn)?;
+            if work > self.entry_in(&wtxn, &best.hash())?.map_or(U256::ZERO, |e| e.work) {
+                self.meta.put(&mut wtxn, META_BEST_HEADER, &id)?;
+            }
         }
         wtxn.commit()?;
-        Ok(true)
+        Ok((new, stop))
     }
 
     fn best_header_in(&self, rtxn: &RoTxn) -> Result<Header> {
@@ -1645,6 +1736,21 @@ impl<V: ProofVerifier> Chain<V> {
         while out.len() < max && h < tip.height {
             h += 1;
             out.push(self.header_at_in(&rtxn, h)?.ok_or(ChainError::Corrupt("main-chain header"))?);
+        }
+        Ok(out)
+    }
+
+    /// Up to `max` main-chain headers from `height` on.
+    pub fn headers_from(&self, height: u32, max: usize) -> Result<Vec<Header>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        let mut h = height;
+        while out.len() < max {
+            match self.header_at_in(&rtxn, h)? {
+                Some(header) => out.push(header),
+                None => break,
+            }
+            h += 1;
         }
         Ok(out)
     }

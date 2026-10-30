@@ -412,8 +412,10 @@ impl Ord for Target {
 
 /// Checks a proof of work using only the text: the mix must match and the
 /// result must meet the target.
-pub fn verify(seed: &SeedText, header_hash: &Digest, nonce: &Nonce, mix: &Digest, target: &Target) -> bool {
-    let out = hashimoto(seed, header_hash, nonce);
+/// Checks a proof of work from `source`: the full [`Dataset`] (microseconds)
+/// or the [`SeedText`] alone (tens of milliseconds).
+pub fn verify<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce, mix: &Digest, target: &Target) -> bool {
+    let out = hashimoto(source, header_hash, nonce);
     out.mix == *mix && target.is_met_by(&out.result)
 }
 
