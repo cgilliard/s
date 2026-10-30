@@ -2,26 +2,27 @@
 //! counter positions, with a lookup from commitment to position.
 //!
 //! Every output ever created gets the next position from a monotonically
-//! increasing counter (positions are never reused), and its commitment is
-//! written as the leaf at that position. Spending an output clears the leaf.
-//! Because a transaction input identifies the output it spends only by its
-//! commitment, an index from commitment to positions is kept alongside the
-//! tree. Two outputs with the same key and amount have the same commitment;
-//! they occupy distinct positions and [`UtxoSet::spend`] consumes the lowest
-//! one first.
+//! increasing counter (positions are never reused), and its leaf, the
+//! commitment and memo compressed ([`crate::transaction::leaf`]), is
+//! written at that position, so the root covers memos too. Spending an
+//! output clears the leaf. Because a transaction input identifies the
+//! output it spends only by its commitment, an index from commitment to
+//! positions is kept alongside the tree. Two outputs with the same key and
+//! amount have the same commitment; they occupy distinct positions and
+//! [`UtxoSet::spend`] consumes the lowest one first.
 //!
 //! Four named LMDB databases live under a common prefix: `<prefix>.tree`
 //! (the Merkle tree), `<prefix>.index` (commitment bytes followed by the
-//! little-endian position, no value), `<prefix>.memo` (position to the
-//! output's memo, for unspent outputs with a non-empty memo; what wallet
-//! recovery scans) and `<prefix>.meta` (the counter). All
+//! little-endian position, no value), `<prefix>.outputs` (position to the
+//! commitment and memo of every unspent output; what wallet recovery
+//! scans) and `<prefix>.meta` (the counter). All
 //! operations take the caller's transaction so a block can update the set
 //! and its own records atomically.
 
 use crate::block::BlockOutput;
 use crate::poseidon2::digest_from_bytes;
 use crate::state_tree::EMPTY;
-use crate::transaction::Memo;
+use crate::transaction::{Memo, leaf};
 use heed::byteorder::LittleEndian;
 use heed::types::{Bytes, Str, U64, Unit};
 use heed::{Database, Env, RoTxn, RwTxn};
@@ -92,7 +93,8 @@ fn index_key(commitment: &Commitment, position: u64) -> [u8; INDEX_KEY_LEN] {
 pub struct UtxoSet {
     tree: StateTree,
     index: Database<Bytes, Unit>,
-    memos: Database<U64<LittleEndian>, Bytes>,
+    /// Position to commitment and memo, for every unspent output.
+    records: Database<U64<LittleEndian>, Bytes>,
     meta: Database<Str, U64<LittleEndian>>,
 }
 
@@ -102,9 +104,9 @@ impl UtxoSet {
     pub fn open(env: &Env, wtxn: &mut RwTxn, prefix: &str) -> Result<UtxoSet> {
         let tree = StateTree::open(env, wtxn, &format!("{prefix}.tree"))?;
         let index = env.create_database(wtxn, Some(&format!("{prefix}.index")))?;
-        let memos = env.create_database(wtxn, Some(&format!("{prefix}.memo")))?;
+        let records = env.create_database(wtxn, Some(&format!("{prefix}.outputs")))?;
         let meta = env.create_database(wtxn, Some(&format!("{prefix}.meta")))?;
-        Ok(UtxoSet { tree, index, memos, meta })
+        Ok(UtxoSet { tree, index, records, meta })
     }
 
     /// The underlying Merkle tree.
@@ -123,17 +125,51 @@ impl UtxoSet {
         Ok(self.meta.get(rtxn, META_NEXT_POSITION)?.unwrap_or(0))
     }
 
-    /// Adds an output's commitment at the next position and returns that
-    /// position.
+    /// Adds an output with an empty memo; returns its position.
     pub fn add(&self, wtxn: &mut RwTxn, commitment: &Commitment) -> Result<u64> {
+        self.add_output(wtxn, &BlockOutput { commitment: *commitment, memo: EMPTY })
+    }
+
+    /// Adds an output at the next position: its leaf is the commitment and
+    /// memo compressed ([`crate::transaction::leaf`]). Returns the position.
+    pub fn add_output(&self, wtxn: &mut RwTxn, output: &BlockOutput) -> Result<u64> {
         let position = self.next_position(wtxn)?;
         if position >= CAPACITY {
             return Err(Error::Full);
         }
-        self.tree.update(wtxn, position, commitment)?;
-        self.index.put(wtxn, &index_key(commitment, position), &())?;
+        self.insert(wtxn, position, &output.commitment, &output.memo)?;
         self.meta.put(wtxn, META_NEXT_POSITION, &(position + 1))?;
         Ok(position)
+    }
+
+    /// Writes an unspent output at `position` without moving the counter:
+    /// for installing a snapshot, with [`UtxoSet::set_next_position`].
+    pub fn insert_at(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
+        if position >= CAPACITY {
+            return Err(Error::Full);
+        }
+        self.insert(wtxn, position, commitment, memo)
+    }
+
+    /// Sets the next position: for installing a snapshot.
+    pub fn set_next_position(&self, wtxn: &mut RwTxn, next: u64) -> Result<()> {
+        self.meta.put(wtxn, META_NEXT_POSITION, &next)?;
+        Ok(())
+    }
+
+    /// Commitment and memo of the unspent output at `position`.
+    pub fn output_at(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo)>> {
+        self.record(rtxn, position)
+    }
+
+    fn insert(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
+        self.tree.update(wtxn, position, &leaf(commitment, memo))?;
+        self.index.put(wtxn, &index_key(commitment, position), &())?;
+        let mut rec = [0u8; 64];
+        rec[..32].copy_from_slice(&digest_to_bytes(commitment));
+        rec[32..].copy_from_slice(&digest_to_bytes(memo));
+        self.records.put(wtxn, &position, &rec)?;
+        Ok(())
     }
 
     /// Positions of all unspent outputs with this commitment, ascending.
@@ -176,47 +212,50 @@ impl UtxoSet {
             return Ok(false);
         }
         self.tree.remove(wtxn, position)?;
-        self.memos.delete(wtxn, &position)?;
+        self.records.delete(wtxn, &position)?;
         Ok(true)
     }
 
     /// Restores a spent output and its memo: the inverse of
     /// [`UtxoSet::spend_at`].
     pub fn unspend(&self, wtxn: &mut RwTxn, commitment: &Commitment, memo: &Memo, position: u64) -> Result<()> {
-        self.tree.update(wtxn, position, commitment)?;
-        self.index.put(wtxn, &index_key(commitment, position), &())?;
-        self.put_memo(wtxn, position, memo)
+        self.insert(wtxn, position, commitment, memo)
     }
 
-    /// Adds an output with its memo; returns its position.
-    pub fn add_output(&self, wtxn: &mut RwTxn, output: &BlockOutput) -> Result<u64> {
-        let position = self.add(wtxn, &output.commitment)?;
-        self.put_memo(wtxn, position, &output.memo)?;
-        Ok(position)
-    }
-
-    fn put_memo(&self, wtxn: &mut RwTxn, position: u64, memo: &Memo) -> Result<()> {
-        if *memo != EMPTY {
-            self.memos.put(wtxn, &position, &digest_to_bytes(memo))?;
+    fn record(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo)>> {
+        match self.records.get(rtxn, &position)? {
+            None => Ok(None),
+            Some(b) if b.len() == 64 => Ok(Some((
+                digest_from_bytes(&b[..32]).ok_or(Error::CorruptIndex)?,
+                digest_from_bytes(&b[32..]).ok_or(Error::CorruptIndex)?,
+            ))),
+            Some(_) => Err(Error::CorruptIndex),
         }
-        Ok(())
     }
 
-    /// The memo of the unspent output at `position` (empty if it has none).
+    /// The memo of the unspent output at `position` (empty if none).
     pub fn memo(&self, rtxn: &RoTxn, position: u64) -> Result<Memo> {
-        match self.memos.get(rtxn, &position)? {
-            None => Ok(EMPTY),
-            Some(b) => digest_from_bytes(b).ok_or(Error::CorruptIndex),
-        }
+        Ok(self.record(rtxn, position)?.map_or(EMPTY, |(_, m)| m))
     }
 
     /// Every unspent output's non-empty memo with its position, in
     /// position order.
     pub fn memos(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Memo)>> {
         let mut out = Vec::new();
-        for item in self.memos.iter(rtxn)? {
-            let (position, b) = item?;
-            out.push((position, digest_from_bytes(b).ok_or(Error::CorruptIndex)?));
+        for (position, (_, memo)) in self.unspent(rtxn)? {
+            if memo != EMPTY {
+                out.push((position, memo));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every unspent output, position order: commitment and memo.
+    pub fn unspent(&self, rtxn: &RoTxn) -> Result<Vec<(u64, (Commitment, Memo))>> {
+        let mut out = Vec::new();
+        for item in self.records.iter(rtxn)? {
+            let (position, _) = item?;
+            out.push((position, self.record(rtxn, position)?.ok_or(Error::CorruptIndex)?));
         }
         out.sort_unstable_by_key(|(p, _)| *p);
         Ok(out)
@@ -235,15 +274,21 @@ impl UtxoSet {
                 return Err(Error::CorruptIndex);
             }
             self.tree.remove(wtxn, position)?;
-            self.memos.delete(wtxn, &position)?;
+            self.records.delete(wtxn, &position)?;
         }
         self.meta.put(wtxn, META_NEXT_POSITION, &first)?;
         Ok(())
     }
 
-    /// Commitment stored at `position`, or the empty digest if spent or
-    /// never assigned.
+    /// Commitment of the unspent output at `position`, or the empty digest
+    /// if spent or never assigned.
     pub fn get(&self, rtxn: &RoTxn, position: u64) -> Result<Digest> {
+        Ok(self.record(rtxn, position)?.map_or(EMPTY, |(c, _)| c))
+    }
+
+    /// The tree leaf at `position`: commitment and memo compressed, or the
+    /// empty digest.
+    pub fn leaf_at(&self, rtxn: &RoTxn, position: u64) -> Result<Digest> {
         Ok(self.tree.get(rtxn, position)?)
     }
 
@@ -322,7 +367,11 @@ mod tests {
             assert_eq!(set.positions(&rtxn, &o.commitment).unwrap(), vec![i as u64]);
             assert!(set.contains(&rtxn, &o.commitment).unwrap());
             let proof = set.prove(&rtxn, i as u64).unwrap();
-            assert!(proof.verify(&set.root(&rtxn).unwrap(), i as u64, &o.commitment));
+            assert!(proof.verify(
+                &set.root(&rtxn).unwrap(),
+                i as u64,
+                &crate::transaction::leaf(&o.commitment, &EMPTY)
+            ));
         }
         assert!(!set.contains(&rtxn, &Output::new(&a, 99).commitment).unwrap());
         assert_eq!(set.get(&rtxn, 3).unwrap(), EMPTY);
@@ -337,7 +386,12 @@ mod tests {
             (dir, env, t)
         };
         let mut w = env2.write_txn().unwrap();
-        let r = tree2.apply(&mut w, outs.iter().enumerate().map(|(i, o)| (i as u64, o.commitment))).unwrap();
+        let r = tree2
+            .apply(
+                &mut w,
+                outs.iter().enumerate().map(|(i, o)| (i as u64, crate::transaction::leaf(&o.commitment, &EMPTY))),
+            )
+            .unwrap();
         assert_eq!(r, set.root(&rtxn).unwrap());
     }
 

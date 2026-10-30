@@ -26,8 +26,11 @@
 //! ([`compile_wrap`]), proven at a lower rate with fewer queries: a much
 //! smaller proof for a fixed extra proving cost, the same for every block.
 //!
-//! Encoding of a block proof: `u32` segment count, then the wrap's machine
-//! proof.
+//! Last, a chain program verifies the wrap together with the previous
+//! block's chain proof (see "Chain proofs" below), so each block's proof
+//! shows the whole chain up to it valid. That chain proof is what a block
+//! carries. A node can therefore check any one block's proof and know
+//! every block before it valid, which is what fast sync uses.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -778,6 +781,8 @@ pub enum Progress {
     Node { segments: usize, log_n: usize, hash_log_n: usize, root: bool, elapsed: std::time::Duration },
     /// The wrap over the root is proven.
     Wrap { log_n: usize, hash_log_n: usize, elapsed: std::time::Duration },
+    /// The chain step over the wrap and the previous block's proof.
+    Chain { elapsed: std::time::Duration },
 }
 
 /// Recently used committed programs, most recent last. A program type's
@@ -904,6 +909,25 @@ pub fn prove_block_cancellable(
     progress: &(dyn Fn(Progress) + Sync),
     cancel: stark::Cancel<'_>,
 ) -> Option<Vec<u8>> {
+    let proof = prove_wrap(params, shape, statement, segments, jobs, progress, cancel)?;
+    let bytes = proof.to_bytes();
+    let mut w = Writer::with_capacity(bytes.len() + 4);
+    w.u32(segments.len() as u32);
+    w.0.extend_from_slice(&bytes);
+    Some(w.finish())
+}
+
+/// The wrap proof of a block: segments, the tree, then the wrap, as
+/// [`prove_block_cancellable`] encodes it.
+pub fn prove_wrap(
+    params: &AggregatorParams,
+    shape: &Shape,
+    statement: &Statement,
+    segments: &[SegmentWitness],
+    jobs: usize,
+    progress: &(dyn Fn(Progress) + Sync),
+    cancel: stark::Cancel<'_>,
+) -> Option<stark::Proof> {
     assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
     let count = segments.len();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -938,11 +962,377 @@ pub fn prove_block_cancellable(
     let tables = VmAir::tables(&trace, &hashes, &pre);
     let proof = stark::try_prove_tables(&params.wrap, &tables, &public, &mut wrap_transcript(), Some(cancel)).ok()?;
     progress(Progress::Wrap { log_n: wrap.log_n, hash_log_n: wrap.hash_log_n, elapsed: t.elapsed() });
-    let bytes = proof.to_bytes();
-    let mut w = Writer::with_capacity(bytes.len() + 4);
-    w.u32(proofs.len() as u32);
-    w.0.extend_from_slice(&bytes);
-    Some(w.finish())
+    Some(proof)
+}
+
+// ---------------------------------------------------------------------------
+// Chain proofs
+// ---------------------------------------------------------------------------
+//
+// A chain proof shows that a block and every block before it are valid. The
+// chain program verifies the block's wrap proof, under a wrap program and
+// tree digest that the plan allows for some segment count (a membership
+// path in the Merkle tree of all of them), checks the block's subsidy
+// against the emission schedule for its height, and links to the previous
+// block's chain proof: the same state root and output position, one less
+// height. Height 1 uses a base program that instead starts from the empty
+// state. Every chain proof outputs
+//
+//     H(height || statement || step program digest || plan root)
+//
+// and a step verifies its predecessor under the step digest it outputs (or
+// the base digest at height 2), so a valid proof at height h covers the
+// whole chain up to h. The verifier supplies the step digest and the plan
+// root it expects, which pins every program involved.
+
+/// Transcript domain separator for chain proofs.
+const DOM_CHAIN_PROOF: u32 = 0x33;
+
+fn chain_transcript() -> Challenger {
+    let mut c = Challenger::new();
+    c.observe(Fp::new(DOM_CHAIN_PROOF));
+    c
+}
+
+/// The allowed wraps: one leaf `H(wrap digest || wrap tree)` per segment
+/// count `1..=max_segments`, padded with empty leaves to a power of two.
+pub fn plan_leaves(params: &AggregatorParams, cache: &mut PlanCache) -> Vec<Digest> {
+    let mut leaves: Vec<Digest> = (1..=params.max_segments)
+        .map(|k| {
+            let w = plan_with(params, k, cache).wrap.expect("planned root");
+            let mut v = w.digest.to_vec();
+            v.extend_from_slice(&w.tree);
+            crate::poseidon2::hash(&v)
+        })
+        .collect();
+    leaves.resize(params.max_segments.next_power_of_two(), [Fp::ZERO; DIGEST]);
+    leaves
+}
+
+/// Output digest of a chain proof.
+pub fn chain_output(height: u32, statement: &Statement, step: &Digest, plan_root: &Digest) -> Digest {
+    let mut v = Vec::with_capacity(1 + STATEMENT_LEN + 2 * DIGEST);
+    v.push(Fp::new(height));
+    v.extend(statement.to_values());
+    v.extend_from_slice(step);
+    v.extend_from_slice(plan_root);
+    crate::poseidon2::hash(&v)
+}
+
+/// The previous block's chain proof, for a step.
+pub struct PrevChain<'a> {
+    pub height: u32,
+    pub statement: &'a Statement,
+    pub proof: &'a stark::Proof,
+}
+
+/// Everything a chain program needs about one block.
+pub struct ChainWitness<'a> {
+    pub height: u32,
+    pub statement: &'a Statement,
+    pub wrap: Wrap,
+    pub wrap_proof: &'a stark::Proof,
+    /// Membership path of the wrap's leaf, and its index.
+    pub path: Vec<Digest>,
+    pub index: usize,
+    /// `None` for the base program (height 1).
+    pub prev: Option<PrevChain<'a>>,
+}
+
+/// The fixed context of the chain programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainSetup {
+    pub plan_root: Digest,
+    /// Height of the plan tree.
+    pub plan_depth: usize,
+    pub base: Digest,
+    pub step: Digest,
+    /// Table heights every chain proof has.
+    pub log_n: usize,
+    pub hash_log_n: usize,
+}
+
+/// Builds a chain program: the base when `w.prev` is `None`, else a step.
+/// `self_step` is the step digest the output commits to (an input, not
+/// part of the program); `pad_to` pads to common heights.
+#[allow(clippy::too_many_arguments)]
+fn compile_chain(
+    params: &AggregatorParams,
+    emission: &[(u32, u64)],
+    plan_root: &Digest,
+    base_digest: &Digest,
+    self_step: &Digest,
+    w: &ChainWitness<'_>,
+    pad_to: Option<(usize, usize)>,
+) -> Compiler {
+    let mut c = Compiler::new();
+    let at = |base: Addr, field: usize| base + field as Addr;
+    let st = c.scalar_inputs(&w.statement.to_values());
+    let h = c.input(Fp4::from_base(Fp::new(w.height)));
+    let dself = c.scalar_inputs(self_step);
+
+    // The wrap is an allowed one: its leaf is in the plan tree.
+    let mut pair_values = w.wrap.digest.to_vec();
+    pair_values.extend_from_slice(&w.wrap.tree);
+    let pair = c.scalar_inputs(&pair_values);
+    let idx = c.input(Fp4::from_base(Fp::new(w.index as u32)));
+    let bits = c.prog.decompose(idx);
+    for k in 0..8 {
+        let v = w.index as u32;
+        c.set_word(bits + k as Addr, Fp4(core::array::from_fn(|j| Fp::new((v >> (4 * k + j)) & 1))));
+    }
+    let root = c.merkle_root(pair, 2 * DIGEST, &w.path, bits);
+    for (i, v) in plan_root.iter().enumerate() {
+        c.assert_scalar(root + i as Addr, *v);
+    }
+
+    // The wrap proof, for this block's statement.
+    let words: Vec<Addr> =
+        (0..STATEMENT_LEN).map(|i| at(st, i)).chain((0..DIGEST).map(|i| at(pair, DIGEST + i))).collect();
+    let block = concat(&mut c, &words);
+    c.hash_scalars(block, words.len());
+    let wrap_out = c.squeeze_digest();
+    let expected = w.statement.output(&w.wrap.tree);
+    let pubv = c.scalar_inputs(&VmAir::public_values(&w.wrap.digest, &expected));
+    c.assert_block(pubv, pair, DIGEST);
+    c.assert_block(at(pubv, PUB_OUTPUT), wrap_out, DIGEST);
+    let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(pubv)), (&HashTableAir, None)];
+    c.verify_stark(&tables, &params.wrap, &[Fp::new(DOM_WRAP_PROOF)], pubv, VM_PUBLIC, w.wrap_proof);
+
+    // The subsidy is the schedule's for the height: for each era boundary
+    // a hinted bit says whether the height is within it, checked by a
+    // range check on the difference either way.
+    let mut sels: Vec<Addr> = Vec::with_capacity(emission.len());
+    let mut end = 0u64;
+    let mut prev_bit: Addr = 0;
+    for (i, &(blocks, _)) in emission.iter().enumerate() {
+        end += blocks as u64;
+        let t = c.scalar(Fp::new(end as u32));
+        let bit = if i + 1 == emission.len() {
+            // Every height is within the last era: the chain ends there.
+            let d = c.sub(t, h);
+            c.assert_bits_zero_from(d, 30);
+            1
+        } else {
+            let within = (w.height as u64) <= end;
+            let b = c.input(Fp4::from_base(Fp::new(within as u32)));
+            let bb = c.mul(b, b);
+            c.assert_eq(bb, b);
+            let below = c.sub(t, h);
+            let above = c.sub(h, t);
+            let above = c.sub(above, 1);
+            let x = c.sub(below, above);
+            let d = c.muladd(b, x, above);
+            c.assert_bits_zero_from(d, 30);
+            b
+        };
+        sels.push(c.sub(bit, prev_bit));
+        prev_bit = bit;
+    }
+    for j in 0..LIMBS {
+        let mut acc: Addr = 0;
+        for (sel, &(_, subsidy)) in sels.iter().zip(emission) {
+            let l = c.scalar(limbs16(subsidy)[j]);
+            acc = c.muladd(*sel, l, acc);
+        }
+        c.assert_eq(acc, at(st, ST_SUBSIDY + j));
+    }
+    // Heights start at 1.
+    let h0 = c.sub(h, 1);
+    c.assert_bits_zero_from(h0, 30);
+
+    match &w.prev {
+        None => {
+            // Height 1 starts from the empty state.
+            c.assert_scalar(h, Fp::ONE);
+            for (i, v) in crate::state_tree::empty_root().iter().enumerate() {
+                c.assert_scalar(at(st, ST_PREV + i), *v);
+            }
+            c.assert_eq(at(st, ST_POS_IN), 0);
+            c.assert_eq(at(st, ST_POS_IN + 1), 0);
+        }
+        Some(prev) => {
+            let pst = c.scalar_inputs(&prev.statement.to_values());
+            let ph = c.input(Fp4::from_base(Fp::new(prev.height)));
+            let next = c.add(ph, 1);
+            c.assert_eq(next, h);
+            c.assert_block(at(pst, ST_NEW), at(st, ST_PREV), DIGEST);
+            c.assert_block(at(pst, ST_POS_OUT), at(st, ST_POS_IN), 2);
+            // The predecessor's program: the base at height 2, else the
+            // step this proof itself claims.
+            let two = c.scalar(Fp::new(2));
+            let e = c.sub(h, two);
+            let b = c.input(Fp4::from_base(Fp::new((w.height == 2) as u32)));
+            let bb = c.mul(b, b);
+            c.assert_eq(bb, b);
+            let eb = c.mul(e, b);
+            c.assert_eq(eb, 0);
+            let inv_v = if w.height == 2 { Fp::ZERO } else { (Fp::new(w.height) - Fp::new(2)).inverse().unwrap() };
+            let inv = c.input(Fp4::from_base(inv_v));
+            let ei = c.mul(e, inv);
+            let one_minus_b = c.sub(1, b);
+            c.assert_eq(ei, one_minus_b);
+            let mut digest_words = Vec::with_capacity(DIGEST);
+            for (i, v) in base_digest.iter().enumerate() {
+                let bd = c.scalar(*v);
+                let diff = c.sub(bd, dself + i as Addr);
+                digest_words.push(c.muladd(b, diff, dself + i as Addr));
+            }
+            let prev_digest: Digest = core::array::from_fn(|i| c.val(digest_words[i]).0[0]);
+            // Its output: its statement, this proof's step digest, the plan.
+            let mut words: Vec<Addr> = vec![ph];
+            words.extend((0..STATEMENT_LEN).map(|i| at(pst, i)));
+            words.extend((0..DIGEST).map(|i| dself + i as Addr));
+            let plan_words: Vec<Addr> = plan_root.iter().map(|v| c.scalar(*v)).collect();
+            words.extend(plan_words);
+            let block = concat(&mut c, &words);
+            c.hash_scalars(block, words.len());
+            let prev_out = c.squeeze_digest();
+            let expected = chain_output(prev.height, prev.statement, self_step, plan_root);
+            let ppub = c.scalar_inputs(&VmAir::public_values(&prev_digest, &expected));
+            for (i, dw) in digest_words.iter().enumerate() {
+                c.assert_eq(ppub + i as Addr, *dw);
+            }
+            c.assert_block(at(ppub, PUB_OUTPUT), prev_out, DIGEST);
+            let tables: [(&dyn stark::DynAir, Option<Addr>); 2] = [(&VmAir, Some(ppub)), (&HashTableAir, None)];
+            c.verify_stark(&tables, &params.wrap, &[Fp::new(DOM_CHAIN_PROOF)], ppub, VM_PUBLIC, prev.proof);
+        }
+    }
+
+    // Output, after padding to the common heights if asked: the padding
+    // leaves room for the output hash, which must come last.
+    let mut words: Vec<Addr> = vec![h];
+    words.extend((0..STATEMENT_LEN).map(|i| at(st, i)));
+    words.extend((0..DIGEST).map(|i| dself + i as Addr));
+    let plan_words: Vec<Addr> = plan_root.iter().map(|v| c.scalar(*v)).collect();
+    words.extend(plan_words);
+    let block = concat(&mut c, &words);
+    let blind = params.wrap.blind_rows();
+    let final_hashes = words.len().div_ceil(8);
+    if let Some((log_n, hash_log_n)) = pad_to {
+        c.prog.reserve(blind + final_hashes);
+        let zero = concat(&mut c, &[]);
+        while VmAir::hash_height(&c.prog) < 1 << hash_log_n {
+            c.hash_scalars(zero, 8);
+        }
+        c.prog.reserve(blind + final_hashes + 1);
+        while c.prog.height() < 1 << log_n {
+            c.add(0, 0);
+        }
+    }
+    c.hash_scalars(block, words.len());
+    c.prog.reserve(blind);
+    c.assert_public();
+    if let Some((log_n, hash_log_n)) = pad_to {
+        assert_eq!(c.prog.height(), 1 << log_n, "chain program does not match its padding");
+        assert_eq!(VmAir::hash_height(&c.prog), 1 << hash_log_n, "chain program does not match its hash padding");
+    }
+    c
+}
+
+/// Heights of every wrap proof (the same for every segment count).
+fn wrap_heights(params: &AggregatorParams, cache: &mut PlanCache) -> (usize, usize) {
+    let w = plan_with(params, 1, cache).wrap.expect("planned root");
+    (w.log_n, w.hash_log_n)
+}
+
+/// Compiles the chain programs for `plan_root` (the root of
+/// [`plan_leaves`]) and finds their common heights.
+pub fn chain_setup(
+    params: &AggregatorParams,
+    emission: &[(u32, u64)],
+    plan_root: &Digest,
+    plan_depth: usize,
+    cache: &mut PlanCache,
+) -> ChainSetup {
+    let (wn, wh) = wrap_heights(params, cache);
+    let wrap_dummy = dummy_proof(&[(&VmAir, wn), (&HashTableAir, wh)], &params.wrap, VM_PUBLIC);
+    let zero = Statement::zero();
+    let wrap = Wrap { digest: [Fp::ZERO; DIGEST], log_n: wn, hash_log_n: wh, tree: [Fp::ZERO; DIGEST] };
+    let path = vec![[Fp::ZERO; DIGEST]; plan_depth];
+    let zd = [Fp::ZERO; DIGEST];
+    fn witness<'a>(
+        height: u32,
+        statement: &'a Statement,
+        wrap: Wrap,
+        wrap_proof: &'a stark::Proof,
+        path: &[Digest],
+        prev: Option<PrevChain<'a>>,
+    ) -> ChainWitness<'a> {
+        ChainWitness { height, statement, wrap, wrap_proof, path: path.to_vec(), index: 0, prev }
+    }
+    let heights = |c: &Compiler| {
+        (c.prog.height().trailing_zeros() as usize, VmAir::hash_height(&c.prog).trailing_zeros() as usize)
+    };
+    let base =
+        compile_chain(params, emission, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), None);
+    // The step verifies a proof of its own heights: find the fixed point,
+    // with room for the padding's bookkeeping.
+    let (bn, bh) = heights(&base);
+    let mut guess = (bn.max(wn), bh.max(wh));
+    loop {
+        let prev = dummy_proof(&[(&VmAir, guess.0), (&HashTableAir, guess.1)], &params.wrap, VM_PUBLIC);
+        let w =
+            witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev }));
+        let step = compile_chain(params, emission, plan_root, &zd, &zd, &w, None);
+        let (sn, sh) = heights(&step);
+        let room = step.prog.num_rows() + 64 < 1 << guess.0;
+        if sn <= guess.0 && sh <= guess.1 && room {
+            break;
+        }
+        guess = (if room { guess.0.max(sn) } else { guess.0 + 1 }, guess.1.max(sh));
+    }
+    let pad = Some(guess);
+    let base =
+        compile_chain(params, emission, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), pad);
+    let base_digest = base.prog.digest(params.wrap.log_blowup);
+    let prev = dummy_proof(&[(&VmAir, guess.0), (&HashTableAir, guess.1)], &params.wrap, VM_PUBLIC);
+    let w = witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev }));
+    let step = compile_chain(params, emission, plan_root, &base_digest, &zd, &w, pad);
+    ChainSetup {
+        plan_root: *plan_root,
+        plan_depth,
+        base: base_digest,
+        step: step.prog.digest(params.wrap.log_blowup),
+        log_n: guess.0,
+        hash_log_n: guess.1,
+    }
+}
+
+/// Proves a chain step (or the base, without `w.prev`).
+pub fn prove_chain(
+    params: &AggregatorParams,
+    emission: &[(u32, u64)],
+    setup: &ChainSetup,
+    w: &ChainWitness<'_>,
+    cancel: stark::Cancel<'_>,
+) -> Option<stark::Proof> {
+    let pad = Some((setup.log_n, setup.hash_log_n));
+    let c = compile_chain(params, emission, &setup.plan_root, &setup.base, &setup.step, w, pad);
+    let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("chain program rejects its own witness");
+    let digest = if w.prev.is_none() { setup.base } else { setup.step };
+    let pre = committed_program(&c.prog, &params.wrap, &digest);
+    let public = VmAir::public_values(&digest, &chain_output(w.height, w.statement, &setup.step, &setup.plan_root));
+    let tables = VmAir::tables(&trace, &hashes, &pre);
+    stark::try_prove_tables(&params.wrap, &tables, &public, &mut chain_transcript(), Some(cancel)).ok()
+}
+
+/// Verifies that `proof` shows the block at `height` with `statement`, and
+/// every block before it, valid.
+pub fn verify_chain(
+    params: &AggregatorParams,
+    setup: &ChainSetup,
+    height: u32,
+    statement: &Statement,
+    proof: &stark::Proof,
+) -> Result<(), AggregateError> {
+    if height == 0 {
+        return Err(AggregateError::Rejected);
+    }
+    let digest = if height == 1 { setup.base } else { setup.step };
+    let public = VmAir::public_values(&digest, &chain_output(height, statement, &setup.step, &setup.plan_root));
+    stark::verify_tables(&params.wrap, &VmAir::specs(&digest), &public, proof, &mut chain_transcript())
+        .map_err(|_| AggregateError::Rejected)
 }
 
 /// Verifies an encoded block proof against a statement. `wrap` gives the
@@ -966,17 +1356,63 @@ pub fn verify_block(
         .map_err(|_| AggregateError::Rejected)
 }
 
-/// Verifies block proofs with the aggregator, caching the planned tree per
-/// segment count.
+/// Mainnet's chain-proof setup: the root of the allowed wraps and the
+/// chain programs, fixed by the circuits. Regenerate with the ignored test
+/// `aggregate::tests::mainnet_chain_constants` after any circuit change.
+pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
+    plan_root: [1247916242, 1882446428, 1447144151, 450301831, 14159551, 1862179341, 1350039139, 828987825],
+    plan_depth: 14,
+    base: [151172052, 115859863, 671589279, 335580281, 702886413, 65863969, 1550395963, 788797239],
+    step: [565762766, 1416504455, 1537457357, 1679329851, 1406711078, 1166448519, 168982398, 537990819],
+    log_n: 17,
+    hash_log_n: 15,
+});
+
+/// [`ChainSetup`] as plain integers, for a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainSetupConst {
+    pub plan_root: [u32; DIGEST],
+    pub plan_depth: usize,
+    pub base: [u32; DIGEST],
+    pub step: [u32; DIGEST],
+    pub log_n: usize,
+    pub hash_log_n: usize,
+}
+
+impl ChainSetupConst {
+    fn setup(&self) -> ChainSetup {
+        let d = |x: &[u32; DIGEST]| x.map(Fp::new);
+        ChainSetup {
+            plan_root: d(&self.plan_root),
+            plan_depth: self.plan_depth,
+            base: d(&self.base),
+            step: d(&self.step),
+            log_n: self.log_n,
+            hash_log_n: self.hash_log_n,
+        }
+    }
+}
+
+/// Verifies block proofs: each a chain proof covering the block and every
+/// block before it. Also proves them, for a miner.
 pub struct AggregateVerifier {
     pub params: AggregatorParams,
+    pub emission: &'static [(u32, u64)],
     /// Compiled program types, and the planned wrap by segment count.
     plans: Mutex<(PlanCache, HashMap<usize, Wrap>)>,
+    setup: std::sync::OnceLock<ChainSetup>,
+    tree: std::sync::OnceLock<crate::merkle::MerkleTree>,
 }
 
 impl AggregateVerifier {
-    pub fn new(params: AggregatorParams) -> AggregateVerifier {
-        AggregateVerifier { params, plans: Mutex::new((PlanCache::new(), HashMap::new())) }
+    pub fn new(params: AggregatorParams, emission: &'static [(u32, u64)]) -> AggregateVerifier {
+        AggregateVerifier {
+            params,
+            emission,
+            plans: Mutex::new((PlanCache::new(), HashMap::new())),
+            setup: std::sync::OnceLock::new(),
+            tree: std::sync::OnceLock::new(),
+        }
     }
 
     /// The planned tree for `k` segments. Program types compiled for
@@ -996,14 +1432,116 @@ impl AggregateVerifier {
         self.shape(k).wrap.expect("planned root")
     }
 
+    /// Mainnet's setup from its constants; otherwise computed, which plans
+    /// every segment count.
+    fn is_mainnet(&self) -> bool {
+        self.params == AggregatorParams::MAINNET && self.emission == crate::chain::MAINNET_EMISSION
+    }
+
+    /// The tree of allowed wraps, which proving needs (computed once:
+    /// about a minute on mainnet). `leaves` may give it precomputed, as
+    /// from [`AggregateVerifier::plan_leaves_bytes`]; they are checked.
+    pub fn plan_tree(&self, leaves: Option<Vec<Digest>>) -> &crate::merkle::MerkleTree {
+        self.tree.get_or_init(|| {
+            if let Some(leaves) = leaves {
+                let t = crate::merkle::MerkleTree::from_leaf_hashes(leaves);
+                if self.setup.get().is_none_or(|s| s.plan_root == t.root())
+                    && self.const_root().is_none_or(|r| r == t.root())
+                {
+                    return t;
+                }
+            }
+            let mut plans = self.plans.lock().unwrap();
+            crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&self.params, &mut plans.0))
+        })
+    }
+
+    fn const_root(&self) -> Option<Digest> {
+        self.is_mainnet().then_some(MAINNET_CHAIN).flatten().map(|c| c.setup().plan_root)
+    }
+
+    /// The chain-proof setup.
+    pub fn setup(&self) -> &ChainSetup {
+        self.setup.get_or_init(|| {
+            if let Some(c) = self.is_mainnet().then_some(MAINNET_CHAIN).flatten() {
+                return c.setup();
+            }
+            let tree = self.plan_tree(None);
+            let (root, depth) = (tree.root(), tree.height());
+            let mut plans = self.plans.lock().unwrap();
+            chain_setup(&self.params, self.emission, &root, depth, &mut plans.0)
+        })
+    }
+
+    /// The plan tree's leaves as bytes, to save and reload with
+    /// [`AggregateVerifier::plan_tree`].
+    pub fn plan_leaves_bytes(&self) -> Vec<u8> {
+        let tree = self.plan_tree(None);
+        let mut w = Writer::default();
+        for i in 0..tree.len() {
+            w.digest(&tree.leaf(i));
+        }
+        w.finish()
+    }
+
+    /// Verifies a block proof: the chain proof of the block at `height`.
+    pub fn verify_chain_proof(&self, height: u32, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
+        let proof = stark::Proof::from_bytes(proof).ok_or(AggregateError::Malformed)?;
+        verify_chain(&self.params, self.setup(), height, statement, &proof)
+    }
+
+    /// Verifies a wrap encoding (segment count and wrap proof), as
+    /// [`prove_block_cancellable`] makes.
     pub fn verify_statement(&self, statement: &Statement, proof: &[u8]) -> Result<(), AggregateError> {
         verify_block(&self.params, &|k| self.wrap(k), statement, proof)
+    }
+
+    /// Proves the block at `height`: its segments, tree and wrap, then the
+    /// chain step on `prev` (the previous block's height, statement and
+    /// proof; `None` at height 1). Returns the block proof.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_block(
+        &self,
+        height: u32,
+        statement: &Statement,
+        segments: &[SegmentWitness],
+        prev: Option<(u32, &Statement, &[u8])>,
+        jobs: usize,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: stark::Cancel<'_>,
+    ) -> Option<Vec<u8>> {
+        let shape = self.shape(segments.len());
+        let wrap_proof = prove_wrap(&self.params, &shape, statement, segments, jobs, progress, cancel)?;
+        let prev_proof = match prev {
+            Some((_, _, bytes)) => Some(stark::Proof::from_bytes(bytes).expect("the previous block's proof decodes")),
+            None => None,
+        };
+        let setup = *self.setup();
+        let tree = self.plan_tree(None);
+        let index = segments.len() - 1;
+        let w = ChainWitness {
+            height,
+            statement,
+            wrap: shape.wrap.expect("planned root"),
+            wrap_proof: &wrap_proof,
+            path: tree.open(index),
+            index,
+            prev: prev.zip(prev_proof.as_ref()).map(|((h, st, _), proof)| PrevChain {
+                height: h,
+                statement: st,
+                proof,
+            }),
+        };
+        let t = std::time::Instant::now();
+        let proof = prove_chain(&self.params, self.emission, &setup, &w, cancel)?;
+        progress(Progress::Chain { elapsed: t.elapsed() });
+        Some(proof.to_bytes())
     }
 }
 
 impl ProofVerifier for AggregateVerifier {
     fn verify(&self, s: &BlockStatement<'_>, proof: &[u8]) -> bool {
-        self.verify_statement(&Statement::from_block(s), proof).is_ok()
+        self.verify_chain_proof(s.height, &Statement::from_block(s), proof).is_ok()
     }
 }
 
@@ -1159,7 +1697,96 @@ mod tests {
         assert!(prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &later).is_none());
         // Never: a proof as from `prove_block_with`.
         let proof = prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &|| false).unwrap();
-        assert_eq!(AggregateVerifier::new(SMALL).verify_statement(&s.statement, &proof), Ok(()));
+        assert_eq!(AggregateVerifier::new(SMALL, &[(10, 55)]).verify_statement(&s.statement, &proof), Ok(()));
+    }
+
+    #[test]
+    #[ignore = "proves two blocks and their chain proofs; run with --release"]
+    fn chain_proofs_cover_history() {
+        let dir = TempDir::new("chain");
+        let env = open_env(&dir.0, 16 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let miner = key(9).public_key();
+        // Two consecutive blocks on one UTXO set, 55 each.
+        let mut block = |txs: Vec<Transaction>, height: u32| {
+            let prev_root = utxo.root(&wtxn).unwrap();
+            let first = utxo.next_position(&wtxn).unwrap();
+            let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, SMALL.segment_rows()).unwrap();
+            let body = Body {
+                inputs: vec![],
+                outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+                proof: vec![],
+            };
+            let statement = Statement::from_block(&BlockStatement {
+                height,
+                prev_state_root: prev_root,
+                new_state_root: utxo.root(&wtxn).unwrap(),
+                first_output_position: first,
+                subsidy: 55,
+                body: &body,
+            });
+            (segments, statement)
+        };
+        let (seg1, st1) = block(vec![reward(&miner, 30), reward(&miner, 25)], 1);
+        let (seg2, st2) = block(vec![reward(&miner, 55)], 2);
+        wtxn.abort();
+
+        let mut cache = PlanCache::new();
+        let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&SMALL, &mut cache));
+        let emission = [(10u32, 55u64)];
+        let t = std::time::Instant::now();
+        let setup = chain_setup(&SMALL, &emission, &tree.root(), tree.height(), &mut cache);
+        println!("chain setup in {:?}: 2^{}/2^{}", t.elapsed(), setup.log_n, setup.hash_log_n);
+        let wrap_of = |segs: &[SegmentWitness], st: &Statement| {
+            let shape = plan_with(&SMALL, segs.len(), &mut PlanCache::new());
+            let proof = prove_wrap(&SMALL, &shape, st, segs, 2, &|_| {}, &|| false).unwrap();
+            (shape.wrap.unwrap(), proof, segs.len() - 1)
+        };
+        let (w1, p1, i1) = wrap_of(&seg1, &st1);
+        let (w2, p2, i2) = wrap_of(&seg2, &st2);
+        let witness = |height, st, wrap, proof, index, prev| ChainWitness {
+            height,
+            statement: st,
+            wrap,
+            wrap_proof: proof,
+            path: tree.open(index),
+            index,
+            prev,
+        };
+        let t = std::time::Instant::now();
+        let c1 = prove_chain(&SMALL, &emission, &setup, &witness(1, &st1, w1, &p1, i1, None), &|| false).unwrap();
+        println!("base proof in {:?}", t.elapsed());
+        assert_eq!(verify_chain(&SMALL, &setup, 1, &st1, &c1), Ok(()));
+        let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+        let t = std::time::Instant::now();
+        let c2 = prove_chain(&SMALL, &emission, &setup, &witness(2, &st2, w2, &p2, i2, Some(prev)), &|| false).unwrap();
+        println!("step proof in {:?}, {} bytes", t.elapsed(), c2.to_bytes().len());
+        assert_eq!(verify_chain(&SMALL, &setup, 2, &st2, &c2), Ok(()));
+        // Wrong height, statement or proof.
+        assert!(verify_chain(&SMALL, &setup, 3, &st2, &c2).is_err());
+        assert!(verify_chain(&SMALL, &setup, 2, &st1, &c2).is_err());
+        assert!(verify_chain(&SMALL, &setup, 2, &st2, &c1).is_err());
+        let mut other = st2.clone();
+        other.end_output_position += 1;
+        assert!(verify_chain(&SMALL, &setup, 2, &other, &c2).is_err());
+        // The schedule is enforced: with block 2 due 7, its 55 is refused.
+        let strict = [(1u32, 55u64), (9, 7)];
+        let bad = std::panic::catch_unwind(|| {
+            let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+            let w = witness(2, &st2, w2, &p2, i2, Some(prev));
+            compile_chain(&SMALL, &strict, &setup.plan_root, &setup.base, &setup.step, &w, None)
+        });
+        if let Ok(c) = bad {
+            assert!(VmAir::execute(&c.prog, &c.inputs).is_err());
+        }
+        // A wrap that is not in the plan is refused.
+        let mut fake = w2;
+        fake.tree[0] += Fp::ONE;
+        let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+        let w = witness(2, &st2, fake, &p2, i2, Some(prev));
+        let c = compile_chain(&SMALL, &emission, &setup.plan_root, &setup.base, &setup.step, &w, None);
+        assert!(VmAir::execute(&c.prog, &c.inputs).is_err());
     }
 
     #[test]
@@ -1178,7 +1805,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments);
         println!("9 segments, 4 levels: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         let mut poor = s.statement.clone();
         poor.subsidy -= 1;
@@ -1190,7 +1817,7 @@ mod tests {
     fn spanning_transaction_roundtrip() {
         let s = spanning_setup("span-roundtrip");
         let proof = prove_block(&SMALL, &s.statement, &s.segments);
-        let v = AggregateVerifier::new(SMALL);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
     }
 
@@ -1390,7 +2017,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments);
         println!("aggregate of 2 segments: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         let t = std::time::Instant::now();
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         println!("verify: {:?}", t.elapsed());
@@ -1419,7 +2046,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments);
         println!("tree aggregate of 3 segments: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         let mut poor = s.statement.clone();
         poor.subsidy = 64;
@@ -1478,6 +2105,111 @@ mod tests {
             body: &body,
         });
         (w, statement)
+    }
+
+    /// Computes mainnet's chain-proof constants ([`MAINNET_CHAIN`]) and
+    /// checks the source has them; prints them when it does not.
+    #[test]
+    #[ignore = "plans every mainnet segment count (about a minute); run with --release"]
+    fn mainnet_chain_constants() {
+        let params = AggregatorParams::MAINNET;
+        let mut cache = PlanCache::new();
+        let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&params, &mut cache));
+        let s = chain_setup(&params, crate::chain::MAINNET_EMISSION, &tree.root(), tree.height(), &mut cache);
+        let u = |d: &Digest| d.map(|x| x.to_canonical());
+        let c = ChainSetupConst {
+            plan_root: u(&s.plan_root),
+            plan_depth: s.plan_depth,
+            base: u(&s.base),
+            step: u(&s.step),
+            log_n: s.log_n,
+            hash_log_n: s.hash_log_n,
+        };
+        println!("pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some({c:?});");
+        assert_eq!(MAINNET_CHAIN, Some(c), "update MAINNET_CHAIN to the line printed above");
+    }
+
+    /// Chain proofs at mainnet parameters (with the plan cut to 16 segment
+    /// counts, which only shortens a Merkle path): two one-segment blocks,
+    /// their wraps, the base proof and a step.
+    #[test]
+    #[ignore = "proves mainnet blocks and chain proofs; run with --release"]
+    fn mainnet_chain_timing() {
+        let params = AggregatorParams { max_segments: 16, ..AggregatorParams::MAINNET };
+        let miner = key(9).public_key();
+        let per = params.segment_rows() / crate::block_air::tx_rows(&reward(&miner, 1));
+        let dir = TempDir::new("mainnet-chain");
+        let env = open_env(&dir.0, 256 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let subsidy: u64 = (1..=per as u64).sum();
+        let mut block = |height: u32| {
+            let txs: Vec<Transaction> = (0..per).map(|i| reward(&miner, 1 + i as u64)).collect();
+            let prev_root = utxo.root(&wtxn).unwrap();
+            let first = utxo.next_position(&wtxn).unwrap();
+            let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows()).unwrap();
+            let body =
+                Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
+            let st = Statement::from_block(&BlockStatement {
+                height,
+                prev_state_root: prev_root,
+                new_state_root: utxo.root(&wtxn).unwrap(),
+                first_output_position: first,
+                subsidy,
+                body: &body,
+            });
+            (w, st)
+        };
+        let (seg1, st1) = block(1);
+        let (seg2, st2) = block(2);
+        wtxn.abort();
+        let mut cache = PlanCache::new();
+        let t = std::time::Instant::now();
+        let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&params, &mut cache));
+        let emission = [(10u32, subsidy)];
+        let setup = chain_setup(&params, &emission, &tree.root(), tree.height(), &mut cache);
+        println!(
+            "plan and chain setup in {:?}: chain proofs 2^{} + 2^{} rows",
+            t.elapsed(),
+            setup.log_n,
+            setup.hash_log_n
+        );
+        let wrap_of = |segs: &[SegmentWitness], st: &Statement, cache: &mut PlanCache| {
+            let shape = plan_with(&params, segs.len(), cache);
+            let t = std::time::Instant::now();
+            let proof = prove_wrap(&params, &shape, st, segs, 2, &|_| {}, &|| false).unwrap();
+            println!("block proven to its wrap in {:?}", t.elapsed());
+            (shape.wrap.unwrap(), proof)
+        };
+        let (w1, p1) = wrap_of(&seg1, &st1, &mut cache);
+        let (w2, p2) = wrap_of(&seg2, &st2, &mut cache);
+        let t = std::time::Instant::now();
+        let base = ChainWitness {
+            height: 1,
+            statement: &st1,
+            wrap: w1,
+            wrap_proof: &p1,
+            path: tree.open(0),
+            index: 0,
+            prev: None,
+        };
+        let c1 = prove_chain(&params, &emission, &setup, &base, &|| false).unwrap();
+        println!("base chain proof in {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let step = ChainWitness {
+            height: 2,
+            statement: &st2,
+            wrap: w2,
+            wrap_proof: &p2,
+            path: tree.open(0),
+            index: 0,
+            prev: Some(PrevChain { height: 1, statement: &st1, proof: &c1 }),
+        };
+        let c2 = prove_chain(&params, &emission, &setup, &step, &|| false).unwrap();
+        println!("step chain proof in {:?}, {} bytes", t.elapsed(), c2.to_bytes().len());
+        let t = std::time::Instant::now();
+        assert_eq!(verify_chain(&params, &setup, 2, &st2, &c2), Ok(()));
+        println!("verified in {:?}; wrap proof was {} bytes", t.elapsed(), p2.to_bytes().len());
     }
 
     /// Candidate security levels: table heights over the segment counts,

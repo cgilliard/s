@@ -1,7 +1,9 @@
 # Security of tabminer's proofs
 
 This note estimates the soundness of the block proof: the segment proofs, the
-recursive node proofs and the zero-knowledge wrap proof a block carries. It
+recursive node proofs, the zero-knowledge wrap proof, and the chain proof a
+block carries, which verifies the wrap and the previous block's chain proof
+so that one proof covers the whole chain. It
 covers the parameters in `AggregatorParams::MAINNET`. All numbers come from
 `tools/soundness.py`, run on `tools/soundness_mainnet.json`. The table
 dimensions in that file, and the grinding schedule the code derives, are
@@ -22,6 +24,12 @@ every Fiat-Shamir round of every proof has an error below 2^-121 per attempt.
 | segment (2^15 rows, rate 1/4) | 54 + 16 grinding bits | 120.0 | about 60 | 68 |
 | node (up to 2^19 + 2^17 rows, rate 1/4) | 54 + 16 | 120.1 | about 60 | 67 |
 | wrap (up to 2^17 + 2^15 rows, rate 1/32) | 22 + 16 | 120.3 | about 60 | 68 |
+| chain step (2^17 + 2^15 rows, rate 1/32) | 22 + 16 | 120.3 | about 60 | 68 |
+
+A chain proof at height h stands for h nested proofs, one per block. A
+forger has to forge one of them, and each attempt costs the same as against
+a single proof, so the chain is as sound as its weakest proof type: the
+figures above, whatever h.
 
 All figures are bits of classical security against a prover that may make
 2^λ hash queries. Against a quantum attacker, Grover search over transcripts

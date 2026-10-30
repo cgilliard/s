@@ -8,10 +8,10 @@
    [
     "BlockAir",
     15,
-    726,
+    736,
     0,
     3,
-    1691,
+    1743,
     0,
     [],
     1
@@ -74,6 +74,60 @@
  },
  {
   "name": "wrap (up to 2^17 + 2^15 rows, zero knowledge)",
+  "log_blowup": 5,
+  "queries": 22,
+  "pow": 16,
+  "zk": true,
+  "tables": [
+   [
+    "VmAir",
+    17,
+    92,
+    21,
+    5,
+    151,
+    19,
+    [
+     110,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    2
+   ],
+   [
+    "HashTableAir",
+    15,
+    338,
+    0,
+    3,
+    398,
+    1,
+    [
+     20
+    ],
+    1
+   ]
+  ],
+  "commit_bits": 121
+ },
+ {
+  "name": "chain step (2^17 + 2^15 rows, zero knowledge)",
   "log_blowup": 5,
   "queries": 22,
   "pow": 16,

@@ -64,6 +64,8 @@ use crate::xmss::{PublicKey, SEED_SIZE};
 const META_ENTROPY: &str = "entropy";
 const META_SEED: &str = "seed";
 const META_FORMAT: &str = "format";
+/// Set by a restore: the wallet's outputs are still to be found on chain.
+const META_SCAN_PENDING: &str = "scan_pending";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys.
 const FORMAT: u8 = 3;
 const MAP_SIZE: usize = 1 << 30;
@@ -497,8 +499,23 @@ impl Wallet {
         meta.put(&mut wtxn, META_ENTROPY, &entropy)?;
         meta.put(&mut wtxn, META_SEED, &seed)?;
         meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
+        meta.put(&mut wtxn, META_SCAN_PENDING, &[1])?;
         wtxn.commit()?;
         Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent })
+    }
+
+    /// Whether a restore is waiting for its first scan.
+    pub fn scan_pending(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.meta.get(&rtxn, META_SCAN_PENDING)?.is_some())
+    }
+
+    /// Marks the restore's first scan done.
+    pub fn clear_scan_pending(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.delete(&mut wtxn, META_SCAN_PENDING)?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// The wallet's 12-word phrase.
@@ -1072,6 +1089,8 @@ mod tests {
         // A restored copy finds it and signs from 8..15, from a random start,
         // wrapping within that half, eight times.
         let r = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
+        assert!(r.scan_pending().unwrap());
+        assert!(!w.scan_pending().unwrap());
         let rtxn = env.read_txn().unwrap();
         assert_eq!(r.scan(&u, &rtxn).unwrap(), (1, 50));
         assert_eq!(r.scan(&u, &rtxn).unwrap(), (0, 0));

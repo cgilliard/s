@@ -433,7 +433,7 @@ impl StarkConfig {
     }
 
     /// Degree of the random polynomials masking the quotient chunks.
-    fn chunk_slack(&self) -> usize {
+    pub(crate) fn chunk_slack(&self) -> usize {
         2 * self.blind_rows()
     }
 
@@ -530,15 +530,15 @@ pub(crate) fn lookup_weight(air: &dyn DynAir, public: &[Fp]) -> usize {
 /// row: a blinding message `u` the table sends and the message `v` it
 /// receives, which on row 0 equals the previous table's `u`. They hide the
 /// tables' lookup totals and mask the FRI codeword.
-const ZK_COLS: usize = 2 * DEGREE;
+pub(crate) const ZK_COLS: usize = 2 * DEGREE;
 /// Auxiliary extension columns a zero-knowledge proof appends: `1 / d(u)`
 /// and `1 / d(v)` on row 0, random elsewhere.
-const ZK_AUX: usize = 2;
+pub(crate) const ZK_AUX: usize = 2;
 /// Lookup constraints a zero-knowledge proof adds: the two inverses.
 const ZK_LOOKUP_CONSTRAINTS: usize = 2;
 /// Blinding messages carry `delta^BLIND_TAG`, a power no AIR tuple
 /// reaches, so they can only match each other.
-const BLIND_TAG: usize = 64;
+pub(crate) const BLIND_TAG: usize = 64;
 
 /// Randomness for zero-knowledge proofs: Poseidon2 in counter mode, with
 /// feed-forward, under a key from the operating system.
@@ -1614,7 +1614,7 @@ fn kept_stride(config: &StarkConfig, degree: usize) -> usize {
 /// Degree of a table's combined constraints: its AIR's, or with zero
 /// knowledge and lookups at least that of the blinding constraints
 /// (selector, inverse and message).
-fn table_degree(config: &StarkConfig, air: &dyn DynAir, terms: usize) -> usize {
+pub(crate) fn table_degree(config: &StarkConfig, air: &dyn DynAir, terms: usize) -> usize {
     let d = air.air_degree();
     if config.zk && terms > 0 { d.max(3) } else { d }
 }

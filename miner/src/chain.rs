@@ -45,6 +45,7 @@
 //! commitments. That, the signatures and the commitment preimages are the
 //! proof's job.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use heed::byteorder::LittleEndian;
@@ -208,6 +209,15 @@ pub enum ChainError {
     InvalidParent,
     /// The block is above the schedule's final height: the chain has ended.
     ChainEnded,
+    /// A block of the branch has no body yet (fast sync stores headers
+    /// alone).
+    MissingBody,
+    /// A reorganization would go below the fast-sync snapshot.
+    BelowSnapshot,
+    /// A reorganization would go deeper than the undo records kept.
+    BeyondUndo,
+    /// A snapshot does not match its block's state root or proof.
+    BadSnapshot,
     /// The block was found invalid before.
     KnownInvalid,
     BadHeight {
@@ -258,6 +268,10 @@ impl ChainError {
                 | ChainError::BadBodyCommitment
                 | ChainError::Corrupt(_)
                 | ChainError::OldFormat
+                | ChainError::MissingBody
+                | ChainError::BelowSnapshot
+                | ChainError::BeyondUndo
+                | ChainError::BadSnapshot
         )
     }
 }
@@ -274,6 +288,10 @@ impl core::fmt::Display for ChainError {
             ChainError::UnknownParent(_) => f.write_str("parent block is unknown"),
             ChainError::InvalidParent => f.write_str("parent block is invalid"),
             ChainError::ChainEnded => f.write_str("the chain has reached its final block"),
+            ChainError::MissingBody => f.write_str("a block of the branch has no body yet"),
+            ChainError::BelowSnapshot => f.write_str("cannot reorganize below the fast-sync snapshot"),
+            ChainError::BeyondUndo => f.write_str("cannot reorganize deeper than the undo records kept"),
+            ChainError::BadSnapshot => f.write_str("snapshot does not match its block"),
             ChainError::KnownInvalid => f.write_str("block is known to be invalid"),
             ChainError::BadHeight { expected, got } => {
                 write!(f, "height {got}, expected {expected}")
@@ -335,14 +353,26 @@ pub enum Applied {
 }
 
 const META_TIP: &str = "tip";
+/// Most-work header known, which may be ahead of the tip.
+const META_BEST_HEADER: &str = "best_header";
+/// Height of the snapshot a fast sync started from: no block at or below
+/// it can be disconnected (its undo record does not exist).
+const META_FLOOR: &str = "floor";
+/// The output counter after the snapshot block.
+const META_FLOOR_NEXT: &str = "floor_next";
+/// Positions per snapshot part (a subtree of the state tree).
+pub const SNAPSHOT_PART_LOG: usize = 12;
 const META_FORMAT: &str = "format";
-/// Version of the on-disk layout: 3 adds output memos.
-const FORMAT: u8 = 3;
+/// Version of the on-disk layout: 4 has leaves of commitment and memo.
+const FORMAT: u8 = 4;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
 const STATUS_VALID: u8 = 1;
 const STATUS_INVALID: u8 = 2;
+/// A header checked on its own (proof of work, difficulty, timestamps),
+/// stored without its body during a fast sync.
+const STATUS_HEADER_ONLY: u8 = 3;
 
 /// A stored header with its index record.
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +383,8 @@ pub struct Entry {
     /// Whether the block has been connected (its state rules checked).
     pub validated: bool,
     pub invalid: bool,
+    /// Stored as a header alone (fast sync), its body not yet seen.
+    pub header_only: bool,
 }
 
 /// What disconnecting a block needs: the commitments and memos its inputs
@@ -400,7 +432,12 @@ pub struct Chain<V: ProofVerifier> {
     undo: Database<Bytes, Bytes>,
     by_height: Database<U32<LittleEndian>, Bytes>,
     meta: Database<Str, Bytes>,
+    /// Undo records kept, counting back from the tip; `None` keeps all.
+    max_undo: Option<u32>,
 }
+
+/// Default undo window: a week of blocks.
+pub const DEFAULT_MAX_UNDO: u32 = 144 * 7;
 
 fn digest_bytes(d: &Digest) -> [u8; 32] {
     crate::poseidon2::digest_to_bytes(d)
@@ -437,7 +474,53 @@ impl<V: ProofVerifier> Chain<V> {
             None => meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?,
         }
         wtxn.commit()?;
-        Ok(Chain { env, params, seed, verifier, utxo, headers, bodies, index, undo, by_height, meta })
+        Ok(Chain {
+            env,
+            params,
+            seed,
+            verifier,
+            utxo,
+            headers,
+            bodies,
+            index,
+            undo,
+            by_height,
+            meta,
+            max_undo: Some(DEFAULT_MAX_UNDO),
+        })
+    }
+
+    /// Keeps undo records for the last `blocks` main-chain blocks (`None`
+    /// keeps them all). Reorganizations deeper than that are refused, and
+    /// snapshots are served only for blocks within it.
+    pub fn with_max_undo(mut self, blocks: Option<u32>) -> Self {
+        self.max_undo = blocks;
+        self
+    }
+
+    /// Deletes undo records outside the window: those of main-chain blocks
+    /// at least `max_undo` below the tip. Returns how many went.
+    pub fn prune_undo(&self) -> Result<usize> {
+        let Some(keep) = self.max_undo else {
+            return Ok(0);
+        };
+        let mut wtxn = self.env.write_txn()?;
+        let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
+        let mut n = 0;
+        let mut h = tip.height.saturating_sub(keep);
+        while h > 0 {
+            let Some(header) = self.header_at_in(&wtxn, h)? else {
+                break;
+            };
+            if !self.undo.delete(&mut wtxn, &digest_bytes(&header.hash()))? {
+                // Everything below was pruned before.
+                break;
+            }
+            n += 1;
+            h -= 1;
+        }
+        wtxn.commit()?;
+        Ok(n)
     }
 
     pub fn params(&self) -> &ChainParams {
@@ -539,7 +622,13 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let work = work_from_bytes(&rec[..32]).ok_or(ChainError::Corrupt("work"))?;
         let status = rec[32];
-        Ok(Some(Entry { header, work, validated: status == STATUS_VALID, invalid: status == STATUS_INVALID }))
+        Ok(Some(Entry {
+            header,
+            work,
+            validated: status == STATUS_VALID,
+            invalid: status == STATUS_INVALID,
+            header_only: status == STATUS_HEADER_ONLY,
+        }))
     }
 
     /// The stored header, work and status of a block id.
@@ -680,7 +769,13 @@ impl<V: ProofVerifier> Chain<V> {
     /// Header rules (1 to 4) of a block whose parent is `parent`: returns
     /// the block's cumulative work.
     fn check_header(&self, rtxn: &RoTxn, block: &Block, parent: &Entry, now: u64) -> Result<U256> {
-        let header = &block.header;
+        let work = self.check_header_rules(rtxn, &block.header, parent, now)?;
+        self.check_body(&block.header, &block.body)?;
+        Ok(work)
+    }
+
+    /// The header rules alone (1 to 3): returns the header's cumulative work.
+    fn check_header_rules(&self, rtxn: &RoTxn, header: &Header, parent: &Entry, now: u64) -> Result<U256> {
         if parent.invalid {
             return Err(ChainError::InvalidParent);
         }
@@ -707,7 +802,6 @@ impl<V: ProofVerifier> Chain<V> {
         if !header.quick_pow_check(&target) || !header.verify_pow(&self.seed, &target) {
             return Err(ChainError::BadProofOfWork);
         }
-        self.check_body(header, &block.body)?;
         Ok(parent.work.saturating_add(ChainParams::block_work(target.into())))
     }
 
@@ -738,7 +832,9 @@ impl<V: ProofVerifier> Chain<V> {
         let tip_entry = self.entry_in(&wtxn, &tip.hash())?.ok_or(ChainError::Corrupt("tip index"))?;
         let hash = header.hash();
         let id = digest_bytes(&hash);
-        if let Some(e) = self.entry_in(&wtxn, &hash)? {
+        if let Some(e) = self.entry_in(&wtxn, &hash)?
+            && !e.header_only
+        {
             return if e.invalid { Err(ChainError::KnownInvalid) } else { Ok(Applied::Known) };
         }
         let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
@@ -769,7 +865,7 @@ impl<V: ProofVerifier> Chain<V> {
             let body = if i + 1 == branch.len() {
                 block.body.clone()
             } else {
-                self.body_by_hash_in(&wtxn, &digest_bytes(&h.hash()))?.ok_or(ChainError::Corrupt("branch body"))?
+                self.body_by_hash_in(&wtxn, &digest_bytes(&h.hash()))?.ok_or(ChainError::MissingBody)?
             };
             if let Err(e) = self.connect(&mut wtxn, h, &body) {
                 drop(wtxn);
@@ -819,16 +915,30 @@ impl<V: ProofVerifier> Chain<V> {
         self.undo.put(wtxn, &id, &Undo { first_output_position, spent }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
+        // The block leaving the undo window.
+        if let Some(keep) = self.max_undo
+            && header.height > keep
+            && let Some(old) = self.header_at_in(wtxn, header.height - keep)?
+        {
+            self.undo.delete(wtxn, &digest_bytes(&old.hash()))?;
+        }
         Ok(())
     }
 
     /// Disconnects the main-chain block at `height`, the tip, restoring the
     /// outputs it spent and removing the ones it appended.
     fn disconnect(&self, wtxn: &mut RwTxn, height: u32) -> Result<()> {
+        if self.floor_in(wtxn)?.is_some_and(|f| height <= f) {
+            return Err(ChainError::BelowSnapshot);
+        }
         let header = self.header_at_in(wtxn, height)?.ok_or(ChainError::Corrupt("disconnecting missing height"))?;
         let id = digest_bytes(&header.hash());
         let body = self.body_by_hash_in(wtxn, &id)?.ok_or(ChainError::Corrupt("body of main-chain block"))?;
-        let undo = self.undo.get(wtxn, &id)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
+        let undo = match self.undo.get(wtxn, &id)? {
+            Some(b) => Undo::from_bytes(b).ok_or(ChainError::Corrupt("undo record"))?,
+            None if self.max_undo.is_some() => return Err(ChainError::BeyondUndo),
+            None => return Err(ChainError::Corrupt("undo record")),
+        };
         if undo.spent.len() != body.inputs.len() {
             return Err(ChainError::Corrupt("undo record length"));
         }
@@ -846,6 +956,300 @@ impl<V: ProofVerifier> Chain<V> {
         self.by_height.delete(wtxn, &height)?;
         self.meta.put(wtxn, META_TIP, &digest_bytes(&header.prev_hash))?;
         Ok(())
+    }
+
+    fn floor_in(&self, rtxn: &RoTxn) -> Result<Option<u32>> {
+        match self.meta.get(rtxn, META_FLOOR)? {
+            None => Ok(None),
+            Some(b) => Ok(Some(u32::from_le_bytes(b.try_into().map_err(|_| ChainError::Corrupt("floor"))?))),
+        }
+    }
+
+    /// Height of the snapshot this chain was fast-synced from, if any.
+    pub fn floor(&self) -> Result<Option<u32>> {
+        let rtxn = self.env.read_txn()?;
+        self.floor_in(&rtxn)
+    }
+
+    /// Checks a header against its stored parent (proof of work,
+    /// difficulty, timestamps) and stores it without a body, for a fast
+    /// sync. Returns whether it was new.
+    pub fn accept_header(&self, header: &Header, now: u64) -> Result<bool> {
+        let mut wtxn = self.env.write_txn()?;
+        let id = digest_bytes(&header.hash());
+        if let Some(e) = self.entry_in(&wtxn, &header.hash())? {
+            return if e.invalid { Err(ChainError::KnownInvalid) } else { Ok(false) };
+        }
+        let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
+        let work = match self.check_header_rules(&wtxn, header, &parent, now) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(wtxn);
+                return Err(e);
+            }
+        };
+        self.headers.put(&mut wtxn, &id, &header.to_bytes())?;
+        self.put_index(&mut wtxn, &id, work, STATUS_HEADER_ONLY)?;
+        let best = self.best_header_in(&wtxn)?;
+        if work > self.entry_in(&wtxn, &best.hash())?.map_or(U256::ZERO, |e| e.work) {
+            self.meta.put(&mut wtxn, META_BEST_HEADER, &id)?;
+        }
+        wtxn.commit()?;
+        Ok(true)
+    }
+
+    fn best_header_in(&self, rtxn: &RoTxn) -> Result<Header> {
+        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
+        let Some(id) = self.meta.get(rtxn, META_BEST_HEADER)? else {
+            return Ok(tip);
+        };
+        let best = self.header_by_hash_in(rtxn, id)?.ok_or(ChainError::Corrupt("best header"))?;
+        let w = |h: &Header| -> Result<U256> { Ok(self.entry_in(rtxn, &h.hash())?.map_or(U256::ZERO, |e| e.work)) };
+        Ok(if w(&best)? > w(&tip)? { best } else { tip })
+    }
+
+    /// The most-work header known: the tip, or a header stored ahead of it.
+    pub fn best_header(&self) -> Result<Header> {
+        let rtxn = self.env.read_txn()?;
+        self.best_header_in(&rtxn)
+    }
+
+    /// Cumulative work of [`Chain::best_header`].
+    pub fn best_header_work(&self) -> Result<U256> {
+        let rtxn = self.env.read_txn()?;
+        let best = self.best_header_in(&rtxn)?;
+        Ok(self.entry_in(&rtxn, &best.hash())?.map_or(U256::ZERO, |e| e.work))
+    }
+
+    /// The ancestor at `height` of the stored header `from`.
+    pub fn ancestor(&self, from: &Header, height: u32) -> Result<Option<Header>> {
+        let rtxn = self.env.read_txn()?;
+        if height > from.height {
+            return Ok(None);
+        }
+        let mut h = *from;
+        while h.height > height {
+            match self.header_by_hash_in(&rtxn, &digest_bytes(&h.prev_hash))? {
+                Some(p) => h = p,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(h))
+    }
+
+    /// A block locator from the best header: it, then the main chain's.
+    pub fn header_locator(&self) -> Result<Vec<Digest>> {
+        let best = self.best_header()?;
+        let mut loc = self.locator()?;
+        if loc.first() != Some(&best.hash()) {
+            loc.insert(0, best.hash());
+        }
+        loc.truncate(32);
+        Ok(loc)
+    }
+
+    /// Checks that `block`, whose header is stored, is valid with the given
+    /// output counter after it (from a snapshot manifest): body rules and
+    /// its proof, which covers every block before it. The statement's
+    /// previous state root comes from the stored parent header.
+    pub fn verify_snapshot_block(&self, block: &Block, next_position: u64) -> Result<()> {
+        let rtxn = self.env.read_txn()?;
+        if block.header.height == 0 {
+            return Err(ChainError::BadSnapshot);
+        }
+        self.entry_in(&rtxn, &block.header.hash())?.ok_or(ChainError::UnknownParent(block.header.hash()))?;
+        let parent = self
+            .header_by_hash_in(&rtxn, &digest_bytes(&block.header.prev_hash))?
+            .ok_or(ChainError::UnknownParent(block.header.prev_hash))?;
+        self.check_body(&block.header, &block.body)?;
+        let first = next_position.checked_sub(block.body.outputs.len() as u64).ok_or(ChainError::BadSnapshot)?;
+        let statement = BlockStatement {
+            height: block.header.height,
+            prev_state_root: parent.state_root,
+            new_state_root: block.header.state_root,
+            first_output_position: first,
+            subsidy: self.params.subsidy(block.header.height),
+            body: &block.body,
+        };
+        if !self.verifier.verify(&statement, &block.body.proof) {
+            return Err(ChainError::BadProof);
+        }
+        Ok(())
+    }
+
+    /// Installs a verified snapshot: the unspent outputs after `block`
+    /// (stored as a header, verified with [`Chain::verify_snapshot_block`])
+    /// and the output counter. The chain must hold genesis alone. Every
+    /// ancestor becomes part of the main chain without its body; `block`
+    /// is the new tip and the floor below which nothing reorganizes.
+    pub fn install_snapshot(
+        &self,
+        block: &Block,
+        outputs: &[(u64, Commitment, Memo)],
+        next_position: u64,
+    ) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
+        if tip.height != 0 || self.utxo.next_position(&wtxn)? != 0 {
+            return Err(ChainError::AlreadyInitialized);
+        }
+        let header = block.header;
+        let entry = self.entry_in(&wtxn, &header.hash())?.ok_or(ChainError::UnknownParent(header.hash()))?;
+        self.check_body(&header, &block.body)?;
+        for (pos, c, m) in outputs {
+            if *pos >= next_position {
+                return Err(ChainError::BadSnapshot);
+            }
+            self.utxo.insert_at(&mut wtxn, *pos, c, m)?;
+        }
+        self.utxo.set_next_position(&mut wtxn, next_position)?;
+        if self.utxo.root(&wtxn)? != header.state_root {
+            return Err(ChainError::BadSnapshot);
+        }
+        // The main chain up to the snapshot: proven by its block's proof.
+        let mut h = header;
+        loop {
+            let id = digest_bytes(&h.hash());
+            let e = self.entry_in(&wtxn, &h.hash())?.ok_or(ChainError::Corrupt("snapshot ancestor"))?;
+            self.put_index(&mut wtxn, &id, e.work, STATUS_VALID)?;
+            self.by_height.put(&mut wtxn, &h.height, &id)?;
+            if h.height == 0 {
+                break;
+            }
+            h = self
+                .header_by_hash_in(&wtxn, &digest_bytes(&h.prev_hash))?
+                .ok_or(ChainError::Corrupt("snapshot ancestor header"))?;
+        }
+        let id = digest_bytes(&header.hash());
+        self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
+        self.put_index(&mut wtxn, &id, entry.work, STATUS_VALID)?;
+        self.meta.put(&mut wtxn, META_TIP, &id)?;
+        self.meta.put(&mut wtxn, META_FLOOR, &header.height.to_le_bytes())?;
+        self.meta.put(&mut wtxn, META_FLOOR_NEXT, &next_position.to_le_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// The state after the main-chain block `id`: its output counter and
+    /// the outputs spent since, to restore (position to commitment and
+    /// memo). `None` if the block is not on the main chain or older than
+    /// this node's undo records.
+    #[allow(clippy::type_complexity)]
+    fn state_after(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u64, HashMap<u64, (Commitment, Memo)>)>> {
+        let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(id))? else {
+            return Ok(None);
+        };
+        if !self.is_main_in(rtxn, &header)? || header.height == 0 {
+            return Ok(None);
+        }
+        let key = digest_bytes(id);
+        let next = match self.undo.get(rtxn, &key)?.and_then(Undo::from_bytes) {
+            Some(u) => {
+                let body = self.body_by_hash_in(rtxn, &key)?.ok_or(ChainError::Corrupt("main-chain body"))?;
+                u.first_output_position + body.outputs.len() as u64
+            }
+            None if self.floor_in(rtxn)? == Some(header.height) => {
+                let b = self.meta.get(rtxn, META_FLOOR_NEXT)?.ok_or(ChainError::Corrupt("floor counter"))?;
+                u64::from_le_bytes(b.try_into().map_err(|_| ChainError::Corrupt("floor counter"))?)
+            }
+            None => return Ok(None),
+        };
+        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
+        let mut restored = HashMap::new();
+        for h in header.height + 1..=tip.height {
+            let hd = self.header_at_in(rtxn, h)?.ok_or(ChainError::Corrupt("main-chain header"))?;
+            let k = digest_bytes(&hd.hash());
+            let body = self.body_by_hash_in(rtxn, &k)?.ok_or(ChainError::Corrupt("main-chain body"))?;
+            let undo = self.undo.get(rtxn, &k)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
+            for (&pos, spent) in body.inputs.iter().zip(&undo.spent) {
+                if pos < next {
+                    restored.insert(pos, *spent);
+                }
+            }
+        }
+        Ok(Some((next, restored)))
+    }
+
+    /// The unspent outputs in snapshot part `part` of the state after the
+    /// main-chain block `id`: positions `part << SNAPSHOT_PART_LOG` and on.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_part_in(
+        &self,
+        rtxn: &RoTxn,
+        next: u64,
+        restored: &HashMap<u64, (Commitment, Memo)>,
+        part: u64,
+    ) -> Result<Vec<(u64, Commitment, Memo)>> {
+        let first = part << SNAPSHOT_PART_LOG;
+        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(next);
+        let mut out = Vec::new();
+        for pos in first..end {
+            if let Some((c, m)) = restored.get(&pos) {
+                out.push((pos, *c, *m));
+            } else if let Some((c, m)) = self.utxo.output_at(rtxn, pos)? {
+                out.push((pos, c, m));
+            }
+        }
+        Ok(out)
+    }
+
+    /// A snapshot manifest of the state after the main-chain block `id`:
+    /// the output counter and the root of every part's subtree.
+    pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<(u64, Vec<Digest>)>> {
+        let rtxn = self.env.read_txn()?;
+        let Some((next, restored)) = self.state_after(&rtxn, id)? else {
+            return Ok(None);
+        };
+        let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
+        let mut roots = Vec::with_capacity(parts as usize);
+        for p in 0..parts {
+            let leaves: Vec<(u64, Digest)> = self
+                .snapshot_part_in(&rtxn, next, &restored, p)?
+                .iter()
+                .map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m)))
+                .collect();
+            roots.push(crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, p << SNAPSHOT_PART_LOG, &leaves));
+        }
+        Ok(Some((next, roots)))
+    }
+
+    /// Part `part` of the snapshot after the main-chain block `id`.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<Vec<(u64, Commitment, Memo)>>> {
+        let rtxn = self.env.read_txn()?;
+        let Some((next, restored)) = self.state_after(&rtxn, id)? else {
+            return Ok(None);
+        };
+        if part >= next.div_ceil(1 << SNAPSHOT_PART_LOG) {
+            return Ok(None);
+        }
+        Ok(Some(self.snapshot_part_in(&rtxn, next, &restored, part)?))
+    }
+
+    /// The proof statement and proof of the main-chain block at `height`
+    /// (at least 1): what the next block's chain proof builds on.
+    pub fn proof_statement(&self, height: u32) -> Result<Option<(crate::aggregate::Statement, Vec<u8>)>> {
+        let rtxn = self.env.read_txn()?;
+        let (Some(header), Some(parent)) =
+            (self.header_at_in(&rtxn, height)?, self.header_at_in(&rtxn, height.saturating_sub(1))?)
+        else {
+            return Ok(None);
+        };
+        if height == 0 {
+            return Ok(None);
+        }
+        let id = digest_bytes(&header.hash());
+        let body = self.body_by_hash_in(&rtxn, &id)?.ok_or(ChainError::Corrupt("main-chain body"))?;
+        let undo = self.undo.get(&rtxn, &id)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
+        let statement = crate::aggregate::Statement::from_block(&BlockStatement {
+            height,
+            prev_state_root: parent.state_root,
+            new_state_root: header.state_root,
+            first_output_position: undo.first_output_position,
+            subsidy: self.params.subsidy(height),
+            body: &body,
+        });
+        Ok(Some((statement, body.proof)))
     }
 
     /// Block ids locating the main chain for a peer: the tip and its
@@ -1475,6 +1879,180 @@ mod tests {
             Block { header: solve(&c, header), body }
         };
         assert!(matches!(a.chain.apply_block(&b3, GENESIS_TIME + 2000), Err(ChainError::InvalidParent)));
+    }
+
+    #[test]
+    fn fast_sync_from_a_snapshot() {
+        let a = open("fast-a");
+        let k = pk(11);
+        a.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        // Twelve blocks: each adds two outputs (with memos) and, from block
+        // 3 on, spends one made two blocks earlier, some after block 8.
+        let mut t = GENESIS_TIME;
+        let mut blocks = Vec::new();
+        for h in 1..=12u64 {
+            t += 600;
+            let memo = |i: u64| core::array::from_fn(|j| crate::poseidon2::Fp::new((h * 10 + i) as u32 + j as u32));
+            let outs = (0..2)
+                .map(|i| Output::with_memo(&crate::transaction::pubkey_hash(&k), h * 10 + i, memo(i)).block_output())
+                .collect();
+            let inputs = if h >= 3 { vec![(h - 3) * 2] } else { vec![] };
+            let block = mine(&a, Body { inputs, outputs: outs, proof: vec![] }, t);
+            a.chain.apply_block(&block, t + 1).unwrap();
+            blocks.push(block);
+        }
+        let s8 = blocks[7].header;
+        let (next, roots) = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        assert_eq!(next, 16);
+        assert_eq!(crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots), s8.state_root);
+        let part = a.chain.snapshot_part(&s8.hash(), 0).unwrap().unwrap();
+        // 16 outputs made, positions 0..=10 spent by blocks 3..8 at even
+        // positions, so 10 unspent after block 8; later spends are restored.
+        assert_eq!(part.len(), 10);
+        assert!(a.chain.snapshot_part(&s8.hash(), 1).unwrap().is_none());
+        assert!(a.chain.snapshot_manifest(&blocks[0].header.prev_hash).unwrap().is_none());
+
+        // b: headers first, then the snapshot, then the tail.
+        let b = open("fast-b");
+        b.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        assert!(matches!(b.chain.accept_header(&blocks[1].header, t), Err(ChainError::UnknownParent(_))));
+        for block in &blocks {
+            assert!(b.chain.accept_header(&block.header, t + 1).unwrap());
+        }
+        assert!(!b.chain.accept_header(&blocks[3].header, t + 1).unwrap());
+        assert_eq!(b.chain.best_header().unwrap(), blocks[11].header);
+        assert_eq!(b.chain.tip().unwrap().unwrap().height, 0);
+        assert_eq!(b.chain.ancestor(&blocks[11].header, 8).unwrap(), Some(s8));
+        let mut bad_header = blocks[11].header;
+        bad_header.nonce[0] ^= 1;
+        assert!(b.chain.accept_header(&bad_header, t + 1).is_err());
+        // A block arriving now cannot connect: its ancestors have no bodies.
+        assert!(matches!(b.chain.apply_block(&blocks[11], t + 1), Err(ChainError::MissingBody)));
+
+        b.chain.verify_snapshot_block(&blocks[7], next).unwrap();
+        let mut forged = part.clone();
+        forged[0].1[0] += crate::poseidon2::Fp::ONE;
+        assert!(matches!(b.chain.install_snapshot(&blocks[7], &forged, next), Err(ChainError::BadSnapshot)));
+        b.chain.install_snapshot(&blocks[7], &part, next).unwrap();
+        assert_eq!(b.chain.tip().unwrap().unwrap(), s8);
+        assert_eq!(b.chain.state_root().unwrap(), s8.state_root);
+        assert_eq!(b.chain.floor().unwrap(), Some(8));
+        assert_eq!(b.chain.header_at(3).unwrap(), Some(blocks[2].header));
+        for block in &blocks[8..] {
+            assert_eq!(b.chain.apply_block(block, t + 1).unwrap(), Applied::Extended);
+        }
+        assert_eq!(b.chain.tip().unwrap().unwrap(), blocks[11].header);
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        // b now serves snapshots from its floor on, the same as a's.
+        assert_eq!(b.chain.snapshot_manifest(&s8.hash()).unwrap(), Some((next, roots)));
+        assert_eq!(b.chain.snapshot_part(&s8.hash(), 0).unwrap(), Some(part));
+        // A memo survived: the wallet's scan reads them from here.
+        let rtxn = b.chain.env().read_txn().unwrap();
+        assert!(b.chain.utxo().memos(&rtxn).unwrap().len() >= 10);
+        drop(rtxn);
+        // Nothing reorganizes below the floor: a heavier branch from block 5
+        // is stored but refused.
+        let fork_root = blocks[4].header;
+        let mut fork = Vec::new();
+        let mut parent = fork_root;
+        let c = open("fast-c");
+        c.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        for block in &blocks[..5] {
+            c.chain.apply_block(block, t + 1).unwrap();
+        }
+        let mut tc = parent.timestamp;
+        for _ in 0..9 {
+            tc += 60;
+            let block = mine(&c, Body { inputs: vec![], outputs: vec![], proof: vec![] }, tc);
+            c.chain.apply_block(&block, tc + 1).unwrap();
+            parent = block.header;
+            fork.push(block);
+        }
+        let _ = parent;
+        let mut refused = false;
+        for block in &fork {
+            match b.chain.apply_block(block, tc + 1) {
+                Ok(_) => {}
+                Err(ChainError::BelowSnapshot | ChainError::MissingBody | ChainError::UnknownParent(_)) => {
+                    refused = true
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(refused || b.chain.tip().unwrap().unwrap() == blocks[11].header);
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+    }
+
+    #[test]
+    fn undo_records_are_pruned_beyond_the_window() {
+        let mut f = open("undo");
+        f.chain = f.chain.with_max_undo(Some(3));
+        let k = pk(12);
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let mut t = GENESIS_TIME;
+        let mut blocks = Vec::new();
+        for i in 1..=6u64 {
+            t += 600;
+            let block = mine_outputs(&f, &[Output::new(&k, i)], t);
+            f.chain.apply_block(&block, t + 1).unwrap();
+            blocks.push(block);
+        }
+        // Heights 4 to 6 keep undo records: snapshots after them are served,
+        // after 3 or below not.
+        let undo = |h: usize| {
+            let rtxn = f.chain.env().read_txn().unwrap();
+            f.chain.undo.get(&rtxn, &digest_bytes(&blocks[h - 1].header.hash())).unwrap().is_some()
+        };
+        assert_eq!((1..=6).map(undo).collect::<Vec<_>>(), [false, false, false, true, true, true]);
+        assert!(f.chain.snapshot_manifest(&blocks[2].header.hash()).unwrap().is_none());
+        assert!(f.chain.snapshot_manifest(&blocks[3].header.hash()).unwrap().is_some());
+        // A heavier branch from block 2 would unwind block 3: refused.
+        let g = open("undo-fork");
+        g.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        for b in &blocks[..2] {
+            g.chain.apply_block(b, t + 1).unwrap();
+        }
+        let mut tg = blocks[1].header.timestamp;
+        let mut refused = false;
+        for _ in 0..8 {
+            tg += 30;
+            let b = mine_outputs(&g, &[], tg);
+            g.chain.apply_block(&b, tg + 1).unwrap();
+            match f.chain.apply_block(&b, tg + 1) {
+                Ok(_) => {}
+                Err(ChainError::BeyondUndo | ChainError::UnknownParent(_)) => refused = true,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(refused);
+        assert_eq!(f.chain.tip().unwrap().unwrap(), blocks[5].header);
+        // A shallow reorganization within the window still works.
+        let h = open("undo-shallow");
+        h.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        for b in &blocks[..5] {
+            h.chain.apply_block(b, t + 1).unwrap();
+        }
+        let mut th = blocks[4].header.timestamp;
+        let mut last = None;
+        for _ in 0..3 {
+            th += 30;
+            let b = mine_outputs(&h, &[], th);
+            h.chain.apply_block(&b, th + 1).unwrap();
+            last = Some(f.chain.apply_block(&b, th + 1).unwrap());
+        }
+        assert!(matches!(last, Some(Applied::Reorganized { fork_height: 5, unwound: 1 }) | Some(Applied::Extended)));
+        // Pruning by hand clears a backlog left by a larger window.
+        let wide = open("undo-wide");
+        let wide_chain = Chain::open(&wide._dir.0.join("c"), 64 << 20, params(), seed(), AcceptAllProofs)
+            .unwrap()
+            .with_max_undo(None);
+        wide_chain.init_genesis(&genesis_block(vec![])).unwrap();
+        for b in &blocks {
+            wide_chain.apply_block(b, t + 1).unwrap();
+        }
+        let wide_chain = wide_chain.with_max_undo(Some(2));
+        assert_eq!(wide_chain.prune_undo().unwrap(), 4);
+        assert_eq!(wide_chain.prune_undo().unwrap(), 0);
     }
 
     #[test]

@@ -35,10 +35,12 @@
 //!
 //! Within a segment, for every input the prover shows an XMSS signature by
 //! the revealed key over the body hash of its transaction, derives the
-//! commitment `H(H(key) || amount)`, proves that commitment sits at the
-//! input's position in the current tree, and clears the leaf. For every
-//! output it derives the commitment `H(key_hash || amount)` from a witness
-//! key hash and appends it at the next position. Positions are absorbed
+//! commitment `H(H(key) || amount)`, compresses it with the output's memo
+//! (a witness) into the tree leaf, proves that leaf sits at the input's
+//! position in the current tree, and clears it. For every output it
+//! derives the commitment `H(key_hash || amount)` from a witness key hash
+//! and appends its leaf, commitment and memo compressed, at the next
+//! position. Positions are absorbed
 //! into the inputs sponge, and output commitments and memos (never amounts)
 //! into the outputs sponge. A memo is a free witness, also absorbed into
 //! the body, so the signatures cover it. Per transaction, the body sponge is rebuilt from the
@@ -49,8 +51,8 @@
 //!
 //! ```text
 //! tx_start | resume                         body sponge header; counters n_in, n_out
-//!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ilist old/new x 40 body_in0 body_in1
-//!   per output: ocm0 ocm1 olist olist2 body_out0 body_out1 body_out2 old/new x 40
+//!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ileaf ilist old/new x 40 body_in0 body_in1
+//!   per output: ocm0 ocm1 oleaf olist olist2 body_out0 body_out1 body_out2 old/new x 40
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
 //! ```
@@ -123,7 +125,9 @@ pub const T_DONE: usize = HM_COLS + 23;
 pub const T_RESUME: usize = HM_COLS + 24;
 pub const T_OLIST2: usize = HM_COLS + 25;
 pub const T_BODY_OUT2: usize = HM_COLS + 26;
-const NUM_TYPES: usize = 27;
+pub const T_ILEAF: usize = HM_COLS + 27;
+pub const T_OLEAF: usize = HM_COLS + 28;
+const NUM_TYPES: usize = 29;
 // ---- xmss counters ----
 pub const C_MC: usize = HM_COLS + NUM_TYPES;
 pub const C_ACTIVE: usize = C_MC + 1;
@@ -181,9 +185,11 @@ pub const C_GO_END: usize = C_GO_OUT + 1;
 /// One while a transaction is open: from its start (or resume) until the
 /// row after its end.
 pub const R_OPEN: usize = C_GO_END + 1;
-/// The current output's memo, set entering its first row.
+/// The current item's memo, set entering its first row.
 pub const R_MEMO: usize = R_OPEN + 1;
-pub const NUM_COLS: usize = R_MEMO + DIGEST;
+/// The current output's tree leaf, set after its leaf row.
+pub const R_LEAF: usize = R_MEMO + DIGEST;
+pub const NUM_COLS: usize = R_LEAF + DIGEST;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -209,9 +215,9 @@ pub const CARRY_OUT_LEFT: usize = CARRY_IN_LEFT + 1;
 pub const CARRY_LEN: usize = CARRY_OUT_LEFT + 1;
 
 /// Rows of one input (signature plus commitment, tree update and body).
-pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 4 + 1 + 2 * DEPTH + 2;
+pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 5 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
-pub const ROWS_PER_OUTPUT: usize = 7 + 2 * DEPTH;
+pub const ROWS_PER_OUTPUT: usize = 8 + 2 * DEPTH;
 
 /// Body elements per input and per output (see
 /// `crate::transaction::body_elements`).
@@ -374,6 +380,8 @@ impl Air for BlockAir {
         let body_out1 = l[T_BODY_OUT1];
         let olist2 = l[T_OLIST2];
         let body_out2 = l[T_BODY_OUT2];
+        let ileaf = l[T_ILEAF];
+        let oleaf = l[T_OLEAF];
         let done = l[T_DONE];
         let resume = l[T_RESUME];
         let active = l[C_ACTIVE];
@@ -395,7 +403,9 @@ impl Air for BlockAir {
                 + body_in0
                 + ocm0
                 + olist
-                + body_out0,
+                + body_out0
+                + ileaf
+                + oleaf,
         );
         b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2);
         b.assert_eq(l[COL_LOAD], load);
@@ -512,7 +522,8 @@ impl Air for BlockAir {
         b.when_transition(pkh0 * (one - nt(T_PKH1)));
         b.when_transition(pkh1 * (one - nt(T_CM0)));
         b.when_transition(cm0 * (one - nt(T_CM1)));
-        b.when_transition(cm1 * (one - nt(T_ILIST)));
+        b.when_transition(cm1 * (one - nt(T_ILEAF)));
+        b.when_transition(ileaf * (one - nt(T_ILIST)));
         b.when_transition(ilist * (one - nt(T_OLD)));
         b.when_transition(ilist * n[C_LEVEL]);
         b.when_transition(old_t * (one - nt(T_NEW)));
@@ -523,7 +534,8 @@ impl Air for BlockAir {
         b.when_transition(body_in0 * (one - nt(T_BODY_IN1)));
         // output
         b.when_transition(ocm0 * (one - nt(T_OCM1)));
-        b.when_transition(ocm1 * (one - nt(T_OLIST)));
+        b.when_transition(ocm1 * (one - nt(T_OLEAF)));
+        b.when_transition(oleaf * (one - nt(T_OLIST)));
         b.when_transition(olist * (one - nt(T_OLIST2)));
         b.when_transition(olist2 * (one - nt(T_BODY_OUT0)));
         b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
@@ -603,7 +615,14 @@ impl Air for BlockAir {
         for i in 0..DIGEST {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
             b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
-            b.when_transition((one - nt(T_OCM0)) * (n[R_MEMO + i] - l[R_MEMO + i]));
+            b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START)) * (n[R_MEMO + i] - l[R_MEMO + i]));
+            // Leaves: the commitment just hashed and the memo, compressed.
+            b.when_transition(nt(T_ILEAF) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.assert_zero(ileaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
+            b.assert_zero(oleaf * (l[COL_INPUT + i] - l[R_OCM + i]));
+            b.assert_zero(oleaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
+            b.when_transition(oleaf * (n[R_LEAF + i] - l[COL_ACC + i]));
+            b.when_transition((one - oleaf) * (n[R_LEAF + i] - l[R_LEAF + i]));
             b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
             // pkroot: set entering pkh0 from the tree root, else copied
             b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
@@ -829,7 +848,7 @@ impl Air for BlockAir {
             b.when_transition((one - old_t - nt(T_ILIST) - body_out2 - smt_end) * (n[R_OLD + i] - o));
             // new: zero on ilist, the output commitment entering an insert, output after new rows
             b.assert_zero(ilist * nw);
-            b.when_transition(body_out2 * (n[R_NEW + i] - l[R_OCM + i]));
+            b.when_transition(body_out2 * (n[R_NEW + i] - l[R_LEAF + i]));
             b.when_transition(new_t * (one - is_last) * (n[R_NEW + i] - out));
             b.when_transition((one - new_t - body_out2 - nt(T_ILIST)) * (n[R_NEW + i] - nw));
             // sibling: witness on old rows, copied to the new row
@@ -908,6 +927,8 @@ impl Air for BlockAir {
 pub struct InputWitness {
     pub pubkey: PublicKey,
     pub amount: u64,
+    /// Memo of the output being spent, part of its leaf.
+    pub memo: Memo,
     pub signature: Sig,
     pub position: u64,
     pub siblings: [Digest; DEPTH],
@@ -1197,7 +1218,9 @@ impl SegmentWitness {
                     if k < n_in {
                         let inp = &tx.inputs[k];
                         let commitment = inp.commitment();
-                        let position = utxo.spend(wtxn, &commitment)?.ok_or(utxo::Error::CorruptIndex)?;
+                        let position = *utxo.positions(wtxn, &commitment)?.first().ok_or(utxo::Error::CorruptIndex)?;
+                        let memo = utxo.memo(wtxn, position)?;
+                        utxo.spend_at(wtxn, &commitment, position)?;
                         // Siblings are unchanged by the removal, so read them after it.
                         let proof = utxo.prove(wtxn, position)?;
                         absorb_position(&mut isp, position);
@@ -1205,6 +1228,7 @@ impl SegmentWitness {
                         inputs.push(InputWitness {
                             pubkey: inp.pubkey,
                             amount: inp.amount,
+                            memo,
                             signature: inp.signature.clone(),
                             position,
                             siblings: proof.siblings,
@@ -1213,7 +1237,7 @@ impl SegmentWitness {
                         let o = &tx.outputs[k - n_in];
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
-                        utxo.add(wtxn, &o.commitment)?;
+                        utxo.add_output(wtxn, &o.block_output())?;
                         absorb_output(&mut osp, &o.commitment, &o.memo);
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
@@ -1299,6 +1323,7 @@ struct Regs {
     out_left: u32,
     open: bool,
     memo: Memo,
+    leaf: Digest,
 }
 
 impl Regs {
@@ -1358,6 +1383,7 @@ impl Regs {
         row[C_GO_END] = Fp::new((in_zero && out_zero) as u32);
         row[R_OPEN] = Fp::new(self.open as u32);
         row[R_MEMO..R_MEMO + DIGEST].copy_from_slice(&self.memo);
+        row[R_LEAF..R_LEAF + DIGEST].copy_from_slice(&self.leaf);
     }
 }
 
@@ -1411,6 +1437,20 @@ impl Gen {
         self.b.state()
     }
 
+    /// A leaf row: the commitment and the memo register compressed.
+    fn leaf_row(&mut self, commitment: Digest, ty: usize) -> Digest {
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..DIGEST].copy_from_slice(&commitment);
+        input[DIGEST..].copy_from_slice(&self.regs.memo);
+        self.b.start(input);
+        let row = self.b.last_row_mut();
+        row[ty] = Fp::ONE;
+        self.regs.write(row);
+        let leaf = self.b.acc();
+        debug_assert_eq!(leaf, crate::transaction::leaf(&commitment, &self.regs.memo));
+        leaf
+    }
+
     fn absorb(&mut self, block: [Fp; RATE], ty: usize) -> [Fp; WIDTH] {
         self.b.absorb(block);
         let row = self.b.last_row_mut();
@@ -1462,6 +1502,7 @@ impl Gen {
         assert!(idx < 1 << HEIGHT);
         let r = &mut self.regs;
         r.pub_seed = ps;
+        r.memo = w.memo;
         r.idx_bits = core::array::from_fn(|i| Fp::new(((idx >> i) & 1) as u32));
         r.amount = w.amount;
         r.is_out = false;
@@ -1607,9 +1648,10 @@ impl Gen {
         for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(w.amount)) {
             *acc += limb.to_canonical();
         }
+        let leaf = self.leaf_row(commitment, T_ILEAF);
 
         // inputs list row, then the removal
-        self.regs.old = commitment;
+        self.regs.old = leaf;
         self.regs.new = EMPTY;
         self.regs.level = 0;
         self.regs.pbits = core::array::from_fn(|i| Fp::new(((w.position >> i) & 1) as u32));
@@ -1652,6 +1694,8 @@ impl Gen {
         }
         self.absorb(amt_block(o.amount), T_OCM1);
         assert_eq!(self.b.acc(), o.commitment, "output commitment does not match its key hash and amount");
+        let leaf = self.leaf_row(o.commitment, T_OLEAF);
+        self.regs.leaf = leaf;
         let out = self.sponge_start(osp, o.commitment, T_OLIST);
         self.regs.osp = out;
         // The amount sum advances on the row after olist.
@@ -1669,7 +1713,7 @@ impl Gen {
         self.regs.bsp = out;
         let position = self.regs.opos;
         self.regs.old = EMPTY;
-        self.regs.new = o.commitment;
+        self.regs.new = self.regs.leaf;
         self.regs.level = 0;
         self.regs.pbits = core::array::from_fn(|i| Fp::new(((position >> i) & 1) as u32));
         self.smt_update(position, &w.siblings);
@@ -1725,6 +1769,7 @@ impl BlockAir {
             out_left: 0,
             open: false,
             memo: EMPTY,
+            leaf: EMPTY,
         };
         let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs };
         let mut carry_in = Carry::CLOSED;
@@ -1891,8 +1936,8 @@ mod tests {
     #[test]
     fn layout_and_degree() {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
-        assert_eq!(ROWS_PER_INPUT, 1150 + 4 + 1 + 80 + 2);
-        assert_eq!(ROWS_PER_OUTPUT, 87);
+        assert_eq!(ROWS_PER_INPUT, 1150 + 5 + 1 + 80 + 2);
+        assert_eq!(ROWS_PER_OUTPUT, 88);
         assert_eq!(NUM_PUBLIC, 96 + 2 * 27);
     }
 
@@ -2094,6 +2139,23 @@ mod tests {
         let r = (0..trace.height()).find(|&r| trace.values[r * width + T_BODY_OUT1] == Fp::ONE).unwrap();
         bad.values[r * width + R_MEMO] += Fp::ONE;
         assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // Leaves: the memo compressed into each leaf must be the register's,
+        // and the leaf inserted must be the one computed.
+        for ty in [T_ILEAF, T_OLEAF] {
+            let mut bad = trace.clone();
+            let r = (0..trace.height()).find(|&r| trace.values[r * width + ty] == Fp::ONE).unwrap();
+            bad.values[r * width + COL_INPUT + RATE + 2] += Fp::ONE;
+            assert!(check_constraints(&BlockAir, &bad, &values).is_err(), "leaf row type {ty}");
+        }
+        let mut bad = trace.clone();
+        let r = (0..trace.height()).find(|&r| trace.values[r * width + T_BODY_OUT2] == Fp::ONE).unwrap();
+        bad.values[r * width + R_LEAF] += Fp::ONE;
+        assert!(check_constraints(&BlockAir, &bad, &values).is_err());
+        // Spending with the wrong memo misses the leaf, so the path misses
+        // the root.
+        let mut wrong_memo = w.clone();
+        wrong_memo.txs[0].inputs[0].memo[1] += Fp::ONE;
+        assert!(std::panic::catch_unwind(|| BlockAir::generate_trace(&wrong_memo)).is_err());
         // A memo changed after signing breaks the body digest.
         let mut swapped = w.clone();
         swapped.txs[0].outputs[0].output.memo[0] += Fp::ONE;

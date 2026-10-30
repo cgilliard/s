@@ -67,28 +67,83 @@ const T_GET_CHUNKS: u8 = 8;
 const T_CHUNK: u8 = 9;
 const T_TX_INV: u8 = 10;
 
-/// What a chunked transfer carries.
+/// What a chunked transfer carries. Snapshot objects are named by the
+/// block whose state they describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Block,
     Tx,
+    /// The output counter and part roots of the state after a block
+    /// ([`encode_manifest`]).
+    Manifest,
+    /// One part of that state ([`encode_part`]).
+    Part(u32),
 }
 
 impl Kind {
-    fn to_u8(self) -> u8 {
+    fn put(self, w: &mut Writer) {
         match self {
-            Kind::Block => 0,
-            Kind::Tx => 1,
+            Kind::Block => w.0.push(0),
+            Kind::Tx => w.0.push(1),
+            Kind::Manifest => w.0.push(2),
+            Kind::Part(i) => {
+                w.0.push(3);
+                w.u32(i);
+            }
         }
     }
 
-    fn from_u8(b: u8) -> Option<Kind> {
-        match b {
+    fn get(r: &mut Reader) -> Option<Kind> {
+        match r.take(1)?[0] {
             0 => Some(Kind::Block),
             1 => Some(Kind::Tx),
+            2 => Some(Kind::Manifest),
+            3 => Some(Kind::Part(r.u32()?)),
             _ => None,
         }
     }
+}
+
+/// Largest manifest: about 260,000 parts, a billion positions.
+pub const MAX_MANIFEST: usize = 8 << 20;
+/// Largest part: every position of the part unspent.
+pub const MAX_PART: usize = 4 + (1 << crate::chain::SNAPSHOT_PART_LOG) * PART_ENTRY;
+const PART_ENTRY: usize = 8 + 32 + 32;
+
+/// A manifest: the output counter after the block, then the root of every
+/// part's subtree.
+pub fn encode_manifest(next: u64, roots: &[Digest]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(12 + 32 * roots.len());
+    w.u64(next);
+    w.digest_vec(roots);
+    w.finish()
+}
+
+pub fn decode_manifest(bytes: &[u8]) -> Option<(u64, Vec<Digest>)> {
+    let mut r = Reader(bytes);
+    let next = r.u64()?;
+    let roots = r.digest_vec()?;
+    r.is_empty().then_some((next, roots))
+}
+
+/// A part: its unspent outputs, position, commitment and memo, ascending.
+pub fn encode_part(outputs: &[(u64, Digest, Digest)]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(4 + PART_ENTRY * outputs.len());
+    w.u32(outputs.len() as u32);
+    for (p, c, m) in outputs {
+        w.u64(*p);
+        w.digest(c);
+        w.digest(m);
+    }
+    w.finish()
+}
+
+#[allow(clippy::type_complexity)]
+pub fn decode_part(bytes: &[u8]) -> Option<Vec<(u64, Digest, Digest)>> {
+    let mut r = Reader(bytes);
+    let n = r.len(PART_ENTRY)?;
+    let out = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.digest()?))).collect::<Option<Vec<_>>>()?;
+    r.is_empty().then_some(out)
 }
 
 /// What a node says about itself in `Ping` and `Pong`.
@@ -205,7 +260,7 @@ impl Message {
             }
             Message::GetChunks { kind, id, indexes } => {
                 w.0.push(T_GET_CHUNKS);
-                w.0.push(kind.to_u8());
+                kind.put(&mut w);
                 w.digest(id);
                 w.0.push(indexes.len().min(WINDOW) as u8);
                 for i in indexes.iter().take(WINDOW) {
@@ -214,7 +269,7 @@ impl Message {
             }
             Message::Chunk { kind, id, len, index, data } => {
                 w.0.push(T_CHUNK);
-                w.0.push(kind.to_u8());
+                kind.put(&mut w);
                 w.digest(id);
                 w.u32(*len);
                 w.0.extend_from_slice(&index.to_le_bytes());
@@ -258,7 +313,7 @@ impl Message {
             T_INV => Message::Inv(Header::from_bytes(r.take(HEADER_SIZE)?)?),
             T_TX_INV => Message::TxInv(r.digest()?),
             T_GET_CHUNKS => {
-                let kind = Kind::from_u8(r.take(1)?[0])?;
+                let kind = Kind::get(&mut r)?;
                 let id = r.digest()?;
                 let n = count(&mut r, WINDOW)?;
                 let indexes = (0..n)
@@ -267,7 +322,7 @@ impl Message {
                 Message::GetChunks { kind, id, indexes }
             }
             T_CHUNK => {
-                let kind = Kind::from_u8(r.take(1)?[0])?;
+                let kind = Kind::get(&mut r)?;
                 let id = r.digest()?;
                 let len = r.u32()?;
                 let index = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
@@ -705,6 +760,8 @@ mod tests {
             Message::TxInv(digest(6)),
             Message::GetChunks { kind: Kind::Tx, id: digest(9), indexes: (0..WINDOW as u16).collect() },
             Message::Chunk { kind: Kind::Block, id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
+            Message::Chunk { kind: Kind::Part(7), id: digest(9), len: 9, index: 0, data: vec![1u8; 9] },
+            Message::GetChunks { kind: Kind::Manifest, id: digest(2), indexes: vec![0, 1] },
         ];
         for m in msgs {
             let bytes = m.encode();

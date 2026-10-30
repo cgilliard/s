@@ -127,6 +127,12 @@ pub fn commitment(pk: &PublicKey, amount: u64) -> Commitment {
     key_commitment(&pubkey_hash(pk), amount)
 }
 
+/// The state tree leaf of an unspent output: its commitment and memo
+/// compressed, so the state root covers the memo too.
+pub fn leaf(commitment: &Commitment, memo: &Memo) -> Digest {
+    crate::poseidon2::compress(commitment, memo)
+}
+
 /// `H(key_hash || amount)`: [`commitment`] from the key's hash.
 pub fn key_commitment(key_hash: &Digest, amount: u64) -> Commitment {
     let mut input = [Fp::ZERO; DIGEST + AMOUNT_LIMBS];

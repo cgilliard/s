@@ -36,6 +36,26 @@ the commands). `--no-prompt` logs to the terminal instead, for scripts.
 
 Every node starts from the fixed mainnet genesis in `ChainParams::MAINNET`.
 
+## Fast sync
+
+Every block carries a chain proof: it verifies the block and the previous
+block's chain proof, so one proof shows the whole chain up to that block
+valid. A node starting from scratch therefore does not replay history. It
+downloads every header (checking proof of work, difficulty and timestamps),
+takes the block `--sync-point` below the best header (144 by default),
+verifies that block's chain proof, downloads the state after it from its
+peers in parallel parts (each checked against the block's state root, memos
+included), and then follows the chain block by block. Nothing about the past
+is taken on trust. `--sync-point 0` replays every block instead. A miner
+waits until its node has caught up before mining.
+
+Nodes keep undo records, which reorganizations and snapshot serving need,
+for the last `--max-undo-blocks` blocks (1008 by default, a week) and delete
+older ones; a reorganization deeper than that is refused.
+
+Proving a chain step adds about 25 seconds per block; the proof stays at
+about 205 KB and verifies in under 10 ms.
+
 ## Wallet
 
 Each node has a wallet in `DIR/wallet`. It is created on first run with a

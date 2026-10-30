@@ -76,6 +76,11 @@ impl MerkleTree {
         self.levels.len() - 1
     }
 
+    /// Leaf hash `index`.
+    pub fn leaf(&self, index: usize) -> Digest {
+        self.levels[0][index]
+    }
+
     /// Sibling hashes for `index`, leaf level first.
     pub fn open(&self, index: usize) -> Vec<Digest> {
         assert!(index < self.len());

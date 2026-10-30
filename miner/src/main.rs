@@ -51,13 +51,13 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tabminer::aggregate::{AggregateVerifier, Progress, Statement, prove_block_cancellable};
+use tabminer::aggregate::{AggregateVerifier, Progress, Statement};
 use tabminer::block::{Block, Body};
 use tabminer::block_air::{SegmentWitness, pack};
-use tabminer::chain::{BlockStatement, Chain, ChainParams};
+use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
-use tabminer::node::{Config, DEFAULT_PORT, Event, Node, Stats};
+use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, Stats};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
@@ -80,6 +80,12 @@ options:
   --listen ADDR     UDP address to listen on (default 0.0.0.0:7417)
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
+  --sync-point N    when starting from genesis, fast-sync from the state N blocks
+                    below the best header, checked by that block's chain proof
+                    (default 144); 0 replays every block instead
+  --max-undo-blocks N  keep undo records for the last N blocks (default 1008, a
+                    week): deeper reorganizations are refused, and snapshots
+                    are served only within them; 0 keeps them all
   --verbose         log every network message handled
   --no-prompt       no wallet prompt; log to the terminal instead of the file";
 
@@ -121,6 +127,8 @@ struct Args {
     peers: Vec<SocketAddr>,
     seeds: Vec<String>,
     verbose: bool,
+    sync_point: u32,
+    max_undo: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -143,6 +151,8 @@ fn parse_args() -> Result<Args, String> {
         peers: Vec::new(),
         seeds: Vec::new(),
         verbose: false,
+        sync_point: DEFAULT_SYNC_POINT,
+        max_undo: DEFAULT_MAX_UNDO,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -164,6 +174,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--seed" => a.seeds.push(value()?),
             "--verbose" => a.verbose = true,
+            "--sync-point" => a.sync_point = number(value()?)? as u32,
+            "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
         }
@@ -238,8 +250,9 @@ fn work_bits(target: &Target) -> f64 {
 
 fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc<Chain<AggregateVerifier>>> {
     std::fs::create_dir_all(args.data.join("chain"))?;
-    let chain =
-        Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, AggregateVerifier::new(params.aggregator))?;
+    let verifier = AggregateVerifier::new(params.aggregator, params.emission);
+    let chain = Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, verifier)?
+        .with_max_undo((args.max_undo > 0).then_some(args.max_undo));
     chain.init_or_check_genesis()?;
     Ok(Arc::new(chain))
 }
@@ -251,6 +264,7 @@ fn net_config(args: &Args) -> Config {
         seeds: args.seeds.clone(),
         peers_file: Some(args.data.join("peers")),
         verbose: args.verbose,
+        sync_point: (args.sync_point > 0).then_some(args.sync_point),
     }
 }
 
@@ -264,16 +278,22 @@ fn show(args: &Args) -> AnyResult<()> {
     println!("{:>6}  {:16}  {:>19}  {:>6} {:>7}  {:>9}", "height", "id", "time", "inputs", "outputs", "proof");
     for h in 0..=tip.height {
         let header = chain.header_at(h)?.ok_or("missing header")?;
-        let body = chain.body_by_hash(&header.hash())?.ok_or("missing body")?;
-        println!(
-            "{:>6}  {}  {:>19}  {:>6} {:>7}  {:>6} KB",
-            h,
-            short(&header.hash()),
-            header.timestamp,
-            body.inputs.len(),
-            body.outputs.len(),
-            body.proof.len() / 1000
-        );
+        match chain.body_by_hash(&header.hash())? {
+            Some(body) => println!(
+                "{:>6}  {}  {:>19}  {:>6} {:>7}  {:>6} KB",
+                h,
+                short(&header.hash()),
+                header.timestamp,
+                body.inputs.len(),
+                body.outputs.len(),
+                body.proof.len() / 1000
+            ),
+            // Below a fast-sync snapshot only headers are kept.
+            None => println!("{:>6}  {}  {:>19}  (header only)", h, short(&header.hash()), header.timestamp),
+        }
+    }
+    if let Some(floor) = chain.floor()? {
+        println!("fast-synced from the state after block {floor}, verified by its chain proof");
     }
     println!(
         "tip {} at height {}, state root {}, work 2^{:.1}",
@@ -299,8 +319,11 @@ struct Ctx {
     events: Sender<Event>,
     stats: Arc<Mutex<Stats>>,
     tip_changes: Arc<AtomicU64>,
+    syncing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     mining: bool,
+    /// The reward output of the block being mined, forgotten on quit.
+    in_flight: Mutex<Option<tabminer::transaction::Commitment>>,
 }
 
 /// Runs the node, the miner if `mining`, and the prompt (or waits) until
@@ -324,7 +347,9 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
                 "generating the {} MB proof-of-work dataset (once per data directory)...",
                 params.pow.dataset_bytes() >> 20
             );
-            println!("{msg}");
+            if !args.no_prompt {
+                println!("{msg}");
+            }
             log::line(&msg);
         }
         let dataset = Dataset::load_or_generate(&seed, &path)?;
@@ -334,6 +359,39 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         None
     };
     let chain = open_chain(args, params, seed)?;
+    let pruned = chain.prune_undo()?;
+    if pruned > 0 {
+        log::line(&format!("pruned {pruned} undo records beyond the last {} blocks", args.max_undo));
+    }
+    if args.max_undo > 0 && args.sync_point > args.max_undo {
+        log::line(&format!(
+            "warning: --sync-point {} is deeper than --max-undo-blocks {}: this node cannot serve such snapshots",
+            args.sync_point, args.max_undo
+        ));
+    }
+    if mining {
+        // The miner proves membership of its wrap in the plan of every
+        // segment count: computed once (about a minute), then kept.
+        let t = Instant::now();
+        let path = args.data.join("plan");
+        let saved = std::fs::read(&path).ok();
+        let leaves = saved
+            .as_ref()
+            .and_then(|b| b.chunks_exact(32).map(tabminer::poseidon2::digest_from_bytes).collect::<Option<Vec<_>>>());
+        if leaves.is_none() {
+            let msg = "planning every segment count for the chain proofs (once per data directory)...";
+            if !args.no_prompt {
+                println!("{msg}");
+            }
+            log::line(msg);
+        }
+        chain.verifier().plan_tree(leaves);
+        let bytes = chain.verifier().plan_leaves_bytes();
+        if saved.as_deref() != Some(&bytes[..]) {
+            std::fs::write(&path, &bytes)?;
+        }
+        log::line(&format!("plan ready in {}", secs(t.elapsed())));
+    }
     let (wallet, created) = Wallet::open(&args.data.join("wallet"))?;
     if let Some(phrase) = created {
         log::line("created a new wallet");
@@ -344,6 +402,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
     let (node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), net_config(args))?;
     let stats = node.stats();
+    let syncing = node.syncing();
     let tip_changes = node.tip_changes();
     let listening = format!("listening on {}", node.local_addr()?);
     log::line(&listening);
@@ -363,8 +422,10 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         events: events.clone(),
         stats,
         tip_changes,
+        syncing,
         stop: Arc::new(AtomicBool::new(false)),
         mining,
+        in_flight: Mutex::new(None),
     });
     // The chain ends at the schedule's final block: once the tip reaches
     // it, the node has nothing left to do.
@@ -382,6 +443,33 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
                     std::process::exit(0);
                 }
                 std::thread::sleep(Duration::from_secs(1));
+            }
+        })?;
+    }
+    // A restored wallet finds its outputs once the node has caught up.
+    if ctx.wallet.scan_pending()? {
+        let ctx = Arc::clone(&ctx);
+        std::thread::Builder::new().name("restore-scan".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let peers = ctx.stats.lock().unwrap().peers.iter().any(|p| p.live);
+                if !peers || ctx.syncing.load(Ordering::Acquire) {
+                    continue;
+                }
+                let found = ctx
+                    .chain
+                    .env()
+                    .read_txn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|rtxn| ctx.wallet.scan(ctx.chain.utxo(), &rtxn).map_err(|e| e.to_string()));
+                match found {
+                    Ok((n, total)) => {
+                        log::line(&format!("restored wallet: found {n} outputs worth {}", fmt_coins(total)));
+                        ctx.wallet.clear_scan_pending().ok();
+                    }
+                    Err(e) => log::line(&format!("restored wallet: scan failed: {e}")),
+                }
+                return;
             }
         })?;
     }
@@ -416,11 +504,28 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         }
     } else {
         prompt(&ctx);
+        // Exit without waiting for the miner: an unfinished proof is simply
+        // dropped, and every database write is an LMDB transaction, so
+        // nothing is left half done. The node gets a moment to save its
+        // peer list.
         ctx.stop.store(true, Ordering::Release);
-        if let Some(m) = miner {
-            println!("stopping the miner...");
-            m.join().ok();
+        drop(miner);
+        // The block being mined will never land: drop its reward record,
+        // unless its block already did.
+        if let Some(c) = ctx.in_flight.lock().unwrap().take() {
+            let held =
+                ctx.chain.env().read_txn().ok().is_some_and(|r| ctx.chain.utxo().contains(&r, &c).unwrap_or(false));
+            if !held {
+                ctx.wallet.forget(&c).ok();
+            }
         }
+        events.send(Event::Stop).ok();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !node_thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log::line("tabminer stopped");
+        std::process::exit(0);
     }
     events.send(Event::Stop).ok();
     node_thread.join().ok();
@@ -480,6 +585,15 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 stats.wanted,
                 stats.orphans
             );
+            match (stats.mode, stats.parts) {
+                (Some(Mode::Headers), _) => println!("sync     fast sync: downloading headers"),
+                (Some(Mode::Snapshot), Some((have, all))) => {
+                    println!("sync     fast sync: {have} of {all} state parts")
+                }
+                (Some(Mode::Snapshot), None) => println!("sync     fast sync: fetching the snapshot block"),
+                _ if ctx.syncing.load(Ordering::Acquire) => println!("sync     catching up"),
+                _ => println!("sync     up to date"),
+            }
             println!("mempool  {} transactions, {} KB", pool.len(), pool.bytes() / 1000);
             println!(
                 "wallet   {} confirmed, {} pending, {} reserved, {} locked",
@@ -710,7 +824,7 @@ fn restore(args: &Args) -> AnyResult<()> {
     std::fs::create_dir_all(&args.data)?;
     Wallet::restore(&dir, &phrase, pass.trim_end_matches(['\r', '\n']))?;
     println!("wallet restored in {}", dir.display());
-    println!("start tabminer with this --data directory, wait for it to sync, then type scan");
+    println!("start tabminer with this --data directory: once it has synced, it finds the wallet's outputs");
     Ok(())
 }
 
@@ -784,7 +898,18 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
     ));
 
     let mut mined = 0u64;
+    let mut waited = false;
     while !ctx.stop.load(Ordering::Acquire) && (blocks == 0 || mined < blocks) {
+        // Mining on a stale tip wastes the proof: wait until caught up.
+        if ctx.syncing.load(Ordering::Acquire) {
+            if !waited {
+                log::line("waiting for the node to catch up before mining");
+                waited = true;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        waited = false;
         let started = Instant::now();
         let generation = ctx.tip_changes.load(Ordering::Acquire);
         let cancel = || ctx.stop.load(Ordering::Acquire) || ctx.tip_changes.load(Ordering::Acquire) != generation;
@@ -816,6 +941,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             wallet.balance(chain.utxo(), &rtxn)?
         };
         let (reward_tx, reward_out) = reward(wallet, subsidy + fees)?;
+        *ctx.in_flight.lock().unwrap() = Some(reward_out.commitment);
         // A block that never gets mined leaves no record behind.
         let abandon = || {
             if let Err(e) = wallet.forget(&reward_out.commitment) {
@@ -861,8 +987,10 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             if segments.len() == 1 { "" } else { "s" },
             fmt_coins(balance.confirmed)
         ));
+        // The chain proof builds on the previous block's.
+        let prev = if height > 1 { chain.proof_statement(height - 1)? } else { None };
         let t = Instant::now();
-        let shape = chain.verifier().shape(segments.len());
+        chain.verifier().shape(segments.len());
         let plan_time = t.elapsed();
         let t = Instant::now();
         let report = |p: Progress| match p {
@@ -878,8 +1006,11 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             Progress::Wrap { log_n, hash_log_n, elapsed } => {
                 log::line(&format!("  wrap (2^{log_n} + 2^{hash_log_n} rows) proven in {}", secs(elapsed)))
             }
+            Progress::Chain { elapsed } => log::line(&format!("  chain step proven in {}", secs(elapsed))),
         };
-        let Some(proof) = prove_block_cancellable(&agg, &shape, &statement, &segments, jobs, &report, &cancel) else {
+        let prev_ref = prev.as_ref().map(|(st, proof)| (height - 1, st, proof.as_slice()));
+        let proof = chain.verifier().prove_block(height, &statement, &segments, prev_ref, jobs, &report, &cancel);
+        let Some(proof) = proof else {
             abandon();
             if ctx.stop.load(Ordering::Acquire) {
                 break;

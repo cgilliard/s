@@ -94,6 +94,60 @@ pub fn empty_root() -> Digest {
     default_hashes()[DEPTH]
 }
 
+/// Root of the subtree of height `level` whose leaves start at
+/// `first = index << level`, from its non-empty leaves `(key, value)`
+/// (keys in that range, ascending, distinct).
+pub fn subtree_root(level: usize, first: u64, leaves: &[(u64, Digest)]) -> Digest {
+    let mut nodes: Vec<(u64, Digest)> = leaves.iter().map(|&(k, v)| (k - first, v)).collect();
+    for l in 0..level {
+        let mut up: Vec<(u64, Digest)> = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut i = 0;
+        while i < nodes.len() {
+            let (k, v) = nodes[i];
+            let (left, right, step) = if k & 1 == 0 {
+                match nodes.get(i + 1) {
+                    Some(&(k2, v2)) if k2 == k + 1 => (v, v2, 2),
+                    _ => (v, default_hashes()[l], 1),
+                }
+            } else {
+                (default_hashes()[l], v, 1)
+            };
+            up.push((k >> 1, compress(&left, &right)));
+            i += step;
+        }
+        nodes = up;
+    }
+    nodes.first().map_or(default_hashes()[level], |&(_, v)| v)
+}
+
+/// Root of the whole tree from the roots of its subtrees of height `level`
+/// at indices `0..roots.len()`; every later subtree is empty.
+pub fn root_from_subtrees(level: usize, roots: &[Digest]) -> Digest {
+    let leaves: Vec<(u64, Digest)> = roots.iter().enumerate().map(|(i, r)| (i as u64, *r)).collect();
+    // The subtree roots are leaves of a tree of height DEPTH - level whose
+    // empty leaves are the default subtree root.
+    let mut nodes = leaves;
+    for l in level..DEPTH {
+        let mut up: Vec<(u64, Digest)> = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut i = 0;
+        while i < nodes.len() {
+            let (k, v) = nodes[i];
+            let (left, right, step) = if k & 1 == 0 {
+                match nodes.get(i + 1) {
+                    Some(&(k2, v2)) if k2 == k + 1 => (v, v2, 2),
+                    _ => (v, default_hashes()[l], 1),
+                }
+            } else {
+                (default_hashes()[l], v, 1)
+            };
+            up.push((k >> 1, compress(&left, &right)));
+            i += step;
+        }
+        nodes = up;
+    }
+    nodes.first().map_or(empty_root(), |&(_, v)| v)
+}
+
 fn node_key(level: u8, index: u64) -> [u8; KEY_LEN] {
     let mut k = [0u8; KEY_LEN];
     k[0] = level;
@@ -294,6 +348,36 @@ mod tests {
         d[0] = Fp::new(n);
         d[7] = Fp::new(n ^ 0xabcd);
         d
+    }
+
+    #[test]
+    fn subtree_roots_compose_to_the_root() {
+        let dir = std::env::temp_dir().join(format!("tabminer-subtree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let tree = StateTree::open(&env, &mut wtxn, "t").unwrap();
+        let mut leaves: Vec<(u64, Digest)> = Vec::new();
+        for k in [0u64, 1, 2, 5, 17, 18, 31, 32, 63, 100] {
+            let v = [Fp::new(k as u32 + 1); DIGEST];
+            tree.update(&mut wtxn, k, &v).unwrap();
+            leaves.push((k, v));
+        }
+        let root = tree.root(&wtxn).unwrap();
+        for level in [0usize, 1, 4, 5] {
+            let span = 1u64 << level;
+            let count = (101 + span - 1) / span;
+            let roots: Vec<Digest> = (0..count)
+                .map(|i| {
+                    let part: Vec<(u64, Digest)> = leaves.iter().copied().filter(|(k, _)| k / span == i).collect();
+                    subtree_root(level, i * span, &part)
+                })
+                .collect();
+            assert_eq!(root_from_subtrees(level, &roots), root, "level {level}");
+        }
+        assert_eq!(root_from_subtrees(4, &[]), empty_root());
+        assert_eq!(subtree_root(3, 8, &[]), default_hashes()[3]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Independent root computation by recursion over the sparse key set.
