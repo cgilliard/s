@@ -57,7 +57,7 @@ use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
-use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, Stats};
+use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
 use tabminer::poseidon2::digest_to_bytes;
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
@@ -80,6 +80,7 @@ options:
   --listen ADDR     UDP address to listen on (default 0.0.0.0:7417)
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
+  --no-seeds        do not contact the built-in seed nodes (for a local network)
   --sync-point N    when starting from genesis, fast-sync from the state N blocks
                     below the best header, checked by that block's chain proof
                     (default 144); 0 replays every block instead
@@ -129,6 +130,7 @@ struct Args {
     verbose: bool,
     sync_point: u32,
     max_undo: u32,
+    no_seeds: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -153,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         sync_point: DEFAULT_SYNC_POINT,
         max_undo: DEFAULT_MAX_UNDO,
+        no_seeds: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -173,6 +176,7 @@ fn parse_args() -> Result<Args, String> {
                 a.peers.push(addrs.next().ok_or(format!("--peer {v}: no address"))?);
             }
             "--seed" => a.seeds.push(value()?),
+            "--no-seeds" => a.no_seeds = true,
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
@@ -261,7 +265,10 @@ fn net_config(args: &Args) -> Config {
     Config {
         listen: args.listen,
         peers: args.peers.clone(),
-        seeds: args.seeds.clone(),
+        seeds: if args.no_seeds { Vec::new() } else { SEEDS.iter().map(|s| s.to_string()).collect() }
+            .into_iter()
+            .chain(args.seeds.iter().cloned())
+            .collect(),
         peers_file: Some(args.data.join("peers")),
         verbose: args.verbose,
         sync_point: (args.sync_point > 0).then_some(args.sync_point),

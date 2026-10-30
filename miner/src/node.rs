@@ -39,7 +39,8 @@
 //!
 //! # Seeds
 //!
-//! On start the node resolves [`SEEDS`] and the configured peers, loads the
+//! On start the node resolves its configured seeds (the binary passes
+//! [`SEEDS`] unless told not to) and peers, loads the
 //! peers it saved last time, and keeps asking peers for more until it has
 //! [`crate::net::TARGET_PEERS`] live ones.
 
@@ -65,7 +66,7 @@ use crate::transaction::Transaction;
 pub const DEFAULT_PORT: u16 = 7417;
 /// Seed nodes, `host:port`, resolved at start and whenever peers run low.
 /// Fill in before a public launch; `--peer` adds more at run time.
-pub const SEEDS: &[&str] = &[];
+pub const SEEDS: &[&str] = &["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
 /// Blocks fetched at once.
 pub const MAX_DOWNLOADS: usize = 4;
 /// Blocks held while their parents are fetched.
@@ -354,7 +355,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn resolve_seeds(&mut self, now: Instant) {
         self.last_seed_lookup = Some(now);
-        let seeds: Vec<String> = SEEDS.iter().map(|s| s.to_string()).chain(self.config.seeds.iter().cloned()).collect();
+        let seeds = self.config.seeds.clone();
         for seed in seeds {
             match seed.to_socket_addrs() {
                 Ok(addrs) => {
