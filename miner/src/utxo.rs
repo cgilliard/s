@@ -3,37 +3,56 @@
 //!
 //! Every output ever created gets the next position from a monotonically
 //! increasing counter (positions are never reused), and its leaf, the
-//! commitment and memo compressed ([`crate::transaction::leaf`]), is
-//! written at that position, so the root covers memos too. Spending an
+//! commitment and memo compressed ([`crate::transaction::leaf`]), is at
+//! that position in the tree, so the root covers memos too. Spending an
 //! output clears the leaf. Because a transaction input identifies the
 //! output it spends only by its commitment, an index from commitment to
-//! positions is kept alongside the tree. Two outputs with the same key and
-//! amount have the same commitment; they occupy distinct positions and
+//! positions is kept alongside. Two outputs with the same key and amount
+//! have the same commitment; they occupy distinct positions and
 //! [`UtxoSet::spend`] consumes the lowest one first.
 //!
-//! Four named LMDB databases live under a common prefix: `<prefix>.tree`
-//! (the Merkle tree), `<prefix>.index` (commitment bytes followed by the
-//! little-endian position, no value), `<prefix>.outputs` (position to the
-//! commitment and memo of every unspent output; what wallet recovery
-//! scans) and `<prefix>.meta` (the counter). All
-//! operations take the caller's transaction so a block can update the set
-//! and its own records atomically.
+//! Storage is laid out for a set of hundreds of millions of outputs spread
+//! thinly over billions of positions, at well under 200 bytes each:
+//!
+//! - `<prefix>.chunks`: the unspent outputs, sixteen positions to an
+//!   entry. The integer key is the position over 16; the value is a 16-bit
+//!   little-endian bitmap of the occupied positions followed by each one's
+//!   commitment and memo (64 bytes), in position order.
+//! - `<prefix>.tree`: the Merkle tree's nodes from level [`GROUP_LOG`] up
+//!   (subtrees of 64 positions). The levels below are recomputed from the
+//!   chunks when needed, at most 64 leaves, rather than stored: they are
+//!   most of a sparse tree's nodes.
+//! - `<prefix>.index`: the first 8 bytes of each unspent output's
+//!   commitment followed by its position (5 bytes, little endian), no
+//!   value. A lookup checks the candidates' full commitments in the chunks.
+//! - `<prefix>.meta`: the counter.
+//!
+//! All operations take the caller's transaction so a block can update the
+//! set and its own records atomically.
 
 use crate::block::BlockOutput;
 use crate::poseidon2::digest_from_bytes;
 use crate::state_tree::EMPTY;
 use crate::transaction::{Memo, leaf};
-use heed::byteorder::LittleEndian;
+use heed::byteorder::{LittleEndian, NativeEndian};
 use heed::types::{Bytes, Str, U64, Unit};
-use heed::{Database, Env, RoTxn, RwTxn};
+use heed::{Database, DatabaseFlags, Env, RoTxn, RwTxn};
 
 use crate::poseidon2::{DIGEST, digest_to_bytes};
-use crate::state_tree::{self, CAPACITY, Digest, Proof, StateTree};
+use crate::state_tree::{self, CAPACITY, Digest, Proof, StateTree, subtree_path, subtree_root};
 use crate::transaction::Commitment;
 
 const COMMITMENT_BYTES: usize = DIGEST * 4;
-const INDEX_KEY_LEN: usize = COMMITMENT_BYTES + 8;
+/// Bytes of the commitment kept in the index.
+const INDEX_PREFIX: usize = 8;
+const INDEX_KEY_LEN: usize = INDEX_PREFIX + 5;
 const META_NEXT_POSITION: &str = "next_position";
+/// Positions per chunk: 16, so a full chunk (2 + 16 * 64 bytes) still fits
+/// in an LMDB page.
+pub const CHUNK_LOG: usize = 4;
+/// Height of the subtrees whose roots are the lowest stored tree level.
+pub const GROUP_LOG: usize = 6;
+const RECORD: usize = 2 * COMMITMENT_BYTES;
 
 /// Errors from UTXO set operations.
 #[derive(Debug)]
@@ -83,9 +102,54 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 fn index_key(commitment: &Commitment, position: u64) -> [u8; INDEX_KEY_LEN] {
     let mut k = [0u8; INDEX_KEY_LEN];
-    k[..COMMITMENT_BYTES].copy_from_slice(&digest_to_bytes(commitment));
-    k[COMMITMENT_BYTES..].copy_from_slice(&position.to_le_bytes());
+    k[..INDEX_PREFIX].copy_from_slice(&digest_to_bytes(commitment)[..INDEX_PREFIX]);
+    k[INDEX_PREFIX..].copy_from_slice(&position.to_le_bytes()[..5]);
     k
+}
+
+/// A chunk's value: the bitmap and the records of its occupied positions.
+struct Chunk {
+    bits: u16,
+    records: Vec<[u8; RECORD]>,
+}
+
+impl Chunk {
+    fn parse(bytes: &[u8]) -> Result<Chunk> {
+        let (bits, rest) = bytes.split_at_checked(2).ok_or(Error::CorruptIndex)?;
+        let bits = u16::from_le_bytes(bits.try_into().unwrap());
+        if rest.len() != bits.count_ones() as usize * RECORD {
+            return Err(Error::CorruptIndex);
+        }
+        Ok(Chunk { bits, records: rest.chunks_exact(RECORD).map(|r| r.try_into().unwrap()).collect() })
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.records.len() * RECORD);
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        for r in &self.records {
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    /// Index into `records` of `slot`, and whether it is occupied.
+    fn find(&self, slot: u32) -> (usize, bool) {
+        ((self.bits & ((1u16 << slot) - 1)).count_ones() as usize, self.bits >> slot & 1 == 1)
+    }
+}
+
+fn record_bytes(commitment: &Commitment, memo: &Memo) -> [u8; RECORD] {
+    let mut rec = [0u8; RECORD];
+    rec[..COMMITMENT_BYTES].copy_from_slice(&digest_to_bytes(commitment));
+    rec[COMMITMENT_BYTES..].copy_from_slice(&digest_to_bytes(memo));
+    rec
+}
+
+fn parse_record(rec: &[u8]) -> Result<(Commitment, Memo)> {
+    Ok((
+        digest_from_bytes(&rec[..COMMITMENT_BYTES]).ok_or(Error::CorruptIndex)?,
+        digest_from_bytes(&rec[COMMITMENT_BYTES..]).ok_or(Error::CorruptIndex)?,
+    ))
 }
 
 /// Handle to the UTXO set.
@@ -93,8 +157,7 @@ fn index_key(commitment: &Commitment, position: u64) -> [u8; INDEX_KEY_LEN] {
 pub struct UtxoSet {
     tree: StateTree,
     index: Database<Bytes, Unit>,
-    /// Position to commitment and memo, for every unspent output.
-    records: Database<U64<LittleEndian>, Bytes>,
+    chunks: Database<U64<NativeEndian>, Bytes>,
     meta: Database<Str, U64<LittleEndian>>,
 }
 
@@ -102,16 +165,16 @@ impl UtxoSet {
     /// Opens the set stored under `prefix` in `env`, creating its databases
     /// if needed. The transaction must be committed by the caller.
     pub fn open(env: &Env, wtxn: &mut RwTxn, prefix: &str) -> Result<UtxoSet> {
-        let tree = StateTree::open(env, wtxn, &format!("{prefix}.tree"))?;
+        let tree = StateTree::open_from(env, wtxn, &format!("{prefix}.tree"), GROUP_LOG)?;
         let index = env.create_database(wtxn, Some(&format!("{prefix}.index")))?;
-        let records = env.create_database(wtxn, Some(&format!("{prefix}.outputs")))?;
+        let chunks = env
+            .database_options()
+            .types::<U64<NativeEndian>, Bytes>()
+            .name(&format!("{prefix}.chunks"))
+            .flags(DatabaseFlags::INTEGER_KEY)
+            .create(wtxn)?;
         let meta = env.create_database(wtxn, Some(&format!("{prefix}.meta")))?;
-        Ok(UtxoSet { tree, index, records, meta })
-    }
-
-    /// The underlying Merkle tree.
-    pub fn tree(&self) -> &StateTree {
-        &self.tree
+        Ok(UtxoSet { tree, index, chunks, meta })
     }
 
     /// Current Merkle root of the set.
@@ -134,21 +197,65 @@ impl UtxoSet {
     /// memo compressed ([`crate::transaction::leaf`]). Returns the position.
     pub fn add_output(&self, wtxn: &mut RwTxn, output: &BlockOutput) -> Result<u64> {
         let position = self.next_position(wtxn)?;
-        if position >= CAPACITY {
-            return Err(Error::Full);
-        }
-        self.insert(wtxn, position, &output.commitment, &output.memo)?;
-        self.meta.put(wtxn, META_NEXT_POSITION, &(position + 1))?;
+        self.add_outputs(wtxn, std::slice::from_ref(output))?;
         Ok(position)
     }
 
-    /// Writes an unspent output at `position` without moving the counter:
-    /// for installing a snapshot, with [`UtxoSet::set_next_position`].
+    /// Adds outputs at the next positions, in order, updating the tree once
+    /// for each subtree they fall in.
+    pub fn add_outputs(&self, wtxn: &mut RwTxn, outputs: &[BlockOutput]) -> Result<()> {
+        let first = self.next_position(wtxn)?;
+        let end = first + outputs.len() as u64;
+        if end > CAPACITY {
+            return Err(Error::Full);
+        }
+        for (i, o) in outputs.iter().enumerate() {
+            self.put_record(wtxn, first + i as u64, &o.commitment, &o.memo)?;
+        }
+        self.meta.put(wtxn, META_NEXT_POSITION, &end)?;
+        if end > first {
+            for g in first >> GROUP_LOG..=(end - 1) >> GROUP_LOG {
+                self.refresh_group(wtxn, g)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes an unspent output at `position` without moving the counter.
     pub fn insert_at(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
         if position >= CAPACITY {
             return Err(Error::Full);
         }
-        self.insert(wtxn, position, commitment, memo)
+        self.put_record(wtxn, position, commitment, memo)?;
+        self.refresh_group(wtxn, position >> GROUP_LOG)
+    }
+
+    /// Fills an empty set from a snapshot: `outputs` ascending by position,
+    /// all below `next`, which becomes the counter. Writes each stored tree
+    /// node once, so it stays fast for a set of any size.
+    pub fn install(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Memo)], next: u64) -> Result<()> {
+        if !self.is_empty(wtxn)? || self.next_position(wtxn)? != 0 || next > CAPACITY {
+            return Err(Error::CorruptIndex);
+        }
+        if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next) {
+            return Err(Error::CorruptIndex);
+        }
+        let mut groups: Vec<(u64, Digest)> = Vec::new();
+        let mut i = 0;
+        while i < outputs.len() {
+            let g = outputs[i].0 >> GROUP_LOG;
+            let mut leaves = Vec::new();
+            while i < outputs.len() && outputs[i].0 >> GROUP_LOG == g {
+                let (pos, c, m) = &outputs[i];
+                self.put_record(wtxn, *pos, c, m)?;
+                leaves.push((*pos, leaf(c, m)));
+                i += 1;
+            }
+            groups.push((g, subtree_root(GROUP_LOG, g << GROUP_LOG, &leaves)));
+        }
+        self.tree.build(wtxn, &groups)?;
+        self.meta.put(wtxn, META_NEXT_POSITION, &next)?;
+        Ok(())
     }
 
     /// Sets the next position: for installing a snapshot.
@@ -157,31 +264,108 @@ impl UtxoSet {
         Ok(())
     }
 
+    fn chunk(&self, rtxn: &RoTxn, chunk: u64) -> Result<Chunk> {
+        match self.chunks.get(rtxn, &chunk)? {
+            Some(b) => Chunk::parse(b),
+            None => Ok(Chunk { bits: 0, records: Vec::new() }),
+        }
+    }
+
+    fn put_chunk(&self, wtxn: &mut RwTxn, key: u64, chunk: &Chunk) -> Result<()> {
+        if chunk.bits == 0 {
+            self.chunks.delete(wtxn, &key)?;
+        } else {
+            self.chunks.put(wtxn, &key, &chunk.to_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Stores an output's record and index entry; the tree is not updated.
+    fn put_record(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
+        let key = position >> CHUNK_LOG;
+        let mut chunk = self.chunk(wtxn, key)?;
+        let (i, occupied) = chunk.find((position & ((1 << CHUNK_LOG) - 1)) as u32);
+        let rec = record_bytes(commitment, memo);
+        if occupied {
+            let (old, _) = parse_record(&chunk.records[i])?;
+            self.index.delete(wtxn, &index_key(&old, position))?;
+            chunk.records[i] = rec;
+        } else {
+            chunk.bits |= 1 << (position & ((1 << CHUNK_LOG) - 1));
+            chunk.records.insert(i, rec);
+        }
+        self.put_chunk(wtxn, key, &chunk)?;
+        self.index.put(wtxn, &index_key(commitment, position), &())?;
+        Ok(())
+    }
+
+    /// Removes the output at `position` if its commitment is `commitment`;
+    /// the tree is not updated. Returns whether it was there.
+    fn remove_record(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment) -> Result<bool> {
+        let key = position >> CHUNK_LOG;
+        let mut chunk = self.chunk(wtxn, key)?;
+        let slot = (position & ((1 << CHUNK_LOG) - 1)) as u32;
+        let (i, occupied) = chunk.find(slot);
+        if !occupied || parse_record(&chunk.records[i])?.0 != *commitment {
+            return Ok(false);
+        }
+        chunk.bits &= !(1 << slot);
+        chunk.records.remove(i);
+        self.put_chunk(wtxn, key, &chunk)?;
+        if !self.index.delete(wtxn, &index_key(commitment, position))? {
+            return Err(Error::CorruptIndex);
+        }
+        Ok(true)
+    }
+
+    /// The leaves of the subtree of 64 positions `group`, ascending.
+    fn group_leaves(&self, rtxn: &RoTxn, group: u64) -> Result<Vec<(u64, Digest)>> {
+        let per = 1u64 << (GROUP_LOG - CHUNK_LOG);
+        let mut leaves = Vec::new();
+        for item in self.chunks.range(rtxn, &(group * per..=group * per + per - 1))? {
+            let (key, bytes) = item?;
+            let chunk = Chunk::parse(bytes)?;
+            let mut r = chunk.records.iter();
+            for slot in 0..1u64 << CHUNK_LOG {
+                if chunk.bits >> slot & 1 == 1 {
+                    let (c, m) = parse_record(r.next().unwrap())?;
+                    leaves.push(((key << CHUNK_LOG) + slot, leaf(&c, &m)));
+                }
+            }
+        }
+        Ok(leaves)
+    }
+
+    /// Recomputes the stored root of subtree `group` and the path above it.
+    fn refresh_group(&self, wtxn: &mut RwTxn, group: u64) -> Result<()> {
+        let leaves = self.group_leaves(wtxn, group)?;
+        self.tree.set(wtxn, group, &subtree_root(GROUP_LOG, group << GROUP_LOG, &leaves))?;
+        Ok(())
+    }
+
     /// Commitment and memo of the unspent output at `position`.
     pub fn output_at(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo)>> {
         self.record(rtxn, position)
     }
 
-    fn insert(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
-        self.tree.update(wtxn, position, &leaf(commitment, memo))?;
-        self.index.put(wtxn, &index_key(commitment, position), &())?;
-        let mut rec = [0u8; 64];
-        rec[..32].copy_from_slice(&digest_to_bytes(commitment));
-        rec[32..].copy_from_slice(&digest_to_bytes(memo));
-        self.records.put(wtxn, &position, &rec)?;
-        Ok(())
-    }
-
     /// Positions of all unspent outputs with this commitment, ascending.
     pub fn positions(&self, rtxn: &RoTxn, commitment: &Commitment) -> Result<Vec<u64>> {
-        let prefix = digest_to_bytes(commitment);
-        let mut out = Vec::new();
-        for item in self.index.prefix_iter(rtxn, &prefix[..])? {
+        let prefix = &digest_to_bytes(commitment)[..INDEX_PREFIX];
+        let mut candidates = Vec::new();
+        for item in self.index.prefix_iter(rtxn, prefix)? {
             let (key, ()) = item?;
             if key.len() != INDEX_KEY_LEN {
                 return Err(Error::CorruptIndex);
             }
-            out.push(u64::from_le_bytes(key[COMMITMENT_BYTES..].try_into().unwrap()));
+            let mut p = [0u8; 8];
+            p[..5].copy_from_slice(&key[INDEX_PREFIX..]);
+            candidates.push(u64::from_le_bytes(p));
+        }
+        let mut out = Vec::new();
+        for p in candidates {
+            if self.record(rtxn, p)?.is_some_and(|(c, _)| c == *commitment) {
+                out.push(p);
+            }
         }
         // Keys are little endian, so LMDB's order is not numeric.
         out.sort_unstable();
@@ -190,9 +374,7 @@ impl UtxoSet {
 
     /// Whether at least one unspent output has this commitment.
     pub fn contains(&self, rtxn: &RoTxn, commitment: &Commitment) -> Result<bool> {
-        let prefix = digest_to_bytes(commitment);
-        let mut iter = self.index.prefix_iter(rtxn, &prefix[..])?;
-        Ok(iter.next().transpose()?.is_some())
+        Ok(!self.positions(rtxn, commitment)?.is_empty())
     }
 
     /// Spends the lowest-positioned unspent output with this commitment,
@@ -208,29 +390,29 @@ impl UtxoSet {
     /// Spends the output with this commitment at exactly `position`.
     /// Returns `false` if no such unspent output exists.
     pub fn spend_at(&self, wtxn: &mut RwTxn, commitment: &Commitment, position: u64) -> Result<bool> {
-        if !self.index.delete(wtxn, &index_key(commitment, position))? {
+        if !self.remove_record(wtxn, position, commitment)? {
             return Ok(false);
         }
-        self.tree.remove(wtxn, position)?;
-        self.records.delete(wtxn, &position)?;
+        self.refresh_group(wtxn, position >> GROUP_LOG)?;
         Ok(true)
     }
 
     /// Restores a spent output and its memo: the inverse of
     /// [`UtxoSet::spend_at`].
     pub fn unspend(&self, wtxn: &mut RwTxn, commitment: &Commitment, memo: &Memo, position: u64) -> Result<()> {
-        self.insert(wtxn, position, commitment, memo)
+        self.insert_at(wtxn, position, commitment, memo)
     }
 
     fn record(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo)>> {
-        match self.records.get(rtxn, &position)? {
-            None => Ok(None),
-            Some(b) if b.len() == 64 => Ok(Some((
-                digest_from_bytes(&b[..32]).ok_or(Error::CorruptIndex)?,
-                digest_from_bytes(&b[32..]).ok_or(Error::CorruptIndex)?,
-            ))),
-            Some(_) => Err(Error::CorruptIndex),
+        let Some(bytes) = self.chunks.get(rtxn, &(position >> CHUNK_LOG))? else {
+            return Ok(None);
+        };
+        let chunk = Chunk::parse(bytes)?;
+        let (i, occupied) = chunk.find((position & ((1 << CHUNK_LOG) - 1)) as u32);
+        if !occupied {
+            return Ok(None);
         }
+        parse_record(&chunk.records[i]).map(Some)
     }
 
     /// The memo of the unspent output at `position` (empty if none).
@@ -252,12 +434,29 @@ impl UtxoSet {
 
     /// Every unspent output, position order: commitment and memo.
     pub fn unspent(&self, rtxn: &RoTxn) -> Result<Vec<(u64, (Commitment, Memo))>> {
+        self.unspent_in(rtxn, 0, CAPACITY)
+    }
+
+    /// The unspent outputs at positions `first..end`, ascending.
+    pub fn unspent_in(&self, rtxn: &RoTxn, first: u64, end: u64) -> Result<Vec<(u64, (Commitment, Memo))>> {
         let mut out = Vec::new();
-        for item in self.records.iter(rtxn)? {
-            let (position, _) = item?;
-            out.push((position, self.record(rtxn, position)?.ok_or(Error::CorruptIndex)?));
+        if end <= first {
+            return Ok(out);
         }
-        out.sort_unstable_by_key(|(p, _)| *p);
+        for item in self.chunks.range(rtxn, &(first >> CHUNK_LOG..=(end - 1) >> CHUNK_LOG))? {
+            let (key, bytes) = item?;
+            let chunk = Chunk::parse(bytes)?;
+            let mut r = chunk.records.iter();
+            for slot in 0..1u64 << CHUNK_LOG {
+                if chunk.bits >> slot & 1 == 1 {
+                    let rec = parse_record(r.next().unwrap())?;
+                    let pos = (key << CHUNK_LOG) + slot;
+                    if (first..end).contains(&pos) {
+                        out.push((pos, rec));
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -265,16 +464,19 @@ impl UtxoSet {
     /// last ones added and still unspent, with `commitments` their
     /// commitments in order; the next position becomes `first`.
     pub fn truncate(&self, wtxn: &mut RwTxn, first: u64, commitments: &[Commitment]) -> Result<()> {
-        if self.next_position(wtxn)? != first + commitments.len() as u64 {
+        let end = first + commitments.len() as u64;
+        if self.next_position(wtxn)? != end {
             return Err(Error::CorruptIndex);
         }
         for (i, c) in commitments.iter().enumerate().rev() {
-            let position = first + i as u64;
-            if !self.index.delete(wtxn, &index_key(c, position))? {
+            if !self.remove_record(wtxn, first + i as u64, c)? {
                 return Err(Error::CorruptIndex);
             }
-            self.tree.remove(wtxn, position)?;
-            self.records.delete(wtxn, &position)?;
+        }
+        if end > first {
+            for g in first >> GROUP_LOG..=(end - 1) >> GROUP_LOG {
+                self.refresh_group(wtxn, g)?;
+            }
         }
         self.meta.put(wtxn, META_NEXT_POSITION, &first)?;
         Ok(())
@@ -289,12 +491,28 @@ impl UtxoSet {
     /// The tree leaf at `position`: commitment and memo compressed, or the
     /// empty digest.
     pub fn leaf_at(&self, rtxn: &RoTxn, position: u64) -> Result<Digest> {
-        Ok(self.tree.get(rtxn, position)?)
+        Ok(self.record(rtxn, position)?.map_or(EMPTY, |(c, m)| leaf(&c, &m)))
+    }
+
+    /// Root of the stored subtree of height `level` (at least
+    /// [`GROUP_LOG`]) at `index`.
+    pub fn subtree(&self, rtxn: &RoTxn, level: usize, index: u64) -> Result<Digest> {
+        Ok(self.tree.node(rtxn, level, index)?)
     }
 
     /// Merkle proof for the leaf at `position`.
     pub fn prove(&self, rtxn: &RoTxn, position: u64) -> Result<Proof> {
-        Ok(self.tree.prove(rtxn, position)?)
+        if position >= CAPACITY {
+            return Err(state_tree::Error::KeyOutOfRange(position).into());
+        }
+        let group = position >> GROUP_LOG;
+        let leaves = self.group_leaves(rtxn, group)?;
+        let (_, low) = subtree_path(GROUP_LOG, group << GROUP_LOG, &leaves, position);
+        let mut siblings = [EMPTY; state_tree::DEPTH];
+        for (s, n) in siblings.iter_mut().zip(low.into_iter().chain(self.tree.upper_siblings(rtxn, group)?)) {
+            *s = n;
+        }
+        Ok(Proof { siblings })
     }
 
     /// Number of unspent outputs.
@@ -304,6 +522,17 @@ impl UtxoSet {
 
     pub fn is_empty(&self, rtxn: &RoTxn) -> Result<bool> {
         Ok(self.len(rtxn)? == 0)
+    }
+
+    /// Disk use of each database in bytes (pages times page size) with its
+    /// entry count: for measuring storage.
+    pub fn storage(&self, rtxn: &RoTxn) -> Result<Vec<(&'static str, u64, usize)>> {
+        let size =
+            |s: heed::DatabaseStat| (s.branch_pages + s.leaf_pages + s.overflow_pages) as u64 * s.page_size as u64;
+        let t = self.tree.db_stat(rtxn)?;
+        let i = self.index.stat(rtxn)?;
+        let c = self.chunks.stat(rtxn)?;
+        Ok(vec![("tree", size(t), t.entries), ("index", size(i), i.entries), ("chunks", size(c), c.entries)])
     }
 }
 
@@ -424,7 +653,7 @@ mod tests {
         assert!(set.spend_at(&mut wtxn, &other.commitment, 1).unwrap());
         assert!(set.is_empty(&wtxn).unwrap());
         assert_eq!(set.root(&wtxn).unwrap(), empty_root());
-        assert_eq!(set.tree().stored_nodes(&wtxn).unwrap(), 0);
+        assert!(set.storage(&wtxn).unwrap().iter().all(|&(_, _, entries)| entries == 0));
         // Non-membership proof for a spent position.
         let proof = set.prove(&wtxn, 0).unwrap();
         assert!(proof.verify(&set.root(&wtxn).unwrap(), 0, &EMPTY));
@@ -458,5 +687,156 @@ mod tests {
         assert_eq!(set.root(&rtxn).unwrap(), root);
         assert_eq!(set.next_position(&rtxn).unwrap(), 2);
         assert_eq!(set.positions(&rtxn, &o.commitment).unwrap(), vec![0, 1]);
+    }
+
+    /// The compact layout gives the same roots and proofs as a plain tree
+    /// of every leaf, through adds, spends, restores, truncation and a
+    /// one-pass install.
+    #[test]
+    fn matches_a_plain_tree() {
+        let (_dir, env, set) = setup("plain");
+        let mut wtxn = env.write_txn().unwrap();
+        let plain = StateTree::open(&env, &mut wtxn, "plain").unwrap();
+        let mut rng = 7u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let digest = |x: u64| {
+            let mut d = EMPTY;
+            d[0] = crate::poseidon2::Fp::new((x % 1000) as u32 + 1);
+            d[3] = crate::poseidon2::Fp::new((x >> 20) as u32 % 1000);
+            d
+        };
+        let mut live: Vec<(u64, Commitment, Memo)> = Vec::new();
+        for round in 0..60 {
+            // Append a run, sometimes long enough to span several groups.
+            let n = 1 + next() % if round % 7 == 0 { 150 } else { 9 };
+            let first = set.next_position(&wtxn).unwrap();
+            let outs: Vec<BlockOutput> =
+                (0..n).map(|_| BlockOutput { commitment: digest(next() % 40), memo: digest(next()) }).collect();
+            set.add_outputs(&mut wtxn, &outs).unwrap();
+            for (i, o) in outs.iter().enumerate() {
+                let p = first + i as u64;
+                plain.update(&mut wtxn, p, &leaf(&o.commitment, &o.memo)).unwrap();
+                live.push((p, o.commitment, o.memo));
+            }
+            // Spend a few at random.
+            for _ in 0..next() % 6 {
+                if live.is_empty() {
+                    break;
+                }
+                let (p, c, m) = live.swap_remove((next() % live.len() as u64) as usize);
+                assert!(set.spend_at(&mut wtxn, &c, p).unwrap());
+                plain.remove(&mut wtxn, p).unwrap();
+                if next() % 4 == 0 {
+                    set.unspend(&mut wtxn, &c, &m, p).unwrap();
+                    plain.update(&mut wtxn, p, &leaf(&c, &m)).unwrap();
+                    live.push((p, c, m));
+                }
+            }
+            // Sometimes take back the last run, as disconnecting a block does.
+            if round % 5 == 4 && live.iter().filter(|o| o.0 >= first).count() as u64 == n {
+                let cs: Vec<Commitment> = outs.iter().map(|o| o.commitment).collect();
+                set.truncate(&mut wtxn, first, &cs).unwrap();
+                for p in first..first + n {
+                    plain.remove(&mut wtxn, p).unwrap();
+                }
+                live.retain(|o| o.0 < first);
+            }
+            let root = set.root(&wtxn).unwrap();
+            assert_eq!(root, plain.root(&wtxn).unwrap(), "round {round}");
+            for _ in 0..4 {
+                let p = next() % (set.next_position(&wtxn).unwrap() + 70);
+                let proof = set.prove(&wtxn, p).unwrap();
+                assert_eq!(proof, plain.prove(&wtxn, p).unwrap(), "proof of {p}");
+                assert!(proof.verify(&root, p, &set.leaf_at(&wtxn, p).unwrap()));
+            }
+            for (p, c, _) in &live {
+                assert!(set.positions(&wtxn, c).unwrap().contains(p));
+            }
+        }
+        // A fresh set installed in one pass from the live outputs matches.
+        live.sort_unstable_by_key(|o| o.0);
+        let fresh = UtxoSet::open(&env, &mut wtxn, "fresh").unwrap();
+        let counter = set.next_position(&wtxn).unwrap();
+        fresh.install(&mut wtxn, &live, counter).unwrap();
+        assert_eq!(fresh.root(&wtxn).unwrap(), set.root(&wtxn).unwrap());
+        assert_eq!(fresh.unspent(&wtxn).unwrap(), set.unspent(&wtxn).unwrap());
+        assert_eq!(fresh.len(&wtxn).unwrap(), live.len() as u64);
+    }
+
+    /// Measures disk use per unspent output and projects it to a Bitcoin
+    /// sized set. `TABMINER_SCALE_N` unspent outputs (default 1,000,000)
+    /// are spread at random over twenty times as many positions, as when
+    /// one output in twenty ever created is still unspent, added a block's
+    /// worth (`TABMINER_SCALE_BLOCK`, default 2,000) per transaction.
+    #[test]
+    #[ignore = "slow: storage measurement"]
+    fn storage_per_unspent_output() {
+        let var = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let n = var("TABMINER_SCALE_N", 1_000_000);
+        let per_txn = var("TABMINER_SCALE_BLOCK", 2_000);
+        let spread = 20u64;
+        let dir = TempDir::new("scale");
+        let env = open_env(&dir.0, 1 << 40).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let set = UtxoSet::open(&env, &mut wtxn, "utxo").unwrap();
+        wtxn.commit().unwrap();
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng = rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut random_digest = || {
+            let mut d = EMPTY;
+            for x in d.iter_mut() {
+                *x = crate::poseidon2::Fp::new((next() % crate::poseidon2::P as u64) as u32);
+            }
+            d
+        };
+        let start = std::time::Instant::now();
+        let (mut added, mut position) = (0u64, 0u64);
+        let mut gaps = 0x2545_f491_4f6c_dd1du64;
+        while added < n {
+            let mut wtxn = env.write_txn().unwrap();
+            for _ in 0..per_txn.min(n - added) {
+                gaps ^= gaps << 13;
+                gaps ^= gaps >> 7;
+                gaps ^= gaps << 17;
+                position += 1 + gaps % (2 * spread - 1);
+                let (c, m) = (random_digest(), random_digest());
+                set.insert_at(&mut wtxn, position, &c, &m).unwrap();
+                added += 1;
+            }
+            set.set_next_position(&mut wtxn, position + 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let rtxn = env.read_txn().unwrap();
+        eprintln!("{n} unspent outputs over {position} positions, {:.0} µs each", secs * 1e6 / n as f64);
+        let mut in_dbs = 0;
+        for (name, bytes, entries) in set.storage(&rtxn).unwrap() {
+            in_dbs += bytes;
+            eprintln!(
+                "  {name:8} {:>8.1} MB  {:>10} entries  {:>6.1} B/output",
+                bytes as f64 / 1e6,
+                entries,
+                bytes as f64 / n as f64
+            );
+        }
+        let file = env.real_disk_size().unwrap();
+        let per = in_dbs as f64 / n as f64;
+        eprintln!(
+            "  in use   {:>8.1} MB, {per:.1} B/output: 170M outputs take {:.1} GB",
+            in_dbs as f64 / 1e6,
+            per * 170e6 / 1e9
+        );
+        eprintln!("  file     {:>8.1} MB with a 1 TiB map (the rest is free pages LMDB reuses)", file as f64 / 1e6);
     }
 }

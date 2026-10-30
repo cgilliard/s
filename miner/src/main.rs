@@ -16,7 +16,7 @@
 //! holds the chain, the wallet, the peer list and `tabminer.log`.
 //!
 //! Every command starts from the fixed mainnet genesis. `mine` and `node`
-//! listen for peers on UDP (port 7417 by default), contact the seeds and
+//! listen for peers on UDP (port 3737 by default), contact the seeds and
 //! any `--peer`, sync to the chain with the most work, relay new blocks and
 //! transactions, and save the peers they found for next time. Logs go to
 //! the log file; the terminal shows a prompt for wallet and status commands
@@ -84,9 +84,10 @@ options:
   --sync-point N    when starting from genesis, fast-sync from the state N blocks
                     below the best header, checked by that block's chain proof
                     (default 144); 0 replays every block instead
-  --max-undo-blocks N  keep undo records for the last N blocks (default 1008, a
-                    week): deeper reorganizations are refused, and snapshots
-                    are served only within them; 0 keeps them all
+  --max-undo-blocks N  keep undo records and bodies for the last N blocks
+                    (default 1008, a week); older blocks keep only their
+                    headers. Deeper reorganizations are refused, and snapshots
+                    are served only within them; 0 keeps everything (archive)
   --verbose         log every network message handled
   --no-prompt       no wallet prompt; log to the terminal instead of the file";
 
@@ -110,8 +111,10 @@ const HELP: &str = "commands:
   quit                      stop the node
 amounts are coins with up to eight decimals, e.g. 1.5";
 
-/// LMDB map size: an upper bound on the database, reserved as address space.
-const MAP_SIZE: usize = 4 << 30;
+/// LMDB map size: 1 TiB. It is only an upper bound, reserved as address
+/// space: the file grows as data is written (a Bitcoin-sized output set
+/// takes under 30 GB) and is never allocated ahead.
+const MAP_SIZE: usize = 1 << 40;
 
 /// How long the miner waits for the node to accept its block before moving
 /// on.
@@ -295,7 +298,8 @@ fn show(args: &Args) -> AnyResult<()> {
                 body.outputs.len(),
                 body.proof.len() / 1000
             ),
-            // Below a fast-sync snapshot only headers are kept.
+            // Below a fast-sync snapshot or the undo window only headers
+            // are kept.
             None => println!("{:>6}  {}  {:>19}  (header only)", h, short(&header.hash()), header.timestamp),
         }
     }

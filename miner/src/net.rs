@@ -104,8 +104,8 @@ impl Kind {
     }
 }
 
-/// Largest manifest: about 260,000 parts, a billion positions.
-pub const MAX_MANIFEST: usize = 8 << 20;
+/// Largest manifest: about a million parts, 17 billion positions.
+pub const MAX_MANIFEST: usize = 32 << 20;
 /// Largest part: every position of the part unspent.
 pub const MAX_PART: usize = 4 + (1 << crate::chain::SNAPSHOT_PART_LOG) * PART_ENTRY;
 const PART_ENTRY: usize = 8 + 32 + 32;
@@ -514,6 +514,9 @@ pub struct Peer {
 #[derive(Default)]
 pub struct Peers {
     map: HashMap<SocketAddr, Peer>,
+    /// Addresses found to be this node itself (a seed or peer list naming
+    /// our own public address); never added again.
+    selves: std::collections::HashSet<SocketAddr>,
 }
 
 impl Peers {
@@ -535,7 +538,7 @@ impl Peers {
 
     /// Adds an address to try, if there is room. Returns whether it is new.
     pub fn add(&mut self, addr: SocketAddr, seed: bool) -> bool {
-        if addr.ip().is_unspecified() || addr.port() == 0 {
+        if addr.ip().is_unspecified() || addr.port() == 0 || self.selves.contains(&addr) {
             return false;
         }
         if let Some(p) = self.map.get_mut(&addr) {
@@ -610,6 +613,18 @@ impl Peers {
             }
             _ => false,
         }
+    }
+
+    /// Whether a ping from `addr` carrying `nonce` is our own ping to
+    /// `addr` come back: `addr` is this node.
+    pub fn is_own_ping(&self, addr: &SocketAddr, nonce: u64) -> bool {
+        self.map.get(addr).is_some_and(|p| p.pending == Some(nonce))
+    }
+
+    /// Forgets `addr` for good: it is this node.
+    pub fn mark_self(&mut self, addr: SocketAddr) {
+        self.map.remove(&addr);
+        self.selves.insert(addr);
     }
 
     pub fn strike(&mut self, addr: SocketAddr) {

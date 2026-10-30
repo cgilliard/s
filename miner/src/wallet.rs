@@ -68,7 +68,8 @@ const META_FORMAT: &str = "format";
 const META_SCAN_PENDING: &str = "scan_pending";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys.
 const FORMAT: u8 = 3;
-const MAP_SIZE: usize = 1 << 30;
+/// Upper bound only, reserved as address space; the file grows as needed.
+const MAP_SIZE: usize = 64 << 30;
 const SLATE_MAGIC: &[u8; 8] = b"tabslt02";
 
 const DOM_MASTER: u32 = 0x30;

@@ -30,7 +30,7 @@
 //! checking proof of work, difficulty and timestamps, without bodies.
 //! It then takes the block `sync_point` below the best header and fetches
 //! it with a manifest of the state after it: the output counter and the
-//! root of each part's subtree (4096 positions), which must compose to the
+//! root of each part's subtree (16,384 positions), which must compose to the
 //! block's state root. The block's proof, a chain proof, is checked
 //! against the counter: it shows that block and every one before it valid,
 //! so nothing about the past is trusted. The parts come from every peer
@@ -63,7 +63,7 @@ use crate::pow::Digest;
 use crate::transaction::Transaction;
 
 /// UDP port nodes listen on by default.
-pub const DEFAULT_PORT: u16 = 7417;
+pub const DEFAULT_PORT: u16 = 3737;
 /// Seed nodes, `host:port`, resolved at start and whenever peers run low.
 /// Fill in before a public launch; `--peer` adds more at run time.
 pub const SEEDS: &[&str] = &["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
@@ -534,8 +534,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match msg {
             Message::Ping(st) => {
                 if st.genesis != self.genesis {
+                    // Answer, so the other side can see why we will not
+                    // talk to it.
                     self.chatter(&format!("{addr} is on another chain"));
                     self.peers.remove(&addr);
+                    self.send(addr, &Message::Pong(self.status(st.nonce)));
+                    return;
+                }
+                // Our own ping to this address arrived back: it is us (a
+                // seed name or peer list giving our public address).
+                if self.peers.is_own_ping(&addr, st.nonce) {
+                    self.log(&format!("{addr} is this node; not a peer"));
+                    self.peers.mark_self(addr);
                     return;
                 }
                 let new = self.peers.get(&addr).is_none_or(|p| p.last_seen.is_none());
@@ -559,6 +569,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Message::Pong(st) => {
                 if st.genesis != self.genesis {
+                    if self.peers.pong(addr, st) {
+                        self.log(&format!(
+                            "{addr} is on another chain: its genesis is {}, ours {}; is one of us out of date?",
+                            short(&st.genesis),
+                            short(&self.genesis)
+                        ));
+                    }
                     self.peers.remove(&addr);
                     return;
                 }
@@ -1387,6 +1404,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    #[test]
+    fn a_node_does_not_peer_with_itself() {
+        // A seed name resolving to the node's own address: its ping comes
+        // back to itself, and the address is dropped for good.
+        let f = open("self");
+        let addr: SocketAddr = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+        let mut cfg = config(vec![addr], &f.dir);
+        cfg.listen = addr;
+        let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+        let stats = node.stats();
+        let h = std::thread::spawn(move || node.run());
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(stats.lock().unwrap().peers.is_empty(), "{:?}", stats.lock().unwrap().peers);
+        tx.send(Event::Stop).unwrap();
+        h.join().unwrap();
     }
 
     #[test]

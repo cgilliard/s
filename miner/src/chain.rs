@@ -368,10 +368,13 @@ const META_FLOOR: &str = "floor";
 /// The output counter after the snapshot block.
 const META_FLOOR_NEXT: &str = "floor_next";
 /// Positions per snapshot part (a subtree of the state tree).
-pub const SNAPSHOT_PART_LOG: usize = 12;
+pub const SNAPSHOT_PART_LOG: usize = 14;
+// Part roots are read from the stored tree, which starts at this level.
+const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
-/// Version of the on-disk layout: 4 has leaves of commitment and memo.
-const FORMAT: u8 = 4;
+/// Version of the on-disk layout: 5 keeps unspent outputs in chunks and
+/// the state tree from subtrees of 64 positions up.
+const FORMAT: u8 = 5;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -497,16 +500,18 @@ impl<V: ProofVerifier> Chain<V> {
         })
     }
 
-    /// Keeps undo records for the last `blocks` main-chain blocks (`None`
-    /// keeps them all). Reorganizations deeper than that are refused, and
+    /// Keeps undo records and bodies for the last `blocks` main-chain blocks
+    /// (`None` keeps them all, an archive). Older blocks keep only their
+    /// headers; reorganizations deeper than that are refused, and
     /// snapshots are served only for blocks within it.
     pub fn with_max_undo(mut self, blocks: Option<u32>) -> Self {
         self.max_undo = blocks;
         self
     }
 
-    /// Deletes undo records outside the window: those of main-chain blocks
-    /// at least `max_undo` below the tip. Returns how many went.
+    /// Deletes undo records and bodies outside the window: those of blocks
+    /// at least `max_undo` below the tip. Returns how many undo records
+    /// went.
     pub fn prune_undo(&self) -> Result<usize> {
         let Some(keep) = self.max_undo else {
             return Ok(0);
@@ -525,6 +530,9 @@ impl<V: ProofVerifier> Chain<V> {
             }
             n += 1;
             h -= 1;
+        }
+        if tip.height > keep {
+            self.prune_bodies(&mut wtxn, tip.height - keep)?;
         }
         wtxn.commit()?;
         Ok(n)
@@ -767,9 +775,7 @@ impl<V: ProofVerifier> Chain<V> {
             }
             spent.push((commitment, memo));
         }
-        for out in &body.outputs {
-            self.utxo.add_output(wtxn, out)?;
-        }
+        self.utxo.add_outputs(wtxn, &body.outputs)?;
         Ok((self.utxo.root(wtxn)?, spent))
     }
 
@@ -922,14 +928,34 @@ impl<V: ProofVerifier> Chain<V> {
         self.undo.put(wtxn, &id, &Undo { first_output_position, spent }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
-        // The block leaving the undo window.
+        // The block leaving the undo window keeps only its header.
         if let Some(keep) = self.max_undo
             && header.height > keep
             && let Some(old) = self.header_at_in(wtxn, header.height - keep)?
         {
             self.undo.delete(wtxn, &digest_bytes(&old.hash()))?;
+            self.prune_bodies(wtxn, header.height - keep)?;
         }
         Ok(())
+    }
+
+    /// Deletes the bodies of every block at or below `height` but genesis,
+    /// on the main chain or not: no reorganization can reach them, and the
+    /// chain proof of every later block covers them. Returns how many went.
+    fn prune_bodies(&self, wtxn: &mut RwTxn, height: u32) -> Result<usize> {
+        let mut old = Vec::new();
+        for item in self.bodies.iter(wtxn)? {
+            let (id, _) = item?;
+            if let Some(h) = self.header_by_hash_in(wtxn, id)?
+                && (1..=height).contains(&h.height)
+            {
+                old.push(id.to_vec());
+            }
+        }
+        for id in &old {
+            self.bodies.delete(wtxn, id)?;
+        }
+        Ok(old.len())
     }
 
     /// Disconnects the main-chain block at `height`, the tip, restoring the
@@ -940,12 +966,12 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let header = self.header_at_in(wtxn, height)?.ok_or(ChainError::Corrupt("disconnecting missing height"))?;
         let id = digest_bytes(&header.hash());
-        let body = self.body_by_hash_in(wtxn, &id)?.ok_or(ChainError::Corrupt("body of main-chain block"))?;
         let undo = match self.undo.get(wtxn, &id)? {
             Some(b) => Undo::from_bytes(b).ok_or(ChainError::Corrupt("undo record"))?,
             None if self.max_undo.is_some() => return Err(ChainError::BeyondUndo),
             None => return Err(ChainError::Corrupt("undo record")),
         };
+        let body = self.body_by_hash_in(wtxn, &id)?.ok_or(ChainError::Corrupt("body of main-chain block"))?;
         if undo.spent.len() != body.inputs.len() {
             return Err(ChainError::Corrupt("undo record length"));
         }
@@ -1103,13 +1129,10 @@ impl<V: ProofVerifier> Chain<V> {
         let header = block.header;
         let entry = self.entry_in(&wtxn, &header.hash())?.ok_or(ChainError::UnknownParent(header.hash()))?;
         self.check_body(&header, &block.body)?;
-        for (pos, c, m) in outputs {
-            if *pos >= next_position {
-                return Err(ChainError::BadSnapshot);
-            }
-            self.utxo.insert_at(&mut wtxn, *pos, c, m)?;
+        if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next_position) {
+            return Err(ChainError::BadSnapshot);
         }
-        self.utxo.set_next_position(&mut wtxn, next_position)?;
+        self.utxo.install(&mut wtxn, outputs, next_position)?;
         if self.utxo.root(&wtxn)? != header.state_root {
             return Err(ChainError::BadSnapshot);
         }
@@ -1189,13 +1212,12 @@ impl<V: ProofVerifier> Chain<V> {
     ) -> Result<Vec<(u64, Commitment, Memo)>> {
         let first = part << SNAPSHOT_PART_LOG;
         let end = (first + (1 << SNAPSHOT_PART_LOG)).min(next);
-        let mut out = Vec::new();
-        for pos in first..end {
-            if let Some((c, m)) = restored.get(&pos) {
-                out.push((pos, *c, *m));
-            } else if let Some((c, m)) = self.utxo.output_at(rtxn, pos)? {
-                out.push((pos, c, m));
-            }
+        let mut out: Vec<(u64, Commitment, Memo)> =
+            self.utxo.unspent_in(rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
+        let before = out.len();
+        out.extend(restored.iter().filter(|(p, _)| (first..end).contains(*p)).map(|(p, (c, m))| (*p, *c, *m)));
+        if out.len() > before {
+            out.sort_unstable_by_key(|o| o.0);
         }
         Ok(out)
     }
@@ -1208,8 +1230,15 @@ impl<V: ProofVerifier> Chain<V> {
             return Ok(None);
         };
         let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
+        // Parts wholly below the counter that nothing since has spent from
+        // are as stored now; only the others are recomputed.
+        let touched: std::collections::HashSet<u64> = restored.keys().map(|p| p >> SNAPSHOT_PART_LOG).collect();
         let mut roots = Vec::with_capacity(parts as usize);
         for p in 0..parts {
+            if !touched.contains(&p) && (p + 1) << SNAPSHOT_PART_LOG <= next {
+                roots.push(self.utxo.subtree(&rtxn, SNAPSHOT_PART_LOG, p)?);
+                continue;
+            }
             let leaves: Vec<(u64, Digest)> = self
                 .snapshot_part_in(&rtxn, next, &restored, p)?
                 .iter()
@@ -1707,6 +1736,63 @@ mod tests {
         mine(f, body, timestamp)
     }
 
+    /// Measures what each block costs once it has left the undo window:
+    /// its header, index record and height entry. Bodies (here with a
+    /// 205 KB proof each, as on mainnet) are kept only inside the window.
+    #[test]
+    #[ignore = "slow: storage measurement"]
+    fn storage_per_block() {
+        let blocks: u64 = std::env::var("TABMINER_SCALE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let window = 100u32;
+        let dir = TempDir::new("scale-blocks");
+        let seed = seed();
+        let dataset = Dataset::generate(&seed);
+        let params = ChainParams {
+            max_block_size: ChainParams::MAINNET.max_block_size,
+            emission: ChainParams::MAINNET.emission,
+            ..params()
+        };
+        let chain = Chain::open(&dir.0, 1 << 30, params, seed, AcceptAllProofs).unwrap().with_max_undo(Some(window));
+        let f = Fixture { _dir: dir, chain, dataset };
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let k = pk(9);
+        let mut t = GENESIS_TIME;
+        for i in 1..=blocks {
+            t += 600;
+            let body =
+                Body { inputs: vec![], outputs: vec![Output::new(&k, i).block_output()], proof: vec![7; 205_000] };
+            let block = mine(&f, body, t);
+            f.chain.apply_block(&block, t + 1).unwrap();
+        }
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let size =
+            |s: heed::DatabaseStat| (s.branch_pages + s.leaf_pages + s.overflow_pages) as u64 * s.page_size as u64;
+        let per_block: u64 = [
+            size(f.chain.headers.stat(&rtxn).unwrap()),
+            size(f.chain.index.stat(&rtxn).unwrap()),
+            size(f.chain.by_height.stat(&rtxn).unwrap()),
+        ]
+        .iter()
+        .sum();
+        let bodies = f.chain.bodies.stat(&rtxn).unwrap();
+        let per = per_block as f64 / (blocks + 1) as f64;
+        eprintln!("{blocks} blocks, window {window}");
+        eprintln!(
+            "  headers, index, heights: {:.1} B/block: {:.1} MB a year, {:.2} GB a century",
+            per,
+            per * BLOCKS_PER_YEAR as f64 / 1e6,
+            per * BLOCKS_PER_YEAR as f64 * 100.0 / 1e9
+        );
+        eprintln!(
+            "  bodies: {} kept, {:.1} MB ({:.0} KB each)",
+            bodies.entries,
+            size(bodies) as f64 / 1e6,
+            size(bodies) as f64 / bodies.entries as f64 / 1e3
+        );
+        assert!(bodies.entries as u32 <= window + 1);
+        eprintln!("  file {:.1} MB", f.chain.env().real_disk_size().unwrap() as f64 / 1e6);
+    }
+
     #[test]
     fn block_work_and_u256() {
         use crate::difficulty::U256;
@@ -2012,6 +2098,10 @@ mod tests {
             f.chain.undo.get(&rtxn, &digest_bytes(&blocks[h - 1].header.hash())).unwrap().is_some()
         };
         assert_eq!((1..=6).map(undo).collect::<Vec<_>>(), [false, false, false, true, true, true]);
+        // Bodies go with them: blocks 1 to 3 keep only their headers.
+        let body = |h: usize| f.chain.body_by_hash(&blocks[h - 1].header.hash()).unwrap().is_some();
+        assert_eq!((1..=6).map(body).collect::<Vec<_>>(), [false, false, false, true, true, true]);
+        assert!(f.chain.entry(&blocks[0].header.hash()).unwrap().unwrap().validated);
         assert!(f.chain.snapshot_manifest(&blocks[2].header.hash()).unwrap().is_none());
         assert!(f.chain.snapshot_manifest(&blocks[3].header.hash()).unwrap().is_some());
         // A heavier branch from block 2 would unwind block 3: refused.
@@ -2049,6 +2139,15 @@ mod tests {
             last = Some(f.chain.apply_block(&b, th + 1).unwrap());
         }
         assert!(matches!(last, Some(Applied::Reorganized { fork_height: 5, unwound: 1 }) | Some(Applied::Extended)));
+        // No body is left at or below the window, side branches included.
+        let tip = f.chain.tip().unwrap().unwrap().height;
+        let rtxn = f.chain.env().read_txn().unwrap();
+        for item in f.chain.bodies.iter(&rtxn).unwrap() {
+            let (id, _) = item.unwrap();
+            let h = f.chain.header_by_hash_in(&rtxn, id).unwrap().unwrap().height;
+            assert!(h == 0 || h > tip - 3, "body at height {h} with the tip at {tip}");
+        }
+        drop(rtxn);
         // Pruning by hand clears a backlog left by a larger window.
         let wide = open("undo-wide");
         let wide_chain = Chain::open(&wide._dir.0.join("c"), 64 << 20, params(), seed(), AcceptAllProofs)

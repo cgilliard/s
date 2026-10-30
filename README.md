@@ -46,7 +46,7 @@ know, then builds blocks from the pooled transactions plus a reward paying
 the subsidy and their fees to its wallet, proves them, mines them and
 announces them, starting over whenever the network delivers a better tip.
 `tabminer node` (or `--no-mine`) follows the chain and relays without
-mining. Both listen on UDP port 7417 by default, contact the seed nodes in
+mining. Both listen on UDP port 3737 by default, contact the seed nodes in
 `miner/src/node.rs` and any `--peer`, and keep the peers they found in
 `DIR/peers` for next time. `show` prints the main chain.
 
@@ -65,12 +65,34 @@ takes the block `--sync-point` below the best header (144 by default),
 verifies that block's chain proof, downloads the state after it from its
 peers in parallel parts (each checked against the block's state root, memos
 included), and then follows the chain block by block. Nothing about the past
-is taken on trust. `--sync-point 0` replays every block instead. A miner
-waits until its node has caught up before mining.
+is taken on trust. `--sync-point 0` replays every block instead, which needs
+a peer that keeps every body (`--max-undo-blocks 0`). A miner waits until its
+node has caught up before mining.
 
-Nodes keep undo records, which reorganizations and snapshot serving need,
-for the last `--max-undo-blocks` blocks (1008 by default, a week) and delete
-older ones; a reorganization deeper than that is refused.
+Nodes keep undo records and block bodies, which reorganizations and snapshot
+serving need, for the last `--max-undo-blocks` blocks (1008 by default, a
+week); older blocks keep only their headers, since every later chain proof
+covers them. A reorganization deeper than that is refused.
+`--max-undo-blocks 0` keeps everything, for an archive node.
+
+## Storage
+
+The chain database grows as it fills (its LMDB map is a 1 TiB bound, reserved
+as address space, never allocated ahead). Measured costs:
+
+| what | cost |
+|---|---|
+| each unspent output | about 166 bytes |
+| each block past the undo window (header, index, height) | about 500 bytes, 26 MB a year |
+| the undo window | its 1008 bodies (205 KB of proof each, plus transactions) and undo records, under 1 GB |
+
+So a Bitcoin-sized set of 170 million unspent outputs takes about 28 GB, and
+a node with it, decades of headers and a busy undo window stays near 30 GB.
+The unspent outputs are kept sixteen positions to an entry, and the state
+tree is stored only from subtrees of 64 positions up, the levels below being
+recomputed from the outputs when needed. `cargo test --release --lib storage
+-- --ignored --nocapture` repeats the measurements (`TABMINER_SCALE_N` sets
+the number of outputs).
 
 Proving a chain step adds about 25 seconds per block; the proof stays at
 about 205 KB and verifies in under 10 ms.
@@ -113,6 +135,6 @@ and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
 To try two nodes on one machine:
 
 ```
-tabminer mine --data /tmp/a --listen 127.0.0.1:7417
-tabminer node --data /tmp/b --listen 127.0.0.1:7418 --peer 127.0.0.1:7417
+tabminer mine --data /tmp/a --listen 127.0.0.1:3737
+tabminer node --data /tmp/b --listen 127.0.0.1:3738 --peer 127.0.0.1:3737
 ```
