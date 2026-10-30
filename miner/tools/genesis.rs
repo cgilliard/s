@@ -41,9 +41,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
-            "--hashrate" => {
-                a.hashrate = Some(value()?.parse().map_err(|_| "--hashrate: not a number".to_string())?)
-            }
+            "--hashrate" => a.hashrate = Some(value()?.parse().map_err(|_| "--hashrate: not a number".to_string())?),
             "--bitcoin-hash" => a.bitcoin_hash = Some(value()?),
             "--timestamp" => a.timestamp = Some(value()?.parse().map_err(|_| "--timestamp: not a number".to_string())?),
             "--out" => a.out = value()?,
@@ -162,7 +160,9 @@ pub const ID: &str = "{id}";
     println!("  bitcoin    {hash_hex}{}", height.map_or(String::new(), |h| format!(" (height {h})")));
     match a.hashrate {
         Some(h) => println!("  hashrate   {h} H/s: first blocks need about {} hashes", per_block.0[0]),
-        None => println!("  target     testing: about {} hashes per block (pass --hashrate for a launch)", per_block.0[0]),
+        None => {
+            println!("  target     testing: about {} hashes per block (pass --hashrate for a launch)", per_block.0[0])
+        }
     }
     println!("  id         {id}");
     println!("rebuild tabminer; data directories of any earlier genesis will be refused");
