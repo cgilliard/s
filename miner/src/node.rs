@@ -120,8 +120,9 @@ struct Snap {
     manifest: Option<(u64, Vec<Digest>)>,
     /// The block's proof checked against the manifest's counter.
     verified: bool,
-    #[allow(clippy::type_complexity)]
-    parts: Vec<Option<Vec<(u64, Digest, Digest)>>>,
+    /// Which parts are stored. Each verified part goes straight to the
+    /// database, so memory holds one part at a time, not the whole state.
+    parts: Vec<bool>,
     /// Rotates the peers asked.
     next_peer: usize,
 }
@@ -429,7 +430,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .snap
             .as_ref()
             .filter(|s| !s.parts.is_empty())
-            .map(|s| (s.parts.iter().filter(|p| p.is_some()).count(), s.parts.len()));
+            .map(|s| (s.parts.iter().filter(|p| **p).count(), s.parts.len()));
         *self.stats.lock().unwrap() = Stats {
             peers,
             downloads: self.downloads.len() + self.snap_downloads.len(),
@@ -1073,20 +1074,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             match self.chain.verify_snapshot_block(snap.block.as_ref().unwrap(), next) {
                 Ok(()) => {
                     self.log(&format!(
-                        "fast sync: block {}'s proof verifies the chain up to it; {} outputs to fetch in {} parts",
+                        "fast sync: block {}'s proof verifies the chain up to it; {} positions to fetch in {} parts",
                         snap.target.height,
                         next,
                         snap.parts.len()
                     ));
+                    if let Err(e) = self.chain.begin_snapshot() {
+                        return self.restart_snapshot(&format!("cannot start installing the snapshot: {e}"));
+                    }
                     self.snap.as_mut().unwrap().verified = true;
                 }
                 Err(e) => return self.restart_snapshot(&format!("the snapshot block does not verify: {e}")),
             }
         }
         let missing: Vec<u32> = match self.snap.as_ref() {
-            Some(s) if s.verified => {
-                s.parts.iter().enumerate().filter(|(_, p)| p.is_none()).map(|(i, _)| i as u32).collect()
-            }
+            Some(s) if s.verified => s.parts.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i as u32).collect(),
             _ => return,
         };
         if missing.is_empty() {
@@ -1104,14 +1106,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(snap) = self.snap.take() else {
             return;
         };
-        let (next, _) = snap.manifest.as_ref().unwrap();
-        let outputs: Vec<(u64, Digest, Digest)> = snap.parts.iter().flatten().flatten().copied().collect();
-        match self.chain.install_snapshot(snap.block.as_ref().unwrap(), &outputs, *next) {
+        let (next, roots) = snap.manifest.as_ref().unwrap();
+        match self.chain.finish_snapshot(snap.block.as_ref().unwrap(), roots, *next) {
             Ok(()) => {
+                let unspent = self.chain.env().read_txn().ok().and_then(|r| self.chain.utxo().len(&r).ok());
                 self.log(&format!(
                     "fast sync: installed the state after block {} ({} unspent outputs); following the chain from there",
                     snap.target.height,
-                    outputs.len()
+                    unspent.unwrap_or(0)
                 ));
                 self.mode = Mode::Normal;
                 self.tip_changes.fetch_add(1, Ordering::Release);
@@ -1129,6 +1131,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn restart_snapshot(&mut self, why: &str) {
         self.snap_attempts += 1;
         self.snap_downloads.clear();
+        if let Err(e) = self.chain.abort_snapshot() {
+            self.log(&format!("fast sync: clearing the partial state: {e}"));
+        }
         if self.snap_attempts >= MAX_SNAPSHOT_ATTEMPTS {
             self.log(&format!("fast sync: {why}; giving up, validating every block instead"));
             self.snap = None;
@@ -1235,14 +1240,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 {
                     return false;
                 }
-                snap.parts = vec![None; roots.len()];
+                snap.parts = vec![false; roots.len()];
                 snap.manifest = Some((next, roots));
                 true
             }
             Kind::Part(i) => {
-                let Some((next, roots)) = snap.manifest.as_ref() else {
+                let (Some((next, roots)), true) = (snap.manifest.as_ref(), snap.verified) else {
                     return true;
                 };
+                if snap.parts.get(i as usize).is_none_or(|p| *p) {
+                    return true;
+                }
                 let Some(outputs) = net::decode_part(bytes) else {
                     return false;
                 };
@@ -1259,7 +1267,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 {
                     return false;
                 }
-                snap.parts[i as usize] = Some(outputs);
+                // Straight to the database: one part in memory at a time.
+                match self.chain.stage_snapshot_part(i as u64, &outputs, *next) {
+                    Ok(_) => snap.parts[i as usize] = true,
+                    Err(e) => self.log(&format!("fast sync: storing part {i}: {e}")),
+                }
                 true
             }
             Kind::Tx => true,

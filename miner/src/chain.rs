@@ -225,6 +225,8 @@ pub enum ChainError {
     BeyondUndo,
     /// A snapshot does not match its block's state root or proof.
     BadSnapshot,
+    /// A snapshot is being installed; blocks wait until it is done.
+    SnapshotInProgress,
     /// The block was found invalid before.
     KnownInvalid,
     BadHeight {
@@ -279,6 +281,7 @@ impl ChainError {
                 | ChainError::BelowSnapshot
                 | ChainError::BeyondUndo
                 | ChainError::BadSnapshot
+                | ChainError::SnapshotInProgress
         )
     }
 }
@@ -299,6 +302,7 @@ impl core::fmt::Display for ChainError {
             ChainError::BelowSnapshot => f.write_str("cannot reorganize below the fast-sync snapshot"),
             ChainError::BeyondUndo => f.write_str("cannot reorganize deeper than the undo records kept"),
             ChainError::BadSnapshot => f.write_str("snapshot does not match its block"),
+            ChainError::SnapshotInProgress => f.write_str("a snapshot is being installed"),
             ChainError::KnownInvalid => f.write_str("block is known to be invalid"),
             ChainError::BadHeight { expected, got } => {
                 write!(f, "height {got}, expected {expected}")
@@ -365,6 +369,9 @@ const META_BEST_HEADER: &str = "best_header";
 /// Height of the snapshot a fast sync started from: no block at or below
 /// it can be disconnected (its undo record does not exist).
 const META_FLOOR: &str = "floor";
+/// Set while a snapshot is being installed part by part; a node that
+/// stops midway clears the partial state when it next opens.
+const META_STAGING: &str = "staging";
 /// The output counter after the snapshot block.
 const META_FLOOR_NEXT: &str = "floor_next";
 /// Positions per snapshot part (a subtree of the state tree).
@@ -372,9 +379,9 @@ pub const SNAPSHOT_PART_LOG: usize = 14;
 // Part roots are read from the stored tree, which starts at this level.
 const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
-/// Version of the on-disk layout: 5 keeps unspent outputs in chunks and
-/// the state tree from subtrees of 64 positions up.
-const FORMAT: u8 = 5;
+/// Version of the on-disk layout: 6 keeps unspent outputs in chunks and
+/// the state tree from subtrees of 256 positions up.
+const FORMAT: u8 = 6;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -484,7 +491,7 @@ impl<V: ProofVerifier> Chain<V> {
             None => meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?,
         }
         wtxn.commit()?;
-        Ok(Chain {
+        let chain = Chain {
             env,
             params,
             seed,
@@ -497,7 +504,10 @@ impl<V: ProofVerifier> Chain<V> {
             by_height,
             meta,
             max_undo: Some(DEFAULT_MAX_UNDO),
-        })
+        };
+        // A snapshot install interrupted by a stop: start over cleanly.
+        chain.abort_snapshot()?;
+        Ok(chain)
     }
 
     /// Keeps undo records and bodies for the last `blocks` main-chain blocks
@@ -822,6 +832,9 @@ impl<V: ProofVerifier> Chain<V> {
     /// branch then has the most work, makes it the tip, reorganizing the
     /// main chain if needed. `now` is the caller's clock in unix seconds.
     pub fn apply_block(&self, block: &Block, now: u64) -> Result<Applied> {
+        if self.staging()? {
+            return Err(ChainError::SnapshotInProgress);
+        }
         let result = self.apply_block_inner(block, now);
         if let Err(e) = &result
             && e.is_invalid_block()
@@ -1121,21 +1134,108 @@ impl<V: ProofVerifier> Chain<V> {
         outputs: &[(u64, Commitment, Memo)],
         next_position: u64,
     ) -> Result<()> {
+        if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next_position) {
+            return Err(ChainError::BadSnapshot);
+        }
+        self.begin_snapshot()?;
+        let result = (|| {
+            let parts = next_position.div_ceil(1 << SNAPSHOT_PART_LOG);
+            let mut roots = Vec::with_capacity(parts as usize);
+            let mut rest = outputs;
+            for p in 0..parts {
+                let n = rest.iter().take_while(|o| o.0 >> SNAPSHOT_PART_LOG == p).count();
+                roots.push(self.stage_snapshot_part(p, &rest[..n], next_position)?);
+                rest = &rest[n..];
+            }
+            self.finish_snapshot(block, &roots, next_position)
+        })();
+        if result.is_err() {
+            self.abort_snapshot()?;
+        }
+        result
+    }
+
+    fn staging_in(&self, rtxn: &RoTxn) -> Result<bool> {
+        Ok(self.meta.get(rtxn, META_STAGING)?.is_some())
+    }
+
+    /// Whether a snapshot is being installed.
+    pub fn staging(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        self.staging_in(&rtxn)
+    }
+
+    /// Starts installing a snapshot a part at a time: the chain must be at
+    /// genesis. Blocks are refused until it is finished or aborted.
+    pub fn begin_snapshot(&self) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
         let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
-        if tip.height != 0 || self.utxo.next_position(&wtxn)? != 0 {
+        if tip.height != 0 || self.floor_in(&wtxn)?.is_some() {
+            return Err(ChainError::AlreadyInitialized);
+        }
+        self.utxo.clear(&mut wtxn)?;
+        self.meta.put(&mut wtxn, META_STAGING, &[1])?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Stores snapshot part `part`: its unspent outputs, ascending, all in
+    /// the part and below `next_position`. Returns the part's root, which
+    /// the caller has checked against the manifest. Each part is its own
+    /// transaction, so memory stays bounded by one part.
+    pub fn stage_snapshot_part(
+        &self,
+        part: u64,
+        outputs: &[(u64, Commitment, Memo)],
+        next_position: u64,
+    ) -> Result<Digest> {
+        let mut wtxn = self.env.write_txn()?;
+        if !self.staging_in(&wtxn)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        let root = self
+            .utxo
+            .stage(&mut wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position)
+            .map_err(|_| ChainError::BadSnapshot)?;
+        wtxn.commit()?;
+        Ok(root)
+    }
+
+    /// Clears a partly installed snapshot, if any.
+    pub fn abort_snapshot(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        if self.staging_in(&wtxn)? {
+            self.utxo.clear(&mut wtxn)?;
+            self.meta.delete(&mut wtxn, META_STAGING)?;
+            wtxn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Completes a snapshot whose every part is staged: `roots` are the
+    /// manifest's part roots and `next_position` its counter. The state
+    /// must reach `block`'s state root (whose chain proof the caller has
+    /// verified); `block` becomes the tip and the floor below which
+    /// nothing reorganizes.
+    pub fn finish_snapshot(&self, block: &Block, roots: &[Digest], next_position: u64) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        if !self.staging_in(&wtxn)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
+        if tip.height != 0 {
             return Err(ChainError::AlreadyInitialized);
         }
         let header = block.header;
         let entry = self.entry_in(&wtxn, &header.hash())?.ok_or(ChainError::UnknownParent(header.hash()))?;
         self.check_body(&header, &block.body)?;
-        if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next_position) {
-            return Err(ChainError::BadSnapshot);
-        }
-        self.utxo.install(&mut wtxn, outputs, next_position)?;
+        self.utxo
+            .finish_staged(&mut wtxn, SNAPSHOT_PART_LOG, roots, next_position)
+            .map_err(|_| ChainError::BadSnapshot)?;
         if self.utxo.root(&wtxn)? != header.state_root {
             return Err(ChainError::BadSnapshot);
         }
+        self.meta.delete(&mut wtxn, META_STAGING)?;
         // The main chain up to the snapshot: proven by its block's proof.
         let mut h = header;
         loop {
@@ -2027,7 +2127,33 @@ mod tests {
         let mut forged = part.clone();
         forged[0].1[0] += crate::poseidon2::Fp::ONE;
         assert!(matches!(b.chain.install_snapshot(&blocks[7], &forged, next), Err(ChainError::BadSnapshot)));
-        b.chain.install_snapshot(&blocks[7], &part, next).unwrap();
+        assert!(!b.chain.staging().unwrap());
+        // Part by part, as a node does: blocks wait meanwhile, and finishing
+        // with a part missing is refused.
+        b.chain.begin_snapshot().unwrap();
+        assert!(matches!(b.chain.apply_block(&blocks[8], t + 1), Err(ChainError::SnapshotInProgress)));
+        assert!(matches!(b.chain.finish_snapshot(&blocks[7], &roots, next), Err(ChainError::BadSnapshot)));
+        assert_eq!(b.chain.stage_snapshot_part(0, &part, next).unwrap(), roots[0]);
+        b.chain.finish_snapshot(&blocks[7], &roots, next).unwrap();
+        assert!(!b.chain.staging().unwrap());
+        assert_eq!(b.chain.utxo().len(&b.chain.env().read_txn().unwrap()).unwrap(), 10);
+        // An install interrupted by a stop is cleared when the chain reopens.
+        let Fixture { _dir: d_dir, chain: d, dataset: _ } = open("fast-d");
+        d.init_genesis(&genesis_block(vec![])).unwrap();
+        for block in &blocks {
+            d.accept_header(&block.header, t + 1).unwrap();
+        }
+        d.begin_snapshot().unwrap();
+        d.stage_snapshot_part(0, &part, next).unwrap();
+        drop(d);
+        let d = Chain::open(&d_dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
+        assert!(!d.staging().unwrap());
+        assert!(d.utxo().is_empty(&d.env().read_txn().unwrap()).unwrap());
+        d.install_snapshot(&blocks[7], &part, next).unwrap();
+        assert_eq!(d.state_root().unwrap(), s8.state_root);
+        drop(d);
+        // A second install on b is refused: its chain is past genesis.
+        assert!(matches!(b.chain.install_snapshot(&blocks[7], &part, next), Err(ChainError::AlreadyInitialized)));
         assert_eq!(b.chain.tip().unwrap().unwrap(), s8);
         assert_eq!(b.chain.state_root().unwrap(), s8.state_root);
         assert_eq!(b.chain.floor().unwrap(), Some(8));

@@ -16,7 +16,7 @@
 //! A tree can also store only the levels from some `base` up, with the
 //! caller keeping the leaves and recomputing the levels below from them
 //! (see [`StateTree::open_from`]): the UTXO set does this, storing nothing
-//! below subtrees of 64 positions.
+//! below subtrees of 256 positions.
 //!
 //! Database layout: one named LMDB database with integer keys, `DEPTH -
 //! level` in the top byte and the index within that level below it,
@@ -29,7 +29,7 @@ use heed::byteorder::NativeEndian;
 use heed::types::{Bytes, U64};
 use heed::{Database, DatabaseFlags, Env, EnvOpenOptions, RoTxn, RwTxn};
 
-use crate::poseidon2::{DIGEST, Fp, compress, digest_from_bytes, digest_to_bytes};
+use crate::poseidon2::{DIGEST, Fp, compress, compress_all, digest_from_bytes, digest_to_bytes};
 
 /// Tree depth: number of levels between a leaf and the root.
 pub const DEPTH: usize = 40;
@@ -132,24 +132,28 @@ fn node_key(level: usize, index: u64) -> u64 {
     ((DEPTH - level) as u64) << 56 | index
 }
 
-/// The parents of the non-empty nodes `nodes` (ascending) at `level`.
+/// The parents of the non-empty nodes `nodes` (ascending) at `level`,
+/// hashed eight at a time.
 fn parents(level: usize, nodes: &[(u64, Digest)]) -> Vec<(u64, Digest)> {
-    let mut up: Vec<(u64, Digest)> = Vec::with_capacity(nodes.len().div_ceil(2));
+    let default = &default_hashes()[level];
+    let mut keys = Vec::with_capacity(nodes.len().div_ceil(2));
+    let mut pairs: Vec<(&Digest, &Digest)> = Vec::with_capacity(nodes.len().div_ceil(2));
     let mut i = 0;
     while i < nodes.len() {
-        let (k, v) = nodes[i];
+        let (k, v) = &nodes[i];
         let (left, right, step) = if k & 1 == 0 {
             match nodes.get(i + 1) {
-                Some(&(k2, v2)) if k2 == k + 1 => (v, v2, 2),
-                _ => (v, default_hashes()[level], 1),
+                Some((k2, v2)) if *k2 == k + 1 => (v, v2, 2),
+                _ => (v, default, 1),
             }
         } else {
-            (default_hashes()[level], v, 1)
+            (default, v, 1)
         };
-        up.push((k >> 1, compress(&left, &right)));
+        keys.push(k >> 1);
+        pairs.push((left, right));
         i += step;
     }
-    up
+    keys.into_iter().zip(compress_all(&pairs)).collect()
 }
 
 /// The root of the subtree of height `level` starting at leaf `first`
@@ -321,8 +325,15 @@ impl StateTree {
     /// Fills an empty tree from its non-default base-level nodes, ascending
     /// by index, writing every level at once. Returns the root.
     pub fn build(&self, wtxn: &mut RwTxn, nodes: &[(u64, Digest)]) -> Result<Digest> {
+        self.build_from(wtxn, self.base, nodes)
+    }
+
+    /// Writes the non-default nodes `nodes` (ascending) at `level`, at
+    /// least the base, and every level above them. Returns the root.
+    pub fn build_from(&self, wtxn: &mut RwTxn, level: usize, nodes: &[(u64, Digest)]) -> Result<Digest> {
+        assert!(level >= self.base);
         let mut level_nodes: Vec<(u64, Digest)> = nodes.to_vec();
-        for level in self.base..=DEPTH {
+        for level in level..=DEPTH {
             for (i, v) in &level_nodes {
                 self.put_node(wtxn, level, *i, v)?;
             }
@@ -332,6 +343,28 @@ impl StateTree {
             level_nodes = parents(level, &level_nodes);
         }
         self.root(wtxn)
+    }
+
+    /// Writes one subtree with its top at `top`: its non-default base-level
+    /// nodes `nodes` (ascending, all under one node at `top`) and every
+    /// level up to `top`. Returns the subtree's root.
+    pub fn write_subtree(&self, wtxn: &mut RwTxn, top: usize, index: u64, nodes: &[(u64, Digest)]) -> Result<Digest> {
+        assert!(top >= self.base && top <= DEPTH);
+        let mut level_nodes: Vec<(u64, Digest)> = nodes.to_vec();
+        for level in self.base..top {
+            for (i, v) in &level_nodes {
+                self.put_node(wtxn, level, *i, v)?;
+            }
+            level_nodes = parents(level, &level_nodes);
+        }
+        let root = level_nodes.first().map_or(default_hashes()[top], |&(_, v)| v);
+        self.put_node(wtxn, top, index, &root)?;
+        Ok(root)
+    }
+
+    /// Deletes every node.
+    pub fn clear(&self, wtxn: &mut RwTxn) -> Result<()> {
+        Ok(self.db.clear(wtxn)?)
     }
 
     /// The siblings from the base level up to just below the root, for

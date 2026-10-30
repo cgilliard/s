@@ -64,7 +64,9 @@ downloads every header (checking proof of work, difficulty and timestamps),
 takes the block `--sync-point` below the best header (144 by default),
 verifies that block's chain proof, downloads the state after it from its
 peers in parallel parts (each checked against the block's state root, memos
-included), and then follows the chain block by block. Nothing about the past
+included, and written to disk as it arrives, so memory stays small whatever
+the state's size; a node stopped midway starts the state over cleanly), and
+then follows the chain block by block. Nothing about the past
 is taken on trust. `--sync-point 0` replays every block instead, which needs
 a peer that keeps every body (`--max-undo-blocks 0`). A miner waits until its
 node has caught up before mining.
@@ -82,15 +84,15 @@ as address space, never allocated ahead). Measured costs:
 
 | what | cost |
 |---|---|
-| each unspent output | about 166 bytes |
+| each unspent output | about 130 bytes |
 | each block past the undo window (header, index, height) | about 500 bytes, 26 MB a year |
 | the undo window | its 1008 bodies (205 KB of proof each, plus transactions) and undo records, under 1 GB |
 
-So a Bitcoin-sized set of 170 million unspent outputs takes about 28 GB, and
-a node with it, decades of headers and a busy undo window stays near 30 GB.
+So a Bitcoin-sized set of 170 million unspent outputs takes about 22 GB, and
+a node with it, decades of headers and a busy undo window stays near 24 GB.
 The unspent outputs are kept sixteen positions to an entry, and the state
-tree is stored only from subtrees of 64 positions up, the levels below being
-recomputed from the outputs when needed. `cargo test --release --lib storage
+tree is stored only from subtrees of 256 positions up, the levels below being
+recomputed from the outputs when needed (under a millisecond per change). `cargo test --release --lib storage
 -- --ignored --nocapture` repeats the measurements (`TABMINER_SCALE_N` sets
 the number of outputs).
 

@@ -12,16 +12,16 @@
 //! [`UtxoSet::spend`] consumes the lowest one first.
 //!
 //! Storage is laid out for a set of hundreds of millions of outputs spread
-//! thinly over billions of positions, at well under 200 bytes each:
+//! thinly over billions of positions, at about 130 bytes each:
 //!
 //! - `<prefix>.chunks`: the unspent outputs, sixteen positions to an
 //!   entry. The integer key is the position over 16; the value is a 16-bit
 //!   little-endian bitmap of the occupied positions followed by each one's
 //!   commitment and memo (64 bytes), in position order.
 //! - `<prefix>.tree`: the Merkle tree's nodes from level [`GROUP_LOG`] up
-//!   (subtrees of 64 positions). The levels below are recomputed from the
-//!   chunks when needed, at most 64 leaves, rather than stored: they are
-//!   most of a sparse tree's nodes.
+//!   (subtrees of 256 positions). The levels below are recomputed from the
+//!   chunks when needed, at most 256 leaves hashed eight at a time, rather
+//!   than stored: they are most of a sparse tree's nodes.
 //! - `<prefix>.index`: the first 8 bytes of each unspent output's
 //!   commitment followed by its position (5 bytes, little endian), no
 //!   value. A lookup checks the candidates' full commitments in the chunks.
@@ -38,7 +38,7 @@ use heed::byteorder::{LittleEndian, NativeEndian};
 use heed::types::{Bytes, Str, U64, Unit};
 use heed::{Database, DatabaseFlags, Env, RoTxn, RwTxn};
 
-use crate::poseidon2::{DIGEST, digest_to_bytes};
+use crate::poseidon2::{DIGEST, compress_all, digest_to_bytes};
 use crate::state_tree::{self, CAPACITY, Digest, Proof, StateTree, subtree_path, subtree_root};
 use crate::transaction::Commitment;
 
@@ -51,7 +51,7 @@ const META_NEXT_POSITION: &str = "next_position";
 /// in an LMDB page.
 pub const CHUNK_LOG: usize = 4;
 /// Height of the subtrees whose roots are the lowest stored tree level.
-pub const GROUP_LOG: usize = 6;
+pub const GROUP_LOG: usize = 8;
 const RECORD: usize = 2 * COMMITMENT_BYTES;
 
 /// Errors from UTXO set operations.
@@ -258,6 +258,74 @@ impl UtxoSet {
         Ok(())
     }
 
+    /// Stores one part of a snapshot being installed, the subtree of height
+    /// `level` at `index`: its unspent outputs (ascending, in the part and
+    /// below `next`) and its tree nodes, but nothing above the part.
+    /// Returns the part's root. [`UtxoSet::finish_staged`] completes the
+    /// tree once every part is in, so a snapshot of any size is installed
+    /// a part at a time.
+    pub fn stage(
+        &self,
+        wtxn: &mut RwTxn,
+        level: usize,
+        index: u64,
+        outputs: &[(u64, Commitment, Memo)],
+        next: u64,
+    ) -> Result<Digest> {
+        let (first, end) = (index << level, ((index + 1) << level).min(next));
+        if level < GROUP_LOG
+            || outputs.windows(2).any(|w| w[0].0 >= w[1].0)
+            || outputs.iter().any(|o| o.0 < first || o.0 >= end)
+        {
+            return Err(Error::CorruptIndex);
+        }
+        let mut groups: Vec<(u64, Digest)> = Vec::new();
+        let mut i = 0;
+        while i < outputs.len() {
+            let g = outputs[i].0 >> GROUP_LOG;
+            let start = i;
+            while i < outputs.len() && outputs[i].0 >> GROUP_LOG == g {
+                let (pos, c, m) = &outputs[i];
+                self.put_record(wtxn, *pos, c, m)?;
+                i += 1;
+            }
+            let pairs: Vec<(&Digest, &Digest)> = outputs[start..i].iter().map(|(_, c, m)| (c, m)).collect();
+            let leaves: Vec<(u64, Digest)> = outputs[start..i].iter().map(|o| o.0).zip(compress_all(&pairs)).collect();
+            groups.push((g, subtree_root(GROUP_LOG, g << GROUP_LOG, &leaves)));
+        }
+        Ok(self.tree.write_subtree(wtxn, level, index, &groups)?)
+    }
+
+    /// Completes a staged snapshot: checks that the stored root of every
+    /// part matches `roots` (the parts of height `level`, in order), writes
+    /// the levels above them and sets the counter to `next`.
+    pub fn finish_staged(&self, wtxn: &mut RwTxn, level: usize, roots: &[Digest], next: u64) -> Result<Digest> {
+        if roots.len() as u64 != next.div_ceil(1 << level) {
+            return Err(Error::CorruptIndex);
+        }
+        let mut nodes = Vec::new();
+        for (p, r) in roots.iter().enumerate() {
+            if self.tree.node(wtxn, level, p as u64)? != *r {
+                return Err(Error::CorruptIndex);
+            }
+            if *r != state_tree::default_hashes()[level] {
+                nodes.push((p as u64, *r));
+            }
+        }
+        let root = self.tree.build_from(wtxn, level, &nodes)?;
+        self.meta.put(wtxn, META_NEXT_POSITION, &next)?;
+        Ok(root)
+    }
+
+    /// Empties the set.
+    pub fn clear(&self, wtxn: &mut RwTxn) -> Result<()> {
+        self.tree.clear(wtxn)?;
+        self.index.clear(wtxn)?;
+        self.chunks.clear(wtxn)?;
+        self.meta.clear(wtxn)?;
+        Ok(())
+    }
+
     /// Sets the next position: for installing a snapshot.
     pub fn set_next_position(&self, wtxn: &mut RwTxn, next: u64) -> Result<()> {
         self.meta.put(wtxn, META_NEXT_POSITION, &next)?;
@@ -318,22 +386,26 @@ impl UtxoSet {
         Ok(true)
     }
 
-    /// The leaves of the subtree of 64 positions `group`, ascending.
+    /// The leaves of the subtree of 256 positions `group`, ascending.
     fn group_leaves(&self, rtxn: &RoTxn, group: u64) -> Result<Vec<(u64, Digest)>> {
         let per = 1u64 << (GROUP_LOG - CHUNK_LOG);
-        let mut leaves = Vec::new();
+        let mut positions = Vec::new();
+        let mut records = Vec::new();
         for item in self.chunks.range(rtxn, &(group * per..=group * per + per - 1))? {
             let (key, bytes) = item?;
             let chunk = Chunk::parse(bytes)?;
             let mut r = chunk.records.iter();
             for slot in 0..1u64 << CHUNK_LOG {
                 if chunk.bits >> slot & 1 == 1 {
-                    let (c, m) = parse_record(r.next().unwrap())?;
-                    leaves.push(((key << CHUNK_LOG) + slot, leaf(&c, &m)));
+                    positions.push((key << CHUNK_LOG) + slot);
+                    records.push(parse_record(r.next().unwrap())?);
                 }
             }
         }
-        Ok(leaves)
+        // Leaves are the commitment and memo compressed, hashed eight at
+        // a time.
+        let pairs: Vec<(&Digest, &Digest)> = records.iter().map(|(c, m)| (c, m)).collect();
+        Ok(positions.into_iter().zip(compress_all(&pairs)).collect())
     }
 
     /// Recomputes the stored root of subtree `group` and the path above it.
@@ -838,5 +910,136 @@ mod tests {
             per * 170e6 / 1e9
         );
         eprintln!("  file     {:>8.1} MB with a 1 TiB map (the rest is free pages LMDB reuses)", file as f64 / 1e6);
+    }
+
+    /// Times a block's worth of work where it costs most: a fully dense
+    /// region (every recent output unspent), 4,000 spends at random, 4,000
+    /// new outputs and a proof for each spend.
+    #[test]
+    #[ignore = "slow: timing"]
+    fn dense_update_cost() {
+        let dir = TempDir::new("dense");
+        let env = open_env(&dir.0, 1 << 34).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let set = UtxoSet::open(&env, &mut wtxn, "utxo").unwrap();
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut digest = |n: &mut dyn FnMut() -> u64| {
+            let mut d = EMPTY;
+            for e in d.iter_mut() {
+                *e = crate::poseidon2::Fp::new((n() % crate::poseidon2::P as u64) as u32);
+            }
+            d
+        };
+        let total = 200_000u64;
+        let outs: Vec<BlockOutput> =
+            (0..total).map(|_| BlockOutput { commitment: digest(&mut next), memo: digest(&mut next) }).collect();
+        set.add_outputs(&mut wtxn, &outs).unwrap();
+        wtxn.commit().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let picks: Vec<u64> =
+            (0..4000).map(|_| next() % total).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let t = std::time::Instant::now();
+        for &p in &picks {
+            let _ = set.prove(&wtxn, p).unwrap();
+        }
+        let prove = t.elapsed();
+        let t = std::time::Instant::now();
+        for &p in &picks {
+            assert!(set.spend_at(&mut wtxn, &outs[p as usize].commitment, p).unwrap());
+        }
+        let spend = t.elapsed();
+        let new: Vec<BlockOutput> =
+            (0..4000).map(|_| BlockOutput { commitment: digest(&mut next), memo: digest(&mut next) }).collect();
+        let t = std::time::Instant::now();
+        set.add_outputs(&mut wtxn, &new).unwrap();
+        let add = t.elapsed();
+        eprintln!(
+            "subtrees of {} positions: {} spends {:.2} s ({:.0} µs each), 4000 adds {:.3} s, {} proofs {:.2} s ({:.0} µs each)",
+            1 << GROUP_LOG,
+            picks.len(),
+            spend.as_secs_f64(),
+            spend.as_secs_f64() * 1e6 / picks.len() as f64,
+            add.as_secs_f64(),
+            picks.len(),
+            prove.as_secs_f64(),
+            prove.as_secs_f64() * 1e6 / picks.len() as f64
+        );
+    }
+
+    /// Installs a snapshot of `TABMINER_SCALE_N` unspent outputs (default
+    /// 4,000,000, one position in twenty) part by part, as a fast-syncing
+    /// node does, and reports time and the most heap memory used.
+    #[test]
+    #[ignore = "slow: measurement"]
+    fn staged_install_at_scale() {
+        fn rss_anon_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("RssAnon:"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+        let n: u64 = std::env::var("TABMINER_SCALE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
+        let level = crate::chain::SNAPSHOT_PART_LOG;
+        let next = n * 20;
+        let parts = next.div_ceil(1 << level);
+        let dir = TempDir::new("staged");
+        let env = open_env(&dir.0, 1 << 40).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let set = UtxoSet::open(&env, &mut wtxn, "utxo").unwrap();
+        wtxn.commit().unwrap();
+        let mut x = 0x0bad_cafe_dead_beefu64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let base = rss_anon_kb();
+        let mut peak = base;
+        let start = std::time::Instant::now();
+        let mut roots = Vec::with_capacity(parts as usize);
+        let mut count = 0u64;
+        for p in 0..parts {
+            let first = p << level;
+            let end = ((p + 1) << level).min(next);
+            let mut outputs = Vec::new();
+            for pos in first..end {
+                if rnd() % 20 == 0 {
+                    let mut c = EMPTY;
+                    let mut m = EMPTY;
+                    for e in c.iter_mut().chain(m.iter_mut()) {
+                        *e = crate::poseidon2::Fp::new((rnd() % crate::poseidon2::P as u64) as u32);
+                    }
+                    outputs.push((pos, c, m));
+                }
+            }
+            count += outputs.len() as u64;
+            let mut wtxn = env.write_txn().unwrap();
+            roots.push(set.stage(&mut wtxn, level, p, &outputs, next).unwrap());
+            wtxn.commit().unwrap();
+            peak = peak.max(rss_anon_kb());
+        }
+        let mut wtxn = env.write_txn().unwrap();
+        let root = set.finish_staged(&mut wtxn, level, &roots, next).unwrap();
+        wtxn.commit().unwrap();
+        peak = peak.max(rss_anon_kb());
+        let secs = start.elapsed().as_secs_f64();
+        assert_eq!(root, state_tree::root_from_subtrees(level, &roots));
+        eprintln!(
+            "{count} outputs in {parts} parts: {secs:.1} s ({:.1} µs each, 170M in {:.0} min); heap grew at most {:.1} MB",
+            secs * 1e6 / count as f64,
+            secs / count as f64 * 170e6 / 60.0,
+            (peak - base) as f64 / 1e3
+        );
     }
 }

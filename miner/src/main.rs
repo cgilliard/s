@@ -113,7 +113,7 @@ amounts are coins with up to eight decimals, e.g. 1.5";
 
 /// LMDB map size: 1 TiB. It is only an upper bound, reserved as address
 /// space: the file grows as data is written (a Bitcoin-sized output set
-/// takes under 30 GB) and is never allocated ahead.
+/// takes about 22 GB) and is never allocated ahead.
 const MAP_SIZE: usize = 1 << 40;
 
 /// How long the miner waits for the node to accept its block before moving

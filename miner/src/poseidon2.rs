@@ -1070,6 +1070,17 @@ pub fn compress_batch(pairs: [(&[Fp; DIGEST], &[Fp; DIGEST]); LANES]) -> [[Fp; D
     out
 }
 
+/// [`compress`] of every pair, eight at a time with [`compress_batch`].
+pub fn compress_all(pairs: &[(&[Fp; DIGEST], &[Fp; DIGEST])]) -> Vec<[Fp; DIGEST]> {
+    let mut out = Vec::with_capacity(pairs.len());
+    let mut chunks = pairs.chunks_exact(LANES);
+    for c in &mut chunks {
+        out.extend(compress_batch(c.try_into().unwrap()));
+    }
+    out.extend(chunks.remainder().iter().map(|(a, b)| compress(a, b)));
+    out
+}
+
 #[cfg(test)]
 mod batch_tests {
     use super::*;
