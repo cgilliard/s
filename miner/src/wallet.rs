@@ -66,6 +66,9 @@ const META_SEED: &str = "seed";
 const META_FORMAT: &str = "format";
 /// Set by a restore: the wallet's outputs are still to be found on chain.
 const META_SCAN_PENDING: &str = "scan_pending";
+/// Height and hash of the block up to which the wallet has looked for its
+/// outputs' positions.
+const META_SYNCED: &str = "synced";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys.
 const FORMAT: u8 = 3;
 /// Upper bound only, reserved as address space; the file grows as needed.
@@ -125,6 +128,9 @@ pub struct Owned {
     pub start: u8,
     /// Signatures made so far, at most [`LEAVES_PER_HALF`].
     pub used: u8,
+    /// Where the output landed in the UTXO set, once a block added it
+    /// (see [`Wallet::locate`]).
+    pub position: Option<u64>,
 }
 
 impl Owned {
@@ -137,6 +143,9 @@ impl Owned {
         w.0.push(self.recovered as u8);
         w.0.push(self.start);
         w.0.push(self.used);
+        if let Some(p) = self.position {
+            w.u64(p);
+        }
         w.finish()
     }
 
@@ -151,7 +160,8 @@ impl Owned {
         if flags[0] > 1 || u32::from(start) >= LEAVES_PER_HALF || u32::from(used) > LEAVES_PER_HALF {
             return None;
         }
-        r.is_empty().then_some(Owned { commitment, nonce, amount, state, created, recovered, start, used })
+        let position = if r.is_empty() { None } else { Some(r.u64()?) };
+        r.is_empty().then_some(Owned { commitment, nonce, amount, state, created, recovered, start, used, position })
     }
 
     /// Signatures this output can still make.
@@ -335,6 +345,8 @@ pub enum WalletError {
     OldFormat,
     /// Restoring over an existing wallet.
     Exists,
+    /// An input has not been seen in a block yet.
+    Unconfirmed,
 }
 
 impl core::fmt::Display for WalletError {
@@ -352,6 +364,7 @@ impl core::fmt::Display for WalletError {
             WalletError::FeeTooLow { min } => write!(f, "the replacement fee must be at least {min}"),
             WalletError::OldFormat => f.write_str("wallet database is from an older format"),
             WalletError::Exists => f.write_str("a wallet already exists in that directory"),
+            WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
         }
     }
 }
@@ -586,6 +599,7 @@ impl Wallet {
             recovered: false,
             start: 0,
             used: 0,
+            position: None,
         };
         self.record(&mut wtxn, &o)?;
         wtxn.commit()?;
@@ -629,12 +643,61 @@ impl Wallet {
         Ok(out)
     }
 
+    /// Whether the UTXO set holds `o` where the wallet last saw it land.
+    pub fn held(&self, o: &Owned, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<bool> {
+        match o.position {
+            Some(p) => Ok(utxo.holds(rtxn, p, &o.commitment)?),
+            None => Ok(false),
+        }
+    }
+
+    /// Height and hash of the block up to which [`Wallet::locate`] has been
+    /// given the outputs, if any.
+    pub fn synced(&self) -> Result<Option<(u32, [u8; 32])>> {
+        let rtxn = self.env.read_txn()?;
+        match self.meta.get(&rtxn, META_SYNCED)? {
+            None => Ok(None),
+            Some(b) if b.len() == 36 => {
+                Ok(Some((u32::from_le_bytes(b[..4].try_into().unwrap()), b[4..].try_into().unwrap())))
+            }
+            Some(_) => Err(WalletError::Corrupt("synced")),
+        }
+    }
+
+    /// Records that the outputs of every block up to `hash`, at `height`,
+    /// have been given to [`Wallet::locate`].
+    pub fn set_synced(&self, height: u32, hash: &[u8; 32]) -> Result<()> {
+        let mut b = height.to_le_bytes().to_vec();
+        b.extend_from_slice(hash);
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, META_SYNCED, &b)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Records the positions of this wallet's outputs among `outputs`, the
+    /// outputs a block added from position `first` on. Returns how many it
+    /// found.
+    pub fn locate(&self, first: u64, outputs: &[crate::block::BlockOutput]) -> Result<usize> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut n = 0;
+        for (i, out) in outputs.iter().enumerate() {
+            if let Some(mut o) = self.owned_in(&wtxn, &out.commitment)? {
+                o.position = Some(first + i as u64);
+                self.record(&mut wtxn, &o)?;
+                n += 1;
+            }
+        }
+        wtxn.commit()?;
+        Ok(n)
+    }
+
     /// Unspent, unreserved outputs the UTXO set holds that can still sign,
     /// largest first.
     pub fn spendable(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Vec<Owned>> {
         let mut keep: Vec<Owned> = Vec::new();
         for o in self.outputs()? {
-            if o.state == State::Unspent && o.signatures_left() > 0 && utxo.contains(rtxn, &o.commitment)? {
+            if o.state == State::Unspent && o.signatures_left() > 0 && self.held(&o, utxo, rtxn)? {
                 keep.push(o);
             }
         }
@@ -648,7 +711,7 @@ impl Wallet {
     pub fn balance(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Balance> {
         let mut b = Balance::default();
         for o in self.outputs()? {
-            let held = utxo.contains(rtxn, &o.commitment)?;
+            let held = self.held(&o, utxo, rtxn)?;
             match (o.state, held) {
                 (State::Unspent, true) => b.confirmed += o.amount as u128,
                 (State::Unspent, false) => b.pending += o.amount as u128,
@@ -678,7 +741,7 @@ impl Wallet {
         let mut wtxn = self.env.write_txn()?;
         let mut n = 0;
         for o in self.outputs()? {
-            if o.state == State::Unspent && !utxo.contains(rtxn, &o.commitment)? {
+            if o.state == State::Unspent && !self.held(&o, utxo, rtxn)? {
                 self.outputs.delete(&mut wtxn, &digest_to_bytes(&o.commitment))?;
                 n += 1;
             }
@@ -688,32 +751,53 @@ impl Wallet {
     }
 
     /// Finds this wallet's unspent outputs in the UTXO set by their memos
-    /// and records the ones it does not know, as recovered. Returns how many
-    /// were added and their total.
+    /// and records the ones it does not know, as recovered, and where the
+    /// known ones are. Returns how many were added and their total.
     pub fn scan(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<(usize, u128)> {
+        self.memo_scan(utxo, rtxn, true)
+    }
+
+    /// Finds where this wallet's known outputs are in the UTXO set by their
+    /// memos: after a gap in [`Wallet::locate`] too long to fill from the
+    /// blocks kept.
+    pub fn relocate(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<()> {
+        self.memo_scan(utxo, rtxn, false).map(|_| ())
+    }
+
+    fn memo_scan(&self, utxo: &UtxoSet, rtxn: &RoTxn, add: bool) -> Result<(usize, u128)> {
         let mut found = Vec::new();
+        let mut moved = Vec::new();
         for (position, memo) in utxo.memos(rtxn)? {
             let Some((nonce, amount)) = self.open_memo(&memo) else {
                 continue;
             };
             let commitment = utxo.get(rtxn, position)?;
             let pk = self.key(&nonce).public_key();
-            if key_commitment(&pubkey_hash(&pk), amount) != commitment || self.owned(&commitment)?.is_some() {
+            if key_commitment(&pubkey_hash(&pk), amount) != commitment {
                 continue;
             }
-            found.push(Owned {
-                commitment,
-                nonce,
-                amount,
-                state: State::Unspent,
-                created: unix_now(),
-                recovered: true,
-                start: random_bytes::<1>()?[0] % LEAVES_PER_HALF as u8,
-                used: 0,
-            });
+            match self.owned(&commitment)? {
+                Some(mut o) if o.position != Some(position) => {
+                    o.position = Some(position);
+                    moved.push(o);
+                }
+                Some(_) => {}
+                None if add => found.push(Owned {
+                    commitment,
+                    nonce,
+                    amount,
+                    state: State::Unspent,
+                    created: unix_now(),
+                    recovered: true,
+                    start: random_bytes::<1>()?[0] % LEAVES_PER_HALF as u8,
+                    used: 0,
+                    position: Some(position),
+                }),
+                None => {}
+            }
         }
         let mut wtxn = self.env.write_txn()?;
-        for o in &found {
+        for o in found.iter().chain(&moved) {
             self.record(&mut wtxn, o)?;
         }
         wtxn.commit()?;
@@ -741,10 +825,15 @@ impl Wallet {
     }
 
     /// Signs `unsigned`, whose inputs must be the wallet's outputs `inputs`
-    /// in order, and marks them spent.
+    /// in order, gives each input its output's position, and marks them
+    /// spent.
     fn sign(&self, unsigned: UnsignedTransaction, inputs: &[Commitment]) -> Result<Signed> {
         if inputs.iter().any(|c| self.owned(c).ok().flatten().is_none_or(|o| o.signatures_left() == 0)) {
             return Err(WalletError::Exhausted);
+        }
+        let mut positions = Vec::with_capacity(inputs.len());
+        for c in inputs {
+            positions.push(self.owned(c)?.and_then(|o| o.position).ok_or(WalletError::Unconfirmed)?);
         }
         let mut keys = Vec::with_capacity(inputs.len());
         let mut last_signatures = Vec::new();
@@ -762,6 +851,8 @@ impl Wallet {
             }
             key.sign(msg).map_err(|_| WalletError::Exhausted)
         })?;
+        let mut tx = tx;
+        tx.set_positions(&positions);
         let mut wtxn = self.env.write_txn()?;
         for c in inputs {
             self.set_state(&mut wtxn, c, State::Spent)?;
@@ -957,7 +1048,9 @@ impl Wallet {
             let s = Sent::from_bytes(txid, b).ok_or(WalletError::Corrupt("sent"))?;
             let mut open = false;
             for c in &s.inputs {
-                open |= utxo.contains(rtxn, c)?;
+                if let Some(o) = self.owned_in(&wrtxn, c)? {
+                    open |= self.held(&o, utxo, rtxn)?;
+                }
             }
             if open {
                 out.push(s);
@@ -1028,12 +1121,15 @@ mod tests {
         (env, u)
     }
 
-    fn land(env: &Env, u: &UtxoSet, outs: &[&Output]) {
+    /// Adds `outs` to the set as a block would, and shows the block to
+    /// `wallet` as the node does.
+    fn land(env: &Env, u: &UtxoSet, wallet: &Wallet, outs: &[&Output]) {
         let mut wtxn = env.write_txn().unwrap();
-        for o in outs {
-            u.add_output(&mut wtxn, &o.block_output()).unwrap();
-        }
+        let first = u.next_position(&wtxn).unwrap();
+        let outs: Vec<_> = outs.iter().map(|o| o.block_output()).collect();
+        u.add_outputs(&mut wtxn, &outs).unwrap();
         wtxn.commit().unwrap();
+        wallet.locate(first, &outs).unwrap();
     }
 
     #[test]
@@ -1050,7 +1146,9 @@ mod tests {
             assert_ne!(a.memo, b.memo);
             assert_eq!(w.open_memo(&a.memo), Some((a.memo[..4].try_into().unwrap(), 100)));
             assert_eq!(w.open_memo(&b.memo).unwrap().1, u64::MAX);
-            land(&env, &u, &[&a]);
+            land(&env, &u, &w, &[&a]);
+            assert_eq!(w.owned(&a.commitment).unwrap().unwrap().position, Some(0));
+            assert_eq!(w.owned(&b.commitment).unwrap().unwrap().position, None);
             let rtxn = env.read_txn().unwrap();
             assert_eq!(
                 w.balance(&u, &rtxn).unwrap(),
@@ -1079,7 +1177,7 @@ mod tests {
         let (w, created) = Wallet::open(&dir.0.join("wallet")).unwrap();
         let phrase = created.unwrap();
         let a = w.receive(50).unwrap();
-        land(&env, &u, &[&a]);
+        land(&env, &u, &w, &[&a]);
         // Normal output: leaves 0..7 in order, the eighth flagged last.
         for i in 0..8u64 {
             let (k, last) = w.signing_key(&a.commitment).unwrap();
@@ -1096,7 +1194,16 @@ mod tests {
         assert_eq!(r.scan(&u, &rtxn).unwrap(), (1, 50));
         assert_eq!(r.scan(&u, &rtxn).unwrap(), (0, 0));
         let o = r.owned(&a.commitment).unwrap().unwrap();
-        assert!(o.recovered && o.amount == 50);
+        assert!(o.recovered && o.amount == 50 && o.position == Some(0));
+        // A known output whose position was lost is found again by memo.
+        let mut lost = w.owned(&a.commitment).unwrap().unwrap();
+        lost.position = None;
+        let mut wtxn = w.env.write_txn().unwrap();
+        w.record(&mut wtxn, &lost).unwrap();
+        wtxn.commit().unwrap();
+        w.relocate(&u, &rtxn).unwrap();
+        assert_eq!(w.owned(&a.commitment).unwrap().unwrap().position, Some(0));
+        assert_eq!(w.outputs().unwrap().len(), 1);
         let mut seen = Vec::new();
         for i in 0..8u32 {
             let (k, last) = r.signing_key(&a.commitment).unwrap();
@@ -1121,7 +1228,7 @@ mod tests {
         let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
         let a1 = alice.receive(60_000).unwrap();
         let a2 = alice.receive(50_000).unwrap();
-        land(&env, &u, &[&a1, &a2]);
+        land(&env, &u, &alice, &[&a1, &a2]);
         let rtxn = env.read_txn().unwrap();
         assert!(matches!(
             alice.send(200_000, 1, &u, &rtxn),
@@ -1147,6 +1254,8 @@ mod tests {
         let signed = alice.finalize(&received).unwrap();
         let tx = signed.tx;
         assert!(tx.verify_signatures() && tx.balance() == 2 && signed.last_signatures.is_empty());
+        // Each input names where its output is.
+        assert_eq!(tx.spent_positions(), vec![0, 1]);
         assert!(matches!(alice.finalize(&received), Err(WalletError::Unknown)));
         // Signed but not confirmed: the inputs are locked, not reserved.
         assert_eq!(
@@ -1165,6 +1274,7 @@ mod tests {
         let replaced = alice.cancel_sent(&tx.txid(), None).unwrap().tx;
         assert!(replaced.verify_signatures());
         assert_eq!(replaced.spent_commitments(), tx.spent_commitments());
+        assert_eq!(replaced.spent_positions(), tx.spent_positions());
         assert_eq!(replaced.balance() as u64, min);
         assert_eq!(replaced.inputs[0].signature.index, 1);
         assert!(matches!(alice.cancel_sent(&tx.txid(), None), Err(WalletError::Unknown)));
@@ -1181,7 +1291,7 @@ mod tests {
         // Cancelling a slate frees its inputs.
         drop(rtxn);
         let a3 = alice.receive(9).unwrap();
-        land(&env, &u, &[&a3]);
+        land(&env, &u, &alice, &[&a3]);
         let rtxn = env.read_txn().unwrap();
         let s2 = alice.send(4, 0, &u, &rtxn).unwrap();
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 9);

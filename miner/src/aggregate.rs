@@ -1402,6 +1402,8 @@ pub struct AggregateVerifier {
     plans: Mutex<(PlanCache, HashMap<usize, Wrap>)>,
     setup: std::sync::OnceLock<ChainSetup>,
     tree: std::sync::OnceLock<crate::merkle::MerkleTree>,
+    /// Debugging only: accept every proof without checking it.
+    unchecked: bool,
 }
 
 impl AggregateVerifier {
@@ -1412,7 +1414,21 @@ impl AggregateVerifier {
             plans: Mutex::new((PlanCache::new(), HashMap::new())),
             setup: std::sync::OnceLock::new(),
             tree: std::sync::OnceLock::new(),
+            unchecked: false,
         }
+    }
+
+    /// Debugging only: a verifier that accepts every block proof unchecked,
+    /// so blocks too large to prove in reasonable time can be simulated.
+    /// Such a node can be fed any block.
+    pub fn unchecked(mut self) -> AggregateVerifier {
+        self.unchecked = true;
+        self
+    }
+
+    /// Whether proofs go unchecked.
+    pub fn is_unchecked(&self) -> bool {
+        self.unchecked
     }
 
     /// The planned tree for `k` segments. Program types compiled for
@@ -1541,7 +1557,7 @@ impl AggregateVerifier {
 
 impl ProofVerifier for AggregateVerifier {
     fn verify(&self, s: &BlockStatement<'_>, proof: &[u8]) -> bool {
-        self.verify_chain_proof(s.height, &Statement::from_block(s), proof).is_ok()
+        self.unchecked || self.verify_chain_proof(s.height, &Statement::from_block(s), proof).is_ok()
     }
 }
 

@@ -84,17 +84,37 @@ as address space, never allocated ahead). Measured costs:
 
 | what | cost |
 |---|---|
-| each unspent output | about 130 bytes |
+| each unspent output, at any density (measured at 20% and 6% of outputs unspent) | about 85 bytes |
 | each block past the undo window (header, index, height) | about 500 bytes, 26 MB a year |
-| the undo window | its 1008 bodies (205 KB of proof each, plus transactions) and undo records, under 1 GB |
+| the undo window | its 1008 bodies and undo records: about 3.2 GB with full 2 MB blocks |
 
-So a Bitcoin-sized set of 170 million unspent outputs takes about 22 GB, and
-a node with it, decades of headers and a busy undo window stays near 24 GB.
-The unspent outputs are kept sixteen positions to an entry, and the state
-tree is stored only from subtrees of 256 positions up, the levels below being
-recomputed from the outputs when needed (under a millisecond per change). `cargo test --release --lib storage
--- --ignored --nocapture` repeats the measurements (`TABMINER_SCALE_N` sets
-the number of outputs).
+So a Bitcoin-sized set of 170 million unspent outputs takes about 14 GB, and a
+node with it, decades of headers and a full undo window stays under 20 GB.
+The unspent outputs are kept in buckets of consecutive ones, each one LMDB
+page of 4 KB at most, split when full and repacked with their neighbours as
+spending thins them, so pages stay about 80% full; each output costs its
+64 bytes of commitment and memo plus a byte or two. The state tree is
+stored only from subtrees of 256 positions up, the levels below being
+recomputed from the outputs when needed. There is no index by commitment:
+blocks name their inputs by position, a transaction input carries its
+output's position (not signed, so a wallet can correct it after a
+reorganization), and wallets learn where their outputs landed from the
+blocks that add them.
+
+A full 2 MB block (20,000 spends at random, 25,000 new outputs) applies in
+about 0.4 s against a million unspent outputs and 0.6 s against ten million,
+on a 6-core laptop. Against 170 million (a 12 GB set, more than a small
+node's memory) it takes about 2.8 s with the outputs' pages on disk: the
+pages a block will need are read from many threads at once before it is
+applied, so the drive works in parallel (one with 36,000 random reads a
+second here), and the state tree and bucket index, which every block uses,
+stay cached. `TABMINER_BLOCK_DIR=DIR TABMINER_BLOCK_UNSPENT=170000000 cargo
+test --release --lib full_block_cost -- --ignored --nocapture` repeats it.
+
+`cargo test --release --lib storage -- --ignored --nocapture` repeats the
+measurements. Large blocks can be simulated end to end with
+`--debug-no-validate-proofs` and `--debug-fill` (see `tabminer --help`), and
+the prompt's `storage` command reports a node's database part by part.
 
 Proving a chain step adds about 25 seconds per block; the proof stays at
 about 205 KB and verifies in under 10 ms.

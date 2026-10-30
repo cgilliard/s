@@ -1217,10 +1217,11 @@ impl SegmentWitness {
                 for k in part.start..part.end {
                     if k < n_in {
                         let inp = &tx.inputs[k];
-                        let commitment = inp.commitment();
-                        let position = *utxo.positions(wtxn, &commitment)?.first().ok_or(utxo::Error::CorruptIndex)?;
+                        let (commitment, position) = (inp.commitment(), inp.position);
                         let memo = utxo.memo(wtxn, position)?;
-                        utxo.spend_at(wtxn, &commitment, position)?;
+                        if !utxo.spend_at(wtxn, &commitment, position)? {
+                            return Err(utxo::Error::CorruptIndex);
+                        }
                         // Siblings are unchanged by the removal, so read them after it.
                         let proof = utxo.prove(wtxn, position)?;
                         absorb_position(&mut isp, position);
@@ -1911,17 +1912,19 @@ mod tests {
         utxo.add(&mut wtxn, &Output::new(&bk.public_key(), 50).commitment).unwrap();
         utxo.add(&mut wtxn, &Output::new(&a.public_key(), 30).commitment).unwrap();
 
-        let tx1 = UnsignedTransaction::new(
+        let mut tx1 = UnsignedTransaction::new(
             vec![(a.public_key(), 100), (bk.public_key(), 50)],
             vec![Output::new(&c, 120), Output::new(&a.public_key(), 25)],
         )
         .sign(|i, _, m| if i == 0 { a.sign(m) } else { bk.sign(m) })
         .unwrap();
+        tx1.set_positions(&[0, 1]);
         let reward =
             UnsignedTransaction::new(vec![], vec![Output::new(&miner, 55)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
-        let tx3 = UnsignedTransaction::new(vec![(a.public_key(), 30)], vec![Output::new(&bk.public_key(), 30)])
+        let mut tx3 = UnsignedTransaction::new(vec![(a.public_key(), 30)], vec![Output::new(&bk.public_key(), 30)])
             .sign_with(&mut a)
             .unwrap();
+        tx3.set_positions(&[2]);
         assert!(tx1.verify_signatures() && tx3.verify_signatures());
         let txs = [tx1, reward, tx3];
         let positions = vec![0, 1, 2];

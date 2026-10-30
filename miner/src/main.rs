@@ -52,13 +52,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement};
-use tabminer::block::{Block, Body};
+use tabminer::block::{Block, BlockOutput, Body, HEADER_SIZE};
 use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
 use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
-use tabminer::poseidon2::digest_to_bytes;
+use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
 use tabminer::wallet::{Signed, Slate, State, Wallet};
@@ -89,7 +89,15 @@ options:
                     headers. Deeper reorganizations are refused, and snapshots
                     are served only within them; 0 keeps everything (archive)
   --verbose         log every network message handled
-  --no-prompt       no wallet prompt; log to the terminal instead of the file";
+  --no-prompt       no wallet prompt; log to the terminal instead of the file
+
+debugging (a node so started can be fed any block; never use with real funds):
+  --debug-no-validate-proofs  accept block proofs without checking them, and
+                    mine without proving (a 205 KB stand-in instead)
+  --debug-fill N[,S]  with the above, fill each mined block with N random
+                    outputs and spend S of the earlier ones at random (default
+                    S = 0), up to the block size limit: for simulating large
+                    blocks and a large state";
 
 const HELP: &str = "commands:
   status                    chain tip, peers, mempool, wallet totals
@@ -108,13 +116,17 @@ const HELP: &str = "commands:
   scan                      find this wallet's outputs on chain (after a restore)
   prune                     forget unspent outputs the chain does not hold
   phrase                    show the wallet's 12-word recovery phrase
+  storage                   disk use of the chain database, part by part
   quit                      stop the node
 amounts are coins with up to eight decimals, e.g. 1.5";
 
 /// LMDB map size: 1 TiB. It is only an upper bound, reserved as address
 /// space: the file grows as data is written (a Bitcoin-sized output set
-/// takes about 22 GB) and is never allocated ahead.
+/// takes about 36 GB) and is never allocated ahead.
 const MAP_SIZE: usize = 1 << 40;
+
+/// Size of the stand-in proof a debugging miner attaches: about a real one.
+const DEBUG_PROOF_SIZE: usize = 205_000;
 
 /// How long the miner waits for the node to accept its block before moving
 /// on.
@@ -134,6 +146,9 @@ struct Args {
     sync_point: u32,
     max_undo: u32,
     no_seeds: bool,
+    debug_unchecked: bool,
+    /// Random outputs to add, and earlier ones to spend, per mined block.
+    debug_fill: Option<(usize, usize)>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -159,6 +174,8 @@ fn parse_args() -> Result<Args, String> {
         sync_point: DEFAULT_SYNC_POINT,
         max_undo: DEFAULT_MAX_UNDO,
         no_seeds: false,
+        debug_unchecked: false,
+        debug_fill: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -180,12 +197,21 @@ fn parse_args() -> Result<Args, String> {
             }
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,
+            "--debug-no-validate-proofs" => a.debug_unchecked = true,
+            "--debug-fill" => {
+                let v = value()?;
+                let (n, s) = v.split_once(',').unwrap_or((&v, "0"));
+                a.debug_fill = Some((number(n.to_string())? as usize, number(s.to_string())? as usize));
+            }
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
         }
+    }
+    if a.debug_fill.is_some() && !a.debug_unchecked {
+        return Err("--debug-fill needs --debug-no-validate-proofs: such blocks cannot be proven".into());
     }
     Ok(a)
 }
@@ -257,7 +283,10 @@ fn work_bits(target: &Target) -> f64 {
 
 fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc<Chain<AggregateVerifier>>> {
     std::fs::create_dir_all(args.data.join("chain"))?;
-    let verifier = AggregateVerifier::new(params.aggregator, params.emission);
+    let mut verifier = AggregateVerifier::new(params.aggregator, params.emission);
+    if args.debug_unchecked {
+        verifier = verifier.unchecked();
+    }
     let chain = Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, verifier)?
         .with_max_undo((args.max_undo > 0).then_some(args.max_undo));
     chain.init_or_check_genesis()?;
@@ -333,6 +362,8 @@ struct Ctx {
     syncing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     mining: bool,
+    /// Debugging: random outputs to add and earlier ones to spend per block.
+    debug_fill: Option<(usize, usize)>,
     /// The reward output of the block being mined, forgotten on quit.
     in_flight: Mutex<Option<tabminer::transaction::Commitment>>,
 }
@@ -380,7 +411,15 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
             args.sync_point, args.max_undo
         ));
     }
-    if mining {
+    if args.debug_unchecked {
+        let msg = "DEBUG: block proofs are not checked and mined blocks are not proven; \
+                   this node accepts any block and its blocks are refused by every other node";
+        if !args.no_prompt {
+            println!("{msg}");
+        }
+        log::line(msg);
+    }
+    if mining && !args.debug_unchecked {
         // The miner proves membership of its wrap in the plan of every
         // segment count: computed once (about a minute), then kept.
         let t = Instant::now();
@@ -436,6 +475,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         syncing,
         stop: Arc::new(AtomicBool::new(false)),
         mining,
+        debug_fill: args.debug_fill,
         in_flight: Mutex::new(None),
     });
     // The chain ends at the schedule's final block: once the tip reaches
@@ -467,6 +507,9 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
                 if !peers || ctx.syncing.load(Ordering::Acquire) {
                     continue;
                 }
+                // The scan finds every output the set holds up to the tip
+                // read first, so the wallet is synced to it.
+                let tip = ctx.chain.tip().ok().flatten();
                 let found = ctx
                     .chain
                     .env()
@@ -476,6 +519,9 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
                 match found {
                     Ok((n, total)) => {
                         log::line(&format!("restored wallet: found {n} outputs worth {}", fmt_coins(total)));
+                        if let Some(tip) = tip {
+                            ctx.wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash())).ok();
+                        }
                         ctx.wallet.clear_scan_pending().ok();
                     }
                     Err(e) => log::line(&format!("restored wallet: scan failed: {e}")),
@@ -524,8 +570,14 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         // The block being mined will never land: drop its reward record,
         // unless its block already did.
         if let Some(c) = ctx.in_flight.lock().unwrap().take() {
-            let held =
-                ctx.chain.env().read_txn().ok().is_some_and(|r| ctx.chain.utxo().contains(&r, &c).unwrap_or(false));
+            sync_wallet(&ctx).ok();
+            let held = ctx.wallet.owned(&c).ok().flatten().is_some_and(|o| {
+                ctx.chain
+                    .env()
+                    .read_txn()
+                    .ok()
+                    .is_some_and(|r| ctx.wallet.held(&o, ctx.chain.utxo(), &r).unwrap_or(false))
+            });
             if !held {
                 ctx.wallet.forget(&c).ok();
             }
@@ -570,7 +622,61 @@ fn prompt(ctx: &Ctx) {
     }
 }
 
+/// Brings the wallet's record of where its outputs are up to the tip:
+/// from the outputs of each main-chain block since it last looked, back to
+/// where a reorganization forked; by their memos when those blocks are no
+/// longer kept (after a fast sync, or a long time offline).
+fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
+    let chain = &ctx.chain;
+    if chain.staging()? {
+        return Ok(());
+    }
+    let Some(tip) = chain.tip()? else {
+        return Ok(());
+    };
+    // The last block looked at that is still on the main chain.
+    let mut from = None;
+    if let Some((mut height, mut hash)) = ctx.wallet.synced()? {
+        loop {
+            if chain.header_at(height)?.is_some_and(|h| digest_to_bytes(&h.hash()) == hash) {
+                from = Some(height);
+                break;
+            }
+            let header = match digest_from_bytes(&hash) {
+                Some(d) if height > 0 => chain.header_by_hash(&d)?,
+                _ => None,
+            };
+            let Some(header) = header else {
+                break;
+            };
+            (height, hash) = (height - 1, digest_to_bytes(&header.prev_hash));
+        }
+    }
+    let mut gap = from.is_none();
+    for height in from.map_or(1, |h| h + 1)..=tip.height {
+        if gap {
+            break;
+        }
+        match chain.main_outputs(height)? {
+            Some((_, first, outputs)) => {
+                ctx.wallet.locate(first, &outputs)?;
+            }
+            None => gap = true,
+        }
+    }
+    if gap && !ctx.wallet.outputs()?.is_empty() {
+        log::line("wallet: finding its outputs by their memos");
+        let rtxn = chain.env().read_txn()?;
+        ctx.wallet.relocate(chain.utxo(), &rtxn)?;
+    }
+    ctx.wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
+    Ok(())
+}
+
 fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
+    if matches!(cmd, "status" | "balance" | "outputs" | "send" | "finalize" | "cancel" | "sent" | "prune") {
+        sync_wallet(ctx)?;
+    }
     match cmd {
         "help" => println!("{HELP}"),
         "status" => {
@@ -615,6 +721,43 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             );
             println!("mining   {}", if ctx.mining { "on" } else { "off" });
         }
+        "storage" => {
+            let (rows, file) = ctx.chain.storage()?;
+            // One read transaction per thread at a time: the tip first.
+            let height = ctx.chain.tip()?.map_or(0, |t| t.height);
+            let rtxn = ctx.chain.env().read_txn()?;
+            let unspent = ctx.chain.utxo().len(&rtxn)?;
+            let positions = ctx.chain.utxo().next_position(&rtxn)?;
+            drop(rtxn);
+            println!("{:<12} {:>12} {:>12} {:>14}", "database", "MB", "entries", "bytes each");
+            let mb = |b: u64| format!("{:.1}", b as f64 / 1e6);
+            let (mut state, mut blocks) = (0u64, 0u64);
+            for (name, bytes, entries) in &rows {
+                // The unspent outputs' parts are per output; the rest per block.
+                let per_utxo = matches!(*name, "tree" | "outputs");
+                let per = if per_utxo { unspent } else { u64::from(height) + 1 };
+                let label = if per_utxo { format!("utxo {name}") } else { name.to_string() };
+                println!(
+                    "{label:<12} {:>12} {entries:>12} {:>9.1} /{}",
+                    mb(*bytes),
+                    *bytes as f64 / per.max(1) as f64,
+                    if per_utxo { "out" } else { "blk" }
+                );
+                if per_utxo { state += bytes } else { blocks += bytes }
+            }
+            println!(
+                "unspent outputs: {unspent} of {positions} made ({:.1}%), {:.1} bytes each",
+                unspent as f64 * 100.0 / positions.max(1) as f64,
+                state as f64 / unspent.max(1) as f64
+            );
+            println!(
+                "in use {} MB (state {}, blocks {}); file {} MB, the rest free pages LMDB reuses",
+                mb(state + blocks),
+                mb(state),
+                mb(blocks),
+                mb(file)
+            );
+        }
         "peers" => {
             let stats = ctx.stats.lock().unwrap().clone();
             if stats.peers.is_empty() {
@@ -652,7 +795,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 println!("no outputs");
             }
             for o in outputs {
-                let held = ctx.chain.utxo().contains(&rtxn, &o.commitment)?;
+                let held = ctx.wallet.held(&o, ctx.chain.utxo(), &rtxn)?;
                 let state = match (o.state, held) {
                     (State::Unspent, true) => "confirmed",
                     (State::Unspent, false) => "pending",
@@ -910,6 +1053,9 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
 
     let mut mined = 0u64;
     let mut waited = false;
+    let unchecked = chain.verifier().is_unchecked();
+    // Debugging: a generator for random outputs and spends.
+    let mut rng = now() ^ 0x9e37_79b9_7f4a_7c15;
     while !ctx.stop.load(Ordering::Acquire) && (blocks == 0 || mined < blocks) {
         // Mining on a stale tip wastes the proof: wait until caught up.
         if ctx.syncing.load(Ordering::Acquire) {
@@ -988,7 +1134,8 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         };
 
         log::line(&format!(
-            "proving block {height} on {}: {} txs ({} in, {} out, {} in fees) in {} segment{}, wallet {} confirmed",
+            "{} block {height} on {}: {} txs ({} in, {} out, {} in fees) in {} segment{}, wallet {} confirmed",
+            if unchecked { "building (debug: not proving)" } else { "proving" },
             short(&tip.hash()),
             txs.len(),
             inputs.len(),
@@ -999,9 +1146,11 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             fmt_coins(balance.confirmed)
         ));
         // The chain proof builds on the previous block's.
-        let prev = if height > 1 { chain.proof_statement(height - 1)? } else { None };
+        let prev = if height > 1 && !unchecked { chain.proof_statement(height - 1)? } else { None };
         let t = Instant::now();
-        chain.verifier().shape(segments.len());
+        if !unchecked {
+            chain.verifier().shape(segments.len());
+        }
         let plan_time = t.elapsed();
         let t = Instant::now();
         let report = |p: Progress| match p {
@@ -1020,7 +1169,12 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             Progress::Chain { elapsed } => log::line(&format!("  chain step proven in {}", secs(elapsed))),
         };
         let prev_ref = prev.as_ref().map(|(st, proof)| (height - 1, st, proof.as_slice()));
-        let proof = chain.verifier().prove_block(height, &statement, &segments, prev_ref, jobs, &report, &cancel);
+        let proof = if unchecked {
+            // Debugging: a stand-in the size of a real proof.
+            Some(vec![0u8; DEBUG_PROOF_SIZE])
+        } else {
+            chain.verifier().prove_block(height, &statement, &segments, prev_ref, jobs, &report, &cancel)
+        };
         let Some(proof) = proof else {
             abandon();
             if ctx.stop.load(Ordering::Acquire) {
@@ -1031,9 +1185,59 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         };
         let prove_time = t.elapsed();
 
+        let (mut inputs, mut outputs) = (inputs, outputs);
+        // Debugging: random outputs, and spends of unspent outputs picked
+        // at random from the whole set (not the wallet's), up to the block
+        // size limit.
+        if let Some((n_out, n_spend)) = ctx.debug_fill {
+            let used = HEADER_SIZE + 64 + inputs.len() * 5 + outputs.len() * 64 + DEBUG_PROOF_SIZE;
+            let room = params.max_block_size.saturating_sub(used);
+            let need = n_out * 64 + n_spend * 5;
+            let (n_out, n_spend) =
+                if need > room { (n_out * room / need, n_spend * room / need) } else { (n_out, n_spend) };
+            let mut next_random = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let ours: std::collections::HashSet<_> = wallet.outputs()?.into_iter().map(|o| o.commitment).collect();
+            let mut taken: std::collections::HashSet<u64> = inputs.iter().copied().collect();
+            let rtxn = chain.env().read_txn()?;
+            let made = chain.utxo().next_position(&rtxn)?;
+            let mut spends = 0;
+            for _ in 0..n_spend * 4 {
+                if spends == n_spend || made == 0 {
+                    break;
+                }
+                let from = next_random() % made;
+                let window = chain.utxo().unspent_in(&rtxn, from, (from + 256).min(made))?;
+                if let Some((p, _)) = window.iter().find(|(p, (c, _))| !taken.contains(p) && !ours.contains(c)) {
+                    taken.insert(*p);
+                    inputs.push(*p);
+                    spends += 1;
+                }
+            }
+            drop(rtxn);
+            for _ in 0..n_out {
+                let mut random_digest =
+                    || core::array::from_fn(|_| tabminer::poseidon2::Fp::new((next_random() % P as u64) as u32));
+                outputs.push(BlockOutput { commitment: random_digest(), memo: random_digest() });
+            }
+            log::line(&format!("  debug fill: {n_out} random outputs, {spends} random spends"));
+        }
         let body = Body { inputs, outputs, proof };
         let timestamp = now().max(tip.timestamp + 1);
-        let mut header = chain.template(&body, timestamp)?;
+        let mut header = match chain.template(&body, timestamp) {
+            Ok(h) => h,
+            // Another node spent or reorganized away outputs of ours.
+            Err(e) if ctx.debug_fill.is_some() => {
+                log::line(&format!("  debug fill: {e}; trying again"));
+                abandon();
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let target = chain.expected_target(&tip)?;
         let t = Instant::now();
         let Some((nonce, out, hashes)) = solve(dataset, &header.pow_hash(), &target, &cancel) else {

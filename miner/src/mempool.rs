@@ -2,8 +2,8 @@
 //!
 //! A transaction enters the pool ([`Mempool::insert`]) only if it decodes,
 //! spends at least one input, has a non-negative balance (its fee), carries a
-//! valid signature on every input, spends outputs the UTXO set holds, and
-//! conflicts with nothing already pooled. The proof cannot tell a user
+//! valid signature on every input, spends outputs the UTXO set holds at the
+//! positions its inputs give, and conflicts with nothing already pooled. The proof cannot tell a user
 //! transaction from a block reward, so the non-negative fee is this policy
 //! rule, not consensus: a negative-balance transaction would be paid out of
 //! the miner's reward.
@@ -176,13 +176,13 @@ impl Mempool {
         }
         let fee = check_static(&tx)?;
         let mut conflicts: Vec<Digest> = Vec::new();
-        for c in tx.spent_commitments() {
+        for (c, p) in tx.spent_commitments().into_iter().zip(tx.spent_positions()) {
             if let Some(other) = self.spends.get(&c)
                 && !conflicts.contains(other)
             {
                 conflicts.push(*other);
             }
-            if !utxo.contains(rtxn, &c).map_err(|_| Reject::UnknownInput(c))? {
+            if !utxo.holds(rtxn, p, &c).map_err(|_| Reject::UnknownInput(c))? {
                 return Err(Reject::UnknownInput(c));
             }
         }
@@ -250,8 +250,8 @@ impl Mempool {
     pub fn revalidate(&mut self, utxo: &UtxoSet, rtxn: &RoTxn) -> utxo::Result<(usize, usize)> {
         let mut gone = Vec::new();
         for e in self.txs.values() {
-            for c in e.tx.spent_commitments() {
-                if !utxo.contains(rtxn, &c)? {
+            for (c, p) in e.tx.spent_commitments().iter().zip(e.tx.spent_positions()) {
+                if !utxo.holds(rtxn, p, c)? {
                     gone.push(e.txid);
                     break;
                 }
@@ -270,11 +270,11 @@ impl Mempool {
         let mut keep = Vec::with_capacity(self.shelf.len());
         for e in std::mem::take(&mut self.shelf) {
             let mut ok = !self.txs.contains_key(&e.txid);
-            for c in e.tx.spent_commitments() {
+            for (c, p) in e.tx.spent_commitments().iter().zip(e.tx.spent_positions()) {
                 if !ok {
                     break;
                 }
-                ok = utxo.contains(rtxn, &c)? && !self.spends.contains_key(&c);
+                ok = utxo.holds(rtxn, p, c)? && !self.spends.contains_key(c);
             }
             if ok && self.make_room(&e).is_ok() {
                 self.add(e);
@@ -335,11 +335,14 @@ mod tests {
         key(tag).public_key()
     }
 
-    /// A transaction spending `amount` from key `tag` to key 100 with `fee`.
+    /// A transaction spending `amount` from key `tag` to key 100 with `fee`,
+    /// the output of key `tag` being at position `tag - 1`.
     fn spend(tag: u8, amount: u64, fee: u64) -> Transaction {
         let mut k = key(tag);
         let outs = vec![Output::new(&pk(100), amount - fee)];
-        UnsignedTransaction::new(vec![(k.public_key(), amount)], outs).sign_with(&mut k).unwrap()
+        let mut tx = UnsignedTransaction::new(vec![(k.public_key(), amount)], outs).sign_with(&mut k).unwrap();
+        tx.set_positions(&[u64::from(tag) - 1]);
+        tx
     }
 
     #[test]
@@ -370,6 +373,10 @@ mod tests {
         assert_eq!(pool.insert(double, &utxo, &rtxn), Err(Reject::ReplacementFee { min }));
         let unknown = spend(4, 7, 1);
         assert!(matches!(pool.insert(unknown, &utxo, &rtxn), Err(Reject::UnknownInput(_))));
+        // An unspent output named at the wrong position is unknown too.
+        let mut misplaced = spend(3, 10, 1);
+        misplaced.set_positions(&[1]);
+        assert!(matches!(pool.insert(misplaced, &utxo, &rtxn), Err(Reject::UnknownInput(_))));
         let mut k3 = key(3);
         let generous =
             UnsignedTransaction::new(vec![(pk(3), 10)], vec![Output::new(&pk(100), 11)]).sign_with(&mut k3).unwrap();
@@ -412,10 +419,11 @@ mod tests {
         // takes t1's place.
         let mut k1 = key(1);
         let bump = 5 + t1.size() as u64;
-        let replacement =
+        let mut replacement =
             UnsignedTransaction::new(vec![(k1.public_key(), 100_000)], vec![Output::new(&pk(1), 100_000 - bump)])
                 .sign_with(&mut k1)
                 .unwrap();
+        replacement.set_positions(&[0]);
         let rid = pool.insert(replacement.clone(), &utxo, &rtxn).unwrap();
         assert!(pool.contains(&rid) && !pool.contains(&id1));
         assert_eq!(pool.len(), 2);

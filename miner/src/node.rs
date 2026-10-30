@@ -98,7 +98,7 @@ pub const DEFAULT_SYNC_POINT: u32 = 144;
 /// Snapshot parts fetched at once.
 const MAX_PART_DOWNLOADS: usize = 16;
 /// Snapshot objects kept for serving.
-const SERVED_SNAPSHOTS: usize = 8;
+const SERVED_SNAPSHOTS: usize = 32;
 /// Failed snapshot attempts before validating from genesis instead.
 const MAX_SNAPSHOT_ATTEMPTS: u32 = 4;
 
@@ -1481,9 +1481,16 @@ mod tests {
             s[0] = 1;
             s
         });
-        let tx = crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), 1)], vec![Output::new(&pk(50), 1)])
-            .sign_with(&mut k)
-            .unwrap();
+        let position = {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            let unspent = a.chain.utxo().unspent(&rtxn).unwrap();
+            unspent.iter().find(|(_, (c, _))| *c == spent.commitment).unwrap().0
+        };
+        let mut tx =
+            crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), 1)], vec![Output::new(&pk(50), 1)])
+                .sign_with(&mut k)
+                .unwrap();
+        tx.set_positions(&[position]);
         let txid = tx.txid();
         tx_a.send(Event::Transaction(tx)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1492,10 +1499,6 @@ mod tests {
         }
         assert!(pool_b.lock().unwrap().contains(&txid), "transaction was not relayed");
         assert!(pool_a.lock().unwrap().contains(&txid));
-        let position = {
-            let rtxn = a.chain.env().read_txn().unwrap();
-            a.chain.utxo().positions(&rtxn, &spent.commitment).unwrap()[0]
-        };
         t += 600;
         let b5 = mine_body(
             &a,

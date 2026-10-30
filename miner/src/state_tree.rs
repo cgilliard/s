@@ -18,16 +18,17 @@
 //! (see [`StateTree::open_from`]): the UTXO set does this, storing nothing
 //! below subtrees of 256 positions.
 //!
-//! Database layout: one named LMDB database with integer keys, `DEPTH -
-//! level` in the top byte and the index within that level below it,
-//! mapping to the 32-byte node digest.
+//! Database layout: one named LMDB database with 8-byte little-endian
+//! integer keys ordered by value ([`LeU64`]), `DEPTH - level` in the top
+//! byte and the index within that level below it, mapping to the 32-byte
+//! node digest.
 
 use std::path::Path;
 use std::sync::OnceLock;
 
-use heed::byteorder::NativeEndian;
+use heed::byteorder::LittleEndian;
 use heed::types::{Bytes, U64};
-use heed::{Database, DatabaseFlags, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::poseidon2::{DIGEST, Fp, compress, compress_all, digest_from_bytes, digest_to_bytes};
 
@@ -40,10 +41,26 @@ pub type Digest = [Fp; DIGEST];
 /// The value of an empty leaf.
 pub const EMPTY: Digest = [Fp::ZERO; DIGEST];
 
-/// Node keys: `DEPTH - level` in the top byte and the index below it, as
-/// an LMDB integer key (native byte order, little endian on every platform
-/// tabminer runs on), so nodes sort from the root down and then by index.
-type NodeKey = U64<NativeEndian>;
+/// Node keys: `DEPTH - level` in the top byte and the index below it, as an
+/// 8-byte little-endian integer ordered by [`LeU64`], so nodes sort from the
+/// root down and then by index.
+type NodeKey = U64<LittleEndian>;
+
+/// Key order for 8-byte little-endian integer keys: by value (byte order
+/// would put 1562 before 31). LMDB orders such a database by it, so a
+/// cursor walks keys by value; heed's range iterator, though, ends a range
+/// by byte order regardless, so range scans must be open-ended and stop by
+/// value themselves. Every database with such keys must be opened with it.
+pub enum LeU64 {}
+
+impl heed::Comparator for LeU64 {
+    fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        match (<[u8; 8]>::try_from(a), <[u8; 8]>::try_from(b)) {
+            (Ok(a), Ok(b)) => u64::from_le_bytes(a).cmp(&u64::from_le_bytes(b)),
+            _ => a.cmp(b),
+        }
+    }
+}
 
 /// Errors from tree operations.
 #[derive(Debug)]
@@ -114,6 +131,17 @@ pub fn subtree_root(level: usize, first: u64, leaves: &[(u64, Digest)]) -> Diges
     nodes.first().map_or(default_hashes()[level], |&(_, v)| v)
 }
 
+/// The roots `(index, root)` of the subtrees of height `level` holding the
+/// non-empty leaves `leaves` (keys ascending, distinct), many subtrees at
+/// once so the hashing fills whole batches; subtrees without leaves are
+/// left out.
+pub fn subtree_roots(level: usize, mut leaves: Vec<(u64, Digest)>) -> Vec<(u64, Digest)> {
+    for l in 0..level {
+        leaves = parents(l, &leaves);
+    }
+    leaves
+}
+
 /// Root of the whole tree from the roots of its subtrees of height `level`
 /// at indices `0..roots.len()`; every later subtree is empty.
 pub fn root_from_subtrees(level: usize, roots: &[Digest]) -> Digest {
@@ -180,10 +208,16 @@ pub fn subtree_path(level: usize, first: u64, leaves: &[(u64, Digest)], key: u64
 /// size, not an allocation; choose it generously.
 pub fn open_env(path: &Path, map_size: usize) -> Result<Env> {
     std::fs::create_dir_all(path).map_err(heed::Error::Io)?;
+    let mut options = EnvOpenOptions::new();
+    options.map_size(map_size).max_dbs(16);
+    // SAFETY: NO_READ_AHEAD only advises the kernel not to read ahead of
+    // page faults in the map: reads are random, so a fault should fetch
+    // its page, not the next hundred kilobytes with it.
+    unsafe { options.flags(heed::EnvFlags::NO_READ_AHEAD) };
     // SAFETY: heed marks `open` unsafe because opening the same environment
     // twice in one process, or deleting its files while open, is undefined
     // behaviour. Callers must open each path once per process.
-    let env = unsafe { EnvOpenOptions::new().map_size(map_size).max_dbs(16).open(path)? };
+    let env = unsafe { options.open(path)? };
     Ok(env)
 }
 
@@ -245,7 +279,7 @@ impl Proof {
 /// sparse tree's nodes.
 #[derive(Clone)]
 pub struct StateTree {
-    db: Database<NodeKey, Bytes>,
+    db: Database<NodeKey, Bytes, LeU64>,
     base: usize,
 }
 
@@ -260,12 +294,7 @@ impl StateTree {
     /// Opens a tree storing levels `base` and above.
     pub fn open_from(env: &Env, wtxn: &mut RwTxn, name: &str, base: usize) -> Result<StateTree> {
         assert!(base <= DEPTH);
-        let db = env
-            .database_options()
-            .types::<NodeKey, Bytes>()
-            .name(name)
-            .flags(DatabaseFlags::INTEGER_KEY)
-            .create(wtxn)?;
+        let db = env.database_options().types::<NodeKey, Bytes>().key_comparator::<LeU64>().name(name).create(wtxn)?;
         Ok(StateTree { db, base })
     }
 
@@ -320,6 +349,50 @@ impl StateTree {
             self.put_node(wtxn, level, idx, &node)?;
         }
         Ok(node)
+    }
+
+    /// Sets several base-level nodes (ascending by index, distinct) and
+    /// recomputes everything above them once, a level at a time with the
+    /// hashing batched: much cheaper than [`StateTree::set`] for each when
+    /// they share ancestors. Returns the new root.
+    pub fn set_many(&self, wtxn: &mut RwTxn, nodes: &[(u64, Digest)]) -> Result<Digest> {
+        if let Some(&(i, _)) = nodes.iter().find(|(i, _)| *i >= 1 << (DEPTH - self.base)) {
+            return Err(Error::KeyOutOfRange(i));
+        }
+        debug_assert!(nodes.windows(2).all(|w| w[0].0 < w[1].0));
+        for (i, v) in nodes {
+            self.put_node(wtxn, self.base, *i, v)?;
+        }
+        let mut level_nodes: Vec<(u64, Digest)> = nodes.to_vec();
+        for level in self.base + 1..=DEPTH {
+            let below = level - 1;
+            let mut keys = Vec::with_capacity(level_nodes.len());
+            let mut children: Vec<(Digest, Digest)> = Vec::with_capacity(level_nodes.len());
+            let mut j = 0;
+            while j < level_nodes.len() {
+                let p = level_nodes[j].0 >> 1;
+                let left = if level_nodes[j].0 == 2 * p {
+                    j += 1;
+                    level_nodes[j - 1].1
+                } else {
+                    self.node(wtxn, below, 2 * p)?
+                };
+                let right = if j < level_nodes.len() && level_nodes[j].0 == 2 * p + 1 {
+                    j += 1;
+                    level_nodes[j - 1].1
+                } else {
+                    self.node(wtxn, below, 2 * p + 1)?
+                };
+                keys.push(p);
+                children.push((left, right));
+            }
+            let pairs: Vec<(&Digest, &Digest)> = children.iter().map(|(l, r)| (l, r)).collect();
+            level_nodes = keys.into_iter().zip(compress_all(&pairs)).collect();
+            for (i, v) in &level_nodes {
+                self.put_node(wtxn, level, *i, v)?;
+            }
+        }
+        self.root(wtxn)
     }
 
     /// Fills an empty tree from its non-default base-level nodes, ascending
@@ -419,6 +492,13 @@ impl StateTree {
     /// Number of non-default nodes stored.
     pub fn stored_nodes(&self, rtxn: &RoTxn) -> Result<u64> {
         Ok(self.db.len(rtxn)?)
+    }
+
+    /// Every stored node's value, in key order: for warming the cache in
+    /// measurements.
+    #[cfg(test)]
+    pub(crate) fn iter_values<'t>(&self, rtxn: &'t RoTxn) -> impl Iterator<Item = Digest> + 't {
+        self.db.iter(rtxn).unwrap().map(|i| digest_from_bytes(i.unwrap().1).unwrap())
     }
 
     /// LMDB statistics of the node database, for measuring storage.

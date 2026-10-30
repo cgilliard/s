@@ -951,15 +951,17 @@ fn permute_batch_scalar(s: &mut BatchState) {
 /// [`crate::packed`] arithmetic (bit-identical to the scalar path).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod avx2 {
-    use super::{BatchState, INTERNAL_DIAG, RC_EXTERNAL_FINAL, RC_EXTERNAL_INITIAL, RC_INTERNAL, WIDTH};
-    use crate::packed::{V, add, load, mul, splat, store};
+    use super::{BatchState, RC_EXTERNAL_FINAL, RC_EXTERNAL_INITIAL, RC_INTERNAL, WIDTH};
+    use crate::packed::{V, add, load, mul, splat, store, sub};
+    use core::arch::x86_64::*;
 
     #[inline(always)]
     fn pow7(a: V) -> V {
+        // Three multiplications deep: x^3 and x^4 are independent.
         let x2 = mul(a, a);
+        let x3 = mul(x2, a);
         let x4 = mul(x2, x2);
-        let x6 = mul(x4, x2);
-        mul(x6, a)
+        mul(x4, x3)
     }
 
     #[inline(always)]
@@ -988,12 +990,47 @@ mod avx2 {
 
     #[inline(always)]
     fn internal(s: &mut [V; WIDTH]) {
-        let mut sum = s[0];
-        for x in &s[1..] {
-            sum = add(sum, *x);
+        // Summed as a tree, four additions deep.
+        let mut t: [V; 8] = core::array::from_fn(|i| add(s[2 * i], s[2 * i + 1]));
+        for w in [4, 2, 1] {
+            for i in 0..w {
+                t[i] = add(t[2 * i], t[2 * i + 1]);
+            }
         }
-        for (x, d) in s.iter_mut().zip(&INTERNAL_DIAG) {
-            *x = add(mul(*x, splat(d.0)), sum);
+        let sum = t[0];
+        let x = *s;
+        let (dbl, triple) = (|v: V| add(v, v), |v: V| add(add(v, v), v));
+        // Each lane times its INTERNAL_DIAG entry (-2, 1, 2, 1/2, 3, 4,
+        // -1/2, -3, -4, 1/2^8, 1/4, 1/8, 1/2^27, -1/2^8, -1/16, -1/2^27)
+        // by additions and shifts, plus the sum.
+        s[0] = sub(sum, dbl(x[0]));
+        s[1] = add(x[1], sum);
+        s[2] = add(dbl(x[2]), sum);
+        s[3] = add(div_2exp(x[3], 1), sum);
+        s[4] = add(triple(x[4]), sum);
+        s[5] = add(dbl(dbl(x[5])), sum);
+        s[6] = sub(sum, div_2exp(x[6], 1));
+        s[7] = sub(sum, triple(x[7]));
+        s[8] = sub(sum, dbl(dbl(x[8])));
+        s[9] = add(div_2exp(x[9], 8), sum);
+        s[10] = add(div_2exp(x[10], 2), sum);
+        s[11] = add(div_2exp(x[11], 3), sum);
+        s[12] = add(div_2exp(x[12], 27), sum);
+        s[13] = sub(sum, div_2exp(x[13], 8));
+        s[14] = sub(sum, div_2exp(x[14], 4));
+        s[15] = sub(sum, div_2exp(x[15], 27));
+    }
+
+    /// `x / 2^k` for `1 <= k <= 27`: with `x = hi 2^k + lo` and
+    /// `2^-k = -(p - 1) / 2^k = -15 2^(27-k)`, it is `hi - lo 15 2^(27-k)`,
+    /// both terms below `p`.
+    #[inline(always)]
+    pub(super) fn div_2exp(x: V, k: u32) -> V {
+        unsafe {
+            let hi = _mm256_srlv_epi32(x, splat(k));
+            let lo = _mm256_and_si256(x, splat((1 << k) - 1));
+            let t = _mm256_sub_epi32(_mm256_sllv_epi32(lo, splat(31 - k)), _mm256_sllv_epi32(lo, splat(27 - k)));
+            sub(hi, t)
         }
     }
 
@@ -1085,6 +1122,32 @@ pub fn compress_all(pairs: &[(&[Fp; DIGEST], &[Fp; DIGEST])]) -> Vec<[Fp; DIGEST
 mod batch_tests {
     use super::*;
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn division_by_powers_of_two() {
+        use crate::packed::{load_fp, mul, splat_fp, store_fp};
+        let mut x = 0x2545_f491u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            Fp::from_mont(x % P)
+        };
+        for k in 1..=27 {
+            let inv = Fp::new(1 << k).inverse().unwrap();
+            for _ in 0..200 {
+                let mut a: [Fp; 8] = core::array::from_fn(|_| next());
+                a[0] = Fp::ZERO;
+                a[1] = Fp::from_mont(P - 1);
+                a[2] = Fp::from_mont((1 << k) - 1);
+                let (mut got, mut want) = ([Fp::ZERO; 8], [Fp::ZERO; 8]);
+                store_fp(&mut got, avx2::div_2exp(load_fp(&a), k));
+                store_fp(&mut want, mul(load_fp(&a), splat_fp(inv)));
+                assert_eq!(got, want, "k = {k}");
+            }
+        }
+    }
+
     #[test]
     fn batch_matches_scalar() {
         let mut rows: Vec<Vec<Fp>> = Vec::new();
@@ -1142,5 +1205,44 @@ mod batch_tests {
         }
         let el = t.elapsed();
         println!("{} permutations batched: {el:?} ({:?} each) {}", n * LANES, el / (n * LANES) as u32, s[0][0]);
+    }
+}
+
+#[cfg(test)]
+mod speed {
+    use super::*;
+
+    /// Time per permutation and per compression, batched and scalar.
+    #[test]
+    #[ignore = "slow: timing measurement"]
+    fn compress_speed() {
+        let a: Vec<[Fp; DIGEST]> = (0..1_000_000u32).map(|i| hash(&[Fp::new(i)])).collect();
+        let pairs: Vec<(&[Fp; DIGEST], &[Fp; DIGEST])> = a.chunks(2).map(|c| (&c[0], &c[1])).collect();
+        let t = std::time::Instant::now();
+        let out = compress_all(&pairs);
+        let batched = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut x = a[0];
+        for p in &pairs[..100_000] {
+            x = compress(&x, p.1);
+        }
+        let scalar = t.elapsed();
+        let mut st: BatchState = [[1u32; LANES]; WIDTH];
+        let t = std::time::Instant::now();
+        for _ in 0..200_000 {
+            permute_batch(&mut st);
+        }
+        eprintln!(
+            "permute_batch alone {:.3} µs per state ({})",
+            t.elapsed().as_secs_f64() * 1e6 / 1_600_000.0,
+            st[0][0]
+        );
+        eprintln!(
+            "batched {:.3} µs per compress, scalar {:.3} µs ({:?} {:?})",
+            batched.as_secs_f64() * 1e6 / pairs.len() as f64,
+            scalar.as_secs_f64() * 1e6 / 100_000.0,
+            out[0][0],
+            x[0]
+        );
     }
 }

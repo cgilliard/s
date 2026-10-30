@@ -64,7 +64,7 @@ const FP_BYTES: usize = 4;
 /// Serialized size of a digest or commitment.
 const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
 /// Serialized size of an [`Input`].
-pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + Sig::SIZE;
+pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + 8 + Sig::SIZE;
 /// Serialized size of an [`Output`].
 pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8 + DIGEST_BYTES;
 
@@ -156,11 +156,15 @@ fn read_u64(bytes: &[u8]) -> Option<(u64, &[u8])> {
 // ---------------------------------------------------------------------------
 
 /// A spend of an existing output: the revealed key and amount plus a
-/// signature over the transaction body.
+/// signature over the transaction body, and the output's position in the
+/// UTXO set. The position is not signed (nor part of the transaction id):
+/// it only tells nodes where to find the output, which they check, so a
+/// wallet can correct it after a reorganization moves the output.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Input {
     pub pubkey: PublicKey,
     pub amount: u64,
+    pub position: u64,
     pub signature: Sig,
 }
 
@@ -242,6 +246,7 @@ impl Input {
         let mut out = Vec::with_capacity(INPUT_SIZE);
         out.extend_from_slice(&self.pubkey.to_bytes());
         out.extend_from_slice(&self.amount.to_le_bytes());
+        out.extend_from_slice(&self.position.to_le_bytes());
         out.extend_from_slice(&self.signature.to_bytes());
         out
     }
@@ -252,8 +257,9 @@ impl Input {
         }
         let pubkey = PublicKey::from_bytes(&bytes[..PublicKey::SIZE])?;
         let (amount, rest) = read_u64(&bytes[PublicKey::SIZE..])?;
+        let (position, rest) = read_u64(rest)?;
         let signature = Sig::from_bytes(rest)?;
-        Some(Input { pubkey, amount, signature })
+        Some(Input { pubkey, amount, position, signature })
     }
 }
 
@@ -302,7 +308,8 @@ impl UnsignedTransaction {
     /// Signs every input. `signer` is called once per input, in order, with
     /// the input index, its public key and the body hash to sign, and must
     /// return a signature made with the matching secret key. Using a closure
-    /// lets one key sign several inputs.
+    /// lets one key sign several inputs. Positions start at zero; see
+    /// [`Transaction::set_positions`].
     pub fn sign<E>(
         self,
         mut signer: impl FnMut(usize, &PublicKey, &Digest) -> Result<Sig, E>,
@@ -311,7 +318,7 @@ impl UnsignedTransaction {
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for (i, (pubkey, amount)) in self.inputs.into_iter().enumerate() {
             let signature = signer(i, &pubkey, &msg)?;
-            inputs.push(Input { pubkey, amount, signature });
+            inputs.push(Input { pubkey, amount, position: 0, signature });
         }
         Ok(Transaction { inputs, outputs: self.outputs })
     }
@@ -374,6 +381,20 @@ impl Transaction {
     pub fn verify_signatures(&self) -> bool {
         let msg = self.body_hash();
         self.inputs.iter().all(|i| i.pubkey.verify(&msg, &i.signature))
+    }
+
+    /// Sets where each input's output is in the UTXO set, in input order.
+    /// Leaves the signatures and the transaction id unchanged.
+    pub fn set_positions(&mut self, positions: &[u64]) {
+        assert_eq!(positions.len(), self.inputs.len(), "one position per input");
+        for (i, p) in self.inputs.iter_mut().zip(positions) {
+            i.position = *p;
+        }
+    }
+
+    /// Positions of the outputs being spent, in input order.
+    pub fn spent_positions(&self) -> Vec<u64> {
+        self.inputs.iter().map(|i| i.position).collect()
     }
 
     /// Commitments of the outputs being spent, in input order.
@@ -451,7 +472,7 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(OUTPUT_SIZE, 72);
-        assert_eq!(INPUT_SIZE, 48 + 8 + 2312);
+        assert_eq!(INPUT_SIZE, 48 + 8 + 8 + 2312);
         assert_eq!(TREE_HEIGHT, 4);
         assert_eq!(Key::LEAVES, 16);
     }
@@ -589,12 +610,17 @@ mod tests {
     fn serialization_roundtrip() {
         let mut ka = key(9);
         let kb = key(10).public_key();
-        let tx = UnsignedTransaction::new(
+        let mut tx = UnsignedTransaction::new(
             vec![(ka.public_key(), 7), (ka.public_key(), 8)],
             vec![Output::new(&kb, 9), Output::new(&kb, u64::MAX)],
         )
         .sign_with(&mut ka)
         .unwrap();
+        // Positions are carried but not signed.
+        let id = tx.txid();
+        tx.set_positions(&[1 << 39, 12345]);
+        assert_eq!((tx.txid(), tx.spent_positions()), (id, vec![1 << 39, 12345]));
+        assert!(tx.verify_signatures());
 
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());

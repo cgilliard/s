@@ -45,15 +45,16 @@
 //! commitments. That, the signatures and the commitment preimages are the
 //! proof's job.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use heed::byteorder::LittleEndian;
 use heed::types::{Bytes, Str, U32};
 use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::aggregate::AggregatorParams;
-use crate::block::{Block, Body, BodyError, HEADER_SIZE, Header};
+use crate::block::{Block, BlockOutput, Body, BodyError, HEADER_SIZE, Header};
 use crate::difficulty::{Asert, U256};
 use crate::poseidon2::digest_from_bytes;
 use crate::pow::{Digest, PowParams, SeedText, Target};
@@ -379,9 +380,10 @@ pub const SNAPSHOT_PART_LOG: usize = 14;
 // Part roots are read from the stored tree, which starts at this level.
 const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
-/// Version of the on-disk layout: 6 keeps unspent outputs in chunks and
-/// the state tree from subtrees of 256 positions up.
-const FORMAT: u8 = 6;
+/// Version of the on-disk layout: 8 keeps unspent outputs in packed
+/// buckets with no index by commitment, and the state tree from subtrees
+/// of 256 positions up.
+const FORMAT: u8 = 8;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -404,18 +406,26 @@ pub struct Entry {
     pub header_only: bool,
 }
 
-/// What disconnecting a block needs: the commitments and memos its inputs
-/// held, in input order, and where its outputs started.
+/// What disconnecting a block needs, and what serving a snapshot of the
+/// state before it needs without reading its body: where its outputs
+/// started and how many it made, and the position, commitment and memo of
+/// every output it spent, in input order.
 struct Undo {
     first_output_position: u64,
-    spent: Vec<(Commitment, Memo)>,
+    outputs: u32,
+    spent: Vec<(u64, Commitment, Memo)>,
 }
+
+/// Bytes per spent output in an undo record: position (5), commitment, memo.
+const UNDO_SPENT: usize = 5 + 64;
 
 impl Undo {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 64 * self.spent.len());
+        let mut out = Vec::with_capacity(12 + UNDO_SPENT * self.spent.len());
         out.extend_from_slice(&self.first_output_position.to_le_bytes());
-        for (c, m) in &self.spent {
+        out.extend_from_slice(&self.outputs.to_le_bytes());
+        for (p, c, m) in &self.spent {
+            out.extend_from_slice(&p.to_le_bytes()[..5]);
             out.extend_from_slice(&digest_bytes(c));
             out.extend_from_slice(&digest_bytes(m));
         }
@@ -423,17 +433,29 @@ impl Undo {
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Undo> {
-        let (first, rest) = bytes.split_at_checked(8)?;
-        if rest.len() % 64 != 0 {
+        let (head, rest) = bytes.split_at_checked(12)?;
+        if rest.len() % UNDO_SPENT != 0 {
             return None;
         }
         let spent = rest
-            .chunks_exact(64)
-            .map(|c| Some((digest_from_bytes(&c[..32])?, digest_from_bytes(&c[32..])?)))
+            .chunks_exact(UNDO_SPENT)
+            .map(|c| {
+                let mut p = [0u8; 8];
+                p[..5].copy_from_slice(&c[..5]);
+                Some((u64::from_le_bytes(p), digest_from_bytes(&c[5..37])?, digest_from_bytes(&c[37..])?))
+            })
             .collect::<Option<Vec<_>>>()?;
-        Some(Undo { first_output_position: u64::from_le_bytes(first.try_into().unwrap()), spent })
+        Some(Undo {
+            first_output_position: u64::from_le_bytes(head[..8].try_into().unwrap()),
+            outputs: u32::from_le_bytes(head[8..].try_into().unwrap()),
+            spent,
+        })
     }
 }
+
+/// The state after a main-chain block, as a snapshot serves it: the output
+/// counter then, and the outputs spent since, by position.
+type SnapshotState = (u64, BTreeMap<u64, (Commitment, Memo)>);
 
 /// Persistent chain state.
 pub struct Chain<V: ProofVerifier> {
@@ -451,6 +473,9 @@ pub struct Chain<V: ProofVerifier> {
     meta: Database<Str, Bytes>,
     /// Undo records kept, counting back from the tip; `None` keeps all.
     max_undo: Option<u32>,
+    /// The last snapshot state served: block id, tip id, state.
+    #[allow(clippy::type_complexity)]
+    snapshot_cache: Mutex<Option<(Digest, Digest, Arc<SnapshotState>)>>,
 }
 
 /// Default undo window: a week of blocks.
@@ -504,6 +529,7 @@ impl<V: ProofVerifier> Chain<V> {
             by_height,
             meta,
             max_undo: Some(DEFAULT_MAX_UNDO),
+            snapshot_cache: Mutex::new(None),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
         chain.abort_snapshot()?;
@@ -626,6 +652,22 @@ impl<V: ProofVerifier> Chain<V> {
         self.body_by_hash_in(&rtxn, &digest_bytes(hash))
     }
 
+    /// The main-chain block at `height`: its id, the position its first
+    /// output took and its outputs. `None` past the tip, or once its body
+    /// and undo record are pruned.
+    pub fn main_outputs(&self, height: u32) -> Result<Option<(Digest, u64, Vec<BlockOutput>)>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(header) = self.header_at_in(&rtxn, height)? else {
+            return Ok(None);
+        };
+        let id = digest_bytes(&header.hash());
+        let (Some(body), Some(undo)) = (self.body_by_hash_in(&rtxn, &id)?, self.undo.get(&rtxn, &id)?) else {
+            return Ok(None);
+        };
+        let undo = Undo::from_bytes(undo).ok_or(ChainError::Corrupt("undo record"))?;
+        Ok(Some((header.hash(), undo.first_output_position, body.outputs)))
+    }
+
     /// A stored valid block, header and body, by id.
     pub fn block_by_hash(&self, hash: &Digest) -> Result<Option<Block>> {
         let rtxn = self.env.read_txn()?;
@@ -741,7 +783,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.headers.put(&mut wtxn, &id, &block.header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
         self.put_index(&mut wtxn, &id, U256::ZERO, STATUS_VALID)?;
-        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, spent: vec![] }.to_bytes())?;
+        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, outputs: 0, spent: vec![] }.to_bytes())?;
         self.by_height.put(&mut wtxn, &0, &id)?;
         self.meta.put(&mut wtxn, META_TIP, &id)?;
         wtxn.commit()?;
@@ -776,15 +818,7 @@ impl<V: ProofVerifier> Chain<V> {
     /// Spends the inputs and appends the outputs; returns the new root and
     /// the commitments the inputs held.
     fn apply_body(&self, wtxn: &mut RwTxn, body: &Body) -> Result<(Digest, Vec<(Commitment, Memo)>)> {
-        let mut spent = Vec::with_capacity(body.inputs.len());
-        for &pos in &body.inputs {
-            let commitment = self.utxo.get(wtxn, pos)?;
-            let memo = self.utxo.memo(wtxn, pos)?;
-            if commitment == EMPTY || !self.utxo.spend_at(wtxn, &commitment, pos)? {
-                return Err(ChainError::UnknownInput(pos));
-            }
-            spent.push((commitment, memo));
-        }
+        let spent = self.utxo.spend_positions(wtxn, &body.inputs)?.map_err(ChainError::UnknownInput)?;
         self.utxo.add_outputs(wtxn, &body.outputs)?;
         Ok((self.utxo.root(wtxn)?, spent))
     }
@@ -938,7 +972,9 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let work = self.entry_in(wtxn, &header.hash())?.ok_or(ChainError::Corrupt("connecting unknown block"))?.work;
         self.put_index(wtxn, &id, work, STATUS_VALID)?;
-        self.undo.put(wtxn, &id, &Undo { first_output_position, spent }.to_bytes())?;
+        let spent = body.inputs.iter().zip(spent).map(|(&p, (c, m))| (p, c, m)).collect();
+        let outputs = body.outputs.len() as u32;
+        self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, spent }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
         // The block leaving the undo window keeps only its header.
@@ -990,9 +1026,7 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
-        for (&pos, (c, m)) in body.inputs.iter().zip(&undo.spent) {
-            self.utxo.unspend(wtxn, c, m, pos)?;
-        }
+        self.utxo.restore(wtxn, &undo.spent)?;
         let parent = self
             .header_by_hash_in(wtxn, &digest_bytes(&header.prev_hash))?
             .ok_or(ChainError::Corrupt("parent of main-chain block"))?;
@@ -1159,6 +1193,26 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(self.meta.get(rtxn, META_STAGING)?.is_some())
     }
 
+    /// Disk use of every database: name, bytes in pages and entries, the
+    /// unspent outputs' parts first. And the file's size.
+    #[allow(clippy::type_complexity)]
+    pub fn storage(&self) -> Result<(Vec<(&'static str, u64, usize)>, u64)> {
+        let rtxn = self.env.read_txn()?;
+        let size =
+            |s: heed::DatabaseStat| (s.branch_pages + s.leaf_pages + s.overflow_pages) as u64 * s.page_size as u64;
+        let mut rows = self.utxo.storage(&rtxn)?;
+        for (name, stat) in [
+            ("headers", self.headers.stat(&rtxn)?),
+            ("block index", self.index.stat(&rtxn)?),
+            ("heights", self.by_height.stat(&rtxn)?),
+            ("bodies", self.bodies.stat(&rtxn)?),
+            ("undo", self.undo.stat(&rtxn)?),
+        ] {
+            rows.push((name, size(stat), stat.entries));
+        }
+        Ok((rows, self.env.real_disk_size()?))
+    }
+
     /// Whether a snapshot is being installed.
     pub fn staging(&self) -> Result<bool> {
         let rtxn = self.env.read_txn()?;
@@ -1261,43 +1315,47 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// The state after the main-chain block `id`: its output counter and
-    /// the outputs spent since, to restore (position to commitment and
-    /// memo). `None` if the block is not on the main chain or older than
-    /// this node's undo records.
-    #[allow(clippy::type_complexity)]
-    fn state_after(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u64, HashMap<u64, (Commitment, Memo)>)>> {
+    /// the outputs spent since, to restore. `None` if the block is not on
+    /// the main chain or older than this node's undo records. Read from
+    /// undo records alone, and kept until the tip moves, so serving every
+    /// part of a snapshot costs one pass.
+    fn state_after(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<Arc<SnapshotState>>> {
         let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(id))? else {
             return Ok(None);
         };
         if !self.is_main_in(rtxn, &header)? || header.height == 0 {
             return Ok(None);
         }
+        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
+        if let Some((i, t, state)) = self.snapshot_cache.lock().unwrap().as_ref()
+            && *i == *id
+            && *t == tip.hash()
+        {
+            return Ok(Some(Arc::clone(state)));
+        }
         let key = digest_bytes(id);
         let next = match self.undo.get(rtxn, &key)?.and_then(Undo::from_bytes) {
-            Some(u) => {
-                let body = self.body_by_hash_in(rtxn, &key)?.ok_or(ChainError::Corrupt("main-chain body"))?;
-                u.first_output_position + body.outputs.len() as u64
-            }
+            Some(u) => u.first_output_position + u64::from(u.outputs),
             None if self.floor_in(rtxn)? == Some(header.height) => {
                 let b = self.meta.get(rtxn, META_FLOOR_NEXT)?.ok_or(ChainError::Corrupt("floor counter"))?;
                 u64::from_le_bytes(b.try_into().map_err(|_| ChainError::Corrupt("floor counter"))?)
             }
             None => return Ok(None),
         };
-        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
-        let mut restored = HashMap::new();
+        let mut restored = BTreeMap::new();
         for h in header.height + 1..=tip.height {
             let hd = self.header_at_in(rtxn, h)?.ok_or(ChainError::Corrupt("main-chain header"))?;
             let k = digest_bytes(&hd.hash());
-            let body = self.body_by_hash_in(rtxn, &k)?.ok_or(ChainError::Corrupt("main-chain body"))?;
             let undo = self.undo.get(rtxn, &k)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
-            for (&pos, spent) in body.inputs.iter().zip(&undo.spent) {
+            for (pos, c, m) in undo.spent {
                 if pos < next {
-                    restored.insert(pos, *spent);
+                    restored.insert(pos, (c, m));
                 }
             }
         }
-        Ok(Some((next, restored)))
+        let state = Arc::new((next, restored));
+        *self.snapshot_cache.lock().unwrap() = Some((*id, tip.hash(), Arc::clone(&state)));
+        Ok(Some(state))
     }
 
     /// The unspent outputs in snapshot part `part` of the state after the
@@ -1307,7 +1365,7 @@ impl<V: ProofVerifier> Chain<V> {
         &self,
         rtxn: &RoTxn,
         next: u64,
-        restored: &HashMap<u64, (Commitment, Memo)>,
+        restored: &BTreeMap<u64, (Commitment, Memo)>,
         part: u64,
     ) -> Result<Vec<(u64, Commitment, Memo)>> {
         let first = part << SNAPSHOT_PART_LOG;
@@ -1315,7 +1373,7 @@ impl<V: ProofVerifier> Chain<V> {
         let mut out: Vec<(u64, Commitment, Memo)> =
             self.utxo.unspent_in(rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
         let before = out.len();
-        out.extend(restored.iter().filter(|(p, _)| (first..end).contains(*p)).map(|(p, (c, m))| (*p, *c, *m)));
+        out.extend(restored.range(first..end).map(|(p, (c, m))| (*p, *c, *m)));
         if out.len() > before {
             out.sort_unstable_by_key(|o| o.0);
         }
@@ -1326,9 +1384,10 @@ impl<V: ProofVerifier> Chain<V> {
     /// the output counter and the root of every part's subtree.
     pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<(u64, Vec<Digest>)>> {
         let rtxn = self.env.read_txn()?;
-        let Some((next, restored)) = self.state_after(&rtxn, id)? else {
+        let Some(state) = self.state_after(&rtxn, id)? else {
             return Ok(None);
         };
+        let (next, restored) = (state.0, &state.1);
         let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
         // Parts wholly below the counter that nothing since has spent from
         // are as stored now; only the others are recomputed.
@@ -1340,7 +1399,7 @@ impl<V: ProofVerifier> Chain<V> {
                 continue;
             }
             let leaves: Vec<(u64, Digest)> = self
-                .snapshot_part_in(&rtxn, next, &restored, p)?
+                .snapshot_part_in(&rtxn, next, restored, p)?
                 .iter()
                 .map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m)))
                 .collect();
@@ -1353,13 +1412,13 @@ impl<V: ProofVerifier> Chain<V> {
     #[allow(clippy::type_complexity)]
     pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<Vec<(u64, Commitment, Memo)>>> {
         let rtxn = self.env.read_txn()?;
-        let Some((next, restored)) = self.state_after(&rtxn, id)? else {
+        let Some(state) = self.state_after(&rtxn, id)? else {
             return Ok(None);
         };
-        if part >= next.div_ceil(1 << SNAPSHOT_PART_LOG) {
+        if part >= state.0.div_ceil(1 << SNAPSHOT_PART_LOG) {
             return Ok(None);
         }
-        Ok(Some(self.snapshot_part_in(&rtxn, next, &restored, part)?))
+        Ok(Some(self.snapshot_part_in(&rtxn, state.0, &state.1, part)?))
     }
 
     /// The proof statement and proof of the main-chain block at `height`
@@ -1891,6 +1950,100 @@ mod tests {
         );
         assert!(bodies.entries as u32 <= window + 1);
         eprintln!("  file {:.1} MB", f.chain.env().real_disk_size().unwrap() as f64 / 1e6);
+    }
+
+    /// Checks the snapshot manifests a real data directory would serve:
+    /// `TABMINER_DEBUG_CHAIN` names a copy of a chain database (it is
+    /// written to), `TABMINER_DEBUG_HEIGHT` the block.
+    #[test]
+    #[ignore = "debugging a data directory"]
+    fn manifest_of_a_data_directory() {
+        let Ok(path) = std::env::var("TABMINER_DEBUG_CHAIN") else {
+            return;
+        };
+        let height: u32 = std::env::var("TABMINER_DEBUG_HEIGHT").unwrap().parse().unwrap();
+        let p = ChainParams::MAINNET;
+        let chain = Chain::open(Path::new(&path), 1 << 40, p, SeedText::new(p.pow), AcceptAllProofs).unwrap();
+        let header = chain.header_at(height).unwrap().unwrap();
+        let (next, roots) = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
+        let ok = crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots) == header.state_root;
+        eprintln!("block {height}: {next} positions, {} parts, composes to the state root: {ok}", roots.len());
+        let mut bad = 0;
+        for (i, r) in roots.iter().enumerate().filter(|_| std::env::var("TABMINER_DEBUG_TIP_ONLY").is_err()) {
+            let part = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
+            let leaves: Vec<(u64, Digest)> =
+                part.iter().map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m))).collect();
+            let full = crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves);
+            if full != *r {
+                bad += 1;
+                if bad <= 5 {
+                    eprintln!("  part {i}: manifest root differs from the part's outputs ({} outputs)", part.len());
+                }
+            }
+        }
+        eprintln!("{bad} parts differ");
+        // The tip's own state, recomputed from its outputs.
+        let tip = chain.tip().unwrap().unwrap();
+        let rtxn = chain.env().read_txn().unwrap();
+        let all = chain.utxo().unspent(&rtxn).unwrap();
+        let leaves: Vec<(u64, Digest)> =
+            all.iter().map(|(pos, (c, m))| (*pos, crate::transaction::leaf(c, m))).collect();
+        let tip_next = chain.utxo().next_position(&rtxn).unwrap();
+        let parts: Vec<Digest> = (0..tip_next.div_ceil(1 << SNAPSHOT_PART_LOG))
+            .map(|i| {
+                let lo = i << SNAPSHOT_PART_LOG;
+                let hi = lo + (1 << SNAPSHOT_PART_LOG);
+                let these: Vec<(u64, Digest)> = leaves.iter().copied().filter(|(p, _)| (lo..hi).contains(p)).collect();
+                crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, lo, &these)
+            })
+            .collect();
+        eprintln!(
+            "tip {}: stored root matches its outputs: {}; matches its header: {}",
+            tip.height,
+            crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &parts) == chain.utxo().root(&rtxn).unwrap(),
+            chain.utxo().root(&rtxn).unwrap() == tip.state_root
+        );
+        let stored_bad = (0..parts.len())
+            .filter(|&i| chain.utxo().subtree(&rtxn, SNAPSHOT_PART_LOG, i as u64).unwrap() != parts[i])
+            .count();
+        eprintln!("{stored_bad} stored part roots differ from their outputs");
+        // Down to the stored subtrees of 256 positions.
+        let groups = tip_next.div_ceil(1 << crate::utxo::GROUP_LOG);
+        let mut wrong = Vec::new();
+        for g in 0..groups {
+            let leaves = chain.utxo().group_leaves(&rtxn, g).unwrap();
+            let want = crate::state_tree::subtree_root(crate::utxo::GROUP_LOG, g << crate::utxo::GROUP_LOG, &leaves);
+            if chain.utxo().subtree(&rtxn, crate::utxo::GROUP_LOG, g).unwrap() != want {
+                wrong.push((g, leaves.len()));
+            }
+        }
+        eprintln!(
+            "{} of {groups} stored subtree roots differ; first: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(12)]
+        );
+        for &(g, _) in wrong.iter().take(3) {
+            let leaves = chain.utxo().group_leaves(&rtxn, g).unwrap();
+            let stored = chain.utxo().subtree(&rtxn, crate::utxo::GROUP_LOG, g).unwrap();
+            let d = crate::state_tree::default_hashes();
+            // Which subset of the leaves gives the stored root?
+            let n = leaves.len();
+            let mut explains = None;
+            for mask in 0u32..(1 << n.min(12)) {
+                let sub: Vec<(u64, Digest)> = (0..n).filter(|i| mask >> i & 1 == 1).map(|i| leaves[i]).collect();
+                if crate::state_tree::subtree_root(crate::utxo::GROUP_LOG, g << crate::utxo::GROUP_LOG, &sub) == stored
+                {
+                    explains = Some(sub.iter().map(|l| l.0).collect::<Vec<_>>());
+                    break;
+                }
+            }
+            eprintln!(
+                "  group {g}: leaves at {:?}; stored root is default: {}; stored root is these leaves: {:?}",
+                leaves.iter().map(|l| l.0).collect::<Vec<_>>(),
+                stored == d[crate::utxo::GROUP_LOG],
+                explains
+            );
+        }
     }
 
     #[test]
