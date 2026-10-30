@@ -1045,6 +1045,35 @@ impl<V: ProofVerifier> Chain<V> {
         }
     }
 
+    /// The lowest height from which this node holds the body of every
+    /// main-chain block up to its tip: 1 for an archive or young chain,
+    /// higher once old bodies are pruned or below a fast-sync snapshot, and
+    /// the tip's height plus one if it holds none but genesis. Peers
+    /// advertise it, so bodies are only asked of nodes that have them.
+    pub fn oldest_body(&self) -> Result<u32> {
+        let rtxn = self.env.read_txn()?;
+        let Some(tip) = self.tip_in(&rtxn)? else {
+            return Ok(1);
+        };
+        let has = |h: u32| -> Result<bool> {
+            Ok(match self.by_height.get(&rtxn, &h)? {
+                Some(id) => self.bodies.get(&rtxn, id)?.is_some(),
+                None => false,
+            })
+        };
+        // The bodies held run up to the tip: search for where they start.
+        let (mut lo, mut hi) = (1, tip.height + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if has(mid)? {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Height of the snapshot this chain was fast-synced from, if any.
     pub fn floor(&self) -> Result<Option<u32>> {
         let rtxn = self.env.read_txn()?;
@@ -2380,6 +2409,7 @@ mod tests {
         // Bodies go with them: blocks 1 to 3 keep only their headers.
         let body = |h: usize| f.chain.body_by_hash(&blocks[h - 1].header.hash()).unwrap().is_some();
         assert_eq!((1..=6).map(body).collect::<Vec<_>>(), [false, false, false, true, true, true]);
+        assert_eq!(f.chain.oldest_body().unwrap(), 4);
         assert!(f.chain.entry(&blocks[0].header.hash()).unwrap().unwrap().validated);
         assert!(f.chain.snapshot_manifest(&blocks[2].header.hash()).unwrap().is_none());
         assert!(f.chain.snapshot_manifest(&blocks[3].header.hash()).unwrap().is_some());

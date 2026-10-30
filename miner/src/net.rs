@@ -42,7 +42,7 @@ use crate::difficulty::U256;
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
@@ -155,6 +155,10 @@ pub struct Status {
     /// Genesis block id; peers on another chain are ignored.
     pub genesis: Digest,
     pub height: u32,
+    /// Lowest height from which the sender holds every main-chain body up
+    /// to its tip ([`crate::chain::Chain::oldest_body`]): pruned and
+    /// fast-synced nodes serve headers below it but not blocks.
+    pub oldest: u32,
     pub tip: Digest,
     /// Cumulative work of the main chain.
     pub work: U256,
@@ -179,6 +183,7 @@ fn put_status(w: &mut Writer, s: &Status) {
     w.u32(s.version);
     w.digest(&s.genesis);
     w.u32(s.height);
+    w.u32(s.oldest);
     w.digest(&s.tip);
     w.0.extend_from_slice(&s.work.to_le_bytes());
 }
@@ -189,6 +194,7 @@ fn get_status(r: &mut Reader) -> Option<Status> {
         version: r.u32()?,
         genesis: r.digest()?,
         height: r.u32()?,
+        oldest: r.u32()?,
         tip: r.digest()?,
         work: U256::from_le_bytes(r.take(32)?.try_into().unwrap()),
     })
@@ -488,6 +494,8 @@ impl Download {
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A peer silent for this long is dropped (unless it is a seed).
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a peer a block download failed from is passed over.
+pub const FETCH_BACKOFF: Duration = Duration::from_secs(600);
 /// Peers kept in the table.
 pub const MAX_PEERS: usize = 64;
 /// Below this many live peers the node looks for more.
@@ -508,6 +516,16 @@ pub struct Peer {
     /// Answered one of our pings with its nonce: it really is at this
     /// address, so it may be served data.
     pub handshaken: bool,
+    /// When a block download from it was last abandoned. A pruned or
+    /// fast-synced peer has every header but not every old body.
+    pub failed_fetch: Option<Instant>,
+}
+
+impl Peer {
+    /// Whether a block download from it failed within [`FETCH_BACKOFF`].
+    fn recently_failed(&self, now: Instant) -> bool {
+        self.failed_fetch.is_some_and(|t| now.duration_since(t) < FETCH_BACKOFF)
+    }
 }
 
 /// The peer table.
@@ -563,6 +581,7 @@ impl Peers {
                 strikes: 0,
                 seed,
                 handshaken: false,
+                failed_fetch: None,
             },
         );
         true
@@ -633,6 +652,13 @@ impl Peers {
         }
     }
 
+    /// Notes that a block download from `addr` was abandoned.
+    pub fn fetch_failed(&mut self, addr: SocketAddr, now: Instant) {
+        if let Some(p) = self.map.get_mut(&addr) {
+            p.failed_fetch = Some(now);
+        }
+    }
+
     pub fn remove(&mut self, addr: &SocketAddr) {
         self.map.remove(addr);
     }
@@ -695,6 +721,31 @@ impl Peers {
         self.live(now).filter(|p| p.status.is_some_and(|s| s.work > work)).max_by_key(|p| p.status.unwrap().work)
     }
 
+    /// The live peer to sync blocks from, among those claiming more than
+    /// `work`: preferably one holding the body at `next`, the first height
+    /// we lack, and one no block download failed from within
+    /// [`FETCH_BACKOFF`]; then the most work.
+    pub fn best_source(&self, work: U256, next: u32, now: Instant) -> Option<&Peer> {
+        self.live(now)
+            .filter(|p| p.status.is_some_and(|s| s.work > work))
+            .max_by_key(|p| (p.status.unwrap().oldest <= next, !p.recently_failed(now), p.status.unwrap().work))
+    }
+
+    /// Where to fetch the block at `height` that `from` told us of: `from`
+    /// if it holds that body, else the live peer holding it that a
+    /// download failed from least recently, with the most work. `from` if
+    /// none is known to.
+    pub fn body_source(&self, height: u32, from: SocketAddr, now: Instant) -> SocketAddr {
+        let holds = |p: &Peer| p.status.is_some_and(|s| s.oldest <= height && height <= s.height);
+        if self.map.get(&from).is_some_and(|p| p.status.is_none_or(|s| s.oldest <= height) && !p.recently_failed(now)) {
+            return from;
+        }
+        self.live(now)
+            .filter(|p| holds(p))
+            .max_by_key(|p| (!p.recently_failed(now), p.status.unwrap().work))
+            .map_or(from, |p| p.addr)
+    }
+
     /// Loads addresses saved by [`Peers::save`], one per line.
     pub fn load(&mut self, path: &Path) -> std::io::Result<usize> {
         let text = match std::fs::read_to_string(path) {
@@ -754,9 +805,38 @@ mod tests {
             version: PROTOCOL_VERSION,
             genesis: digest(1),
             height: 42,
+            oldest: 5,
             tip: digest(2),
             work: U256([1, 2, 3, 4]),
         }
+    }
+
+    #[test]
+    fn bodies_are_sought_from_peers_that_hold_them() {
+        // a has every body to height 100; b more work, but bodies only
+        // from 90; c the least work above ours, everything.
+        let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) =
+            ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap(), "10.0.0.3:1".parse().unwrap());
+        let t0 = Instant::now();
+        let mut peers = Peers::new();
+        for (addr, oldest, height, work) in [(a, 1, 100, 10), (b, 90, 101, 11), (c, 1, 50, 6)] {
+            peers.add(addr, false);
+            peers.seen(addr, t0);
+            peers.set_status(addr, Status { oldest, height, work: U256([work, 0, 0, 0]), ..status() });
+        }
+        let ours = U256([5, 0, 0, 0]);
+        // Starting low: a holds the next body; past 90, b's work wins.
+        assert_eq!(peers.best_source(ours, 10, t0).map(|p| p.addr), Some(a));
+        assert_eq!(peers.best_source(ours, 95, t0).map(|p| p.addr), Some(b));
+        // A body b announced but lacks is fetched from a holder instead.
+        assert_eq!(peers.body_source(20, b, t0), a);
+        assert_eq!(peers.body_source(95, b, t0), b);
+        assert_eq!(peers.body_source(101, b, t0), b);
+        // A peer a download failed from is passed over while others hold it.
+        peers.fetch_failed(a, t0);
+        assert_eq!(peers.best_source(ours, 10, t0).map(|p| p.addr), Some(c));
+        assert_eq!(peers.body_source(20, a, t0), c);
+        assert_eq!(peers.body_source(20, a, t0 + FETCH_BACKOFF), a);
     }
 
     #[test]

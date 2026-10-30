@@ -217,6 +217,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
+    tabminer::parallel::limit_arenas();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

@@ -349,6 +349,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             version: PROTOCOL_VERSION,
             genesis: self.genesis,
             height: tip.map_or(0, |h| h.height),
+            oldest: self.chain.oldest_body().unwrap_or_else(|_| tip.map_or(1, |h| h.height + 1)),
             tip: tip.map_or(self.genesis, |h| h.hash()),
             work: self.chain.tip_work().unwrap_or(U256::ZERO),
         }
@@ -446,7 +447,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn sync(&mut self, now: Instant) {
         if self.downloads.is_empty() && self.wanted.is_empty() {
             let ours = self.chain.tip_work().unwrap_or(U256::ZERO);
-            if let Some(best) = self.peers.best_above(ours, now).map(|p| p.addr)
+            let next = self.chain.tip().ok().flatten().map_or(1, |h| h.height + 1);
+            if let Some(best) = self.peers.best_source(ours, next, now).map(|p| p.addr)
                 && self.last_sync.is_none_or(|t| now.duration_since(t) >= SYNC_INTERVAL)
             {
                 self.last_sync = Some(now);
@@ -478,6 +480,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             if self.have_block(&id) {
                 continue;
             }
+            let from = self.peers.body_source(header.height, from, now);
             self.start_download(Kind::Block, id, from, now);
         }
     }
@@ -520,9 +523,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.send(to, &msg);
         }
         for (id, from) in abandoned {
-            self.downloads.remove(&id);
+            let Some(d) = self.downloads.remove(&id) else { continue };
             self.peers.strike(from);
             self.log(&format!("gave up fetching {} from {from}", short(&id)));
+            if d.kind == Kind::Block {
+                // It may lack old bodies (pruned, or fast-synced): drop the
+                // rest of what it was to serve, and sync from another peer.
+                self.peers.fetch_failed(from, now);
+                self.wanted.retain(|(_, f)| *f != from);
+            }
         }
     }
 
@@ -870,6 +879,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
         }
+        crate::parallel::release_free_memory();
     }
 
     /// Pools a transaction and announces it if new.
@@ -1597,6 +1607,51 @@ mod tests {
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();
         hb.join().unwrap();
+    }
+
+    #[test]
+    fn a_peer_without_old_bodies_is_passed_over() {
+        // b fast-syncs from a, then takes a block of its own, three hours
+        // ahead so that no other node accepts it yet: b claims the most
+        // work but has no bodies below its snapshot. c starts from genesis
+        // knowing only b, hears of a from b, and must fetch the blocks from
+        // a.
+        let a = open("bodies-a");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=12u8 {
+            t += 600;
+            a.chain.apply_block(&mine(&a, tag, t), now).unwrap();
+        }
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let b = open("bodies-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a.chain.tip().unwrap().unwrap(), 30), "b did not fast-sync");
+        tx_b.send(Event::Stop).unwrap();
+        hb.join().unwrap();
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let ahead = now + 3 * 3600;
+        b.chain.apply_block(&mine(&b, 13, ahead), ahead).unwrap();
+        assert_eq!(b.chain.oldest_body().unwrap(), 8);
+
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+        let hb = std::thread::spawn(move || node_b.run());
+        let c = open("bodies-c");
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![addr_b], &c.dir)).unwrap();
+        let hc = std::thread::spawn(move || node_c.run());
+        assert!(wait_for_tip(&c.chain, &a_tip, 30), "c did not sync from a");
+        for (tx, h) in [(tx_a, ha), (tx_b, hb), (tx_c, hc)] {
+            tx.send(Event::Stop).unwrap();
+            h.join().unwrap();
+        }
     }
 
     #[test]

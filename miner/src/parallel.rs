@@ -19,6 +19,41 @@ pub fn threads() -> usize {
     })
 }
 
+/// Caps glibc's allocator arenas at two. glibc otherwise gives threads
+/// their own arenas, up to eight per core, and memory freed in one stays
+/// with it, fragmented: the scoped threads every block spawns left a
+/// following node holding over 700 MB, of which under 100 MB was in use.
+/// Proving is no slower. Call before any threads start; a no-op on other
+/// platforms.
+pub fn limit_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        const M_ARENA_MAX: i32 = -8;
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        // SAFETY: sets an allocator parameter; no allocation is in flight.
+        unsafe {
+            mallopt(M_ARENA_MAX, 2);
+        }
+    }
+}
+
+/// Returns freed heap memory to the system, for a long-running node after
+/// the burst of allocations a block brings. A no-op on other platforms.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: malloc_trim only releases free pages; it is thread safe.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
 /// Below this many items a loop runs serially.
 const MIN_PARALLEL: usize = 1024;
 
