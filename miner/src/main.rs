@@ -77,7 +77,7 @@ const USAGE: &str = "usage:
   --no-mine         follow the chain without mining (same as the node command)
 
 options:
-  --listen ADDR     UDP address to listen on (default 0.0.0.0:7417)
+  --listen ADDR     UDP address to listen on (default 0.0.0.0:3737)
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
   --no-seeds        do not contact the built-in seed nodes (for a local network)
