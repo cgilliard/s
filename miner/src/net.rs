@@ -47,8 +47,13 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
 pub const CHUNK_BYTES: usize = 1024;
-/// Chunks requested at once.
+/// Chunks named in one `GetChunks`, and in flight when a download starts.
 pub const WINDOW: usize = 32;
+/// Most chunks a download keeps in flight, asked in several `GetChunks`:
+/// the window doubles each time a whole one arrives without a retry, and
+/// halves when chunks go missing, so a fast path is filled and a lossy one
+/// is not flooded.
+pub const MAX_IN_FLIGHT: usize = 512;
 /// Headers per `Headers` message.
 pub const HEADERS_PER_MESSAGE: usize = 6;
 /// Most headers a `GetHeaders` is answered with, over several messages.
@@ -366,6 +371,11 @@ impl Message {
     }
 }
 
+/// `GetChunks` messages asking for `indexes`, [`WINDOW`] at a time.
+pub fn chunk_requests(kind: Kind, id: Digest, indexes: &[u16]) -> impl Iterator<Item = Message> + '_ {
+    indexes.chunks(WINDOW).map(move |c| Message::GetChunks { kind, id, indexes: c.to_vec() })
+}
+
 /// Number of chunks of a block of `len` bytes.
 pub fn chunk_count(len: u32) -> usize {
     (len as usize).div_ceil(CHUNK_BYTES)
@@ -410,6 +420,10 @@ pub struct Download {
     pub last_request: Instant,
     pub retries: u32,
     pub started: Instant,
+    /// Chunks kept in flight, from [`WINDOW`] to [`MAX_IN_FLIGHT`].
+    window: usize,
+    /// Chunks arrived since the window last grew.
+    delivered: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -434,6 +448,8 @@ impl Download {
             last_request: now,
             retries: 0,
             started: now,
+            window: WINDOW,
+            delivered: 0,
         }
     }
 
@@ -448,11 +464,12 @@ impl Download {
     }
 
     /// Missing indexes to request now: those not in flight, up to the free
-    /// part of the window. They become in flight.
+    /// part of the window. They become in flight. Send them with
+    /// [`chunk_requests`].
     pub fn request(&mut self, now: Instant) -> Vec<u16> {
-        let room = WINDOW.saturating_sub(self.in_flight.len());
+        let room = self.window.saturating_sub(self.in_flight.len());
         let fresh: Vec<u16> = self
-            .missing(WINDOW + self.in_flight.len())
+            .missing(self.window + self.in_flight.len())
             .into_iter()
             .filter(|i| !self.in_flight.contains(i))
             .take(room)
@@ -464,13 +481,21 @@ impl Download {
         fresh
     }
 
-    /// Forgets what is in flight, so the next request repeats it.
+    /// Forgets what is in flight, so the next request repeats it: chunks
+    /// went missing, so the window halves.
     pub fn reset_window(&mut self) {
         self.in_flight.clear();
+        self.window = (self.window / 2).max(WINDOW);
+        self.delivered = 0;
     }
 
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Whether enough of the window has arrived to ask for more: half.
+    pub fn wants_refill(&self) -> bool {
+        self.in_flight.len() <= self.window / 2
     }
 
     /// Records a chunk; `Ok(true)` when the block is complete.
@@ -495,6 +520,11 @@ impl Download {
             self.chunks[i] = Some(data);
             self.last_progress = now;
             self.retries = 0;
+            self.delivered += 1;
+            if self.delivered >= self.window && self.window < MAX_IN_FLIGHT {
+                self.window = (self.window * 2).min(MAX_IN_FLIGHT);
+                self.delivered = 0;
+            }
         }
         self.in_flight.retain(|&j| j != index);
         Ok(self.chunks.iter().all(Option::is_some))
@@ -937,6 +967,44 @@ mod tests {
             tip: digest(2),
             work: U256([1, 2, 3, 4]),
         }
+    }
+
+    #[test]
+    fn the_window_grows_while_whole_and_halves_on_loss() {
+        let t = Instant::now();
+        let len = (CHUNK_BYTES * 4000) as u32;
+        let mut d = Download::new(Kind::Part(0), digest(1), "10.0.0.1:1".parse().unwrap(), len as usize, t);
+        let chunk = vec![0u8; CHUNK_BYTES];
+        let mut next = 0u16;
+        let mut deliver = |d: &mut Download, n: usize| {
+            for _ in 0..n {
+                d.insert(len, next, chunk.clone(), t).unwrap();
+                next += 1;
+            }
+        };
+        assert_eq!(d.request(t).len(), WINDOW);
+        deliver(&mut d, WINDOW);
+        // A whole window arrived: the next asks for twice as many, in
+        // messages of at most WINDOW indexes.
+        let asked = d.request(t);
+        assert_eq!(asked.len(), 2 * WINDOW);
+        assert_eq!(chunk_requests(Kind::Part(0), digest(1), &asked).count(), 2);
+        deliver(&mut d, 2 * WINDOW);
+        assert_eq!(d.request(t).len(), 4 * WINDOW);
+        deliver(&mut d, 4 * WINDOW);
+        for _ in 0..4 {
+            d.request(t);
+            let n = d.in_flight();
+            deliver(&mut d, n);
+        }
+        assert_eq!(d.request(t).len(), MAX_IN_FLIGHT);
+        // Chunks went missing: half the window, and so on down to WINDOW.
+        d.reset_window();
+        assert_eq!(d.request(t).len(), MAX_IN_FLIGHT / 2);
+        for _ in 0..8 {
+            d.reset_window();
+        }
+        assert_eq!(d.request(t).len(), WINDOW);
     }
 
     #[test]

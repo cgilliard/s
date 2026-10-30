@@ -90,6 +90,16 @@ on meanwhile. A fast sync of a 1,487-block chain from three peers took
 38 s on a first start, 29 s of it building the dataset, against 92 s
 before. Transaction announcements are ignored until a node has caught up.
 
+The state comes in parts of 16,384 positions, up to 32 at once from every
+peer that can serve them. Each download keeps 32 chunks in flight at first
+and doubles that each time a whole window arrives without a retry, up to
+512, halving when chunks go missing; parts are checked against their roots
+and stored on the applier thread, so the network goes on meanwhile. A fast
+sync of 2.16 million unspent outputs (155 MB) from three peers at 80 ms
+round trips installed the state in 8.6 s, against 57 s with 32 chunks and
+16 parts in flight, and reached the tip, 156 full blocks on, in 29 s
+rather than 90 s.
+
 Nodes take a snapshot after every block whose height is a multiple of 144
 and keep the newest three; fast sync uses the newest one at least
 `--sync-point` deep. A snapshot stores only its manifest (the output

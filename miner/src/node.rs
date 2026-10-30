@@ -13,11 +13,11 @@
 //! and the lowest height from which it holds every block. Only peers that
 //! answered our own ping are believed. While any claims more work than our
 //! best header, headers are fetched in batches by height
-//! (`GetHeadersFrom`, [`MAX_HEADERS`] each), up to [`HEADER_BATCHES`] at
+//! (`GetHeadersFrom`, [`MAX_HEADERS`] each), up to `HEADER_BATCHES` at
 //! once, each from a different such peer; complete batches are checked
 //! (proof of work, in parallel, difficulty, timestamps) and stored in
 //! order, so a slow peer delays only its share, and a batch late by
-//! [`BATCH_TIMEOUT`] goes to another peer. A batch that does not follow
+//! `BATCH_TIMEOUT` goes to another peer. A batch that does not follow
 //! our best header means a fork: a locator (`GetHeaders`) finds where. A
 //! peer that sends no header we lack within [`net::HEADER_TIMEOUT`] is not
 //! believed for a while, so a false claim cannot stall the sync.
@@ -52,8 +52,13 @@
 //! block's state root. The block's proof, a chain proof, is checked
 //! against the counter: it shows that block and every one before it valid,
 //! so nothing about the past is trusted. The parts come from every peer
-//! that can serve them, in parallel, each checked against its root; the
-//! snapshot is installed and ordinary sync fetches the blocks after it.
+//! that can serve them, `MAX_PART_DOWNLOADS` at once, and are checked
+//! against their roots and stored on the applier thread; the snapshot is
+//! installed and ordinary sync fetches the blocks after it.
+//!
+//! Every transfer keeps [`net::WINDOW`] chunks in flight at first and
+//! doubles that each time a whole window arrives without a retry, up to
+//! [`net::MAX_IN_FLIGHT`], halving when chunks go missing.
 //!
 //! # Seeds
 //!
@@ -133,7 +138,7 @@ pub struct Config {
 /// Default depth of the fast-sync snapshot: a day of blocks.
 pub const DEFAULT_SYNC_POINT: u32 = 144;
 /// Snapshot parts fetched at once.
-const MAX_PART_DOWNLOADS: usize = 16;
+const MAX_PART_DOWNLOADS: usize = 32;
 /// Snapshot objects kept for serving.
 const SERVED_SNAPSHOTS: usize = 8;
 /// Failed snapshot attempts before validating from genesis instead.
@@ -169,6 +174,8 @@ struct Snap {
     /// Peers that did not serve something of this snapshot: perhaps they
     /// do not keep it. Asked again only if no other can be.
     unserved: std::collections::HashSet<SocketAddr>,
+    /// Parts fetched and with the applier, being checked and stored.
+    staging: std::collections::HashSet<u32>,
 }
 
 /// What the node's loop consumes.
@@ -196,9 +203,22 @@ struct HeaderBatch {
 }
 
 /// A block handed to the applier thread, with who sent it.
-type Job = (Block, Option<SocketAddr>);
+enum Job {
+    Block(Block, Option<SocketAddr>),
+    /// A fast-sync part, checked against its manifest root and stored.
+    Part {
+        index: u32,
+        bytes: Vec<u8>,
+        next: u64,
+        root: Digest,
+        from: SocketAddr,
+    },
+}
 /// What applying it gave.
-type Outcome = (Block, Option<SocketAddr>, Result<Applied, ChainError>);
+enum Outcome {
+    Block(Box<Block>, Option<SocketAddr>, Result<Applied, ChainError>),
+    Part { index: u32, from: SocketAddr, result: Result<(), ChainError> },
+}
 
 /// A snapshot of the node for the prompt, refreshed every second.
 #[derive(Clone, Debug, Default)]
@@ -280,6 +300,31 @@ fn short(d: &Digest) -> String {
     crate::poseidon2::digest_to_bytes(d).iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
+/// Asks for 4 MB socket buffers, so bursts of chunks are not dropped while
+/// the reader thread catches up. The kernel caps them (`net.core.rmem_max`
+/// and `wmem_max`) for an unprivileged process.
+fn enlarge_buffers(socket: &UdpSocket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn setsockopt(fd: i32, level: i32, name: i32, value: *const std::ffi::c_void, len: u32) -> i32;
+        }
+        const SOL_SOCKET: i32 = 1;
+        const SO_SNDBUF: i32 = 7;
+        const SO_RCVBUF: i32 = 8;
+        let size: i32 = 4 << 20;
+        for name in [SO_RCVBUF, SO_SNDBUF] {
+            // SAFETY: a valid socket and a pointer to an int of the size given.
+            unsafe {
+                setsockopt(socket.as_raw_fd(), SOL_SOCKET, name, (&size as *const i32).cast(), 4);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = socket;
+}
+
 /// Re-requests the window of downloads that stalled; returns the requests
 /// to send and the downloads to give up: no progress after
 /// [`net::MAX_RETRIES`] retries, or, for a block, crawling.
@@ -301,7 +346,7 @@ fn stalled(downloads: &mut HashMap<Digest, Download>, now: Instant) -> (Vec<(Soc
         } else {
             d.reset_window();
             let indexes = d.request(now);
-            requests.push((d.from, Message::GetChunks { kind: d.kind, id: d.id, indexes }));
+            requests.extend(net::chunk_requests(d.kind, d.id, &indexes).map(|m| (d.from, m)));
         }
     }
     (requests, abandoned)
@@ -317,6 +362,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         config: Config,
     ) -> std::io::Result<(Node<V>, SyncSender<Event>)> {
         let socket = UdpSocket::bind(config.listen)?;
+        enlarge_buffers(&socket);
         let genesis = chain
             .header_at(0)
             .map_err(std::io::Error::other)?
@@ -360,18 +406,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
         })?;
-        // The applier: blocks are applied, in the order handed over, on a
-        // thread of their own, so the network goes on meanwhile.
+        // The applier: blocks are applied, and fast-sync parts checked and
+        // stored, in the order handed over, on a thread of their own, so
+        // the network goes on meanwhile.
         let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
         let (outcome_tx, outcomes) = std::sync::mpsc::channel::<Outcome>();
         let applier = {
             let chain = Arc::clone(&chain);
             let wake = tx.clone();
             std::thread::Builder::new().name("applier".into()).spawn(move || {
-                for (block, from) in job_rx {
-                    let result = chain.apply_block(&block, unix_now());
-                    crate::parallel::release_free_memory();
-                    if outcome_tx.send((block, from, result)).is_err() {
+                for job in job_rx {
+                    let outcome = match job {
+                        Job::Block(block, from) => {
+                            let result = chain.apply_block(&block, unix_now());
+                            crate::parallel::release_free_memory();
+                            Outcome::Block(Box::new(block), from, result)
+                        }
+                        Job::Part { index, bytes, next, root, from } => {
+                            let result = match net::decode_part(&bytes) {
+                                Some(outputs) => {
+                                    chain.stage_snapshot_part(index as u64, &outputs, next, Some(&root)).map(|_| ())
+                                }
+                                None => Err(ChainError::BadSnapshot),
+                            };
+                            Outcome::Part { index, from, result }
+                        }
+                    };
+                    if outcome_tx.send(outcome).is_err() {
                         break;
                     }
                     let _ = wake.try_send(Event::Wake);
@@ -456,7 +517,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             }
             while let Ok(outcome) = self.outcomes.try_recv() {
-                self.on_applied(outcome);
+                self.on_outcome(outcome);
             }
             let now = Instant::now();
             self.retry_downloads(now);
@@ -611,7 +672,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// The header pipeline: verifies the complete batches at the best
     /// header in order, gives late ones to other peers, and asks for more,
-    /// up to [`HEADER_BATCHES`] ahead, each of a different peer claiming
+    /// up to `HEADER_BATCHES` ahead, each of a different peer claiming
     /// more work, so one slow peer slows only its own share.
     fn pump_headers(&mut self, now: Instant) {
         if self.mode == Mode::Snapshot {
@@ -1149,10 +1210,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match d.insert(len, index, data, now) {
             Ok(false) => {
                 // Refill the window once half of it has arrived.
-                if d.in_flight() <= WINDOW / 2 {
+                if d.wants_refill() {
                     let indexes = d.request(now);
-                    if !indexes.is_empty() {
-                        self.send(from, &Message::GetChunks { kind, id, indexes });
+                    for msg in net::chunk_requests(kind, id, &indexes) {
+                        self.send(from, &msg);
                     }
                 }
             }
@@ -1206,13 +1267,41 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         }
         if let Some(jobs) = &self.jobs {
-            let _ = jobs.send((block, from));
+            let _ = jobs.send(Job::Block(block, from));
         }
     }
 
     /// A block applied: announces a new tip, and hands over the fetched
     /// blocks that were waiting for it.
-    fn on_applied(&mut self, (block, from, result): Outcome) {
+    fn on_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Block(block, from, result) => self.on_applied(*block, from, result),
+            Outcome::Part { index, from, result } => self.on_part_staged(index, from, result),
+        }
+    }
+
+    /// A fast-sync part checked and stored, or refused.
+    fn on_part_staged(&mut self, index: u32, from: SocketAddr, result: Result<(), ChainError>) {
+        let Some(snap) = self.snap.as_mut() else { return };
+        if !snap.staging.remove(&index) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                if let Some(p) = snap.parts.get_mut(index as usize) {
+                    *p = true;
+                }
+            }
+            Err(e) => {
+                self.log(&format!("fast sync: part {index} from {from} refused: {e}"));
+                self.peers.strike(from);
+                self.peers.fetch_failed(from, Instant::now());
+            }
+        }
+        self.snapshot_sync(Instant::now());
+    }
+
+    fn on_applied(&mut self, block: Block, from: Option<SocketAddr>, result: Result<Applied, ChainError>) {
         let id = block.header.hash();
         let height = block.header.height;
         self.applying.remove(&id);
@@ -1406,6 +1495,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             manifest_from: None,
             bad_manifests: 0,
             unserved: std::collections::HashSet::new(),
+            staging: std::collections::HashSet::new(),
         });
         self.mode = Mode::Snapshot;
         self.snapshot_sync(now);
@@ -1503,15 +1593,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
         }
-        let missing: Vec<u32> = match self.snap.as_ref() {
-            Some(s) if s.verified => s.parts.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i as u32).collect(),
+        let (done, staging, missing): (bool, usize, Vec<u32>) = match self.snap.as_ref() {
+            Some(s) if s.verified => (
+                s.parts.iter().all(|p| *p),
+                s.staging.len(),
+                s.parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, p)| !**p && !s.staging.contains(&(*i as u32)))
+                    .map(|(i, _)| i as u32)
+                    .collect(),
+            ),
             _ => return,
         };
-        if missing.is_empty() {
+        if done {
             return self.install_snapshot();
         }
         for i in missing {
-            if self.snap_downloads.len() >= MAX_PART_DOWNLOADS {
+            // Parts waiting for the applier count too, so a slow disk
+            // bounds what is held in memory.
+            if self.snap_downloads.len() + staging >= MAX_PART_DOWNLOADS {
                 break;
             }
             self.start_snapshot_download(Kind::Part(i), now);
@@ -1546,6 +1647,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Drops what was fetched and starts the snapshot again from other
     /// peers, or gives up on fast sync after a few attempts.
     fn restart_snapshot(&mut self, why: &str) {
+        // Parts still with the applier belong to this attempt: let them
+        // land before the partial state is cleared.
+        while self.snap.as_ref().is_some_and(|s| !s.staging.is_empty()) {
+            match self.outcomes.recv() {
+                Ok(Outcome::Part { index, .. }) => {
+                    self.snap.as_mut().unwrap().staging.remove(&index);
+                }
+                Ok(Outcome::Block(b, f, r)) => self.on_applied(*b, f, r),
+                Err(_) => break,
+            }
+        }
         self.snap_attempts += 1;
         self.snap_downloads.clear();
         if let Err(e) = self.chain.abort_snapshot() {
@@ -1586,7 +1698,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             } else {
                 d.reset_window();
                 let indexes = d.request(now);
-                requests.push((d.from, Message::GetChunks { kind: *kind, id: d.id, indexes }));
+                requests.extend(net::chunk_requests(*kind, d.id, &indexes).map(|m| (d.from, m)));
             }
         }
         for (to, msg) in requests {
@@ -1620,10 +1732,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         match d.insert(len, index, data, now) {
             Ok(false) => {
-                if d.in_flight() <= WINDOW / 2 {
+                if d.wants_refill() {
                     let indexes = d.request(now);
-                    if !indexes.is_empty() {
-                        self.send(from, &Message::GetChunks { kind, id, indexes });
+                    for msg in net::chunk_requests(kind, id, &indexes) {
+                        self.send(from, &msg);
                     }
                 }
             }
@@ -1678,29 +1790,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let (Some((next, roots)), true) = (snap.manifest.as_ref(), snap.verified) else {
                     return true;
                 };
-                if snap.parts.get(i as usize).is_none_or(|p| *p) {
+                if snap.parts.get(i as usize).is_none_or(|p| *p) || snap.staging.contains(&i) {
                     return true;
                 }
-                let Some(outputs) = net::decode_part(bytes) else {
+                let Some(&root) = roots.get(i as usize) else {
                     return false;
                 };
-                let first = (i as u64) << SNAPSHOT_PART_LOG;
-                let end = (first + (1 << SNAPSHOT_PART_LOG)).min(*next);
-                let ordered = outputs.windows(2).all(|w| w[0].0 < w[1].0);
-                let in_range = outputs.iter().all(|o| o.0 >= first && o.0 < end);
-                let leaves: Vec<(u64, Digest)> =
-                    outputs.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
-                let Some(root) = roots.get(i as usize) else {
-                    return false;
-                };
-                if !ordered || !in_range || crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, first, &leaves) != *root
-                {
-                    return false;
-                }
-                // Straight to the database: one part in memory at a time.
-                match self.chain.stage_snapshot_part(i as u64, &outputs, *next) {
-                    Ok(_) => snap.parts[i as usize] = true,
-                    Err(e) => self.log(&format!("fast sync: storing part {i}: {e}")),
+                // Checked against its root and stored on the applier
+                // thread, hashed once, while the network goes on; one
+                // part's outputs in memory there at a time.
+                let next = *next;
+                snap.staging.insert(i);
+                if let Some(jobs) = &self.jobs {
+                    let _ = jobs.send(Job::Part { index: i, bytes: bytes.to_vec(), next, root, from });
                 }
                 true
             }

@@ -1404,7 +1404,7 @@ impl<V: ProofVerifier> Chain<V> {
             let mut rest = outputs;
             for p in 0..parts {
                 let n = rest.iter().take_while(|o| o.0 >> SNAPSHOT_PART_LOG == p).count();
-                roots.push(self.stage_snapshot_part(p, &rest[..n], next_position)?);
+                roots.push(self.stage_snapshot_part(p, &rest[..n], next_position, None)?);
                 rest = &rest[n..];
             }
             self.finish_snapshot(block, &roots, next_position)
@@ -1462,14 +1462,16 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Stores snapshot part `part`: its unspent outputs, ascending, all in
-    /// the part and below `next_position`. Returns the part's root, which
-    /// the caller has checked against the manifest. Each part is its own
-    /// transaction, so memory stays bounded by one part.
+    /// the part and below `next_position`. Returns the part's root; with
+    /// `expected` (the manifest's), a part with another root is refused
+    /// and nothing stored. Each part is its own transaction, so memory
+    /// stays bounded by one part.
     pub fn stage_snapshot_part(
         &self,
         part: u64,
         outputs: &[(u64, Commitment, Memo)],
         next_position: u64,
+        expected: Option<&Digest>,
     ) -> Result<Digest> {
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
@@ -1479,6 +1481,9 @@ impl<V: ProofVerifier> Chain<V> {
             .utxo
             .stage(&mut wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position)
             .map_err(|_| ChainError::BadSnapshot)?;
+        if expected.is_some_and(|e| *e != root) {
+            return Err(ChainError::BadSnapshot);
+        }
         wtxn.commit()?;
         Ok(root)
     }
@@ -2641,7 +2646,10 @@ mod tests {
         b.chain.begin_snapshot().unwrap();
         assert!(matches!(b.chain.apply_block(&blocks[8], t + 1), Err(ChainError::SnapshotInProgress)));
         assert!(matches!(b.chain.finish_snapshot(&blocks[7], &roots, next), Err(ChainError::BadSnapshot)));
-        assert_eq!(b.chain.stage_snapshot_part(0, &part, next).unwrap(), roots[0]);
+        let mut wrong = roots[0];
+        wrong[0] += crate::poseidon2::Fp::ONE;
+        assert!(matches!(b.chain.stage_snapshot_part(0, &part, next, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        assert_eq!(b.chain.stage_snapshot_part(0, &part, next, Some(&roots[0])).unwrap(), roots[0]);
         b.chain.finish_snapshot(&blocks[7], &roots, next).unwrap();
         assert!(!b.chain.staging().unwrap());
         assert_eq!(b.chain.utxo().len(&b.chain.env().read_txn().unwrap()).unwrap(), 10);
@@ -2652,7 +2660,7 @@ mod tests {
             d.accept_header(&block.header, t + 1).unwrap();
         }
         d.begin_snapshot().unwrap();
-        d.stage_snapshot_part(0, &part, next).unwrap();
+        d.stage_snapshot_part(0, &part, next, None).unwrap();
         drop(d);
         let d = Chain::open(&d_dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
         assert!(!d.staging().unwrap());
