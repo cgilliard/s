@@ -66,16 +66,36 @@ verifies that block's chain proof, downloads the state after it from its
 peers in parallel parts (each checked against the block's state root, memos
 included, and written to disk as it arrives, so memory stays small whatever
 the state's size; a node stopped midway starts the state over cleanly), and
-then follows the chain block by block. Nothing about the past
-is taken on trust. `--sync-point 0` replays every block instead, which needs
-a peer that keeps every body (`--max-undo-blocks 0`). A miner waits until its
-node has caught up before mining.
+then fetches the blocks after it. Nothing about the past is taken on trust.
+`--sync-point 0` replays every block instead, which needs a peer that keeps
+every body (`--max-undo-blocks 0`). A miner waits until its node has caught
+up before mining.
 
-Nodes keep undo records and block bodies, which reorganizations and snapshot
-serving need, for the last `--max-undo-blocks` blocks (1008 by default, a
-week); older blocks keep only their headers, since every later chain proof
-covers them. A reorganization deeper than that is refused.
-`--max-undo-blocks 0` keeps everything, for an archive node.
+Catching up, a node checks and stores headers first and only then fetches
+blocks, from several peers at once (up to 24 blocks, 8 from any one peer,
+and no more than 32 past the first one missing), applying them in order.
+Each peer's status says the lowest height from which it holds every block,
+so blocks are only asked of peers that have them. A peer that claims more
+work but sends no headers for it, or whose downloads stall or crawl, is
+passed over for ten minutes, and only peers that answered the node's own
+ping are believed at all. Replaying 60 full blocks over links with 80 ms
+round trips took 20 s from three peers and 30 s from one, against about
+60 s before; blocks are applied on a thread of their own, so downloads go
+on meanwhile.
+
+Nodes take a snapshot after every block whose height is a multiple of 144
+and keep the newest three; fast sync uses the newest one at least
+`--sync-point` deep. A snapshot stores only its manifest (the output
+counter and each part's root, read from the state tree when the block
+connects) and, as later blocks spend outputs it holds, those outputs. A
+part is served from the outputs unspent now in its range plus those, so
+serving costs a range read, whatever the request.
+
+Nodes keep undo records and block bodies, which reorganizations need, for
+the last `--max-undo-blocks` blocks (1008 by default, a week); older blocks
+keep only their headers, since every later chain proof covers them. A
+reorganization deeper than that is refused. `--max-undo-blocks 0` keeps
+everything, for an archive node.
 
 ## Storage
 

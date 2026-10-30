@@ -235,6 +235,7 @@ mod tests {
             median_time_window: 11,
             emission: &[(1000, 50)],
             aggregator: crate::aggregate::AggregatorParams::MAINNET,
+            snapshot_interval: 4,
         }
     }
 

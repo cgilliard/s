@@ -45,12 +45,11 @@
 //! commitments. That, the signatures and the commitment preimages are the
 //! proof's job.
 
-use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use heed::byteorder::LittleEndian;
-use heed::types::{Bytes, Str, U32};
+use heed::byteorder::{BigEndian, LittleEndian};
+use heed::types::{Bytes, Str, U32, U64};
 use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::aggregate::AggregatorParams;
@@ -104,6 +103,9 @@ pub struct ChainParams {
     pub emission: &'static [(u32, u64)],
     /// Parameters of the block validity proof.
     pub aggregator: AggregatorParams,
+    /// Snapshots of the state are taken after every block at a multiple of
+    /// this height, and only those are served for fast sync.
+    pub snapshot_interval: u32,
 }
 
 impl ChainParams {
@@ -118,6 +120,7 @@ impl ChainParams {
         median_time_window: 11,
         emission: MAINNET_EMISSION,
         aggregator: AggregatorParams::MAINNET,
+        snapshot_interval: 144,
     };
 
     /// Subsidy paid by the block at `height`: zero for genesis and above
@@ -453,9 +456,9 @@ impl Undo {
     }
 }
 
-/// The state after a main-chain block, as a snapshot serves it: the output
-/// counter then, and the outputs spent since, by position.
-type SnapshotState = (u64, BTreeMap<u64, (Commitment, Memo)>);
+/// Snapshots kept for serving, the newest: a node fast-syncing from one
+/// has at least two intervals to fetch it before it is dropped.
+pub const SNAPSHOTS_KEPT: usize = 3;
 
 /// Persistent chain state.
 pub struct Chain<V: ProofVerifier> {
@@ -473,9 +476,18 @@ pub struct Chain<V: ProofVerifier> {
     meta: Database<Str, Bytes>,
     /// Undo records kept, counting back from the tip; `None` keeps all.
     max_undo: Option<u32>,
-    /// The last snapshot state served: block id, tip id, state.
-    #[allow(clippy::type_complexity)]
-    snapshot_cache: Mutex<Option<(Digest, Digest, Arc<SnapshotState>)>>,
+    /// Snapshot taken after the main-chain block at each kept height
+    /// ([`ChainParams::snapshot_interval`]): its id, the output counter and
+    /// the root of every part, as a manifest serves them.
+    snapshots: Database<U32<BigEndian>, Bytes>,
+    /// Outputs that existed at a kept snapshot and were spent since, by
+    /// position: the height spending it, commitment and memo. A snapshot's
+    /// part is the outputs unspent now in its range, plus these.
+    snapshot_spent: Database<U64<BigEndian>, Bytes>,
+    /// The best header's branch above the main chain, oldest first, as
+    /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
+    /// rather than walked again.
+    branch: Mutex<Vec<Header>>,
 }
 
 /// Default undo window: a week of blocks.
@@ -509,6 +521,8 @@ impl<V: ProofVerifier> Chain<V> {
         let undo = env.create_database(&mut wtxn, Some("undo"))?;
         let by_height = env.create_database(&mut wtxn, Some("by_height"))?;
         let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
+        let snapshots = env.create_database(&mut wtxn, Some("snapshots"))?;
+        let snapshot_spent = env.create_database(&mut wtxn, Some("snapshot_spent"))?;
         match meta.get(&wtxn, META_FORMAT)? {
             Some([FORMAT]) => {}
             Some(_) => return Err(ChainError::OldFormat),
@@ -529,7 +543,9 @@ impl<V: ProofVerifier> Chain<V> {
             by_height,
             meta,
             max_undo: Some(DEFAULT_MAX_UNDO),
-            snapshot_cache: Mutex::new(None),
+            snapshots,
+            snapshot_spent,
+            branch: Mutex::new(Vec::new()),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
         chain.abort_snapshot()?;
@@ -666,6 +682,17 @@ impl<V: ProofVerifier> Chain<V> {
         };
         let undo = Undo::from_bytes(undo).ok_or(ChainError::Corrupt("undo record"))?;
         Ok(Some((header.hash(), undo.first_output_position, body.outputs)))
+    }
+
+    /// A stored block's serialization, as [`Block::to_bytes`] gives it,
+    /// copied out without decoding: for serving.
+    pub fn block_bytes(&self, hash: &Digest) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        let id = digest_bytes(hash);
+        match (self.headers.get(&rtxn, &id)?, self.bodies.get(&rtxn, &id)?) {
+            (Some(header), Some(body)) => Ok(Some([header, body].concat())),
+            _ => Ok(None),
+        }
     }
 
     /// A stored valid block, header and body, by id.
@@ -972,11 +999,15 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let work = self.entry_in(wtxn, &header.hash())?.ok_or(ChainError::Corrupt("connecting unknown block"))?.work;
         self.put_index(wtxn, &id, work, STATUS_VALID)?;
-        let spent = body.inputs.iter().zip(spent).map(|(&p, (c, m))| (p, c, m)).collect();
+        let spent: Vec<(u64, Commitment, Memo)> = body.inputs.iter().zip(spent).map(|(&p, (c, m))| (p, c, m)).collect();
+        self.record_snapshot_spends(wtxn, header.height, &spent)?;
         let outputs = body.outputs.len() as u32;
         self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, spent }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
+        if header.height.is_multiple_of(self.params.snapshot_interval) {
+            self.take_snapshot(wtxn, header)?;
+        }
         // The block leaving the undo window keeps only its header.
         if let Some(keep) = self.max_undo
             && header.height > keep
@@ -1027,6 +1058,10 @@ impl<V: ProofVerifier> Chain<V> {
         let commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
         self.utxo.restore(wtxn, &undo.spent)?;
+        for (p, _, _) in &undo.spent {
+            self.snapshot_spent.delete(wtxn, p)?;
+        }
+        self.snapshots.delete(wtxn, &height)?;
         let parent = self
             .header_by_hash_in(wtxn, &digest_bytes(&header.prev_hash))?
             .ok_or(ChainError::Corrupt("parent of main-chain block"))?;
@@ -1081,13 +1116,23 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Checks a header against its stored parent (proof of work,
-    /// difficulty, timestamps) and stores it without a body, for a fast
-    /// sync. Returns whether it was new.
+    /// difficulty, timestamps) and stores it without a body, so that its
+    /// block can be fetched once its branch has the most work. Returns
+    /// whether it was new. A known header can still become the best one,
+    /// after a branch above an invalid block was dropped.
     pub fn accept_header(&self, header: &Header, now: u64) -> Result<bool> {
         let mut wtxn = self.env.write_txn()?;
         let id = digest_bytes(&header.hash());
         if let Some(e) = self.entry_in(&wtxn, &header.hash())? {
-            return if e.invalid { Err(ChainError::KnownInvalid) } else { Ok(false) };
+            if e.invalid {
+                return Err(ChainError::KnownInvalid);
+            }
+            let best = self.best_header_in(&wtxn)?;
+            if e.work > self.entry_in(&wtxn, &best.hash())?.map_or(U256::ZERO, |b| b.work) {
+                self.meta.put(&mut wtxn, META_BEST_HEADER, &id)?;
+                wtxn.commit()?;
+            }
+            return Ok(false);
         }
         let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
         let work = match self.check_header_rules(&wtxn, header, &parent, now) {
@@ -1128,6 +1173,67 @@ impl<V: ProofVerifier> Chain<V> {
         let rtxn = self.env.read_txn()?;
         let best = self.best_header_in(&rtxn)?;
         Ok(self.entry_in(&rtxn, &best.hash())?.map_or(U256::ZERO, |e| e.work))
+    }
+
+    /// The first `max` blocks, oldest first, whose bodies are still needed
+    /// to reach the best header: those on its branch above the main chain
+    /// that are stored as headers alone. If the branch runs through an
+    /// invalid block, it is dropped as the best header (the tip is the best
+    /// again until a peer offers another) and nothing is returned.
+    ///
+    /// The branch is kept between calls: blocks joining the main chain
+    /// leave its front and new headers join its end, so a call costs about
+    /// what changed, not the branch's length.
+    pub fn missing_bodies(&self, max: usize) -> Result<Vec<Header>> {
+        let rtxn = self.env.read_txn()?;
+        let best = self.best_header_in(&rtxn)?;
+        let mut branch = self.branch.lock().unwrap();
+        let joined = branch.iter().take_while(|h| self.is_main_in(&rtxn, h).unwrap_or(false)).count();
+        branch.drain(..joined);
+        // Still a branch off the main chain, ending where the best was?
+        let rooted = match branch.first() {
+            Some(first) => {
+                let parent = self.header_by_hash_in(&rtxn, &digest_bytes(&first.prev_hash))?;
+                parent.is_some_and(|p| self.is_main_in(&rtxn, &p).unwrap_or(false))
+            }
+            None => true,
+        };
+        if !rooted {
+            branch.clear();
+        }
+        let end = branch.last().map(|h| h.hash());
+        let mut fresh = Vec::new();
+        let mut h = best;
+        while Some(h.hash()) != end && !self.is_main_in(&rtxn, &h)? {
+            fresh.push(h);
+            h = self
+                .header_by_hash_in(&rtxn, &digest_bytes(&h.prev_hash))?
+                .ok_or(ChainError::Corrupt("best branch parent"))?;
+        }
+        if Some(h.hash()) != end {
+            // The best header left the cached branch: start again from it.
+            branch.clear();
+        }
+        branch.extend(fresh.into_iter().rev());
+        let mut out = Vec::new();
+        for h in branch.iter() {
+            if out.len() == max {
+                break;
+            }
+            let e = self.entry_in(&rtxn, &h.hash())?.ok_or(ChainError::Corrupt("best branch header"))?;
+            if e.invalid {
+                branch.clear();
+                drop(rtxn);
+                let mut wtxn = self.env.write_txn()?;
+                self.meta.delete(&mut wtxn, META_BEST_HEADER)?;
+                wtxn.commit()?;
+                return Ok(vec![]);
+            }
+            if e.header_only {
+                out.push(*h);
+            }
+        }
+        Ok(out)
     }
 
     /// The ancestor at `height` of the stored header `from`.
@@ -1236,6 +1342,8 @@ impl<V: ProofVerifier> Chain<V> {
             ("heights", self.by_height.stat(&rtxn)?),
             ("bodies", self.bodies.stat(&rtxn)?),
             ("undo", self.undo.stat(&rtxn)?),
+            ("snapshots", self.snapshots.stat(&rtxn)?),
+            ("snapshot spends", self.snapshot_spent.stat(&rtxn)?),
         ] {
             rows.push((name, size(stat), stat.entries));
         }
@@ -1339,115 +1447,130 @@ impl<V: ProofVerifier> Chain<V> {
         self.meta.put(&mut wtxn, META_TIP, &id)?;
         self.meta.put(&mut wtxn, META_FLOOR, &header.height.to_le_bytes())?;
         self.meta.put(&mut wtxn, META_FLOOR_NEXT, &next_position.to_le_bytes())?;
+        if header.height.is_multiple_of(self.params.snapshot_interval) {
+            self.put_snapshot(&mut wtxn, &header, next_position, roots)?;
+        }
         wtxn.commit()?;
         Ok(())
     }
 
-    /// The state after the main-chain block `id`: its output counter and
-    /// the outputs spent since, to restore. `None` if the block is not on
-    /// the main chain or older than this node's undo records. Read from
-    /// undo records alone, and kept until the tip moves, so serving every
-    /// part of a snapshot costs one pass.
-    fn state_after(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<Arc<SnapshotState>>> {
+    /// Records the outputs block `height` spent that a kept snapshot holds:
+    /// those below the newest snapshot's output counter.
+    fn record_snapshot_spends(&self, wtxn: &mut RwTxn, height: u32, spent: &[(u64, Commitment, Memo)]) -> Result<()> {
+        let Some((_, newest)) = self.snapshots.last(wtxn)? else {
+            return Ok(());
+        };
+        let next = u64::from_le_bytes(newest[32..40].try_into().map_err(|_| ChainError::Corrupt("snapshot"))?);
+        let mut value = [0u8; 68];
+        for (p, c, m) in spent.iter().filter(|o| o.0 < next) {
+            value[..4].copy_from_slice(&height.to_le_bytes());
+            value[4..36].copy_from_slice(&digest_bytes(c));
+            value[36..].copy_from_slice(&digest_bytes(m));
+            self.snapshot_spent.put(wtxn, p, &value)?;
+        }
+        Ok(())
+    }
+
+    /// Takes the snapshot after `header`, just connected: the roots of its
+    /// parts are read from the state tree as it stands.
+    fn take_snapshot(&self, wtxn: &mut RwTxn, header: &Header) -> Result<()> {
+        let next = self.utxo.next_position(wtxn)?;
+        let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
+        let roots =
+            (0..parts).map(|p| self.utxo.subtree(wtxn, SNAPSHOT_PART_LOG, p)).collect::<utxo::Result<Vec<_>>>()?;
+        self.put_snapshot(wtxn, header, next, &roots)
+    }
+
+    /// Stores a snapshot and drops the oldest beyond [`SNAPSHOTS_KEPT`],
+    /// with the spends only they needed.
+    fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, next: u64, roots: &[Digest]) -> Result<()> {
+        let mut value = Vec::with_capacity(40 + 32 * roots.len());
+        value.extend_from_slice(&digest_bytes(&header.hash()));
+        value.extend_from_slice(&next.to_le_bytes());
+        for r in roots {
+            value.extend_from_slice(&digest_bytes(r));
+        }
+        self.snapshots.put(wtxn, &header.height, &value)?;
+        let heights: Vec<u32> = self.snapshots.iter(wtxn)?.map(|e| e.map(|(h, _)| h)).collect::<heed::Result<_>>()?;
+        let Some(&oldest) = heights.iter().rev().nth(SNAPSHOTS_KEPT - 1) else {
+            return Ok(());
+        };
+        for h in heights.iter().filter(|&&h| h < oldest) {
+            self.snapshots.delete(wtxn, h)?;
+        }
+        // Spends at or before the oldest snapshot kept serve none.
+        let mut stale = Vec::new();
+        for e in self.snapshot_spent.iter(wtxn)? {
+            let (p, v) = e?;
+            if u32::from_le_bytes(v[..4].try_into().map_err(|_| ChainError::Corrupt("snapshot spend"))?) <= oldest {
+                stale.push(p);
+            }
+        }
+        for p in stale {
+            self.snapshot_spent.delete(wtxn, &p)?;
+        }
+        Ok(())
+    }
+
+    /// The kept snapshot after the main-chain block `id`: its height,
+    /// output counter and part roots.
+    fn snapshot_in(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u32, u64, Vec<Digest>)>> {
         let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(id))? else {
             return Ok(None);
         };
-        if !self.is_main_in(rtxn, &header)? || header.height == 0 {
+        let Some(value) = self.snapshots.get(rtxn, &header.height)? else {
+            return Ok(None);
+        };
+        if value.len() < 40 || value[..32] != digest_bytes(id) || (value.len() - 40) % 32 != 0 {
             return Ok(None);
         }
-        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
-        if let Some((i, t, state)) = self.snapshot_cache.lock().unwrap().as_ref()
-            && *i == *id
-            && *t == tip.hash()
-        {
-            return Ok(Some(Arc::clone(state)));
-        }
-        let key = digest_bytes(id);
-        let next = match self.undo.get(rtxn, &key)?.and_then(Undo::from_bytes) {
-            Some(u) => u.first_output_position + u64::from(u.outputs),
-            None if self.floor_in(rtxn)? == Some(header.height) => {
-                let b = self.meta.get(rtxn, META_FLOOR_NEXT)?.ok_or(ChainError::Corrupt("floor counter"))?;
-                u64::from_le_bytes(b.try_into().map_err(|_| ChainError::Corrupt("floor counter"))?)
-            }
-            None => return Ok(None),
-        };
-        let mut restored = BTreeMap::new();
-        for h in header.height + 1..=tip.height {
-            let hd = self.header_at_in(rtxn, h)?.ok_or(ChainError::Corrupt("main-chain header"))?;
-            let k = digest_bytes(&hd.hash());
-            let undo = self.undo.get(rtxn, &k)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
-            for (pos, c, m) in undo.spent {
-                if pos < next {
-                    restored.insert(pos, (c, m));
-                }
-            }
-        }
-        let state = Arc::new((next, restored));
-        *self.snapshot_cache.lock().unwrap() = Some((*id, tip.hash(), Arc::clone(&state)));
-        Ok(Some(state))
-    }
-
-    /// The unspent outputs in snapshot part `part` of the state after the
-    /// main-chain block `id`: positions `part << SNAPSHOT_PART_LOG` and on.
-    #[allow(clippy::type_complexity)]
-    fn snapshot_part_in(
-        &self,
-        rtxn: &RoTxn,
-        next: u64,
-        restored: &BTreeMap<u64, (Commitment, Memo)>,
-        part: u64,
-    ) -> Result<Vec<(u64, Commitment, Memo)>> {
-        let first = part << SNAPSHOT_PART_LOG;
-        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(next);
-        let mut out: Vec<(u64, Commitment, Memo)> =
-            self.utxo.unspent_in(rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
-        let before = out.len();
-        out.extend(restored.range(first..end).map(|(p, (c, m))| (*p, *c, *m)));
-        if out.len() > before {
-            out.sort_unstable_by_key(|o| o.0);
-        }
-        Ok(out)
+        let next = u64::from_le_bytes(value[32..40].try_into().unwrap());
+        let roots = value[40..]
+            .chunks_exact(32)
+            .map(digest_from_bytes)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ChainError::Corrupt("snapshot root"))?;
+        Ok(Some((header.height, next, roots)))
     }
 
     /// A snapshot manifest of the state after the main-chain block `id`:
-    /// the output counter and the root of every part's subtree.
+    /// the output counter and the root of every part's subtree. `None`
+    /// unless a snapshot was taken after that block and is still kept.
     pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<(u64, Vec<Digest>)>> {
         let rtxn = self.env.read_txn()?;
-        let Some(state) = self.state_after(&rtxn, id)? else {
-            return Ok(None);
-        };
-        let (next, restored) = (state.0, &state.1);
-        let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
-        // Parts wholly below the counter that nothing since has spent from
-        // are as stored now; only the others are recomputed.
-        let touched: std::collections::HashSet<u64> = restored.keys().map(|p| p >> SNAPSHOT_PART_LOG).collect();
-        let mut roots = Vec::with_capacity(parts as usize);
-        for p in 0..parts {
-            if !touched.contains(&p) && (p + 1) << SNAPSHOT_PART_LOG <= next {
-                roots.push(self.utxo.subtree(&rtxn, SNAPSHOT_PART_LOG, p)?);
-                continue;
-            }
-            let leaves: Vec<(u64, Digest)> = self
-                .snapshot_part_in(&rtxn, next, restored, p)?
-                .iter()
-                .map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m)))
-                .collect();
-            roots.push(crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, p << SNAPSHOT_PART_LOG, &leaves));
-        }
-        Ok(Some((next, roots)))
+        Ok(self.snapshot_in(&rtxn, id)?.map(|(_, next, roots)| (next, roots)))
     }
 
-    /// Part `part` of the snapshot after the main-chain block `id`.
+    /// The unspent outputs in part `part` of the snapshot after the
+    /// main-chain block `id` (positions `part << SNAPSHOT_PART_LOG` and on,
+    /// below its counter): those unspent now, with those spent since.
     #[allow(clippy::type_complexity)]
     pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<Vec<(u64, Commitment, Memo)>>> {
         let rtxn = self.env.read_txn()?;
-        let Some(state) = self.state_after(&rtxn, id)? else {
+        let Some((height, next, roots)) = self.snapshot_in(&rtxn, id)? else {
             return Ok(None);
         };
-        if part >= state.0.div_ceil(1 << SNAPSHOT_PART_LOG) {
+        if part >= roots.len() as u64 {
             return Ok(None);
         }
-        Ok(Some(self.snapshot_part_in(&rtxn, state.0, &state.1, part)?))
+        let first = part << SNAPSHOT_PART_LOG;
+        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(next);
+        let mut out: Vec<(u64, Commitment, Memo)> =
+            self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
+        let before = out.len();
+        for e in self.snapshot_spent.range(&rtxn, &(first..end))? {
+            let (p, v) = e?;
+            let spent_at = u32::from_le_bytes(v[..4].try_into().map_err(|_| ChainError::Corrupt("snapshot spend"))?);
+            if spent_at > height {
+                let c = digest_from_bytes(&v[4..36]).ok_or(ChainError::Corrupt("snapshot spend"))?;
+                let m = digest_from_bytes(&v[36..68]).ok_or(ChainError::Corrupt("snapshot spend"))?;
+                out.push((p, c, m));
+            }
+        }
+        if out.len() > before {
+            out.sort_unstable_by_key(|o| o.0);
+        }
+        Ok(Some(out))
     }
 
     /// The proof statement and proof of the main-chain block at `height`
@@ -1605,6 +1728,7 @@ mod tests {
             median_time_window: 11,
             emission: &[(10, 50), (10, 25), (5, 12)],
             aggregator: AggregatorParams::MAINNET,
+            snapshot_interval: 4,
         }
     }
 
@@ -2258,6 +2382,102 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_are_kept_and_served_through_spends_and_reorganizations() {
+        // Twenty blocks of three outputs each, from block 3 on spending two
+        // earlier ones; snapshots after every fourth block, three kept.
+        let k = pk(13);
+        let f = open("snap-f");
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let mut unspent: Vec<u64> = Vec::new();
+        let mut next = 0u64;
+        let mut lcg = 7u64;
+        let mut t = GENESIS_TIME;
+        let mut blocks = Vec::new();
+        let mut build = |chain_f: &Fixture, h: u64, unspent: &mut Vec<u64>, next: &mut u64, tag: u64, t: &mut u64| {
+            let mut inputs = Vec::new();
+            if h >= 3 {
+                for _ in 0..2 {
+                    lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    inputs.push(unspent.swap_remove((lcg >> 33) as usize % unspent.len()));
+                }
+            }
+            let outputs = (0..3).map(|i| Output::new(&k, h * 100 + i + tag).block_output()).collect();
+            unspent.extend(*next..*next + 3);
+            *next += 3;
+            *t += 600;
+            mine(chain_f, Body { inputs, outputs, proof: vec![] }, *t)
+        };
+        for h in 1..=20u64 {
+            let block = build(&f, h, &mut unspent, &mut next, 0, &mut t);
+            f.chain.apply_block(&block, t + 1).unwrap();
+            blocks.push(block);
+        }
+        let check = |chain: &Chain<AcceptAllProofs>, header: &Header| {
+            let (n, roots) = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
+            assert_eq!(crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots), header.state_root);
+            for (i, r) in roots.iter().enumerate() {
+                let part = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
+                assert!(part.iter().all(|o| o.0 < n));
+                let leaves: Vec<(u64, Digest)> =
+                    part.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
+                assert_eq!(
+                    crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves),
+                    *r
+                );
+            }
+            (n, roots)
+        };
+        let kept = |chain: &Chain<AcceptAllProofs>, blocks: &[Block]| {
+            (1..=blocks.len())
+                .filter(|&h| chain.snapshot_manifest(&blocks[h - 1].header.hash()).unwrap().is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(&f.chain, &blocks), [12, 16, 20]);
+        for h in [12, 16, 20] {
+            check(&f.chain, &blocks[h - 1].header);
+        }
+        // Spends at or before the oldest kept snapshot are dropped.
+        let rtxn = f.chain.env().read_txn().unwrap();
+        for e in f.chain.snapshot_spent.iter(&rtxn).unwrap() {
+            assert!(u32::from_le_bytes(e.unwrap().1[..4].try_into().unwrap()) > 12);
+        }
+        drop(rtxn);
+        // g shares blocks 1 to 16, then outgrows f with its own 17 to 21.
+        let g = open("snap-g");
+        g.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        for b in &blocks[..16] {
+            g.chain.apply_block(b, t + 1).unwrap();
+        }
+        let mut g_unspent: Vec<u64> = Vec::new();
+        let mut g_next = 0u64;
+        // Rebuild the unspent set as of block 16 by replaying its bodies.
+        for b in &blocks[..16] {
+            g_unspent.retain(|p| !b.body.inputs.contains(p));
+            g_unspent.extend(g_next..g_next + b.body.outputs.len() as u64);
+            g_next += b.body.outputs.len() as u64;
+        }
+        t = blocks[15].header.timestamp;
+        let mut fork = Vec::new();
+        for h in 17..=21u64 {
+            let block = build(&g, h, &mut g_unspent, &mut g_next, 50, &mut t);
+            g.chain.apply_block(&block, t + 1).unwrap();
+            fork.push(block);
+        }
+        for b in &fork {
+            f.chain.apply_block(b, t + 1).unwrap();
+        }
+        assert_eq!(f.chain.tip().unwrap(), g.chain.tip().unwrap());
+        // f's block 20 went with the reorganization; the new 20 replaced it.
+        assert!(f.chain.snapshot_manifest(&blocks[19].header.hash()).unwrap().is_none());
+        let both: Vec<Block> = blocks[..16].iter().chain(fork.iter()).cloned().collect();
+        assert_eq!(kept(&f.chain, &both), [12, 16, 20]);
+        for h in [12, 16, 20] {
+            let header = both[h - 1].header;
+            assert_eq!(check(&f.chain, &header), check(&g.chain, &header));
+        }
+    }
+
+    #[test]
     fn fast_sync_from_a_snapshot() {
         let a = open("fast-a");
         let k = pk(11);
@@ -2383,6 +2603,42 @@ mod tests {
         }
         assert!(refused || b.chain.tip().unwrap().unwrap() == blocks[11].header);
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+    }
+
+    #[test]
+    fn missing_bodies_follow_the_best_branch() {
+        let a = open("missing-a");
+        a.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let k = pk(3);
+        let mut t = GENESIS_TIME;
+        let mut blocks = Vec::new();
+        for i in 1..=8u64 {
+            t += 600;
+            let block = mine_outputs(&a, &[Output::new(&k, i)], t);
+            a.chain.apply_block(&block, t + 1).unwrap();
+            blocks.push(block);
+        }
+        let b = open("missing-b");
+        b.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let heights = |n: usize| b.chain.missing_bodies(n).unwrap().iter().map(|h| h.height).collect::<Vec<_>>();
+        assert!(heights(4).is_empty());
+        for block in &blocks[..5] {
+            assert!(b.chain.accept_header(&block.header, t + 1).unwrap());
+        }
+        assert_eq!(heights(4), [1, 2, 3, 4]);
+        // Connected blocks leave the front, new headers join the end.
+        for block in &blocks[..2] {
+            b.chain.apply_block(block, t + 1).unwrap();
+        }
+        assert_eq!(heights(4), [3, 4, 5]);
+        for block in &blocks[5..] {
+            b.chain.accept_header(&block.header, t + 1).unwrap();
+        }
+        assert_eq!(heights(10), [3, 4, 5, 6, 7, 8]);
+        for block in &blocks[2..] {
+            b.chain.apply_block(block, t + 1).unwrap();
+        }
+        assert!(heights(4).is_empty());
     }
 
     #[test]

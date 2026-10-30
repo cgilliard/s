@@ -47,14 +47,14 @@ use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement};
 use tabminer::block::{Block, BlockOutput, Body, HEADER_SIZE};
 use tabminer::block_air::{SegmentWitness, pack};
-use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
+use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO, SNAPSHOTS_KEPT};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
 use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
@@ -357,7 +357,7 @@ struct Ctx {
     chain: Arc<Chain<AggregateVerifier>>,
     mempool: Arc<Mutex<Mempool>>,
     wallet: Arc<Wallet>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     stats: Arc<Mutex<Stats>>,
     tip_changes: Arc<AtomicU64>,
     syncing: Arc<AtomicBool>,
@@ -406,10 +406,12 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     if pruned > 0 {
         log::line(&format!("pruned {pruned} undo records beyond the last {} blocks", args.max_undo));
     }
-    if args.max_undo > 0 && args.sync_point > args.max_undo {
+    let served = (SNAPSHOTS_KEPT as u32 - 1) * params.snapshot_interval;
+    if args.sync_point > served {
         log::line(&format!(
-            "warning: --sync-point {} is deeper than --max-undo-blocks {}: this node cannot serve such snapshots",
-            args.sync_point, args.max_undo
+            "warning: --sync-point {} is deeper than the {served} blocks peers keep snapshots for: \
+             a fast sync will find none and validate every block instead",
+            args.sync_point
         ));
     }
     if args.debug_unchecked {
@@ -696,12 +698,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 log::timestamp_of(tip.timestamp)
             );
             println!(
-                "peers    {} live of {} known; {} downloads, {} queued, {} orphans",
+                "peers    {} live of {} known; {} downloads, {} blocks to fetch, {} waiting for a parent",
                 stats.peers.iter().filter(|p| p.live).count(),
                 stats.peers.len(),
                 stats.downloads,
                 stats.wanted,
-                stats.orphans
+                stats.waiting
             );
             match (stats.mode, stats.parts) {
                 (Some(Mode::Headers), _) => println!("sync     fast sync: downloading headers"),

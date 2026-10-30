@@ -112,7 +112,8 @@ pub struct Mempool {
     shelf: Vec<Entry>,
 }
 
-/// Checks a transaction against everything but the pool and the UTXO set.
+/// The cheap checks of a transaction on its own: all but its signatures,
+/// which [`Mempool::insert`] checks last, the pool and the UTXO set.
 fn check_static(tx: &Transaction) -> Result<u64, Reject> {
     if tx.inputs.is_empty() {
         return Err(Reject::NoInputs);
@@ -132,9 +133,6 @@ fn check_static(tx: &Transaction) -> Result<u64, Reject> {
     let fee = tx.balance();
     if fee < 0 {
         return Err(Reject::NegativeFee);
-    }
-    if !tx.verify_signatures() {
-        return Err(Reject::BadSignature);
     }
     Ok(fee.min(u64::MAX as i128) as u64)
 }
@@ -185,6 +183,12 @@ impl Mempool {
             if !utxo.holds(rtxn, p, &c).map_err(|_| Reject::UnknownInput(c))? {
                 return Err(Reject::UnknownInput(c));
             }
+        }
+        // Signatures last: they cost about half a millisecond an input, and
+        // an input naming an output the set does not hold, which anyone can
+        // sign with a key of their own, is turned away above for a lookup.
+        if !tx.verify_signatures() {
+            return Err(Reject::BadSignature);
         }
         let size = tx.size();
         if !conflicts.is_empty() {

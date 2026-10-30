@@ -363,6 +363,10 @@ pub fn chunk_of(kind: Kind, id: &Digest, bytes: &[u8], index: u16) -> Option<Mes
 pub const RETRY: Duration = Duration::from_millis(400);
 /// Retries without progress before a download is abandoned.
 pub const MAX_RETRIES: u32 = 8;
+/// A block download averaging under this many bytes a second after
+/// [`SLOW_GRACE`] is abandoned for another peer.
+pub const MIN_RATE: usize = 8 << 10;
+pub const SLOW_GRACE: Duration = Duration::from_secs(15);
 
 /// A block being fetched chunk by chunk from one peer, with a sliding
 /// window of requested chunks: [`Download::request`] asks for up to
@@ -382,6 +386,7 @@ pub struct Download {
     pub last_progress: Instant,
     pub last_request: Instant,
     pub retries: u32,
+    pub started: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -405,6 +410,7 @@ impl Download {
             last_progress: now,
             last_request: now,
             retries: 0,
+            started: now,
         }
     }
 
@@ -485,6 +491,13 @@ impl Download {
         self.chunks.iter().filter(|c| c.is_some()).count()
     }
 
+    /// Whether, after [`SLOW_GRACE`], it averages under [`MIN_RATE`]: a
+    /// peer trickling chunks just fast enough to avoid retries.
+    pub fn too_slow(&self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.started);
+        elapsed >= SLOW_GRACE && (self.received() * CHUNK_BYTES) as f64 / elapsed.as_secs_f64() < MIN_RATE as f64
+    }
+
     pub fn total(&self) -> Option<usize> {
         self.len.map(chunk_count)
     }
@@ -494,10 +507,22 @@ impl Download {
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A peer silent for this long is dropped (unless it is a seed).
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(180);
-/// How long a peer a block download failed from is passed over.
+/// How long a peer a block download failed from, or that did not back its
+/// claimed work with headers, is passed over.
 pub const FETCH_BACKOFF: Duration = Duration::from_secs(600);
+/// How long a peer asked for headers may take to send one we lack.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Peers kept in the table.
 pub const MAX_PEERS: usize = 64;
+/// Pings sent per tick to addresses that have not yet answered one: a
+/// forged ping costs at most this much traffic towards its victim.
+pub const UNVERIFIED_PINGS: usize = 8;
+/// Strikes after which a peer is dropped and its address refused for
+/// [`BAN_TIME`]; a peer's strikes are forgotten [`STRIKE_DECAY`] after the
+/// last one.
+pub const MAX_STRIKES: u32 = 5;
+pub const STRIKE_DECAY: Duration = Duration::from_secs(600);
+pub const BAN_TIME: Duration = Duration::from_secs(3600);
 /// Below this many live peers the node looks for more.
 pub const TARGET_PEERS: usize = 8;
 
@@ -510,15 +535,20 @@ pub struct Peer {
     /// Nonce of the ping awaiting its pong.
     pub pending: Option<u64>,
     pub status: Option<Status>,
-    /// Malformed or useless replies; dropped past a threshold.
+    /// Bad replies to our requests; dropped at [`MAX_STRIKES`].
     pub strikes: u32,
+    pub last_strike: Option<Instant>,
     pub seed: bool,
     /// Answered one of our pings with its nonce: it really is at this
     /// address, so it may be served data.
     pub handshaken: bool,
-    /// When a block download from it was last abandoned. A pruned or
-    /// fast-synced peer has every header but not every old body.
+    /// When a block download from it was last abandoned, or it last
+    /// failed to send headers for the work it claims. A pruned or
+    /// fast-synced peer has every header but not every old body; a lying
+    /// peer has neither.
     pub failed_fetch: Option<Instant>,
+    /// Since when we have been waiting for headers from it.
+    pub headers_asked: Option<Instant>,
 }
 
 impl Peer {
@@ -535,6 +565,10 @@ pub struct Peers {
     /// Addresses found to be this node itself (a seed or peer list naming
     /// our own public address); never added again.
     selves: std::collections::HashSet<SocketAddr>,
+    /// Addresses dropped for strikes, and when.
+    banned: HashMap<SocketAddr, Instant>,
+    /// Pings to unverified addresses left this tick.
+    budget: usize,
 }
 
 impl Peers {
@@ -559,13 +593,17 @@ impl Peers {
         if addr.ip().is_unspecified() || addr.port() == 0 || self.selves.contains(&addr) {
             return false;
         }
+        if self.banned.get(&addr).is_some_and(|t| t.elapsed() < BAN_TIME) {
+            return false;
+        }
         if let Some(p) = self.map.get_mut(&addr) {
             p.seed |= seed;
             return false;
         }
         if self.map.len() >= MAX_PEERS {
-            // Replace a never-seen non-seed entry, if any.
-            let Some(victim) = self.map.values().find(|p| p.last_seen.is_none() && !p.seed).map(|p| p.addr) else {
+            // Replace a non-seed entry that never proved its address, so
+            // forged pings and peer lists cannot crowd out real peers.
+            let Some(victim) = self.map.values().find(|p| !p.handshaken && !p.seed).map(|p| p.addr) else {
                 return false;
             };
             self.map.remove(&victim);
@@ -579,9 +617,11 @@ impl Peers {
                 pending: None,
                 status: None,
                 strikes: 0,
+                last_strike: None,
                 seed,
                 handshaken: false,
                 failed_fetch: None,
+                headers_asked: None,
             },
         );
         true
@@ -592,7 +632,6 @@ impl Peers {
         self.add(addr, false);
         if let Some(p) = self.map.get_mut(&addr) {
             p.last_seen = Some(now);
-            p.strikes = 0;
         }
     }
 
@@ -623,9 +662,14 @@ impl Peers {
 
     /// Marks `addr` pinged now with `nonce`, if it has no ping outstanding.
     /// Returns whether to send one.
+    /// An unverified address is pinged only within this tick's budget of
+    /// [`UNVERIFIED_PINGS`].
     pub fn ping_now(&mut self, addr: SocketAddr, nonce: u64, now: Instant) -> bool {
         match self.map.get_mut(&addr) {
-            Some(p) if p.pending.is_none() => {
+            Some(p) if p.pending.is_none() && (p.handshaken || p.seed || self.budget > 0) => {
+                if !p.handshaken && !p.seed {
+                    self.budget -= 1;
+                }
                 p.last_ping = Some(now);
                 p.pending = Some(nonce);
                 true
@@ -646,9 +690,16 @@ impl Peers {
         self.selves.insert(addr);
     }
 
+    /// A bad reply from `addr`. Strikes are forgotten after
+    /// [`STRIKE_DECAY`] without another.
     pub fn strike(&mut self, addr: SocketAddr) {
+        let now = Instant::now();
         if let Some(p) = self.map.get_mut(&addr) {
+            if p.last_strike.is_some_and(|t| now.duration_since(t) >= STRIKE_DECAY) {
+                p.strikes = 0;
+            }
             p.strikes += 1;
+            p.last_strike = Some(now);
         }
     }
 
@@ -668,9 +719,13 @@ impl Peers {
         self.map.values()
     }
 
-    /// Peers heard from within the timeout.
+    /// Peers that proved their address by answering our ping, heard from
+    /// within the timeout: the only ones counted, told of blocks and peers,
+    /// or believed.
     pub fn live(&self, now: Instant) -> impl Iterator<Item = &Peer> {
-        self.map.values().filter(move |p| p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TIMEOUT))
+        self.map
+            .values()
+            .filter(move |p| p.handshaken && p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TIMEOUT))
     }
 
     pub fn live_count(&self, now: Instant) -> usize {
@@ -681,8 +736,15 @@ impl Peers {
     /// interval. Marks them pinged with `nonce`.
     pub fn due_for_ping(&mut self, now: Instant, mut nonce: impl FnMut() -> u64) -> Vec<(SocketAddr, u64)> {
         let mut out = Vec::new();
+        self.budget = UNVERIFIED_PINGS;
         for p in self.map.values_mut() {
             if p.last_ping.is_none_or(|t| now.duration_since(t) >= PING_INTERVAL) {
+                if !p.handshaken && !p.seed {
+                    if self.budget == 0 {
+                        continue;
+                    }
+                    self.budget -= 1;
+                }
                 let n = nonce();
                 p.last_ping = Some(now);
                 p.pending = Some(n);
@@ -696,11 +758,14 @@ impl Peers {
     /// ping (or never answered), and peers with too many strikes. Seeds
     /// stay.
     pub fn prune(&mut self, now: Instant) {
+        self.banned.retain(|_, t| now.duration_since(*t) < BAN_TIME);
+        let banned = &mut self.banned;
         self.map.retain(|_, p| {
             if p.seed {
                 return true;
             }
-            if p.strikes >= 5 {
+            if p.strikes >= MAX_STRIKES && p.last_strike.is_some_and(|t| now.duration_since(t) < STRIKE_DECAY) {
+                banned.insert(p.addr, now);
                 return false;
             }
             match (p.last_seen, p.last_ping) {
@@ -721,29 +786,69 @@ impl Peers {
         self.live(now).filter(|p| p.status.is_some_and(|s| s.work > work)).max_by_key(|p| p.status.unwrap().work)
     }
 
-    /// The live peer to sync blocks from, among those claiming more than
-    /// `work`: preferably one holding the body at `next`, the first height
-    /// we lack, and one no block download failed from within
-    /// [`FETCH_BACKOFF`]; then the most work.
-    pub fn best_source(&self, work: U256, next: u32, now: Instant) -> Option<&Peer> {
+    /// Live peers: only their claims count.
+    pub fn trusted(&self, now: Instant) -> impl Iterator<Item = &Peer> {
         self.live(now)
-            .filter(|p| p.status.is_some_and(|s| s.work > work))
-            .max_by_key(|p| (p.status.unwrap().oldest <= next, !p.recently_failed(now), p.status.unwrap().work))
     }
 
-    /// Where to fetch the block at `height` that `from` told us of: `from`
-    /// if it holds that body, else the live peer holding it that a
-    /// download failed from least recently, with the most work. `from` if
-    /// none is known to.
-    pub fn body_source(&self, height: u32, from: SocketAddr, now: Instant) -> SocketAddr {
-        let holds = |p: &Peer| p.status.is_some_and(|s| s.oldest <= height && height <= s.height);
-        if self.map.get(&from).is_some_and(|p| p.status.is_none_or(|s| s.oldest <= height) && !p.recently_failed(now)) {
-            return from;
+    /// Trusted peers claiming more work than `work`, but for those passed
+    /// over after a failure.
+    pub fn claimants(&self, work: U256, now: Instant) -> impl Iterator<Item = &Peer> {
+        self.trusted(now).filter(move |p| !p.recently_failed(now) && p.status.is_some_and(|s| s.work > work))
+    }
+
+    /// The peer to ask for headers, among those claiming more than `work`:
+    /// preferably one holding the body at `next`, the first height we lack,
+    /// then the one claiming the most.
+    pub fn best_source(&self, work: U256, next: u32, now: Instant) -> Option<&Peer> {
+        self.claimants(work, now).max_by_key(|p| (p.status.unwrap().oldest <= next, p.status.unwrap().work))
+    }
+
+    /// Trusted peers, not passed over, whose main chain reaches `height`
+    /// with every body from it up.
+    pub fn holders(&self, height: u32, now: Instant) -> impl Iterator<Item = &Peer> {
+        self.trusted(now).filter(move |p| {
+            !p.recently_failed(now) && p.status.is_some_and(|s| s.oldest <= height && height <= s.height)
+        })
+    }
+
+    /// Whether `addr` may be asked for a block: trusted and not passed over.
+    pub fn may_serve(&self, addr: &SocketAddr, now: Instant) -> bool {
+        self.map.get(addr).is_some_and(|p| {
+            p.handshaken && p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TIMEOUT) && !p.recently_failed(now)
+        })
+    }
+
+    /// Notes that `addr` was asked for headers, unless already waiting.
+    pub fn asked_headers(&mut self, addr: SocketAddr, now: Instant) {
+        if let Some(p) = self.map.get_mut(&addr) {
+            p.headers_asked.get_or_insert(now);
         }
-        self.live(now)
-            .filter(|p| holds(p))
-            .max_by_key(|p| (!p.recently_failed(now), p.status.unwrap().work))
-            .map_or(from, |p| p.addr)
+    }
+
+    /// Notes that `addr` sent headers we lacked.
+    pub fn headers_arrived(&mut self, addr: SocketAddr) {
+        if let Some(p) = self.map.get_mut(&addr) {
+            p.headers_asked = None;
+        }
+    }
+
+    /// Peers asked for headers longer than [`HEADER_TIMEOUT`] ago that sent
+    /// none we lacked and still claim more than `ours`, our best header's
+    /// work: their claims are not believed for [`FETCH_BACKOFF`]. (One whose
+    /// claim we have since reached, from it or another, is not to blame.)
+    pub fn expire_header_requests(&mut self, ours: U256, now: Instant) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        for p in self.map.values_mut() {
+            if p.headers_asked.is_some_and(|t| now.duration_since(t) >= HEADER_TIMEOUT) {
+                p.headers_asked = None;
+                if p.status.is_some_and(|s| s.work > ours) {
+                    p.failed_fetch = Some(now);
+                    out.push(p.addr);
+                }
+            }
+        }
+        out
     }
 
     /// Loads addresses saved by [`Peers::save`], one per line.
@@ -812,31 +917,112 @@ mod tests {
     }
 
     #[test]
-    fn bodies_are_sought_from_peers_that_hold_them() {
-        // a has every body to height 100; b more work, but bodies only
-        // from 90; c the least work above ours, everything.
-        let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) =
-            ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap(), "10.0.0.3:1".parse().unwrap());
+    fn forged_addresses_cannot_crowd_the_table() {
         let t0 = Instant::now();
         let mut peers = Peers::new();
-        for (addr, oldest, height, work) in [(a, 1, 100, 10), (b, 90, 101, 11), (c, 1, 50, 6)] {
-            peers.add(addr, false);
-            peers.seen(addr, t0);
-            peers.set_status(addr, Status { oldest, height, work: U256([work, 0, 0, 0]), ..status() });
+        let addr = |i: u32| -> SocketAddr { SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)), 1) };
+        // One real peer, proven by answering our ping.
+        let real = addr(1);
+        peers.add(real, false);
+        let pings = peers.due_for_ping(t0, || 42);
+        assert_eq!(pings, [(real, 42)]);
+        assert!(peers.pong(real, Status { nonce: 42, ..status() }));
+        peers.seen(real, t0);
+        // A flood of forged pings fills the table with unverified entries:
+        // none is live, and they are pinged a few per tick, not all.
+        for i in 2..1000 {
+            peers.add(addr(i), false);
+        }
+        assert_eq!(peers.len(), MAX_PEERS);
+        assert_eq!(peers.live_count(t0), 1);
+        let mut n = 100;
+        let pings = peers.due_for_ping(t0 + Duration::from_secs(1), || {
+            n += 1;
+            n
+        });
+        assert_eq!(pings.len(), UNVERIFIED_PINGS);
+        // A newcomer still gets in, replacing an unverified entry.
+        assert!(peers.add(addr(5000), false));
+        assert!(peers.get(&real).is_some());
+        // Strikes are forgotten after a quiet spell; enough at once drop
+        // the peer and keep its address out for a while.
+        for _ in 0..MAX_STRIKES - 1 {
+            peers.strike(real);
+        }
+        peers.prune(t0);
+        assert!(peers.get(&real).is_some());
+        peers.map.get_mut(&real).unwrap().last_strike = Some(t0 - STRIKE_DECAY);
+        peers.strike(real);
+        assert_eq!(peers.get(&real).unwrap().strikes, 1);
+        for _ in 0..MAX_STRIKES {
+            peers.strike(real);
+        }
+        peers.prune(Instant::now());
+        assert!(peers.get(&real).is_none());
+        assert!(!peers.add(real, false));
+    }
+
+    #[test]
+    fn claims_and_bodies_are_believed_from_trusted_peers() {
+        // a has every body to height 100; b more work, but bodies only
+        // from 90; c the least work above ours, everything; d claims the
+        // most but never answered our ping.
+        let addr = |i: u8| -> SocketAddr { format!("10.0.0.{i}:1").parse().unwrap() };
+        let (a, b, c, d) = (addr(1), addr(2), addr(3), addr(4));
+        let t0 = Instant::now();
+        let mut peers = Peers::new();
+        for x in [a, b, c, d] {
+            peers.add(x, false);
+        }
+        let mut n = 0;
+        let pings = peers.due_for_ping(t0, || {
+            n += 1;
+            n
+        });
+        for (x, oldest, height, work) in [(a, 1, 100, 10), (b, 90, 101, 11), (c, 1, 50, 6), (d, 1, 500, 99)] {
+            let st = Status { oldest, height, work: U256([work, 0, 0, 0]), ..status() };
+            peers.seen(x, t0);
+            if x == d {
+                peers.set_status(x, st);
+            } else {
+                let nonce = pings.iter().find(|(p, _)| *p == x).unwrap().1;
+                assert!(peers.pong(x, Status { nonce, ..st }));
+            }
         }
         let ours = U256([5, 0, 0, 0]);
-        // Starting low: a holds the next body; past 90, b's work wins.
-        assert_eq!(peers.best_source(ours, 10, t0).map(|p| p.addr), Some(a));
-        assert_eq!(peers.best_source(ours, 95, t0).map(|p| p.addr), Some(b));
-        // A body b announced but lacks is fetched from a holder instead.
-        assert_eq!(peers.body_source(20, b, t0), a);
-        assert_eq!(peers.body_source(95, b, t0), b);
-        assert_eq!(peers.body_source(101, b, t0), b);
-        // A peer a download failed from is passed over while others hold it.
-        peers.fetch_failed(a, t0);
-        assert_eq!(peers.best_source(ours, 10, t0).map(|p| p.addr), Some(c));
-        assert_eq!(peers.body_source(20, a, t0), c);
-        assert_eq!(peers.body_source(20, a, t0 + FETCH_BACKOFF), a);
+        let best = |peers: &Peers, next: u32, now: Instant| peers.best_source(ours, next, now).map(|p| p.addr);
+        let holders = |peers: &Peers, height: u32, now: Instant| {
+            let mut v: Vec<SocketAddr> = peers.holders(height, now).map(|p| p.addr).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(peers.claimants(ours, t0).count(), 3);
+        // Starting low, a holds the next body; past 90, b's work wins.
+        assert_eq!(best(&peers, 10, t0), Some(a));
+        assert_eq!(best(&peers, 95, t0), Some(b));
+        assert_eq!(holders(&peers, 20, t0), [a, c]);
+        assert_eq!(holders(&peers, 95, t0), [a, b]);
+        assert_eq!(holders(&peers, 101, t0), [b]);
+        // b, asked for headers, sends none in time: passed over.
+        let t1 = t0 + HEADER_TIMEOUT;
+        peers.asked_headers(b, t0);
+        assert!(peers.expire_header_requests(ours, t0 + HEADER_TIMEOUT / 2).is_empty());
+        assert_eq!(peers.expire_header_requests(ours, t1), [b]);
+        assert_eq!(best(&peers, 95, t1), Some(a));
+        assert!(holders(&peers, 101, t1).is_empty());
+        // a, asked, sends none, but we have since reached its claim.
+        peers.asked_headers(a, t0);
+        assert!(peers.expire_header_requests(U256([10, 0, 0, 0]), t1).is_empty());
+        // A failed download passes a peer over until the backoff ends.
+        peers.fetch_failed(a, t1);
+        assert_eq!(best(&peers, 10, t1), Some(c));
+        assert_eq!(holders(&peers, 20, t1), [c]);
+        let t2 = t1 + FETCH_BACKOFF;
+        for x in [a, b, c] {
+            peers.seen(x, t2);
+        }
+        assert_eq!(best(&peers, 10, t2), Some(a));
+        assert!(peers.may_serve(&a, t2) && !peers.may_serve(&d, t2));
     }
 
     #[test]
