@@ -435,6 +435,19 @@ impl StateTree {
         Ok(root)
     }
 
+    /// Deletes every stored node of the subtree with its top at `top` and
+    /// index `index`, the top included.
+    pub fn clear_subtree(&self, wtxn: &mut RwTxn, top: usize, index: u64) -> Result<()> {
+        assert!(top >= self.base && top <= DEPTH);
+        for level in self.base..=top {
+            let width = 1u64 << (top - level);
+            for i in index * width..(index + 1) * width {
+                self.db.delete(wtxn, &node_key(level, i))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Deletes every node.
     pub fn clear(&self, wtxn: &mut RwTxn) -> Result<()> {
         Ok(self.db.clear(wtxn)?)

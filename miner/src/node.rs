@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{Block, Header};
-use crate::chain::{Applied, Chain, ChainError, ProofVerifier, SNAPSHOT_PART_LOG};
+use crate::chain::{Applied, CarriedPart, Chain, ChainError, ProofVerifier, SNAPSHOT_PART_LOG};
 use crate::difficulty::U256;
 use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
@@ -143,6 +143,8 @@ const MAX_PART_DOWNLOADS: usize = 32;
 const SERVED_SNAPSHOTS: usize = 8;
 /// Failed snapshot attempts before validating from genesis instead.
 const MAX_SNAPSHOT_ATTEMPTS: u32 = 4;
+/// Staged parts carried forward in one job (one transaction).
+const CARRY_BATCH: usize = 64;
 
 /// How the node is catching up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,8 +176,28 @@ struct Snap {
     /// Peers that did not serve something of this snapshot: perhaps they
     /// do not keep it. Asked again only if no other can be.
     unserved: std::collections::HashSet<SocketAddr>,
-    /// Parts fetched and with the applier, being checked and stored.
+    /// Parts fetched and with the applier, being checked and stored, or
+    /// being carried forward.
     staging: std::collections::HashSet<u32>,
+    /// Staging has begun in the database: it outlasts a move to a later
+    /// snapshot, whose parts are carried forward rather than fetched again.
+    begun: bool,
+    carry: Option<Carry>,
+}
+
+/// Parts staged for an earlier snapshot, to be carried forward to the
+/// snapshot being fetched once the bodies between them are in.
+struct Carry {
+    /// The earlier snapshot's output counter: parts wholly below it are
+    /// carried, the one it ends in is fetched again.
+    next: u64,
+    /// The parts staged for it.
+    staged: Vec<u32>,
+    /// Blocks after it, up to the snapshot's, whose bodies are still
+    /// wanted: their inputs are the outputs the parts lose.
+    wanted: HashMap<Digest, Header>,
+    /// Positions spent by the bodies received.
+    spent: Vec<u64>,
 }
 
 /// What the node's loop consumes.
@@ -213,11 +235,15 @@ enum Job {
         root: Digest,
         from: SocketAddr,
     },
+    /// Staged parts carried forward to a later snapshot.
+    Carry { parts: Vec<CarriedPart>, next: u64 },
 }
 /// What applying it gave.
 enum Outcome {
     Block(Box<Block>, Option<SocketAddr>, Result<Applied, ChainError>),
     Part { index: u32, from: SocketAddr, result: Result<(), ChainError> },
+    /// Which parts were carried.
+    Carry { indexes: Vec<u32>, result: Result<Vec<bool>, ChainError> },
 }
 
 /// A snapshot of the node for the prompt, refreshed every second.
@@ -275,8 +301,17 @@ pub struct Node<V: ProofVerifier> {
     served_snapshots: VecDeque<((Kind, Digest), Vec<u8>)>,
     mode: Mode,
     snap: Option<Snap>,
-    snap_downloads: HashMap<Kind, Download>,
+    snap_downloads: HashMap<(Kind, Digest), Download>,
     snap_attempts: u32,
+    /// Tests: fetch at most this many parts of the first snapshot, so that
+    /// a move to a later one finds parts staged.
+    #[cfg(test)]
+    hold_parts: Option<usize>,
+    #[cfg(test)]
+    moved: bool,
+    /// Tests: parts fetched and staged.
+    #[cfg(test)]
+    parts_staged: Arc<AtomicU64>,
     last_header_request: Option<Instant>,
     syncing: Arc<AtomicBool>,
     rx: Receiver<Event>,
@@ -431,6 +466,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             };
                             Outcome::Part { index, from, result }
                         }
+                        Job::Carry { parts, next } => Outcome::Carry {
+                            indexes: parts.iter().map(|p| p.index as u32).collect(),
+                            result: chain.carry_snapshot_parts(&parts, next),
+                        },
                     };
                     if outcome_tx.send(outcome).is_err() {
                         break;
@@ -464,6 +503,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             snap: None,
             snap_downloads: HashMap::new(),
             snap_attempts: 0,
+            #[cfg(test)]
+            hold_parts: None,
+            #[cfg(test)]
+            moved: false,
+            #[cfg(test)]
+            parts_staged: Arc::new(AtomicU64::new(0)),
             last_header_request: None,
             syncing: Arc::new(AtomicBool::new(true)),
             rx,
@@ -624,7 +669,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match self.mode {
             Mode::Normal => self.sync(now),
             Mode::Headers => self.header_sync(now),
-            Mode::Snapshot => self.snapshot_sync(now),
+            Mode::Snapshot => {
+                self.pump_headers(now);
+                self.check_snapshot_target(now);
+                self.snapshot_sync(now);
+            }
         }
         let behind = self.peers.claimants(self.chain.tip_work().unwrap_or(U256::ZERO), now).next().is_some();
         let fresh = self.peers.live_count(now) == 0 && now.duration_since(self.started) < Duration::from_secs(5);
@@ -675,9 +724,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// up to `HEADER_BATCHES` ahead, each of a different peer claiming
     /// more work, so one slow peer slows only its own share.
     fn pump_headers(&mut self, now: Instant) {
-        if self.mode == Mode::Snapshot {
-            return;
-        }
         let late: Vec<u32> = self
             .header_batches
             .iter()
@@ -1066,8 +1112,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A peer's status: if a trusted peer claims more work than our best
     /// header, fetch headers now rather than at the next tick.
     fn consider(&mut self, addr: SocketAddr, st: &Status, now: Instant) {
-        if self.mode != Mode::Snapshot
-            && self.peers.handshaken(&addr)
+        if self.peers.handshaken(&addr)
             && st.work > self.chain.best_header_work().unwrap_or(U256::ZERO)
         {
             self.pump_headers(now);
@@ -1077,9 +1122,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Headers from `from`: into the batch it was asked for, or, if none
     /// (a reply to a locator), checked and stored at once.
     fn handle_headers(&mut self, from: SocketAddr, headers: Vec<Header>, now: Instant) {
-        if self.mode == Mode::Snapshot {
-            return;
-        }
         let step = MAX_HEADERS as u32;
         if let Some(b) = self
             .header_batches
@@ -1118,9 +1160,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A block announced: its header is checked and stored before the
-    /// block is fetched.
+    /// block is fetched. During a snapshot sync only the header is taken,
+    /// to keep the snapshot within peers' windows.
     fn handle_inv(&mut self, from: SocketAddr, header: Header, now: Instant) {
-        if self.mode != Mode::Normal {
+        if self.mode == Mode::Headers {
             return;
         }
         let id = header.hash();
@@ -1195,9 +1238,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         data: Vec<u8>,
         now: Instant,
     ) {
-        if matches!(kind, Kind::Manifest | Kind::Part(_))
-            || (kind == Kind::Block && self.snap.as_ref().is_some_and(|s| s.target.hash() == id))
-        {
+        if matches!(kind, Kind::Manifest | Kind::Part(_)) || self.snap_downloads.contains_key(&(kind, id)) {
             return self.handle_snapshot_chunk(from, kind, id, len, index, data, now);
         }
         let downloads = if kind == Kind::Tx { &mut self.tx_downloads } else { &mut self.downloads };
@@ -1276,12 +1317,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn on_outcome(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Block(block, from, result) => self.on_applied(*block, from, result),
-            Outcome::Part { index, from, result } => self.on_part_staged(index, from, result),
+            Outcome::Part { index, from, result } => {
+                self.record_part(index, from, result);
+                self.snapshot_sync(Instant::now());
+            }
+            Outcome::Carry { indexes, result } => match self.record_carry(indexes, result) {
+                Ok(()) => self.snapshot_sync(Instant::now()),
+                Err(why) => self.restart_snapshot(&why),
+            },
         }
     }
 
     /// A fast-sync part checked and stored, or refused.
-    fn on_part_staged(&mut self, index: u32, from: SocketAddr, result: Result<(), ChainError>) {
+    fn record_part(&mut self, index: u32, from: SocketAddr, result: Result<(), ChainError>) {
         let Some(snap) = self.snap.as_mut() else { return };
         if !snap.staging.remove(&index) {
             return;
@@ -1291,6 +1339,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 if let Some(p) = snap.parts.get_mut(index as usize) {
                     *p = true;
                 }
+                #[cfg(test)]
+                self.parts_staged.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.log(&format!("fast sync: part {index} from {from} refused: {e}"));
@@ -1298,7 +1348,41 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.peers.fetch_failed(from, Instant::now());
             }
         }
-        self.snapshot_sync(Instant::now());
+    }
+
+    /// Staged parts carried forward, or those that were not cleared, to be
+    /// fetched. An error leaves the staged state unknown: start over.
+    fn record_carry(&mut self, indexes: Vec<u32>, result: Result<Vec<bool>, ChainError>) -> Result<(), String> {
+        let Some(snap) = self.snap.as_mut() else { return Ok(()) };
+        for i in &indexes {
+            snap.staging.remove(i);
+        }
+        let carried = result.map_err(|e| format!("carrying the staged parts forward failed: {e}"))?;
+        for (i, ok) in indexes.iter().zip(carried) {
+            if let Some(p) = snap.parts.get_mut(*i as usize) {
+                *p = ok;
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for the parts with the applier, recording what became of
+    /// them; blocks applied meanwhile are taken too.
+    fn drain_staging(&mut self) -> Result<(), String> {
+        let mut failed = Ok(());
+        while self.snap.as_ref().is_some_and(|s| !s.staging.is_empty()) {
+            match self.outcomes.recv() {
+                Ok(Outcome::Part { index, from, result }) => self.record_part(index, from, result),
+                Ok(Outcome::Carry { indexes, result }) => {
+                    if let Err(e) = self.record_carry(indexes, result) {
+                        failed = Err(e);
+                    }
+                }
+                Ok(Outcome::Block(b, f, r)) => self.on_applied(*b, f, r),
+                Err(_) => break,
+            }
+        }
+        failed
     }
 
     fn on_applied(&mut self, block: Block, from: Option<SocketAddr>, result: Result<Applied, ChainError>) {
@@ -1496,16 +1580,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             bad_manifests: 0,
             unserved: std::collections::HashSet::new(),
             staging: std::collections::HashSet::new(),
+            begun: false,
+            carry: None,
         });
         self.mode = Mode::Snapshot;
         self.snapshot_sync(now);
     }
 
-    /// Peers that may serve the snapshot: trusted, at or past its block.
-    /// Peers passed over after a failure are asked only if no other can.
+    /// Peers that may serve the snapshot: trusted, past its block and
+    /// still holding the blocks after it, which a snapshot is kept as long
+    /// as. Peers passed over after a failure are asked only if no other can.
     fn snapshot_peers(&self, now: Instant) -> Vec<SocketAddr> {
         let height = self.snap.as_ref().map_or(0, |s| s.target.height);
-        let at = |p: &&net::Peer| p.status.is_some_and(|s| s.height >= height);
+        let at = |p: &&net::Peer| p.status.is_some_and(|s| s.height >= height && s.oldest <= height);
         let unserved = |a: &SocketAddr| self.snap.as_ref().is_some_and(|s| s.unserved.contains(a));
         let fresh: Vec<SocketAddr> = self
             .peers
@@ -1521,16 +1608,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn start_snapshot_download(&mut self, kind: Kind, now: Instant) {
+        let Some(id) = self.snap.as_ref().map(|s| s.target.hash()) else {
+            return;
+        };
         let peers = self.snapshot_peers(now);
+        self.fetch_for_snapshot(kind, id, &peers, now);
+    }
+
+    /// Fetches `kind` of `id` for the snapshot, from the next of `peers`.
+    fn fetch_for_snapshot(&mut self, kind: Kind, id: Digest, peers: &[SocketAddr], now: Instant) {
         let Some(snap) = self.snap.as_mut() else {
             return;
         };
-        if peers.is_empty() || self.snap_downloads.contains_key(&kind) {
+        if peers.is_empty() || self.snap_downloads.contains_key(&(kind, id)) {
             return;
         }
         let from = peers[snap.next_peer % peers.len()];
         snap.next_peer += 1;
-        let id = snap.target.hash();
         let max_len = match kind {
             Kind::Block => self.chain.params().max_block_size,
             Kind::Manifest => net::MAX_MANIFEST,
@@ -1540,7 +1634,199 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
         self.send(from, &Message::GetChunks { kind, id, indexes });
-        self.snap_downloads.insert(kind, d);
+        self.snap_downloads.insert((kind, id), d);
+    }
+
+    /// The newest snapshot at least the sync point deep below `best`: peers
+    /// take one every `snapshot_interval` blocks and serve no others.
+    fn snapshot_target(&self, best: &Header) -> Option<Header> {
+        let depth = self.config.sync_point.unwrap_or(0);
+        let interval = self.chain.params().snapshot_interval;
+        let height = best.height.saturating_sub(depth) / interval * interval;
+        if height == 0 {
+            return None;
+        }
+        self.chain.ancestor(best, height).ok().flatten()
+    }
+
+    /// Moves to a later snapshot when peers are about to drop this one (it
+    /// nears the end of their undo windows: the bodies after it, which a
+    /// carry needs, go at the same time) or none serves it, and starts over
+    /// if the best chain no longer holds it.
+    fn check_snapshot_target(&mut self, now: Instant) {
+        let Some(snap) = self.snap.as_ref() else { return };
+        let Ok(best) = self.chain.best_header() else { return };
+        let target = snap.target;
+        if self.chain.ancestor(&best, target.height).ok().flatten() != Some(target) {
+            self.restart_snapshot("the best chain no longer holds the snapshot block");
+            if self.mode == Mode::Snapshot {
+                self.snap = None;
+                self.mode = Mode::Headers;
+            }
+            return;
+        }
+        let Some(later) = self.snapshot_target(&best).filter(|h| h.height > target.height) else {
+            return;
+        };
+        let margin = (self.chain.params().snapshot_interval / 4).max(1);
+        let at: Vec<SocketAddr> = self
+            .peers
+            .trusted(now)
+            .filter(|p| p.status.is_some_and(|s| s.height >= target.height))
+            .map(|p| p.addr)
+            .collect();
+        // A window moves with its tip: blocks found since a peer's status
+        // moved its oldest too.
+        let expiring = !at.is_empty()
+            && !self.peers.trusted(now).any(|p| {
+                p.status.is_some_and(|s| {
+                    let oldest = s.oldest + best.height.saturating_sub(s.height);
+                    s.height >= target.height && oldest + margin <= target.height
+                })
+            });
+        let unserved = !at.is_empty() && at.iter().all(|a| snap.unserved.contains(a));
+        if expiring {
+            self.move_snapshot(later, "peers are about to drop the snapshot");
+        } else if unserved {
+            self.move_snapshot(later, "no peer serves the snapshot");
+        }
+    }
+
+    /// Fetches the snapshot after `target`, later on the same chain,
+    /// instead: the parts already staged are carried forward once the
+    /// bodies in between are in, rather than fetched again.
+    fn move_snapshot(&mut self, target: Header, why: &str) {
+        // Parts with the applier belong to the old snapshot: let them land.
+        if let Err(e) = self.drain_staging() {
+            return self.restart_snapshot(&e);
+        }
+        self.snap_downloads.clear();
+        #[cfg(test)]
+        {
+            self.moved = true;
+        }
+        let Some(snap) = self.snap.as_mut() else { return };
+        let old = snap.target;
+        if snap.begun {
+            let carry = match (snap.carry.take(), &snap.manifest) {
+                // Moving again before carrying: the same parts, more bodies.
+                (Some(c), _) => c,
+                (None, Some((next, _))) => Carry {
+                    next: *next,
+                    staged: (0..snap.parts.len() as u32).filter(|&i| snap.parts[i as usize]).collect(),
+                    wanted: HashMap::new(),
+                    spent: Vec::new(),
+                },
+                (None, None) => unreachable!("staging begins only once the manifest is checked"),
+            };
+            snap.carry = Some(carry);
+        }
+        snap.target = target;
+        snap.block = None;
+        snap.manifest = None;
+        snap.verified = false;
+        snap.parts.clear();
+        snap.manifest_from = None;
+        snap.bad_manifests = 0;
+        snap.unserved.clear();
+        let mut bodies = Vec::new();
+        if snap.carry.is_some() {
+            let mut h = target;
+            while h.height > old.height {
+                let prev = h.prev_hash;
+                bodies.push(h);
+                match self.chain.header_by_hash(&prev) {
+                    Ok(Some(p)) => h = p,
+                    _ => return self.restart_snapshot("a header between the snapshots is missing"),
+                }
+            }
+        }
+        let snap = self.snap.as_mut().unwrap();
+        if let Some(carry) = snap.carry.as_mut() {
+            carry.wanted.extend(bodies.into_iter().map(|h| (h.hash(), h)));
+        }
+        let staged = snap.carry.as_ref().map_or(0, |c| c.staged.len());
+        self.log(&format!(
+            "fast sync: {why}; moving to the state after block {} ({}), {staged} staged parts to carry forward",
+            target.height,
+            short(&target.hash())
+        ));
+    }
+
+    /// Fetches the bodies a carry still wants, from peers holding them. If
+    /// no peer holds one any more, the staged parts are dropped and the
+    /// state fetched afresh.
+    fn fetch_carry_bodies(&mut self, now: Instant) {
+        let wanted: Vec<Header> = match self.snap.as_ref().and_then(|s| s.carry.as_ref()) {
+            Some(c) => c.wanted.values().copied().collect(),
+            None => return,
+        };
+        let held = |h: u32| self.peers.trusted(now).any(|p| p.status.is_some_and(|s| s.oldest <= h && h <= s.height));
+        if wanted.iter().any(|h| !held(h.height)) {
+            return self.drop_carry();
+        }
+        for header in wanted {
+            if self.snap_downloads.len() >= MAX_PART_DOWNLOADS {
+                break;
+            }
+            let peers: Vec<SocketAddr> = self.peers.holders(header.height, now).map(|p| p.addr).collect();
+            self.fetch_for_snapshot(Kind::Block, header.hash(), &peers, now);
+        }
+    }
+
+    /// Gives up carrying the staged parts forward: they are cleared, and
+    /// the snapshot is staged from the start once its block is checked.
+    fn drop_carry(&mut self) {
+        let Some(snap) = self.snap.as_mut() else { return };
+        let Some(carry) = snap.carry.take() else { return };
+        let target = snap.target.hash();
+        snap.begun = false;
+        snap.verified = false;
+        self.snap_downloads.retain(|(kind, id), _| *kind != Kind::Block || *id == target);
+        if let Err(e) = self.chain.abort_snapshot() {
+            return self.restart_snapshot(&format!("clearing the staged parts: {e}"));
+        }
+        self.log(&format!(
+            "fast sync: the blocks between the snapshots are no longer served; dropping {} staged parts",
+            carry.staged.len()
+        ));
+    }
+
+    /// Hands the staged parts to the applier to carry forward to the
+    /// snapshot's manifest, with the outputs spent in between.
+    fn dispatch_carry(&mut self) {
+        let Some(snap) = self.snap.as_mut() else { return };
+        let (Some(carry), Some((next, roots))) = (snap.carry.take(), snap.manifest.as_ref()) else {
+            return;
+        };
+        let mut spent = carry.spent;
+        spent.sort_unstable();
+        spent.dedup();
+        let parts: Vec<CarriedPart> = carry
+            .staged
+            .iter()
+            .map(|&i| {
+                let first = (i as u64) << SNAPSHOT_PART_LOG;
+                let end = first + (1 << SNAPSHOT_PART_LOG);
+                let (lo, hi) = (spent.partition_point(|p| *p < first), spent.partition_point(|p| *p < end));
+                // The part the earlier counter ends in has grown since.
+                let root = if end <= carry.next { roots.get(i as usize).copied() } else { None };
+                CarriedPart { index: i as u64, spent: spent[lo..hi].to_vec(), root }
+            })
+            .collect();
+        let next = *next;
+        for batch in parts.chunks(CARRY_BATCH) {
+            snap.staging.extend(batch.iter().map(|p| p.index as u32));
+            if let Some(jobs) = &self.jobs {
+                let _ = jobs.send(Job::Carry { parts: batch.to_vec(), next });
+            }
+        }
+        let height = snap.target.height;
+        self.log(&format!(
+            "fast sync: carrying {} staged parts forward to block {height}, less {} outputs spent since",
+            parts.len(),
+            spent.len()
+        ));
     }
 
     /// Fast sync, snapshot: fetch what is missing, verify, install.
@@ -1550,6 +1836,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         };
         let (has_block, has_manifest) = (snap.block.is_some(), snap.manifest.is_some());
+        self.fetch_carry_bodies(now);
         if !has_block {
             self.start_snapshot_download(Kind::Block, now);
         }
@@ -1567,8 +1854,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         next,
                         snap.parts.len()
                     ));
-                    if let Err(e) = self.chain.begin_snapshot() {
-                        return self.restart_snapshot(&format!("cannot start installing the snapshot: {e}"));
+                    if !self.snap.as_ref().unwrap().begun {
+                        if let Err(e) = self.chain.begin_snapshot() {
+                            return self.restart_snapshot(&format!("cannot start installing the snapshot: {e}"));
+                        }
+                        self.snap.as_mut().unwrap().begun = true;
                     }
                     self.snap.as_mut().unwrap().verified = true;
                 }
@@ -1593,6 +1883,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
         }
+        // Staged parts are carried forward before any is fetched for this
+        // snapshot, once every body in between is in.
+        match self.snap.as_ref().and_then(|s| s.carry.as_ref().map(|c| (s.verified, c.wanted.is_empty()))) {
+            Some((true, true)) => self.dispatch_carry(),
+            Some(_) => return,
+            None => {}
+        }
         let (done, staging, missing): (bool, usize, Vec<u32>) = match self.snap.as_ref() {
             Some(s) if s.verified => (
                 s.parts.iter().all(|p| *p),
@@ -1606,13 +1903,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             ),
             _ => return,
         };
-        if done {
+        if done && staging == 0 {
             return self.install_snapshot();
         }
         for i in missing {
             // Parts waiting for the applier count too, so a slow disk
             // bounds what is held in memory.
             if self.snap_downloads.len() + staging >= MAX_PART_DOWNLOADS {
+                break;
+            }
+            #[cfg(test)]
+            if !self.moved
+                && self.hold_parts.is_some_and(|n| {
+                    let s = self.snap.as_ref().unwrap();
+                    s.parts.iter().filter(|p| **p).count() + staging + self.snap_downloads.len() >= n
+                })
+            {
                 break;
             }
             self.start_snapshot_download(Kind::Part(i), now);
@@ -1649,15 +1955,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn restart_snapshot(&mut self, why: &str) {
         // Parts still with the applier belong to this attempt: let them
         // land before the partial state is cleared.
-        while self.snap.as_ref().is_some_and(|s| !s.staging.is_empty()) {
-            match self.outcomes.recv() {
-                Ok(Outcome::Part { index, .. }) => {
-                    self.snap.as_mut().unwrap().staging.remove(&index);
-                }
-                Ok(Outcome::Block(b, f, r)) => self.on_applied(*b, f, r),
-                Err(_) => break,
-            }
-        }
+        let _ = self.drain_staging();
         self.snap_attempts += 1;
         self.snap_downloads.clear();
         if let Err(e) = self.chain.abort_snapshot() {
@@ -1677,15 +1975,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             s.parts.clear();
             s.manifest_from = None;
             s.bad_manifests = 0;
+            s.begun = false;
+            s.carry = None;
         }
     }
 
     fn retry_snapshot_downloads(&mut self, now: Instant) {
         let mut abandoned = Vec::new();
         let mut requests = Vec::new();
-        for (kind, d) in self.snap_downloads.iter_mut() {
+        for (&(kind, id), d) in self.snap_downloads.iter_mut() {
             if d.too_slow(now) {
-                abandoned.push((*kind, d.from));
+                abandoned.push((kind, id, d.from));
                 continue;
             }
             if now.duration_since(d.last_progress) < net::RETRY || now.duration_since(d.last_request) < net::RETRY {
@@ -1694,22 +1994,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             d.retries += 1;
             d.last_request = now;
             if d.retries > net::MAX_RETRIES {
-                abandoned.push((*kind, d.from));
+                abandoned.push((kind, id, d.from));
             } else {
                 d.reset_window();
                 let indexes = d.request(now);
-                requests.extend(net::chunk_requests(*kind, d.id, &indexes).map(|m| (d.from, m)));
+                requests.extend(net::chunk_requests(kind, d.id, &indexes).map(|m| (d.from, m)));
             }
         }
         for (to, msg) in requests {
             self.send(to, &msg);
         }
-        for (kind, from) in abandoned {
-            self.snap_downloads.remove(&kind);
-            if let Some(s) = self.snap.as_mut() {
-                s.unserved.insert(from);
+        for (kind, id, from) in abandoned {
+            self.snap_downloads.remove(&(kind, id));
+            match self.snap.as_mut() {
+                Some(s) if s.target.hash() == id => {
+                    s.unserved.insert(from);
+                }
+                // A body between snapshots: like any block download.
+                _ => self.peers.fetch_failed(from, now),
             }
-            self.chatter(&format!("fast sync: {from} did not serve {kind:?}; asking another peer"));
+            self.chatter(&format!("fast sync: {from} did not serve {kind:?} {}; asking another peer", short(&id)));
         }
     }
 
@@ -1724,7 +2028,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         data: Vec<u8>,
         now: Instant,
     ) {
-        let Some(d) = self.snap_downloads.get_mut(&kind) else {
+        let Some(d) = self.snap_downloads.get_mut(&(kind, id)) else {
             return;
         };
         if d.from != from || d.id != id {
@@ -1741,8 +2045,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Ok(true) => {
                 let bytes = d.assemble().unwrap_or_default();
-                self.snap_downloads.remove(&kind);
-                if !self.accept_snapshot_object(kind, &bytes, from) {
+                self.snap_downloads.remove(&(kind, id));
+                if !self.accept_snapshot_object(kind, id, &bytes, from) {
                     self.log(&format!("fast sync: {from} sent a bad {kind:?}"));
                     self.peers.strike(from);
                     self.peers.fetch_failed(from, now);
@@ -1750,22 +2054,46 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.snapshot_sync(now);
             }
             Err(_) => {
-                self.snap_downloads.remove(&kind);
+                self.snap_downloads.remove(&(kind, id));
                 self.peers.strike(from);
             }
         }
     }
 
     /// Checks a fetched snapshot object and keeps it; `false` if it is bad.
-    fn accept_snapshot_object(&mut self, kind: Kind, bytes: &[u8], from: SocketAddr) -> bool {
+    fn accept_snapshot_object(&mut self, kind: Kind, id: Digest, bytes: &[u8], from: SocketAddr) -> bool {
         let Some(snap) = self.snap.as_mut() else {
             return true;
         };
         match kind {
+            // A body between an earlier snapshot and this one, for its
+            // inputs: checked against its stored header.
+            Kind::Block if id != snap.target.hash() => {
+                let Some(carry) = snap.carry.as_mut() else {
+                    return true;
+                };
+                let Some(header) = carry.wanted.get(&id).copied() else {
+                    return true;
+                };
+                match Block::from_bytes(bytes) {
+                    Ok(block) if block.header == header && block.body.commitment() == header.body_commitment => {
+                        carry.wanted.remove(&id);
+                        carry.spent.extend_from_slice(&block.body.inputs);
+                        true
+                    }
+                    _ => false,
+                }
+            }
             // The body is checked against the header here, so a corrupted
             // copy is one peer's fault, not a failed attempt.
             Kind::Block => match Block::from_bytes(bytes) {
                 Ok(block) if block.header == snap.target && block.body.commitment() == block.header.body_commitment => {
+                    // A carry wants its body too, the last between them.
+                    if let Some(carry) = snap.carry.as_mut()
+                        && carry.wanted.remove(&id).is_some()
+                    {
+                        carry.spent.extend_from_slice(&block.body.inputs);
+                    }
                     snap.block = Some(block);
                     true
                 }
@@ -2126,6 +2454,85 @@ mod tests {
         assert_eq!(b.chain.header_at(3).unwrap(), a.chain.header_at(3).unwrap());
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!syncing.load(Ordering::Acquire));
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    #[test]
+    fn staged_parts_are_carried_to_a_later_snapshot() {
+        // a keeps nine blocks of undo; its block 1 makes 20,000 outputs, so
+        // the state has two parts. b fast-syncs with a sync point of 4 from
+        // block 8's snapshot, but fetches only part 0 of it. a then grows to
+        // 16, so that block 8 is about to leave its window: b moves to block
+        // 12's snapshot, carries part 0 forward through the spend in block
+        // 10, and fetches only part 1 again.
+        let big = || ChainParams { max_block_size: ChainParams::MAINNET.max_block_size, ..params() };
+        let make = |name: &str, window: Option<u32>| {
+            let dir = TempDir::new(name);
+            let seed = seed();
+            let dataset = Dataset::generate(&seed);
+            let chain = Chain::open(&dir.0.join("chain"), 256 << 20, big(), seed, AcceptAllProofs).unwrap();
+            let chain = chain.with_max_undo(window);
+            chain.init_or_check_genesis().unwrap();
+            Fixture { dir, chain: Arc::new(chain), dataset }
+        };
+        let a = make("carry-a", Some(9));
+        let now = unix_now();
+        let mut t = T0;
+        let mut grow = |a: &Fixture, h: u64, via: Option<&SyncSender<Event>>| {
+            t += 600;
+            let n = if h == 1 { 20_000 } else { 1 };
+            let key = pk(h as u8);
+            let outputs = (0..n).map(|i| Output::new(&key, i).block_output()).collect();
+            let inputs = match h {
+                10 => vec![5],
+                14 => vec![7],
+                _ => vec![],
+            };
+            let block = mine_body(a, Body { inputs, outputs, proof: vec![h as u8; 100] }, t);
+            match via {
+                // Through a's node, which announces it.
+                Some(tx) => {
+                    let id = block.header.hash();
+                    tx.send(Event::Mined(block)).unwrap();
+                    while a.chain.tip().unwrap().unwrap().hash() != id {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                None => {
+                    a.chain.apply_block(&block, now).unwrap();
+                }
+            }
+        };
+        for h in 1..=12 {
+            grow(&a, h, None);
+        }
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let b = make("carry-b", None);
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (mut node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        node_b.hold_parts = Some(1);
+        let staged = Arc::clone(&node_b.parts_staged);
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while staged.load(Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "b staged no part of block 8's snapshot");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for h in 13..=16 {
+            grow(&a, h, Some(&tx_a));
+        }
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not reach a's tip");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        assert_eq!(b.chain.floor().unwrap(), Some(12));
+        // Part 0 once, for block 8, and part 1 once, for block 12.
+        assert_eq!(staged.load(Ordering::Relaxed), 2);
         tx_a.send(Event::Stop).unwrap();
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();

@@ -455,6 +455,17 @@ fn read_spent_entry(value: &[u8]) -> Option<(u32, Commitment, Memo)> {
     Some((height, digest_from_bytes(&value[4..36])?, digest_from_bytes(&value[36..])?))
 }
 
+/// A staged snapshot part to carry forward: see
+/// [`Chain::carry_snapshot_parts`].
+#[derive(Clone, Debug)]
+pub struct CarriedPart {
+    pub index: u64,
+    /// Positions in the part spent since, ascending.
+    pub spent: Vec<u64>,
+    /// Its root in the later manifest; `None` clears it.
+    pub root: Option<Digest>,
+}
+
 /// Persistent chain state.
 pub struct Chain<V: ProofVerifier> {
     env: Env,
@@ -1494,6 +1505,48 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(root)
     }
 
+    /// Carries staged parts forward to a later snapshot, whose counter is
+    /// `next_position`: each part loses the outputs spent since, and must
+    /// then have the later manifest's root. Parts that do not, or that are
+    /// given no root, are cleared, to be fetched again. Returns, for each
+    /// part, whether it was carried. One transaction for them all.
+    pub fn carry_snapshot_parts(&self, parts: &[CarriedPart], next_position: u64) -> Result<Vec<bool>> {
+        let mut wtxn = self.env.write_txn()?;
+        if !self.staging_in(&wtxn)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        let mut carried = Vec::with_capacity(parts.len());
+        for part in parts {
+            // Untouched parts keep their root: only check it.
+            if part.spent.is_empty()
+                && let Some(root) = &part.root
+                && self.utxo.subtree(&wtxn, SNAPSHOT_PART_LOG, part.index)? == *root
+            {
+                carried.push(true);
+                continue;
+            }
+            let mut outputs = self.utxo.unstage(&mut wtxn, SNAPSHOT_PART_LOG, part.index)?;
+            let Some(root) = &part.root else {
+                carried.push(false);
+                continue;
+            };
+            outputs.retain(|o| part.spent.binary_search(&o.0).is_err());
+            let leaves: Vec<(u64, Digest)> =
+                outputs.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
+            let first = part.index << SNAPSHOT_PART_LOG;
+            if crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, first, &leaves) != *root {
+                carried.push(false);
+                continue;
+            }
+            self.utxo
+                .stage(&mut wtxn, SNAPSHOT_PART_LOG, part.index, &outputs, next_position)
+                .map_err(|_| ChainError::BadSnapshot)?;
+            carried.push(true);
+        }
+        wtxn.commit()?;
+        Ok(carried)
+    }
+
     /// Clears a partly installed snapshot, if any.
     pub fn abort_snapshot(&self) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
@@ -1575,9 +1628,11 @@ impl<V: ProofVerifier> Chain<V> {
     /// Drops the manifests that can no longer be served, with the tip at
     /// `tip`: a part needs the outputs spent by every block after its
     /// snapshot, and those leave the spent log with the undo window. An
-    /// archive (no window) keeps the default window's worth.
+    /// archive (no window) keeps them all, as its status promises.
     fn prune_snapshots(&self, wtxn: &mut RwTxn, tip: u32) -> Result<()> {
-        let keep = self.max_undo.unwrap_or(DEFAULT_MAX_UNDO);
+        let Some(keep) = self.max_undo else {
+            return Ok(());
+        };
         let Some(oldest) = tip.checked_sub(keep) else {
             return Ok(());
         };
@@ -2594,6 +2649,79 @@ mod tests {
             let header = both[h - 1].header;
             assert_eq!(check(&f.chain, &header), check(&g.chain, &header));
         }
+    }
+
+    #[test]
+    fn staged_parts_are_carried_to_a_later_snapshot() {
+        // Blocks 1 to 3 make 20,000 outputs each: parts 0 to 2 full, part
+        // 3 begun. Blocks 4 to 8 make one each and spend in parts 0 and 2.
+        let big = || ChainParams { max_block_size: ChainParams::MAINNET.max_block_size, ..params() };
+        let make = |name: &str| {
+            let dir = TempDir::new(name);
+            let seed = seed();
+            let dataset = Dataset::generate(&seed);
+            let chain = Chain::open(&dir.0, 1 << 30, big(), seed, AcceptAllProofs).unwrap();
+            chain.init_genesis(&genesis_block(vec![])).unwrap();
+            Fixture { _dir: dir, chain, dataset }
+        };
+        let a = make("carry-a");
+        let k = pk(14);
+        let mut t = GENESIS_TIME;
+        let mut blocks = Vec::new();
+        for h in 1..=8u64 {
+            t += 600;
+            let n = if h <= 3 { 20_000 } else { 1 };
+            let outputs = (0..n).map(|i| Output::new(&k, h * 100_000 + i).block_output()).collect();
+            let inputs = match h {
+                4 => vec![1, 33_000],
+                5 => vec![2, 40_000],
+                6 => vec![3],
+                7 => vec![34_000, 35_000],
+                _ => vec![],
+            };
+            let block = mine(&a, Body { inputs, outputs, proof: vec![] }, t);
+            a.chain.apply_block(&block, t + 1).unwrap();
+            blocks.push(block);
+        }
+        let (s4, s8) = (blocks[3].header, blocks[7].header);
+        let (next4, roots4) = a.chain.snapshot_manifest(&s4.hash()).unwrap().unwrap();
+        let (next8, roots8) = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        assert_eq!((next4, roots4.len(), next8, roots8.len()), (60_001, 4, 60_005, 4));
+
+        // b stages the snapshot after block 4, then moves to block 8's.
+        let b = make("carry-b");
+        for block in &blocks {
+            b.chain.accept_header(&block.header, t + 1).unwrap();
+        }
+        b.chain.begin_snapshot().unwrap();
+        for (i, root) in roots4.iter().enumerate() {
+            let part = a.chain.snapshot_part(&s4.hash(), i as u64).unwrap().unwrap();
+            b.chain.stage_snapshot_part(i as u64, &part, next4, Some(root)).unwrap();
+        }
+        let mut spent: Vec<u64> = blocks[4..8].iter().flat_map(|b| b.body.inputs.clone()).collect();
+        spent.sort_unstable();
+        let in_part = |i: u64| -> Vec<u64> { spent.iter().copied().filter(|p| p >> SNAPSHOT_PART_LOG == i).collect() };
+        let parts = [
+            // Spends carried away.
+            CarriedPart { index: 0, spent: in_part(0), root: Some(roots8[0]) },
+            // Untouched.
+            CarriedPart { index: 1, spent: in_part(1), root: Some(roots8[1]) },
+            // A spend missed (a lying body would do this): cleared.
+            CarriedPart { index: 2, spent: vec![34_000], root: Some(roots8[2]) },
+            // Begun at block 4, grown since: cleared.
+            CarriedPart { index: 3, spent: in_part(3), root: None },
+        ];
+        assert!(in_part(1).is_empty());
+        assert_eq!(b.chain.carry_snapshot_parts(&parts, next8).unwrap(), [true, true, false, false]);
+        // The cleared parts are fetched at block 8 and the install completes.
+        for i in [2u64, 3] {
+            let part = a.chain.snapshot_part(&s8.hash(), i).unwrap().unwrap();
+            b.chain.stage_snapshot_part(i, &part, next8, Some(&roots8[i as usize])).unwrap();
+        }
+        b.chain.finish_snapshot(&blocks[7], &roots8, next8).unwrap();
+        let rtxn = b.chain.env().read_txn().unwrap();
+        assert_eq!(b.chain.utxo().root(&rtxn).unwrap(), s8.state_root);
+        assert_eq!(b.chain.utxo().len(&rtxn).unwrap(), a.chain.utxo().len(&a.chain.env().read_txn().unwrap()).unwrap());
     }
 
     #[test]

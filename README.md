@@ -103,6 +103,12 @@ rather than 90 s.
 Nodes take a snapshot after every block whose height is a multiple of 144
 and keep those within the undo window; fast sync uses the newest one at
 least `--sync-point` deep, so any sync point up to 865 is always served.
+A download that outlasts its snapshot loses nothing: as the snapshot nears
+the end of its peers' windows (each peer's status says where its window
+starts), or if no peer serves it, the node moves to a later one, fetches
+the blocks in between and carries the parts it has forward, removing the
+outputs those blocks spent and checking each part against the later
+manifest; only parts that do not match are fetched again.
 A snapshot stores only its manifest: the output counter and each part's
 root, read from the state tree when the block connects. The outputs spent
 by blocks in the undo window are kept once, by position, with the height

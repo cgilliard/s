@@ -386,6 +386,22 @@ impl UtxoSet {
         Ok(self.tree.write_subtree(wtxn, level, index, &Self::roots_of(outputs))?)
     }
 
+    /// Removes a staged part, the subtree of height `level` at `index`:
+    /// its outputs and its tree nodes. Returns the outputs, ascending.
+    pub fn unstage(&self, wtxn: &mut RwTxn, level: usize, index: u64) -> Result<Vec<(u64, Commitment, Memo)>> {
+        if level < GROUP_LOG {
+            return Err(Error::CorruptIndex);
+        }
+        let (first, end) = (index << level, (index + 1) << level);
+        let outputs: Vec<(u64, Commitment, Memo)> =
+            self.unspent_in(wtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
+        // Staged buckets hold one part's outputs each, keyed within it.
+        self.outputs.delete_range(wtxn, &(first..end))?;
+        self.add_count(wtxn, -(outputs.len() as i64))?;
+        self.tree.clear_subtree(wtxn, level, index)?;
+        Ok(outputs)
+    }
+
     /// Completes a staged snapshot: checks that the stored root of every
     /// part matches `roots` (the parts of height `level`, in order), writes
     /// the levels above them and sets the counter to `next`.
