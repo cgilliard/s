@@ -3,7 +3,8 @@
 A proof-of-work chain whose blocks carry only output commitments and a
 zero-knowledge validity proof. `miner/` holds the node, the prover and the
 wallet; `miner/SECURITY.md` analyses the proofs; `docs/HARDENING.md` lists
-the known gaps still to close.
+the known gaps still to close; `docs/NAMES.md` is the design of the name
+registry.
 
 ## Genesis
 
