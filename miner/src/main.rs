@@ -432,7 +432,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     if args.sync_point > served {
         log::line(&format!(
             "warning: --sync-point {} is deeper than the {served} blocks peers surely keep snapshots for: \
-             a fast sync may find none and validate every block instead",
+             a fast sync may use the deepest snapshot they keep instead",
             args.sync_point
         ));
     }

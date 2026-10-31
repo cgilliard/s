@@ -1549,11 +1549,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Ok(b) => b,
             Err(e) => return self.log(&format!("fast sync: {e}")),
         };
-        // The newest snapshot at least the sync point deep: peers take one
-        // every `snapshot_interval` blocks and serve no others.
-        let depth = self.config.sync_point.unwrap_or(0);
-        let interval = self.chain.params().snapshot_interval;
-        let height = best.height.saturating_sub(depth) / interval * interval;
+        let height = self.snapshot_height(&best, now);
         if height == 0 {
             self.log(&format!("fast sync: best header at height {}; validating every block instead", best.height));
             self.mode = Mode::Normal;
@@ -1569,6 +1565,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             target.height,
             short(&target.hash())
         ));
+        let depth = self.config.sync_point.unwrap_or(0);
+        if best.height - height < depth {
+            self.log(&format!(
+                "fast sync: peers keep no snapshot {depth} blocks deep; using one {} deep",
+                best.height - height
+            ));
+        }
         self.snap = Some(Snap {
             target,
             block: None,
@@ -1637,16 +1640,41 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.snap_downloads.insert((kind, id), d);
     }
 
-    /// The newest snapshot at least the sync point deep below `best`: peers
-    /// take one every `snapshot_interval` blocks and serve no others.
-    fn snapshot_target(&self, best: &Header) -> Option<Header> {
+    /// The height of the snapshot to fetch below `best`: the newest at
+    /// least the sync point deep that a peer keeps for a while yet (peers
+    /// take one every `snapshot_interval` blocks and keep it through their
+    /// undo windows). With a sync point deeper than every peer's window,
+    /// the deepest one a peer keeps instead, since waiting for a deeper one
+    /// would never end. 0 if the chain is too short for any.
+    fn snapshot_height(&self, best: &Header, now: Instant) -> u32 {
         let depth = self.config.sync_point.unwrap_or(0);
         let interval = self.chain.params().snapshot_interval;
-        let height = best.height.saturating_sub(depth) / interval * interval;
-        if height == 0 {
-            return None;
+        let want = best.height.saturating_sub(depth) / interval * interval;
+        if want == 0 {
+            return 0;
         }
-        self.chain.ancestor(best, height).ok().flatten()
+        // A window moves with its tip: blocks found since a peer's status
+        // moved its oldest too.
+        let margin = (interval / 4).max(1);
+        let lowest = self
+            .peers
+            .trusted(now)
+            .filter_map(|p| p.status)
+            .filter(|s| s.height >= want)
+            .map(|s| s.oldest + best.height.saturating_sub(s.height) + margin)
+            .min();
+        match lowest {
+            Some(l) if l > want && l.div_ceil(interval) * interval <= best.height => l.div_ceil(interval) * interval,
+            _ => want,
+        }
+    }
+
+    /// The snapshot block [`Node::snapshot_height`] picks.
+    fn snapshot_target(&self, best: &Header, now: Instant) -> Option<Header> {
+        match self.snapshot_height(best, now) {
+            0 => None,
+            height => self.chain.ancestor(best, height).ok().flatten(),
+        }
     }
 
     /// Moves to a later snapshot when peers are about to drop this one (it
@@ -1665,7 +1693,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             return;
         }
-        let Some(later) = self.snapshot_target(&best).filter(|h| h.height > target.height) else {
+        let Some(later) = self.snapshot_target(&best, now).filter(|h| h.height > target.height) else {
             return;
         };
         let margin = (self.chain.params().snapshot_interval / 4).max(1);
@@ -1962,10 +1990,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.log(&format!("fast sync: clearing the partial state: {e}"));
         }
         if self.snap_attempts >= MAX_SNAPSHOT_ATTEMPTS {
-            self.log(&format!("fast sync: {why}; giving up, validating every block instead"));
-            self.snap = None;
-            self.mode = Mode::Normal;
-            return;
+            // Validating from genesis needs a peer keeping every block;
+            // without one it would stall for good, so keep trying.
+            let archive = self.peers.trusted(Instant::now()).any(|p| p.status.is_some_and(|s| s.height > 0 && s.oldest <= 1));
+            if archive {
+                self.log(&format!("fast sync: {why}; giving up, validating every block instead"));
+                self.snap = None;
+                self.mode = Mode::Normal;
+                return;
+            }
+            self.log(&format!("fast sync: {why}; no peer keeps every block to validate instead"));
+            self.snap_attempts = 0;
         }
         self.log(&format!("fast sync: {why}; trying again"));
         if let Some(s) = self.snap.as_mut() {
@@ -2533,6 +2568,43 @@ mod tests {
         assert_eq!(b.chain.floor().unwrap(), Some(12));
         // Part 0 once, for block 8, and part 1 once, for block 12.
         assert_eq!(staged.load(Ordering::Relaxed), 2);
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    #[test]
+    fn a_sync_point_deeper_than_peers_keep_uses_the_deepest_snapshot_kept() {
+        // a keeps nine blocks of undo, so of its sixteen it serves snapshots
+        // from block 8 on. b asks for a sync point of 12, which would be
+        // block 4's: it takes block 12's, the deepest a keeps with a margin,
+        // rather than waiting for ever.
+        let dir = TempDir::new("deep-a");
+        let seed = seed();
+        let dataset = Dataset::generate(&seed);
+        let chain = Chain::open(&dir.0.join("chain"), 64 << 20, params(), seed, AcceptAllProofs).unwrap();
+        let chain = chain.with_max_undo(Some(9));
+        chain.init_or_check_genesis().unwrap();
+        let a = Fixture { dir, chain: Arc::new(chain), dataset };
+        let now = unix_now();
+        for tag in 1..=16u8 {
+            let block = mine(&a, tag, T0 + 600 * tag as u64);
+            a.chain.apply_block(&block, now).unwrap();
+        }
+        assert_eq!(a.chain.oldest_body().unwrap(), 8);
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let b = open("deep-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(12);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 30), "b did not fast-sync to a's tip");
+        assert_eq!(b.chain.floor().unwrap(), Some(12));
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         tx_a.send(Event::Stop).unwrap();
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();

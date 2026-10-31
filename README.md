@@ -68,7 +68,8 @@ included, and written to disk as it arrives, so memory stays small whatever
 the state's size; a node stopped midway starts the state over cleanly), and
 then fetches the blocks after it. Nothing about the past is taken on trust.
 `--sync-point 0` replays every block instead, which needs a peer that keeps
-every body (`--max-undo-blocks 0`). A miner waits until its node has caught
+every body (`--max-undo-blocks 0`); a fast sync that keeps failing falls back
+to that only when such a peer is known, and otherwise tries again. A miner waits until its node has caught
 up before mining.
 
 Catching up, a node checks and stores headers first, in batches of 60
@@ -102,7 +103,9 @@ rather than 90 s.
 
 Nodes take a snapshot after every block whose height is a multiple of 144
 and keep those within the undo window; fast sync uses the newest one at
-least `--sync-point` deep, so any sync point up to 865 is always served.
+least `--sync-point` deep, so any sync point up to 865 is always served;
+with a deeper one than its peers keep, it uses the deepest snapshot they
+do keep rather than wait for one that will never come.
 A download that outlasts its snapshot loses nothing: as the snapshot nears
 the end of its peers' windows (each peer's status says where its window
 starts), or if no peer serves it, the node moves to a later one, fetches
