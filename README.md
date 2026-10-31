@@ -101,12 +101,14 @@ round trips installed the state in 8.6 s, against 57 s with 32 chunks and
 rather than 90 s.
 
 Nodes take a snapshot after every block whose height is a multiple of 144
-and keep the newest three; fast sync uses the newest one at least
-`--sync-point` deep. A snapshot stores only its manifest (the output
-counter and each part's root, read from the state tree when the block
-connects) and, as later blocks spend outputs it holds, those outputs. A
-part is served from the outputs unspent now in its range plus those, so
-serving costs a range read, whatever the request.
+and keep those within the undo window; fast sync uses the newest one at
+least `--sync-point` deep, so any sync point up to 865 is always served.
+A snapshot stores only its manifest: the output counter and each part's
+root, read from the state tree when the block connects. The outputs spent
+by blocks in the undo window are kept once, by position, with the height
+spending them; disconnecting a block restores its inputs from there, and a
+part is served from the outputs unspent now in its range plus those spent
+after the snapshot, so serving costs two range reads, whatever the request.
 
 Nodes keep undo records and block bodies, which reorganizations need, for
 the last `--max-undo-blocks` blocks (1008 by default, a week); older blocks

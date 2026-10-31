@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement};
 use tabminer::block::{Block, BlockOutput, Body, HEADER_SIZE};
 use tabminer::block_air::{SegmentWitness, pack};
-use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO, SNAPSHOTS_KEPT};
+use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
 use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
@@ -426,11 +426,13 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     if pruned > 0 {
         log::line(&format!("pruned {pruned} undo records beyond the last {} blocks", args.max_undo));
     }
-    let served = (SNAPSHOTS_KEPT as u32 - 1) * params.snapshot_interval;
+    // Peers keep a snapshot every interval through their undo window, so
+    // one at least this deep is always within it.
+    let served = (DEFAULT_MAX_UNDO + 1).saturating_sub(params.snapshot_interval);
     if args.sync_point > served {
         log::line(&format!(
-            "warning: --sync-point {} is deeper than the {served} blocks peers keep snapshots for: \
-             a fast sync will find none and validate every block instead",
+            "warning: --sync-point {} is deeper than the {served} blocks peers surely keep snapshots for: \
+             a fast sync may find none and validate every block instead",
             args.sync_point
         ));
     }

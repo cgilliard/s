@@ -385,8 +385,9 @@ const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
 /// Version of the on-disk layout: 8 keeps unspent outputs in packed
 /// buckets with no index by commitment, and the state tree from subtrees
-/// of 256 positions up.
-const FORMAT: u8 = 8;
+/// of 256 positions up; 9 keeps the outputs spent within the undo window
+/// once, by position, for reorganizations and snapshots alike.
+const FORMAT: u8 = 9;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -409,56 +410,50 @@ pub struct Entry {
     pub header_only: bool,
 }
 
-/// What disconnecting a block needs, and what serving a snapshot of the
-/// state before it needs without reading its body: where its outputs
-/// started and how many it made, and the position, commitment and memo of
-/// every output it spent, in input order.
+/// What disconnecting a block needs besides its body and the outputs it
+/// spent (kept by position in the spent log): where its outputs started
+/// and how many it made.
 struct Undo {
     first_output_position: u64,
     outputs: u32,
-    spent: Vec<(u64, Commitment, Memo)>,
 }
 
-/// Bytes per spent output in an undo record: position (5), commitment, memo.
-const UNDO_SPENT: usize = 5 + 64;
-
 impl Undo {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(12 + UNDO_SPENT * self.spent.len());
-        out.extend_from_slice(&self.first_output_position.to_le_bytes());
-        out.extend_from_slice(&self.outputs.to_le_bytes());
-        for (p, c, m) in &self.spent {
-            out.extend_from_slice(&p.to_le_bytes()[..5]);
-            out.extend_from_slice(&digest_bytes(c));
-            out.extend_from_slice(&digest_bytes(m));
-        }
+    fn to_bytes(&self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[..8].copy_from_slice(&self.first_output_position.to_le_bytes());
+        out[8..].copy_from_slice(&self.outputs.to_le_bytes());
         out
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Undo> {
-        let (head, rest) = bytes.split_at_checked(12)?;
-        if rest.len() % UNDO_SPENT != 0 {
-            return None;
-        }
-        let spent = rest
-            .chunks_exact(UNDO_SPENT)
-            .map(|c| {
-                let mut p = [0u8; 8];
-                p[..5].copy_from_slice(&c[..5]);
-                Some((u64::from_le_bytes(p), digest_from_bytes(&c[5..37])?, digest_from_bytes(&c[37..])?))
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let bytes: &[u8; 12] = bytes.try_into().ok()?;
         Some(Undo {
-            first_output_position: u64::from_le_bytes(head[..8].try_into().unwrap()),
-            outputs: u32::from_le_bytes(head[8..].try_into().unwrap()),
-            spent,
+            first_output_position: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            outputs: u32::from_le_bytes(bytes[8..].try_into().unwrap()),
         })
     }
 }
 
-/// Snapshots kept for serving, the newest: a node fast-syncing from one
-/// has at least two intervals to fetch it before it is dropped.
-pub const SNAPSHOTS_KEPT: usize = 3;
+/// A spent-log entry: the height of the block spending the output, then
+/// its commitment and memo.
+const SPENT_ENTRY: usize = 4 + 64;
+
+fn spent_entry(height: u32, commitment: &Commitment, memo: &Memo) -> [u8; SPENT_ENTRY] {
+    let mut value = [0u8; SPENT_ENTRY];
+    value[..4].copy_from_slice(&height.to_le_bytes());
+    value[4..36].copy_from_slice(&digest_bytes(commitment));
+    value[36..].copy_from_slice(&digest_bytes(memo));
+    value
+}
+
+fn read_spent_entry(value: &[u8]) -> Option<(u32, Commitment, Memo)> {
+    if value.len() != SPENT_ENTRY {
+        return None;
+    }
+    let height = u32::from_le_bytes(value[..4].try_into().unwrap());
+    Some((height, digest_from_bytes(&value[4..36])?, digest_from_bytes(&value[36..])?))
+}
 
 /// Persistent chain state.
 pub struct Chain<V: ProofVerifier> {
@@ -476,14 +471,15 @@ pub struct Chain<V: ProofVerifier> {
     meta: Database<Str, Bytes>,
     /// Undo records kept, counting back from the tip; `None` keeps all.
     max_undo: Option<u32>,
-    /// Snapshot taken after the main-chain block at each kept height
-    /// ([`ChainParams::snapshot_interval`]): its id, the output counter and
-    /// the root of every part, as a manifest serves them.
+    /// Snapshot manifest of the main-chain block at each multiple of
+    /// [`ChainParams::snapshot_interval`] within the undo window: its id,
+    /// the output counter and the root of every part.
     snapshots: Database<U32<BigEndian>, Bytes>,
-    /// Outputs that existed at a kept snapshot and were spent since, by
-    /// position: the height spending it, commitment and memo. A snapshot's
-    /// part is the outputs unspent now in its range, plus these.
-    snapshot_spent: Database<U64<BigEndian>, Bytes>,
+    /// Every output spent by a main-chain block within the undo window, by
+    /// position: the spending block's height, the commitment and memo.
+    /// Disconnecting a block restores its inputs from here, and a snapshot's
+    /// part is the outputs unspent now in its range plus those spent since.
+    spent: Database<U64<BigEndian>, Bytes>,
     /// The best header's branch above the main chain, oldest first, as
     /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
     /// rather than walked again.
@@ -526,7 +522,7 @@ impl<V: ProofVerifier> Chain<V> {
         let by_height = env.create_database(&mut wtxn, Some("by_height"))?;
         let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
         let snapshots = env.create_database(&mut wtxn, Some("snapshots"))?;
-        let snapshot_spent = env.create_database(&mut wtxn, Some("snapshot_spent"))?;
+        let spent = env.create_database(&mut wtxn, Some("spent"))?;
         match meta.get(&wtxn, META_FORMAT)? {
             Some([FORMAT]) => {}
             Some(_) => return Err(ChainError::OldFormat),
@@ -548,7 +544,7 @@ impl<V: ProofVerifier> Chain<V> {
             meta,
             max_undo: Some(DEFAULT_MAX_UNDO),
             snapshots,
-            snapshot_spent,
+            spent,
             branch: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
         };
@@ -585,12 +581,14 @@ impl<V: ProofVerifier> Chain<V> {
                 // Everything below was pruned before.
                 break;
             }
+            self.forget_spends(&mut wtxn, &header)?;
             n += 1;
             h -= 1;
         }
         if tip.height > keep {
             self.prune_bodies(&mut wtxn, tip.height - keep)?;
         }
+        self.prune_snapshots(&mut wtxn, tip.height)?;
         wtxn.commit()?;
         Ok(n)
     }
@@ -815,7 +813,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.headers.put(&mut wtxn, &id, &block.header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
         self.put_index(&mut wtxn, &id, U256::ZERO, STATUS_VALID)?;
-        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, outputs: 0, spent: vec![] }.to_bytes())?;
+        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, outputs: 0 }.to_bytes())?;
         self.by_height.put(&mut wtxn, &0, &id)?;
         self.meta.put(&mut wtxn, META_TIP, &id)?;
         wtxn.commit()?;
@@ -1033,10 +1031,11 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let work = self.entry_in(wtxn, &header.hash())?.ok_or(ChainError::Corrupt("connecting unknown block"))?.work;
         self.put_index(wtxn, &id, work, STATUS_VALID)?;
-        let spent: Vec<(u64, Commitment, Memo)> = body.inputs.iter().zip(spent).map(|(&p, (c, m))| (p, c, m)).collect();
-        self.record_snapshot_spends(wtxn, header.height, &spent)?;
+        for (p, (c, m)) in body.inputs.iter().zip(spent) {
+            self.spent.put(wtxn, p, &spent_entry(header.height, &c, &m))?;
+        }
         let outputs = body.outputs.len() as u32;
-        self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, spent }.to_bytes())?;
+        self.undo.put(wtxn, &id, &Undo { first_output_position, outputs }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
         if header.height.is_multiple_of(self.params.snapshot_interval) {
@@ -1048,8 +1047,10 @@ impl<V: ProofVerifier> Chain<V> {
             && let Some(old) = self.header_at_in(wtxn, header.height - keep)?
         {
             self.undo.delete(wtxn, &digest_bytes(&old.hash()))?;
+            self.forget_spends(wtxn, &old)?;
             self.prune_bodies(wtxn, header.height - keep)?;
         }
+        self.prune_snapshots(wtxn, header.height)?;
         Ok(())
     }
 
@@ -1086,14 +1087,19 @@ impl<V: ProofVerifier> Chain<V> {
             None => return Err(ChainError::Corrupt("undo record")),
         };
         let body = self.body_by_hash_in(wtxn, &id)?.ok_or(ChainError::Corrupt("body of main-chain block"))?;
-        if undo.spent.len() != body.inputs.len() {
-            return Err(ChainError::Corrupt("undo record length"));
+        let mut spent = Vec::with_capacity(body.inputs.len());
+        for &p in &body.inputs {
+            let entry = self.spent.get(wtxn, &p)?.and_then(read_spent_entry);
+            match entry {
+                Some((h, c, m)) if h == height => spent.push((p, c, m)),
+                _ => return Err(ChainError::Corrupt("spent log")),
+            }
         }
         let commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
-        self.utxo.restore(wtxn, &undo.spent)?;
-        for (p, _, _) in &undo.spent {
-            self.snapshot_spent.delete(wtxn, p)?;
+        self.utxo.restore(wtxn, &spent)?;
+        for (p, _, _) in &spent {
+            self.spent.delete(wtxn, p)?;
         }
         self.snapshots.delete(wtxn, &height)?;
         let parent = self
@@ -1434,7 +1440,7 @@ impl<V: ProofVerifier> Chain<V> {
             ("bodies", self.bodies.stat(&rtxn)?),
             ("undo", self.undo.stat(&rtxn)?),
             ("snapshots", self.snapshots.stat(&rtxn)?),
-            ("snapshot spends", self.snapshot_spent.stat(&rtxn)?),
+            ("spent outputs", self.spent.stat(&rtxn)?),
         ] {
             rows.push((name, size(stat), stat.entries));
         }
@@ -1550,19 +1556,35 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(())
     }
 
-    /// Records the outputs block `height` spent that a kept snapshot holds:
-    /// those below the newest snapshot's output counter.
-    fn record_snapshot_spends(&self, wtxn: &mut RwTxn, height: u32, spent: &[(u64, Commitment, Memo)]) -> Result<()> {
-        let Some((_, newest)) = self.snapshots.last(wtxn)? else {
+    /// Drops the spent-log entries of the main-chain block `header`,
+    /// leaving the undo window: its inputs, read from its body before that
+    /// goes too. A block without a body (the floor of a fast sync) spent
+    /// nothing that was logged.
+    fn forget_spends(&self, wtxn: &mut RwTxn, header: &Header) -> Result<()> {
+        let Some(body) = self.body_by_hash_in(wtxn, &digest_bytes(&header.hash()))? else {
             return Ok(());
         };
-        let next = u64::from_le_bytes(newest[32..40].try_into().map_err(|_| ChainError::Corrupt("snapshot"))?);
-        let mut value = [0u8; 68];
-        for (p, c, m) in spent.iter().filter(|o| o.0 < next) {
-            value[..4].copy_from_slice(&height.to_le_bytes());
-            value[4..36].copy_from_slice(&digest_bytes(c));
-            value[36..].copy_from_slice(&digest_bytes(m));
-            self.snapshot_spent.put(wtxn, p, &value)?;
+        for p in &body.inputs {
+            if self.spent.get(wtxn, p)?.and_then(read_spent_entry).is_some_and(|(h, _, _)| h == header.height) {
+                self.spent.delete(wtxn, p)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the manifests that can no longer be served, with the tip at
+    /// `tip`: a part needs the outputs spent by every block after its
+    /// snapshot, and those leave the spent log with the undo window. An
+    /// archive (no window) keeps the default window's worth.
+    fn prune_snapshots(&self, wtxn: &mut RwTxn, tip: u32) -> Result<()> {
+        let keep = self.max_undo.unwrap_or(DEFAULT_MAX_UNDO);
+        let Some(oldest) = tip.checked_sub(keep) else {
+            return Ok(());
+        };
+        let stale: Vec<u32> =
+            self.snapshots.range(wtxn, &(..oldest))?.map(|e| e.map(|(h, _)| h)).collect::<heed::Result<_>>()?;
+        for h in stale {
+            self.snapshots.delete(wtxn, &h)?;
         }
         Ok(())
     }
@@ -1577,8 +1599,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.put_snapshot(wtxn, header, next, &roots)
     }
 
-    /// Stores a snapshot and drops the oldest beyond [`SNAPSHOTS_KEPT`],
-    /// with the spends only they needed.
+    /// Stores a snapshot manifest.
     fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, next: u64, roots: &[Digest]) -> Result<()> {
         let mut value = Vec::with_capacity(40 + 32 * roots.len());
         value.extend_from_slice(&digest_bytes(&header.hash()));
@@ -1587,24 +1608,6 @@ impl<V: ProofVerifier> Chain<V> {
             value.extend_from_slice(&digest_bytes(r));
         }
         self.snapshots.put(wtxn, &header.height, &value)?;
-        let heights: Vec<u32> = self.snapshots.iter(wtxn)?.map(|e| e.map(|(h, _)| h)).collect::<heed::Result<_>>()?;
-        let Some(&oldest) = heights.iter().rev().nth(SNAPSHOTS_KEPT - 1) else {
-            return Ok(());
-        };
-        for h in heights.iter().filter(|&&h| h < oldest) {
-            self.snapshots.delete(wtxn, h)?;
-        }
-        // Spends at or before the oldest snapshot kept serve none.
-        let mut stale = Vec::new();
-        for e in self.snapshot_spent.iter(wtxn)? {
-            let (p, v) = e?;
-            if u32::from_le_bytes(v[..4].try_into().map_err(|_| ChainError::Corrupt("snapshot spend"))?) <= oldest {
-                stale.push(p);
-            }
-        }
-        for p in stale {
-            self.snapshot_spent.delete(wtxn, &p)?;
-        }
         Ok(())
     }
 
@@ -1654,12 +1657,10 @@ impl<V: ProofVerifier> Chain<V> {
         let mut out: Vec<(u64, Commitment, Memo)> =
             self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
         let before = out.len();
-        for e in self.snapshot_spent.range(&rtxn, &(first..end))? {
+        for e in self.spent.range(&rtxn, &(first..end))? {
             let (p, v) = e?;
-            let spent_at = u32::from_le_bytes(v[..4].try_into().map_err(|_| ChainError::Corrupt("snapshot spend"))?);
+            let (spent_at, c, m) = read_spent_entry(v).ok_or(ChainError::Corrupt("spent log"))?;
             if spent_at > height {
-                let c = digest_from_bytes(&v[4..36]).ok_or(ChainError::Corrupt("snapshot spend"))?;
-                let m = digest_from_bytes(&v[36..68]).ok_or(ChainError::Corrupt("snapshot spend"))?;
                 out.push((p, c, m));
             }
         }
@@ -2495,9 +2496,11 @@ mod tests {
     #[test]
     fn snapshots_are_kept_and_served_through_spends_and_reorganizations() {
         // Twenty blocks of three outputs each, from block 3 on spending two
-        // earlier ones; snapshots after every fourth block, three kept.
+        // earlier ones; snapshots after every fourth block, kept for the
+        // undo window of nine blocks.
         let k = pk(13);
-        let f = open("snap-f");
+        let mut f = open("snap-f");
+        f.chain = f.chain.with_max_undo(Some(9));
         f.chain.init_genesis(&genesis_block(vec![])).unwrap();
         let mut unspent: Vec<u64> = Vec::new();
         let mut next = 0u64;
@@ -2547,12 +2550,16 @@ mod tests {
         for h in [12, 16, 20] {
             check(&f.chain, &blocks[h - 1].header);
         }
-        // Spends at or before the oldest kept snapshot are dropped.
-        let rtxn = f.chain.env().read_txn().unwrap();
-        for e in f.chain.snapshot_spent.iter(&rtxn).unwrap() {
-            assert!(u32::from_le_bytes(e.unwrap().1[..4].try_into().unwrap()) > 12);
-        }
-        drop(rtxn);
+        // The spent log holds the spends of the blocks in the window, 12 to
+        // 20, and nothing older.
+        let spent_heights = |chain: &Chain<AcceptAllProofs>| {
+            let rtxn = chain.env().read_txn().unwrap();
+            let mut heights: Vec<u32> =
+                chain.spent.iter(&rtxn).unwrap().map(|e| read_spent_entry(e.unwrap().1).unwrap().0).collect();
+            heights.sort_unstable();
+            heights
+        };
+        assert_eq!(spent_heights(&f.chain), (12..=20).flat_map(|h| [h, h]).collect::<Vec<_>>());
         // g shares blocks 1 to 16, then outgrows f with its own 17 to 21.
         let g = open("snap-g");
         g.chain.init_genesis(&genesis_block(vec![])).unwrap();
@@ -2582,6 +2589,7 @@ mod tests {
         assert!(f.chain.snapshot_manifest(&blocks[19].header.hash()).unwrap().is_none());
         let both: Vec<Block> = blocks[..16].iter().chain(fork.iter()).cloned().collect();
         assert_eq!(kept(&f.chain, &both), [12, 16, 20]);
+        assert_eq!(spent_heights(&f.chain), (13..=21).flat_map(|h| [h, h]).collect::<Vec<_>>());
         for h in [12, 16, 20] {
             let header = both[h - 1].header;
             assert_eq!(check(&f.chain, &header), check(&g.chain, &header));
@@ -2769,8 +2777,8 @@ mod tests {
             f.chain.apply_block(&block, t + 1).unwrap();
             blocks.push(block);
         }
-        // Heights 4 to 6 keep undo records: snapshots after them are served,
-        // after 3 or below not.
+        // Heights 4 to 6 keep undo records and their spends: snapshots from
+        // height 3 on can be served, older ones not.
         let undo = |h: usize| {
             let rtxn = f.chain.env().read_txn().unwrap();
             f.chain.undo.get(&rtxn, &digest_bytes(&blocks[h - 1].header.hash())).unwrap().is_some()
