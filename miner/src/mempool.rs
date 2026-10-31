@@ -30,7 +30,7 @@ use std::time::Instant;
 use heed::RoTxn;
 
 use crate::pow::Digest;
-use crate::transaction::{Commitment, Transaction};
+use crate::transaction::{Commitment, INPUT_SIZE, OUTPUT_SIZE, Transaction};
 use crate::utxo::{self, UtxoSet};
 
 /// Largest transaction accepted, in bytes (about 50 inputs).
@@ -41,6 +41,30 @@ pub const DEFAULT_CAPACITY: usize = 64 << 20;
 const SHELF: usize = 1024;
 /// Base units per byte a replacement must add over what it replaces.
 pub const REPLACEMENT_FEE_PER_BYTE: u64 = 1;
+/// Base units per byte a transaction must pay to be pooled at all, so
+/// that filling blocks, and the UTXO set, costs something.
+pub const MIN_FEE_PER_BYTE: u64 = 1;
+/// The smallest output pooled: one worth the fee of spending it at that
+/// rate, so that nobody fills the UTXO set with outputs no one will spend.
+pub const DUST: u64 = (INPUT_SIZE as u64) * MIN_FEE_PER_BYTE;
+
+/// What a pool asks of a transaction beyond validity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub min_fee_per_byte: u64,
+    pub dust: u64,
+}
+
+impl Policy {
+    pub const MAINNET: Policy = Policy { min_fee_per_byte: MIN_FEE_PER_BYTE, dust: DUST };
+    /// Anything valid, for tests.
+    pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0 };
+
+    /// The smallest fee a transaction of `inputs` and `outputs` may pay.
+    pub fn min_fee(&self, inputs: usize, outputs: usize) -> u64 {
+        self.min_fee_per_byte * (8 + inputs * INPUT_SIZE + outputs * OUTPUT_SIZE) as u64
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -53,6 +77,14 @@ pub enum Reject {
     NegativeFee,
     /// Zero-amount output or duplicate input.
     Malformed,
+    /// Pays less than [`Policy::min_fee`].
+    FeeTooLow {
+        min: u64,
+    },
+    /// An output below the pool's dust limit.
+    Dust {
+        min: u64,
+    },
     BadSignature,
     /// An input's output is not unspent.
     UnknownInput(Commitment),
@@ -72,6 +104,8 @@ impl core::fmt::Display for Reject {
             Reject::NoInputs => f.write_str("no inputs"),
             Reject::TooLarge(n) => write!(f, "{n} bytes exceeds the transaction size limit"),
             Reject::NegativeFee => f.write_str("outputs exceed inputs"),
+            Reject::FeeTooLow { min } => write!(f, "fee below the minimum of {min} base units"),
+            Reject::Dust { min } => write!(f, "an output is below the dust limit of {min} base units"),
             Reject::Malformed => f.write_str("malformed transaction"),
             Reject::BadSignature => f.write_str("invalid signature"),
             Reject::UnknownInput(_) => f.write_str("spends an output that is not unspent"),
@@ -110,11 +144,12 @@ pub struct Mempool {
     /// Transactions dropped for spent inputs, oldest first, in case a
     /// reorganization brings their inputs back.
     shelf: Vec<Entry>,
+    policy: Policy,
 }
 
 /// The cheap checks of a transaction on its own: all but its signatures,
 /// which [`Mempool::insert`] checks last, the pool and the UTXO set.
-fn check_static(tx: &Transaction) -> Result<u64, Reject> {
+fn check_static(tx: &Transaction, policy: &Policy) -> Result<u64, Reject> {
     if tx.inputs.is_empty() {
         return Err(Reject::NoInputs);
     }
@@ -125,6 +160,9 @@ fn check_static(tx: &Transaction) -> Result<u64, Reject> {
     if tx.outputs.iter().any(|o| o.amount == 0) {
         return Err(Reject::Malformed);
     }
+    if tx.outputs.iter().any(|o| o.amount < policy.dust) {
+        return Err(Reject::Dust { min: policy.dust });
+    }
     let mut spent = tx.spent_commitments();
     spent.sort_unstable_by_key(|c| crate::poseidon2::digest_to_bytes(c));
     if spent.windows(2).any(|w| w[0] == w[1]) {
@@ -134,12 +172,26 @@ fn check_static(tx: &Transaction) -> Result<u64, Reject> {
     if fee < 0 {
         return Err(Reject::NegativeFee);
     }
-    Ok(fee.min(u64::MAX as i128) as u64)
+    let fee = fee.min(u64::MAX as i128) as u64;
+    let min = policy.min_fee(tx.inputs.len(), tx.outputs.len());
+    if fee < min {
+        return Err(Reject::FeeTooLow { min });
+    }
+    Ok(fee)
 }
 
 impl Mempool {
+    /// A pool of `capacity` bytes with the mainnet policy.
     pub fn new(capacity: usize) -> Mempool {
-        Mempool { txs: HashMap::new(), spends: HashMap::new(), bytes: 0, capacity, shelf: Vec::new() }
+        Self::with_policy(capacity, Policy::MAINNET)
+    }
+
+    pub fn with_policy(capacity: usize, policy: Policy) -> Mempool {
+        Mempool { txs: HashMap::new(), spends: HashMap::new(), bytes: 0, capacity, shelf: Vec::new(), policy }
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
     }
 
     pub fn len(&self) -> usize {
@@ -172,7 +224,7 @@ impl Mempool {
         if self.txs.contains_key(&txid) {
             return Err(Reject::Known);
         }
-        let fee = check_static(&tx)?;
+        let fee = check_static(&tx, &self.policy)?;
         let mut conflicts: Vec<Digest> = Vec::new();
         for (c, p) in tx.spent_commitments().into_iter().zip(tx.spent_positions()) {
             if let Some(other) = self.spends.get(&c)
@@ -363,8 +415,14 @@ mod tests {
         }
         wtxn.commit().unwrap();
 
-        let mut pool = Mempool::new(1 << 20);
+        let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
         let rtxn = env.read_txn().unwrap();
+        // The mainnet policy wants a fee per byte and no dust.
+        let mut strict = Mempool::new(1 << 20);
+        let min = Policy::MAINNET.min_fee(1, 1);
+        assert_eq!(strict.insert(spend(1, 100_000, min - 1), &utxo, &rtxn), Err(Reject::FeeTooLow { min }));
+        assert_eq!(strict.insert(spend(1, 100_000, 100_000 - DUST + 1), &utxo, &rtxn), Err(Reject::Dust { min: DUST }));
+        strict.insert(spend(1, 100_000, min), &utxo, &rtxn).unwrap();
         let t1 = spend(1, 100_000, 5);
         let t2 = spend(2, 50, 10);
         let id1 = pool.insert(t1.clone(), &utxo, &rtxn).unwrap();
@@ -438,7 +496,7 @@ mod tests {
 
         // Capacity: a tiny pool evicts the lower rate for a higher one and
         // refuses a lower one.
-        let mut small = Mempool::new(t1.size());
+        let mut small = Mempool::with_policy(t1.size(), Policy::NONE);
         small.insert(t1.clone(), &utxo, &rtxn).unwrap();
         assert_eq!(small.insert(t2.clone(), &utxo, &rtxn), Ok(id2));
         assert!(!small.contains(&id1));

@@ -218,7 +218,13 @@ impl Body {
     }
 
     pub fn size(&self) -> usize {
-        12 + self.inputs.len() * POSITION_SIZE + self.outputs.len() * BLOCK_OUTPUT_SIZE + self.proof.len()
+        Self::size_of(self.inputs.len(), self.outputs.len(), self.proof.len())
+    }
+
+    /// The serialized size of a body with these counts and a proof of
+    /// `proof` bytes: what a block builder checks against the size limit.
+    pub fn size_of(inputs: usize, outputs: usize, proof: usize) -> usize {
+        12 + inputs * POSITION_SIZE + outputs * BLOCK_OUTPUT_SIZE + proof
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

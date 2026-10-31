@@ -782,6 +782,13 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(times[times.len() / 2])
     }
 
+    /// The earliest timestamp a block after `parent` may carry: one past
+    /// the median time of the blocks ending at `parent`.
+    pub fn earliest_timestamp(&self, parent: &Header) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.median_time_past(&rtxn, parent)? + 1)
+    }
+
     /// ASERT schedule anchored at genesis.
     fn asert(&self, genesis: &Header) -> Asert {
         Asert::from_genesis(genesis.timestamp as i64, self.params.genesis_target, self.params.max_target)
@@ -1739,12 +1746,22 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let id = digest_bytes(&header.hash());
         let body = self.body_by_hash_in(&rtxn, &id)?.ok_or(ChainError::Corrupt("main-chain body"))?;
-        let undo = self.undo.get(&rtxn, &id)?.and_then(Undo::from_bytes).ok_or(ChainError::Corrupt("undo record"))?;
+        // The fast-sync snapshot block has no undo record: its output
+        // counter comes from the manifest.
+        let first_output_position = match self.undo.get(&rtxn, &id)?.and_then(Undo::from_bytes) {
+            Some(undo) => undo.first_output_position,
+            None if self.floor_in(&rtxn)? == Some(height) => {
+                let next = self.meta.get(&rtxn, META_FLOOR_NEXT)?.ok_or(ChainError::Corrupt("floor_next"))?;
+                let next = u64::from_le_bytes(next.try_into().map_err(|_| ChainError::Corrupt("floor_next"))?);
+                next.checked_sub(body.outputs.len() as u64).ok_or(ChainError::Corrupt("floor_next"))?
+            }
+            None => return Err(ChainError::Corrupt("undo record")),
+        };
         let statement = crate::aggregate::Statement::from_block(&BlockStatement {
             height,
             prev_state_root: parent.state_root,
             new_state_root: header.state_root,
-            first_output_position: undo.first_output_position,
+            first_output_position,
             subsidy: self.params.subsidy(height),
             body: &body,
         });

@@ -13,23 +13,25 @@
 //!
 //! | message      | payload                                   | reply            |
 //! |--------------|-------------------------------------------|------------------|
-//! | `Ping`       | [`Status`]: nonce, version, genesis, tip  | `Pong`           |
+//! | `Ping`       | [`Status`]: nonce, version, token, genesis, tip | `Pong`     |
 //! | `Pong`       | [`Status`] echoing the nonce              |                  |
-//! | `GetPeers`   |                                           | `Peers`          |
+//! | `GetPeers`   | token                                     | `Peers`          |
 //! | `Peers`      | up to 32 addresses                        |                  |
-//! | `GetHeaders` | block locator, up to 32 ids               | `Headers`, several |
+//! | `GetHeaders` | token, block locator, up to 32 ids        | `Headers`, several |
+//! | `GetHeadersFrom` | token, height                         | `Headers`, several |
 //! | `Headers`    | up to 6 main-chain headers, oldest first  |                  |
 //! | `Inv`        | the header of a new block                 |                  |
 //! | `TxInv`      | the id of a new transaction               |                  |
-//! | `GetChunks`  | kind, id and up to 32 chunk indexes       | `Chunk`, one each |
+//! | `GetChunks`  | token, kind, id and up to 32 chunk indexes | `Chunk`, one each |
 //! | `Chunk`      | kind, id, object length, index, bytes     |                  |
 //!
 //! A block or transaction (the [`Kind`]) is fetched as [`CHUNK_BYTES`]-byte
 //! chunks of its serialization, pulled by the receiver in windows of
 //! [`WINDOW`] with [`Download`] tracking what arrived. A node only sends
 //! data in reply to a request, never more than the request asked for, and
-//! only to a peer that has answered one of its pings (so the address is
-//! not forged), so it cannot be used to amplify traffic.
+//! only to a request carrying the token it gave that address in its own
+//! status (so neither the address nor the request is forged), so it
+//! cannot be used to amplify traffic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -42,7 +44,7 @@ use crate::difficulty::U256;
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
@@ -158,6 +160,11 @@ pub struct Status {
     /// Set by the pinger; the pong echoes it.
     pub nonce: u64,
     pub version: u32,
+    /// What the receiver must put in its requests to the sender: a value
+    /// the sender derives from the receiver's address with a secret of its
+    /// own, so a request forged from another address goes unanswered and
+    /// the sender cannot be made to flood anyone.
+    pub token: u64,
     /// Genesis block id; peers on another chain are ignored.
     pub genesis: Digest,
     pub height: u32,
@@ -174,15 +181,21 @@ pub struct Status {
 pub enum Message {
     Ping(Status),
     Pong(Status),
-    GetPeers,
+    /// Every request carries the [`Status::token`] the receiver gave the
+    /// sender; the node fills it in as it sends.
+    GetPeers {
+        token: u64,
+    },
     Peers(Vec<SocketAddr>),
     GetHeaders {
         locator: Vec<Digest>,
+        token: u64,
     },
     /// Main-chain headers from `height` on, up to [`MAX_HEADERS`]: several
     /// can be asked of different peers at once, unlike `GetHeaders`.
     GetHeadersFrom {
         height: u32,
+        token: u64,
     },
     Headers(Vec<Header>),
     Inv(Header),
@@ -191,6 +204,7 @@ pub enum Message {
         kind: Kind,
         id: Digest,
         indexes: Vec<u16>,
+        token: u64,
     },
     Chunk {
         kind: Kind,
@@ -204,6 +218,7 @@ pub enum Message {
 fn put_status(w: &mut Writer, s: &Status) {
     w.u64(s.nonce);
     w.u32(s.version);
+    w.u64(s.token);
     w.digest(&s.genesis);
     w.u32(s.height);
     w.u32(s.oldest);
@@ -215,6 +230,7 @@ fn get_status(r: &mut Reader) -> Option<Status> {
     Some(Status {
         nonce: r.u64()?,
         version: r.u32()?,
+        token: r.u64()?,
         genesis: r.digest()?,
         height: r.u32()?,
         oldest: r.u32()?,
@@ -260,7 +276,10 @@ impl Message {
                 w.0.push(T_PONG);
                 put_status(&mut w, s);
             }
-            Message::GetPeers => w.0.push(T_GET_PEERS),
+            Message::GetPeers { token } => {
+                w.0.push(T_GET_PEERS);
+                w.u64(*token);
+            }
             Message::Peers(addrs) => {
                 w.0.push(T_PEERS);
                 w.0.push(addrs.len().min(MAX_PEERS_MESSAGE) as u8);
@@ -268,12 +287,14 @@ impl Message {
                     put_addr(&mut w, a);
                 }
             }
-            Message::GetHeaders { locator } => {
+            Message::GetHeaders { locator, token } => {
                 w.0.push(T_GET_HEADERS);
+                w.u64(*token);
                 w.digest_vec(&locator[..locator.len().min(MAX_LOCATOR)]);
             }
-            Message::GetHeadersFrom { height } => {
+            Message::GetHeadersFrom { height, token } => {
                 w.0.push(T_GET_HEADERS_FROM);
+                w.u64(*token);
                 w.u32(*height);
             }
             Message::Headers(headers) => {
@@ -291,8 +312,9 @@ impl Message {
                 w.0.push(T_TX_INV);
                 w.digest(id);
             }
-            Message::GetChunks { kind, id, indexes } => {
+            Message::GetChunks { kind, id, indexes, token } => {
                 w.0.push(T_GET_CHUNKS);
+                w.u64(*token);
                 kind.put(&mut w);
                 w.digest(id);
                 w.0.push(indexes.len().min(WINDOW) as u8);
@@ -328,17 +350,21 @@ impl Message {
         let msg = match bytes[4] {
             T_PING => Message::Ping(get_status(&mut r)?),
             T_PONG => Message::Pong(get_status(&mut r)?),
-            T_GET_PEERS => Message::GetPeers,
+            T_GET_PEERS => Message::GetPeers { token: r.u64()? },
             T_PEERS => {
                 let n = count(&mut r, MAX_PEERS_MESSAGE)?;
                 Message::Peers((0..n).map(|_| get_addr(&mut r)).collect::<Option<Vec<_>>>()?)
             }
             T_GET_HEADERS => {
+                let token = r.u64()?;
                 let locator = r.digest_vec()?;
                 (locator.len() <= MAX_LOCATOR).then_some(())?;
-                Message::GetHeaders { locator }
+                Message::GetHeaders { locator, token }
             }
-            T_GET_HEADERS_FROM => Message::GetHeadersFrom { height: r.u32()? },
+            T_GET_HEADERS_FROM => {
+                let token = r.u64()?;
+                Message::GetHeadersFrom { height: r.u32()?, token }
+            }
             T_HEADERS => {
                 let n = count(&mut r, HEADERS_PER_MESSAGE)?;
                 let headers = (0..n).map(|_| Header::from_bytes(r.take(HEADER_SIZE)?)).collect::<Option<Vec<_>>>()?;
@@ -347,13 +373,14 @@ impl Message {
             T_INV => Message::Inv(Header::from_bytes(r.take(HEADER_SIZE)?)?),
             T_TX_INV => Message::TxInv(r.digest()?),
             T_GET_CHUNKS => {
+                let token = r.u64()?;
                 let kind = Kind::get(&mut r)?;
                 let id = r.digest()?;
                 let n = count(&mut r, WINDOW)?;
                 let indexes = (0..n)
                     .map(|_| Some(u16::from_le_bytes(r.take(2)?.try_into().unwrap())))
                     .collect::<Option<Vec<_>>>()?;
-                Message::GetChunks { kind, id, indexes }
+                Message::GetChunks { kind, id, indexes, token }
             }
             T_CHUNK => {
                 let kind = Kind::get(&mut r)?;
@@ -373,7 +400,32 @@ impl Message {
 
 /// `GetChunks` messages asking for `indexes`, [`WINDOW`] at a time.
 pub fn chunk_requests(kind: Kind, id: Digest, indexes: &[u16]) -> impl Iterator<Item = Message> + '_ {
-    indexes.chunks(WINDOW).map(move |c| Message::GetChunks { kind, id, indexes: c.to_vec() })
+    indexes.chunks(WINDOW).map(move |c| Message::GetChunks { kind, id, indexes: c.to_vec(), token: 0 })
+}
+
+impl Message {
+    /// The request's token, if it is a request.
+    pub fn token(&self) -> Option<u64> {
+        match self {
+            Message::GetPeers { token }
+            | Message::GetHeaders { token, .. }
+            | Message::GetHeadersFrom { token, .. }
+            | Message::GetChunks { token, .. } => Some(*token),
+            _ => None,
+        }
+    }
+
+    /// The same message with `token` as its request token, if it is a request.
+    pub fn with_token(mut self, t: u64) -> Message {
+        match &mut self {
+            Message::GetPeers { token }
+            | Message::GetHeaders { token, .. }
+            | Message::GetHeadersFrom { token, .. }
+            | Message::GetChunks { token, .. } => *token = t,
+            _ => {}
+        }
+        self
+    }
 }
 
 /// Number of chunks of a block of `len` bytes.
@@ -567,6 +619,15 @@ pub const FETCH_BACKOFF: Duration = Duration::from_secs(600);
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Peers kept in the table.
 pub const MAX_PEERS: usize = 64;
+/// Most peer entries one public host may hold, over all its ports.
+pub const MAX_PER_HOST: usize = 2;
+
+/// What a ban is keyed by: the host, for a public address (a new port
+/// would get around it), the socket address for loopback, where many
+/// nodes may run on one machine.
+fn ban_key(addr: &SocketAddr) -> SocketAddr {
+    if addr.ip().is_loopback() { *addr } else { SocketAddr::new(addr.ip(), 0) }
+}
 /// Pings sent per tick to addresses that have not yet answered one: a
 /// forged ping costs at most this much traffic towards its victim.
 pub const UNVERIFIED_PINGS: usize = 8;
@@ -642,15 +703,23 @@ impl Peers {
     }
 
     /// Adds an address to try, if there is room. Returns whether it is new.
+    /// One host (a public address, whatever its ports) gets at most
+    /// [`MAX_PER_HOST`] entries, so it cannot fill the table.
     pub fn add(&mut self, addr: SocketAddr, seed: bool) -> bool {
         if addr.ip().is_unspecified() || addr.port() == 0 || self.selves.contains(&addr) {
             return false;
         }
-        if self.banned.get(&addr).is_some_and(|t| t.elapsed() < BAN_TIME) {
+        if self.banned.get(&ban_key(&addr)).is_some_and(|t| t.elapsed() < BAN_TIME) {
             return false;
         }
         if let Some(p) = self.map.get_mut(&addr) {
             p.seed |= seed;
+            return false;
+        }
+        if !seed
+            && !addr.ip().is_loopback()
+            && self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
+        {
             return false;
         }
         if self.map.len() >= MAX_PEERS {
@@ -706,6 +775,11 @@ impl Peers {
         p.status = Some(status);
         p.handshaken = true;
         true
+    }
+
+    /// The token `addr` gave us to put in requests (0 before its status).
+    pub fn token(&self, addr: &SocketAddr) -> u64 {
+        self.map.get(addr).and_then(|p| p.status).map_or(0, |s| s.token)
     }
 
     /// Whether `addr` has answered a ping of ours.
@@ -818,7 +892,7 @@ impl Peers {
                 return true;
             }
             if p.strikes >= MAX_STRIKES && p.last_strike.is_some_and(|t| now.duration_since(t) < STRIKE_DECAY) {
-                banned.insert(p.addr, now);
+                banned.insert(ban_key(&p.addr), now);
                 return false;
             }
             match (p.last_seen, p.last_ping) {
@@ -827,6 +901,9 @@ impl Peers {
                 (None, None) => true,
             }
         });
+        // A banned host's other entries go with it.
+        let banned = &self.banned;
+        self.map.retain(|_, p| p.seed || !banned.contains_key(&ban_key(&p.addr)));
     }
 
     /// Up to `n` live peers other than `exclude`, in table order.
@@ -877,6 +954,11 @@ impl Peers {
         if let Some(p) = self.map.get_mut(&addr) {
             p.headers_asked.get_or_insert(now);
         }
+    }
+
+    /// Whether `addr` was asked for headers and has not yet sent any we lacked.
+    pub fn awaiting_headers(&self, addr: &SocketAddr) -> bool {
+        self.map.get(addr).is_some_and(|p| p.headers_asked.is_some())
     }
 
     /// Notes that `addr` sent headers we lacked.
@@ -961,6 +1043,7 @@ mod tests {
         Status {
             nonce: 77,
             version: PROTOCOL_VERSION,
+            token: 0x1234_5678_9abc_def0,
             genesis: digest(1),
             height: 42,
             oldest: 5,
@@ -1005,6 +1088,27 @@ mod tests {
             d.reset_window();
         }
         assert_eq!(d.request(t).len(), WINDOW);
+    }
+
+    #[test]
+    fn one_host_gets_few_entries_and_a_ban_covers_its_ports() {
+        let mut peers = Peers::new();
+        let host = |port: u16| -> SocketAddr { format!("10.0.0.9:{port}").parse().unwrap() };
+        assert!(peers.add(host(1), false));
+        assert!(peers.add(host(2), false));
+        assert!(!peers.add(host(3), false));
+        // Loopback is exempt: many nodes may share one machine.
+        for port in 1..5 {
+            assert!(peers.add(format!("127.0.0.1:{port}").parse().unwrap(), false));
+        }
+        // Strikes against one port ban the host, every port of it.
+        for _ in 0..MAX_STRIKES {
+            peers.strike(host(1));
+        }
+        peers.prune(Instant::now());
+        assert!(peers.get(&host(1)).is_none() && peers.get(&host(2)).is_none());
+        assert!(!peers.add(host(3), false));
+        assert_eq!(peers.len(), 4);
     }
 
     #[test]
@@ -1123,18 +1227,18 @@ mod tests {
         let msgs = vec![
             Message::Ping(status()),
             Message::Pong(status()),
-            Message::GetPeers,
+            Message::GetPeers { token: 7 },
             Message::Peers(vec![v4, v6]),
             Message::Peers(vec![v6; MAX_PEERS_MESSAGE]),
-            Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect() },
-            Message::GetHeadersFrom { height: 123_456 },
+            Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect(), token: u64::MAX },
+            Message::GetHeadersFrom { height: 123_456, token: 1 },
             Message::Headers((0..HEADERS_PER_MESSAGE as u32).map(header).collect()),
             Message::Inv(header(5)),
             Message::TxInv(digest(6)),
-            Message::GetChunks { kind: Kind::Tx, id: digest(9), indexes: (0..WINDOW as u16).collect() },
+            Message::GetChunks { kind: Kind::Tx, id: digest(9), indexes: (0..WINDOW as u16).collect(), token: 3 },
             Message::Chunk { kind: Kind::Block, id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
             Message::Chunk { kind: Kind::Part(7), id: digest(9), len: 9, index: 0, data: vec![1u8; 9] },
-            Message::GetChunks { kind: Kind::Manifest, id: digest(2), indexes: vec![0, 1] },
+            Message::GetChunks { kind: Kind::Manifest, id: digest(2), indexes: vec![0, 1], token: 0 },
         ];
         for m in msgs {
             let bytes = m.encode();

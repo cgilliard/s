@@ -2,7 +2,8 @@
 
 A proof-of-work chain whose blocks carry only output commitments and a
 zero-knowledge validity proof. `miner/` holds the node, the prover and the
-wallet; `miner/SECURITY.md` analyses the proofs.
+wallet; `miner/SECURITY.md` analyses the proofs; `docs/HARDENING.md` lists
+the known gaps still to close.
 
 ## Genesis
 
@@ -83,8 +84,16 @@ and no more than 32 past the first one missing), applying them in order.
 Each peer's status says the lowest height from which it holds every block,
 so blocks are only asked of peers that have them. A peer that claims more
 work but sends no headers for it, or whose downloads stall or crawl, is
-passed over for ten minutes, and only peers that answered the node's own
-ping are believed at all. Replaying 60 full blocks over links with 80 ms
+passed over for ten minutes (a strike, five of which ban a host for an
+hour, is only for bad data), and only peers that answered the node's own
+ping are believed at all. A peer claiming more work at or below the node's
+own height is asked for its branch with a locator, and walked further
+along it as long as it has more, so a fork deeper than one reply is still
+found. Every request carries a token the serving node derived from the
+asking address with a secret of its own and sent there in its status, so
+a request forged from another address goes unanswered: a node cannot be
+made to flood anyone. One public host gets at most two peer entries,
+whatever its ports. Replaying 60 full blocks over links with 80 ms
 round trips took 20 s from three peers and 30 s from one, against about
 60 s before; blocks are applied on a thread of their own, so downloads go
 on meanwhile. A fast sync of a 1,487-block chain from three peers took
@@ -191,12 +200,24 @@ start, so a restored copy never signs with a leaf the original used.
 Payments use slate files passed between the two wallets by any channel:
 
 ```
-> send 10 0.5 /tmp/pay.slate        # sender: 10 coins, 0.5 fee; reserves inputs
+> send 10 /tmp/pay.slate            # sender: 10 coins at the smallest fee; reserves inputs
+> send 10 0.5 /tmp/pay.slate        # the same with a 0.5 fee
 > receive /tmp/pay.slate            # recipient: adds their output, writes /tmp/pay.slate.received
 > finalize /tmp/pay.slate.received  # sender: signs and pools the transaction
 > cancel ID                         # sender: replace it, before it confirms, with
                                     # one paying the inputs back at a higher fee
 ```
+
+The recipient may only add its output: `finalize` checks the amount and
+fee the sender offered, the change output down to its memo, and what the
+pool would refuse, before signing. The pool takes a transaction only if it
+pays at least one base unit per byte and makes no output worth less than
+the fee of spending it (about 0.000023 coins), so filling blocks, and the
+set of unspent outputs, costs something; `send` folds change below that
+into the fee. A payment the pool refuses is reported at the prompt and
+can be cancelled. The signatures, the leaves they use and the record of
+the payment are written in one wallet transaction, so a crash leaves
+nothing half done.
 
 `balance` shows confirmed, pending (incoming), reserved (held for a slate)
 and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,

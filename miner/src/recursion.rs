@@ -1506,8 +1506,8 @@ mod tests {
         use crate::stark::{TableInput, TableSpec};
         // One table: Fibonacci, whose last constrained row is the last
         // before the blinding rows.
-        let (trace, _) = fib_trace(6);
-        let last = 64 - ZK.blind_rows() - 1;
+        let (trace, _) = fib_trace(7);
+        let last = 128 - ZK.blind_rows() - 1;
         let public = vec![trace.values[2 * last + 1]];
         let proof = prove(&ZK, &Fibonacci, &trace, &public, &mut Challenger::new());
         assert_eq!(verify(&ZK, &Fibonacci, &public, &proof, &mut Challenger::new()), Ok(()));
@@ -1515,7 +1515,7 @@ mod tests {
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("verifier program accepts a zero-knowledge proof");
         assert_eq!(exec.output_digest, Some(output_digest(&public)));
         check_program(&c, &public);
-        let dummy = dummy_proof(&[(&Fibonacci, 6)], &ZK, 1);
+        let dummy = dummy_proof(&[(&Fibonacci, 7)], &ZK, 1);
         assert_eq!(compile_verifier(&Fibonacci, &ZK, &[Fp::ZERO], &dummy).prog.digest(1), c.prog.digest(1));
         let cb = compile_verifier(&Fibonacci, &ZK, &[public[0] + Fp::ONE], &proof);
         assert!(VmAir::execute(&cb.prog, &cb.inputs).is_err());
@@ -1526,7 +1526,7 @@ mod tests {
 
         // Two tables exchanging values through a lookup, with blinded rows
         // of junk the lookup must ignore.
-        let n = 64;
+        let n = 128;
         let real = n - ZK.blind_rows();
         let send = Trace::new((0..n).map(|i| Fp::new(if i < real { 10 + i as u32 % 4 } else { 999 })).collect(), 1);
         let (mut a, mut b) = (Fp::ZERO, Fp::ONE);

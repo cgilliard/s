@@ -212,13 +212,17 @@ impl Dataset {
         Dataset { params, items }
     }
 
-    /// Loads a dataset saved by [`Dataset::save`], or generates and saves
-    /// it. A loaded file is accepted if it has the right size and a few
-    /// items spread through it match the text.
+    /// Loads a saved dataset, or generates and saves it. A loaded file is
+    /// accepted if it has the right size, its checksum holds (a corrupt
+    /// item would make honest blocks look invalid) and a few items spread
+    /// through it match the text.
     pub fn load_or_generate(seed: &SeedText, path: &std::path::Path) -> std::io::Result<Dataset> {
         let params = *seed.params();
         if let Ok(bytes) = std::fs::read(path)
-            && let Some(d) = Self::from_bytes(params, &bytes)
+            && bytes.len() > CHECKSUM_BYTES
+            && let (body, sum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES)
+            && sum == checksum(body)
+            && let Some(d) = Self::from_bytes(params, body)
         {
             let n = d.items.len();
             if (0..8).map(|k| k * (n - 1) / 7).all(|i| d.items[i] == seed.calc_dataset_item(i)) {
@@ -227,7 +231,9 @@ impl Dataset {
         }
         let d = Self::generate(seed);
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, d.to_bytes())?;
+        let mut bytes = d.to_bytes();
+        bytes.extend_from_slice(&checksum(&bytes));
+        std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(d)
     }
@@ -264,6 +270,17 @@ impl Dataset {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+const CHECKSUM_BYTES: usize = 8;
+
+/// A checksum of the dataset file against corruption (not forgery: the
+/// sampled items guard the contents, the chain's blocks the rest).
+fn checksum(bytes: &[u8]) -> [u8; CHECKSUM_BYTES] {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    h.write(bytes);
+    h.finish().to_le_bytes()
 }
 
 impl ItemSource for Dataset {

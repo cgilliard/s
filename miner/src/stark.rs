@@ -46,9 +46,11 @@
 //! beyond the public values (the preprocessed tables are public anyway):
 //!
 //! - The last [`StarkConfig::blind_rows`] rows of every trace and
-//!   auxiliary trace are replaced with random values, more than the points
-//!   any column is opened at. Interpolation turns them into independent
-//!   uniform values at those points. The constraints hold on the rows
+//!   auxiliary trace are replaced with random values, more than the
+//!   `Fp`-linear functions of any column the openings reveal (four per
+//!   out-of-domain point, one per query row, and the next row's through
+//!   the quotient). Interpolation turns them into independent uniform
+//!   values at those points. The constraints hold on the rows
 //!   before: the vanishing polynomial is `Z_H / Z_B` with `Z_B` the product
 //!   over the blinding rows, and the boundary and transition selectors
 //!   treat the last row before them as the last row. The quotient's
@@ -426,10 +428,14 @@ impl StarkConfig {
     }
 
     /// Rows at the end of every table that a zero-knowledge proof fills
-    /// with randomness: more than the points any column is opened at (two
-    /// out of domain, one per query).
+    /// with randomness: more than the values any column gives away. A
+    /// column is a polynomial over `Fp`, so each of the two out-of-domain
+    /// openings (at ζ and gζ, in the quartic extension) reveals four
+    /// `Fp`-linear functions of it, and each query row one more; the
+    /// quotient opened at a query row also reveals the next row's. Twice
+    /// the queries plus eight exceeds all of that.
     pub fn blind_rows(&self) -> usize {
-        if self.zk { self.num_queries + 4 } else { 0 }
+        if self.zk { 2 * self.num_queries + 8 } else { 0 }
     }
 
     /// Degree of the random polynomials masking the quotient chunks.
@@ -2945,12 +2951,12 @@ mod tests {
 
     const ZK: StarkConfig = StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 0, zk: true, commit_bits: 0 };
 
-    /// A 64-row sender and a 64-row receiver for zero-knowledge proofs:
+    /// A 128-row sender and a 128-row receiver for zero-knowledge proofs:
     /// the rows before the blinding rows send `10 + i % 4`, and the
     /// receiver takes each value with multiplicity `mults` on its first
     /// four rows. The blinding rows hold junk the proof must ignore.
     fn zk_exchange(mults: [u32; 4]) -> (Trace, Trace) {
-        let n = 64;
+        let n = 128;
         let real = n - ZK.blind_rows();
         let send = Trace::new((0..n).map(|i| Fp::new(if i < real { 10 + i as u32 % 4 } else { 999 })).collect(), 1);
         let (mut a, mut b) = (Fp::ZERO, Fp::ONE);
@@ -2971,7 +2977,7 @@ mod tests {
 
     #[test]
     fn zero_knowledge_tables() {
-        let real = 64 - ZK.blind_rows();
+        let real = 128 - ZK.blind_rows();
         let (send, recv) = zk_exchange([real as u32 / 4; 4]);
         let tables = [
             TableInput { air: &Sender, trace: &send, pre: None },
@@ -3075,8 +3081,8 @@ mod tests {
     fn zero_knowledge_rejects_bad_rows() {
         // Fibonacci with the public value at the last row before the
         // blinding rows; what follows is junk.
-        let (mut trace, _) = fib_trace(6);
-        let last = 63 - ZK.blind_rows();
+        let (mut trace, _) = fib_trace(7);
+        let last = 127 - ZK.blind_rows();
         let out = vec![trace.values[2 * last + 1]];
         for v in &mut trace.values[2 * (last + 1)..] {
             *v = Fp::new(5);

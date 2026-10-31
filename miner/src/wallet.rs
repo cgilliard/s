@@ -45,6 +45,7 @@
 //! signing a replacement that pays the inputs back to the wallet with a
 //! higher fee, which the mempool accepts in its place.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use heed::types::{Bytes, Str};
@@ -52,6 +53,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::bip39;
 use crate::codec::{Reader, Writer};
+use crate::mempool::{MAX_TX_SIZE, Policy};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::state_tree::open_env;
 use crate::transaction::{
@@ -70,7 +72,7 @@ const META_SCAN_PENDING: &str = "scan_pending";
 /// outputs' positions.
 const META_SYNCED: &str = "synced";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys.
-const FORMAT: u8 = 3;
+const FORMAT: u8 = 4;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
 const SLATE_MAGIC: &[u8; 8] = b"tabslt02";
@@ -248,10 +250,13 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// What the sender keeps about a pending slate: its inputs and change, by
-/// commitment.
+/// commitment, and the amount and fee it offered, which the answered
+/// slate must still show.
 struct Pending {
     inputs: Vec<Commitment>,
     change: Option<Commitment>,
+    amount: u64,
+    fee: u64,
 }
 
 /// What the sender keeps about a finalized payment, to cancel it.
@@ -284,6 +289,8 @@ impl Pending {
         if let Some(c) = &self.change {
             w.digest(c);
         }
+        w.u64(self.amount);
+        w.u64(self.fee);
         w.finish()
     }
 
@@ -295,7 +302,9 @@ impl Pending {
             1 => Some(r.digest()?),
             _ => return None,
         };
-        r.is_empty().then_some(Pending { inputs, change })
+        let amount = r.u64()?;
+        let fee = r.u64()?;
+        r.is_empty().then_some(Pending { inputs, change, amount, fee })
     }
 }
 
@@ -361,7 +370,7 @@ impl core::fmt::Display for WalletError {
             WalletError::BadSlate(w) => write!(f, "bad slate: {w}"),
             WalletError::Unknown => f.write_str("no pending slate or sent payment with that id"),
             WalletError::Exhausted => f.write_str("an input has no signatures left"),
-            WalletError::FeeTooLow { min } => write!(f, "the replacement fee must be at least {min}"),
+            WalletError::FeeTooLow { min } => write!(f, "the fee must be at least {min} base units"),
             WalletError::OldFormat => f.write_str("wallet database is from an older format"),
             WalletError::Exists => f.write_str("a wallet already exists in that directory"),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
@@ -736,12 +745,23 @@ impl Wallet {
     }
 
     /// Deletes unspent records the UTXO set does not hold: outputs of blocks
-    /// or payments that never landed. Returns how many.
-    pub fn prune_pending(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<usize> {
+    /// or payments that never landed. The change of a pending slate stays,
+    /// as does anything in `keep`: the outputs of pooled transactions and
+    /// the reward of the block being mined, which may yet land. Returns
+    /// how many.
+    pub fn prune_pending(&self, utxo: &UtxoSet, rtxn: &RoTxn, keep: &HashSet<Commitment>) -> Result<usize> {
         let mut wtxn = self.env.write_txn()?;
+        let mut pending_change = HashSet::new();
+        for item in self.slates.iter(&wtxn)? {
+            let (_, b) = item?;
+            if let Some(c) = Pending::from_bytes(b).ok_or(WalletError::Corrupt("slate"))?.change {
+                pending_change.insert(c);
+            }
+        }
         let mut n = 0;
         for o in self.outputs()? {
-            if o.state == State::Unspent && !self.held(&o, utxo, rtxn)? {
+            let in_flight = keep.contains(&o.commitment) || pending_change.contains(&o.commitment);
+            if o.state == State::Unspent && !in_flight && !self.held(&o, utxo, rtxn)? {
                 self.outputs.delete(&mut wtxn, &digest_to_bytes(&o.commitment))?;
                 n += 1;
             }
@@ -807,9 +827,8 @@ impl Wallet {
     /// The key of `c` positioned at its next leaf. The leaf is recorded as
     /// used and committed before the key is returned. Also returns whether
     /// this is the output's last signature.
-    fn signing_key(&self, c: &Commitment) -> Result<(Key, bool)> {
-        let mut wtxn = self.env.write_txn()?;
-        let mut o = self.owned_in(&wtxn, c)?.ok_or(WalletError::Corrupt("missing output"))?;
+    fn signing_key(&self, wtxn: &mut RwTxn, c: &Commitment) -> Result<(Key, bool)> {
+        let mut o = self.owned_in(wtxn, c)?.ok_or(WalletError::Corrupt("missing output"))?;
         if u32::from(o.used) >= LEAVES_PER_HALF {
             return Err(WalletError::Exhausted);
         }
@@ -817,28 +836,40 @@ impl Wallet {
         let leaf = base + (u32::from(o.start) + u32::from(o.used)) % LEAVES_PER_HALF;
         o.used += 1;
         let last = u32::from(o.used) == LEAVES_PER_HALF;
-        self.record(&mut wtxn, &o)?;
-        wtxn.commit()?;
+        self.record(wtxn, &o)?;
         let mut key = self.key(&o.nonce);
         key.set_next_index(u64::from(leaf));
         Ok((key, last))
     }
 
+    /// [`Wallet::signing_key`] in a transaction of its own.
+    #[cfg(test)]
+    fn next_signing_key(&self, c: &Commitment) -> Result<(Key, bool)> {
+        let mut wtxn = self.env.write_txn()?;
+        let r = self.signing_key(&mut wtxn, c)?;
+        wtxn.commit()?;
+        Ok(r)
+    }
+
     /// Signs `unsigned`, whose inputs must be the wallet's outputs `inputs`
     /// in order, gives each input its output's position, and marks them
-    /// spent.
-    fn sign(&self, unsigned: UnsignedTransaction, inputs: &[Commitment]) -> Result<Signed> {
-        if inputs.iter().any(|c| self.owned(c).ok().flatten().is_none_or(|o| o.signatures_left() == 0)) {
-            return Err(WalletError::Exhausted);
+    /// spent, all within `wtxn`: the leaves used, the spent marks and
+    /// whatever the caller records about the payment land together, or,
+    /// if the process dies first, not at all.
+    fn sign(&self, wtxn: &mut RwTxn, unsigned: UnsignedTransaction, inputs: &[Commitment]) -> Result<Signed> {
+        for c in inputs {
+            if self.owned_in(wtxn, c)?.is_none_or(|o| o.signatures_left() == 0) {
+                return Err(WalletError::Exhausted);
+            }
         }
         let mut positions = Vec::with_capacity(inputs.len());
         for c in inputs {
-            positions.push(self.owned(c)?.and_then(|o| o.position).ok_or(WalletError::Unconfirmed)?);
+            positions.push(self.owned_in(wtxn, c)?.and_then(|o| o.position).ok_or(WalletError::Unconfirmed)?);
         }
         let mut keys = Vec::with_capacity(inputs.len());
         let mut last_signatures = Vec::new();
         for c in inputs {
-            let (key, last) = self.signing_key(c)?;
+            let (key, last) = self.signing_key(wtxn, c)?;
             if last {
                 last_signatures.push(*c);
             }
@@ -853,27 +884,60 @@ impl Wallet {
         })?;
         let mut tx = tx;
         tx.set_positions(&positions);
-        let mut wtxn = self.env.write_txn()?;
         for c in inputs {
-            self.set_state(&mut wtxn, c, State::Spent)?;
+            self.set_state(wtxn, c, State::Spent)?;
         }
-        wtxn.commit()?;
         Ok(Signed { tx, last_signatures })
     }
 
-    /// Starts a payment of `amount` with `fee`: picks confirmed inputs
-    /// largest first, reserves them, adds change to a fresh output, and
-    /// returns the stage-1 slate for the recipient.
-    pub fn send(&self, amount: u64, fee: u64, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
-        let need = amount as u128 + fee as u128;
+    /// The smallest fee a payment from `inputs` inputs may carry, with a
+    /// recipient output and change: what the pool asks ([`Policy::min_fee`]).
+    pub fn min_fee(inputs: usize) -> u64 {
+        Policy::MAINNET.min_fee(inputs, 2)
+    }
+
+    /// Starts a payment of `amount` with `fee` (or the smallest the pool
+    /// takes, if `None`): picks confirmed inputs largest first, reserves
+    /// them, adds change to a fresh output, and returns the stage-1 slate
+    /// for the recipient. Change below the dust limit goes to the fee.
+    pub fn send(&self, amount: u64, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
         if amount == 0 {
             return Err(WalletError::BadSlate("amount is zero"));
         }
-        let coins = self.spendable(utxo, rtxn)?;
-        let have: u128 = coins.iter().map(|c| c.amount as u128).sum();
-        if have < need {
-            return Err(WalletError::Insufficient { have, need });
+        let dust = Policy::MAINNET.dust;
+        if amount < dust {
+            return Err(WalletError::BadSlate("amount is below the dust limit"));
         }
+        let coins = self.spendable(utxo, rtxn)?;
+        // The fee depends on the inputs, which depend on the fee: with a
+        // fee for the inputs chosen so far, choose again until it holds.
+        let mut inputs = 1;
+        let given = fee;
+        let fee = loop {
+            let fee = given.unwrap_or_else(|| Self::min_fee(inputs));
+            let need = amount as u128 + fee as u128;
+            let mut picked = 0usize;
+            let mut total = 0u128;
+            for c in &coins {
+                if total >= need {
+                    break;
+                }
+                total += c.amount as u128;
+                picked += 1;
+            }
+            if total < need {
+                return Err(WalletError::Insufficient { have: total, need });
+            }
+            let min = Self::min_fee(picked.max(1));
+            if given.is_some() && fee < min {
+                return Err(WalletError::FeeTooLow { min });
+            }
+            if picked <= inputs {
+                break fee;
+            }
+            inputs = picked;
+        };
+        let need = amount as u128 + fee as u128;
         let mut picked = Vec::new();
         let mut total = 0u128;
         for c in coins {
@@ -884,9 +948,10 @@ impl Wallet {
             picked.push(c);
         }
         let change_amount = (total - need) as u64;
+        let fee = if change_amount < dust { fee + change_amount } else { fee };
         let mut outputs = Vec::new();
         let mut change = None;
-        if change_amount > 0 {
+        if change_amount >= dust {
             let out = self.receive(change_amount)?;
             change = Some(out.commitment);
             outputs.push(out);
@@ -896,7 +961,7 @@ impl Wallet {
             self.set_state(&mut wtxn, &c.commitment, State::Reserved)?;
         }
         let id = random_bytes::<32>()?;
-        let pending = Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change };
+        let pending = Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change, amount, fee };
         self.slates.put(&mut wtxn, &id, &pending.to_bytes())?;
         wtxn.commit()?;
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
@@ -943,21 +1008,43 @@ impl Wallet {
         if slate.outputs.len() <= slate.change as usize {
             return Err(WalletError::BadSlate("no recipient output"));
         }
+        // The recipient may only have added its output: the amount and
+        // fee offered must stand, or it could pocket the fee.
+        if slate.amount != pending.amount || slate.fee != pending.fee {
+            return Err(WalletError::BadSlate("amount or fee changed"));
+        }
         let ins: u128 = slate.inputs.iter().map(|(_, a)| *a as u128).sum();
         let outs: u128 = slate.outputs.iter().map(|o| o.amount as u128).sum();
         let paid: u128 = slate.outputs[slate.change as usize..].iter().map(|o| o.amount as u128).sum();
         if paid != slate.amount as u128 || ins != outs + slate.fee as u128 {
             return Err(WalletError::BadSlate("amounts do not balance"));
         }
+        // The change output, memo included: a changed memo would still
+        // spend, but a wallet restored from the phrase could never find it.
         let change_ok = match pending.change {
-            Some(c) => slate.change == 1 && slate.outputs[0].commitment == c,
+            Some(c) => {
+                let o = self.owned(&c)?.ok_or(WalletError::Corrupt("change output"))?;
+                let pk = self.key(&o.nonce).public_key();
+                let ours = Output::with_memo(&pubkey_hash(&pk), o.amount, self.memo(&o.nonce, o.amount));
+                slate.change == 1 && slate.outputs[0].to_bytes() == ours.to_bytes()
+            }
             None => slate.change == 0,
         };
         if !change_ok {
             return Err(WalletError::BadSlate("change output changed"));
         }
-        let signed = self.sign(slate.unsigned(), &pending.inputs)?;
+        // What the pool will refuse is not worth a signature.
+        if slate.outputs.iter().any(|o| o.amount == 0) {
+            return Err(WalletError::BadSlate("an output is for zero"));
+        }
+        if slate.outputs.iter().any(|o| o.amount < Policy::MAINNET.dust) {
+            return Err(WalletError::BadSlate("an output is below the dust limit"));
+        }
+        if 8 + slate.inputs.len() * INPUT_SIZE + slate.outputs.len() * OUTPUT_SIZE > MAX_TX_SIZE {
+            return Err(WalletError::BadSlate("too many outputs for one transaction"));
+        }
         let mut wtxn = self.env.write_txn()?;
+        let signed = self.sign(&mut wtxn, slate.unsigned(), &pending.inputs)?;
         self.slates.delete(&mut wtxn, &slate.id)?;
         let sent = Sent {
             txid: signed.tx.txid(),
@@ -1021,14 +1108,15 @@ impl Wallet {
             return Err(WalletError::Insufficient { have: total, need: fee as u128 + 1 });
         }
         let back = self.receive((total - fee as u128) as u64)?;
-        let signed = match self.sign(UnsignedTransaction::new(inputs, vec![back]), &sent.inputs) {
+        let mut wtxn = self.env.write_txn()?;
+        let signed = match self.sign(&mut wtxn, UnsignedTransaction::new(inputs, vec![back]), &sent.inputs) {
             Ok(s) => s,
             Err(e) => {
+                drop(wtxn);
                 self.forget(&back.commitment)?;
                 return Err(e);
             }
         };
-        let mut wtxn = self.env.write_txn()?;
         self.sent.delete(&mut wtxn, &digest_to_bytes(txid))?;
         let next =
             Sent { txid: signed.tx.txid(), inputs: sent.inputs, fee, size: signed.tx.size(), created: unix_now() };
@@ -1092,6 +1180,7 @@ pub fn digest_from_hex(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mempool::DUST;
     use std::path::PathBuf;
 
     struct TempDir(PathBuf);
@@ -1165,7 +1254,10 @@ mod tests {
         let o = w.owned(&a_commitment).unwrap().unwrap();
         assert!(other.open_memo(&w.memo(&o.nonce, 100)).is_none());
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(w.prune_pending(&u, &rtxn).unwrap(), 1);
+        // What is kept, as being in flight, is not pruned.
+        let b_commitment = w.outputs().unwrap().into_iter().find(|o| o.commitment != a_commitment).unwrap().commitment;
+        assert_eq!(w.prune_pending(&u, &rtxn, &HashSet::from([b_commitment])).unwrap(), 0);
+        assert_eq!(w.prune_pending(&u, &rtxn, &HashSet::new()).unwrap(), 1);
         assert_eq!(w.outputs().unwrap().len(), 1);
         assert!(matches!(Wallet::restore(&dir.0.join("wallet"), &phrase, ""), Err(WalletError::Exists)));
     }
@@ -1180,11 +1272,11 @@ mod tests {
         land(&env, &u, &w, &[&a]);
         // Normal output: leaves 0..7 in order, the eighth flagged last.
         for i in 0..8u64 {
-            let (k, last) = w.signing_key(&a.commitment).unwrap();
+            let (k, last) = w.next_signing_key(&a.commitment).unwrap();
             assert_eq!(k.next_index(), i);
             assert_eq!(last, i == 7);
         }
-        assert!(matches!(w.signing_key(&a.commitment), Err(WalletError::Exhausted)));
+        assert!(matches!(w.next_signing_key(&a.commitment), Err(WalletError::Exhausted)));
         // A restored copy finds it and signs from 8..15, from a random start,
         // wrapping within that half, eight times.
         let r = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
@@ -1206,7 +1298,7 @@ mod tests {
         assert_eq!(w.outputs().unwrap().len(), 1);
         let mut seen = Vec::new();
         for i in 0..8u32 {
-            let (k, last) = r.signing_key(&a.commitment).unwrap();
+            let (k, last) = r.next_signing_key(&a.commitment).unwrap();
             assert!((8..16).contains(&k.next_index()));
             assert_eq!(k.next_index() as u32, 8 + (u32::from(o.start) + i) % 8);
             assert_eq!(last, i == 7);
@@ -1214,7 +1306,7 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (8..16).collect::<Vec<_>>());
-        assert!(matches!(r.signing_key(&a.commitment), Err(WalletError::Exhausted)));
+        assert!(matches!(r.next_signing_key(&a.commitment), Err(WalletError::Exhausted)));
         // A wrong passphrase finds nothing.
         let wrong = Wallet::restore(&dir.0.join("wrong"), &phrase, "x").unwrap();
         assert_eq!(wrong.scan(&u, &rtxn).unwrap(), (0, 0));
@@ -1226,20 +1318,31 @@ mod tests {
         let (env, u) = utxo(&dir);
         let (alice, _) = Wallet::open(&dir.0.join("alice")).unwrap();
         let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
-        let a1 = alice.receive(60_000).unwrap();
-        let a2 = alice.receive(50_000).unwrap();
+        let a1 = alice.receive(60_000_000).unwrap();
+        let a2 = alice.receive(50_000_000).unwrap();
         land(&env, &u, &alice, &[&a1, &a2]);
         let rtxn = env.read_txn().unwrap();
+        let fee = Wallet::min_fee(2);
         assert!(matches!(
-            alice.send(200_000, 1, &u, &rtxn),
-            Err(WalletError::Insufficient { have: 110_000, need: 200_001 })
+            alice.send(200_000_000, Some(1), &u, &rtxn),
+            Err(WalletError::Insufficient { have: 110_000_000, need }) if need == 200_000_001
         ));
-        let slate = alice.send(70_000, 2, &u, &rtxn).unwrap();
+        assert!(
+            matches!(alice.send(70_000_000, Some(fee - 1), &u, &rtxn), Err(WalletError::FeeTooLow { min }) if min == fee)
+        );
+        assert!(matches!(alice.send(DUST - 1, None, &u, &rtxn), Err(WalletError::BadSlate(_))));
+        // Without a fee given, the smallest one for the inputs it takes.
+        assert_eq!(alice.send(70_000_000, None, &u, &rtxn).unwrap().fee, fee);
+        for (id, _) in alice.pending_slates().unwrap() {
+            alice.cancel_slate(&id).unwrap();
+        }
+        let slate = alice.send(70_000_000, Some(fee), &u, &rtxn).unwrap();
+        let change = 110_000_000 - 70_000_000 - fee;
         assert_eq!((slate.stage, slate.inputs.len(), slate.change), (1, 2, 1));
-        assert_eq!(slate.outputs[0].amount, 39_998);
+        assert_eq!(slate.outputs[0].amount, change);
         assert_eq!(
             alice.balance(&u, &rtxn).unwrap(),
-            Balance { confirmed: 0, pending: 39_998, reserved: 110_000, locked: 0 }
+            Balance { confirmed: 0, pending: change as u128, reserved: 110_000_000, locked: 0 }
         );
         let mut received = Slate::from_bytes(&slate.to_bytes()).unwrap();
         assert_eq!(received, slate);
@@ -1249,18 +1352,36 @@ mod tests {
         let received = Slate::from_bytes(&received.to_bytes()).unwrap();
         assert!(matches!(bob.finalize(&received), Err(WalletError::Unknown)));
         let mut greedy = received.clone();
-        greedy.outputs[1] = Output::new(&bob.key(&[Fp::ONE; 4]).public_key(), 70_001);
+        greedy.outputs[1] = Output::new(&bob.key(&[Fp::ONE; 4]).public_key(), 70_000_001);
         assert!(matches!(alice.finalize(&greedy), Err(WalletError::BadSlate("amounts do not balance"))));
+        // The recipient may not move the fee into its own pocket.
+        let mut greedy = received.clone();
+        greedy.fee = 0;
+        greedy.amount = 70_000_000 + fee;
+        greedy.outputs[1] = Output::new(&bob.key(&[Fp::ONE; 4]).public_key(), 70_000_000 + fee);
+        assert!(matches!(alice.finalize(&greedy), Err(WalletError::BadSlate("amount or fee changed"))));
+        // Nor touch the change's memo, which a restored wallet needs.
+        let mut spoiled = received.clone();
+        spoiled.outputs[0].memo[5] = spoiled.outputs[0].memo[5].add(&Fp::ONE);
+        assert_eq!(spoiled.outputs[0].commitment, received.outputs[0].commitment);
+        assert!(matches!(alice.finalize(&spoiled), Err(WalletError::BadSlate("change output changed"))));
+        // Nor add what the pool would refuse.
+        let mut dust = received.clone();
+        dust.outputs[1] = Output::new(&bob.key(&[Fp::ONE; 4]).public_key(), 70_000_000 - (DUST - 1));
+        dust.outputs.push(Output::new(&bob.key(&[Fp::ONE; 4]).public_key(), DUST - 1));
+        assert!(matches!(alice.finalize(&dust), Err(WalletError::BadSlate("an output is below the dust limit"))));
+        // The change stays through a prune while the slate is pending.
+        assert_eq!(alice.prune_pending(&u, &rtxn, &HashSet::new()).unwrap(), 0);
         let signed = alice.finalize(&received).unwrap();
         let tx = signed.tx;
-        assert!(tx.verify_signatures() && tx.balance() == 2 && signed.last_signatures.is_empty());
+        assert!(tx.verify_signatures() && tx.balance() == fee as i128 && signed.last_signatures.is_empty());
         // Each input names where its output is.
         assert_eq!(tx.spent_positions(), vec![0, 1]);
         assert!(matches!(alice.finalize(&received), Err(WalletError::Unknown)));
         // Signed but not confirmed: the inputs are locked, not reserved.
         assert_eq!(
             alice.balance(&u, &rtxn).unwrap(),
-            Balance { confirmed: 0, pending: 39_998, reserved: 0, locked: 110_000 }
+            Balance { confirmed: 0, pending: change as u128, reserved: 0, locked: 110_000_000 }
         );
         // The recipient's output carries a memo only bob can open.
         assert!(bob.open_memo(&tx.outputs[1].memo).is_some());
@@ -1290,11 +1411,11 @@ mod tests {
 
         // Cancelling a slate frees its inputs.
         drop(rtxn);
-        let a3 = alice.receive(9).unwrap();
+        let a3 = alice.receive(9_000_000).unwrap();
         land(&env, &u, &alice, &[&a3]);
         let rtxn = env.read_txn().unwrap();
-        let s2 = alice.send(4, 0, &u, &rtxn).unwrap();
-        assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 9);
+        let s2 = alice.send(4_000_000, None, &u, &rtxn).unwrap();
+        assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 9_000_000);
         alice.cancel_slate(&s2.id).unwrap();
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 0);
         assert!(matches!(alice.cancel_slate(&s2.id), Err(WalletError::Unknown)));

@@ -132,6 +132,18 @@ found the same effect for BabyBear^4. There the commit phase reached 99.5
 bits against a 100-bit claim, and OpenVM added a grinding step before
 sampling ζ.
 
+## Zero knowledge
+
+The wrap and chain proofs hide their traces: the last `blind_rows` rows of
+every trace and auxiliary trace are random, and the quotient chunks are
+masked. A column is a polynomial over `Fp` opened at ζ and gζ, which lie in
+the quartic extension, so each of those two openings reveals four
+`Fp`-linear functions of the column, each query row one more, and the
+quotient at a query row the next row's values. The blinding must exceed
+all of that: `2 × queries + 8` rows (52 for the wrap, which has 22
+queries). With fewer rows, as before (queries + 4), a few linear relations
+on each column's real rows would leak per proof.
+
 ## Commit-phase grinding
 
 Before each challenge of the commit phase, the prover finds a witness w such

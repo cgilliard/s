@@ -236,14 +236,24 @@ enum Job {
         from: SocketAddr,
     },
     /// Staged parts carried forward to a later snapshot.
-    Carry { parts: Vec<CarriedPart>, next: u64 },
+    Carry {
+        parts: Vec<CarriedPart>,
+        next: u64,
+    },
 }
 /// What applying it gave.
 enum Outcome {
     Block(Box<Block>, Option<SocketAddr>, Result<Applied, ChainError>),
-    Part { index: u32, from: SocketAddr, result: Result<(), ChainError> },
+    Part {
+        index: u32,
+        from: SocketAddr,
+        result: Result<(), ChainError>,
+    },
     /// Which parts were carried.
-    Carry { indexes: Vec<u32>, result: Result<Vec<bool>, ChainError> },
+    Carry {
+        indexes: Vec<u32>,
+        result: Result<Vec<bool>, ChainError>,
+    },
 }
 
 /// A snapshot of the node for the prompt, refreshed every second.
@@ -286,6 +296,9 @@ pub struct Node<V: ProofVerifier> {
     /// Who announced a block we may fetch: asked first, since its status
     /// may not show the block yet.
     sources: HashMap<Digest, SocketAddr>,
+    /// Blocks of a branch forking below what the chain can unwind: not
+    /// fetched again.
+    unfollowable: std::collections::HashSet<Digest>,
     /// Header batches in flight or complete, by first height, verified in
     /// order as the one at the best header comes in.
     header_batches: std::collections::BTreeMap<u32, HeaderBatch>,
@@ -313,6 +326,10 @@ pub struct Node<V: ProofVerifier> {
     #[cfg(test)]
     parts_staged: Arc<AtomicU64>,
     last_header_request: Option<Instant>,
+    /// Peers whose branch we are walking with locators because they claim
+    /// more work than our best header without yet showing it: the height
+    /// the last request continued from, so each reply brings one more.
+    fork_probe: HashMap<SocketAddr, u32>,
     syncing: Arc<AtomicBool>,
     rx: Receiver<Event>,
     tip_changes: Arc<AtomicU64>,
@@ -322,6 +339,8 @@ pub struct Node<V: ProofVerifier> {
     /// address it does not hold.
     nonce_key: std::collections::hash_map::RandomState,
     nonce_count: u64,
+    /// Request tokens are this key's SipHash of the peer's address.
+    token_key: std::collections::hash_map::RandomState,
     last_seed_lookup: Option<Instant>,
     last_save: Instant,
     started: Instant,
@@ -491,6 +510,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             tx_downloads: HashMap::new(),
             pending: HashMap::new(),
             sources: HashMap::new(),
+            unfollowable: std::collections::HashSet::new(),
             applying: std::collections::HashSet::new(),
             header_batches: std::collections::BTreeMap::new(),
             slow_batches: HashMap::new(),
@@ -510,12 +530,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             #[cfg(test)]
             parts_staged: Arc::new(AtomicU64::new(0)),
             last_header_request: None,
+            fork_probe: HashMap::new(),
             syncing: Arc::new(AtomicBool::new(true)),
             rx,
             tip_changes: Arc::new(AtomicU64::new(0)),
             running,
             nonce_key: std::collections::hash_map::RandomState::new(),
             nonce_count: 0,
+            token_key: std::collections::hash_map::RandomState::new(),
             last_seed_lookup: None,
             last_save: now,
             started: now,
@@ -591,10 +613,27 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// Sends a message, giving a request the token its receiver gave us.
     fn send(&self, addr: SocketAddr, msg: &Message) {
-        if let Err(e) = self.socket.send_to(&msg.encode(), addr) {
+        let bytes = match msg.token() {
+            Some(_) => msg.clone().with_token(self.peers.token(&addr)).encode(),
+            None => msg.encode(),
+        };
+        if let Err(e) = self.socket.send_to(&bytes, addr) {
             self.chatter(&format!("send to {addr} failed: {e}"));
         }
+    }
+
+    /// The token `addr` must put in its requests: derived from the address
+    /// with a secret of this node's, so it need not be remembered and
+    /// nobody who did not receive it (at that address) can present it.
+    fn token_for(&self, addr: &SocketAddr) -> u64 {
+        std::hash::BuildHasher::hash_one(&self.token_key, addr)
+    }
+
+    /// Whether a request from `addr` carries `addr`'s token.
+    fn request_ok(&self, addr: &SocketAddr, token: u64) -> bool {
+        token == self.token_for(addr)
     }
 
     fn next_nonce(&mut self) -> u64 {
@@ -602,11 +641,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         std::hash::BuildHasher::hash_one(&self.nonce_key, self.nonce_count)
     }
 
-    fn status(&self, nonce: u64) -> Status {
+    /// Our status for `to`, with the token it must put in its requests.
+    fn status(&self, to: &SocketAddr, nonce: u64) -> Status {
         let tip = self.chain.tip().ok().flatten();
         Status {
             nonce,
             version: PROTOCOL_VERSION,
+            token: self.token_for(to),
             genesis: self.genesis,
             height: tip.map_or(0, |h| h.height),
             oldest: self.chain.oldest_body().unwrap_or_else(|_| tip.map_or(1, |h| h.height + 1)),
@@ -649,7 +690,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             std::hash::BuildHasher::hash_one(key, *count)
         });
         for (addr, n) in due {
-            let st = self.status(n);
+            let st = self.status(&addr, n);
             self.send(addr, &Message::Ping(st));
         }
         if self.peers.live_count(now) < TARGET_PEERS {
@@ -657,11 +698,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.resolve_seeds(now);
             }
             if let Some(p) = self.peers.sample(1, None, now).first() {
-                self.send(*p, &Message::GetPeers);
+                self.send(*p, &Message::GetPeers { token: 0 });
             }
         }
         let best_work = self.chain.best_header_work().unwrap_or(U256::ZERO);
         for addr in self.peers.expire_header_requests(best_work, now) {
+            self.fork_probe.remove(&addr);
             self.log(&format!("{addr} sent no headers for the work it claims; passing it over"));
         }
         let stale = now.checked_sub(PENDING_TIMEOUT);
@@ -771,7 +813,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 break;
             };
             let (peer, height) = free.swap_remove(i);
-            self.send(peer, &Message::GetHeadersFrom { height: start });
+            self.send(peer, &Message::GetHeadersFrom { height: start, token: 0 });
             self.peers.asked_headers(peer, now);
             let end = height.min(start + step - 1);
             self.header_batches.insert(
@@ -779,6 +821,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 HeaderBatch { start, peer, asked: now, end, headers: std::collections::BTreeMap::new() },
             );
             start += step;
+        }
+        // A peer claiming more work at or below our best header's height
+        // is on another branch, or lying: a locator finds the fork, and a
+        // peer that sends nothing for its claim is passed over in time.
+        let probes: Vec<SocketAddr> = free
+            .iter()
+            .filter(|(a, h)| *h <= best.height && !self.peers.awaiting_headers(a))
+            .map(|(a, _)| *a)
+            .collect();
+        for peer in probes {
+            self.request_headers(peer, now);
         }
     }
 
@@ -843,7 +896,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.chatter(&format!("asking {to} for headers"));
                 self.last_header_request = Some(now);
                 self.peers.asked_headers(to, now);
-                self.send(to, &Message::GetHeaders { locator });
+                self.send(to, &Message::GetHeaders { locator, token: 0 });
+            }
+            Err(e) => self.log(&format!("header locator: {e}")),
+        }
+    }
+
+    /// Asks `to` for the headers after `from`, a header of its branch we
+    /// hold, falling back to our main chain's locator.
+    fn continue_headers(&mut self, to: SocketAddr, from: Digest, now: Instant) {
+        match self.chain.header_locator() {
+            Ok(mut locator) => {
+                locator.insert(0, from);
+                locator.truncate(32);
+                self.chatter(&format!("asking {to} for more of its branch"));
+                self.peers.asked_headers(to, now);
+                self.send(to, &Message::GetHeaders { locator, token: 0 });
             }
             Err(e) => self.log(&format!("header locator: {e}")),
         }
@@ -862,6 +930,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         for header in plan {
             if self.downloads.len() >= MAX_DOWNLOADS {
+                break;
+            }
+            if self.unfollowable.contains(&header.hash()) {
                 break;
             }
             let id = header.hash();
@@ -924,7 +995,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
-        self.send(from, &Message::GetChunks { kind, id, indexes });
+        self.send(from, &Message::GetChunks { kind, id, indexes, token: 0 });
         self.chatter(&format!("fetching {kind:?} {} from {from}", short(&id)));
         match kind {
             Kind::Tx => self.tx_downloads.insert(id, d),
@@ -939,10 +1010,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for (to, msg) in requests {
             self.send(to, &msg);
         }
+        // A transaction gone from its pool, or a slow link: no fault.
         for id in txs {
-            if let Some(d) = self.tx_downloads.remove(&id) {
-                self.peers.strike(d.from);
-            }
+            self.tx_downloads.remove(&id);
         }
         if blocks.is_empty() {
             return;
@@ -950,9 +1020,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for id in blocks {
             let Some(d) = self.downloads.remove(&id) else { continue };
             self.log(&format!("gave up fetching block {} from {}; trying another peer", short(&id), d.from));
-            // It may lack old bodies (pruned, or fast-synced), or be slow
-            // or hostile: pass it over for a while.
-            self.peers.strike(d.from);
+            // It may lack old bodies (pruned, or fast-synced), or be slow,
+            // or the fault may be on our side: pass it over for a while.
+            // Strikes are for bad data, not for silence.
             self.peers.fetch_failed(d.from, now);
             if self.sources.get(&id) == Some(&d.from) {
                 self.sources.remove(&id);
@@ -963,23 +1033,37 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn handle_packet(&mut self, addr: SocketAddr, bytes: &[u8]) {
         // Anyone can forge a source address: nothing that arrives unasked
-        // counts against the peer it names, and only peers that answered
-        // our ping are heard beyond a ping or pong.
+        // counts against the peer it names, and beyond a ping or pong only
+        // peers that answered our ping, or requests carrying the token we
+        // gave their address, are heard.
         let Some(msg) = Message::decode(bytes) else {
+            self.chatter(&format!(
+                "{addr} sent {} bytes that are not a message; another protocol version?",
+                bytes.len()
+            ));
             return;
         };
         let now = Instant::now();
-        if !matches!(msg, Message::Ping(_) | Message::Pong(_)) && !self.peers.handshaken(&addr) {
+        // A request proves its address with its token; anything else
+        // unasked for is heard only from a peer that answered our ping.
+        if !matches!(msg, Message::Ping(_) | Message::Pong(_)) && msg.token().is_none() && !self.peers.handshaken(&addr)
+        {
             return;
         }
         match msg {
             Message::Ping(st) => {
+                if st.version != PROTOCOL_VERSION {
+                    // Answer, so the other side can see why; not a peer.
+                    self.chatter(&format!("{addr} speaks protocol v{}, ours is v{PROTOCOL_VERSION}", st.version));
+                    self.send(addr, &Message::Pong(self.status(&addr, st.nonce)));
+                    return;
+                }
                 if st.genesis != self.genesis {
                     // Answer, so the other side can see why we will not
                     // talk to it. (Its pong to our ping, which proves the
                     // address, is what drops it.)
                     self.chatter(&format!("{addr} is on another chain"));
-                    self.send(addr, &Message::Pong(self.status(st.nonce)));
+                    self.send(addr, &Message::Pong(self.status(&addr, st.nonce)));
                     return;
                 }
                 // Our own ping to this address arrived back: it is us (a
@@ -995,20 +1079,30 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 } else {
                     self.peers.add(addr, false);
                 }
-                let reply = self.status(st.nonce);
+                let reply = self.status(&addr, st.nonce);
                 self.send(addr, &Message::Pong(reply));
                 // Complete the handshake from our side at once, within the
                 // budget for unverified addresses.
                 if !self.peers.handshaken(&addr) {
                     let nonce = self.next_nonce();
                     if self.peers.ping_now(addr, nonce, now) {
-                        let ping = self.status(nonce);
+                        let ping = self.status(&addr, nonce);
                         self.send(addr, &Message::Ping(ping));
                     }
                 }
                 self.consider(addr, &st, now);
             }
             Message::Pong(st) => {
+                if st.version != PROTOCOL_VERSION {
+                    if self.peers.pong(addr, st) {
+                        self.log(&format!(
+                            "{addr} speaks protocol v{}, ours is v{PROTOCOL_VERSION}; is one of us out of date?",
+                            st.version
+                        ));
+                        self.peers.remove(&addr);
+                    }
+                    return;
+                }
                 if st.genesis != self.genesis {
                     if self.peers.pong(addr, st) {
                         self.log(&format!(
@@ -1030,8 +1124,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 self.consider(addr, &st, now);
             }
-            Message::GetPeers => {
-                if !self.peers.handshaken(&addr) {
+            Message::GetPeers { token } => {
+                if !self.request_ok(&addr, token) {
                     return;
                 }
                 self.peers.seen(addr, now);
@@ -1046,8 +1140,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     }
                 }
             }
-            Message::GetHeaders { locator } => {
-                if !self.peers.handshaken(&addr) {
+            Message::GetHeaders { locator, token } => {
+                if !self.request_ok(&addr, token) {
                     return;
                 }
                 self.peers.seen(addr, now);
@@ -1060,7 +1154,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     Err(e) => self.log(&format!("headers: {e}")),
                 }
             }
-            Message::GetHeadersFrom { height } => {
+            Message::GetHeadersFrom { height, token } => {
+                if !self.request_ok(&addr, token) {
+                    return;
+                }
                 self.peers.seen(addr, now);
                 match self.chain.headers_from(height, MAX_HEADERS) {
                     Ok(headers) => {
@@ -1095,8 +1192,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     self.start_download(Kind::Tx, txid, addr, now);
                 }
             }
-            Message::GetChunks { kind, id, indexes } => {
-                if !self.peers.handshaken(&addr) {
+            Message::GetChunks { kind, id, indexes, token } => {
+                if !self.request_ok(&addr, token) {
                     return;
                 }
                 self.peers.seen(addr, now);
@@ -1112,9 +1209,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A peer's status: if a trusted peer claims more work than our best
     /// header, fetch headers now rather than at the next tick.
     fn consider(&mut self, addr: SocketAddr, st: &Status, now: Instant) {
-        if self.peers.handshaken(&addr)
-            && st.work > self.chain.best_header_work().unwrap_or(U256::ZERO)
-        {
+        if self.peers.handshaken(&addr) && st.work > self.chain.best_header_work().unwrap_or(U256::ZERO) {
             self.pump_headers(now);
         }
     }
@@ -1138,19 +1233,37 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             for h in headers.iter().take(new) {
                 self.note_source(h.hash(), from);
             }
+            let mut refused = false;
             match stop {
                 None | Some(ChainError::TimestampTooNew { .. }) => {}
+                // A reply comes in several datagrams, which may arrive out
+                // of order or not at all: a header whose parent is still on
+                // its way is no fault.
+                Some(ChainError::UnknownParent(_)) => refused = true,
                 Some(e) => {
+                    refused = true;
                     self.log(&format!("headers from {from} refused: {e}"));
                     self.peers.strike(from);
                 }
             }
             if self.chain.best_header_work().unwrap_or(U256::ZERO) > before {
                 self.peers.headers_arrived(from);
+                self.fork_probe.remove(&from);
                 // The fork is found: the pipeline goes on from here.
                 if headers.len() == net::HEADERS_PER_MESSAGE {
                     self.request_headers(from, now);
                 }
+            } else if !refused
+                && headers.len() == net::HEADERS_PER_MESSAGE
+                && let Some(last) = headers.last()
+                && self.peers.awaiting_headers(&from)
+                && self.fork_probe.get(&from).is_none_or(|&p| last.height >= p + MAX_HEADERS as u32)
+            {
+                // Its branch so far is no heavier than ours, and a locator
+                // from our main chain would bring these same headers again:
+                // continue from the last one, one request per reply.
+                self.fork_probe.insert(from, last.height);
+                self.continue_headers(from, last.hash(), now);
             }
         }
         match self.mode {
@@ -1420,6 +1533,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 false
             }
+            Err(e @ (ChainError::BelowSnapshot | ChainError::BeyondUndo)) => {
+                // The best header's branch forks below what this node can
+                // unwind: it will not be fetched again until restarted.
+                if self.unfollowable.insert(id) {
+                    self.log(&format!(
+                        "cannot follow block {} at height {height}: {e}; the network's chain forked below \
+                         what this node keeps (start again with a fresh data directory to follow it)",
+                        short(&id)
+                    ));
+                }
+                self.drop_pending_descendants(id);
+                false
+            }
             Err(e) => {
                 self.log(&format!("rejected block {} at height {height}: {e}", short(&id)));
                 if e.is_invalid_block() {
@@ -1460,6 +1586,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Pools a transaction and announces it if new.
     fn handle_transaction(&mut self, tx: Transaction, from: Option<SocketAddr>) {
+        let txid = tx.txid();
         let result = {
             let rtxn = match self.chain.env().read_txn() {
                 Ok(t) => t,
@@ -1471,9 +1598,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), &rtxn)
         };
         match result {
+            // Ours may have been pooled already, by the prompt: announce it.
+            Ok(_) | Err(Reject::Known) if from.is_none() => {
+                self.log(&format!("our transaction {} pooled", short(&txid)));
+                let now = Instant::now();
+                for addr in self.peers.sample(net::MAX_PEERS, None, now) {
+                    self.send(addr, &Message::TxInv(txid));
+                }
+            }
             Ok(txid) => {
-                let whose = from.map_or("our transaction".to_string(), |a| format!("transaction from {a}"));
-                self.log(&format!("{whose} {} pooled", short(&txid)));
+                self.log(&format!("transaction from {} {} pooled", from.unwrap(), short(&txid)));
                 let now = Instant::now();
                 for addr in self.peers.sample(net::MAX_PEERS, from, now) {
                     self.send(addr, &Message::TxInv(txid));
@@ -1484,7 +1618,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.log(&format!("rejected transaction{}: {e}", from.map_or(String::new(), |a| format!(" from {a}"))));
                 // Conflicts, spent or not-yet-seen inputs and a full pool
                 // happen to honest peers in races; the rest cannot.
-                let honest = matches!(e, Reject::ReplacementFee { .. } | Reject::UnknownInput(_) | Reject::Full);
+                let honest = matches!(
+                    e,
+                    Reject::ReplacementFee { .. }
+                        | Reject::UnknownInput(_)
+                        | Reject::Full
+                        | Reject::FeeTooLow { .. }
+                        | Reject::Dust { .. }
+                );
                 if let Some(from) = from
                     && !honest
                 {
@@ -1636,7 +1777,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
-        self.send(from, &Message::GetChunks { kind, id, indexes });
+        self.send(from, &Message::GetChunks { kind, id, indexes, token: 0 });
         self.snap_downloads.insert((kind, id), d);
     }
 
@@ -1992,7 +2133,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.snap_attempts >= MAX_SNAPSHOT_ATTEMPTS {
             // Validating from genesis needs a peer keeping every block;
             // without one it would stall for good, so keep trying.
-            let archive = self.peers.trusted(Instant::now()).any(|p| p.status.is_some_and(|s| s.height > 0 && s.oldest <= 1));
+            let archive =
+                self.peers.trusted(Instant::now()).any(|p| p.status.is_some_and(|s| s.height > 0 && s.oldest <= 1));
             if archive {
                 self.log(&format!("fast sync: {why}; giving up, validating every block instead"));
                 self.snap = None;
@@ -2265,7 +2407,7 @@ mod tests {
     }
 
     fn pool() -> Arc<Mutex<Mempool>> {
-        Arc::new(Mutex::new(Mempool::new(1 << 20)))
+        Arc::new(Mutex::new(Mempool::with_policy(1 << 20, crate::mempool::Policy::NONE)))
     }
 
     fn pk(tag: u8) -> crate::xmss::PublicKey {
@@ -2692,7 +2834,18 @@ mod tests {
         // The liar answers pings claiming all the work there could be, and
         // nothing else. c, knowing it and a, must still sync from a, and
         // stop counting itself as behind (which would idle its miner).
-        let a = open("liar-a");
+        false_claim_does_not_stall("liar", 1_000_000);
+    }
+
+    #[test]
+    fn a_false_claim_of_work_at_a_low_height_does_not_stall_the_sync() {
+        // The same liar, claiming its work at height 1: too short for the
+        // header pipeline, it used to be neither asked nor passed over.
+        false_claim_does_not_stall("short-liar", 1);
+    }
+
+    fn false_claim_does_not_stall(name: &str, liar_height: u32) {
+        let a = open(&format!("{name}-a"));
         let now = unix_now();
         let mut t = T0;
         for tag in 1..=3u8 {
@@ -2718,8 +2871,9 @@ mod tests {
                         let claim = Status {
                             nonce: st.nonce,
                             version: PROTOCOL_VERSION,
+                            token: 0,
                             genesis,
-                            height: 1_000_000,
+                            height: liar_height,
                             oldest: 1,
                             tip: genesis,
                             work: U256([u64::MAX; 4]),
@@ -2729,12 +2883,13 @@ mod tests {
                 }
             })
         };
-        let c = open("liar-c");
+        let c = open(&format!("{name}-c"));
         let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![liar_addr, addr_a], &c.dir)).unwrap();
         let syncing = node_c.syncing();
         let hc = std::thread::spawn(move || node_c.run());
         assert!(wait_for_tip(&c.chain, &a_tip, 40), "c did not sync from a");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The liar is passed over once it has sent nothing for HEADER_TIMEOUT.
+        let deadline = Instant::now() + net::HEADER_TIMEOUT + Duration::from_secs(5);
         while syncing.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -2745,6 +2900,54 @@ mod tests {
             tx.send(Event::Stop).unwrap();
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn requests_need_the_token_the_node_gave_that_address() {
+        // A request forged from another address cannot make a node send
+        // data there: the token in its status to that address is required.
+        let a = open("token-a");
+        a.chain.apply_block(&mine(&a, 1, T0 + 600), unix_now()).unwrap();
+        let block_id = a.chain.tip().unwrap().unwrap().hash();
+        let genesis = a.chain.header_at(0).unwrap().unwrap().hash();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 2048];
+        let mut receive = |want: fn(&Message) -> bool| -> Option<Message> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && let Some(m) = Message::decode(&buf[..n])
+                    && want(&m)
+                {
+                    return Some(m);
+                }
+            }
+            None
+        };
+        let status = Status {
+            nonce: 5,
+            version: PROTOCOL_VERSION,
+            token: 0,
+            genesis,
+            height: 0,
+            oldest: 1,
+            tip: genesis,
+            work: U256::ZERO,
+        };
+        sock.send_to(&Message::Ping(status).encode(), addr_a).unwrap();
+        let Some(Message::Pong(st)) = receive(|m| matches!(m, Message::Pong(_))) else { panic!("no pong") };
+        let ask = |token: u64| Message::GetChunks { kind: Kind::Block, id: block_id, indexes: vec![0], token };
+        sock.send_to(&ask(0).encode(), addr_a).unwrap();
+        sock.send_to(&ask(st.token ^ 1).encode(), addr_a).unwrap();
+        assert!(receive(|m| matches!(m, Message::Chunk { .. })).is_none(), "served without the token");
+        sock.send_to(&ask(st.token).encode(), addr_a).unwrap();
+        assert!(receive(|m| matches!(m, Message::Chunk { .. })).is_some(), "not served with the token");
+        tx_a.send(Event::Stop).unwrap();
+        ha.join().unwrap();
     }
 
     #[test]

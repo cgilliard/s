@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tabminer::aggregate::{AggregateVerifier, Progress, Statement};
-use tabminer::block::{Block, BlockOutput, Body, HEADER_SIZE};
+use tabminer::block::{BLOCK_OUTPUT_SIZE, Block, BlockOutput, Body, HEADER_SIZE, POSITION_SIZE};
 use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
@@ -61,6 +61,7 @@ use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node
 use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
+use tabminer::utxo;
 use tabminer::wallet::{Signed, Slate, State, Wallet};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -105,7 +106,8 @@ const HELP: &str = "commands:
   mempool                   pooled transactions
   balance                   confirmed, pending, reserved and locked funds
   outputs                   the wallet's outputs
-  send AMOUNT FEE FILE      start a payment: write a slate for the recipient
+  send AMOUNT [FEE] FILE    start a payment: write a slate for the recipient
+                            (the fee defaults to the smallest the pool takes)
   receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
   cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
@@ -127,6 +129,8 @@ const MAP_SIZE: usize = 1 << 40;
 
 /// Size of the stand-in proof a debugging miner attaches: about a real one.
 const DEBUG_PROOF_SIZE: usize = 205_000;
+/// Room a block template leaves for its proof (about 205 KB).
+const PROOF_SIZE_ALLOWANCE: usize = 256 << 10;
 
 /// How long the miner waits for the node to accept its block before moving
 /// on.
@@ -840,11 +844,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
         }
         "send" => {
-            let [amount, fee, file] = args else {
-                return Err("usage: send AMOUNT FEE FILE".into());
+            let (amount, fee, file) = match args {
+                [amount, file] => (*amount, None, *file),
+                [amount, fee, file] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *file),
+                _ => return Err("usage: send AMOUNT [FEE] FILE".into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
-            let fee = parse_coins(fee).ok_or("bad fee")?;
             let rtxn = ctx.chain.env().read_txn()?;
             let slate = ctx.wallet.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
             std::fs::write(file, slate.to_bytes())?;
@@ -853,7 +858,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 &slate.id_hex()[..16],
                 file,
                 fmt_coins(amount as u128),
-                fmt_coins(fee as u128),
+                fmt_coins(slate.fee as u128),
                 slate.inputs.len()
             );
         }
@@ -950,8 +955,13 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
         }
         "prune" => {
+            // Outputs of pooled transactions and the reward being mined
+            // may yet land.
+            let mut keep: std::collections::HashSet<_> =
+                ctx.mempool.lock().unwrap().entries().flat_map(|e| e.tx.outputs.iter().map(|o| o.commitment)).collect();
+            keep.extend(*ctx.in_flight.lock().unwrap());
             let rtxn = ctx.chain.env().read_txn()?;
-            let n = ctx.wallet.prune_pending(ctx.chain.utxo(), &rtxn)?;
+            let n = ctx.wallet.prune_pending(ctx.chain.utxo(), &rtxn, &keep)?;
             println!("{n} pending outputs forgotten");
         }
         "phrase" => {
@@ -967,8 +977,9 @@ fn hex_digest(d: &Digest) -> String {
     hex(d)
 }
 
-/// Pools a signed transaction and reports it, with a warning for inputs
-/// that made their last signature.
+/// Pools a signed transaction here, so that a refusal reaches the prompt,
+/// then hands it to the node to announce; warns of inputs that made their
+/// last signature.
 fn submit(ctx: &Ctx, signed: Signed) {
     let txid = signed.tx.txid();
     if !signed.last_signatures.is_empty() {
@@ -977,9 +988,21 @@ fn submit(ctx: &Ctx, signed: Signed) {
             if signed.last_signatures.len() == 1 { "an input" } else { "some inputs" }
         );
     }
+    let pooled = match ctx.chain.env().read_txn() {
+        Ok(rtxn) => ctx.mempool.lock().unwrap().insert(signed.tx.clone(), ctx.chain.utxo(), &rtxn),
+        Err(e) => {
+            println!("transaction {} signed, but not pooled: {e}", short(&txid));
+            return;
+        }
+    };
+    if let Err(e) = pooled {
+        println!("transaction {} signed, but the pool refused it: {e}", short(&txid));
+        println!("its inputs stay locked until it is cancelled (cancel {})", short(&txid));
+        return;
+    }
     match ctx.events.send(Event::Transaction(signed.tx)) {
-        Ok(()) => println!("transaction {} signed and sent to the pool", short(&txid)),
-        Err(_) => println!("transaction {} signed, but the node has stopped", short(&txid)),
+        Ok(()) => println!("transaction {} pooled and announced", short(&txid)),
+        Err(_) => println!("transaction {} pooled, but the node has stopped", short(&txid)),
     }
 }
 
@@ -1105,8 +1128,8 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
 
         // Transactions: the reward, then the pooled ones by fee rate while
         // they fit the block's segment and size limits. Size: header, body
-        // counts, outputs, input positions and a margin for the proof.
-        let size = |ins: usize, outs: usize| 172 + 12 + ins * 5 + outs * 40 + (256 << 10);
+        // counts, input positions, outputs and room for the proof.
+        let size = |ins: usize, outs: usize| HEADER_SIZE + Body::size_of(ins, outs, PROOF_SIZE_ALLOWANCE);
         let fits = |ins: usize, outs: usize, items: &dyn Fn(usize) -> (usize, usize), n: usize| {
             pack(n, items, agg.segment_rows()).len() <= agg.max_segments && size(ins, outs) <= params.max_block_size
         };
@@ -1141,7 +1164,18 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             let utxo = chain.utxo();
             let prev_state_root = utxo.root(&wtxn)?;
             let first_output_position = utxo.next_position(&wtxn)?;
-            let segments = SegmentWitness::collect_by_rows(utxo, &mut wtxn, &txs, agg.segment_rows())?;
+            let segments = match SegmentWitness::collect_by_rows(utxo, &mut wtxn, &txs, agg.segment_rows()) {
+                Ok(s) => s,
+                // A block applied since the transactions were chosen spent
+                // or moved one of their inputs; the pool is being revalidated.
+                Err(utxo::Error::CorruptIndex) if cancel() => {
+                    drop(wtxn);
+                    abandon();
+                    log::line(&format!("  tip changed while building block {height}; starting over"));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let new_state_root = utxo.root(&wtxn)?;
             wtxn.abort();
             let inputs: Vec<u64> = segments.iter().flat_map(|s| s.positions()).collect();
@@ -1215,9 +1249,9 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         // at random from the whole set (not the wallet's), up to the block
         // size limit.
         if let Some((n_out, n_spend)) = ctx.debug_fill {
-            let used = HEADER_SIZE + 64 + inputs.len() * 5 + outputs.len() * 64 + DEBUG_PROOF_SIZE;
+            let used = HEADER_SIZE + Body::size_of(inputs.len(), outputs.len(), DEBUG_PROOF_SIZE);
             let room = params.max_block_size.saturating_sub(used);
-            let need = n_out * 64 + n_spend * 5;
+            let need = n_out * BLOCK_OUTPUT_SIZE + n_spend * POSITION_SIZE;
             let (n_out, n_spend) =
                 if need > room { (n_out * room / need, n_spend * room / need) } else { (n_out, n_spend) };
             let mut next_random = || {
@@ -1252,7 +1286,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             log::line(&format!("  debug fill: {n_out} random outputs, {spends} random spends"));
         }
         let body = Body { inputs, outputs, proof };
-        let timestamp = now().max(tip.timestamp + 1);
+        let timestamp = now().max(chain.earliest_timestamp(&tip)?);
         let mut header = match chain.template(&body, timestamp) {
             Ok(h) => h,
             // Another node spent or reorganized away outputs of ours.
