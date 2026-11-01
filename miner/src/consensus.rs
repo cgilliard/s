@@ -5,7 +5,11 @@
 //! A miner that publishes a file sets leaf 0 to its SHA-256; a node that
 //! follows the chain fetches every block's leaves, counts the nonzero
 //! leaf-0 values over the last [`WINDOW`] main-chain blocks, and fetches
-//! the file the most common one names. The chain keeps the leaves with
+//! the files they name, most voted first. The most voted file that is
+//! held and valid is in force, whatever its mode, so a file saying
+//! `mode init` is a vote for init mode; votes for a file that cannot be
+//! fetched or does not parse count for nothing, and with no vote that
+//! counts the network is in init mode. The chain keeps the leaves with
 //! the block (`Chain::aux_leaves_of`) and the files for good
 //! (`Chain::consensus_file`); this module holds the constants, the count
 //! and the file's transfer id.
@@ -63,15 +67,9 @@ impl Votes {
         Votes { counts, missing, blocks: n, range }
     }
 
-    /// The winning hash: the most voted, ties to the most recently
-    /// committed. `None` when no block in the window votes.
-    pub fn winner(&self) -> Option<Hash> {
-        self.counts.first().map(|c| c.0)
-    }
-
-    /// The winner's votes.
-    pub fn winning_votes(&self) -> u32 {
-        self.counts.first().map_or(0, |c| c.1)
+    /// Votes cast, for any file.
+    pub fn cast(&self) -> u32 {
+        self.counts.iter().map(|c| c.1).sum()
     }
 }
 
@@ -114,21 +112,13 @@ impl std::fmt::Display for Mode {
     }
 }
 
-/// A relay's optional flags; their meaning is an open point of the design.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Flag {
-    Exit,
-    Rendezvous,
-    Guard,
-}
-
-/// A `relay` line: the relay's id, its UDP address as written
-/// (`host:port`, not resolved here) and its flags.
+/// A `relay` line: the relay's id (the hash of its Dilithium key) and its
+/// UDP address as written (`host:port`, not resolved here). Every relay
+/// may serve any role: a hop, or a rendezvous point.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Relay {
     pub id: Digest,
     pub addr: String,
-    pub flags: Vec<Flag>,
 }
 
 /// A parsed `consensus.txt`.
@@ -148,12 +138,10 @@ pub enum ParseError {
     /// The first directive is not `mode init` or `mode onion`.
     NoMode,
     BadMode(usize),
-    /// A `relay` line without an id and an address, or with extra words
-    /// that are not flags.
+    /// A `relay` line that is not an id and an address.
     BadRelay(usize),
     BadId(usize),
     BadAddress(usize),
-    BadFlag(usize),
     DuplicateRelay(usize),
     TooManyRelays,
     TooFewRelays(usize),
@@ -166,10 +154,9 @@ impl std::fmt::Display for ParseError {
             ParseError::NotText => f.write_str("not UTF-8 text"),
             ParseError::NoMode => f.write_str("the first directive must be `mode init` or `mode onion`"),
             ParseError::BadMode(l) => write!(f, "line {l}: the mode must be init or onion"),
-            ParseError::BadRelay(l) => write!(f, "line {l}: a relay line is `relay ID HOST:PORT [FLAGS]`"),
+            ParseError::BadRelay(l) => write!(f, "line {l}: a relay line is `relay ID HOST:PORT`"),
             ParseError::BadId(l) => write!(f, "line {l}: the id must be a tab1… address or 64 hex digits"),
             ParseError::BadAddress(l) => write!(f, "line {l}: the address must be HOST:PORT"),
-            ParseError::BadFlag(l) => write!(f, "line {l}: flags are exit, rendezvous and guard"),
             ParseError::DuplicateRelay(l) => write!(f, "line {l}: the relay is listed already"),
             ParseError::TooManyRelays => write!(f, "more than {MAX_RELAYS} relays"),
             ParseError::TooFewRelays(n) => write!(f, "onion mode lists {n} relays, fewer than the {MIN_RELAYS} needed"),
@@ -214,7 +201,7 @@ impl File {
     /// Parses and validates a `consensus.txt` (`docs/ONION.md`): UTF-8,
     /// one directive per line, `#` comments, blank lines ignored, the
     /// first directive the mode. In init mode the rest is ignored; in
-    /// onion mode `relay ID HOST:PORT [FLAGS]` lines list the relays,
+    /// onion mode `relay ID HOST:PORT` lines list the relays,
     /// between [`MIN_RELAYS`] and [`MAX_RELAYS`] of them, no id twice.
     /// Unknown directives are ignored.
     pub fn parse(bytes: &[u8]) -> Result<File, ParseError> {
@@ -246,24 +233,12 @@ impl File {
             if mode == Mode::Init || directive != "relay" {
                 continue;
             }
-            let (Some(id), Some(addr)) = (words.next(), words.next()) else {
+            let (Some(id), Some(addr), None) = (words.next(), words.next(), words.next()) else {
                 return Err(ParseError::BadRelay(line));
             };
             let id = parse_id(id).ok_or(ParseError::BadId(line))?;
             if !address_ok(addr) {
                 return Err(ParseError::BadAddress(line));
-            }
-            let mut flags = Vec::new();
-            for w in words {
-                let flag = match w {
-                    "exit" => Flag::Exit,
-                    "rendezvous" => Flag::Rendezvous,
-                    "guard" => Flag::Guard,
-                    _ => return Err(ParseError::BadFlag(line)),
-                };
-                if !flags.contains(&flag) {
-                    flags.push(flag);
-                }
             }
             if relays.iter().any(|r| r.id == id) {
                 return Err(ParseError::DuplicateRelay(line));
@@ -271,7 +246,7 @@ impl File {
             if relays.len() >= MAX_RELAYS {
                 return Err(ParseError::TooManyRelays);
             }
-            relays.push(Relay { id, addr: addr.to_string(), flags });
+            relays.push(Relay { id, addr: addr.to_string() });
         }
         let mode = mode.ok_or(ParseError::NoMode)?;
         if mode == Mode::Onion && relays.len() < MIN_RELAYS {
@@ -282,30 +257,55 @@ impl File {
     }
 }
 
-/// The file in force: the window's winner, if its file is held and parses,
-/// else init mode with the reason.
+/// Why a voted-for file does not count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// Not fetched (yet).
+    NotHeld,
+    Invalid(ParseError),
+}
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Skip::NotHeld => f.write_str("not fetched"),
+            Skip::Invalid(e) => write!(f, "invalid: {e}"),
+        }
+    }
+}
+
+/// The file in force: the most voted of the window's files that is held
+/// and valid, ties to the most recently committed; init mode when there
+/// is none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Current {
     pub mode: Mode,
-    /// The winning hash, if any block of the window voted.
-    pub winner: Option<Hash>,
-    /// The winner's file, when it is held and valid.
+    /// The file in force, its hash and its votes.
+    pub winner: Option<(Hash, u32)>,
     pub file: Option<File>,
-    /// Why the winner's file is not in force: not fetched yet, or invalid.
-    pub problem: Option<String>,
+    /// The files voted for more than the winner (every one, without a
+    /// winner) that do not count, most voted first, and why: a node
+    /// fetches those not held, since one may yet win.
+    pub skipped: Vec<(Hash, u32, Skip)>,
 }
 
 impl Current {
-    /// Decides from the votes and the winner's bytes, if held.
-    pub fn decide(votes: &Votes, bytes: Option<&[u8]>) -> Current {
-        let Some(winner) = votes.winner() else {
-            return Current { mode: Mode::Init, winner: None, file: None, problem: None };
-        };
-        match bytes.map(File::parse) {
-            None => Current { mode: Mode::Init, winner: Some(winner), file: None, problem: Some("not fetched yet".into()) },
-            Some(Err(e)) => Current { mode: Mode::Init, winner: Some(winner), file: None, problem: Some(format!("invalid: {e}")) },
-            Some(Ok(file)) => Current { mode: file.mode, winner: Some(winner), file: Some(file), problem: None },
+    /// Decides from the votes, given the bytes of each file held.
+    pub fn decide(votes: &Votes, mut held: impl FnMut(&Hash) -> Option<Vec<u8>>) -> Current {
+        let mut skipped = Vec::new();
+        for &(hash, n, _) in &votes.counts {
+            match held(&hash).map(|b| File::parse(&b)) {
+                None => skipped.push((hash, n, Skip::NotHeld)),
+                Some(Err(e)) => skipped.push((hash, n, Skip::Invalid(e))),
+                Some(Ok(file)) => return Current { mode: file.mode, winner: Some((hash, n)), file: Some(file), skipped },
+            }
         }
+        Current { mode: Mode::Init, winner: None, file: None, skipped }
+    }
+
+    /// The files to fetch: voted for more than the winner, not held.
+    pub fn unfetched(&self) -> impl Iterator<Item = &Hash> {
+        self.skipped.iter().filter(|s| s.2 == Skip::NotHeld).map(|s| &s.0)
     }
 }
 
@@ -335,11 +335,9 @@ mod tests {
         assert_eq!(v.missing, vec![(id(4), 13)]);
         // Two each; a was committed most recently.
         assert_eq!(v.counts, vec![(a, 2, 15), (b, 2, 14)]);
-        assert_eq!(v.winner(), Some(a));
-        assert_eq!(v.winning_votes(), 2);
+        assert_eq!(v.cast(), 4);
         let v = Votes::tally((1, 2), vec![(id(1), 1, Some([0u8; 32])), (id(2), 2, None)].into_iter());
-        assert_eq!(v.winner(), None);
-        assert_eq!(Votes::default().winner(), None);
+        assert!(v.counts.is_empty());
     }
 
     #[test]
@@ -352,8 +350,8 @@ mod tests {
         let init = "# a comment\n\n  mode init  # trailing\nrelay garbage\nfuture directive\n";
         assert_eq!(File::parse(init.as_bytes()).unwrap().mode, Mode::Init);
         let onion = format!(
-            "mode onion\nrelay {} relay3.example.org:3737 exit guard\nrelay {} 10.0.0.2:3737\n\
-             relay {} [2001:db8::1]:3737 rendezvous rendezvous\nfuture directive\n",
+            "mode onion\nrelay {} relay3.example.org:3737\nrelay {} 10.0.0.2:3737\n\
+             relay {} [2001:db8::1]:3737\nfuture directive\n",
             addr(2),
             hex(0),
             addr(1)
@@ -364,9 +362,6 @@ mod tests {
         // Sorted by id, whatever the order written and the id's form.
         assert_eq!(f.relays.iter().map(|r| r.id).collect::<Vec<_>>(), ids[..3].to_vec());
         assert_eq!(f.relays[2].addr, "relay3.example.org:3737");
-        assert_eq!(f.relays[2].flags, vec![Flag::Exit, Flag::Guard]);
-        assert_eq!(f.relays[0].flags, vec![]);
-        assert_eq!(f.relays[1].flags, vec![Flag::Rendezvous]);
         let bad = [
             ("", ParseError::NoMode),
             ("# only a comment\n", ParseError::NoMode),
@@ -386,23 +381,62 @@ mod tests {
         assert_eq!(File::parse(with(&format!("relay {} :3737", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
         assert_eq!(File::parse(with(&format!("relay {} c:99999", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
         assert_eq!(File::parse(with(&format!("relay {} [::1:3737", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
-        assert_eq!(File::parse(with(&format!("relay {} c:1 fast", addr(2))).as_bytes()), Err(ParseError::BadFlag(4)));
+        // No flags: any relay serves any role.
+        assert_eq!(File::parse(with(&format!("relay {} c:1 exit", addr(2))).as_bytes()), Err(ParseError::BadRelay(4)));
         assert_eq!(File::parse(with(&format!("relay {} c:1", addr(1))).as_bytes()), Err(ParseError::DuplicateRelay(4)));
         assert_eq!(File::parse(&[0xffu8, 0xfe]), Err(ParseError::NotText));
         assert!(matches!(File::parse(&vec![b' '; MAX_CONSENSUS + 1]), Err(ParseError::TooLarge(_))));
         assert_eq!(ParseError::TooFewRelays(2).to_string(), "onion mode lists 2 relays, fewer than the 3 needed");
-        // The decision: no votes, a winner not fetched, invalid, valid.
-        let votes = Votes::tally((1, 2), vec![(id(1), 1, Some([1u8; 32]))].into_iter());
-        assert_eq!(Current::decide(&Votes::default(), None).mode, Mode::Init);
-        let c = Current::decide(&votes, None);
-        assert_eq!((c.mode, c.winner, c.problem.as_deref()), (Mode::Init, Some([1u8; 32]), Some("not fetched yet")));
-        let c = Current::decide(&votes, Some(b"mode tor\n"));
-        assert_eq!(c.mode, Mode::Init);
-        assert!(c.problem.unwrap().starts_with("invalid: line 1"));
-        let c = Current::decide(&votes, Some(onion.as_bytes()));
-        assert_eq!(c.mode, Mode::Onion);
-        assert_eq!(c.file.unwrap().relays.len(), 3);
-        assert_eq!(c.problem, None);
+        // The decision: the most voted file held and valid, whatever its
+        // mode; files not held or invalid count for nothing.
+        let (x, y, z) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let votes = Votes::tally(
+            (1, 6),
+            vec![
+                (id(1), 1, Some(x)),
+                (id(2), 2, Some(x)),
+                (id(3), 3, Some(x)),
+                (id(4), 4, Some(y)),
+                (id(5), 5, Some(y)),
+                (id(6), 6, Some(z)),
+            ]
+            .into_iter(),
+        );
+        fn files<'a>(
+            x: Option<&'a [u8]>,
+            y: Option<&'a [u8]>,
+            z: Option<&'a [u8]>,
+        ) -> impl FnMut(&Hash) -> Option<Vec<u8>> + 'a {
+            move |h: &Hash| [x, y, z][h[0] as usize - 1].map(|b| b.to_vec())
+        }
+        assert_eq!(Current::decide(&Votes::default(), |_| None), Current {
+            mode: Mode::Init,
+            winner: None,
+            file: None,
+            skipped: vec![]
+        });
+        // Nothing held: init, and every file is to be fetched.
+        let c = Current::decide(&votes, files(None, None, None));
+        assert_eq!((c.mode, c.winner), (Mode::Init, None));
+        assert_eq!(c.unfetched().collect::<Vec<_>>(), vec![&x, &y, &z]);
+        // The leader is not held: the next, valid, is in force meanwhile,
+        // and the leader is still wanted.
+        let c = Current::decide(&votes, files(None, Some(onion.as_bytes()), None));
+        assert_eq!((c.mode, c.winner), (Mode::Onion, Some((y, 2))));
+        assert_eq!(c.file.as_ref().unwrap().relays.len(), 3);
+        assert_eq!(c.unfetched().collect::<Vec<_>>(), vec![&x]);
+        // The leader is invalid: it counts for nothing.
+        let c = Current::decide(&votes, files(Some(b"mode tor\n"), Some(onion.as_bytes()), None));
+        assert_eq!(c.winner, Some((y, 2)));
+        assert!(matches!(c.skipped[..], [(h, 3, Skip::Invalid(ParseError::BadMode(1)))] if h == x));
+        assert_eq!(c.unfetched().count(), 0);
+        // An explicit vote for init wins like any other.
+        let c = Current::decide(&votes, files(Some(b"mode init\n"), Some(onion.as_bytes()), None));
+        assert_eq!((c.mode, c.winner), (Mode::Init, Some((x, 3))));
+        // Only invalid files: init, with nothing in force.
+        let c = Current::decide(&votes, files(Some(b"x"), Some(b"y"), Some(b"z")));
+        assert_eq!((c.mode, c.winner, c.skipped.len()), (Mode::Init, None, 3));
+        assert_eq!(c.skipped[2].2.to_string(), "invalid: the first directive must be `mode init` or `mode onion`");
     }
 
     #[test]

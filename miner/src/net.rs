@@ -29,6 +29,8 @@
 //! | `GetAnnounce`| token, id, our token for the receiver     | `Offer` or `Notice` |
 //! | `Offer`      | token, object id and length, our token    | `GetChunks`      |
 //! | `Notice`     | subject (an id or object), code           |                  |
+//! | `Handshake`  | token, our token, channel, stage, fragment | `Handshake`     |
+//! | `Frame`      | a channel's frame ([`crate::channel::Frame`]) | `Frame` (ack) |
 //!
 //! The last five are the message layer's rendezvous sessions
 //! (`docs/ONION.md`, [`crate::node`]). An object of the message layer
@@ -36,6 +38,13 @@
 //! pushed: the receiver pulls it as [`Kind::Object`] chunks with the token
 //! the offer carried, so a relay can reach a participant that is not in
 //! its peer table.
+//!
+//! The last two are onion mode's channels (`docs/ONION.md`): a handshake
+//! message is cut into fragments of [`HANDSHAKE_FRAGMENT`] bytes, each a
+//! request carrying the receiver's token and ours, so a relay answers a
+//! hello (a datagram or two) with its reply (six) only to an address that
+//! proved itself. Frames are sealed under the channel's keys and need no
+//! token: a forged one does not open.
 //!
 //! A block or transaction (the [`Kind`]) is fetched as [`CHUNK_BYTES`]-byte
 //! chunks of its serialization, pulled by the receiver in windows of
@@ -98,6 +107,10 @@ const T_SESSION_STATE: u8 = 17;
 const T_GET_ANNOUNCE: u8 = 18;
 const T_OFFER: u8 = 19;
 const T_NOTICE: u8 = 20;
+const T_HANDSHAKE: u8 = 21;
+const T_FRAME: u8 = 22;
+/// Bytes of a handshake message per `Handshake` datagram.
+pub const HANDSHAKE_FRAGMENT: usize = 1152;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
 pub const PROOF_SIBLINGS_PER_MESSAGE: usize = crate::state_tree::DEPTH / 2;
 
@@ -365,6 +378,19 @@ pub enum Message {
         subject: Digest,
         code: u8,
     },
+    /// Fragment `index` of `count` of a channel handshake message
+    /// (`stage` 1 hello, 2 reply, 3 auth) for channel `chan`; `back` is the
+    /// sender's token for the receiver.
+    Handshake {
+        chan: u64,
+        stage: u8,
+        index: u8,
+        count: u8,
+        data: Vec<u8>,
+        back: u64,
+        token: u64,
+    },
+    Frame(crate::channel::Frame),
 }
 
 /// A payload was handed down the recipient's live session.
@@ -552,6 +578,19 @@ impl Message {
                 w.digest(subject);
                 w.0.push(*code);
             }
+            Message::Handshake { chan, stage, index, count, data, back, token } => {
+                w.0.push(T_HANDSHAKE);
+                w.u64(*token);
+                w.u64(*back);
+                w.u64(*chan);
+                w.0.extend_from_slice(&[*stage, *index, *count]);
+                w.0.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                w.0.extend_from_slice(data);
+            }
+            Message::Frame(f) => {
+                w.0.push(T_FRAME);
+                f.put(&mut w);
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -658,6 +697,17 @@ impl Message {
                 Message::Offer { object: r.digest()?, len: r.u32()?, back: r.u64()?, token }
             }
             T_NOTICE => Message::Notice { subject: r.digest()?, code: r.take(1)?[0] },
+            T_HANDSHAKE => {
+                let (token, back, chan) = (r.u64()?, r.u64()?, r.u64()?);
+                let h = r.take(3)?;
+                let (stage, index, count) = (h[0], h[1], h[2]);
+                let n = u16::from_le_bytes(r.take(2)?.try_into().unwrap()) as usize;
+                if n > HANDSHAKE_FRAGMENT || index >= count || !(1..=3).contains(&stage) {
+                    return None;
+                }
+                Message::Handshake { chan, stage, index, count, data: r.take(n)?.to_vec(), back, token }
+            }
+            T_FRAME => Message::Frame(crate::channel::Frame::get(&mut r)?),
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -680,7 +730,8 @@ impl Message {
             | Message::GetAux { token, .. }
             | Message::Session { token, .. }
             | Message::GetAnnounce { token, .. }
-            | Message::Offer { token, .. } => Some(*token),
+            | Message::Offer { token, .. }
+            | Message::Handshake { token, .. } => Some(*token),
             _ => None,
         }
     }
@@ -695,7 +746,8 @@ impl Message {
             | Message::GetAux { token, .. }
             | Message::Session { token, .. }
             | Message::GetAnnounce { token, .. }
-            | Message::Offer { token, .. } => *token = t,
+            | Message::Offer { token, .. }
+            | Message::Handshake { token, .. } => *token = t,
             _ => {}
         }
         self
@@ -1528,16 +1580,36 @@ mod tests {
             Message::Offer { object: digest(3), len: 6_500, back: 15, token: 16 },
             Message::GetChunks { kind: Kind::Object, id: digest(3), indexes: vec![0, 6], token: 15 },
             Message::Notice { subject: digest(4), code: NOTICE_OFFLINE },
+            Message::Handshake {
+                chan: u64::MAX,
+                stage: 2,
+                index: 5,
+                count: 6,
+                data: vec![9u8; HANDSHAKE_FRAGMENT],
+                back: 1,
+                token: 2,
+            },
+            Message::Frame(crate::channel::Frame {
+                chan: 3,
+                kind: 0,
+                seq: 4,
+                ack: 5,
+                sack: 6,
+                sealed: vec![7u8; crate::channel::MAX_BODY + 16],
+            }),
         ];
         for m in msgs {
             let bytes = m.encode();
             assert!(bytes.len() <= MAX_DATAGRAM, "{m:?}: {} bytes", bytes.len());
             assert_eq!(Message::decode(&bytes), Some(m.clone()), "{m:?}");
-            // Trailing or missing bytes are rejected.
+            // Trailing or missing bytes are rejected; a frame's sealed body
+            // runs to the end, so a shorter one only fails to open.
             let mut longer = bytes.clone();
             longer.push(0);
             assert_eq!(Message::decode(&longer), None);
-            assert_eq!(Message::decode(&bytes[..bytes.len() - 1]), None);
+            if !matches!(m, Message::Frame(_)) {
+                assert_eq!(Message::decode(&bytes[..bytes.len() - 1]), None);
+            }
         }
         assert_eq!(Message::decode(b"TAB1\xff"), None);
         assert_eq!(Message::decode(b"XXXX\x03"), None);

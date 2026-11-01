@@ -1,6 +1,10 @@
-# Security of tabminer's proofs
+# Security of tabminer
 
-This note estimates the soundness of the block proof: the transaction
+This note covers two things: the soundness of the proofs, which is most
+of it, and the message layer that carries payments between wallets
+(`docs/ONION.md`), at the end.
+
+It estimates the soundness of the block proof: the transaction
 segment proofs and the name segment proof, the recursive node proofs, the
 zero-knowledge wrap proof, and the chain proof a block carries, which
 verifies the wrap and the previous block's chain proof so that one proof
@@ -258,6 +262,114 @@ over it 2^17, as at 50. The verifier of a single segment passes 2^17 rows
 and its wrap 2^17 as well: at 50 queries that wrap fit 2^16, so the
 single-segment block's wrap doubled, from about 10 s to 22 s. The published
 proof is the wrap's, so its size hardly depends on the block.
+
+## The message layer
+
+The message layer (`docs/ONION.md`) carries slates and other messages
+between wallets. Nothing on it touches consensus: a forged or lost
+message can stop a payment, never forge one, since the sender's wallet
+checks the answered slate before signing (`Wallet::finalize`) and the
+chain checks the transaction.
+
+**Primitives.** All are the crate's own, checked against the standard
+vectors (`tests/vectors/`, NIST ACVP and RFC 8439), and none has been
+independently reviewed.
+
+| use | primitive | level |
+|---|---|---|
+| identity, signatures | ML-DSA-65 (Dilithium, FIPS 204), deterministic, with a context string per use | NIST category 3 |
+| key exchange | ML-KEM-768 (Kyber, FIPS 203) | NIST category 3 |
+| encryption | ChaCha20-Poly1305 (RFC 8439), 256-bit keys | 256 bits, about 128 against Grover |
+| key derivation, transcripts | SHAKE256 (FIPS 202) | 256 bits |
+| ids | Poseidon2 digest of the Dilithium key, 247 bits | second preimage about 2^247, collision 2^124 |
+
+Every exchange is post-quantum: no Diffie-Hellman anywhere, so traffic
+recorded today does not open to a quantum computer later.
+
+**Identities and announces.** An id is the hash of a Dilithium key
+derived from the wallet's phrase. An announce is a fresh Kyber key signed
+by it with a sequence number (milliseconds, rising across restarts), an
+expiry (a day) and the nonce of the session it is offered on, which binds
+it to one session (a SipHash under the relay's secret of the
+participant's address, or circuit, and id), so it cannot be replayed to
+open a session elsewhere. A wallet's Kyber key is replaced at start, on
+every reconnect and after 12 hours; a retired key opens payloads for ten
+more minutes and is then dropped, so a key taken later opens nothing
+older (forward secrecy within that window).
+
+**Payloads.** A payload is encapsulated to the recipient's announced
+Kyber key and sealed with ChaCha20-Poly1305, the ids, ciphertext and
+nonce as associated data. A sender that names itself puts its own
+announce inside and signs the whole, so the recipient knows who sent it
+and can answer forward-secretly; relays see neither the kind nor the
+content. A wallet answers a stage-1 slate automatically (see the gaps
+below) and finalizes a stage-2 slate only from the id it sent the slate
+to.
+
+**Init mode.** The seeds are not authenticated: whoever answers at a
+seed's address holds sessions. Such a party, or the seed itself, can
+drop messages and learns which ids talk, when, how much, and from which
+network addresses; it cannot read or alter a payload or pass one
+participant off as another. Init mode protects content, not metadata.
+
+**Onion mode handshake.** Channels and every circuit hop use one
+exchange: the initiator sends a fresh Kyber key and a 32-byte challenge;
+the relay answers with its Dilithium key, a Kyber ciphertext and a
+signature over the transcript hash (the domain, the channel number, the
+hello, its key and the ciphertext). The initiator checks the key against
+the relay's listed id, the signature, and decapsulates; the keys, one per
+direction, are SHAKE256 of the shared secret and the transcript. The
+relay so proves it holds the listed key, and a man in the middle cannot
+substitute a ciphertext without breaking ML-DSA. A relay opening a channel
+to a relay also signs, under another context, so relays know each other;
+participants never sign, so a relay cannot tell a participant from any
+other. Each exchange has its own Kyber key, so each channel and each hop
+is forward secret on its own.
+
+**Channels.** Frames are sealed under a sequence-number nonce, and an
+acknowledgement frame under a separate nonce space. A lost frame is resent
+as the very bytes first sent, never sealed again, so no nonce ever covers
+two messages. A frame that does not open is dropped; a replayed one is
+recognized by its number.
+
+**Circuits.** Each hop holds a key per direction and counts the cells it
+passes; a layer is ChaCha20 with the count as nonce, and the cell for a
+hop carries a Poly1305 tag under that hop's key inside all the layers.
+What each party learns:
+
+- the first hop: the participant's network address, and that it keeps a
+  circuit, never its id;
+- a middle hop: its two neighbours;
+- a rendezvous point: the id whose session it holds (it must, to route
+  by it), and when messages for it come; for a payload it forwards, the
+  recipient's id and the relay it came from;
+- the recipient's rendezvous point: that the payload came from one of the
+  sender's rendezvous points, which narrows the sender to the ids that
+  relay serves, the cost of having no exits;
+- every relay: the number of cells, which says roughly how large a
+  message is (a slate is a few cells).
+
+**Gaps.** Known weaknesses, all in `docs/HARDENING.md`:
+
+- **No cover traffic.** An observer of both ends of a path, or one who
+  watches many links, can match a payment's cells by timing. With few
+  relays (three is the minimum, meant for testing) there is little
+  anonymity to speak of.
+- **Tagging.** The layers carry no tag of their own, so a hop can flip
+  bits in a cell for a later hop. The tag at the end fails and the circuit
+  dies, but a colluding later hop that sees the failure learns the two
+  are on one circuit.
+- **The relay list is the miners'.** The file in force is the most voted
+  valid one over 144 blocks, and one vote is enough: a miner who mines
+  the only votes of a window, or most miners together, chooses every
+  relay, and could list only their own. This is by design: miners and
+  pools agree the file among themselves.
+- **Unsolicited slates.** An online wallet answers any stage-1 slate,
+  so anyone who knows an address can make the wallet create outputs and
+  show unconfirmed incoming funds.
+- **Denial of service.** A relay answers a hello with an encapsulation
+  and a signature, and holds abandoned channels for two minutes; sessions
+  and hops are capped but not priced.
 
 ## References
 

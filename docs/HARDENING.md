@@ -185,7 +185,11 @@ history and the README; this file holds what is left.
   pruned: `receive_slate` trusts `slate.amount` and the inputs. Expected of
   a slate design; show "unconfirmed, unverifiable until it lands" rather
   than counting it, or verify the inputs against the UTXO set when the
-  recipient's node has it.
+  recipient's node has it. Over the message layer this needs no access to
+  the victim's files: an online wallet answers every stage-1 slate it is
+  sent (`main.rs`, `on_message`), so anyone who knows its address can make
+  it create outputs at will. Also limit answers per sending id and per
+  minute, or ask at the prompt above some count.
 - **Minor.** `wallet.rs`: `cancel_sent` does not check the inputs are
   still held (the prompt filters through `sent`, the library does not);
   `cancel ID` prefix match takes the first hit; `send` writes the change
@@ -221,9 +225,64 @@ history and the README; this file holds what is left.
   near-capacity failures of 2026 are acknowledged in SECURITY.md, with
   margin left. Revisit when the constants in those results are known.
 
+## Message layer
+
+Found while building it (2026-11-01).
+
+- **A relay whose key does not match its listed id is not penalized.**
+  `node/channels.rs`, `on_reply`: a handshake that fails with `WrongKey`
+  is logged and the channel dropped, but the address takes no strike,
+  since the client's consensus file may be the stale one and the address
+  an honest chain peer. A relay at that address can make clients retry
+  it forever. Fix: remember the (address, expected id) pair as failed for
+  a while and skip it when choosing hops, and strike only if the same
+  peer fails against the id that the current file names and that file is
+  recent.
+- **Abandoned channels hold relay state until they time out.**
+  `node/channels.rs`: a relay keeps a channel whose initiator gave up
+  (a failed handshake on the initiator's side, a crash) until two minutes
+  of silence, so a client can occupy up to `MAX_CHANNELS` (4,096) slots
+  with hellos it never follows. Each hello also costs the relay a Kyber
+  encapsulation and a Dilithium signature. Fix: a short timeout for a
+  channel that has not yet received a frame (a few seconds), a per-address
+  limit on channels, and perhaps a cheap cookie round trip before the
+  relay does the expensive work.
+
+- **Relay layers are not authenticated hop by hop.** `circuit.rs`: a
+  layer is a bare ChaCha20 stream; only the target hop checks a tag. A
+  hop can flip bits in a cell for a later hop (a tagging attack): the
+  tag at the end fails and the circuit dies, but a colluding later hop
+  that sees the flip learns the two are on one circuit. Fix: a
+  wide-block cipher per layer, or a tag per layer (Tor's counter galois
+  onion proposal), at the cost of cell space.
+- **Idle hops live as long as their channels.** `node/circuits.rs`: a
+  relay drops a hop only on `Destroy` or when a channel under it
+  closes; a client that keeps its channel open can hold up to
+  `MAX_HOPS` (16,384) hops with circuits it never uses. There is no
+  flow control per circuit either: one circuit can fill a channel's
+  queue. Fix: drop hops idle for an hour, cap hops per channel, and
+  window cells per circuit.
+
+- **Standing circuits are not rotated on a timer.** `node/participant.rs`
+  rebuilds a circuit only when it dies or its session is lost; the
+  design says circuits also rotate on a timer, so a long-lived circuit
+  keeps the same hops for as long as they stay up. Fix: rebuild each
+  standing circuit after a random few hours, the new one first.
+- **A dead relay is noticed slowly.** A participant learns that a hop
+  went down when its channel gives up (twelve resends, about 45 s) or
+  its session falls silent (90 s); sends in the meantime may time out.
+  Fix: treat an unanswered `Session` keepalive after a few seconds as a
+  failed circuit, and keep a spare circuit to each point.
+- **A relay's own wallet skips itself as a rendezvous point,** in both
+  modes: a seed or relay does not hold a session for its own id, so it
+  is reachable only through its other points (with one seed, not at
+  all). Fix: hold the own session locally and answer lookups and
+  payloads for it directly.
+
 ## Deployment and operations
 
-- **Seeds** run an old binary. They need the current one (protocol v5,
+- **Seeds** run an old binary. They need the current one, started with
+  `--relay` so that wallets hold their init-mode sessions there (protocol v5,
   wallet format 6 (keys carry a tree height; slate format 3), chain format 13 (a snapshot manifest for every block in the undo window; output leaves carry the creation height; policy inputs, keys of any height to 20), new genesis id (17980c69…, the header carries 32 aux bytes under the proof of work), new `MAINNET_CHAIN`) and wiped data
   directories. Fresh nodes cannot sync until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
@@ -239,8 +298,9 @@ history and the README; this file holds what is left.
 
 ## Features deferred
 
-- Addresses, so payments need not pass slate files by hand.
 - Payment proofs: the transaction, a Merkle path to the header, and a
   signature with the output's key over an agreed message.
-- Onion routing or some other cover for the address a transaction is
-  first sent from, which links it to its sender.
+- Cover for the address a transaction is first sent from, which links it
+  to its sender: the message layer carries slates, but a finished
+  transaction is still announced as a `TxInv` from the node's own address.
+  Send it to a relay over a circuit, to announce for us.

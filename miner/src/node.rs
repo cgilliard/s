@@ -88,6 +88,10 @@ use crate::net::{
 use crate::pow::Digest;
 use crate::transaction::Transaction;
 
+mod channels;
+mod circuits;
+mod participant;
+mod rendezvous;
 mod sessions;
 pub use sessions::{Note, Outbound};
 
@@ -174,6 +178,8 @@ const AUX_RETRY: Duration = Duration::from_secs(2);
 const AUX_MAX_TRIES: u32 = 16;
 /// Aux leaf requests sent per tick.
 const AUX_REQUESTS_PER_TICK: usize = 64;
+/// A file no live peer served is not asked for again for this long.
+const FILE_BACKOFF: Duration = Duration::from_secs(600);
 /// Between scans of the window for leaves not yet fetched and the file
 /// the window names; a scan also follows every tip change and arrival.
 const AUX_SCAN: Duration = Duration::from_secs(10);
@@ -303,6 +309,23 @@ pub enum Event {
     Transaction(Transaction),
     /// A message for an id, from the wallet (`docs/ONION.md`).
     Send(Outbound),
+    /// Tests: a body for the relay with this id at this address, over a
+    /// channel opened for it if need be.
+    #[cfg(test)]
+    TestChannel(SocketAddr, Digest, Vec<u8>),
+    /// Tests: relays as if an onion-mode file listed them.
+    #[cfg(test)]
+    TestRelays(Vec<consensus::Relay>),
+    /// Tests: a circuit through these relays, and data for its hops once
+    /// it is built.
+    #[cfg(test)]
+    TestCircuit(Vec<Digest>, Vec<(usize, Vec<u8>)>),
+    /// Tests: keep no standing circuits.
+    #[cfg(test)]
+    TestQuiet,
+    /// Tests: a relay message to a hop of a circuit built.
+    #[cfg(test)]
+    TestCircuitSend(u64, usize, u8, Vec<u8>),
     /// The applier thread has a result: nothing else to do but take it.
     Wake,
     Stop,
@@ -381,6 +404,10 @@ pub struct Stats {
     pub rendezvous: Vec<(SocketAddr, bool)>,
     /// Sessions held for others, as a relay.
     pub sessions: usize,
+    /// Onion-mode channels open, either end.
+    pub channels: usize,
+    /// Onion-mode circuits: ours built, and hops served for others.
+    pub circuits: (usize, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -474,8 +501,22 @@ pub struct Node<V: ProofVerifier> {
     last_consensus: Option<(Option<consensus::Hash>, consensus::Mode)>,
     /// Peers that did not serve the wanted file.
     file_failed: std::collections::HashSet<SocketAddr>,
+    /// Files no live peer served, and when they were given up.
+    file_unavailable: HashMap<consensus::Hash, Instant>,
     /// The message layer's sessions and sends.
     rv: sessions::State,
+    /// Onion mode's channels.
+    channels: channels::Channels,
+    /// Onion mode's circuits: ours and those through us.
+    circuits: circuits::Circuits,
+    /// Onion mode's rendezvous service.
+    rdv: rendezvous::Rendezvous,
+    /// Onion mode's participant: standing circuits and sends.
+    part: participant::Participant,
+    /// Tests: no standing circuits, for tests that drive circuits by hand.
+    #[cfg(test)]
+    quiet: bool,
+    last_channel_poll: Instant,
 }
 
 fn unix_now() -> u64 {
@@ -693,7 +734,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             file_want: None,
             last_consensus: None,
             file_failed: std::collections::HashSet::new(),
+            file_unavailable: HashMap::new(),
             rv,
+            channels: channels::Channels::default(),
+            circuits: circuits::Circuits::default(),
+            rdv: rendezvous::Rendezvous::default(),
+            part: participant::Participant::default(),
+            #[cfg(test)]
+            quiet: false,
+            last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
             node.mode = Mode::Headers;
@@ -734,6 +783,29 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Mined(block)) => self.submit_block(block, None),
                 Ok(Event::Transaction(tx)) => self.handle_transaction(tx, None),
                 Ok(Event::Send(out)) => self.start_send(out, Instant::now()),
+                #[cfg(test)]
+                Ok(Event::TestChannel(addr, id, body)) => {
+                    let now = Instant::now();
+                    let key = self.channel_to(addr, id, now).unwrap();
+                    self.channel_send(key, &body, now).unwrap();
+                }
+                #[cfg(test)]
+                Ok(Event::TestRelays(relays)) => self.rv.set_relays(relays),
+                #[cfg(test)]
+                Ok(Event::TestQuiet) => self.quiet = true,
+                #[cfg(test)]
+                Ok(Event::TestCircuit(path, queued)) => {
+                    if let Err(e) = self.build_circuit(path, queued, Instant::now()) {
+                        self.log(&format!("circuit: {e}"));
+                        self.circuits.seen.lock().unwrap().push(circuits::Seen::Failed(u64::MAX));
+                    }
+                }
+                #[cfg(test)]
+                Ok(Event::TestCircuitSend(handle, hop, cmd, data)) => {
+                    if let Err(e) = self.circuit_send(handle, hop, cmd, &data, Instant::now()) {
+                        self.log(&format!("circuit: {e}"));
+                    }
+                }
                 Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) => {}
                 Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -744,6 +816,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.retry_downloads(now);
             self.retry_snapshot_downloads(now);
             self.retry_objects(now);
+            if now.duration_since(self.last_channel_poll) >= Duration::from_millis(100) {
+                self.last_channel_poll = now;
+                self.poll_channels(now);
+            }
             if now.duration_since(last_tick) >= Duration::from_secs(1) {
                 last_tick = now;
                 self.tick(now);
@@ -775,6 +851,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             None => msg.encode(),
         };
         if let Err(e) = self.socket.send_to(&bytes, addr) {
+            self.chatter(&format!("send to {addr} failed: {e}"));
+        }
+    }
+
+    /// Sends a request with `token` in it, rather than the one the peer
+    /// table holds: the token an offer, a session request or a handshake
+    /// carried.
+    fn send_with(&self, addr: SocketAddr, msg: Message, token: u64) {
+        if let Err(e) = self.socket.send_to(&msg.with_token(token).encode(), addr) {
             self.chatter(&format!("send to {addr} failed: {e}"));
         }
     }
@@ -877,6 +962,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
         }
         self.sessions_tick(now);
+        self.circuits_tick(now);
+        self.rendezvous_tick(now);
         let behind = self.peers.claimants(self.chain.tip_work().unwrap_or(U256::ZERO), now).next().is_some();
         let fresh = self.peers.live_count(now) == 0 && now.duration_since(self.started) < Duration::from_secs(5);
         self.syncing.store(self.mode != Mode::Normal || behind || fresh, Ordering::Release);
@@ -904,7 +991,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             (Ok(best), Ok(Some(tip))) => best.height.saturating_sub(tip.height) as usize,
             _ => 0,
         };
-        let (rendezvous, sessions) = self.rv.summary(now);
+        let (mut rendezvous, sessions) = self.rv.summary(now);
+        if self.rv.relays().is_some() {
+            rendezvous = self.onion_summary(now);
+        }
         *self.stats.lock().unwrap() = Stats {
             peers,
             downloads: self.downloads.len() + self.tx_downloads.len() + self.snap_downloads.len(),
@@ -914,7 +1004,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             parts,
             aux_wanted: self.aux_wants.len(),
             rendezvous,
-            sessions,
+            sessions: sessions + self.rdv.sessions(),
+            channels: self.channels.count(),
+            circuits: self.circuits.counts(),
         };
     }
 
@@ -1222,6 +1314,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // for them with the token its offer carried, in our table or not.
         let asked = match &msg {
             Message::Chunk { kind: Kind::Object, id, .. } => self.rv.downloads.get(id).is_some_and(|d| d.from == addr),
+            // Frames are sealed: one that is not ours does not open.
+            Message::Frame(f) => self.channels.knows(&addr, f.chan),
             _ => false,
         };
         if !matches!(msg, Message::Ping(_) | Message::Pong(_))
@@ -1477,6 +1571,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
             Message::Notice { subject, code } => self.on_notice(addr, subject, code, now),
+            Message::Handshake { chan, stage, index, count, data, back, token } => {
+                if self.request_ok(&addr, token) {
+                    self.on_handshake(addr, chan, stage, index, count, data, back, now);
+                }
+            }
+            Message::Frame(f) => self.on_frame(addr, f, now),
         }
     }
 
@@ -1519,38 +1619,43 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             match self.chain.consensus() {
                 Ok((votes, current)) => {
                     self.rv.set_consensus(&current);
-                    let decided = (current.winner, current.mode);
+                    let decided = (current.winner.map(|w| w.0), current.mode);
                     if self.last_consensus != Some(decided) {
                         self.last_consensus = Some(decided);
-                        let by = match (&current.winner, &current.problem) {
-                            (None, _) => "no block of the window votes".to_string(),
-                            (Some(h), Some(problem)) => format!("file {} is {problem}", consensus::hex(h)),
-                            (Some(h), None) => format!(
-                                "file {} with {} of the window's {} votes{}",
+                        let by = match &current.winner {
+                            None if votes.counts.is_empty() => "no block of the window votes".to_string(),
+                            None => format!("none of the {} files voted for counts yet", votes.counts.len()),
+                            Some((h, n)) => format!(
+                                "file {} with {n} of the window's {} votes{}",
                                 consensus::hex(h),
-                                votes.winning_votes(),
                                 votes.blocks,
                                 current.file.as_ref().map_or(String::new(), |f| format!(", {} relays", f.relays.len()))
                             ),
                         };
                         self.log(&format!("consensus: {} mode: {by}", current.mode));
+                        for (h, n, why) in &current.skipped {
+                            self.log(&format!("consensus: file {} with {n} votes does not count: {why}", consensus::hex(h)));
+                        }
                     }
                     for (id, _) in &votes.missing {
                         if let Ok(Some(header)) = self.chain.header_by_hash(id) {
                             self.want_aux(&header, None);
                         }
                     }
-                    let want = match votes.winner() {
-                        Some(hash) if !self.chain.has_consensus_file(&hash).unwrap_or(true) => Some(hash),
-                        _ => None,
-                    };
+                    // Files voted for more than the one in force, most
+                    // voted first, passing over those no peer served lately.
+                    let unavailable = &self.file_unavailable;
+                    let want = current
+                        .unfetched()
+                        .find(|h| unavailable.get(*h).is_none_or(|t| now.duration_since(*t) >= FILE_BACKOFF))
+                        .copied();
                     if want != self.file_want {
                         self.file_failed.clear();
                         if let Some(hash) = want {
+                            let n = current.skipped.iter().find(|s| s.0 == hash).map_or(0, |s| s.1);
                             self.log(&format!(
-                                "consensus: file {} has {} of the window's {} votes; fetching it",
+                                "consensus: file {} has {n} of the window's {} votes; fetching it",
                                 consensus::hex(&hash),
-                                votes.winning_votes(),
                                 votes.blocks
                             ));
                         }
@@ -1606,11 +1711,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if let Some(hash) = self.file_want {
             let id = consensus::file_id(&hash);
             if !self.downloads.contains_key(&id) {
-                if self.file_failed.len() >= live.len() {
-                    self.file_failed.clear();
-                }
-                if let Some(from) = live.iter().find(|a| !self.file_failed.contains(a)).copied() {
-                    self.start_download(Kind::Consensus, id, from, now);
+                match live.iter().find(|a| !self.file_failed.contains(a)).copied() {
+                    Some(from) => self.start_download(Kind::Consensus, id, from, now),
+                    None => {
+                        // No live peer serves it: it counts for nothing
+                        // for a while, and the next is fetched.
+                        self.log(&format!("consensus: no peer serves file {}; passing it over for now", consensus::hex(&hash)));
+                        self.file_unavailable.insert(hash, now);
+                        self.file_want = None;
+                        self.file_failed.clear();
+                        self.last_aux_scan = None;
+                    }
                 }
             }
         }
@@ -2837,6 +2948,8 @@ mod tests {
     use crate::pow::{self, Dataset, PowParams, SeedText, nonce_from_u64};
     use crate::state_tree::EMPTY;
     use crate::transaction::{Key, Output};
+    use crate::circuit;
+    use crate::poseidon2::digest_to_bytes;
     use std::path::PathBuf;
 
     struct TempDir(PathBuf);
@@ -3126,7 +3239,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
                 let v = chain.consensus_votes(consensus::WINDOW).unwrap();
-                if v.missing.is_empty() && v.winner() == Some(want) && chain.has_consensus_file(&want).unwrap() {
+                if v.missing.is_empty() && v.counts.first().map(|c| c.0) == Some(want) && chain.has_consensus_file(&want).unwrap() {
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -3154,7 +3267,7 @@ mod tests {
             assert!(wait_for_tip(&b.chain, &block.header, 20), "b did not receive block {tag}");
             if tag < 6 {
                 std::thread::sleep(Duration::from_millis(300));
-                assert_eq!(b.chain.consensus_votes(consensus::WINDOW).unwrap().winner(), Some(hash), "at block {tag}");
+                assert_eq!(b.chain.consensus_votes(consensus::WINDOW).unwrap().counts[0].0, hash, "at block {tag}");
             }
         }
         assert!(settled(&b.chain, hash2, 20), "the second file did not take over: {:?}", b.chain.consensus_votes(144));
@@ -3162,7 +3275,7 @@ mod tests {
         assert_eq!(v.counts, vec![(hash2, 4, 7), (hash, 3, 3)]);
         assert_eq!(b.chain.consensus_file(&hash2).unwrap().as_deref(), Some(&file2[..]));
         let (_, current) = b.chain.consensus().unwrap();
-        assert_eq!((current.mode, current.winner, current.problem), (consensus::Mode::Init, Some(hash2), None));
+        assert_eq!((current.mode, current.winner, current.skipped), (consensus::Mode::Init, Some((hash2, 4)), vec![]));
         // Both files stay.
         assert!(b.chain.has_consensus_file(&hash).unwrap());
         // A peer serves leaves it holds and nothing for a block it does not.
@@ -3833,6 +3946,308 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    /// Onion mode's channels between nodes: a participant opens one to a
+    /// relay and stays anonymous; a relay opens one to a relay and proves
+    /// its id; bodies arrive in order. A wrong id, or a node that does not
+    /// relay, gets no channel.
+    #[test]
+    fn channels_open_between_nodes() {
+        let (a, b, c, d) = (open("ch-relay-a"), open("ch-relay-b"), open("ch-participant"), open("ch-plain"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let start = |f: &Fixture, relay: bool, tag: u8| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = relay;
+            cfg.identity = Some(key(tag));
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let sink = Arc::clone(&node.channels.sink);
+            let stats = node.stats();
+            (addr, tx, sink, stats, std::thread::spawn(move || node.run()))
+        };
+        let (addr_a, tx_a, sink_a, stats_a, h_a) = start(&a, true, 1);
+        let (_, tx_b, _, _, h_b) = start(&b, true, 2);
+        let (_, tx_c, _, _, h_c) = start(&c, false, 3);
+        let (addr_d, tx_d, sink_d, _, h_d) = start(&d, false, 4);
+        let n = 100usize;
+        for k in 0..n {
+            tx_b.send(Event::TestChannel(addr_a, id(1), format!("from b {k}").into_bytes())).unwrap();
+            tx_c.send(Event::TestChannel(addr_a, id(1), format!("from c {k}").into_bytes())).unwrap();
+        }
+        // c expects another key at a's address; nobody relays at d.
+        tx_c.send(Event::TestChannel(addr_a, id(9), b"to an impostor".to_vec())).unwrap();
+        tx_c.send(Event::TestChannel(addr_d, id(4), b"to a non-relay".to_vec())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sink_a.lock().unwrap().len() < 2 * n && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let got = sink_a.lock().unwrap().clone();
+        let from = |who: &str| -> Vec<(Option<Digest>, Vec<u8>)> {
+            got.iter().filter(|(_, _, b)| b.starts_with(format!("from {who}").as_bytes())).map(|(_, p, b)| (*p, b.clone())).collect()
+        };
+        let (bs, cs) = (from("b"), from("c"));
+        assert_eq!((bs.len(), cs.len(), got.len()), (n, n, 2 * n), "{:?}", got.iter().map(|g| &g.2).collect::<Vec<_>>());
+        for k in 0..n {
+            // b proved it is the relay with id 2; c is nobody.
+            assert_eq!(bs[k], (Some(id(2)), format!("from b {k}").into_bytes()));
+            assert_eq!(cs[k], (None, format!("from c {k}").into_bytes()));
+        }
+        assert!(sink_d.lock().unwrap().is_empty());
+        // b's, c's, and the one c abandoned when a's key was not the one
+        // it expected (a drops it once it falls silent). Stats refresh once
+        // a second.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while stats_a.lock().unwrap().channels != 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(stats_a.lock().unwrap().channels, 3);
+        for tx in [tx_a, tx_b, tx_c, tx_d] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [h_a, h_b, h_c, h_d] {
+            h.join().unwrap();
+        }
+    }
+
+    /// A circuit through three listed relays: data reaches the hop it is
+    /// for and no other, answers come back from the right hop, a message
+    /// spans several cells. A hop refuses to extend to an unlisted relay.
+    #[test]
+    fn circuits_are_built_hop_by_hop() {
+        use circuits::Seen;
+        let fixtures: Vec<Fixture> = (0..5).map(|i| open(&format!("circ-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 4;
+            cfg.identity = Some(key(i as u8 + 1));
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let seen = Arc::clone(&node.circuits.seen);
+            nodes.push((addr, tx, seen, std::thread::spawn(move || node.run())));
+        }
+        // a, b and c are listed; d relays but is not; p is the client.
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestQuiet).unwrap();
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let big: Vec<u8> = b"echo:".iter().copied().chain((0..5000u32).map(|i| i as u8)).collect();
+        let queued = vec![(2, b"echo:one".to_vec()), (1, b"echo:mid".to_vec()), (2, big.clone())];
+        nodes[4].1.send(Event::TestCircuit(vec![id(1), id(2), id(3)], queued)).unwrap();
+        let wait = |seen: &Arc<Mutex<Vec<Seen>>>, n: usize| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while seen.lock().unwrap().len() < n && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            seen.lock().unwrap().clone()
+        };
+        let got = wait(&nodes[4].2, 4);
+        let mut echoed = b"echoed:".to_vec();
+        echoed.extend_from_slice(&big[5..]);
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0], Seen::Ready(0));
+        // In order from each hop; the middle one's answer may come first.
+        let from = |hop: usize| got.iter().filter(|s| matches!(s, Seen::Data(0, h, _) if *h == hop)).cloned().collect::<Vec<_>>();
+        assert_eq!(from(1), vec![Seen::Data(0, 1, b"echoed:mid".to_vec())]);
+        assert_eq!(from(2), vec![Seen::Data(0, 2, b"echoed:one".to_vec()), Seen::Data(0, 2, echoed)]);
+        // Each hop saw only what was for it.
+        assert!(nodes[0].2.lock().unwrap().is_empty());
+        assert_eq!(*nodes[1].2.lock().unwrap(), vec![Seen::AtHop(b"echo:mid".to_vec())]);
+        assert_eq!(*nodes[2].2.lock().unwrap(), vec![Seen::AtHop(b"echo:one".to_vec()), Seen::AtHop(big)]);
+        // Through a to d, which is not listed: a refuses, the circuit ends.
+        nodes[4].1.send(Event::TestCircuit(vec![id(1), id(4)], vec![])).unwrap();
+        let got = wait(&nodes[4].2, 5);
+        assert_eq!(got[4], Seen::Failed(1));
+        assert!(nodes[3].2.lock().unwrap().is_empty());
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.3.join().unwrap();
+        }
+    }
+
+    /// Onion mode's rendezvous service, the participants driven by hand:
+    /// p holds a session at its rendezvous point over a circuit; q, whose
+    /// circuit ends at another relay, looks p up and sends it a payload,
+    /// which its relay forwards to p's point and down p's circuit.
+    #[test]
+    fn rendezvous_points_meet_over_circuits() {
+        use circuits::Seen;
+        use crate::onion::{Announce, Object, Payload};
+        let fixtures: Vec<Fixture> = (0..5).map(|i| open(&format!("rdv-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(key(i as u8 + 1));
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let seen = Arc::clone(&node.circuits.seen);
+            nodes.push((addr, tx, seen, std::thread::spawn(move || node.run())));
+        }
+        let mut listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        listed.sort_by_key(|r| digest_to_bytes(&r.id));
+        for n in &nodes {
+            n.1.send(Event::TestQuiet).unwrap();
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let (p, q) = (3usize, 4usize);
+        let (id_p, key_p, key_q) = (id(4), key(4), key(5));
+        // p's first rendezvous point; q's circuit ends elsewhere.
+        let rp = listed[crate::onion::rendezvous_indexes(&id_p, 3)[0]].id;
+        let others: Vec<Digest> = listed.iter().map(|r| r.id).filter(|r| *r != rp).collect();
+        let wait = |n: usize, pred: &dyn Fn(&Seen) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(s) = nodes[n].2.lock().unwrap().iter().find(|s| pred(s)).cloned() {
+                    return s;
+                }
+                assert!(Instant::now() < deadline, "waited in vain: {:?}", nodes[n].2.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let msg = |n: usize, cmd: u8| match wait(n, &|s| matches!(s, Seen::Msg(_, _, c, _) if *c == cmd)) {
+            Seen::Msg(_, _, _, b) => {
+                nodes[n].2.lock().unwrap().retain(|s| !matches!(s, Seen::Msg(_, _, c, _) if *c == cmd));
+                b
+            }
+            _ => unreachable!(),
+        };
+        // p: a circuit to its rendezvous point, a session, an announce.
+        nodes[p].1.send(Event::TestCircuit(vec![others[0], rp], vec![])).unwrap();
+        wait(p, &|s| *s == Seen::Ready(0));
+        nodes[p].1.send(Event::TestCircuitSend(0, 1, circuit::SESSION, digest_to_bytes(&id_p).to_vec())).unwrap();
+        let state = msg(p, circuit::SESSION_STATE);
+        assert_eq!((&state[..32], &state[40..]), (&digest_to_bytes(&id_p)[..], &0u64.to_le_bytes()[..]));
+        let nonce = u64::from_le_bytes(state[32..40].try_into().unwrap());
+        let kyber = crate::mlkem::keygen(&[7u8; 64]);
+        let announce = Announce::make(&key_p, kyber.public_key(), 1, unix_now() + 3600, nonce);
+        // An announce bound to another nonce is refused.
+        let wrong = Announce::make(&key_p, kyber.public_key(), 1, unix_now() + 3600, nonce ^ 1);
+        nodes[p].1.send(Event::TestCircuitSend(0, 1, circuit::ANNOUNCE, wrong.to_bytes())).unwrap();
+        let notice = msg(p, circuit::NOTICE);
+        assert_eq!(notice[32], net::NOTICE_REJECTED);
+        nodes[p].1.send(Event::TestCircuitSend(0, 1, circuit::ANNOUNCE, announce.to_bytes())).unwrap();
+        let state = msg(p, circuit::SESSION_STATE);
+        assert_eq!(&state[40..], &1u64.to_le_bytes());
+        // q: a circuit ending at a relay that is not p's point.
+        nodes[q].1.send(Event::TestCircuit(vec![others[0], others[1]], vec![])).unwrap();
+        wait(q, &|s| *s == Seen::Ready(0));
+        nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::GET_ANNOUNCE, digest_to_bytes(&id_p).to_vec())).unwrap();
+        let found = Announce::from_bytes(&msg(q, circuit::ANNOUNCE)).unwrap();
+        assert_eq!(found, announce);
+        let q_announce = Announce::make(&key_q, crate::mlkem::keygen(&[8u8; 64]).public_key(), 1, unix_now() + 3600, 0);
+        let payload = Payload::seal(&found, Some((&key_q, &q_announce)), 1, b"a slate", &[3u8; 32], [4u8; 12]).unwrap();
+        let bytes = Object::Payload(payload).to_bytes();
+        nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::SEND, bytes.clone())).unwrap();
+        let notice = msg(q, circuit::NOTICE);
+        assert_eq!((&notice[..32], notice[32]), (&digest_to_bytes(&Object::id_of(&bytes))[..], net::NOTICE_FORWARDED));
+        let delivered = msg(p, circuit::DELIVER);
+        let Some(Object::Payload(got)) = Object::from_bytes(&delivered) else { panic!() };
+        let opened = got.open(&kyber, unix_now()).unwrap();
+        assert_eq!((opened.kind, &opened.inner[..]), (1, &b"a slate"[..]));
+        assert_eq!(opened.from.map(|a| a.id), Some(id(5)));
+        // Nobody holds a session for this id.
+        nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::GET_ANNOUNCE, digest_to_bytes(&id(9)).to_vec())).unwrap();
+        let notice = msg(q, circuit::NOTICE);
+        assert_eq!((&notice[..32], notice[32]), (&digest_to_bytes(&id(9))[..], net::NOTICE_OFFLINE));
+        // A lookup at p's own point is answered there.
+        nodes[q].1.send(Event::TestCircuit(vec![others[1], rp], vec![])).unwrap();
+        wait(q, &|s| *s == Seen::Ready(1));
+        nodes[q].1.send(Event::TestCircuitSend(1, 1, circuit::GET_ANNOUNCE, digest_to_bytes(&id_p).to_vec())).unwrap();
+        assert_eq!(Announce::from_bytes(&msg(q, circuit::ANNOUNCE)), Some(announce));
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.3.join().unwrap();
+        }
+    }
+
+    /// Onion mode end to end: two wallets' nodes keep circuits standing
+    /// to their rendezvous points among three listed relays, and one
+    /// reaches the other by id and is answered, as in init mode.
+    #[test]
+    fn messages_meet_in_onion_mode() {
+        use crate::onion;
+        let fixtures: Vec<Fixture> = (0..5).map(|i| open(&format!("onion-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(key(i as u8 + 1));
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let (p, q) = (3usize, 4usize);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 3 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(live(p) && live(q)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(p) && live(q), "{:?} {:?}", nodes[p].3.lock().unwrap().rendezvous, nodes[q].3.lock().unwrap().rendezvous);
+        let delivered = Mutex::new(Vec::new());
+        let received = |n: usize| loop {
+            match nodes[n].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+                Note::Received(o) => return o,
+                Note::Failed { why, .. } => panic!("{why}"),
+                Note::Delivered { tag, .. } => delivered.lock().unwrap().push(tag),
+            }
+        };
+        let out = Outbound { tag: 1, to: id(4), kind: onion::KIND_SLATE, inner: b"a slate".to_vec(), recipient: None };
+        nodes[q].1.send(Event::Send(out)).unwrap();
+        let o = received(p);
+        assert_eq!((o.kind, &o.inner[..]), (onion::KIND_SLATE, &b"a slate"[..]));
+        let from = o.from.expect("q names itself");
+        assert_eq!(from.id, id(5));
+        let out = Outbound { tag: 2, to: from.id, kind: onion::KIND_SLATE, inner: b"answered".to_vec(), recipient: Some(from) };
+        nodes[p].1.send(Event::Send(out)).unwrap();
+        let o = received(q);
+        assert_eq!(&o.inner[..], b"answered");
+        assert_eq!(o.from.map(|a| a.id), Some(id(4)));
+        // Each send was confirmed delivered.
+        if let Ok(Note::Delivered { tag, .. }) = nodes[p].2.recv_timeout(Duration::from_secs(5)) {
+            delivered.lock().unwrap().push(tag);
+        }
+        let mut tags = delivered.lock().unwrap().clone();
+        tags.sort();
+        assert_eq!(tags, vec![1, 2]);
+        // Nobody holds a session for this id.
+        nodes[q].1.send(Event::Send(Outbound { tag: 3, to: id(9), kind: 1, inner: vec![], recipient: None })).unwrap();
+        match nodes[q].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
+            Note::Failed { tag: 3, why, .. } => assert!(why.contains("offline"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.4.join().unwrap();
         }
     }
 

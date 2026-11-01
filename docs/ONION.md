@@ -13,8 +13,8 @@ is in and, in onion mode, which relays exist. There is no store and
 forward anywhere: a recipient is reachable while it is online and
 connected to its rendezvous points, and not otherwise.
 
-This is the design as discussed on 2026-11-01: the parts settled so far,
-with the open points listed at the end. Constants are listed before them.
+This is the design as discussed and settled on 2026-11-01, with what
+remains open listed at the end. Constants are listed before it.
 
 ## Identities
 
@@ -33,8 +33,8 @@ holder. The Dilithium key is long-lived
 and signs everything the holder publishes. Encryption to the holder uses
 Kyber keys that are ephemeral: made fresh, signed by the Dilithium key
 with a sequence number and an expiry, published where the holder is
-reached (a wallet at its rendezvous points, a relay in its descriptor),
-and rotated often, so a key compromised later opens nothing sent before
+reached (a wallet at its rendezvous points; a relay makes one per
+handshake, see "Handshake"), and rotated often, so a key compromised later opens nothing sent before
 its rotation (forward secrecy), and a holder rotates without touching the
 chain. Anyone given the Dilithium key checks it against the id by one
 hash, then checks a Kyber key by one signature. The chain never carries
@@ -74,25 +74,29 @@ it may carry comments or an announcement. No file at all means init mode.
 
 ```
 mode onion
-relay ID ADDRESS [FLAGS]
-relay ID ADDRESS [FLAGS]
+relay ID ADDRESS
+relay ID ADDRESS
 ...
 ```
 
 Onion mode: `relay` lines list the relays, one per line: its id (a
-`tab1…` address, or 64 hex digits), its address (`host:port`, UDP, the
-same transport as the chain's; a v6 address in brackets), and optional
-flags (`exit`, `rendezvous`, `guard`; their meaning is an open point).
-Addresses may change without a new consensus: a relay whose address is
-stale is found through its descriptor served by other relays (open
-point). The relays are taken sorted by id, whatever order they are
-written in.
+`tab1…` address, or 64 hex digits: the hash of its Dilithium key, which
+a node started with `--relay` prints) and its address (`host:port`, UDP,
+the same transport as the chain's; a v6 address in brackets), and
+nothing else. There are no flags and no descriptors: the system is flat,
+and every listed relay may be a hop or a rendezvous point. The file
+carries only the key's hash; the key itself is shown, and proven held,
+in the handshake that opens a channel to the relay. A relay that changes
+its address or its Dilithium key needs a new file. The relays are taken
+sorted by id, whatever order they are written in. Onion mode needs at
+least `MIN_RELAYS` (three) of them: two hops and a rendezvous point for
+each circuit. That is enough for testing, not for privacy.
 
 Unknown directives are ignored (forward compatibility); a file that does
-not parse, is not UTF-8, exceeds the size, lists an id twice, lists more
-than `MAX_RELAYS` relays, or in onion mode fewer than `MIN_RELAYS` (three,
-the rendezvous points a participant needs) is invalid and never replaces
-the current one. `set-leaf 0 FILE` refuses such a file, so a miner cannot
+not parse, is not UTF-8, exceeds the size, lists an id twice, has a
+relay line with anything after the address, lists more than
+`MAX_RELAYS` relays, or in onion mode fewer than `MIN_RELAYS` is invalid
+and its votes count for nothing. `set-leaf 0 FILE` refuses such a file, so a miner cannot
 vote for one by accident.
 
 ## Commitment and propagation
@@ -111,8 +115,8 @@ its own blocks; a node that has checked a block's leaves serves them. The
 leaves are kept with the block for the undo window. Leaf 0 is the
 block's vote: the SHA-256 of a `consensus.txt`, or zero for no vote.
 
-**The file.** A node fetches a file only when it needs it: the one whose
-hash wins the window below, from any peer that serves it (a miner serves
+**The file.** A node fetches a file only when it needs it: one voted for
+more than the file in force (below), from any peer that serves it (a miner serves
 the file it committed; a node that has fetched and checked a file serves
 it). The file is checked by `SHA-256(file) == hash`. It is at most
 `MAX_CONSENSUS` bytes and travels through the chunked transfer the chain
@@ -121,16 +125,19 @@ arrives in windows of datagrams and is checked once whole. Files that
 won at any time are kept for good.
 
 **Which file is current.** Over the last `WINDOW` (144) main-chain blocks,
-count the nonzero leaf-0 hashes; the most common one, if its file has
-been fetched, checked and parses, is the current file. Ties go to the hash
-committed most recently. If no block in the window votes, or the winning
-file cannot be fetched or does not parse, the network is in init mode.
-The window moves with the chain, so the current file follows the main
-chain through reorganizations without any special case, and a file has
-to be committed by more blocks than any other over a day to take effect:
-one miner's block changes nothing. Who may author the file is an open
-point below, and until it is settled the file is whatever most miners
-choose, as with any aux leaf.
+count the nonzero leaf-0 hashes. Only votes for a file that has been
+fetched, checked and parses count: votes for a file that is corrupt, or
+that no peer serves, count for nothing. Of the files that count, the
+most voted is current, ties to the one committed most recently; one vote
+is enough. A file saying `mode init` counts like any other, so miners
+can vote the network back into init mode. With no vote that counts in
+the window the network is in init mode. A node fetches the files voted
+for more than the current one, most voted first, and passes over for
+ten minutes a file no live peer serves. The window moves with the
+chain, so the current file follows the main chain through
+reorganizations without any special case. The file is whatever the
+miners choose, as with any aux leaf; in practice miners and pools agree
+on it among themselves.
 
 **Why propagate rather than embed.** The header carries 32 bytes; the file
 is the thing those bytes commit to. Propagating it with the block gives
@@ -195,88 +202,106 @@ the window.
 
 ## Onion mode
 
-**Relays.** Each listed relay runs the onion service next to its node: it
-holds a Dilithium key whose hash is its listed id, publishes a signed
-descriptor (the Dilithium key, a Kyber key announcement rotated weekly,
-the address, flags, a sequence number) that any node fetches and checks
-against the id, and forwards cells. Circuit keys come from encapsulating
-to the descriptor's Kyber key, so a hop's past traffic is safe once that
-key rotates.
+The listed relays carry the traffic, through circuits in the manner of
+Tor: a participant keeps circuits standing, and messages travel over
+them in fixed-size cells, each relay knowing only its neighbours.
 
-**The `--relay` flag.** A node relays only when started with `--relay`.
-Without it a node is a participant: it keeps its own sessions and
-circuits, never accepts a circuit or forwards a cell, and publishes no
-descriptor. With it the node runs the relay service on its UDP port,
-publishes its descriptor and forwards for anyone. The relay's id is its
-wallet's id (the seed-derived Dilithium key, shown by `address`), which
-is what an operator puts in the `relay` line of a `consensus.txt`. A
-node started with `--relay` prints that line ready to paste at startup,
-its id as a `tab1…` address with its listening address, and logs it, so
-an operator can hand it to whoever is assembling the next file; a
-node listed in the file but not started with `--relay` forwards nothing
-and is skipped by others once its descriptor cannot be fetched, and a
-node started with `--relay` but not listed forwards for nobody, since
-circuits are built only through listed relays. In init mode the same
-flag turns on the rendezvous service, so the seed nodes run with it.
+**Handshake.** Every link is opened by one handshake, the same whether a
+participant opens it to a relay or a relay to another relay, and whether
+it is a channel to a neighbour or a hop added to a circuit through one:
+
+```
+initiator → relay    fresh Kyber public key, random challenge
+relay → initiator    Dilithium public key, Kyber ciphertext,
+                     signature over the challenge and the whole exchange
+```
+
+The initiator checks the Dilithium key against the relay's listed id
+(one hash), the signature, and decapsulates; both derive their
+ChaCha20-Poly1305 keys from the shared secret and the transcript. The
+relay so proves it holds the key the file names, and the Kyber key is
+fresh every time, so each link is forward secret on its own. A relay
+opening a channel to another relay also signs the exchange with its own
+key, so both ends know they talk to a listed relay; a participant does
+not, and stays anonymous. In init mode the roles are the other way
+round: the participant signs the seed's nonce (see "Init mode").
+
+**Channels.** A channel is the link between two neighbours, participant
+to relay or relay to relay, opened by the handshake and carrying
+frames sealed with ChaCha20-Poly1305 under a sequence number. Loss is
+handled hop by hop: the receiver acknowledges what arrived, and the
+sender resends what was not acknowledged, so a lost datagram costs one
+link's round trip, not the whole path's. Circuits are multiplexed over
+channels by a circuit number per channel.
+
+**Circuits.** A circuit is built one hop at a time: the first hop by the
+handshake over the channel to it, each further hop by the same
+handshake carried inside the circuit (the participant's Kyber key and
+challenge go to the last hop, which passes them to the next relay, as
+Tor's EXTEND), so a hop learns nothing of the keys of the hops beyond
+it. A cell is `CELL_BYTES` long, padded, so a relay cannot tell a slate
+from a channel update from a zone by length, and carries one layer of
+encryption per hop. Relays are distinct within a circuit; two circuits
+may share relays.
 
 **Standing circuits.** Building a circuit costs a round trip per hop, so
-no circuit is built per payment. Every participant keeps two kinds
-standing:
-
-- an *inbound* circuit to each of its three rendezvous relays, through
-  two relays of its choice: `rendezvous ← relay ← relay ← participant`;
-  this is the session the rendezvous relay forwards down, with the
-  participant's keys announced over it;
-- an *outbound* circuit through two relays of its choice to an *exit*
-  relay it picks at random: `participant → relay → relay → exit`.
-
-A payment is one message over circuits that already exist:
+none is built per payment. Each participant keeps a circuit to each of
+its three rendezvous points, through two relays chosen at random:
 
 ```
-sender → relay1 → relay2 → exit → recipient's rendezvous → relay3 → relay4 → recipient
+participant → r1 → r2 → rendezvous point
 ```
 
-The exit forwards the message, addressed by the recipient's id, to one
-of the recipient's rendezvous relays (which it computes from the id like
-anyone); that relay forwards it down the recipient's inbound circuit.
-Circuits are two-way: the rendezvous relay remembers for the exchange
-which inbound session the message went to and which link it came from,
-and the reply travels back the same path, so a slate's stages go back
-and forth without any further setup. Six relays see a payment, each
-knowing only its neighbours.
+Its keys are announced over the circuit, and the rendezvous point holds
+the session for its id over it, as a seed does over a direct connection
+in init mode. The same circuits carry what the participant sends:
 
-The exit is chosen at random and is not one of the sender's own
-rendezvous relays: the recipient's rendezvous relay sees where messages
-for the recipient arrive from, and a relay tied to the sender's id would
-narrow the sender to the ids that relay serves. After a payment the
-sender retires its outbound circuit and uses the next, built in the
-background while the last was in use, so there is always one ready and
-no two payments share a path. Inbound circuits rotate on a timer and when
-a hop fails.
+```
+S → r1 → r2 → rend(S) → rend(R) → r3 → r4 → R
+```
 
-**Cells.** One Kyber encapsulation per hop establishes a per-hop key;
-each layer of a packet is encrypted to one hop, and each hop learns only
-the previous and the next. Packets are fixed-size cells padded to
-`CELL_BYTES`, so a relay cannot tell a slate from a channel update from a
-zone by length. The construction is a Sphinx-style packet with a
-post-quantum KEM in place of Diffie-Hellman; its exact format is an open
-point below.
+The sender's message goes up one of its circuits to its own rendezvous
+point, which forwards it, addressed by the recipient's id, relay to
+relay to one of the recipient's rendezvous points (computed from the id
+like anyone), which sends it down the recipient's circuit. A reply goes
+back the same way, so a slate's stages go back and forth without any
+further setup. Six relays see a payment, each knowing only its
+neighbours. Hops are chosen at random; only rendezvous points are fixed,
+by the hash of the id, so that they can be found. A circuit is rebuilt
+when a hop fails, and rotated on a timer.
 
 **Rendezvous.** This is what `docs/NAMES.md` calls a name's rendezvous
-points: a name resolves to an id, the id to its three rendezvous relays,
-and any exit reaches one of them. Neither side learns the other's network
-address; a rendezvous relay learns the id it serves (it must, to route by
-it) and that a message for it came from some exit, never who sent it.
+points: a name resolves to an id, the id to its three rendezvous relays.
+Neither side learns the other's network address. A rendezvous point
+learns the id it serves (it must, to route by it). The recipient's
+rendezvous point also learns which relay a message came from: one of the
+sender's rendezvous points, so it narrows the sender to the ids that
+relay serves, a cost of having no exits.
 
 **What travels.** Slates, channel signing rounds (`sign_policy` on a
 transaction's bytes passed around a factory's members), name zones for
 sub-names, and anything else wallets agree on. Each is a message of a
 kind inside a cell's encrypted body; relays never see kinds.
 
-**Transition.** When the window's winner changes mode, participants
+**The `--relay` flag.** A node relays only when started with `--relay`.
+Without it a node is a participant: it keeps its own channels and
+circuits, never accepts a circuit or forwards a cell. With it the node
+runs the relay service on its UDP port and forwards for anyone. The
+relay's id is its wallet's id (the seed-derived Dilithium key, shown by
+`address`), which is what an operator puts in the `relay` line of a
+`consensus.txt`. A node started with `--relay` prints that line ready to
+paste at startup, its id as a `tab1…` address with its listening
+address, and logs it, so an operator can hand it to whoever is
+assembling the next file. A node listed in the file but not started
+with `--relay` refuses handshakes and is passed over; a node started
+with `--relay` but not listed forwards for nobody, since circuits are
+built only through listed relays. In init mode the same flag turns on
+the rendezvous service, so the seed nodes run with it.
+
+**Transition.** When the current file changes mode, participants
 reconnect to the rendezvous points the new mode gives them at the next
-keepalive; a message in flight is lost at worst and resent, since nothing
-is stored anywhere.
+keepalive; a message in flight is lost at worst and resent, since
+nothing is stored anywhere.
 
 ## Decisions
 
@@ -305,6 +330,26 @@ Settled on 2026-11-01, before implementation.
   carry traffic and the only switch: being listed in `consensus.txt`
   makes a relay usable, not active.
 
+Settled on 2026-11-01, before onion mode.
+
+- **No descriptors.** `consensus.txt` lists a relay's id (the hash of
+  its Dilithium key) and address; the key is revealed and proven held
+  in the handshake. A new key or address needs a new file.
+- **One handshake** (Dilithium signature over a challenge, fresh Kyber
+  key exchange, then ChaCha20-Poly1305) for channels and for every hop
+  of a circuit; relays authenticate to each other both ways.
+- **Tor-style circuits**: built hop by hop, fixed-size cells, one layer
+  per hop; loss handled hop by hop on channels by acknowledgement and
+  resending.
+- **A flat network**: no exit, guard or rendezvous flags. Every relay
+  may be a hop or a rendezvous point; hops are random, rendezvous points
+  come from the id. Participants keep circuits only to their own
+  rendezvous points, and messages go rendezvous point to rendezvous
+  point.
+- **Votes**: one is enough. Only files fetched and valid count; the
+  most voted wins, whatever its mode, so a `mode init` file is a vote
+  for init; nothing that counts means init mode.
+
 ## Constants
 
 | constant | value |
@@ -313,39 +358,25 @@ Settled on 2026-11-01, before implementation.
 | Kyber keys | ephemeral, signed by the Dilithium key; wallets rotate per session and daily, relays weekly |
 | `MAX_CONSENSUS` | 1 MiB |
 | `MAX_RELAYS` | 8,192 |
-| `MIN_RELAYS` | 3: an onion-mode file with fewer is invalid |
+| `MIN_RELAYS` | 3: two hops and a rendezvous point; an onion-mode file with fewer is invalid |
 | `WINDOW` | 144 blocks: the most committed file over them is current |
 | `KEEPALIVE` | 30 seconds between pings on a rendezvous session |
-| circuit length | 2 relays plus the exit or the rendezvous relay: 6 relays end to end |
-| outbound circuits | one in use, one prebuilt; retired after each payment |
+| circuit length | 2 random relays plus the participant's rendezvous point |
+| path | sender's 2 hops, both rendezvous points, recipient's 2 hops: 6 relays |
 | `RENDEZVOUS` | 3 points per participant, from `H(id ‖ k)` |
 | `CELL_BYTES` | 1,024 |
 | aux leaf 0 | `SHA-256(consensus.txt)`; zero is no vote |
 
 ## Open points
 
-To be settled before implementation, in roughly this order.
-
-1. **Relay descriptors.** Where a relay's keys, address and flags are
-   fetched from (other relays, the seeds, the relay itself at its listed
-   address) and how a changed address is found.
-2. **Packet format.** The Sphinx-style construction with Kyber: header
-   size per hop, the per-hop MAC, replay protection, and the reply path a
-   first message carries.
-3. **Relay economics.** Whether relays are paid (channels fit naturally:
+1. **Relay economics.** Whether relays are paid (channels fit naturally:
    a relay is a liquidity provider's node) and how a sender proves it
-   paid without being identified.
-4. **Flags and selection.** What `exit`, `rendezvous` and `guard` mean,
-   how senders weight relays, and whether a sender keeps long-lived
-   guards as Tor does.
-5. **Session limits.** How many sessions a rendezvous point holds, and
+   paid without being identified. Unpaid for now.
+2. **Session limits.** How many sessions a rendezvous point holds, and
    whether holding one costs a proof of work or a payment, against a
-   flood of ids.
-6. **Cover traffic and timing.** Whether relays and wallets send padding
-   cells, and at what rate.
-7. **Ties and thin windows.** Ties go to the most recent commitment; a
-   window with few votes (right after launch, or after a long quiet
-   spell) may need a minimum count before a file applies.
+   flood of ids. A fixed cap for now (`MAX_SESSIONS`, 10,000).
+3. **Cover traffic and timing.** Whether relays and wallets send padding
+   cells, and at what rate. None for now.
 
 ## Implementation order
 
@@ -415,6 +446,81 @@ To be settled before implementation, in roughly this order.
    Not yet: a relay's own wallet is reached only through other points
    (a point that is this node is skipped), and nothing limits who may
    send a stage-1 slate to an online wallet (open point 5).
-4. **Onion mode.** Relay service behind `--relay`, descriptors, circuits
-   and cells, rendezvous over circuits, and the wallet's use of them.
-5. **Docs.** README, SECURITY.md, HARDENING.md.
+4. **Onion mode**, done (2026-11-01), in parts:
+   - 4a. Done (2026-11-01): the decisions above; the vote counts only
+     files fetched and valid (`consensus::Current::decide`, which lists
+     the files that do not count and why; the node fetches those voted
+     for more than the current one, most voted first, and passes over
+     for ten minutes one no peer serves); relay lines lose their flags.
+   - 4b. Done (2026-11-01): `channel.rs` and `node/channels.rs`. The
+     handshake as above: the hello (1,217 bytes) and the reply (6,349)
+     and auth (5,261) travel as `Handshake` fragments of 1,152 bytes,
+     each a request with the receiver's token, so a relay answers only
+     an address that answered its ping; the transcript hash covers the
+     channel number, the hello, the relay's key and the ciphertext, and
+     the two signatures are under different contexts; keys come from
+     SHAKE256 of the shared secret and the transcript, one per direction.
+     Only a node started with `--relay` answers a hello. Frames: a
+     sequence number, everything received below `ack` and a 64-bit
+     bitmap past it, the body sealed under the nonce `0 ‖ seq` (ack-only
+     frames under `1 ‖ n`), at most 1,178 bytes of body per datagram. A
+     frame is resent as the very bytes first sent, after 0.4 s doubling
+     to 5 s, twelve times before the channel is given up; at most 64 are
+     in flight, none past the oldest unacknowledged by 64 or more;
+     bodies are delivered in order; the initiator keeps the channel alive
+     every 30 s, and two minutes of silence ends it. A relay takes no
+     frame on a mutual channel before the auth, and the initiating relay
+     resends the auth until something is acknowledged.
+   - 4c. Done (2026-11-01): `circuit.rs` and `node/circuits.rs`. A cell
+     is 1,024 bytes, one channel body: a circuit number, a command
+     (`Create`, `Created`, `Relay`, `Destroy`) and a payload. Every hop,
+     the first too, gets the channel handshake under its own transcript
+     domain, carried in `Create`/`Created` cells for the first hop and
+     as `Extend`/`Extended` relay messages through the circuit for the
+     others; a hop extends only to a relay the file lists, at its listed
+     address, opening a mutual channel to it if there is none. Each hop
+     has a key per direction and counts the relay cells it passes; a
+     layer is ChaCha20 under the key with the count as nonce, and the
+     cell for hop `t` carries a Poly1305 tag of its body under hop `t`'s
+     key, inside all the layers, so each hop knows the cells for it and
+     passes the rest on, and the client knows which hop answered.
+     Messages span cells (999 bytes each). Circuit numbers are per
+     channel, the opener's half and the other's half apart. A channel
+     that closes ends every circuit over it, and each hop passes the
+     `Destroy` on; a circuit not built in 30 s is given up.
+   - 4d. Done (2026-11-01): `node/rendezvous.rs`. At the last hop of a
+     participant's circuit: `Session(id)` answered by `SessionState(id,
+     nonce, seq)`, the nonce this relay's SipHash of the circuit and the
+     id, so a session is bound to its circuit; `Announce` checked as in
+     init mode and held while the circuit lives and keepalives come;
+     `GetAnnounce(id)` answered by `Announce` or `Notice(offline)`;
+     `Send(payload)` answered by `Notice(forwarded or offline)`, the
+     recipient getting `Deliver(payload)` down its circuit. Between
+     rendezvous points, `Rendezvous` cells on circuit number 0 of their
+     mutual channel, taken only from a listed relay: `Lookup(id)` →
+     `Found(announce)` or `Result(offline)`, `Forward(payload)` →
+     `Result(forwarded or offline)`. A sender's point asks the
+     recipient's points in the order the id gives them, answering at
+     once when it is one of them and holds the session, and moves to
+     the next on offline or after 8 s; a relay serves sessions only for
+     ids whose points include it.
+   - 4e. Done (2026-11-01): `node/participant.rs`. While an onion-mode
+     file is in force a node with a wallet keeps a circuit to each of its
+     rendezvous points, through two other listed relays chosen at
+     random (fewer when too few are listed), and holds its session over
+     each as in init mode: `Session` every 30 s, every 3 s while the
+     point does not hold the current announce, the same Kyber key at
+     every point, rotated at start, when a live session or its circuit
+     is lost, and after 12 hours. A circuit that dies is built again
+     after 3 s; a point that refuses is left for a minute. A send goes
+     over a live circuit picked at random: `GetAnnounce` unless the
+     wallet gave the recipient's announce, then `Send`, and the wallet
+     is told delivered or why not (30 s at most, waiting for a circuit
+     included). Delivered payloads are opened as in init mode. Back in
+     init mode the circuits are closed and the init-mode sessions come
+     back. The wallet's side (`send` to an address or `@name`, answering
+     and finalizing) is unchanged: the node picks the mode.
+5. **Docs.** Done (2026-11-01): the README's "Message layer" section
+   and payments by address or `@name`; the message layer's cryptography,
+   what each party learns and its gaps in `miner/SECURITY.md`; the gaps
+   found while building it in `docs/HARDENING.md`.

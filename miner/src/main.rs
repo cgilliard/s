@@ -1026,51 +1026,40 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 }
             );
             for (hash, n, last) in &votes.counts {
-                let held = ctx.chain.has_consensus_file(hash)?;
-                println!(
-                    "vote     {}  {n:>3} blocks, last at height {last}{}",
-                    hex(hash),
-                    if held { "" } else { "  (file not fetched)" }
-                );
+                let state = match (&current.winner, current.skipped.iter().find(|s| s.0 == *hash)) {
+                    (Some((w, _)), _) if w == hash => "  (in force)".to_string(),
+                    (_, Some((_, _, why))) => format!("  ({why})"),
+                    _ => String::new(),
+                };
+                println!("vote     {}  {n:>3} blocks, last at height {last}{state}", hex(hash));
             }
-            match votes.winner() {
-                None => println!("mode     init: no block of the window votes for a file"),
-                Some(hash) => match ctx.chain.consensus_file(&hash)? {
-                    None => println!("mode     init: file {} not fetched yet", hex(&hash)),
-                    Some(bytes) => {
-                        match (&current.file, &current.problem) {
-                            (Some(f), _) => println!(
-                                "mode     {}{}",
-                                f.mode,
-                                if f.mode == tabminer::consensus::Mode::Onion {
-                                    format!(": {} relays", f.relays.len())
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                            (None, Some(problem)) => println!("mode     init: the winning file is {problem}"),
-                            (None, None) => println!("mode     init"),
+            match (&current.winner, &current.file) {
+                (Some((hash, n)), Some(f)) => {
+                    println!(
+                        "mode     {}{}",
+                        f.mode,
+                        if f.mode == tabminer::consensus::Mode::Onion {
+                            format!(": {} relays", f.relays.len())
+                        } else {
+                            String::new()
                         }
-                        println!(
-                            "current  {}  ({} bytes, {} of {} blocks)",
-                            hex(&hash),
-                            bytes.len(),
-                            votes.winning_votes(),
-                            votes.blocks
-                        );
-                        match std::str::from_utf8(&bytes) {
-                            Ok(text) => {
-                                for line in text.lines().take(64) {
-                                    println!("  | {line}");
-                                }
-                                if text.lines().count() > 64 {
-                                    println!("  | ... ({} lines in all)", text.lines().count());
-                                }
+                    );
+                    let bytes = ctx.chain.consensus_file(hash)?.unwrap_or_default();
+                    println!("current  {}  ({} bytes, {n} of {} blocks)", hex(hash), bytes.len(), votes.blocks);
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) => {
+                            for line in text.lines().take(64) {
+                                println!("  | {line}");
                             }
-                            Err(_) => println!("  (not text)"),
+                            if text.lines().count() > 64 {
+                                println!("  | ... ({} lines in all)", text.lines().count());
+                            }
                         }
+                        Err(_) => println!("  (not text)"),
                     }
-                },
+                }
+                _ if votes.counts.is_empty() => println!("mode     init: no block of the window votes for a file"),
+                _ => println!("mode     init: no file voted for is fetched and valid"),
             }
         }
         "leaves" => {

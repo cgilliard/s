@@ -2427,11 +2427,10 @@ impl<V: ProofVerifier> Chain<V> {
     /// [`crate::consensus::WINDOW`] blocks and what they decide.
     pub fn consensus(&self) -> Result<(crate::consensus::Votes, crate::consensus::Current)> {
         let votes = self.consensus_votes(crate::consensus::WINDOW)?;
-        let bytes = match votes.winner() {
-            Some(hash) => self.consensus_file(&hash)?,
-            None => None,
-        };
-        let current = crate::consensus::Current::decide(&votes, bytes.as_deref());
+        let rtxn = self.env.read_txn()?;
+        let current = crate::consensus::Current::decide(&votes, |h| {
+            self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec())
+        });
         Ok((votes, current))
     }
 
@@ -2571,7 +2570,7 @@ mod tests {
         assert_eq!(votes.blocks, 6);
         assert_eq!(votes.range, (0, 5));
         assert_eq!(votes.missing.len(), 4);
-        assert_eq!(votes.winner(), None);
+        assert!(votes.counts.is_empty());
         for (header, leaves) in &leaves_of[..4] {
             let id = header.hash();
             assert_eq!(f.chain.aux_leaves_of(&id).unwrap(), None);
@@ -2588,12 +2587,11 @@ mod tests {
         let votes = f.chain.consensus_votes(144).unwrap();
         assert!(votes.missing.is_empty());
         assert_eq!(votes.counts, vec![(hash, 2, 3), (other, 1, 2)]);
-        assert_eq!(votes.winner(), Some(hash));
         let (v, current) = f.chain.consensus().unwrap();
         assert_eq!(v, votes);
         assert_eq!(current.mode, crate::consensus::Mode::Init);
-        assert_eq!(current.winner, Some(hash));
-        assert!(current.file.is_some() && current.problem.is_none());
+        assert_eq!(current.winner, Some((hash, 2)));
+        assert!(current.file.is_some() && current.skipped.is_empty());
         // A window of the last two blocks sees one vote for `hash`.
         let votes = f.chain.consensus_votes(3).unwrap();
         assert_eq!(votes.range, (3, 5));

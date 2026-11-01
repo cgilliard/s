@@ -106,17 +106,17 @@ pub enum Note {
 }
 
 /// The participant: its Dilithium key and its Kyber keys.
-struct Me {
-    key: mldsa::SecretKey,
-    id: Digest,
+pub(super) struct Me {
+    pub(super) key: mldsa::SecretKey,
+    pub(super) id: Digest,
     /// The current Kyber key first, then retired ones with when.
-    keys: Vec<(mlkem::SecretKey, Option<Instant>)>,
-    seq: u64,
+    pub(super) keys: Vec<(mlkem::SecretKey, Option<Instant>)>,
+    pub(super) seq: u64,
     expiry: u64,
-    made: Instant,
+    pub(super) made: Instant,
     /// The current key's announce for payloads (nonce zero), for replies.
     carried: Announce,
-    rotate: bool,
+    pub(super) rotate: bool,
 }
 
 impl Me {
@@ -143,7 +143,7 @@ impl Me {
         Ok(())
     }
 
-    fn announce(&self, nonce: u64) -> Announce {
+    pub(super) fn announce(&self, nonce: u64) -> Announce {
         Announce::make(&self.key, self.keys[0].0.public_key(), self.seq, self.expiry, nonce)
     }
 }
@@ -233,7 +233,7 @@ impl Job {
 
 /// The node's message-layer state.
 pub(super) struct State {
-    me: Option<Me>,
+    pub(super) me: Option<Me>,
     points: Vec<Point>,
     held: HashMap<Digest, Held>,
     nonce_key: RandomState,
@@ -269,6 +269,17 @@ impl State {
         })
     }
 
+    /// The relays of the onion-mode file in force, sorted by id.
+    pub(super) fn relays(&self) -> Option<&[consensus::Relay]> {
+        self.relays.as_deref()
+    }
+
+    /// Tests: relays as if an onion-mode file were in force.
+    #[cfg(test)]
+    pub(super) fn set_relays(&mut self, relays: Vec<consensus::Relay>) {
+        self.relays = Some(relays);
+    }
+
     /// Forgets resolved addresses: the seeds are being looked up again.
     pub(super) fn reresolve(&mut self) {
         self.resolved.clear();
@@ -293,7 +304,7 @@ impl State {
         (points, self.held.len())
     }
 
-    fn note(&self, note: Note) {
+    pub(super) fn note(&self, note: Note) {
         if let Err(TrySendError::Full(_)) = self.notes.try_send(note) {
             crate::log::line("net: message layer: the wallet is not taking notes; one dropped");
         }
@@ -321,12 +332,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.rv.notes_rx.take()
     }
 
-    /// Sends a request with `token` in it, rather than the one the peer
-    /// table holds: the token an offer or a session request carried.
-    fn send_with(&self, addr: SocketAddr, msg: Message, token: u64) {
-        if let Err(e) = self.socket.send_to(&msg.with_token(token).encode(), addr) {
-            self.chatter(&format!("send to {addr} failed: {e}"));
-        }
+    /// The nonce an announce over the circuit `link` for `id` must carry.
+    pub(super) fn link_nonce(&self, link: &super::circuits::Link, id: &Digest) -> u64 {
+        std::hash::BuildHasher::hash_one(&self.rv.nonce_key, (link, digest_to_bytes(id)))
     }
 
     /// The nonce an announce from `addr` for `id` must carry.
@@ -367,7 +375,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Whether this node, as a relay, is a rendezvous point of `id`: any id
     /// in init mode, where the seeds cannot tell which seed name they are;
     /// in onion mode, only an id whose points include this node's own.
-    fn serves(&self, id: &Digest) -> bool {
+    pub(super) fn serves(&self, id: &Digest) -> bool {
         match (&self.rv.relays, &self.rv.me) {
             (None, _) => true,
             (Some(relays), Some(me)) => {
@@ -399,7 +407,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.chatter(&format!("message layer: {} sessions went quiet", before - self.rv.held.len()));
         }
         self.rv.outbox.retain(|_, o| now.duration_since(o.at) < OUTBOX_TIME);
-        self.participate(now);
+        // Onion mode keeps sessions over circuits, init mode directly.
+        if self.rv.relays.is_some() {
+            self.onion_participate(now);
+        } else {
+            self.onion_stand_down(now);
+            self.participate(now);
+        }
         self.progress_sends(now);
     }
 
@@ -467,7 +481,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A new Kyber key: every point is asked at once, and each that holds
     /// the old one is offered the new.
-    fn rotate(&mut self, now: Instant) {
+    pub(super) fn rotate(&mut self, now: Instant) {
         let Some(me) = self.rv.me.as_mut() else { return };
         if let Err(e) = me.rotate(now) {
             self.log(&format!("message layer: no new Kyber key: {e}"));
@@ -705,7 +719,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A payload for us: opened with the newest key that opens it.
-    fn open(&mut self, from: SocketAddr, p: Payload) {
+    pub(super) fn open(&mut self, from: impl std::fmt::Display, p: Payload) {
         let Some(me) = &self.rv.me else { return };
         let now = unix_now();
         match me.keys.iter().find_map(|(k, _)| p.open(k, now)) {
@@ -761,6 +775,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let fail = |why: &str| Note::Failed { tag: out.tag, to: out.to, why: why.to_string() };
         if self.rv.me.is_none() {
             return self.rv.note(fail("this node has no identity"));
+        }
+        if self.rv.relays.is_some() {
+            return self.onion_send(out, now);
         }
         if self.rv.sends.len() >= MAX_SENDS {
             return self.rv.note(fail("too many sends in progress"));
@@ -837,7 +854,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A payload to `to`, naming us with our current key for the reply.
-    fn seal(&self, to: &Announce, kind: u8, inner: &[u8]) -> Result<Vec<u8>, String> {
+    pub(super) fn seal(&self, to: &Announce, kind: u8, inner: &[u8]) -> Result<Vec<u8>, String> {
         let me = self.rv.me.as_ref().ok_or("no identity")?;
         let m = random_bytes::<32>().map_err(|e| e.to_string())?;
         let nonce = random_bytes::<12>().map_err(|e| e.to_string())?;

@@ -2,9 +2,11 @@
 
 A proof-of-work chain whose blocks carry only output commitments and a
 zero-knowledge validity proof. `miner/` holds the node, the prover and the
-wallet; `miner/SECURITY.md` analyses the proofs; `docs/HARDENING.md` lists
-the known gaps still to close; `docs/NAMES.md` is the design of the name
-registry.
+wallet; `miner/SECURITY.md` analyses the proofs and the message layer;
+`docs/HARDENING.md` lists the known gaps still to close; `docs/NAMES.md`
+is the design of the name registry, `docs/ONION.md` of the message layer
+that carries payments between wallets, `docs/ELTOO.md` of payment
+channels.
 
 ## Genesis
 
@@ -40,7 +42,8 @@ tabminer node [--data DIR] [options]
 tabminer show [--data DIR]
 tabminer restore [--data DIR]
 
-options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--verbose] [--no-prompt]
+options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--no-seeds] [--relay]
+         [--verbose] [--no-prompt]
 ```
 
 `tabminer` with no command mines: it syncs to the heaviest chain its peers
@@ -50,7 +53,8 @@ announces them, starting over whenever the network delivers a better tip.
 `tabminer node` (or `--no-mine`) follows the chain and relays without
 mining. Both listen on UDP port 3737 by default, contact the seed nodes in
 `miner/src/node.rs` and any `--peer`, and keep the peers they found in
-`DIR/peers` for next time. `show` prints the main chain.
+`DIR/peers` for next time. `show` prints the main chain. `--relay` makes
+the node relay for others on the message layer (below).
 
 Logs go to `DIR/tabminer.log`; the terminal shows a prompt (`help` lists
 the commands). `--no-prompt` logs to the terminal instead, for scripts.
@@ -63,10 +67,10 @@ Every header carries 32 aux bytes under the proof of work that consensus
 never reads. A miner fills them with the SHA-256 Merkle root of 16 leaves it
 sets at the prompt, `set-leaf INDEX FILE` (the file's SHA-256) or
 `set-leaf-value INDEX HEX`, shown by `leaves`. Leaf 0 is a vote for a
-consensus file of the message layer (`docs/ONION.md`): nodes fetch and
-check every block's leaves, count leaf 0 over the last 144 blocks, and
-fetch the file the winning hash names; `consensus` shows the count and the
-file. The leaves are kept in the
+consensus file of the message layer (below): nodes fetch and check every
+block's leaves, count leaf 0 over the last 144 blocks, and fetch the files
+voted for; `consensus` shows the count, each file's state and the file in
+force. The leaves are kept in the
 chain directory and go into every block the node mines until one is
 changed; while all are zero the aux bytes are zero.
 
@@ -212,7 +216,19 @@ outputs from leaves 0 to 7 (a spend and up to seven cancellations, the last
 one flagged); outputs found by `scan` sign from leaves 8 to 15, from a random
 start, so a restored copy never signs with a leaf the original used.
 
-Payments use slate files passed between the two wallets by any channel:
+A payment is a slate the two wallets pass back and forth. With both
+online, the message layer carries it (below): give `send` the recipient's
+`tab1…` address, or a registered name with `@`:
+
+```
+> send 10 tab1…                     # 10 coins to that address
+> send 10 0.5 @alice                # to the address the name alice points at, fee 0.5
+```
+
+The recipient's wallet answers at once and the sender's signs and pools
+the answer; each prompt reports what happened. A slate no rendezvous point
+would take (the recipient is offline) is cancelled and its inputs freed.
+Without the message layer, slates go as files by any channel:
 
 ```
 > send 10 /tmp/pay.slate            # sender: 10 coins at the smallest fee; reserves inputs
@@ -253,13 +269,7 @@ outputs it is party to (`policies`), funds them, builds spends through a
 chosen leaf and signs with its own keys, rebindable signatures using the
 state number as the leaf index; the parties pass the transaction's bytes
 between them to collect signatures. Policy outputs are not recoverable
-from the phrase: a wallet keeps them as channel state. Identities on the
-message layer (`docs/ONION.md`) are written as `tab1…` addresses: bech32m
-with a checksum, accepted and shown by the prompt wherever a name's value
-appears. A wallet's identity is the hash of an ML-DSA-65 (Dilithium) key
-derived from its phrase, so a restore keeps its address (`address` at the
-prompt); the message layer's primitives (ChaCha20-Poly1305, ML-KEM-768,
-ML-DSA-65) are the crate's own, tested against the standard vectors. Any peer answers
+from the phrase: a wallet keeps them as channel state. Any peer answers
 `GetProof` for a position with the output there and its path against the
 peer's tip, so a client holding headers (and a chain proof for one of
 them) checks its outputs and watches spends without trusting a node.
@@ -268,18 +278,20 @@ them) checks its outputs and watches spends without trusting a node.
 
 The chain carries a registry of names, 1 to 32 characters of `a-z`, `0-9`
 and `_`, owned for good by whoever registers them (see `docs/NAMES.md`).
-A name's record holds its owner's key hash, a 32-byte value (the hash of
-the owner's payment keys) and a memo the owner's wallet reads. Registering
+A name's record holds its owner's key hash, a 32-byte value (an address
+on the message layer: `name-commit` sets the wallet's own unless given
+another) and a memo the owner's wallet reads; `send 10 @alice` pays the
+address alice points at. Registering
 takes two transactions: a commit, which hides the name, and a reveal, at
 least 12 blocks later, which names it. A block admits five reveals, so
 registrations are paid for by their fees.
 
 ```
-> name-commit alice                 # pool a commit to "alice" (optionally a 64-hex value and a fee)
+> name-commit alice                 # pool a commit to "alice" (optionally an address and a fee)
 > names                             # ... committed at block N, ready in 12 blocks
 > name-reveal alice                 # reveal once the commit is 12 blocks old
 > name-reveal alice 100             # or wait longer: a deeper reorganization is needed to take it
-> name-update alice HEX             # change the value; the owner key rotates
+> name-update alice tab1…           # change the value; the owner key rotates
 > name alice                        # look a name up
 ```
 
@@ -297,6 +309,71 @@ restored wallet's names from the chain's records and its pending commits
 from their outputs; a recovered commit is matched to its name when you
 reveal it. Names must be revealed within 288 blocks of their commit or the
 commit is swept.
+
+## Message layer
+
+Wallets reach each other without a server and, once relays exist,
+without learning each other's network address (`docs/ONION.md`). Each
+wallet has an address, `tab1…` (`address` at the prompt): bech32m with a
+checksum, the hash of an ML-DSA-65 (Dilithium) key derived from the
+phrase, so a restore keeps it. Messages to it are sealed with ML-KEM-768
+(Kyber) keys the wallet makes fresh, signs and rotates, and
+ChaCha20-Poly1305; the primitives are the crate's own, tested against the
+standard vectors. There is no mailbox: a wallet is reached while it is
+online and not otherwise.
+
+An address names three rendezvous points, chosen from it by hash among
+the nodes that relay. A wallet's node keeps a session at each, which
+forwards what is sent to the address. What relays exist, and so which
+mode the network is in, is a file the miners vote for in aux leaf 0
+(above): the most voted `consensus.txt` that is fetched and valid is in
+force, one vote is enough, and with none the network is in init mode.
+
+- **Init mode** (`mode init`, or no file): the seed nodes are the
+  rendezvous points, run with `--relay`, and wallets connect to them
+  directly. Bodies are sealed, but a seed sees which addresses talk, when,
+  from which network addresses.
+- **Onion mode**: the file lists the relays, at least three, each as
+  `relay ID HOST:PORT`, where the id is the hash of the relay's Dilithium
+  key. A node started with `--relay` prints its line at startup, ready to
+  paste:
+
+  ```
+  mode onion
+  relay tab1… relay1.example.org:3737
+  relay tab1… 203.0.113.7:3737
+  relay tab1… [2001:db8::1]:3737
+  ```
+
+  Every link is opened by a handshake in which the relay proves its key
+  (a Dilithium signature over the exchange) and the two agree a fresh
+  Kyber key; wallets stay anonymous. Each wallet keeps a circuit to each
+  of its rendezvous points through two other relays chosen at random, in
+  the manner of Tor: fixed 1,024-byte cells, one layer of encryption per
+  hop. A message goes up the sender's circuit to its rendezvous point,
+  across to the recipient's, and down the recipient's circuit: six
+  relays, each knowing only its neighbours.
+
+A miner votes with `set-leaf 0 consensus.txt`, which checks the file first;
+votes for a file that does not parse, or that no peer serves, count for
+nothing, and a file saying `mode init` votes the network back to init
+mode. `status` shows the wallet's rendezvous sessions and, on a relay, the
+sessions it holds; `consensus` the vote. The known gaps (no cover traffic,
+a hop could tag cells for a later one, circuits not rotated on a timer)
+are in `miner/SECURITY.md` and `docs/HARDENING.md`.
+
+To try a message layer on one machine, start the seed as a relay and point
+the wallets at it (init mode):
+
+```
+tabminer node --data /tmp/seed --listen 127.0.0.1:4000 --no-seeds --relay
+tabminer mine --data /tmp/a --listen 127.0.0.1:4001 --no-seeds --seed 127.0.0.1:4000
+tabminer node --data /tmp/b --listen 127.0.0.1:4002 --no-seeds --seed 127.0.0.1:4000
+```
+
+then `address` on b and `send 1 tab1…` on a once it has mined a block.
+
+## Two nodes
 
 To try two nodes on one machine:
 
