@@ -89,6 +89,8 @@ options:
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
   --no-seeds        do not contact the built-in seed nodes (for a local network)
+  --relay           relay for others on the message layer (docs/ONION.md); prints
+                    this node's `relay` line for consensus.txt at startup
   --sync-point N    when starting from genesis, fast-sync from the state N blocks
                     below the best header, checked by that block's chain proof
                     (default 144); 0 replays every block instead
@@ -185,6 +187,8 @@ struct Args {
     sync_point: u32,
     max_undo: u32,
     no_seeds: bool,
+    /// Relay for others on the message layer (`docs/ONION.md`).
+    relay: bool,
     debug_unchecked: bool,
     /// Random outputs to add, and earlier ones to spend, per mined block.
     debug_fill: Option<(usize, usize)>,
@@ -215,6 +219,7 @@ fn parse_args() -> Result<Args, String> {
         sync_point: DEFAULT_SYNC_POINT,
         max_undo: DEFAULT_MAX_UNDO,
         no_seeds: false,
+        relay: false,
         debug_unchecked: false,
         debug_fill: None,
         debug_fill_names: 0,
@@ -239,6 +244,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,
+            "--relay" => a.relay = true,
             "--debug-no-validate-proofs" => a.debug_unchecked = true,
             "--debug-fill" => {
                 let v = value()?;
@@ -358,6 +364,7 @@ fn net_config(args: &Args) -> Config {
             .collect(),
         peers_file: Some(args.data.join("peers")),
         verbose: args.verbose,
+        relay: args.relay,
         sync_point: (args.sync_point > 0).then_some(args.sync_point),
     }
 }
@@ -540,6 +547,14 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     log::line(&tip_line);
     if !args.no_prompt {
         println!("{listening}; {tip_line}; type help for commands");
+    }
+    if args.relay {
+        for line in relay_lines(&wallet.address(), args.listen) {
+            log::line(&line);
+            if !args.no_prompt {
+                println!("{line}");
+            }
+        }
     }
 
     let ctx = Arc::new(Ctx {
@@ -1429,6 +1444,24 @@ fn restore(args: &Args) -> AnyResult<()> {
     println!("wallet restored in {}", dir.display());
     println!("start tabminer with this --data directory: once it has synced, it finds the wallet's outputs");
     Ok(())
+}
+
+/// What a node started with `--relay` prints: its `relay` line for a
+/// `consensus.txt`, ready to paste, and a note when the listening address
+/// is not one others can reach as written.
+fn relay_lines(address: &str, listen: SocketAddr) -> Vec<String> {
+    let mut lines = vec!["relay mode: add this line to consensus.txt to be listed as a relay:".to_string()];
+    if listen.ip().is_unspecified() {
+        lines.push(format!("  relay {address} HOST:{}", listen.port()));
+        lines.push("  (replace HOST with this node's public host name or IP)".to_string());
+    } else {
+        let addr = match listen {
+            SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+            SocketAddr::V4(v4) => v4.to_string(),
+        };
+        lines.push(format!("  relay {address} {addr}"));
+    }
+    lines
 }
 
 fn read_slate(file: &str) -> AnyResult<Slate> {

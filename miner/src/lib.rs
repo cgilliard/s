@@ -30,6 +30,7 @@ pub mod names;
 pub mod net;
 pub mod node;
 pub mod ntt;
+pub mod onion;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod packed;
 pub mod parallel;

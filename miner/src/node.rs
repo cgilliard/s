@@ -136,6 +136,9 @@ pub struct Config {
     /// Fast sync from this many blocks below the best header, when starting
     /// from genesis; `None` validates every block from genesis instead.
     pub sync_point: Option<u32>,
+    /// Started with `--relay`: the operator's consent to relay for others
+    /// on the message layer (`docs/ONION.md`).
+    pub relay: bool,
 }
 
 /// Default depth of the fast-sync snapshot: a day of blocks.
@@ -2877,6 +2880,7 @@ mod tests {
             peers_file: Some(dir.0.join("peers")),
             verbose: true,
             sync_point: None,
+            relay: false,
         }
     }
 

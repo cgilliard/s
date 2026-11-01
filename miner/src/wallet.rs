@@ -71,6 +71,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use crate::address;
 use crate::bip39;
 use crate::mldsa;
+use crate::mlkem;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
@@ -693,7 +694,8 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+/// `N` bytes from the system's random source.
+pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     let mut out = [0u8; N];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut out)?;
     Ok(out)
@@ -834,6 +836,18 @@ impl Wallet {
     /// The wallet's `tab1…` address: its id in text.
     pub fn address(&self) -> String {
         address::encode(&self.id())
+    }
+
+    /// A fresh ephemeral Kyber (ML-KEM-768) key and its announcement,
+    /// signed by the wallet's Dilithium key with sequence number `seq`,
+    /// valid until `expiry` and bound to the rendezvous point's session
+    /// `nonce` (`docs/ONION.md`). The Kyber key is random, never derived
+    /// or stored: a key compromised later opens nothing sent before it
+    /// was rotated.
+    pub fn fresh_announce(&self, seq: u64, expiry: u64, nonce: u64) -> Result<(mlkem::SecretKey, crate::onion::Announce)> {
+        let kyber = mlkem::keygen(&random_bytes::<64>()?);
+        let announce = crate::onion::Announce::make(&self.identity_key(), kyber.public_key(), seq, expiry, nonce);
+        Ok((kyber, announce))
     }
 
     /// The key of the output with nonce `nonce`, at its first leaf.
@@ -2379,6 +2393,14 @@ mod tests {
         let key = w.identity_key();
         assert_eq!(address::id_of(key.public_key()), w.id());
         assert!(mldsa::verify(key.public_key(), b"hello", b"", &key.sign(b"hello", b"")));
+        // Announcements: a fresh Kyber key each time, signed under the id.
+        let (k1, a1) = w.fresh_announce(1, unix_now() + 60, 9).unwrap();
+        let (_, a2) = w.fresh_announce(2, unix_now() + 60, 9).unwrap();
+        assert_eq!(a1.id, w.id());
+        assert!(a1.verify(unix_now()) && a2.verify(unix_now()));
+        assert_ne!(a1.kyber, a2.kyber);
+        assert_eq!(k1.public_key(), &a1.kyber[..]);
+        assert_eq!(restored.fresh_announce(1, unix_now() + 60, 9).unwrap().1.id, w.id());
         let rtxn = env.read_txn().unwrap();
         // What is kept, as being in flight, is not pruned.
         let b_commitment = w.outputs().unwrap().into_iter().find(|o| o.commitment != a_commitment).unwrap().commitment;

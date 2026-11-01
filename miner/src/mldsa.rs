@@ -394,6 +394,12 @@ pub struct SecretKey {
     pk: Vec<u8>,
 }
 
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(..)")
+    }
+}
+
 /// Generates a key pair from a 32-byte seed, deterministically.
 pub fn keygen(seed: &[u8; SEED_LEN]) -> SecretKey {
     let mut input = [0u8; 34];

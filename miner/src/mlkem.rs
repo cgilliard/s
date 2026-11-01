@@ -340,6 +340,12 @@ pub struct SecretKey {
     bytes: Vec<u8>,
 }
 
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(..)")
+    }
+}
+
 /// Generates a key pair from the two 32-byte seeds, deterministically.
 pub fn keygen_from_seeds(d: &[u8; 32], z: &[u8; 32]) -> SecretKey {
     let (ek, s) = kpke_keygen(d);
