@@ -1,9 +1,9 @@
 # Names
 
 A post-quantum name registry in the state tree. A name resolves to a
-32-byte value, the hash of its owner's Kyber and Dilithium keys, from which
-the payment layer derives the owner's rendezvous points and obtains the
-keys themselves. Registration is commit-then-reveal, as in Namecoin;
+32-byte value, the hash of its owner's Dilithium key (the owner's onion
+identity, `docs/ONION.md`), from which the message layer derives the
+owner's rendezvous points and obtains the keys themselves. Registration is commit-then-reveal, as in Namecoin;
 ownership is perpetual and transferable; the chain verifies only XMSS
 signatures, as it does for payments.
 
@@ -21,7 +21,7 @@ A name's record is
 |---|---|---|
 | name | 1 + 1..32 | length and the characters |
 | owner | 32 | hash of the XMSS public key that may update the record |
-| value | 32 | `H(Kyber key ‖ Dilithium key)`, the owner's payment identity |
+| value | 32 | `H(Dilithium key)`, the owner's payment identity (`docs/ONION.md`); written as a `tab1…` address |
 | memo | 32 | the owner's wallet data: the nonce of the owner key and a check value |
 
 Every node keeps every record, keyed by the name's hash, and answers
@@ -143,9 +143,10 @@ derived from the seed and the commit's nonce, so a wallet restored
 between commit and reveal can still reveal. A restored wallet signs from
 leaves 8 to 15, as for outputs.
 
-Kyber and Dilithium never touch consensus. Their hash is the record's
-value; the keys are revealed at the rendezvous points derived from that
-hash, and a payer checks them against the chain.
+Dilithium never touches consensus. Its hash is the record's value; the
+key, and the ephemeral Kyber keys it signs, are revealed at the
+rendezvous points derived from that hash, and a payer checks them against
+the chain.
 
 ### Walk-throughs
 

@@ -142,6 +142,10 @@ const HELP: &str = "commands:
   name-transfer FILE [FEE]  sign a name over to the record in FILE
   names                     this wallet's names and pending commits
   name NAME                 look a name up on chain
+  set-leaf INDEX FILE       set aux leaf INDEX (0 to 15) to the SHA-256 of FILE:
+                            their Merkle root goes in the headers this node mines
+  set-leaf-value INDEX HEX  set aux leaf INDEX to a 32-byte value given in hex
+  leaves                    the aux leaves and their root
   policies                  this wallet's policy outputs: multisigs, channels
   channel-key [HEIGHT]      a fresh channel key for a policy: its nonce and key
                             hash (HEIGHT levels, 16 by default, 20 at most)
@@ -750,8 +754,11 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
 fn parse_value(s: Option<&str>) -> AnyResult<tabminer::pow::Digest> {
     match s {
         None => Ok([tabminer::poseidon2::Fp::ZERO; 8]),
+        Some(h) if h.len() == tabminer::address::LEN => {
+            tabminer::address::decode(h).ok_or_else(|| "not a valid address: check the characters".into())
+        }
         Some(h) => {
-            let bytes = tabminer::wallet::digest_from_hex(h).ok_or("a value is 64 hex digits")?;
+            let bytes = tabminer::wallet::digest_from_hex(h).ok_or("a value is 64 hex digits or a tab1 address")?;
             digest_from_bytes(&bytes).ok_or_else(|| "a value's 4-byte words must be below the field modulus".into())
         }
     }
@@ -897,6 +904,39 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("pending   {}  incoming, not yet on chain", fmt_coins(b.pending));
             println!("reserved  {}  held for a slate not yet finalized", fmt_coins(b.reserved));
             println!("locked    {}  signed, being sent, not yet confirmed", fmt_coins(b.locked));
+        }
+        "set-leaf" => {
+            let [index, file] = args else { return Err("usage: set-leaf INDEX FILE".into()) };
+            let index: usize = index.parse().map_err(|_| format!("not a leaf index: {index}"))?;
+            if index >= tabminer::chain::AUX_LEAVES {
+                return Err(format!("leaf index must be 0 to {}", tabminer::chain::AUX_LEAVES - 1).into());
+            }
+            let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+            let hash = tabminer::bip39::sha256(&bytes);
+            let root = ctx.chain.set_aux_leaf(index, hash)?;
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            println!("leaf {index}  {}  ({} bytes)", hex(&hash), bytes.len());
+            println!("root     {}  (in the headers mined from now on)", hex(&root));
+        }
+        "set-leaf-value" => {
+            let [index, hex_value] = args else { return Err("usage: set-leaf-value INDEX HEX".into()) };
+            let index: usize = index.parse().map_err(|_| format!("not a leaf index: {index}"))?;
+            if index >= tabminer::chain::AUX_LEAVES {
+                return Err(format!("leaf index must be 0 to {}", tabminer::chain::AUX_LEAVES - 1).into());
+            }
+            let value = tabminer::wallet::digest_from_hex(hex_value).ok_or("the value must be 64 hex digits")?;
+            let root = ctx.chain.set_aux_leaf(index, value)?;
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            println!("leaf {index}  {}", hex(&value));
+            println!("root     {}  (in the headers mined from now on)", hex(&root));
+        }
+        "leaves" => {
+            let leaves = ctx.chain.aux_leaves()?;
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            for (i, l) in leaves.iter().enumerate() {
+                println!("leaf {i:>2}  {}", hex(l));
+            }
+            println!("root     {}", hex(&ctx.chain.aux_root()?));
         }
         "policies" => {
             let outputs = ctx.wallet.policy_outputs()?;
@@ -1202,6 +1242,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     let ours = ctx.wallet.owned_name(name.as_bytes())?.is_some();
                     println!("owner {}", hex_digest(&r.owner));
                     println!("value {}", hex_digest(&r.value));
+                    println!("      {}", tabminer::address::encode(&r.value));
                     println!("memo  {}{}", hex_digest(&r.memo), if ours { "  (this wallet's)" } else { "" });
                 }
             }
@@ -1420,7 +1461,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
                     if t == 0 {
                         (vec![tabminer::block_air::ROWS_PER_OUTPUT], false)
                     } else {
-                        tabminer::block_air::item_rows_of(&chosen[t - 1])
+                        tabminer::block_air::item_rows_of(chosen[t - 1])
                     }
                 };
                 fits(ins, outs, names, &items, chosen.len() + 1)

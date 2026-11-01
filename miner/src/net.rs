@@ -1147,6 +1147,7 @@ mod tests {
             timestamp: 1_700_000_000 + tag as u64,
             body_commitment: digest(tag + 1),
             state_root: digest(tag + 2),
+            aux: [tag as u8; 32],
             mix: digest(tag + 3),
             nonce: [tag as u8; 32],
         }

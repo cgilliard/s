@@ -1,7 +1,7 @@
 //! Block format: a proof-of-work header over a body of input positions,
 //! outputs and a validity proof.
 //!
-//! # Header, 172 bytes
+//! # Header, 204 bytes
 //!
 //! | field           | bytes | meaning                                        |
 //! |-----------------|-------|------------------------------------------------|
@@ -10,10 +10,11 @@
 //! | timestamp       | 8     | unix seconds                                   |
 //! | body_commitment | 32    | [`Body::commitment`]                           |
 //! | state_root      | 32    | UTXO tree root after applying this block       |
+//! | aux             | 32    | the miner's own bytes, any value; zero here    |
 //! | mix             | 32    | proof-of-work mix digest                       |
 //! | nonce           | 32    | proof-of-work nonce                            |
 //!
-//! [`Header::pow_hash`] covers the first five fields and seeds the proof of
+//! [`Header::pow_hash`] covers the first six fields and seeds the proof of
 //! work together with the nonce. [`Header::hash`] covers everything and is
 //! the block id. The difficulty target is not stored; it follows from the
 //! parent header through [`crate::difficulty::Asert`].
@@ -47,7 +48,7 @@ use crate::pow::{self, Digest, ItemSource, Nonce, PowOutput, Target, pack_bytes}
 use crate::state_tree::OUTPUT_CAPACITY;
 use crate::transaction::{Commitment, Memo, hash_domain};
 
-pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32;
+pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32 + 32;
 pub const POSITION_SIZE: usize = 5;
 pub const COMMITMENT_SIZE: usize = 4 * DIGEST;
 /// Serialized size of a block output: commitment and memo.
@@ -80,6 +81,9 @@ pub struct Header {
     pub timestamp: u64,
     pub body_commitment: Digest,
     pub state_root: Digest,
+    /// Auxiliary bytes for the miner's own use, any value: under the
+    /// proof of work, unread by consensus.
+    pub aux: [u8; 32],
     pub mix: Digest,
     pub nonce: Nonce,
 }
@@ -93,6 +97,7 @@ impl Header {
         w.put(&self.timestamp.to_le_bytes());
         w.put(&digest_to_bytes(&self.body_commitment));
         w.put(&digest_to_bytes(&self.state_root));
+        w.put(&self.aux);
         w.put(&digest_to_bytes(&self.mix));
         w.put(&self.nonce);
         out
@@ -109,6 +114,7 @@ impl Header {
             timestamp: u64::from_le_bytes(r.take(8)?.try_into().unwrap()),
             body_commitment: r.digest()?,
             state_root: r.digest()?,
+            aux: r.take(32)?.try_into().unwrap(),
             mix: r.digest()?,
             nonce: r.take(32)?.try_into().unwrap(),
         })
@@ -116,7 +122,7 @@ impl Header {
 
     /// Hash of the fields under proof of work: everything but mix and nonce.
     pub fn pow_hash(&self) -> Digest {
-        let mut v = Vec::with_capacity(3 * DIGEST + 4);
+        let mut v = Vec::with_capacity(3 * DIGEST + 15);
         v.extend_from_slice(&self.prev_hash);
         v.push(Fp::from_u32(self.height));
         v.push(Fp::new((self.timestamp & MASK30) as u32));
@@ -124,6 +130,7 @@ impl Header {
         v.push(Fp::new((self.timestamp >> 60) as u32));
         v.extend_from_slice(&self.body_commitment);
         v.extend_from_slice(&self.state_root);
+        v.extend(pack_bytes(&self.aux));
         hash_domain(DOM_POW_HASH, &v)
     }
 
@@ -460,6 +467,7 @@ mod tests {
             timestamp: 1_700_000_000,
             body_commitment: d(100),
             state_root: d(200),
+            aux: [9u8; 32],
             mix: d(300),
             nonce: nonce_from_u64(42),
         }
@@ -478,9 +486,13 @@ mod tests {
     fn header_roundtrip_and_hashes() {
         let h = header();
         let bytes = h.to_bytes();
-        assert_eq!(bytes.len(), 172);
-        assert_eq!(HEADER_SIZE, 172);
+        assert_eq!(bytes.len(), 204);
+        assert_eq!(HEADER_SIZE, 204);
         assert_eq!(Header::from_bytes(&bytes), Some(h));
+        // The aux bytes are under the proof of work.
+        let other = Header { aux: [10u8; 32], ..h };
+        assert_ne!(other.pow_hash(), h.pow_hash());
+        assert_ne!(other.hash(), h.hash());
         assert!(Header::from_bytes(&bytes[1..]).is_none());
         let mut bad = bytes;
         bad[..4].copy_from_slice(&0x7800_0001u32.to_le_bytes());

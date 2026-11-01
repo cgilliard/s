@@ -224,7 +224,7 @@ history and the README; this file holds what is left.
 ## Deployment and operations
 
 - **Seeds** run an old binary. They need the current one (protocol v5,
-  wallet format 6 (keys carry a tree height; slate format 3), chain format 13 (a snapshot manifest for every block in the undo window; output leaves carry the creation height; policy inputs, keys of any height to 20), new genesis id, new `MAINNET_CHAIN`) and wiped data
+  wallet format 6 (keys carry a tree height; slate format 3), chain format 13 (a snapshot manifest for every block in the undo window; output leaves carry the creation height; policy inputs, keys of any height to 20), new genesis id (17980c69…, the header carries 32 aux bytes under the proof of work), new `MAINNET_CHAIN`) and wiped data
   directories. Fresh nodes cannot sync until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
   expected network rate (README, Genesis).

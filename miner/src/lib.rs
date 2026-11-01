@@ -1,3 +1,4 @@
+pub mod address;
 pub mod aggregate;
 pub mod bip39;
 pub mod block;

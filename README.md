@@ -57,6 +57,15 @@ the commands). `--no-prompt` logs to the terminal instead, for scripts.
 
 Every node starts from the mainnet genesis in `miner/src/genesis.rs`.
 
+## Aux leaves
+
+Every header carries 32 aux bytes under the proof of work that consensus
+never reads. A miner fills them with the SHA-256 Merkle root of 16 leaves it
+sets at the prompt, `set-leaf INDEX FILE` (the file's SHA-256) or
+`set-leaf-value INDEX HEX`, shown by `leaves`. The leaves are kept in the
+chain directory and go into every block the node mines until one is
+changed; while all are zero the aux bytes are zero.
+
 ## Fast sync
 
 Every block carries a chain proof: it verifies the block and the previous
@@ -240,7 +249,10 @@ outputs it is party to (`policies`), funds them, builds spends through a
 chosen leaf and signs with its own keys, rebindable signatures using the
 state number as the leaf index; the parties pass the transaction's bytes
 between them to collect signatures. Policy outputs are not recoverable
-from the phrase: a wallet keeps them as channel state. Any peer answers
+from the phrase: a wallet keeps them as channel state. Identities on the
+message layer (`docs/ONION.md`) are written as `tab1…` addresses: bech32m
+with a checksum, accepted and shown by the prompt wherever a name's value
+appears. Any peer answers
 `GetProof` for a position with the output there and its path against the
 peer's tip, so a client holding headers (and a chain proof for one of
 them) checks its outputs and watches spends without trusting a node.

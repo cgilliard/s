@@ -162,6 +162,7 @@ impl ChainParams {
             timestamp: self.genesis_timestamp,
             body_commitment: body.commitment(),
             state_root: empty_root(),
+            aux: [0u8; 32],
             mix: EMPTY,
             nonce: self.genesis_nonce,
         };
@@ -398,6 +399,10 @@ pub const SNAPSHOT_PART_LOG: usize = 14;
 // Part roots are read from the stored tree, which starts at this level.
 const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
+/// The miner's 16 aux leaves, 32 bytes each (see [`Chain::aux_root`]).
+const META_AUX_LEAVES: &str = "aux_leaves";
+/// Leaves of the aux tree.
+pub const AUX_LEAVES: usize = 16;
 /// Version of the on-disk layout: 8 keeps unspent outputs in packed
 /// buckets with no index by commitment, and the state tree from subtrees
 /// of 256 positions up; 9 keeps the outputs spent within the undo window
@@ -2282,10 +2287,67 @@ impl<V: ProofVerifier> Chain<V> {
             timestamp,
             body_commitment: body.commitment(),
             state_root: self.preview_state_root(body)?,
+            aux: self.aux_root()?,
             mix: EMPTY,
             nonce: [0u8; 32],
         })
     }
+
+    /// The miner's aux leaves: [`AUX_LEAVES`] 32-byte values, all zero
+    /// until set, whose Merkle root goes in the headers this node mines.
+    pub fn aux_leaves(&self) -> Result<[[u8; 32]; AUX_LEAVES]> {
+        let rtxn = self.env.read_txn()?;
+        let mut leaves = [[0u8; 32]; AUX_LEAVES];
+        if let Some(bytes) = self.meta.get(&rtxn, META_AUX_LEAVES)? {
+            if bytes.len() != 32 * AUX_LEAVES {
+                return Err(ChainError::Corrupt("aux leaves"));
+            }
+            for (leaf, chunk) in leaves.iter_mut().zip(bytes.chunks(32)) {
+                leaf.copy_from_slice(chunk);
+            }
+        }
+        Ok(leaves)
+    }
+
+    /// Sets aux leaf `index` (0 to 15). Returns the new root.
+    pub fn set_aux_leaf(&self, index: usize, value: [u8; 32]) -> Result<[u8; 32]> {
+        if index >= AUX_LEAVES {
+            return Err(ChainError::Corrupt("aux leaf index"));
+        }
+        let mut leaves = self.aux_leaves()?;
+        leaves[index] = value;
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, META_AUX_LEAVES, &leaves.concat())?;
+        wtxn.commit()?;
+        Ok(aux_merkle_root(&leaves))
+    }
+
+    /// The header aux value this node mines with: [`aux_merkle_root`] of
+    /// its leaves.
+    pub fn aux_root(&self) -> Result<[u8; 32]> {
+        Ok(aux_merkle_root(&self.aux_leaves()?))
+    }
+}
+
+/// The SHA-256 Merkle root of 16 leaves, nodes `SHA-256(left ‖ right)`,
+/// or all zero while every leaf is zero (the default header aux value).
+pub fn aux_merkle_root(leaves: &[[u8; 32]; AUX_LEAVES]) -> [u8; 32] {
+    if leaves.iter().all(|l| *l == [0u8; 32]) {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let mut input = [0u8; 64];
+                input[..32].copy_from_slice(&pair[0]);
+                input[32..].copy_from_slice(&pair[1]);
+                crate::bip39::sha256(&input)
+            })
+            .collect();
+    }
+    level[0]
 }
 
 #[cfg(test)]
@@ -2312,6 +2374,43 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn aux_leaves_make_the_template_root() {
+        let f = open("aux");
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        assert_eq!(f.chain.aux_root().unwrap(), [0u8; 32]);
+        let body = Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() };
+        assert_eq!(f.chain.template(&body, GENESIS_TIME + 600).unwrap().aux, [0u8; 32]);
+        let a = crate::bip39::sha256(b"a");
+        let root = f.chain.set_aux_leaf(3, a).unwrap();
+        let mut leaves = [[0u8; 32]; AUX_LEAVES];
+        leaves[3] = a;
+        assert_eq!(root, aux_merkle_root(&leaves));
+        assert_ne!(root, [0u8; 32]);
+        assert_eq!(f.chain.aux_leaves().unwrap(), leaves);
+        assert_eq!(f.chain.template(&body, GENESIS_TIME + 600).unwrap().aux, root);
+        // Four levels of SHA-256 over the pairs.
+        let h = |l: &[u8; 32], r: &[u8; 32]| {
+            let mut v = [0u8; 64];
+            v[..32].copy_from_slice(l);
+            v[32..].copy_from_slice(r);
+            crate::bip39::sha256(&v)
+        };
+        let z = [0u8; 32];
+        let n1 = h(&z, &a);
+        let n2 = h(&h(&z, &z), &n1);
+        let n3 = h(&n2, &h(&h(&z, &z), &h(&z, &z)));
+        let n4 = h(&n3, &h(&h(&h(&z, &z), &h(&z, &z)), &h(&h(&z, &z), &h(&z, &z))));
+        assert_eq!(root, n4);
+        assert!(f.chain.set_aux_leaf(16, a).is_err());
+        // Leaves persist across reopening: every block mined from now on
+        // carries the root until a leaf changes.
+        let Fixture { _dir: dir, chain, .. } = f;
+        drop(chain);
+        let chain = Chain::open(&dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
+        assert_eq!(chain.aux_root().unwrap(), root);
     }
 
     #[test]
@@ -2389,6 +2488,7 @@ mod tests {
             timestamp: GENESIS_TIME,
             body_commitment: body.commitment(),
             state_root,
+            aux: [0u8; 32],
             mix: EMPTY,
             nonce: [0u8; 32],
         };
@@ -2421,6 +2521,7 @@ mod tests {
             timestamp,
             body_commitment: body.commitment(),
             state_root,
+            aux: [0u8; 32],
             mix: EMPTY,
             nonce: [0u8; 32],
         };
@@ -2564,7 +2665,7 @@ mod tests {
             ..Default::default()
         };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(512))));
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(544))));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();
@@ -3046,6 +3147,7 @@ mod tests {
                 timestamp: GENESIS_TIME + 1900,
                 body_commitment: body.commitment(),
                 state_root: b1.header.state_root,
+                aux: [0u8; 32],
                 mix: EMPTY,
                 nonce: [0u8; 32],
             };
