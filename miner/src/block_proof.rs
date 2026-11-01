@@ -1,37 +1,64 @@
 //! Block validity proofs: segments proven in parallel and aggregated.
 //!
-//! A block's proof is a list of segment proofs (see [`crate::block_air`]),
-//! each with its public boundary values. The verifier checks that the
-//! segments chain, that the chain starts at the block's previous root, the
-//! initial sponge states and first output position, that it ends at the new
-//! root and at the sponge states of the block's own input and output lists,
-//! that the summed input amounts plus the subsidy equal the summed output
-//! amounts as integers, and that every segment's STARK proof verifies.
+//! A block's proof is a list of transaction segment proofs (see
+//! [`crate::block_air`]) and one name segment proof (see
+//! [`crate::name_air`]), each with its public boundary values. The
+//! verifier checks that the segments chain, that the chain starts at the
+//! block's previous root, the initial sponge states and first output
+//! position, that the name segment continues from where the last segment
+//! ends and ends at the new root and the block's end position, that the
+//! sponge states are those of the block's own input, output, operation and
+//! sweep lists, that the summed input amounts plus the subsidy equal the
+//! summed output amounts as integers, and that every STARK proof verifies.
 //!
-//! Today the chaining check is done by the node; the segment interface is
-//! what a recursive aggregator will consume later.
+//! This module's checks are native; [`crate::aggregate`] does the same in
+//! a recursive proof, which is what blocks carry.
 //!
-//! Encoding: `u32 count`, then per segment the 92 public values followed by
-//! a length-prefixed STARK proof.
+//! Encoding: `u32 count`, then per segment its public values followed by a
+//! length-prefixed STARK proof, then the name segment's the same way.
 
 use crate::block::Body;
 use crate::block_air::{
-    BlockAir, Carry, LIMBS, NUM_PUBLIC, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state,
-    inputs_state, outputs_state,
+    BlockAir, Carry, LIMBS, NUM_PUBLIC, SegmentPublic, SegmentWitness, initial_inputs_state, initial_names_state,
+    initial_outputs_state, inputs_state, names_state, outputs_state, sweeps_state,
 };
 use crate::chain::{BlockStatement, ProofVerifier};
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
+use crate::name_air::{NAME_LOG_ROWS, NUM_PUBLIC as NAME_PUBLIC, NameAir, NamePublic, NameWitness};
+use crate::names::{OpKind, count_ops};
 use crate::poseidon2::Fp;
 use crate::stark::{self, StarkConfig};
 
 /// Transcript domain separator for segment proofs.
 pub(crate) const DOM_SEGMENT_PROOF: u32 = 0x30;
+/// Transcript domain separator for name segment proofs.
+pub(crate) const DOM_NAME_PROOF: u32 = 0x34;
 
 pub(crate) fn transcript() -> Challenger {
     let mut c = Challenger::new();
     c.observe(Fp::new(DOM_SEGMENT_PROOF));
     c
+}
+
+pub(crate) fn name_transcript() -> Challenger {
+    let mut c = Challenger::new();
+    c.observe(Fp::new(DOM_NAME_PROOF));
+    c
+}
+
+/// A proven name segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameProof {
+    pub public: NamePublic,
+    pub proof: stark::Proof,
+}
+
+/// Proves a block's name segment padded to `2^log_n` rows.
+pub fn prove_name_padded(config: &StarkConfig, witness: &NameWitness, log_n: usize) -> NameProof {
+    let (trace, public) = NameAir::generate_trace_padded(witness, log_n);
+    let proof = stark::prove(config, &NameAir, &trace, &public.to_values(), &mut name_transcript());
+    NameProof { public, proof }
 }
 
 /// A proven segment.
@@ -56,17 +83,25 @@ pub fn prove_segment_padded(config: &StarkConfig, witness: &SegmentWitness, log_
     SegmentProof { public, proof }
 }
 
-/// Proves every segment, one thread per segment, and encodes the aggregate.
-pub fn prove_block(config: &StarkConfig, segments: &[SegmentWitness]) -> Vec<u8> {
-    let proofs: Vec<SegmentProof> = std::thread::scope(|s| {
+/// Proves every segment and the name segment (at its natural height),
+/// one thread each, and encodes the lot.
+pub fn prove_block(config: &StarkConfig, segments: &[SegmentWitness], name: &NameWitness) -> Vec<u8> {
+    let (proofs, name_proof) = std::thread::scope(|s| {
         let handles: Vec<_> = segments.iter().map(|w| s.spawn(move || prove_segment(config, w))).collect();
-        handles.into_iter().map(|h| h.join().expect("segment prover panicked")).collect()
+        let np = s.spawn(move || {
+            let (trace, public) = NameAir::generate_trace(name);
+            let proof = stark::prove(config, &NameAir, &trace, &public.to_values(), &mut name_transcript());
+            NameProof { public, proof }
+        });
+        let proofs: Vec<SegmentProof> =
+            handles.into_iter().map(|h| h.join().expect("segment prover panicked")).collect();
+        (proofs, np.join().expect("name segment prover panicked"))
     });
-    encode(&proofs)
+    encode(&proofs, &name_proof)
 }
 
-pub fn encode(proofs: &[SegmentProof]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(proofs.len() << 18);
+pub fn encode(proofs: &[SegmentProof], name: &NameProof) -> Vec<u8> {
+    let mut w = Writer::with_capacity((proofs.len() + 1) << 18);
     w.u32(proofs.len() as u32);
     for sp in proofs {
         w.fps(&sp.public.to_values());
@@ -74,10 +109,14 @@ pub fn encode(proofs: &[SegmentProof]) -> Vec<u8> {
         w.u32(bytes.len() as u32);
         w.0.extend_from_slice(&bytes);
     }
+    w.fps(&name.public.to_values());
+    let bytes = name.proof.to_bytes();
+    w.u32(bytes.len() as u32);
+    w.0.extend_from_slice(&bytes);
     w.finish()
 }
 
-pub fn decode(bytes: &[u8]) -> Option<Vec<SegmentProof>> {
+pub fn decode(bytes: &[u8]) -> Option<(Vec<SegmentProof>, NameProof)> {
     let mut r = Reader(bytes);
     let n = r.len(NUM_PUBLIC * 4)?;
     let mut out = Vec::with_capacity(n);
@@ -91,17 +130,27 @@ pub fn decode(bytes: &[u8]) -> Option<Vec<SegmentProof>> {
         let proof = stark::Proof::from_bytes(r.take(len)?)?;
         out.push(SegmentProof { public, proof });
     }
+    let mut values = Vec::with_capacity(NAME_PUBLIC);
+    for _ in 0..NAME_PUBLIC {
+        values.push(r.fp()?);
+    }
+    let public = NamePublic::from_values(&values)?;
+    let len = r.len(1)?;
+    let proof = stark::Proof::from_bytes(r.take(len)?)?;
     if !r.is_empty() {
         return None;
     }
-    Some(out)
+    Some((out, NameProof { public, proof }))
 }
 
-/// Assembles a block body from the segments and the encoded proof.
-pub fn body_from_segments(segments: &[SegmentWitness], proof: Vec<u8>) -> Body {
+/// Assembles a block body from the segments, the name witness and the
+/// encoded proof.
+pub fn body_from_segments(segments: &[SegmentWitness], name: &NameWitness, proof: Vec<u8>) -> Body {
     Body {
         inputs: segments.iter().flat_map(|s| s.positions()).collect(),
         outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+        ops: name.block_ops(),
+        sweeps: name.sweeps(),
         proof,
     }
 }
@@ -117,19 +166,25 @@ pub enum AggregateError {
     },
     /// The last segment does not end at the block's root, lists or position.
     WrongEnd,
+    /// The name segment does not continue from the last segment, or does
+    /// not end at the block's root, position, operation and sweep lists,
+    /// height or caps.
+    WrongNames,
     Unbalanced,
     SegmentRejected {
         index: usize,
     },
+    NameSegmentRejected,
 }
 
 /// Checks the aggregate's chaining and balance against the statement,
 /// without verifying the STARK proofs.
-pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result<(), AggregateError> {
+pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof], name: &NameProof) -> Result<(), AggregateError> {
     let first = proofs.first().ok_or(AggregateError::NoSegments)?;
     if first.public.root_in != s.prev_state_root
         || first.public.isp_in != initial_inputs_state()
         || first.public.osp_in != initial_outputs_state()
+        || first.public.nsp_in != initial_names_state()
         || first.public.pos_in != s.first_output_position
         || first.public.carry_in != Carry::CLOSED
     {
@@ -140,6 +195,7 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result
         if a.root_out != b.root_in
             || a.isp_out != b.isp_in
             || a.osp_out != b.osp_in
+            || a.nsp_out != b.nsp_in
             || a.pos_out != b.pos_in
             || a.carry_out != b.carry_in
         {
@@ -147,14 +203,28 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result
         }
     }
     let last = &proofs.last().unwrap().public;
-    let expected_pos = s.first_output_position + s.body.outputs.len() as u64;
-    if last.root_out != s.new_state_root
-        || last.isp_out != inputs_state(&s.body.inputs)
+    let after_outputs = s.first_output_position + s.body.outputs.len() as u64;
+    if last.isp_out != inputs_state(&s.body.inputs)
         || last.osp_out != outputs_state(&s.body.outputs)
-        || last.pos_out != expected_pos
+        || last.nsp_out != names_state(&s.body.op_digests())
+        || last.pos_out != after_outputs
         || last.carry_out != Carry::CLOSED
     {
         return Err(AggregateError::WrongEnd);
+    }
+    let nm = &name.public;
+    let kinds = s.body.ops.iter().map(|o| o.kind()).chain(s.body.sweeps.iter().map(|_| OpKind::Sweep));
+    let counts = count_ops(kinds).map_err(|_| AggregateError::WrongNames)?;
+    if nm.root_in != last.root_out
+        || nm.root_out != s.new_state_root
+        || nm.pos_in != last.pos_out
+        || nm.pos_out != after_outputs + s.body.commit_positions(0).len() as u64
+        || nm.nsp != last.nsp_out
+        || nm.ssp != sweeps_state(&s.body.sweeps)
+        || nm.height != s.height
+        || nm.counts.iter().zip(&counts).any(|(a, b)| *a as usize != *b)
+    {
+        return Err(AggregateError::WrongNames);
     }
     let total_in: u128 = proofs.iter().map(|p| SegmentPublic::total(&p.public.sum_in)).sum();
     let total_out: u128 = proofs.iter().map(|p| SegmentPublic::total(&p.public.sum_out)).sum();
@@ -166,15 +236,21 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof]) -> Result
 
 /// Full verification of an encoded block proof against a statement.
 pub fn verify_block(config: &StarkConfig, s: &BlockStatement<'_>, proof: &[u8]) -> Result<(), AggregateError> {
-    let proofs = decode(proof).ok_or(AggregateError::Malformed)?;
-    check_chaining(s, &proofs)?;
+    let (proofs, name) = decode(proof).ok_or(AggregateError::Malformed)?;
+    check_chaining(s, &proofs, &name)?;
     for (i, sp) in proofs.iter().enumerate() {
         if stark::verify(config, &BlockAir, &sp.public.to_values(), &sp.proof, &mut transcript()).is_err() {
             return Err(AggregateError::SegmentRejected { index: i });
         }
     }
+    if stark::verify(config, &NameAir, &name.public.to_values(), &name.proof, &mut name_transcript()).is_err() {
+        return Err(AggregateError::NameSegmentRejected);
+    }
     Ok(())
 }
+
+/// The rows every name segment is padded to on mainnet.
+pub const NAME_ROWS_LOG: usize = NAME_LOG_ROWS;
 
 /// Verifies block proofs with the STARK verifier.
 #[derive(Clone, Copy, Debug)]
@@ -264,7 +340,9 @@ mod tests {
         };
         assert!(!v.verify(&st, &[]));
         assert!(!v.verify(&st, &[1, 2, 3]));
-        assert_eq!(verify_block(&STARK, &st, &encode(&[])), Err(AggregateError::NoSegments));
+        let empty = NameWitness { root_in: EMPTY, pos_in: 0, height: 1, ops: vec![] };
+        let name = prove_name_padded(&STARK, &empty, 4);
+        assert_eq!(verify_block(&STARK, &st, &encode(&[], &name)), Err(AggregateError::NoSegments));
     }
 
     #[test]
@@ -290,6 +368,7 @@ mod tests {
                 Output::new(&d.public_key(), 7).block_output(),
             ],
             proof: vec![],
+            ..Default::default()
         };
         let genesis_root = chain.preview_state_root(&genesis_body).unwrap();
         let genesis = Block {
@@ -308,29 +387,41 @@ mod tests {
 
         // Block 1, three transactions in two segments: A and B pay C with a
         // fee of 10; D pays itself; the miner claims subsidy 50 plus fee 10.
-        let tx =
+        let mut tx =
             UnsignedTransaction::new(vec![(a.public_key(), 100), (bk.public_key(), 40)], vec![Output::new(&c, 130)])
                 .sign(|i, _, m| if i == 0 { a.sign(m) } else { bk.sign(m) })
                 .unwrap();
-        let tx_d = UnsignedTransaction::new(vec![(d.public_key(), 7)], vec![Output::new(&d.public_key(), 7)])
+        tx.set_positions(&[0, 1]);
+        let mut tx_d = UnsignedTransaction::new(vec![(d.public_key(), 7)], vec![Output::new(&d.public_key(), 7)])
             .sign_with(&mut d)
             .unwrap();
+        tx_d.set_positions(&[2]);
         let reward =
             UnsignedTransaction::new(vec![], vec![Output::new(&miner, 60)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
         let txs = [tx, tx_d, reward];
-        let segments = {
+        let empty_names = |segments: &[SegmentWitness], height: u32, wtxn: &heed::RwTxn| {
+            NameWitness {
+                root_in: chain.utxo().root(wtxn).unwrap(),
+                pos_in: chain.utxo().next_position(wtxn).unwrap(),
+                height,
+                ops: vec![],
+            }
+            .with_segments(segments)
+        };
+        let (segments, names) = {
             let mut wtxn = chain.env().write_txn().unwrap();
             let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &txs, 2).unwrap();
+            let n = empty_names(&s, 1, &wtxn);
             wtxn.abort();
-            s
+            (s, n)
         };
         assert_eq!(segments.len(), 2);
         let t = std::time::Instant::now();
-        let proof = prove_block(&STARK, &segments);
-        println!("2 segments in parallel: {} bytes in {:?}", proof.len(), t.elapsed());
-        let decoded = decode(&proof).unwrap();
+        let proof = prove_block(&STARK, &segments, &names);
+        println!("2 segments and the name segment in parallel: {} bytes in {:?}", proof.len(), t.elapsed());
+        let (decoded, _) = decode(&proof).unwrap();
         assert_eq!(decoded.len(), 2);
-        let body = body_from_segments(&segments, proof);
+        let body = body_from_segments(&segments, &names, proof);
         assert_eq!(body.inputs, vec![0, 1, 2]);
         assert_eq!(body.outputs.len(), 3);
 
@@ -358,7 +449,7 @@ mod tests {
             (tip, body.clone())
         };
         let (_, body1) = statement(&block.body);
-        let proofs = decode(&body1.proof).unwrap();
+        let (proofs, name) = decode(&body1.proof).unwrap();
         let st = BlockStatement {
             height: 1,
             prev_state_root: genesis_root,
@@ -367,38 +458,49 @@ mod tests {
             subsidy: 50,
             body: &body1,
         };
-        assert_eq!(check_chaining(&st, &proofs), Ok(()));
+        assert_eq!(check_chaining(&st, &proofs, &name), Ok(()));
         let swapped = vec![proofs[1].clone(), proofs[0].clone()];
-        assert_eq!(check_chaining(&st, &swapped), Err(AggregateError::BrokenChain { index: 0 }));
-        assert_eq!(check_chaining(&st, &proofs[..1]), Err(AggregateError::WrongEnd));
+        assert_eq!(check_chaining(&st, &swapped, &name), Err(AggregateError::BrokenChain { index: 0 }));
+        assert_eq!(check_chaining(&st, &proofs[..1], &name), Err(AggregateError::WrongEnd));
         let mut poor = st.clone();
         poor.subsidy = 49;
-        assert_eq!(check_chaining(&poor, &proofs), Err(AggregateError::Unbalanced));
+        assert_eq!(check_chaining(&poor, &proofs, &name), Err(AggregateError::Unbalanced));
         let mut moved = st.clone();
         moved.first_output_position = 4;
-        assert_eq!(check_chaining(&moved, &proofs), Err(AggregateError::BrokenChain { index: 0 }));
+        assert_eq!(check_chaining(&moved, &proofs, &name), Err(AggregateError::BrokenChain { index: 0 }));
+        let mut other = name.clone();
+        other.public.height += 1;
+        assert_eq!(check_chaining(&st, &proofs, &other), Err(AggregateError::WrongNames));
         // A segment proof swapped for another segment's: chaining passes,
-        // the STARK check fails on that index.
+        // the STARK check fails on that index; a name proof for other
+        // public values fails its check.
         let mut cross = proofs.clone();
         cross[1].proof = proofs[0].proof.clone();
-        assert_eq!(verify_block(&STARK, &st, &encode(&cross)), Err(AggregateError::SegmentRejected { index: 1 }));
+        assert_eq!(
+            verify_block(&STARK, &st, &encode(&cross, &name)),
+            Err(AggregateError::SegmentRejected { index: 1 })
+        );
+        let mut forged = name.clone();
+        forged.proof = proofs[0].proof.clone();
+        assert_eq!(verify_block(&STARK, &st, &encode(&proofs, &forged)), Err(AggregateError::NameSegmentRejected));
 
         // Block 2 with a stale proof is rejected by the chain; a fresh one applies.
         let reward2 =
             UnsignedTransaction::new(vec![], vec![Output::new(&miner, 50)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
-        let seg2 = {
+        let (seg2, names2) = {
             let mut wtxn = chain.env().write_txn().unwrap();
             let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &[reward2], 2).unwrap();
+            let n = empty_names(&s, 2, &wtxn);
             wtxn.abort();
-            s
+            (s, n)
         };
-        let stale = body_from_segments(&seg2, block.body.proof.clone());
+        let stale = body_from_segments(&seg2, &names2, block.body.proof.clone());
         let h2 = mine(&stale, GENESIS_TIME + 1200);
         assert!(matches!(
             chain.apply_block(&Block { header: h2, body: stale }, GENESIS_TIME + 1300),
             Err(ChainError::BadProof)
         ));
-        let good = body_from_segments(&seg2, prove_block(&STARK, &seg2));
+        let good = body_from_segments(&seg2, &names2, prove_block(&STARK, &seg2, &names2));
         let h2 = mine(&good, GENESIS_TIME + 1200);
         chain.apply_block(&Block { header: h2, body: good }, GENESIS_TIME + 1300).unwrap();
         assert_eq!(chain.tip().unwrap().unwrap().height, 2);

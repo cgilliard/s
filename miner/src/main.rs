@@ -57,6 +57,8 @@ use tabminer::block_air::{SegmentWitness, pack};
 use tabminer::chain::{BlockStatement, Chain, ChainParams, DEFAULT_MAX_UNDO};
 use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
+use tabminer::name_air::NameWitness;
+use tabminer::names::NameOp;
 use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
 use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
@@ -115,8 +117,22 @@ const HELP: &str = "commands:
                             (FEE defaults to the smallest the network accepts)
   slates                    pending slates
   sent                      unconfirmed payments that can be cancelled
-  scan                      find this wallet's outputs on chain (after a restore)
+  scan                      find this wallet's outputs and names on chain (after a restore)
   prune                     forget unspent outputs the chain does not hold
+  name-commit NAME [VALUE] [FEE]
+                            start registering NAME: pool a transaction committing to it
+                            (VALUE: 64 hex digits, the payment identity; default zeros)
+  name-reveal NAME [WAIT] [FEE]
+                            reveal a committed name once its commit is WAIT blocks old
+                            (at least 12; more makes the registration harder to undo)
+  name-update NAME VALUE [FEE]
+                            change a name's value, rotating its owner key
+  name-offer NAME FILE [VALUE]
+                            write a record for NAME under a key of yours, for its owner
+                            to sign over with name-transfer
+  name-transfer FILE [FEE]  sign a name over to the record in FILE
+  names                     this wallet's names and pending commits
+  name NAME                 look a name up on chain
   phrase                    show the wallet's 12-word recovery phrase
   storage                   disk use of the chain database, part by part
   quit                      stop the node
@@ -699,11 +715,50 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         ctx.wallet.relocate(chain.utxo(), &rtxn)?;
     }
     ctx.wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
+    let rtxn = chain.env().read_txn()?;
+    ctx.wallet.sync_names(chain.names(), &rtxn)?;
+    Ok(())
+}
+
+/// A 32-byte value from 64 hex digits, or zeros when absent.
+fn parse_value(s: Option<&str>) -> AnyResult<tabminer::pow::Digest> {
+    match s {
+        None => Ok([tabminer::poseidon2::Fp::ZERO; 8]),
+        Some(h) => {
+            let bytes = tabminer::wallet::digest_from_hex(h).ok_or("a value is 64 hex digits")?;
+            digest_from_bytes(&bytes).ok_or_else(|| "a value's 4-byte words must be below the field modulus".into())
+        }
+    }
+}
+
+/// Carries name operations in a transaction of the wallet's and pools it.
+fn carry(ctx: &Ctx, ops: Vec<NameOp>, fee: Option<u64>) -> AnyResult<()> {
+    let rtxn = ctx.chain.env().read_txn()?;
+    let signed = ctx.wallet.carry(ops, fee, ctx.chain.utxo(), &rtxn)?;
+    drop(rtxn);
+    println!("transaction {} pays a fee of {}", short(&signed.tx.txid()), fmt_coins(signed.tx.balance() as u128));
+    submit(ctx, signed);
     Ok(())
 }
 
 fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
-    if matches!(cmd, "status" | "balance" | "outputs" | "send" | "finalize" | "cancel" | "sent" | "prune") {
+    if matches!(
+        cmd,
+        "status"
+            | "balance"
+            | "outputs"
+            | "send"
+            | "finalize"
+            | "cancel"
+            | "sent"
+            | "prune"
+            | "names"
+            | "name-commit"
+            | "name-reveal"
+            | "name-update"
+            | "name-offer"
+            | "name-transfer"
+    ) {
         sync_wallet(ctx)?;
     }
     match cmd {
@@ -939,7 +994,141 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         "scan" => {
             let rtxn = ctx.chain.env().read_txn()?;
             let (n, total) = ctx.wallet.scan(ctx.chain.utxo(), &rtxn)?;
-            println!("found {n} outputs worth {}", fmt_coins(total));
+            let (names, commits) = ctx.wallet.scan_names(ctx.chain.utxo(), ctx.chain.names(), &rtxn)?;
+            println!("found {n} outputs worth {}, {names} names and {commits} pending commits", fmt_coins(total));
+            if commits > 0 {
+                println!("a pending commit's name is matched when you reveal it: name-reveal NAME");
+            }
+        }
+        "name-commit" => {
+            let (name, value, fee) = match args {
+                [name] => (*name, None, None),
+                [name, value] => (*name, Some(*value), None),
+                [name, value, fee] => (*name, Some(*value), Some(parse_coins(fee).ok_or("bad fee")?)),
+                _ => return Err("usage: name-commit NAME [VALUE] [FEE]".into()),
+            };
+            let op = ctx.wallet.name_commit(name.as_bytes(), parse_value(value)?)?;
+            carry(ctx, vec![op], fee)?;
+            println!("committed to {name}; reveal it with name-reveal {name} once the commit is 12 blocks old");
+        }
+        "name-reveal" => {
+            let (name, wait, fee) = match args {
+                [name] => (*name, tabminer::names::MIN_REVEAL, None),
+                [name, wait] => (*name, wait.parse().map_err(|_| "bad wait")?, None),
+                [name, wait, fee] => {
+                    (*name, wait.parse().map_err(|_| "bad wait")?, Some(parse_coins(fee).ok_or("bad fee")?))
+                }
+                _ => return Err("usage: name-reveal NAME [WAIT] [FEE]".into()),
+            };
+            let height = ctx.chain.tip()?.map_or(1, |t| t.height + 1);
+            let op = {
+                let rtxn = ctx.chain.env().read_txn()?;
+                ctx.wallet.name_reveal(name.as_bytes(), wait, ctx.chain.names(), &rtxn, height)?
+            };
+            if wait <= tabminer::names::MIN_REVEAL {
+                println!(
+                    "note: revealing at the minimum wait; a reorganization of {} blocks could let another take the name",
+                    tabminer::names::MIN_REVEAL
+                );
+            }
+            carry(ctx, vec![op], fee)?;
+            println!("revealing {name}");
+        }
+        "name-update" => {
+            let (name, value, fee) = match args {
+                [name, value] => (*name, *value, None),
+                [name, value, fee] => (*name, *value, Some(parse_coins(fee).ok_or("bad fee")?)),
+                _ => return Err("usage: name-update NAME VALUE [FEE]".into()),
+            };
+            let op = ctx.wallet.name_update(name.as_bytes(), parse_value(Some(value))?)?;
+            carry(ctx, vec![op], fee)?;
+            println!("updating {name}; its owner key rotates when the update confirms");
+        }
+        "name-offer" => {
+            let (name, file, value) = match args {
+                [name, file] => (*name, *file, None),
+                [name, file, value] => (*name, *file, Some(*value)),
+                _ => return Err("usage: name-offer NAME FILE [VALUE]".into()),
+            };
+            let record = ctx.wallet.name_offer(name.as_bytes(), parse_value(value)?)?;
+            std::fs::write(file, record.to_bytes())?;
+            println!("record for {name} written to {file}; give it to the name's owner to sign over");
+        }
+        "name-transfer" => {
+            let (file, fee) = match args {
+                [file] => (*file, None),
+                [file, fee] => (*file, Some(parse_coins(fee).ok_or("bad fee")?)),
+                _ => return Err("usage: name-transfer FILE [FEE]".into()),
+            };
+            let record = tabminer::names::Record::from_bytes(&std::fs::read(file)?).ok_or("not a name record")?;
+            let name = String::from_utf8_lossy(&record.name).into_owned();
+            let op = ctx.wallet.name_transfer(record)?;
+            carry(ctx, vec![op], fee)?;
+            println!("transferring {name}; it leaves this wallet when the update confirms");
+        }
+        "names" => {
+            let rtxn = ctx.chain.env().read_txn()?;
+            let names = ctx.wallet.owned_names()?;
+            let commits = ctx.wallet.pending_commits()?;
+            if names.is_empty() && commits.is_empty() {
+                println!("no names");
+            }
+            for n in names {
+                let stage = match (n.stage, n.pending.is_some(), n.transferring) {
+                    (tabminer::wallet::NameStage::Revealed, _, _) => "revealed, awaiting the chain",
+                    (tabminer::wallet::NameStage::Offered, _, _) => "offered, awaiting the transfer",
+                    (_, true, _) => "owned, update pending",
+                    (_, _, true) => "owned, transfer pending",
+                    _ => "owned",
+                };
+                println!(
+                    "{:<32}  {}  value {}  {} signatures left{}",
+                    String::from_utf8_lossy(&n.name),
+                    stage,
+                    hex_digest(&n.value),
+                    n.signatures_left(),
+                    if n.recovered { ", recovered" } else { "" }
+                );
+            }
+            for c in commits {
+                let height = ctx.chain.tip()?.map_or(0, |t| t.height);
+                let on_chain = ctx.chain.names().commit_position(&rtxn, &c.commit)?;
+                let status = match on_chain {
+                    None => "not on chain yet".to_string(),
+                    Some(p) => match ctx.chain.names().commit_at(&rtxn, p)? {
+                        Some(k) if height >= k.height + tabminer::names::MIN_REVEAL => {
+                            format!("committed at block {}, ready to reveal", k.height)
+                        }
+                        Some(k) => format!(
+                            "committed at block {}, ready in {} blocks",
+                            k.height,
+                            k.height + tabminer::names::MIN_REVEAL - height
+                        ),
+                        None => "not on chain yet".to_string(),
+                    },
+                };
+                println!(
+                    "{:<32}  commit {}  {}",
+                    c.name.as_deref().map_or("(name unknown)".to_string(), |n| String::from_utf8_lossy(n).into_owned()),
+                    short(&c.commit),
+                    status
+                );
+            }
+        }
+        "name" => {
+            let [name] = args else {
+                return Err("usage: name NAME".into());
+            };
+            let rtxn = ctx.chain.env().read_txn()?;
+            match ctx.chain.names().lookup(&rtxn, name.as_bytes())? {
+                None => println!("{name} is not registered"),
+                Some(r) => {
+                    let ours = ctx.wallet.owned_name(name.as_bytes())?.is_some();
+                    println!("owner {}", hex_digest(&r.owner));
+                    println!("value {}", hex_digest(&r.value));
+                    println!("memo  {}{}", hex_digest(&r.memo), if ours { "  (this wallet's)" } else { "" });
+                }
+            }
         }
         "slates" => {
             let slates = ctx.wallet.pending_slates()?;
@@ -988,8 +1177,11 @@ fn submit(ctx: &Ctx, signed: Signed) {
             if signed.last_signatures.len() == 1 { "an input" } else { "some inputs" }
         );
     }
+    let height = ctx.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
     let pooled = match ctx.chain.env().read_txn() {
-        Ok(rtxn) => ctx.mempool.lock().unwrap().insert(signed.tx.clone(), ctx.chain.utxo(), &rtxn),
+        Ok(rtxn) => {
+            ctx.mempool.lock().unwrap().insert(signed.tx.clone(), ctx.chain.utxo(), ctx.chain.names(), &rtxn, height)
+        }
         Err(e) => {
             println!("transaction {} signed, but not pooled: {e}", short(&txid));
             return;
@@ -1128,18 +1320,37 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
 
         // Transactions: the reward, then the pooled ones by fee rate while
         // they fit the block's segment and size limits. Size: header, body
-        // counts, input positions, outputs and room for the proof.
-        let size = |ins: usize, outs: usize| HEADER_SIZE + Body::size_of(ins, outs, PROOF_SIZE_ALLOWANCE);
-        let fits = |ins: usize, outs: usize, items: &dyn Fn(usize) -> (usize, usize), n: usize| {
-            pack(n, items, agg.segment_rows()).len() <= agg.max_segments && size(ins, outs) <= params.max_block_size
+        // counts, input positions, outputs, the name section and room for
+        // the proof. The name section also sweeps expired commits.
+        let sweeps: Vec<u64> = {
+            let rtxn = chain.env().read_txn()?;
+            Mempool::sweeps(chain.names(), &rtxn, height)
         };
-        let pooled: Vec<Transaction> = ctx.mempool.lock().unwrap().select(|chosen| {
-            let ins: usize = chosen.iter().map(|t| t.inputs.len()).sum();
-            let outs: usize = 1 + chosen.iter().map(|t| t.outputs.len()).sum::<usize>();
-            let items =
-                |t: usize| if t == 0 { (0, 1) } else { (chosen[t - 1].inputs.len(), chosen[t - 1].outputs.len()) };
-            fits(ins, outs, &items, chosen.len() + 1)
-        });
+        let sweep_bytes = sweeps.len() * POSITION_SIZE;
+        let size = |ins: usize, outs: usize, names: usize| {
+            HEADER_SIZE + Body::size_of(ins, outs, names + sweep_bytes, PROOF_SIZE_ALLOWANCE)
+        };
+        let fits = |ins: usize, outs: usize, names: usize, items: &dyn Fn(usize) -> (usize, usize, usize), n: usize| {
+            pack(n, items, agg.segment_rows()).len() <= agg.max_segments
+                && size(ins, outs, names) <= params.max_block_size
+        };
+        let pooled: Vec<Transaction> = {
+            let rtxn = chain.env().read_txn()?;
+            ctx.mempool.lock().unwrap().select(chain.names(), &rtxn, height, |chosen| {
+                let ins: usize = chosen.iter().map(|t| t.inputs.len()).sum();
+                let outs: usize = 1 + chosen.iter().map(|t| t.outputs.len()).sum::<usize>();
+                let names: usize = chosen.iter().flat_map(|t| t.ops.iter()).map(|op| op.block_op().size()).sum();
+                let items = |t: usize| {
+                    if t == 0 {
+                        (0, 1, 0)
+                    } else {
+                        let tx = &chosen[t - 1];
+                        (tx.inputs.len(), tx.outputs.len(), tx.ops.len())
+                    }
+                };
+                fits(ins, outs, names, &items, chosen.len() + 1)
+            })
+        };
         let fees = Mempool::fees(&pooled);
         let balance = {
             let rtxn = chain.env().read_txn()?;
@@ -1157,9 +1368,9 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         txs.extend(pooled);
         let build_time = started.elapsed();
 
-        // Witnesses: apply the transactions in a transaction that is thrown
-        // away, recording the tree paths.
-        let (segments, statement, inputs, outputs) = {
+        // Witnesses: apply the transactions and the name section in a
+        // transaction that is thrown away, recording the tree paths.
+        let (segments, names, statement, inputs, outputs) = {
             let mut wtxn = chain.env().write_txn()?;
             let utxo = chain.utxo();
             let prev_state_root = utxo.root(&wtxn)?;
@@ -1176,11 +1387,30 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
                 }
                 Err(e) => return Err(e.into()),
             };
+            let ops: Vec<NameOp> = txs.iter().flat_map(|t| t.ops.iter().cloned()).collect();
+            let names = match NameWitness::collect(utxo, chain.names(), &mut wtxn, height, &ops, &sweeps) {
+                Ok(n) => n,
+                // The pool admitted an operation the state no longer
+                // allows; it is revalidated after every block. Start over.
+                Err(e) => {
+                    drop(wtxn);
+                    abandon();
+                    log::line(&format!("  name operations no longer apply ({e}); starting over"));
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
             let new_state_root = utxo.root(&wtxn)?;
             wtxn.abort();
             let inputs: Vec<u64> = segments.iter().flat_map(|s| s.positions()).collect();
             let outputs: Vec<_> = segments.iter().flat_map(|s| s.block_outputs()).collect();
-            let body = Body { inputs: inputs.clone(), outputs: outputs.clone(), proof: vec![] };
+            let body = Body {
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                ops: names.block_ops(),
+                sweeps: names.sweeps(),
+                proof: vec![],
+            };
             let statement = Statement::from_block(&BlockStatement {
                 height,
                 prev_state_root,
@@ -1189,16 +1419,18 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
                 subsidy,
                 body: &body,
             });
-            (segments, statement, inputs, outputs)
+            (segments, names, statement, inputs, outputs)
         };
 
         log::line(&format!(
-            "{} block {height} on {}: {} txs ({} in, {} out, {} in fees) in {} segment{}, wallet {} confirmed",
+            "{} block {height} on {}: {} txs ({} in, {} out, {} name ops, {} sweeps, {} in fees) in {} segment{}, wallet {} confirmed",
             if unchecked { "building (debug: not proving)" } else { "proving" },
             short(&tip.hash()),
             txs.len(),
             inputs.len(),
             outputs.len(),
+            names.ops.len() - names.sweeps().len(),
+            names.sweeps().len(),
             fmt_coins(fees as u128),
             segments.len(),
             if segments.len() == 1 { "" } else { "s" },
@@ -1216,6 +1448,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             Progress::Segment { index, count, elapsed } => {
                 log::line(&format!("  segment {}/{count} proven in {}", index + 1, secs(elapsed)))
             }
+            Progress::Name { elapsed } => log::line(&format!("  name segment proven in {}", secs(elapsed))),
             Progress::Node { segments, log_n, hash_log_n, root, elapsed } => log::line(&format!(
                 "  {} over {segments} segment{} (2^{log_n} + 2^{hash_log_n} rows) proven in {}",
                 if root { "root node" } else { "node" },
@@ -1232,7 +1465,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             // Debugging: a stand-in the size of a real proof.
             Some(vec![0u8; DEBUG_PROOF_SIZE])
         } else {
-            chain.verifier().prove_block(height, &statement, &segments, prev_ref, jobs, &report, &cancel)
+            chain.verifier().prove_block(height, &statement, &segments, &names, prev_ref, jobs, &report, &cancel)
         };
         let Some(proof) = proof else {
             abandon();
@@ -1249,7 +1482,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         // at random from the whole set (not the wallet's), up to the block
         // size limit.
         if let Some((n_out, n_spend)) = ctx.debug_fill {
-            let used = HEADER_SIZE + Body::size_of(inputs.len(), outputs.len(), DEBUG_PROOF_SIZE);
+            let used = HEADER_SIZE + Body::size_of(inputs.len(), outputs.len(), 0, DEBUG_PROOF_SIZE);
             let room = params.max_block_size.saturating_sub(used);
             let need = n_out * BLOCK_OUTPUT_SIZE + n_spend * POSITION_SIZE;
             let (n_out, n_spend) =
@@ -1285,7 +1518,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             }
             log::line(&format!("  debug fill: {n_out} random outputs, {spends} random spends"));
         }
-        let body = Body { inputs, outputs, proof };
+        let body = Body { inputs, outputs, ops: names.block_ops(), sweeps: names.sweeps(), proof };
         let timestamp = now().max(chain.earliest_timestamp(&tip)?);
         let mut header = match chain.template(&body, timestamp) {
             Ok(h) => h,

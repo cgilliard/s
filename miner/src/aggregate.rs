@@ -6,11 +6,14 @@
 //! that the children chain, and outputs the digest of the combined span
 //! record (the values a segment exports: state roots, list sponges, output
 //! positions, amount sums and open-transaction carries in and out, with the
-//! sums normalized) followed by its tree digest. The root node instead
+//! sums normalized) followed by its tree digest. The root node also
+//! verifies the block's name segment proof (see [`crate::name_air`]) and
 //! binds the span to the block statement: the chain starts at the block's
-//! previous state, ends at the body's lists and new state, no transaction
-//! is open at either end, and the amounts balance against the subsidy; it
-//! outputs the digest of the statement and its tree digest.
+//! previous state, the name segment continues from where it ends and ends
+//! at the new state, the sponges are the body's lists, no transaction is
+//! open at either end, the name operation counts are within the caps and
+//! the amounts balance against the subsidy; it outputs the digest of the
+//! statement and its tree digest.
 //!
 //! A node verifies a child node's proof under whatever program digest the
 //! child's public values give, and commits to it in its tree digest
@@ -37,17 +40,25 @@ use std::sync::{Arc, Mutex};
 
 use crate::block_air::{
     BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_ISP_IN, PUB_ISP_OUT,
-    PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN, PUB_SUM_OUT,
-    ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_outputs_state, inputs_state, limbs16,
-    limbs16_wide, outputs_state,
+    PUB_NSP_IN, PUB_NSP_OUT, PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN,
+    PUB_SUM_OUT, ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_names_state,
+    initial_outputs_state, inputs_state, limbs16, limbs16_wide, names_state, outputs_state, sweeps_state,
 };
-use crate::block_proof::{DOM_SEGMENT_PROOF, SegmentProof, prove_segment_padded};
+use crate::block_proof::{
+    DOM_NAME_PROOF, DOM_SEGMENT_PROOF, NameProof, SegmentProof, prove_name_padded, prove_segment_padded,
+};
 use crate::chain::{BlockStatement, ProofVerifier};
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
 use crate::ext::Fp4;
 use crate::hash_table::HashTableAir;
 use crate::merkle::Digest;
+use crate::name_air::{
+    self, NUM_PUBLIC as NAME_PUBLIC, NameAir, NamePublic, NameWitness, PUB_COUNTS as NM_COUNTS,
+    PUB_HEIGHT as NM_HEIGHT, PUB_NSP as NM_NSP, PUB_POS_IN as NM_POS_IN, PUB_POS_OUT as NM_POS_OUT,
+    PUB_ROOT_IN as NM_ROOT_IN, PUB_ROOT_OUT as NM_ROOT_OUT, PUB_SSP as NM_SSP,
+};
+use crate::names::OpKind;
 use crate::poseidon2::{DIGEST, Fp, P, WIDTH};
 use crate::recursion::{Compiler, dummy_proof};
 use crate::stark::{self, Preprocessed, StarkConfig};
@@ -78,6 +89,9 @@ pub struct AggregatorParams {
     pub segment: StarkConfig,
     /// Every segment trace has exactly `2^segment_log_n` rows.
     pub segment_log_n: usize,
+    /// Every name segment trace has exactly `2^name_log_n` rows; it is
+    /// proven at the segment configuration.
+    pub name_log_n: usize,
     /// Largest segment count a block may use.
     pub max_segments: usize,
     /// Largest number of children a node verifies.
@@ -119,6 +133,7 @@ impl AggregatorParams {
     pub const MAINNET: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 },
         segment_log_n: 15,
+        name_log_n: name_air::NAME_LOG_ROWS,
         max_segments: 1 << 14,
         fan_in: 4,
         outer: StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 },
@@ -145,12 +160,18 @@ pub struct Statement {
     /// Outputs sponge state after the block's outputs.
     pub outputs_state: [Fp; WIDTH],
     pub first_output_position: u64,
+    /// The next position after the block's outputs and commits.
     pub end_output_position: u64,
     pub subsidy: u64,
+    pub height: u32,
+    /// Name operations sponge state after the block's operation digests.
+    pub names_state: [Fp; WIDTH],
+    /// Sweeps sponge state after the block's swept positions.
+    pub sweeps_state: [Fp; WIDTH],
 }
 
 /// Scalars in the statement encoding.
-pub const STATEMENT_LEN: usize = 2 * DIGEST + 2 * WIDTH + 4 + LIMBS;
+pub const STATEMENT_LEN: usize = 2 * DIGEST + 4 * WIDTH + 4 + LIMBS + 1;
 const ST_PREV: usize = 0;
 const ST_NEW: usize = DIGEST;
 const ST_ISP: usize = 2 * DIGEST;
@@ -158,17 +179,24 @@ const ST_OSP: usize = ST_ISP + WIDTH;
 const ST_POS_IN: usize = ST_OSP + WIDTH;
 const ST_POS_OUT: usize = ST_POS_IN + 2;
 const ST_SUBSIDY: usize = ST_POS_OUT + 2;
+const ST_HEIGHT: usize = ST_SUBSIDY + LIMBS;
+const ST_NSP: usize = ST_HEIGHT + 1;
+const ST_SSP: usize = ST_NSP + WIDTH;
 
 impl Statement {
     pub fn from_block(s: &BlockStatement<'_>) -> Statement {
+        let commits = s.body.commit_positions(0).len() as u64;
         Statement {
             prev_state_root: s.prev_state_root,
             new_state_root: s.new_state_root,
             inputs_state: inputs_state(&s.body.inputs),
             outputs_state: outputs_state(&s.body.outputs),
             first_output_position: s.first_output_position,
-            end_output_position: s.first_output_position + s.body.outputs.len() as u64,
+            end_output_position: s.first_output_position + s.body.outputs.len() as u64 + commits,
             subsidy: s.subsidy,
+            height: s.height,
+            names_state: names_state(&s.body.op_digests()),
+            sweeps_state: sweeps_state(&s.body.sweeps),
         }
     }
 
@@ -181,6 +209,9 @@ impl Statement {
             first_output_position: 0,
             end_output_position: 0,
             subsidy: 0,
+            height: 0,
+            names_state: [Fp::ZERO; WIDTH],
+            sweeps_state: [Fp::ZERO; WIDTH],
         }
     }
 
@@ -195,6 +226,9 @@ impl Statement {
             v.push(Fp::new((p >> 30) as u32));
         }
         v.extend_from_slice(&limbs16(self.subsidy));
+        v.push(Fp::new(self.height));
+        v.extend_from_slice(&self.names_state);
+        v.extend_from_slice(&self.sweeps_state);
         debug_assert_eq!(v.len(), STATEMENT_LEN);
         v
     }
@@ -211,6 +245,8 @@ impl Statement {
 
 /// Descriptor tag of a segment child.
 const SEGMENT_TAG: u32 = 0x41;
+/// Descriptor tag of the root's name segment child.
+const NAME_TAG: u32 = 0x42;
 /// Scalars per child descriptor.
 const DESCRIPTOR: usize = 2 * DIGEST;
 
@@ -232,6 +268,27 @@ pub fn tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
             }
         }
     }
+    crate::poseidon2::hash(&v)
+}
+
+/// Tree digest of the root: its children's descriptors, then the name
+/// segment's `[NAME_TAG, 0, ..]`.
+pub fn root_tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
+    let mut v = Vec::with_capacity(DESCRIPTOR * (children.len() + 1));
+    for ch in children {
+        match ch {
+            None => {
+                v.push(Fp::new(SEGMENT_TAG));
+                v.extend_from_slice(&[Fp::ZERO; DESCRIPTOR - 1]);
+            }
+            Some((digest, tree)) => {
+                v.extend_from_slice(digest);
+                v.extend_from_slice(tree);
+            }
+        }
+    }
+    v.push(Fp::new(NAME_TAG));
+    v.extend_from_slice(&[Fp::ZERO; DESCRIPTOR - 1]);
     crate::poseidon2::hash(&v)
 }
 
@@ -258,6 +315,8 @@ pub fn combine_records(records: &[SegmentPublic]) -> SegmentPublic {
         isp_out: last.isp_out,
         osp_in: first.osp_in,
         osp_out: last.osp_out,
+        nsp_in: first.nsp_in,
+        nsp_out: last.nsp_out,
         pos_in: first.pos_in,
         pos_out: last.pos_out,
         sum_in: [0; LIMBS],
@@ -356,8 +415,9 @@ impl Child<'_> {
 pub enum Output<'a> {
     /// The combined span record (inner nodes).
     Record,
-    /// The block statement, after binding the span to it (the root).
-    Statement(&'a Statement),
+    /// The block statement, after binding the span and the name segment
+    /// to it (the root).
+    Statement(&'a Statement, &'a NameProof),
 }
 
 /// Copies `words` into a fresh block, zero padded to a multiple of eight,
@@ -415,16 +475,13 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             }
         }
     }
-    let block = concat(&mut c, &descriptors);
-    c.hash_scalars(block, descriptors.len());
-    let tree = c.squeeze_digest();
-
     // Chaining between consecutive children.
     for w in recs.windows(2) {
         let (a, b) = (w[0], w[1]);
         c.assert_block(at(a, PUB_ROOT_OUT), at(b, PUB_ROOT_IN), DIGEST);
         c.assert_block(at(a, PUB_ISP_OUT), at(b, PUB_ISP_IN), WIDTH);
         c.assert_block(at(a, PUB_OSP_OUT), at(b, PUB_OSP_IN), WIDTH);
+        c.assert_block(at(a, PUB_NSP_OUT), at(b, PUB_NSP_IN), WIDTH);
         c.assert_block(at(a, PUB_POS_OUT), at(b, PUB_POS_IN), 2);
         c.assert_block(at(a, PUB_CARRY_OUT), at(b, PUB_CARRY_IN), CARRY_LEN);
     }
@@ -432,6 +489,9 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
 
     match output {
         Output::Record => {
+            let block = concat(&mut c, &descriptors);
+            c.hash_scalars(block, descriptors.len());
+            let tree = c.squeeze_digest();
             // Combined record: copies of the boundary fields, summed limbs;
             // then the tree digest.
             let padded = (SEGMENT_PUBLIC + DIGEST).div_ceil(8) * 8;
@@ -449,6 +509,8 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             copy(&mut c, at(last, PUB_ISP_OUT), PUB_ISP_OUT, WIDTH);
             copy(&mut c, at(first, PUB_OSP_IN), PUB_OSP_IN, WIDTH);
             copy(&mut c, at(last, PUB_OSP_OUT), PUB_OSP_OUT, WIDTH);
+            copy(&mut c, at(first, PUB_NSP_IN), PUB_NSP_IN, WIDTH);
+            copy(&mut c, at(last, PUB_NSP_OUT), PUB_NSP_OUT, WIDTH);
             copy(&mut c, at(first, PUB_POS_IN), PUB_POS_IN, 2);
             copy(&mut c, at(last, PUB_POS_OUT), PUB_POS_OUT, 2);
             copy(&mut c, at(first, PUB_CARRY_IN), PUB_CARRY_IN, CARRY_LEN);
@@ -474,7 +536,20 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.hash_scalars(out, SEGMENT_PUBLIC + DIGEST);
             c.assert_public();
         }
-        Output::Statement(statement) => {
+        Output::Statement(statement, name) => {
+            // The name segment: its record as inputs, then its proof, and
+            // its descriptor last in the tree digest.
+            let nm = c.scalar_inputs(&name.public.to_values());
+            assert_eq!(name.proof.tables[0].log_n, params.name_log_n, "name segment proof has the wrong height");
+            let name_prefix = [Fp::new(DOM_NAME_PROOF)];
+            c.verify_stark(&[(&NameAir, None)], &params.segment, &name_prefix, nm, NAME_PUBLIC, &name.proof);
+            let tag = c.scalar(Fp::new(NAME_TAG));
+            descriptors.push(tag);
+            descriptors.extend([0; DESCRIPTOR - 1]);
+            let block = concat(&mut c, &descriptors);
+            c.hash_scalars(block, descriptors.len());
+            let tree = c.squeeze_digest();
+
             let st = c.scalar_inputs(&statement.to_values());
             // The span starts at the block's previous state and the fixed
             // initial list states, and ends at the statement's.
@@ -485,11 +560,34 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             for (i, v) in initial_outputs_state().iter().enumerate() {
                 c.assert_scalar(at(first, PUB_OSP_IN + i), *v);
             }
+            for (i, v) in initial_names_state().iter().enumerate() {
+                c.assert_scalar(at(first, PUB_NSP_IN + i), *v);
+            }
             c.assert_block(at(first, PUB_POS_IN), at(st, ST_POS_IN), 2);
-            c.assert_block(at(last, PUB_ROOT_OUT), at(st, ST_NEW), DIGEST);
             c.assert_block(at(last, PUB_ISP_OUT), at(st, ST_ISP), WIDTH);
             c.assert_block(at(last, PUB_OSP_OUT), at(st, ST_OSP), WIDTH);
-            c.assert_block(at(last, PUB_POS_OUT), at(st, ST_POS_OUT), 2);
+            c.assert_block(at(last, PUB_NSP_OUT), at(st, ST_NSP), WIDTH);
+            // The name segment continues from the last segment to the
+            // statement's end: root, position, and the operations it
+            // applied are the ones the transactions carried.
+            c.assert_block(at(nm, NM_ROOT_IN), at(last, PUB_ROOT_OUT), DIGEST);
+            c.assert_block(at(nm, NM_ROOT_OUT), at(st, ST_NEW), DIGEST);
+            c.assert_block(at(nm, NM_POS_IN), at(last, PUB_POS_OUT), 2);
+            c.assert_block(at(nm, NM_POS_OUT), at(st, ST_POS_OUT), 2);
+            c.assert_block(at(nm, NM_NSP), at(st, ST_NSP), WIDTH);
+            c.assert_block(at(nm, NM_SSP), at(st, ST_SSP), WIDTH);
+            c.assert_eq(at(nm, NM_HEIGHT), at(st, ST_HEIGHT));
+            // Operation counts within the caps: the count is one of 0..=cap.
+            for (k, kind) in [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].into_iter().enumerate() {
+                let count = at(nm, NM_COUNTS + k);
+                let mut product = c.scalar(Fp::ONE);
+                for i in 0..=kind.cap() {
+                    let v = c.scalar(Fp::new(i as u32));
+                    let term = c.sub(count, v);
+                    product = c.mul(product, term);
+                }
+                c.assert_eq(product, 0);
+            }
             // No transaction is open at either end.
             for i in 0..CARRY_LEN {
                 c.assert_eq(at(first, PUB_CARRY_IN + i), 0);
@@ -697,6 +795,14 @@ fn dummy_record() -> SegmentPublic {
     SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap()
 }
 
+/// A name segment proof of the right shape with zero values, for planning.
+fn dummy_name(params: &AggregatorParams) -> NameProof {
+    NameProof {
+        public: NamePublic::from_values(&vec![Fp::ZERO; NAME_PUBLIC]).unwrap(),
+        proof: dummy_proof(&[(&NameAir, params.name_log_n)], &params.segment, NAME_PUBLIC),
+    }
+}
+
 fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCache) -> Shape {
     if k == 1 && !root {
         return Shape {
@@ -742,7 +848,8 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
             .map(|kind| if kind.is_none() { Child::Segment(&segment_dummy) } else { Child::Node(nd.next().unwrap()) })
             .collect();
         let zero = Statement::zero();
-        let output = if root { Output::Statement(&zero) } else { Output::Record };
+        let name_dummy = dummy_name(params);
+        let output = if root { Output::Statement(&zero, &name_dummy) } else { Output::Record };
         Compiled::of(&compile_node(params, &child_refs, output).prog, params.outer.log_blowup)
     });
     let descriptors: Vec<Option<(Digest, Digest)>> =
@@ -752,7 +859,7 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
         digest: compiled.digest,
         log_n: compiled.log_n,
         hash_log_n: compiled.hash_log_n,
-        tree: tree_digest(&descriptors),
+        tree: if root { root_tree_digest(&descriptors) } else { tree_digest(&descriptors) },
         wrap: None,
         children,
     }
@@ -777,6 +884,8 @@ pub enum AggregateError {
 pub enum Progress {
     /// Segment `index` of `count` is proven.
     Segment { index: usize, count: usize, elapsed: std::time::Duration },
+    /// The name segment is proven.
+    Name { elapsed: std::time::Duration },
     /// A node over `segments` segments is proven; `root` for the last one.
     Node { segments: usize, log_n: usize, hash_log_n: usize, root: bool, elapsed: std::time::Duration },
     /// The wrap over the root is proven.
@@ -839,7 +948,7 @@ fn prove_node(
         return None;
     }
     let t = std::time::Instant::now();
-    let root = matches!(output, Output::Statement(_));
+    let root = matches!(output, Output::Statement(..));
     let mut at = 0;
     let children: Vec<Child<'_>> = shape
         .children
@@ -858,7 +967,7 @@ fn prove_node(
     let record = combine_records(&records);
     let out_digest = match &output {
         Output::Record => node_output(&record, &shape.tree),
-        Output::Statement(s) => s.output(&shape.tree),
+        Output::Statement(s, _) => s.output(&shape.tree),
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
@@ -877,9 +986,15 @@ fn prove_node(
 }
 
 /// Proves a block: segments in parallel, then the tree. The segments must
-/// each fit `params.segment_log_n` rows.
-pub fn prove_block(params: &AggregatorParams, statement: &Statement, segments: &[SegmentWitness]) -> Vec<u8> {
-    prove_block_with(params, &plan(params, segments.len()), statement, segments, segments.len(), &|_| {})
+/// each fit `params.segment_log_n` rows and the name segment
+/// `params.name_log_n`.
+pub fn prove_block(
+    params: &AggregatorParams,
+    statement: &Statement,
+    segments: &[SegmentWitness],
+    names: &NameWitness,
+) -> Vec<u8> {
+    prove_block_with(params, &plan(params, segments.len()), statement, segments, names, segments.len(), &|_| {})
 }
 
 /// As [`prove_block`], with the tree `shape` already planned for
@@ -891,25 +1006,29 @@ pub fn prove_block_with(
     shape: &Shape,
     statement: &Statement,
     segments: &[SegmentWitness],
+    names: &NameWitness,
     jobs: usize,
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Vec<u8> {
-    prove_block_cancellable(params, shape, statement, segments, jobs, progress, &|| false).expect("no cancellation")
+    prove_block_cancellable(params, shape, statement, segments, names, jobs, progress, &|| false)
+        .expect("no cancellation")
 }
 
 /// As [`prove_block_with`], giving up with `None` once `cancel` returns
 /// `true`: before each segment and node, and between the phases of each
 /// proof.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_block_cancellable(
     params: &AggregatorParams,
     shape: &Shape,
     statement: &Statement,
     segments: &[SegmentWitness],
+    names: &NameWitness,
     jobs: usize,
     progress: &(dyn Fn(Progress) + Sync),
     cancel: stark::Cancel<'_>,
 ) -> Option<Vec<u8>> {
-    let proof = prove_wrap(params, shape, statement, segments, jobs, progress, cancel)?;
+    let proof = prove_wrap(params, shape, statement, segments, names, jobs, progress, cancel)?;
     let bytes = proof.to_bytes();
     let mut w = Writer::with_capacity(bytes.len() + 4);
     w.u32(segments.len() as u32);
@@ -917,33 +1036,43 @@ pub fn prove_block_cancellable(
     Some(w.finish())
 }
 
-/// The wrap proof of a block: segments, the tree, then the wrap, as
-/// [`prove_block_cancellable`] encodes it.
+/// The wrap proof of a block: segments and the name segment, the tree,
+/// then the wrap, as [`prove_block_cancellable`] encodes it.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_wrap(
     params: &AggregatorParams,
     shape: &Shape,
     statement: &Statement,
     segments: &[SegmentWitness],
+    names: &NameWitness,
     jobs: usize,
     progress: &(dyn Fn(Progress) + Sync),
     cancel: stark::Cancel<'_>,
 ) -> Option<stark::Proof> {
     assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
     let count = segments.len();
+    // Job `count` is the name segment.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done: Vec<Mutex<Option<SegmentProof>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let name_done: Mutex<Option<NameProof>> = Mutex::new(None);
     std::thread::scope(|s| {
-        for _ in 0..jobs.clamp(1, count.max(1)) {
+        for _ in 0..jobs.clamp(1, count + 1) {
             s.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if index >= count || cancel() {
+                    if index > count || cancel() {
                         break;
                     }
                     let t = std::time::Instant::now();
-                    let p = prove_segment_padded(&params.segment, &segments[index], params.segment_log_n);
-                    progress(Progress::Segment { index, count, elapsed: t.elapsed() });
-                    *done[index].lock().unwrap() = Some(p);
+                    if index == count {
+                        let p = prove_name_padded(&params.segment, names, params.name_log_n);
+                        progress(Progress::Name { elapsed: t.elapsed() });
+                        *name_done.lock().unwrap() = Some(p);
+                    } else {
+                        let p = prove_segment_padded(&params.segment, &segments[index], params.segment_log_n);
+                        progress(Progress::Segment { index, count, elapsed: t.elapsed() });
+                        *done[index].lock().unwrap() = Some(p);
+                    }
                 }
             });
         }
@@ -952,7 +1081,8 @@ pub fn prove_wrap(
         return None;
     }
     let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-    let root = prove_node(params, shape, &proofs, Output::Statement(statement), progress, cancel)?;
+    let name_proof = name_done.into_inner().unwrap().unwrap();
+    let root = prove_node(params, shape, &proofs, Output::Statement(statement, &name_proof), progress, cancel)?;
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
     let c = compile_wrap(params, &root, statement);
@@ -1137,9 +1267,10 @@ fn compile_chain(
         }
         c.assert_eq(acc, at(st, ST_SUBSIDY + j));
     }
-    // Heights start at 1.
+    // Heights start at 1, and the statement's is the proof's.
     let h0 = c.sub(h, 1);
     c.assert_bits_zero_from(h0, 30);
+    c.assert_eq(at(st, ST_HEIGHT), h);
 
     match &w.prev {
         None => {
@@ -1360,10 +1491,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1247916242, 1882446428, 1447144151, 450301831, 14159551, 1862179341, 1350039139, 828987825],
+    plan_root: [1107466150, 1766067965, 1015254447, 414564257, 817907748, 861542583, 144563581, 367948958],
     plan_depth: 14,
-    base: [1185110990, 1011536564, 223824267, 1448692456, 1352418199, 1294080464, 1405248802, 1579702729],
-    step: [934427987, 1691063748, 995040494, 82266015, 484674746, 678894995, 1287682845, 1272007917],
+    base: [1326945329, 600314399, 123343493, 1214413567, 984976053, 429980701, 1506861292, 788243183],
+    step: [934466741, 713122222, 1487576785, 68261089, 296638118, 121096819, 990136056, 1364385150],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -1512,22 +1643,24 @@ impl AggregateVerifier {
         verify_block(&self.params, &|k| self.wrap(k), statement, proof)
     }
 
-    /// Proves the block at `height`: its segments, tree and wrap, then the
-    /// chain step on `prev` (the previous block's height, statement and
-    /// proof; `None` at height 1). Returns the block proof.
+    /// Proves the block at `height`: its segments and name segment, tree
+    /// and wrap, then the chain step on `prev` (the previous block's
+    /// height, statement and proof; `None` at height 1). Returns the block
+    /// proof.
     #[allow(clippy::too_many_arguments)]
     pub fn prove_block(
         &self,
         height: u32,
         statement: &Statement,
         segments: &[SegmentWitness],
+        names: &NameWitness,
         prev: Option<(u32, &Statement, &[u8])>,
         jobs: usize,
         progress: &(dyn Fn(Progress) + Sync),
         cancel: stark::Cancel<'_>,
     ) -> Option<Vec<u8>> {
         let shape = self.shape(segments.len());
-        let wrap_proof = prove_wrap(&self.params, &shape, statement, segments, jobs, progress, cancel)?;
+        let wrap_proof = prove_wrap(&self.params, &shape, statement, segments, names, jobs, progress, cancel)?;
         let prev_proof = match prev {
             Some((_, _, bytes)) => Some(stark::Proof::from_bytes(bytes).expect("the previous block's proof decodes")),
             None => None,
@@ -1606,6 +1739,7 @@ mod tests {
     const SMALL: AggregatorParams = AggregatorParams {
         segment: StarkConfig { log_blowup: 1, num_queries: 4, pow_bits: 3, zk: false, commit_bits: 110 },
         segment_log_n: 7,
+        name_log_n: 11,
         max_segments: 16,
         fan_in: 2,
         outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5, zk: false, commit_bits: 112 },
@@ -1615,8 +1749,16 @@ mod tests {
     struct Setup {
         _dir: TempDir,
         segments: Vec<SegmentWitness>,
+        names: NameWitness,
         statement: Statement,
         proofs: Vec<SegmentProof>,
+        name_proof: NameProof,
+    }
+
+    /// An empty name segment witness after `segments`, at `height`.
+    fn empty_names(segments: &[SegmentWitness], height: u32) -> NameWitness {
+        let first = &segments[0];
+        NameWitness { root_in: first.root_in, pos_in: first.pos_in, height, ops: vec![] }.with_segments(segments)
     }
 
     fn setup(name: &str, amounts: &[u64], subsidy: u64) -> Setup {
@@ -1636,8 +1778,12 @@ mod tests {
         let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows()).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
-        let body =
-            Body { inputs: vec![], outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
+        let body = Body {
+            inputs: vec![],
+            outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+            proof: vec![],
+            ..Default::default()
+        };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,
@@ -1648,7 +1794,9 @@ mod tests {
         });
         let proofs: Vec<SegmentProof> =
             segments.iter().map(|w| prove_segment_padded(&SMALL.segment, w, SMALL.segment_log_n)).collect();
-        Setup { _dir: dir, segments, statement, proofs }
+        let names = empty_names(&segments, 1);
+        let name_proof = prove_name_padded(&SMALL.segment, &names, SMALL.name_log_n);
+        Setup { _dir: dir, segments, names, statement, proofs, name_proof }
     }
 
     fn seg_children(proofs: &[SegmentProof]) -> Vec<Child<'_>> {
@@ -1690,7 +1838,7 @@ mod tests {
             subsidy: 30,
             ..s.statement.clone()
         };
-        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short));
+        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short, &s.name_proof));
         assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
     }
 
@@ -1705,14 +1853,19 @@ mod tests {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         };
-        assert!(prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &now).is_none());
+        assert!(
+            prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, &s.names, 2, &quiet, &now).is_none()
+        );
         assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 1);
         // Part way: after the segments, during the node's phases.
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let later = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 6;
-        assert!(prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &later).is_none());
+        assert!(
+            prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, &s.names, 2, &quiet, &later).is_none()
+        );
         // Never: a proof as from `prove_block_with`.
-        let proof = prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, 2, &quiet, &|| false).unwrap();
+        let proof =
+            prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, &s.names, 2, &quiet, &|| false).unwrap();
         assert_eq!(AggregateVerifier::new(SMALL, &[(10, 55)]).verify_statement(&s.statement, &proof), Ok(()));
     }
 
@@ -1733,6 +1886,7 @@ mod tests {
                 inputs: vec![],
                 outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
                 proof: vec![],
+                ..Default::default()
             };
             let statement = Statement::from_block(&BlockStatement {
                 height,
@@ -1742,10 +1896,11 @@ mod tests {
                 subsidy: 55,
                 body: &body,
             });
-            (segments, statement)
+            let names = empty_names(&segments, height);
+            (segments, statement, names)
         };
-        let (seg1, st1) = block(vec![reward(&miner, 30), reward(&miner, 25)], 1);
-        let (seg2, st2) = block(vec![reward(&miner, 55)], 2);
+        let (seg1, st1, nm1) = block(vec![reward(&miner, 30), reward(&miner, 25)], 1);
+        let (seg2, st2, nm2) = block(vec![reward(&miner, 55)], 2);
         wtxn.abort();
 
         let mut cache = PlanCache::new();
@@ -1754,13 +1909,13 @@ mod tests {
         let t = std::time::Instant::now();
         let setup = chain_setup(&SMALL, &emission, &tree.root(), tree.height(), &mut cache);
         println!("chain setup in {:?}: 2^{}/2^{}", t.elapsed(), setup.log_n, setup.hash_log_n);
-        let wrap_of = |segs: &[SegmentWitness], st: &Statement| {
+        let wrap_of = |segs: &[SegmentWitness], st: &Statement, nm: &NameWitness| {
             let shape = plan_with(&SMALL, segs.len(), &mut PlanCache::new());
-            let proof = prove_wrap(&SMALL, &shape, st, segs, 2, &|_| {}, &|| false).unwrap();
+            let proof = prove_wrap(&SMALL, &shape, st, segs, nm, 2, &|_| {}, &|| false).unwrap();
             (shape.wrap.unwrap(), proof, segs.len() - 1)
         };
-        let (w1, p1, i1) = wrap_of(&seg1, &st1);
-        let (w2, p2, i2) = wrap_of(&seg2, &st2);
+        let (w1, p1, i1) = wrap_of(&seg1, &st1, &nm1);
+        let (w2, p2, i2) = wrap_of(&seg2, &st2, &nm2);
         let witness = |height, st, wrap, proof, index, prev| ChainWitness {
             height,
             statement: st,
@@ -1819,7 +1974,7 @@ mod tests {
         let shape = plan(&SMALL, 9);
         assert_eq!(shape.children.iter().map(|c| c.segments).collect::<Vec<_>>(), vec![8, 1]);
         let t = std::time::Instant::now();
-        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("9 segments, 4 levels: {} bytes in {:?}", proof.len(), t.elapsed());
         let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
@@ -1832,9 +1987,80 @@ mod tests {
     #[ignore = "proves an aggregate; run with --release"]
     fn spanning_transaction_roundtrip() {
         let s = spanning_setup("span-roundtrip");
-        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
+    }
+
+    /// Blocks whose transactions carry name operations, applied by the name
+    /// segment: a commit, its reveal, an update; each proven and verified.
+    #[test]
+    fn name_operations_roundtrip() {
+        use crate::name_air::NameWitness;
+        use crate::names::{NameOp, NameSet, Record, commit_hash, name_hash};
+        use crate::transaction::pubkey_hash;
+        let dir = TempDir::new("names");
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        wtxn.commit().unwrap();
+        let miner = key(9).public_key();
+        let mut k1 = key(21);
+        let k2 = key(22);
+        let o1 = pubkey_hash(&k1.public_key());
+        let o2 = pubkey_hash(&k2.public_key());
+        let alice = Record::new(b"alice", o1, [Fp::new(5); DIGEST], [Fp::new(6); DIGEST]).unwrap();
+        let salt = [Fp::new(77); DIGEST];
+        let c = commit_hash(&name_hash(&alice.elements().unwrap()), &salt, &o1);
+        let v = AggregateVerifier::new(SMALL, &[(1000, 55)]);
+
+        // A block of one reward transaction carrying `ops`, applied and proven.
+        let block = |height: u32, ops: Vec<NameOp>| {
+            let tx = UnsignedTransaction::with_ops(vec![], vec![TxOutput::new(&miner, 55)], ops.clone())
+                .sign(|_, _, _| Err::<Sig, ()>(()))
+                .unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let prev_root = utxo.root(&wtxn).unwrap();
+            let first = utxo.next_position(&wtxn).unwrap();
+            let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &[tx], SMALL.segment_rows()).unwrap();
+            let nm = NameWitness::collect(&utxo, &names, &mut wtxn, height, &ops, &[]).unwrap();
+            let new_root = utxo.root(&wtxn).unwrap();
+            wtxn.commit().unwrap();
+            let body = Body {
+                inputs: vec![],
+                outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+                ops: nm.block_ops(),
+                sweeps: nm.sweeps(),
+                proof: vec![],
+            };
+            assert_eq!(body.validate(), Ok(()));
+            let statement = Statement::from_block(&BlockStatement {
+                height,
+                prev_state_root: prev_root,
+                new_state_root: new_root,
+                first_output_position: first,
+                subsidy: 55,
+                body: &body,
+            });
+            let t = std::time::Instant::now();
+            let proof = prove_block(&SMALL, &statement, &segments, &nm);
+            println!("block {height} with {} name operations: {} bytes in {:?}", ops.len(), proof.len(), t.elapsed());
+            assert_eq!(v.verify_statement(&statement, &proof), Ok(()));
+            // The operations are bound: a statement without them is refused.
+            let mut without = statement.clone();
+            without.names_state = crate::block_air::initial_names_state();
+            assert_eq!(v.verify_statement(&without, &proof), Err(AggregateError::Rejected));
+            statement
+        };
+        let st1 = block(1, vec![NameOp::Commit { commit: c, memo: [Fp::new(8); DIGEST] }]);
+        assert_eq!(st1.end_output_position, 2);
+        let st2 = block(1 + crate::names::MIN_REVEAL, vec![NameOp::Reveal { record: alice.clone(), salt, commit: 1 }]);
+        assert_eq!(st2.end_output_position, 3);
+        let alice2 = Record::new(b"alice", o2, [Fp::new(9); DIGEST], [Fp::new(10); DIGEST]).unwrap();
+        block(2 + crate::names::MIN_REVEAL, vec![NameOp::update(alice2.clone(), &mut k1).unwrap()]);
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(names.lookup(&rtxn, b"alice").unwrap(), Some(alice2));
     }
 
     #[test]
@@ -1845,13 +2071,18 @@ mod tests {
             let tr = &mut crate::block_proof::transcript();
             assert_eq!(stark::verify(&SMALL.segment, &BlockAir, &sp.public.to_values(), &sp.proof, tr), Ok(()));
         }
-        let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Statement(&s.statement));
+        let tr = &mut crate::block_proof::name_transcript();
+        assert_eq!(
+            stark::verify(&SMALL.segment, &NameAir, &s.name_proof.public.to_values(), &s.name_proof.proof, tr),
+            Ok(())
+        );
+        let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Statement(&s.statement, &s.name_proof));
         let exec = match VmAir::execute(&c.prog, &c.inputs) {
             Ok(e) => e,
             Err(ExecError::AssertionFailed(i)) => panic!("root rejected at {i}: {:?}", c.prog.instrs[i]),
             Err(e) => panic!("{e:?}"),
         };
-        assert_eq!(exec.output_digest, Some(s.statement.output(&tree_digest(&[None, None]))));
+        assert_eq!(exec.output_digest, Some(s.statement.output(&root_tree_digest(&[None, None]))));
         println!(
             "root over 2 segments of 2^{}: {} instructions, {} inputs",
             SMALL.segment_log_n,
@@ -1863,10 +2094,22 @@ mod tests {
         assert!(shape.children.iter().all(|c| c.is_segment()));
         assert_ne!(plan(&SMALL, 1).digest, shape.digest);
 
-        let rejects = |st: &Statement, proofs: &[SegmentProof]| {
-            let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st));
+        let rejects_with = |st: &Statement, proofs: &[SegmentProof], name: &NameProof| {
+            let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st, name));
             matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_)))
         };
+        let rejects = |st: &Statement, proofs: &[SegmentProof]| rejects_with(st, proofs, &s.name_proof);
+        // The name segment must continue from the segments: a different
+        // height, a count beyond the cap, a different end state.
+        let mut other = s.name_proof.clone();
+        other.public.height = 2;
+        assert!(rejects_with(&s.statement, &s.proofs, &other));
+        let mut capped = s.name_proof.clone();
+        capped.public.counts[0] = crate::names::MAX_COMMITS as u32 + 1;
+        assert!(rejects_with(&s.statement, &s.proofs, &capped));
+        let mut forged = s.name_proof.clone();
+        forged.public.root_in = s.proofs[0].public.root_in;
+        assert!(rejects_with(&s.statement, &s.proofs, &forged));
         // Unbalanced.
         let mut poor = s.statement.clone();
         poor.subsidy = 54;
@@ -1972,7 +2215,8 @@ mod tests {
             let public = SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap();
             let seg = SegmentProof { public, proof: dummy };
             let zero = Statement::zero();
-            let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero));
+            let nm = dummy_name(&params);
+            let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm));
             let mut hist = std::collections::BTreeMap::new();
             for ins in &c.prog.instrs {
                 let name = format!("{ins:?}");
@@ -2001,7 +2245,8 @@ mod tests {
                 proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
             };
             let zero = Statement::zero();
-            let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero)).prog;
+            let nm = dummy_name(&params);
+            let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm)).prog;
             let np = NodeProof {
                 record: seg.public,
                 digest: [Fp::ZERO; DIGEST],
@@ -2031,7 +2276,7 @@ mod tests {
     fn aggregate_proof_roundtrip() {
         let s = setup("roundtrip", &[30, 25], 55);
         let t = std::time::Instant::now();
-        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("aggregate of 2 segments: {} bytes in {:?}", proof.len(), t.elapsed());
         let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         let t = std::time::Instant::now();
@@ -2060,7 +2305,7 @@ mod tests {
         assert!(!shape.children[0].is_segment());
         assert!(shape.children[1].is_segment());
         let t = std::time::Instant::now();
-        let proof = prove_block(&SMALL, &s.statement, &s.segments);
+        let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("tree aggregate of 3 segments: {} bytes in {:?}", proof.len(), t.elapsed());
         let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
@@ -2097,7 +2342,11 @@ mod tests {
 
     /// Mainnet-sized output-only block of `segments` full segments under
     /// `params`: the witnesses and the statement.
-    fn full_segments(name: &str, params: &AggregatorParams, segments: usize) -> (Vec<SegmentWitness>, Statement) {
+    fn full_segments(
+        name: &str,
+        params: &AggregatorParams,
+        segments: usize,
+    ) -> (Vec<SegmentWitness>, Statement, NameWitness) {
         let miner = key(9).public_key();
         let per = params.segment_rows() / crate::block_air::tx_rows(&reward(&miner, 1));
         let txs: Vec<Transaction> = (0..segments * per).map(|i| reward(&miner, 1 + i as u64)).collect();
@@ -2111,7 +2360,12 @@ mod tests {
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         assert_eq!(w.len(), segments);
-        let body = Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
+        let body = Body {
+            inputs: vec![],
+            outputs: w.iter().flat_map(|s| s.block_outputs()).collect(),
+            proof: vec![],
+            ..Default::default()
+        };
         let statement = Statement::from_block(&BlockStatement {
             height: 1,
             prev_state_root: prev_root,
@@ -2120,7 +2374,8 @@ mod tests {
             subsidy,
             body: &body,
         });
-        (w, statement)
+        let names = NameWitness { root_in: new_root, pos_in: statement.end_output_position, height: 1, ops: vec![] };
+        (w, statement, names)
     }
 
     /// Computes mainnet's chain-proof constants ([`MAINNET_CHAIN`]) and
@@ -2164,8 +2419,12 @@ mod tests {
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
             let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows()).unwrap();
-            let body =
-                Body { inputs: vec![], outputs: w.iter().flat_map(|s| s.block_outputs()).collect(), proof: vec![] };
+            let body = Body {
+                inputs: vec![],
+                outputs: w.iter().flat_map(|s| s.block_outputs()).collect(),
+                proof: vec![],
+                ..Default::default()
+            };
             let st = Statement::from_block(&BlockStatement {
                 height,
                 prev_state_root: prev_root,
@@ -2174,10 +2433,11 @@ mod tests {
                 subsidy,
                 body: &body,
             });
-            (w, st)
+            let nm = NameWitness { root_in: st.new_state_root, pos_in: st.end_output_position, height, ops: vec![] };
+            (w, st, nm)
         };
-        let (seg1, st1) = block(1);
-        let (seg2, st2) = block(2);
+        let (seg1, st1, nm1) = block(1);
+        let (seg2, st2, nm2) = block(2);
         wtxn.abort();
         let mut cache = PlanCache::new();
         let t = std::time::Instant::now();
@@ -2190,15 +2450,15 @@ mod tests {
             setup.log_n,
             setup.hash_log_n
         );
-        let wrap_of = |segs: &[SegmentWitness], st: &Statement, cache: &mut PlanCache| {
+        let wrap_of = |segs: &[SegmentWitness], st: &Statement, nm: &NameWitness, cache: &mut PlanCache| {
             let shape = plan_with(&params, segs.len(), cache);
             let t = std::time::Instant::now();
-            let proof = prove_wrap(&params, &shape, st, segs, 2, &|_| {}, &|| false).unwrap();
+            let proof = prove_wrap(&params, &shape, st, segs, nm, 2, &|_| {}, &|| false).unwrap();
             println!("block proven to its wrap in {:?}", t.elapsed());
             (shape.wrap.unwrap(), proof)
         };
-        let (w1, p1) = wrap_of(&seg1, &st1, &mut cache);
-        let (w2, p2) = wrap_of(&seg2, &st2, &mut cache);
+        let (w1, p1) = wrap_of(&seg1, &st1, &nm1, &mut cache);
+        let (w2, p2) = wrap_of(&seg2, &st2, &nm2, &mut cache);
         let t = std::time::Instant::now();
         let base = ChainWitness {
             height: 1,
@@ -2270,11 +2530,11 @@ mod tests {
                 );
             }
             for k in [1, 16] {
-                let (segments, statement) = full_segments(name, &params, k);
+                let (segments, statement, names) = full_segments(name, &params, k);
                 let shape = plan_with(&params, k, &mut cache);
                 let t = std::time::Instant::now();
                 let times = Mutex::new(Vec::new());
-                let proof = prove_block_with(&params, &shape, &statement, &segments, 2, &|p| {
+                let proof = prove_block_with(&params, &shape, &statement, &segments, &names, 2, &|p| {
                     times.lock().unwrap().push(format!("{p:?}"));
                 });
                 let elapsed = t.elapsed();
@@ -2316,6 +2576,7 @@ mod tests {
             );
         }
         table("segment BlockAir", &BlockAir, BLOCK_PUBLIC);
+        table("name segment NameAir", &NameAir, NAME_PUBLIC);
         table("machine VmAir", &VmAir, crate::vm_air::NUM_PUBLIC);
         table("hash HashTableAir", &crate::hash_table::HashTableAir, crate::vm_air::NUM_PUBLIC);
         let m = AggregatorParams::MAINNET;
@@ -2329,8 +2590,9 @@ mod tests {
         let wrap = full.wrap.unwrap();
         let hash = crate::hash_table::HashTableAir;
         type Kind<'a> = (&'a str, StarkConfig, Vec<(&'a dyn DynAir, usize)>, usize);
-        let kinds: [Kind<'_>; 3] = [
+        let kinds: [Kind<'_>; 4] = [
             ("segment", m.segment, vec![(&BlockAir, m.segment_log_n)], BLOCK_PUBLIC),
+            ("name segment", m.segment, vec![(&NameAir, m.name_log_n)], NAME_PUBLIC),
             ("node", m.outer, vec![(&VmAir, full.log_n), (&hash, full.hash_log_n)], crate::vm_air::NUM_PUBLIC),
             ("wrap", m.wrap, vec![(&VmAir, wrap.log_n), (&hash, wrap.hash_log_n)], crate::vm_air::NUM_PUBLIC),
         ];
@@ -2356,11 +2618,13 @@ mod tests {
     fn wrap_program_accepts_and_rejects() {
         let s = setup("wrap", &[30, 25], 55);
         let shape = plan(&SMALL, 2);
-        let root = prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement), &|_| {}, &|| false).unwrap();
+        let root =
+            prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement, &s.name_proof), &|_| {}, &|| false)
+                .unwrap();
         let c = compile_wrap(&SMALL, &root, &s.statement);
         let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
         let wrap = shape.wrap.unwrap();
-        assert_eq!(wrap.tree, wrap_tree(&shape.digest, &tree_digest(&[None, None])));
+        assert_eq!(wrap.tree, wrap_tree(&shape.digest, &root_tree_digest(&[None, None])));
         assert_eq!(exec.output_digest, Some(s.statement.output(&wrap.tree)));
         assert_eq!(c.prog.digest(SMALL.wrap.log_blowup), wrap.digest);
         let rejects = |c: Compiler| matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_)));
@@ -2401,8 +2665,10 @@ mod tests {
         let s = setup("wrap-timing", &[30], 30);
         let params = AggregatorParams::MAINNET;
         let seg = prove_segment_padded(&params.segment, &s.segments[0], params.segment_log_n);
+        let name = prove_name_padded(&params.segment, &s.names, params.name_log_n);
         let shape = plan(&params, 1);
-        let root = prove_node(&params, &shape, &[seg], Output::Statement(&s.statement), &|_| {}, &|| false).unwrap();
+        let root =
+            prove_node(&params, &shape, &[seg], Output::Statement(&s.statement, &name), &|_| {}, &|| false).unwrap();
         let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
             Ok(v) => {
                 let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();

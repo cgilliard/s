@@ -21,22 +21,30 @@
 //! # Body
 //!
 //! 1. Inputs: positions in the state tree of the outputs being spent, five
-//!    bytes each (little endian, below 2^40), in transaction order and
+//!    bytes each (little endian, below 2^39), in transaction order and
 //!    without repeats.
 //! 2. Outputs: a commitment and a memo, 32 bytes each, in the order they
 //!    are appended to the state tree. The memo is opaque to consensus (its
 //!    owner's wallet uses it for recovery); the proof binds it to the
 //!    transaction that created the output.
-//! 3. The validity proof.
+//! 3. Name operations, in order (see [`crate::names::BlockNameOp`]), at
+//!    most the cap of each kind. A commit occupies the counter position
+//!    after the block's outputs, in operation order; a reveal names the
+//!    position of the commit it spends.
+//! 4. Swept commits: positions, five bytes each. The positions spent by
+//!    inputs, reveals and sweeps are all distinct; at most [`MAX_SWEEPS`]
+//!    sweeps.
+//! 5. The validity proof.
 //!
-//! Keys, amounts, signatures and transaction boundaries are not on chain;
-//! the proof attests to them and reveals nothing else about them.
+//! Keys, amounts, signatures, salts and transaction boundaries are not on
+//! chain; the proof attests to them and reveals nothing else about them.
 //!
-//! The body commitment hashes all three.
+//! The body commitment hashes all five.
 
+use crate::names::{BlockNameOp, MAX_SWEEPS, OpKind, count_ops};
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
 use crate::pow::{self, Digest, ItemSource, Nonce, PowOutput, Target, pack_bytes};
-use crate::state_tree::CAPACITY;
+use crate::state_tree::OUTPUT_CAPACITY;
 use crate::transaction::{Commitment, Memo, hash_domain};
 
 pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32;
@@ -152,6 +160,14 @@ pub enum BodyError {
     DuplicateInput(u64),
     /// An input position is not below the tree capacity.
     InputOutOfRange(u64),
+    /// More operations of a kind than its cap.
+    TooMany(OpKind),
+    /// A reveal or update with a malformed name.
+    BadName,
+    /// A position spent by a reveal or a sweep is repeated or also spent.
+    DuplicateSpend(u64),
+    /// A position spent by a reveal or a sweep is not below the tree capacity.
+    SpendOutOfRange(u64),
     Malformed,
 }
 
@@ -160,6 +176,10 @@ impl core::fmt::Display for BodyError {
         match self {
             BodyError::DuplicateInput(p) => write!(f, "input position {p} appears twice"),
             BodyError::InputOutOfRange(p) => write!(f, "input position {p} exceeds the state tree"),
+            BodyError::TooMany(k) => write!(f, "more than {} {} operations", k.cap(), k.name()),
+            BodyError::BadName => f.write_str("a name operation has a malformed name"),
+            BodyError::DuplicateSpend(p) => write!(f, "position {p} is spent twice"),
+            BodyError::SpendOutOfRange(p) => write!(f, "spent position {p} exceeds the state tree"),
             BodyError::Malformed => f.write_str("malformed block body"),
         }
     }
@@ -173,23 +193,74 @@ pub struct Body {
     pub inputs: Vec<u64>,
     /// The new outputs, in tree order.
     pub outputs: Vec<BlockOutput>,
+    /// Name operations, in order.
+    pub ops: Vec<BlockNameOp>,
+    /// Positions of the commits swept, in order.
+    pub sweeps: Vec<u64>,
     /// Validity proof.
     pub proof: Vec<u8>,
 }
 
 impl Body {
-    /// Checks that inputs are in range and distinct.
+    /// Checks that inputs and sweeps are in range and distinct, names well
+    /// formed and operation counts within the caps.
     pub fn validate(&self) -> Result<(), BodyError> {
-        let mut seen = std::collections::HashSet::with_capacity(self.inputs.len());
+        let mut seen = std::collections::HashSet::with_capacity(self.inputs.len() + self.sweeps.len());
         for &p in &self.inputs {
-            if p >= CAPACITY {
+            if p >= OUTPUT_CAPACITY {
                 return Err(BodyError::InputOutOfRange(p));
             }
             if !seen.insert(p) {
                 return Err(BodyError::DuplicateInput(p));
             }
         }
+        for p in self.ops.iter().filter_map(BlockNameOp::spends).chain(self.sweeps.iter().copied()) {
+            if p >= OUTPUT_CAPACITY {
+                return Err(BodyError::SpendOutOfRange(p));
+            }
+            if !seen.insert(p) {
+                return Err(BodyError::DuplicateSpend(p));
+            }
+        }
+        let kinds = self.ops.iter().map(BlockNameOp::kind).chain(self.sweeps.iter().map(|_| OpKind::Sweep));
+        count_ops(kinds).map_err(BodyError::TooMany)?;
+        if !self.ops.iter().all(BlockNameOp::is_well_formed) {
+            return Err(BodyError::BadName);
+        }
         Ok(())
+    }
+
+    /// The digests of the name operations, in order. Panics on a malformed
+    /// name; [`validate`](Body::validate) first.
+    pub fn op_digests(&self) -> Vec<Digest> {
+        self.ops.iter().map(|op| op.digest().expect("validated body")).collect()
+    }
+
+    /// The counter positions the commits take: after the outputs, in order.
+    pub fn commit_positions(&self, first_output: u64) -> Vec<u64> {
+        let first = first_output + self.outputs.len() as u64;
+        (0..self.commits() as u64).map(|i| first + i).collect()
+    }
+
+    /// How many commits the block makes.
+    pub fn commits(&self) -> usize {
+        self.ops.iter().filter(|op| op.kind() == OpKind::Commit).count()
+    }
+
+    /// Every position the block spends: inputs, then the commits its
+    /// reveals and sweeps consume.
+    pub fn spent_positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.inputs
+            .iter()
+            .copied()
+            .chain(self.ops.iter().filter_map(BlockNameOp::spends))
+            .chain(self.sweeps.iter().copied())
+    }
+
+    /// Serialized size of the name section's items (operations and swept
+    /// positions), without the counts.
+    pub fn names_size(&self) -> usize {
+        self.ops.iter().map(BlockNameOp::size).sum::<usize>() + self.sweeps.len() * POSITION_SIZE
     }
 
     /// Hash of the proof bytes, length bound.
@@ -200,31 +271,46 @@ impl Body {
         hash_domain(DOM_PROOF, &v)
     }
 
-    /// Commitment to inputs, outputs and proof.
+    /// Commitment to inputs, outputs, name operations (by digest, plus the
+    /// positions reveals spend), sweeps and proof.
     pub fn commitment(&self) -> Digest {
-        let mut v = Vec::with_capacity(2 + 2 * self.inputs.len() + 2 * DIGEST * self.outputs.len() + DIGEST);
-        v.push(Fp::from_u64(self.inputs.len() as u64));
-        for &p in &self.inputs {
-            v.push(Fp::new((p & MASK30) as u32));
-            v.push(Fp::new((p >> 30) as u32));
-        }
+        let positions = |v: &mut Vec<Fp>, ps: &[u64]| {
+            v.push(Fp::from_u64(ps.len() as u64));
+            for &p in ps {
+                v.push(Fp::new((p & MASK30) as u32));
+                v.push(Fp::new((p >> 30) as u32));
+            }
+        };
+        let mut v = Vec::with_capacity(
+            4 + 2 * (self.inputs.len() + self.sweeps.len()) + DIGEST * (2 * self.outputs.len() + self.ops.len() + 1),
+        );
+        positions(&mut v, &self.inputs);
         v.push(Fp::from_u64(self.outputs.len() as u64));
         for o in &self.outputs {
             v.extend_from_slice(&o.commitment);
             v.extend_from_slice(&o.memo);
         }
+        v.push(Fp::from_u64(self.ops.len() as u64));
+        for op in &self.ops {
+            v.extend_from_slice(&op.digest().unwrap_or([Fp::ZERO; DIGEST]));
+        }
+        // The digests leave out the positions reveals spend.
+        let spends: Vec<u64> = self.ops.iter().filter_map(BlockNameOp::spends).collect();
+        positions(&mut v, &spends);
+        positions(&mut v, &self.sweeps);
         v.extend_from_slice(&self.proof_hash());
         hash_domain(DOM_BODY, &v)
     }
 
     pub fn size(&self) -> usize {
-        Self::size_of(self.inputs.len(), self.outputs.len(), self.proof.len())
+        Self::size_of(self.inputs.len(), self.outputs.len(), self.names_size(), self.proof.len())
     }
 
-    /// The serialized size of a body with these counts and a proof of
+    /// The serialized size of a body with these counts, a name section of
+    /// `names` bytes ([`names_size`](Body::names_size)) and a proof of
     /// `proof` bytes: what a block builder checks against the size limit.
-    pub fn size_of(inputs: usize, outputs: usize, proof: usize) -> usize {
-        12 + inputs * POSITION_SIZE + outputs * BLOCK_OUTPUT_SIZE + proof
+    pub fn size_of(inputs: usize, outputs: usize, names: usize, proof: usize) -> usize {
+        20 + inputs * POSITION_SIZE + outputs * BLOCK_OUTPUT_SIZE + names + proof
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -237,6 +323,14 @@ impl Body {
         for o in &self.outputs {
             out.extend_from_slice(&digest_to_bytes(&o.commitment));
             out.extend_from_slice(&digest_to_bytes(&o.memo));
+        }
+        out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        for op in &self.ops {
+            out.extend_from_slice(&op.to_bytes());
+        }
+        out.extend_from_slice(&(self.sweeps.len() as u32).to_le_bytes());
+        for &p in &self.sweeps {
+            out.extend_from_slice(&p.to_le_bytes()[..POSITION_SIZE]);
         }
         out.extend_from_slice(&(self.proof.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.proof);
@@ -254,14 +348,7 @@ impl Body {
 
     fn parse(bytes: &[u8]) -> Result<(Body, &[u8]), BodyError> {
         let mut r = Reader(bytes);
-        let n_in = r.u32().ok_or(BodyError::Malformed)? as usize;
-        let mut inputs = Vec::with_capacity(n_in.min(bytes.len() / POSITION_SIZE));
-        for _ in 0..n_in {
-            let b = r.take(POSITION_SIZE).ok_or(BodyError::Malformed)?;
-            let mut buf = [0u8; 8];
-            buf[..POSITION_SIZE].copy_from_slice(b);
-            inputs.push(u64::from_le_bytes(buf));
-        }
+        let inputs = r.positions().ok_or(BodyError::Malformed)?;
         let n_out = r.u32().ok_or(BodyError::Malformed)? as usize;
         let mut outputs = Vec::with_capacity(n_out.min(bytes.len() / BLOCK_OUTPUT_SIZE));
         for _ in 0..n_out {
@@ -272,9 +359,17 @@ impl Body {
                 memo: digest_from_bytes(m).ok_or(BodyError::Malformed)?,
             });
         }
+        let n_ops = r.u32().ok_or(BodyError::Malformed)? as usize;
+        let mut ops = Vec::with_capacity(n_ops.min(MAX_SWEEPS * 2));
+        for _ in 0..n_ops {
+            let (op, rest) = BlockNameOp::parse(r.0).ok_or(BodyError::Malformed)?;
+            ops.push(op);
+            r.0 = rest;
+        }
+        let sweeps = r.positions().ok_or(BodyError::Malformed)?;
         let n_proof = r.u32().ok_or(BodyError::Malformed)? as usize;
         let proof = r.take(n_proof).ok_or(BodyError::Malformed)?.to_vec();
-        let body = Body { inputs, outputs, proof };
+        let body = Body { inputs, outputs, ops, sweeps, proof };
         body.validate()?;
         Ok((body, r.0))
     }
@@ -333,6 +428,18 @@ impl<'a> Reader<'a> {
 
     fn digest(&mut self) -> Option<Digest> {
         digest_from_bytes(self.take(32)?)
+    }
+
+    /// A count and that many five-byte positions.
+    fn positions(&mut self) -> Option<Vec<u64>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(self.0.len() / POSITION_SIZE));
+        for _ in 0..n {
+            let mut buf = [0u8; 8];
+            buf[..POSITION_SIZE].copy_from_slice(self.take(POSITION_SIZE)?);
+            out.push(u64::from_le_bytes(buf));
+        }
+        Some(out)
     }
 }
 
@@ -399,20 +506,38 @@ mod tests {
         }
     }
 
+    fn record(name: &str, n: u32) -> crate::names::Record {
+        crate::names::Record::new(name.as_bytes(), d(n), d(n + 1), d(n + 2)).unwrap()
+    }
+
+    fn ops() -> Vec<BlockNameOp> {
+        vec![
+            BlockNameOp::Commit { commit: d(10), memo: d(11) },
+            BlockNameOp::Reveal { record: record("alice", 20), commit: 12 },
+            BlockNameOp::Update(record("bob_99", 30)),
+            BlockNameOp::Commit { commit: d(12), memo: d(13) },
+        ]
+    }
+
     #[test]
     fn body_canonical_form() {
         let outs = outputs();
-        let ok = Body { inputs: vec![5, 1, 0, CAPACITY - 1], outputs: outs.clone(), proof: vec![1, 2, 3] };
+        let ok = Body {
+            inputs: vec![5, 1, 0, OUTPUT_CAPACITY - 1],
+            outputs: outs.clone(),
+            proof: vec![1, 2, 3],
+            ..Default::default()
+        };
         assert_eq!(ok.validate(), Ok(()));
         let dup = Body { inputs: vec![1, 7, 1], ..ok.clone() };
         assert_eq!(dup.validate(), Err(BodyError::DuplicateInput(1)));
-        let big = Body { inputs: vec![CAPACITY], ..ok.clone() };
-        assert_eq!(big.validate(), Err(BodyError::InputOutOfRange(CAPACITY)));
+        let big = Body { inputs: vec![OUTPUT_CAPACITY], ..ok.clone() };
+        assert_eq!(big.validate(), Err(BodyError::InputOutOfRange(OUTPUT_CAPACITY)));
         assert_eq!(Body::default().validate(), Ok(()));
 
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
-        assert_eq!(bytes.len(), 12 + 4 * 5 + 2 * 64 + 3);
+        assert_eq!(bytes.len(), 20 + 4 * 5 + 2 * 64 + 3);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
         assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(BodyError::DuplicateInput(1)));
         assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
@@ -420,14 +545,100 @@ mod tests {
         extra.push(0);
         assert_eq!(Body::from_bytes(&extra), Err(BodyError::Malformed));
         // Five-byte positions survive the top bits.
-        let top = Body { inputs: vec![CAPACITY - 1], outputs: vec![], proof: vec![] };
-        assert_eq!(Body::from_bytes(&top.to_bytes()).unwrap().inputs, vec![CAPACITY - 1]);
+        let top = Body { inputs: vec![OUTPUT_CAPACITY - 1], sweeps: vec![OUTPUT_CAPACITY - 2], ..Default::default() };
+        let back = Body::from_bytes(&top.to_bytes()).unwrap();
+        assert_eq!((back.inputs, back.sweeps), (vec![OUTPUT_CAPACITY - 1], vec![OUTPUT_CAPACITY - 2]));
+    }
+
+    #[test]
+    fn name_section() {
+        let ok = Body { inputs: vec![3], outputs: outputs(), ops: ops(), sweeps: vec![7, 8], proof: vec![1] };
+        assert_eq!(ok.validate(), Ok(()));
+        let bytes = ok.to_bytes();
+        assert_eq!(bytes.len(), ok.size());
+        assert_eq!(ok.names_size(), 2 * 65 + (98 + 5 + 5) + (98 + 6) + 2 * 5);
+        assert_eq!(bytes.len(), 20 + 5 + 2 * 64 + ok.names_size() + 1);
+        assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
+        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
+        assert_eq!(ok.op_digests().len(), 4);
+        assert_eq!(ok.op_digests(), ops().iter().map(|o| o.digest().unwrap()).collect::<Vec<_>>());
+        // Commits take the positions after the outputs, in order.
+        assert_eq!(ok.commit_positions(100), vec![102, 103]);
+        assert_eq!(Body::default().commit_positions(5), Vec::<u64>::new());
+
+        // The commitment covers every part of the section.
+        let c = ok.commitment();
+        let mut b = ok.clone();
+        b.ops.swap(0, 3);
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.ops[1] = BlockNameOp::Update(record("alice", 20));
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        if let BlockNameOp::Reveal { commit, .. } = &mut b.ops[1] {
+            *commit = 9;
+        }
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.ops.pop();
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.sweeps[0] = 9;
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.sweeps.pop();
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        if let BlockNameOp::Reveal { record, .. } = &mut b.ops[1] {
+            record.memo = d(0);
+        }
+        assert_ne!(b.commitment(), c);
+
+        // Validation: sweeps distinct and apart from inputs, in range; caps; names.
+        let bad = Body { sweeps: vec![1, 1], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(1)));
+        let bad = Body { inputs: vec![4], sweeps: vec![4], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(4)));
+        let bad = Body { ops: ops(), sweeps: vec![12], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(12)));
+        let bad = Body { sweeps: vec![OUTPUT_CAPACITY], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::SpendOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(ok.spent_positions().collect::<Vec<_>>(), vec![3, 12, 7, 8]);
+        let bad = Body { sweeps: (0..MAX_SWEEPS as u64 + 1).collect(), ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Sweep)));
+        assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(BodyError::TooMany(OpKind::Sweep)));
+        let full = Body { sweeps: (0..MAX_SWEEPS as u64).collect(), ..Default::default() };
+        assert_eq!(full.validate(), Ok(()));
+        let reveal = |i: u64| BlockNameOp::Reveal { record: record("a", 1), commit: 100 + i };
+        let bad = Body { ops: (0..crate::names::MAX_REVEALS as u64 + 1).map(reveal).collect(), ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Reveal)));
+        let bad = Body {
+            ops: vec![BlockNameOp::Update(record("a", 1)); crate::names::MAX_UPDATES + 1],
+            ..Default::default()
+        };
+        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Update)));
+        let bad = Body { ops: vec![ops()[0].clone(); crate::names::MAX_COMMITS + 1], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Commit)));
+        let at_caps = Body {
+            ops: [
+                (0..crate::names::MAX_REVEALS as u64).map(reveal).collect(),
+                vec![BlockNameOp::Update(record("a", 1)); crate::names::MAX_UPDATES],
+                vec![ops()[0].clone(); crate::names::MAX_COMMITS],
+            ]
+            .concat(),
+            ..Default::default()
+        };
+        assert_eq!(at_caps.validate(), Ok(()));
+        let malformed = crate::names::Record { name: b"A".to_vec(), owner: d(1), value: d(2), memo: d(3) };
+        let bad = Body { ops: vec![BlockNameOp::Reveal { record: malformed, commit: 0 }], ..Default::default() };
+        assert_eq!(bad.validate(), Err(BodyError::BadName));
+        assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(BodyError::Malformed));
     }
 
     #[test]
     fn body_commitment_covers_everything() {
         let outs = outputs();
-        let base = Body { inputs: vec![3, 9], outputs: outs.clone(), proof: vec![7; 100] };
+        let base = Body { inputs: vec![3, 9], outputs: outs.clone(), proof: vec![7; 100], ..Default::default() };
         let c = base.commitment();
         assert_eq!(c, base.clone().commitment());
         let mut b = base.clone();
@@ -453,7 +664,7 @@ mod tests {
 
     #[test]
     fn block_roundtrip() {
-        let body = Body { inputs: vec![1, 2], outputs: outputs(), proof: vec![0xab; 10] };
+        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 10] };
         let mut h = header();
         h.body_commitment = body.commitment();
         let block = Block { header: h, body };

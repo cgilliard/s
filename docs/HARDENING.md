@@ -191,8 +191,8 @@ history and the README; this file holds what is left.
 
 ## Deployment and operations
 
-- **Seeds** run an old binary. They need the current one (protocol v4,
-  wallet format 4, chain format 9, new `MAINNET_CHAIN`) and wiped data
+- **Seeds** run an old binary. They need the current one (protocol v5,
+  wallet format 5, chain format 11, new genesis id, new `MAINNET_CHAIN`) and wiped data
   directories. Fresh nodes cannot sync until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
   expected network rate (README, Genesis).

@@ -55,6 +55,8 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use crate::aggregate::AggregatorParams;
 use crate::block::{Block, BlockOutput, Body, BodyError, HEADER_SIZE, Header};
 use crate::difficulty::{Asert, U256};
+use crate::name_trie::Key;
+use crate::names::{ApplyError, Commit, NAME_PART_RECORDS, NameSet, NameUndo, Record, commit_leaf, name_part_hash};
 use crate::poseidon2::digest_from_bytes;
 use crate::pow::{Digest, PowParams, SeedText, Target};
 use crate::state_tree::{EMPTY, empty_root, open_env};
@@ -154,7 +156,7 @@ impl ChainParams {
     /// checked on genesis). Every node of a network must start from the
     /// same one.
     pub fn genesis(&self) -> Block {
-        let body = Body { inputs: vec![], outputs: vec![], proof: vec![] };
+        let body = Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() };
         let header = Header {
             prev_hash: EMPTY,
             height: 0,
@@ -210,6 +212,8 @@ pub enum ChainError {
     Heed(heed::Error),
     Utxo(utxo::Error),
     Body(BodyError),
+    /// A name operation or sweep cannot be applied.
+    Name(ApplyError),
     NoGenesis,
     AlreadyInitialized,
     /// The stored genesis is not the one the parameters name.
@@ -273,6 +277,7 @@ impl ChainError {
             self,
             ChainError::Heed(_)
                 | ChainError::Utxo(_)
+                | ChainError::Name(ApplyError::Utxo(_) | ApplyError::Names(_))
                 | ChainError::NoGenesis
                 | ChainError::AlreadyInitialized
                 | ChainError::WrongGenesis
@@ -296,6 +301,7 @@ impl core::fmt::Display for ChainError {
             ChainError::Heed(e) => write!(f, "lmdb error: {e}"),
             ChainError::Utxo(e) => write!(f, "{e}"),
             ChainError::Body(e) => write!(f, "{e}"),
+            ChainError::Name(e) => write!(f, "name operation: {e}"),
             ChainError::NoGenesis => f.write_str("chain has no genesis block"),
             ChainError::AlreadyInitialized => f.write_str("chain already has a genesis block"),
             ChainError::WrongGenesis => f.write_str("stored genesis differs from the network's"),
@@ -386,8 +392,10 @@ const META_FORMAT: &str = "format";
 /// Version of the on-disk layout: 8 keeps unspent outputs in packed
 /// buckets with no index by commitment, and the state tree from subtrees
 /// of 256 positions up; 9 keeps the outputs spent within the undo window
-/// once, by position, for reorganizations and snapshots alike.
-const FORMAT: u8 = 9;
+/// once, by position, for reorganizations and snapshots alike; 10 stores
+/// block bodies with a name section; 11 keeps the name registry, name undo
+/// records and snapshot manifests with the name half.
+const FORMAT: u8 = 11;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -416,21 +424,25 @@ pub struct Entry {
 struct Undo {
     first_output_position: u64,
     outputs: u32,
+    /// What its name section did.
+    names: NameUndo,
 }
 
 impl Undo {
-    fn to_bytes(&self) -> [u8; 12] {
-        let mut out = [0u8; 12];
-        out[..8].copy_from_slice(&self.first_output_position.to_le_bytes());
-        out[8..].copy_from_slice(&self.outputs.to_le_bytes());
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12);
+        out.extend_from_slice(&self.first_output_position.to_le_bytes());
+        out.extend_from_slice(&self.outputs.to_le_bytes());
+        out.extend_from_slice(&self.names.to_bytes());
         out
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Undo> {
-        let bytes: &[u8; 12] = bytes.try_into().ok()?;
+        let (head, rest) = bytes.split_at_checked(12)?;
         Some(Undo {
-            first_output_position: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            outputs: u32::from_le_bytes(bytes[8..].try_into().unwrap()),
+            first_output_position: u64::from_le_bytes(head[..8].try_into().unwrap()),
+            outputs: u32::from_le_bytes(head[8..].try_into().unwrap()),
+            names: NameUndo::from_bytes(rest)?,
         })
     }
 }
@@ -455,6 +467,88 @@ fn read_spent_entry(value: &[u8]) -> Option<(u32, Commitment, Memo)> {
     Some((height, digest_from_bytes(&value[4..36])?, digest_from_bytes(&value[36..])?))
 }
 
+/// A snapshot manifest: the state after a block, as fast sync transfers it
+/// in parts. The output half comes in parts of `2^SNAPSHOT_PART_LOG`
+/// positions with the root of each; the name half in parts of up to
+/// [`NAME_PART_RECORDS`] records in key order, each with the key its range
+/// starts at (the next part's starts its end) and a hash of its records;
+/// the trie's root checks them all at the end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifest {
+    /// The output counter after the block.
+    pub next: u64,
+    /// Root of every output part's subtree.
+    pub roots: Vec<Digest>,
+    /// The name trie's root: the tree's right half.
+    pub name_root: Digest,
+    pub names: Vec<NamePart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamePart {
+    pub first: Key,
+    pub hash: Digest,
+}
+
+impl Manifest {
+    /// Parts in all: output parts, then name parts, indexed together.
+    pub fn parts(&self) -> usize {
+        self.roots.len() + self.names.len()
+    }
+
+    /// The state root the manifest composes to.
+    pub fn state_root(&self) -> Digest {
+        crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &self.roots, &self.name_root)
+    }
+
+    /// The key range of name part `part`.
+    pub fn name_range(&self, part: usize) -> Option<(Key, Key)> {
+        let lo = self.names.get(part)?.first;
+        let hi = self.names.get(part + 1).map_or(Key::MAX, |n| n.first);
+        Some((lo, hi))
+    }
+
+    fn to_bytes(&self, id: &Digest) -> Vec<u8> {
+        let mut value = Vec::with_capacity(80 + 32 * self.roots.len() + 47 * self.names.len());
+        value.extend_from_slice(&digest_bytes(id));
+        value.extend_from_slice(&self.next.to_le_bytes());
+        value.extend_from_slice(&(self.roots.len() as u32).to_le_bytes());
+        for r in &self.roots {
+            value.extend_from_slice(&digest_bytes(r));
+        }
+        value.extend_from_slice(&digest_bytes(&self.name_root));
+        value.extend_from_slice(&(self.names.len() as u32).to_le_bytes());
+        for n in &self.names {
+            value.extend_from_slice(&n.first.to_be_bytes()[1..]);
+            value.extend_from_slice(&digest_bytes(&n.hash));
+        }
+        value
+    }
+
+    /// Parses a stored manifest, checking it is `id`'s.
+    fn from_bytes(id: &Digest, value: &[u8]) -> Option<Manifest> {
+        let mut r = crate::codec::Reader(value);
+        if r.digest()? != *id {
+            return None;
+        }
+        let next = r.u64()?;
+        let roots = r.digest_vec()?;
+        let name_root = r.digest()?;
+        let n = r.u32()? as usize;
+        let mut names = Vec::with_capacity(n.min(value.len() / 47));
+        for _ in 0..n {
+            let mut k = [0u8; 16];
+            k[1..].copy_from_slice(r.take(15)?);
+            names.push(NamePart { first: Key::from_be_bytes(k), hash: r.digest()? });
+        }
+        r.is_empty().then_some(Manifest { next, roots, name_root, names })
+    }
+}
+
+/// The commits among an output part's outputs: position, commit hash and
+/// height, which the output's commitment must be the leaf of.
+pub type PartCommits = Vec<(u64, Digest, u32)>;
+
 /// A staged snapshot part to carry forward: see
 /// [`Chain::carry_snapshot_parts`].
 #[derive(Clone, Debug)]
@@ -473,6 +567,8 @@ pub struct Chain<V: ProofVerifier> {
     seed: SeedText,
     verifier: V,
     utxo: UtxoSet,
+    /// The name registry: the tree's right half and the commit tables.
+    names: NameSet,
     headers: Database<Bytes, Bytes>,
     bodies: Database<Bytes, Bytes>,
     /// Block id to its work (32 bytes, little endian) and status byte.
@@ -526,6 +622,7 @@ impl<V: ProofVerifier> Chain<V> {
         })?;
         let mut wtxn = env.write_txn()?;
         let utxo = UtxoSet::open(&env, &mut wtxn, "utxo")?;
+        let names = NameSet::open(&env, &mut wtxn, "names").map_err(|e| ChainError::Name(ApplyError::Names(e)))?;
         let headers = env.create_database(&mut wtxn, Some("headers"))?;
         let bodies = env.create_database(&mut wtxn, Some("bodies"))?;
         let index = env.create_database(&mut wtxn, Some("index"))?;
@@ -547,6 +644,7 @@ impl<V: ProofVerifier> Chain<V> {
             seed,
             verifier,
             utxo,
+            names,
             headers,
             bodies,
             index,
@@ -614,6 +712,10 @@ impl<V: ProofVerifier> Chain<V> {
 
     pub fn utxo(&self) -> &UtxoSet {
         &self.utxo
+    }
+
+    pub fn names(&self) -> &NameSet {
+        &self.names
     }
 
     pub fn env(&self) -> &Env {
@@ -823,7 +925,7 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::UnknownInput(block.body.inputs[0]));
         }
         self.check_body(&block.header, &block.body)?;
-        let (root, _) = self.apply_body(&mut wtxn, &block.body)?;
+        let (root, _, names) = self.apply_body(&mut wtxn, &block.body, 0)?;
         if root != block.header.state_root {
             return Err(ChainError::StateRootMismatch { expected: root, got: block.header.state_root });
         }
@@ -831,7 +933,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.headers.put(&mut wtxn, &id, &block.header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
         self.put_index(&mut wtxn, &id, U256::ZERO, STATUS_VALID)?;
-        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, outputs: 0 }.to_bytes())?;
+        self.undo.put(&mut wtxn, &id, &Undo { first_output_position: 0, outputs: 0, names }.to_bytes())?;
         self.by_height.put(&mut wtxn, &0, &id)?;
         self.meta.put(&mut wtxn, META_TIP, &id)?;
         wtxn.commit()?;
@@ -863,12 +965,20 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(())
     }
 
-    /// Spends the inputs and appends the outputs; returns the new root and
-    /// the commitments the inputs held.
-    fn apply_body(&self, wtxn: &mut RwTxn, body: &Body) -> Result<(Digest, Vec<(Commitment, Memo)>)> {
+    /// Spends the inputs, appends the outputs and applies the name section
+    /// of a block at `height`; returns the new root, the commitments the
+    /// inputs held and what undoing the name section needs.
+    #[allow(clippy::type_complexity)]
+    fn apply_body(
+        &self,
+        wtxn: &mut RwTxn,
+        body: &Body,
+        height: u32,
+    ) -> Result<(Digest, Vec<(Commitment, Memo)>, NameUndo)> {
         let spent = self.utxo.spend_positions(wtxn, &body.inputs)?.map_err(ChainError::UnknownInput)?;
         self.utxo.add_outputs(wtxn, &body.outputs)?;
-        Ok((self.utxo.root(wtxn)?, spent))
+        let names = self.names.apply(&self.utxo, wtxn, height, &body.ops, &body.sweeps).map_err(ChainError::Name)?;
+        Ok((self.utxo.root(wtxn)?, spent, names))
     }
 
     /// Uses the full proof-of-work dataset for header checks from now on.
@@ -1032,7 +1142,7 @@ impl<V: ProofVerifier> Chain<V> {
         let id = digest_bytes(&header.hash());
         let prev_state_root = self.utxo.root(wtxn)?;
         let first_output_position = self.utxo.next_position(wtxn)?;
-        let (new_root, spent) = self.apply_body(wtxn, body)?;
+        let (new_root, spent, names) = self.apply_body(wtxn, body, header.height)?;
         if new_root != header.state_root {
             return Err(ChainError::StateRootMismatch { expected: new_root, got: header.state_root });
         }
@@ -1052,8 +1162,12 @@ impl<V: ProofVerifier> Chain<V> {
         for (p, (c, m)) in body.inputs.iter().zip(spent) {
             self.spent.put(wtxn, p, &spent_entry(header.height, &c, &m))?;
         }
+        // The commits reveals and sweeps consumed were outputs too.
+        for (p, c, m) in &names.consumed {
+            self.spent.put(wtxn, p, &spent_entry(header.height, &commit_leaf(&c.hash, c.height), m))?;
+        }
         let outputs = body.outputs.len() as u32;
-        self.undo.put(wtxn, &id, &Undo { first_output_position, outputs }.to_bytes())?;
+        self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, names }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
         if header.height.is_multiple_of(self.params.snapshot_interval) {
@@ -1113,10 +1227,17 @@ impl<V: ProofVerifier> Chain<V> {
                 _ => return Err(ChainError::Corrupt("spent log")),
             }
         }
-        let commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
+        // The block's outputs, then the commits it made, leave the set.
+        let mut commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
+        commitments.extend(undo.names.commits.iter().map(|c| commit_leaf(&c.hash, c.height)));
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
         self.utxo.restore(wtxn, &spent)?;
         for (p, _, _) in &spent {
+            self.spent.delete(wtxn, p)?;
+        }
+        let first_commit = undo.first_output_position + undo.outputs as u64;
+        self.names.undo(&self.utxo, wtxn, &undo.names, first_commit).map_err(ChainError::Name)?;
+        for (p, _, _) in &undo.names.consumed {
             self.spent.delete(wtxn, p)?;
         }
         self.snapshots.delete(wtxn, &height)?;
@@ -1392,7 +1513,8 @@ impl<V: ProofVerifier> Chain<V> {
             .header_by_hash_in(&rtxn, &digest_bytes(&block.header.prev_hash))?
             .ok_or(ChainError::UnknownParent(block.header.prev_hash))?;
         self.check_body(&block.header, &block.body)?;
-        let first = next_position.checked_sub(block.body.outputs.len() as u64).ok_or(ChainError::BadSnapshot)?;
+        let made = block.body.outputs.len() as u64 + block.body.commits() as u64;
+        let first = next_position.checked_sub(made).ok_or(ChainError::BadSnapshot)?;
         let statement = BlockStatement {
             height: block.header.height,
             prev_state_root: parent.state_root,
@@ -1408,14 +1530,17 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Installs a verified snapshot: the unspent outputs after `block`
-    /// (stored as a header, verified with [`Chain::verify_snapshot_block`])
-    /// and the output counter. The chain must hold genesis alone. Every
-    /// ancestor becomes part of the main chain without its body; `block`
-    /// is the new tip and the floor below which nothing reorganizes.
+    /// (stored as a header, verified with [`Chain::verify_snapshot_block`]),
+    /// the commits among them, the name records (in key order) and the
+    /// output counter. The chain must hold genesis alone. Every ancestor
+    /// becomes part of the main chain without its body; `block` is the
+    /// new tip and the floor below which nothing reorganizes.
     pub fn install_snapshot(
         &self,
         block: &Block,
         outputs: &[(u64, Commitment, Memo)],
+        commits: &[(u64, Digest, u32)],
+        records: &[Record],
         next_position: u64,
     ) -> Result<()> {
         if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next_position) {
@@ -1428,10 +1553,19 @@ impl<V: ProofVerifier> Chain<V> {
             let mut rest = outputs;
             for p in 0..parts {
                 let n = rest.iter().take_while(|o| o.0 >> SNAPSHOT_PART_LOG == p).count();
-                roots.push(self.stage_snapshot_part(p, &rest[..n], next_position, None)?);
+                let in_part: PartCommits = commits.iter().copied().filter(|c| c.0 >> SNAPSHOT_PART_LOG == p).collect();
+                roots.push(self.stage_snapshot_part(p, &rest[..n], &in_part, next_position, None)?);
                 rest = &rest[n..];
             }
-            self.finish_snapshot(block, &roots, next_position)
+            let mut names = Vec::new();
+            for chunk in records.chunks(NAME_PART_RECORDS) {
+                let hash = self.stage_name_part(chunk, None)?;
+                names.push(NamePart { first: chunk[0].key().ok_or(ChainError::BadSnapshot)?, hash });
+            }
+            let rtxn = self.env.read_txn()?;
+            let name_root = self.names.root(&rtxn).map_err(|e| ChainError::Name(e.into()))?;
+            drop(rtxn);
+            self.finish_snapshot(block, &Manifest { next: next_position, roots, name_root, names })
         })();
         if result.is_err() {
             self.abort_snapshot()?;
@@ -1451,6 +1585,7 @@ impl<V: ProofVerifier> Chain<V> {
         let size =
             |s: heed::DatabaseStat| (s.branch_pages + s.leaf_pages + s.overflow_pages) as u64 * s.page_size as u64;
         let mut rows = self.utxo.storage(&rtxn)?;
+        rows.extend(self.names.storage(&rtxn).map_err(|e| ChainError::Name(e.into()))?);
         for (name, stat) in [
             ("headers", self.headers.stat(&rtxn)?),
             ("block index", self.index.stat(&rtxn)?),
@@ -1480,20 +1615,23 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::AlreadyInitialized);
         }
         self.utxo.clear(&mut wtxn)?;
+        self.names.clear(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
         self.meta.put(&mut wtxn, META_STAGING, &[1])?;
         wtxn.commit()?;
         Ok(())
     }
 
     /// Stores snapshot part `part`: its unspent outputs, ascending, all in
-    /// the part and below `next_position`. Returns the part's root; with
-    /// `expected` (the manifest's), a part with another root is refused
-    /// and nothing stored. Each part is its own transaction, so memory
-    /// stays bounded by one part.
+    /// the part and below `next_position`, and which of them are commits
+    /// (checked: the output's commitment must be the commit's leaf).
+    /// Returns the part's root; with `expected` (the manifest's), a part
+    /// with another root is refused and nothing stored. Each part is its
+    /// own transaction, so memory stays bounded by one part.
     pub fn stage_snapshot_part(
         &self,
         part: u64,
         outputs: &[(u64, Commitment, Memo)],
+        commits: &[(u64, Digest, u32)],
         next_position: u64,
         expected: Option<&Digest>,
     ) -> Result<Digest> {
@@ -1508,8 +1646,47 @@ impl<V: ProofVerifier> Chain<V> {
         if expected.is_some_and(|e| *e != root) {
             return Err(ChainError::BadSnapshot);
         }
+        for &(p, hash, height) in commits {
+            let i = outputs.binary_search_by_key(&p, |o| o.0).map_err(|_| ChainError::BadSnapshot)?;
+            if outputs[i].1 != commit_leaf(&hash, height) {
+                return Err(ChainError::BadSnapshot);
+            }
+            self.names.add_commit(&mut wtxn, p, Commit { hash, height }).map_err(|e| ChainError::Name(e.into()))?;
+        }
         wtxn.commit()?;
         Ok(root)
+    }
+
+    /// Stores a snapshot's name part: records in key order, registered in
+    /// the trie being rebuilt. Returns the part's hash; with `expected`
+    /// (the manifest's), a part with another hash is refused and nothing
+    /// stored. The trie's root is checked when the snapshot finishes.
+    pub fn stage_name_part(&self, records: &[Record], expected: Option<&Digest>) -> Result<Digest> {
+        let hash = name_part_hash(records);
+        if expected.is_some_and(|e| *e != hash) || records.windows(2).any(|w| w[0].key() >= w[1].key()) {
+            return Err(ChainError::BadSnapshot);
+        }
+        let mut wtxn = self.env.write_txn()?;
+        if !self.staging_in(&wtxn)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        for r in records {
+            self.names.register(&mut wtxn, r).map_err(|_| ChainError::BadSnapshot)?;
+        }
+        wtxn.commit()?;
+        Ok(hash)
+    }
+
+    /// Clears the staged name parts, keeping the output parts and their
+    /// commits: name parts are fetched afresh for a later snapshot.
+    pub fn clear_staged_names(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        if !self.staging_in(&wtxn)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        self.names.clear_names(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// Carries staged parts forward to a later snapshot, whose counter is
@@ -1533,6 +1710,24 @@ impl<V: ProofVerifier> Chain<V> {
                 continue;
             }
             let mut outputs = self.utxo.unstage(&mut wtxn, SNAPSHOT_PART_LOG, part.index)?;
+            // Commits spent since leave with their outputs; a cleared part
+            // loses them all, to be fetched again.
+            let (first, end) = (part.index << SNAPSHOT_PART_LOG, (part.index + 1) << SNAPSHOT_PART_LOG);
+            let gone: Vec<u64> = match part.root {
+                Some(_) => part.spent.clone(),
+                None => self
+                    .names
+                    .commits_in(&wtxn, first, end)
+                    .map_err(|e| ChainError::Name(e.into()))?
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect(),
+            };
+            for p in gone {
+                if self.names.commit_at(&wtxn, p).map_err(|e| ChainError::Name(e.into()))?.is_some() {
+                    self.names.remove_commit(&mut wtxn, p).map_err(|e| ChainError::Name(e.into()))?;
+                }
+            }
             let Some(root) = &part.root else {
                 carried.push(false);
                 continue;
@@ -1540,7 +1735,6 @@ impl<V: ProofVerifier> Chain<V> {
             outputs.retain(|o| part.spent.binary_search(&o.0).is_err());
             let leaves: Vec<(u64, Digest)> =
                 outputs.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
-            let first = part.index << SNAPSHOT_PART_LOG;
             if crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, first, &leaves) != *root {
                 carried.push(false);
                 continue;
@@ -1559,18 +1753,19 @@ impl<V: ProofVerifier> Chain<V> {
         let mut wtxn = self.env.write_txn()?;
         if self.staging_in(&wtxn)? {
             self.utxo.clear(&mut wtxn)?;
+            self.names.clear(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
             self.meta.delete(&mut wtxn, META_STAGING)?;
             wtxn.commit()?;
         }
         Ok(())
     }
 
-    /// Completes a snapshot whose every part is staged: `roots` are the
-    /// manifest's part roots and `next_position` its counter. The state
-    /// must reach `block`'s state root (whose chain proof the caller has
-    /// verified); `block` becomes the tip and the floor below which
-    /// nothing reorganizes.
-    pub fn finish_snapshot(&self, block: &Block, roots: &[Digest], next_position: u64) -> Result<()> {
+    /// Completes a snapshot whose every part is staged, against its
+    /// manifest. The state must reach `block`'s state root (whose chain
+    /// proof the caller has verified); `block` becomes the tip and the
+    /// floor below which nothing reorganizes.
+    pub fn finish_snapshot(&self, block: &Block, manifest: &Manifest) -> Result<()> {
+        let (roots, next_position) = (&manifest.roots[..], manifest.next);
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
             return Err(ChainError::BadSnapshot);
@@ -1585,6 +1780,11 @@ impl<V: ProofVerifier> Chain<V> {
         self.utxo
             .finish_staged(&mut wtxn, SNAPSHOT_PART_LOG, roots, next_position)
             .map_err(|_| ChainError::BadSnapshot)?;
+        let name_root = self.names.root(&wtxn).map_err(|e| ChainError::Name(e.into()))?;
+        if name_root != manifest.name_root {
+            return Err(ChainError::BadSnapshot);
+        }
+        self.utxo.set_name_root(&mut wtxn, &name_root)?;
         if self.utxo.root(&wtxn)? != header.state_root {
             return Err(ChainError::BadSnapshot);
         }
@@ -1610,7 +1810,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.meta.put(&mut wtxn, META_FLOOR, &header.height.to_le_bytes())?;
         self.meta.put(&mut wtxn, META_FLOOR_NEXT, &next_position.to_le_bytes())?;
         if header.height.is_multiple_of(self.params.snapshot_interval) {
-            self.put_snapshot(&mut wtxn, &header, next_position, roots)?;
+            self.put_snapshot(&mut wtxn, &header, manifest)?;
         }
         wtxn.commit()?;
         Ok(())
@@ -1624,9 +1824,9 @@ impl<V: ProofVerifier> Chain<V> {
         let Some(body) = self.body_by_hash_in(wtxn, &digest_bytes(&header.hash()))? else {
             return Ok(());
         };
-        for p in &body.inputs {
-            if self.spent.get(wtxn, p)?.and_then(read_spent_entry).is_some_and(|(h, _, _)| h == header.height) {
-                self.spent.delete(wtxn, p)?;
+        for p in body.spent_positions() {
+            if self.spent.get(wtxn, &p)?.and_then(read_spent_entry).is_some_and(|(h, _, _)| h == header.height) {
+                self.spent.delete(wtxn, &p)?;
             }
         }
         Ok(())
@@ -1652,70 +1852,88 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Takes the snapshot after `header`, just connected: the roots of its
-    /// parts are read from the state tree as it stands.
+    /// parts are read from the state tree as it stands, and the name parts
+    /// from the registry.
     fn take_snapshot(&self, wtxn: &mut RwTxn, header: &Header) -> Result<()> {
         let next = self.utxo.next_position(wtxn)?;
         let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
         let roots =
             (0..parts).map(|p| self.utxo.subtree(wtxn, SNAPSHOT_PART_LOG, p)).collect::<utxo::Result<Vec<_>>>()?;
-        self.put_snapshot(wtxn, header, next, &roots)
+        let records = self.names.records_in(wtxn, 0, Key::MAX).map_err(|e| ChainError::Name(e.into()))?;
+        let names = records
+            .chunks(NAME_PART_RECORDS)
+            .map(|chunk| NamePart {
+                first: chunk[0].key().expect("stored records are well formed"),
+                hash: name_part_hash(chunk),
+            })
+            .collect();
+        let name_root = self.utxo.name_root(wtxn)?;
+        self.put_snapshot(wtxn, header, &Manifest { next, roots, name_root, names })
     }
 
     /// Stores a snapshot manifest.
-    fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, next: u64, roots: &[Digest]) -> Result<()> {
-        let mut value = Vec::with_capacity(40 + 32 * roots.len());
-        value.extend_from_slice(&digest_bytes(&header.hash()));
-        value.extend_from_slice(&next.to_le_bytes());
-        for r in roots {
-            value.extend_from_slice(&digest_bytes(r));
-        }
-        self.snapshots.put(wtxn, &header.height, &value)?;
+    fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, manifest: &Manifest) -> Result<()> {
+        self.snapshots.put(wtxn, &header.height, &manifest.to_bytes(&header.hash()))?;
         Ok(())
     }
 
-    /// The kept snapshot after the main-chain block `id`: its height,
-    /// output counter and part roots.
-    fn snapshot_in(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u32, u64, Vec<Digest>)>> {
+    /// The kept snapshot after the main-chain block `id`: its height and
+    /// manifest.
+    fn snapshot_in(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u32, Manifest)>> {
         let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(id))? else {
             return Ok(None);
         };
         let Some(value) = self.snapshots.get(rtxn, &header.height)? else {
             return Ok(None);
         };
-        if value.len() < 40 || value[..32] != digest_bytes(id) || (value.len() - 40) % 32 != 0 {
+        if value.len() < 32 || value[..32] != digest_bytes(id) {
             return Ok(None);
         }
-        let next = u64::from_le_bytes(value[32..40].try_into().unwrap());
-        let roots = value[40..]
-            .chunks_exact(32)
-            .map(digest_from_bytes)
-            .collect::<Option<Vec<_>>>()
-            .ok_or(ChainError::Corrupt("snapshot root"))?;
-        Ok(Some((header.height, next, roots)))
+        let manifest = Manifest::from_bytes(id, value).ok_or(ChainError::Corrupt("snapshot manifest"))?;
+        Ok(Some((header.height, manifest)))
     }
 
-    /// A snapshot manifest of the state after the main-chain block `id`:
-    /// the output counter and the root of every part's subtree. `None`
-    /// unless a snapshot was taken after that block and is still kept.
-    pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<(u64, Vec<Digest>)>> {
+    /// A snapshot manifest of the state after the main-chain block `id`.
+    /// `None` unless a snapshot was taken after that block and is still
+    /// kept.
+    pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<Manifest>> {
         let rtxn = self.env.read_txn()?;
-        Ok(self.snapshot_in(&rtxn, id)?.map(|(_, next, roots)| (next, roots)))
+        Ok(self.snapshot_in(&rtxn, id)?.map(|(_, m)| m))
+    }
+
+    /// The name undo records of the main-chain blocks above `height`, from
+    /// the tip down: what the registry and the commits looked like at
+    /// `height` is the state now with these undone.
+    fn name_undos_above(&self, rtxn: &RoTxn, height: u32) -> Result<Vec<NameUndo>> {
+        let tip = self.tip_in(rtxn)?.ok_or(ChainError::NoGenesis)?;
+        let mut out = Vec::new();
+        for h in (height + 1..=tip.height).rev() {
+            let header = self.header_at_in(rtxn, h)?.ok_or(ChainError::Corrupt("main-chain header"))?;
+            let undo = self
+                .undo
+                .get(rtxn, &digest_bytes(&header.hash()))?
+                .and_then(Undo::from_bytes)
+                .ok_or(ChainError::Corrupt("undo record"))?;
+            out.push(undo.names);
+        }
+        Ok(out)
     }
 
     /// The unspent outputs in part `part` of the snapshot after the
     /// main-chain block `id` (positions `part << SNAPSHOT_PART_LOG` and on,
-    /// below its counter): those unspent now, with those spent since.
+    /// below its counter): those unspent now, with those spent since; and
+    /// which of them were commits.
     #[allow(clippy::type_complexity)]
-    pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<Vec<(u64, Commitment, Memo)>>> {
+    pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<(Vec<(u64, Commitment, Memo)>, PartCommits)>> {
         let rtxn = self.env.read_txn()?;
-        let Some((height, next, roots)) = self.snapshot_in(&rtxn, id)? else {
+        let Some((height, manifest)) = self.snapshot_in(&rtxn, id)? else {
             return Ok(None);
         };
-        if part >= roots.len() as u64 {
+        if part >= manifest.roots.len() as u64 {
             return Ok(None);
         }
         let first = part << SNAPSHOT_PART_LOG;
-        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(next);
+        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
         let mut out: Vec<(u64, Commitment, Memo)> =
             self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
         let before = out.len();
@@ -1729,7 +1947,63 @@ impl<V: ProofVerifier> Chain<V> {
         if out.len() > before {
             out.sort_unstable_by_key(|o| o.0);
         }
-        Ok(Some(out))
+        let mut commits: PartCommits = self
+            .names
+            .commits_in(&rtxn, first, end)
+            .map_err(|e| ChainError::Name(e.into()))?
+            .into_iter()
+            .map(|(p, c)| (p, c.hash, c.height))
+            .collect();
+        for undo in self.name_undos_above(&rtxn, height)? {
+            for (p, c, _) in &undo.consumed {
+                if (first..end).contains(p) {
+                    commits.push((*p, c.hash, c.height));
+                }
+            }
+        }
+        commits.sort_unstable_by_key(|c| c.0);
+        Ok(Some((out, commits)))
+    }
+
+    /// Name part `part` of the snapshot after the main-chain block `id`:
+    /// the records in its key range as they were then, from the records
+    /// now with the blocks since undone.
+    pub fn snapshot_name_part(&self, id: &Digest, part: u64) -> Result<Option<Vec<Record>>> {
+        let rtxn = self.env.read_txn()?;
+        let Some((height, manifest)) = self.snapshot_in(&rtxn, id)? else {
+            return Ok(None);
+        };
+        let Some((lo, hi)) = manifest.name_range(part as usize) else {
+            return Ok(None);
+        };
+        let mut records = self.names.records_in(&rtxn, lo, hi).map_err(|e| ChainError::Name(e.into()))?;
+        // Per key, what the record was at the snapshot: `None` for a name
+        // registered since. Later blocks first, so the earliest state wins.
+        let mut then: std::collections::HashMap<Key, Option<Record>> = std::collections::HashMap::new();
+        for undo in self.name_undos_above(&rtxn, height)? {
+            for r in undo.updated.iter().rev() {
+                let k = r.key().ok_or(ChainError::Corrupt("undo record"))?;
+                if (lo..hi).contains(&k) {
+                    then.insert(k, Some(r.clone()));
+                }
+            }
+            for k in undo.registered.iter().rev() {
+                if (lo..hi).contains(k) {
+                    then.insert(*k, None);
+                }
+            }
+        }
+        if !then.is_empty() {
+            records = records
+                .into_iter()
+                .filter_map(|r| match then.get(&r.key().unwrap()) {
+                    None => Some(r),
+                    Some(None) => None,
+                    Some(Some(old)) => Some(old.clone()),
+                })
+                .collect();
+        }
+        Ok(Some(records))
     }
 
     /// The proof statement and proof of the main-chain block at `height`
@@ -1753,7 +2027,8 @@ impl<V: ProofVerifier> Chain<V> {
             None if self.floor_in(&rtxn)? == Some(height) => {
                 let next = self.meta.get(&rtxn, META_FLOOR_NEXT)?.ok_or(ChainError::Corrupt("floor_next"))?;
                 let next = u64::from_le_bytes(next.try_into().map_err(|_| ChainError::Corrupt("floor_next"))?);
-                next.checked_sub(body.outputs.len() as u64).ok_or(ChainError::Corrupt("floor_next"))?
+                next.checked_sub(body.outputs.len() as u64 + body.commits() as u64)
+                    .ok_or(ChainError::Corrupt("floor_next"))?
             }
             None => return Err(ChainError::Corrupt("undo record")),
         };
@@ -1837,7 +2112,8 @@ impl<V: ProofVerifier> Chain<V> {
     /// without committing. Used to fill a block template.
     pub fn preview_state_root(&self, body: &Body) -> Result<Digest> {
         let mut wtxn = self.env.write_txn()?;
-        let (root, _) = self.apply_body(&mut wtxn, body)?;
+        let height = self.tip_in(&wtxn)?.map_or(0, |t| t.height + 1);
+        let (root, _, _) = self.apply_body(&mut wtxn, body, height)?;
         wtxn.abort();
         Ok(root)
     }
@@ -1889,8 +2165,8 @@ mod tests {
         // Inputs cost the most rows per byte (1237 for 5), so the block that
         // needs the most segments is all inputs, with no proof bytes.
         let p = ChainParams::MAINNET;
-        let n = (p.max_block_size - HEADER_SIZE - 12) / crate::block::POSITION_SIZE;
-        let segments = crate::block_air::pack(1, |_| (n, 0), p.aggregator.segment_rows()).len();
+        let n = (p.max_block_size - HEADER_SIZE - 20) / crate::block::POSITION_SIZE;
+        let segments = crate::block_air::pack(1, |_| (n, 0, 0), p.aggregator.segment_rows()).len();
         assert!(segments <= p.aggregator.max_segments, "{n} inputs need {segments} segments");
         println!("{n} inputs: {segments} of {} segments", p.aggregator.max_segments);
     }
@@ -1907,7 +2183,7 @@ mod tests {
             genesis_target: U256([0, 0, 0, 1 << 48]),
             max_target: ChainParams::MAINNET.max_target,
             // Four outputs and a short proof.
-            max_block_size: HEADER_SIZE + 12 + 4 * crate::block::BLOCK_OUTPUT_SIZE + 31,
+            max_block_size: HEADER_SIZE + 20 + 4 * crate::block::BLOCK_OUTPUT_SIZE + 31,
             max_future_drift: 7200,
             median_time_window: 11,
             emission: &[(10, 50), (10, 25), (5, 12)],
@@ -1942,7 +2218,12 @@ mod tests {
     }
 
     fn genesis_block(outputs: Vec<Output>) -> Block {
-        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.block_output()).collect(), proof: vec![] };
+        let body = Body {
+            inputs: vec![],
+            outputs: outputs.iter().map(|o| o.block_output()).collect(),
+            proof: vec![],
+            ..Default::default()
+        };
         // State root: compute via a throwaway chain.
         let dir = TempDir::new("genesis-scratch");
         let scratch = Chain::open(&dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
@@ -2014,6 +2295,7 @@ mod tests {
             inputs: vec![0],
             outputs: vec![Output::new(&b, 60).block_output(), Output::new(&a, 40).block_output()],
             proof: vec![9],
+            ..Default::default()
         };
         let block1 = mine(&f, body1, GENESIS_TIME + 600);
         f.chain.apply_block(&block1, GENESIS_TIME + 700).unwrap();
@@ -2027,7 +2309,12 @@ mod tests {
         }
 
         // Block 2 spends positions 1 and 2, with a reward-only style output.
-        let body2 = Body { inputs: vec![1, 2], outputs: vec![Output::new(&b, 200).block_output()], proof: vec![] };
+        let body2 = Body {
+            inputs: vec![1, 2],
+            outputs: vec![Output::new(&b, 200).block_output()],
+            proof: vec![],
+            ..Default::default()
+        };
         let block2 = mine(&f, body2, GENESIS_TIME + 1200);
         f.chain.apply_block(&block2, GENESIS_TIME + 1300).unwrap();
         assert_eq!(f.chain.tip().unwrap().unwrap().height, 2);
@@ -2038,7 +2325,7 @@ mod tests {
         let root_before = f.chain.state_root().unwrap();
         let bad = mine_with_root(
             &f,
-            Body { inputs: vec![0], outputs: vec![], proof: vec![] },
+            Body { inputs: vec![0], outputs: vec![], proof: vec![], ..Default::default() },
             GENESIS_TIME + 1800,
             root_before,
         );
@@ -2076,7 +2363,12 @@ mod tests {
         let f = open("invalid");
         let a = pk(3);
         f.chain.init_genesis(&genesis_block(vec![Output::new(&a, 1)])).unwrap();
-        let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 7).block_output()], proof: vec![] };
+        let body = Body {
+            inputs: vec![],
+            outputs: vec![Output::new(&a, 7).block_output()],
+            proof: vec![],
+            ..Default::default()
+        };
         let good = mine(&f, body.clone(), GENESIS_TIME + 600);
         let now = GENESIS_TIME + 700;
 
@@ -2110,9 +2402,14 @@ mod tests {
         let b = mine_with_root(&f, wrong, GENESIS_TIME + 600, good.header.state_root);
         assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::StateRootMismatch { .. })));
         // Too large.
-        let many = Body { inputs: vec![], outputs: vec![Output::new(&a, 1).block_output(); 5], proof: vec![] };
+        let many = Body {
+            inputs: vec![],
+            outputs: vec![Output::new(&a, 1).block_output(); 5],
+            proof: vec![],
+            ..Default::default()
+        };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(504))));
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(512))));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();
@@ -2130,8 +2427,12 @@ mod tests {
         let times = [600u64, 30, 2000, 10, 1500, 600, 5, 900, 700, 600, 600, 300];
         for (i, dt) in times.iter().enumerate() {
             t += dt;
-            let body =
-                Body { inputs: vec![], outputs: vec![Output::new(&a, i as u64 + 1).block_output()], proof: vec![] };
+            let body = Body {
+                inputs: vec![],
+                outputs: vec![Output::new(&a, i as u64 + 1).block_output()],
+                proof: vec![],
+                ..Default::default()
+            };
             let block = mine(&f, body, t);
             f.chain.apply_block(&block, t + 10).unwrap();
         }
@@ -2143,7 +2444,7 @@ mod tests {
         let median = f.chain.median_time_past(&rtxn, &tip).unwrap();
         drop(rtxn);
         assert!(median < tip.timestamp);
-        let body = Body { inputs: vec![], outputs: vec![], proof: vec![] };
+        let body = Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() };
         let late = mine(&f, body.clone(), median);
         assert!(matches!(f.chain.apply_block(&late, tip.timestamp + 10), Err(ChainError::TimestampTooOld { .. })));
         let ok = mine(&f, body, median + 1);
@@ -2183,7 +2484,8 @@ mod tests {
         let tip = chain.tip().unwrap().unwrap();
         let target = chain.expected_target(&tip).unwrap();
         let make = |proof: Vec<u8>| {
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&a, 3).block_output()], proof };
+            let body =
+                Body { inputs: vec![], outputs: vec![Output::new(&a, 3).block_output()], proof, ..Default::default() };
             let mut header = chain.template(&body, GENESIS_TIME + 600).unwrap();
             let (nonce, out) =
                 pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
@@ -2212,7 +2514,12 @@ mod tests {
             let f = Fixture { _dir: TempDir(PathBuf::new()), chain, dataset };
             let block = mine(
                 &f,
-                Body { inputs: vec![0], outputs: vec![Output::new(&a, 2).block_output()], proof: vec![] },
+                Body {
+                    inputs: vec![0],
+                    outputs: vec![Output::new(&a, 2).block_output()],
+                    proof: vec![],
+                    ..Default::default()
+                },
                 GENESIS_TIME + 600,
             );
             f.chain.apply_block(&block, GENESIS_TIME + 700).unwrap();
@@ -2228,7 +2535,12 @@ mod tests {
 
     /// Mines a block on `f`'s tip with `body` and `timestamp`.
     fn mine_outputs(f: &Fixture, outputs: &[Output], timestamp: u64) -> Block {
-        let body = Body { inputs: vec![], outputs: outputs.iter().map(|o| o.block_output()).collect(), proof: vec![] };
+        let body = Body {
+            inputs: vec![],
+            outputs: outputs.iter().map(|o| o.block_output()).collect(),
+            proof: vec![],
+            ..Default::default()
+        };
         mine(f, body, timestamp)
     }
 
@@ -2255,8 +2567,12 @@ mod tests {
         let mut t = GENESIS_TIME;
         for i in 1..=blocks {
             t += 600;
-            let body =
-                Body { inputs: vec![], outputs: vec![Output::new(&k, i).block_output()], proof: vec![7; 205_000] };
+            let body = Body {
+                inputs: vec![],
+                outputs: vec![Output::new(&k, i).block_output()],
+                proof: vec![7; 205_000],
+                ..Default::default()
+            };
             let block = mine(&f, body, t);
             f.chain.apply_block(&block, t + 1).unwrap();
         }
@@ -2302,12 +2618,13 @@ mod tests {
         let p = ChainParams::MAINNET;
         let chain = Chain::open(Path::new(&path), 1 << 40, p, SeedText::new(p.pow), AcceptAllProofs).unwrap();
         let header = chain.header_at(height).unwrap().unwrap();
-        let (next, roots) = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
-        let ok = crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots) == header.state_root;
+        let manifest = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
+        let (next, roots) = (manifest.next, &manifest.roots);
+        let ok = manifest.state_root() == header.state_root;
         eprintln!("block {height}: {next} positions, {} parts, composes to the state root: {ok}", roots.len());
         let mut bad = 0;
         for (i, r) in roots.iter().enumerate().filter(|_| std::env::var("TABMINER_DEBUG_TIP_ONLY").is_err()) {
-            let part = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
+            let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
             let leaves: Vec<(u64, Digest)> =
                 part.iter().map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m))).collect();
             let full = crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves);
@@ -2337,7 +2654,8 @@ mod tests {
         eprintln!(
             "tip {}: stored root matches its outputs: {}; matches its header: {}",
             tip.height,
-            crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &parts) == chain.utxo().root(&rtxn).unwrap(),
+            crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &parts, &crate::name_trie::empty_root())
+                == chain.utxo().root(&rtxn).unwrap(),
             chain.utxo().root(&rtxn).unwrap() == tip.state_root
         );
         let stored_bad = (0..parts.len())
@@ -2415,6 +2733,7 @@ mod tests {
                 inputs: vec![0],
                 outputs: vec![Output::new(&k, 10).block_output(), Output::new(&k, 11).block_output()],
                 proof: vec![1],
+                ..Default::default()
             },
             GENESIS_TIME + 600,
         );
@@ -2426,13 +2745,23 @@ mod tests {
         // b: B1 spends position 1, B2 spends B1's output.
         let b1 = mine(
             &b,
-            Body { inputs: vec![1], outputs: vec![Output::new(&k, 20).block_output()], proof: vec![2] },
+            Body {
+                inputs: vec![1],
+                outputs: vec![Output::new(&k, 20).block_output()],
+                proof: vec![2],
+                ..Default::default()
+            },
             GENESIS_TIME + 650,
         );
         b.chain.apply_block(&b1, GENESIS_TIME + 700).unwrap();
         let b2 = mine(
             &b,
-            Body { inputs: vec![2], outputs: vec![Output::new(&k, 21).block_output()], proof: vec![3] },
+            Body {
+                inputs: vec![2],
+                outputs: vec![Output::new(&k, 21).block_output()],
+                proof: vec![3],
+                ..Default::default()
+            },
             GENESIS_TIME + 1250,
         );
         b.chain.apply_block(&b2, GENESIS_TIME + 1300).unwrap();
@@ -2530,7 +2859,12 @@ mod tests {
         // pass, so a stores it as a side block; connecting it fails).
         let b1 = mine_outputs(&b, &[Output::new(&k, 6)], GENESIS_TIME + 650);
         b.chain.apply_block(&b1, GENESIS_TIME + 700).unwrap();
-        let bad_body = Body { inputs: vec![], outputs: vec![Output::new(&k, 7).block_output()], proof: vec![] };
+        let bad_body = Body {
+            inputs: vec![],
+            outputs: vec![Output::new(&k, 7).block_output()],
+            proof: vec![],
+            ..Default::default()
+        };
         let b2 = mine_with_root(&b, bad_body, GENESIS_TIME + 1250, b1.header.state_root);
         assert_eq!(a.chain.apply_block(&b1, GENESIS_TIME + 1300).unwrap(), Applied::Side);
         assert!(matches!(a.chain.apply_block(&b2, GENESIS_TIME + 1300), Err(ChainError::StateRootMismatch { .. })));
@@ -2550,7 +2884,7 @@ mod tests {
             let h = Header { prev_hash: b2.header.hash(), height: 2, ..b2.header };
             let _ = h;
             // Build B3 with prev_hash = B2 by hand on top of c's tip target.
-            let body = Body { inputs: vec![], outputs: vec![], proof: vec![] };
+            let body = Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() };
             let header = Header {
                 prev_hash: b2.header.hash(),
                 height: 3,
@@ -2591,7 +2925,7 @@ mod tests {
             unspent.extend(*next..*next + 3);
             *next += 3;
             *t += 600;
-            mine(chain_f, Body { inputs, outputs, proof: vec![] }, *t)
+            mine(chain_f, Body { inputs, outputs, proof: vec![], ..Default::default() }, *t)
         };
         for h in 1..=20u64 {
             let block = build(&f, h, &mut unspent, &mut next, 0, &mut t);
@@ -2599,10 +2933,11 @@ mod tests {
             blocks.push(block);
         }
         let check = |chain: &Chain<AcceptAllProofs>, header: &Header| {
-            let (n, roots) = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
-            assert_eq!(crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots), header.state_root);
+            let manifest = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
+            let (n, roots) = (manifest.next, manifest.roots.clone());
+            assert_eq!(manifest.state_root(), header.state_root);
             for (i, r) in roots.iter().enumerate() {
-                let part = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
+                let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
                 assert!(part.iter().all(|o| o.0 < n));
                 let leaves: Vec<(u64, Digest)> =
                     part.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
@@ -2696,13 +3031,14 @@ mod tests {
                 7 => vec![34_000, 35_000],
                 _ => vec![],
             };
-            let block = mine(&a, Body { inputs, outputs, proof: vec![] }, t);
+            let block = mine(&a, Body { inputs, outputs, proof: vec![], ..Default::default() }, t);
             a.chain.apply_block(&block, t + 1).unwrap();
             blocks.push(block);
         }
         let (s4, s8) = (blocks[3].header, blocks[7].header);
-        let (next4, roots4) = a.chain.snapshot_manifest(&s4.hash()).unwrap().unwrap();
-        let (next8, roots8) = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        let m4 = a.chain.snapshot_manifest(&s4.hash()).unwrap().unwrap();
+        let m8 = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        let (next4, roots4, next8, roots8) = (m4.next, m4.roots.clone(), m8.next, m8.roots.clone());
         assert_eq!((next4, roots4.len(), next8, roots8.len()), (60_001, 4, 60_005, 4));
 
         // b stages the snapshot after block 4, then moves to block 8's.
@@ -2712,8 +3048,8 @@ mod tests {
         }
         b.chain.begin_snapshot().unwrap();
         for (i, root) in roots4.iter().enumerate() {
-            let part = a.chain.snapshot_part(&s4.hash(), i as u64).unwrap().unwrap();
-            b.chain.stage_snapshot_part(i as u64, &part, next4, Some(root)).unwrap();
+            let (part, commits) = a.chain.snapshot_part(&s4.hash(), i as u64).unwrap().unwrap();
+            b.chain.stage_snapshot_part(i as u64, &part, &commits, next4, Some(root)).unwrap();
         }
         let mut spent: Vec<u64> = blocks[4..8].iter().flat_map(|b| b.body.inputs.clone()).collect();
         spent.sort_unstable();
@@ -2732,10 +3068,10 @@ mod tests {
         assert_eq!(b.chain.carry_snapshot_parts(&parts, next8).unwrap(), [true, true, false, false]);
         // The cleared parts are fetched at block 8 and the install completes.
         for i in [2u64, 3] {
-            let part = a.chain.snapshot_part(&s8.hash(), i).unwrap().unwrap();
-            b.chain.stage_snapshot_part(i, &part, next8, Some(&roots8[i as usize])).unwrap();
+            let (part, commits) = a.chain.snapshot_part(&s8.hash(), i).unwrap().unwrap();
+            b.chain.stage_snapshot_part(i, &part, &commits, next8, Some(&roots8[i as usize])).unwrap();
         }
-        b.chain.finish_snapshot(&blocks[7], &roots8, next8).unwrap();
+        b.chain.finish_snapshot(&blocks[7], &m8).unwrap();
         let rtxn = b.chain.env().read_txn().unwrap();
         assert_eq!(b.chain.utxo().root(&rtxn).unwrap(), s8.state_root);
         assert_eq!(b.chain.utxo().len(&rtxn).unwrap(), a.chain.utxo().len(&a.chain.env().read_txn().unwrap()).unwrap());
@@ -2757,15 +3093,18 @@ mod tests {
                 .map(|i| Output::with_memo(&crate::transaction::pubkey_hash(&k), h * 10 + i, memo(i)).block_output())
                 .collect();
             let inputs = if h >= 3 { vec![(h - 3) * 2] } else { vec![] };
-            let block = mine(&a, Body { inputs, outputs: outs, proof: vec![] }, t);
+            let block = mine(&a, Body { inputs, outputs: outs, proof: vec![], ..Default::default() }, t);
             a.chain.apply_block(&block, t + 1).unwrap();
             blocks.push(block);
         }
         let s8 = blocks[7].header;
-        let (next, roots) = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        let manifest = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
+        let (next, roots) = (manifest.next, manifest.roots.clone());
         assert_eq!(next, 16);
-        assert_eq!(crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots), s8.state_root);
-        let part = a.chain.snapshot_part(&s8.hash(), 0).unwrap().unwrap();
+        assert_eq!(manifest.state_root(), s8.state_root);
+        assert!(manifest.names.is_empty());
+        let (part, commits) = a.chain.snapshot_part(&s8.hash(), 0).unwrap().unwrap();
+        assert!(commits.is_empty());
         // 16 outputs made, positions 0..=10 spent by blocks 3..8 at even
         // positions, so 10 unspent after block 8; later spends are restored.
         assert_eq!(part.len(), 10);
@@ -2792,18 +3131,24 @@ mod tests {
         b.chain.verify_snapshot_block(&blocks[7], next).unwrap();
         let mut forged = part.clone();
         forged[0].1[0] += crate::poseidon2::Fp::ONE;
-        assert!(matches!(b.chain.install_snapshot(&blocks[7], &forged, next), Err(ChainError::BadSnapshot)));
+        assert!(matches!(b.chain.install_snapshot(&blocks[7], &forged, &[], &[], next), Err(ChainError::BadSnapshot)));
         assert!(!b.chain.staging().unwrap());
         // Part by part, as a node does: blocks wait meanwhile, and finishing
         // with a part missing is refused.
         b.chain.begin_snapshot().unwrap();
         assert!(matches!(b.chain.apply_block(&blocks[8], t + 1), Err(ChainError::SnapshotInProgress)));
-        assert!(matches!(b.chain.finish_snapshot(&blocks[7], &roots, next), Err(ChainError::BadSnapshot)));
+        assert!(matches!(b.chain.finish_snapshot(&blocks[7], &manifest), Err(ChainError::BadSnapshot)));
         let mut wrong = roots[0];
         wrong[0] += crate::poseidon2::Fp::ONE;
-        assert!(matches!(b.chain.stage_snapshot_part(0, &part, next, Some(&wrong)), Err(ChainError::BadSnapshot)));
-        assert_eq!(b.chain.stage_snapshot_part(0, &part, next, Some(&roots[0])).unwrap(), roots[0]);
-        b.chain.finish_snapshot(&blocks[7], &roots, next).unwrap();
+        assert!(matches!(b.chain.stage_snapshot_part(0, &part, &[], next, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        // A commit entry whose leaf is not the output's is refused.
+        let fake = vec![(part[0].0, [crate::poseidon2::Fp::ONE; 8], 3u32)];
+        assert!(matches!(
+            b.chain.stage_snapshot_part(0, &part, &fake, next, Some(&roots[0])),
+            Err(ChainError::BadSnapshot)
+        ));
+        assert_eq!(b.chain.stage_snapshot_part(0, &part, &[], next, Some(&roots[0])).unwrap(), roots[0]);
+        b.chain.finish_snapshot(&blocks[7], &manifest).unwrap();
         assert!(!b.chain.staging().unwrap());
         assert_eq!(b.chain.utxo().len(&b.chain.env().read_txn().unwrap()).unwrap(), 10);
         // An install interrupted by a stop is cleared when the chain reopens.
@@ -2813,16 +3158,19 @@ mod tests {
             d.accept_header(&block.header, t + 1).unwrap();
         }
         d.begin_snapshot().unwrap();
-        d.stage_snapshot_part(0, &part, next, None).unwrap();
+        d.stage_snapshot_part(0, &part, &[], next, None).unwrap();
         drop(d);
         let d = Chain::open(&d_dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
         assert!(!d.staging().unwrap());
         assert!(d.utxo().is_empty(&d.env().read_txn().unwrap()).unwrap());
-        d.install_snapshot(&blocks[7], &part, next).unwrap();
+        d.install_snapshot(&blocks[7], &part, &[], &[], next).unwrap();
         assert_eq!(d.state_root().unwrap(), s8.state_root);
         drop(d);
         // A second install on b is refused: its chain is past genesis.
-        assert!(matches!(b.chain.install_snapshot(&blocks[7], &part, next), Err(ChainError::AlreadyInitialized)));
+        assert!(matches!(
+            b.chain.install_snapshot(&blocks[7], &part, &[], &[], next),
+            Err(ChainError::AlreadyInitialized)
+        ));
         assert_eq!(b.chain.tip().unwrap().unwrap(), s8);
         assert_eq!(b.chain.state_root().unwrap(), s8.state_root);
         assert_eq!(b.chain.floor().unwrap(), Some(8));
@@ -2833,8 +3181,8 @@ mod tests {
         assert_eq!(b.chain.tip().unwrap().unwrap(), blocks[11].header);
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         // b now serves snapshots from its floor on, the same as a's.
-        assert_eq!(b.chain.snapshot_manifest(&s8.hash()).unwrap(), Some((next, roots)));
-        assert_eq!(b.chain.snapshot_part(&s8.hash(), 0).unwrap(), Some(part));
+        assert_eq!(b.chain.snapshot_manifest(&s8.hash()).unwrap(), Some(manifest.clone()));
+        assert_eq!(b.chain.snapshot_part(&s8.hash(), 0).unwrap(), Some((part, vec![])));
         // A memo survived: the wallet's scan reads them from here.
         let rtxn = b.chain.env().read_txn().unwrap();
         assert!(b.chain.utxo().memos(&rtxn).unwrap().len() >= 10);
@@ -2852,7 +3200,7 @@ mod tests {
         let mut tc = parent.timestamp;
         for _ in 0..9 {
             tc += 60;
-            let block = mine(&c, Body { inputs: vec![], outputs: vec![], proof: vec![] }, tc);
+            let block = mine(&c, Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() }, tc);
             c.chain.apply_block(&block, tc + 1).unwrap();
             parent = block.header;
             fork.push(block);
@@ -2992,6 +3340,257 @@ mod tests {
         let wide_chain = wide_chain.with_max_undo(Some(2));
         assert_eq!(wide_chain.prune_undo().unwrap(), 4);
         assert_eq!(wide_chain.prune_undo().unwrap(), 0);
+    }
+
+    /// A snapshot carries the name half: commits among its outputs, the
+    /// records in name parts as they were then, and the trie rebuilt from
+    /// them.
+    #[test]
+    fn snapshots_carry_names() {
+        use crate::names::{BlockNameOp as Op, Record};
+        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 50)], ..params() };
+        let open_long = |name: &str| {
+            let dir = TempDir::new(name);
+            let chain = Chain::open(&dir.0, 64 << 20, long, seed(), AcceptAllProofs).unwrap();
+            Fixture { _dir: dir, chain, dataset: Dataset::generate(&seed()) }
+        };
+        let a = open_long("snap-names-a");
+        let genesis = genesis_block(vec![Output::new(&pk(7), 1)]);
+        a.chain.init_genesis(&genesis).unwrap();
+        let d = |n: u32| -> Digest { core::array::from_fn(|i| crate::poseidon2::Fp::new(n * 10 + i as u32)) };
+        let alice = Record::new(b"alice", d(1), d(2), d(3)).unwrap();
+        let alice2 = Record::new(b"alice", d(4), d(5), d(6)).unwrap();
+        let bob = Record::new(b"bob", d(7), d(8), d(9)).unwrap();
+        let t = std::cell::Cell::new(GENESIS_TIME);
+        let blocks = std::cell::RefCell::new(Vec::new());
+        let mine_on = |body: Body| {
+            t.set(t.get() + 600);
+            let block = mine(&a, body, t.get());
+            a.chain.apply_block(&block, t.get() + 100).unwrap();
+            blocks.borrow_mut().push(block);
+        };
+        // Block 1: commits at 1 (alice), 2 (bob), 3 (unused). Blocks 13
+        // and 14: reveals. Block 16: a snapshot (interval 4) with alice,
+        // bob and the unused commit. Block 17: alice updated; block 20:
+        // another snapshot, after the update.
+        mine_on(Body {
+            ops: vec![
+                Op::Commit { commit: d(10), memo: d(11) },
+                Op::Commit { commit: d(12), memo: d(13) },
+                Op::Commit { commit: d(14), memo: d(15) },
+            ],
+            ..Default::default()
+        });
+        for _ in 2..=12 {
+            mine_on(Body::default());
+        }
+        mine_on(Body { ops: vec![Op::Reveal { record: alice.clone(), commit: 1 }], ..Default::default() });
+        mine_on(Body { ops: vec![Op::Reveal { record: bob.clone(), commit: 2 }], ..Default::default() });
+        mine_on(Body::default());
+        mine_on(Body::default());
+        mine_on(Body { ops: vec![Op::Update(alice2.clone())], ..Default::default() });
+        for _ in 18..=20 {
+            mine_on(Body::default());
+        }
+        let blocks = blocks.into_inner();
+        let s16 = blocks[15].header;
+        let s20 = blocks[19].header;
+        // Block 16's manifest: one output part with the unused commit, one
+        // name part of two records as they were (alice before her update).
+        let m16 = a.chain.snapshot_manifest(&s16.hash()).unwrap().unwrap();
+        assert_eq!(m16.state_root(), s16.state_root);
+        assert_eq!((m16.next, m16.roots.len(), m16.names.len()), (4, 1, 1));
+        let (outputs16, commits16) = a.chain.snapshot_part(&s16.hash(), 0).unwrap().unwrap();
+        assert_eq!(outputs16.iter().map(|o| o.0).collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(commits16, vec![(3, d(14), 1)]);
+        let names16 = a.chain.snapshot_name_part(&s16.hash(), 0).unwrap().unwrap();
+        let mut expected = vec![alice.clone(), bob.clone()];
+        expected.sort_by_key(|r| r.key().unwrap());
+        assert_eq!(names16, expected);
+        assert_eq!(crate::names::name_part_hash(&names16), m16.names[0].hash);
+        assert!(a.chain.snapshot_name_part(&s16.hash(), 1).unwrap().is_none());
+        // Block 20's: alice as updated.
+        let m20 = a.chain.snapshot_manifest(&s20.hash()).unwrap().unwrap();
+        let names20 = a.chain.snapshot_name_part(&s20.hash(), 0).unwrap().unwrap();
+        assert!(names20.contains(&alice2) && !names20.contains(&alice));
+        assert_ne!(m20.name_root, m16.name_root);
+
+        // b fast-syncs to block 16 and follows to 20.
+        let b = open_long("snap-names-b");
+        b.chain.init_genesis(&genesis).unwrap();
+        for block in &blocks {
+            b.chain.accept_header(&block.header, t.get() + 1).unwrap();
+        }
+        b.chain.verify_snapshot_block(&blocks[15], m16.next).unwrap();
+        b.chain.begin_snapshot().unwrap();
+        b.chain.stage_snapshot_part(0, &outputs16, &commits16, m16.next, Some(&m16.roots[0])).unwrap();
+        // A name part with another hash, or out of order, is refused.
+        let mut wrong = m16.names[0].hash;
+        wrong[0] += crate::poseidon2::Fp::ONE;
+        assert!(matches!(b.chain.stage_name_part(&names16, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        let reversed: Vec<Record> = names16.iter().rev().cloned().collect();
+        assert!(matches!(b.chain.stage_name_part(&reversed, None), Err(ChainError::BadSnapshot)));
+        // Without the name part the trie's root is not the manifest's.
+        assert!(matches!(b.chain.finish_snapshot(&blocks[15], &m16), Err(ChainError::BadSnapshot)));
+        b.chain.stage_name_part(&names16, Some(&m16.names[0].hash)).unwrap();
+        b.chain.finish_snapshot(&blocks[15], &m16).unwrap();
+        assert_eq!(b.chain.state_root().unwrap(), s16.state_root);
+        {
+            let rtxn = b.chain.env().read_txn().unwrap();
+            assert_eq!(b.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice.clone()));
+            assert_eq!(b.chain.names().commit_at(&rtxn, 3).unwrap().map(|c| c.hash), Some(d(14)));
+        }
+        for block in &blocks[16..] {
+            b.chain.apply_block(block, t.get() + 100).unwrap();
+        }
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        {
+            let rtxn = b.chain.env().read_txn().unwrap();
+            assert_eq!(b.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice2.clone()));
+        }
+        // b serves block 20's snapshot like a.
+        assert_eq!(b.chain.snapshot_manifest(&s20.hash()).unwrap(), Some(m20.clone()));
+        assert_eq!(b.chain.snapshot_name_part(&s20.hash(), 0).unwrap().unwrap(), names20);
+        // Clearing staged names during an install keeps the commits.
+        let c = open_long("snap-names-c");
+        c.chain.init_genesis(&genesis).unwrap();
+        for block in &blocks {
+            c.chain.accept_header(&block.header, t.get() + 1).unwrap();
+        }
+        c.chain.begin_snapshot().unwrap();
+        c.chain.stage_snapshot_part(0, &outputs16, &commits16, m16.next, Some(&m16.roots[0])).unwrap();
+        c.chain.stage_name_part(&names16, None).unwrap();
+        c.chain.clear_staged_names().unwrap();
+        {
+            let rtxn = c.chain.env().read_txn().unwrap();
+            assert!(c.chain.names().is_empty(&rtxn).unwrap());
+            assert!(c.chain.names().commit_at(&rtxn, 3).unwrap().is_some());
+        }
+        c.chain.stage_name_part(&names16, None).unwrap();
+        c.chain.finish_snapshot(&blocks[15], &m16).unwrap();
+        assert_eq!(c.chain.state_root().unwrap(), s16.state_root);
+    }
+
+    /// Blocks with name operations applied, reorganized away and back.
+    #[test]
+    fn name_operations_apply_and_reorganize() {
+        use crate::names::{BlockNameOp as Op, Record};
+        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 50)], ..params() };
+        let open_long = |name: &str| {
+            let dir = TempDir::new(name);
+            let chain = Chain::open(&dir.0, 64 << 20, long, seed(), AcceptAllProofs).unwrap();
+            Fixture { _dir: dir, chain, dataset: Dataset::generate(&seed()) }
+        };
+        let a = open_long("names-a");
+        let b = open_long("names-b");
+        let k = pk(7);
+        let genesis = genesis_block(vec![Output::new(&k, 1), Output::new(&k, 2)]);
+        a.chain.init_genesis(&genesis).unwrap();
+        b.chain.init_genesis(&genesis).unwrap();
+        let d = |n: u32| -> Digest { core::array::from_fn(|i| crate::poseidon2::Fp::new(n * 10 + i as u32)) };
+        let alice = Record::new(b"alice", d(1), d(2), d(3)).unwrap();
+        let alice2 = Record::new(b"alice", d(4), d(5), d(6)).unwrap();
+        let t = std::cell::Cell::new(GENESIS_TIME);
+        let mine_on = |f: &Fixture, body: Body| {
+            t.set(t.get() + 600);
+            let block = mine(f, body, t.get());
+            f.chain.apply_block(&block, t.get() + 100).unwrap();
+            block
+        };
+        // Block 1: two commits, at positions 2 and 3.
+        let ops = vec![Op::Commit { commit: d(10), memo: d(11) }, Op::Commit { commit: d(12), memo: d(13) }];
+        let b1 = mine_on(&a, Body { ops, ..Default::default() });
+        {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            assert_eq!(a.chain.utxo().next_position(&rtxn).unwrap(), 4);
+            assert_eq!(a.chain.names().commit_at(&rtxn, 2).unwrap().map(|c| c.height), Some(1));
+        }
+        for _ in 2..=12 {
+            mine_on(&a, Body::default());
+        }
+        let root12 = a.chain.state_root().unwrap();
+        // Block 13: reveal alice from the commit at 2; block 14: update her.
+        let b13 =
+            mine_on(&a, Body { ops: vec![Op::Reveal { record: alice.clone(), commit: 2 }], ..Default::default() });
+        let b14 = mine_on(&a, Body { ops: vec![Op::Update(alice2.clone())], ..Default::default() });
+        {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            assert_eq!(a.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice2.clone()));
+            assert!(a.chain.utxo().output_at(&rtxn, 2).unwrap().is_none());
+            assert!(a.chain.names().commit_at(&rtxn, 2).unwrap().is_none());
+            assert_eq!(a.chain.utxo().name_root(&rtxn).unwrap(), a.chain.names().root(&rtxn).unwrap());
+        }
+        let root14 = a.chain.state_root().unwrap();
+        // Invalid name sections are refused as invalid blocks.
+        t.set(t.get() + 600);
+        let bad = mine_with_root(
+            &a,
+            Body { ops: vec![Op::Reveal { record: alice.clone(), commit: 3 }], ..Default::default() },
+            t.get(),
+            root14,
+        );
+        let e = a.chain.apply_block(&bad, t.get() + 100).unwrap_err();
+        assert!(matches!(e, ChainError::Name(crate::names::ApplyError::Registered)), "{e}");
+        assert!(e.is_invalid_block());
+        let bad = mine_with_root(&a, Body { sweeps: vec![3], ..Default::default() }, t.get(), root14);
+        assert!(matches!(a.chain.apply_block(&bad, t.get() + 100), Err(ChainError::Name(_))));
+        assert_eq!(a.chain.tip().unwrap().unwrap().height, 14);
+
+        // b follows a to 12, then mines three empty blocks: a reorganizes
+        // to them, undoing the update and the reveal.
+        b.chain.apply_block(&b1, t.get()).unwrap();
+        for h in 2..=12 {
+            let blk = a.chain.block_by_hash(&a.chain.header_at(h).unwrap().unwrap().hash()).unwrap().unwrap();
+            b.chain.apply_block(&blk, t.get()).unwrap();
+        }
+        assert_eq!(b.chain.state_root().unwrap(), root12);
+        let mut side = Vec::new();
+        for _ in 0..3 {
+            side.push(mine_on(&b, Body::default()));
+        }
+        for blk in &side {
+            a.chain.apply_block(blk, t.get() + 100).unwrap();
+        }
+        assert_eq!(a.chain.tip().unwrap().unwrap().height, 15);
+        assert_eq!(a.chain.state_root().unwrap(), b.chain.state_root().unwrap());
+        {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            assert_eq!(a.chain.names().lookup(&rtxn, b"alice").unwrap(), None);
+            assert!(a.chain.names().is_empty(&rtxn).unwrap());
+            assert_eq!(a.chain.names().commit_at(&rtxn, 2).unwrap().map(|c| c.hash), Some(d(10)));
+            assert!(a.chain.utxo().output_at(&rtxn, 2).unwrap().is_some());
+        }
+        // And back: a longer branch holding the reveal and the update.
+        let mut back = vec![b13.clone(), b14.clone()];
+        let c = open_long("names-c");
+        c.chain.init_genesis(&genesis).unwrap();
+        for h in 1..=14 {
+            let blk = if h == 13 {
+                b13.clone()
+            } else if h == 14 {
+                b14.clone()
+            } else {
+                a.chain.block_by_hash(&a.chain.ancestor(&b14.header, h).unwrap().unwrap().hash()).unwrap().unwrap()
+            };
+            c.chain.apply_block(&blk, t.get()).unwrap();
+        }
+        assert_eq!(c.chain.state_root().unwrap(), root14);
+        for _ in 0..2 {
+            back.push(mine_on(&c, Body::default()));
+        }
+        for blk in &back {
+            a.chain.apply_block(blk, t.get() + 100).unwrap();
+        }
+        assert_eq!(a.chain.tip().unwrap().unwrap().height, 16);
+        assert_eq!(a.chain.state_root().unwrap(), c.chain.state_root().unwrap());
+        {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            assert_eq!(a.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice2));
+            assert!(a.chain.names().commit_at(&rtxn, 2).unwrap().is_none());
+        }
+        // The proof statement of a block with operations counts its commits.
+        let (st, _) = a.chain.proof_statement(1).unwrap().unwrap();
+        assert_eq!((st.first_output_position, st.end_output_position), (2, 4));
     }
 
     #[test]

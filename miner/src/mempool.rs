@@ -23,15 +23,68 @@
 //!
 //! The miner takes transactions by fee rate with [`Mempool::select`], and
 //! pays itself the subsidy plus their fees.
+//!
+//! # Name operations
+//!
+//! A transaction's name operations (see [`crate::names`]) are checked
+//! against the registry as the chain would check them, less what only the
+//! proof knows: a reveal's commit must be at the position it names, with
+//! the hash the name, salt and owner give, and not past its window (one
+//! not yet in it is pooled and mined once it is); the name must be free
+//! for a reveal and registered for an update, whose signature the current
+//! owner must have made. A name and a commit position are claimed by at
+//! most one pooled transaction: a second claim is refused rather than
+//! replacing the first, since no fee rule makes the two comparable.
+//! Revalidation drops transactions whose claims the chain has settled
+//! otherwise. The miner takes operations within the block's caps, skipping
+//! what does not fit and reveals whose window has not opened.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use heed::RoTxn;
 
+use crate::name_trie::Key;
+use crate::names::{MAX_REVEAL, NameOp, NameSet, OpKind, commit_hash, count_ops, in_window, name_hash};
 use crate::pow::Digest;
 use crate::transaction::{Commitment, INPUT_SIZE, OUTPUT_SIZE, Transaction};
 use crate::utxo::{self, UtxoSet};
+
+/// Why the registry refuses a name operation (the storage errors apart).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameReject {
+    /// No commit at the position, or not this reveal's.
+    NoCommit,
+    /// The commit (made at this height) is past its window.
+    Expired(u32),
+    Registered,
+    NotRegistered,
+    /// Not signed by the current owner, or keeping it.
+    BadOwner,
+    /// The registry could not be read.
+    Store,
+}
+
+impl core::fmt::Display for NameReject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NameReject::NoCommit => f.write_str("no such commit"),
+            NameReject::Expired(h) => write!(f, "the commit at height {h} is past its window"),
+            NameReject::Registered => f.write_str("the name is registered"),
+            NameReject::NotRegistered => f.write_str("the name is not registered"),
+            NameReject::BadOwner => f.write_str("not signed by the current owner, or the owner is unchanged"),
+            NameReject::Store => f.write_str("the registry could not be read"),
+        }
+    }
+}
+
+/// What a pooled name operation holds for itself: a name, or a commit's
+/// position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Claim {
+    Name(Key),
+    Commit(u64),
+}
 
 /// Largest transaction accepted, in bytes (about 50 inputs).
 pub const MAX_TX_SIZE: usize = 128 << 10;
@@ -60,9 +113,15 @@ impl Policy {
     /// Anything valid, for tests.
     pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0 };
 
-    /// The smallest fee a transaction of `inputs` and `outputs` may pay.
+    /// The smallest fee a transaction of `inputs` and `outputs` and no
+    /// name operations may pay.
     pub fn min_fee(&self, inputs: usize, outputs: usize) -> u64 {
-        self.min_fee_per_byte * (8 + inputs * INPUT_SIZE + outputs * OUTPUT_SIZE) as u64
+        self.min_fee_for(12 + inputs * INPUT_SIZE + outputs * OUTPUT_SIZE)
+    }
+
+    /// The smallest fee a transaction of `size` bytes may pay.
+    pub fn min_fee_for(&self, size: usize) -> u64 {
+        self.min_fee_per_byte * size as u64
     }
 }
 
@@ -95,6 +154,10 @@ pub enum Reject {
     },
     /// The pool is full of better-paying transactions.
     Full,
+    /// A name operation the registry refuses.
+    Name(NameReject),
+    /// A name or commit another pooled transaction already claims.
+    NameConflict,
 }
 
 impl core::fmt::Display for Reject {
@@ -113,6 +176,8 @@ impl core::fmt::Display for Reject {
                 write!(f, "conflicts with a pooled transaction; a replacement must pay at least {min}")
             }
             Reject::Full => f.write_str("pool is full"),
+            Reject::Name(e) => write!(f, "name operation: {e}"),
+            Reject::NameConflict => f.write_str("a pooled transaction already claims the name or commit"),
         }
     }
 }
@@ -126,6 +191,8 @@ pub struct Entry {
     pub fee: u64,
     pub size: usize,
     pub added: Instant,
+    /// What its name operations claim.
+    pub claims: Vec<Claim>,
 }
 
 impl Entry {
@@ -139,6 +206,8 @@ pub struct Mempool {
     txs: HashMap<Digest, Entry>,
     /// Spent commitment to the pooled transaction spending it.
     spends: HashMap<Commitment, Digest>,
+    /// Name or commit to the pooled transaction claiming it.
+    claims: HashMap<Claim, Digest>,
     bytes: usize,
     capacity: usize,
     /// Transactions dropped for spent inputs, oldest first, in case a
@@ -160,6 +229,10 @@ fn check_static(tx: &Transaction, policy: &Policy) -> Result<u64, Reject> {
     if tx.outputs.iter().any(|o| o.amount == 0) {
         return Err(Reject::Malformed);
     }
+    // Name operations: within the caps and well formed.
+    if count_ops(tx.ops.iter().map(NameOp::kind)).is_err() || !tx.ops.iter().all(NameOp::is_well_formed) {
+        return Err(Reject::Malformed);
+    }
     if tx.outputs.iter().any(|o| o.amount < policy.dust) {
         return Err(Reject::Dust { min: policy.dust });
     }
@@ -173,11 +246,71 @@ fn check_static(tx: &Transaction, policy: &Policy) -> Result<u64, Reject> {
         return Err(Reject::NegativeFee);
     }
     let fee = fee.min(u64::MAX as i128) as u64;
-    let min = policy.min_fee(tx.inputs.len(), tx.outputs.len());
+    let min = policy.min_fee_for(size);
     if fee < min {
         return Err(Reject::FeeTooLow { min });
     }
     Ok(fee)
+}
+
+/// The name operations of `tx` against the registry, for a block at
+/// `height` or later: returns what they claim, distinct within the
+/// transaction.
+fn check_ops(tx: &Transaction, names: &NameSet, rtxn: &RoTxn, height: u32) -> Result<Vec<Claim>, Reject> {
+    let mut claims = Vec::with_capacity(tx.ops.len());
+    let name_err = |_: crate::names::Error| Reject::Name(NameReject::Store);
+    for op in &tx.ops {
+        match op {
+            NameOp::Commit { .. } => {}
+            NameOp::Reveal { record, salt, commit } => {
+                let elements = record.elements().ok_or(Reject::Malformed)?;
+                let nh = name_hash(&elements);
+                let found = names.commit_at(rtxn, *commit).map_err(name_err)?;
+                match found {
+                    Some(c) if c.hash == commit_hash(&nh, salt, &record.owner) => {
+                        if c.height.saturating_add(MAX_REVEAL) < height {
+                            return Err(Reject::Name(NameReject::Expired(c.height)));
+                        }
+                    }
+                    _ => return Err(Reject::Name(NameReject::NoCommit)),
+                }
+                let key = crate::name_trie::key_of(&nh);
+                if names.record(rtxn, key).map_err(name_err)?.is_some() {
+                    return Err(Reject::Name(NameReject::Registered));
+                }
+                claims.push(Claim::Name(key));
+                claims.push(Claim::Commit(*commit));
+            }
+            NameOp::Update { record, .. } => {
+                let key = record.key().ok_or(Reject::Malformed)?;
+                let current =
+                    names.record(rtxn, key).map_err(name_err)?.ok_or(Reject::Name(NameReject::NotRegistered))?;
+                if !op.verify_owner(&current.owner) {
+                    return Err(Reject::Name(NameReject::BadOwner));
+                }
+                claims.push(Claim::Name(key));
+            }
+        }
+    }
+    let mut sorted = claims.clone();
+    sorted.sort_unstable_by_key(|c| match c {
+        Claim::Name(k) => (0u8, *k),
+        Claim::Commit(p) => (1u8, *p as u128),
+    });
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err(Reject::Malformed);
+    }
+    Ok(claims)
+}
+
+/// Whether every reveal of `tx` is in its window at `height`.
+fn reveals_open(tx: &Transaction, names: &NameSet, rtxn: &RoTxn, height: u32) -> bool {
+    tx.ops.iter().all(|op| match op {
+        NameOp::Reveal { commit, .. } => {
+            matches!(names.commit_at(rtxn, *commit), Ok(Some(c)) if in_window(height, c.height))
+        }
+        _ => true,
+    })
 }
 
 impl Mempool {
@@ -187,7 +320,15 @@ impl Mempool {
     }
 
     pub fn with_policy(capacity: usize, policy: Policy) -> Mempool {
-        Mempool { txs: HashMap::new(), spends: HashMap::new(), bytes: 0, capacity, shelf: Vec::new(), policy }
+        Mempool {
+            txs: HashMap::new(),
+            spends: HashMap::new(),
+            claims: HashMap::new(),
+            bytes: 0,
+            capacity,
+            shelf: Vec::new(),
+            policy,
+        }
     }
 
     pub fn policy(&self) -> &Policy {
@@ -218,8 +359,16 @@ impl Mempool {
         self.txs.values()
     }
 
-    /// Validates and adds `tx`; returns its id.
-    pub fn insert(&mut self, tx: Transaction, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Digest, Reject> {
+    /// Validates and adds `tx`, for a block at `height` or later; returns
+    /// its id.
+    pub fn insert(
+        &mut self,
+        tx: Transaction,
+        utxo: &UtxoSet,
+        names: &NameSet,
+        rtxn: &RoTxn,
+        height: u32,
+    ) -> Result<Digest, Reject> {
         let txid = tx.txid();
         if self.txs.contains_key(&txid) {
             return Err(Reject::Known);
@@ -236,6 +385,11 @@ impl Mempool {
                 return Err(Reject::UnknownInput(c));
             }
         }
+        let claims = check_ops(&tx, names, rtxn, height)?;
+        // Claims held by the transactions this one replaces are free.
+        if claims.iter().any(|c| self.claims.get(c).is_some_and(|holder| !conflicts.contains(holder))) {
+            return Err(Reject::NameConflict);
+        }
         // Signatures last: they cost about half a millisecond an input, and
         // an input naming an output the set does not hold, which anyone can
         // sign with a key of their own, is turned away above for a lookup.
@@ -250,7 +404,7 @@ impl Mempool {
                 return Err(Reject::ReplacementFee { min });
             }
         }
-        let entry = Entry { size, tx, txid, fee, added: Instant::now() };
+        let entry = Entry { size, tx, txid, fee, added: Instant::now(), claims };
         // Replaced transactions go first, so their room counts; they are
         // put back if the new one still does not fit.
         let removed: Vec<Entry> = conflicts.iter().filter_map(|id| self.remove(id)).collect();
@@ -286,6 +440,9 @@ impl Mempool {
         for c in entry.tx.spent_commitments() {
             self.spends.insert(c, entry.txid);
         }
+        for c in &entry.claims {
+            self.claims.insert(*c, entry.txid);
+        }
         self.bytes += entry.size;
         self.txs.insert(entry.txid, entry);
     }
@@ -296,14 +453,24 @@ impl Mempool {
         for c in entry.tx.spent_commitments() {
             self.spends.remove(&c);
         }
+        for c in &entry.claims {
+            self.claims.remove(c);
+        }
         self.bytes -= entry.size;
         Some(entry)
     }
 
     /// After the tip changed: drops transactions whose inputs are no longer
-    /// unspent, shelving them, and brings back shelved ones that became
-    /// valid again. Returns how many left and how many returned.
-    pub fn revalidate(&mut self, utxo: &UtxoSet, rtxn: &RoTxn) -> utxo::Result<(usize, usize)> {
+    /// unspent or whose name operations the chain has settled otherwise,
+    /// shelving them, and brings back shelved ones that became valid again.
+    /// Returns how many left and how many returned.
+    pub fn revalidate(
+        &mut self,
+        utxo: &UtxoSet,
+        names: &NameSet,
+        rtxn: &RoTxn,
+        height: u32,
+    ) -> utxo::Result<(usize, usize)> {
         let mut gone = Vec::new();
         for e in self.txs.values() {
             for (c, p) in e.tx.spent_commitments().iter().zip(e.tx.spent_positions()) {
@@ -311,6 +478,9 @@ impl Mempool {
                     gone.push(e.txid);
                     break;
                 }
+            }
+            if !e.tx.ops.is_empty() && check_ops(&e.tx, names, rtxn, height).is_err() && !gone.contains(&e.txid) {
+                gone.push(e.txid);
             }
         }
         for id in &gone {
@@ -332,6 +502,10 @@ impl Mempool {
                 }
                 ok = utxo.holds(rtxn, p, c)? && !self.spends.contains_key(c);
             }
+            if ok && !e.tx.ops.is_empty() {
+                ok = check_ops(&e.tx, names, rtxn, height).is_ok()
+                    && e.claims.iter().all(|c| !self.claims.contains_key(c));
+            }
             if ok && self.make_room(&e).is_ok() {
                 self.add(e);
                 back += 1;
@@ -346,14 +520,34 @@ impl Mempool {
         Ok((gone.len(), back))
     }
 
-    /// Transactions by fee rate, highest first, while `fits` accepts the
-    /// running selection (it is called with the candidate list including
-    /// the next transaction).
-    pub fn select(&self, mut fits: impl FnMut(&[&Transaction]) -> bool) -> Vec<Transaction> {
+    /// Transactions for a block at `height`, by fee rate, highest first,
+    /// while `fits` accepts the running selection (it is called with the
+    /// candidate list including the next transaction). Transactions whose
+    /// name operations would exceed the block's caps, or whose reveals are
+    /// not yet in their window, are passed over.
+    pub fn select(
+        &self,
+        names: &NameSet,
+        rtxn: &RoTxn,
+        height: u32,
+        mut fits: impl FnMut(&[&Transaction]) -> bool,
+    ) -> Vec<Transaction> {
         let mut entries: Vec<&Entry> = self.txs.values().collect();
         entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then(a.added.cmp(&b.added)));
         let mut chosen: Vec<&Transaction> = Vec::new();
+        let mut counts = [0usize; 4];
         for e in entries {
+            if !e.tx.ops.is_empty() {
+                let mut with = counts;
+                for op in &e.tx.ops {
+                    with[op.kind() as usize] += 1;
+                }
+                let over = [OpKind::Commit, OpKind::Reveal, OpKind::Update].iter().any(|k| with[*k as usize] > k.cap());
+                if over || !reveals_open(&e.tx, names, rtxn, height) {
+                    continue;
+                }
+                counts = with;
+            }
             chosen.push(&e.tx);
             if !fits(&chosen) {
                 chosen.pop();
@@ -361,6 +555,18 @@ impl Mempool {
             }
         }
         chosen.into_iter().cloned().collect()
+    }
+
+    /// The expired commits a block at `height` may sweep, by position, at
+    /// most the cap.
+    pub fn sweeps(names: &NameSet, rtxn: &RoTxn, height: u32) -> Vec<u64> {
+        let Some(last) = height.checked_sub(MAX_REVEAL + 1) else {
+            return vec![];
+        };
+        match names.commits_up_to(rtxn, last) {
+            Ok(commits) => commits.into_iter().map(|(p, _)| p).take(crate::names::MAX_SWEEPS).collect(),
+            Err(_) => vec![],
+        }
     }
 
     /// Sum of the fees of `txs`.
@@ -377,6 +583,7 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::NameSet;
     use crate::state_tree::open_env;
     use crate::transaction::{Key, Output, UnsignedTransaction};
     use crate::xmss::PublicKey;
@@ -409,6 +616,7 @@ mod tests {
         let env = open_env(&dir, 64 << 20).unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
         // Outputs: key 1 with 100000, key 2 with 50, key 3 with 10.
         for (tag, amount) in [(1u8, 100_000u64), (2, 50), (3, 10)] {
             utxo.add(&mut wtxn, &Output::new(&pk(tag), amount).commitment).unwrap();
@@ -420,42 +628,45 @@ mod tests {
         // The mainnet policy wants a fee per byte and no dust.
         let mut strict = Mempool::new(1 << 20);
         let min = Policy::MAINNET.min_fee(1, 1);
-        assert_eq!(strict.insert(spend(1, 100_000, min - 1), &utxo, &rtxn), Err(Reject::FeeTooLow { min }));
-        assert_eq!(strict.insert(spend(1, 100_000, 100_000 - DUST + 1), &utxo, &rtxn), Err(Reject::Dust { min: DUST }));
-        strict.insert(spend(1, 100_000, min), &utxo, &rtxn).unwrap();
+        assert_eq!(strict.insert(spend(1, 100_000, min - 1), &utxo, &names, &rtxn, 1), Err(Reject::FeeTooLow { min }));
+        assert_eq!(
+            strict.insert(spend(1, 100_000, 100_000 - DUST + 1), &utxo, &names, &rtxn, 1),
+            Err(Reject::Dust { min: DUST })
+        );
+        strict.insert(spend(1, 100_000, min), &utxo, &names, &rtxn, 1).unwrap();
         let t1 = spend(1, 100_000, 5);
         let t2 = spend(2, 50, 10);
-        let id1 = pool.insert(t1.clone(), &utxo, &rtxn).unwrap();
-        let id2 = pool.insert(t2.clone(), &utxo, &rtxn).unwrap();
-        assert_eq!(pool.insert(t1.clone(), &utxo, &rtxn), Err(Reject::Known));
+        let id1 = pool.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        let id2 = pool.insert(t2.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        assert_eq!(pool.insert(t1.clone(), &utxo, &names, &rtxn, 1), Err(Reject::Known));
         assert_eq!(pool.len(), 2);
         // Conflicts, unknown inputs, negative fees, bad signatures, rewards.
         let double = spend(1, 100_000, 6);
         let min = 5 + double.size() as u64;
-        assert_eq!(pool.insert(double, &utxo, &rtxn), Err(Reject::ReplacementFee { min }));
+        assert_eq!(pool.insert(double, &utxo, &names, &rtxn, 1), Err(Reject::ReplacementFee { min }));
         let unknown = spend(4, 7, 1);
-        assert!(matches!(pool.insert(unknown, &utxo, &rtxn), Err(Reject::UnknownInput(_))));
+        assert!(matches!(pool.insert(unknown, &utxo, &names, &rtxn, 1), Err(Reject::UnknownInput(_))));
         // An unspent output named at the wrong position is unknown too.
         let mut misplaced = spend(3, 10, 1);
         misplaced.set_positions(&[1]);
-        assert!(matches!(pool.insert(misplaced, &utxo, &rtxn), Err(Reject::UnknownInput(_))));
+        assert!(matches!(pool.insert(misplaced, &utxo, &names, &rtxn, 1), Err(Reject::UnknownInput(_))));
         let mut k3 = key(3);
         let generous =
             UnsignedTransaction::new(vec![(pk(3), 10)], vec![Output::new(&pk(100), 11)]).sign_with(&mut k3).unwrap();
-        assert_eq!(pool.insert(generous, &utxo, &rtxn), Err(Reject::NegativeFee));
+        assert_eq!(pool.insert(generous, &utxo, &names, &rtxn, 1), Err(Reject::NegativeFee));
         let mut forged = spend(3, 10, 1);
         forged.outputs[0] = Output::new(&pk(101), 9);
-        assert_eq!(pool.insert(forged, &utxo, &rtxn), Err(Reject::BadSignature));
+        assert_eq!(pool.insert(forged, &utxo, &names, &rtxn, 1), Err(Reject::BadSignature));
         let reward = UnsignedTransaction::new(vec![], vec![Output::new(&pk(100), 5)])
             .sign(|_, _, _| Err::<crate::transaction::Sig, ()>(()))
             .unwrap();
-        assert_eq!(pool.insert(reward, &utxo, &rtxn), Err(Reject::NoInputs));
+        assert_eq!(pool.insert(reward, &utxo, &names, &rtxn, 1), Err(Reject::NoInputs));
 
         // Selection: t2 pays a higher rate (same size, bigger fee).
-        let all = pool.select(|_| true);
+        let all = pool.select(&names, &rtxn, 1, |_| true);
         assert_eq!(all.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![id2, id1]);
         assert_eq!(Mempool::fees(&all), 15);
-        let one = pool.select(|c| c.len() <= 1);
+        let one = pool.select(&names, &rtxn, 1, |c| c.len() <= 1);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].txid(), id2);
         drop(rtxn);
@@ -467,14 +678,14 @@ mod tests {
         assert!(utxo.spend_at(&mut wtxn, &c1, 0).unwrap());
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &rtxn).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &rtxn).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1).unwrap(), (0, 1));
         assert!(pool.contains(&id1));
 
         // Replacement: paying the old fee plus a byte's worth per byte
@@ -486,21 +697,150 @@ mod tests {
                 .sign_with(&mut k1)
                 .unwrap();
         replacement.set_positions(&[0]);
-        let rid = pool.insert(replacement.clone(), &utxo, &rtxn).unwrap();
+        let rid = pool.insert(replacement.clone(), &utxo, &names, &rtxn, 1).unwrap();
         assert!(pool.contains(&rid) && !pool.contains(&id1));
         assert_eq!(pool.len(), 2);
         // The original cannot come back.
-        assert!(matches!(pool.insert(t1.clone(), &utxo, &rtxn), Err(Reject::ReplacementFee { .. })));
+        assert!(matches!(pool.insert(t1.clone(), &utxo, &names, &rtxn, 1), Err(Reject::ReplacementFee { .. })));
         pool.remove(&rid);
-        pool.insert(t1.clone(), &utxo, &rtxn).unwrap();
+        pool.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
 
         // Capacity: a tiny pool evicts the lower rate for a higher one and
         // refuses a lower one.
         let mut small = Mempool::with_policy(t1.size(), Policy::NONE);
-        small.insert(t1.clone(), &utxo, &rtxn).unwrap();
-        assert_eq!(small.insert(t2.clone(), &utxo, &rtxn), Ok(id2));
+        small.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        assert_eq!(small.insert(t2.clone(), &utxo, &names, &rtxn, 1), Ok(id2));
         assert!(!small.contains(&id1));
-        assert_eq!(small.insert(t1.clone(), &utxo, &rtxn), Err(Reject::Full));
+        assert_eq!(small.insert(t1.clone(), &utxo, &names, &rtxn, 1), Err(Reject::Full));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_operations_are_checked_claimed_and_selected() {
+        use crate::names::{BlockNameOp, Record, commit_hash, name_hash};
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        // Keys 1 to 6 each own an output of 1000 at positions 0 to 5.
+        for tag in 1..=6u8 {
+            utxo.add(&mut wtxn, &Output::new(&pk(tag), 1000).commitment).unwrap();
+        }
+        let d = |n: u32| -> Digest { core::array::from_fn(|i| crate::poseidon2::Fp::new(n * 10 + i as u32)) };
+        let mut o1 = key(21);
+        let owner1 = crate::transaction::pubkey_hash(&o1.public_key());
+        let owner2 = crate::transaction::pubkey_hash(&key(22).public_key());
+        let alice = Record::new(b"alice", owner1, d(1), d(2)).unwrap();
+        let salt = d(9);
+        let c = commit_hash(&name_hash(&alice.elements().unwrap()), &salt, &owner1);
+        // The chain made alice's commit at position 6 in block 10, and
+        // registered bob.
+        names.apply(&utxo, &mut wtxn, 10, &[BlockNameOp::Commit { commit: c, memo: d(3) }], &[]).unwrap();
+        let bob = Record::new(b"bob", owner2, d(4), d(5)).unwrap();
+        names.register(&mut wtxn, &bob).unwrap();
+        let root = names.root(&wtxn).unwrap();
+        utxo.set_name_root(&mut wtxn, &root).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+        // A transaction from key `tag` carrying `ops`, paying 1 in fee.
+        let with = |tag: u8, ops: Vec<NameOp>| {
+            let mut k = key(tag);
+            let mut tx =
+                UnsignedTransaction::with_ops(vec![(k.public_key(), 1000)], vec![Output::new(&pk(100), 999)], ops)
+                    .sign_with(&mut k)
+                    .unwrap();
+            tx.set_positions(&[u64::from(tag) - 1]);
+            tx
+        };
+        let reveal = NameOp::Reveal { record: alice.clone(), salt, commit: 6 };
+        // Height 15: the reveal's window has not opened, but it pools.
+        let t1 = with(1, vec![reveal.clone()]);
+        let id1 = pool.insert(t1.clone(), &utxo, &names, &rtxn, 15).unwrap();
+        // Another reveal of the same name, or of the same commit, conflicts.
+        let other = Record::new(b"alice", owner2, d(6), d(7)).unwrap();
+        let wrong = with(2, vec![NameOp::Reveal { record: other.clone(), salt, commit: 6 }]);
+        assert_eq!(pool.insert(wrong, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::NoCommit)));
+        let dup = with(2, vec![reveal.clone()]);
+        assert_eq!(pool.insert(dup, &utxo, &names, &rtxn, 15), Err(Reject::NameConflict));
+        // Wrong position, registered name, update of an unregistered name,
+        // update by the wrong key, update keeping the owner.
+        let moved = with(2, vec![NameOp::Reveal { record: alice.clone(), salt, commit: 5 }]);
+        assert_eq!(pool.insert(moved, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::NoCommit)));
+        let bob_c = commit_hash(&name_hash(&bob.elements().unwrap()), &salt, &owner2);
+        let mut wtxn = env.write_txn().unwrap();
+        names.apply(&utxo, &mut wtxn, 11, &[BlockNameOp::Commit { commit: bob_c, memo: d(3) }], &[]).unwrap();
+        wtxn.commit().unwrap();
+        drop(rtxn);
+        let rtxn = env.read_txn().unwrap();
+        let taken = with(2, vec![NameOp::Reveal { record: bob.clone(), salt, commit: 7 }]);
+        assert_eq!(pool.insert(taken, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::Registered)));
+        let carol = Record::new(b"carol", owner2, d(1), d(2)).unwrap();
+        let unknown = with(2, vec![NameOp::update(carol, &mut o1).unwrap()]);
+        assert_eq!(pool.insert(unknown, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::NotRegistered)));
+        let bob2 = Record::new(b"bob", owner1, d(8), d(8)).unwrap();
+        let forged = with(2, vec![NameOp::update(bob2.clone(), &mut o1).unwrap()]);
+        assert_eq!(pool.insert(forged, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::BadOwner)));
+        let mut o2 = key(22);
+        let same = with(2, vec![NameOp::update(Record::new(b"bob", owner2, d(8), d(8)).unwrap(), &mut o2).unwrap()]);
+        assert_eq!(pool.insert(same, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::BadOwner)));
+        // A good update of bob, and a second one conflicts.
+        let t2 = with(2, vec![NameOp::update(bob2.clone(), &mut o2).unwrap()]);
+        let id2 = pool.insert(t2, &utxo, &names, &rtxn, 15).unwrap();
+        let again = with(3, vec![NameOp::update(bob2.clone(), &mut o2).unwrap()]);
+        assert_eq!(pool.insert(again, &utxo, &names, &rtxn, 15), Err(Reject::NameConflict));
+        // Commits pool freely; more than the cap in one transaction do not.
+        let t3 = with(3, vec![NameOp::Commit { commit: d(50), memo: d(51) }]);
+        let id3 = pool.insert(t3, &utxo, &names, &rtxn, 15).unwrap();
+        let many: Vec<NameOp> = (0..crate::names::MAX_COMMITS as u32 + 1)
+            .map(|i| NameOp::Commit { commit: d(60 + i), memo: d(1) })
+            .collect();
+        assert_eq!(pool.insert(with(4, many), &utxo, &names, &rtxn, 15), Err(Reject::Malformed));
+        // Selection at height 15 skips the closed reveal; at 22 takes it;
+        // the commit cap holds across transactions.
+        let ids = |txs: Vec<Transaction>| txs.iter().map(|t| t.txid()).collect::<Vec<_>>();
+        let picked = ids(pool.select(&names, &rtxn, 15, |_| true));
+        assert!(!picked.contains(&id1) && picked.contains(&id2) && picked.contains(&id3));
+        assert!(ids(pool.select(&names, &rtxn, 22, |_| true)).contains(&id1));
+        let big: Vec<NameOp> =
+            (0..crate::names::MAX_COMMITS as u32).map(|i| NameOp::Commit { commit: d(70 + i), memo: d(1) }).collect();
+        let t4 = with(4, big);
+        // t4 pays a higher rate than t3? Same fee, larger size: lower rate,
+        // so t3 comes first and t4's eight commits do not fit beside it.
+        let id4 = pool.insert(t4, &utxo, &names, &rtxn, 15).unwrap();
+        let picked = ids(pool.select(&names, &rtxn, 15, |_| true));
+        assert!(picked.contains(&id3) && !picked.contains(&id4));
+        // Expiry: a reveal whose commit is too old is refused, before the
+        // pool's own claims are consulted.
+        assert_eq!(
+            pool.insert(with(5, vec![reveal.clone()]), &utxo, &names, &rtxn, 10 + MAX_REVEAL + 1),
+            Err(Reject::Name(NameReject::Expired(10)))
+        );
+        assert_eq!(pool.insert(with(5, vec![reveal.clone()]), &utxo, &names, &rtxn, 22), Err(Reject::NameConflict));
+        // Sweeps: none before expiry, the commits after.
+        assert!(Mempool::sweeps(&names, &rtxn, 10 + MAX_REVEAL).is_empty());
+        assert_eq!(Mempool::sweeps(&names, &rtxn, 10 + MAX_REVEAL + 1), vec![6]);
+        assert_eq!(Mempool::sweeps(&names, &rtxn, 11 + MAX_REVEAL + 1), vec![6, 7]);
+        drop(rtxn);
+        // The chain reveals alice from another transaction: t1 is dropped
+        // on revalidation, t2 stays until bob's owner changes.
+        let mut wtxn = env.write_txn().unwrap();
+        names.apply(&utxo, &mut wtxn, 22, &[BlockNameOp::Reveal { record: alice.clone(), commit: 6 }], &[]).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23).unwrap(), (1, 0));
+        assert!(!pool.contains(&id1) && pool.contains(&id2));
+        drop(rtxn);
+        let mut wtxn = env.write_txn().unwrap();
+        names.apply(&utxo, &mut wtxn, 23, &[BlockNameOp::Update(bob2.clone())], &[]).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24).unwrap(), (1, 0));
+        assert!(!pool.contains(&id2));
+        drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

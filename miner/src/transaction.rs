@@ -12,10 +12,15 @@
 //! only to whoever proves the block; the block proof attests to them and
 //! reveals nothing about them.
 //!
-//! The body is the canonical encoding of all inputs (key and amount) and all
-//! outputs (commitment and amount), with signatures excluded, laid out in
-//! whole sponge blocks per item (see `body_elements`). Every input
-//! signs the same body hash, which is also the transaction id.
+//! The body is the canonical encoding of all inputs (key and amount), all
+//! outputs (commitment and amount) and the digests of the name operations,
+//! with signatures excluded, laid out in whole sponge blocks per item (see
+//! `body_elements`). Every input signs the same body hash, which is also the
+//! transaction id.
+//!
+//! A transaction may carry name operations (see [`crate::names`]): the
+//! inputs sign them and pay their fee, the block lists their public part
+//! and the proof's name segment applies them.
 //!
 //! Fees are implicit: a transaction's [`balance`](Transaction::balance) is the
 //! sum of input amounts minus the sum of output amounts. It may be negative;
@@ -32,9 +37,10 @@
 //! canonical encoding from [`crate::poseidon2`].
 //!
 //! ```text
-//! transaction := u32 n_in, n_in * input, u32 n_out, n_out * output
-//! input       := pubkey (48) | amount u64 (8) | signature (2312)
+//! transaction := u32 n_in, n_in * input, u32 n_out, n_out * output, u32 n_ops, n_ops * op
+//! input       := pubkey (48) | amount u64 (8) | position u64 (8) | signature (2312)
 //! output      := key hash (32) | amount u64 (8) | memo (32)
+//! op          := see `crate::names::NameOp`
 //! ```
 //!
 //! An output's memo is eight field elements its owner's wallet fills to find
@@ -45,6 +51,7 @@
 //! three limbs of 30, 30 and 4 bits, a public key is its 12 elements and a
 //! commitment its 8.
 
+use crate::names::NameOp;
 use crate::poseidon2::{DIGEST, Fp, WIDTH, digest_from_bytes, digest_to_bytes, permute_in_place};
 use crate::xmss::{Digest, KeyExhausted, PUB_SEED_LEN, PublicKey, SecretKey, Signature};
 
@@ -184,6 +191,8 @@ pub struct Output {
 pub struct Transaction {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
+    /// Name operations, signed by the inputs.
+    pub ops: Vec<NameOp>,
 }
 
 /// A transaction whose inputs have not been signed yet.
@@ -192,6 +201,7 @@ pub struct UnsignedTransaction {
     /// Revealed key and amount of each output being spent.
     pub inputs: Vec<(PublicKey, u64)>,
     pub outputs: Vec<Output>,
+    pub ops: Vec<NameOp>,
 }
 
 impl Output {
@@ -266,15 +276,20 @@ impl Input {
 /// Body elements, block aligned so each item is whole sponge blocks:
 ///
 /// ```text
-/// [n_in, n_out, 0, 0, 0, 0, 0, 0]
+/// [n_in, n_out, n_ops, 0, 0, 0, 0, 0]
 /// per input:  [root(8)] [pub_seed(4), amount lo30, mid30, hi4, 0]
 /// per output: [commitment(8)] [amount lo30, mid30, hi4, 0, 0, 0, 0, 0] [memo(8)]
+/// per op:     [digest(8)]
 /// ```
-pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output]) -> Vec<Fp> {
-    let mut body = Vec::with_capacity(8 + 16 * inputs.len() + 24 * outputs.len());
+///
+/// A malformed operation (a bad name) contributes a zero digest; such a
+/// transaction is invalid regardless.
+pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output], ops: &[NameOp]) -> Vec<Fp> {
+    let mut body = Vec::with_capacity(8 + 16 * inputs.len() + 24 * outputs.len() + 8 * ops.len());
     body.push(Fp::from_u64(inputs.len() as u64));
     body.push(Fp::from_u64(outputs.len() as u64));
-    body.extend_from_slice(&[Fp::ZERO; 6]);
+    body.push(Fp::from_u64(ops.len() as u64));
+    body.extend_from_slice(&[Fp::ZERO; 5]);
     for (pk, amount) in inputs {
         body.extend_from_slice(&pk.root);
         body.extend_from_slice(&pk.pub_seed);
@@ -287,22 +302,31 @@ pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output]) -> 
         body.extend_from_slice(&[Fp::ZERO; 5]);
         body.extend_from_slice(&out.memo);
     }
+    for op in ops {
+        body.extend_from_slice(&op.digest().unwrap_or([Fp::ZERO; DIGEST]));
+    }
     body
 }
 
 /// Hash of the canonical body (see [`body_elements`]).
-fn body_hash(inputs: &[(PublicKey, u64)], outputs: &[Output]) -> Digest {
-    hash_domain(DOM_BODY, &body_elements(inputs, outputs))
+fn body_hash(inputs: &[(PublicKey, u64)], outputs: &[Output], ops: &[NameOp]) -> Digest {
+    hash_domain(DOM_BODY, &body_elements(inputs, outputs, ops))
 }
 
 impl UnsignedTransaction {
+    /// A transaction without name operations.
     pub fn new(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>) -> UnsignedTransaction {
-        UnsignedTransaction { inputs, outputs }
+        UnsignedTransaction { inputs, outputs, ops: vec![] }
+    }
+
+    /// A transaction carrying name operations.
+    pub fn with_ops(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>, ops: Vec<NameOp>) -> UnsignedTransaction {
+        UnsignedTransaction { inputs, outputs, ops }
     }
 
     /// The body hash every input must sign; equals the final transaction id.
     pub fn body_hash(&self) -> Digest {
-        body_hash(&self.inputs, &self.outputs)
+        body_hash(&self.inputs, &self.outputs, &self.ops)
     }
 
     /// Signs every input. `signer` is called once per input, in order, with
@@ -320,7 +344,7 @@ impl UnsignedTransaction {
             let signature = signer(i, &pubkey, &msg)?;
             inputs.push(Input { pubkey, amount, position: 0, signature });
         }
-        Ok(Transaction { inputs, outputs: self.outputs })
+        Ok(Transaction { inputs, outputs: self.outputs, ops: self.ops })
     }
 
     /// Signs every input with the one key `key`, which must own all of them.
@@ -359,7 +383,7 @@ impl Transaction {
     /// Hash of the body, excluding signatures.
     pub fn body_hash(&self) -> Digest {
         let inputs: Vec<(PublicKey, u64)> = self.inputs.iter().map(|i| (i.pubkey, i.amount)).collect();
-        body_hash(&inputs, &self.outputs)
+        body_hash(&inputs, &self.outputs, &self.ops)
     }
 
     /// Transaction id: the body hash.
@@ -372,7 +396,14 @@ impl Transaction {
         UnsignedTransaction {
             inputs: self.inputs.iter().map(|i| (i.pubkey, i.amount)).collect(),
             outputs: self.outputs.clone(),
+            ops: self.ops.clone(),
         }
+    }
+
+    /// The digests of the name operations, in order; `None` if one has a
+    /// malformed name.
+    pub fn op_digests(&self) -> Option<Vec<Digest>> {
+        self.ops.iter().map(NameOp::digest).collect()
     }
 
     /// Checks that every input carries a valid signature over the body by
@@ -420,7 +451,9 @@ impl Transaction {
 
     /// Serialized size in bytes.
     pub fn size(&self) -> usize {
-        8 + self.inputs.len() * INPUT_SIZE + self.outputs.len() * OUTPUT_SIZE
+        12 + self.inputs.len() * INPUT_SIZE
+            + self.outputs.len() * OUTPUT_SIZE
+            + self.ops.iter().map(NameOp::size).sum::<usize>()
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -432,6 +465,10 @@ impl Transaction {
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
             out.extend_from_slice(&o.to_bytes());
+        }
+        out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        for op in &self.ops {
+            out.extend_from_slice(&op.to_bytes());
         }
         out
     }
@@ -452,10 +489,17 @@ impl Transaction {
             outputs.push(Output::from_bytes(head)?);
             rest = tail;
         }
+        let (n_ops, mut rest) = read_u32(rest)?;
+        let mut ops = Vec::with_capacity((n_ops as usize).min(rest.len() / crate::names::COMMIT_OP_SIZE));
+        for _ in 0..n_ops {
+            let (op, tail) = NameOp::parse(rest)?;
+            ops.push(op);
+            rest = tail;
+        }
         if !rest.is_empty() {
             return None;
         }
-        Some(Transaction { inputs, outputs })
+        Some(Transaction { inputs, outputs, ops })
     }
 }
 
@@ -607,6 +651,54 @@ mod tests {
     }
 
     #[test]
+    fn name_operations_are_signed_and_carried() {
+        use crate::names::{BlockNameOp, NameOp, Record};
+        let d = |n: u32| -> Digest { core::array::from_fn(|i| Fp::new(n + i as u32)) };
+        let mut ka = key(11);
+        let mut owner = key(12);
+        let commit = NameOp::Commit { commit: d(1), memo: d(2) };
+        let reveal = NameOp::Reveal { record: Record::new(b"alice", d(3), d(4), d(5)).unwrap(), salt: d(6), commit: 1 };
+        let update = NameOp::update(Record::new(b"bob", d(7), d(8), d(9)).unwrap(), &mut owner).unwrap();
+        let ops = vec![commit.clone(), reveal.clone(), update.clone()];
+        let unsigned = UnsignedTransaction::with_ops(
+            vec![(ka.public_key(), 40)],
+            vec![Output::new(&ka.public_key(), 30)],
+            ops.clone(),
+        );
+        let tx = unsigned.sign_with(&mut ka).unwrap();
+        assert!(tx.verify_signatures());
+        assert_eq!(tx.ops, ops);
+        assert_eq!(tx.balance(), 10);
+        assert_eq!(tx.op_digests().unwrap(), ops.iter().map(|o| o.digest().unwrap()).collect::<Vec<_>>());
+
+        // The same inputs and outputs without the operations sign differently.
+        let plain = UnsignedTransaction::new(vec![(ka.public_key(), 40)], vec![Output::new(&ka.public_key(), 30)]);
+        assert_ne!(plain.body_hash(), tx.txid());
+        // Changing an operation's public part breaks the signatures; the witness is not signed.
+        let mut t = tx.clone();
+        t.ops.swap(0, 1);
+        assert!(!t.verify_signatures());
+        let mut t = tx.clone();
+        t.ops.pop();
+        assert!(!t.verify_signatures());
+        let mut t = tx.clone();
+        t.ops[0] = NameOp::Commit { commit: d(2), memo: d(2) };
+        assert!(!t.verify_signatures());
+        let mut t = tx.clone();
+        t.ops[1] = NameOp::Reveal { record: Record::new(b"alice", d(3), d(4), d(5)).unwrap(), salt: d(60), commit: 2 };
+        assert!(t.verify_signatures());
+        assert_eq!(t.txid(), tx.txid());
+        assert_eq!(tx.ops[2].block_op(), BlockNameOp::Update(Record::new(b"bob", d(7), d(8), d(9)).unwrap()));
+
+        let bytes = tx.to_bytes();
+        assert_eq!(bytes.len(), tx.size());
+        assert_eq!(bytes.len(), 12 + INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>());
+        assert_eq!(Transaction::from_bytes(&bytes), Some(tx.clone()));
+        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert_eq!(tx.unsigned().body_hash(), tx.txid());
+    }
+
+    #[test]
     fn serialization_roundtrip() {
         let mut ka = key(9);
         let kb = key(10).public_key();
@@ -624,7 +716,7 @@ mod tests {
 
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());
-        assert_eq!(bytes.len(), 8 + 2 * INPUT_SIZE + 2 * OUTPUT_SIZE);
+        assert_eq!(bytes.len(), 12 + 2 * INPUT_SIZE + 2 * OUTPUT_SIZE);
         let back = Transaction::from_bytes(&bytes).unwrap();
         assert_eq!(back, tx);
         assert!(back.verify_signatures());
@@ -639,7 +731,7 @@ mod tests {
         assert!(Transaction::from_bytes(&huge).is_none());
         assert!(Transaction::from_bytes(&[]).is_none());
 
-        let empty = Transaction { inputs: vec![], outputs: vec![] };
+        let empty = Transaction { inputs: vec![], outputs: vec![], ops: vec![] };
         assert_eq!(Transaction::from_bytes(&empty.to_bytes()), Some(empty));
 
         let out = Output::new(&kb, 3);

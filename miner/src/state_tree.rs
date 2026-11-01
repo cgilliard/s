@@ -36,6 +36,10 @@ use crate::poseidon2::{DIGEST, Fp, compress, compress_all, digest_from_bytes, di
 pub const DEPTH: usize = 40;
 /// Number of addressable leaves.
 pub const CAPACITY: u64 = 1 << DEPTH;
+/// Leaves of the left half, where outputs live: the right half, under
+/// the node at level `DEPTH - 1`, index 1, is the name trie
+/// ([`crate::name_trie`]), whose root a tree stores as that node.
+pub const OUTPUT_CAPACITY: u64 = CAPACITY / 2;
 /// A leaf value or node hash.
 pub type Digest = [Fp; DIGEST];
 /// The value of an empty leaf.
@@ -142,16 +146,18 @@ pub fn subtree_roots(level: usize, mut leaves: Vec<(u64, Digest)>) -> Vec<(u64, 
     leaves
 }
 
-/// Root of the whole tree from the roots of its subtrees of height `level`
-/// at indices `0..roots.len()`; every later subtree is empty.
-pub fn root_from_subtrees(level: usize, roots: &[Digest]) -> Digest {
+/// Root of the whole tree from the roots of its left-half subtrees of
+/// height `level` at indices `0..roots.len()` (every later subtree
+/// empty) and the right half's root `right`.
+pub fn root_from_subtrees(level: usize, roots: &[Digest], right: &Digest) -> Digest {
     // The subtree roots are leaves of a tree of height DEPTH - level whose
     // empty leaves are the default subtree root.
     let mut nodes: Vec<(u64, Digest)> = roots.iter().enumerate().map(|(i, r)| (i as u64, *r)).collect();
-    for l in level..DEPTH {
+    for l in level..DEPTH - 1 {
         nodes = parents(l, &nodes);
     }
-    nodes.first().map_or(empty_root(), |&(_, v)| v)
+    let left = nodes.first().map_or(default_hashes()[DEPTH - 1], |&(_, v)| v);
+    compress(&left, right)
 }
 
 fn node_key(level: usize, index: u64) -> u64 {
@@ -333,6 +339,39 @@ impl StateTree {
         self.node(rtxn, DEPTH, 0)
     }
 
+    /// The right half's root (the level default when nothing was set).
+    pub fn right(&self, rtxn: &RoTxn) -> Result<Digest> {
+        self.node(rtxn, DEPTH - 1, 1)
+    }
+
+    /// The left half's root: the root over the output positions.
+    pub fn left(&self, rtxn: &RoTxn) -> Result<Digest> {
+        self.node(rtxn, DEPTH - 1, 0)
+    }
+
+    /// Sets the right half's root and recomputes the tree's. Returns it.
+    pub fn set_right(&self, wtxn: &mut RwTxn, right: &Digest) -> Result<Digest> {
+        self.put_node(wtxn, DEPTH - 1, 1, right)?;
+        let root = compress(&self.node(wtxn, DEPTH - 1, 0)?, right);
+        self.put_node(wtxn, DEPTH, 0, &root)?;
+        Ok(root)
+    }
+
+    /// The parents of `nodes` at `level`, from the stored tree: as
+    /// [`parents`], except that at the top the right half's stored root
+    /// stands in for the default.
+    fn stored_parents(&self, rtxn: &RoTxn, level: usize, nodes: &[(u64, Digest)]) -> Result<Vec<(u64, Digest)>> {
+        if level == DEPTH - 1 && !nodes.iter().any(|(i, _)| *i == 1) {
+            let right = self.right(rtxn)?;
+            if right != default_hashes()[DEPTH - 1] {
+                let mut with_right = nodes.to_vec();
+                with_right.push((1, right));
+                return Ok(parents(level, &with_right));
+            }
+        }
+        Ok(parents(level, nodes))
+    }
+
     /// Sets the node at the base level, `index`, and recomputes the path
     /// to the root. Returns the new root.
     pub fn set(&self, wtxn: &mut RwTxn, index: u64, value: &Digest) -> Result<Digest> {
@@ -413,7 +452,7 @@ impl StateTree {
             if level == DEPTH {
                 break;
             }
-            level_nodes = parents(level, &level_nodes);
+            level_nodes = self.stored_parents(wtxn, level, &level_nodes)?;
         }
         self.root(wtxn)
     }
@@ -428,7 +467,7 @@ impl StateTree {
             for (i, v) in &level_nodes {
                 self.put_node(wtxn, level, *i, v)?;
             }
-            level_nodes = parents(level, &level_nodes);
+            level_nodes = self.stored_parents(wtxn, level, &level_nodes)?;
         }
         let root = level_nodes.first().map_or(default_hashes()[top], |&(_, v)| v);
         self.put_node(wtxn, top, index, &root)?;
@@ -581,9 +620,9 @@ mod tests {
                     subtree_root(level, i * span, &part)
                 })
                 .collect();
-            assert_eq!(root_from_subtrees(level, &roots), root, "level {level}");
+            assert_eq!(root_from_subtrees(level, &roots, &default_hashes()[DEPTH - 1]), root, "level {level}");
         }
-        assert_eq!(root_from_subtrees(4, &[]), empty_root());
+        assert_eq!(root_from_subtrees(4, &[], &default_hashes()[DEPTH - 1]), empty_root());
         assert_eq!(subtree_root(3, 8, &[]), default_hashes()[3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -727,5 +766,40 @@ mod tests {
         leaves.insert(11, val(2));
         leaves.insert(12, val(3));
         assert_eq!(root_after, reference_root(&leaves, DEPTH, 0));
+    }
+
+    #[test]
+    fn the_right_half_is_kept_through_every_way_of_building() {
+        let (_dir, env, tree) = setup("right");
+        let mut wtxn = env.write_txn().unwrap();
+        let right = val(77);
+        // Nothing set: the default empty half.
+        assert_eq!(tree.right(&wtxn).unwrap(), default_hashes()[DEPTH - 1]);
+        tree.update(&mut wtxn, 5, &val(5)).unwrap();
+        let left = tree.node(&wtxn, DEPTH - 1, 0).unwrap();
+        assert_eq!(tree.root(&wtxn).unwrap(), compress(&left, &default_hashes()[DEPTH - 1]));
+        // Set: the root compresses both halves.
+        assert_eq!(tree.set_right(&mut wtxn, &right).unwrap(), compress(&left, &right));
+        assert_eq!(tree.right(&wtxn).unwrap(), right);
+        // A leaf update keeps it.
+        tree.update(&mut wtxn, 6, &val(6)).unwrap();
+        let left = tree.node(&wtxn, DEPTH - 1, 0).unwrap();
+        assert_eq!(tree.root(&wtxn).unwrap(), compress(&left, &right));
+        // So do set_many and build_from.
+        tree.set_many(&mut wtxn, &[(7, val(7)), (300, val(8))]).unwrap();
+        let left = tree.node(&wtxn, DEPTH - 1, 0).unwrap();
+        assert_eq!(tree.root(&wtxn).unwrap(), compress(&left, &right));
+        let groups = [tree.node(&wtxn, 8, 0).unwrap(), tree.node(&wtxn, 8, 1).unwrap()];
+        let root = tree.build_from(&mut wtxn, 8, &[(0, groups[0]), (1, groups[1])]).unwrap();
+        assert_eq!(root, compress(&left, &right));
+        // A proof's top sibling is the right half.
+        let proof = tree.prove(&wtxn, 300).unwrap();
+        assert_eq!(proof.siblings[DEPTH - 1], right);
+        assert!(proof.verify(&root, 300, &val(8)));
+        assert_eq!(root_from_subtrees(8, &groups, &right), root);
+        // Back to the default: the node is dropped and the root is as before.
+        tree.set_right(&mut wtxn, &default_hashes()[DEPTH - 1]).unwrap();
+        assert_eq!(tree.root(&wtxn).unwrap(), compress(&left, &default_hashes()[DEPTH - 1]));
+        assert_eq!(tree.right(&wtxn).unwrap(), default_hashes()[DEPTH - 1]);
     }
 }

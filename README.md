@@ -224,6 +224,40 @@ nothing half done.
 and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
 `mempool`, `peers` and `status` show the rest. The reward of a mined block goes to the miner's wallet.
 
+## Names
+
+The chain carries a registry of names, 1 to 32 characters of `a-z`, `0-9`
+and `_`, owned for good by whoever registers them (see `docs/NAMES.md`).
+A name's record holds its owner's key hash, a 32-byte value (the hash of
+the owner's payment keys) and a memo the owner's wallet reads. Registering
+takes two transactions: a commit, which hides the name, and a reveal, at
+least 12 blocks later, which names it. A block admits five reveals, so
+registrations are paid for by their fees.
+
+```
+> name-commit alice                 # pool a commit to "alice" (optionally a 64-hex value and a fee)
+> names                             # ... committed at block N, ready in 12 blocks
+> name-reveal alice                 # reveal once the commit is 12 blocks old
+> name-reveal alice 100             # or wait longer: a deeper reorganization is needed to take it
+> name-update alice HEX             # change the value; the owner key rotates
+> name alice                        # look a name up
+```
+
+To transfer a name, the recipient writes a record under a key of theirs
+and the owner signs it over:
+
+```
+> name-offer alice /tmp/alice.rec   # recipient: writes the record (optionally with a value)
+> name-transfer /tmp/alice.rec      # owner: signs the update and pools it
+```
+
+Operations ride in a transaction of the wallet's that pays their fee and
+can be cancelled like a payment while unconfirmed. `scan` recovers a
+restored wallet's names from the chain's records and its pending commits
+from their outputs; a recovered commit is matched to its name when you
+reveal it. Names must be revealed within 288 blocks of their commit or the
+commit is swept.
+
 To try two nodes on one machine:
 
 ```

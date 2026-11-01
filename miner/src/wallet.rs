@@ -44,6 +44,23 @@
 //! spent. A finalized payment can be cancelled ([`Wallet::cancel_sent`]) by
 //! signing a replacement that pays the inputs back to the wallet with a
 //! higher fee, which the mempool accepts in its place.
+//!
+//! # Names
+//!
+//! A name registration (see `docs/NAMES.md`) draws one nonce `r` like an
+//! output: the owner key is generated from `H(m, r)` under its own domain,
+//! the commit's salt is `H(m, r)` under another, and the memo of both the
+//! commit's output and the name's record is the output memo with a zero
+//! amount, so [`Wallet::scan_names`] recovers registered names from the
+//! records every node keeps (the memo opens and the owner key's hash is
+//! the record's owner) and pending commits from the commit outputs (the
+//! memo opens; the name itself is learned when the user reveals it, by
+//! recomputing the commit). Every signed operation rotates the owner key
+//! to a fresh nonce; the old key's leaves work like an output's for
+//! cancellations. A transfer is an update to a record the recipient wrote
+//! ([`Wallet::name_offer`]), signed by the owner ([`Wallet::name_transfer`]).
+//! Operations ride in a transaction of the wallet's that pays their fee
+//! ([`Wallet::carry`]).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -54,6 +71,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use crate::bip39;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
+use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::state_tree::open_env;
 use crate::transaction::{
@@ -71,8 +89,9 @@ const META_SCAN_PENDING: &str = "scan_pending";
 /// Height and hash of the block up to which the wallet has looked for its
 /// outputs' positions.
 const META_SYNCED: &str = "synced";
-/// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys.
-const FORMAT: u8 = 4;
+/// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys;
+/// 5 adds the name tables.
+const FORMAT: u8 = 5;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
 const SLATE_MAGIC: &[u8; 8] = b"tabslt02";
@@ -80,6 +99,8 @@ const SLATE_MAGIC: &[u8; 8] = b"tabslt02";
 const DOM_MASTER: u32 = 0x30;
 const DOM_PAD: u32 = 0x31;
 const DOM_KEY: u32 = 0x32;
+const DOM_OWNER: u32 = 0x33;
+const DOM_SALT: u32 = 0x34;
 /// Nonce elements in a memo.
 const NONCE: usize = 4;
 /// Leaves a key may sign from, in each half of its tree.
@@ -167,6 +188,145 @@ impl Owned {
     }
 
     /// Signatures this output can still make.
+    pub fn signatures_left(&self) -> u32 {
+        LEAVES_PER_HALF - u32::from(self.used)
+    }
+}
+
+/// A commit this wallet made, or found by a scan, awaiting its reveal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCommit {
+    pub commit: Commitment,
+    pub nonce: [Fp; NONCE],
+    /// Unknown for a commit found by a scan, until the user reveals it.
+    pub name: Option<Vec<u8>>,
+    pub value: Commitment,
+    pub created: u64,
+    pub recovered: bool,
+}
+
+impl PendingCommit {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.fps(&self.nonce);
+        let name = self.name.as_deref().unwrap_or(&[]);
+        w.0.push(name.len() as u8);
+        w.0.extend_from_slice(name);
+        w.digest(&self.value);
+        w.u64(self.created);
+        w.0.push(self.recovered as u8);
+        w.finish()
+    }
+
+    fn from_bytes(commit: Commitment, bytes: &[u8]) -> Option<PendingCommit> {
+        let mut r = Reader(bytes);
+        let nonce = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
+        let n = r.take(1)?[0] as usize;
+        let name = r.take(n)?.to_vec();
+        let value = r.digest()?;
+        let created = r.u64()?;
+        let recovered = r.take(1)?[0] == 1;
+        r.is_empty().then_some(PendingCommit {
+            commit,
+            nonce,
+            name: (n > 0).then_some(name),
+            value,
+            created,
+            recovered,
+        })
+    }
+}
+
+/// Where a name of the wallet's stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameStage {
+    /// Its reveal is signed; the record is not on chain yet.
+    Revealed,
+    /// The chain's record names this wallet's key.
+    Owned,
+    /// The wallet wrote a record for it, to receive it from its owner.
+    Offered,
+}
+
+/// A name this wallet owns, or is about to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedName {
+    pub name: Vec<u8>,
+    /// The current owner key's nonce.
+    pub nonce: [Fp; NONCE],
+    pub value: Commitment,
+    pub created: u64,
+    pub stage: NameStage,
+    /// Found by a scan: the key signs from leaves 8 to 15.
+    pub recovered: bool,
+    pub start: u8,
+    pub used: u8,
+    /// A rotation signed but not yet on chain: the new key's nonce and the
+    /// value written.
+    pub pending: Option<([Fp; NONCE], Commitment)>,
+    /// Signed over to another wallet; the record goes once the chain shows it.
+    pub transferring: bool,
+}
+
+impl OwnedName {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.fps(&self.nonce);
+        w.digest(&self.value);
+        w.u64(self.created);
+        w.0.push(match self.stage {
+            NameStage::Revealed => 0,
+            NameStage::Owned => 1,
+            NameStage::Offered => 2,
+        });
+        w.0.extend_from_slice(&[self.recovered as u8, self.start, self.used, self.transferring as u8]);
+        match &self.pending {
+            Some((nonce, value)) => {
+                w.0.push(1);
+                w.fps(nonce);
+                w.digest(value);
+            }
+            None => w.0.push(0),
+        }
+        w.finish()
+    }
+
+    fn from_bytes(name: Vec<u8>, bytes: &[u8]) -> Option<OwnedName> {
+        let mut r = Reader(bytes);
+        let nonce = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
+        let value = r.digest()?;
+        let created = r.u64()?;
+        let stage = match r.take(1)?[0] {
+            0 => NameStage::Revealed,
+            1 => NameStage::Owned,
+            2 => NameStage::Offered,
+            _ => return None,
+        };
+        let flags = r.take(4)?;
+        let (recovered, start, used, transferring) = (flags[0] == 1, flags[1], flags[2], flags[3] == 1);
+        if u32::from(start) >= LEAVES_PER_HALF || u32::from(used) > LEAVES_PER_HALF {
+            return None;
+        }
+        let pending = match r.take(1)?[0] {
+            0 => None,
+            1 => Some(([r.fp()?, r.fp()?, r.fp()?, r.fp()?], r.digest()?)),
+            _ => return None,
+        };
+        r.is_empty().then_some(OwnedName {
+            name,
+            nonce,
+            value,
+            created,
+            stage,
+            recovered,
+            start,
+            used,
+            pending,
+            transferring,
+        })
+    }
+
+    /// Signatures the current owner key can still make.
     pub fn signatures_left(&self) -> u32 {
         LEAVES_PER_HALF - u32::from(self.used)
     }
@@ -356,6 +516,8 @@ pub enum WalletError {
     Exists,
     /// An input has not been seen in a block yet.
     Unconfirmed,
+    /// A name operation the wallet cannot make.
+    Name(String),
 }
 
 impl core::fmt::Display for WalletError {
@@ -374,6 +536,7 @@ impl core::fmt::Display for WalletError {
             WalletError::OldFormat => f.write_str("wallet database is from an older format"),
             WalletError::Exists => f.write_str("a wallet already exists in that directory"),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
+            WalletError::Name(m) => f.write_str(m),
         }
     }
 }
@@ -433,6 +596,10 @@ pub struct Wallet {
     outputs: Database<Bytes, Bytes>,
     slates: Database<Bytes, Bytes>,
     sent: Database<Bytes, Bytes>,
+    /// Pending commits by commit hash.
+    commits: Database<Bytes, Bytes>,
+    /// Names by name.
+    names: Database<Bytes, Bytes>,
 }
 
 fn unix_now() -> u64 {
@@ -461,7 +628,8 @@ fn master_of(seed: &[u8; 64]) -> [Fp; DIGEST] {
 }
 
 impl Wallet {
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 3])> {
+    #[allow(clippy::type_complexity)]
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 5])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
@@ -471,14 +639,16 @@ impl Wallet {
         let outputs = env.create_database(&mut wtxn, Some("outputs"))?;
         let slates = env.create_database(&mut wtxn, Some("slates"))?;
         let sent = env.create_database(&mut wtxn, Some("sent"))?;
+        let commits = env.create_database(&mut wtxn, Some("commits"))?;
+        let names = env.create_database(&mut wtxn, Some("names"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent]))
+        Ok((env, meta, [outputs, slates, sent, commits, names]))
     }
 
     /// Opens the wallet in `dir`, creating one with a fresh phrase if there
     /// is none. Returns the wallet and, if it was just created, its phrase.
     pub fn open(dir: &Path) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         let created = match meta.get(&wtxn, META_SEED)? {
             Some(_) => {
@@ -506,7 +676,7 @@ impl Wallet {
             .try_into()
             .map_err(|_| WalletError::Corrupt("seed"))?;
         wtxn.commit()?;
-        Ok((Wallet { env, master: master_of(&seed), meta, outputs, slates, sent }, created))
+        Ok((Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names }, created))
     }
 
     /// Creates a wallet in `dir` from a phrase and passphrase; the outputs
@@ -514,7 +684,7 @@ impl Wallet {
     pub fn restore(dir: &Path, phrase: &str, passphrase: &str) -> Result<Wallet> {
         let entropy = bip39::entropy(phrase)?;
         let seed = bip39::seed(phrase, passphrase)?;
-        let (env, meta, [outputs, slates, sent]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         if meta.get(&wtxn, META_SEED)?.is_some() || !outputs.is_empty(&wtxn)? {
             return Err(WalletError::Exists);
@@ -524,7 +694,7 @@ impl Wallet {
         meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
         meta.put(&mut wtxn, META_SCAN_PENDING, &[1])?;
         wtxn.commit()?;
-        Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent })
+        Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names })
     }
 
     /// Whether a restore is waiting for its first scan.
@@ -1165,6 +1335,414 @@ impl Wallet {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+impl Wallet {
+    /// The owner key of the name registration with nonce `nonce`.
+    pub fn owner_key(&self, nonce: &[Fp; NONCE]) -> Key {
+        let seed: [u8; SEED_SIZE] = digest_to_bytes(&self.with_master(DOM_OWNER, nonce));
+        Key::generate(&seed)
+    }
+
+    fn owner_hash(&self, nonce: &[Fp; NONCE]) -> Commitment {
+        pubkey_hash(&self.owner_key(nonce).public_key())
+    }
+
+    /// The commit salt of the registration with nonce `nonce`.
+    fn salt(&self, nonce: &[Fp; NONCE]) -> Commitment {
+        self.with_master(DOM_SALT, nonce)
+    }
+
+    /// The record this wallet writes for `name` under the key of `nonce`.
+    fn name_record(&self, name: &[u8], nonce: &[Fp; NONCE], value: &Commitment) -> Result<Record> {
+        Record::new(name, self.owner_hash(nonce), *value, self.memo(nonce, 0))
+            .ok_or_else(|| WalletError::Name(format!("{} is not a valid name", String::from_utf8_lossy(name))))
+    }
+
+    fn commit_of(&self, name: &[u8], nonce: &[Fp; NONCE]) -> Option<Commitment> {
+        let nh = name_hash(&names::name_elements(name)?);
+        Some(commit_hash(&nh, &self.salt(nonce), &self.owner_hash(nonce)))
+    }
+
+    fn put_commit(&self, wtxn: &mut RwTxn, c: &PendingCommit) -> Result<()> {
+        self.commits.put(wtxn, &digest_to_bytes(&c.commit), &c.to_bytes())?;
+        Ok(())
+    }
+
+    fn put_name(&self, wtxn: &mut RwTxn, n: &OwnedName) -> Result<()> {
+        self.names.put(wtxn, &n.name, &n.to_bytes())?;
+        Ok(())
+    }
+
+    fn name_in(&self, rtxn: &RoTxn, name: &[u8]) -> Result<Option<OwnedName>> {
+        match self.names.get(rtxn, name)? {
+            None => Ok(None),
+            Some(b) => OwnedName::from_bytes(name.to_vec(), b).map(Some).ok_or(WalletError::Corrupt("name")),
+        }
+    }
+
+    /// The wallet's record of `name`, if any.
+    pub fn owned_name(&self, name: &[u8]) -> Result<Option<OwnedName>> {
+        let rtxn = self.env.read_txn()?;
+        self.name_in(&rtxn, name)
+    }
+
+    /// Every name the wallet holds or awaits, by name.
+    pub fn owned_names(&self) -> Result<Vec<OwnedName>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.names.iter(&rtxn)? {
+            let (k, b) = item?;
+            out.push(OwnedName::from_bytes(k.to_vec(), b).ok_or(WalletError::Corrupt("name"))?);
+        }
+        Ok(out)
+    }
+
+    /// Every commit awaiting its reveal, oldest first.
+    pub fn pending_commits(&self) -> Result<Vec<PendingCommit>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.commits.iter(&rtxn)? {
+            let (k, b) = item?;
+            let c = crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("commit key"))?;
+            out.push(PendingCommit::from_bytes(c, b).ok_or(WalletError::Corrupt("commit"))?);
+        }
+        out.sort_by_key(|c| c.created);
+        Ok(out)
+    }
+
+    /// Starts registering `name` with `value`: a commit operation to carry
+    /// in a transaction, remembered for the reveal.
+    pub fn name_commit(&self, name: &[u8], value: Commitment) -> Result<NameOp> {
+        if !names::valid_name(name) {
+            return Err(WalletError::Name(format!("{} is not a valid name", String::from_utf8_lossy(name))));
+        }
+        let rtxn = self.env.read_txn()?;
+        if self.name_in(&rtxn, name)?.is_some() {
+            return Err(WalletError::Name("the wallet already holds that name".into()));
+        }
+        drop(rtxn);
+        if self.pending_commits()?.iter().any(|c| c.name.as_deref() == Some(name)) {
+            return Err(WalletError::Name("the wallet has already committed to that name".into()));
+        }
+        let nonce = [random_fp()?, random_fp()?, random_fp()?, random_fp()?];
+        let commit = self.commit_of(name, &nonce).expect("validated name");
+        let entry =
+            PendingCommit { commit, nonce, name: Some(name.to_vec()), value, created: unix_now(), recovered: false };
+        let mut wtxn = self.env.write_txn()?;
+        self.put_commit(&mut wtxn, &entry)?;
+        wtxn.commit()?;
+        Ok(NameOp::Commit { commit, memo: self.memo(&nonce, 0) })
+    }
+
+    /// Reveals `name` from its commit, for a block at `height`, once the
+    /// commit is at least `wait` blocks old (at least [`MIN_REVEAL`]). A
+    /// commit found by a scan is matched to the name here. The name's
+    /// record is then awaited on chain.
+    pub fn name_reveal(&self, name: &[u8], wait: u32, registry: &NameSet, rtxn: &RoTxn, height: u32) -> Result<NameOp> {
+        let pending = self.pending_commits()?;
+        let entry = pending
+            .iter()
+            .find(|c| c.name.as_deref() == Some(name))
+            .or_else(|| pending.iter().find(|c| c.name.is_none() && self.commit_of(name, &c.nonce) == Some(c.commit)))
+            .cloned()
+            .ok_or_else(|| WalletError::Name(format!("no commit for {}", String::from_utf8_lossy(name))))?;
+        let position = registry
+            .commit_position(rtxn, &entry.commit)
+            .map_err(|e| WalletError::Name(e.to_string()))?
+            .ok_or_else(|| WalletError::Name("the commit is not on chain yet".into()))?;
+        let commit = registry
+            .commit_at(rtxn, position)
+            .map_err(|e| WalletError::Name(e.to_string()))?
+            .ok_or_else(|| WalletError::Name("the commit is not on chain yet".into()))?;
+        let wait = wait.max(MIN_REVEAL);
+        if height < commit.height.saturating_add(wait) {
+            return Err(WalletError::Name(format!(
+                "the commit is {} blocks old; wait {} more",
+                height.saturating_sub(commit.height),
+                commit.height + wait - height
+            )));
+        }
+        let record = self.name_record(name, &entry.nonce, &entry.value)?;
+        let op = NameOp::Reveal { record, salt: self.salt(&entry.nonce), commit: position };
+        let owned = OwnedName {
+            name: name.to_vec(),
+            nonce: entry.nonce,
+            value: entry.value,
+            created: unix_now(),
+            stage: NameStage::Revealed,
+            recovered: entry.recovered,
+            start: if entry.recovered { random_bytes::<1>()?[0] % LEAVES_PER_HALF as u8 } else { 0 },
+            used: 0,
+            pending: None,
+            transferring: false,
+        };
+        let mut wtxn = self.env.write_txn()?;
+        self.put_name(&mut wtxn, &owned)?;
+        self.commits.delete(&mut wtxn, &digest_to_bytes(&entry.commit))?;
+        wtxn.commit()?;
+        Ok(op)
+    }
+
+    /// Signs `record` as the current owner of its name with the key's next
+    /// leaf, recording the signature. The entry is updated by the caller.
+    fn sign_update(&self, wtxn: &mut RwTxn, entry: &mut OwnedName, record: Record) -> Result<NameOp> {
+        if u32::from(entry.used) >= LEAVES_PER_HALF {
+            return Err(WalletError::Exhausted);
+        }
+        let base = if entry.recovered { LEAVES_PER_HALF } else { 0 };
+        let leaf = base + (u32::from(entry.start) + u32::from(entry.used)) % LEAVES_PER_HALF;
+        entry.used += 1;
+        let mut key = self.owner_key(&entry.nonce);
+        key.set_next_index(u64::from(leaf));
+        let op = NameOp::update(record, &mut key).map_err(|e| WalletError::Name(e.to_string()))?;
+        self.put_name(wtxn, entry)?;
+        Ok(op)
+    }
+
+    /// Changes `name`'s value, rotating its owner key: an update operation
+    /// to carry in a transaction.
+    pub fn name_update(&self, name: &[u8], value: Commitment) -> Result<NameOp> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut entry = self
+            .name_in(&wtxn, name)?
+            .filter(|n| n.stage == NameStage::Owned)
+            .ok_or_else(|| WalletError::Name(format!("the wallet does not own {}", String::from_utf8_lossy(name))))?;
+        if entry.pending.is_some() || entry.transferring {
+            return Err(WalletError::Name("an operation on that name is already signed".into()));
+        }
+        let nonce = [random_fp()?, random_fp()?, random_fp()?, random_fp()?];
+        let record = self.name_record(name, &nonce, &value)?;
+        entry.pending = Some((nonce, value));
+        let op = self.sign_update(&mut wtxn, &mut entry, record)?;
+        wtxn.commit()?;
+        Ok(op)
+    }
+
+    /// Prepares to receive `name` from its owner: a record under a fresh key
+    /// of this wallet's, for the owner to sign over ([`Wallet::name_transfer`]).
+    pub fn name_offer(&self, name: &[u8], value: Commitment) -> Result<Record> {
+        let rtxn = self.env.read_txn()?;
+        if self.name_in(&rtxn, name)?.is_some() {
+            return Err(WalletError::Name("the wallet already holds that name".into()));
+        }
+        drop(rtxn);
+        let nonce = [random_fp()?, random_fp()?, random_fp()?, random_fp()?];
+        let record = self.name_record(name, &nonce, &value)?;
+        let entry = OwnedName {
+            name: name.to_vec(),
+            nonce,
+            value,
+            created: unix_now(),
+            stage: NameStage::Offered,
+            recovered: false,
+            start: 0,
+            used: 0,
+            pending: None,
+            transferring: false,
+        };
+        let mut wtxn = self.env.write_txn()?;
+        self.put_name(&mut wtxn, &entry)?;
+        wtxn.commit()?;
+        Ok(record)
+    }
+
+    /// Signs `record`, written by its recipient, over as the owner of its
+    /// name: an update operation to carry in a transaction.
+    pub fn name_transfer(&self, record: Record) -> Result<NameOp> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut entry =
+            self.name_in(&wtxn, &record.name)?.filter(|n| n.stage == NameStage::Owned).ok_or_else(|| {
+                WalletError::Name(format!("the wallet does not own {}", String::from_utf8_lossy(&record.name)))
+            })?;
+        if entry.pending.is_some() || entry.transferring {
+            return Err(WalletError::Name("an operation on that name is already signed".into()));
+        }
+        if record.owner == self.owner_hash(&entry.nonce) {
+            return Err(WalletError::Name("the record keeps the current owner".into()));
+        }
+        entry.transferring = true;
+        let op = self.sign_update(&mut wtxn, &mut entry, record)?;
+        wtxn.commit()?;
+        Ok(op)
+    }
+
+    /// Brings the wallet's names in line with the chain's records: a reveal
+    /// or a rotation seen on chain settles, an offered name arrives, a
+    /// transferred one leaves, and a name whose record names someone else's
+    /// key is dropped. Returns how many entries changed.
+    pub fn sync_names(&self, registry: &NameSet, rtxn: &RoTxn) -> Result<usize> {
+        let mut changed = 0;
+        let mut wtxn = self.env.write_txn()?;
+        for mut entry in self.owned_names()? {
+            let Some(record) = registry.lookup(rtxn, &entry.name).map_err(|e| WalletError::Name(e.to_string()))? else {
+                continue;
+            };
+            let mine = record.owner == self.owner_hash(&entry.nonce);
+            let rotated = entry.pending.as_ref().is_some_and(|(n, _)| record.owner == self.owner_hash(n));
+            if rotated {
+                let (nonce, value) = entry.pending.take().unwrap();
+                entry.nonce = nonce;
+                entry.value = value;
+                entry.recovered = false;
+                entry.start = 0;
+                entry.used = 0;
+                entry.stage = NameStage::Owned;
+                self.put_name(&mut wtxn, &entry)?;
+                changed += 1;
+            } else if mine {
+                if entry.stage != NameStage::Owned || entry.value != record.value {
+                    entry.stage = NameStage::Owned;
+                    entry.value = record.value;
+                    self.put_name(&mut wtxn, &entry)?;
+                    changed += 1;
+                }
+            } else if entry.transferring || entry.stage != NameStage::Offered {
+                // Signed away, or registered by someone else first.
+                self.names.delete(&mut wtxn, &entry.name)?;
+                changed += 1;
+            }
+        }
+        wtxn.commit()?;
+        Ok(changed)
+    }
+
+    /// Recovery: finds the wallet's names among the registry's records and
+    /// its pending commits among the commit outputs. Returns how many of
+    /// each were new.
+    pub fn scan_names(&self, utxo: &UtxoSet, registry: &NameSet, rtxn: &RoTxn) -> Result<(usize, usize)> {
+        let err = |e: names::Error| WalletError::Name(e.to_string());
+        let mut found_names = Vec::new();
+        for record in registry.records_in(rtxn, 0, crate::name_trie::Key::MAX).map_err(err)? {
+            let Some((nonce, 0)) = self.open_memo(&record.memo) else {
+                continue;
+            };
+            if record.owner != self.owner_hash(&nonce) || self.owned_name(&record.name)?.is_some() {
+                continue;
+            }
+            found_names.push(OwnedName {
+                name: record.name.clone(),
+                nonce,
+                value: record.value,
+                created: unix_now(),
+                stage: NameStage::Owned,
+                recovered: true,
+                start: random_bytes::<1>()?[0] % LEAVES_PER_HALF as u8,
+                used: 0,
+                pending: None,
+                transferring: false,
+            });
+        }
+        let mut found_commits = Vec::new();
+        let known = self.pending_commits()?;
+        for (position, commit) in registry.commits(rtxn).map_err(err)? {
+            let Some((nonce, 0)) = self.open_memo(&utxo.memo(rtxn, position)?) else {
+                continue;
+            };
+            if known.iter().any(|c| c.commit == commit.hash) {
+                continue;
+            }
+            found_commits.push(PendingCommit {
+                commit: commit.hash,
+                nonce,
+                name: None,
+                value: [Fp::ZERO; DIGEST],
+                created: unix_now(),
+                recovered: true,
+            });
+        }
+        let mut wtxn = self.env.write_txn()?;
+        for n in &found_names {
+            self.put_name(&mut wtxn, n)?;
+        }
+        for c in &found_commits {
+            self.put_commit(&mut wtxn, c)?;
+        }
+        wtxn.commit()?;
+        Ok((found_names.len(), found_commits.len()))
+    }
+
+    /// The smallest fee a transaction carrying `ops` from `inputs` inputs
+    /// with change may pay.
+    pub fn min_carry_fee(inputs: usize, ops: &[NameOp]) -> u64 {
+        let size = 12 + inputs * INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>();
+        Policy::MAINNET.min_fee_for(size)
+    }
+
+    /// Signs a transaction of this wallet's that carries `ops` and pays
+    /// `fee` (or the smallest the pool takes): confirmed inputs largest
+    /// first, change to a fresh output. Recorded like a payment, so it can
+    /// be cancelled while unconfirmed.
+    pub fn carry(&self, ops: Vec<NameOp>, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
+        if ops.is_empty() {
+            return Err(WalletError::Name("nothing to carry".into()));
+        }
+        let dust = Policy::MAINNET.dust;
+        let coins = self.spendable(utxo, rtxn)?;
+        let mut inputs = 1;
+        let fee = loop {
+            let fee = fee.unwrap_or_else(|| Self::min_carry_fee(inputs, &ops));
+            let mut picked = 0usize;
+            let mut total = 0u128;
+            for c in &coins {
+                if total >= fee as u128 {
+                    break;
+                }
+                total += c.amount as u128;
+                picked += 1;
+            }
+            if total < fee as u128 {
+                return Err(WalletError::Insufficient { have: total, need: fee as u128 });
+            }
+            let min = Self::min_carry_fee(picked.max(1), &ops);
+            if fee < min {
+                return Err(WalletError::FeeTooLow { min });
+            }
+            if picked <= inputs {
+                break fee;
+            }
+            inputs = picked;
+        };
+        let mut picked = Vec::new();
+        let mut total = 0u128;
+        for c in coins {
+            if total >= fee as u128 {
+                break;
+            }
+            total += c.amount as u128;
+            picked.push(c);
+        }
+        let change_amount = (total - fee as u128) as u64;
+        let (fee, outputs, change) = if change_amount >= dust {
+            let out = self.receive(change_amount)?;
+            (fee, vec![out], Some(out.commitment))
+        } else {
+            (fee + change_amount, vec![], None)
+        };
+        let inputs: Vec<(PublicKey, u64)> =
+            picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
+        let commitments: Vec<Commitment> = picked.iter().map(|c| c.commitment).collect();
+        let mut wtxn = self.env.write_txn()?;
+        let signed = match self.sign(&mut wtxn, UnsignedTransaction::with_ops(inputs, outputs, ops), &commitments) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(wtxn);
+                if let Some(c) = change {
+                    self.forget(&c)?;
+                }
+                return Err(e);
+            }
+        };
+        let sent =
+            Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created: unix_now() };
+        self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
+        wtxn.commit()?;
+        Ok(signed)
+    }
+}
+
 /// 32 bytes from 64 hex digits.
 pub fn digest_from_hex(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
@@ -1420,5 +1998,131 @@ mod tests {
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 0);
         assert!(matches!(alice.cancel_slate(&s2.id), Err(WalletError::Unknown)));
         assert_eq!(digest_from_hex(&s2.id_hex()), Some(s2.id));
+    }
+
+    #[test]
+    fn names_commit_reveal_update_transfer_and_recover() {
+        use crate::names::{BlockNameOp, NameSet};
+        let dir = TempDir::new("names");
+        let (env, u) = utxo(&dir);
+        let registry = {
+            let mut wtxn = env.write_txn().unwrap();
+            let n = NameSet::open(&env, &mut wtxn, "n").unwrap();
+            wtxn.commit().unwrap();
+            n
+        };
+        // The chain, as far as the wallet sees it: applies a carried
+        // transaction's operations (and sweeps) at `height`.
+        let apply = |tx: &Transaction, height: u32| {
+            let mut wtxn = env.write_txn().unwrap();
+            let ops: Vec<BlockNameOp> = tx.ops.iter().map(NameOp::block_op).collect();
+            for (c, p) in tx.spent_commitments().iter().zip(tx.spent_positions()) {
+                assert!(u.spend_at(&mut wtxn, c, p).unwrap());
+            }
+            let first = u.next_position(&wtxn).unwrap();
+            let outs: Vec<_> = tx.outputs.iter().map(|o| o.block_output()).collect();
+            u.add_outputs(&mut wtxn, &outs).unwrap();
+            registry.apply(&u, &mut wtxn, height, &ops, &[]).unwrap();
+            wtxn.commit().unwrap();
+            (first, outs)
+        };
+        let (alice, phrase) = Wallet::open(&dir.0.join("alice")).unwrap();
+        let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
+        let coin = alice.receive(10_000_000).unwrap();
+        land(&env, &u, &alice, &[&coin]);
+        let value = |n: u32| -> Commitment { core::array::from_fn(|i| Fp::new(n * 100 + i as u32)) };
+
+        // Commit, carried by a transaction paying the minimum fee.
+        let commit = alice.name_commit(b"alice", value(1)).unwrap();
+        assert!(alice.name_commit(b"Alice", value(1)).is_err());
+        assert!(alice.name_commit(b"alice", value(1)).is_err());
+        let rtxn = env.read_txn().unwrap();
+        let signed = alice.carry(vec![commit.clone()], None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        assert_eq!(signed.tx.ops, vec![commit.clone()]);
+        assert_eq!(signed.tx.balance() as u64, Wallet::min_carry_fee(1, &signed.tx.ops));
+        assert!(signed.tx.verify_signatures());
+        let (first, outs) = apply(&signed.tx, 1);
+        alice.locate(first, &outs).unwrap();
+        let NameOp::Commit { commit: c, .. } = &commit else { unreachable!() };
+        assert_eq!(alice.pending_commits().unwrap()[0].commit, *c);
+        // Reveal: too early at 12 with a longer wait, refused; at 13 fine.
+        let rtxn = env.read_txn().unwrap();
+        assert!(alice.name_reveal(b"alice", 0, &registry, &rtxn, 12).is_err());
+        assert!(alice.name_reveal(b"alice", 20, &registry, &rtxn, 13).is_err());
+        assert!(alice.name_reveal(b"bob", 0, &registry, &rtxn, 13).is_err());
+        let reveal = alice.name_reveal(b"alice", 0, &registry, &rtxn, 13).unwrap();
+        let signed = alice.carry(vec![reveal.clone()], None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        assert!(alice.pending_commits().unwrap().is_empty());
+        assert_eq!(alice.owned_name(b"alice").unwrap().unwrap().stage, NameStage::Revealed);
+        let (first, outs) = apply(&signed.tx, 13);
+        alice.locate(first, &outs).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(alice.sync_names(&registry, &rtxn).unwrap(), 1);
+        let owned = alice.owned_name(b"alice").unwrap().unwrap();
+        assert_eq!((owned.stage, owned.value), (NameStage::Owned, value(1)));
+        let on_chain = registry.lookup(&rtxn, b"alice").unwrap().unwrap();
+        assert_eq!(on_chain.owner, alice.owner_hash(&owned.nonce));
+        assert_eq!(alice.open_memo(&on_chain.memo), Some((owned.nonce, 0)));
+
+        // Update: the key rotates once the chain shows the new owner.
+        let update = alice.name_update(b"alice", value(2)).unwrap();
+        assert!(alice.name_update(b"alice", value(3)).is_err());
+        assert!(update.verify_owner(&on_chain.owner));
+        let signed = alice.carry(vec![update], None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        let (first, outs) = apply(&signed.tx, 14);
+        alice.locate(first, &outs).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(alice.sync_names(&registry, &rtxn).unwrap(), 1);
+        let rotated = alice.owned_name(b"alice").unwrap().unwrap();
+        assert_ne!(rotated.nonce, owned.nonce);
+        assert_eq!((rotated.value, rotated.used, rotated.pending), (value(2), 0, None));
+        assert_eq!(registry.lookup(&rtxn, b"alice").unwrap().unwrap().owner, alice.owner_hash(&rotated.nonce));
+
+        // Transfer to bob: his record, her signature.
+        let offer = bob.name_offer(b"alice", value(5)).unwrap();
+        assert_eq!(bob.owned_name(b"alice").unwrap().unwrap().stage, NameStage::Offered);
+        assert!(alice.name_transfer(Record::new(b"carol", offer.owner, value(1), offer.memo).unwrap()).is_err());
+        let transfer = alice.name_transfer(offer.clone()).unwrap();
+        assert!(alice.name_update(b"alice", value(3)).is_err());
+        let signed = alice.carry(vec![transfer], None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        let (first, outs) = apply(&signed.tx, 15);
+        alice.locate(first, &outs).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(alice.sync_names(&registry, &rtxn).unwrap(), 1);
+        assert!(alice.owned_name(b"alice").unwrap().is_none());
+        assert_eq!(bob.sync_names(&registry, &rtxn).unwrap(), 1);
+        assert_eq!(bob.owned_name(b"alice").unwrap().unwrap().stage, NameStage::Owned);
+        assert_eq!(registry.lookup(&rtxn, b"alice").unwrap().unwrap(), offer);
+
+        // Bob commits to another name; a restored bob finds his name and
+        // the pending commit, and reveals it once told the name.
+        let coin = bob.receive(10_000_000).unwrap();
+        drop(rtxn);
+        land(&env, &u, &bob, &[&coin]);
+        let commit = bob.name_commit(b"bob_2", value(7)).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let signed = bob.carry(vec![commit], None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        apply(&signed.tx, 20);
+        let (_, bob_phrase) = (0, bob.phrase().unwrap());
+        let restored = Wallet::restore(&dir.0.join("bob2"), &bob_phrase, "").unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(restored.scan_names(&u, &registry, &rtxn).unwrap(), (1, 1));
+        assert_eq!(restored.scan_names(&u, &registry, &rtxn).unwrap(), (0, 0));
+        let found = restored.owned_name(b"alice").unwrap().unwrap();
+        assert!(found.recovered && found.stage == NameStage::Owned && found.value == value(5));
+        let pending = &restored.pending_commits().unwrap()[0];
+        assert!(pending.recovered && pending.name.is_none());
+        assert!(restored.name_reveal(b"wrong", 0, &registry, &rtxn, 40).is_err());
+        let reveal = restored.name_reveal(b"bob_2", 0, &registry, &rtxn, 40).unwrap();
+        let NameOp::Reveal { record, .. } = &reveal else { unreachable!() };
+        assert_eq!(record.owner, restored.owner_hash(&pending.nonce));
+        // Alice's restored wallet finds nothing: the name left her.
+        let alice2 = Wallet::restore(&dir.0.join("alice2"), &phrase.unwrap(), "").unwrap();
+        assert_eq!(alice2.scan_names(&u, &registry, &rtxn).unwrap(), (0, 0));
     }
 }

@@ -18,6 +18,9 @@ pub mod inflate;
 pub mod log;
 pub mod mempool;
 pub mod merkle;
+pub mod name_air;
+pub mod name_trie;
+pub mod names;
 pub mod net;
 pub mod node;
 pub mod ntt;
@@ -37,6 +40,7 @@ pub mod vm_air;
 pub mod wallet;
 pub mod xmss;
 pub mod xmss_air;
+pub mod xmss_fragment;
 
 #[cfg(test)]
 pub(crate) mod test_util {

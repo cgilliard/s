@@ -43,7 +43,7 @@ use heed::types::{Bytes, Str, U64};
 use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::poseidon2::{DIGEST, compress_all, digest_to_bytes};
-use crate::state_tree::{self, CAPACITY, Digest, Proof, StateTree, subtree_path, subtree_root, subtree_roots};
+use crate::state_tree::{self, Digest, OUTPUT_CAPACITY, Proof, StateTree, subtree_path, subtree_root, subtree_roots};
 use crate::transaction::Commitment;
 
 const COMMITMENT_BYTES: usize = DIGEST * 4;
@@ -70,7 +70,7 @@ type Record = [u8; RECORD];
 pub enum Error {
     Tree(state_tree::Error),
     Heed(heed::Error),
-    /// All `2^DEPTH` positions have been assigned.
+    /// Every output position (below [`OUTPUT_CAPACITY`]) has been assigned.
     Full,
     /// A stored record could not be decoded, or an output is missing where
     /// it must be.
@@ -82,7 +82,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Tree(e) => write!(f, "{e}"),
             Error::Heed(e) => write!(f, "lmdb error: {e}"),
-            Error::Full => f.write_str("utxo set is full: no positions left"),
+            Error::Full => f.write_str("utxo set is full: no output positions left"),
             Error::CorruptIndex => f.write_str("corrupt or missing utxo record"),
         }
     }
@@ -157,7 +157,7 @@ fn decode_bucket(key: u64, bytes: &[u8]) -> Result<Vec<(u64, Record)>> {
         if delta == 0 && !out.is_empty() {
             return Err(Error::CorruptIndex);
         }
-        let position = prev.checked_add(delta).filter(|&p| p < CAPACITY).ok_or(Error::CorruptIndex)?;
+        let position = prev.checked_add(delta).filter(|&p| p < OUTPUT_CAPACITY).ok_or(Error::CorruptIndex)?;
         let rec = bytes.get(i..i + RECORD).ok_or(Error::CorruptIndex)?;
         out.push((position, rec.try_into().unwrap()));
         (prev, i) = (position, i + RECORD);
@@ -250,9 +250,26 @@ impl UtxoSet {
         Ok(UtxoSet { env: env.clone(), tree, outputs, meta })
     }
 
-    /// Current Merkle root of the set.
+    /// Current Merkle root of the set: the state root, which covers the
+    /// name trie's root as the tree's right half.
     pub fn root(&self, rtxn: &RoTxn) -> Result<Digest> {
         Ok(self.tree.root(rtxn)?)
+    }
+
+    /// The name trie's root as the tree holds it.
+    pub fn name_root(&self, rtxn: &RoTxn) -> Result<Digest> {
+        Ok(self.tree.right(rtxn)?)
+    }
+
+    /// The root of the tree's left half, over the outputs alone.
+    pub fn output_root(&self, rtxn: &RoTxn) -> Result<Digest> {
+        Ok(self.tree.left(rtxn)?)
+    }
+
+    /// Stores the name trie's root as the tree's right half; returns the
+    /// state root.
+    pub fn set_name_root(&self, wtxn: &mut RwTxn, root: &Digest) -> Result<Digest> {
+        Ok(self.tree.set_right(wtxn, root)?)
     }
 
     /// Position the next added output will receive; also the number of
@@ -279,7 +296,7 @@ impl UtxoSet {
     pub fn add_outputs(&self, wtxn: &mut RwTxn, outputs: &[BlockOutput]) -> Result<()> {
         let first = self.next_position(wtxn)?;
         let end = first + outputs.len() as u64;
-        if end > CAPACITY {
+        if end > OUTPUT_CAPACITY {
             return Err(Error::Full);
         }
         let mut edit = Edit::default();
@@ -325,7 +342,7 @@ impl UtxoSet {
         self.prefetch(outputs.iter().map(|o| o.0 >> GROUP_LOG).collect());
         let mut edit = Edit::default();
         for (p, c, m) in outputs {
-            if *p >= CAPACITY {
+            if *p >= OUTPUT_CAPACITY {
                 return Err(Error::Full);
             }
             self.put_record(wtxn, &mut edit, *p, c, m)?;
@@ -336,7 +353,7 @@ impl UtxoSet {
 
     /// Writes an unspent output at `position` without moving the counter.
     pub fn insert_at(&self, wtxn: &mut RwTxn, position: u64, commitment: &Commitment, memo: &Memo) -> Result<()> {
-        if position >= CAPACITY {
+        if position >= OUTPUT_CAPACITY {
             return Err(Error::Full);
         }
         let mut edit = Edit::default();
@@ -349,7 +366,7 @@ impl UtxoSet {
     /// all below `next`, which becomes the counter. Writes each stored tree
     /// node once, so it stays fast for a set of any size.
     pub fn install(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Memo)], next: u64) -> Result<()> {
-        if !self.is_empty(wtxn)? || self.next_position(wtxn)? != 0 || next > CAPACITY {
+        if !self.is_empty(wtxn)? || self.next_position(wtxn)? != 0 || next > OUTPUT_CAPACITY {
             return Err(Error::CorruptIndex);
         }
         if outputs.windows(2).any(|w| w[0].0 >= w[1].0) || outputs.last().is_some_and(|o| o.0 >= next) {
@@ -757,7 +774,7 @@ impl UtxoSet {
 
     /// Every unspent output, position order: commitment and memo.
     pub fn unspent(&self, rtxn: &RoTxn) -> Result<Vec<(u64, (Commitment, Memo))>> {
-        self.unspent_in(rtxn, 0, CAPACITY)
+        self.unspent_in(rtxn, 0, OUTPUT_CAPACITY)
     }
 
     /// The unspent outputs at positions `first..end`, ascending.
@@ -812,7 +829,7 @@ impl UtxoSet {
 
     /// Merkle proof for the leaf at `position`.
     pub fn prove(&self, rtxn: &RoTxn, position: u64) -> Result<Proof> {
-        if position >= CAPACITY {
+        if position >= OUTPUT_CAPACITY {
             return Err(state_tree::Error::KeyOutOfRange(position).into());
         }
         let group = position >> GROUP_LOG;
@@ -1309,7 +1326,7 @@ mod tests {
         wtxn.commit().unwrap();
         peak = peak.max(rss_anon_kb());
         let secs = start.elapsed().as_secs_f64();
-        assert_eq!(root, state_tree::root_from_subtrees(level, &roots));
+        assert_eq!(root, state_tree::root_from_subtrees(level, &roots, &crate::name_trie::empty_root()));
         eprintln!(
             "{count} outputs in {parts} parts: {secs:.1} s ({:.1} µs each, 170M in {:.0} min); heap grew at most {:.1} MB",
             secs * 1e6 / count as f64,

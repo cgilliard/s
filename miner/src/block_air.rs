@@ -4,18 +4,19 @@
 //!
 //! # Statement
 //!
-//! Public values (150 elements):
+//! Public values (184 elements):
 //!
 //! ```text
 //! root_in[8] root_out[8]            UTXO root before and after
 //! isp_in[16] isp_out[16]            inputs sponge state before and after
 //! osp_in[16] osp_out[16]            outputs sponge state before and after
+//! nsp_in[16] nsp_out[16]            name operations sponge state before and after
 //! pos_in(2) pos_out(2)              next output position before and after
 //! sum_in[6] sum_out[6]              16-bit limb sums of input and output amounts
-//! carry_in[27] carry_out[27]        transaction open across the boundary:
+//! carry_in[28] carry_out[28]        transaction open across the boundary:
 //!                                   open, message[8], body sponge[16],
-//!                                   inputs left, outputs left (all zero
-//!                                   when closed)
+//!                                   inputs, outputs and operations left
+//!                                   (all zero when closed)
 //! ```
 //!
 //! Segments chain by matching one segment's `*_out` to the next segment's
@@ -47,12 +48,19 @@
 //! same registers the signatures and commitments use and must equal the
 //! signed message.
 //!
+//! A transaction's name operations (see [`crate::names`]) come after its
+//! outputs as digests: each is a free witness absorbed into the body, so
+//! the signatures cover it, and into the operations sponge, which the
+//! block's name segment must reproduce (see `crate::name_air`). The
+//! segment applies no operation itself.
+//!
 //! # Schedule
 //!
 //! ```text
 //! tx_start | resume                         body sponge header; counters n_in, n_out
 //!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ileaf ilist old/new x 40 body_in0 body_in1
 //!   per output: ocm0 ocm1 oleaf olist olist2 body_out0 body_out1 body_out2 old/new x 40
+//!   per op:     op_body op_list
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
 //! ```
@@ -80,15 +88,10 @@ use crate::transaction::{
     Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Memo, Output, Sig, TREE_HEIGHT, Transaction, amount_fps,
 };
 use crate::utxo::{self, UtxoSet};
-use crate::xmss::{
-    CHAINS, CSUM_CHAINS, DIGITS_PER_ELEMENT, DOM_MSG, DOM_TREE, DOM_WOTS_CHAIN, DOM_WOTS_PK, Digest, MSG_CHAINS,
-    PUB_SEED_LEN, PublicKey, W, digits,
-};
+use crate::xmss::{Digest, PUB_SEED_LEN, PublicKey};
+use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes};
 
 pub const HEIGHT: usize = TREE_HEIGHT;
-const STEPS: usize = W - 1;
-const ELEMENTS: usize = DIGEST + 1;
-const BITS: usize = 31;
 const AMOUNT_BITS: usize = 64;
 /// 16-bit limbs of amount sums: four hold an amount, six any sum of a
 /// block's amounts (fewer than `2^32` of them).
@@ -96,6 +99,8 @@ pub const LIMBS: usize = 6;
 const MASK30: u64 = (1 << 30) - 1;
 const DOM_INPUTS: u32 = 0x21;
 const DOM_OUTPUTS: u32 = 0x22;
+const DOM_NAME_OPS: u32 = 0x23;
+const DOM_SWEEPS: u32 = 0x24;
 
 // ---- row types ----
 pub const T_TX_START: usize = HM_COLS;
@@ -127,30 +132,24 @@ pub const T_OLIST2: usize = HM_COLS + 25;
 pub const T_BODY_OUT2: usize = HM_COLS + 26;
 pub const T_ILEAF: usize = HM_COLS + 27;
 pub const T_OLEAF: usize = HM_COLS + 28;
-const NUM_TYPES: usize = 29;
-// ---- xmss counters ----
-pub const C_MC: usize = HM_COLS + NUM_TYPES;
-pub const C_ACTIVE: usize = C_MC + 1;
-pub const C_REM: usize = C_ACTIVE + 1;
-pub const C_REM_INV: usize = C_REM + 1;
-pub const C_SSEL: usize = C_REM_INV + 1;
-pub const C_KSEL: usize = C_SSEL + STEPS;
-pub const C_ESEL: usize = C_KSEL + DIGITS_PER_ELEMENT;
-pub const C_LAST: usize = C_ESEL + ELEMENTS;
-pub const C_LSEL: usize = C_LAST + 1;
-pub const C_BITS: usize = C_LSEL + HEIGHT;
-pub const C_T3: usize = C_BITS + BITS;
-pub const C_D: usize = C_T3 + 1;
-pub const C_CSUM: usize = C_D + 1;
-// ---- xmss registers ----
-pub const R_PUB_SEED: usize = C_CSUM + 1;
-pub const R_IDX: usize = R_PUB_SEED + PUB_SEED_LEN;
-pub const R_M: usize = R_IDX + HEIGHT;
-pub const R_SP: usize = R_M + DIGEST;
-pub const R_NODE: usize = R_SP + WIDTH;
-pub const R_SIB: usize = R_NODE + DIGEST;
+pub const T_OP_BODY: usize = HM_COLS + 29;
+pub const T_OP_LIST: usize = HM_COLS + 30;
+const NUM_TYPES: usize = 31;
+// ---- xmss fragment ----
+pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
+pub const XTYPES: XTypes = XTypes {
+    msg_start: T_MSG_START,
+    msg_abs: T_MSG_ABS,
+    load: T_LOAD,
+    step: T_STEP,
+    leaf: T_LEAF,
+    tree_start: T_TREE_START,
+    tree_abs: T_TREE_ABS,
+};
+/// The fragment's sibling register, shared with the tree update.
+pub const R_SIB: usize = XCOLS.sib(0);
 // ---- tree update ----
-pub const C_LEVEL: usize = R_SIB + DIGEST;
+pub const C_LEVEL: usize = XCOLS.base + xmss_fragment::LEN;
 pub const C_LEVEL_INV: usize = C_LEVEL + 1;
 pub const C_IS_LAST: usize = C_LEVEL_INV + 1;
 pub const C_SMT_END: usize = C_IS_LAST + 1;
@@ -189,7 +188,15 @@ pub const R_OPEN: usize = C_GO_END + 1;
 pub const R_MEMO: usize = R_OPEN + 1;
 /// The current output's tree leaf, set after its leaf row.
 pub const R_LEAF: usize = R_MEMO + DIGEST;
-pub const NUM_COLS: usize = R_LEAF + DIGEST;
+/// The current name operation's digest, set entering its first row.
+pub const R_OPD: usize = R_LEAF + DIGEST;
+/// The name operations sponge.
+pub const R_NSP: usize = R_OPD + DIGEST;
+pub const R_OPS_LEFT: usize = R_NSP + WIDTH;
+pub const C_OPS_ZERO: usize = R_OPS_LEFT + 1;
+pub const C_OPS_INV: usize = C_OPS_ZERO + 1;
+pub const C_GO_OPS: usize = C_OPS_INV + 1;
+pub const NUM_COLS: usize = C_GO_OPS + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -198,7 +205,9 @@ pub const PUB_ISP_IN: usize = 2 * DIGEST;
 pub const PUB_ISP_OUT: usize = PUB_ISP_IN + WIDTH;
 pub const PUB_OSP_IN: usize = PUB_ISP_OUT + WIDTH;
 pub const PUB_OSP_OUT: usize = PUB_OSP_IN + WIDTH;
-pub const PUB_POS_IN: usize = PUB_OSP_OUT + WIDTH; // lo, hi
+pub const PUB_NSP_IN: usize = PUB_OSP_OUT + WIDTH;
+pub const PUB_NSP_OUT: usize = PUB_NSP_IN + WIDTH;
+pub const PUB_POS_IN: usize = PUB_NSP_OUT + WIDTH; // lo, hi
 pub const PUB_POS_OUT: usize = PUB_POS_IN + 2;
 pub const PUB_SUM_IN: usize = PUB_POS_OUT + 2;
 pub const PUB_SUM_OUT: usize = PUB_SUM_IN + LIMBS;
@@ -212,25 +221,36 @@ pub const CARRY_MSG: usize = 1;
 pub const CARRY_BSP: usize = CARRY_MSG + DIGEST;
 pub const CARRY_IN_LEFT: usize = CARRY_BSP + WIDTH;
 pub const CARRY_OUT_LEFT: usize = CARRY_IN_LEFT + 1;
-pub const CARRY_LEN: usize = CARRY_OUT_LEFT + 1;
+pub const CARRY_OPS_LEFT: usize = CARRY_OUT_LEFT + 1;
+pub const CARRY_LEN: usize = CARRY_OPS_LEFT + 1;
 
 /// Rows of one input (signature plus commitment, tree update and body).
-pub const ROWS_PER_INPUT: usize = 3 + CHAINS * (2 + STEPS) + 2 * HEIGHT + 5 + 1 + 2 * DEPTH + 2;
+pub const ROWS_PER_INPUT: usize = xmss_fragment::ROWS + 5 + 1 + 2 * DEPTH + 2;
 /// Rows of one output.
 pub const ROWS_PER_OUTPUT: usize = 8 + 2 * DEPTH;
+/// Rows of one name operation.
+pub const ROWS_PER_OP: usize = 2;
 
-/// Body elements per input and per output (see
+/// Body elements per input, output and operation (see
 /// `crate::transaction::body_elements`).
 const BODY_PER_INPUT: u32 = 16;
 const BODY_PER_OUTPUT: u32 = 24;
+const BODY_PER_OP: u32 = 8;
 
 /// Body sponge state after a transaction's header block.
-pub fn body_init(n_in: u32, n_out: u32) -> [Fp; WIDTH] {
+pub fn body_init(n_in: u32, n_out: u32, n_ops: u32) -> [Fp; WIDTH] {
     let mut input = [Fp::ZERO; WIDTH];
     input[0] = Fp::new(n_in);
     input[1] = Fp::new(n_out);
-    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, 8 + BODY_PER_INPUT * n_in + BODY_PER_OUTPUT * n_out));
+    input[2] = Fp::new(n_ops);
+    let len = 8 + BODY_PER_INPUT * n_in + BODY_PER_OUTPUT * n_out + BODY_PER_OP * n_ops;
+    input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, len));
     permute(input)
+}
+
+/// Absorbs one name operation's digest into a body sponge.
+pub fn body_absorb_op(state: &mut [Fp; WIDTH], digest: &Digest) {
+    absorb_block(state, digest);
 }
 
 fn absorb_block(state: &mut [Fp; WIDTH], block: &[Fp]) {
@@ -278,6 +298,51 @@ pub fn initial_inputs_state() -> [Fp; WIDTH] {
 pub fn initial_outputs_state() -> [Fp; WIDTH] {
     let mut state = [Fp::ZERO; WIDTH];
     state[RATE] = Fp::new(DOM_OUTPUTS);
+    state
+}
+
+/// Initial state of the name operations sponge.
+pub fn initial_names_state() -> [Fp; WIDTH] {
+    let mut state = [Fp::ZERO; WIDTH];
+    state[RATE] = Fp::new(DOM_NAME_OPS);
+    state
+}
+
+/// Absorbs one operation digest into the name operations sponge.
+pub fn absorb_op(state: &mut [Fp; WIDTH], digest: &Digest) {
+    absorb_block(state, digest);
+}
+
+/// Name operations sponge state after absorbing all of a block's
+/// operation digests, in order.
+pub fn names_state(digests: &[Digest]) -> [Fp; WIDTH] {
+    let mut state = initial_names_state();
+    for d in digests {
+        absorb_op(&mut state, d);
+    }
+    state
+}
+
+/// Initial state of the sweeps sponge: the positions of the commits a
+/// block's name segment sweeps.
+pub fn initial_sweeps_state() -> [Fp; WIDTH] {
+    let mut state = [Fp::ZERO; WIDTH];
+    state[RATE] = Fp::new(DOM_SWEEPS);
+    state
+}
+
+/// Absorbs one swept position into the sweeps sponge, as
+/// [`absorb_position`] does for the inputs sponge.
+pub fn absorb_sweep(state: &mut [Fp; WIDTH], position: u64) {
+    absorb_position(state, position);
+}
+
+/// Sweeps sponge state after absorbing all of a block's swept positions.
+pub fn sweeps_state(positions: &[u64]) -> [Fp; WIDTH] {
+    let mut state = initial_sweeps_state();
+    for &p in positions {
+        absorb_sweep(&mut state, p);
+    }
     state
 }
 
@@ -382,11 +447,13 @@ impl Air for BlockAir {
         let body_out2 = l[T_BODY_OUT2];
         let ileaf = l[T_ILEAF];
         let oleaf = l[T_OLEAF];
+        let op_body = l[T_OP_BODY];
+        let op_list = l[T_OP_LIST];
         let done = l[T_DONE];
         let resume = l[T_RESUME];
-        let active = l[C_ACTIVE];
-        b.assert_zero(active * active - active);
-        b.assert_zero(active * (one - step));
+        let active = l[XCOLS.active()];
+        let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
+        xmss_fragment::eval(b, &XCOLS, &XTYPES, &msg, n[T_PKH0]);
 
         // machine op mapping
         b.assert_eq(
@@ -405,7 +472,9 @@ impl Air for BlockAir {
                 + olist
                 + body_out0
                 + ileaf
-                + oleaf,
+                + oleaf
+                + op_body
+                + op_list,
         );
         b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2);
         b.assert_eq(l[COL_LOAD], load);
@@ -417,28 +486,6 @@ impl Air for BlockAir {
 
         // ---------------- counters and gadgets ----------------
         b.mark("counters");
-        let ssel: [F; STEPS] = core::array::from_fn(|i| l[C_SSEL + i]);
-        let ksel: [F; DIGITS_PER_ELEMENT] = core::array::from_fn(|i| l[C_KSEL + i]);
-        let esel: [F; ELEMENTS] = core::array::from_fn(|i| l[C_ESEL + i]);
-        let lsel: [F; HEIGHT] = core::array::from_fn(|i| l[C_LSEL + i]);
-        for v in ssel.iter().chain(&ksel).chain(&esel).chain(&lsel) {
-            b.assert_zero(*v * *v - *v);
-        }
-        b.assert_eq(ssel.iter().fold(F::ZERO, |a, v| a + *v), step);
-        b.assert_eq(ksel.iter().fold(F::ZERO, |a, v| a + *v), one);
-        b.assert_eq(esel.iter().fold(F::ZERO, |a, v| a + *v), one);
-        b.assert_eq(lsel.iter().fold(F::ZERO, |a, v| a + *v), tree_start + tree_abs);
-        let mc = l[C_MC];
-        b.assert_zero(mc * mc - mc);
-        b.assert_zero(mc * (one - msg_abs));
-        let last = l[C_LAST];
-        b.assert_eq(last, esel[ELEMENTS - 1] * ksel[CSUM_CHAINS - 1]);
-        for (i, k) in ksel.iter().enumerate() {
-            b.assert_zero(msg_start * (*k - if i == DIGITS_PER_ELEMENT - 1 { one } else { F::ZERO }));
-        }
-        for (e, v) in esel.iter().enumerate() {
-            b.assert_zero(msg_start * (*v - if e == ELEMENTS - 1 { one } else { F::ZERO }));
-        }
         // tree-update level gadget
         let level = l[C_LEVEL];
         let is_last = l[C_IS_LAST];
@@ -463,21 +510,31 @@ impl Air for BlockAir {
         b.assert_zero(in_zero * in_left);
         b.assert_eq(out_left * l[C_OUT_INV], one - out_zero);
         b.assert_zero(out_zero * out_left);
+        let ops_left = l[R_OPS_LEFT];
+        let ops_zero = l[C_OPS_ZERO];
+        b.assert_zero(ops_zero * ops_zero - ops_zero);
+        b.assert_eq(ops_left * l[C_OPS_INV], one - ops_zero);
+        b.assert_zero(ops_zero * ops_left);
         let go_out = l[C_GO_OUT];
+        let go_ops = l[C_GO_OPS];
         let go_end = l[C_GO_END];
         b.assert_eq(go_out, in_zero * (one - out_zero));
-        b.assert_eq(go_end, in_zero * out_zero);
+        b.assert_eq(go_ops, in_zero * out_zero * (one - ops_zero));
+        b.assert_eq(go_end, in_zero * out_zero * ops_zero);
 
         // ---------------- schedule ----------------
         b.mark("schedule");
         let nt = |t: usize| n[t];
-        // dispatch after tx_start, after an input (body_in1), after an output (out_end)
-        // (and after a resume); or into the done rows, leaving the
-        // transaction open.
-        let disp = tx_start + body_in1 + out_end + resume;
+        // dispatch after tx_start, after an input (body_in1), after an
+        // output (out_end), after an operation (op_list) and after a
+        // resume; or into the done rows, leaving the transaction open.
+        let disp = tx_start + body_in1 + out_end + op_list + resume;
         b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
         b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE)));
+        b.when_transition(disp * go_ops * (one - nt(T_OP_BODY) - nt(T_DONE)));
         b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
+        // operation
+        b.when_transition(op_body * (one - nt(T_OP_LIST)));
         // A resume is only ever the first row.
         b.when_transition(nt(T_RESUME));
         b.when_first_row(resume - pubv(PUB_CARRY_IN + CARRY_OPEN));
@@ -491,34 +548,7 @@ impl Air for BlockAir {
         b.when_last_row(open - pubv(PUB_CARRY_OUT + CARRY_OPEN));
         b.when_transition(tx_end * (one - nt(T_TX_START) - nt(T_DONE)));
         b.when_transition(done * (one - nt(T_DONE)));
-        // xmss
-        b.when_transition(msg_start * (one - nt(T_MSG_ABS)));
-        b.when_transition(msg_start * n[C_MC]);
-        b.when_transition(msg_abs * (one - mc) * (one - nt(T_MSG_ABS)));
-        b.when_transition(msg_abs * (one - mc) * (one - n[C_MC]));
-        b.when_transition(msg_abs * mc * (one - nt(T_LOAD)));
-        b.when_transition(load * (one - nt(T_STEP)));
-        b.when_transition(load * (one - n[C_SSEL]));
-        let s_last = ssel[STEPS - 1];
-        b.when_transition(step * (one - s_last) * (one - nt(T_STEP)));
-        for i in 1..STEPS {
-            b.when_transition(step * (n[C_SSEL + i] - ssel[i - 1]));
-        }
-        b.when_transition(step * s_last * (one - nt(T_LEAF)));
-        b.when_transition(leaf * (nt(T_LOAD) - (one - last)));
-        b.when_transition(leaf * (nt(T_TREE_START) - last));
-        b.when_transition(leaf * last * (one - n[C_LSEL]));
-        b.when_transition(tree_start * (one - nt(T_TREE_ABS)));
-        for i in 0..HEIGHT {
-            b.when_transition(tree_start * (n[C_LSEL + i] - lsel[i]));
-        }
-        let l_last = lsel[HEIGHT - 1];
-        b.when_transition(tree_abs * (one - l_last) * (one - nt(T_TREE_START)));
-        for i in 1..HEIGHT {
-            b.when_transition(tree_abs * (n[C_LSEL + i] - lsel[i - 1]));
-        }
-        b.when_transition(tree_abs * l_last * (one - nt(T_PKH0)));
-        // input tail
+        // input tail (the signature rows are the fragment's)
         b.when_transition(pkh0 * (one - nt(T_PKH1)));
         b.when_transition(pkh1 * (one - nt(T_CM0)));
         b.when_transition(cm0 * (one - nt(T_CM1)));
@@ -552,14 +582,18 @@ impl Air for BlockAir {
         b.when_transition((one - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
         b.when_transition(nt(T_OCM0) * (n[R_OUT_LEFT] - out_left + one));
         b.when_transition((one - nt(T_OCM0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
+        b.when_transition(nt(T_OP_BODY) * (n[R_OPS_LEFT] - ops_left + one));
+        b.when_transition((one - nt(T_OP_BODY) - nt(T_TX_START)) * (n[R_OPS_LEFT] - ops_left));
         b.assert_zero(tx_end * in_left);
         b.assert_zero(tx_end * out_left);
+        b.assert_zero(tx_end * ops_left);
         // Carries: the open transaction's state on the resume row and at
         // the end (carried there through the done rows), zero when closed.
         let carried = |c: usize| -> F {
             match c {
                 CARRY_IN_LEFT => in_left,
                 CARRY_OUT_LEFT => out_left,
+                CARRY_OPS_LEFT => ops_left,
                 c if c < CARRY_BSP => l[R_MSG + c - CARRY_MSG],
                 c => l[R_BSP + c - CARRY_BSP],
             }
@@ -569,33 +603,9 @@ impl Air for BlockAir {
             b.when_last_row(open * carried(c) - pubv(PUB_CARRY_OUT + c));
         }
 
-        // ---------------- xmss: digit selectors rotate on load rows ----------------
-        b.mark("digit selectors");
-        for i in 0..DIGITS_PER_ELEMENT {
-            let prev = ksel[(i + DIGITS_PER_ELEMENT - 1) % DIGITS_PER_ELEMENT];
-            b.when_transition(nt(T_LOAD) * (n[C_KSEL + i] - prev));
-            b.when_transition((one - nt(T_LOAD) - nt(T_MSG_START)) * (n[C_KSEL + i] - ksel[i]));
-        }
-        let wrap_k = ksel[DIGITS_PER_ELEMENT - 1];
-        for e in 0..ELEMENTS {
-            let prev = esel[(e + ELEMENTS - 1) % ELEMENTS];
-            b.when_transition(nt(T_LOAD) * (n[C_ESEL + e] - (esel[e] + wrap_k * (prev - esel[e]))));
-            b.when_transition((one - nt(T_LOAD) - nt(T_MSG_START)) * (n[C_ESEL + e] - esel[e]));
-        }
-
-        // ---------------- registers: key, index, amount bits ----------------
-        b.mark("key/index/amount registers");
-        let pub_seed: [F; PUB_SEED_LEN] = core::array::from_fn(|i| l[R_PUB_SEED + i]);
-        for i in 0..PUB_SEED_LEN {
-            b.when_transition((one - nt(T_MSG_START)) * (n[R_PUB_SEED + i] - pub_seed[i]));
-        }
-        let idx_bits: [F; HEIGHT] = core::array::from_fn(|i| l[R_IDX + i]);
-        let mut idx = F::ZERO;
-        for (i, bit) in idx_bits.iter().enumerate() {
-            b.assert_zero(*bit * *bit - *bit);
-            b.when_transition((one - nt(T_MSG_START)) * (n[R_IDX + i] - *bit));
-            idx += *bit * pow2::<F>(i);
-        }
+        // ---------------- registers: amount bits ----------------
+        b.mark("amount registers");
+        let pub_seed: [F; PUB_SEED_LEN] = core::array::from_fn(|i| l[XCOLS.pub_seed(i)]);
         let abits: [F; AMOUNT_BITS] = core::array::from_fn(|i| l[R_ABITS + i]);
         let (mut amt_lo, mut amt_mid, mut amt_hi) = (F::ZERO, F::ZERO, F::ZERO);
         let mut l16 = [F::ZERO; LIMBS];
@@ -611,7 +621,6 @@ impl Air for BlockAir {
             }
             l16[i / 16] += *bit * pow2::<F>(i % 16);
         }
-        let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
         for i in 0..DIGEST {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
             b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
@@ -623,151 +632,12 @@ impl Air for BlockAir {
             b.assert_zero(oleaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
             b.when_transition(oleaf * (n[R_LEAF + i] - l[COL_ACC + i]));
             b.when_transition((one - oleaf) * (n[R_LEAF + i] - l[R_LEAF + i]));
+            // The operation digest is a witness entering its first row.
+            b.when_transition((one - nt(T_OP_BODY)) * (n[R_OPD + i] - l[R_OPD + i]));
             b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
             // pkroot: set entering pkh0 from the tree root, else copied
             b.when_transition(nt(T_PKH0) * (n[R_PKROOT + i] - l[COL_ACC + i]));
             b.when_transition((one - nt(T_PKH0)) * (n[R_PKROOT + i] - l[R_PKROOT + i]));
-        }
-
-        // ---------------- xmss: bits, digit, checksum ----------------
-        b.mark("xmss digits");
-        let bits: [F; BITS] = core::array::from_fn(|i| l[C_BITS + i]);
-        let mut value = F::ZERO;
-        let mut low27 = F::ZERO;
-        let mut high12 = F::ZERO;
-        for (i, bit) in bits.iter().enumerate() {
-            b.assert_zero(*bit * *bit - *bit);
-            value += *bit * pow2::<F>(i);
-            if i < 27 {
-                low27 += *bit * pow2::<F>(i);
-            }
-            if i >= 12 {
-                high12 += *bit;
-            }
-        }
-        let t3 = l[C_T3];
-        b.assert_eq(t3, bits[30] * bits[29] * bits[28]);
-        b.assert_zero(t3 * bits[27] * low27);
-        let mut elem = F::ZERO;
-        for e in 0..DIGEST {
-            elem += esel[e] * l[R_M + e];
-        }
-        elem += esel[DIGEST] * l[C_CSUM];
-        b.assert_zero(load * (value - elem));
-        b.assert_zero(esel[DIGEST] * high12);
-        let mut d = F::ZERO;
-        for k in 0..DIGITS_PER_ELEMENT {
-            let mut nib = F::ZERO;
-            let width = if k == DIGITS_PER_ELEMENT - 1 { 3 } else { 4 };
-            for j in 0..width {
-                nib += bits[4 * k + j] * pow2::<F>(j);
-            }
-            d += ksel[k] * nib;
-        }
-        let dcol = l[C_D];
-        b.assert_eq(dcol, d);
-        let fifteen = F::from_u32((W - 1) as u32);
-        // Accumulates after each message chain's load row; resets to zero
-        // entering a new signature.
-        b.when_transition(
-            n[C_CSUM] - l[C_CSUM] - load * (one - esel[DIGEST]) * (fifteen - dcol) + nt(T_MSG_START) * l[C_CSUM],
-        );
-        b.assert_zero(msg_start * l[C_CSUM]);
-        // chain control
-        b.mark("chain control");
-        let rem = l[C_REM];
-        b.assert_zero(load * (rem - dcol));
-        b.when_transition(load * (n[C_REM] - rem));
-        b.assert_zero(step * active * rem);
-        b.assert_zero(step * ((one - active) - rem * l[C_REM_INV]));
-        b.when_transition(step * (n[C_REM] - rem + (one - active)));
-        let mut chain_idx = F::ZERO;
-        for (e, v) in esel.iter().enumerate() {
-            chain_idx += *v * F::from_u32((e * DIGITS_PER_ELEMENT) as u32);
-        }
-        for (k, v) in ksel.iter().enumerate() {
-            chain_idx += *v * F::from_u32(k as u32);
-        }
-        let mut step_idx = F::ZERO;
-        for (i, v) in ssel.iter().enumerate() {
-            step_idx += *v * F::from_u32(i as u32);
-        }
-        let chain_cap = [
-            pub_seed[0],
-            pub_seed[1],
-            pub_seed[2],
-            pub_seed[3],
-            F::from_u32(DOM_WOTS_CHAIN),
-            idx,
-            F::ZERO,
-            chain_idx + step_idx * F::from_u32(1 << 16),
-        ];
-        for (j, c) in chain_cap.iter().enumerate() {
-            b.assert_zero(step * active * (l[COL_DATA + j] - *c));
-        }
-        // message digest sponge (message from the register)
-        b.mark("message sponge");
-        let msg_cap = [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], F::from_u32(DOM_MSG), idx, F::ZERO, F::ZERO];
-        for (j, c) in msg_cap.iter().enumerate() {
-            b.assert_zero(msg_start * (l[COL_INPUT + RATE + j] - *c));
-        }
-        let block0: [F; RATE] = core::array::from_fn(|i| if i == 0 { F::from_u32(DIGEST as u32) } else { msg[i - 1] });
-        let block1: [F; RATE] = core::array::from_fn(|i| if i == 0 { msg[DIGEST - 1] } else { F::ZERO });
-        for i in 0..RATE {
-            b.assert_zero(msg_abs * (l[COL_DATA + i] - ((one - mc) * block0[i] + mc * block1[i])));
-        }
-        for i in 0..DIGEST {
-            b.when_transition(msg_abs * mc * (n[R_M + i] - l[COL_ACC + i]));
-            b.when_transition((one - msg_abs * mc) * (n[R_M + i] - l[R_M + i]));
-        }
-        // leaf sponge
-        b.mark("leaf sponge");
-        let sp_init: [F; WIDTH] = core::array::from_fn(|j| match j {
-            j if j < RATE => F::ZERO,
-            j if j < RATE + PUB_SEED_LEN => pub_seed[j - RATE],
-            j if j == RATE + PUB_SEED_LEN => F::from_u32(DOM_WOTS_PK),
-            j if j == RATE + PUB_SEED_LEN + 1 => idx,
-            _ => F::ZERO,
-        });
-        for j in 0..WIDTH {
-            b.assert_zero(msg_start * (l[R_SP + j] - sp_init[j]));
-            b.when_transition(leaf * (n[R_SP + j] - l[COL_OUTPUT + j]));
-            b.when_transition((one - leaf - nt(T_MSG_START)) * (n[R_SP + j] - l[R_SP + j]));
-        }
-        for i in 0..RATE {
-            b.when_transition(nt(T_LEAF) * (n[COL_INPUT + i] - n[R_SP + i] - l[COL_ACC + i]));
-            b.when_transition(nt(T_LEAF) * (n[COL_INPUT + RATE + i] - n[R_SP + RATE + i]));
-        }
-        // xmss tree levels
-        b.mark("xmss tree");
-        let dir = l[COL_DIR];
-        let mut dir_want = F::ZERO;
-        let mut pos = F::ZERO;
-        let mut level_plus_one = F::ZERO;
-        for (lv, sel) in lsel.iter().enumerate() {
-            dir_want += *sel * idx_bits[lv];
-            let mut p = pow2::<F>(HEIGHT - 1 - lv);
-            for (i, bit) in idx_bits.iter().enumerate().skip(lv + 1) {
-                p += *bit * pow2::<F>(i - lv - 1);
-            }
-            pos += *sel * p;
-            level_plus_one += *sel * F::from_u32((lv + 1) as u32);
-        }
-        b.assert_zero(tree_start * (dir - dir_want));
-        b.when_transition(tree_start * (n[COL_DIR] - dir));
-        for i in 0..DIGEST {
-            b.when_transition(nt(T_TREE_START) * (n[R_NODE + i] - l[COL_ACC + i]));
-            b.when_transition((one - nt(T_TREE_START)) * (n[R_NODE + i] - l[R_NODE + i]));
-            b.when_transition(tree_start * (n[R_SIB + i] - l[R_SIB + i]));
-            let node = l[R_NODE + i];
-            let sib = l[R_SIB + i];
-            b.assert_zero(tree_start * (l[COL_INPUT + i] - ((one - dir) * node + dir * sib)));
-            b.assert_zero(tree_abs * (l[COL_DATA + i] - ((one - dir) * sib + dir * node)));
-        }
-        let tree_cap =
-            [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], F::from_u32(DOM_TREE), pos, F::ZERO, level_plus_one];
-        for (j, c) in tree_cap.iter().enumerate() {
-            b.assert_zero(tree_start * (l[COL_INPUT + RATE + j] - *c));
         }
 
         // ---------------- key hash and commitment ----------------
@@ -836,6 +706,7 @@ impl Air for BlockAir {
         b.when_first_row(l[R_OPOS_HI] - pubv(PUB_POS_IN + 1));
         b.when_last_row(l[R_OPOS_LO] - pubv(PUB_POS_OUT));
         b.when_last_row(l[R_OPOS_HI] - pubv(PUB_POS_OUT + 1));
+        let dir = l[COL_DIR];
         b.assert_zero(old_t * (dir - pbits[0]));
         b.when_transition(old_t * (n[COL_DIR] - dir));
         for i in 0..DIGEST {
@@ -868,10 +739,13 @@ impl Air for BlockAir {
             b.assert_zero(new_t * (inp_hi - ((one - dir) * sib + dir * nw)));
         }
 
-        // ---------------- register sponges: body, inputs, outputs ----------------
+        // ---------------- register sponges: body, inputs, outputs, operations ----------------
         b.mark("register sponges");
-        let body_len = F::from_u32(8) + in_left * F::from_u32(BODY_PER_INPUT) + out_left * F::from_u32(BODY_PER_OUTPUT);
-        let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1 + body_out2;
+        let body_len = F::from_u32(8)
+            + in_left * F::from_u32(BODY_PER_INPUT)
+            + out_left * F::from_u32(BODY_PER_OUTPUT)
+            + ops_left * F::from_u32(BODY_PER_OP);
+        let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1 + body_out2 + op_body;
         let osp_rows = olist + olist2;
         for j in 0..WIDTH {
             b.when_transition(bsp_rows * (n[R_BSP + j] - l[COL_OUTPUT + j]));
@@ -880,19 +754,22 @@ impl Air for BlockAir {
             b.when_transition((one - ilist) * (n[R_ISP + j] - l[R_ISP + j]));
             b.when_transition(osp_rows * (n[R_OSP + j] - l[COL_OUTPUT + j]));
             b.when_transition((one - osp_rows) * (n[R_OSP + j] - l[R_OSP + j]));
+            b.when_transition(op_list * (n[R_NSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - op_list) * (n[R_NSP + j] - l[R_NSP + j]));
             b.when_first_row(l[R_ISP + j] - pubv(PUB_ISP_IN + j));
             b.when_first_row(l[R_OSP + j] - pubv(PUB_OSP_IN + j));
+            b.when_first_row(l[R_NSP + j] - pubv(PUB_NSP_IN + j));
             b.when_last_row(l[R_ISP + j] - pubv(PUB_ISP_OUT + j));
             b.when_last_row(l[R_OSP + j] - pubv(PUB_OSP_OUT + j));
+            b.when_last_row(l[R_NSP + j] - pubv(PUB_NSP_OUT + j));
         }
         for i in 0..RATE {
             // tx_start: body header block with the body capacity
-            let header = if i == 0 {
-                in_left
-            } else if i == 1 {
-                out_left
-            } else {
-                F::ZERO
+            let header = match i {
+                0 => in_left,
+                1 => out_left,
+                2 => ops_left,
+                _ => F::ZERO,
             };
             b.assert_zero(tx_start * (l[COL_INPUT + i] - header));
             let cap_body = [F::from_u32(DOM_BODY), body_len, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
@@ -904,6 +781,11 @@ impl Air for BlockAir {
             b.assert_zero(body_out0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
             b.assert_zero(olist * (l[COL_INPUT + i] - l[R_OSP + i] - l[R_OCM + i]));
             b.assert_zero(olist * (l[COL_INPUT + RATE + i] - l[R_OSP + RATE + i]));
+            // operations: the digest into the body, then into the operations sponge
+            b.assert_zero(op_body * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_OPD + i]));
+            b.assert_zero(op_body * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
+            b.assert_zero(op_list * (l[COL_INPUT + i] - l[R_NSP + i] - l[R_OPD + i]));
+            b.assert_zero(op_list * (l[COL_INPUT + RATE + i] - l[R_NSP + RATE + i]));
             let ilist_block = if i == 0 {
                 pos_lo
             } else if i == 1 {
@@ -946,12 +828,15 @@ pub struct OutputWitness {
 pub struct TxWitness {
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<OutputWitness>,
+    /// Digests of the name operations in this part.
+    pub ops: Vec<Digest>,
     /// The transaction body hash, which every input signed.
     pub message: Digest,
-    /// Inputs and outputs of the transaction from this part on: all of
-    /// them when the part starts the transaction.
+    /// Inputs, outputs and operations of the transaction from this part
+    /// on: all of them when the part starts the transaction.
     pub in_left: u32,
     pub out_left: u32,
+    pub ops_left: u32,
     /// The body sponge state when this part resumes a transaction begun in
     /// an earlier segment; `None` when it starts the transaction.
     pub resume: Option<[Fp; WIDTH]>,
@@ -963,7 +848,10 @@ impl TxWitness {
     /// Trace rows of this part: a start or resume row, the items, and the
     /// end row if it ends here.
     pub fn num_rows(&self) -> usize {
-        1 + self.inputs.len() * ROWS_PER_INPUT + self.outputs.len() * ROWS_PER_OUTPUT + usize::from(self.ends)
+        1 + self.inputs.len() * ROWS_PER_INPUT
+            + self.outputs.len() * ROWS_PER_OUTPUT
+            + self.ops.len() * ROWS_PER_OP
+            + usize::from(self.ends)
     }
 }
 
@@ -977,11 +865,12 @@ pub struct Carry {
     pub bsp: [Fp; WIDTH],
     pub in_left: u32,
     pub out_left: u32,
+    pub ops_left: u32,
 }
 
 impl Carry {
     pub const CLOSED: Carry =
-        Carry { open: false, msg: [Fp::ZERO; DIGEST], bsp: [Fp::ZERO; WIDTH], in_left: 0, out_left: 0 };
+        Carry { open: false, msg: [Fp::ZERO; DIGEST], bsp: [Fp::ZERO; WIDTH], in_left: 0, out_left: 0, ops_left: 0 };
 
     fn push_values(&self, v: &mut Vec<Fp>) {
         v.push(Fp::new(self.open as u32));
@@ -989,6 +878,7 @@ impl Carry {
         v.extend_from_slice(&self.bsp);
         v.push(Fp::new(self.in_left));
         v.push(Fp::new(self.out_left));
+        v.push(Fp::new(self.ops_left));
     }
 
     /// Parses a carry; a closed one must be all zero.
@@ -1004,6 +894,7 @@ impl Carry {
             bsp: v[CARRY_BSP..CARRY_BSP + WIDTH].try_into().unwrap(),
             in_left: v[CARRY_IN_LEFT].to_canonical(),
             out_left: v[CARRY_OUT_LEFT].to_canonical(),
+            ops_left: v[CARRY_OPS_LEFT].to_canonical(),
         };
         (open || c == Carry::CLOSED).then_some(c)
     }
@@ -1018,6 +909,8 @@ pub struct SegmentPublic {
     pub isp_out: [Fp; WIDTH],
     pub osp_in: [Fp; WIDTH],
     pub osp_out: [Fp; WIDTH],
+    pub nsp_in: [Fp; WIDTH],
+    pub nsp_out: [Fp; WIDTH],
     pub pos_in: u64,
     pub pos_out: u64,
     pub sum_in: [u32; LIMBS],
@@ -1035,6 +928,8 @@ impl SegmentPublic {
         v.extend_from_slice(&self.isp_out);
         v.extend_from_slice(&self.osp_in);
         v.extend_from_slice(&self.osp_out);
+        v.extend_from_slice(&self.nsp_in);
+        v.extend_from_slice(&self.nsp_out);
         for p in [self.pos_in, self.pos_out] {
             v.push(Fp::new((p & MASK30) as u32));
             v.push(Fp::new((p >> 30) as u32));
@@ -1066,6 +961,8 @@ impl SegmentPublic {
             isp_out: state(PUB_ISP_OUT),
             osp_in: state(PUB_OSP_IN),
             osp_out: state(PUB_OSP_OUT),
+            nsp_in: state(PUB_NSP_IN),
+            nsp_out: state(PUB_NSP_OUT),
             pos_in: pos(PUB_POS_IN)?,
             pos_out: pos(PUB_POS_OUT)?,
             sum_in: sums(PUB_SUM_IN),
@@ -1087,12 +984,13 @@ pub struct SegmentWitness {
     pub root_in: Digest,
     pub isp_in: [Fp; WIDTH],
     pub osp_in: [Fp; WIDTH],
+    pub nsp_in: [Fp; WIDTH],
     pub pos_in: u64,
     pub txs: Vec<TxWitness>,
 }
 
-/// A run of one transaction's items, `start..end` in input-then-output
-/// order, placed in a segment.
+/// A run of one transaction's items, `start..end` in input, output then
+/// operation order, placed in a segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Part {
     pub tx: usize,
@@ -1100,26 +998,33 @@ pub struct Part {
     pub end: usize,
 }
 
-/// Trace rows of item `k` of a transaction with `n_in` inputs.
-fn item_rows(k: usize, n_in: usize) -> usize {
-    if k < n_in { ROWS_PER_INPUT } else { ROWS_PER_OUTPUT }
+/// Trace rows of item `k` of a transaction with `n_in` inputs and `n_out`
+/// outputs.
+fn item_rows(k: usize, n_in: usize, n_out: usize) -> usize {
+    if k < n_in {
+        ROWS_PER_INPUT
+    } else if k < n_in + n_out {
+        ROWS_PER_OUTPUT
+    } else {
+        ROWS_PER_OP
+    }
 }
 
 /// Packs transactions into segments of `max_rows` trace rows (one kept
 /// for padding), greedily and splitting a transaction between items when
 /// it does not fit what is left of a segment. Each segment lists its
-/// parts in order. `items(t)` gives transaction `t`'s input and output
-/// counts.
-pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize), max_rows: usize) -> Vec<Vec<Part>> {
+/// parts in order. `items(t)` gives transaction `t`'s input, output and
+/// operation counts.
+pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize, usize), max_rows: usize) -> Vec<Vec<Part>> {
     let cap = max_rows - 1;
     let mut segments = Vec::new();
     let mut cur: Vec<Part> = Vec::new();
     let mut rows = 0;
     for tx in 0..num_txs {
-        let (n_in, n_out) = items(tx);
-        let n = n_in + n_out;
+        let (n_in, n_out, n_ops) = items(tx);
+        let n = n_in + n_out + n_ops;
         // Rows item k needs, with the end row after the last item.
-        let cost = |k: usize| item_rows(k, n_in) + usize::from(k + 1 == n);
+        let cost = |k: usize| item_rows(k, n_in, n_out) + usize::from(k + 1 == n);
         let mut k = 0;
         loop {
             // A part needs its start (or resume) row and its first item,
@@ -1133,7 +1038,7 @@ pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize), max_rows: u
             let start = k;
             rows += 1;
             while k < n && rows + cost(k) <= cap {
-                rows += item_rows(k, n_in);
+                rows += item_rows(k, n_in, n_out);
                 k += 1;
             }
             cur.push(Part { tx, start, end: k });
@@ -1167,7 +1072,7 @@ impl SegmentWitness {
         let parts: Vec<Part> = txs
             .iter()
             .enumerate()
-            .map(|(t, tx)| Part { tx: t, start: 0, end: tx.inputs.len() + tx.outputs.len() })
+            .map(|(t, tx)| Part { tx: t, start: 0, end: tx.inputs.len() + tx.outputs.len() + tx.ops.len() })
             .collect();
         Self::collect_parts(utxo, wtxn, txs, parts.chunks(txs_per_segment).map(|c| c.to_vec()).collect())
     }
@@ -1180,7 +1085,7 @@ impl SegmentWitness {
         txs: &[Transaction],
         max_rows: usize,
     ) -> utxo::Result<Vec<SegmentWitness>> {
-        let plan = pack(txs.len(), |t| (txs[t].inputs.len(), txs[t].outputs.len()), max_rows);
+        let plan = pack(txs.len(), |t| (txs[t].inputs.len(), txs[t].outputs.len(), txs[t].ops.len()), max_rows);
         Self::collect_parts(utxo, wtxn, txs, plan)
     }
 
@@ -1195,25 +1100,27 @@ impl SegmentWitness {
     ) -> utxo::Result<Vec<SegmentWitness>> {
         let mut isp = initial_inputs_state();
         let mut osp = initial_outputs_state();
+        let mut nsp = initial_names_state();
         let mut bsp = [Fp::ZERO; WIDTH];
         let mut out_segments = Vec::with_capacity(segments.len());
         for parts in segments {
             let root_in = utxo.root(wtxn)?;
             let pos_in = utxo.next_position(wtxn)?;
-            let (isp_in, osp_in) = (isp, osp);
+            let (isp_in, osp_in, nsp_in) = (isp, osp, nsp);
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
                 let tx = &txs[part.tx];
-                let (n_in, n_out) = (tx.inputs.len(), tx.outputs.len());
-                assert!(part.start <= part.end && part.end <= n_in + n_out, "part out of range");
+                let (n_in, n_out, n_ops) = (tx.inputs.len(), tx.outputs.len(), tx.ops.len());
+                assert!(part.start <= part.end && part.end <= n_in + n_out + n_ops, "part out of range");
                 let resume = if part.start == 0 {
-                    bsp = body_init(n_in as u32, n_out as u32);
+                    bsp = body_init(n_in as u32, n_out as u32, n_ops as u32);
                     None
                 } else {
                     Some(bsp)
                 };
                 let mut inputs = Vec::new();
                 let mut outputs = Vec::new();
+                let mut ops = Vec::new();
                 for k in part.start..part.end {
                     if k < n_in {
                         let inp = &tx.inputs[k];
@@ -1234,7 +1141,7 @@ impl SegmentWitness {
                             position,
                             siblings: proof.siblings,
                         });
-                    } else {
+                    } else if k < n_in + n_out {
                         let o = &tx.outputs[k - n_in];
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
@@ -1242,19 +1149,26 @@ impl SegmentWitness {
                         absorb_output(&mut osp, &o.commitment, &o.memo);
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
+                    } else {
+                        let digest = tx.ops[k - n_in - n_out].digest().expect("a well-formed operation");
+                        absorb_op(&mut nsp, &digest);
+                        body_absorb_op(&mut bsp, &digest);
+                        ops.push(digest);
                     }
                 }
                 out.push(TxWitness {
                     inputs,
                     outputs,
+                    ops,
                     message: tx.body_hash(),
                     in_left: n_in.saturating_sub(part.start) as u32,
-                    out_left: (n_out - part.start.saturating_sub(n_in)) as u32,
+                    out_left: n_out.saturating_sub(part.start.saturating_sub(n_in)) as u32,
+                    ops_left: (n_ops - part.start.saturating_sub(n_in + n_out)) as u32,
                     resume,
-                    ends: part.end == n_in + n_out,
+                    ends: part.end == n_in + n_out + n_ops,
                 });
             }
-            out_segments.push(SegmentWitness { root_in, isp_in, osp_in, pos_in, txs: out });
+            out_segments.push(SegmentWitness { root_in, isp_in, osp_in, nsp_in, pos_in, txs: out });
         }
         Ok(out_segments)
     }
@@ -1285,7 +1199,7 @@ impl SegmentWitness {
 
 /// Trace rows a transaction occupies in a segment.
 pub fn tx_rows(tx: &Transaction) -> usize {
-    2 + tx.inputs.len() * ROWS_PER_INPUT + tx.outputs.len() * ROWS_PER_OUTPUT
+    2 + tx.inputs.len() * ROWS_PER_INPUT + tx.outputs.len() * ROWS_PER_OUTPUT + tx.ops.len() * ROWS_PER_OP
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,16 +1208,7 @@ pub fn tx_rows(tx: &Transaction) -> usize {
 
 #[derive(Clone)]
 struct Regs {
-    pub_seed: [Fp; PUB_SEED_LEN],
-    idx_bits: [Fp; HEIGHT],
-    m: Digest,
-    sp: [Fp; WIDTH],
-    node: Digest,
-    sib: Digest,
-    csum: u32,
-    ksel: usize,
-    esel: usize,
-    rem: u32,
+    xmss: xmss_fragment::Regs,
     level: u32,
     pbits: [Fp; DEPTH],
     root: Digest,
@@ -1325,21 +1230,19 @@ struct Regs {
     open: bool,
     memo: Memo,
     leaf: Digest,
+    opd: Digest,
+    nsp: [Fp; WIDTH],
+    ops_left: u32,
 }
 
 impl Regs {
     fn write(&self, row: &mut [Fp]) {
-        row[R_PUB_SEED..R_PUB_SEED + PUB_SEED_LEN].copy_from_slice(&self.pub_seed);
-        row[R_IDX..R_IDX + HEIGHT].copy_from_slice(&self.idx_bits);
-        row[R_M..R_M + DIGEST].copy_from_slice(&self.m);
-        row[R_SP..R_SP + WIDTH].copy_from_slice(&self.sp);
-        row[R_NODE..R_NODE + DIGEST].copy_from_slice(&self.node);
-        row[R_SIB..R_SIB + DIGEST].copy_from_slice(&self.sib);
-        row[C_CSUM] = Fp::new(self.csum);
-        row[C_KSEL + self.ksel] = Fp::ONE;
-        row[C_ESEL + self.esel] = Fp::ONE;
-        row[C_LAST] = Fp::new((self.esel == ELEMENTS - 1 && self.ksel == CSUM_CHAINS - 1) as u32);
-        row[C_REM] = Fp::new(self.rem);
+        self.xmss.write(row, &XCOLS);
+        self.write_rest(row);
+    }
+
+    /// Everything but the signature fragment's registers.
+    fn write_rest(&self, row: &mut [Fp]) {
         row[C_LEVEL] = Fp::new(self.level);
         let diff = Fp::new(self.level) - Fp::new((DEPTH - 1) as u32);
         let is_last = diff.is_zero();
@@ -1380,29 +1283,19 @@ impl Regs {
         row[C_IN_INV] = if in_zero { Fp::ZERO } else { Fp::new(self.in_left).inverse().unwrap() };
         row[C_OUT_ZERO] = Fp::new(out_zero as u32);
         row[C_OUT_INV] = if out_zero { Fp::ZERO } else { Fp::new(self.out_left).inverse().unwrap() };
+        let ops_zero = self.ops_left == 0;
+        row[R_OPS_LEFT] = Fp::new(self.ops_left);
+        row[C_OPS_ZERO] = Fp::new(ops_zero as u32);
+        row[C_OPS_INV] = if ops_zero { Fp::ZERO } else { Fp::new(self.ops_left).inverse().unwrap() };
         row[C_GO_OUT] = Fp::new((in_zero && !out_zero) as u32);
-        row[C_GO_END] = Fp::new((in_zero && out_zero) as u32);
+        row[C_GO_OPS] = Fp::new((in_zero && out_zero && !ops_zero) as u32);
+        row[C_GO_END] = Fp::new((in_zero && out_zero && ops_zero) as u32);
         row[R_OPEN] = Fp::new(self.open as u32);
         row[R_MEMO..R_MEMO + DIGEST].copy_from_slice(&self.memo);
         row[R_LEAF..R_LEAF + DIGEST].copy_from_slice(&self.leaf);
+        row[R_OPD..R_OPD + DIGEST].copy_from_slice(&self.opd);
+        row[R_NSP..R_NSP + WIDTH].copy_from_slice(&self.nsp);
     }
-}
-
-fn cap(pub_seed: &[Fp; PUB_SEED_LEN], domain: u32, index: u64, extra: u32) -> [Fp; DIGEST] {
-    let mut c = [Fp::ZERO; DIGEST];
-    c[..PUB_SEED_LEN].copy_from_slice(pub_seed);
-    c[PUB_SEED_LEN] = Fp::new(domain);
-    c[PUB_SEED_LEN + 1] = Fp::new((index & MASK30) as u32);
-    c[PUB_SEED_LEN + 2] = Fp::new((index >> 30) as u32);
-    c[PUB_SEED_LEN + 3] = Fp::new(extra);
-    c
-}
-
-fn write_bits(row: &mut [Fp], value: u32) {
-    for i in 0..BITS {
-        row[C_BITS + i] = Fp::new((value >> i) & 1);
-    }
-    row[C_T3] = Fp::new(((value >> 28) & 7 == 7) as u32);
 }
 
 fn compress_input(node: &Digest, sib: &Digest, right: bool) -> [Fp; WIDTH] {
@@ -1467,8 +1360,8 @@ impl Gen {
         for (level, sib) in siblings.iter().enumerate() {
             let right = (position >> level) & 1 == 1;
             self.regs.level = level as u32;
-            self.regs.sib = *sib;
-            self.b.start(compress_input(&old_node, &self.regs.sib, right));
+            self.regs.xmss.sib = *sib;
+            self.b.start(compress_input(&old_node, &self.regs.xmss.sib, right));
             {
                 let row = self.b.last_row_mut();
                 row[T_OLD] = Fp::ONE;
@@ -1477,7 +1370,7 @@ impl Gen {
             }
             old_node = self.b.acc();
             self.regs.old = old_node;
-            self.b.start(compress_input(&new_node, &self.regs.sib, right));
+            self.b.start(compress_input(&new_node, &self.regs.xmss.sib, right));
             {
                 let row = self.b.last_row_mut();
                 row[T_NEW] = Fp::ONE;
@@ -1499,126 +1392,27 @@ impl Gen {
 
     fn input(&mut self, w: &InputWitness) {
         let ps = w.pubkey.pub_seed;
-        let idx = w.signature.index;
-        assert!(idx < 1 << HEIGHT);
         let r = &mut self.regs;
-        r.pub_seed = ps;
         r.memo = w.memo;
-        r.idx_bits = core::array::from_fn(|i| Fp::new(((idx >> i) & 1) as u32));
         r.amount = w.amount;
         r.is_out = false;
         r.in_left -= 1;
-        r.csum = 0;
-        r.ksel = DIGITS_PER_ELEMENT - 1;
-        r.esel = ELEMENTS - 1;
-        r.sp = [Fp::ZERO; WIDTH];
-        r.sp[RATE..].copy_from_slice(&cap(&ps, DOM_WOTS_PK, idx, 0));
         let msg = r.msg;
 
-        // message digest sponge
-        let mut input = [Fp::ZERO; WIDTH];
-        input[..RATE].copy_from_slice(&w.signature.randomizer);
-        input[RATE..].copy_from_slice(&cap(&ps, DOM_MSG, idx, 0));
-        self.b.start(input);
-        {
-            let row = self.b.last_row_mut();
-            row[T_MSG_START] = Fp::ONE;
-            self.regs.write(row);
-        }
-        let mut block0 = [Fp::ZERO; RATE];
-        block0[0] = Fp::from_u32(DIGEST as u32);
-        block0[1..].copy_from_slice(&msg[..RATE - 1]);
-        self.absorb(block0, T_MSG_ABS);
-        let mut block1 = [Fp::ZERO; RATE];
-        block1[0] = msg[DIGEST - 1];
-        self.b.absorb(block1);
-        {
-            let row = self.b.last_row_mut();
-            row[T_MSG_ABS] = Fp::ONE;
-            row[C_MC] = Fp::ONE;
-            self.regs.write(row);
-        }
-        let m = self.b.acc();
-        self.regs.m = m;
-        let digs = digits(&m);
-
-        for (c, &digit) in digs.iter().enumerate() {
-            let wrap = self.regs.ksel == DIGITS_PER_ELEMENT - 1;
-            self.regs.ksel = (self.regs.ksel + 1) % DIGITS_PER_ELEMENT;
-            if wrap {
-                self.regs.esel = (self.regs.esel + 1) % ELEMENTS;
-            }
-            let d = digit as u32;
-            self.regs.rem = d;
-            self.b.load(w.signature.wots[c]);
-            {
-                let elem = if self.regs.esel < DIGEST { m[self.regs.esel].to_canonical() } else { self.regs.csum };
-                let row = self.b.last_row_mut();
-                row[T_LOAD] = Fp::ONE;
-                write_bits(row, elem);
-                row[C_D] = Fp::new(d);
-                self.regs.write(row);
-            }
-            if c < MSG_CHAINS {
-                self.regs.csum += (W as u32 - 1) - d;
-            }
-            for step in 0..STEPS {
-                let active = self.regs.rem == 0;
-                if active {
-                    self.b.chain(cap(&ps, DOM_WOTS_CHAIN, idx, c as u32 | (step as u32) << 16));
-                } else {
-                    self.b.pass();
-                }
-                {
-                    let rem = self.regs.rem;
-                    let row = self.b.last_row_mut();
-                    row[T_STEP] = Fp::ONE;
-                    row[C_SSEL + step] = Fp::ONE;
-                    row[C_ACTIVE] = Fp::new(active as u32);
-                    row[C_REM_INV] = if active { Fp::ZERO } else { Fp::new(rem).inverse().unwrap() };
-                    self.regs.write(row);
-                }
-                if !active {
-                    self.regs.rem -= 1;
-                }
-            }
-            let end = self.b.acc();
-            let sp = self.regs.sp;
-            let out = self.sponge_start(sp, end, T_LEAF);
-            self.regs.sp = out;
-        }
-
-        // xmss tree levels
-        let mut pos = (1u64 << HEIGHT) + idx;
-        for level in 0..HEIGHT {
-            let right = pos & 1 == 1;
-            pos >>= 1;
-            self.regs.node = self.b.acc();
-            self.regs.sib = w.signature.auth_path[level];
-            let (left_v, right_v) =
-                if right { (self.regs.sib, self.regs.node) } else { (self.regs.node, self.regs.sib) };
-            let mut input = [Fp::ZERO; WIDTH];
-            input[..RATE].copy_from_slice(&left_v);
-            input[RATE..].copy_from_slice(&cap(&ps, DOM_TREE, pos, (level + 1) as u32));
-            self.b.start(input);
-            {
-                let row = self.b.last_row_mut();
-                row[T_TREE_START] = Fp::ONE;
-                row[C_LSEL + level] = Fp::ONE;
-                row[COL_DIR] = Fp::new(right as u32);
-                self.regs.write(row);
-            }
-            self.b.absorb(right_v);
-            {
-                let row = self.b.last_row_mut();
-                row[T_TREE_ABS] = Fp::ONE;
-                row[C_LSEL + level] = Fp::ONE;
-                row[COL_DIR] = Fp::new(right as u32);
-                self.regs.write(row);
-            }
-        }
-        let root = self.b.acc();
-        assert_eq!(root, w.pubkey.root, "signature does not verify under the given key");
+        // the signature
+        let mut xr = self.regs.xmss.clone();
+        let regs = &self.regs;
+        let root = xmss_fragment::generate(
+            &mut self.b,
+            &mut xr,
+            &XCOLS,
+            &XTYPES,
+            &msg,
+            &w.signature,
+            &w.pubkey,
+            &mut |row, _| regs.write_rest(row),
+        );
+        self.regs.xmss = xr;
         self.regs.pkroot = root;
 
         // key hash and commitment
@@ -1720,6 +1514,19 @@ impl Gen {
         self.smt_update(position, &w.siblings);
         self.regs.opos += 1;
     }
+
+    /// A name operation: its digest into the body, then into the
+    /// operations sponge.
+    fn op(&mut self, digest: &Digest) {
+        self.regs.opd = *digest;
+        self.regs.ops_left -= 1;
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, *digest, T_OP_BODY);
+        self.regs.bsp = out;
+        let nsp = self.regs.nsp;
+        let out = self.sponge_start(nsp, *digest, T_OP_LIST);
+        self.regs.nsp = out;
+    }
 }
 
 impl BlockAir {
@@ -1740,16 +1547,7 @@ impl BlockAir {
     fn generate_trace_with(w: &SegmentWitness, min_rows: usize) -> (Trace, SegmentPublic) {
         assert!(!w.txs.is_empty(), "a segment needs at least one transaction");
         let regs = Regs {
-            pub_seed: [Fp::ZERO; PUB_SEED_LEN],
-            idx_bits: [Fp::ZERO; HEIGHT],
-            m: EMPTY,
-            sp: [Fp::ZERO; WIDTH],
-            node: EMPTY,
-            sib: EMPTY,
-            csum: 0,
-            ksel: 0,
-            esel: 0,
-            rem: 0,
+            xmss: xmss_fragment::Regs::default(),
             level: 0,
             pbits: [Fp::ZERO; DEPTH],
             root: w.root_in,
@@ -1771,19 +1569,30 @@ impl BlockAir {
             open: false,
             memo: EMPTY,
             leaf: EMPTY,
+            opd: EMPTY,
+            nsp: w.nsp_in,
+            ops_left: 0,
         };
         let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs };
         let mut carry_in = Carry::CLOSED;
         let mut carry_out = Carry::CLOSED;
         let parts = w.txs.len();
         for (p, tx) in w.txs.iter().enumerate() {
-            let (n_in, n_out) = (tx.inputs.len() as u32, tx.outputs.len() as u32);
-            assert!(n_in <= tx.in_left && n_out <= tx.out_left, "more items than the transaction has left");
+            let (n_in, n_out, n_ops) = (tx.inputs.len() as u32, tx.outputs.len() as u32, tx.ops.len() as u32);
+            assert!(
+                n_in <= tx.in_left && n_out <= tx.out_left && n_ops <= tx.ops_left,
+                "more items than the transaction has left"
+            );
             assert!(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
-            assert!(!tx.ends || (n_in, n_out) == (tx.in_left, tx.out_left), "a part that ends has every item left");
+            assert!(n_ops == 0 || (n_in == tx.in_left && n_out == tx.out_left), "operations before the last output");
+            assert!(
+                !tx.ends || (n_in, n_out, n_ops) == (tx.in_left, tx.out_left, tx.ops_left),
+                "a part that ends has every item left"
+            );
             g.regs.msg = tx.message;
             g.regs.in_left = tx.in_left;
             g.regs.out_left = tx.out_left;
+            g.regs.ops_left = tx.ops_left;
             g.regs.is_out = false;
             g.regs.open = true;
             match tx.resume {
@@ -1791,9 +1600,10 @@ impl BlockAir {
                     let mut input = [Fp::ZERO; WIDTH];
                     input[0] = Fp::new(tx.in_left);
                     input[1] = Fp::new(tx.out_left);
+                    input[2] = Fp::new(tx.ops_left);
                     input[RATE..].copy_from_slice(&cap_const::<Fp>(
                         DOM_BODY,
-                        8 + BODY_PER_INPUT * tx.in_left + BODY_PER_OUTPUT * tx.out_left,
+                        8 + BODY_PER_INPUT * tx.in_left + BODY_PER_OUTPUT * tx.out_left + BODY_PER_OP * tx.ops_left,
                     ));
                     g.b.start(input);
                     let row = g.b.last_row_mut();
@@ -1808,7 +1618,14 @@ impl BlockAir {
                     let row = g.b.last_row_mut();
                     row[T_RESUME] = Fp::ONE;
                     g.regs.write(row);
-                    carry_in = Carry { open: true, msg: tx.message, bsp, in_left: tx.in_left, out_left: tx.out_left };
+                    carry_in = Carry {
+                        open: true,
+                        msg: tx.message,
+                        bsp,
+                        in_left: tx.in_left,
+                        out_left: tx.out_left,
+                        ops_left: tx.ops_left,
+                    };
                 }
             }
             for inp in &tx.inputs {
@@ -1816,6 +1633,9 @@ impl BlockAir {
             }
             for out in &tx.outputs {
                 g.output(out);
+            }
+            for op in &tx.ops {
+                g.op(op);
             }
             if tx.ends {
                 assert_eq!(&g.regs.bsp[..DIGEST], &tx.message[..], "body digest does not match the signed message");
@@ -1827,7 +1647,14 @@ impl BlockAir {
             } else {
                 assert_eq!(p + 1, parts, "only a segment's last part may leave a transaction open");
                 let r = &g.regs;
-                carry_out = Carry { open: true, msg: r.msg, bsp: r.bsp, in_left: r.in_left, out_left: r.out_left };
+                carry_out = Carry {
+                    open: true,
+                    msg: r.msg,
+                    bsp: r.bsp,
+                    in_left: r.in_left,
+                    out_left: r.out_left,
+                    ops_left: r.ops_left,
+                };
             }
         }
         let public = SegmentPublic {
@@ -1837,6 +1664,8 @@ impl BlockAir {
             isp_out: g.regs.isp,
             osp_in: w.osp_in,
             osp_out: g.regs.osp,
+            nsp_in: w.nsp_in,
+            nsp_out: g.regs.nsp,
             pos_in: w.pos_in,
             pos_out: g.regs.opos,
             sum_in: g.regs.sum_in,
@@ -1941,7 +1770,7 @@ mod tests {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
         assert_eq!(ROWS_PER_INPUT, 1150 + 5 + 1 + 80 + 2);
         assert_eq!(ROWS_PER_OUTPUT, 88);
-        assert_eq!(NUM_PUBLIC, 96 + 2 * 27);
+        assert_eq!(NUM_PUBLIC, 128 + 2 * 28);
     }
 
     #[test]
@@ -2072,7 +1901,7 @@ mod tests {
 
     #[test]
     fn packing_splits_between_items() {
-        let items = |t: usize| [(0, 1), (3, 2), (1, 2), (0, 5)][t];
+        let items = |t: usize| [(0, 1, 0), (3, 2, 1), (1, 2, 0), (0, 5, 3)][t];
         let max_rows = 2048;
         let plan = pack(4, items, max_rows);
         // Parts cover every item once, in order.
@@ -2085,18 +1914,18 @@ mod tests {
                 last_tx = p.tx;
                 assert_eq!(p.start, next[p.tx]);
                 next[p.tx] = p.end;
-                let (n_in, n_out) = items(p.tx);
-                rows += 1 + (p.start..p.end).map(|k| item_rows(k, n_in)).sum::<usize>();
-                rows += usize::from(p.end == n_in + n_out);
+                let (n_in, n_out, n_ops) = items(p.tx);
+                rows += 1 + (p.start..p.end).map(|k| item_rows(k, n_in, n_out)).sum::<usize>();
+                rows += usize::from(p.end == n_in + n_out + n_ops);
             }
             assert!(rows < max_rows, "{rows}");
         }
-        assert_eq!(next, [1, 5, 3, 5]);
+        assert_eq!(next, [1, 6, 3, 8]);
         // A segment holds one input: the second transaction's three are
         // spread over three segments, its outputs joining the last.
         assert_eq!(plan[0], vec![Part { tx: 0, start: 0, end: 1 }, Part { tx: 1, start: 0, end: 1 }]);
         assert_eq!(plan[1], vec![Part { tx: 1, start: 1, end: 2 }]);
-        assert_eq!(plan[2][0], Part { tx: 1, start: 2, end: 5 });
+        assert_eq!(plan[2][0], Part { tx: 1, start: 2, end: 6 });
     }
 
     #[test]

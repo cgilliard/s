@@ -1,9 +1,10 @@
 # Security of tabminer's proofs
 
-This note estimates the soundness of the block proof: the segment proofs, the
-recursive node proofs, the zero-knowledge wrap proof, and the chain proof a
-block carries, which verifies the wrap and the previous block's chain proof
-so that one proof covers the whole chain. It
+This note estimates the soundness of the block proof: the transaction
+segment proofs and the name segment proof, the recursive node proofs, the
+zero-knowledge wrap proof, and the chain proof a block carries, which
+verifies the wrap and the previous block's chain proof so that one proof
+covers the whole chain. It
 covers the parameters in `AggregatorParams::MAINNET`. All numbers come from
 `tools/soundness.py`, run on `tools/soundness_mainnet.json`. The table
 dimensions in that file, and the grinding schedule the code derives, are
@@ -22,6 +23,7 @@ every Fiat-Shamir round of every proof has an error below 2^-121 per attempt.
 | proof | queries | conjectured, every round | quantum | proven (Johnson regime) |
 |---|---|---|---|---|
 | segment (2^15 rows, rate 1/4) | 54 + 16 grinding bits | 120.0 | about 60 | 68 |
+| name segment (2^15 rows, rate 1/4) | 54 + 16 | 120.0 | about 60 | 68 |
 | node (up to 2^19 + 2^17 rows, rate 1/4) | 54 + 16 | 120.1 | about 60 | 67 |
 | wrap (up to 2^17 + 2^15 rows, rate 1/32) | 22 + 16 | 120.3 | about 60 | 68 |
 | chain step (2^17 + 2^15 rows, rate 1/32) | 22 + 16 | 120.3 | about 60 | 68 |
@@ -94,6 +96,11 @@ before the challenge in parentheses.
 | FRI folding, first round (later rounds need 2 bits less each) | 121.6 (17) | 121.6 (21) | 121.6 (22) |
 | queries, toy-problem conjecture | 124.0 | 124.0 | 126.0 |
 | queries, list-decoding-capacity radius | 122.0 | 122.0 | 124.3 |
+
+The name segment has the segment's rows and rate with more columns (995
+against 766) and constraints (3,255 against 1,860); its rounds are the
+segment's, with the constraint combination at 122.0 behind 10 grinding
+bits.
 
 Without grinding and with powers of one challenge for the batching, the
 same rounds gave the following bits (the parameters of 2025: 42 queries,
@@ -228,6 +235,14 @@ independent coefficients.
 The grinding dominates the step from 112 to 120 bits: each challenge needs
 8 more bits, 256 times the work, and a node's lookup challenges alone take
 2^24 permutations, about 8 s. A 16-segment block proves five nodes.
+
+These block timings predate the name segment. It is one more proof per
+block of 2^15 rows and 995 columns, proven at the segment parameters
+beside the transaction segments: about 2.4 s on the development laptop,
+the same empty or full, verified natively in 27 ms
+(`name_air::tests::mainnet_name_segment_timing`). The root verifies it as
+one more child, so the root of a one-segment block passes 2^18 rows where
+it passed 2^17; the wrap stays at 2^17.
 
 At 54 queries, a node of four children still passes 2^19 rows and the wrap
 over it 2^17, as at 50. The verifier of a single segment passes 2^17 rows

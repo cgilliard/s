@@ -39,12 +39,15 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::block::{HEADER_SIZE, Header};
+use crate::chain::{Manifest, NamePart, PartCommits};
 use crate::codec::{Reader, Writer};
 use crate::difficulty::U256;
+use crate::name_trie::Key;
+use crate::names::{NAME_PART_RECORDS, Record};
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
@@ -81,10 +84,10 @@ const T_GET_HEADERS_FROM: u8 = 11;
 pub enum Kind {
     Block,
     Tx,
-    /// The output counter and part roots of the state after a block
-    /// ([`encode_manifest`]).
+    /// The manifest of the state after a block ([`encode_manifest`]).
     Manifest,
-    /// One part of that state ([`encode_part`]).
+    /// One part of that state: an output part ([`encode_part`]) or, after
+    /// those, a name part ([`encode_name_part`]).
     Part(u32),
 }
 
@@ -114,43 +117,92 @@ impl Kind {
 
 /// Largest manifest: about a million parts, 17 billion positions.
 pub const MAX_MANIFEST: usize = 32 << 20;
-/// Largest part: every position of the part unspent.
-pub const MAX_PART: usize = 4 + (1 << crate::chain::SNAPSHOT_PART_LOG) * PART_ENTRY;
+/// Largest part: every position of an output part unspent and a commit,
+/// which also bounds a name part of [`NAME_PART_RECORDS`] records.
+pub const MAX_PART: usize = 8 + (1 << crate::chain::SNAPSHOT_PART_LOG) * (PART_ENTRY + COMMIT_ENTRY);
 const PART_ENTRY: usize = 8 + 32 + 32;
+const COMMIT_ENTRY: usize = 8 + 32 + 4;
+const _: () = assert!(MAX_PART >= 4 + NAME_PART_RECORDS * (1 + 32 + 96));
 
-/// A manifest: the output counter after the block, then the root of every
-/// part's subtree.
-pub fn encode_manifest(next: u64, roots: &[Digest]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(12 + 32 * roots.len());
-    w.u64(next);
-    w.digest_vec(roots);
+/// A manifest: the output counter after the block, the root of every
+/// output part's subtree, the name root, and every name part's first key
+/// and hash.
+pub fn encode_manifest(m: &Manifest) -> Vec<u8> {
+    let mut w = Writer::with_capacity(48 + 32 * m.roots.len() + 47 * m.names.len());
+    w.u64(m.next);
+    w.digest_vec(&m.roots);
+    w.digest(&m.name_root);
+    w.u32(m.names.len() as u32);
+    for n in &m.names {
+        w.0.extend_from_slice(&n.first.to_be_bytes()[1..]);
+        w.digest(&n.hash);
+    }
     w.finish()
 }
 
-pub fn decode_manifest(bytes: &[u8]) -> Option<(u64, Vec<Digest>)> {
+pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
     let mut r = Reader(bytes);
     let next = r.u64()?;
     let roots = r.digest_vec()?;
-    r.is_empty().then_some((next, roots))
+    let name_root = r.digest()?;
+    let n = r.len(15 + 32)?;
+    let mut names = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut k = [0u8; 16];
+        k[1..].copy_from_slice(r.take(15)?);
+        names.push(NamePart { first: Key::from_be_bytes(k), hash: r.digest()? });
+    }
+    r.is_empty().then_some(Manifest { next, roots, name_root, names })
 }
 
-/// A part: its unspent outputs, position, commitment and memo, ascending.
-pub fn encode_part(outputs: &[(u64, Digest, Digest)]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(4 + PART_ENTRY * outputs.len());
+/// An output part: its unspent outputs, position, commitment and memo,
+/// ascending; then which of them are commits: position, commit hash and
+/// height, ascending.
+pub fn encode_part(outputs: &[(u64, Digest, Digest)], commits: &[(u64, Digest, u32)]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(8 + PART_ENTRY * outputs.len() + COMMIT_ENTRY * commits.len());
     w.u32(outputs.len() as u32);
     for (p, c, m) in outputs {
         w.u64(*p);
         w.digest(c);
         w.digest(m);
     }
+    w.u32(commits.len() as u32);
+    for (p, hash, height) in commits {
+        w.u64(*p);
+        w.digest(hash);
+        w.u32(*height);
+    }
     w.finish()
 }
 
 #[allow(clippy::type_complexity)]
-pub fn decode_part(bytes: &[u8]) -> Option<Vec<(u64, Digest, Digest)>> {
+pub fn decode_part(bytes: &[u8]) -> Option<(Vec<(u64, Digest, Digest)>, PartCommits)> {
     let mut r = Reader(bytes);
     let n = r.len(PART_ENTRY)?;
     let out = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.digest()?))).collect::<Option<Vec<_>>>()?;
+    let n = r.len(COMMIT_ENTRY)?;
+    let commits = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.u32()?))).collect::<Option<Vec<_>>>()?;
+    r.is_empty().then_some((out, commits))
+}
+
+/// A name part: its records, in key order.
+pub fn encode_name_part(records: &[Record]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(4 + 130 * records.len());
+    w.u32(records.len() as u32);
+    for r in records {
+        w.0.extend_from_slice(&r.to_bytes());
+    }
+    w.finish()
+}
+
+pub fn decode_name_part(bytes: &[u8]) -> Option<Vec<Record>> {
+    let mut r = Reader(bytes);
+    let n = r.len(1 + 96)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = *r.0.first()? as usize;
+        out.push(Record::from_bytes(r.take(1 + len + 96)?)?);
+    }
     r.is_empty().then_some(out)
 }
 

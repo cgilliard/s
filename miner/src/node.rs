@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{Block, Header};
-use crate::chain::{Applied, CarriedPart, Chain, ChainError, ProofVerifier, SNAPSHOT_PART_LOG};
+use crate::chain::{Applied, CarriedPart, Chain, ChainError, Manifest, ProofVerifier, SNAPSHOT_PART_LOG};
 use crate::difficulty::U256;
 use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
@@ -161,7 +161,7 @@ pub enum Mode {
 struct Snap {
     target: Header,
     block: Option<Block>,
-    manifest: Option<(u64, Vec<Digest>)>,
+    manifest: Option<Manifest>,
     /// The block's proof checked against the manifest's counter.
     verified: bool,
     /// Which parts are stored. Each verified part goes straight to the
@@ -227,12 +227,19 @@ struct HeaderBatch {
 /// A block handed to the applier thread, with who sent it.
 enum Job {
     Block(Block, Option<SocketAddr>),
-    /// A fast-sync part, checked against its manifest root and stored.
+    /// A fast-sync output part, checked against its manifest root and stored.
     Part {
         index: u32,
         bytes: Vec<u8>,
         next: u64,
         root: Digest,
+        from: SocketAddr,
+    },
+    /// A fast-sync name part, checked against its manifest hash and stored.
+    NamePart {
+        index: u32,
+        bytes: Vec<u8>,
+        hash: Digest,
         from: SocketAddr,
     },
     /// Staged parts carried forward to a later snapshot.
@@ -478,9 +485,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         }
                         Job::Part { index, bytes, next, root, from } => {
                             let result = match net::decode_part(&bytes) {
-                                Some(outputs) => {
-                                    chain.stage_snapshot_part(index as u64, &outputs, next, Some(&root)).map(|_| ())
-                                }
+                                Some((outputs, commits)) => chain
+                                    .stage_snapshot_part(index as u64, &outputs, &commits, next, Some(&root))
+                                    .map(|_| ()),
+                                None => Err(ChainError::BadSnapshot),
+                            };
+                            Outcome::Part { index, from, result }
+                        }
+                        Job::NamePart { index, bytes, hash, from } => {
+                            let result = match net::decode_name_part(&bytes) {
+                                Some(records) => chain.stage_name_part(&records, Some(&hash)).map(|_| ()),
                                 None => Err(ChainError::BadSnapshot),
                             };
                             Outcome::Part { index, from, result }
@@ -1595,7 +1609,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     return;
                 }
             };
-            self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), &rtxn)
+            let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
+            self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), self.chain.names(), &rtxn, height)
         };
         match result {
             // Ours may have been pooled already, by the prompt: announce it.
@@ -1625,6 +1640,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         | Reject::Full
                         | Reject::FeeTooLow { .. }
                         | Reject::Dust { .. }
+                        | Reject::Name(_)
+                        | Reject::NameConflict
                 );
                 if let Some(from) = from
                     && !honest
@@ -1641,7 +1658,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Ok(rtxn) = self.chain.env().read_txn() else {
             return;
         };
-        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), &rtxn) {
+        let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
+        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), self.chain.names(), &rtxn, height) {
             Ok((gone, back)) if gone + back > 0 => {
                 self.chatter(&format!("mempool: {gone} transactions confirmed or conflicted, {back} restored"));
             }
@@ -1880,16 +1898,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let carry = match (snap.carry.take(), &snap.manifest) {
                 // Moving again before carrying: the same parts, more bodies.
                 (Some(c), _) => c,
-                (None, Some((next, _))) => Carry {
-                    next: *next,
-                    staged: (0..snap.parts.len() as u32).filter(|&i| snap.parts[i as usize]).collect(),
+                // Output parts are carried; name parts are fetched afresh.
+                (None, Some(m)) => Carry {
+                    next: m.next,
+                    staged: (0..m.roots.len() as u32).filter(|&i| snap.parts[i as usize]).collect(),
                     wanted: HashMap::new(),
                     spent: Vec::new(),
                 },
                 (None, None) => unreachable!("staging begins only once the manifest is checked"),
             };
             snap.carry = Some(carry);
+            if let Err(e) = self.chain.clear_staged_names() {
+                return self.restart_snapshot(&format!("clearing the staged name parts: {e}"));
+            }
         }
+        let Some(snap) = self.snap.as_mut() else { return };
         snap.target = target;
         snap.block = None;
         snap.manifest = None;
@@ -1965,9 +1988,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// snapshot's manifest, with the outputs spent in between.
     fn dispatch_carry(&mut self) {
         let Some(snap) = self.snap.as_mut() else { return };
-        let (Some(carry), Some((next, roots))) = (snap.carry.take(), snap.manifest.as_ref()) else {
+        let (Some(carry), Some(manifest)) = (snap.carry.take(), snap.manifest.as_ref()) else {
             return;
         };
+        let (next, roots) = (&manifest.next, &manifest.roots);
         let mut spent = carry.spent;
         spent.sort_unstable();
         spent.dedup();
@@ -2014,7 +2038,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         if has_block && has_manifest && !self.snap.as_ref().unwrap().verified {
             let snap = self.snap.as_ref().unwrap();
-            let next = snap.manifest.as_ref().unwrap().0;
+            let next = snap.manifest.as_ref().unwrap().next;
             match self.chain.verify_snapshot_block(snap.block.as_ref().unwrap(), next) {
                 Ok(()) => {
                     self.log(&format!(
@@ -2098,8 +2122,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(snap) = self.snap.take() else {
             return;
         };
-        let (next, roots) = snap.manifest.as_ref().unwrap();
-        match self.chain.finish_snapshot(snap.block.as_ref().unwrap(), roots, *next) {
+        let manifest = snap.manifest.as_ref().unwrap();
+        match self.chain.finish_snapshot(snap.block.as_ref().unwrap(), manifest) {
             Ok(()) => {
                 let unspent = self.chain.env().read_txn().ok().and_then(|r| self.chain.utxo().len(&r).ok());
                 self.log(&format!(
@@ -2277,37 +2301,43 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 _ => false,
             },
             Kind::Manifest => {
-                let Some((next, roots)) = net::decode_manifest(bytes) else {
+                let Some(manifest) = net::decode_manifest(bytes) else {
                     return false;
                 };
-                let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
-                if roots.len() as u64 != parts
-                    || crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &roots) != snap.target.state_root
+                let parts = manifest.next.div_ceil(1 << SNAPSHOT_PART_LOG);
+                if manifest.roots.len() as u64 != parts
+                    || manifest.state_root() != snap.target.state_root
+                    || manifest.names.windows(2).any(|w| w[0].first >= w[1].first)
                 {
                     return false;
                 }
-                snap.parts = vec![false; roots.len()];
-                snap.manifest = Some((next, roots));
+                snap.parts = vec![false; manifest.parts()];
+                snap.manifest = Some(manifest);
                 snap.manifest_from = Some(from);
                 true
             }
             Kind::Part(i) => {
-                let (Some((next, roots)), true) = (snap.manifest.as_ref(), snap.verified) else {
+                let (Some(manifest), true) = (snap.manifest.as_ref(), snap.verified) else {
                     return true;
                 };
                 if snap.parts.get(i as usize).is_none_or(|p| *p) || snap.staging.contains(&i) {
                     return true;
                 }
-                let Some(&root) = roots.get(i as usize) else {
-                    return false;
+                // Checked against its root or hash and stored on the
+                // applier thread, hashed once, while the network goes on;
+                // one part in memory there at a time.
+                let job = if (i as usize) < manifest.roots.len() {
+                    let root = manifest.roots[i as usize];
+                    Job::Part { index: i, bytes: bytes.to_vec(), next: manifest.next, root, from }
+                } else {
+                    let Some(part) = manifest.names.get(i as usize - manifest.roots.len()) else {
+                        return false;
+                    };
+                    Job::NamePart { index: i, bytes: bytes.to_vec(), hash: part.hash, from }
                 };
-                // Checked against its root and stored on the applier
-                // thread, hashed once, while the network goes on; one
-                // part's outputs in memory there at a time.
-                let next = *next;
                 snap.staging.insert(i);
                 if let Some(jobs) = &self.jobs {
-                    let _ = jobs.send(Job::Part { index: i, bytes: bytes.to_vec(), next, root, from });
+                    let _ = jobs.send(job);
                 }
                 true
             }
@@ -2324,11 +2354,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Some(bytes);
         }
         let bytes = match kind {
-            Kind::Manifest => {
-                let (next, roots) = self.chain.snapshot_manifest(id).ok().flatten()?;
-                net::encode_manifest(next, &roots)
+            Kind::Manifest => net::encode_manifest(&self.chain.snapshot_manifest(id).ok().flatten()?),
+            Kind::Part(i) => {
+                let manifest = self.chain.snapshot_manifest(id).ok().flatten()?;
+                if (i as usize) < manifest.roots.len() {
+                    let (outputs, commits) = self.chain.snapshot_part(id, i as u64).ok().flatten()?;
+                    net::encode_part(&outputs, &commits)
+                } else {
+                    let j = i as u64 - manifest.roots.len() as u64;
+                    net::encode_name_part(&self.chain.snapshot_name_part(id, j).ok().flatten()?)
+                }
             }
-            Kind::Part(i) => net::encode_part(&self.chain.snapshot_part(id, i as u64).ok().flatten()?),
             _ => return None,
         };
         self.served_snapshots.push_front(((kind, *id), bytes.clone()));
@@ -2418,8 +2454,12 @@ mod tests {
 
     /// Mines a block with one output and a padding "proof" on the tip.
     fn mine(f: &Fixture, tag: u8, timestamp: u64) -> Block {
-        let body =
-            Body { inputs: vec![], outputs: vec![Output::new(&pk(tag), 1).block_output()], proof: vec![tag; 2500] };
+        let body = Body {
+            inputs: vec![],
+            outputs: vec![Output::new(&pk(tag), 1).block_output()],
+            proof: vec![tag; 2500],
+            ..Default::default()
+        };
         mine_body(f, body, timestamp)
     }
 
@@ -2544,6 +2584,7 @@ mod tests {
                 inputs: vec![position],
                 outputs: vec![Output::new(&pk(50), 1).block_output()],
                 proof: vec![5; 2500],
+                ..Default::default()
             },
             t,
         );
@@ -2606,9 +2647,15 @@ mod tests {
                     inputs: vec![pos],
                     outputs: vec![Output::new(&pk(tag), 1).block_output()],
                     proof: vec![tag; 2500],
+                    ..Default::default()
                 }
             } else {
-                Body { inputs: vec![], outputs: vec![Output::new(&pk(tag), 1).block_output()], proof: vec![tag; 2500] }
+                Body {
+                    inputs: vec![],
+                    outputs: vec![Output::new(&pk(tag), 1).block_output()],
+                    proof: vec![tag; 2500],
+                    ..Default::default()
+                }
             };
             let block = mine_body(&a, body, t);
             a.chain.apply_block(&block, now).unwrap();
@@ -2631,6 +2678,65 @@ mod tests {
         assert_eq!(b.chain.header_at(3).unwrap(), a.chain.header_at(3).unwrap());
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!syncing.load(Ordering::Acquire));
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    /// Fast sync with names: the snapshot carries the records, a pending
+    /// commit's metadata, and the blocks after it reveal from it.
+    #[test]
+    fn a_fresh_node_fast_syncs_names() {
+        use crate::names::{BlockNameOp as Op, Record};
+        let a = open("fast-names-a");
+        let now = unix_now();
+        let mut t = T0;
+        let d = |n: u32| -> Digest { core::array::from_fn(|i| crate::poseidon2::Fp::new(n * 10 + i as u32)) };
+        let alice = Record::new(b"alice", d(1), d(2), d(3)).unwrap();
+        let alice2 = Record::new(b"alice", d(4), d(5), d(6)).unwrap();
+        let bob = Record::new(b"bob", d(7), d(8), d(9)).unwrap();
+        // Block 1 makes two commits (positions 1 and 2); blocks 3 to 12
+        // spend the output made two blocks before; 13 reveals alice and
+        // commits again (position 15), 14 updates alice, 15 reveals bob.
+        for tag in 1..=20u8 {
+            t += 600;
+            let ops = match tag {
+                1 => vec![Op::Commit { commit: d(10), memo: d(11) }, Op::Commit { commit: d(12), memo: d(13) }],
+                13 => vec![Op::Reveal { record: alice.clone(), commit: 1 }, Op::Commit { commit: d(14), memo: d(15) }],
+                14 => vec![Op::Update(alice2.clone())],
+                15 => vec![Op::Reveal { record: bob.clone(), commit: 2 }],
+                _ => vec![],
+            };
+            let inputs = if (3..=12).contains(&tag) { vec![tag as u64] } else { vec![] };
+            let body = Body {
+                inputs,
+                outputs: vec![Output::new(&pk(tag), 1).block_output()],
+                ops,
+                proof: vec![tag; 2500],
+                ..Default::default()
+            };
+            let block = mine_body(&a, body, t);
+            a.chain.apply_block(&block, now).unwrap();
+        }
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let b = open("fast-names-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 30), "b did not fast-sync to a's tip");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        assert_eq!(b.chain.floor().unwrap(), Some(16));
+        let rtxn = b.chain.env().read_txn().unwrap();
+        assert_eq!(b.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice2));
+        assert_eq!(b.chain.names().lookup(&rtxn, b"bob").unwrap(), Some(bob));
+        assert_eq!(b.chain.names().commit_at(&rtxn, 15).unwrap().map(|c| (c.hash, c.height)), Some((d(14), 13)));
+        assert!(b.chain.names().commit_at(&rtxn, 1).unwrap().is_none());
+        drop(rtxn);
         tx_a.send(Event::Stop).unwrap();
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();
@@ -2668,7 +2774,7 @@ mod tests {
                 14 => vec![7],
                 _ => vec![],
             };
-            let block = mine_body(a, Body { inputs, outputs, proof: vec![h as u8; 100] }, t);
+            let block = mine_body(a, Body { inputs, outputs, proof: vec![h as u8; 100], ..Default::default() }, t);
             match via {
                 // Through a's node, which announces it.
                 Some(tx) => {
@@ -2956,7 +3062,12 @@ mod tests {
         let dir_b = TempDir::new("other-b");
         let chain_b = Chain::open(&dir_b.0.join("chain"), 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
         let genesis = {
-            let body = Body { inputs: vec![], outputs: vec![Output::new(&pk(1), 1).block_output()], proof: vec![] };
+            let body = Body {
+                inputs: vec![],
+                outputs: vec![Output::new(&pk(1), 1).block_output()],
+                proof: vec![],
+                ..Default::default()
+            };
             let mut header = params().genesis().header;
             header.body_commitment = body.commitment();
             header.state_root = chain_b.preview_state_root(&body).unwrap();

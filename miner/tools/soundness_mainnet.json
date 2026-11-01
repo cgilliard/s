@@ -8,10 +8,30 @@
    [
     "BlockAir",
     15,
-    736,
+    766,
     0,
     3,
-    1743,
+    1860,
+    0,
+    [],
+    1
+   ]
+  ],
+  "commit_bits": 121
+ },
+ {
+  "name": "name segment (2^15 rows)",
+  "log_blowup": 2,
+  "queries": 54,
+  "pow": 16,
+  "tables": [
+   [
+    "NameAir",
+    15,
+    995,
+    0,
+    3,
+    3255,
     0,
     [],
     1
