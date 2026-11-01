@@ -332,7 +332,7 @@ impl Air for XmssAir {
         let mut level_plus_one = F::ZERO;
         for (lv, sel) in lsel.iter().enumerate() {
             dir_want += *sel * idx_bits[lv];
-            let mut p = pow2::<F>(HEIGHT - 1 - lv);
+            let mut p = F::ZERO;
             for (i, bit) in idx_bits.iter().enumerate().skip(lv + 1) {
                 p += *bit * pow2::<F>(i - lv - 1);
             }
@@ -351,8 +351,16 @@ impl Air for XmssAir {
             b.assert_zero(tree_abs * (l[COL_DATA + i] - ((one - dir) * sib + dir * node)));
             b.assert_zero(tree_abs * l_last * (l[COL_ACC + i] - pubv(PUB_ROOT + i)));
         }
-        let tree_cap =
-            [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], F::from_u32(DOM_TREE), pos, F::ZERO, level_plus_one];
+        let tree_cap = [
+            pub_seed[0],
+            pub_seed[1],
+            pub_seed[2],
+            pub_seed[3],
+            F::from_u32(DOM_TREE),
+            pos,
+            F::from_u32(HEIGHT as u32),
+            level_plus_one,
+        ];
         for (j, c) in tree_cap.iter().enumerate() {
             b.assert_zero(tree_start * (l[COL_INPUT + RATE + j] - *c));
         }
@@ -414,7 +422,8 @@ impl XmssAir {
     /// Builds the trace for verifying `sig` on `msg` under `pk`. The trace is
     /// valid only for a genuine signature; an invalid one yields a trace
     /// that fails the constraints (or a panic on malformed input).
-    pub fn generate_trace(pk: &PublicKey, msg: &[Fp; DIGEST], sig: &Signature<HEIGHT>) -> Trace {
+    pub fn generate_trace(pk: &PublicKey, msg: &[Fp; DIGEST], sig: &Signature) -> Trace {
+        assert!(pk.height() == HEIGHT && sig.height() == HEIGHT);
         assert!(sig.index < 1 << HEIGHT);
         let mut b = HashTraceBuilder::new(NUM_COLS);
         let ps = pk.pub_seed;
@@ -525,16 +534,16 @@ impl XmssAir {
         }
 
         // Tree levels.
-        let mut pos = (1u64 << HEIGHT) + idx;
+        let mut index = idx;
         for level in 0..HEIGHT {
-            let right = pos & 1 == 1;
-            pos >>= 1;
+            let right = index & 1 == 1;
+            index >>= 1;
             regs.node = b.acc();
             regs.sib = sig.auth_path[level];
             let (left_v, right_v) = if right { (regs.sib, regs.node) } else { (regs.node, regs.sib) };
             let mut input = [Fp::ZERO; WIDTH];
             input[..RATE].copy_from_slice(&left_v);
-            input[RATE..].copy_from_slice(&cap(&ps, DOM_TREE, pos, (level + 1) as u32));
+            input[RATE..].copy_from_slice(&cap(&ps, DOM_TREE, (HEIGHT as u64) << 30 | index, (level + 1) as u32));
             b.start(input);
             {
                 let row = b.last_row_mut();
@@ -585,7 +594,7 @@ mod tests {
     use crate::stark::{StarkConfig, check_constraints, prove, verify};
     use crate::xmss::SecretKey;
 
-    fn key(tag: u8) -> SecretKey<HEIGHT> {
+    fn key(tag: u8) -> SecretKey {
         let mut seed = [0u8; 32];
         seed[0] = tag;
         SecretKey::generate(&seed)

@@ -344,6 +344,133 @@ mod tests {
         assert_eq!(verify_block(&STARK, &st, &encode(&[], &name)), Err(AggregateError::NoSegments));
     }
 
+    /// A policy output (2-of-3 multisig) made in one proven block is spent
+    /// in the next through the pool, the proof and the chain.
+    #[test]
+    #[ignore = "proves blocks; run with --release"]
+    fn policy_spend_block_proves_and_applies() {
+        use crate::mempool::{Mempool, Policy as PoolPolicy};
+        use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer};
+        use crate::poseidon2::DIGEST;
+        use crate::transaction::{Transaction, pubkey_hash};
+        use crate::xmss::Digest;
+        let dir = TempDir::new("e2e-policy");
+        let p = params();
+        let seed = seed();
+        let dataset = Dataset::generate(&seed);
+        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK }).unwrap();
+        let mut a = key(1);
+        let mut bk = key(2);
+        let c = key(3);
+        let miner = key(4).public_key();
+        let keys: Vec<Digest> = [&a, &bk, &c].iter().map(|k| pubkey_hash(&k.public_key())).collect();
+        let multisig = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys }])]);
+        let genesis_body = Body {
+            inputs: vec![],
+            outputs: vec![Output::new(&a.public_key(), 100).block_output()],
+            proof: vec![],
+            ..Default::default()
+        };
+        let genesis_root = chain.preview_state_root(&genesis_body).unwrap();
+        let genesis = Block {
+            header: Header {
+                prev_hash: EMPTY,
+                height: 0,
+                timestamp: GENESIS_TIME,
+                body_commitment: genesis_body.commitment(),
+                state_root: genesis_root,
+                mix: EMPTY,
+                nonce: [0u8; 32],
+            },
+            body: genesis_body,
+        };
+        chain.init_genesis(&genesis).unwrap();
+        let names_for = |segments: &[SegmentWitness], height: u32, wtxn: &heed::RwTxn| {
+            NameWitness {
+                root_in: chain.utxo().root(wtxn).unwrap(),
+                pos_in: chain.utxo().next_position(wtxn).unwrap(),
+                height,
+                ops: vec![],
+            }
+            .with_segments(segments)
+        };
+        let mine = |body: &Body, timestamp: u64| -> Header {
+            let mut header = chain.template(body, timestamp).unwrap();
+            let tip = chain.tip().unwrap().unwrap();
+            let target = chain.expected_target(&tip).unwrap();
+            let (nonce, out) =
+                pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
+            header.nonce = nonce;
+            header.mix = out.mix;
+            header
+        };
+        let prove_and_apply = |txs: &[Transaction], height: u32, time: u64| {
+            let (segments, names) = {
+                let mut wtxn = chain.env().write_txn().unwrap();
+                let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, txs, 4, height).unwrap();
+                let n = names_for(&s, height, &wtxn);
+                wtxn.abort();
+                (s, n)
+            };
+            let proof = prove_block(&STARK, &segments, &names);
+            let body = body_from_segments(&segments, &names, proof);
+            let header = mine(&body, time);
+            chain.apply_block(&Block { header, body }, time + 100).unwrap();
+            assert_eq!(chain.tip().unwrap().unwrap().height, height);
+        };
+
+        // Block 1: A pays 90 into the multisig, fee 10; the miner takes 60.
+        let funding = multisig.output(90, [Fp::new(7); DIGEST]);
+        let mut tx1 = UnsignedTransaction::new(vec![(a.public_key(), 100)], vec![funding]).sign_with(&mut a).unwrap();
+        tx1.set_positions(&[0]);
+        let reward1 =
+            UnsignedTransaction::new(vec![], vec![Output::new(&miner, 60)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
+        prove_and_apply(&[tx1, reward1], 1, GENESIS_TIME + 600);
+        // The funding output sits at position 1, created at height 1.
+        {
+            let rtxn = chain.env().read_txn().unwrap();
+            let (c1, _, created) = chain.utxo().output_at(&rtxn, 1).unwrap().unwrap();
+            assert_eq!(c1, funding.commitment);
+            assert_eq!(created, 1);
+        }
+
+        // Block 2: A and B spend the multisig to C, fee 10, through the pool.
+        let mut spend = multisig.spend(0, 90, 1);
+        let outputs = vec![Output::new(&c.public_key(), 80)];
+        let body =
+            UnsignedTransaction::new(vec![], outputs.clone()).with_policy_inputs(vec![spend.clone()]).body_hash();
+        spend.witness[0] = CondWitness::Signatures(vec![
+            Signer { key: 0, pubkey: a.public_key(), signature: a.sign(&body).unwrap() },
+            Signer { key: 1, pubkey: bk.public_key(), signature: bk.sign(&body).unwrap() },
+        ]);
+        let tx2 = UnsignedTransaction::new(vec![], outputs)
+            .with_policy_inputs(vec![spend])
+            .sign(|_, _, _| Err::<Sig, ()>(()))
+            .unwrap();
+        assert_eq!(tx2.weight(), 2);
+        let mut pool = Mempool::with_policy(1 << 20, PoolPolicy::NONE);
+        {
+            let rtxn = chain.env().read_txn().unwrap();
+            pool.insert(tx2.clone(), chain.utxo(), chain.names(), &rtxn, 2).unwrap();
+            // The same output again is a conflict; a wrong state number is a
+            // policy rejection only if the leaf cares, so tamper the amount.
+            let mut bad = tx2.clone();
+            bad.policy_inputs[0].amount = 91;
+            assert!(matches!(
+                pool.insert(bad, chain.utxo(), chain.names(), &rtxn, 2),
+                Err(crate::mempool::Reject::UnknownInput(_))
+            ));
+        }
+        let reward2 =
+            UnsignedTransaction::new(vec![], vec![Output::new(&miner, 60)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
+        prove_and_apply(&[tx2, reward2], 2, GENESIS_TIME + 1200);
+        {
+            let rtxn = chain.env().read_txn().unwrap();
+            assert!(chain.utxo().output_at(&rtxn, 1).unwrap().is_none(), "the multisig output is spent");
+            assert!(chain.utxo().output_at(&rtxn, 3).unwrap().is_some(), "C's output exists");
+        }
+    }
+
     #[test]
     #[ignore = "proves blocks; run with --release"]
     fn mine_prove_and_apply_segmented_block() {
@@ -409,7 +536,7 @@ mod tests {
         };
         let (segments, names) = {
             let mut wtxn = chain.env().write_txn().unwrap();
-            let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &txs, 2).unwrap();
+            let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &txs, 2, 1).unwrap();
             let n = empty_names(&s, 1, &wtxn);
             wtxn.abort();
             (s, n)
@@ -488,7 +615,7 @@ mod tests {
             UnsignedTransaction::new(vec![], vec![Output::new(&miner, 50)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
         let (seg2, names2) = {
             let mut wtxn = chain.env().write_txn().unwrap();
-            let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &[reward2], 2).unwrap();
+            let s = SegmentWitness::collect(chain.utxo(), &mut wtxn, &[reward2], 2, 2).unwrap();
             let n = empty_names(&s, 2, &wtxn);
             wtxn.abort();
             (s, n)

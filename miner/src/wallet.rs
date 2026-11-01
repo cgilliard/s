@@ -72,6 +72,7 @@ use crate::bip39;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
+use crate::policy::{Cond, CondWitness, Mode, Policy as SpendPolicy, Signer, rebind_message};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::state_tree::open_env;
 use crate::transaction::{
@@ -90,17 +91,22 @@ const META_SCAN_PENDING: &str = "scan_pending";
 /// outputs' positions.
 const META_SYNCED: &str = "synced";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys;
-/// 5 adds the name tables.
-const FORMAT: u8 = 5;
+/// 5 adds the name tables; 6 stores keys with their tree height (slate
+/// format 3).
+const FORMAT: u8 = 6;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
-const SLATE_MAGIC: &[u8; 8] = b"tabslt02";
+const SLATE_MAGIC: &[u8; 8] = b"tabslt03";
 
 const DOM_MASTER: u32 = 0x30;
 const DOM_PAD: u32 = 0x31;
 const DOM_KEY: u32 = 0x32;
 const DOM_OWNER: u32 = 0x33;
 const DOM_SALT: u32 = 0x34;
+const DOM_CHANNEL: u32 = 0x35;
+/// Tree height of the channel keys this wallet makes unless told
+/// otherwise: 65,536 states.
+pub const CHANNEL_HEIGHT: usize = 16;
 /// Nonce elements in a memo.
 const NONCE: usize = 4;
 /// Leaves a key may sign from, in each half of its tree.
@@ -190,6 +196,79 @@ impl Owned {
     /// Signatures this output can still make.
     pub fn signatures_left(&self) -> u32 {
         LEAVES_PER_HALF - u32::from(self.used)
+    }
+}
+
+/// A key of this wallet listed in a tracked policy: which listed key it
+/// is, the nonce it derives from, its tree height, and the leaves used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyKey {
+    pub index: u8,
+    pub nonce: [Fp; NONCE],
+    pub height: u8,
+    pub used: u32,
+}
+
+/// An output under a spend policy this wallet is party to: a multisig, an
+/// HTLC, a channel state or a factory (see `docs/ELTOO.md`). Unlike plain
+/// outputs these are not found again from the seed: the policy comes from
+/// the parties' agreement, so a wallet keeps it, as channel wallets keep
+/// their channel state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyOutput {
+    pub commitment: Commitment,
+    pub policy: SpendPolicy,
+    pub amount: u64,
+    pub memo: Memo,
+    pub state: State,
+    pub created: u64,
+    pub position: Option<u64>,
+    pub keys: Vec<PolicyKey>,
+}
+
+impl PolicyOutput {
+    fn to_bytes(&self) -> Vec<u8> {
+        let policy = self.policy.to_bytes();
+        let mut w = Writer::with_capacity(64 + policy.len());
+        w.u32(policy.len() as u32);
+        w.0.extend_from_slice(&policy);
+        w.u64(self.amount);
+        w.digest(&self.memo);
+        w.0.push(self.state.to_u8());
+        w.u64(self.created);
+        w.0.push(self.position.is_some() as u8);
+        w.u64(self.position.unwrap_or(0));
+        w.u32(self.keys.len() as u32);
+        for k in &self.keys {
+            w.0.push(k.index);
+            w.fps(&k.nonce);
+            w.0.push(k.height);
+            w.u32(k.used);
+        }
+        w.finish()
+    }
+
+    fn from_bytes(commitment: Commitment, bytes: &[u8]) -> Option<PolicyOutput> {
+        let mut r = Reader(bytes);
+        let n = r.u32()? as usize;
+        let policy = SpendPolicy::from_bytes(r.take(n)?)?;
+        let amount = r.u64()?;
+        let memo = r.digest()?;
+        let state = State::from_u8(r.take(1)?[0])?;
+        let created = r.u64()?;
+        let has = r.take(1)?[0];
+        let position = r.u64()?;
+        let position = (has == 1).then_some(position);
+        let n = r.len(1 + 4 * NONCE + 1 + 4)?;
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let index = r.take(1)?[0];
+            let nonce = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
+            let height = r.take(1)?[0];
+            let used = r.u32()?;
+            keys.push(PolicyKey { index, nonce, height, used });
+        }
+        r.is_empty().then_some(PolicyOutput { commitment, policy, amount, memo, state, created, position, keys })
     }
 }
 
@@ -518,6 +597,8 @@ pub enum WalletError {
     Unconfirmed,
     /// A name operation the wallet cannot make.
     Name(String),
+    /// A policy spend could not be made.
+    Policy(&'static str),
 }
 
 impl core::fmt::Display for WalletError {
@@ -537,6 +618,7 @@ impl core::fmt::Display for WalletError {
             WalletError::Exists => f.write_str("a wallet already exists in that directory"),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
             WalletError::Name(m) => f.write_str(m),
+            WalletError::Policy(m) => write!(f, "policy: {m}"),
         }
     }
 }
@@ -600,6 +682,8 @@ pub struct Wallet {
     commits: Database<Bytes, Bytes>,
     /// Names by name.
     names: Database<Bytes, Bytes>,
+    /// Policy outputs by commitment.
+    policies: Database<Bytes, Bytes>,
 }
 
 fn unix_now() -> u64 {
@@ -629,7 +713,7 @@ fn master_of(seed: &[u8; 64]) -> [Fp; DIGEST] {
 
 impl Wallet {
     #[allow(clippy::type_complexity)]
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 5])> {
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 6])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
@@ -641,14 +725,15 @@ impl Wallet {
         let sent = env.create_database(&mut wtxn, Some("sent"))?;
         let commits = env.create_database(&mut wtxn, Some("commits"))?;
         let names = env.create_database(&mut wtxn, Some("names"))?;
+        let policies = env.create_database(&mut wtxn, Some("policies"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent, commits, names]))
+        Ok((env, meta, [outputs, slates, sent, commits, names, policies]))
     }
 
     /// Opens the wallet in `dir`, creating one with a fresh phrase if there
     /// is none. Returns the wallet and, if it was just created, its phrase.
     pub fn open(dir: &Path) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent, commits, names]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         let created = match meta.get(&wtxn, META_SEED)? {
             Some(_) => {
@@ -676,7 +761,7 @@ impl Wallet {
             .try_into()
             .map_err(|_| WalletError::Corrupt("seed"))?;
         wtxn.commit()?;
-        Ok((Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names }, created))
+        Ok((Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names, policies }, created))
     }
 
     /// Creates a wallet in `dir` from a phrase and passphrase; the outputs
@@ -684,7 +769,7 @@ impl Wallet {
     pub fn restore(dir: &Path, phrase: &str, passphrase: &str) -> Result<Wallet> {
         let entropy = bip39::entropy(phrase)?;
         let seed = bip39::seed(phrase, passphrase)?;
-        let (env, meta, [outputs, slates, sent, commits, names]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         if meta.get(&wtxn, META_SEED)?.is_some() || !outputs.is_empty(&wtxn)? {
             return Err(WalletError::Exists);
@@ -694,7 +779,7 @@ impl Wallet {
         meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
         meta.put(&mut wtxn, META_SCAN_PENDING, &[1])?;
         wtxn.commit()?;
-        Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names })
+        Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names, policies })
     }
 
     /// Whether a restore is waiting for its first scan.
@@ -864,6 +949,11 @@ impl Wallet {
             if let Some(mut o) = self.owned_in(&wtxn, &out.commitment)? {
                 o.position = Some(first + i as u64);
                 self.record(&mut wtxn, &o)?;
+                n += 1;
+            }
+            if let Some(mut p) = self.policy_in(&wtxn, &out.commitment)? {
+                p.position = Some(first + i as u64);
+                self.record_policy(&mut wtxn, &p)?;
                 n += 1;
             }
         }
@@ -1210,7 +1300,7 @@ impl Wallet {
         if slate.outputs.iter().any(|o| o.amount < Policy::MAINNET.dust) {
             return Err(WalletError::BadSlate("an output is below the dust limit"));
         }
-        if 8 + slate.inputs.len() * INPUT_SIZE + slate.outputs.len() * OUTPUT_SIZE > MAX_TX_SIZE {
+        if 12 + slate.inputs.len() * INPUT_SIZE + slate.outputs.len() * OUTPUT_SIZE > MAX_TX_SIZE {
             return Err(WalletError::BadSlate("too many outputs for one transaction"));
         }
         let mut wtxn = self.env.write_txn()?;
@@ -1248,7 +1338,7 @@ impl Wallet {
     /// The smallest fee a replacement of `sent` may pay: its fee plus one
     /// base unit per byte of the replacement (see [`crate::mempool`]).
     pub fn min_replacement_fee(sent: &Sent) -> u64 {
-        sent.fee + (8 + sent.inputs.len() * INPUT_SIZE + OUTPUT_SIZE) as u64
+        sent.fee + (12 + sent.inputs.len() * INPUT_SIZE + OUTPUT_SIZE) as u64
     }
 
     /// Cancels a finalized payment that is not yet confirmed: signs a
@@ -1671,7 +1761,7 @@ impl Wallet {
     /// The smallest fee a transaction carrying `ops` from `inputs` inputs
     /// with change may pay.
     pub fn min_carry_fee(inputs: usize, ops: &[NameOp]) -> u64 {
-        let size = 12 + inputs * INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>();
+        let size = 16 + inputs * INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>();
         Policy::MAINNET.min_fee_for(size)
     }
 
@@ -1745,6 +1835,271 @@ impl Wallet {
         wtxn.commit()?;
         Ok(signed)
     }
+
+    // ---------------------------------------------------------------------
+    // Policies: multisig, HTLCs, channels (docs/ELTOO.md)
+    // ---------------------------------------------------------------------
+
+    /// A channel key: an XMSS key of `height` levels (1 to 20) derived from
+    /// the seed by `nonce`, for thresholds in policies. Building one costs
+    /// `2^height` leaves (about a second per 2^16 per core), so callers
+    /// make tall keys off the prompt thread.
+    pub fn channel_key(&self, nonce: &[Fp; NONCE], height: usize) -> Key {
+        let seed: [u8; SEED_SIZE] = digest_to_bytes(&self.with_master(DOM_CHANNEL, nonce));
+        Key::generate_with_height(&seed, height)
+    }
+
+    /// The hash of a channel key: what a policy lists.
+    pub fn channel_key_hash(&self, nonce: &[Fp; NONCE], height: usize) -> Commitment {
+        pubkey_hash(&self.channel_key(nonce, height).public_key())
+    }
+
+    /// A fresh nonce for a channel key.
+    pub fn fresh_nonce() -> Result<[Fp; NONCE]> {
+        Ok([random_fp()?, random_fp()?, random_fp()?, random_fp()?])
+    }
+
+    fn record_policy(&self, wtxn: &mut RwTxn, p: &PolicyOutput) -> Result<()> {
+        self.policies.put(wtxn, &digest_to_bytes(&p.commitment), &p.to_bytes())?;
+        Ok(())
+    }
+
+    fn policy_in(&self, rtxn: &RoTxn, c: &Commitment) -> Result<Option<PolicyOutput>> {
+        match self.policies.get(rtxn, &digest_to_bytes(c))? {
+            None => Ok(None),
+            Some(b) => PolicyOutput::from_bytes(*c, b).map(Some).ok_or(WalletError::Corrupt("policy output")),
+        }
+    }
+
+    /// Tracks an output under `policy` paying `amount` with `memo` that this
+    /// wallet is party to with `keys` (its keys among the policy's), so it
+    /// can sign spends of it. Returns the output, for a funding transaction
+    /// ([`Wallet::fund`]) or another policy spend's outputs.
+    pub fn track_policy(&self, policy: &SpendPolicy, amount: u64, memo: Memo, keys: Vec<PolicyKey>) -> Result<Output> {
+        if !policy.valid() {
+            return Err(WalletError::Policy("malformed policy"));
+        }
+        let out = policy.output(amount, memo);
+        let p = PolicyOutput {
+            commitment: out.commitment,
+            policy: policy.clone(),
+            amount,
+            memo,
+            state: State::Unspent,
+            created: unix_now(),
+            position: None,
+            keys,
+        };
+        let mut wtxn = self.env.write_txn()?;
+        self.record_policy(&mut wtxn, &p)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn policy_output(&self, c: &Commitment) -> Result<Option<PolicyOutput>> {
+        let rtxn = self.env.read_txn()?;
+        self.policy_in(&rtxn, c)
+    }
+
+    /// Every tracked policy output, oldest first.
+    pub fn policy_outputs(&self) -> Result<Vec<PolicyOutput>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.policies.iter(&rtxn)? {
+            let (k, v) = item?;
+            let c = crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("policy key"))?;
+            out.push(PolicyOutput::from_bytes(c, v).ok_or(WalletError::Corrupt("policy output"))?);
+        }
+        out.sort_by_key(|p| p.created);
+        Ok(out)
+    }
+
+    /// The smallest fee a transaction paying `outputs` from `inputs` inputs
+    /// with change may carry.
+    pub fn min_fund_fee(inputs: usize, outputs: usize) -> u64 {
+        Policy::MAINNET.min_fee(inputs, outputs + 1)
+    }
+
+    /// Pays `outputs` (a channel's funding output, say) from this wallet's
+    /// confirmed outputs with `fee` (or the smallest the pool takes), change
+    /// to a fresh output; the outputs are tracked by whoever owns them.
+    pub fn fund(&self, outputs: Vec<Output>, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
+        if outputs.is_empty() || outputs.iter().any(|o| o.amount == 0) {
+            return Err(WalletError::BadSlate("nothing to fund"));
+        }
+        let amount: u128 = outputs.iter().map(|o| o.amount as u128).sum();
+        let dust = Policy::MAINNET.dust;
+        let coins = self.spendable(utxo, rtxn)?;
+        let mut inputs = 1;
+        let given = fee;
+        let fee = loop {
+            let fee = given.unwrap_or_else(|| Self::min_fund_fee(inputs, outputs.len()));
+            let need = amount + fee as u128;
+            let mut picked = 0usize;
+            let mut total = 0u128;
+            for c in &coins {
+                if total >= need {
+                    break;
+                }
+                total += c.amount as u128;
+                picked += 1;
+            }
+            if total < need {
+                return Err(WalletError::Insufficient { have: total, need });
+            }
+            let min = Self::min_fund_fee(picked.max(1), outputs.len());
+            if given.is_some() && fee < min {
+                return Err(WalletError::FeeTooLow { min });
+            }
+            if picked <= inputs {
+                break fee;
+            }
+            inputs = picked;
+        };
+        let need = amount + fee as u128;
+        let mut picked = Vec::new();
+        let mut total = 0u128;
+        for c in coins {
+            if total >= need {
+                break;
+            }
+            total += c.amount as u128;
+            picked.push(c);
+        }
+        let change_amount = (total - need) as u64;
+        let mut outputs = outputs;
+        let (fee, change) = if change_amount >= dust {
+            let out = self.receive(change_amount)?;
+            outputs.push(out);
+            (fee, Some(out.commitment))
+        } else {
+            (fee + change_amount, None)
+        };
+        let inputs: Vec<(PublicKey, u64)> =
+            picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
+        let commitments: Vec<Commitment> = picked.iter().map(|c| c.commitment).collect();
+        let mut wtxn = self.env.write_txn()?;
+        let signed = match self.sign(&mut wtxn, UnsignedTransaction::new(inputs, outputs), &commitments) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(wtxn);
+                if let Some(c) = change {
+                    self.forget(&c)?;
+                }
+                return Err(e);
+            }
+        };
+        let sent =
+            Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created: unix_now() };
+        self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
+        wtxn.commit()?;
+        Ok(signed)
+    }
+
+    /// A spend of the tracked policy output `c` through its leaf `leaf`
+    /// into `outputs`, with the state number and covered run a channel
+    /// update or settlement names (zero and empty otherwise). The spend
+    /// carries no signatures yet: each party signs with
+    /// [`Wallet::sign_policy`] in turn, passing the transaction's bytes
+    /// along; a hash lock's preimage goes into its witness directly.
+    pub fn policy_spend(
+        &self,
+        c: &Commitment,
+        leaf: usize,
+        outputs: Vec<Output>,
+        state: u32,
+        covered: (u8, u8),
+    ) -> Result<Transaction> {
+        let p = self.policy_output(c)?.ok_or(WalletError::Unknown)?;
+        let position = p.position.ok_or(WalletError::Unconfirmed)?;
+        if leaf >= p.policy.leaves.len() {
+            return Err(WalletError::Policy("no such leaf"));
+        }
+        let mut spend = p.policy.spend(leaf, p.amount, position);
+        spend.state = state;
+        spend.covered = covered;
+        let tx = UnsignedTransaction::new(vec![], outputs)
+            .with_policy_inputs(vec![spend])
+            .sign(|_, _, _| Err::<crate::transaction::Sig, WalletError>(WalletError::Unknown))?;
+        Ok(tx)
+    }
+
+    /// Signs the policy spend `tx` with every key of this wallet the leaf's
+    /// thresholds list that has not signed yet: over the body hash, or for
+    /// a rebindable threshold the rebindable message with leaf index equal
+    /// to the state number. Returns how many signatures were added. The
+    /// leaves used are recorded; a rebindable key never signs a state it
+    /// has passed.
+    pub fn sign_policy(&self, tx: &mut Transaction) -> Result<usize> {
+        let Some(input) = tx.policy_inputs.first() else {
+            return Err(WalletError::Policy("no policy input"));
+        };
+        let c = input.commitment();
+        let mut p = self.policy_output(&c)?.ok_or(WalletError::Unknown)?;
+        let body = tx.body_hash();
+        let covered = input.covered_outputs(&tx.outputs).ok_or(WalletError::Policy("covered run past the outputs"))?;
+        let state = input.state;
+        let leaf = input.leaf.clone();
+        let mut added = 0;
+        let mut witness = input.witness.clone();
+        for (k, cond) in leaf.conds.iter().enumerate() {
+            let Cond::Thresh { mode, keys, .. } = cond else { continue };
+            let CondWitness::Signatures(signers) = &mut witness[k] else {
+                return Err(WalletError::Policy("witness does not fit the threshold"));
+            };
+            for key in p.keys.iter_mut() {
+                let idx = key.index as usize;
+                if idx >= keys.len() || signers.iter().any(|s| s.key == key.index) {
+                    continue;
+                }
+                let mut sk = self.channel_key(&key.nonce, key.height as usize);
+                if pubkey_hash(&sk.public_key()) != keys[idx] {
+                    continue;
+                }
+                let (msg, index) = match mode {
+                    Mode::Body => (body, key.used as u64),
+                    Mode::Rebindable { channel } => (rebind_message(channel, state, &covered), state as u64),
+                };
+                if index < key.used as u64 && matches!(mode, Mode::Rebindable { .. }) {
+                    return Err(WalletError::Policy("this key has signed a later state"));
+                }
+                if index >= sk.leaves() {
+                    return Err(WalletError::Exhausted);
+                }
+                sk.set_next_index(index);
+                let signature = sk.sign(&msg).map_err(|_| WalletError::Exhausted)?;
+                key.used = (index + 1) as u32;
+                signers.push(Signer { key: key.index, pubkey: sk.public_key(), signature });
+                added += 1;
+            }
+            signers.sort_by_key(|s| s.key);
+        }
+        if added > 0 {
+            tx.policy_inputs[0].witness = witness;
+            let mut wtxn = self.env.write_txn()?;
+            self.record_policy(&mut wtxn, &p)?;
+            wtxn.commit()?;
+        }
+        Ok(added)
+    }
+
+    /// Records a policy spend this wallet published: the policy output is
+    /// spent and the transaction is remembered as sent.
+    pub fn policy_sent(&self, tx: &Transaction) -> Result<()> {
+        let Some(input) = tx.policy_inputs.first() else {
+            return Err(WalletError::Policy("no policy input"));
+        };
+        let c = input.commitment();
+        let mut p = self.policy_output(&c)?.ok_or(WalletError::Unknown)?;
+        p.state = State::Spent;
+        let fee = tx.balance().max(0) as u64;
+        let mut wtxn = self.env.write_txn()?;
+        self.record_policy(&mut wtxn, &p)?;
+        let sent = Sent { txid: tx.txid(), inputs: vec![c], fee, size: tx.size(), created: unix_now() };
+        self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
 }
 
 /// 32 bytes from 64 hex digits.
@@ -1798,9 +2153,166 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let first = u.next_position(&wtxn).unwrap();
         let outs: Vec<_> = outs.iter().map(|o| o.block_output()).collect();
-        u.add_outputs(&mut wtxn, &outs).unwrap();
+        u.add_outputs(&mut wtxn, &outs, 0).unwrap();
         wtxn.commit().unwrap();
         wallet.locate(first, &outs).unwrap();
+    }
+
+    /// Two wallets run an eltoo channel through the policy API: funding,
+    /// an update signed by both with rebindable signatures, a cooperative
+    /// close, a covenant settlement after the delay, and a three-party
+    /// factory settling into channel outputs; a 2-of-3 multisig too.
+    #[test]
+    fn channels_and_multisig_through_the_policy_api() {
+        use crate::policy::{Cond, Leaf, Mode, Policy as SpendPolicy, PolicyError};
+        let dir = TempDir::new("channel");
+        let (env, u) = utxo(&dir);
+        let (a, _) = Wallet::open(&dir.0.join("a")).unwrap();
+        let (b, _) = Wallet::open(&dir.0.join("b")).unwrap();
+        let (c, _) = Wallet::open(&dir.0.join("c")).unwrap();
+        const H: usize = 6;
+        let d = |x: u32| {
+            let mut v = [Fp::ZERO; DIGEST];
+            v[0] = Fp::new(x);
+            v
+        };
+        let land_all = |outs: &[&Output], wallets: &[&Wallet]| {
+            let mut wtxn = env.write_txn().unwrap();
+            let first = u.next_position(&wtxn).unwrap();
+            let outs: Vec<_> = outs.iter().map(|o| o.block_output()).collect();
+            u.add_outputs(&mut wtxn, &outs, 0).unwrap();
+            wtxn.commit().unwrap();
+            for w in wallets {
+                w.locate(first, &outs).unwrap();
+            }
+        };
+        let coin = a.receive(10_000).unwrap();
+        land_all(&[&coin], &[&a]);
+
+        // Channel keys and the state policy shape.
+        let (na, nb, nc) =
+            (Wallet::fresh_nonce().unwrap(), Wallet::fresh_nonce().unwrap(), Wallet::fresh_nonce().unwrap());
+        let (ka, kb, kc) = (a.channel_key_hash(&na, H), b.channel_key_hash(&nb, H), c.channel_key_hash(&nc, H));
+        let key_a = || PolicyKey { index: 0, nonce: na, height: H as u8, used: 0 };
+        let key_b = || PolicyKey { index: 1, nonce: nb, height: H as u8, used: 0 };
+        let channel = d(1);
+        let state_policy = |n: u32, settle: &[Output]| {
+            let pairs: Vec<(Commitment, Memo)> = settle.iter().map(|o| (o.commitment, o.memo)).collect();
+            SpendPolicy::new(vec![
+                Leaf::new(vec![
+                    Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: vec![ka, kb] },
+                    Cond::State(n),
+                ]),
+                Leaf::new(vec![Cond::Older(10), Cond::Outputs(pairs)]),
+                Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: vec![ka, kb] }]),
+            ])
+        };
+
+        // Open: A funds 5000; state 0 refunds A.
+        let refund0 = a.receive(5000).unwrap();
+        let p0 = state_policy(0, &[refund0]);
+        let funding = a.track_policy(&p0, 5000, d(50), vec![key_a()]).unwrap();
+        assert_eq!(b.track_policy(&p0, 5000, d(50), vec![key_b()]).unwrap(), funding);
+        let signed = {
+            let rtxn = env.read_txn().unwrap();
+            a.fund(vec![funding], None, &u, &rtxn).unwrap()
+        };
+        assert_eq!(signed.tx.outputs[0], funding);
+        assert_eq!(signed.tx.inputs.len(), 1);
+        assert!(signed.tx.verify_signatures());
+        let outs: Vec<&Output> = signed.tx.outputs.iter().collect();
+        land_all(&outs, &[&a, &b]);
+        assert_eq!(a.policy_output(&funding.commitment).unwrap().unwrap().position, Some(1));
+        assert_eq!(b.policy_output(&funding.commitment).unwrap().unwrap().position, Some(1));
+        assert_eq!(a.policy_outputs().unwrap().len(), 1);
+
+        // Update to state 1: B is paid 2000. B proposes and signs, A signs.
+        let refund1 = a.receive(3000).unwrap();
+        let pay1 = b.receive(2000).unwrap();
+        let p1 = state_policy(1, &[refund1, pay1]);
+        let state1 = a.track_policy(&p1, 5000, d(51), vec![key_a()]).unwrap();
+        b.track_policy(&p1, 5000, d(51), vec![key_b()]).unwrap();
+        let mut update = b.policy_spend(&funding.commitment, 0, vec![state1], 1, (0, 1)).unwrap();
+        assert_eq!(b.sign_policy(&mut update).unwrap(), 1);
+        assert_eq!(update.check_policy_inputs(1, |_| Some(0)), Err(PolicyError::Signatures));
+        let mut update = Transaction::from_bytes(&update.to_bytes()).unwrap();
+        assert_eq!(a.sign_policy(&mut update).unwrap(), 1);
+        assert_eq!(a.sign_policy(&mut update).unwrap(), 0, "already signed");
+        assert_eq!(update.check_policy_inputs(1, |_| Some(0)), Ok(()));
+        assert_eq!(update.weight(), 2);
+        // Having signed state 1, B's key will not sign state 1 (or 0) again.
+        let mut stale = b.policy_spend(&funding.commitment, 0, vec![state1], 1, (0, 1)).unwrap();
+        assert!(matches!(b.sign_policy(&mut stale), Err(WalletError::Policy(_))));
+
+        // Cooperative close of the funding output straight to final outputs.
+        let (fa, fb) = (a.receive(2990).unwrap(), b.receive(2000).unwrap());
+        let mut close = a.policy_spend(&funding.commitment, 2, vec![fa, fb], 0, (0, 0)).unwrap();
+        assert_eq!(a.sign_policy(&mut close).unwrap(), 1);
+        assert_eq!(b.sign_policy(&mut close).unwrap(), 1);
+        assert_eq!(close.check_policy_inputs(1, |_| Some(0)), Ok(()));
+        assert_eq!(close.balance(), 10);
+
+        // Unilateral: the update lands; after the delay anyone settles into
+        // the covenant's outputs, no signature needed.
+        land_all(&[&state1], &[&a, &b]);
+        let created = u64::from(a.policy_output(&state1.commitment).unwrap().unwrap().position.is_some());
+        assert_eq!(created, 1);
+        let settle = b.policy_spend(&state1.commitment, 1, vec![refund1, pay1], 0, (0, 2)).unwrap();
+        assert_eq!(settle.policy_inputs[0].signatures(), 0);
+        assert_eq!(settle.check_policy_inputs(9, |_| Some(0)), Err(PolicyError::Locked));
+        assert_eq!(settle.check_policy_inputs(10, |_| Some(0)), Ok(()));
+        b.policy_sent(&settle).unwrap();
+        assert_eq!(b.policy_output(&state1.commitment).unwrap().unwrap().state, State::Spent);
+        // A wrong covered run is refused by the check.
+        let wrong = b.policy_spend(&state1.commitment, 1, vec![pay1, refund1], 0, (0, 2)).unwrap();
+        assert_eq!(wrong.check_policy_inputs(10, |_| Some(0)), Err(PolicyError::Covenant));
+
+        // A factory of A, B and C settling into two channel outputs (A with
+        // B, A with C), 3-of-3 to update.
+        let chan_ab = state_policy(0, &[refund0]).output(3000, d(60));
+        let chan_ac =
+            SpendPolicy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: vec![ka, kc] }])])
+                .output(2000, d(61));
+        let factory = SpendPolicy::new(vec![
+            Leaf::new(vec![
+                Cond::Thresh { mode: Mode::Rebindable { channel: d(2) }, m: 3, keys: vec![ka, kb, kc] },
+                Cond::State(0),
+            ]),
+            Leaf::new(vec![
+                Cond::Older(10),
+                Cond::Outputs(vec![(chan_ab.commitment, chan_ab.memo), (chan_ac.commitment, chan_ac.memo)]),
+            ]),
+            Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 3, keys: vec![ka, kb, kc] }]),
+        ]);
+        let fout = a.track_policy(&factory, 5000, d(70), vec![key_a()]).unwrap();
+        b.track_policy(&factory, 5000, d(70), vec![key_b()]).unwrap();
+        c.track_policy(&factory, 5000, d(70), vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }])
+            .unwrap();
+        land_all(&[&fout], &[&a, &b, &c]);
+        let mut regroup = a.policy_spend(&fout.commitment, 2, vec![chan_ab, chan_ac], 0, (0, 0)).unwrap();
+        for w in [&a, &b, &c] {
+            assert_eq!(w.sign_policy(&mut regroup).unwrap(), 1);
+        }
+        assert_eq!(regroup.check_policy_inputs(1, |_| Some(0)), Ok(()));
+        assert_eq!(regroup.weight(), 3);
+        let settle_f = c.policy_spend(&fout.commitment, 1, vec![chan_ab, chan_ac], 0, (0, 2)).unwrap();
+        assert_eq!(settle_f.check_policy_inputs(10, |_| Some(0)), Ok(()));
+
+        // A 2-of-3 multisig, A and C signing.
+        let multisig =
+            SpendPolicy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: vec![ka, kb, kc] }])]);
+        let mout = a.track_policy(&multisig, 1000, d(80), vec![key_a()]).unwrap();
+        c.track_policy(&multisig, 1000, d(80), vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }])
+            .unwrap();
+        land_all(&[&mout], &[&a, &c]);
+        let mut spend = c.policy_spend(&mout.commitment, 0, vec![c.receive(990).unwrap()], 0, (0, 0)).unwrap();
+        assert_eq!(c.sign_policy(&mut spend).unwrap(), 1);
+        assert_eq!(a.sign_policy(&mut spend).unwrap(), 1);
+        assert_eq!(spend.check_policy_inputs(1, |_| Some(0)), Ok(()));
+        // Reopened wallets keep their policy outputs.
+        drop(a);
+        let (a, _) = Wallet::open(&dir.0.join("a")).unwrap();
+        assert_eq!(a.policy_outputs().unwrap().len(), 4);
     }
 
     #[test]
@@ -2025,7 +2537,7 @@ mod tests {
             }
             let first = u.next_position(&wtxn).unwrap();
             let outs: Vec<_> = tx.outputs.iter().map(|o| o.block_output()).collect();
-            u.add_outputs(&mut wtxn, &outs).unwrap();
+            u.add_outputs(&mut wtxn, &outs, 0).unwrap();
             registry.apply(&u, &mut wtxn, height, &ops, &[]).unwrap();
             wtxn.commit().unwrap();
             (first, outs)

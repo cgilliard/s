@@ -28,10 +28,10 @@
 //! witnesses that are not computed in the circuit, then:
 //!
 //! ```text
-//! commit:  cleaf(2) leafc pload walk(40) term opd(3) nlist
-//! sweep:   cleaf(2) leafc win pload walk(40) term slist
+//! commit:  cleaf(2) leafc leafc2 pload walk(40) term opd(3) nlist
+//! sweep:   cleaf(2) leafc leafc2 win pload walk(40) term slist
 //! reveal:  name(4) key(4) rec2(4) rec(4) tleaf(2) tleaf2(2) tload walk(1+d) term [split..]
-//!          commit(3) cleaf(2) leafc win win2 pload walk(40) term opd(2) nlist
+//!          commit(3) cleaf(2) leafc leafc2 win win2 pload walk(40) term opd(2) nlist
 //! update:  name(4) key(4) rec2(4) rec(4) tleaf(2) tleaf2(2) tload walk(1+d) term
 //!          umsg [xmss signature] pkh0 pkh1 opd(2) nlist
 //! ```
@@ -129,7 +129,10 @@ pub const T_OPD: usize = HM_COLS + 28;
 pub const T_NLIST: usize = HM_COLS + 29;
 pub const T_SLIST: usize = HM_COLS + 30;
 pub const T_DONE: usize = HM_COLS + 31;
-const NUM_TYPES: usize = 32;
+/// The commit output's second leaf row: `leafc`'s digest compressed with
+/// the commit's height, its creation height ([`crate::transaction::leaf`]).
+pub const T_LEAFC2: usize = HM_COLS + 32;
+const NUM_TYPES: usize = 33;
 
 /// Row types and their lengths (rows per phase); `T_OPD` is 2 or 3.
 const PHASES: [(usize, usize); 9] = [
@@ -290,6 +293,7 @@ impl Air for NameAir {
         let (tleaf, tleaf2, tload, wold, wnew) = (ty(T_TLEAF), ty(T_TLEAF2), ty(T_TLOAD), ty(T_WOLD), ty(T_WNEW));
         let (term, split, umsg, pkh0, pkh1) = (ty(T_TERM), ty(T_SPLIT), ty(T_UMSG), ty(T_PKH0), ty(T_PKH1));
         let (commit_t, cleaf, leafc, win, win2) = (ty(T_COMMIT), ty(T_CLEAF), ty(T_LEAFC), ty(T_WIN), ty(T_WIN2));
+        let leafc2 = ty(T_LEAFC2);
         let (pload, opd, nlist, slist, done) = (ty(T_PLOAD), ty(T_OPD), ty(T_NLIST), ty(T_SLIST), ty(T_DONE));
         let (msg_start, msg_abs, load, step) = (ty(T_MSG_START), ty(T_MSG_ABS), ty(T_LOAD), ty(T_STEP));
         let (xleaf, tree_start, tree_abs) = (ty(T_LEAF), ty(T_TREE_START), ty(T_TREE_ABS));
@@ -322,7 +326,19 @@ impl Air for NameAir {
         let multi_absorb = (name + rec2 + rec + commit_t + opd) * (one - idx[0]) + (cleaf + tleaf + tleaf2) * idx[1];
         b.assert_eq(
             l[COL_START],
-            multi_start + leafc + umsg + wold + wnew + split + nlist + slist + pkh0 + msg_start + xleaf + tree_start,
+            multi_start
+                + leafc
+                + leafc2
+                + umsg
+                + wold
+                + wnew
+                + split
+                + nlist
+                + slist
+                + pkh0
+                + msg_start
+                + xleaf
+                + tree_start,
         );
         b.assert_eq(l[COL_ABSORB], multi_absorb + pkh1 + msg_abs + tree_abs);
         b.assert_eq(l[COL_LOAD], load);
@@ -345,6 +361,7 @@ impl Air for NameAir {
             + split
             + umsg
             + leafc
+            + leafc2
             + win
             + win2
             + pload
@@ -469,8 +486,9 @@ impl Air for NameAir {
         b.when_transition(pkh0 * (one - nt(T_PKH1)));
         b.when_transition(pkh1 * (one - nt(T_OPD)));
         // Commit leaf and window.
-        b.when_transition(leafc * is_commit * (one - nt(T_PLOAD)));
-        b.when_transition(leafc * (is_reveal + is_sweep) * (one - nt(T_WIN)));
+        b.when_transition(leafc * (one - nt(T_LEAFC2)));
+        b.when_transition(leafc2 * is_commit * (one - nt(T_PLOAD)));
+        b.when_transition(leafc2 * (is_reveal + is_sweep) * (one - nt(T_WIN)));
         b.when_transition(win * is_sweep * (one - nt(T_PLOAD)));
         b.when_transition(win * is_reveal * (one - nt(T_WIN2)));
         b.when_transition(win2 * (one - nt(T_PLOAD)));
@@ -529,7 +547,7 @@ impl Air for NameAir {
         computed(b, R_VAL, rec * idx[IDX - 1]);
         computed(b, R_LEAF, tleaf * idx[1]);
         computed(b, R_OLEAF, tleaf2 * idx[1]);
-        computed(b, R_CLEAF, leafc);
+        computed(b, R_CLEAF, leafc2);
         computed(b, R_MSG, umsg);
         for i in 0..DIGEST {
             b.when_transition(commit_t * idx[2] * (n[R_C + i] - l[COL_ACC + i]));
@@ -617,11 +635,15 @@ impl Air for NameAir {
         // pkh0, pkh1: the signer's key hash is the current owner.
         for i in 0..RATE {
             b.when_transition(nt(T_PKH0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
-            let seed = if i < PUB_SEED_LEN { l[XCOLS.pub_seed(i)] } else { F::ZERO };
+            let seed = match i {
+                _ if i < PUB_SEED_LEN => l[XCOLS.pub_seed(i)],
+                PUB_SEED_LEN => xmss_fragment::height_value(l, &XCOLS),
+                _ => F::ZERO,
+            };
             b.assert_zero(pkh1 * (data[i] - seed));
             b.assert_zero(pkh1 * (l[COL_ACC + i] - l[R_OWNER2 + i]));
         }
-        start_cap(b, pkh0, cap_const(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN) as u32));
+        start_cap(b, pkh0, cap_const(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
         // commit: name hash, salt (free), owner.
         start_cap(b, commit_t * idx[0], cap_const(names::DOM_COMMIT, 3 * DIGEST as u32));
         block_is(b, commit_t * idx[0], true, nameh);
@@ -631,9 +653,12 @@ impl Air for NameAir {
         block_is(b, cleaf * idx[0], true, digest_block(R_C));
         let ch_block: [F; RATE] = core::array::from_fn(|i| if i == 0 { l[R_CH] } else { F::ZERO });
         block_is(b, cleaf * idx[1], false, ch_block);
+        // leafc2: that digest compressed with the commit's height, the
+        // output's creation height.
         for i in 0..RATE {
-            b.when_transition(nt(T_LEAFC) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.when_transition((nt(T_LEAFC) + nt(T_LEAFC2)) * (n[COL_INPUT + i] - l[COL_ACC + i]));
             b.assert_zero(leafc * (inp[RATE + i] - l[R_CMEMO + i]));
+            b.assert_zero(leafc2 * (inp[RATE + i] - if i == 0 { l[R_CH] } else { F::ZERO }));
         }
         // win, win2: the commit's age against the window (or past it).
         let min = F::from_u32(MIN_REVEAL);
@@ -846,8 +871,8 @@ impl OpWitness {
     pub fn rows(&self) -> usize {
         let trie_walk = |t: &TriePath| 1 + 2 * (1 + t.proof.depth()) + 1;
         match self {
-            OpWitness::Commit { .. } => 1 + 2 + 1 + OUTPUT_WALK_ROWS + 3 + 1,
-            OpWitness::Sweep { .. } => 1 + 2 + 1 + 1 + OUTPUT_WALK_ROWS + 1,
+            OpWitness::Commit { .. } => 1 + 2 + 2 + OUTPUT_WALK_ROWS + 3 + 1,
+            OpWitness::Sweep { .. } => 1 + 2 + 2 + 1 + OUTPUT_WALK_ROWS + 1,
             OpWitness::Reveal { record, trie, .. } => {
                 let split = match trie.proof.terminal {
                     Terminal::Empty => 0,
@@ -856,9 +881,11 @@ impl OpWitness {
                         first_difference(k, key) + 1 - trie.proof.depth()
                     }
                 };
-                1 + 4 * 4 + 2 * 2 + trie_walk(trie) + split + 3 + 2 + 1 + 2 + OUTPUT_WALK_ROWS + 2 + 1
+                1 + 4 * 4 + 2 * 2 + trie_walk(trie) + split + 3 + 2 + 2 + 2 + OUTPUT_WALK_ROWS + 2 + 1
             }
-            OpWitness::Update { trie, .. } => 1 + 4 * 4 + 2 * 2 + trie_walk(trie) + 1 + xmss_fragment::ROWS + 2 + 2 + 1,
+            OpWitness::Update { trie, pubkey, .. } => {
+                1 + 4 * 4 + 2 * 2 + trie_walk(trie) + 1 + xmss_fragment::rows(pubkey.height()) + 2 + 2 + 1
+            }
         }
     }
 }
@@ -904,7 +931,7 @@ impl NameWitness {
                     let position = utxo.next_position(wtxn)?;
                     let path = utxo.prove(wtxn, position)?.siblings;
                     let leaf = commit_leaf(commit, height);
-                    utxo.add_output(wtxn, &crate::block::BlockOutput { commitment: leaf, memo: *memo })?;
+                    utxo.add_output(wtxn, &crate::block::BlockOutput { commitment: leaf, memo: *memo }, height)?;
                     names.add_commit(wtxn, position, Commit { hash: *commit, height })?;
                     OpWitness::Commit { commit: *commit, memo: *memo, path }
                 }
@@ -1326,7 +1353,7 @@ impl Gen {
         self.b.acc()
     }
 
-    /// The commit leaf rows: `cleaf(2)`, `leafc`.
+    /// The commit leaf rows: `cleaf(2)`, `leafc`, `leafc2`.
     fn commit_leaf_rows(&mut self) {
         self.start(T_CLEAF, names::DOM_COMMIT_LEAF, DIGEST as u32 + 1, self.r.c);
         let mut block1 = [Fp::ZERO; RATE];
@@ -1337,8 +1364,16 @@ impl Gen {
         input[DIGEST..].copy_from_slice(&self.r.cmemo);
         self.b.start(input);
         self.finish(T_LEAFC, 0);
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..DIGEST].copy_from_slice(&self.b.acc());
+        input[DIGEST..].copy_from_slice(&crate::transaction::height_digest(self.r.ch));
+        self.b.start(input);
+        self.finish(T_LEAFC2, 0);
         self.r.cleaf = self.b.acc();
-        debug_assert_eq!(self.r.cleaf, crate::transaction::leaf(&commit_leaf(&self.r.c, self.r.ch), &self.r.cmemo));
+        debug_assert_eq!(
+            self.r.cleaf,
+            crate::transaction::leaf(&commit_leaf(&self.r.c, self.r.ch), &self.r.cmemo, self.r.ch)
+        );
     }
 
     /// A window (or expiry) row: `value` must be non-negative.
@@ -1671,11 +1706,12 @@ impl Gen {
                 self.r.xmss = xr;
                 let mut input = [Fp::ZERO; WIDTH];
                 input[..RATE].copy_from_slice(&root);
-                input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN) as u32));
+                input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
                 self.b.start(input);
                 self.finish(T_PKH0, 0);
                 let mut seed_block = [Fp::ZERO; RATE];
                 seed_block[..PUB_SEED_LEN].copy_from_slice(&pubkey.pub_seed);
+                seed_block[PUB_SEED_LEN] = Fp::new(pubkey.height as u32);
                 self.absorb(T_PKH1, 0, seed_block);
                 assert_eq!(self.b.acc(), old.owner, "the signer is not the current owner");
                 assert_ne!(new.owner, old.owner, "an update must change the owner");

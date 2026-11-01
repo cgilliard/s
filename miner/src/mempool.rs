@@ -100,6 +100,10 @@ pub const MIN_FEE_PER_BYTE: u64 = 1;
 /// The smallest output pooled: one worth the fee of spending it at that
 /// rate, so that nobody fills the UTXO set with outputs no one will spend.
 pub const DUST: u64 = (INPUT_SIZE as u64) * MIN_FEE_PER_BYTE;
+/// Trace rows a transaction with a policy input may take: it is proven
+/// whole in one segment, with its start and end rows and the segment's
+/// padding row. About 27 signatures of 16-level keys.
+pub const MAX_TX_ROWS: usize = (1 << crate::aggregate::AggregatorParams::MAINNET.segment_log_n) - 1;
 
 /// What a pool asks of a transaction beyond validity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +120,7 @@ impl Policy {
     /// The smallest fee a transaction of `inputs` and `outputs` and no
     /// name operations may pay.
     pub fn min_fee(&self, inputs: usize, outputs: usize) -> u64 {
-        self.min_fee_for(12 + inputs * INPUT_SIZE + outputs * OUTPUT_SIZE)
+        self.min_fee_for(16 + inputs * INPUT_SIZE + outputs * OUTPUT_SIZE)
     }
 
     /// The smallest fee a transaction of `size` bytes may pay.
@@ -145,6 +149,11 @@ pub enum Reject {
         min: u64,
     },
     BadSignature,
+    /// A policy input's leaf is not satisfied.
+    Policy(crate::policy::PolicyError),
+    /// The transaction takes more trace rows than one segment holds: a
+    /// policy spend is proven whole, so its signatures are bounded.
+    TooManyRows(usize),
     /// An input's output is not unspent.
     UnknownInput(Commitment),
     /// Spends an output pooled transactions spend, without paying enough
@@ -171,6 +180,8 @@ impl core::fmt::Display for Reject {
             Reject::Dust { min } => write!(f, "an output is below the dust limit of {min} base units"),
             Reject::Malformed => f.write_str("malformed transaction"),
             Reject::BadSignature => f.write_str("invalid signature"),
+            Reject::Policy(e) => write!(f, "policy input: {e}"),
+            Reject::TooManyRows(n) => write!(f, "{n} trace rows exceeds a segment: too many signatures"),
             Reject::UnknownInput(_) => f.write_str("spends an output that is not unspent"),
             Reject::ReplacementFee { min } => {
                 write!(f, "conflicts with a pooled transaction; a replacement must pay at least {min}")
@@ -219,8 +230,17 @@ pub struct Mempool {
 /// The cheap checks of a transaction on its own: all but its signatures,
 /// which [`Mempool::insert`] checks last, the pool and the UTXO set.
 fn check_static(tx: &Transaction, policy: &Policy) -> Result<u64, Reject> {
-    if tx.inputs.is_empty() {
+    if tx.inputs.is_empty() && tx.policy_inputs.is_empty() {
         return Err(Reject::NoInputs);
+    }
+    if tx.policy_inputs.len() > 1 {
+        return Err(Reject::Malformed);
+    }
+    if !tx.policy_inputs.is_empty() {
+        let rows = crate::block_air::tx_rows(tx);
+        if rows > MAX_TX_ROWS {
+            return Err(Reject::TooManyRows(rows));
+        }
     }
     let size = tx.size();
     if size > MAX_TX_SIZE {
@@ -396,6 +416,8 @@ impl Mempool {
         if !tx.verify_signatures() {
             return Err(Reject::BadSignature);
         }
+        tx.check_policy_inputs(height, |p| utxo.output_at(rtxn, p).ok().flatten().map(|(_, _, h)| h))
+            .map_err(Reject::Policy)?;
         let size = tx.size();
         if !conflicts.is_empty() {
             let replaced: u64 = conflicts.iter().map(|id| self.txs[id].fee).sum();
@@ -682,7 +704,7 @@ mod tests {
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
-        utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0).unwrap();
+        utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0, 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
         assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1).unwrap(), (0, 1));

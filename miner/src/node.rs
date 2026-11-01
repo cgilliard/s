@@ -216,6 +216,53 @@ struct Carry {
     spent: Vec<u64>,
 }
 
+/// The `Proof` messages answering a request for `position`: the output
+/// there (zero when none) and its path in two parts. `None` before
+/// genesis.
+pub fn proof_messages<V: ProofVerifier>(chain: &Chain<V>, position: u64) -> Result<Option<Vec<Message>>, ChainError> {
+    let Some((tip, output, proof)) = chain.output_proof(position)? else {
+        return Ok(None);
+    };
+    let (commitment, memo, created) = output.unwrap_or((crate::state_tree::EMPTY, crate::state_tree::EMPTY, 0));
+    let tip = tip.hash();
+    let msgs = proof
+        .siblings
+        .chunks(net::PROOF_SIBLINGS_PER_MESSAGE)
+        .enumerate()
+        .map(|(part, s)| Message::Proof {
+            position,
+            tip,
+            commitment,
+            memo,
+            created,
+            part: part as u8,
+            siblings: s.to_vec(),
+        })
+        .collect();
+    Ok(Some(msgs))
+}
+
+/// Whether a state proof's output (zero for none) and full path put the
+/// leaf at `position` under `state_root`.
+pub fn verify_proof(
+    state_root: &Digest,
+    position: u64,
+    commitment: &Digest,
+    memo: &Digest,
+    created: u32,
+    siblings: &[Digest],
+) -> bool {
+    let Ok(siblings) = <[Digest; crate::state_tree::DEPTH]>::try_from(siblings.to_vec()) else {
+        return false;
+    };
+    let leaf = if *commitment == crate::state_tree::EMPTY {
+        crate::state_tree::EMPTY
+    } else {
+        crate::transaction::leaf(commitment, memo, created)
+    };
+    crate::state_tree::Proof { siblings }.verify(state_root, position, &leaf)
+}
+
 /// What the node's loop consumes.
 pub enum Event {
     Packet(SocketAddr, Vec<u8>),
@@ -352,6 +399,11 @@ pub struct Node<V: ProofVerifier> {
     /// Tests: parts fetched and staged.
     #[cfg(test)]
     parts_staged: Arc<AtomicU64>,
+    /// State proofs received in part, by peer, position and tip.
+    #[allow(clippy::type_complexity)]
+    proof_parts: HashMap<(SocketAddr, u64, Digest), [Option<(Digest, Digest, u32, Vec<Digest>)>; 2]>,
+    /// State proofs received and verified against a known header.
+    pub proofs_verified: Arc<AtomicU64>,
     last_header_request: Option<Instant>,
     /// Peers whose branch we are walking with locators because they claim
     /// more work than our best header without yet showing it: the height
@@ -567,6 +619,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             moved: false,
             #[cfg(test)]
             parts_staged: Arc::new(AtomicU64::new(0)),
+            proof_parts: HashMap::new(),
+            proofs_verified: Arc::new(AtomicU64::new(0)),
             last_header_request: None,
             fork_probe: HashMap::new(),
             syncing: Arc::new(AtomicBool::new(true)),
@@ -1204,6 +1258,53 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         }
                     }
                     Err(e) => self.log(&format!("headers: {e}")),
+                }
+            }
+            Message::GetProof { position, token } => {
+                if !self.request_ok(&addr, token) {
+                    return;
+                }
+                self.peers.seen(addr, now);
+                match proof_messages(&self.chain, position) {
+                    Ok(Some(msgs)) => {
+                        for m in msgs {
+                            self.send(addr, &m);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.log(&format!("proof: {e}")),
+                }
+            }
+            Message::Proof { position, tip, commitment, memo, created, part, siblings } => {
+                self.peers.seen(addr, now);
+                // Two parts, the second completing the path; checked against
+                // the header the proof names, if we have it.
+                let key = (addr, position, tip);
+                let entry = self.proof_parts.entry(key).or_insert([None, None]);
+                entry[part as usize] = Some((commitment, memo, created, siblings));
+                if let [Some(a), Some(b)] = entry.clone() {
+                    self.proof_parts.remove(&key);
+                    let mut siblings = a.3.clone();
+                    siblings.extend(b.3);
+                    let ok = a.0 == b.0
+                        && a.1 == b.1
+                        && a.2 == b.2
+                        && self
+                            .chain
+                            .header_by_hash(&tip)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|h| verify_proof(&h.state_root, position, &a.0, &a.1, a.2, &siblings));
+                    self.log(&format!(
+                        "proof of position {position} after {} from {addr}: {}",
+                        short(&tip),
+                        if ok { "verified" } else { "invalid" }
+                    ));
+                    if ok {
+                        self.proofs_verified.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if self.proof_parts.len() > 64 {
+                    self.proof_parts.clear();
                 }
             }
             Message::Headers(headers) => {
@@ -2601,7 +2702,7 @@ mod tests {
         let position = {
             let rtxn = a.chain.env().read_txn().unwrap();
             let unspent = a.chain.utxo().unspent(&rtxn).unwrap();
-            unspent.iter().find(|(_, (c, _))| *c == spent.commitment).unwrap().0
+            unspent.iter().find(|(_, (c, _, _))| *c == spent.commitment).unwrap().0
         };
         let mut tx =
             crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), 1)], vec![Output::new(&pk(50), 1)])
@@ -2668,6 +2769,58 @@ mod tests {
         // Peers were saved.
         let saved = std::fs::read_to_string(b.dir.0.join("peers")).unwrap();
         assert!(saved.contains(&addr_a.to_string()), "{saved}");
+    }
+
+    /// A state proof for an unspent output and for an empty position
+    /// travels in two datagrams and verifies against the tip's state root.
+    #[test]
+    fn state_proofs_verify_against_the_tip() {
+        let a = open("proof");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=2u8 {
+            t += 600;
+            a.chain.apply_block(&mine(&a, tag, t), now).unwrap();
+        }
+        let tip = a.chain.tip().unwrap().unwrap();
+        let (occupied, empty) = {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            let next = a.chain.utxo().next_position(&rtxn).unwrap();
+            (next - 1, next + 5)
+        };
+        let fetch = |position: u64| {
+            let msgs = proof_messages(&a.chain, position).unwrap().unwrap();
+            assert_eq!(msgs.len(), 2);
+            let mut siblings = Vec::new();
+            let mut output = None;
+            for (i, m) in msgs.iter().enumerate() {
+                let bytes = m.encode();
+                assert!(bytes.len() <= net::MAX_DATAGRAM);
+                let Some(Message::Proof { position: p, tip: h, commitment, memo, created, part, siblings: s }) =
+                    Message::decode(&bytes)
+                else {
+                    panic!("not a proof");
+                };
+                assert_eq!((p, h, part as usize), (position, tip.hash(), i));
+                siblings.extend(s);
+                output = Some((commitment, memo, created));
+            }
+            (output.unwrap(), siblings)
+        };
+        let ((c, m, created), siblings) = fetch(occupied);
+        assert_ne!(c, EMPTY);
+        assert_eq!(created, 2);
+        assert!(verify_proof(&tip.state_root, occupied, &c, &m, created, &siblings));
+        assert!(!verify_proof(&tip.state_root, occupied, &c, &m, created + 1, &siblings));
+        assert!(!verify_proof(&tip.state_root, occupied + 1, &c, &m, created, &siblings));
+        assert!(!verify_proof(&EMPTY, occupied, &c, &m, created, &siblings));
+        let ((c, m, created), siblings) = fetch(empty);
+        assert_eq!((c, m, created), (EMPTY, EMPTY, 0));
+        assert!(verify_proof(&tip.state_root, empty, &c, &m, created, &siblings));
+        assert!(!verify_proof(&tip.state_root, occupied, &c, &m, created, &siblings));
+        // The request round-trips too.
+        let req = Message::GetProof { position: 7, token: 9 };
+        assert_eq!(Message::decode(&req.encode()), Some(req));
     }
 
     #[test]

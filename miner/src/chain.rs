@@ -114,7 +114,10 @@ impl ChainParams {
         genesis_nonce: crate::genesis::BITCOIN_HASH,
         genesis_target: U256(crate::genesis::TARGET),
         max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
-        max_block_size: 2 << 20,
+        // Every block within this size is provable in `max_segments`
+        // segments, even one of inputs by the tallest keys alone (see
+        // `mainnet_segments_cover_the_largest_block`).
+        max_block_size: 2_000_000,
         max_future_drift: 2 * 3600,
         median_time_window: 11,
         emission: MAINNET_EMISSION,
@@ -401,8 +404,9 @@ const META_FORMAT: &str = "format";
 /// once, by position, for reorganizations and snapshots alike; 10 stores
 /// block bodies with a name section; 11 keeps the name registry, name undo
 /// records and snapshot manifests with the name half; 12 keeps the
-/// registry's bucket table.
-const FORMAT: u8 = 12;
+/// registry's bucket table; 13 stores each output's creation height, part
+/// of its leaf.
+const FORMAT: u8 = 13;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -454,24 +458,27 @@ impl Undo {
     }
 }
 
-/// A spent-log entry: the height of the block spending the output, then
-/// its commitment and memo.
-const SPENT_ENTRY: usize = 4 + 64;
+/// A spent-log entry: the height of the block spending the output, the
+/// height that created it, then its commitment and memo.
+const SPENT_ENTRY: usize = 4 + 4 + 64;
 
-fn spent_entry(height: u32, commitment: &Commitment, memo: &Memo) -> [u8; SPENT_ENTRY] {
+fn spent_entry(height: u32, created: u32, commitment: &Commitment, memo: &Memo) -> [u8; SPENT_ENTRY] {
     let mut value = [0u8; SPENT_ENTRY];
     value[..4].copy_from_slice(&height.to_le_bytes());
-    value[4..36].copy_from_slice(&digest_bytes(commitment));
-    value[36..].copy_from_slice(&digest_bytes(memo));
+    value[4..8].copy_from_slice(&created.to_le_bytes());
+    value[8..40].copy_from_slice(&digest_bytes(commitment));
+    value[40..].copy_from_slice(&digest_bytes(memo));
     value
 }
 
-fn read_spent_entry(value: &[u8]) -> Option<(u32, Commitment, Memo)> {
+/// Spending height, creation height, commitment and memo.
+fn read_spent_entry(value: &[u8]) -> Option<(u32, u32, Commitment, Memo)> {
     if value.len() != SPENT_ENTRY {
         return None;
     }
     let height = u32::from_le_bytes(value[..4].try_into().unwrap());
-    Some((height, digest_from_bytes(&value[4..36])?, digest_from_bytes(&value[36..])?))
+    let created = u32::from_le_bytes(value[4..8].try_into().unwrap());
+    Some((height, created, digest_from_bytes(&value[8..40])?, digest_from_bytes(&value[40..])?))
 }
 
 /// A snapshot manifest: the state after a block, as fast sync transfers it
@@ -1073,9 +1080,9 @@ impl<V: ProofVerifier> Chain<V> {
         wtxn: &mut RwTxn,
         body: &Body,
         height: u32,
-    ) -> Result<(Digest, Vec<(Commitment, Memo)>, NameUndo)> {
+    ) -> Result<(Digest, Vec<(Commitment, Memo, u32)>, NameUndo)> {
         let spent = self.utxo.spend_positions(wtxn, &body.inputs)?.map_err(ChainError::UnknownInput)?;
-        self.utxo.add_outputs(wtxn, &body.outputs)?;
+        self.utxo.add_outputs(wtxn, &body.outputs, height)?;
         let names = self.names.apply(&self.utxo, wtxn, height, &body.ops, &body.sweeps).map_err(ChainError::Name)?;
         Ok((self.utxo.root(wtxn)?, spent, names))
     }
@@ -1258,12 +1265,12 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let work = self.entry_in(wtxn, &header.hash())?.ok_or(ChainError::Corrupt("connecting unknown block"))?.work;
         self.put_index(wtxn, &id, work, STATUS_VALID)?;
-        for (p, (c, m)) in body.inputs.iter().zip(spent) {
-            self.spent.put(wtxn, p, &spent_entry(header.height, &c, &m))?;
+        for (p, (c, m, created)) in body.inputs.iter().zip(spent) {
+            self.spent.put(wtxn, p, &spent_entry(header.height, created, &c, &m))?;
         }
         // The commits reveals and sweeps consumed were outputs too.
         for (p, c, m) in &names.consumed {
-            self.spent.put(wtxn, p, &spent_entry(header.height, &commit_leaf(&c.hash, c.height), m))?;
+            self.spent.put(wtxn, p, &spent_entry(header.height, c.height, &commit_leaf(&c.hash, c.height), m))?;
         }
         let outputs = body.outputs.len() as u32;
         self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, names }.to_bytes())?;
@@ -1329,7 +1336,7 @@ impl<V: ProofVerifier> Chain<V> {
         for &p in &body.inputs {
             let entry = self.spent.get(wtxn, &p)?.and_then(read_spent_entry);
             match entry {
-                Some((h, c, m)) if h == height => spent.push((p, c, m)),
+                Some((h, created, c, m)) if h == height => spent.push((p, c, m, created)),
                 _ => return Err(ChainError::Corrupt("spent log")),
             }
         }
@@ -1338,7 +1345,7 @@ impl<V: ProofVerifier> Chain<V> {
         commitments.extend(undo.names.commits.iter().map(|c| commit_leaf(&c.hash, c.height)));
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
         self.utxo.restore(wtxn, &spent)?;
-        for (p, _, _) in &spent {
+        for (p, _, _, _) in &spent {
             self.spent.delete(wtxn, p)?;
         }
         let first_commit = undo.first_output_position + undo.outputs as u64;
@@ -1644,7 +1651,7 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn install_snapshot(
         &self,
         block: &Block,
-        outputs: &[(u64, Commitment, Memo)],
+        outputs: &[(u64, Commitment, Memo, u32)],
         commits: &[(u64, Digest, u32)],
         records: &[Record],
         next_position: u64,
@@ -1744,7 +1751,7 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn stage_snapshot_part(
         &self,
         part: u64,
-        outputs: &[(u64, Commitment, Memo)],
+        outputs: &[(u64, Commitment, Memo, u32)],
         commits: &[(u64, Digest, u32)],
         next_position: u64,
         expected: Option<&Digest>,
@@ -1862,7 +1869,7 @@ impl<V: ProofVerifier> Chain<V> {
             };
             outputs.retain(|o| part.spent.binary_search(&o.0).is_err());
             let leaves: Vec<(u64, Digest)> =
-                outputs.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
+                outputs.iter().map(|(p, c, m, h)| (*p, crate::transaction::leaf(c, m, *h))).collect();
             if crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, first, &leaves) != *root {
                 carried.push(false);
                 continue;
@@ -1952,7 +1959,7 @@ impl<V: ProofVerifier> Chain<V> {
             return Ok(());
         };
         for p in body.spent_positions() {
-            if self.spent.get(wtxn, &p)?.and_then(read_spent_entry).is_some_and(|(h, _, _)| h == header.height) {
+            if self.spent.get(wtxn, &p)?.and_then(read_spent_entry).is_some_and(|(h, _, _, _)| h == header.height) {
                 self.spent.delete(wtxn, &p)?;
             }
         }
@@ -2050,7 +2057,11 @@ impl<V: ProofVerifier> Chain<V> {
     /// below its counter): those unspent now, with those spent since; and
     /// which of them were commits.
     #[allow(clippy::type_complexity)]
-    pub fn snapshot_part(&self, id: &Digest, part: u64) -> Result<Option<(Vec<(u64, Commitment, Memo)>, PartCommits)>> {
+    pub fn snapshot_part(
+        &self,
+        id: &Digest,
+        part: u64,
+    ) -> Result<Option<(Vec<(u64, Commitment, Memo, u32)>, PartCommits)>> {
         let rtxn = self.env.read_txn()?;
         let Some((height, manifest)) = self.snapshot_in(&rtxn, id)? else {
             return Ok(None);
@@ -2060,14 +2071,14 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let first = part << SNAPSHOT_PART_LOG;
         let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
-        let mut out: Vec<(u64, Commitment, Memo)> =
-            self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m))| (p, c, m)).collect();
+        let mut out: Vec<(u64, Commitment, Memo, u32)> =
+            self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m, h))| (p, c, m, h)).collect();
         let before = out.len();
         for e in self.spent.range(&rtxn, &(first..end))? {
             let (p, v) = e?;
-            let (spent_at, c, m) = read_spent_entry(v).ok_or(ChainError::Corrupt("spent log"))?;
+            let (spent_at, created, c, m) = read_spent_entry(v).ok_or(ChainError::Corrupt("spent log"))?;
             if spent_at > height {
-                out.push((p, c, m));
+                out.push((p, c, m, created));
             }
         }
         if out.len() > before {
@@ -2130,6 +2141,23 @@ impl<V: ProofVerifier> Chain<V> {
                 .collect();
         }
         Ok(Some(records))
+    }
+
+    /// A state proof for `position` against the tip: the tip header, the
+    /// output there if unspent (commitment, memo, creation height), and the
+    /// path. `None` before genesis.
+    #[allow(clippy::type_complexity)]
+    pub fn output_proof(
+        &self,
+        position: u64,
+    ) -> Result<Option<(Header, Option<(Commitment, Memo, u32)>, crate::state_tree::Proof)>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(tip) = self.tip_in(&rtxn)? else {
+            return Ok(None);
+        };
+        let output = self.utxo.output_at(&rtxn, position)?;
+        let proof = self.utxo.prove(&rtxn, position)?;
+        Ok(Some((tip, output, proof)))
     }
 
     /// The proof statement and proof of the main-chain block at `height`
@@ -2288,11 +2316,13 @@ mod tests {
 
     #[test]
     fn mainnet_segments_cover_the_largest_block() {
-        // Inputs cost the most rows per byte (1237 for 5), so the block that
-        // needs the most segments is all inputs, with no proof bytes.
+        // Inputs cost the most rows per byte (about 1,270 for 5), so the
+        // block that needs the most segments is all inputs by the tallest
+        // keys, with no proof bytes.
         let p = ChainParams::MAINNET;
         let n = (p.max_block_size - HEADER_SIZE - 20) / crate::block::POSITION_SIZE;
-        let segments = crate::block_air::pack(1, |_| (n, 0, 0), p.aggregator.segment_rows()).len();
+        let tallest = vec![crate::block_air::ROWS_PER_INPUT; n];
+        let segments = crate::block_air::pack(1, |_| (tallest.clone(), false), p.aggregator.segment_rows()).len();
         assert!(segments <= p.aggregator.max_segments, "{n} inputs need {segments} segments");
         println!("{n} inputs: {segments} of {} segments", p.aggregator.max_segments);
     }
@@ -2751,7 +2781,7 @@ mod tests {
         for (i, r) in roots.iter().enumerate().filter(|_| std::env::var("TABMINER_DEBUG_TIP_ONLY").is_err()) {
             let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
             let leaves: Vec<(u64, Digest)> =
-                part.iter().map(|(pos, c, m)| (*pos, crate::transaction::leaf(c, m))).collect();
+                part.iter().map(|(pos, c, m, h)| (*pos, crate::transaction::leaf(c, m, *h))).collect();
             let full = crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves);
             if full != *r {
                 bad += 1;
@@ -2766,7 +2796,7 @@ mod tests {
         let rtxn = chain.env().read_txn().unwrap();
         let all = chain.utxo().unspent(&rtxn).unwrap();
         let leaves: Vec<(u64, Digest)> =
-            all.iter().map(|(pos, (c, m))| (*pos, crate::transaction::leaf(c, m))).collect();
+            all.iter().map(|(pos, (c, m, h))| (*pos, crate::transaction::leaf(c, m, *h))).collect();
         let tip_next = chain.utxo().next_position(&rtxn).unwrap();
         let parts: Vec<Digest> = (0..tip_next.div_ceil(1 << SNAPSHOT_PART_LOG))
             .map(|i| {
@@ -3065,7 +3095,7 @@ mod tests {
                 let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
                 assert!(part.iter().all(|o| o.0 < n));
                 let leaves: Vec<(u64, Digest)> =
-                    part.iter().map(|(p, c, m)| (*p, crate::transaction::leaf(c, m))).collect();
+                    part.iter().map(|(p, c, m, h)| (*p, crate::transaction::leaf(c, m, *h))).collect();
                 assert_eq!(
                     crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves),
                     *r

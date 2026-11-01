@@ -39,9 +39,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::block_air::{
-    BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_ISP_IN, PUB_ISP_OUT,
-    PUB_NSP_IN, PUB_NSP_OUT, PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT, PUB_SUM_IN,
-    PUB_SUM_OUT, ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_names_state,
+    BlockAir, CARRY_LEN, LIMBS, NUM_PUBLIC as SEGMENT_PUBLIC, PUB_CARRY_IN, PUB_CARRY_OUT, PUB_HEIGHT, PUB_ISP_IN,
+    PUB_ISP_OUT, PUB_NSP_IN, PUB_NSP_OUT, PUB_OSP_IN, PUB_OSP_OUT, PUB_POS_IN, PUB_POS_OUT, PUB_ROOT_IN, PUB_ROOT_OUT,
+    PUB_SUM_IN, PUB_SUM_OUT, ROWS_PER_OUTPUT, SegmentPublic, SegmentWitness, initial_inputs_state, initial_names_state,
     initial_outputs_state, inputs_state, limbs16, limbs16_wide, names_state, outputs_state, sweeps_state,
 };
 use crate::block_proof::{
@@ -309,6 +309,7 @@ pub fn node_output(record: &SegmentPublic, tree: &Digest) -> Digest {
 pub fn combine_records(records: &[SegmentPublic]) -> SegmentPublic {
     let (first, last) = (&records[0], &records[records.len() - 1]);
     let mut out = SegmentPublic {
+        height: first.height,
         root_in: first.root_in,
         root_out: last.root_out,
         isp_in: first.isp_in,
@@ -484,6 +485,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
         c.assert_block(at(a, PUB_NSP_OUT), at(b, PUB_NSP_IN), WIDTH);
         c.assert_block(at(a, PUB_POS_OUT), at(b, PUB_POS_IN), 2);
         c.assert_block(at(a, PUB_CARRY_OUT), at(b, PUB_CARRY_IN), CARRY_LEN);
+        c.assert_eq(at(a, PUB_HEIGHT), at(b, PUB_HEIGHT));
     }
     let (first, last) = (recs[0], recs[k - 1]);
 
@@ -515,6 +517,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             copy(&mut c, at(last, PUB_POS_OUT), PUB_POS_OUT, 2);
             copy(&mut c, at(first, PUB_CARRY_IN), PUB_CARRY_IN, CARRY_LEN);
             copy(&mut c, at(last, PUB_CARRY_OUT), PUB_CARRY_OUT, CARRY_LEN);
+            copy(&mut c, at(first, PUB_HEIGHT), PUB_HEIGHT, 1);
             for field in [PUB_SUM_IN, PUB_SUM_OUT] {
                 let sums = sum_limbs(&mut c, &recs, field, None);
                 let limbs = normalize(&mut c, &sums);
@@ -577,6 +580,9 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.assert_block(at(nm, NM_NSP), at(st, ST_NSP), WIDTH);
             c.assert_block(at(nm, NM_SSP), at(st, ST_SSP), WIDTH);
             c.assert_eq(at(nm, NM_HEIGHT), at(st, ST_HEIGHT));
+            // Every transaction segment created its outputs at the block's
+            // height.
+            c.assert_eq(at(first, PUB_HEIGHT), at(st, ST_HEIGHT));
             // Operation counts within the caps: the count is one of 0..=cap.
             for (k, kind) in [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].into_iter().enumerate() {
                 let count = at(nm, NM_COUNTS + k);
@@ -1491,10 +1497,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1107466150, 1766067965, 1015254447, 414564257, 817907748, 861542583, 144563581, 367948958],
+    plan_root: [1988072124, 742274853, 1154908393, 268409728, 1815481072, 787271082, 21707773, 526048172],
     plan_depth: 14,
-    base: [1326945329, 600314399, 123343493, 1214413567, 984976053, 429980701, 1506861292, 788243183],
-    step: [934466741, 713122222, 1487576785, 68261089, 296638118, 121096819, 990136056, 1364385150],
+    base: [1716336543, 708301632, 1586392367, 1595975372, 1834481717, 1588379706, 1153034480, 121278388],
+    step: [981075344, 42996742, 647483301, 320133933, 572712437, 1669517614, 700302691, 1902592081],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -1779,7 +1785,7 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let prev_root = utxo.root(&wtxn).unwrap();
-        let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows()).unwrap();
+        let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, txs, SMALL.segment_rows(), 1).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         let body = Body {
@@ -1885,7 +1891,8 @@ mod tests {
         let mut block = |txs: Vec<Transaction>, height: u32| {
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
-            let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, SMALL.segment_rows()).unwrap();
+            let segments =
+                SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, SMALL.segment_rows(), height).unwrap();
             let body = Body {
                 inputs: vec![],
                 outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
@@ -2027,7 +2034,8 @@ mod tests {
             let mut wtxn = env.write_txn().unwrap();
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
-            let segments = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &[tx], SMALL.segment_rows()).unwrap();
+            let segments =
+                SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &[tx], SMALL.segment_rows(), height).unwrap();
             let nm = NameWitness::collect(&utxo, &names, &mut wtxn, height, &ops, &[]).unwrap();
             let new_root = utxo.root(&wtxn).unwrap();
             wtxn.commit().unwrap();
@@ -2360,7 +2368,7 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let prev_root = utxo.root(&wtxn).unwrap();
-        let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows()).unwrap();
+        let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows(), 1).unwrap();
         let new_root = utxo.root(&wtxn).unwrap();
         wtxn.abort();
         assert_eq!(w.len(), segments);
@@ -2422,7 +2430,7 @@ mod tests {
             let txs: Vec<Transaction> = (0..per).map(|i| reward(&miner, 1 + i as u64)).collect();
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
-            let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows()).unwrap();
+            let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows(), height).unwrap();
             let body = Body {
                 inputs: vec![],
                 outputs: w.iter().flat_map(|s| s.block_outputs()).collect(),

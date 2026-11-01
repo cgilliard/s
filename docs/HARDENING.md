@@ -143,6 +143,15 @@ history and the README; this file holds what is left.
 
 ## Wallet
 
+- **Policy outputs are not recoverable from the seed.** A multisig,
+  HTLC or channel output is found again only from the policy the parties
+  agreed, which the wallet stores (`policies` table); a wallet restored
+  from its phrase alone has none of them. This is the Lightning
+  situation and a reference wallet accepts it. Fix for user wallets:
+  back up channel state with the counterparty or a watchtower, or derive
+  shared memos the wallet can scan for and fetch policies from the
+  counterparty.
+
 - **Cancelling a carried name operation leaves its wallet state pending.**
   `cancel` on a transaction that carried a reveal or an update pays the
   inputs back but the name entry stays "revealed, awaiting the chain" or
@@ -215,7 +224,7 @@ history and the README; this file holds what is left.
 ## Deployment and operations
 
 - **Seeds** run an old binary. They need the current one (protocol v5,
-  wallet format 5, chain format 12 (a snapshot manifest for every block in the undo window), new genesis id, new `MAINNET_CHAIN`) and wiped data
+  wallet format 6 (keys carry a tree height; slate format 3), chain format 13 (a snapshot manifest for every block in the undo window; output leaves carry the creation height; policy inputs, keys of any height to 20), new genesis id, new `MAINNET_CHAIN`) and wiped data
   directories. Fresh nodes cannot sync until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
   expected network rate (README, Genesis).

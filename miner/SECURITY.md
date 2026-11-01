@@ -97,8 +97,8 @@ before the challenge in parentheses.
 | queries, toy-problem conjecture | 124.0 | 124.0 | 126.0 |
 | queries, list-decoding-capacity radius | 122.0 | 122.0 | 124.3 |
 
-The name segment has the segment's rows and rate with more columns (995
-against 766) and constraints (3,255 against 1,860); its rounds are the
+The name segment has the segment's rows and rate with more columns (1,049
+against 991) and constraints (3,407 against 2,708); its rounds are the
 segment's, with the constraint combination at 122.0 behind 10 grinding
 bits.
 
@@ -237,12 +237,21 @@ The grinding dominates the step from 112 to 120 bits: each challenge needs
 2^24 permutations, about 8 s. A 16-segment block proves five nodes.
 
 These block timings predate the name segment. It is one more proof per
-block of 2^15 rows and 995 columns, proven at the segment parameters
+block of 2^15 rows and 1,049 columns, proven at the segment parameters
 beside the transaction segments: about 2.4 s on the development laptop,
 the same empty or full, verified natively in 27 ms
 (`name_air::tests::mainnet_name_segment_timing`). The root verifies it as
 one more child, so the root of a one-segment block passes 2^18 rows where
 it passed 2^17; the wrap stays at 2^17.
+
+The transaction segment's policy rows (`docs/ELTOO.md`) add registers and
+row types but no new proof: a policy spend's leaf, path, conditions and
+signatures are rows of the same AIR, and its soundness is the segment's.
+The XMSS fragment verifies keys of any height up to 20 with the height a
+one-hot register hashed into the key hash and the tree tweaks keyed by
+level index and height, so a key's height cannot be misstated. A policy
+spend is proven whole in one segment: its registers are never carried
+between segments, which is what bounds it to about 27 signatures.
 
 At 54 queries, a node of four children still passes 2^19 rows and the wrap
 over it 2^17, as at 50. The verifier of a single segment passes 2^17 rows

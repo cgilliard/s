@@ -1,8 +1,10 @@
 //! XMSS (eXtended Merkle Signature Scheme) with WOTS+ one-time signatures,
 //! built on the Poseidon2 permutation over BabyBear from [`crate::poseidon2`].
 //!
-//! The Merkle tree height `H` is a const generic parameter of
-//! [`SecretKey`] and [`Signature`]; a key pair can sign `2^H` messages.
+//! The Merkle tree height is a property of each key, 1 to [`MAX_HEIGHT`],
+//! part of its public key; a key pair of height `h` can sign `2^h`
+//! messages. Payment keys use [`PLAIN_HEIGHT`]; channel keys (see
+//! `docs/ELTOO.md`) use taller trees, one leaf per channel state.
 //!
 //! # Construction
 //!
@@ -15,7 +17,7 @@
 //! | WOTS secret chain starts   | `DOM_WOTS_PRF`  | leaf index     | chain             |
 //! | WOTS chain steps           | `DOM_WOTS_CHAIN`| leaf index     | chain + step<<16  |
 //! | WOTS public key (leaf)     | `DOM_WOTS_PK`   | leaf index     | 0                 |
-//! | Merkle tree nodes          | `DOM_TREE`      | heap position  | level             |
+//! | Merkle tree nodes          | `DOM_TREE`      | node index at its level, tree height in the high limb | level |
 //! | message digest             | `DOM_MSG`       | leaf index     | 0                 |
 //! | message randomizer         | `DOM_RAND`      | leaf index     | 0                 |
 //! | seed expansion             | `DOM_KEYGEN`    | 0 or 1         | 0                 |
@@ -67,14 +69,18 @@ const _: () = assert!(2 * DIGEST == WIDTH);
 
 /// Size in bytes of the seed accepted by [`SecretKey::generate`].
 pub const SEED_SIZE: usize = 32;
+/// Tree height of ordinary payment keys: 16 leaves.
+pub const PLAIN_HEIGHT: usize = 4;
+/// The tallest tree a key may have: a million leaves.
+pub const MAX_HEIGHT: usize = 20;
 /// Number of field elements in the public seed.
 pub const PUB_SEED_LEN: usize = 4;
 /// Serialized size of one field element.
 const FP_BYTES: usize = 4;
 /// Serialized size of a digest.
 pub const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
-/// Serialized size of a [`SecretKey`] (seeds and index; independent of `H`).
-pub const SECRET_KEY_SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 8;
+/// Serialized size of a [`SecretKey`]: seeds, index and height.
+pub const SECRET_KEY_SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 8 + 1;
 
 const DOM_WOTS_PRF: u32 = 1;
 pub(crate) const DOM_WOTS_CHAIN: u32 = 2;
@@ -232,20 +238,29 @@ pub fn bytes_to_message(bytes: &[u8]) -> Vec<Fp> {
 // Merkle tree
 // ---------------------------------------------------------------------------
 
-/// Hashes two children into the node at heap position `pos` and height
-/// `level` (leaves are level 0, the root is level `H`).
-fn tree_node(pub_seed: &[Fp; PUB_SEED_LEN], pos: u64, level: u32, left: &Digest, right: &Digest) -> Digest {
+/// Hashes two children into node `index` of level `level` (leaves are
+/// level 0, the root is level `height`) of a tree of `height`. The tweak
+/// is the index with the height in its high limb, so a circuit computes it
+/// from the leaf index bits and the height alone.
+fn tree_node(
+    pub_seed: &[Fp; PUB_SEED_LEN],
+    index: u64,
+    height: u8,
+    level: u32,
+    left: &Digest,
+    right: &Digest,
+) -> Digest {
     let mut input = [Fp::ZERO; 2 * DIGEST];
     input[..DIGEST].copy_from_slice(left);
     input[DIGEST..].copy_from_slice(right);
-    th(pub_seed, DOM_TREE, pos, level, &input)
+    th(pub_seed, DOM_TREE, (height as u64) << 30 | index, level, &input)
 }
 
 // ---------------------------------------------------------------------------
 // Keys and signatures
 // ---------------------------------------------------------------------------
 
-/// Returned by [`SecretKey::sign`] once all `2^H` leaves have been used.
+/// Returned by [`SecretKey::sign`] once all of a key's leaves have been used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyExhausted;
 
@@ -257,16 +272,19 @@ impl fmt::Display for KeyExhausted {
 
 impl std::error::Error for KeyExhausted {}
 
-/// XMSS public key: Merkle root plus the public seed.
+/// XMSS public key: Merkle root, public seed and tree height. The height
+/// is part of the key (and so of its hash): the root alone does not fix
+/// how tall the tree is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PublicKey {
     pub root: Digest,
     pub pub_seed: [Fp; PUB_SEED_LEN],
+    pub height: u8,
 }
 
-/// XMSS signature for a tree of height `H`.
+/// XMSS signature; its tree height is the authentication path's length.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Signature<const H: usize> {
+pub struct Signature {
     /// Leaf index used for this signature.
     pub index: u64,
     /// Randomizer mixed into the message digest.
@@ -274,43 +292,57 @@ pub struct Signature<const H: usize> {
     /// WOTS+ signature: one intermediate chain value per chain.
     pub wots: [Digest; CHAINS],
     /// Sibling nodes from the leaf up to (but excluding) the root.
-    pub auth_path: [Digest; H],
+    pub auth_path: Vec<Digest>,
 }
 
-/// XMSS secret key for a tree of height `H`, with the tree cached.
+/// XMSS secret key, with the tree cached.
 #[derive(Clone)]
-pub struct SecretKey<const H: usize> {
+pub struct SecretKey {
+    height: u8,
     sk_seed: Digest,
     pub_seed: [Fp; PUB_SEED_LEN],
     next_index: u64,
-    /// Heap layout: position 1 is the root, leaf `i` is at `2^H + i`.
+    /// Heap layout: position 1 is the root, leaf `i` is at `2^height + i`.
     tree: Vec<Digest>,
 }
 
 impl PublicKey {
     /// Serialized size in bytes.
-    pub const SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES;
+    pub const SIZE: usize = (DIGEST + PUB_SEED_LEN) * FP_BYTES + 1;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut out = Vec::with_capacity(Self::SIZE);
         fps_to_bytes(&mut out, &self.root);
         fps_to_bytes(&mut out, &self.pub_seed);
+        out.push(self.height);
         out.try_into().unwrap()
     }
 
+    /// Parses a key; its height must be 1 to [`MAX_HEIGHT`].
     pub fn from_bytes(bytes: &[u8]) -> Option<PublicKey> {
         if bytes.len() != Self::SIZE {
             return None;
         }
         let (root, rest) = read_fps::<DIGEST>(bytes)?;
-        let (pub_seed, _) = read_fps::<PUB_SEED_LEN>(rest)?;
-        Some(PublicKey { root, pub_seed })
+        let (pub_seed, rest) = read_fps::<PUB_SEED_LEN>(rest)?;
+        let height = rest[0];
+        if height == 0 || height as usize > MAX_HEIGHT {
+            return None;
+        }
+        Some(PublicKey { root, pub_seed, height })
+    }
+
+    /// The tree height.
+    pub fn height(&self) -> usize {
+        self.height as usize
     }
 
     /// Verifies `sig` over a message of field elements. Returns `false` for
-    /// an out-of-range leaf index or any mismatch.
-    pub fn verify<const H: usize>(&self, msg: &[Fp], sig: &Signature<H>) -> bool {
-        if H > 40 || sig.index >= (1u64 << H) {
+    /// a signature of another height, an out-of-range leaf index or any
+    /// mismatch.
+    pub fn verify(&self, msg: &[Fp], sig: &Signature) -> bool {
+        let h = self.height();
+        if h == 0 || h > MAX_HEIGHT || sig.auth_path.len() != h || sig.index >= (1u64 << h) {
             return false;
         }
         let d = digits(&message_digest(&self.pub_seed, sig.index, &sig.randomizer, msg));
@@ -320,27 +352,34 @@ impl PublicKey {
             *end = chain(&self.pub_seed, sig.index, c, &sig.wots[c], done, W - 1 - done);
         }
         let mut node = wots_pk_from_ends(&self.pub_seed, sig.index, &ends);
-        let mut pos = (1u64 << H) + sig.index;
+        let mut index = sig.index;
         for (level, sibling) in sig.auth_path.iter().enumerate() {
-            let (left, right) = if pos & 1 == 0 { (&node, sibling) } else { (sibling, &node) };
-            pos >>= 1;
-            node = tree_node(&self.pub_seed, pos, (level + 1) as u32, left, right);
+            let (left, right) = if index & 1 == 0 { (&node, sibling) } else { (sibling, &node) };
+            index >>= 1;
+            node = tree_node(&self.pub_seed, index, self.height, (level + 1) as u32, left, right);
         }
         node == self.root
     }
 
     /// Verifies a signature made with [`SecretKey::sign_bytes`].
-    pub fn verify_bytes<const H: usize>(&self, msg: &[u8], sig: &Signature<H>) -> bool {
+    pub fn verify_bytes(&self, msg: &[u8], sig: &Signature) -> bool {
         self.verify(&bytes_to_message(msg), sig)
     }
 }
 
-impl<const H: usize> Signature<H> {
-    /// Serialized size in bytes.
-    pub const SIZE: usize = 8 + (1 + CHAINS + H) * DIGEST_BYTES;
+impl Signature {
+    /// Serialized size in bytes of a signature of a tree of `height`.
+    pub const fn size(height: usize) -> usize {
+        8 + (1 + CHAINS + height) * DIGEST_BYTES
+    }
+
+    /// The tree height this signature belongs to.
+    pub fn height(&self) -> usize {
+        self.auth_path.len()
+    }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::SIZE);
+        let mut out = Vec::with_capacity(Self::size(self.height()));
         out.extend_from_slice(&self.index.to_le_bytes());
         fps_to_bytes(&mut out, &self.randomizer);
         for d in &self.wots {
@@ -352,8 +391,9 @@ impl<const H: usize> Signature<H> {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Signature<H>> {
-        if bytes.len() != Self::SIZE {
+    /// Parses a signature of a tree of `height` (the signer's key says).
+    pub fn from_bytes(bytes: &[u8], height: usize) -> Option<Signature> {
+        if height == 0 || height > MAX_HEIGHT || bytes.len() != Self::size(height) {
             return None;
         }
         let index = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -364,54 +404,70 @@ impl<const H: usize> Signature<H> {
             *d = v;
             rest = r;
         }
-        let mut auth_path = [[Fp::ZERO; DIGEST]; H];
-        for d in auth_path.iter_mut() {
+        let mut auth_path = Vec::with_capacity(height);
+        for _ in 0..height {
             let (v, r) = read_fps::<DIGEST>(rest)?;
-            *d = v;
+            auth_path.push(v);
             rest = r;
         }
         Some(Signature { index, randomizer, wots, auth_path })
     }
 }
 
-impl<const H: usize> SecretKey<H> {
-    /// Number of signatures a key pair can produce.
-    pub const LEAVES: u64 = 1 << H;
-    /// Serialized size in bytes (seeds and index; the tree is rebuilt on load).
+impl SecretKey {
+    /// Serialized size in bytes (seeds, index and height; the tree is
+    /// rebuilt on load).
     pub const SIZE: usize = SECRET_KEY_SIZE;
 
-    /// Derives a key pair deterministically from `seed`, which must be
-    /// uniformly random (for example 32 bytes from the operating system RNG).
-    /// Builds the whole tree: cost grows as `2^H`.
-    pub fn generate(seed: &[u8; SEED_SIZE]) -> SecretKey<H> {
-        const {
-            assert!(H >= 1 && H <= 40, "tree height must be between 1 and 40");
-        }
+    /// Derives a payment key pair ([`PLAIN_HEIGHT`]) deterministically from
+    /// `seed`, which must be uniformly random (for example 32 bytes from
+    /// the operating system RNG).
+    pub fn generate(seed: &[u8; SEED_SIZE]) -> SecretKey {
+        Self::generate_with_height(seed, PLAIN_HEIGHT)
+    }
+
+    /// Derives a key pair of tree height `height` (1 to [`MAX_HEIGHT`])
+    /// from `seed`. Builds the whole tree: cost grows as `2^height`, about
+    /// a second per 2^16 leaves per core, so tall keys are made in the
+    /// background.
+    pub fn generate_with_height(seed: &[u8; SEED_SIZE], height: usize) -> SecretKey {
+        assert!((1..=MAX_HEIGHT).contains(&height), "tree height must be between 1 and {MAX_HEIGHT}");
         let seed_fps = bytes_to_fps(seed);
         let zero = [Fp::ZERO; PUB_SEED_LEN];
         let sk_seed = th(&zero, DOM_KEYGEN, 0, 0, &seed_fps);
         let ps = th(&zero, DOM_KEYGEN, 1, 0, &seed_fps);
         let pub_seed = ps[..PUB_SEED_LEN].try_into().unwrap();
-        Self::from_parts(sk_seed, pub_seed, 0)
+        Self::from_parts(height as u8, sk_seed, pub_seed, 0)
     }
 
-    fn from_parts(sk_seed: Digest, pub_seed: [Fp; PUB_SEED_LEN], next_index: u64) -> SecretKey<H> {
-        let n = 1usize << H;
+    fn from_parts(height: u8, sk_seed: Digest, pub_seed: [Fp; PUB_SEED_LEN], next_index: u64) -> SecretKey {
+        let h = height as usize;
+        let n = 1usize << h;
         let mut tree = vec![[Fp::ZERO; DIGEST]; 2 * n];
-        for i in 0..n {
-            tree[n + i] = wots_leaf(&pub_seed, &sk_seed, i as u64);
-        }
-        for level in 1..=H {
-            let start = 1usize << (H - level);
+        let leaves = crate::parallel::par_map_min(n, 1 << 8, |i| wots_leaf(&pub_seed, &sk_seed, i as u64));
+        tree[n..].copy_from_slice(&leaves);
+        for level in 1..=h {
+            let start = 1usize << (h - level);
             for pos in start..2 * start {
-                tree[pos] = tree_node(&pub_seed, pos as u64, level as u32, &tree[2 * pos], &tree[2 * pos + 1]);
+                let index = (pos - start) as u64;
+                tree[pos] = tree_node(&pub_seed, index, height, level as u32, &tree[2 * pos], &tree[2 * pos + 1]);
             }
         }
-        SecretKey { sk_seed, pub_seed, next_index, tree }
+        SecretKey { height, sk_seed, pub_seed, next_index, tree }
     }
 
     pub fn public_key(&self) -> PublicKey {
-        PublicKey { root: self.tree[1], pub_seed: self.pub_seed }
+        PublicKey { root: self.tree[1], pub_seed: self.pub_seed, height: self.height }
+    }
+
+    /// The tree height.
+    pub fn height(&self) -> usize {
+        self.height as usize
+    }
+
+    /// Number of signatures a key pair can produce.
+    pub fn leaves(&self) -> u64 {
+        1 << self.height
     }
 
     /// Index of the leaf the next signature will use.
@@ -422,19 +478,19 @@ impl<const H: usize> SecretKey<H> {
     /// Moves to leaf `index`, skipping the ones before it. Used to resume a
     /// key whose leaf count is kept elsewhere; never move backwards.
     pub fn set_next_index(&mut self, index: u64) {
-        assert!(index <= Self::LEAVES, "leaf index beyond the tree");
+        assert!(index <= self.leaves(), "leaf index beyond the tree");
         self.next_index = index;
     }
 
     /// Number of signatures left.
     pub fn remaining(&self) -> u64 {
-        Self::LEAVES - self.next_index
+        self.leaves() - self.next_index
     }
 
     /// Signs a message of field elements with the next unused leaf and
     /// advances the index.
-    pub fn sign(&mut self, msg: &[Fp]) -> Result<Signature<H>, KeyExhausted> {
-        if self.next_index >= Self::LEAVES {
+    pub fn sign(&mut self, msg: &[Fp]) -> Result<Signature, KeyExhausted> {
+        if self.next_index >= self.leaves() {
             return Err(KeyExhausted);
         }
         let index = self.next_index;
@@ -447,17 +503,17 @@ impl<const H: usize> SecretKey<H> {
             let sk = wots_sk(&self.pub_seed, &self.sk_seed, index, c);
             *out = chain(&self.pub_seed, index, c, &sk, 0, d[c] as usize);
         }
-        let mut auth_path = [[Fp::ZERO; DIGEST]; H];
-        let mut pos = (1usize << H) + index as usize;
-        for sibling in auth_path.iter_mut() {
-            *sibling = self.tree[pos ^ 1];
+        let mut auth_path = Vec::with_capacity(self.height());
+        let mut pos = (1usize << self.height()) + index as usize;
+        for _ in 0..self.height() {
+            auth_path.push(self.tree[pos ^ 1]);
             pos >>= 1;
         }
         Ok(Signature { index, randomizer, wots, auth_path })
     }
 
     /// Signs a byte string, encoded with [`bytes_to_message`].
-    pub fn sign_bytes(&mut self, msg: &[u8]) -> Result<Signature<H>, KeyExhausted> {
+    pub fn sign_bytes(&mut self, msg: &[u8]) -> Result<Signature, KeyExhausted> {
         self.sign(&bytes_to_message(msg))
     }
 
@@ -468,28 +524,30 @@ impl<const H: usize> SecretKey<H> {
         fps_to_bytes(&mut out, &self.sk_seed);
         fps_to_bytes(&mut out, &self.pub_seed);
         out.extend_from_slice(&self.next_index.to_le_bytes());
+        out.push(self.height);
         out.try_into().unwrap()
     }
 
     /// Restores a key from [`SecretKey::to_bytes`], rebuilding the tree.
-    pub fn from_bytes(bytes: &[u8]) -> Option<SecretKey<H>> {
+    pub fn from_bytes(bytes: &[u8]) -> Option<SecretKey> {
         if bytes.len() != Self::SIZE {
             return None;
         }
         let (sk_seed, rest) = read_fps::<DIGEST>(bytes)?;
         let (pub_seed, rest) = read_fps::<PUB_SEED_LEN>(rest)?;
-        let next_index = u64::from_le_bytes(rest.try_into().unwrap());
-        if next_index > Self::LEAVES {
+        let next_index = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        let height = rest[8];
+        if height == 0 || height as usize > MAX_HEIGHT || next_index > 1 << height {
             return None;
         }
-        Some(Self::from_parts(sk_seed, pub_seed, next_index))
+        Some(Self::from_parts(height, sk_seed, pub_seed, next_index))
     }
 }
 
-impl<const H: usize> fmt::Debug for SecretKey<H> {
+impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretKey")
-            .field("height", &H)
+            .field("height", &self.height)
             .field("next_index", &self.next_index)
             .field("public_key", &self.public_key())
             .finish_non_exhaustive()
@@ -515,10 +573,10 @@ mod tests {
         assert_eq!(MSG_CHAINS, 64);
         assert_eq!(CHAINS, 67);
         assert_eq!(MAX_CSUM, 960);
-        assert_eq!(PublicKey::SIZE, 48);
-        assert_eq!(Signature::<3>::SIZE, 8 + 32 + 67 * 32 + 3 * 32);
-        assert_eq!(SecretKey::<3>::SIZE, 56);
-        assert_eq!(SecretKey::<3>::LEAVES, 8);
+        assert_eq!(PublicKey::SIZE, 49);
+        assert_eq!(Signature::size(3), 8 + 32 + 67 * 32 + 3 * 32);
+        assert_eq!(SecretKey::SIZE, 57);
+        assert_eq!((1u64 << 3), 8);
     }
 
     #[test]
@@ -579,9 +637,9 @@ mod tests {
 
     #[test]
     fn keygen_is_deterministic() {
-        let a = SecretKey::<2>::generate(&SEED);
-        let b = SecretKey::<2>::generate(&SEED);
-        let c = SecretKey::<2>::generate(&other_seed());
+        let a = SecretKey::generate_with_height(&SEED, 2);
+        let b = SecretKey::generate_with_height(&SEED, 2);
+        let c = SecretKey::generate_with_height(&other_seed(), 2);
         assert_eq!(a.public_key(), b.public_key());
         assert_ne!(a.public_key(), c.public_key());
         assert_ne!(a.public_key().root, [Fp::ZERO; DIGEST]);
@@ -590,10 +648,10 @@ mod tests {
     #[test]
     fn sign_verify_every_leaf_then_exhaust() {
         const H: usize = 3;
-        let mut sk = SecretKey::<H>::generate(&SEED);
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         assert_eq!(sk.remaining(), 8);
-        for i in 0..SecretKey::<H>::LEAVES {
+        for i in 0..(1u64 << H) {
             let msg = format!("message number {i}");
             assert_eq!(sk.next_index(), i);
             let sig = sk.sign_bytes(msg.as_bytes()).unwrap();
@@ -608,7 +666,7 @@ mod tests {
     #[test]
     fn tampered_signatures_fail() {
         const H: usize = 2;
-        let mut sk = SecretKey::<H>::generate(&SEED);
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         let msg = b"hello";
         let sig = sk.sign_bytes(msg).unwrap();
@@ -633,7 +691,7 @@ mod tests {
             s.auth_path[l][0] += Fp::ONE;
             assert!(!pk.verify_bytes(msg, &s), "auth level {l}");
         }
-        let other = SecretKey::<H>::generate(&other_seed()).public_key();
+        let other = SecretKey::generate_with_height(&other_seed(), H).public_key();
         assert!(!other.verify_bytes(msg, &sig));
         // Empty message and a long multi-block message both round-trip.
         let sig = sk.sign_bytes(b"").unwrap();
@@ -651,7 +709,7 @@ mod tests {
 
     #[test]
     fn signatures_differ_per_leaf_and_message() {
-        let mut sk = SecretKey::<1>::generate(&SEED);
+        let mut sk = SecretKey::generate_with_height(&SEED, 1);
         let a = sk.sign_bytes(b"same").unwrap();
         let b = sk.sign_bytes(b"same").unwrap();
         assert_ne!(a.index, b.index);
@@ -662,7 +720,7 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         const H: usize = 2;
-        let mut sk = SecretKey::<H>::generate(&SEED);
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         let sig0 = sk.sign_bytes(b"first").unwrap();
 
@@ -675,16 +733,16 @@ mod tests {
         assert!(PublicKey::from_bytes(&bad).is_none());
 
         let sig_bytes = sig0.to_bytes();
-        assert_eq!(sig_bytes.len(), Signature::<H>::SIZE);
-        let back = Signature::<H>::from_bytes(&sig_bytes).unwrap();
+        assert_eq!(sig_bytes.len(), Signature::size(H));
+        let back = Signature::from_bytes(&sig_bytes, H).unwrap();
         assert_eq!(back, sig0);
         assert!(pk.verify_bytes(b"first", &back));
-        assert!(Signature::<H>::from_bytes(&sig_bytes[..sig_bytes.len() - 1]).is_none());
-        assert!(Signature::<{ H + 1 }>::from_bytes(&sig_bytes).is_none());
+        assert!(Signature::from_bytes(&sig_bytes[..sig_bytes.len() - 1], H).is_none());
+        assert!(Signature::from_bytes(&sig_bytes, H + 1).is_none());
 
         let sk_bytes = sk.to_bytes();
-        assert_eq!(sk_bytes.len(), SecretKey::<H>::SIZE);
-        let mut restored = SecretKey::<H>::from_bytes(&sk_bytes).unwrap();
+        assert_eq!(sk_bytes.len(), SecretKey::SIZE);
+        let mut restored = SecretKey::from_bytes(&sk_bytes).unwrap();
         assert_eq!(restored.public_key(), pk);
         assert_eq!(restored.next_index(), 1);
         let sig1 = restored.sign_bytes(b"second").unwrap();
@@ -695,14 +753,14 @@ mod tests {
         assert_eq!(sig1, sig1_orig);
         // An index past the end is rejected.
         let mut bad = sk_bytes;
-        bad[48..].copy_from_slice(&(SecretKey::<H>::LEAVES + 1).to_le_bytes());
-        assert!(SecretKey::<H>::from_bytes(&bad).is_none());
+        bad[48..56].copy_from_slice(&((1u64 << H) + 1).to_le_bytes());
+        assert!(SecretKey::from_bytes(&bad).is_none());
     }
 
     #[test]
     fn taller_tree() {
         const H: usize = 5;
-        let mut sk = SecretKey::<H>::generate(&SEED);
+        let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         for _ in 0..7 {
             let _ = sk.sign_bytes(b"skip").unwrap();

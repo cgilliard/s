@@ -152,9 +152,9 @@ node with it, decades of headers and a full undo window stays under 20 GB.
 The unspent outputs are kept in buckets of consecutive ones, each one LMDB
 page of 4 KB at most, split when full and repacked with their neighbours as
 spending thins them, so pages stay about 80% full; each output costs its
-64 bytes of commitment and memo plus a byte or two. The state tree is
-stored only from subtrees of 256 positions up, the levels below being
-recomputed from the outputs when needed. There is no index by commitment:
+68 bytes of commitment, memo and creation height plus a byte or two. The
+state tree is stored only from subtrees of 256 positions up, the levels
+below being recomputed from the outputs when needed. There is no index by commitment:
 blocks name their inputs by position, a transaction input carries its
 output's position (not signed, so a wallet can correct it after a
 reorganization), and wallets learn where their outputs landed from the
@@ -224,6 +224,26 @@ nothing half done.
 `balance` shows confirmed, pending (incoming), reserved (held for a slate)
 and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
 `mempool`, `peers` and `status` show the rest. The reward of a mined block goes to the miner's wallet.
+
+## Policies and channels
+
+An output may be paid to a spend policy instead of a single key: a Merkle
+tree of leaves, each a set of conditions, from which a spend reveals one
+leaf in zero knowledge, so a multisig, an HTLC or an eltoo channel state is
+indistinguishable on chain from any other output (`docs/ELTOO.md`).
+Conditions are `m`-of-`n` signatures in body mode or rebindable mode,
+a hash lock, an absolute or relative timelock, a state number the spend
+must exceed, and a covenant naming the outputs the spend must create.
+Keys may have up to 20 tree levels; `channel-key [HEIGHT]` derives a fresh
+one and prints its key hash for a policy. The wallet tracks the policy
+outputs it is party to (`policies`), funds them, builds spends through a
+chosen leaf and signs with its own keys, rebindable signatures using the
+state number as the leaf index; the parties pass the transaction's bytes
+between them to collect signatures. Policy outputs are not recoverable
+from the phrase: a wallet keeps them as channel state. Any peer answers
+`GetProof` for a position with the output there and its path against the
+peer's tip, so a client holding headers (and a chain proof for one of
+them) checks its outputs and watches spends without trusting a node.
 
 ## Names
 

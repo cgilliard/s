@@ -77,6 +77,10 @@ const T_GET_CHUNKS: u8 = 8;
 const T_CHUNK: u8 = 9;
 const T_TX_INV: u8 = 10;
 const T_GET_HEADERS_FROM: u8 = 11;
+const T_GET_PROOF: u8 = 12;
+const T_PROOF: u8 = 13;
+/// Siblings per `Proof` message: a 40-level path takes two datagrams.
+pub const PROOF_SIBLINGS_PER_MESSAGE: usize = crate::state_tree::DEPTH / 2;
 
 /// What a chunked transfer carries. Snapshot objects are named by the
 /// block whose state they describe.
@@ -120,7 +124,7 @@ pub const MAX_MANIFEST: usize = 32 << 20;
 /// Largest part: every position of an output part unspent and a commit,
 /// which also bounds a name part of [`NAME_PART_RECORDS`] records.
 pub const MAX_PART: usize = 8 + (1 << crate::chain::SNAPSHOT_PART_LOG) * (PART_ENTRY + COMMIT_ENTRY);
-const PART_ENTRY: usize = 8 + 32 + 32;
+const PART_ENTRY: usize = 8 + 32 + 32 + 4;
 const COMMIT_ENTRY: usize = 8 + 32 + 4;
 const _: () = assert!(MAX_PART >= 4 + NAME_PART_RECORDS * (1 + 32 + 96));
 
@@ -155,16 +159,17 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
     r.is_empty().then_some(Manifest { next, roots, name_root, names })
 }
 
-/// An output part: its unspent outputs, position, commitment and memo,
-/// ascending; then which of them are commits: position, commit hash and
-/// height, ascending.
-pub fn encode_part(outputs: &[(u64, Digest, Digest)], commits: &[(u64, Digest, u32)]) -> Vec<u8> {
+/// An output part: its unspent outputs, position, commitment, memo and
+/// creation height, ascending; then which of them are commits: position,
+/// commit hash and height, ascending.
+pub fn encode_part(outputs: &[(u64, Digest, Digest, u32)], commits: &[(u64, Digest, u32)]) -> Vec<u8> {
     let mut w = Writer::with_capacity(8 + PART_ENTRY * outputs.len() + COMMIT_ENTRY * commits.len());
     w.u32(outputs.len() as u32);
-    for (p, c, m) in outputs {
+    for (p, c, m, h) in outputs {
         w.u64(*p);
         w.digest(c);
         w.digest(m);
+        w.u32(*h);
     }
     w.u32(commits.len() as u32);
     for (p, hash, height) in commits {
@@ -176,10 +181,10 @@ pub fn encode_part(outputs: &[(u64, Digest, Digest)], commits: &[(u64, Digest, u
 }
 
 #[allow(clippy::type_complexity)]
-pub fn decode_part(bytes: &[u8]) -> Option<(Vec<(u64, Digest, Digest)>, PartCommits)> {
+pub fn decode_part(bytes: &[u8]) -> Option<(Vec<(u64, Digest, Digest, u32)>, PartCommits)> {
     let mut r = Reader(bytes);
     let n = r.len(PART_ENTRY)?;
-    let out = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.digest()?))).collect::<Option<Vec<_>>>()?;
+    let out = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.digest()?, r.u32()?))).collect::<Option<Vec<_>>>()?;
     let n = r.len(COMMIT_ENTRY)?;
     let commits = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.u32()?))).collect::<Option<Vec<_>>>()?;
     r.is_empty().then_some((out, commits))
@@ -264,6 +269,25 @@ pub enum Message {
         len: u32,
         index: u16,
         data: Vec<u8>,
+    },
+    /// A state proof for the output at `position` against the sender's
+    /// tip: for light clients holding headers.
+    GetProof {
+        position: u64,
+        token: u64,
+    },
+    /// The output at `position` (commitment, memo and creation height; all
+    /// zero when the position is spent or unassigned) and its path in the
+    /// state after block `tip`, in two parts of
+    /// [`PROOF_SIBLINGS_PER_MESSAGE`] siblings each, bottom up.
+    Proof {
+        position: u64,
+        tip: Digest,
+        commitment: Digest,
+        memo: Digest,
+        created: u32,
+        part: u8,
+        siblings: Vec<Digest>,
     },
 }
 
@@ -383,6 +407,24 @@ impl Message {
                 w.0.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 w.0.extend_from_slice(data);
             }
+            Message::GetProof { position, token } => {
+                w.0.push(T_GET_PROOF);
+                w.u64(*position);
+                w.u64(*token);
+            }
+            Message::Proof { position, tip, commitment, memo, created, part, siblings } => {
+                w.0.push(T_PROOF);
+                w.u64(*position);
+                w.digest(tip);
+                w.digest(commitment);
+                w.digest(memo);
+                w.u32(*created);
+                w.0.push(*part);
+                w.0.push(siblings.len() as u8);
+                for s in siblings {
+                    w.digest(s);
+                }
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -443,6 +485,25 @@ impl Message {
                 (n <= CHUNK_BYTES).then_some(())?;
                 let data = r.take(n)?.to_vec();
                 Message::Chunk { kind, id, len, index, data }
+            }
+            T_GET_PROOF => {
+                let position = r.u64()?;
+                let token = r.u64()?;
+                Message::GetProof { position, token }
+            }
+            T_PROOF => {
+                let position = r.u64()?;
+                let tip = r.digest()?;
+                let commitment = r.digest()?;
+                let memo = r.digest()?;
+                let created = r.u32()?;
+                let part = r.take(1)?[0];
+                let n = r.take(1)?[0] as usize;
+                if part > 1 || n > PROOF_SIBLINGS_PER_MESSAGE {
+                    return None;
+                }
+                let siblings = (0..n).map(|_| r.digest()).collect::<Option<Vec<_>>>()?;
+                Message::Proof { position, tip, commitment, memo, created, part, siblings }
             }
             _ => return None,
         };

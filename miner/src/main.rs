@@ -142,6 +142,9 @@ const HELP: &str = "commands:
   name-transfer FILE [FEE]  sign a name over to the record in FILE
   names                     this wallet's names and pending commits
   name NAME                 look a name up on chain
+  policies                  this wallet's policy outputs: multisigs, channels
+  channel-key [HEIGHT]      a fresh channel key for a policy: its nonce and key
+                            hash (HEIGHT levels, 16 by default, 20 at most)
   phrase                    show the wallet's 12-word recovery phrase
   storage                   disk use of the chain database, part by part
   quit                      stop the node
@@ -895,6 +898,47 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("reserved  {}  held for a slate not yet finalized", fmt_coins(b.reserved));
             println!("locked    {}  signed, being sent, not yet confirmed", fmt_coins(b.locked));
         }
+        "policies" => {
+            let outputs = ctx.wallet.policy_outputs()?;
+            if outputs.is_empty() {
+                println!("no policy outputs");
+            }
+            for p in outputs {
+                let state = match (p.state, p.position) {
+                    (State::Unspent, Some(_)) => "confirmed",
+                    (State::Unspent, None) => "pending",
+                    (State::Reserved, _) => "reserved",
+                    (State::Spent, _) => "spent",
+                };
+                println!(
+                    "{}  {:>20}  {:<9}  {} leaves, {} of our keys  {}",
+                    short(&p.commitment),
+                    fmt_coins(p.amount as u128),
+                    state,
+                    p.policy.leaves.len(),
+                    p.keys.len(),
+                    log::timestamp_of(p.created)
+                );
+            }
+        }
+        "channel-key" => {
+            let height = match args {
+                [] => tabminer::wallet::CHANNEL_HEIGHT,
+                [h] => h.parse::<usize>().map_err(|_| format!("not a height: {h}"))?,
+                _ => return Err("usage: channel-key [HEIGHT]".into()),
+            };
+            if !(1..=tabminer::xmss::MAX_HEIGHT).contains(&height) {
+                return Err(format!("height must be 1 to {}", tabminer::xmss::MAX_HEIGHT).into());
+            }
+            let nonce = Wallet::fresh_nonce()?;
+            let t = Instant::now();
+            let hash = ctx.wallet.channel_key_hash(&nonce, height);
+            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let nonce_bytes: Vec<u8> = nonce.iter().flat_map(|x| x.to_le_bytes()).collect();
+            println!("nonce     {}", hex(&nonce_bytes));
+            println!("key hash  {}  ({height} levels, made in {})", hex(&digest_to_bytes(&hash)), secs(t.elapsed()));
+            println!("keep the nonce: the key is derived from it and the wallet's seed");
+        }
         "outputs" => {
             let rtxn = ctx.chain.env().read_txn()?;
             let outputs = ctx.wallet.outputs()?;
@@ -1362,7 +1406,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
         let size = |ins: usize, outs: usize, names: usize| {
             HEADER_SIZE + Body::size_of(ins, outs, names + sweep_bytes, PROOF_SIZE_ALLOWANCE)
         };
-        let fits = |ins: usize, outs: usize, names: usize, items: &dyn Fn(usize) -> (usize, usize, usize), n: usize| {
+        let fits = |ins: usize, outs: usize, names: usize, items: &dyn Fn(usize) -> (Vec<usize>, bool), n: usize| {
             pack(n, items, agg.segment_rows()).len() <= agg.max_segments
                 && size(ins, outs, names) <= params.max_block_size
         };
@@ -1374,10 +1418,9 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
                 let names: usize = chosen.iter().flat_map(|t| t.ops.iter()).map(|op| op.block_op().size()).sum();
                 let items = |t: usize| {
                     if t == 0 {
-                        (0, 1, 0)
+                        (vec![tabminer::block_air::ROWS_PER_OUTPUT], false)
                     } else {
-                        let tx = &chosen[t - 1];
-                        (tx.inputs.len(), tx.outputs.len(), tx.ops.len())
+                        tabminer::block_air::item_rows_of(&chosen[t - 1])
                     }
                 };
                 fits(ins, outs, names, &items, chosen.len() + 1)
@@ -1407,7 +1450,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             let utxo = chain.utxo();
             let prev_state_root = utxo.root(&wtxn)?;
             let first_output_position = utxo.next_position(&wtxn)?;
-            let segments = match SegmentWitness::collect_by_rows(utxo, &mut wtxn, &txs, agg.segment_rows()) {
+            let segments = match SegmentWitness::collect_by_rows(utxo, &mut wtxn, &txs, agg.segment_rows(), height) {
                 Ok(s) => s,
                 // A block applied since the transactions were chosen spent
                 // or moved one of their inputs; the pool is being revalidated.
@@ -1536,7 +1579,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
                 }
                 let from = next_random() % made;
                 let window = chain.utxo().unspent_in(&rtxn, from, (from + 256).min(made))?;
-                if let Some((p, _)) = window.iter().find(|(p, (c, _))| !taken.contains(p) && !ours.contains(c)) {
+                if let Some((p, _)) = window.iter().find(|(p, (c, _, _))| !taken.contains(p) && !ours.contains(c)) {
                     taken.insert(*p);
                     inputs.push(*p);
                     spends += 1;

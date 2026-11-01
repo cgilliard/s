@@ -52,15 +52,17 @@
 //! commitment its 8.
 
 use crate::names::NameOp;
+use crate::policy::{PolicyError, PolicyInput};
 use crate::poseidon2::{DIGEST, Fp, WIDTH, digest_from_bytes, digest_to_bytes, permute_in_place};
 use crate::xmss::{Digest, KeyExhausted, PUB_SEED_LEN, PublicKey, SecretKey, Signature};
 
-/// XMSS tree height used for all transaction signatures (16 leaves per key).
-pub const TREE_HEIGHT: usize = 4;
+/// XMSS tree height of payment keys (16 leaves per key): the height the
+/// block circuit verifies today.
+pub const TREE_HEIGHT: usize = crate::xmss::PLAIN_HEIGHT;
 /// Signature type used in inputs.
-pub type Sig = Signature<TREE_HEIGHT>;
+pub type Sig = Signature;
 /// Secret key type matching [`Sig`].
-pub type Key = SecretKey<TREE_HEIGHT>;
+pub type Key = SecretKey;
 /// An output commitment `H(H(pubkey) || amount)`.
 pub type Commitment = Digest;
 /// An output's recovery memo: opaque to consensus.
@@ -70,8 +72,9 @@ pub type Memo = Digest;
 const FP_BYTES: usize = 4;
 /// Serialized size of a digest or commitment.
 const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
-/// Serialized size of an [`Input`].
-pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + 8 + Sig::SIZE;
+/// Serialized size of an [`Input`] whose key has [`TREE_HEIGHT`]; an input
+/// is [`Input::size`] bytes in general.
+pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + 8 + Signature::size(TREE_HEIGHT);
 /// Serialized size of an [`Output`].
 pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8 + DIGEST_BYTES;
 
@@ -81,7 +84,7 @@ pub(crate) const DOM_BODY: u32 = 3;
 
 const MASK30: u64 = (1 << 30) - 1;
 const AMOUNT_LIMBS: usize = 3;
-const PUBKEY_FPS: usize = DIGEST + PUB_SEED_LEN;
+const PUBKEY_FPS: usize = DIGEST + PUB_SEED_LEN + 1;
 
 // ---------------------------------------------------------------------------
 // Hashing
@@ -120,11 +123,12 @@ pub(crate) fn amount_fps(amount: u64) -> [Fp; AMOUNT_LIMBS] {
 fn pubkey_fps(pk: &PublicKey) -> [Fp; PUBKEY_FPS] {
     let mut out = [Fp::ZERO; PUBKEY_FPS];
     out[..DIGEST].copy_from_slice(&pk.root);
-    out[DIGEST..].copy_from_slice(&pk.pub_seed);
+    out[DIGEST..DIGEST + PUB_SEED_LEN].copy_from_slice(&pk.pub_seed);
+    out[DIGEST + PUB_SEED_LEN] = Fp::new(pk.height as u32);
     out
 }
 
-/// `H(pubkey)`.
+/// `H(pubkey)`: the root, the public seed and the tree height.
 pub fn pubkey_hash(pk: &PublicKey) -> Digest {
     hash_domain(DOM_PUBKEY, &pubkey_fps(pk))
 }
@@ -136,8 +140,16 @@ pub fn commitment(pk: &PublicKey, amount: u64) -> Commitment {
 
 /// The state tree leaf of an unspent output: its commitment and memo
 /// compressed, so the state root covers the memo too.
-pub fn leaf(commitment: &Commitment, memo: &Memo) -> Digest {
-    crate::poseidon2::compress(commitment, memo)
+pub fn leaf(commitment: &Commitment, memo: &Memo, height: u32) -> Digest {
+    crate::poseidon2::compress(&crate::poseidon2::compress(commitment, memo), &height_digest(height))
+}
+
+/// A block height as a digest: one element, then zeros. The second half
+/// of a leaf's final compression (see [`leaf`]).
+pub fn height_digest(height: u32) -> Digest {
+    let mut d = [Fp::ZERO; DIGEST];
+    d[0] = Fp::new(height);
+    d
 }
 
 /// `H(key_hash || amount)`: [`commitment`] from the key's hash.
@@ -190,6 +202,9 @@ pub struct Output {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Transaction {
     pub inputs: Vec<Input>,
+    /// Spends of policy outputs (see [`crate::policy`]), after the plain
+    /// inputs in the body and in position order.
+    pub policy_inputs: Vec<PolicyInput>,
     pub outputs: Vec<Output>,
     /// Name operations, signed by the inputs.
     pub ops: Vec<NameOp>,
@@ -200,6 +215,8 @@ pub struct Transaction {
 pub struct UnsignedTransaction {
     /// Revealed key and amount of each output being spent.
     pub inputs: Vec<(PublicKey, u64)>,
+    /// Policy spends, with or without their witnesses yet.
+    pub policy_inputs: Vec<PolicyInput>,
     pub outputs: Vec<Output>,
     pub ops: Vec<NameOp>,
 }
@@ -252,8 +269,13 @@ impl Input {
         commitment(&self.pubkey, self.amount)
     }
 
+    /// Serialized size: the signature's grows with the key's tree height.
+    pub fn size(&self) -> usize {
+        PublicKey::SIZE + 8 + 8 + Signature::size(self.pubkey.height())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(INPUT_SIZE);
+        let mut out = Vec::with_capacity(self.size());
         out.extend_from_slice(&self.pubkey.to_bytes());
         out.extend_from_slice(&self.amount.to_le_bytes());
         out.extend_from_slice(&self.position.to_le_bytes());
@@ -261,40 +283,62 @@ impl Input {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Input> {
-        if bytes.len() != INPUT_SIZE {
-            return None;
-        }
-        let pubkey = PublicKey::from_bytes(&bytes[..PublicKey::SIZE])?;
-        let (amount, rest) = read_u64(&bytes[PublicKey::SIZE..])?;
+    /// Parses an input from the front of `bytes`, returning the rest.
+    pub fn read(bytes: &[u8]) -> Option<(Input, &[u8])> {
+        let (pk, rest) = bytes.split_at_checked(PublicKey::SIZE)?;
+        let pubkey = PublicKey::from_bytes(pk)?;
+        let (amount, rest) = read_u64(rest)?;
         let (position, rest) = read_u64(rest)?;
-        let signature = Sig::from_bytes(rest)?;
-        Some(Input { pubkey, amount, position, signature })
+        let (sig, rest) = rest.split_at_checked(Signature::size(pubkey.height()))?;
+        let signature = Sig::from_bytes(sig, pubkey.height())?;
+        Some((Input { pubkey, amount, position, signature }, rest))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Input> {
+        match Self::read(bytes)? {
+            (input, []) => Some(input),
+            _ => None,
+        }
     }
 }
 
 /// Body elements, block aligned so each item is whole sponge blocks:
 ///
 /// ```text
-/// [n_in, n_out, n_ops, 0, 0, 0, 0, 0]
-/// per input:  [root(8)] [pub_seed(4), amount lo30, mid30, hi4, 0]
-/// per output: [commitment(8)] [amount lo30, mid30, hi4, 0, 0, 0, 0, 0] [memo(8)]
-/// per op:     [digest(8)]
+/// [n_in, n_out, n_ops, n_policy, 0, 0, 0, 0]
+/// per input:        [root(8)] [pub_seed(4), amount lo30, mid30, hi4, 0]
+/// per policy input: [policy(8)] [0, 0, 0, 0, amount lo30, mid30, hi4, 1]
+/// per output:       [commitment(8)] [amount lo30, mid30, hi4, 0, 0, 0, 0, 0] [memo(8)]
+/// per op:           [digest(8)]
 /// ```
 ///
-/// A malformed operation (a bad name) contributes a zero digest; such a
-/// transaction is invalid regardless.
-pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output], ops: &[NameOp]) -> Vec<Fp> {
-    let mut body = Vec::with_capacity(8 + 16 * inputs.len() + 24 * outputs.len() + 8 * ops.len());
+/// A policy input contributes what identifies the output it spends, not
+/// its witness, so two spends of the same output through different
+/// witnesses are the same transaction. A malformed operation (a bad name)
+/// contributes a zero digest; such a transaction is invalid regardless.
+pub(crate) fn body_elements(
+    inputs: &[(PublicKey, u64)],
+    policy: &[PolicyInput],
+    outputs: &[Output],
+    ops: &[NameOp],
+) -> Vec<Fp> {
+    let mut body = Vec::with_capacity(8 + 16 * (inputs.len() + policy.len()) + 24 * outputs.len() + 8 * ops.len());
     body.push(Fp::from_u64(inputs.len() as u64));
     body.push(Fp::from_u64(outputs.len() as u64));
     body.push(Fp::from_u64(ops.len() as u64));
-    body.extend_from_slice(&[Fp::ZERO; 5]);
+    body.push(Fp::from_u64(policy.len() as u64));
+    body.extend_from_slice(&[Fp::ZERO; 4]);
     for (pk, amount) in inputs {
         body.extend_from_slice(&pk.root);
         body.extend_from_slice(&pk.pub_seed);
         body.extend_from_slice(&amount_fps(*amount));
         body.push(Fp::ZERO);
+    }
+    for p in policy {
+        body.extend_from_slice(&p.policy());
+        body.extend_from_slice(&[Fp::ZERO; 4]);
+        body.extend_from_slice(&amount_fps(p.amount));
+        body.push(Fp::ONE);
     }
     for out in outputs {
         body.extend_from_slice(&out.commitment);
@@ -309,24 +353,31 @@ pub(crate) fn body_elements(inputs: &[(PublicKey, u64)], outputs: &[Output], ops
 }
 
 /// Hash of the canonical body (see [`body_elements`]).
-fn body_hash(inputs: &[(PublicKey, u64)], outputs: &[Output], ops: &[NameOp]) -> Digest {
-    hash_domain(DOM_BODY, &body_elements(inputs, outputs, ops))
+fn body_hash(inputs: &[(PublicKey, u64)], policy: &[PolicyInput], outputs: &[Output], ops: &[NameOp]) -> Digest {
+    hash_domain(DOM_BODY, &body_elements(inputs, policy, outputs, ops))
 }
 
 impl UnsignedTransaction {
     /// A transaction without name operations.
     pub fn new(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>) -> UnsignedTransaction {
-        UnsignedTransaction { inputs, outputs, ops: vec![] }
+        UnsignedTransaction { inputs, policy_inputs: vec![], outputs, ops: vec![] }
     }
 
     /// A transaction carrying name operations.
     pub fn with_ops(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>, ops: Vec<NameOp>) -> UnsignedTransaction {
-        UnsignedTransaction { inputs, outputs, ops }
+        UnsignedTransaction { inputs, policy_inputs: vec![], outputs, ops }
+    }
+
+    /// Adds policy spends. Their body-mode signatures are over the body
+    /// hash this gives once every input is in place.
+    pub fn with_policy_inputs(mut self, policy_inputs: Vec<PolicyInput>) -> UnsignedTransaction {
+        self.policy_inputs = policy_inputs;
+        self
     }
 
     /// The body hash every input must sign; equals the final transaction id.
     pub fn body_hash(&self) -> Digest {
-        body_hash(&self.inputs, &self.outputs, &self.ops)
+        body_hash(&self.inputs, &self.policy_inputs, &self.outputs, &self.ops)
     }
 
     /// Signs every input. `signer` is called once per input, in order, with
@@ -344,7 +395,7 @@ impl UnsignedTransaction {
             let signature = signer(i, &pubkey, &msg)?;
             inputs.push(Input { pubkey, amount, position: 0, signature });
         }
-        Ok(Transaction { inputs, outputs: self.outputs, ops: self.ops })
+        Ok(Transaction { inputs, policy_inputs: self.policy_inputs, outputs: self.outputs, ops: self.ops })
     }
 
     /// Signs every input with the one key `key`, which must own all of them.
@@ -383,7 +434,7 @@ impl Transaction {
     /// Hash of the body, excluding signatures.
     pub fn body_hash(&self) -> Digest {
         let inputs: Vec<(PublicKey, u64)> = self.inputs.iter().map(|i| (i.pubkey, i.amount)).collect();
-        body_hash(&inputs, &self.outputs, &self.ops)
+        body_hash(&inputs, &self.policy_inputs, &self.outputs, &self.ops)
     }
 
     /// Transaction id: the body hash.
@@ -395,6 +446,7 @@ impl Transaction {
     pub fn unsigned(&self) -> UnsignedTransaction {
         UnsignedTransaction {
             inputs: self.inputs.iter().map(|i| (i.pubkey, i.amount)).collect(),
+            policy_inputs: self.policy_inputs.clone(),
             outputs: self.outputs.clone(),
             ops: self.ops.clone(),
         }
@@ -414,28 +466,60 @@ impl Transaction {
         self.inputs.iter().all(|i| i.pubkey.verify(&msg, &i.signature))
     }
 
-    /// Sets where each input's output is in the UTXO set, in input order.
-    /// Leaves the signatures and the transaction id unchanged.
+    /// Checks every policy input's leaf against this transaction, for a
+    /// block at `height`; `created` gives the creation height of the
+    /// output at a position (`None` if unknown: unspendable).
+    pub fn check_policy_inputs(&self, height: u32, created: impl Fn(u64) -> Option<u32>) -> Result<(), PolicyError> {
+        if self.policy_inputs.is_empty() {
+            return Ok(());
+        }
+        let body = self.body_hash();
+        for p in &self.policy_inputs {
+            let c = created(p.position).ok_or(PolicyError::Locked)?;
+            p.check(&body, &self.outputs, height, c)?;
+        }
+        Ok(())
+    }
+
+    /// Signatures the block proof checks for this transaction: its weight
+    /// toward block capacity.
+    pub fn weight(&self) -> usize {
+        self.inputs.len() + self.policy_inputs.iter().map(PolicyInput::signatures).sum::<usize>()
+    }
+
+    /// Sets where each input's output is in the UTXO set, in input order
+    /// (plain inputs, then policy inputs). Leaves the signatures and the
+    /// transaction id unchanged.
     pub fn set_positions(&mut self, positions: &[u64]) {
-        assert_eq!(positions.len(), self.inputs.len(), "one position per input");
-        for (i, p) in self.inputs.iter_mut().zip(positions) {
+        assert_eq!(positions.len(), self.inputs.len() + self.policy_inputs.len(), "one position per input");
+        let (plain, policy) = positions.split_at(self.inputs.len());
+        for (i, p) in self.inputs.iter_mut().zip(plain) {
+            i.position = *p;
+        }
+        for (i, p) in self.policy_inputs.iter_mut().zip(policy) {
             i.position = *p;
         }
     }
 
-    /// Positions of the outputs being spent, in input order.
+    /// Positions of the outputs being spent, in input order (plain inputs,
+    /// then policy inputs).
     pub fn spent_positions(&self) -> Vec<u64> {
-        self.inputs.iter().map(|i| i.position).collect()
+        self.inputs.iter().map(|i| i.position).chain(self.policy_inputs.iter().map(|p| p.position)).collect()
     }
 
     /// Commitments of the outputs being spent, in input order.
     pub fn spent_commitments(&self) -> Vec<Commitment> {
-        self.inputs.iter().map(Input::commitment).collect()
+        self.inputs
+            .iter()
+            .map(Input::commitment)
+            .chain(self.policy_inputs.iter().map(PolicyInput::commitment))
+            .collect()
     }
 
     /// Sum of input amounts.
     pub fn input_total(&self) -> u128 {
-        self.inputs.iter().map(|i| i.amount as u128).sum()
+        self.inputs.iter().map(|i| i.amount as u128).sum::<u128>()
+            + self.policy_inputs.iter().map(|p| p.amount as u128).sum::<u128>()
     }
 
     /// Sum of output amounts.
@@ -451,7 +535,8 @@ impl Transaction {
 
     /// Serialized size in bytes.
     pub fn size(&self) -> usize {
-        12 + self.inputs.len() * INPUT_SIZE
+        16 + self.inputs.iter().map(Input::size).sum::<usize>()
+            + self.policy_inputs.iter().map(PolicyInput::size).sum::<usize>()
             + self.outputs.len() * OUTPUT_SIZE
             + self.ops.iter().map(NameOp::size).sum::<usize>()
     }
@@ -461,6 +546,10 @@ impl Transaction {
         out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
         for i in &self.inputs {
             out.extend_from_slice(&i.to_bytes());
+        }
+        out.extend_from_slice(&(self.policy_inputs.len() as u32).to_le_bytes());
+        for p in &self.policy_inputs {
+            out.extend_from_slice(&p.to_bytes());
         }
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
@@ -478,8 +567,15 @@ impl Transaction {
         let (n_in, mut rest) = read_u32(bytes)?;
         let mut inputs = Vec::with_capacity((n_in as usize).min(rest.len() / INPUT_SIZE));
         for _ in 0..n_in {
-            let (head, tail) = rest.split_at_checked(INPUT_SIZE)?;
-            inputs.push(Input::from_bytes(head)?);
+            let (input, tail) = Input::read(rest)?;
+            inputs.push(input);
+            rest = tail;
+        }
+        let (n_policy, mut rest) = read_u32(rest)?;
+        let mut policy_inputs = Vec::with_capacity((n_policy as usize).min(rest.len() / 64));
+        for _ in 0..n_policy {
+            let (input, tail) = PolicyInput::read(rest)?;
+            policy_inputs.push(input);
             rest = tail;
         }
         let (n_out, mut rest) = read_u32(rest)?;
@@ -499,7 +595,7 @@ impl Transaction {
         if !rest.is_empty() {
             return None;
         }
-        Some(Transaction { inputs, outputs, ops })
+        Some(Transaction { inputs, policy_inputs, outputs, ops })
     }
 }
 
@@ -516,9 +612,9 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(OUTPUT_SIZE, 72);
-        assert_eq!(INPUT_SIZE, 48 + 8 + 8 + 2312);
+        assert_eq!(INPUT_SIZE, 49 + 8 + 8 + 2312);
         assert_eq!(TREE_HEIGHT, 4);
-        assert_eq!(Key::LEAVES, 16);
+        assert_eq!(Key::generate(&[7; 32]).leaves(), 16);
     }
 
     #[test]
@@ -692,7 +788,7 @@ mod tests {
 
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());
-        assert_eq!(bytes.len(), 12 + INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>());
+        assert_eq!(bytes.len(), 16 + INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>());
         assert_eq!(Transaction::from_bytes(&bytes), Some(tx.clone()));
         assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         assert_eq!(tx.unsigned().body_hash(), tx.txid());
@@ -716,7 +812,7 @@ mod tests {
 
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());
-        assert_eq!(bytes.len(), 12 + 2 * INPUT_SIZE + 2 * OUTPUT_SIZE);
+        assert_eq!(bytes.len(), 16 + 2 * INPUT_SIZE + 2 * OUTPUT_SIZE);
         let back = Transaction::from_bytes(&bytes).unwrap();
         assert_eq!(back, tx);
         assert!(back.verify_signatures());
@@ -731,7 +827,7 @@ mod tests {
         assert!(Transaction::from_bytes(&huge).is_none());
         assert!(Transaction::from_bytes(&[]).is_none());
 
-        let empty = Transaction { inputs: vec![], outputs: vec![], ops: vec![] };
+        let empty = Transaction { inputs: vec![], policy_inputs: vec![], outputs: vec![], ops: vec![] };
         assert_eq!(Transaction::from_bytes(&empty.to_bytes()), Some(empty));
 
         let out = Output::new(&kb, 3);

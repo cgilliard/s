@@ -586,7 +586,7 @@ impl NameOp {
             + match self {
                 NameOp::Commit { .. } => 0,
                 NameOp::Reveal { .. } => DIGEST_BYTES,
-                NameOp::Update { .. } => PublicKey::SIZE + Sig::SIZE,
+                NameOp::Update { pubkey, .. } => PublicKey::SIZE + Sig::size(pubkey.height()),
             }
     }
 
@@ -614,9 +614,9 @@ impl NameOp {
             }
             BlockNameOp::Update(record) => {
                 let (pk, rest) = rest.split_at_checked(PublicKey::SIZE)?;
-                let (sig, rest) = rest.split_at_checked(Sig::SIZE)?;
                 let pubkey = PublicKey::from_bytes(pk)?;
-                let signature = Sig::from_bytes(sig)?;
+                let (sig, rest) = rest.split_at_checked(Sig::size(pubkey.height()))?;
+                let signature = Sig::from_bytes(sig, pubkey.height())?;
                 Some((NameOp::Update { record, pubkey, signature }, rest))
             }
         }
@@ -1161,6 +1161,7 @@ impl NameSet {
                     utxo.add_output(
                         wtxn,
                         &crate::block::BlockOutput { commitment: commit_leaf(commit, height), memo: *memo },
+                        height,
                     )?;
                     self.add_commit(wtxn, position, c)?;
                     undo.commits.push(c);
@@ -1239,7 +1240,7 @@ impl NameSet {
             self.unregister(wtxn, *key)?;
         }
         for (position, commit, memo) in undo.consumed.iter().rev() {
-            utxo.insert_at(wtxn, *position, &commit_leaf(&commit.hash, commit.height), memo)?;
+            utxo.insert_at(wtxn, *position, &commit_leaf(&commit.hash, commit.height), memo, commit.height)?;
             self.add_commit(wtxn, *position, *commit)?;
         }
         utxo.set_name_root(wtxn, &self.root(wtxn)?)?;
@@ -1472,7 +1473,7 @@ mod tests {
         assert_eq!(commit.size(), COMMIT_OP_SIZE);
         assert_eq!(reveal.block_op().size(), RECORD_OP_FIXED + 5 + 5);
         assert_eq!(reveal.size(), RECORD_OP_FIXED + 5 + 5 + 32);
-        assert_eq!(update.size(), RECORD_OP_FIXED + 5 + PublicKey::SIZE + Sig::SIZE);
+        assert_eq!(update.size(), RECORD_OP_FIXED + 5 + PublicKey::SIZE + Sig::size(crate::transaction::TREE_HEIGHT));
         assert_eq!(update.block_op().elements().unwrap().len(), 16);
         assert_eq!(commit.block_op().elements().unwrap().len(), 24);
 

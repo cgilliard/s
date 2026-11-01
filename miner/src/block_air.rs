@@ -58,8 +58,11 @@
 //!
 //! ```text
 //! tx_start | resume                         body sponge header; counters n_in, n_out
-//!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ileaf ilist old/new x 40 body_in0 body_in1
-//!   per output: ocm0 ocm1 oleaf olist olist2 body_out0 body_out1 body_out2 old/new x 40
+//!   per input:  [xmss rows] pkh0 pkh1 cm0 cm1 ileaf ileaf2 ilist old/new x 40 body_in0 body_in1
+//!   policy:     pstart cvs lhdr [conditions] pp0..pp3 ([xmss rows] pkh0 pkh1 psig)* pend
+//!               cm0 cm1 ileaf ileaf2 ilist old/new x 40 body_in0 body_in1
+//!   per output: ocm0 ocm1 oleaf oleaf2 olist olist2 body_out0 body_out1 body_out2 old/new x 40
+//!               [cvc cvm] [rb0 rb1 rb2]        covered outputs, and the run's end
 //!   per op:     op_body op_list
 //! tx_end                                    body digest == signed message
 //! ... more transactions ... done rows
@@ -80,18 +83,18 @@ use crate::hash_machine::{
     COL_ABSORB, COL_ACC, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_DIR, COL_LOAD, COL_PASS, COL_START, HashTraceBuilder,
     NUM_COLS as HM_COLS, eval_hash_machine,
 };
+use crate::policy::{Cond, CondWitness, LEAF_CONDS, POLICY_DEPTH, PolicyInput};
 use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute};
 use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
 use crate::stark::{Air, Builder, Trace};
 use crate::state_tree::{DEPTH, EMPTY};
 use crate::transaction::{
-    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Memo, Output, Sig, TREE_HEIGHT, Transaction, amount_fps,
+    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Memo, Output, Sig, Transaction, amount_fps,
 };
 use crate::utxo::{self, UtxoSet};
 use crate::xmss::{Digest, PUB_SEED_LEN, PublicKey};
 use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes};
 
-pub const HEIGHT: usize = TREE_HEIGHT;
 const AMOUNT_BITS: usize = 64;
 /// 16-bit limbs of amount sums: four hold an amount, six any sum of a
 /// block's amounts (fewer than `2^32` of them).
@@ -134,7 +137,51 @@ pub const T_ILEAF: usize = HM_COLS + 27;
 pub const T_OLEAF: usize = HM_COLS + 28;
 pub const T_OP_BODY: usize = HM_COLS + 29;
 pub const T_OP_LIST: usize = HM_COLS + 30;
-const NUM_TYPES: usize = 31;
+/// The second leaf row: the first's digest compressed with the creation
+/// height (see [`crate::transaction::leaf`]).
+pub const T_ILEAF2: usize = HM_COLS + 31;
+pub const T_OLEAF2: usize = HM_COLS + 32;
+// ---- policy input rows (see `docs/ELTOO.md` and `crate::policy`) ----
+/// Pass row loading the policy input's registers.
+pub const T_PSTART: usize = HM_COLS + 33;
+/// Covered-run sponge start: `[count, 0, …]`.
+pub const T_CVS: usize = HM_COLS + 34;
+/// Leaf sponge start: the header block.
+pub const T_LHDR: usize = HM_COLS + 35;
+/// Threshold header block `[mode, m, n, 0, …]`.
+pub const T_THR: usize = HM_COLS + 36;
+/// Threshold channel block.
+pub const T_CHAN: usize = HM_COLS + 37;
+/// One listed key hash.
+pub const T_KEY: usize = HM_COLS + 38;
+/// A selected key, absorbed into the keys sponge after its `key` row.
+pub const T_KSEL: usize = HM_COLS + 39;
+/// The hash lock's preimage hashed (its own permutation).
+pub const T_HL: usize = HM_COLS + 40;
+/// The hash lock block, equal to the preimage's hash.
+pub const T_HASH: usize = HM_COLS + 41;
+pub const T_AFTER: usize = HM_COLS + 42;
+pub const T_OLDER: usize = HM_COLS + 43;
+pub const T_STATE: usize = HM_COLS + 44;
+/// The covenant block: the covered digest.
+pub const T_OUTS: usize = HM_COLS + 45;
+/// The policy tree path, one row per level.
+pub const T_PP0: usize = HM_COLS + 46;
+pub const T_PP1: usize = HM_COLS + 47;
+pub const T_PP2: usize = HM_COLS + 48;
+pub const T_PP3: usize = HM_COLS + 49;
+/// A signer's key hash absorbed into the signers sponge.
+pub const T_PSIG: usize = HM_COLS + 50;
+/// Pass row ending the signatures: signers and selected keys agree.
+pub const T_PEND: usize = HM_COLS + 51;
+/// A covered output's commitment, then memo, into the covered sponge.
+pub const T_CVC: usize = HM_COLS + 52;
+pub const T_CVM: usize = HM_COLS + 53;
+/// The rebindable message over the channel, state and covered digest.
+pub const T_RB0: usize = HM_COLS + 54;
+pub const T_RB1: usize = HM_COLS + 55;
+pub const T_RB2: usize = HM_COLS + 56;
+const NUM_TYPES: usize = 57;
 // ---- xmss fragment ----
 pub const XCOLS: XCols = XCols::new(HM_COLS + NUM_TYPES);
 pub const XTYPES: XTypes = XTypes {
@@ -196,7 +243,80 @@ pub const R_OPS_LEFT: usize = R_NSP + WIDTH;
 pub const C_OPS_ZERO: usize = R_OPS_LEFT + 1;
 pub const C_OPS_INV: usize = C_OPS_ZERO + 1;
 pub const C_GO_OPS: usize = C_OPS_INV + 1;
-pub const NUM_COLS: usize = C_GO_OPS + 1;
+// ---- policy input registers ----
+/// One from the policy input's start row to the transaction's end.
+pub const R_POL: usize = C_GO_OPS + 1;
+/// One over the policy input's own rows (start to its `body_in1`).
+pub const R_PIN: usize = R_POL + 1;
+/// Policy inputs left: 0 or 1, from the transaction header.
+pub const R_POL_LEFT: usize = R_PIN + 1;
+/// `in_zero` and no policy input left: outputs may follow.
+pub const C_IN_DONE: usize = R_POL_LEFT + 1;
+/// Dispatch rows, with the covered-run detours folded in.
+pub const C_DISP: usize = C_IN_DONE + 1;
+/// The spending transaction's state number.
+pub const R_PSTATE: usize = C_DISP + 1;
+/// Outputs before the covered run, and covered outputs left.
+pub const R_CVB: usize = R_PSTATE + 1;
+pub const R_CVN: usize = R_CVB + 1;
+pub const C_CVB_ZERO: usize = R_CVN + 1;
+pub const C_CVB_INV: usize = C_CVB_ZERO + 1;
+pub const C_CVN_ZERO: usize = C_CVB_INV + 1;
+pub const C_CVN_INV: usize = C_CVN_ZERO + 1;
+/// The current output is in the covered run.
+pub const R_INRUN: usize = C_CVN_INV + 1;
+/// The spent output's creation height.
+pub const R_CREATED: usize = R_INRUN + 1;
+/// The message the signature fragment verifies: the body hash, or the
+/// rebindable message for a rebindable threshold.
+pub const R_SMSG: usize = R_CREATED + 1;
+/// The rebindable message the policy input's signatures are over.
+pub const R_RMSG: usize = R_SMSG + DIGEST;
+/// The leaf's index in the policy tree, as bits.
+pub const R_PIDX: usize = R_RMSG + DIGEST;
+/// The leaf's element count, and blocks absorbed so far.
+pub const R_LLEN: usize = R_PIDX + POLICY_DEPTH;
+pub const R_LCNT: usize = R_LLEN + 1;
+/// The leaf sponge.
+pub const R_LSP: usize = R_LCNT + 1;
+/// Conditions left, and the tags of the next conditions (the current
+/// first, shifted as conditions start).
+pub const R_NC: usize = R_LSP + WIDTH;
+pub const C_NC_ZERO: usize = R_NC + 1;
+pub const C_NC_INV: usize = C_NC_ZERO + 1;
+pub const R_TAG: usize = C_NC_INV + 1;
+/// Threshold: `m`, keys left to list, signatures left, and whether one
+/// was seen.
+pub const R_M: usize = R_TAG + LEAF_CONDS;
+pub const C_M_INV: usize = R_M + 1;
+pub const R_KREM: usize = C_M_INV + 1;
+pub const C_KLAST: usize = R_KREM + 1;
+pub const C_KLAST_INV: usize = C_KLAST + 1;
+pub const R_SREM: usize = C_KLAST_INV + 1;
+pub const C_SREM_ZERO: usize = R_SREM + 1;
+pub const C_SREM_INV: usize = C_SREM_ZERO + 1;
+pub const R_HADTHR: usize = C_SREM_INV + 1;
+/// Rebindable mode, and the channel.
+pub const R_REBIND: usize = R_HADTHR + 1;
+pub const R_CHAN: usize = R_REBIND + 1;
+/// A covenant was listed, with its covered digest; the covered run must
+/// end; it did.
+pub const R_HASCOV: usize = R_CHAN + DIGEST;
+pub const R_NEEDRUN: usize = R_HASCOV + 1;
+pub const R_RUNDONE: usize = R_NEEDRUN + 1;
+pub const R_COV: usize = R_RUNDONE + 1;
+/// The policy root, from the path.
+pub const R_PROOT: usize = R_COV + DIGEST;
+/// The selected keys and the signers sponges.
+pub const R_KSP: usize = R_PROOT + DIGEST;
+pub const R_SSP: usize = R_KSP + WIDTH;
+/// The covered-run sponge.
+pub const R_CSP: usize = R_SSP + WIDTH;
+/// The end of a condition (a next-row dependent flag).
+pub const C_CEND: usize = R_CSP + WIDTH;
+/// Plain inputs done and a policy input left.
+pub const C_GO_POL: usize = C_CEND + 1;
+pub const NUM_COLS: usize = C_GO_POL + 1;
 
 // ---- public values ----
 pub const PUB_ROOT_IN: usize = 0;
@@ -213,7 +333,9 @@ pub const PUB_SUM_IN: usize = PUB_POS_OUT + 2;
 pub const PUB_SUM_OUT: usize = PUB_SUM_IN + LIMBS;
 pub const PUB_CARRY_IN: usize = PUB_SUM_OUT + LIMBS;
 pub const PUB_CARRY_OUT: usize = PUB_CARRY_IN + CARRY_LEN;
-pub const NUM_PUBLIC: usize = PUB_CARRY_OUT + CARRY_LEN;
+/// The block's height: the creation height of every output.
+pub const PUB_HEIGHT: usize = PUB_CARRY_OUT + CARRY_LEN;
+pub const NUM_PUBLIC: usize = PUB_HEIGHT + 1;
 
 /// Layout of a carry: open flag, message, body sponge, items left.
 pub const CARRY_OPEN: usize = 0;
@@ -225,11 +347,70 @@ pub const CARRY_OPS_LEFT: usize = CARRY_OUT_LEFT + 1;
 pub const CARRY_LEN: usize = CARRY_OPS_LEFT + 1;
 
 /// Rows of one input (signature plus commitment, tree update and body).
-pub const ROWS_PER_INPUT: usize = xmss_fragment::ROWS + 5 + 1 + 2 * DEPTH + 2;
+/// Rows of an input whose key has `height`: its signature, key hash,
+/// commitment, leaf and list rows, the removal, and the body rows.
+pub const fn input_rows(height: usize) -> usize {
+    xmss_fragment::rows(height) + 6 + 1 + 2 * DEPTH + 2
+}
+/// Rows of an input by the tallest key.
+pub const ROWS_PER_INPUT: usize = input_rows(crate::xmss::MAX_HEIGHT);
 /// Rows of one output.
-pub const ROWS_PER_OUTPUT: usize = 8 + 2 * DEPTH;
+pub const ROWS_PER_OUTPUT: usize = 9 + 2 * DEPTH;
+/// Extra rows of an output in a policy input's covered run.
+pub const ROWS_PER_COVERED: usize = 2;
+/// Rows ending a covered run: the rebindable message.
+pub const ROWS_RUN_END: usize = 3;
 /// Rows of one name operation.
 pub const ROWS_PER_OP: usize = 2;
+
+/// Rows of a policy input: its start and covered-sponge rows, the leaf
+/// header, the conditions, the path, the signatures (each a fragment, the
+/// key hash and a signers row), the end row, then the commitment, leaf,
+/// list, removal and body rows as a plain input has.
+pub fn policy_rows(p: &PolicyInput) -> usize {
+    let conds: usize = p
+        .leaf
+        .conds
+        .iter()
+        .map(|c| match c {
+            Cond::Thresh { m, keys, .. } => 2 + keys.len() + *m as usize,
+            Cond::Hash(_) => 2,
+            _ => 1,
+        })
+        .sum();
+    let sigs: usize = p
+        .witness
+        .iter()
+        .filter_map(|w| match w {
+            CondWitness::Signatures(s) => {
+                Some(s.iter().map(|s| xmss_fragment::rows(s.pubkey.height()) + 3).sum::<usize>())
+            }
+            _ => None,
+        })
+        .sum();
+    3 + conds + POLICY_DEPTH + sigs + 1 + 6 + 1 + 2 * DEPTH + 2
+}
+
+/// Rows of each item of `tx`, in item order (plain inputs, the policy
+/// input, outputs, operations), and whether the transaction must stay
+/// whole in one segment (it has a policy input: the covered run and the
+/// policy's registers are not carried between segments).
+pub fn item_rows_of(tx: &Transaction) -> (Vec<usize>, bool) {
+    let mut rows: Vec<usize> = tx.inputs.iter().map(|i| input_rows(i.pubkey.height())).collect();
+    let (mut start, mut count) = (usize::MAX, 0);
+    if let Some(p) = tx.policy_inputs.first() {
+        rows.push(policy_rows(p));
+        start = p.covered.0 as usize;
+        count = p.covered.1 as usize;
+    }
+    for j in 0..tx.outputs.len() {
+        let covered = j >= start && j < start + count;
+        let last = covered && j + 1 == start + count;
+        rows.push(ROWS_PER_OUTPUT + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END);
+    }
+    rows.extend(std::iter::repeat_n(ROWS_PER_OP, tx.ops.len()));
+    (rows, !tx.policy_inputs.is_empty())
+}
 
 /// Body elements per input, output and operation (see
 /// `crate::transaction::body_elements`).
@@ -238,14 +419,25 @@ const BODY_PER_OUTPUT: u32 = 24;
 const BODY_PER_OP: u32 = 8;
 
 /// Body sponge state after a transaction's header block.
-pub fn body_init(n_in: u32, n_out: u32, n_ops: u32) -> [Fp; WIDTH] {
+pub fn body_init(n_in: u32, n_out: u32, n_ops: u32, n_policy: u32) -> [Fp; WIDTH] {
     let mut input = [Fp::ZERO; WIDTH];
     input[0] = Fp::new(n_in);
     input[1] = Fp::new(n_out);
     input[2] = Fp::new(n_ops);
-    let len = 8 + BODY_PER_INPUT * n_in + BODY_PER_OUTPUT * n_out + BODY_PER_OP * n_ops;
+    input[3] = Fp::new(n_policy);
+    let len = 8 + BODY_PER_INPUT * (n_in + n_policy) + BODY_PER_OUTPUT * n_out + BODY_PER_OP * n_ops;
     input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_BODY, len));
     permute(input)
+}
+
+/// Absorbs one policy input (its policy root, then the amount with the
+/// policy marker) into a body sponge.
+pub fn body_absorb_policy(state: &mut [Fp; WIDTH], policy: &Digest, amount: u64) {
+    absorb_block(state, policy);
+    let mut blk = [Fp::ZERO; RATE];
+    blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(amount));
+    blk[RATE - 1] = Fp::ONE;
+    absorb_block(state, &blk);
 }
 
 /// Absorbs one name operation's digest into a body sponge.
@@ -447,13 +639,32 @@ impl Air for BlockAir {
         let body_out2 = l[T_BODY_OUT2];
         let ileaf = l[T_ILEAF];
         let oleaf = l[T_OLEAF];
+        let ileaf2 = l[T_ILEAF2];
+        let oleaf2 = l[T_OLEAF2];
+        let (pstart, cvs, lhdr, thr, chan, key, ksel) =
+            (l[T_PSTART], l[T_CVS], l[T_LHDR], l[T_THR], l[T_CHAN], l[T_KEY], l[T_KSEL]);
+        let (hl, hash_t, after, older, state_t, outs) =
+            (l[T_HL], l[T_HASH], l[T_AFTER], l[T_OLDER], l[T_STATE], l[T_OUTS]);
+        let (pp0, pp1, pp2, pp3, psig, pend) = (l[T_PP0], l[T_PP1], l[T_PP2], l[T_PP3], l[T_PSIG], l[T_PEND]);
+        let (cvc, cvm, rb0, rb1, rb2) = (l[T_CVC], l[T_CVM], l[T_RB0], l[T_RB1], l[T_RB2]);
+        let (pol, pin, pol_left, inrun) = (l[R_POL], l[R_PIN], l[R_POL_LEFT], l[R_INRUN]);
+        let (pstate, cvb, cvn, created) = (l[R_PSTATE], l[R_CVB], l[R_CVN], l[R_CREATED]);
+        let (cvb_zero, cvn_zero, nc_zero, srem_zero) = (l[C_CVB_ZERO], l[C_CVN_ZERO], l[C_NC_ZERO], l[C_SREM_ZERO]);
+        let (nc, m_reg, krem, klast, srem, hadthr) = (l[R_NC], l[R_M], l[R_KREM], l[C_KLAST], l[R_SREM], l[R_HADTHR]);
+        let (rebind, hascov, needrun, rundone, cend) =
+            (l[R_REBIND], l[R_HASCOV], l[R_NEEDRUN], l[R_RUNDONE], l[C_CEND]);
+        // Leaf-sponge absorb rows: a block added to the leaf sponge register.
+        let labs = thr + chan + key + hash_t + after + older + state_t + outs;
+        let labs_next =
+            |n: &[F]| n[T_THR] + n[T_CHAN] + n[T_KEY] + n[T_HASH] + n[T_AFTER] + n[T_OLDER] + n[T_STATE] + n[T_OUTS];
         let op_body = l[T_OP_BODY];
         let op_list = l[T_OP_LIST];
         let done = l[T_DONE];
         let resume = l[T_RESUME];
         let active = l[XCOLS.active()];
         let msg: [F; DIGEST] = core::array::from_fn(|i| l[R_MSG + i]);
-        xmss_fragment::eval(b, &XCOLS, &XTYPES, &msg, n[T_PKH0]);
+        let smsg: [F; DIGEST] = core::array::from_fn(|i| l[R_SMSG + i]);
+        xmss_fragment::eval(b, &XCOLS, &XTYPES, &smsg, n[T_PKH0]);
 
         // machine op mapping
         b.assert_eq(
@@ -473,13 +684,31 @@ impl Air for BlockAir {
                 + body_out0
                 + ileaf
                 + oleaf
+                + ileaf2
+                + oleaf2
                 + op_body
-                + op_list,
+                + op_list
+                + cvs
+                + lhdr
+                + labs
+                + ksel
+                + hl
+                + pp0
+                + pp1
+                + pp2
+                + pp3
+                + psig
+                + cvc
+                + cvm
+                + rb0,
         );
-        b.assert_eq(l[COL_ABSORB], msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2);
+        b.assert_eq(
+            l[COL_ABSORB],
+            msg_abs + tree_abs + pkh1 + cm1 + body_in1 + ocm1 + olist2 + body_out1 + body_out2 + rb1 + rb2,
+        );
         b.assert_eq(l[COL_LOAD], load);
         b.assert_eq(l[COL_CHAIN], step * active);
-        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume);
+        b.assert_eq(l[COL_PASS], step * (one - active) + tx_end + done + resume + pstart + pend);
         b.assert_zero(l[COL_COMPRESS]);
         b.when_first_row(one - tx_start - resume);
         b.when_last_row(one - done);
@@ -518,9 +747,11 @@ impl Air for BlockAir {
         let go_out = l[C_GO_OUT];
         let go_ops = l[C_GO_OPS];
         let go_end = l[C_GO_END];
-        b.assert_eq(go_out, in_zero * (one - out_zero));
-        b.assert_eq(go_ops, in_zero * out_zero * (one - ops_zero));
-        b.assert_eq(go_end, in_zero * out_zero * ops_zero);
+        let in_done = l[C_IN_DONE];
+        b.assert_eq(in_done, in_zero * (one - pol_left));
+        b.assert_eq(go_out, in_done * (one - out_zero));
+        b.assert_eq(go_ops, in_done * out_zero * (one - ops_zero));
+        b.assert_eq(go_end, in_done * out_zero * ops_zero);
 
         // ---------------- schedule ----------------
         b.mark("schedule");
@@ -528,8 +759,17 @@ impl Air for BlockAir {
         // dispatch after tx_start, after an input (body_in1), after an
         // output (out_end), after an operation (op_list) and after a
         // resume; or into the done rows, leaving the transaction open.
-        let disp = tx_start + body_in1 + out_end + op_list + resume;
+        // A covered output continues into its covered rows, and the run's
+        // end into the rebindable message rows, before dispatching.
+        let disp = l[C_DISP];
+        b.assert_eq(
+            disp,
+            tx_start + body_in1 + out_end * (one - inrun) + op_list + resume + rb2 + cvm * (one - cvn_zero),
+        );
         b.when_transition(disp * (one - in_zero) * (one - nt(T_MSG_START) - nt(T_DONE)));
+        let go_pol = l[C_GO_POL];
+        b.assert_eq(go_pol, in_zero * pol_left);
+        b.when_transition(disp * go_pol * (one - nt(T_PSTART) - nt(T_DONE)));
         b.when_transition(disp * go_out * (one - nt(T_OCM0) - nt(T_DONE)));
         b.when_transition(disp * go_ops * (one - nt(T_OP_BODY) - nt(T_DONE)));
         b.when_transition(disp * go_end * (one - nt(T_TX_END) - nt(T_DONE)));
@@ -550,10 +790,12 @@ impl Air for BlockAir {
         b.when_transition(done * (one - nt(T_DONE)));
         // input tail (the signature rows are the fragment's)
         b.when_transition(pkh0 * (one - nt(T_PKH1)));
-        b.when_transition(pkh1 * (one - nt(T_CM0)));
+        b.when_transition(pkh1 * (one - pin) * (one - nt(T_CM0)));
+        b.when_transition(pkh1 * pin * (one - nt(T_PSIG)));
         b.when_transition(cm0 * (one - nt(T_CM1)));
         b.when_transition(cm1 * (one - nt(T_ILEAF)));
-        b.when_transition(ileaf * (one - nt(T_ILIST)));
+        b.when_transition(ileaf * (one - nt(T_ILEAF2)));
+        b.when_transition(ileaf2 * (one - nt(T_ILIST)));
         b.when_transition(ilist * (one - nt(T_OLD)));
         b.when_transition(ilist * n[C_LEVEL]);
         b.when_transition(old_t * (one - nt(T_NEW)));
@@ -565,7 +807,8 @@ impl Air for BlockAir {
         // output
         b.when_transition(ocm0 * (one - nt(T_OCM1)));
         b.when_transition(ocm1 * (one - nt(T_OLEAF)));
-        b.when_transition(oleaf * (one - nt(T_OLIST)));
+        b.when_transition(oleaf * (one - nt(T_OLEAF2)));
+        b.when_transition(oleaf2 * (one - nt(T_OLIST)));
         b.when_transition(olist * (one - nt(T_OLIST2)));
         b.when_transition(olist2 * (one - nt(T_BODY_OUT0)));
         b.when_transition(body_out0 * (one - nt(T_BODY_OUT1)));
@@ -578,8 +821,8 @@ impl Air for BlockAir {
         b.assert_zero(tx_start * is_out);
         b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IS_OUT] - is_out));
         // item counters
-        b.when_transition(nt(T_MSG_START) * (n[R_IN_LEFT] - in_left + one));
-        b.when_transition((one - nt(T_MSG_START) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
+        b.when_transition(nt(T_MSG_START) * (one - n[R_PIN]) * (n[R_IN_LEFT] - in_left + one));
+        b.when_transition((one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_TX_START)) * (n[R_IN_LEFT] - in_left));
         b.when_transition(nt(T_OCM0) * (n[R_OUT_LEFT] - out_left + one));
         b.when_transition((one - nt(T_OCM0) - nt(T_TX_START)) * (n[R_OUT_LEFT] - out_left));
         b.when_transition(nt(T_OP_BODY) * (n[R_OPS_LEFT] - ops_left + one));
@@ -587,6 +830,7 @@ impl Air for BlockAir {
         b.assert_zero(tx_end * in_left);
         b.assert_zero(tx_end * out_left);
         b.assert_zero(tx_end * ops_left);
+        b.assert_zero(tx_end * pol_left);
         // Carries: the open transaction's state on the resume row and at
         // the end (carried there through the done rows), zero when closed.
         let carried = |c: usize| -> F {
@@ -611,7 +855,9 @@ impl Air for BlockAir {
         let mut l16 = [F::ZERO; LIMBS];
         for (i, bit) in abits.iter().enumerate() {
             b.assert_zero(*bit * *bit - *bit);
-            b.when_transition((one - nt(T_MSG_START) - nt(T_OCM0)) * (n[R_ABITS + i] - *bit));
+            b.when_transition(
+                (one - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_OCM0) - nt(T_PSTART)) * (n[R_ABITS + i] - *bit),
+            );
             if i < 30 {
                 amt_lo += *bit * pow2::<F>(i);
             } else if i < 60 {
@@ -621,17 +867,28 @@ impl Air for BlockAir {
             }
             l16[i / 16] += *bit * pow2::<F>(i % 16);
         }
+        b.assert_zero(oleaf2 * (l[COL_INPUT + RATE] - pubv(PUB_HEIGHT)));
         for i in 0..DIGEST {
             b.when_transition((one - nt(T_TX_START)) * (n[R_MSG + i] - msg[i]));
             b.when_transition((one - nt(T_OCM0)) * (n[R_OCM + i] - l[R_OCM + i]));
-            b.when_transition((one - nt(T_OCM0) - nt(T_MSG_START)) * (n[R_MEMO + i] - l[R_MEMO + i]));
-            // Leaves: the commitment just hashed and the memo, compressed.
+            b.when_transition(
+                (one - nt(T_OCM0) - nt(T_MSG_START) * (one - n[R_PIN]) - nt(T_PSTART))
+                    * (n[R_MEMO + i] - l[R_MEMO + i]),
+            );
+            // Leaves: the commitment just hashed and the memo, compressed,
+            // then that digest compressed with the creation height: the
+            // block's (public) for an output, a witness for an input, which
+            // the tree path authenticates.
             b.when_transition(nt(T_ILEAF) * (n[COL_INPUT + i] - l[COL_ACC + i]));
             b.assert_zero(ileaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
             b.assert_zero(oleaf * (l[COL_INPUT + i] - l[R_OCM + i]));
             b.assert_zero(oleaf * (l[COL_INPUT + RATE + i] - l[R_MEMO + i]));
-            b.when_transition(oleaf * (n[R_LEAF + i] - l[COL_ACC + i]));
-            b.when_transition((one - oleaf) * (n[R_LEAF + i] - l[R_LEAF + i]));
+            b.when_transition((nt(T_ILEAF2) + nt(T_OLEAF2)) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            if i > 0 {
+                b.assert_zero((ileaf2 + oleaf2) * l[COL_INPUT + RATE + i]);
+            }
+            b.when_transition(oleaf2 * (n[R_LEAF + i] - l[COL_ACC + i]));
+            b.when_transition((one - oleaf2) * (n[R_LEAF + i] - l[R_LEAF + i]));
             // The operation digest is a witness entering its first row.
             b.when_transition((one - nt(T_OP_BODY)) * (n[R_OPD + i] - l[R_OPD + i]));
             b.assert_zero((olist2 + body_out2) * (l[COL_DATA + i] - l[R_MEMO + i]));
@@ -642,25 +899,32 @@ impl Air for BlockAir {
 
         // ---------------- key hash and commitment ----------------
         b.mark("key hash / commitment / amounts");
-        let cap_pk = cap_const::<F>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN) as u32);
+        let cap_pk = cap_const::<F>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32);
         let cap_cm = cap_const::<F>(DOM_COMMITMENT, (DIGEST + 3) as u32);
         for i in 0..RATE {
             b.when_transition(nt(T_PKH0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
-            b.when_transition(nt(T_CM0) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.when_transition(nt(T_CM0) * (one - n[R_PIN]) * (n[COL_INPUT + i] - l[COL_ACC + i]));
+            b.when_transition(nt(T_CM0) * n[R_PIN] * (n[COL_INPUT + i] - n[R_PROOT + i]));
             b.assert_zero(pkh0 * (l[COL_INPUT + RATE + i] - cap_pk[i]));
             b.assert_zero(cm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
             // An output's commitment is H(key_hash || amount) with the key
             // hash a free witness, so the amount summed is the one it hides.
             b.assert_zero(ocm0 * (l[COL_INPUT + RATE + i] - cap_cm[i]));
             b.assert_zero(ocm1 * (l[COL_ACC + i] - l[R_OCM + i]));
-            let pkh1_data = if i < PUB_SEED_LEN { pub_seed[i] } else { F::ZERO };
+            // The key hash covers the tree height: the fragment's for now.
+            let pkh1_data = match i {
+                _ if i < PUB_SEED_LEN => pub_seed[i],
+                PUB_SEED_LEN => xmss_fragment::height_value(l, &XCOLS),
+                _ => F::ZERO,
+            };
             b.assert_zero(pkh1 * (l[COL_DATA + i] - pkh1_data));
             let amt_block = [amt_lo, amt_mid, amt_hi, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
             b.assert_zero(cm1 * (l[COL_DATA + i] - amt_block[i]));
             b.assert_zero(ocm1 * (l[COL_DATA + i] - amt_block[i]));
             b.assert_zero(body_out1 * (l[COL_DATA + i] - amt_block[i]));
             let body_in1_data = [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], amt_lo, amt_mid, amt_hi, F::ZERO];
-            b.assert_zero(body_in1 * (l[COL_DATA + i] - body_in1_data[i]));
+            let body_pol_data = [F::ZERO, F::ZERO, F::ZERO, F::ZERO, amt_lo, amt_mid, amt_hi, one];
+            b.assert_zero(body_in1 * (l[COL_DATA + i] - ((one - pin) * body_in1_data[i] + pin * body_pol_data[i])));
         }
         // amount sums: zero at the start of the segment, exported at the end
         for j in 0..LIMBS {
@@ -739,10 +1003,297 @@ impl Air for BlockAir {
             b.assert_zero(new_t * (inp_hi - ((one - dir) * sib + dir * nw)));
         }
 
+        // ---------------- policy input ----------------
+        b.mark("policy input");
+        let height = pubv(PUB_HEIGHT);
+        let hold = |b: &mut Builder<'_, F>, reg: usize, len: usize, except: F| {
+            for i in 0..len {
+                b.when_transition((one - except) * (n[reg + i] - l[reg + i]));
+            }
+        };
+        let zero_at_start = |b: &mut Builder<'_, F>, reg: usize, len: usize| {
+            for i in 0..len {
+                b.when_transition(nt(T_TX_START) * n[reg + i]);
+            }
+        };
+        let is_bool = |b: &mut Builder<'_, F>, v: F| b.assert_zero(v * v - v);
+        for v in
+            [pol, pin, pol_left, inrun, cvb_zero, cvn_zero, nc_zero, srem_zero, klast, hadthr, rebind, hascov, rundone]
+        {
+            is_bool(b, v);
+        }
+        // Zero tests.
+        b.assert_eq(cvb * l[C_CVB_INV], one - cvb_zero);
+        b.assert_zero(cvb_zero * cvb);
+        b.assert_eq(cvn * l[C_CVN_INV], one - cvn_zero);
+        b.assert_zero(cvn_zero * cvn);
+        b.assert_eq(nc * l[C_NC_INV], one - nc_zero);
+        b.assert_zero(nc_zero * nc);
+        b.assert_eq(srem * l[C_SREM_INV], one - srem_zero);
+        b.assert_zero(srem_zero * srem);
+        b.assert_eq(krem * l[C_KLAST_INV], one - klast);
+        b.assert_zero(klast * krem);
+        // Flags: `pol` from the start to the transaction's end, `pin` to the
+        // input's last body row; one policy input at most, never split
+        // between segments.
+        b.when_first_row(pol);
+        b.when_first_row(pin);
+        b.when_first_row(resume * pol_left);
+        b.when_last_row(open * pol);
+        b.when_last_row(open * pol_left);
+        b.when_transition(nt(T_PSTART) * (n[R_POL] - one));
+        b.when_transition(tx_end * n[R_POL]);
+        b.when_transition((one - nt(T_PSTART) - tx_end) * (n[R_POL] - pol));
+        b.when_transition(nt(T_PSTART) * (n[R_PIN] - one));
+        b.when_transition(body_in1 * n[R_PIN]);
+        b.when_transition((one - nt(T_PSTART) - body_in1) * (n[R_PIN] - pin));
+        b.when_transition(nt(T_PSTART) * (n[R_POL_LEFT] - pol_left + one));
+        b.when_transition((one - nt(T_TX_START) - nt(T_PSTART)) * (n[R_POL_LEFT] - pol_left));
+        // Registers the start row loads, held until the next policy input.
+        for (reg, len) in
+            [(R_PSTATE, 1), (R_CREATED, 1), (R_RMSG, DIGEST), (R_PIDX, POLICY_DEPTH), (R_LLEN, 1), (R_CHAN, DIGEST)]
+        {
+            hold(b, reg, len, nt(T_PSTART));
+        }
+        for i in 0..POLICY_DEPTH {
+            is_bool(b, l[R_PIDX + i]);
+        }
+        // The signing message: the body hash outside a policy input and for
+        // body-mode thresholds, the rebindable message otherwise.
+        hold(b, R_SMSG, DIGEST, nt(T_TX_START) + nt(T_PSTART) + body_in1);
+        // (`rebind` is only ever set within a policy input.)
+        for i in 0..DIGEST {
+            b.assert_zero((one - pin) * (smsg[i] - msg[i]));
+            b.assert_zero(msg_abs * (one - rebind) * (smsg[i] - msg[i]));
+            b.assert_zero(msg_abs * rebind * (smsg[i] - l[R_RMSG + i]));
+        }
+        // A rebindable signature's leaf index is the state number.
+        let idx = (0..crate::xmss::MAX_HEIGHT).fold(F::ZERO, |a, i| a + l[XCOLS.idx(i)] * pow2::<F>(i));
+        b.assert_zero(msg_start * rebind * (idx - pstate));
+        // The covered run: counters loaded at the start, zero for a
+        // transaction without a policy input, moving as outputs begin.
+        for reg in [R_CVB, R_CVN] {
+            hold(b, reg, 1, nt(T_PSTART) + nt(T_TX_START) + nt(T_OCM0));
+        }
+        zero_at_start(b, R_CVB, 1);
+        zero_at_start(b, R_CVN, 1);
+        b.when_transition(nt(T_OCM0) * (n[R_INRUN] - cvb_zero * (one - cvn_zero)));
+        b.when_transition(nt(T_OCM0) * (n[R_CVB] - cvb + (one - cvb_zero)));
+        b.when_transition(nt(T_OCM0) * (n[R_CVN] - cvn + n[R_INRUN]));
+        hold(b, R_INRUN, 1, nt(T_OCM0) + nt(T_TX_START));
+        zero_at_start(b, R_INRUN, 1);
+        // Threshold, covenant and run flags: free entering their rows, zero
+        // for a fresh transaction.
+        for reg in [R_REBIND, R_M, R_HADTHR, R_HASCOV, R_RUNDONE] {
+            zero_at_start(b, reg, 1);
+        }
+        hold(b, R_REBIND, 1, nt(T_THR) + nt(T_TX_START));
+        hold(b, R_M, 1, nt(T_THR) + nt(T_TX_START));
+        hold(b, R_KREM, 1, nt(T_THR) + nt(T_KEY));
+        hold(b, R_SREM, 1, nt(T_THR) + nt(T_PSIG) + nt(T_TX_START));
+        zero_at_start(b, R_SREM, 1);
+        hold(b, R_HADTHR, 1, nt(T_THR) + nt(T_TX_START));
+        b.when_transition(nt(T_THR) * (n[R_HADTHR] - one));
+        b.when_transition(nt(T_THR) * hadthr);
+        hold(b, R_HASCOV, 1, nt(T_OUTS) + nt(T_TX_START));
+        b.when_transition(nt(T_OUTS) * (n[R_HASCOV] - one));
+        b.when_transition(nt(T_OUTS) * hascov);
+        hold(b, R_COV, DIGEST, nt(T_OUTS));
+        hold(b, R_RUNDONE, 1, rb2 + nt(T_TX_START));
+        b.when_transition(rb2 * (n[R_RUNDONE] - one));
+        b.assert_eq(needrun, rebind + hascov - rebind * hascov);
+        b.assert_zero(tx_end * needrun * (one - rundone));
+        // Sponges: leaf, selected keys, signers, covered run.
+        for j in 0..WIDTH {
+            b.when_transition((lhdr + labs) * (n[R_LSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - lhdr - labs) * (n[R_LSP + j] - l[R_LSP + j]));
+            b.when_transition(ksel * (n[R_KSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - ksel - nt(T_THR)) * (n[R_KSP + j] - l[R_KSP + j]));
+            b.when_transition(psig * (n[R_SSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - psig - nt(T_THR)) * (n[R_SSP + j] - l[R_SSP + j]));
+            b.when_transition((cvs + cvc + cvm) * (n[R_CSP + j] - l[COL_OUTPUT + j]));
+            b.when_transition((one - cvs - cvc - cvm) * (n[R_CSP + j] - l[R_CSP + j]));
+        }
+        // Leaf: header, element count, conditions left and their tags.
+        hold(b, R_LCNT, 1, nt(T_LHDR) + labs_next(n));
+        b.when_transition(nt(T_LHDR) * (n[R_LCNT] - one));
+        b.when_transition(labs_next(n) * (n[R_LCNT] - l[R_LCNT] - one));
+        b.when_transition(nt(T_PP0) * (l[R_LCNT] * F::from_u32(DIGEST as u32) - l[R_LLEN]));
+        let cstart_next = nt(T_THR) + nt(T_HL) + nt(T_AFTER) + nt(T_OLDER) + nt(T_STATE) + nt(T_OUTS);
+        hold(b, R_NC, 1, cstart_next + nt(T_LHDR));
+        b.when_transition(cstart_next * (n[R_NC] - nc + one));
+        for k in 0..LEAF_CONDS {
+            let next_tag = if k + 1 < LEAF_CONDS { l[R_TAG + k + 1] } else { F::ZERO };
+            b.when_transition(cstart_next * (n[R_TAG + k] - next_tag));
+            b.when_transition((one - cstart_next - nt(T_LHDR)) * (n[R_TAG + k] - l[R_TAG + k]));
+            b.assert_zero(lhdr * (l[COL_INPUT + 1 + k] - l[R_TAG + k]));
+        }
+        b.assert_zero(lhdr * (l[COL_INPUT] - nc));
+        for i in 1 + LEAF_CONDS..RATE {
+            b.assert_zero(lhdr * l[COL_INPUT + i]);
+        }
+        let cap_leaf = [
+            F::from_u32(crate::policy::DOM_POLICY_LEAF),
+            l[R_LLEN],
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        let cap_hl = cap_const::<F>(crate::policy::DOM_HASHLOCK, DIGEST as u32);
+        let cap_cv = [
+            F::from_u32(crate::policy::DOM_COVERED),
+            F::from_u32(8) + cvn * F::from_u32(16),
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        let cap_rb = cap_const::<F>(crate::policy::DOM_REBIND, (2 * DIGEST + 1) as u32);
+        let cap_signers = [
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::from_u32(crate::policy::DOM_SIGNERS),
+            m_reg * F::from_u32(DIGEST as u32),
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+            F::ZERO,
+        ];
+        // The end of a condition: dispatch to the next or to the path.
+        b.when_transition(
+            cend - (lhdr + hash_t + after + older + state_t + outs + ksel * klast + key * klast * (one - nt(T_KSEL))),
+        );
+        b.when_last_row(cend);
+        b.when_transition(cend * nc_zero * (one - nt(T_PP0)));
+        b.when_transition(cend * (one - nc_zero) * (one - cstart_next));
+        let tag_next = nt(T_THR)
+            + nt(T_HL) * F::from_u32(2)
+            + nt(T_AFTER) * F::from_u32(3)
+            + nt(T_OLDER) * F::from_u32(4)
+            + nt(T_STATE) * F::from_u32(5)
+            + nt(T_OUTS) * F::from_u32(6);
+        b.when_transition(cend * (one - nc_zero) * (l[R_TAG] - tag_next));
+        // Schedule within the policy input.
+        b.when_transition(pstart * (one - nt(T_CVS)));
+        b.when_transition(cvs * (one - nt(T_LHDR)));
+        b.when_transition(thr * (one - nt(T_CHAN)));
+        b.when_transition(chan * (one - nt(T_KEY)));
+        b.when_transition(key * (one - klast) * (one - nt(T_KEY) - nt(T_KSEL)));
+        b.when_transition(ksel * (one - klast) * (one - nt(T_KEY)));
+        b.when_transition(nt(T_KSEL) * (one - key));
+        b.when_transition(hl * (one - nt(T_HASH)));
+        b.when_transition(nt(T_HASH) * (one - hl));
+        b.when_transition(pp0 * (one - nt(T_PP1)));
+        b.when_transition(pp1 * (one - nt(T_PP2)));
+        b.when_transition(pp2 * (one - nt(T_PP3)));
+        b.when_transition(pp3 * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(pp3 * srem_zero * (one - nt(T_PEND)));
+        b.when_transition(psig * (one - srem_zero) * (one - nt(T_MSG_START)));
+        b.when_transition(psig * srem_zero * (one - nt(T_PEND)));
+        b.when_transition(nt(T_PSIG) * (one - pkh1));
+        b.when_transition(pend * (one - nt(T_CM0)));
+        b.when_transition(out_end * inrun * (one - nt(T_CVC)));
+        b.when_transition(cvc * (one - nt(T_CVM)));
+        b.when_transition(cvm * cvn_zero * (one - nt(T_RB0)));
+        b.when_transition(rb0 * (one - nt(T_RB1)));
+        b.when_transition(rb1 * (one - nt(T_RB2)));
+        // Counters moved by rows.
+        b.when_transition(nt(T_KEY) * (n[R_KREM] - krem + one));
+        b.when_transition(nt(T_PSIG) * (n[R_SREM] - srem + one));
+        // Policy root after the path; checks at the end of the signatures.
+        hold(b, R_PROOT, DIGEST, pp3);
+        b.assert_zero(pend * srem);
+        for j in 0..WIDTH {
+            b.assert_zero(pend * (l[R_KSP + j] - l[R_SSP + j]));
+            b.assert_zero(thr * (l[R_KSP + j] - cap_signers[j]));
+            b.assert_zero(thr * (l[R_SSP + j] - cap_signers[j]));
+        }
+        b.assert_zero(thr * (m_reg * l[C_M_INV] - one));
+        b.assert_zero(thr * (srem - m_reg));
+        b.assert_zero(ileaf2 * pin * (l[COL_INPUT + RATE] - created));
+        b.assert_zero(rb2 * hascov * cvn);
+        let bits_v = xmss_fragment::bits_value(l, &XCOLS);
+        for i in 0..RATE {
+            let blk = l[COL_INPUT + i] - l[R_LSP + i];
+            // Leaf rows continue the leaf sponge; the header starts it.
+            b.assert_zero(labs * (l[COL_INPUT + RATE + i] - l[R_LSP + RATE + i]));
+            b.assert_zero(lhdr * (l[COL_INPUT + RATE + i] - cap_leaf[i]));
+            // Threshold header: mode, m, n.
+            let thr_word = match i {
+                0 => rebind,
+                1 => m_reg,
+                2 => krem,
+                _ => F::ZERO,
+            };
+            b.assert_zero(thr * (blk - thr_word));
+            // Channel: the register's, zero in body mode.
+            b.assert_zero(chan * (blk - l[R_CHAN + i]));
+            b.assert_zero(chan * (one - rebind) * blk);
+            // A selected key: the key row's block, into the keys sponge.
+            b.when_transition(nt(T_KSEL) * (n[COL_INPUT + i] - n[R_KSP + i] - blk));
+            b.assert_zero(ksel * (l[COL_INPUT + RATE + i] - l[R_KSP + RATE + i]));
+            // Hash lock: the preimage's hash is the block.
+            b.assert_zero(hl * (l[COL_INPUT + RATE + i] - cap_hl[i]));
+            b.when_transition(nt(T_HASH) * (n[COL_INPUT + i] - n[R_LSP + i] - l[COL_ACC + i]));
+            // Timelocks and state: one word, non-negative differences.
+            let word = after + older + state_t;
+            if i == 0 {
+                b.assert_zero(after * (bits_v - (height - blk)));
+                b.assert_zero(older * (bits_v - (height - created - blk)));
+                b.assert_zero(state_t * (bits_v - (pstate - blk - one)));
+            } else {
+                b.assert_zero(word * blk);
+            }
+            // Covenant: the covered digest the register holds.
+            b.assert_zero(outs * (blk - l[R_COV + i]));
+            // Signers: the key hash just computed, into the signers sponge.
+            b.when_transition(nt(T_PSIG) * (n[COL_INPUT + i] - n[R_SSP + i] - l[COL_ACC + i]));
+            b.assert_zero(psig * (l[COL_INPUT + RATE + i] - l[R_SSP + RATE + i]));
+            // Policy path: compress the node with its sibling by the index
+            // bit, starting from the leaf sponge's digest (the last leaf row
+            // may be followed by a selected key's row).
+            for (k, pp_next) in [nt(T_PP0), nt(T_PP1), nt(T_PP2), nt(T_PP3)].into_iter().enumerate() {
+                let bit = n[R_PIDX + k];
+                let node = if k == 0 { n[R_LSP + i] } else { l[COL_ACC + i] };
+                b.when_transition(pp_next * (n[COL_INPUT + i] - ((one - bit) * node + bit * n[R_SIB + i])));
+                b.when_transition(pp_next * (n[COL_INPUT + RATE + i] - (bit * node + (one - bit) * n[R_SIB + i])));
+            }
+            b.when_transition(pp3 * (n[R_PROOT + i] - l[COL_ACC + i]));
+            // Covered run: its count, then each covered output's commitment and memo.
+            let cvs_word = if i == 0 { cvn } else { F::ZERO };
+            b.assert_zero(cvs * (l[COL_INPUT + i] - cvs_word));
+            b.assert_zero(cvs * (l[COL_INPUT + RATE + i] - cap_cv[i]));
+            b.assert_zero(cvc * (l[COL_INPUT + i] - l[R_CSP + i] - l[R_OCM + i]));
+            b.assert_zero(cvc * (l[COL_INPUT + RATE + i] - l[R_CSP + RATE + i]));
+            b.assert_zero(cvm * (l[COL_INPUT + i] - l[R_CSP + i] - l[R_MEMO + i]));
+            b.assert_zero(cvm * (l[COL_INPUT + RATE + i] - l[R_CSP + RATE + i]));
+            // The rebindable message: channel, state and the covered digest.
+            b.assert_zero(rb0 * (l[COL_INPUT + i] - l[R_CHAN + i]));
+            b.assert_zero(rb0 * (l[COL_INPUT + RATE + i] - cap_rb[i]));
+            let rb1_word = if i == 0 { pstate } else { l[R_CSP + i - 1] };
+            b.assert_zero(rb1 * (l[COL_DATA + i] - rb1_word));
+            let rb2_word = if i == 0 { l[R_CSP + RATE - 1] } else { F::ZERO };
+            b.assert_zero(rb2 * (l[COL_DATA + i] - rb2_word));
+            b.assert_zero(rb2 * rebind * (l[COL_ACC + i] - l[R_RMSG + i]));
+            b.assert_zero(rb2 * hascov * (l[R_CSP + i] - l[R_COV + i]));
+        }
         // ---------------- register sponges: body, inputs, outputs, operations ----------------
         b.mark("register sponges");
         let body_len = F::from_u32(8)
-            + in_left * F::from_u32(BODY_PER_INPUT)
+            + (in_left + pol_left) * F::from_u32(BODY_PER_INPUT)
             + out_left * F::from_u32(BODY_PER_OUTPUT)
             + ops_left * F::from_u32(BODY_PER_OP);
         let bsp_rows = tx_start + body_in0 + body_in1 + body_out0 + body_out1 + body_out2 + op_body;
@@ -769,13 +1320,16 @@ impl Air for BlockAir {
                 0 => in_left,
                 1 => out_left,
                 2 => ops_left,
+                3 => pol_left,
                 _ => F::ZERO,
             };
             b.assert_zero(tx_start * (l[COL_INPUT + i] - header));
             let cap_body = [F::from_u32(DOM_BODY), body_len, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO, F::ZERO];
             b.assert_zero(tx_start * (l[COL_INPUT + RATE + i] - cap_body[i]));
             // body_in0 / body_out0 / olist0 / ilist: start rows continuing a register sponge
-            b.assert_zero(body_in0 * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_PKROOT + i]));
+            b.assert_zero(
+                body_in0 * (l[COL_INPUT + i] - l[R_BSP + i] - ((one - pin) * l[R_PKROOT + i] + pin * l[R_PROOT + i])),
+            );
             b.assert_zero(body_in0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
             b.assert_zero(body_out0 * (l[COL_INPUT + i] - l[R_BSP + i] - l[R_OCM + i]));
             b.assert_zero(body_out0 * (l[COL_INPUT + RATE + i] - l[R_BSP + RATE + i]));
@@ -811,6 +1365,8 @@ pub struct InputWitness {
     pub amount: u64,
     /// Memo of the output being spent, part of its leaf.
     pub memo: Memo,
+    /// Creation height of the output being spent, part of its leaf.
+    pub height: u32,
     pub signature: Sig,
     pub position: u64,
     pub siblings: [Digest; DEPTH],
@@ -822,11 +1378,36 @@ pub struct OutputWitness {
     pub siblings: [Digest; DEPTH],
 }
 
+/// A policy input (see [`crate::policy`]) with what the prover reads from
+/// the state: the spent output's memo and creation height, its tree path,
+/// and the rebindable message its signatures are over (zero when none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyWitness {
+    pub input: PolicyInput,
+    pub memo: Memo,
+    pub created: u32,
+    pub siblings: [Digest; DEPTH],
+    pub rmsg: Digest,
+}
+
+impl PolicyWitness {
+    /// The threshold's mode: rebindable with its channel, if the leaf has
+    /// a threshold in that mode.
+    fn rebind_channel(&self) -> Option<Digest> {
+        self.input.leaf.conds.iter().find_map(|c| match c {
+            Cond::Thresh { mode: crate::policy::Mode::Rebindable { channel }, .. } => Some(*channel),
+            _ => None,
+        })
+    }
+}
+
 /// The part of one transaction that a segment proves: some of its items,
 /// in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxWitness {
     pub inputs: Vec<InputWitness>,
+    /// The policy input, in a part that holds the whole transaction.
+    pub policy: Option<PolicyWitness>,
     pub outputs: Vec<OutputWitness>,
     /// Digests of the name operations in this part.
     pub ops: Vec<Digest>,
@@ -837,6 +1418,8 @@ pub struct TxWitness {
     pub in_left: u32,
     pub out_left: u32,
     pub ops_left: u32,
+    /// Policy inputs of the transaction from this part on: 0 or 1.
+    pub pol_left: u32,
     /// The body sponge state when this part resumes a transaction begun in
     /// an earlier segment; `None` when it starts the transaction.
     pub resume: Option<[Fp; WIDTH]>,
@@ -848,8 +1431,18 @@ impl TxWitness {
     /// Trace rows of this part: a start or resume row, the items, and the
     /// end row if it ends here.
     pub fn num_rows(&self) -> usize {
-        1 + self.inputs.len() * ROWS_PER_INPUT
-            + self.outputs.len() * ROWS_PER_OUTPUT
+        let (start, count) =
+            self.policy.as_ref().map_or((usize::MAX, 0), |p| (p.input.covered.0 as usize, p.input.covered.1 as usize));
+        let outputs: usize = (0..self.outputs.len())
+            .map(|j| {
+                let covered = j >= start && j < start + count;
+                let last = covered && j + 1 == start + count;
+                ROWS_PER_OUTPUT + usize::from(covered) * ROWS_PER_COVERED + usize::from(last) * ROWS_RUN_END
+            })
+            .sum();
+        1 + self.inputs.iter().map(|i| input_rows(i.pubkey.height())).sum::<usize>()
+            + self.policy.as_ref().map_or(0, |p| policy_rows(&p.input))
+            + outputs
             + self.ops.len() * ROWS_PER_OP
             + usize::from(self.ends)
     }
@@ -917,6 +1510,7 @@ pub struct SegmentPublic {
     pub sum_out: [u32; LIMBS],
     pub carry_in: Carry,
     pub carry_out: Carry,
+    pub height: u32,
 }
 
 impl SegmentPublic {
@@ -938,6 +1532,7 @@ impl SegmentPublic {
         v.extend(self.sum_out.iter().map(|x| Fp::new(*x)));
         self.carry_in.push_values(&mut v);
         self.carry_out.push_values(&mut v);
+        v.push(Fp::new(self.height));
         v
     }
 
@@ -969,6 +1564,7 @@ impl SegmentPublic {
             sum_out: sums(PUB_SUM_OUT),
             carry_in: Carry::from_values(&v[PUB_CARRY_IN..PUB_CARRY_IN + CARRY_LEN])?,
             carry_out: Carry::from_values(&v[PUB_CARRY_OUT..PUB_CARRY_OUT + CARRY_LEN])?,
+            height: v[PUB_HEIGHT].to_canonical(),
         })
     }
 
@@ -981,6 +1577,8 @@ impl SegmentPublic {
 /// Everything needed to prove one segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentWitness {
+    /// The block's height: the creation height of its outputs.
+    pub height: u32,
     pub root_in: Digest,
     pub isp_in: [Fp; WIDTH],
     pub osp_in: [Fp; WIDTH],
@@ -998,33 +1596,32 @@ pub struct Part {
     pub end: usize,
 }
 
-/// Trace rows of item `k` of a transaction with `n_in` inputs and `n_out`
-/// outputs.
-fn item_rows(k: usize, n_in: usize, n_out: usize) -> usize {
-    if k < n_in {
-        ROWS_PER_INPUT
-    } else if k < n_in + n_out {
-        ROWS_PER_OUTPUT
-    } else {
-        ROWS_PER_OP
-    }
-}
-
 /// Packs transactions into segments of `max_rows` trace rows (one kept
 /// for padding), greedily and splitting a transaction between items when
 /// it does not fit what is left of a segment. Each segment lists its
-/// parts in order. `items(t)` gives transaction `t`'s input, output and
-/// operation counts.
-pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize, usize), max_rows: usize) -> Vec<Vec<Part>> {
+/// parts in order. `items(t)` gives the rows of each of transaction `t`'s
+/// items ([`item_rows_of`]) and whether it must stay whole.
+pub fn pack(num_txs: usize, items: impl Fn(usize) -> (Vec<usize>, bool), max_rows: usize) -> Vec<Vec<Part>> {
     let cap = max_rows - 1;
     let mut segments = Vec::new();
     let mut cur: Vec<Part> = Vec::new();
     let mut rows = 0;
     for tx in 0..num_txs {
-        let (n_in, n_out, n_ops) = items(tx);
-        let n = n_in + n_out + n_ops;
+        let (item_rows, whole) = items(tx);
+        let n = item_rows.len();
+        if whole {
+            let total = 2 + item_rows.iter().sum::<usize>();
+            assert!(total <= cap, "a transaction with a policy input does not fit a segment of {max_rows} rows");
+            if rows + total > cap {
+                segments.push(std::mem::take(&mut cur));
+                rows = 0;
+            }
+            cur.push(Part { tx, start: 0, end: n });
+            rows += total;
+            continue;
+        }
         // Rows item k needs, with the end row after the last item.
-        let cost = |k: usize| item_rows(k, n_in, n_out) + usize::from(k + 1 == n);
+        let cost = |k: usize| item_rows[k] + usize::from(k + 1 == n);
         let mut k = 0;
         loop {
             // A part needs its start (or resume) row and its first item,
@@ -1038,7 +1635,7 @@ pub fn pack(num_txs: usize, items: impl Fn(usize) -> (usize, usize, usize), max_
             let start = k;
             rows += 1;
             while k < n && rows + cost(k) <= cap {
-                rows += item_rows(k, n_in, n_out);
+                rows += item_rows[k];
                 k += 1;
             }
             cur.push(Part { tx, start, end: k });
@@ -1067,14 +1664,19 @@ impl SegmentWitness {
         wtxn: &mut heed::RwTxn,
         txs: &[Transaction],
         txs_per_segment: usize,
+        height: u32,
     ) -> utxo::Result<Vec<SegmentWitness>> {
         assert!(txs_per_segment > 0);
         let parts: Vec<Part> = txs
             .iter()
             .enumerate()
-            .map(|(t, tx)| Part { tx: t, start: 0, end: tx.inputs.len() + tx.outputs.len() + tx.ops.len() })
+            .map(|(t, tx)| Part {
+                tx: t,
+                start: 0,
+                end: tx.inputs.len() + tx.policy_inputs.len() + tx.outputs.len() + tx.ops.len(),
+            })
             .collect();
-        Self::collect_parts(utxo, wtxn, txs, parts.chunks(txs_per_segment).map(|c| c.to_vec()).collect())
+        Self::collect_parts(utxo, wtxn, txs, parts.chunks(txs_per_segment).map(|c| c.to_vec()).collect(), height)
     }
 
     /// As [`SegmentWitness::collect`], packed by [`pack`] into segments of
@@ -1084,9 +1686,10 @@ impl SegmentWitness {
         wtxn: &mut heed::RwTxn,
         txs: &[Transaction],
         max_rows: usize,
+        height: u32,
     ) -> utxo::Result<Vec<SegmentWitness>> {
-        let plan = pack(txs.len(), |t| (txs[t].inputs.len(), txs[t].outputs.len(), txs[t].ops.len()), max_rows);
-        Self::collect_parts(utxo, wtxn, txs, plan)
+        let plan = pack(txs.len(), |t| item_rows_of(&txs[t]), max_rows);
+        Self::collect_parts(utxo, wtxn, txs, plan, height)
     }
 
     /// Applies the parts of `txs` in order, one segment per entry of
@@ -1097,6 +1700,7 @@ impl SegmentWitness {
         wtxn: &mut heed::RwTxn,
         txs: &[Transaction],
         segments: Vec<Vec<Part>>,
+        height: u32,
     ) -> utxo::Result<Vec<SegmentWitness>> {
         let mut isp = initial_inputs_state();
         let mut osp = initial_outputs_state();
@@ -1110,22 +1714,48 @@ impl SegmentWitness {
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
                 let tx = &txs[part.tx];
-                let (n_in, n_out, n_ops) = (tx.inputs.len(), tx.outputs.len(), tx.ops.len());
-                assert!(part.start <= part.end && part.end <= n_in + n_out + n_ops, "part out of range");
+                assert!(tx.policy_inputs.len() <= 1, "one policy input per transaction");
+                let (n_in, n_pol, n_out, n_ops) =
+                    (tx.inputs.len(), tx.policy_inputs.len(), tx.outputs.len(), tx.ops.len());
+                assert!(part.start <= part.end && part.end <= n_in + n_pol + n_out + n_ops, "part out of range");
+                assert!(
+                    n_pol == 0 || (part.start == 0 && part.end == n_in + n_pol + n_out + n_ops),
+                    "a policy spend stays whole"
+                );
                 let resume = if part.start == 0 {
-                    bsp = body_init(n_in as u32, n_out as u32, n_ops as u32);
+                    bsp = body_init(n_in as u32, n_out as u32, n_ops as u32, n_pol as u32);
                     None
                 } else {
                     Some(bsp)
                 };
                 let mut inputs = Vec::new();
+                let mut policy = None;
                 let mut outputs = Vec::new();
                 let mut ops = Vec::new();
                 for k in part.start..part.end {
+                    if k >= n_in && k < n_in + n_pol {
+                        let p = &tx.policy_inputs[k - n_in];
+                        let (c, memo, created) = utxo.output_at(wtxn, p.position)?.ok_or(utxo::Error::CorruptIndex)?;
+                        if c != p.commitment() || !utxo.spend_at(wtxn, &c, p.position)? {
+                            return Err(utxo::Error::CorruptIndex);
+                        }
+                        let proof = utxo.prove(wtxn, p.position)?;
+                        absorb_position(&mut isp, p.position);
+                        body_absorb_policy(&mut bsp, &p.policy(), p.amount);
+                        let covered = p.covered_outputs(&tx.outputs).unwrap_or_default();
+                        let mut w =
+                            PolicyWitness { input: p.clone(), memo, created, siblings: proof.siblings, rmsg: EMPTY };
+                        if let Some(channel) = w.rebind_channel() {
+                            w.rmsg = crate::policy::rebind_message(&channel, p.state, &covered);
+                        }
+                        policy = Some(w);
+                        continue;
+                    }
+                    let k = if k > n_in { k - n_pol } else { k };
                     if k < n_in {
                         let inp = &tx.inputs[k];
                         let (commitment, position) = (inp.commitment(), inp.position);
-                        let memo = utxo.memo(wtxn, position)?;
+                        let (_, memo, created) = utxo.output_at(wtxn, position)?.ok_or(utxo::Error::CorruptIndex)?;
                         if !utxo.spend_at(wtxn, &commitment, position)? {
                             return Err(utxo::Error::CorruptIndex);
                         }
@@ -1137,6 +1767,7 @@ impl SegmentWitness {
                             pubkey: inp.pubkey,
                             amount: inp.amount,
                             memo,
+                            height: created,
                             signature: inp.signature.clone(),
                             position,
                             siblings: proof.siblings,
@@ -1145,7 +1776,7 @@ impl SegmentWitness {
                         let o = &tx.outputs[k - n_in];
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
-                        utxo.add_output(wtxn, &o.block_output())?;
+                        utxo.add_output(wtxn, &o.block_output(), height)?;
                         absorb_output(&mut osp, &o.commitment, &o.memo);
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
@@ -1158,23 +1789,28 @@ impl SegmentWitness {
                 }
                 out.push(TxWitness {
                     inputs,
+                    policy,
                     outputs,
                     ops,
                     message: tx.body_hash(),
                     in_left: n_in.saturating_sub(part.start) as u32,
-                    out_left: n_out.saturating_sub(part.start.saturating_sub(n_in)) as u32,
-                    ops_left: (n_ops - part.start.saturating_sub(n_in + n_out)) as u32,
+                    out_left: n_out.saturating_sub(part.start.saturating_sub(n_in + n_pol)) as u32,
+                    ops_left: (n_ops - part.start.saturating_sub(n_in + n_pol + n_out)) as u32,
+                    pol_left: n_pol.saturating_sub(part.start.saturating_sub(n_in)) as u32,
                     resume,
-                    ends: part.end == n_in + n_out + n_ops,
+                    ends: part.end == n_in + n_pol + n_out + n_ops,
                 });
             }
-            out_segments.push(SegmentWitness { root_in, isp_in, osp_in, nsp_in, pos_in, txs: out });
+            out_segments.push(SegmentWitness { height, root_in, isp_in, osp_in, nsp_in, pos_in, txs: out });
         }
         Ok(out_segments)
     }
 
     pub fn positions(&self) -> Vec<u64> {
-        self.txs.iter().flat_map(|t| t.inputs.iter().map(|i| i.position)).collect()
+        self.txs
+            .iter()
+            .flat_map(|t| t.inputs.iter().map(|i| i.position).chain(t.policy.iter().map(|p| p.input.position)))
+            .collect()
     }
 
     pub fn outputs(&self) -> Vec<Output> {
@@ -1199,7 +1835,7 @@ impl SegmentWitness {
 
 /// Trace rows a transaction occupies in a segment.
 pub fn tx_rows(tx: &Transaction) -> usize {
-    2 + tx.inputs.len() * ROWS_PER_INPUT + tx.outputs.len() * ROWS_PER_OUTPUT + tx.ops.len() * ROWS_PER_OP
+    2 + item_rows_of(tx).0.iter().sum::<usize>()
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,9 +1869,56 @@ struct Regs {
     opd: Digest,
     nsp: [Fp; WIDTH],
     ops_left: u32,
+    // policy input
+    pol: bool,
+    pin: bool,
+    pol_left: u32,
+    pstate: u32,
+    cvb: u32,
+    cvn: u32,
+    inrun: bool,
+    created: u32,
+    smsg: Digest,
+    rmsg: Digest,
+    pidx: usize,
+    llen: u32,
+    lcnt: u32,
+    lsp: [Fp; WIDTH],
+    nc: u32,
+    tags: [u32; LEAF_CONDS],
+    m: u32,
+    krem: u32,
+    srem: u32,
+    hadthr: bool,
+    rebind: bool,
+    chan: Digest,
+    hascov: bool,
+    rundone: bool,
+    cov: Digest,
+    proot: Digest,
+    ksp: [Fp; WIDTH],
+    ssp: [Fp; WIDTH],
+    csp: [Fp; WIDTH],
 }
 
 impl Regs {
+    /// Clears the policy registers a transaction start resets; the rest
+    /// hold their last values until the rows that set them.
+    fn reset_policy(&mut self) {
+        self.pol = false;
+        self.pin = false;
+        self.pol_left = 0;
+        self.cvb = 0;
+        self.cvn = 0;
+        self.inrun = false;
+        self.rebind = false;
+        self.m = 0;
+        self.srem = 0;
+        self.hadthr = false;
+        self.hascov = false;
+        self.rundone = false;
+    }
+
     fn write(&self, row: &mut [Fp]) {
         self.xmss.write(row, &XCOLS);
         self.write_rest(row);
@@ -1287,14 +1970,77 @@ impl Regs {
         row[R_OPS_LEFT] = Fp::new(self.ops_left);
         row[C_OPS_ZERO] = Fp::new(ops_zero as u32);
         row[C_OPS_INV] = if ops_zero { Fp::ZERO } else { Fp::new(self.ops_left).inverse().unwrap() };
-        row[C_GO_OUT] = Fp::new((in_zero && !out_zero) as u32);
-        row[C_GO_OPS] = Fp::new((in_zero && out_zero && !ops_zero) as u32);
-        row[C_GO_END] = Fp::new((in_zero && out_zero && ops_zero) as u32);
+        let in_done = in_zero && self.pol_left == 0;
+        row[C_GO_OUT] = Fp::new((in_done && !out_zero) as u32);
+        row[C_GO_OPS] = Fp::new((in_done && out_zero && !ops_zero) as u32);
+        row[C_GO_END] = Fp::new((in_done && out_zero && ops_zero) as u32);
         row[R_OPEN] = Fp::new(self.open as u32);
         row[R_MEMO..R_MEMO + DIGEST].copy_from_slice(&self.memo);
         row[R_LEAF..R_LEAF + DIGEST].copy_from_slice(&self.leaf);
         row[R_OPD..R_OPD + DIGEST].copy_from_slice(&self.opd);
         row[R_NSP..R_NSP + WIDTH].copy_from_slice(&self.nsp);
+        // policy input
+        let zero_test = |row: &mut [Fp], v: u32, zero_col: usize, inv_col: usize| {
+            row[zero_col] = Fp::new((v == 0) as u32);
+            row[inv_col] = if v == 0 { Fp::ZERO } else { Fp::new(v).inverse().unwrap() };
+        };
+        row[R_POL] = Fp::new(self.pol as u32);
+        row[R_PIN] = Fp::new(self.pin as u32);
+        row[R_POL_LEFT] = Fp::new(self.pol_left);
+        row[C_IN_DONE] = Fp::new((in_zero && self.pol_left == 0) as u32);
+        row[C_GO_POL] = Fp::new((in_zero && self.pol_left != 0) as u32);
+        row[R_PSTATE] = Fp::new(self.pstate);
+        row[R_CVB] = Fp::new(self.cvb);
+        row[R_CVN] = Fp::new(self.cvn);
+        zero_test(row, self.cvb, C_CVB_ZERO, C_CVB_INV);
+        zero_test(row, self.cvn, C_CVN_ZERO, C_CVN_INV);
+        row[R_INRUN] = Fp::new(self.inrun as u32);
+        row[R_CREATED] = Fp::new(self.created);
+        row[R_SMSG..R_SMSG + DIGEST].copy_from_slice(&self.smsg);
+        row[R_RMSG..R_RMSG + DIGEST].copy_from_slice(&self.rmsg);
+        for i in 0..POLICY_DEPTH {
+            row[R_PIDX + i] = Fp::new(((self.pidx >> i) & 1) as u32);
+        }
+        row[R_LLEN] = Fp::new(self.llen);
+        row[R_LCNT] = Fp::new(self.lcnt);
+        row[R_LSP..R_LSP + WIDTH].copy_from_slice(&self.lsp);
+        row[R_NC] = Fp::new(self.nc);
+        zero_test(row, self.nc, C_NC_ZERO, C_NC_INV);
+        for k in 0..LEAF_CONDS {
+            row[R_TAG + k] = Fp::new(self.tags[k]);
+        }
+        row[R_M] = Fp::new(self.m);
+        row[C_M_INV] = if self.m == 0 { Fp::ZERO } else { Fp::new(self.m).inverse().unwrap() };
+        row[R_KREM] = Fp::new(self.krem);
+        zero_test(row, self.krem, C_KLAST, C_KLAST_INV);
+        row[R_SREM] = Fp::new(self.srem);
+        zero_test(row, self.srem, C_SREM_ZERO, C_SREM_INV);
+        row[R_HADTHR] = Fp::new(self.hadthr as u32);
+        row[R_REBIND] = Fp::new(self.rebind as u32);
+        row[R_CHAN..R_CHAN + DIGEST].copy_from_slice(&self.chan);
+        row[R_HASCOV] = Fp::new(self.hascov as u32);
+        row[R_NEEDRUN] = Fp::new((self.rebind || self.hascov) as u32);
+        row[R_RUNDONE] = Fp::new(self.rundone as u32);
+        row[R_COV..R_COV + DIGEST].copy_from_slice(&self.cov);
+        row[R_PROOT..R_PROOT + DIGEST].copy_from_slice(&self.proot);
+        row[R_KSP..R_KSP + WIDTH].copy_from_slice(&self.ksp);
+        row[R_SSP..R_SSP + WIDTH].copy_from_slice(&self.ssp);
+        row[R_CSP..R_CSP + WIDTH].copy_from_slice(&self.csp);
+        // Dispatch rows: a covered output and the run's end detour first.
+        let out_end = row[C_OUT_END] == Fp::ONE;
+        let disp = row[T_TX_START] == Fp::ONE
+            || row[T_BODY_IN1] == Fp::ONE
+            || (out_end && !self.inrun)
+            || row[T_OP_LIST] == Fp::ONE
+            || row[T_RESUME] == Fp::ONE
+            || row[T_RB2] == Fp::ONE
+            || (row[T_CVM] == Fp::ONE && self.cvn != 0);
+        row[C_DISP] = Fp::new(disp as u32);
+        // Condition ends that do not depend on the next row; a key row's is
+        // set by the generator.
+        let cend = [T_LHDR, T_HASH, T_AFTER, T_OLDER, T_STATE, T_OUTS].iter().any(|&t| row[t] == Fp::ONE)
+            || (row[T_KSEL] == Fp::ONE && self.krem == 0);
+        row[C_CEND] = Fp::new(cend as u32);
     }
 }
 
@@ -1315,6 +2061,8 @@ fn amt_block(amount: u64) -> [Fp; RATE] {
 struct Gen {
     b: HashTraceBuilder,
     regs: Regs,
+    /// The block's height: every output's creation height.
+    height: u32,
 }
 
 impl Gen {
@@ -1331,8 +2079,9 @@ impl Gen {
         self.b.state()
     }
 
-    /// A leaf row: the commitment and the memo register compressed.
-    fn leaf_row(&mut self, commitment: Digest, ty: usize) -> Digest {
+    /// The leaf rows: the commitment and the memo register compressed
+    /// (`ty`), then that compressed with the creation height (`ty2`).
+    fn leaf_rows(&mut self, commitment: Digest, height: u32, ty: usize, ty2: usize) -> Digest {
         let mut input = [Fp::ZERO; WIDTH];
         input[..DIGEST].copy_from_slice(&commitment);
         input[DIGEST..].copy_from_slice(&self.regs.memo);
@@ -1340,8 +2089,16 @@ impl Gen {
         let row = self.b.last_row_mut();
         row[ty] = Fp::ONE;
         self.regs.write(row);
+        let inner = self.b.acc();
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..DIGEST].copy_from_slice(&inner);
+        input[DIGEST..].copy_from_slice(&crate::transaction::height_digest(height));
+        self.b.start(input);
+        let row = self.b.last_row_mut();
+        row[ty2] = Fp::ONE;
+        self.regs.write(row);
         let leaf = self.b.acc();
-        debug_assert_eq!(leaf, crate::transaction::leaf(&commitment, &self.regs.memo));
+        debug_assert_eq!(leaf, crate::transaction::leaf(&commitment, &self.regs.memo, height));
         leaf
     }
 
@@ -1397,7 +2154,7 @@ impl Gen {
         r.amount = w.amount;
         r.is_out = false;
         r.in_left -= 1;
-        let msg = r.msg;
+        let msg = r.smsg;
 
         // the signature
         let mut xr = self.regs.xmss.clone();
@@ -1418,7 +2175,7 @@ impl Gen {
         // key hash and commitment
         let mut input = [Fp::ZERO; WIDTH];
         input[..RATE].copy_from_slice(&root);
-        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN) as u32));
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
         self.b.start(input);
         {
             let row = self.b.last_row_mut();
@@ -1427,6 +2184,7 @@ impl Gen {
         }
         let mut seed_block = [Fp::ZERO; RATE];
         seed_block[..PUB_SEED_LEN].copy_from_slice(&ps);
+        seed_block[PUB_SEED_LEN] = Fp::new(w.pubkey.height as u32);
         self.absorb(seed_block, T_PKH1);
         let pkh = self.b.acc();
         let mut input = [Fp::ZERO; WIDTH];
@@ -1443,7 +2201,7 @@ impl Gen {
         for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(w.amount)) {
             *acc += limb.to_canonical();
         }
-        let leaf = self.leaf_row(commitment, T_ILEAF);
+        let leaf = self.leaf_rows(commitment, w.height, T_ILEAF, T_ILEAF2);
 
         // inputs list row, then the removal
         self.regs.old = leaf;
@@ -1469,9 +2227,323 @@ impl Gen {
         self.regs.bsp = out;
     }
 
+    /// A leaf-sponge row: `block` added to the leaf sponge register.
+    fn leaf_absorb(&mut self, block: [Fp; RATE], ty: usize) {
+        let lsp = self.regs.lsp;
+        self.regs.lcnt += 1;
+        let out = self.sponge_start(lsp, block, ty);
+        self.regs.lsp = out;
+    }
+
+    /// The key hash rows after a signature: the fragment's root hashed with
+    /// the public seed and tree height. Returns the key hash.
+    fn key_hash_rows(&mut self, root: Digest, pk: &PublicKey) -> Digest {
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&root);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_PUBKEY, (DIGEST + PUB_SEED_LEN + 1) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_PKH0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let mut seed_block = [Fp::ZERO; RATE];
+        seed_block[..PUB_SEED_LEN].copy_from_slice(&pk.pub_seed);
+        seed_block[PUB_SEED_LEN] = Fp::new(pk.height as u32);
+        self.absorb(seed_block, T_PKH1);
+        self.b.acc()
+    }
+
+    /// One signature's rows: the fragment, then the key hash rows.
+    fn signature_rows(&mut self, sig: &Sig, pk: &PublicKey) -> Digest {
+        let msg = self.regs.smsg;
+        let mut xr = self.regs.xmss.clone();
+        let regs = &self.regs;
+        let root = xmss_fragment::generate(&mut self.b, &mut xr, &XCOLS, &XTYPES, &msg, sig, pk, &mut |row, _| {
+            regs.write_rest(row)
+        });
+        self.regs.xmss = xr;
+        self.regs.pkroot = root;
+        self.key_hash_rows(root, pk)
+    }
+
+    fn policy(&mut self, w: &PolicyWitness) {
+        let p = &w.input;
+        let blocks = p.leaf.blocks();
+        let channel = w.rebind_channel();
+        let height = self.height;
+        {
+            let r = &mut self.regs;
+            r.pol = true;
+            r.pin = true;
+            r.pol_left -= 1;
+            r.memo = w.memo;
+            r.amount = p.amount;
+            r.is_out = false;
+            r.pstate = p.state;
+            r.cvb = p.covered.0 as u32;
+            r.cvn = p.covered.1 as u32;
+            r.created = w.created;
+            r.rmsg = w.rmsg;
+            r.pidx = p.index as usize;
+            r.llen = (blocks.len() * DIGEST) as u32;
+            r.chan = channel.unwrap_or(EMPTY);
+            r.smsg = if channel.is_some() { w.rmsg } else { r.msg };
+        }
+        // start
+        self.b.pass();
+        {
+            let row = self.b.last_row_mut();
+            row[T_PSTART] = Fp::ONE;
+            self.regs.write(row);
+        }
+        // the covered-run sponge: the count block
+        let cvn = self.regs.cvn;
+        let mut input = [Fp::ZERO; WIDTH];
+        input[0] = Fp::new(cvn);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::policy::DOM_COVERED, 8 + 16 * cvn));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_CVS] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.csp = self.b.state();
+        // the leaf header
+        let header = blocks[0];
+        {
+            let r = &mut self.regs;
+            r.nc = p.leaf.conds.len() as u32;
+            for k in 0..LEAF_CONDS {
+                r.tags[k] = header[1 + k].to_canonical();
+            }
+            r.lcnt = 1;
+        }
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&header);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::policy::DOM_POLICY_LEAF, self.regs.llen));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_LHDR] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.regs.lsp = self.b.state();
+        // the conditions
+        let mut bi = 1;
+        for (cond, wit) in p.leaf.conds.iter().zip(&p.witness) {
+            {
+                let r = &mut self.regs;
+                r.nc -= 1;
+                for k in 0..LEAF_CONDS - 1 {
+                    r.tags[k] = r.tags[k + 1];
+                }
+                r.tags[LEAF_CONDS - 1] = 0;
+            }
+            match (cond, wit) {
+                (Cond::Thresh { mode, m, keys }, CondWitness::Signatures(signers)) => {
+                    let n = keys.len() as u32;
+                    {
+                        let r = &mut self.regs;
+                        r.rebind = matches!(mode, crate::policy::Mode::Rebindable { .. });
+                        r.m = *m as u32;
+                        r.krem = n;
+                        r.srem = *m as u32;
+                        r.hadthr = true;
+                        let mut init = [Fp::ZERO; WIDTH];
+                        init[RATE..]
+                            .copy_from_slice(&cap_const::<Fp>(crate::policy::DOM_SIGNERS, *m as u32 * DIGEST as u32));
+                        r.ksp = init;
+                        r.ssp = init;
+                    }
+                    self.leaf_absorb(blocks[bi], T_THR);
+                    bi += 1;
+                    self.leaf_absorb(blocks[bi], T_CHAN);
+                    bi += 1;
+                    for j in 0..keys.len() {
+                        let selected = signers.iter().any(|s| s.key as usize == j);
+                        self.regs.krem -= 1;
+                        self.leaf_absorb(blocks[bi], T_KEY);
+                        {
+                            let last = self.regs.krem == 0;
+                            let row = self.b.last_row_mut();
+                            row[C_CEND] = Fp::new((last && !selected) as u32);
+                        }
+                        if selected {
+                            let ksp = self.regs.ksp;
+                            let out = self.sponge_start(ksp, blocks[bi], T_KSEL);
+                            self.regs.ksp = out;
+                        }
+                        bi += 1;
+                    }
+                }
+                (Cond::Hash(_), CondWitness::Preimage(preimage)) => {
+                    let mut input = [Fp::ZERO; WIDTH];
+                    input[..RATE].copy_from_slice(preimage);
+                    input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::policy::DOM_HASHLOCK, DIGEST as u32));
+                    self.b.start(input);
+                    {
+                        let row = self.b.last_row_mut();
+                        row[T_HL] = Fp::ONE;
+                        self.regs.write(row);
+                    }
+                    debug_assert_eq!(self.b.acc(), blocks[bi], "preimage does not open the hash lock");
+                    self.leaf_absorb(blocks[bi], T_HASH);
+                    bi += 1;
+                }
+                (Cond::After(v), CondWitness::None)
+                | (Cond::Older(v), CondWitness::None)
+                | (Cond::State(v), CondWitness::None) => {
+                    let (ty, value) = match cond {
+                        Cond::After(_) => (T_AFTER, height as i64 - *v as i64),
+                        Cond::Older(_) => (T_OLDER, height as i64 - self.regs.created as i64 - *v as i64),
+                        _ => (T_STATE, self.regs.pstate as i64 - *v as i64 - 1),
+                    };
+                    assert!((0..1 << 31).contains(&value), "a policy condition's lock has not passed");
+                    self.leaf_absorb(blocks[bi], ty);
+                    bi += 1;
+                    let ksel = self.regs.xmss.ksel;
+                    let row = self.b.last_row_mut();
+                    xmss_fragment::write_bits(row, &XCOLS, value as u32, ksel);
+                }
+                (Cond::Outputs(list), CondWitness::None) => {
+                    self.regs.cov = crate::policy::covered_digest(list);
+                    self.regs.hascov = true;
+                    self.leaf_absorb(blocks[bi], T_OUTS);
+                    bi += 1;
+                }
+                _ => panic!("a policy witness does not fit its condition"),
+            }
+        }
+        assert_eq!(bi, blocks.len());
+        assert_eq!(self.regs.lcnt as usize * DIGEST, self.regs.llen as usize);
+        // the path to the policy root, from the leaf sponge's digest
+        let mut node: Digest = self.regs.lsp[..DIGEST].try_into().unwrap();
+        debug_assert_eq!(node, p.leaf.hash(), "leaf sponge");
+        for (k, ty) in [T_PP0, T_PP1, T_PP2, T_PP3].into_iter().enumerate() {
+            let right = (p.index as usize >> k) & 1 == 1;
+            let sib = p.siblings[k];
+            self.regs.xmss.sib = sib;
+            self.b.start(compress_input(&node, &sib, right));
+            {
+                let row = self.b.last_row_mut();
+                row[ty] = Fp::ONE;
+                self.regs.write(row);
+            }
+            node = self.b.acc();
+        }
+        self.regs.proot = node;
+        assert_eq!(node, p.policy(), "policy path does not reach the policy");
+        // the signatures, each into the signers sponge
+        for wit in &p.witness {
+            let CondWitness::Signatures(signers) = wit else { continue };
+            for signer in signers {
+                let pkh = self.signature_rows(&signer.signature, &signer.pubkey);
+                self.regs.srem -= 1;
+                let ssp = self.regs.ssp;
+                let out = self.sponge_start(ssp, pkh, T_PSIG);
+                self.regs.ssp = out;
+            }
+        }
+        assert_eq!(self.regs.ksp, self.regs.ssp, "signers are not the selected keys");
+        self.b.pass();
+        {
+            let row = self.b.last_row_mut();
+            row[T_PEND] = Fp::ONE;
+            self.regs.write(row);
+        }
+        // the commitment from the policy root and amount
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&node);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(DOM_COMMITMENT, (DIGEST + 3) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_CM0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        self.absorb(amt_block(p.amount), T_CM1);
+        let commitment = self.b.acc();
+        assert_eq!(commitment, p.commitment(), "policy input commitment");
+        for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(p.amount)) {
+            *acc += limb.to_canonical();
+        }
+        let leaf = self.leaf_rows(commitment, w.created, T_ILEAF, T_ILEAF2);
+        self.regs.old = leaf;
+        self.regs.new = EMPTY;
+        self.regs.level = 0;
+        self.regs.pbits = core::array::from_fn(|i| Fp::new(((p.position >> i) & 1) as u32));
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = Fp::new((p.position & MASK30) as u32);
+        blk[1] = Fp::new((p.position >> 30) as u32);
+        let isp = self.regs.isp;
+        let out = self.sponge_start(isp, blk, T_ILIST);
+        self.regs.isp = out;
+        self.smt_update(p.position, &w.siblings);
+        // body: the policy root, then the amount with the policy marker
+        let bsp = self.regs.bsp;
+        let out = self.sponge_start(bsp, node, T_BODY_IN0);
+        self.regs.bsp = out;
+        let mut blk = [Fp::ZERO; RATE];
+        blk[PUB_SEED_LEN..PUB_SEED_LEN + 3].copy_from_slice(&amount_fps(p.amount));
+        blk[RATE - 1] = Fp::ONE;
+        let out = self.absorb(blk, T_BODY_IN1);
+        self.regs.bsp = out;
+        self.regs.pin = false;
+        self.regs.smsg = self.regs.msg;
+    }
+
+    /// The covered-run rows after an output in the run, and the run's end.
+    fn covered_rows(&mut self) {
+        if !self.regs.inrun {
+            return;
+        }
+        let csp = self.regs.csp;
+        let out = self.sponge_start(csp, self.regs.ocm, T_CVC);
+        self.regs.csp = out;
+        let csp = self.regs.csp;
+        let out = self.sponge_start(csp, self.regs.memo, T_CVM);
+        self.regs.csp = out;
+        if self.regs.cvn != 0 {
+            return;
+        }
+        let mut input = [Fp::ZERO; WIDTH];
+        input[..RATE].copy_from_slice(&self.regs.chan);
+        input[RATE..].copy_from_slice(&cap_const::<Fp>(crate::policy::DOM_REBIND, (2 * DIGEST + 1) as u32));
+        self.b.start(input);
+        {
+            let row = self.b.last_row_mut();
+            row[T_RB0] = Fp::ONE;
+            self.regs.write(row);
+        }
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = Fp::new(self.regs.pstate);
+        blk[1..].copy_from_slice(&self.regs.csp[..RATE - 1]);
+        self.absorb(blk, T_RB1);
+        let mut blk = [Fp::ZERO; RATE];
+        blk[0] = self.regs.csp[RATE - 1];
+        self.absorb(blk, T_RB2);
+        if self.regs.rebind {
+            assert_eq!(self.b.acc(), self.regs.rmsg, "rebindable message does not match the covered outputs");
+        }
+        if self.regs.hascov {
+            assert_eq!(&self.regs.csp[..DIGEST], &self.regs.cov[..], "covered outputs are not the covenant's");
+        }
+        self.regs.rundone = true;
+    }
+
     fn output(&mut self, w: &OutputWitness) {
         let o = &w.output;
         let r = &mut self.regs;
+        if r.cvb > 0 {
+            r.cvb -= 1;
+            r.inrun = false;
+        } else if r.cvn > 0 {
+            r.cvn -= 1;
+            r.inrun = true;
+        } else {
+            r.inrun = false;
+        }
         r.ocm = o.commitment;
         r.memo = o.memo;
         r.amount = o.amount;
@@ -1489,7 +2561,7 @@ impl Gen {
         }
         self.absorb(amt_block(o.amount), T_OCM1);
         assert_eq!(self.b.acc(), o.commitment, "output commitment does not match its key hash and amount");
-        let leaf = self.leaf_row(o.commitment, T_OLEAF);
+        let leaf = self.leaf_rows(o.commitment, self.height, T_OLEAF, T_OLEAF2);
         self.regs.leaf = leaf;
         let out = self.sponge_start(osp, o.commitment, T_OLIST);
         self.regs.osp = out;
@@ -1513,6 +2585,7 @@ impl Gen {
         self.regs.pbits = core::array::from_fn(|i| Fp::new(((position >> i) & 1) as u32));
         self.smt_update(position, &w.siblings);
         self.regs.opos += 1;
+        self.covered_rows();
     }
 
     /// A name operation: its digest into the body, then into the
@@ -1572,8 +2645,37 @@ impl BlockAir {
             opd: EMPTY,
             nsp: w.nsp_in,
             ops_left: 0,
+            pol: false,
+            pin: false,
+            pol_left: 0,
+            pstate: 0,
+            cvb: 0,
+            cvn: 0,
+            inrun: false,
+            created: 0,
+            smsg: w.txs.first().map_or(EMPTY, |t| t.message),
+            rmsg: EMPTY,
+            pidx: 0,
+            llen: 0,
+            lcnt: 0,
+            lsp: [Fp::ZERO; WIDTH],
+            nc: 0,
+            tags: [0; LEAF_CONDS],
+            m: 0,
+            krem: 0,
+            srem: 0,
+            hadthr: false,
+            rebind: false,
+            chan: EMPTY,
+            hascov: false,
+            rundone: false,
+            cov: EMPTY,
+            proot: EMPTY,
+            ksp: [Fp::ZERO; WIDTH],
+            ssp: [Fp::ZERO; WIDTH],
+            csp: [Fp::ZERO; WIDTH],
         };
-        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs };
+        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), regs, height: w.height };
         let mut carry_in = Carry::CLOSED;
         let mut carry_out = Carry::CLOSED;
         let parts = w.txs.len();
@@ -1584,26 +2686,35 @@ impl BlockAir {
                 "more items than the transaction has left"
             );
             assert!(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
+            assert!(tx.pol_left == 0 || tx.policy.is_some() || n_out == 0, "outputs before the policy input");
             assert!(n_ops == 0 || (n_in == tx.in_left && n_out == tx.out_left), "operations before the last output");
             assert!(
                 !tx.ends || (n_in, n_out, n_ops) == (tx.in_left, tx.out_left, tx.ops_left),
                 "a part that ends has every item left"
             );
+            assert!(tx.pol_left <= 1 && (tx.policy.is_some() == (tx.pol_left == 1)), "one policy input, whole");
+            assert!(tx.policy.is_none() || (tx.resume.is_none() && tx.ends), "a policy spend is never split");
             g.regs.msg = tx.message;
             g.regs.in_left = tx.in_left;
             g.regs.out_left = tx.out_left;
             g.regs.ops_left = tx.ops_left;
             g.regs.is_out = false;
             g.regs.open = true;
+            g.regs.reset_policy();
+            g.regs.pol_left = tx.pol_left;
+            g.regs.smsg = tx.message;
             match tx.resume {
                 None => {
                     let mut input = [Fp::ZERO; WIDTH];
                     input[0] = Fp::new(tx.in_left);
                     input[1] = Fp::new(tx.out_left);
                     input[2] = Fp::new(tx.ops_left);
+                    input[3] = Fp::new(tx.pol_left);
                     input[RATE..].copy_from_slice(&cap_const::<Fp>(
                         DOM_BODY,
-                        8 + BODY_PER_INPUT * tx.in_left + BODY_PER_OUTPUT * tx.out_left + BODY_PER_OP * tx.ops_left,
+                        8 + BODY_PER_INPUT * (tx.in_left + tx.pol_left)
+                            + BODY_PER_OUTPUT * tx.out_left
+                            + BODY_PER_OP * tx.ops_left,
                     ));
                     g.b.start(input);
                     let row = g.b.last_row_mut();
@@ -1631,6 +2742,9 @@ impl BlockAir {
             for inp in &tx.inputs {
                 g.input(inp);
             }
+            if let Some(p) = &tx.policy {
+                g.policy(p);
+            }
             for out in &tx.outputs {
                 g.output(out);
             }
@@ -1644,6 +2758,7 @@ impl BlockAir {
                 row[T_TX_END] = Fp::ONE;
                 g.regs.write(row);
                 g.regs.open = false;
+                g.regs.pol = false;
             } else {
                 assert_eq!(p + 1, parts, "only a segment's last part may leave a transaction open");
                 let r = &g.regs;
@@ -1658,6 +2773,7 @@ impl BlockAir {
             }
         }
         let public = SegmentPublic {
+            height: w.height,
             root_in: w.root_in,
             root_out: g.regs.root,
             isp_in: w.isp_in,
@@ -1722,7 +2838,7 @@ mod tests {
     /// split into segments of `per_segment` transactions. Returns the
     /// segments, the final root, the positions and the outputs.
     fn scenario(name: &str, per_segment: usize) -> (Vec<SegmentWitness>, Digest, Vec<u64>, Vec<Output>) {
-        scenario_with(name, |utxo, wtxn, txs| SegmentWitness::collect(utxo, wtxn, txs, per_segment).unwrap())
+        scenario_with(name, |utxo, wtxn, txs| SegmentWitness::collect(utxo, wtxn, txs, per_segment, 1).unwrap())
     }
 
     fn scenario_with(
@@ -1765,12 +2881,194 @@ mod tests {
         (segments, new_root, positions, outputs)
     }
 
+    /// Policy spends: 2-of-3 multisig, an HTLC claim, an eltoo update with
+    /// rebindable signatures and a covenant settlement, each a whole
+    /// transaction in a segment, satisfy the constraints; a tampered state
+    /// number does not.
+    #[test]
+    fn policy_spends_satisfy_constraints() {
+        use crate::block::BlockOutput;
+        use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer, covered_digest, hash_lock, rebind_message};
+        use crate::transaction::pubkey_hash;
+        let dir = TempDir::new("policy");
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let (mut a, mut bk, mut c) = (key(1), key(2), key(3));
+        let keys: Vec<Digest> = [&a, &bk, &c].iter().map(|k| pubkey_hash(&k.public_key())).collect();
+        let dest = key(4).public_key();
+        let height = 200;
+        let d = |x: u32| {
+            let mut v = EMPTY;
+            v[0] = Fp::new(x);
+            v
+        };
+        let memo = |x: u32| d(100 + x);
+
+        // Outputs: a 2-of-3, an HTLC, an eltoo state (settling to a and b).
+        let multisig = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: keys.clone() }])]);
+        let preimage = d(77);
+        let htlc = Policy::new(vec![
+            Leaf::new(vec![
+                Cond::Hash(hash_lock(&preimage)),
+                Cond::Thresh { mode: Mode::Body, m: 1, keys: keys[1..2].to_vec() },
+            ]),
+            Leaf::new(vec![Cond::After(100), Cond::Thresh { mode: Mode::Body, m: 1, keys: keys[..1].to_vec() }]),
+        ]);
+        let channel = d(5);
+        let settle_outputs = [Output::with_memo(&keys[0], 600, memo(1)), Output::with_memo(&keys[1], 400, memo(2))];
+        let settle: Vec<(Commitment, Memo)> = settle_outputs.iter().map(|o| (o.commitment, o.memo)).collect();
+        let state = Policy::new(vec![
+            Leaf::new(vec![
+                Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: keys[..2].to_vec() },
+                Cond::State(3),
+            ]),
+            Leaf::new(vec![Cond::Older(144), Cond::Outputs(settle.clone())]),
+        ]);
+        let outs = [
+            (multisig.root(), 1000u64, memo(10)),
+            (htlc.root(), 500, memo(11)),
+            (state.root(), 1000, memo(12)),
+            (state.root(), 1000, memo(13)),
+        ];
+        for (policy, amount, m) in &outs {
+            let o = Output::with_memo(policy, *amount, *m);
+            utxo.add_output(&mut wtxn, &BlockOutput { commitment: o.commitment, memo: o.memo }, 0).unwrap();
+        }
+
+        // 2-of-3 in body mode: a and c sign the body hash.
+        let mut spend = multisig.spend(0, 1000, 0);
+        let unsigned =
+            UnsignedTransaction::new(vec![], vec![Output::new(&dest, 1000)]).with_policy_inputs(vec![spend.clone()]);
+        let body = unsigned.body_hash();
+        spend.witness[0] = CondWitness::Signatures(vec![
+            Signer { key: 0, pubkey: a.public_key(), signature: a.sign(&body).unwrap() },
+            Signer { key: 2, pubkey: c.public_key(), signature: c.sign(&body).unwrap() },
+        ]);
+        let tx_multisig = UnsignedTransaction::new(vec![], vec![Output::new(&dest, 1000)])
+            .with_policy_inputs(vec![spend])
+            .sign(|_, _, _| Err::<Sig, ()>(()))
+            .unwrap();
+        assert_eq!(tx_multisig.body_hash(), body);
+
+        // HTLC claim: the preimage and b's signature.
+        let mut claim = htlc.spend(0, 500, 1);
+        let unsigned =
+            UnsignedTransaction::new(vec![], vec![Output::new(&dest, 500)]).with_policy_inputs(vec![claim.clone()]);
+        let body = unsigned.body_hash();
+        claim.witness[0] = CondWitness::Preimage(preimage);
+        claim.witness[1] = CondWitness::Signatures(vec![Signer {
+            key: 0,
+            pubkey: bk.public_key(),
+            signature: bk.sign(&body).unwrap(),
+        }]);
+        let tx_claim = UnsignedTransaction::new(vec![], vec![Output::new(&dest, 500)])
+            .with_policy_inputs(vec![claim])
+            .sign(|_, _, _| Err::<Sig, ()>(()))
+            .unwrap();
+
+        // Eltoo update to state 4: a and b sign the rebindable message with
+        // leaf 4, over the new state output as the covered run.
+        let new_state = Output::with_memo(&state.root(), 1000, memo(14));
+        let mut update = state.spend(0, 1000, 2);
+        update.state = 4;
+        update.covered = (0, 1);
+        let msg = rebind_message(&channel, 4, &[(new_state.commitment, new_state.memo)]);
+        let mut a4 = key(1);
+        a4.set_next_index(4);
+        let mut b4 = key(2);
+        b4.set_next_index(4);
+        update.witness[0] = CondWitness::Signatures(vec![
+            Signer { key: 0, pubkey: a4.public_key(), signature: a4.sign(&msg).unwrap() },
+            Signer { key: 1, pubkey: b4.public_key(), signature: b4.sign(&msg).unwrap() },
+        ]);
+        let tx_update = UnsignedTransaction::new(vec![], vec![new_state])
+            .with_policy_inputs(vec![update])
+            .sign(|_, _, _| Err::<Sig, ()>(()))
+            .unwrap();
+
+        // Settlement of the other state output: no signature, the covered
+        // run is the covenant's, after the delay (created at 0, height 200).
+        let mut settlement = state.spend(1, 1000, 3);
+        settlement.covered = (1, 2);
+        let tx_settle = UnsignedTransaction::new(
+            vec![],
+            vec![Output::new(&dest, 7), settle_outputs[0], settle_outputs[1], Output::new(&dest, 9)],
+        )
+        .with_policy_inputs(vec![settlement])
+        .sign(|_, _, _| Err::<Sig, ()>(()))
+        .unwrap();
+        assert_eq!(covered_digest(&settle), covered_digest(&settle));
+
+        let txs = [tx_multisig, tx_claim, tx_update, tx_settle];
+        for tx in &txs {
+            let created = |_| Some(0);
+            assert_eq!(tx.check_policy_inputs(height, created), Ok(()), "node-side check");
+        }
+        let segments = SegmentWitness::collect(&utxo, &mut wtxn, &txs, 1, height).unwrap();
+        wtxn.abort();
+        assert_eq!(segments.len(), 4);
+        for (k, seg) in segments.iter().enumerate() {
+            assert_eq!(seg.num_rows(), tx_rows(&txs[k]), "rows of transaction {k}");
+            let (trace, public) = BlockAir::generate_trace(seg);
+            assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "transaction {k}");
+            // Tampering with the state number breaks the update's rows.
+            if k == 2 {
+                let mut bad = trace.clone();
+                let width = bad.width;
+                for r in 0..bad.height() {
+                    if bad.values[r * width + R_PSTATE] == Fp::new(4) {
+                        bad.values[r * width + R_PSTATE] = Fp::new(5);
+                    }
+                }
+                assert!(check_constraints(&BlockAir, &bad, &public.to_values()).is_err());
+            }
+        }
+        assert_eq!(txs[2].weight(), 2);
+        assert_eq!(txs[3].weight(), 0);
+    }
+
+    /// Keys of any height up to the maximum verify; the fragment stops at
+    /// the key's last level and the rows count accordingly.
+    #[test]
+    fn keys_of_other_heights_verify() {
+        let dir = TempDir::new("heights");
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let mut tall = Key::generate_with_height(&[9; 32], 10);
+        let mut short = Key::generate_with_height(&[8; 32], 1);
+        // The tall key signs from a high leaf: the index bits above a
+        // plain key's height are in use.
+        tall.set_next_index(1000);
+        let dest = key(3).public_key();
+        utxo.add(&mut wtxn, &Output::new(&tall.public_key(), 70).commitment).unwrap();
+        utxo.add(&mut wtxn, &Output::new(&short.public_key(), 30).commitment).unwrap();
+        let mut tx = UnsignedTransaction::new(
+            vec![(tall.public_key(), 70), (short.public_key(), 30)],
+            vec![Output::new(&dest, 100)],
+        )
+        .sign(|i, _, m| if i == 0 { tall.sign(m) } else { short.sign(m) })
+        .unwrap();
+        tx.set_positions(&[0, 1]);
+        assert!(tx.verify_signatures());
+        assert_eq!(tx.inputs[0].signature.height(), 10);
+        assert_eq!(tx.inputs[1].signature.height(), 1);
+        let segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, 1).unwrap();
+        wtxn.abort();
+        assert_eq!(segments[0].num_rows(), 2 + input_rows(10) + input_rows(1) + ROWS_PER_OUTPUT);
+        let (trace, public) = BlockAir::generate_trace(&segments[0]);
+        assert_eq!(trace.height(), segments[0].num_rows().next_power_of_two());
+        assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()));
+    }
+
     #[test]
     fn layout_and_degree() {
         assert_eq!(measure_degree(&BlockAir, NUM_PUBLIC), 3);
-        assert_eq!(ROWS_PER_INPUT, 1150 + 5 + 1 + 80 + 2);
-        assert_eq!(ROWS_PER_OUTPUT, 88);
-        assert_eq!(NUM_PUBLIC, 128 + 2 * 28);
+        assert_eq!(input_rows(4), 1150 + 6 + 1 + 80 + 2);
+        assert_eq!(ROWS_PER_INPUT, 1182 + 6 + 1 + 80 + 2);
+        assert_eq!(ROWS_PER_OUTPUT, 89);
+        assert_eq!(NUM_PUBLIC, 128 + 2 * 28 + 1);
     }
 
     #[test]
@@ -1778,7 +3076,7 @@ mod tests {
         let (segments, expected_root, positions, outputs) = scenario("ok", 2);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].txs.len(), 2);
-        assert_eq!(segments[0].num_rows(), 2 * 2 + 2 * ROWS_PER_INPUT + 3 * ROWS_PER_OUTPUT);
+        assert_eq!(segments[0].num_rows(), 2 * 2 + 2 * input_rows(4) + 3 * ROWS_PER_OUTPUT);
         let mut publics = Vec::new();
         for (k, seg) in segments.iter().enumerate() {
             let (trace, public) = BlockAir::generate_trace(seg);
@@ -1841,7 +3139,7 @@ mod tests {
             vec![Part { tx: 0, start: 3, end: 4 }, Part { tx: 1, start: 0, end: 1 }, Part { tx: 2, start: 0, end: 2 }],
         ];
         let (segments, expected_root, positions, outputs) =
-            scenario_with("span", |utxo, wtxn, txs| SegmentWitness::collect_parts(utxo, wtxn, txs, plan).unwrap());
+            scenario_with("span", |utxo, wtxn, txs| SegmentWitness::collect_parts(utxo, wtxn, txs, plan, 1).unwrap());
         assert_eq!(segments.len(), 3);
         let mut publics = Vec::new();
         let mut traces = Vec::new();
@@ -1901,7 +3199,20 @@ mod tests {
 
     #[test]
     fn packing_splits_between_items() {
-        let items = |t: usize| [(0, 1, 0), (3, 2, 1), (1, 2, 0), (0, 5, 3)][t];
+        // Inputs by keys of 4, 20 and 16 levels; the last transaction stays
+        // whole.
+        let items = |t: usize| {
+            let (heights, n_out, n_ops, whole): (&[usize], usize, usize, bool) = [
+                (&[][..], 1, 0, false),
+                (&[4, 20, 16][..], 2, 1, false),
+                (&[4][..], 2, 0, false),
+                (&[][..], 5, 3, true),
+            ][t];
+            let mut rows: Vec<usize> = heights.iter().map(|&h| input_rows(h)).collect();
+            rows.extend(std::iter::repeat_n(ROWS_PER_OUTPUT, n_out));
+            rows.extend(std::iter::repeat_n(ROWS_PER_OP, n_ops));
+            (rows, whole)
+        };
         let max_rows = 2048;
         let plan = pack(4, items, max_rows);
         // Parts cover every item once, in order.
@@ -1914,9 +3225,10 @@ mod tests {
                 last_tx = p.tx;
                 assert_eq!(p.start, next[p.tx]);
                 next[p.tx] = p.end;
-                let (n_in, n_out, n_ops) = items(p.tx);
-                rows += 1 + (p.start..p.end).map(|k| item_rows(k, n_in, n_out)).sum::<usize>();
-                rows += usize::from(p.end == n_in + n_out + n_ops);
+                let (item_rows, whole) = items(p.tx);
+                assert!(!whole || (p.start == 0 && p.end == item_rows.len()));
+                rows += 1 + item_rows[p.start..p.end].iter().sum::<usize>();
+                rows += usize::from(p.end == item_rows.len());
             }
             assert!(rows < max_rows, "{rows}");
         }
