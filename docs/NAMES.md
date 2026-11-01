@@ -280,13 +280,18 @@ operation are not.
    commits made and consumed, the keys registered and the records
    replaced; consumed commits join the spent log; the template applies
    the name section. Snapshots carry the name half: the manifest holds
-   the name root and name parts (up to 4,096 records in key order, each
-   with its first key and a hash), output parts list which outputs are
-   commits (hash and height, checked against the leaf), name parts are
-   served as the records were at the snapshot by undoing later blocks,
-   and the trie is rebuilt from them and checked against the name root.
-   Moving to a later snapshot carries output parts and fetches name
-   parts afresh. Chain format 11. The body gained the position of the
+   the name root and name parts (groups of key buckets of up to 4,096
+   records, each part its first key and a hash of its buckets' hashes;
+   the registry keeps a count and hash per bucket, the top 16 key bits,
+   as records change, so a snapshot reads the bucket table and never the
+   records), output parts list which outputs are commits (hash and
+   height, checked against the leaf), name parts are served as the
+   records were at the snapshot by undoing later blocks, and the trie is
+   rebuilt from them and checked against the name root. Moving to a
+   later snapshot carries output parts, and keeps the staged name
+   records: the later manifest's name parts whose ranges hash to the
+   same value are satisfied by them, and only the ranges with a name
+   operation since are cleared and fetched again. Chain format 12. The body gained the position of the
    commit a reveal spends (unsigned, like an input's position; the body
    commitment covers it), since a node cannot find the commit without
    the salt. The pool still refuses transactions with operations, and
@@ -321,6 +326,19 @@ operation are not.
    it. Owner keys sign from leaves 0 to 7, or 8 to 15 when recovered, as
    output keys do. Wallet format 5. The pool's minimum fee is by
    transaction size, so operations pay for their bytes.
+   Scale test (2026-11-01, two debug nodes filled with 10M synthetic
+   names by `--debug-fill-names`, one in RAM and one on disk): fill
+   10M in 944 s in RAM and 2,830 s on disk, bucket rebuild 116 s;
+   registry 4.9 GB (trie 2.9 GB, records 2.0 GB, buckets 3.4 MB); point
+   lookups instant; block build with a name op 0.02 s; block accept
+   0.05 s, 0.12 s on snapshot blocks; commit, reveal and update
+   confirmed; a third start fast-synced the registry from the other node
+   in about 24 minutes (2,489 name parts, 2 GB, trie rebuilt and name
+   root matched), then followed the chain to the same tip. Found and
+   fixed along the way: snapshots read every record (bucket table), and
+   a snapshot move discarded all staged name parts (carried by hash now).
+   Open: served-part cache and lone-peer handling, see HARDENING.md.
+
 7. **Docs.** README, SECURITY.md, HARDENING.md for anything new; a note
    on the zone format for the rendezvous layer.
 

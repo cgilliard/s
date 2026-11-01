@@ -1692,6 +1692,10 @@ impl ProofVerifier for AggregateVerifier {
     fn verify(&self, s: &BlockStatement<'_>, proof: &[u8]) -> bool {
         self.unchecked || self.verify_chain_proof(s.height, &Statement::from_block(s), proof).is_ok()
     }
+
+    fn is_unchecked(&self) -> bool {
+        self.unchecked
+    }
 }
 
 #[cfg(test)]

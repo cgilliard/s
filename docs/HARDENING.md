@@ -69,6 +69,20 @@ history and the README; this file holds what is left.
 
 ## Networking and sync
 
+- **Fast-sync name parts are checked only at the end.** A name part's
+  hash in the manifest is not bound to the state root, so a lying peer's
+  manifest is found out when the rebuilt trie's root fails the final
+  check, after every part is fetched; the install then restarts. Output
+  parts fail per part. Fix: verify a sample of each part's records by
+  trie proof against the name root as they arrive, or have the manifest's
+  part hashes cross-checked among peers before fetching.
+
+- **One slow peer is taken for no peer.** `node.rs`,
+  `check_snapshot_target`: a part download abandoned for slowness marks
+  its peer unserving, and with a single peer that moves the snapshot. Fix:
+  back off and retry the only peer; move only when it refuses or drops
+  the snapshot.
+
 - **The staging drain blocks the network thread.** `node.rs`,
   `drain_staging`: a blocking `recv` while the applier stages up to 32
   parts or applies a block. No pongs go out meanwhile and the event queue
@@ -128,6 +142,15 @@ history and the README; this file holds what is left.
   poisoning; IPv6; NAT.
 
 ## Wallet
+
+- **Cancelling a carried name operation leaves its wallet state pending.**
+  `cancel` on a transaction that carried a reveal or an update pays the
+  inputs back but the name entry stays "revealed, awaiting the chain" or
+  "update pending" with the leaf consumed; the user must re-issue the
+  operation (a new reveal re-signs nothing; a new update takes another
+  leaf). Fix: have `cancel_sent` revert the entries of the operations the
+  transaction carried (reveal: back to a pending commit; update: drop the
+  pending nonce).
 
 - **Seed and entropy are stored in plaintext LMDB**, and `restore` reads
   the phrase and passphrase with terminal echo. Fix: encrypt the seed at
@@ -192,7 +215,7 @@ history and the README; this file holds what is left.
 ## Deployment and operations
 
 - **Seeds** run an old binary. They need the current one (protocol v5,
-  wallet format 5, chain format 11, new genesis id, new `MAINNET_CHAIN`) and wiped data
+  wallet format 5, chain format 12 (a snapshot manifest for every block in the undo window), new genesis id, new `MAINNET_CHAIN`) and wiped data
   directories. Fresh nodes cannot sync until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
   expected network rate (README, Genesis).

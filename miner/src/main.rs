@@ -31,7 +31,9 @@
 //! announced. If the network delivers a better tip while a block is being
 //! proven or mined, the miner drops it and starts over on the new tip.
 //! `--blocks 0` (the default) runs until `quit`. `--jobs` bounds how many
-//! segments are proven at once.
+//! segments are proven at once; the `TABMINER_THREADS` environment variable
+//! bounds the threads hashing and proving use (all cores by default), for
+//! a machine that also serves peers.
 //!
 //! The wallet is created on first run with a 12-word BIP39 phrase, shown
 //! once (and by `phrase`). `restore` rebuilds a wallet from a phrase in an
@@ -77,6 +79,9 @@ const USAGE: &str = "usage:
   --data DIR        chain, wallet and log directory (default ~/.tabernacle/tabminer)
   --blocks N        blocks to mine, 0 for no limit (default 0)
   --jobs N          segments proven at once (default 2)
+  TABMINER_THREADS=N  (environment) threads for hashing and proving, all
+                    cores by default; fewer leaves the node responsive to
+                    peers while it mines
   --no-mine         follow the chain without mining (same as the node command)
 
 options:
@@ -100,7 +105,11 @@ debugging (a node so started can be fed any block; never use with real funds):
   --debug-fill N[,S]  with the above, fill each mined block with N random
                     outputs and spend S of the earlier ones at random (default
                     S = 0), up to the block size limit: for simulating large
-                    blocks and a large state";
+                    blocks and a large state
+  --debug-fill-names N  with the above, start with N synthetic names in the
+                    registry behind genesis (the same N on every node of the
+                    network, on the first start only): for testing names at
+                    scale";
 
 const HELP: &str = "commands:
   status                    chain tip, peers, mempool, wallet totals
@@ -169,6 +178,8 @@ struct Args {
     debug_unchecked: bool,
     /// Random outputs to add, and earlier ones to spend, per mined block.
     debug_fill: Option<(usize, usize)>,
+    /// Synthetic names to start the registry with.
+    debug_fill_names: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -196,6 +207,7 @@ fn parse_args() -> Result<Args, String> {
         no_seeds: false,
         debug_unchecked: false,
         debug_fill: None,
+        debug_fill_names: 0,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -223,6 +235,7 @@ fn parse_args() -> Result<Args, String> {
                 let (n, s) = v.split_once(',').unwrap_or((&v, "0"));
                 a.debug_fill = Some((number(n.to_string())? as usize, number(s.to_string())? as usize));
             }
+            "--debug-fill-names" => a.debug_fill_names = number(value()?)? as usize,
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
@@ -230,8 +243,10 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown option {flag}")),
         }
     }
-    if a.debug_fill.is_some() && !a.debug_unchecked {
-        return Err("--debug-fill needs --debug-no-validate-proofs: such blocks cannot be proven".into());
+    if (a.debug_fill.is_some() || a.debug_fill_names > 0) && !a.debug_unchecked {
+        return Err(
+            "--debug-fill and --debug-fill-names need --debug-no-validate-proofs: such a chain cannot be proven".into(),
+        );
     }
     Ok(a)
 }
@@ -311,6 +326,15 @@ fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc
     let chain = Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, verifier)?
         .with_max_undo((args.max_undo > 0).then_some(args.max_undo));
     chain.init_or_check_genesis()?;
+    if args.debug_fill_names > 0 {
+        let t = Instant::now();
+        chain.debug_fill_names(args.debug_fill_names, &|done| {
+            if done.is_multiple_of(1_000_000) {
+                log::line(&format!("debug: {done} names filled in {}", secs(t.elapsed())));
+            }
+        })?;
+        log::line(&format!("debug: the registry holds {} names", args.debug_fill_names));
+    }
     Ok(Arc::new(chain))
 }
 
@@ -446,9 +470,8 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     if pruned > 0 {
         log::line(&format!("pruned {pruned} undo records beyond the last {} blocks", args.max_undo));
     }
-    // Peers keep a snapshot every interval through their undo window, so
-    // one at least this deep is always within it.
-    let served = (DEFAULT_MAX_UNDO + 1).saturating_sub(params.snapshot_interval);
+    // Peers keep a snapshot manifest for every block in their undo window.
+    let served = DEFAULT_MAX_UNDO;
     if args.sync_point > served {
         log::line(&format!(
             "warning: --sync-point {} is deeper than the {served} blocks peers surely keep snapshots for: \
@@ -888,12 +911,11 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     (State::Spent, false) => "spent",
                 };
                 println!(
-                    "{}  {:>20}  {:<9}  {} signatures left{}  {}",
+                    "{}  {:>20}  {:<9}{}  {}",
                     short(&o.commitment),
                     fmt_coins(o.amount as u128),
                     state,
-                    o.signatures_left(),
-                    if o.recovered { ", recovered" } else { "" },
+                    if o.recovered { "  recovered" } else { "" },
                     log::timestamp_of(o.created)
                 );
             }
@@ -1040,9 +1062,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [name, value, fee] => (*name, *value, Some(parse_coins(fee).ok_or("bad fee")?)),
                 _ => return Err("usage: name-update NAME VALUE [FEE]".into()),
             };
-            let op = ctx.wallet.name_update(name.as_bytes(), parse_value(Some(value))?)?;
+            let (op, last) = ctx.wallet.name_update(name.as_bytes(), parse_value(Some(value))?)?;
             carry(ctx, vec![op], fee)?;
             println!("updating {name}; its owner key rotates when the update confirms");
+            if last {
+                println!(
+                    "warning: this was the last signature {name}'s current key can make; the update cannot be cancelled and replaced"
+                );
+            }
         }
         "name-offer" => {
             let (name, file, value) = match args {
@@ -1062,11 +1089,18 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             };
             let record = tabminer::names::Record::from_bytes(&std::fs::read(file)?).ok_or("not a name record")?;
             let name = String::from_utf8_lossy(&record.name).into_owned();
-            let op = ctx.wallet.name_transfer(record)?;
+            let (op, last) = ctx.wallet.name_transfer(record)?;
             carry(ctx, vec![op], fee)?;
             println!("transferring {name}; it leaves this wallet when the update confirms");
+            if last {
+                println!(
+                    "warning: this was the last signature {name}'s key can make; the transfer cannot be cancelled and replaced"
+                );
+            }
         }
         "names" => {
+            // One chain read transaction per thread: the tip comes first.
+            let height = ctx.chain.tip()?.map_or(0, |t| t.height);
             let rtxn = ctx.chain.env().read_txn()?;
             let names = ctx.wallet.owned_names()?;
             let commits = ctx.wallet.pending_commits()?;
@@ -1082,16 +1116,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     _ => "owned",
                 };
                 println!(
-                    "{:<32}  {}  value {}  {} signatures left{}",
+                    "{:<32}  {}  value {}{}",
                     String::from_utf8_lossy(&n.name),
                     stage,
                     hex_digest(&n.value),
-                    n.signatures_left(),
-                    if n.recovered { ", recovered" } else { "" }
+                    if n.recovered { "  recovered" } else { "" }
                 );
             }
             for c in commits {
-                let height = ctx.chain.tip()?.map_or(0, |t| t.height);
                 let on_chain = ctx.chain.names().commit_position(&rtxn, &c.commit)?;
                 let status = match on_chain {
                     None => "not on chain yet".to_string(),

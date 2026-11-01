@@ -1487,24 +1487,27 @@ impl Wallet {
     }
 
     /// Signs `record` as the current owner of its name with the key's next
-    /// leaf, recording the signature. The entry is updated by the caller.
-    fn sign_update(&self, wtxn: &mut RwTxn, entry: &mut OwnedName, record: Record) -> Result<NameOp> {
+    /// leaf, recording the signature; also returns whether it was the key's
+    /// last. The entry is written with the caller's changes.
+    fn sign_update(&self, wtxn: &mut RwTxn, entry: &mut OwnedName, record: Record) -> Result<(NameOp, bool)> {
         if u32::from(entry.used) >= LEAVES_PER_HALF {
             return Err(WalletError::Exhausted);
         }
         let base = if entry.recovered { LEAVES_PER_HALF } else { 0 };
         let leaf = base + (u32::from(entry.start) + u32::from(entry.used)) % LEAVES_PER_HALF;
         entry.used += 1;
+        let last = u32::from(entry.used) == LEAVES_PER_HALF;
         let mut key = self.owner_key(&entry.nonce);
         key.set_next_index(u64::from(leaf));
         let op = NameOp::update(record, &mut key).map_err(|e| WalletError::Name(e.to_string()))?;
         self.put_name(wtxn, entry)?;
-        Ok(op)
+        Ok((op, last))
     }
 
     /// Changes `name`'s value, rotating its owner key: an update operation
-    /// to carry in a transaction.
-    pub fn name_update(&self, name: &[u8], value: Commitment) -> Result<NameOp> {
+    /// to carry in a transaction, and whether it took the current key's
+    /// last signature (after which it cannot be cancelled and replaced).
+    pub fn name_update(&self, name: &[u8], value: Commitment) -> Result<(NameOp, bool)> {
         let mut wtxn = self.env.write_txn()?;
         let mut entry = self
             .name_in(&wtxn, name)?
@@ -1550,8 +1553,9 @@ impl Wallet {
     }
 
     /// Signs `record`, written by its recipient, over as the owner of its
-    /// name: an update operation to carry in a transaction.
-    pub fn name_transfer(&self, record: Record) -> Result<NameOp> {
+    /// name: an update operation to carry in a transaction, and whether it
+    /// took the key's last signature.
+    pub fn name_transfer(&self, record: Record) -> Result<(NameOp, bool)> {
         let mut wtxn = self.env.write_txn()?;
         let mut entry =
             self.name_in(&wtxn, &record.name)?.filter(|n| n.stage == NameStage::Owned).ok_or_else(|| {
@@ -2067,7 +2071,8 @@ mod tests {
         assert_eq!(alice.open_memo(&on_chain.memo), Some((owned.nonce, 0)));
 
         // Update: the key rotates once the chain shows the new owner.
-        let update = alice.name_update(b"alice", value(2)).unwrap();
+        let (update, last) = alice.name_update(b"alice", value(2)).unwrap();
+        assert!(!last);
         assert!(alice.name_update(b"alice", value(3)).is_err());
         assert!(update.verify_owner(&on_chain.owner));
         let signed = alice.carry(vec![update], None, &u, &rtxn).unwrap();
@@ -2085,7 +2090,7 @@ mod tests {
         let offer = bob.name_offer(b"alice", value(5)).unwrap();
         assert_eq!(bob.owned_name(b"alice").unwrap().unwrap().stage, NameStage::Offered);
         assert!(alice.name_transfer(Record::new(b"carol", offer.owner, value(1), offer.memo).unwrap()).is_err());
-        let transfer = alice.name_transfer(offer.clone()).unwrap();
+        let (transfer, _) = alice.name_transfer(offer.clone()).unwrap();
         assert!(alice.name_update(b"alice", value(3)).is_err());
         let signed = alice.carry(vec![transfer], None, &u, &rtxn).unwrap();
         drop(rtxn);

@@ -111,19 +111,20 @@ round trips installed the state in 8.6 s, against 57 s with 32 chunks and
 16 parts in flight, and reached the tip, 156 full blocks on, in 29 s
 rather than 90 s.
 
-Nodes take a snapshot after every block whose height is a multiple of 144
-and keep those within the undo window; fast sync uses the newest one at
-least `--sync-point` deep, so any sync point up to 865 is always served;
-with a deeper one than its peers keep, it uses the deepest snapshot they
-do keep rather than wait for one that will never come.
+Nodes keep a snapshot manifest for every block within the undo window;
+fast sync uses the block `--sync-point` deep, so any sync point up to 1008
+is always served; with a deeper one than its peers keep, it uses the
+deepest block they do keep rather than wait for one that will never come.
 A download that outlasts its snapshot loses nothing: as the snapshot nears
 the end of its peers' windows (each peer's status says where its window
 starts), or if no peer serves it, the node moves to a later one, fetches
 the blocks in between and carries the parts it has forward, removing the
 outputs those blocks spent and checking each part against the later
 manifest; only parts that do not match are fetched again.
-A snapshot stores only its manifest: the output counter and each part's
-root, read from the state tree when the block connects. The outputs spent
+A snapshot stores only its manifest, about 150 KB with millions of outputs
+and names: the output counter, each output part's root, the name root and
+each name part's hash, read from the state tree and the registry's bucket
+table when the block connects. The outputs spent
 by blocks in the undo window are kept once, by position, with the height
 spending them; disconnecting a block restores its inputs from there, and a
 part is served from the outputs unspent now in its range plus those spent

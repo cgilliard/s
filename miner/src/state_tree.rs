@@ -215,7 +215,7 @@ pub fn subtree_path(level: usize, first: u64, leaves: &[(u64, Digest)], key: u64
 pub fn open_env(path: &Path, map_size: usize) -> Result<Env> {
     std::fs::create_dir_all(path).map_err(heed::Error::Io)?;
     let mut options = EnvOpenOptions::new();
-    options.map_size(map_size).max_dbs(16);
+    options.map_size(map_size).max_dbs(32);
     // SAFETY: NO_READ_AHEAD only advises the kernel not to read ahead of
     // page faults in the map: reads are random, so a fault should fetch
     // its page, not the next hundred kilobytes with it.

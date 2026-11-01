@@ -44,10 +44,9 @@
 //! A node starting from genesis with a sync point (by default 144 blocks)
 //! first downloads every header from the peer claiming the most work,
 //! checking proof of work, difficulty and timestamps, without bodies.
-//! It then takes the newest block at least `sync_point` below the best
-//! header whose height is a multiple of the snapshot interval (nodes take a
-//! snapshot after each such block and serve only those), and fetches it
-//! with a manifest of the state after it: the output counter and the
+//! It then takes the block `sync_point` below the best header (every node
+//! keeps a snapshot manifest for each block in its undo window), and
+//! fetches it with a manifest of the state after it: the output counter and the
 //! root of each part's subtree (16,384 positions), which must compose to the
 //! block's state root. The block's proof, a chain proof, is checked
 //! against the counter: it shows that block and every one before it valid,
@@ -76,7 +75,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{Block, Header};
-use crate::chain::{Applied, CarriedPart, Chain, ChainError, Manifest, ProofVerifier, SNAPSHOT_PART_LOG};
+use crate::chain::{
+    Applied, CarriedNamePart, CarriedPart, Chain, ChainError, Manifest, ProofVerifier, SNAPSHOT_PART_LOG,
+};
 use crate::difficulty::U256;
 use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
@@ -140,7 +141,19 @@ pub const DEFAULT_SYNC_POINT: u32 = 144;
 /// Snapshot parts fetched at once.
 const MAX_PART_DOWNLOADS: usize = 32;
 /// Snapshot objects kept for serving.
-const SERVED_SNAPSHOTS: usize = 8;
+/// Served snapshot parts kept encoded: a syncer has `MAX_PART_DOWNLOADS`
+/// in flight and asks for each in windows, and a part is costly to make
+/// (a range read and the undo records since the snapshot), so enough for
+/// two syncers at once; name parts are the largest, under a megabyte.
+const SERVED_SNAPSHOTS: usize = 2 * MAX_PART_DOWNLOADS;
+
+/// Blocks a snapshot target keeps clear of the start of a peer's undo
+/// window: a window moves with its tip, and the blocks after the snapshot
+/// are wanted too. A small share of the window itself (about 7 blocks of
+/// the default 1,008), at least one.
+fn snapshot_margin(status: &net::Status) -> u32 {
+    (status.height.saturating_sub(status.oldest) / 128).max(1)
+}
 /// Failed snapshot attempts before validating from genesis instead.
 const MAX_SNAPSHOT_ATTEMPTS: u32 = 4;
 /// Staged parts carried forward in one job (one transaction).
@@ -191,8 +204,11 @@ struct Carry {
     /// The earlier snapshot's output counter: parts wholly below it are
     /// carried, the one it ends in is fetched again.
     next: u64,
-    /// The parts staged for it.
+    /// The output parts staged for it.
     staged: Vec<u32>,
+    /// The name parts staged for it: their records stay, and satisfy the
+    /// later manifest's name parts where its hashes agree.
+    names: usize,
     /// Blocks after it, up to the snapshot's, whose bodies are still
     /// wanted: their inputs are the outputs the parts lose.
     wanted: HashMap<Digest, Header>,
@@ -239,6 +255,8 @@ enum Job {
     NamePart {
         index: u32,
         bytes: Vec<u8>,
+        lo: crate::name_trie::Key,
+        hi: crate::name_trie::Key,
         hash: Digest,
         from: SocketAddr,
     },
@@ -247,6 +265,8 @@ enum Job {
         parts: Vec<CarriedPart>,
         next: u64,
     },
+    /// Staged name records checked against a later manifest's name parts.
+    CarryNames(Vec<CarriedNamePart>),
 }
 /// What applying it gave.
 enum Outcome {
@@ -492,9 +512,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             };
                             Outcome::Part { index, from, result }
                         }
-                        Job::NamePart { index, bytes, hash, from } => {
+                        Job::NamePart { index, bytes, lo, hi, hash, from } => {
                             let result = match net::decode_name_part(&bytes) {
-                                Some(records) => chain.stage_name_part(&records, Some(&hash)).map(|_| ()),
+                                Some(records) => chain.stage_name_part(&records, lo, hi, Some(&hash)).map(|_| ()),
                                 None => Err(ChainError::BadSnapshot),
                             };
                             Outcome::Part { index, from, result }
@@ -502,6 +522,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         Job::Carry { parts, next } => Outcome::Carry {
                             indexes: parts.iter().map(|p| p.index as u32).collect(),
                             result: chain.carry_snapshot_parts(&parts, next),
+                        },
+                        Job::CarryNames(parts) => Outcome::Carry {
+                            indexes: parts.iter().map(|p| p.index).collect(),
+                            result: chain.carry_name_parts(&parts),
                         },
                     };
                     if outcome_tx.send(outcome).is_err() {
@@ -1799,31 +1823,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.snap_downloads.insert((kind, id), d);
     }
 
-    /// The height of the snapshot to fetch below `best`: the newest at
-    /// least the sync point deep that a peer keeps for a while yet (peers
-    /// take one every `snapshot_interval` blocks and keep it through their
-    /// undo windows). With a sync point deeper than every peer's window,
-    /// the deepest one a peer keeps instead, since waiting for a deeper one
-    /// would never end. 0 if the chain is too short for any.
+    /// The height of the snapshot to fetch below `best`: the block the sync
+    /// point deep (peers keep a manifest for every block in their undo
+    /// windows). With a sync point deeper than every peer's window, the
+    /// deepest block a peer keeps, with a margin, since waiting for a deeper
+    /// one would never end. 0 if the chain is too short for any.
     fn snapshot_height(&self, best: &Header, now: Instant) -> u32 {
         let depth = self.config.sync_point.unwrap_or(0);
-        let interval = self.chain.params().snapshot_interval;
-        let want = best.height.saturating_sub(depth) / interval * interval;
+        let want = best.height.saturating_sub(depth);
         if want == 0 {
             return 0;
         }
         // A window moves with its tip: blocks found since a peer's status
         // moved its oldest too.
-        let margin = (interval / 4).max(1);
         let lowest = self
             .peers
             .trusted(now)
             .filter_map(|p| p.status)
             .filter(|s| s.height >= want)
-            .map(|s| s.oldest + best.height.saturating_sub(s.height) + margin)
+            .map(|s| s.oldest + best.height.saturating_sub(s.height) + snapshot_margin(&s))
             .min();
         match lowest {
-            Some(l) if l > want && l.div_ceil(interval) * interval <= best.height => l.div_ceil(interval) * interval,
+            Some(l) if l > want && l <= best.height => l,
             _ => want,
         }
     }
@@ -1855,7 +1876,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(later) = self.snapshot_target(&best, now).filter(|h| h.height > target.height) else {
             return;
         };
-        let margin = (self.chain.params().snapshot_interval / 4).max(1);
         let at: Vec<SocketAddr> = self
             .peers
             .trusted(now)
@@ -1868,7 +1888,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             && !self.peers.trusted(now).any(|p| {
                 p.status.is_some_and(|s| {
                     let oldest = s.oldest + best.height.saturating_sub(s.height);
-                    s.height >= target.height && oldest + margin <= target.height
+                    s.height >= target.height && oldest + snapshot_margin(&s) <= target.height
                 })
             });
         let unserved = !at.is_empty() && at.iter().all(|a| snap.unserved.contains(a));
@@ -1898,19 +1918,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let carry = match (snap.carry.take(), &snap.manifest) {
                 // Moving again before carrying: the same parts, more bodies.
                 (Some(c), _) => c,
-                // Output parts are carried; name parts are fetched afresh.
                 (None, Some(m)) => Carry {
                     next: m.next,
                     staged: (0..m.roots.len() as u32).filter(|&i| snap.parts[i as usize]).collect(),
+                    names: snap.parts[m.roots.len()..].iter().filter(|p| **p).count(),
                     wanted: HashMap::new(),
                     spent: Vec::new(),
                 },
                 (None, None) => unreachable!("staging begins only once the manifest is checked"),
             };
             snap.carry = Some(carry);
-            if let Err(e) = self.chain.clear_staged_names() {
-                return self.restart_snapshot(&format!("clearing the staged name parts: {e}"));
-            }
         }
         let Some(snap) = self.snap.as_mut() else { return };
         snap.target = target;
@@ -1937,9 +1954,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if let Some(carry) = snap.carry.as_mut() {
             carry.wanted.extend(bodies.into_iter().map(|h| (h.hash(), h)));
         }
-        let staged = snap.carry.as_ref().map_or(0, |c| c.staged.len());
+        let (staged, names) = snap.carry.as_ref().map_or((0, 0), |c| (c.staged.len(), c.names));
         self.log(&format!(
-            "fast sync: {why}; moving to the state after block {} ({}), {staged} staged parts to carry forward",
+            "fast sync: {why}; moving to the state after block {} ({}), {staged} staged output parts and {names} name parts to carry forward",
             target.height,
             short(&target.hash())
         ));
@@ -2014,11 +2031,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let _ = jobs.send(Job::Carry { parts: batch.to_vec(), next });
             }
         }
+        // Staged name records satisfy the name parts whose ranges saw no
+        // name operation since, which the hashes tell; the rest are
+        // cleared and fetched.
+        let names: Vec<CarriedNamePart> = if carry.names > 0 {
+            (0..manifest.names.len())
+                .filter_map(|j| {
+                    let (lo, hi) = manifest.name_range(j)?;
+                    let index = (roots.len() + j) as u32;
+                    Some(CarriedNamePart { index, lo, hi, hash: manifest.names[j].hash })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for batch in names.chunks(CARRY_BATCH) {
+            snap.staging.extend(batch.iter().map(|p| p.index));
+            if let Some(jobs) = &self.jobs {
+                let _ = jobs.send(Job::CarryNames(batch.to_vec()));
+            }
+        }
         let height = snap.target.height;
         self.log(&format!(
-            "fast sync: carrying {} staged parts forward to block {height}, less {} outputs spent since",
+            "fast sync: carrying {} staged output parts forward to block {height}, less {} outputs spent since, and {} staged name parts against its {} name parts",
             parts.len(),
-            spent.len()
+            spent.len(),
+            carry.names,
+            names.len()
         ));
     }
 
@@ -2330,10 +2369,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     let root = manifest.roots[i as usize];
                     Job::Part { index: i, bytes: bytes.to_vec(), next: manifest.next, root, from }
                 } else {
-                    let Some(part) = manifest.names.get(i as usize - manifest.roots.len()) else {
+                    let j = i as usize - manifest.roots.len();
+                    let (Some(part), Some((lo, hi))) = (manifest.names.get(j), manifest.name_range(j)) else {
                         return false;
                     };
-                    Job::NamePart { index: i, bytes: bytes.to_vec(), hash: part.hash, from }
+                    Job::NamePart { index: i, bytes: bytes.to_vec(), lo, hi, hash: part.hash, from }
                 };
                 snap.staging.insert(i);
                 if let Some(jobs) = &self.jobs {
@@ -2418,7 +2458,6 @@ mod tests {
             median_time_window: 11,
             emission: &[(1000, 50)],
             aggregator: AggregatorParams::MAINNET,
-            snapshot_interval: 4,
         }
     }
 
@@ -2851,7 +2890,8 @@ mod tests {
         let ha = std::thread::spawn(move || node_a.run());
         let hb = std::thread::spawn(move || node_b.run());
         assert!(wait_for_tip(&b.chain, &a_tip, 30), "b did not fast-sync to a's tip");
-        assert_eq!(b.chain.floor().unwrap(), Some(12));
+        // a keeps bodies from 8: the snapshot sits a block above that.
+        assert_eq!(b.chain.floor().unwrap(), Some(9));
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         tx_a.send(Event::Stop).unwrap();
         tx_b.send(Event::Stop).unwrap();

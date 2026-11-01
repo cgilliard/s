@@ -62,10 +62,10 @@
 //! every signed operation, which also makes a replayed signature useless.
 
 use heed::byteorder::BigEndian;
-use heed::types::{Bytes, U64};
+use heed::types::{Bytes, U32, U64};
 use heed::{Database, Env, RoTxn, RwTxn};
 
-use crate::name_trie::{self, Key, NameProof, NameTrie, key_of};
+use crate::name_trie::{self, KEY_BITS, Key, NameProof, NameTrie, key_of};
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
 use crate::state_tree::Digest;
 use crate::transaction::{Key as OwnerKey, Sig, hash_domain, pubkey_hash};
@@ -110,6 +110,7 @@ pub(crate) const DOM_COMMIT_LEAF: u32 = 8;
 pub(crate) const DOM_OP: u32 = 9;
 pub(crate) const DOM_UPDATE: u32 = 10;
 const DOM_NAME_PART: u32 = 11;
+const DOM_NAME_BUCKET: u32 = 12;
 
 const DIGEST_BYTES: usize = DIGEST * 4;
 const COMMIT_ENTRY: usize = DIGEST_BYTES + 4;
@@ -631,6 +632,87 @@ pub struct NameSet {
     commits: Database<U64<BigEndian>, Bytes>,
     /// Commit hash to position.
     by_hash: Database<Bytes, U64<BigEndian>>,
+    /// Per key bucket (the top [`NAME_BUCKET_LOG`] bits), the count and
+    /// hash of its records: what a snapshot's name parts are made of, kept
+    /// as records change so taking a snapshot never reads them all.
+    buckets: Database<U32<BigEndian>, Bytes>,
+}
+
+/// Key bits that pick a record's bucket.
+pub const NAME_BUCKET_LOG: usize = 16;
+
+/// The bucket of a key.
+pub fn bucket_of(key: Key) -> u32 {
+    (key >> (KEY_BITS - NAME_BUCKET_LOG)) as u32
+}
+
+/// The first key of bucket `b`.
+pub fn bucket_start(b: u32) -> Key {
+    (b as Key) << (KEY_BITS - NAME_BUCKET_LOG)
+}
+
+/// The keys of bucket `b`: `start <= key < end` (`end` is `Key::MAX` for
+/// the last, which excludes only a key no hash gives).
+fn bucket_range(b: u32) -> (Key, Key) {
+    let start = bucket_start(b);
+    let end = if b as usize + 1 == 1 << NAME_BUCKET_LOG { Key::MAX } else { bucket_start(b + 1) };
+    (start, end)
+}
+
+/// The hash of a bucket's records in key order; the empty bucket's is zero.
+pub fn bucket_hash(records: &[Record]) -> Digest {
+    if records.is_empty() {
+        return [Fp::ZERO; DIGEST];
+    }
+    let mut bytes = Vec::with_capacity(records.len() * (RECORD_FIXED + 16));
+    for r in records {
+        bytes.extend_from_slice(&r.to_bytes());
+    }
+    let mut v = Vec::with_capacity(1 + bytes.len().div_ceil(3));
+    v.push(Fp::from_u64(records.len() as u64));
+    v.extend(crate::pow::pack_bytes(&bytes));
+    hash_domain(DOM_NAME_BUCKET, &v)
+}
+
+/// The hash of a snapshot name part: its non-empty buckets' indexes and
+/// hashes, ascending.
+fn part_hash_of_buckets(buckets: &[(u32, Digest)]) -> Digest {
+    let mut v = Vec::with_capacity(buckets.len() * (1 + DIGEST));
+    for (b, h) in buckets {
+        v.push(Fp::new(*b));
+        v.extend_from_slice(h);
+    }
+    hash_domain(DOM_NAME_PART, &v)
+}
+
+/// The hash of a name part made of `records`, which must be in key order
+/// within `lo <= key < hi`; `None` if they are not.
+pub fn part_hash(records: &[Record], lo: Key, hi: Key) -> Option<Digest> {
+    let mut buckets: Vec<(u32, Digest)> = Vec::new();
+    let mut i = 0;
+    let mut prev: Option<Key> = None;
+    while i < records.len() {
+        let key = records[i].key()?;
+        if key < lo || key >= hi || prev.is_some_and(|p| p >= key) {
+            return None;
+        }
+        let b = bucket_of(key);
+        let mut j = i + 1;
+        while j < records.len() {
+            let k = records[j].key()?;
+            if bucket_of(k) != b {
+                break;
+            }
+            if k <= records[j - 1].key()? {
+                return None;
+            }
+            j += 1;
+        }
+        buckets.push((b, bucket_hash(&records[i..j])));
+        prev = records[j - 1].key();
+        i = j;
+    }
+    Some(part_hash_of_buckets(&buckets))
 }
 
 fn key_bytes(key: Key) -> [u8; 15] {
@@ -645,7 +727,8 @@ impl NameSet {
         let records = env.create_database(wtxn, Some(&format!("{prefix}.records")))?;
         let commits = env.create_database(wtxn, Some(&format!("{prefix}.commits")))?;
         let by_hash = env.create_database(wtxn, Some(&format!("{prefix}.commits_by_hash")))?;
-        Ok(NameSet { trie, records, commits, by_hash })
+        let buckets = env.create_database(wtxn, Some(&format!("{prefix}.buckets")))?;
+        Ok(NameSet { trie, records, commits, by_hash, buckets })
     }
 
     pub fn trie(&self) -> &NameTrie {
@@ -684,6 +767,14 @@ impl NameSet {
 
     /// Registers a name that is not yet registered. Returns the trie root.
     pub fn register(&self, wtxn: &mut RwTxn, record: &Record) -> Result<Digest> {
+        let root = self.register_unindexed(wtxn, record)?;
+        self.reindex_bucket(wtxn, bucket_of(record.key().expect("checked")))?;
+        Ok(root)
+    }
+
+    /// [`NameSet::register`] without maintaining the bucket table: for bulk
+    /// loads, followed by [`NameSet::rebuild_buckets`].
+    pub fn register_unindexed(&self, wtxn: &mut RwTxn, record: &Record) -> Result<Digest> {
         let key = record.key().ok_or(Error::BadName)?;
         let root = self.trie.insert(wtxn, key, &record.leaf_value().ok_or(Error::BadName)?)?;
         self.records.put(wtxn, &key_bytes(key), &record.to_bytes())?;
@@ -697,6 +788,7 @@ impl NameSet {
         let previous = self.record(wtxn, key)?.ok_or(name_trie::Error::Absent(key))?;
         let root = self.trie.update(wtxn, key, &record.leaf_value().ok_or(Error::BadName)?)?;
         self.records.put(wtxn, &key_bytes(key), &record.to_bytes())?;
+        self.reindex_bucket(wtxn, bucket_of(key))?;
         Ok((previous, root))
     }
 
@@ -706,7 +798,96 @@ impl NameSet {
         let record = self.record(wtxn, key)?.ok_or(name_trie::Error::Absent(key))?;
         let root = self.trie.remove(wtxn, key)?;
         self.records.delete(wtxn, &key_bytes(key))?;
+        self.reindex_bucket(wtxn, bucket_of(key))?;
         Ok((record, root))
+    }
+
+    /// Removes the records with `lo <= key < hi` and their leaves, without
+    /// maintaining the bucket table: for staging, which rebuilds it.
+    pub fn clear_range_unindexed(&self, wtxn: &mut RwTxn, lo: Key, hi: Key) -> Result<()> {
+        let keys: Vec<Key> = self.trie.entries_in(wtxn, lo, hi)?.into_iter().map(|(k, _)| k).collect();
+        for key in keys {
+            self.trie.remove(wtxn, key)?;
+            self.records.delete(wtxn, &key_bytes(key))?;
+        }
+        Ok(())
+    }
+
+    fn put_bucket(&self, wtxn: &mut RwTxn, b: u32, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            self.buckets.delete(wtxn, &b)?;
+            return Ok(());
+        }
+        let mut value = Vec::with_capacity(4 + DIGEST_BYTES);
+        value.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        value.extend_from_slice(&digest_to_bytes(&bucket_hash(records)));
+        self.buckets.put(wtxn, &b, &value)?;
+        Ok(())
+    }
+
+    /// Recomputes bucket `b` from its records.
+    fn reindex_bucket(&self, wtxn: &mut RwTxn, b: u32) -> Result<()> {
+        let (lo, hi) = bucket_range(b);
+        let records = self.records_in(wtxn, lo, hi)?;
+        self.put_bucket(wtxn, b, &records)
+    }
+
+    /// Recomputes every bucket from the records, a page at a time.
+    pub fn rebuild_buckets(&self, wtxn: &mut RwTxn) -> Result<()> {
+        self.buckets.clear(wtxn)?;
+        let mut from: Key = 0;
+        let mut current: Vec<Record> = Vec::new();
+        loop {
+            let page = self.records_from(wtxn, from, NAME_PART_RECORDS)?;
+            let Some(last) = page.last() else { break };
+            let last_key = last.key().ok_or(Error::Corrupt("record"))?;
+            for r in page.iter() {
+                let b = bucket_of(r.key().ok_or(Error::Corrupt("record"))?);
+                if current.first().is_some_and(|c| bucket_of(c.key().unwrap()) != b) {
+                    let cb = bucket_of(current[0].key().unwrap());
+                    self.put_bucket(wtxn, cb, &current)?;
+                    current.clear();
+                }
+                current.push(r.clone());
+            }
+            if page.len() < NAME_PART_RECORDS || last_key == Key::MAX {
+                break;
+            }
+            from = last_key + 1;
+        }
+        if !current.is_empty() {
+            let cb = bucket_of(current[0].key().unwrap());
+            self.put_bucket(wtxn, cb, &current)?;
+        }
+        Ok(())
+    }
+
+    /// A snapshot's name parts from the bucket table: consecutive buckets
+    /// grouped to at most [`NAME_PART_RECORDS`] records each (a larger
+    /// bucket is a part of its own), as the first key and the hash of each.
+    pub fn name_parts(&self, rtxn: &RoTxn) -> Result<Vec<(Key, Digest)>> {
+        let mut parts = Vec::new();
+        let mut group: Vec<(u32, Digest)> = Vec::new();
+        let mut count = 0usize;
+        for item in self.buckets.iter(rtxn)? {
+            let (b, value) = item?;
+            if value.len() != 4 + DIGEST_BYTES {
+                return Err(Error::Corrupt("bucket"));
+            }
+            let n = u32::from_le_bytes(value[..4].try_into().unwrap()) as usize;
+            let h = digest_from_bytes(&value[4..]).ok_or(Error::Corrupt("bucket"))?;
+            if !group.is_empty() && count + n > NAME_PART_RECORDS {
+                parts.push((bucket_start(group[0].0), part_hash_of_buckets(&group)));
+                group.clear();
+                count = 0;
+            }
+            group.push((b, h));
+            count += n;
+        }
+        if !group.is_empty() {
+            parts.push((bucket_start(group[0].0), part_hash_of_buckets(&group)));
+        }
+        Ok(parts)
     }
 
     /// A membership or non-membership proof for `name`.
@@ -765,9 +946,36 @@ impl NameSet {
 
     /// The commits made at or before `height`, ascending by position:
     /// those past their window once `height` is the last they could be
-    /// revealed at.
+    /// revealed at. Positions grow with height, so the walk stops at the
+    /// first later commit and costs what it returns.
     pub fn commits_up_to(&self, rtxn: &RoTxn, height: u32) -> Result<Vec<(u64, Commit)>> {
-        Ok(self.commits(rtxn)?.into_iter().filter(|(_, c)| c.height <= height).collect())
+        let mut out = Vec::new();
+        for item in self.commits.iter(rtxn)? {
+            let (p, b) = item?;
+            let c = Commit::from_bytes(b).ok_or(Error::Corrupt("commit"))?;
+            if c.height > height {
+                break;
+            }
+            out.push((p, c));
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` records with keys from `from` on, ascending: a page
+    /// of the registry, for walking it without holding it all.
+    pub fn records_from(&self, rtxn: &RoTxn, from: Key, limit: usize) -> Result<Vec<Record>> {
+        let mut out = Vec::with_capacity(limit);
+        let lo = key_bytes(from);
+        let bounds: (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>) =
+            (std::ops::Bound::Included(&lo[..]), std::ops::Bound::Unbounded);
+        for item in self.records.range(rtxn, &bounds)? {
+            let (_, b) = item?;
+            out.push(Record::from_bytes(b).ok_or(Error::Corrupt("record"))?);
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Removes everything.
@@ -776,6 +984,7 @@ impl NameSet {
         self.records.clear(wtxn)?;
         self.commits.clear(wtxn)?;
         self.by_hash.clear(wtxn)?;
+        self.buckets.clear(wtxn)?;
         Ok(())
     }
 }
@@ -834,20 +1043,9 @@ impl From<Error> for ApplyError {
     }
 }
 
-/// Records per fast-sync name part (see `Chain::snapshot_name_part`).
+/// Records a fast-sync name part holds at most, buckets permitting (see
+/// [`NameSet::name_parts`]).
 pub const NAME_PART_RECORDS: usize = 4096;
-
-/// The hash of a fast-sync name part: its records' bytes, in key order.
-pub fn name_part_hash(records: &[Record]) -> Digest {
-    let mut bytes = Vec::with_capacity(records.len() * (RECORD_FIXED + 16));
-    for r in records {
-        bytes.extend_from_slice(&r.to_bytes());
-    }
-    let mut v = Vec::with_capacity(1 + bytes.len().div_ceil(3));
-    v.push(Fp::from_u64(records.len() as u64));
-    v.extend(crate::pow::pack_bytes(&bytes));
-    hash_domain(DOM_NAME_PART, &v)
-}
 
 /// Whether a commit made at `commit_height` can be revealed at `height`.
 pub fn in_window(height: u32, commit_height: u32) -> bool {
@@ -1068,16 +1266,19 @@ impl NameSet {
             ("name records", self.records.stat(rtxn)?),
             ("commits", self.commits.stat(rtxn)?),
             ("commits by hash", self.by_hash.stat(rtxn)?),
+            ("name buckets", self.buckets.stat(rtxn)?),
         ] {
             out.push((name, size(stat), stat.entries));
         }
         Ok(out)
     }
 
-    /// Removes every record and the trie, keeping the commit tables.
+    /// Removes every record, the trie and the buckets, keeping the commit
+    /// tables.
     pub fn clear_names(&self, wtxn: &mut RwTxn) -> Result<()> {
         self.trie.clear(wtxn)?;
         self.records.clear(wtxn)?;
+        self.buckets.clear(wtxn)?;
         Ok(())
     }
 }
@@ -1423,5 +1624,84 @@ mod tests {
         assert!(set.commits(&wtxn).unwrap().is_empty());
         assert!(set.is_empty(&wtxn).unwrap());
         wtxn.abort();
+    }
+
+    /// Scale: `TABMINER_SCALE_NAMES` synthetic names (default a million)
+    /// registered in batches, then lookups, proofs and the snapshot's
+    /// name-part pass timed over them.
+    #[test]
+    #[ignore = "registers a million names; run with --release"]
+    fn scale() {
+        let n: usize = std::env::var("TABMINER_SCALE_NAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+        let dir = TempDir::new("scale");
+        let env = open_env(&dir.0, 64 << 30).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let set = NameSet::open(&env, &mut wtxn, "names").unwrap();
+        wtxn.commit().unwrap();
+        let name_of = |i: usize| format!("n{i:x}").into_bytes();
+        let t = std::time::Instant::now();
+        let batch = 10_000;
+        for start in (0..n).step_by(batch) {
+            let mut wtxn = env.write_txn().unwrap();
+            for i in start..(start + batch).min(n) {
+                let r = Record { name: name_of(i), owner: d(i as u32), value: d(1), memo: d(2) };
+                set.register(&mut wtxn, &r).unwrap();
+            }
+            wtxn.commit().unwrap();
+            if (start / batch) % 10 == 9 {
+                eprintln!("  {} names in {:?}", start + batch, t.elapsed());
+            }
+        }
+        let insert_time = t.elapsed();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(set.len(&rtxn).unwrap(), n as u64);
+        // Lookups and proofs of random names.
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let samples = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..samples {
+            assert!(set.lookup(&rtxn, &name_of(next())).unwrap().is_some());
+        }
+        let lookup = t.elapsed() / samples;
+        let t = std::time::Instant::now();
+        let mut depth = (usize::MAX, 0usize, 0usize);
+        for _ in 0..samples {
+            let p = set.prove(&rtxn, &name_of(next())).unwrap();
+            depth = (depth.0.min(p.depth()), depth.1.max(p.depth()), depth.2 + p.depth());
+        }
+        let prove = t.elapsed() / samples;
+        let t = std::time::Instant::now();
+        assert!(set.lookup(&rtxn, b"notregistered").unwrap().is_none());
+        let miss = t.elapsed();
+        // The snapshot's pass over the buckets, and a full rebuild.
+        let t = std::time::Instant::now();
+        let parts = set.name_parts(&rtxn).unwrap().len();
+        let snapshot = t.elapsed();
+        drop(rtxn);
+        let t = std::time::Instant::now();
+        let mut wtxn = env.write_txn().unwrap();
+        set.rebuild_buckets(&mut wtxn).unwrap();
+        wtxn.commit().unwrap();
+        let rebuild = t.elapsed();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(set.name_parts(&rtxn).unwrap().len(), parts);
+        let storage = set.storage(&rtxn).unwrap();
+        let bytes: u64 = storage.iter().map(|(_, b, _)| *b).sum();
+        println!(
+            "{n} names: registered in {insert_time:?} ({:.0}/s); lookup {lookup:?}, miss {miss:?}, proof {prove:?} \
+             (depth {} to {}, mean {:.1}); snapshot pass {snapshot:?} over {parts} parts, bucket rebuild {rebuild:?}; {} MB on disk ({:?})",
+            n as f64 / insert_time.as_secs_f64(),
+            depth.0,
+            depth.1,
+            depth.2 as f64 / samples as f64,
+            bytes >> 20,
+            storage.iter().map(|(k, b, e)| format!("{k}: {} MB, {e} entries", b >> 20)).collect::<Vec<_>>()
+        );
     }
 }

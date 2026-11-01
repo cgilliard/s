@@ -56,7 +56,7 @@ use crate::aggregate::AggregatorParams;
 use crate::block::{Block, BlockOutput, Body, BodyError, HEADER_SIZE, Header};
 use crate::difficulty::{Asert, U256};
 use crate::name_trie::Key;
-use crate::names::{ApplyError, Commit, NAME_PART_RECORDS, NameSet, NameUndo, Record, commit_leaf, name_part_hash};
+use crate::names::{ApplyError, Commit, NameSet, NameUndo, Record, commit_leaf, part_hash};
 use crate::poseidon2::digest_from_bytes;
 use crate::pow::{Digest, PowParams, SeedText, Target};
 use crate::state_tree::{EMPTY, empty_root, open_env};
@@ -105,9 +105,6 @@ pub struct ChainParams {
     pub emission: &'static [(u32, u64)],
     /// Parameters of the block validity proof.
     pub aggregator: AggregatorParams,
-    /// Snapshots of the state are taken after every block at a multiple of
-    /// this height, and only those are served for fast sync.
-    pub snapshot_interval: u32,
 }
 
 impl ChainParams {
@@ -122,7 +119,6 @@ impl ChainParams {
         median_time_window: 11,
         emission: MAINNET_EMISSION,
         aggregator: AggregatorParams::MAINNET,
-        snapshot_interval: 144,
     };
 
     /// Subsidy paid by the block at `height`: zero for genesis and above
@@ -194,6 +190,12 @@ pub struct BlockStatement<'a> {
 /// verifier for the block circuit.
 pub trait ProofVerifier {
     fn verify(&self, statement: &BlockStatement<'_>, proof: &[u8]) -> bool;
+
+    /// Debugging only: whether proofs go unchecked, which also permits
+    /// [`Chain::debug_fill_names`].
+    fn is_unchecked(&self) -> bool {
+        false
+    }
 }
 
 /// Accepts every proof. For development and tests only; a node using this
@@ -203,6 +205,10 @@ pub struct AcceptAllProofs;
 
 impl ProofVerifier for AcceptAllProofs {
     fn verify(&self, _: &BlockStatement<'_>, _: &[u8]) -> bool {
+        true
+    }
+
+    fn is_unchecked(&self) -> bool {
         true
     }
 }
@@ -394,8 +400,9 @@ const META_FORMAT: &str = "format";
 /// of 256 positions up; 9 keeps the outputs spent within the undo window
 /// once, by position, for reorganizations and snapshots alike; 10 stores
 /// block bodies with a name section; 11 keeps the name registry, name undo
-/// records and snapshot manifests with the name half.
-const FORMAT: u8 = 11;
+/// records and snapshot manifests with the name half; 12 keeps the
+/// registry's bucket table.
+const FORMAT: u8 = 12;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -560,6 +567,18 @@ pub struct CarriedPart {
     pub root: Option<Digest>,
 }
 
+/// A name part of a later snapshot's manifest, to be satisfied by staged
+/// records where it can (see [`Chain::carry_name_parts`]).
+#[derive(Clone, Debug)]
+pub struct CarriedNamePart {
+    /// Its index among the manifest's parts (after the output parts).
+    pub index: u32,
+    pub lo: Key,
+    pub hi: Key,
+    /// Its hash in the later manifest.
+    pub hash: Digest,
+}
+
 /// Persistent chain state.
 pub struct Chain<V: ProofVerifier> {
     env: Env,
@@ -578,9 +597,11 @@ pub struct Chain<V: ProofVerifier> {
     meta: Database<Str, Bytes>,
     /// Undo records kept, counting back from the tip; `None` keeps all.
     max_undo: Option<u32>,
-    /// Snapshot manifest of the main-chain block at each multiple of
-    /// [`ChainParams::snapshot_interval`] within the undo window: its id,
-    /// the output counter and the root of every part.
+    /// Snapshot manifest of every main-chain block within the undo window
+    /// (taken as a block connects, if it is within the window of the best
+    /// header known: an initial sync skips the blocks it would prune), by
+    /// height: its id, the output counter, the root of every output part,
+    /// the name root and the name parts.
     snapshots: Database<U32<BigEndian>, Bytes>,
     /// Every output spent by a main-chain block within the undo window, by
     /// position: the spending block's height, the commitment and memo.
@@ -947,8 +968,86 @@ impl<V: ProofVerifier> Chain<V> {
         match self.header_at(0)? {
             None => self.init_genesis(&expected),
             Some(h) if h == expected.header => Ok(()),
+            // A debugging chain whose registry was filled behind genesis
+            // (see `debug_fill_names`) differs in the state root alone.
+            Some(h)
+                if self.verifier.is_unchecked()
+                    && Header { state_root: expected.header.state_root, ..h } == expected.header =>
+            {
+                Ok(())
+            }
             Some(_) => Err(ChainError::WrongGenesis),
         }
+    }
+
+    /// Debugging only (the verifier must be unchecked): fills the registry
+    /// with `n` synthetic names behind genesis, as if they had always been
+    /// there, for testing at scale without mining them. The names are
+    /// `n0`, `n1`, ... in hexadecimal, with owner hashes no key matches,
+    /// so every node filling with the same `n` computes the same state and
+    /// genesis header, whose state root is rewritten. A chain that already
+    /// has blocks or names is left alone.
+    pub fn debug_fill_names(&self, n: usize, progress: &dyn Fn(usize)) -> Result<()> {
+        if !self.verifier.is_unchecked() {
+            return Err(ChainError::Corrupt("filling names needs an unchecked verifier"));
+        }
+        let rtxn = self.env.read_txn()?;
+        let tip = self.tip_in(&rtxn)?.ok_or(ChainError::NoGenesis)?;
+        let have = self.names.len(&rtxn).map_err(|e| ChainError::Name(e.into()))? as usize;
+        drop(rtxn);
+        // Only a fresh chain is filled: once it has blocks, or names from a
+        // fill or a fast sync, the flag is a no-op (a half-staged fast sync
+        // leaves no names, so the flag is best dropped after the first
+        // start).
+        if tip.height != 0 || have != 0 {
+            return Ok(());
+        }
+        let batch = 10_000;
+        for start in (0..n).step_by(batch) {
+            let mut wtxn = self.env.write_txn()?;
+            for i in start..(start + batch).min(n) {
+                let name = format!("n{i:x}").into_bytes();
+                let owner = crate::poseidon2::hash(&[
+                    crate::poseidon2::Fp::from_u64(i as u64),
+                    crate::poseidon2::Fp::new(0xf111),
+                ]);
+                let record = Record::new(&name, owner, EMPTY, EMPTY).expect("a hexadecimal name is valid");
+                self.names.register_unindexed(&mut wtxn, &record).map_err(|e| ChainError::Name(e.into()))?;
+            }
+            wtxn.commit()?;
+            progress((start + batch).min(n));
+        }
+        let mut wtxn = self.env.write_txn()?;
+        self.names.rebuild_buckets(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
+        wtxn.commit()?;
+        // The state root changed under genesis: rewrite its header, whose
+        // id every record of it is keyed by.
+        let mut wtxn = self.env.write_txn()?;
+        let root = self.names.root(&wtxn).map_err(|e| ChainError::Name(e.into()))?;
+        let state_root = self.utxo.set_name_root(&mut wtxn, &root)?;
+        let old = Header { ..tip };
+        let new = Header { state_root, ..tip };
+        let (old_id, new_id) = (digest_bytes(&old.hash()), digest_bytes(&new.hash()));
+        let body = self.bodies.get(&wtxn, &old_id)?.map(<[u8]>::to_vec);
+        let index = self.index.get(&wtxn, &old_id)?.map(<[u8]>::to_vec);
+        let undo = self.undo.get(&wtxn, &old_id)?.map(<[u8]>::to_vec);
+        for db in [&self.headers, &self.bodies, &self.index, &self.undo] {
+            db.delete(&mut wtxn, &old_id)?;
+        }
+        self.headers.put(&mut wtxn, &new_id, &new.to_bytes())?;
+        if let Some(b) = body {
+            self.bodies.put(&mut wtxn, &new_id, &b)?;
+        }
+        if let Some(b) = index {
+            self.index.put(&mut wtxn, &new_id, &b)?;
+        }
+        if let Some(b) = undo {
+            self.undo.put(&mut wtxn, &new_id, &b)?;
+        }
+        self.by_height.put(&mut wtxn, &0, &new_id)?;
+        self.meta.put(&mut wtxn, META_TIP, &new_id)?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// The commitment is checked first: the other failures condemn the
@@ -1170,7 +1269,14 @@ impl<V: ProofVerifier> Chain<V> {
         self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, names }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
-        if header.height.is_multiple_of(self.params.snapshot_interval) {
+        // A manifest for every block in the undo window, counted from the
+        // best header known: an initial sync skips the blocks it would
+        // prune at once.
+        let within = match self.max_undo {
+            None => true,
+            Some(keep) => header.height + keep >= self.best_header_in(wtxn)?.height,
+        };
+        if within {
             self.take_snapshot(wtxn, header)?;
         }
         // The block leaving the undo window keeps only its header.
@@ -1557,13 +1663,21 @@ impl<V: ProofVerifier> Chain<V> {
                 roots.push(self.stage_snapshot_part(p, &rest[..n], &in_part, next_position, None)?);
                 rest = &rest[n..];
             }
-            let mut names = Vec::new();
-            for chunk in records.chunks(NAME_PART_RECORDS) {
-                let hash = self.stage_name_part(chunk, None)?;
-                names.push(NamePart { first: chunk[0].key().ok_or(ChainError::BadSnapshot)?, hash });
+            if !records.is_empty() {
+                self.stage_name_part(records, 0, Key::MAX, None)?;
             }
+            let mut wtxn = self.env.write_txn()?;
+            self.names.rebuild_buckets(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
+            wtxn.commit()?;
             let rtxn = self.env.read_txn()?;
             let name_root = self.names.root(&rtxn).map_err(|e| ChainError::Name(e.into()))?;
+            let names = self
+                .names
+                .name_parts(&rtxn)
+                .map_err(|e| ChainError::Name(e.into()))?
+                .into_iter()
+                .map(|(first, hash)| NamePart { first, hash })
+                .collect();
             drop(rtxn);
             self.finish_snapshot(block, &Manifest { next: next_position, roots, name_root, names })
         })();
@@ -1657,13 +1771,14 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(root)
     }
 
-    /// Stores a snapshot's name part: records in key order, registered in
-    /// the trie being rebuilt. Returns the part's hash; with `expected`
-    /// (the manifest's), a part with another hash is refused and nothing
-    /// stored. The trie's root is checked when the snapshot finishes.
-    pub fn stage_name_part(&self, records: &[Record], expected: Option<&Digest>) -> Result<Digest> {
-        let hash = name_part_hash(records);
-        if expected.is_some_and(|e| *e != hash) || records.windows(2).any(|w| w[0].key() >= w[1].key()) {
+    /// Stores a snapshot's name part covering keys `lo <= key < hi`: its
+    /// records in key order, registered in the trie being rebuilt. Returns
+    /// the part's hash; with `expected` (the manifest's), a part with
+    /// another hash is refused and nothing stored. The trie's root is
+    /// checked, and the bucket table rebuilt, when the snapshot finishes.
+    pub fn stage_name_part(&self, records: &[Record], lo: Key, hi: Key, expected: Option<&Digest>) -> Result<Digest> {
+        let hash = part_hash(records, lo, hi).ok_or(ChainError::BadSnapshot)?;
+        if expected.is_some_and(|e| *e != hash) {
             return Err(ChainError::BadSnapshot);
         }
         let mut wtxn = self.env.write_txn()?;
@@ -1671,22 +1786,35 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::BadSnapshot);
         }
         for r in records {
-            self.names.register(&mut wtxn, r).map_err(|_| ChainError::BadSnapshot)?;
+            self.names.register_unindexed(&mut wtxn, r).map_err(|_| ChainError::BadSnapshot)?;
         }
         wtxn.commit()?;
         Ok(hash)
     }
 
-    /// Clears the staged name parts, keeping the output parts and their
-    /// commits: name parts are fetched afresh for a later snapshot.
-    pub fn clear_staged_names(&self) -> Result<()> {
+    /// Carries staged name records forward to a later snapshot: each of
+    /// its name parts is satisfied if the staged records in its key range
+    /// hash to the manifest's value (the range had no name operation in
+    /// between and was wholly staged), and otherwise its range is cleared,
+    /// to be fetched again. Returns, for each part, whether it was
+    /// satisfied. One transaction for them all.
+    pub fn carry_name_parts(&self, parts: &[CarriedNamePart]) -> Result<Vec<bool>> {
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
             return Err(ChainError::BadSnapshot);
         }
-        self.names.clear_names(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
+        let mut carried = Vec::with_capacity(parts.len());
+        for part in parts {
+            let records = self.names.records_in(&wtxn, part.lo, part.hi).map_err(|e| ChainError::Name(e.into()))?;
+            if !records.is_empty() && part_hash(&records, part.lo, part.hi) == Some(part.hash) {
+                carried.push(true);
+                continue;
+            }
+            self.names.clear_range_unindexed(&mut wtxn, part.lo, part.hi).map_err(|e| ChainError::Name(e.into()))?;
+            carried.push(false);
+        }
         wtxn.commit()?;
-        Ok(())
+        Ok(carried)
     }
 
     /// Carries staged parts forward to a later snapshot, whose counter is
@@ -1784,6 +1912,7 @@ impl<V: ProofVerifier> Chain<V> {
         if name_root != manifest.name_root {
             return Err(ChainError::BadSnapshot);
         }
+        self.names.rebuild_buckets(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
         self.utxo.set_name_root(&mut wtxn, &name_root)?;
         if self.utxo.root(&wtxn)? != header.state_root {
             return Err(ChainError::BadSnapshot);
@@ -1809,9 +1938,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.meta.put(&mut wtxn, META_TIP, &id)?;
         self.meta.put(&mut wtxn, META_FLOOR, &header.height.to_le_bytes())?;
         self.meta.put(&mut wtxn, META_FLOOR_NEXT, &next_position.to_le_bytes())?;
-        if header.height.is_multiple_of(self.params.snapshot_interval) {
-            self.put_snapshot(&mut wtxn, &header, manifest)?;
-        }
+        self.put_snapshot(&mut wtxn, &header, manifest)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -1859,13 +1986,12 @@ impl<V: ProofVerifier> Chain<V> {
         let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
         let roots =
             (0..parts).map(|p| self.utxo.subtree(wtxn, SNAPSHOT_PART_LOG, p)).collect::<utxo::Result<Vec<_>>>()?;
-        let records = self.names.records_in(wtxn, 0, Key::MAX).map_err(|e| ChainError::Name(e.into()))?;
-        let names = records
-            .chunks(NAME_PART_RECORDS)
-            .map(|chunk| NamePart {
-                first: chunk[0].key().expect("stored records are well formed"),
-                hash: name_part_hash(chunk),
-            })
+        let names = self
+            .names
+            .name_parts(wtxn)
+            .map_err(|e| ChainError::Name(e.into()))?
+            .into_iter()
+            .map(|(first, hash)| NamePart { first, hash })
             .collect();
         let name_root = self.utxo.name_root(wtxn)?;
         self.put_snapshot(wtxn, header, &Manifest { next, roots, name_root, names })
@@ -2188,7 +2314,6 @@ mod tests {
             median_time_window: 11,
             emission: &[(10, 50), (10, 25), (5, 12)],
             aggregator: AggregatorParams::MAINNET,
-            snapshot_interval: 4,
         }
     }
 
@@ -2953,8 +3078,9 @@ mod tests {
                 .filter(|&h| chain.snapshot_manifest(&blocks[h - 1].header.hash()).unwrap().is_some())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(kept(&f.chain, &blocks), [12, 16, 20]);
-        for h in [12, 16, 20] {
+        // A manifest for every block in the undo window.
+        assert_eq!(kept(&f.chain, &blocks), (11..=20).collect::<Vec<_>>());
+        for h in [11, 12, 16, 20] {
             check(&f.chain, &blocks[h - 1].header);
         }
         // The spent log holds the spends of the blocks in the window, 12 to
@@ -2995,9 +3121,9 @@ mod tests {
         // f's block 20 went with the reorganization; the new 20 replaced it.
         assert!(f.chain.snapshot_manifest(&blocks[19].header.hash()).unwrap().is_none());
         let both: Vec<Block> = blocks[..16].iter().chain(fork.iter()).cloned().collect();
-        assert_eq!(kept(&f.chain, &both), [12, 16, 20]);
+        assert_eq!(kept(&f.chain, &both), (12..=21).collect::<Vec<_>>());
         assert_eq!(spent_heights(&f.chain), (13..=21).flat_map(|h| [h, h]).collect::<Vec<_>>());
-        for h in [12, 16, 20] {
+        for h in [12, 16, 17, 20, 21] {
             let header = both[h - 1].header;
             assert_eq!(check(&f.chain, &header), check(&g.chain, &header));
         }
@@ -3282,8 +3408,10 @@ mod tests {
         assert_eq!((1..=6).map(body).collect::<Vec<_>>(), [false, false, false, true, true, true]);
         assert_eq!(f.chain.oldest_body().unwrap(), 4);
         assert!(f.chain.entry(&blocks[0].header.hash()).unwrap().unwrap().validated);
-        assert!(f.chain.snapshot_manifest(&blocks[2].header.hash()).unwrap().is_none());
-        assert!(f.chain.snapshot_manifest(&blocks[3].header.hash()).unwrap().is_some());
+        // Manifests go with the window too: block 3's parts are still served
+        // (the undo records after it remain), block 2's are not.
+        assert!(f.chain.snapshot_manifest(&blocks[1].header.hash()).unwrap().is_none());
+        assert!(f.chain.snapshot_manifest(&blocks[2].header.hash()).unwrap().is_some());
         // A heavier branch from block 2 would unwind block 3: refused.
         let g = open("undo-fork");
         g.chain.init_genesis(&genesis_block(vec![])).unwrap();
@@ -3407,7 +3535,8 @@ mod tests {
         let mut expected = vec![alice.clone(), bob.clone()];
         expected.sort_by_key(|r| r.key().unwrap());
         assert_eq!(names16, expected);
-        assert_eq!(crate::names::name_part_hash(&names16), m16.names[0].hash);
+        let (lo16, hi16) = m16.name_range(0).unwrap();
+        assert_eq!(crate::names::part_hash(&names16, lo16, hi16), Some(m16.names[0].hash));
         assert!(a.chain.snapshot_name_part(&s16.hash(), 1).unwrap().is_none());
         // Block 20's: alice as updated.
         let m20 = a.chain.snapshot_manifest(&s20.hash()).unwrap().unwrap();
@@ -3427,12 +3556,12 @@ mod tests {
         // A name part with another hash, or out of order, is refused.
         let mut wrong = m16.names[0].hash;
         wrong[0] += crate::poseidon2::Fp::ONE;
-        assert!(matches!(b.chain.stage_name_part(&names16, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        assert!(matches!(b.chain.stage_name_part(&names16, lo16, hi16, Some(&wrong)), Err(ChainError::BadSnapshot)));
         let reversed: Vec<Record> = names16.iter().rev().cloned().collect();
-        assert!(matches!(b.chain.stage_name_part(&reversed, None), Err(ChainError::BadSnapshot)));
+        assert!(matches!(b.chain.stage_name_part(&reversed, lo16, hi16, None), Err(ChainError::BadSnapshot)));
         // Without the name part the trie's root is not the manifest's.
         assert!(matches!(b.chain.finish_snapshot(&blocks[15], &m16), Err(ChainError::BadSnapshot)));
-        b.chain.stage_name_part(&names16, Some(&m16.names[0].hash)).unwrap();
+        b.chain.stage_name_part(&names16, lo16, hi16, Some(&m16.names[0].hash)).unwrap();
         b.chain.finish_snapshot(&blocks[15], &m16).unwrap();
         assert_eq!(b.chain.state_root().unwrap(), s16.state_root);
         {
@@ -3459,14 +3588,22 @@ mod tests {
         }
         c.chain.begin_snapshot().unwrap();
         c.chain.stage_snapshot_part(0, &outputs16, &commits16, m16.next, Some(&m16.roots[0])).unwrap();
-        c.chain.stage_name_part(&names16, None).unwrap();
-        c.chain.clear_staged_names().unwrap();
+        c.chain.stage_name_part(&names16, lo16, hi16, None).unwrap();
+        // Carrying to a manifest with the same part keeps it; with another
+        // hash, the range is cleared and the commits kept.
+        let same = CarriedNamePart { index: 1, lo: lo16, hi: hi16, hash: m16.names[0].hash };
+        assert_eq!(c.chain.carry_name_parts(std::slice::from_ref(&same)).unwrap(), vec![true]);
+        {
+            let rtxn = c.chain.env().read_txn().unwrap();
+            assert_eq!(c.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice.clone()));
+        }
+        assert_eq!(c.chain.carry_name_parts(&[CarriedNamePart { hash: wrong, ..same }]).unwrap(), vec![false]);
         {
             let rtxn = c.chain.env().read_txn().unwrap();
             assert!(c.chain.names().is_empty(&rtxn).unwrap());
             assert!(c.chain.names().commit_at(&rtxn, 3).unwrap().is_some());
         }
-        c.chain.stage_name_part(&names16, None).unwrap();
+        c.chain.stage_name_part(&names16, lo16, hi16, None).unwrap();
         c.chain.finish_snapshot(&blocks[15], &m16).unwrap();
         assert_eq!(c.chain.state_root().unwrap(), s16.state_root);
     }
