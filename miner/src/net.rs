@@ -24,6 +24,18 @@
 //! | `TxInv`      | the id of a new transaction               |                  |
 //! | `GetChunks`  | token, kind, id and up to 32 chunk indexes | `Chunk`, one each |
 //! | `Chunk`      | kind, id, object length, index, bytes     |                  |
+//! | `Session`    | token, id, our token for the receiver     | `SessionState`   |
+//! | `SessionState` | id, announce nonce, sequence held       |                  |
+//! | `GetAnnounce`| token, id, our token for the receiver     | `Offer` or `Notice` |
+//! | `Offer`      | token, object id and length, our token    | `GetChunks`      |
+//! | `Notice`     | subject (an id or object), code           |                  |
+//!
+//! The last five are the message layer's rendezvous sessions
+//! (`docs/ONION.md`, [`crate::node`]). An object of the message layer
+//! (an announce or a payload, [`crate::onion::Object`]) is offered, never
+//! pushed: the receiver pulls it as [`Kind::Object`] chunks with the token
+//! the offer carried, so a relay can reach a participant that is not in
+//! its peer table.
 //!
 //! A block or transaction (the [`Kind`]) is fetched as [`CHUNK_BYTES`]-byte
 //! chunks of its serialization, pulled by the receiver in windows of
@@ -81,6 +93,11 @@ const T_GET_PROOF: u8 = 12;
 const T_PROOF: u8 = 13;
 const T_GET_AUX: u8 = 14;
 const T_AUX: u8 = 15;
+const T_SESSION: u8 = 16;
+const T_SESSION_STATE: u8 = 17;
+const T_GET_ANNOUNCE: u8 = 18;
+const T_OFFER: u8 = 19;
+const T_NOTICE: u8 = 20;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
 pub const PROOF_SIBLINGS_PER_MESSAGE: usize = crate::state_tree::DEPTH / 2;
 
@@ -98,6 +115,10 @@ pub enum Kind {
     /// A consensus file (`docs/ONION.md`), named by
     /// [`crate::consensus::file_id`] of its SHA-256.
     Consensus,
+    /// An object of the message layer ([`crate::onion::Object`]), named by
+    /// [`crate::onion::Object::id_of`] and served only to whom it was
+    /// offered.
+    Object,
 }
 
 impl Kind {
@@ -111,6 +132,7 @@ impl Kind {
                 w.u32(i);
             }
             Kind::Consensus => w.0.push(4),
+            Kind::Object => w.0.push(5),
         }
     }
 
@@ -121,6 +143,7 @@ impl Kind {
             2 => Some(Kind::Manifest),
             3 => Some(Kind::Part(r.u32()?)),
             4 => Some(Kind::Consensus),
+            5 => Some(Kind::Object),
             _ => None,
         }
     }
@@ -306,7 +329,52 @@ pub enum Message {
         id: Digest,
         leaves: [[u8; 32]; crate::chain::AUX_LEAVES],
     },
+    /// Opens or keeps a rendezvous session for `id` at a relay; `back` is
+    /// the sender's token for the relay, for the relay's requests to it.
+    Session {
+        id: Digest,
+        back: u64,
+        token: u64,
+    },
+    /// The relay's answer: the nonce an announce for this session must
+    /// carry, and the sequence number of the announce it holds for `id`
+    /// from this address (0 for none: the session is not live).
+    SessionState {
+        id: Digest,
+        nonce: u64,
+        seq: u64,
+    },
+    /// Asks a relay for the announce of `id`: answered with an `Offer` of
+    /// it while `id` has a live session there, else a `Notice`.
+    GetAnnounce {
+        id: Digest,
+        back: u64,
+        token: u64,
+    },
+    /// An object of `len` bytes for the receiver to pull as
+    /// [`Kind::Object`] chunks, using `back` as its token.
+    Offer {
+        object: Digest,
+        len: u32,
+        back: u64,
+        token: u64,
+    },
+    /// What became of a request about `subject`: one of the `NOTICE_`
+    /// codes.
+    Notice {
+        subject: Digest,
+        code: u8,
+    },
 }
+
+/// A payload was handed down the recipient's live session.
+pub const NOTICE_FORWARDED: u8 = 0;
+/// The id has no live session here.
+pub const NOTICE_OFFLINE: u8 = 1;
+/// This node does not relay, or holds no more sessions.
+pub const NOTICE_REFUSED: u8 = 2;
+/// The object was not what it should be.
+pub const NOTICE_REJECTED: u8 = 3;
 
 fn put_status(w: &mut Writer, s: &Status) {
     w.u64(s.nonce);
@@ -454,6 +522,36 @@ impl Message {
                     w.0.extend_from_slice(l);
                 }
             }
+            Message::Session { id, back, token } => {
+                w.0.push(T_SESSION);
+                w.u64(*token);
+                w.digest(id);
+                w.u64(*back);
+            }
+            Message::SessionState { id, nonce, seq } => {
+                w.0.push(T_SESSION_STATE);
+                w.digest(id);
+                w.u64(*nonce);
+                w.u64(*seq);
+            }
+            Message::GetAnnounce { id, back, token } => {
+                w.0.push(T_GET_ANNOUNCE);
+                w.u64(*token);
+                w.digest(id);
+                w.u64(*back);
+            }
+            Message::Offer { object, len, back, token } => {
+                w.0.push(T_OFFER);
+                w.u64(*token);
+                w.digest(object);
+                w.u32(*len);
+                w.u64(*back);
+            }
+            Message::Notice { subject, code } => {
+                w.0.push(T_NOTICE);
+                w.digest(subject);
+                w.0.push(*code);
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -546,6 +644,20 @@ impl Message {
                 }
                 Message::Aux { id, leaves }
             }
+            T_SESSION => {
+                let token = r.u64()?;
+                Message::Session { id: r.digest()?, back: r.u64()?, token }
+            }
+            T_SESSION_STATE => Message::SessionState { id: r.digest()?, nonce: r.u64()?, seq: r.u64()? },
+            T_GET_ANNOUNCE => {
+                let token = r.u64()?;
+                Message::GetAnnounce { id: r.digest()?, back: r.u64()?, token }
+            }
+            T_OFFER => {
+                let token = r.u64()?;
+                Message::Offer { object: r.digest()?, len: r.u32()?, back: r.u64()?, token }
+            }
+            T_NOTICE => Message::Notice { subject: r.digest()?, code: r.take(1)?[0] },
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -565,7 +677,10 @@ impl Message {
             | Message::GetHeaders { token, .. }
             | Message::GetHeadersFrom { token, .. }
             | Message::GetChunks { token, .. }
-            | Message::GetAux { token, .. } => Some(*token),
+            | Message::GetAux { token, .. }
+            | Message::Session { token, .. }
+            | Message::GetAnnounce { token, .. }
+            | Message::Offer { token, .. } => Some(*token),
             _ => None,
         }
     }
@@ -577,7 +692,10 @@ impl Message {
             | Message::GetHeaders { token, .. }
             | Message::GetHeadersFrom { token, .. }
             | Message::GetChunks { token, .. }
-            | Message::GetAux { token, .. } => *token = t,
+            | Message::GetAux { token, .. }
+            | Message::Session { token, .. }
+            | Message::GetAnnounce { token, .. }
+            | Message::Offer { token, .. } => *token = t,
             _ => {}
         }
         self
@@ -965,6 +1083,11 @@ impl Peers {
     /// `addr` come back: `addr` is this node.
     pub fn is_own_ping(&self, addr: &SocketAddr, nonce: u64) -> bool {
         self.map.get(addr).is_some_and(|p| p.pending == Some(nonce))
+    }
+
+    /// Whether `addr` was found to be this node.
+    pub fn is_self(&self, addr: &SocketAddr) -> bool {
+        self.selves.contains(addr)
     }
 
     /// Forgets `addr` for good: it is this node.
@@ -1399,6 +1522,12 @@ mod tests {
             Message::GetChunks { kind: Kind::Consensus, id: digest(4), indexes: vec![0], token: 5 },
             Message::GetAux { id: digest(8), token: 9 },
             Message::Aux { id: digest(8), leaves: core::array::from_fn(|i| [i as u8; 32]) },
+            Message::Session { id: digest(1), back: 11, token: 12 },
+            Message::SessionState { id: digest(1), nonce: u64::MAX, seq: 3 },
+            Message::GetAnnounce { id: digest(2), back: 13, token: 14 },
+            Message::Offer { object: digest(3), len: 6_500, back: 15, token: 16 },
+            Message::GetChunks { kind: Kind::Object, id: digest(3), indexes: vec![0, 6], token: 15 },
+            Message::Notice { subject: digest(4), code: NOTICE_OFFLINE },
         ];
         for m in msgs {
             let bytes = m.encode();

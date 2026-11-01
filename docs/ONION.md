@@ -381,10 +381,40 @@ To be settled before implementation, in roughly this order.
    file is held and valid); the node logs each change of winner or mode
    and the verdict on every file it fetches; `consensus` at the prompt
    shows the mode; `set-leaf 0 FILE` parses the file first.
-3. **Init mode.** The `--relay` flag; sessions at the seeds with
-   keepalives, the rendezvous choice by id, the message format, the
-   Dilithium key in the wallet (the id behind a name's value) and its
-   ephemeral Kyber keys and announcements, and slates by name or id.
+3. **Init mode.** Done (2026-11-01). `onion.rs` holds the objects: an
+   `Announce` (Dilithium key, Kyber key, sequence number, expiry, the
+   session's nonce, signed), a `Payload` (encapsulated to the recipient's
+   Kyber key, sealed with ChaCha20-Poly1305, carrying the sender's own
+   announce for the reply and then signed) and `rendezvous_indexes`.
+   The node's session layer (`node/sessions.rs`) rides five new messages:
+   `Session` (open, and keepalive every 30 s) answered by `SessionState`
+   (the nonce the announce must carry, a SipHash of the participant's
+   address and id so nothing is stored per attempt, and the sequence
+   number held), `GetAnnounce`, `Offer` and `Notice` (forwarded,
+   offline, refused, rejected). Objects are never pushed: an `Offer`
+   names one and the receiver pulls it as `Kind::Object` chunks with the
+   token the offer carried, so a relay reaches a participant that is not
+   in its peer table. A node started with `--relay` holds up to
+   `MAX_SESSIONS` (10,000) sessions, any id in init mode (a seed cannot
+   tell which seed name it is), and forwards a payload only down a live
+   session. A node with a wallet keeps sessions at its points (the
+   seeds, sorted by name), announcing one Kyber key at all of them,
+   rotated at start, on every reconnect and after 12 hours; a retired
+   key opens payloads for ten more minutes. Sequence numbers are the
+   time in milliseconds, so they rise across restarts. A request left
+   unanswered pings the point again, since a restarted relay has new
+   tokens. At the prompt, `send AMOUNT [FEE] TO` takes a `tab1…`
+   address, 64 hex digits or `@name` besides a file; the recipient's
+   wallet answers a stage-1 slate at once over the reply key, and the
+   sender's finalizes and pools the answer, checking it came from the
+   id it was sent to (`Wallet::take_slate`); a slate that no point would
+   forward is cancelled. `name-commit NAME` without a value points the
+   name at the wallet's own id, so `@NAME` reaches it.
+   `status` shows the sessions. In onion mode the same sessions go
+   directly to the listed relays until step 4 puts circuits in between.
+   Not yet: a relay's own wallet is reached only through other points
+   (a point that is this node is skipped), and nothing limits who may
+   send a stage-1 slate to an online wallet (open point 5).
 4. **Onion mode.** Relay service behind `--relay`, descriptors, circuits
    and cells, rendezvous over circuits, and the wallet's use of them.
 5. **Docs.** README, SECURITY.md, HARDENING.md.

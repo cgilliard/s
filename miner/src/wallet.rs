@@ -571,6 +571,14 @@ impl Sent {
     }
 }
 
+/// What [`Wallet::take_slate`] made of a slate.
+pub enum Incoming {
+    /// A payment to us, answered: to return to the sender.
+    Answered(Slate),
+    /// Our payment, answered and signed: to pool.
+    Finalized(Slate, Signed),
+}
+
 #[derive(Debug)]
 pub enum WalletError {
     Heed(heed::Error),
@@ -1276,6 +1284,29 @@ impl Wallet {
         slate.outputs.push(out);
         slate.stage = 2;
         Ok(())
+    }
+
+    /// A slate that came over the message layer (`docs/ONION.md`) from the
+    /// id `from`: a stage-1 slate gets our output and is to go back; a
+    /// stage-2 one, the answer to ours, is signed. `sent_to` is the id
+    /// this wallet sent that slate to over the network, if it did: only
+    /// that id may answer it.
+    pub fn take_slate(&self, bytes: &[u8], from: &Commitment, sent_to: Option<&Commitment>) -> Result<Incoming> {
+        let mut slate = Slate::from_bytes(bytes).ok_or(WalletError::BadSlate("malformed"))?;
+        match slate.stage {
+            1 => {
+                self.receive_slate(&mut slate)?;
+                Ok(Incoming::Answered(slate))
+            }
+            2 => {
+                if sent_to.is_some_and(|to| to != from) {
+                    return Err(WalletError::BadSlate("answered by an id it was not sent to"));
+                }
+                let signed = self.finalize(&slate)?;
+                Ok(Incoming::Finalized(slate, signed))
+            }
+            _ => Err(WalletError::BadSlate("unknown stage")),
+        }
     }
 
     /// The sender's last step: checks the stage-2 slate against the pending

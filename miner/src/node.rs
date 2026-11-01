@@ -88,6 +88,9 @@ use crate::net::{
 use crate::pow::Digest;
 use crate::transaction::Transaction;
 
+mod sessions;
+pub use sessions::{Note, Outbound};
+
 /// UDP port nodes listen on by default.
 pub const DEFAULT_PORT: u16 = 3737;
 /// Seed nodes, `host:port`, resolved at start and whenever peers run low.
@@ -139,6 +142,9 @@ pub struct Config {
     /// Started with `--relay`: the operator's consent to relay for others
     /// on the message layer (`docs/ONION.md`).
     pub relay: bool,
+    /// The wallet's Dilithium key: with it the node keeps rendezvous
+    /// sessions for the wallet's id and sends and receives its messages.
+    pub identity: Option<crate::mldsa::SecretKey>,
 }
 
 /// Default depth of the fast-sync snapshot: a day of blocks.
@@ -295,6 +301,8 @@ pub enum Event {
     Mined(Block),
     /// A transaction made locally: pool it and announce it.
     Transaction(Transaction),
+    /// A message for an id, from the wallet (`docs/ONION.md`).
+    Send(Outbound),
     /// The applier thread has a result: nothing else to do but take it.
     Wake,
     Stop,
@@ -369,6 +377,10 @@ pub struct Stats {
     pub waiting: usize,
     /// Blocks whose aux leaves are still to be fetched.
     pub aux_wanted: usize,
+    /// The wallet's rendezvous points and whether each session is live.
+    pub rendezvous: Vec<(SocketAddr, bool)>,
+    /// Sessions held for others, as a relay.
+    pub sessions: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -462,6 +474,8 @@ pub struct Node<V: ProofVerifier> {
     last_consensus: Option<(Option<consensus::Hash>, consensus::Mode)>,
     /// Peers that did not serve the wanted file.
     file_failed: std::collections::HashSet<SocketAddr>,
+    /// The message layer's sessions and sends.
+    rv: sessions::State,
 }
 
 fn unix_now() -> u64 {
@@ -627,6 +641,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             })?
         };
         let now = Instant::now();
+        let rv = sessions::State::new(config.identity.clone(), now)?;
         let mut node = Node {
             chain,
             mempool,
@@ -678,6 +693,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             file_want: None,
             last_consensus: None,
             file_failed: std::collections::HashSet::new(),
+            rv,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
             node.mode = Mode::Headers;
@@ -717,6 +733,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Packet(addr, bytes)) => self.handle_packet(addr, &bytes),
                 Ok(Event::Mined(block)) => self.submit_block(block, None),
                 Ok(Event::Transaction(tx)) => self.handle_transaction(tx, None),
+                Ok(Event::Send(out)) => self.start_send(out, Instant::now()),
                 Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) => {}
                 Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -726,6 +743,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let now = Instant::now();
             self.retry_downloads(now);
             self.retry_snapshot_downloads(now);
+            self.retry_objects(now);
             if now.duration_since(last_tick) >= Duration::from_secs(1) {
                 last_tick = now;
                 self.tick(now);
@@ -795,6 +813,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn resolve_seeds(&mut self, now: Instant) {
         self.last_seed_lookup = Some(now);
+        self.rv.reresolve();
         let seeds = self.config.seeds.clone();
         for seed in seeds {
             match seed.to_socket_addrs() {
@@ -857,6 +876,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.snapshot_sync(now);
             }
         }
+        self.sessions_tick(now);
         let behind = self.peers.claimants(self.chain.tip_work().unwrap_or(U256::ZERO), now).next().is_some();
         let fresh = self.peers.live_count(now) == 0 && now.duration_since(self.started) < Duration::from_secs(5);
         self.syncing.store(self.mode != Mode::Normal || behind || fresh, Ordering::Release);
@@ -884,6 +904,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             (Ok(best), Ok(Some(tip))) => best.height.saturating_sub(tip.height) as usize,
             _ => 0,
         };
+        let (rendezvous, sessions) = self.rv.summary(now);
         *self.stats.lock().unwrap() = Stats {
             peers,
             downloads: self.downloads.len() + self.tx_downloads.len() + self.snap_downloads.len(),
@@ -892,6 +913,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             mode: Some(self.mode),
             parts,
             aux_wanted: self.aux_wants.len(),
+            rendezvous,
+            sessions,
         };
     }
 
@@ -1134,6 +1157,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Manifest => net::MAX_MANIFEST,
             Kind::Part(_) => net::MAX_PART,
             Kind::Consensus => consensus::MAX_CONSENSUS,
+            Kind::Object => crate::onion::MAX_OBJECT,
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
@@ -1194,7 +1218,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let now = Instant::now();
         // A request proves its address with its token; anything else
         // unasked for is heard only from a peer that answered our ping.
-        if !matches!(msg, Message::Ping(_) | Message::Pong(_)) && msg.token().is_none() && !self.peers.handshaken(&addr)
+        // Chunks of a message-layer object come from whoever was asked
+        // for them with the token its offer carried, in our table or not.
+        let asked = match &msg {
+            Message::Chunk { kind: Kind::Object, id, .. } => self.rv.downloads.get(id).is_some_and(|d| d.from == addr),
+            _ => false,
+        };
+        if !matches!(msg, Message::Ping(_) | Message::Pong(_))
+            && msg.token().is_none()
+            && !asked
+            && !self.peers.handshaken(&addr)
         {
             return;
         }
@@ -1427,6 +1460,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     Err(e) => self.log(&format!("keeping aux leaves of {}: {e}", short(&id))),
                 }
             }
+            Message::Session { id, back, token } => {
+                if self.request_ok(&addr, token) {
+                    self.on_session(addr, id, back, now);
+                }
+            }
+            Message::SessionState { id, nonce, seq } => self.on_session_state(addr, id, nonce, seq, now),
+            Message::GetAnnounce { id, back, token } => {
+                if self.request_ok(&addr, token) {
+                    self.on_get_announce(addr, id, back, now);
+                }
+            }
+            Message::Offer { object, len, back, token } => {
+                if self.request_ok(&addr, token) {
+                    self.on_offer(addr, object, len, back, now);
+                }
+            }
+            Message::Notice { subject, code } => self.on_notice(addr, subject, code, now),
         }
     }
 
@@ -1468,6 +1518,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.aux_scanned_at = changes;
             match self.chain.consensus() {
                 Ok((votes, current)) => {
+                    self.rv.set_consensus(&current);
                     let decided = (current.winner, current.mode);
                     if self.last_consensus != Some(decided) {
                         self.last_consensus = Some(decided);
@@ -1696,6 +1747,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Some(b)) => b,
                 _ => return,
             },
+            Kind::Object => return self.serve_object(to, &id, indexes),
         };
         for &i in indexes.iter().take(WINDOW) {
             if let Some(msg) = chunk_of(kind, &id, &bytes, i) {
@@ -1714,6 +1766,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         data: Vec<u8>,
         now: Instant,
     ) {
+        if kind == Kind::Object {
+            return self.on_object_chunk(from, id, len, index, data, now);
+        }
         if matches!(kind, Kind::Manifest | Kind::Part(_)) || self.snap_downloads.contains_key(&(kind, id)) {
             return self.handle_snapshot_chunk(from, kind, id, len, index, data, now);
         }
@@ -1777,7 +1832,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             self.file_failed.insert(from);
                         }
                     },
-                    Kind::Manifest | Kind::Part(_) => {}
+                    Kind::Manifest | Kind::Part(_) | Kind::Object => {}
                 }
                 self.start_downloads(now);
             }
@@ -2175,6 +2230,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Part(_) => net::MAX_PART,
             Kind::Tx => MAX_TX_SIZE,
             Kind::Consensus => consensus::MAX_CONSENSUS,
+            Kind::Object => crate::onion::MAX_OBJECT,
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
@@ -2740,7 +2796,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 true
             }
-            Kind::Tx | Kind::Consensus => true,
+            Kind::Tx | Kind::Consensus | Kind::Object => true,
         }
     }
 
@@ -2881,6 +2937,7 @@ mod tests {
             verbose: true,
             sync_point: None,
             relay: false,
+            identity: None,
         }
     }
 
@@ -3580,6 +3637,284 @@ mod tests {
         hl.join().unwrap();
         for (tx, h) in [(tx_a, ha), (tx_c, hc)] {
             tx.send(Event::Stop).unwrap();
+            h.join().unwrap();
+        }
+    }
+
+    /// The message layer in init mode: a seed started with `--relay`
+    /// holds the sessions of two participants; one reaches the other by
+    /// id, and the answer comes back sealed to the key the first carried.
+    /// An id with no session is reported offline; a node without
+    /// `--relay` refuses sessions.
+    #[test]
+    fn messages_meet_at_a_rendezvous_point() {
+        use crate::onion;
+        let (r, p, q, n, x) = (open("rv-relay"), open("rv-p"), open("rv-q"), open("rv-plain"), open("rv-x"));
+        let mut cfg = config(vec![], &r.dir);
+        cfg.relay = true;
+        let (node_r, tx_r) = Node::bind(Arc::clone(&r.chain), pool(), cfg).unwrap();
+        let addr_r = node_r.local_addr().unwrap();
+        let (node_n, tx_n) = Node::bind(Arc::clone(&n.chain), pool(), config(vec![], &n.dir)).unwrap();
+        let addr_n = node_n.local_addr().unwrap();
+        let participant = |f: &Fixture, tag: u8, seed: SocketAddr| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.seeds = vec![seed.to_string()];
+            cfg.identity = Some(crate::mldsa::keygen(&[tag; 32]));
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            (node, tx, notes, stats)
+        };
+        let (node_p, tx_p, notes_p, stats_p) = participant(&p, 1, addr_r);
+        let (node_q, tx_q, notes_q, _) = participant(&q, 2, addr_r);
+        let (node_x, tx_x, _, stats_x) = participant(&x, 3, addr_n);
+        let id_p = crate::address::id_of(crate::mldsa::keygen(&[1; 32]).public_key());
+        let id_q = crate::address::id_of(crate::mldsa::keygen(&[2; 32]).public_key());
+        let handles: Vec<_> =
+            [node_r, node_n, node_p, node_q, node_x].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
+        let live = |stats: &Arc<Mutex<Stats>>, secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < deadline {
+                let s = stats.lock().unwrap().clone();
+                if !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(live(&stats_p, 15), "p's session did not go live: {:?}", stats_p.lock().unwrap().rendezvous);
+        let wait = |rx: &Receiver<Note>| rx.recv_timeout(Duration::from_secs(20)).expect("a note");
+        // q reaches p by id alone: q's node asks the point for p's announce.
+        let out = Outbound { tag: 7, to: id_p, kind: onion::KIND_SLATE, inner: b"a slate".to_vec(), recipient: None };
+        tx_q.send(Event::Send(out)).unwrap();
+        let mut got = None;
+        let mut delivered = false;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while (got.is_none() || !delivered) && Instant::now() < deadline {
+            if let Ok(Note::Received(o)) = notes_p.recv_timeout(Duration::from_millis(100)) {
+                got = Some(o);
+            }
+            if let Ok(note) = notes_q.try_recv() {
+                assert!(matches!(note, Note::Delivered { tag: 7, via, .. } if via == addr_r), "{note:?}");
+                delivered = true;
+            }
+        }
+        let got = got.expect("p did not receive q's message");
+        assert!(delivered, "q was not told its message was delivered");
+        assert_eq!((got.kind, &got.inner[..]), (onion::KIND_SLATE, &b"a slate"[..]));
+        let q_announce = got.from.expect("q names itself");
+        assert_eq!(q_announce.id, id_q);
+        // p answers to the key q carried; q need not ask for it.
+        let out = Outbound { tag: 8, to: id_q, kind: onion::KIND_SLATE, inner: b"answered".to_vec(), recipient: Some(q_announce) };
+        tx_p.send(Event::Send(out)).unwrap();
+        let mut answer = None;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while answer.is_none() && Instant::now() < deadline {
+            if let Ok(Note::Received(o)) = notes_q.recv_timeout(Duration::from_millis(100)) {
+                answer = Some(o);
+            }
+        }
+        let answer = answer.expect("q did not receive p's answer");
+        assert_eq!(&answer.inner[..], b"answered");
+        assert_eq!(answer.from.map(|a| a.id), Some(id_p));
+        assert!(matches!(wait(&notes_p), Note::Delivered { tag: 8, .. }));
+        // An id with no session anywhere: offline.
+        let nobody = crate::address::id_of(crate::mldsa::keygen(&[9; 32]).public_key());
+        tx_q.send(Event::Send(Outbound { tag: 9, to: nobody, kind: 1, inner: vec![], recipient: None })).unwrap();
+        match wait(&notes_q) {
+            Note::Failed { tag: 9, why, .. } => assert!(why.contains("offline"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // A node without --relay holds no sessions.
+        std::thread::sleep(Duration::from_secs(2));
+        let s = stats_x.lock().unwrap().clone();
+        assert_eq!(s.rendezvous, vec![(addr_n, false)]);
+        for tx in [tx_r, tx_n, tx_p, tx_q, tx_x] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// A payment end to end over the message layer: alice's wallet starts
+    /// a slate for bob's id, bob's wallet answers it over the key alice
+    /// carried, and alice's signs the answer; an answer from anyone else
+    /// is refused.
+    #[test]
+    fn a_payment_by_id_goes_and_comes_back() {
+        use crate::onion;
+        use crate::wallet::{Incoming, Wallet};
+        let (r, p, q) = (open("pay-relay"), open("pay-alice"), open("pay-bob"));
+        let (alice, _) = Wallet::open(&p.dir.0.join("wallet")).unwrap();
+        let (bob, _) = Wallet::open(&q.dir.0.join("wallet")).unwrap();
+        // alice holds an output on her node's chain.
+        let funds = alice.receive(60_000_000).unwrap();
+        let body = Body {
+            inputs: vec![],
+            outputs: vec![funds.block_output()],
+            proof: vec![1; 2500],
+            ..Default::default()
+        };
+        let block = mine_body(&p, body, T0 + 600);
+        p.chain.apply_block(&block, unix_now()).unwrap();
+        let (_, first, outputs) = p.chain.main_outputs(1).unwrap().unwrap();
+        assert_eq!(alice.locate(first, &outputs).unwrap(), 1);
+        let mut cfg = config(vec![], &r.dir);
+        cfg.relay = true;
+        let (node_r, tx_r) = Node::bind(Arc::clone(&r.chain), pool(), cfg).unwrap();
+        let addr_r = node_r.local_addr().unwrap();
+        let participant = |f: &Fixture, w: &Wallet| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.seeds = vec![addr_r.to_string()];
+            cfg.identity = Some(w.identity_key());
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            (node, tx, notes, stats)
+        };
+        let (node_a, tx_a, notes_a, stats_a) = participant(&p, &alice);
+        let (node_b, tx_b, notes_b, stats_b) = participant(&q, &bob);
+        let handles: Vec<_> = [node_r, node_a, node_b].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let live = |s: &Arc<Mutex<Stats>>| s.lock().unwrap().rendezvous.iter().any(|(_, l)| *l);
+        while !(live(&stats_a) && live(&stats_b)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(live(&stats_a) && live(&stats_b), "the sessions did not go live");
+        let received = |rx: &Receiver<Note>| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if let Ok(Note::Received(o)) = rx.recv_timeout(Duration::from_millis(100)) {
+                    return o;
+                }
+            }
+            panic!("nothing received");
+        };
+        // alice sends a slate to bob's id, as `send AMOUNT tab1…` does.
+        let slate = {
+            let rtxn = p.chain.env().read_txn().unwrap();
+            alice.send(20_000_000, None, p.chain.utxo(), &rtxn).unwrap()
+        };
+        let out = Outbound { tag: 1, to: bob.id(), kind: onion::KIND_SLATE, inner: slate.to_bytes(), recipient: None };
+        tx_a.send(Event::Send(out)).unwrap();
+        // bob's wallet answers it, to the key alice carried.
+        let o = received(&notes_b);
+        let from = o.from.expect("alice names herself");
+        assert_eq!(from.id, alice.id());
+        let answered = match bob.take_slate(&o.inner, &from.id, None).unwrap() {
+            Incoming::Answered(s) => s,
+            Incoming::Finalized(..) => panic!("bob had nothing to finalize"),
+        };
+        assert_eq!((answered.id, answered.stage), (slate.id, 2));
+        let out = Outbound { tag: 2, to: from.id, kind: onion::KIND_SLATE, inner: answered.to_bytes(), recipient: Some(from) };
+        tx_b.send(Event::Send(out)).unwrap();
+        // alice's wallet signs the answer; only bob's id may give it.
+        let o = received(&notes_a);
+        let bob_id = o.from.as_ref().expect("bob names himself").id;
+        assert_eq!(bob_id, bob.id());
+        let stranger = crate::address::id_of(crate::mldsa::keygen(&[9; 32]).public_key());
+        assert!(alice.take_slate(&o.inner, &stranger, Some(&bob.id())).is_err());
+        let (finished, signed) = match alice.take_slate(&o.inner, &bob_id, Some(&bob.id())).unwrap() {
+            Incoming::Finalized(s, signed) => (s, signed),
+            Incoming::Answered(_) => panic!("alice had nothing to answer"),
+        };
+        assert_eq!(finished.id, slate.id);
+        let tx = signed.tx;
+        assert!(tx.verify_signatures());
+        assert_eq!(tx.balance(), slate.fee as i128);
+        // The transaction pays bob an output his wallet holds.
+        let to_bob = answered.outputs[1].commitment;
+        assert!(tx.outputs.iter().any(|out| out.commitment == to_bob));
+        assert_eq!(bob.owned(&to_bob).unwrap().map(|o| o.amount), Some(20_000_000));
+        for tx in [tx_r, tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// A relay that restarts has lost every session and given new tokens:
+    /// its participants find their requests unanswered, ping it again,
+    /// see their announce gone, reconnect with a new Kyber key, and are
+    /// reachable again within a keepalive or so.
+    #[test]
+    fn sessions_come_back_after_the_relay_restarts() {
+        use crate::onion;
+        let (r, p, q) = (open("rs-relay"), open("rs-p"), open("rs-q"));
+        let start_relay = |addr: Option<SocketAddr>| {
+            let mut cfg = config(vec![], &r.dir);
+            cfg.relay = true;
+            if let Some(a) = addr {
+                cfg.listen = a;
+            }
+            let (node, tx) = Node::bind(Arc::clone(&r.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            (addr, tx, std::thread::spawn(move || node.run()))
+        };
+        let (addr_r, tx_r, h_r) = start_relay(None);
+        let participant = |f: &Fixture, tag: u8| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.seeds = vec![addr_r.to_string()];
+            cfg.identity = Some(crate::mldsa::keygen(&[tag; 32]));
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            (tx, notes, stats, std::thread::spawn(move || node.run()))
+        };
+        let (tx_p, notes_p, stats_p, h_p) = participant(&p, 1);
+        let (tx_q, notes_q, _, h_q) = participant(&q, 2);
+        let id_p = crate::address::id_of(crate::mldsa::keygen(&[1; 32]).public_key());
+        let live = |secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < deadline {
+                if stats_p.lock().unwrap().rendezvous.iter().any(|(_, l)| *l) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        let deliver = |tag: u64, recipient: Option<onion::Announce>| {
+            let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient };
+            tx_q.send(Event::Send(out)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut opened = None;
+            while Instant::now() < deadline {
+                if let Ok(Note::Received(o)) = notes_p.recv_timeout(Duration::from_millis(100)) {
+                    opened = Some(o);
+                    break;
+                }
+            }
+            while notes_q.try_recv().is_ok() {}
+            opened
+        };
+        assert!(live(15), "p's session did not go live");
+        // q fetches p's announce, which carries p's first Kyber key.
+        let first = deliver(1, None).expect("the first message");
+        assert_eq!(first.inner, vec![1]);
+        // The relay restarts on the same address, holding nothing.
+        tx_r.send(Event::Stop).unwrap();
+        h_r.join().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (_, tx_r, h_r) = start_relay(Some(addr_r));
+        // p notices (its keepalive finds no announce held), reconnects
+        // with a new key, and is reachable again.
+        let restarted = Instant::now();
+        let deadline = restarted + Duration::from_secs(70);
+        let mut back = None;
+        while back.is_none() && Instant::now() < deadline {
+            back = deliver(3, None);
+        }
+        let back = back.expect("p was not reachable after the restart");
+        assert_eq!(back.inner, vec![3]);
+        assert!(restarted.elapsed() < Duration::from_secs(50), "took {:?}", restarted.elapsed());
+        for tx in [tx_r, tx_p, tx_q] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [h_r, h_p, h_q] {
             h.join().unwrap();
         }
     }

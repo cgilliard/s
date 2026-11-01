@@ -43,7 +43,10 @@
 //! Payments use slate files: `send` writes one for the recipient, who
 //! answers it with `receive`; `finalize` on the sender's side signs it and
 //! pools the transaction. `cancel` replaces an unconfirmed payment with
-//! one paying the inputs back, at a higher fee.
+//! one paying the inputs back, at a higher fee. Given a `tab1…` address
+//! or `@name` instead of a file, `send` goes over the message layer
+//! (`docs/ONION.md`): the recipient's wallet answers at once and this one
+//! finalizes, if both are online.
 
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -61,12 +64,13 @@ use tabminer::log;
 use tabminer::mempool::{DEFAULT_CAPACITY, Mempool};
 use tabminer::name_air::NameWitness;
 use tabminer::names::NameOp;
-use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, SEEDS, Stats};
+use tabminer::node::{Config, DEFAULT_PORT, DEFAULT_SYNC_POINT, Event, Mode, Node, Note, Outbound, SEEDS, Stats};
+use tabminer::onion;
 use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
 use tabminer::utxo;
-use tabminer::wallet::{Signed, Slate, State, Wallet};
+use tabminer::wallet::{Incoming, Signed, Slate, State, Wallet};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -119,7 +123,10 @@ const HELP: &str = "commands:
   mempool                   pooled transactions
   balance                   confirmed, pending, reserved and locked funds
   outputs                   the wallet's outputs
-  send AMOUNT [FEE] FILE    start a payment: write a slate for the recipient
+  send AMOUNT [FEE] TO      start a payment: TO is a file to write the slate to for
+                            the recipient, or a tab1… address or @NAME to send it to
+                            over the message layer, where the recipient's wallet
+                            answers it and this one finalizes it, if both are online
                             (the fee defaults to the smallest the pool takes)
   receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
@@ -132,7 +139,8 @@ const HELP: &str = "commands:
   prune                     forget unspent outputs the chain does not hold
   name-commit NAME [VALUE] [FEE]
                             start registering NAME: pool a transaction committing to it
-                            (VALUE: 64 hex digits, the payment identity; default zeros)
+                            (VALUE: a tab1… address or 64 hex digits, the id payments
+                            to @NAME go to; default this wallet's address)
   name-reveal NAME [WAIT] [FEE]
                             reveal a committed name once its commit is WAIT blocks old
                             (at least 12; more makes the registration harder to undo)
@@ -365,6 +373,7 @@ fn net_config(args: &Args) -> Config {
         peers_file: Some(args.data.join("peers")),
         verbose: args.verbose,
         relay: args.relay,
+        identity: None,
         sync_point: (args.sync_point > 0).then_some(args.sync_point),
     }
 }
@@ -424,10 +433,17 @@ struct Ctx {
     syncing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     mining: bool,
+    /// Started with `--relay`.
+    relay: bool,
     /// Debugging: random outputs to add and earlier ones to spend per block.
     debug_fill: Option<(usize, usize)>,
     /// The reward output of the block being mined, forgotten on quit.
     in_flight: Mutex<Option<tabminer::transaction::Commitment>>,
+    /// Slates sent over the message layer and not yet answered: the
+    /// recipient's id by the slate's.
+    outgoing: Mutex<std::collections::HashMap<[u8; 32], Digest>>,
+    /// Whether a prompt is on the terminal (else the log is).
+    prompt: bool,
 }
 
 /// Runs the node, the miner if `mining`, and the prompt (or waits) until
@@ -535,7 +551,10 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     }
     let wallet = Arc::new(wallet);
     let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
-    let (node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), net_config(args))?;
+    let mut config = net_config(args);
+    config.identity = Some(wallet.identity_key());
+    let (mut node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), config)?;
+    let notes = node.take_notes();
     let stats = node.stats();
     let syncing = node.syncing();
     let tip_changes = node.tip_changes();
@@ -568,9 +587,20 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         syncing,
         stop: Arc::new(AtomicBool::new(false)),
         mining,
+        relay: args.relay,
         debug_fill: args.debug_fill,
         in_flight: Mutex::new(None),
+        outgoing: Mutex::new(std::collections::HashMap::new()),
+        prompt: !args.no_prompt,
     });
+    if let Some(notes) = notes {
+        let ctx = Arc::clone(&ctx);
+        std::thread::Builder::new().name("messages".into()).spawn(move || {
+            for note in notes {
+                on_note(&ctx, note);
+            }
+        })?;
+    }
     // The chain ends at the schedule's final block: once the tip reaches
     // it, the node has nothing left to do.
     {
@@ -855,6 +885,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 fmt_coins(b.locked)
             );
             println!("mining   {}", if ctx.mining { "on" } else { "off" });
+            let live = stats.rendezvous.iter().filter(|(_, l)| *l).count();
+            print!("messages {live} of {} rendezvous sessions live", stats.rendezvous.len());
+            if stats.sessions > 0 || ctx.relay {
+                print!("; holding {} sessions as a relay", stats.sessions);
+            }
+            println!();
         }
         "storage" => {
             let (rows, file) = ctx.chain.storage()?;
@@ -1115,11 +1151,30 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let (amount, fee, file) = match args {
                 [amount, file] => (*amount, None, *file),
                 [amount, fee, file] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *file),
-                _ => return Err("usage: send AMOUNT [FEE] FILE".into()),
+                _ => return Err("usage: send AMOUNT [FEE] FILE|ADDRESS|@NAME".into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
+            let to = recipient(ctx, file)?;
             let rtxn = ctx.chain.env().read_txn()?;
             let slate = ctx.wallet.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            if let Some(to) = to {
+                ctx.outgoing.lock().unwrap().insert(slate.id, to);
+                let out = Outbound { tag: slate_tag(&slate.id), to, kind: onion::KIND_SLATE, inner: slate.to_bytes(), recipient: None };
+                if ctx.events.send(Event::Send(out)).is_err() {
+                    ctx.wallet.cancel_slate(&slate.id)?;
+                    return Err("the node has stopped".into());
+                }
+                println!(
+                    "slate {} sent to {}: {} coins plus {} fee from {} inputs; it is finalized when the recipient answers",
+                    &slate.id_hex()[..16],
+                    tabminer::address::encode(&to),
+                    fmt_coins(amount as u128),
+                    fmt_coins(slate.fee as u128),
+                    slate.inputs.len()
+                );
+                return Ok(());
+            }
             std::fs::write(file, slate.to_bytes())?;
             println!(
                 "slate {} written to {}: {} coins plus {} fee from {} inputs; send it to the recipient",
@@ -1220,7 +1275,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [name, value, fee] => (*name, Some(*value), Some(parse_coins(fee).ok_or("bad fee")?)),
                 _ => return Err("usage: name-commit NAME [VALUE] [FEE]".into()),
             };
-            let op = ctx.wallet.name_commit(name.as_bytes(), parse_value(value)?)?;
+            // By default the name points at this wallet, so @NAME reaches it.
+            let value = match value {
+                Some(v) => parse_value(Some(v))?,
+                None => ctx.wallet.id(),
+            };
+            let op = ctx.wallet.name_commit(name.as_bytes(), value)?;
             carry(ctx, vec![op], fee)?;
             println!("committed to {name}; reveal it with name-reveal {name} once the commit is 12 blocks old");
         }
@@ -1443,6 +1503,109 @@ fn restore(args: &Args) -> AnyResult<()> {
     Wallet::restore(&dir, &phrase, pass.trim_end_matches(['\r', '\n']))?;
     println!("wallet restored in {}", dir.display());
     println!("start tabminer with this --data directory: once it has synced, it finds the wallet's outputs");
+    Ok(())
+}
+
+/// Where `send` sends: an id (a `tab1…` address or 64 hex digits) or a
+/// registered `@name`'s value; `None` for a file.
+fn recipient(ctx: &Ctx, to: &str) -> AnyResult<Option<Digest>> {
+    if let Some(name) = to.strip_prefix('@') {
+        let rtxn = ctx.chain.env().read_txn()?;
+        let record = ctx.chain.names().lookup(&rtxn, name.as_bytes())?.ok_or_else(|| format!("{name} is not registered"))?;
+        if record.value == [tabminer::poseidon2::Fp::ZERO; 8] {
+            return Err(format!("{name} has no value: its owner has not set an address").into());
+        }
+        return Ok(Some(record.value));
+    }
+    Ok(onion::parse_id(to))
+}
+
+/// Says something from the message layer: logged, and shown at the prompt.
+fn say(ctx: &Ctx, msg: &str) {
+    log::line(msg);
+    if ctx.prompt {
+        println!("\n{msg}");
+    }
+}
+
+/// What the message layer delivers: a slate to answer or to finalize, or
+/// what became of a send.
+fn on_note(ctx: &Ctx, note: Note) {
+    match note {
+        Note::Received(opened) => {
+            if let Err(e) = on_message(ctx, opened) {
+                say(ctx, &format!("message: {e}"));
+            }
+        }
+        Note::Delivered { tag, to, via } => {
+            if ctx.outgoing.lock().unwrap().keys().any(|id| slate_tag(id) == tag) {
+                say(ctx, &format!("slate delivered to {} via {via}; waiting for the answer", tabminer::address::encode(&to)));
+            }
+        }
+        Note::Failed { tag, to, why } => {
+            let to = tabminer::address::encode(&to);
+            let mut outgoing = ctx.outgoing.lock().unwrap();
+            let id = outgoing.keys().find(|id| slate_tag(id) == tag).copied();
+            match id.and_then(|id| outgoing.remove(&id).map(|_| id)) {
+                // It never reached the recipient: its inputs are freed.
+                Some(id) => {
+                    let freed = ctx.wallet.cancel_slate(&id).is_ok();
+                    say(
+                        ctx,
+                        &format!(
+                            "could not deliver the slate to {to}: {why}{}",
+                            if freed { "; it is cancelled and its inputs are spendable again" } else { "" }
+                        ),
+                    );
+                }
+                None => say(ctx, &format!("could not answer {to}: {why}")),
+            }
+        }
+    }
+}
+
+/// The tag a send of slate `id` goes under: its first eight bytes.
+fn slate_tag(id: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(id[..8].try_into().unwrap())
+}
+
+/// A message: a stage-1 slate is answered with an output of ours, a
+/// stage-2 one (the answer to ours) signed and pooled.
+fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
+    if opened.kind != onion::KIND_SLATE {
+        return Err(format!("a message of unknown kind {}", opened.kind).into());
+    }
+    let from = opened.from.ok_or("a slate from someone unnamed, which cannot be answered")?;
+    let who = tabminer::address::encode(&from.id);
+    let id = Slate::from_bytes(&opened.inner).ok_or("a malformed slate")?.id;
+    let sent_to = ctx.outgoing.lock().unwrap().get(&id).copied();
+    sync_wallet(ctx)?;
+    match ctx.wallet.take_slate(&opened.inner, &from.id, sent_to.as_ref())? {
+        Incoming::Answered(slate) => {
+            let out = Outbound {
+                tag: 0,
+                to: from.id,
+                kind: onion::KIND_SLATE,
+                inner: slate.to_bytes(),
+                recipient: Some(from),
+            };
+            ctx.events.send(Event::Send(out)).map_err(|_| "the node has stopped")?;
+            say(
+                ctx,
+                &format!(
+                    "receiving {} coins (fee {}) from {who}; slate {} answered",
+                    fmt_coins(slate.amount as u128),
+                    fmt_coins(slate.fee as u128),
+                    &slate.id_hex()[..16]
+                ),
+            );
+        }
+        Incoming::Finalized(slate, signed) => {
+            ctx.outgoing.lock().unwrap().remove(&slate.id);
+            say(ctx, &format!("slate {} answered by {who}; signing and pooling", &slate.id_hex()[..16]));
+            submit(ctx, signed);
+        }
+    }
     Ok(())
 }
 
