@@ -62,7 +62,11 @@ Every node starts from the mainnet genesis in `miner/src/genesis.rs`.
 Every header carries 32 aux bytes under the proof of work that consensus
 never reads. A miner fills them with the SHA-256 Merkle root of 16 leaves it
 sets at the prompt, `set-leaf INDEX FILE` (the file's SHA-256) or
-`set-leaf-value INDEX HEX`, shown by `leaves`. The leaves are kept in the
+`set-leaf-value INDEX HEX`, shown by `leaves`. Leaf 0 is a vote for a
+consensus file of the message layer (`docs/ONION.md`): nodes fetch and
+check every block's leaves, count leaf 0 over the last 144 blocks, and
+fetch the file the winning hash names; `consensus` shows the count and the
+file. The leaves are kept in the
 chain directory and go into every block the node mines until one is
 changed; while all are zero the aux bytes are zero.
 
@@ -252,7 +256,10 @@ between them to collect signatures. Policy outputs are not recoverable
 from the phrase: a wallet keeps them as channel state. Identities on the
 message layer (`docs/ONION.md`) are written as `tab1…` addresses: bech32m
 with a checksum, accepted and shown by the prompt wherever a name's value
-appears. Any peer answers
+appears. A wallet's identity is the hash of an ML-DSA-65 (Dilithium) key
+derived from its phrase, so a restore keeps its address (`address` at the
+prompt); the message layer's primitives (ChaCha20-Poly1305, ML-KEM-768,
+ML-DSA-65) are the crate's own, tested against the standard vectors. Any peer answers
 `GetProof` for a position with the output there and its path against the
 peer's tip, so a client holding headers (and a chain proof for one of
 them) checks its outputs and watches spends without trusting a node.

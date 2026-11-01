@@ -77,7 +77,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::block::{Block, Header};
 use crate::chain::{
     Applied, CarriedNamePart, CarriedPart, Chain, ChainError, Manifest, ProofVerifier, SNAPSHOT_PART_LOG,
+    aux_merkle_root,
 };
+use crate::consensus;
 use crate::difficulty::U256;
 use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
@@ -156,6 +158,26 @@ fn snapshot_margin(status: &net::Status) -> u32 {
 }
 /// Failed snapshot attempts before validating from genesis instead.
 const MAX_SNAPSHOT_ATTEMPTS: u32 = 4;
+/// Between requests for a block's aux leaves.
+const AUX_RETRY: Duration = Duration::from_secs(2);
+/// Requests for a block's aux leaves before it is given up (until the
+/// next scan of the window wants it again).
+const AUX_MAX_TRIES: u32 = 16;
+/// Aux leaf requests sent per tick.
+const AUX_REQUESTS_PER_TICK: usize = 64;
+/// Between scans of the window for leaves not yet fetched and the file
+/// the window names; a scan also follows every tip change and arrival.
+const AUX_SCAN: Duration = Duration::from_secs(10);
+
+/// A block's aux leaves wanted from peers.
+struct AuxWant {
+    height: u32,
+    /// Who sent the block: asked first.
+    from: Option<SocketAddr>,
+    asked: Option<Instant>,
+    tries: u32,
+    tried: Vec<SocketAddr>,
+}
 /// Staged parts carried forward in one job (one transaction).
 const CARRY_BATCH: usize = 64;
 
@@ -342,6 +364,8 @@ pub struct Stats {
     pub wanted: usize,
     /// Fetched blocks waiting for their parent.
     pub waiting: usize,
+    /// Blocks whose aux leaves are still to be fetched.
+    pub aux_wanted: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -423,6 +447,18 @@ pub struct Node<V: ProofVerifier> {
     last_seed_lookup: Option<Instant>,
     last_save: Instant,
     started: Instant,
+    /// Blocks whose aux leaves are to be fetched (`docs/ONION.md`).
+    aux_wants: HashMap<Digest, AuxWant>,
+    last_aux_scan: Option<Instant>,
+    /// The tip change count at the last scan.
+    aux_scanned_at: u64,
+    /// The consensus file the window names and this node lacks.
+    file_want: Option<consensus::Hash>,
+    /// What the window last decided, to log changes: the winning hash and
+    /// the mode in force.
+    last_consensus: Option<(Option<consensus::Hash>, consensus::Mode)>,
+    /// Peers that did not serve the wanted file.
+    file_failed: std::collections::HashSet<SocketAddr>,
 }
 
 fn unix_now() -> u64 {
@@ -633,6 +669,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             last_seed_lookup: None,
             last_save: now,
             started: now,
+            aux_wants: HashMap::new(),
+            last_aux_scan: None,
+            aux_scanned_at: 0,
+            file_want: None,
+            last_consensus: None,
+            file_failed: std::collections::HashSet::new(),
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
             node.mode = Mode::Headers;
@@ -801,7 +843,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let stale = now.checked_sub(PENDING_TIMEOUT);
         self.pending.retain(|_, (_, _, at)| stale.is_none_or(|s| *at > s));
         match self.mode {
-            Mode::Normal => self.sync(now),
+            Mode::Normal => {
+                self.sync(now);
+                self.aux_sync(now);
+            }
             Mode::Headers => self.header_sync(now),
             Mode::Snapshot => {
                 self.pump_headers(now);
@@ -843,6 +888,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             waiting: self.pending.len(),
             mode: Some(self.mode),
             parts,
+            aux_wanted: self.aux_wants.len(),
         };
     }
 
@@ -1084,6 +1130,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Tx => MAX_TX_SIZE,
             Kind::Manifest => net::MAX_MANIFEST,
             Kind::Part(_) => net::MAX_PART,
+            Kind::Consensus => consensus::MAX_CONSENSUS,
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
@@ -1111,6 +1158,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         for id in blocks {
             let Some(d) = self.downloads.remove(&id) else { continue };
+            if d.kind == Kind::Consensus {
+                // A peer may simply not hold the file: asked elsewhere.
+                self.chatter(&format!("{} did not serve the consensus file; asking another peer", d.from));
+                self.file_failed.insert(d.from);
+                continue;
+            }
             self.log(&format!("gave up fetching block {} from {}; trying another peer", short(&id), d.from));
             // It may lack old bodies (pruned, or fast-synced), or be slow,
             // or the fault may be on our side: pass it over for a while.
@@ -1342,6 +1395,170 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.peers.seen(addr, now);
                 self.handle_chunk(addr, kind, id, len, index, data, now);
             }
+            Message::GetAux { id, token } => {
+                if !self.request_ok(&addr, token) {
+                    return;
+                }
+                self.peers.seen(addr, now);
+                if let Ok(Some(leaves)) = self.chain.aux_leaves_of(&id) {
+                    self.send(addr, &Message::Aux { id, leaves });
+                }
+            }
+            Message::Aux { id, leaves } => {
+                self.peers.seen(addr, now);
+                let Some(want) = self.aux_wants.get_mut(&id) else {
+                    return;
+                };
+                match self.chain.put_aux_leaves(&id, &leaves) {
+                    Ok(()) => {
+                        self.aux_wants.remove(&id);
+                        self.chatter(&format!("aux leaves of block {} from {addr}", short(&id)));
+                        // Count the vote.
+                        self.last_aux_scan = None;
+                    }
+                    Err(ChainError::AuxMismatch) => {
+                        want.asked = None;
+                        self.log(&format!("{addr} sent aux leaves that do not match block {}", short(&id)));
+                        self.peers.strike(addr);
+                    }
+                    Err(e) => self.log(&format!("keeping aux leaves of {}: {e}", short(&id))),
+                }
+            }
+        }
+    }
+
+    /// Wants the aux leaves of a block whose header has a nonzero aux root,
+    /// unless they are held already or are this node's own (a block mined
+    /// here, or by a peer with the same leaves).
+    fn want_aux(&mut self, header: &Header, from: Option<SocketAddr>) {
+        if header.aux == [0u8; 32] {
+            return;
+        }
+        let id = header.hash();
+        match self.chain.aux_leaves_of(&id) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => return self.log(&format!("aux leaves of {}: {e}", short(&id))),
+        }
+        if let Ok(leaves) = self.chain.aux_leaves()
+            && aux_merkle_root(&leaves) == header.aux
+        {
+            match self.chain.put_aux_leaves(&id, &leaves) {
+                Ok(()) => {
+                    self.last_aux_scan = None;
+                    return;
+                }
+                Err(e) => self.log(&format!("keeping our aux leaves for {}: {e}", short(&id))),
+            }
+        }
+        self.aux_wants
+            .entry(id)
+            .or_insert(AuxWant { height: header.height, from, asked: None, tries: 0, tried: Vec::new() });
+    }
+
+    /// Fetches the aux leaves of the window's blocks that lack them and the
+    /// consensus file the window names (`docs/ONION.md`).
+    fn aux_sync(&mut self, now: Instant) {
+        let changes = self.tip_changes.load(Ordering::Acquire);
+        if self.last_aux_scan.is_none_or(|t| now.duration_since(t) >= AUX_SCAN) || changes != self.aux_scanned_at {
+            self.last_aux_scan = Some(now);
+            self.aux_scanned_at = changes;
+            match self.chain.consensus() {
+                Ok((votes, current)) => {
+                    let decided = (current.winner, current.mode);
+                    if self.last_consensus != Some(decided) {
+                        self.last_consensus = Some(decided);
+                        let by = match (&current.winner, &current.problem) {
+                            (None, _) => "no block of the window votes".to_string(),
+                            (Some(h), Some(problem)) => format!("file {} is {problem}", consensus::hex(h)),
+                            (Some(h), None) => format!(
+                                "file {} with {} of the window's {} votes{}",
+                                consensus::hex(h),
+                                votes.winning_votes(),
+                                votes.blocks,
+                                current.file.as_ref().map_or(String::new(), |f| format!(", {} relays", f.relays.len()))
+                            ),
+                        };
+                        self.log(&format!("consensus: {} mode: {by}", current.mode));
+                    }
+                    for (id, _) in &votes.missing {
+                        if let Ok(Some(header)) = self.chain.header_by_hash(id) {
+                            self.want_aux(&header, None);
+                        }
+                    }
+                    let want = match votes.winner() {
+                        Some(hash) if !self.chain.has_consensus_file(&hash).unwrap_or(true) => Some(hash),
+                        _ => None,
+                    };
+                    if want != self.file_want {
+                        self.file_failed.clear();
+                        if let Some(hash) = want {
+                            self.log(&format!(
+                                "consensus: file {} has {} of the window's {} votes; fetching it",
+                                consensus::hex(&hash),
+                                votes.winning_votes(),
+                                votes.blocks
+                            ));
+                        }
+                    }
+                    self.file_want = want;
+                }
+                Err(e) => self.log(&format!("counting aux votes: {e}")),
+            }
+        }
+        let peers: Vec<(SocketAddr, u32)> =
+            self.peers.live(now).map(|p| (p.addr, p.status.map_or(0, |s| s.height))).collect();
+        if peers.is_empty() {
+            return;
+        }
+        let live: Vec<SocketAddr> = peers.iter().map(|(a, _)| *a).collect();
+        // Leaves: the block's sender first, then each live peer that has
+        // the block in turn.
+        let mut requests = Vec::new();
+        let mut given_up = Vec::new();
+        for (id, w) in self.aux_wants.iter_mut() {
+            if w.asked.is_some_and(|t| now.duration_since(t) < AUX_RETRY) || requests.len() >= AUX_REQUESTS_PER_TICK
+            {
+                continue;
+            }
+            if w.tries >= AUX_MAX_TRIES {
+                given_up.push(*id);
+                continue;
+            }
+            // The sender has it whatever its last status said; then peers
+            // whose status reaches the block; then any, as statuses age.
+            let able: Vec<SocketAddr> = peers.iter().filter(|(_, h)| *h >= w.height).map(|(a, _)| *a).collect();
+            let peer = w
+                .from
+                .take()
+                .filter(|a| live.contains(a))
+                .or_else(|| able.iter().find(|a| !w.tried.contains(a)).copied())
+                .or_else(|| live.iter().find(|a| !w.tried.contains(a)).copied())
+                .or_else(|| live.get(w.tries as usize % live.len()).copied());
+            if let Some(p) = peer {
+                w.asked = Some(now);
+                w.tries += 1;
+                w.tried.push(p);
+                requests.push((p, *id));
+            }
+        }
+        for id in given_up {
+            self.aux_wants.remove(&id);
+        }
+        for (p, id) in requests {
+            self.send(p, &Message::GetAux { id, token: 0 });
+        }
+        // The file, from a peer that has not failed to serve it.
+        if let Some(hash) = self.file_want {
+            let id = consensus::file_id(&hash);
+            if !self.downloads.contains_key(&id) {
+                if self.file_failed.len() >= live.len() {
+                    self.file_failed.clear();
+                }
+                if let Some(from) = live.iter().find(|a| !self.file_failed.contains(a)).copied() {
+                    self.start_download(Kind::Consensus, id, from, now);
+                }
+            }
         }
     }
 
@@ -1472,6 +1689,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Some(b) => b,
                 None => return,
             },
+            Kind::Consensus => match self.chain.consensus_file_by_id(&id) {
+                Ok(Some(b)) => b,
+                _ => return,
+            },
         };
         for &i in indexes.iter().take(WINDOW) {
             if let Some(msg) = chunk_of(kind, &id, &bytes, i) {
@@ -1526,6 +1747,31 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         _ => {
                             self.log(&format!("{from} sent a malformed transaction for {}", short(&id)));
                             self.peers.strike(from);
+                        }
+                    },
+                    Kind::Consensus => match self.file_want {
+                        Some(hash) if consensus::file_id(&hash) == id && consensus::file_matches(&hash, &bytes) => {
+                            match self.chain.put_consensus_file(&bytes) {
+                                Ok(_) => {
+                                    let verdict = match consensus::File::parse(&bytes) {
+                                        Ok(f) => format!("mode {}", f.mode),
+                                        Err(e) => format!("invalid, so ignored: {e}"),
+                                    };
+                                    self.log(&format!(
+                                        "consensus: fetched file {} ({} bytes) from {from}: {verdict}",
+                                        consensus::hex(&hash),
+                                        bytes.len()
+                                    ));
+                                    self.file_want = None;
+                                    self.last_aux_scan = None;
+                                }
+                                Err(e) => self.log(&format!("keeping the consensus file: {e}")),
+                            }
+                        }
+                        _ => {
+                            self.log(&format!("{from} sent a consensus file that is not the one asked for"));
+                            self.peers.strike(from);
+                            self.file_failed.insert(from);
                         }
                     },
                     Kind::Manifest | Kind::Part(_) => {}
@@ -1640,6 +1886,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn on_applied(&mut self, block: Block, from: Option<SocketAddr>, result: Result<Applied, ChainError>) {
         let id = block.header.hash();
         let height = block.header.height;
+        let header = block.header;
         self.applying.remove(&id);
         let connected = match result {
             Ok(Applied::Known) => true,
@@ -1698,6 +1945,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         if connected {
             self.sources.remove(&id);
+            // Its aux leaves, if it is near enough the tip to count.
+            let floor = self.chain.best_header().map_or(0, |b| {
+                b.height.saturating_sub(self.chain.undo_window().unwrap_or(crate::chain::DEFAULT_MAX_UNDO))
+            });
+            if height >= floor {
+                self.want_aux(&header, from);
+            }
             // Fetched blocks waiting for this one.
             let children: Vec<Digest> =
                 self.pending.iter().filter(|(_, (b, _, _))| b.header.prev_hash == id).map(|(k, _)| *k).collect();
@@ -1917,6 +2171,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Manifest => net::MAX_MANIFEST,
             Kind::Part(_) => net::MAX_PART,
             Kind::Tx => MAX_TX_SIZE,
+            Kind::Consensus => consensus::MAX_CONSENSUS,
         };
         let mut d = Download::new(kind, id, from, max_len, now);
         let indexes = d.request(now);
@@ -2482,7 +2737,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 true
             }
-            Kind::Tx => true,
+            Kind::Tx | Kind::Consensus => true,
         }
     }
 
@@ -2769,6 +3024,130 @@ mod tests {
         // Peers were saved.
         let saved = std::fs::read_to_string(b.dir.0.join("peers")).unwrap();
         assert!(saved.contains(&addr_a.to_string()), "{saved}");
+    }
+
+    /// Blocks with aux leaves: the miner keeps its own leaves, a peer
+    /// fetches and checks them, counts the window's votes and fetches the
+    /// file the winning hash names; a later file takes over once more
+    /// blocks vote for it.
+    #[test]
+    fn aux_leaves_and_the_consensus_file_propagate() {
+        let a = open("aux-a");
+        let b = open("aux-b");
+        let now = unix_now();
+        let file = b"mode init\n# the first file\n";
+        let hash = a.chain.put_consensus_file(file).unwrap();
+        a.chain.set_aux_leaf(0, hash).unwrap();
+        a.chain.set_aux_leaf(7, [7u8; 32]).unwrap();
+        let leaves = a.chain.aux_leaves().unwrap();
+        let mut t = T0;
+        let mut blocks = Vec::new();
+        for tag in 1..=2u8 {
+            t += 600;
+            let block = mine(&a, tag, t);
+            assert_eq!(block.header.aux, crate::chain::aux_merkle_root(&leaves));
+            a.chain.apply_block(&block, now).unwrap();
+            blocks.push(block);
+        }
+        // Applied directly, so the node has not kept their leaves yet.
+        assert_eq!(a.chain.aux_leaves_of(&blocks[0].header.hash()).unwrap(), None);
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), config(vec![addr_a], &b.dir)).unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        t += 600;
+        let b3 = mine(&a, 3, t);
+        tx_a.send(Event::Mined(b3.clone())).unwrap();
+        blocks.push(b3.clone());
+        assert!(wait_for_tip(&b.chain, &b3.header, 20), "b did not sync");
+        let settled = |chain: &Chain<AcceptAllProofs>, want: consensus::Hash, secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < deadline {
+                let v = chain.consensus_votes(consensus::WINDOW).unwrap();
+                if v.missing.is_empty() && v.winner() == Some(want) && chain.has_consensus_file(&want).unwrap() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(settled(&b.chain, hash, 20), "b did not fetch the leaves and the file: {:?}", b.chain.consensus_votes(144));
+        for block in &blocks {
+            assert_eq!(b.chain.aux_leaves_of(&block.header.hash()).unwrap(), Some(leaves));
+            assert_eq!(a.chain.aux_leaves_of(&block.header.hash()).unwrap(), Some(leaves), "a keeps its own");
+        }
+        assert_eq!(b.chain.consensus_file(&hash).unwrap().as_deref(), Some(&file[..]));
+        let v = b.chain.consensus_votes(consensus::WINDOW).unwrap();
+        assert_eq!(v.counts, vec![(hash, 3, 3)]);
+        assert_eq!(v.blocks, 4);
+        // A second file: three votes against three go to the most recent
+        // commitment, so it wins at block 6 and holds at 7.
+        let file2 = b"mode init\n# the second file\n";
+        let hash2 = a.chain.put_consensus_file(file2).unwrap();
+        a.chain.set_aux_leaf(0, hash2).unwrap();
+        for tag in 4..=7u8 {
+            t += 600;
+            let block = mine(&a, tag, t);
+            tx_a.send(Event::Mined(block.clone())).unwrap();
+            assert!(wait_for_tip(&b.chain, &block.header, 20), "b did not receive block {tag}");
+            if tag < 6 {
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(b.chain.consensus_votes(consensus::WINDOW).unwrap().winner(), Some(hash), "at block {tag}");
+            }
+        }
+        assert!(settled(&b.chain, hash2, 20), "the second file did not take over: {:?}", b.chain.consensus_votes(144));
+        let v = b.chain.consensus_votes(consensus::WINDOW).unwrap();
+        assert_eq!(v.counts, vec![(hash2, 4, 7), (hash, 3, 3)]);
+        assert_eq!(b.chain.consensus_file(&hash2).unwrap().as_deref(), Some(&file2[..]));
+        let (_, current) = b.chain.consensus().unwrap();
+        assert_eq!((current.mode, current.winner, current.problem), (consensus::Mode::Init, Some(hash2), None));
+        // Both files stay.
+        assert!(b.chain.has_consensus_file(&hash).unwrap());
+        // A peer serves leaves it holds and nothing for a block it does not.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let token = {
+            // Learn our token from a's pong.
+            let genesis = a.chain.header_at(0).unwrap().unwrap().hash();
+            let st = net::Status {
+                nonce: 1,
+                version: net::PROTOCOL_VERSION,
+                token: 0,
+                genesis,
+                height: 0,
+                oldest: 1,
+                tip: genesis,
+                work: U256::ZERO,
+            };
+            sock.send_to(&Message::Ping(st).encode(), addr_a).unwrap();
+            let mut buf = [0u8; net::MAX_DATAGRAM];
+            let mut token = None;
+            for _ in 0..4 {
+                let Ok((n, _)) = sock.recv_from(&mut buf) else { break };
+                if let Some(Message::Pong(s)) = Message::decode(&buf[..n]) {
+                    token = Some(s.token);
+                    break;
+                }
+            }
+            token.expect("a's pong")
+        };
+        sock.send_to(&Message::GetAux { id: b3.header.hash(), token }.encode(), addr_a).unwrap();
+        let mut buf = [0u8; net::MAX_DATAGRAM];
+        let mut got = None;
+        for _ in 0..4 {
+            let Ok((n, _)) = sock.recv_from(&mut buf) else { break };
+            if let Some(Message::Aux { id, leaves: l }) = Message::decode(&buf[..n]) {
+                got = Some((id, l));
+                break;
+            }
+        }
+        assert_eq!(got, Some((b3.header.hash(), leaves)));
+        for tx in [tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        ha.join().unwrap();
+        hb.join().unwrap();
     }
 
     /// A state proof for an unspent output and for an empty position

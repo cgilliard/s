@@ -79,6 +79,8 @@ const T_TX_INV: u8 = 10;
 const T_GET_HEADERS_FROM: u8 = 11;
 const T_GET_PROOF: u8 = 12;
 const T_PROOF: u8 = 13;
+const T_GET_AUX: u8 = 14;
+const T_AUX: u8 = 15;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
 pub const PROOF_SIBLINGS_PER_MESSAGE: usize = crate::state_tree::DEPTH / 2;
 
@@ -93,6 +95,9 @@ pub enum Kind {
     /// One part of that state: an output part ([`encode_part`]) or, after
     /// those, a name part ([`encode_name_part`]).
     Part(u32),
+    /// A consensus file (`docs/ONION.md`), named by
+    /// [`crate::consensus::file_id`] of its SHA-256.
+    Consensus,
 }
 
 impl Kind {
@@ -105,6 +110,7 @@ impl Kind {
                 w.0.push(3);
                 w.u32(i);
             }
+            Kind::Consensus => w.0.push(4),
         }
     }
 
@@ -114,6 +120,7 @@ impl Kind {
             1 => Some(Kind::Tx),
             2 => Some(Kind::Manifest),
             3 => Some(Kind::Part(r.u32()?)),
+            4 => Some(Kind::Consensus),
             _ => None,
         }
     }
@@ -289,6 +296,16 @@ pub enum Message {
         part: u8,
         siblings: Vec<Digest>,
     },
+    /// The 16 aux leaves of block `id` (`docs/ONION.md`), answered by a
+    /// node that holds them checked.
+    GetAux {
+        id: Digest,
+        token: u64,
+    },
+    Aux {
+        id: Digest,
+        leaves: [[u8; 32]; crate::chain::AUX_LEAVES],
+    },
 }
 
 fn put_status(w: &mut Writer, s: &Status) {
@@ -425,6 +442,18 @@ impl Message {
                     w.digest(s);
                 }
             }
+            Message::GetAux { id, token } => {
+                w.0.push(T_GET_AUX);
+                w.u64(*token);
+                w.digest(id);
+            }
+            Message::Aux { id, leaves } => {
+                w.0.push(T_AUX);
+                w.digest(id);
+                for l in leaves {
+                    w.0.extend_from_slice(l);
+                }
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -505,6 +534,18 @@ impl Message {
                 let siblings = (0..n).map(|_| r.digest()).collect::<Option<Vec<_>>>()?;
                 Message::Proof { position, tip, commitment, memo, created, part, siblings }
             }
+            T_GET_AUX => {
+                let token = r.u64()?;
+                Message::GetAux { id: r.digest()?, token }
+            }
+            T_AUX => {
+                let id = r.digest()?;
+                let mut leaves = [[0u8; 32]; crate::chain::AUX_LEAVES];
+                for l in leaves.iter_mut() {
+                    l.copy_from_slice(r.take(32)?);
+                }
+                Message::Aux { id, leaves }
+            }
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -523,7 +564,8 @@ impl Message {
             Message::GetPeers { token }
             | Message::GetHeaders { token, .. }
             | Message::GetHeadersFrom { token, .. }
-            | Message::GetChunks { token, .. } => Some(*token),
+            | Message::GetChunks { token, .. }
+            | Message::GetAux { token, .. } => Some(*token),
             _ => None,
         }
     }
@@ -534,7 +576,8 @@ impl Message {
             Message::GetPeers { token }
             | Message::GetHeaders { token, .. }
             | Message::GetHeadersFrom { token, .. }
-            | Message::GetChunks { token, .. } => *token = t,
+            | Message::GetChunks { token, .. }
+            | Message::GetAux { token, .. } => *token = t,
             _ => {}
         }
         self
@@ -1353,6 +1396,9 @@ mod tests {
             Message::Chunk { kind: Kind::Block, id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
             Message::Chunk { kind: Kind::Part(7), id: digest(9), len: 9, index: 0, data: vec![1u8; 9] },
             Message::GetChunks { kind: Kind::Manifest, id: digest(2), indexes: vec![0, 1], token: 0 },
+            Message::GetChunks { kind: Kind::Consensus, id: digest(4), indexes: vec![0], token: 5 },
+            Message::GetAux { id: digest(8), token: 9 },
+            Message::Aux { id: digest(8), leaves: core::array::from_fn(|i| [i as u8; 32]) },
         ];
         for m in msgs {
             let bytes = m.encode();

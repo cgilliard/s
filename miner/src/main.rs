@@ -146,9 +146,12 @@ const HELP: &str = "commands:
                             their Merkle root goes in the headers this node mines
   set-leaf-value INDEX HEX  set aux leaf INDEX to a 32-byte value given in hex
   leaves                    the aux leaves and their root
+  consensus                 the consensus file in force (docs/ONION.md): the window's
+                            votes, the winning file and its text
   policies                  this wallet's policy outputs: multisigs, channels
   channel-key [HEIGHT]      a fresh channel key for a policy: its nonce and key
                             hash (HEIGHT levels, 16 by default, 20 at most)
+  address                   this wallet's tab1… address (the hash of its Dilithium key)
   phrase                    show the wallet's 12-word recovery phrase
   storage                   disk use of the chain database, part by part
   quit                      stop the node
@@ -912,11 +915,32 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 return Err(format!("leaf index must be 0 to {}", tabminer::chain::AUX_LEAVES - 1).into());
             }
             let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+            if index == 0 {
+                // A vote for a file nobody can follow is refused here.
+                if let Err(e) = tabminer::consensus::File::parse(&bytes) {
+                    return Err(format!("{file} is not a valid consensus file: {e}").into());
+                }
+            }
             let hash = tabminer::bip39::sha256(&bytes);
             let root = ctx.chain.set_aux_leaf(index, hash)?;
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
             println!("leaf {index}  {}  ({} bytes)", hex(&hash), bytes.len());
             println!("root     {}  (in the headers mined from now on)", hex(&root));
+            if index == 0 {
+                // Leaf 0 is a vote for a consensus file: kept, to be served
+                // to the nodes that count it.
+                ctx.chain.put_consensus_file(&bytes)?;
+                let parsed = tabminer::consensus::File::parse(&bytes)?;
+                println!(
+                    "kept     {file} as a consensus file (mode {}{}), served to peers",
+                    parsed.mode,
+                    if parsed.mode == tabminer::consensus::Mode::Onion {
+                        format!(", {} relays", parsed.relays.len())
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         "set-leaf-value" => {
             let [index, hex_value] = args else { return Err("usage: set-leaf-value INDEX HEX".into()) };
@@ -929,6 +953,74 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
             println!("leaf {index}  {}", hex(&value));
             println!("root     {}  (in the headers mined from now on)", hex(&root));
+        }
+        "address" => {
+            println!("{}", ctx.wallet.address());
+            println!("id {}", hex_digest(&ctx.wallet.id()));
+        }
+        "consensus" => {
+            use tabminer::consensus::hex;
+            let (votes, current) = ctx.chain.consensus()?;
+            let stats = ctx.stats.lock().unwrap().clone();
+            println!(
+                "window   heights {} to {}: {} blocks, {} voting{}",
+                votes.range.0,
+                votes.range.1,
+                votes.blocks,
+                votes.counts.iter().map(|c| c.1).sum::<u32>(),
+                if votes.missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} with leaves still to fetch ({} wanted)", votes.missing.len(), stats.aux_wanted)
+                }
+            );
+            for (hash, n, last) in &votes.counts {
+                let held = ctx.chain.has_consensus_file(hash)?;
+                println!(
+                    "vote     {}  {n:>3} blocks, last at height {last}{}",
+                    hex(hash),
+                    if held { "" } else { "  (file not fetched)" }
+                );
+            }
+            match votes.winner() {
+                None => println!("mode     init: no block of the window votes for a file"),
+                Some(hash) => match ctx.chain.consensus_file(&hash)? {
+                    None => println!("mode     init: file {} not fetched yet", hex(&hash)),
+                    Some(bytes) => {
+                        match (&current.file, &current.problem) {
+                            (Some(f), _) => println!(
+                                "mode     {}{}",
+                                f.mode,
+                                if f.mode == tabminer::consensus::Mode::Onion {
+                                    format!(": {} relays", f.relays.len())
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            (None, Some(problem)) => println!("mode     init: the winning file is {problem}"),
+                            (None, None) => println!("mode     init"),
+                        }
+                        println!(
+                            "current  {}  ({} bytes, {} of {} blocks)",
+                            hex(&hash),
+                            bytes.len(),
+                            votes.winning_votes(),
+                            votes.blocks
+                        );
+                        match std::str::from_utf8(&bytes) {
+                            Ok(text) => {
+                                for line in text.lines().take(64) {
+                                    println!("  | {line}");
+                                }
+                                if text.lines().count() > 64 {
+                                    println!("  | ... ({} lines in all)", text.lines().count());
+                                }
+                            }
+                            Err(_) => println!("  (not text)"),
+                        }
+                    }
+                },
+            }
         }
         "leaves" => {
             let leaves = ctx.chain.aux_leaves()?;

@@ -79,16 +79,21 @@ relay ID ADDRESS [FLAGS]
 ...
 ```
 
-Onion mode: `relay` lines list the relays, one per line: its id
-(64 hex digits), its address (`host:port`, UDP, the same transport as the
-chain's), and optional flags (`exit`, `rendezvous`, `guard`; their meaning
-is an open point). Addresses may change without a new consensus: a relay
-whose address is stale is found through its descriptor served by other
-relays (open point).
+Onion mode: `relay` lines list the relays, one per line: its id (a
+`tab1…` address, or 64 hex digits), its address (`host:port`, UDP, the
+same transport as the chain's; a v6 address in brackets), and optional
+flags (`exit`, `rendezvous`, `guard`; their meaning is an open point).
+Addresses may change without a new consensus: a relay whose address is
+stale is found through its descriptor served by other relays (open
+point). The relays are taken sorted by id, whatever order they are
+written in.
 
 Unknown directives are ignored (forward compatibility); a file that does
-not parse, exceeds the size, or lists more than `MAX_RELAYS` relays is
-invalid and never replaces the current one.
+not parse, is not UTF-8, exceeds the size, lists an id twice, lists more
+than `MAX_RELAYS` relays, or in onion mode fewer than `MIN_RELAYS` (three,
+the rendezvous points a participant needs) is invalid and never replaces
+the current one. `set-leaf 0 FILE` refuses such a file, so a miner cannot
+vote for one by accident.
 
 ## Commitment and propagation
 
@@ -198,6 +203,22 @@ against the id, and forwards cells. Circuit keys come from encapsulating
 to the descriptor's Kyber key, so a hop's past traffic is safe once that
 key rotates.
 
+**The `--relay` flag.** A node relays only when started with `--relay`.
+Without it a node is a participant: it keeps its own sessions and
+circuits, never accepts a circuit or forwards a cell, and publishes no
+descriptor. With it the node runs the relay service on its UDP port,
+publishes its descriptor and forwards for anyone. The relay's id is its
+wallet's id (the seed-derived Dilithium key, shown by `address`), which
+is what an operator puts in the `relay` line of a `consensus.txt`. A
+node started with `--relay` prints that line ready to paste at startup,
+its id as a `tab1…` address with its listening address, and logs it, so
+an operator can hand it to whoever is assembling the next file; a
+node listed in the file but not started with `--relay` forwards nothing
+and is skipped by others once its descriptor cannot be fetched, and a
+node started with `--relay` but not listed forwards for nobody, since
+circuits are built only through listed relays. In init mode the same
+flag turns on the rendezvous service, so the seed nodes run with it.
+
 **Standing circuits.** Building a circuit costs a round trip per hop, so
 no circuit is built per payment. Every participant keeps two kinds
 standing:
@@ -278,6 +299,11 @@ Settled on 2026-11-01, before implementation.
 - **No authority over `consensus.txt`.** The file in force is purely the
   window's winner: the hash committed by the most main-chain blocks of
   the last 144, ties to the most recent. Miners are the electorate.
+- **Relaying is opt-in by `--relay`.** A node forwards for others, and
+  serves as a rendezvous point, only when started with the flag; every
+  other node is a participant only. The flag is the operator's consent to
+  carry traffic and the only switch: being listed in `consensus.txt`
+  makes a relay usable, not active.
 
 ## Constants
 
@@ -287,6 +313,7 @@ Settled on 2026-11-01, before implementation.
 | Kyber keys | ephemeral, signed by the Dilithium key; wallets rotate per session and daily, relays weekly |
 | `MAX_CONSENSUS` | 1 MiB |
 | `MAX_RELAYS` | 8,192 |
+| `MIN_RELAYS` | 3: an onion-mode file with fewer is invalid |
 | `WINDOW` | 144 blocks: the most committed file over them is current |
 | `KEEPALIVE` | 30 seconds between pings on a rendezvous session |
 | circuit length | 2 relays plus the exit or the rendezvous relay: 6 relays end to end |
@@ -322,21 +349,42 @@ To be settled before implementation, in roughly this order.
 
 ## Implementation order
 
-0. **Primitives.** `chacha20poly1305.rs`, `mlkem.rs` and `mldsa.rs`
-   with the standard test vectors; the wallet's Dilithium key from the
-   seed and its `tab1…` address (`address` at the prompt).
-1. **Aux leaves.** Nodes fetch, check, keep and serve the leaves of
-   blocks with a nonzero aux root; the window count of leaf-0 hashes;
-   `Kind::Consensus` in the chunked transfer for the winning file;
-   `consensus` at the prompt shows the current file, its hash and its
-   votes in the window; miners serve their own.
-2. **The file.** Parsing and validation of `consensus.txt`, the current
-   file's selection by the window, and a miner's `set-leaf 0` wiring with
-   a check that the file parses.
-3. **Init mode.** Sessions at the seeds with keepalives, the rendezvous
-   choice by id, the message format, the Dilithium key in the wallet
-   (the id behind a name's value) and its ephemeral Kyber keys and
-   announcements, and slates by name or id.
-4. **Onion mode.** Relay service, descriptors, circuits and cells,
-   rendezvous over circuits, and the wallet's use of them.
+0. **Primitives.** Done (2026-11-01): `chacha20poly1305.rs` (RFC 8439,
+   its vectors), `keccak.rs` (SHA-3 and SHAKE, FIPS 202), `mlkem.rs`
+   (ML-KEM-768) and `mldsa.rs` (ML-DSA-65), the last two checked against
+   NIST's ACVP known answers in `tests/vectors/` for key generation,
+   encapsulation and decapsulation (including implicit rejection and the
+   modulus check), signing and verification (including each kind of
+   tampered signature). ML-DSA signatures are deterministic over a message
+   and a context string. The wallet derives its ML-DSA seed from the
+   master key under its own domain tag (`identity_key`), its id is
+   `H(DOM_ID ‖ public key)` with `DOM_ID` 18 (`address::id_of`), and
+   `address` at the prompt shows the `tab1…` form and the id.
+1. **Aux leaves.** Done (2026-11-01). `GetAux`/`Aux` carry a block's 16
+   leaves in one datagram; a node wants the leaves of every connected
+   block with a nonzero aux root within the undo window of the best
+   header (the sender first, then peers in turn) and of any block of the
+   last 144 it finds without them, checks them against the header
+   (`Chain::put_aux_leaves`, a mismatch is a strike) and keeps them with
+   the body. The window count (`consensus.rs`, `Chain::consensus_votes`)
+   runs on every tip change, arrival and ten seconds; the winning hash's
+   file travels as `Kind::Consensus` through the chunked transfer, named
+   by its SHA-256 cut to a canonical digest (`consensus::file_id`), is
+   checked by the full hash and kept for good. `set-leaf 0 FILE` keeps
+   the file so the miner serves it; a node that mines a block with its
+   own root keeps its own leaves. `consensus` at the prompt shows the
+   window's votes, the winning file and its text. Parsing is step 2:
+   until then "current" means held, not yet valid.
+2. **The file.** Done (2026-11-01): `consensus::File::parse` with every
+   rule above and a line-numbered error; `Chain::consensus` decides the
+   mode from the window (`consensus::Current`: init unless the winner's
+   file is held and valid); the node logs each change of winner or mode
+   and the verdict on every file it fetches; `consensus` at the prompt
+   shows the mode; `set-leaf 0 FILE` parses the file first.
+3. **Init mode.** The `--relay` flag; sessions at the seeds with
+   keepalives, the rendezvous choice by id, the message format, the
+   Dilithium key in the wallet (the id behind a name's value) and its
+   ephemeral Kyber keys and announcements, and slates by name or id.
+4. **Onion mode.** Relay service behind `--relay`, descriptors, circuits
+   and cells, rendezvous over circuits, and the wallet's use of them.
 5. **Docs.** README, SECURITY.md, HARDENING.md.

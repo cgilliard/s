@@ -68,7 +68,9 @@ use std::path::Path;
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, RoTxn, RwTxn};
 
+use crate::address;
 use crate::bip39;
+use crate::mldsa;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
@@ -80,7 +82,7 @@ use crate::transaction::{
     key_commitment, pubkey_hash,
 };
 use crate::utxo::{self, UtxoSet};
-use crate::xmss::{PublicKey, SEED_SIZE};
+use crate::xmss::{Digest, PublicKey, SEED_SIZE};
 
 const META_ENTROPY: &str = "entropy";
 const META_SEED: &str = "seed";
@@ -104,6 +106,7 @@ const DOM_KEY: u32 = 0x32;
 const DOM_OWNER: u32 = 0x33;
 const DOM_SALT: u32 = 0x34;
 const DOM_CHANNEL: u32 = 0x35;
+const DOM_IDENTITY: u32 = 0x36;
 /// Tree height of the channel keys this wallet makes unless told
 /// otherwise: 65,536 states.
 pub const CHANNEL_HEIGHT: usize = 16;
@@ -813,6 +816,24 @@ impl Wallet {
         input[..DIGEST].copy_from_slice(&self.master);
         input[DIGEST..].copy_from_slice(nonce);
         hash_domain(domain, &input)
+    }
+
+    /// The wallet's Dilithium (ML-DSA-65) key, from the master key: a
+    /// wallet restored from its phrase has the same key, id and address.
+    pub fn identity_key(&self) -> mldsa::SecretKey {
+        let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_IDENTITY, &self.master));
+        mldsa::keygen(&seed)
+    }
+
+    /// The wallet's id on the message layer: the hash of its Dilithium
+    /// public key (`docs/ONION.md`).
+    pub fn id(&self) -> Digest {
+        address::id_of(self.identity_key().public_key())
+    }
+
+    /// The wallet's `tab1…` address: its id in text.
+    pub fn address(&self) -> String {
+        address::encode(&self.id())
     }
 
     /// The key of the output with nonce `nonce`, at its first leaf.
@@ -2347,6 +2368,17 @@ mod tests {
         let (other, _) = Wallet::open(&dir.0.join("other")).unwrap();
         let o = w.owned(&a_commitment).unwrap().unwrap();
         assert!(other.open_memo(&w.memo(&o.nonce, 100)).is_none());
+        // The identity comes from the phrase: a restore has the same
+        // address, another wallet a different one, and the key signs.
+        let address = w.address();
+        assert_eq!(address.len(), address::LEN);
+        assert_eq!(address::decode(&address), Some(w.id()));
+        assert_ne!(other.address(), address);
+        let restored = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
+        assert_eq!(restored.address(), address);
+        let key = w.identity_key();
+        assert_eq!(address::id_of(key.public_key()), w.id());
+        assert!(mldsa::verify(key.public_key(), b"hello", b"", &key.sign(b"hello", b"")));
         let rtxn = env.read_txn().unwrap();
         // What is kept, as being in flight, is not pruned.
         let b_commitment = w.outputs().unwrap().into_iter().find(|o| o.commitment != a_commitment).unwrap().commitment;

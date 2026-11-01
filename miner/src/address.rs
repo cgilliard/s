@@ -6,9 +6,20 @@
 //! The id is a Poseidon2 digest (eight field elements), encoded as 32
 //! little-endian bytes exactly as [`crate::poseidon2::digest_to_bytes`]
 //! does, so an address round-trips to the digest a name's record holds.
+//! The id itself is the hash of a Dilithium (ML-DSA-65) public key under
+//! [`DOM_ID`] ([`id_of`]).
 
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
+use crate::transaction::hash_domain;
 use crate::xmss::Digest;
+
+/// Domain tag of an id: `H(DOM_ID ‖ Dilithium public key)`.
+pub const DOM_ID: u32 = 18;
+
+/// The id of a Dilithium public key.
+pub fn id_of(dilithium_public_key: &[u8]) -> Digest {
+    hash_domain(DOM_ID, &crate::pow::pack_bytes(dilithium_public_key))
+}
 
 /// The human-readable part of every address.
 pub const HRP: &str = "tab";
@@ -139,5 +150,15 @@ mod tests {
         let zero = [Fp::ZERO; 8];
         assert_eq!(decode(&encode(&zero)), Some(zero));
         assert_ne!(encode(&zero), a);
+    }
+
+    #[test]
+    fn ids_come_from_keys() {
+        let pk = crate::mldsa::keygen(&[9u8; 32]);
+        let id = id_of(pk.public_key());
+        assert_eq!(id, id_of(pk.public_key()));
+        assert_ne!(id, id_of(crate::mldsa::keygen(&[10u8; 32]).public_key()));
+        assert_ne!(id, id_of(&pk.public_key()[1..]));
+        assert_eq!(decode(&encode(&id)), Some(id));
     }
 }

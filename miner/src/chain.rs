@@ -274,6 +274,11 @@ pub enum ChainError {
     Corrupt(&'static str),
     /// The data directory was written by an incompatible version.
     OldFormat,
+    /// Aux leaves offered for a block are not the ones its header commits
+    /// to, or the block is not known.
+    AuxMismatch,
+    /// A consensus file exceeds [`crate::consensus::MAX_CONSENSUS`].
+    FileTooLarge(usize),
 }
 
 impl ChainError {
@@ -295,6 +300,8 @@ impl ChainError {
                 | ChainError::TimestampTooNew { .. }
                 | ChainError::BadBodyCommitment
                 | ChainError::Corrupt(_)
+                | ChainError::AuxMismatch
+                | ChainError::FileTooLarge(_)
                 | ChainError::OldFormat
                 | ChainError::MissingBody
                 | ChainError::BelowSnapshot
@@ -340,6 +347,8 @@ impl core::fmt::Display for ChainError {
             ChainError::BadProof => f.write_str("validity proof rejected"),
             ChainError::StateRootMismatch { .. } => f.write_str("state root does not match the applied body"),
             ChainError::Corrupt(what) => write!(f, "corrupt chain record: {what}"),
+            ChainError::AuxMismatch => f.write_str("aux leaves do not match the block's header"),
+            ChainError::FileTooLarge(n) => write!(f, "consensus file of {n} bytes exceeds the limit"),
             ChainError::OldFormat => {
                 f.write_str("chain database is from an older format; delete the chain directory and resync")
             }
@@ -620,6 +629,13 @@ pub struct Chain<V: ProofVerifier> {
     /// Disconnecting a block restores its inputs from here, and a snapshot's
     /// part is the outputs unspent now in its range plus those spent since.
     spent: Database<U64<BigEndian>, Bytes>,
+    /// The 16 aux leaves of every block with a nonzero aux root whose
+    /// leaves have been fetched and checked (or mined here), by block id,
+    /// kept as long as its body (`docs/ONION.md`).
+    aux: Database<Bytes, Bytes>,
+    /// Consensus files by SHA-256: the ones that won a window, and the
+    /// ones this miner committed to. Kept for good.
+    files: Database<Bytes, Bytes>,
     /// The best header's branch above the main chain, oldest first, as
     /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
     /// rather than walked again.
@@ -664,6 +680,8 @@ impl<V: ProofVerifier> Chain<V> {
         let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
         let snapshots = env.create_database(&mut wtxn, Some("snapshots"))?;
         let spent = env.create_database(&mut wtxn, Some("spent"))?;
+        let aux = env.create_database(&mut wtxn, Some("aux"))?;
+        let files = env.create_database(&mut wtxn, Some("files"))?;
         match meta.get(&wtxn, META_FORMAT)? {
             Some([FORMAT]) => {}
             Some(_) => return Err(ChainError::OldFormat),
@@ -687,6 +705,8 @@ impl<V: ProofVerifier> Chain<V> {
             max_undo: Some(DEFAULT_MAX_UNDO),
             snapshots,
             spent,
+            aux,
+            files,
             branch: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
         };
@@ -1319,6 +1339,18 @@ impl<V: ProofVerifier> Chain<V> {
         }
         for id in &old {
             self.bodies.delete(wtxn, id)?;
+        }
+        let mut old_aux = Vec::new();
+        for item in self.aux.iter(wtxn)? {
+            let (id, _) = item?;
+            if let Some(h) = self.header_by_hash_in(wtxn, id)?
+                && (1..=height).contains(&h.height)
+            {
+                old_aux.push(id.to_vec());
+            }
+        }
+        for id in &old_aux {
+            self.aux.delete(wtxn, id)?;
         }
         Ok(old.len())
     }
@@ -2327,6 +2359,126 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn aux_root(&self) -> Result<[u8; 32]> {
         Ok(aux_merkle_root(&self.aux_leaves()?))
     }
+
+    /// The checked aux leaves of block `id`, if held.
+    pub fn aux_leaves_of(&self, id: &Digest) -> Result<Option<[[u8; 32]; AUX_LEAVES]>> {
+        let rtxn = self.env.read_txn()?;
+        self.aux_leaves_of_in(&rtxn, &digest_bytes(id))
+    }
+
+    fn aux_leaves_of_in(&self, rtxn: &RoTxn, id: &[u8]) -> Result<Option<[[u8; 32]; AUX_LEAVES]>> {
+        let Some(bytes) = self.aux.get(rtxn, id)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 * AUX_LEAVES {
+            return Err(ChainError::Corrupt("aux leaves of a block"));
+        }
+        let mut leaves = [[0u8; 32]; AUX_LEAVES];
+        for (leaf, chunk) in leaves.iter_mut().zip(bytes.chunks(32)) {
+            leaf.copy_from_slice(chunk);
+        }
+        Ok(Some(leaves))
+    }
+
+    /// Keeps the aux leaves of block `id`, checked against its header:
+    /// [`ChainError::AuxMismatch`] if their root is not the header's, or
+    /// the header is unknown. A header with a zero aux root has no leaves
+    /// to keep.
+    pub fn put_aux_leaves(&self, id: &Digest, leaves: &[[u8; 32]; AUX_LEAVES]) -> Result<()> {
+        let key = digest_bytes(id);
+        let mut wtxn = self.env.write_txn()?;
+        let Some(header) = self.header_by_hash_in(&wtxn, &key)? else {
+            return Err(ChainError::AuxMismatch);
+        };
+        if header.aux == [0u8; 32] || aux_merkle_root(leaves) != header.aux {
+            return Err(ChainError::AuxMismatch);
+        }
+        self.aux.put(&mut wtxn, &key, &leaves.concat())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// The votes of the last `window` main-chain blocks: each block's leaf
+    /// 0 where its leaves are held, and which blocks' leaves are missing
+    /// (`docs/ONION.md`).
+    pub fn consensus_votes(&self, window: u32) -> Result<crate::consensus::Votes> {
+        let rtxn = self.env.read_txn()?;
+        let Some(tip) = self.tip_in(&rtxn)? else {
+            return Ok(crate::consensus::Votes::default());
+        };
+        let first = (tip.height + 1).saturating_sub(window);
+        let mut blocks = Vec::with_capacity(window as usize);
+        for h in first..=tip.height {
+            let Some(header) = self.header_at_in(&rtxn, h)? else {
+                return Err(ChainError::Corrupt("main chain height"));
+            };
+            let id = header.hash();
+            let vote = if header.aux == [0u8; 32] {
+                Some([0u8; 32])
+            } else {
+                self.aux_leaves_of_in(&rtxn, &digest_bytes(&id))?.map(|l| l[0])
+            };
+            blocks.push((id, h, vote));
+        }
+        Ok(crate::consensus::Votes::tally((first, tip.height), blocks.into_iter()))
+    }
+
+    /// The consensus file in force (`docs/ONION.md`): the votes of the last
+    /// [`crate::consensus::WINDOW`] blocks and what they decide.
+    pub fn consensus(&self) -> Result<(crate::consensus::Votes, crate::consensus::Current)> {
+        let votes = self.consensus_votes(crate::consensus::WINDOW)?;
+        let bytes = match votes.winner() {
+            Some(hash) => self.consensus_file(&hash)?,
+            None => None,
+        };
+        let current = crate::consensus::Current::decide(&votes, bytes.as_deref());
+        Ok((votes, current))
+    }
+
+    /// A consensus file held, by its SHA-256.
+    pub fn consensus_file(&self, hash: &crate::consensus::Hash) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.files.get(&rtxn, hash)?.map(|b| b.to_vec()))
+    }
+
+    /// Whether the file with SHA-256 `hash` is held.
+    pub fn has_consensus_file(&self, hash: &crate::consensus::Hash) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.files.get(&rtxn, hash)?.is_some())
+    }
+
+    /// A consensus file held, by its transfer id
+    /// ([`crate::consensus::file_id`]): what a peer asks for.
+    pub fn consensus_file_by_id(&self, id: &Digest) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        for item in self.files.iter(&rtxn)? {
+            let (hash, bytes) = item?;
+            let hash: crate::consensus::Hash = hash.try_into().map_err(|_| ChainError::Corrupt("file hash"))?;
+            if crate::consensus::file_id(&hash) == *id {
+                return Ok(Some(bytes.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Blocks of undo records and bodies kept below the tip; `None` for
+    /// all of them.
+    pub fn undo_window(&self) -> Option<u32> {
+        self.max_undo
+    }
+
+    /// Keeps a consensus file for good; returns its SHA-256, the vote
+    /// value for leaf 0.
+    pub fn put_consensus_file(&self, bytes: &[u8]) -> Result<crate::consensus::Hash> {
+        if bytes.len() > crate::consensus::MAX_CONSENSUS {
+            return Err(ChainError::FileTooLarge(bytes.len()));
+        }
+        let hash = crate::bip39::sha256(bytes);
+        let mut wtxn = self.env.write_txn()?;
+        self.files.put(&mut wtxn, &hash, bytes)?;
+        wtxn.commit()?;
+        Ok(hash)
+    }
 }
 
 /// The SHA-256 Merkle root of 16 leaves, nodes `SHA-256(left ‖ right)`,
@@ -2374,6 +2526,84 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn aux_leaves_are_kept_checked_and_counted() {
+        let f = open("aux-votes");
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let file = b"mode init\n# hello\n";
+        let hash = f.chain.put_consensus_file(file).unwrap();
+        assert_eq!(hash, crate::bip39::sha256(file));
+        assert_eq!(f.chain.consensus_file(&hash).unwrap().as_deref(), Some(&file[..]));
+        assert!(f.chain.has_consensus_file(&hash).unwrap());
+        assert_eq!(f.chain.consensus_file_by_id(&crate::consensus::file_id(&hash)).unwrap().as_deref(), Some(&file[..]));
+        assert_eq!(f.chain.consensus_file_by_id(&crate::consensus::file_id(&[9u8; 32])).unwrap(), None);
+        assert!(matches!(
+            f.chain.put_consensus_file(&vec![0u8; crate::consensus::MAX_CONSENSUS + 1]),
+            Err(ChainError::FileTooLarge(_))
+        ));
+        // Two blocks voting for the file, one voting for another, one
+        // without a vote (leaf 0 zero but leaf 1 set), one with no leaves.
+        let body = Body { inputs: vec![], outputs: vec![], proof: vec![], ..Default::default() };
+        let other = crate::bip39::sha256(b"other");
+        let mut t = GENESIS_TIME;
+        let mut leaves_of = Vec::new();
+        for vote in [Some(hash), Some(other), Some(hash), None, Some([0u8; 32])] {
+            t += 600;
+            let mut leaves = [[0u8; 32]; AUX_LEAVES];
+            match vote {
+                Some(h) if h != [0u8; 32] => leaves[0] = h,
+                Some(_) => {}
+                None => leaves[1] = [7u8; 32],
+            }
+            for (i, l) in leaves.iter().enumerate() {
+                f.chain.set_aux_leaf(i, *l).unwrap();
+            }
+            let block = mine(&f, body.clone(), t);
+            assert_eq!(block.header.aux, aux_merkle_root(&leaves));
+            f.chain.apply_block(&block, t).unwrap();
+            leaves_of.push((block.header, leaves));
+        }
+        // Nothing counted before the leaves are in: all five are missing
+        // but the last, whose header has a zero root.
+        let votes = f.chain.consensus_votes(144).unwrap();
+        assert_eq!(votes.blocks, 6);
+        assert_eq!(votes.range, (0, 5));
+        assert_eq!(votes.missing.len(), 4);
+        assert_eq!(votes.winner(), None);
+        for (header, leaves) in &leaves_of[..4] {
+            let id = header.hash();
+            assert_eq!(f.chain.aux_leaves_of(&id).unwrap(), None);
+            let mut wrong = *leaves;
+            wrong[5] = [1u8; 32];
+            assert!(matches!(f.chain.put_aux_leaves(&id, &wrong), Err(ChainError::AuxMismatch)));
+            f.chain.put_aux_leaves(&id, leaves).unwrap();
+            assert_eq!(f.chain.aux_leaves_of(&id).unwrap(), Some(*leaves));
+        }
+        // A zero-root header takes no leaves; an unknown block neither.
+        let zero = [[0u8; 32]; AUX_LEAVES];
+        assert!(matches!(f.chain.put_aux_leaves(&leaves_of[4].0.hash(), &zero), Err(ChainError::AuxMismatch)));
+        assert!(matches!(f.chain.put_aux_leaves(&[crate::poseidon2::Fp::new(5); crate::poseidon2::DIGEST], &zero), Err(ChainError::AuxMismatch)));
+        let votes = f.chain.consensus_votes(144).unwrap();
+        assert!(votes.missing.is_empty());
+        assert_eq!(votes.counts, vec![(hash, 2, 3), (other, 1, 2)]);
+        assert_eq!(votes.winner(), Some(hash));
+        let (v, current) = f.chain.consensus().unwrap();
+        assert_eq!(v, votes);
+        assert_eq!(current.mode, crate::consensus::Mode::Init);
+        assert_eq!(current.winner, Some(hash));
+        assert!(current.file.is_some() && current.problem.is_none());
+        // A window of the last two blocks sees one vote for `hash`.
+        let votes = f.chain.consensus_votes(3).unwrap();
+        assert_eq!(votes.range, (3, 5));
+        assert_eq!(votes.counts, vec![(hash, 1, 3)]);
+        // Pruning bodies prunes leaves with them; the file stays.
+        let chain = f.chain.with_max_undo(Some(2));
+        chain.prune_undo().unwrap();
+        assert_eq!(chain.aux_leaves_of(&leaves_of[0].0.hash()).unwrap(), None);
+        assert_eq!(chain.aux_leaves_of(&leaves_of[3].0.hash()).unwrap(), Some(leaves_of[3].1));
+        assert!(chain.has_consensus_file(&hash).unwrap());
     }
 
     #[test]
