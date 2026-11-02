@@ -12,6 +12,13 @@
 //! and after half its lifetime. A circuit that dies is built again after
 //! a few seconds.
 //!
+//! The node's own transactions go the same way in onion mode: up a live
+//! circuit to the rendezvous point, which pools and announces it as its
+//! own, so that the first node to announce it is a relay and not the
+//! sender. One that no circuit takes in [`BROADCAST_TIMEOUT`] is left in
+//! the node's pool unannounced, and the wallet told: it is never
+//! announced from the node's own address.
+//!
 //! A send goes over any live circuit: the recipient's announce is asked
 //! of our point (unless the wallet gave it, from a payload it answers),
 //! the payload sealed to it and sent; the point answers forwarded, or
@@ -44,6 +51,10 @@ const HOPS: usize = 2;
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SENDS: usize = 64;
+/// A broadcast unanswered by then is tried on another circuit.
+const BROADCAST_WAIT: Duration = Duration::from_secs(15);
+/// One no circuit took by then is given up.
+const BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A circuit standing to one of our rendezvous points, and our session
 /// over it.
@@ -83,10 +94,23 @@ struct Job {
     started: Instant,
 }
 
+/// A transaction of ours to be announced by a relay.
+struct Broadcast {
+    txid: Digest,
+    bytes: Vec<u8>,
+    /// The circuit it was sent on, and when.
+    sent: Option<(u64, Instant)>,
+    /// Circuits that did not take it.
+    tried: Vec<u64>,
+    started: Instant,
+    why: String,
+}
+
 #[derive(Default)]
 pub(super) struct Participant {
     standing: Vec<Standing>,
     jobs: Vec<Job>,
+    broadcasts: Vec<Broadcast>,
 }
 
 impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
@@ -97,10 +121,71 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.part.standing.iter().map(|s| (s.addr.unwrap_or(unknown), s.live(seq, now))).collect()
     }
 
+    /// Whether our own transactions go out over a circuit: in onion mode,
+    /// with a wallet.
+    pub(super) fn broadcasts_privately(&self) -> bool {
+        self.rv.relays().is_some() && self.rv.me.is_some()
+    }
+
+    /// A transaction of ours, pooled: to a relay over a circuit.
+    pub(super) fn onion_broadcast(&mut self, txid: Digest, bytes: Vec<u8>, now: Instant) {
+        if self.part.broadcasts.iter().any(|b| b.txid == txid) {
+            return;
+        }
+        self.part.broadcasts.push(Broadcast { txid, bytes, sent: None, tried: Vec::new(), started: now, why: String::new() });
+        self.progress_broadcasts(now);
+    }
+
+    /// Sends each broadcast not yet out over a live circuit it was not
+    /// tried on; gives up those out of time.
+    fn progress_broadcasts(&mut self, now: Instant) {
+        let Some(seq) = self.rv.me.as_ref().map(|m| m.seq) else { return };
+        let live: Vec<u64> = self.part.standing.iter().filter(|s| s.live(seq, now)).filter_map(|s| s.circuit).collect();
+        let mut i = 0;
+        while i < self.part.broadcasts.len() {
+            let b = &mut self.part.broadcasts[i];
+            if b.sent.is_some_and(|(_, t)| now.duration_since(t) >= BROADCAST_WAIT) {
+                let (h, _) = b.sent.take().unwrap();
+                b.tried.push(h);
+                b.why = "no answer from the relay".into();
+            }
+            if b.sent.is_none() && now.duration_since(b.started) >= BROADCAST_TIMEOUT {
+                let b = self.part.broadcasts.remove(i);
+                let why = if b.why.is_empty() { "no circuit to send it over".to_string() } else { b.why };
+                self.log(&format!(
+                    "onion: transaction {} not broadcast: {why}; it stays in this node's pool, unannounced",
+                    crate::poseidon2::digest_to_bytes(&b.txid).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>()
+                ));
+                self.rv.note(Note::Broadcast { txid: b.txid, how: Err(why) });
+                continue;
+            }
+            if b.sent.is_none() {
+                // Circuits not yet tried first; all of them again once each was.
+                let fresh: Vec<u64> = live.iter().copied().filter(|h| !b.tried.contains(h)).collect();
+                let pool = if fresh.is_empty() { live.clone() } else { fresh };
+                if !pool.is_empty() {
+                    let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) as usize;
+                    let h = pool[x % pool.len()];
+                    b.sent = Some((h, now));
+                    let bytes = b.bytes.clone();
+                    let last = self.circuit_hops(h).saturating_sub(1);
+                    if let Err(e) = self.circuit_send(h, last, circuit::BROADCAST, &bytes, now) {
+                        self.part.broadcasts[i].sent = None;
+                        self.part.broadcasts[i].why = e;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
     /// Back in init mode: the standing circuits go, sends fail.
     pub(super) fn onion_stand_down(&mut self, now: Instant) {
-        if self.part.standing.is_empty() && self.part.jobs.is_empty() {
+        if self.part.standing.is_empty() && self.part.jobs.is_empty() && self.part.broadcasts.is_empty() {
             return;
+        }
+        for b in std::mem::take(&mut self.part.broadcasts) {
+            self.rv.note(Note::Broadcast { txid: b.txid, how: Err("the network went back to init mode".into()) });
         }
         let standing = std::mem::take(&mut self.part.standing);
         for s in standing {
@@ -200,6 +285,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let _ = self.circuit_send(h, last, circuit::SESSION, &digest_to_bytes(&id), now);
         }
         self.progress_onion_sends(now);
+        self.progress_broadcasts(now);
     }
 
     /// Builds the circuit to standing point `i`: random hops, then it.
@@ -262,6 +348,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             j.circuit = None;
             j.stage = Stage::Waiting;
         }
+        for b in self.part.broadcasts.iter_mut().filter(|b| b.sent.is_some_and(|(h, _)| h == handle)) {
+            b.sent = None;
+            b.tried.push(handle);
+        }
     }
 
     /// A message from the last hop of one of our circuits: `true` if it
@@ -271,6 +361,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle));
         if standing.is_none() && !job {
             return false;
+        }
+        // The answer to a broadcast of ours.
+        if cmd == circuit::NOTICE
+            && msg.len() == 33
+            && let Some(subject) = digest_from_bytes(&msg[..32])
+            && let Some(i) = self.part.broadcasts.iter().position(|b| b.txid == subject && b.sent.is_some_and(|(h, _)| h == handle))
+        {
+            if msg[32] == NOTICE_FORWARDED {
+                let b = self.part.broadcasts.remove(i);
+                let point = standing.map_or(crate::onion::NOBODY, |s| self.part.standing[s].point);
+                self.log(&format!("onion: our transaction announced by {}", onion::short(&point)));
+                self.rv.note(Note::Broadcast { txid: b.txid, how: Ok(format!("announced by relay {}", onion::short(&point))) });
+            } else {
+                let b = &mut self.part.broadcasts[i];
+                b.sent = None;
+                b.tried.push(handle);
+                b.why = "a relay refused it".into();
+                self.progress_broadcasts(now);
+            }
+            return true;
         }
         match cmd {
             circuit::SESSION_STATE => {

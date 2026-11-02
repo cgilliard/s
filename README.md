@@ -352,7 +352,9 @@ force, one vote is enough, and with none the network is in init mode.
   the manner of Tor: fixed 1,024-byte cells, one layer of encryption per
   hop. A message goes up the sender's circuit to its rendezvous point,
   across to the recipient's, and down the recipient's circuit: six
-  relays, each knowing only its neighbours.
+  relays, each knowing only its neighbours. The finished transaction
+  goes up a circuit too, and a relay announces it, so the sender's
+  address is never the first to.
 
 A miner votes with `set-leaf 0 consensus.txt`, which checks the file first;
 votes for a file that does not parse, or that no peer serves, count for

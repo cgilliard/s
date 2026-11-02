@@ -103,6 +103,9 @@ pub enum Note {
     Delivered { tag: u64, to: Digest, via: SocketAddr },
     /// No rendezvous point took it: the last reason.
     Failed { tag: u64, to: Digest, why: String },
+    /// What became of a transaction of ours: how it was announced, or
+    /// why it was not.
+    Broadcast { txid: Digest, how: Result<String, String> },
 }
 
 /// The participant: its Dilithium key and its Kyber keys.

@@ -1466,7 +1466,7 @@ fn submit(ctx: &Ctx, signed: Signed) {
         return;
     }
     match ctx.events.send(Event::Transaction(signed.tx)) {
-        Ok(()) => println!("transaction {} pooled and announced", short(&txid)),
+        Ok(()) => println!("transaction {} pooled; broadcasting it", short(&txid)),
         Err(_) => println!("transaction {} pooled, but the node has stopped", short(&txid)),
     }
 }
@@ -1531,6 +1531,13 @@ fn on_note(ctx: &Ctx, note: Note) {
                 say(ctx, &format!("slate delivered to {} via {via}; waiting for the answer", tabminer::address::encode(&to)));
             }
         }
+        Note::Broadcast { txid, how } => match how {
+            Ok(how) => say(ctx, &format!("transaction {} {how}", short(&txid))),
+            Err(why) => say(
+                ctx,
+                &format!("transaction {} not broadcast: {why} (it stays pooled here; cancel {} to free its inputs)", short(&txid), short(&txid)),
+            ),
+        },
         Note::Failed { tag, to, why } => {
             let to = tabminer::address::encode(&to);
             let mut outgoing = ctx.outgoing.lock().unwrap();

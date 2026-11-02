@@ -37,8 +37,10 @@ pub const BODY: usize = PAYLOAD - TAG_LEN;
 pub const RELAY_DATA: usize = BODY - 4;
 /// Handshake bytes in one `Create` or `Created` cell.
 pub const CREATE_DATA: usize = PAYLOAD - 3;
-/// Largest relay message reassembled.
-pub const MAX_MESSAGE: usize = 72 << 10;
+/// Largest relay message reassembled: a transaction, the largest thing a
+/// circuit carries, with room to spare.
+pub const MAX_MESSAGE: usize = 136 << 10;
+const _: () = assert!(MAX_MESSAGE >= crate::mempool::MAX_TX_SIZE + 1024);
 
 pub const CREATE: u8 = 1;
 pub const CREATED: u8 = 2;
@@ -61,6 +63,9 @@ pub const GET_ANNOUNCE: u8 = 7;
 pub const SEND: u8 = 8;
 pub const DELIVER: u8 = 9;
 pub const NOTICE: u8 = 10;
+/// A participant's finished transaction, for the last hop to pool and
+/// announce as its own; answered by `Notice(txid, forwarded or rejected)`.
+pub const BROADCAST: u8 = 11;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {

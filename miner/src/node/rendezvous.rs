@@ -12,7 +12,12 @@
 //! GetAnnounce(id)      → Announce(announce) or Notice(id, offline)
 //! Send(payload)        → Notice(object, forwarded or offline)
 //!                        Deliver(payload)               to the recipient
+//! Broadcast(tx)        → Notice(txid, forwarded or rejected)
 //! ```
+//!
+//! A broadcast transaction is pooled and announced by this relay as if
+//! it were its own, so that its sender's address is never the first to
+//! announce it.
 //!
 //! The nonce an announce must carry is this relay's SipHash of the
 //! circuit and the id, so a session is bound to the circuit it was opened
@@ -184,6 +189,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 _ => self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), NOTICE_REJECTED), now),
             },
+            circuit::BROADCAST => {
+                if !self.config.relay {
+                    return true;
+                }
+                let Some(tx) = crate::transaction::Transaction::from_bytes(msg) else {
+                    return true;
+                };
+                let txid = tx.txid();
+                let code = match self.pool_transaction(tx) {
+                    Some(Ok(_)) | Some(Err(crate::mempool::Reject::Known)) => {
+                        let n = self.announce_transaction(txid, None);
+                        self.chatter(&format!("rendezvous: a transaction from a circuit announced to {n} peers"));
+                        NOTICE_FORWARDED
+                    }
+                    Some(Err(e)) => {
+                        self.chatter(&format!("rendezvous: a transaction from a circuit refused: {e}"));
+                        NOTICE_REJECTED
+                    }
+                    None => NOTICE_REFUSED,
+                };
+                self.hop_reply(link, circuit::NOTICE, &result(&txid, code), now);
+            }
             _ => return false,
         }
         true

@@ -326,7 +326,6 @@ Found while building it (2026-11-01).
 
 - Payment proofs: the transaction, a Merkle path to the header, and a
   signature with the output's key over an agreed message.
-- Cover for the address a transaction is first sent from, which links it
-  to its sender: the message layer carries slates, but a finished
-  transaction is still announced as a `TxInv` from the node's own address.
-  Send it to a relay over a circuit, to announce for us.
+- Cover for the address a transaction is first sent from, in init mode:
+  onion mode hands it to a relay over a circuit (`docs/ONION.md`,
+  enhancement 1), but in init mode the node announces it itself.

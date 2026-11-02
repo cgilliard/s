@@ -394,6 +394,16 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    pools and announces it as its own; the wallet's node pools it only
    once a peer announces it back. In init mode, a seed does the same
    over the session.
+
+   Done (2026-11-01) for onion mode: the `Broadcast` relay message
+   (`node/rendezvous.rs`, `node/participant.rs`). The node pools its own
+   transaction and sends it over a random live circuit; the relay at its
+   end pools and announces it and answers forwarded or rejected; on a
+   refusal or no answer in 15 s another circuit is tried, and after two
+   minutes it is given up, left in the node's pool unannounced, and the
+   wallet told. It is never announced from the node's own address. In
+   init mode the node still announces it itself: a seed already sees the
+   address of every participant it serves.
 2. **Change the file in force at epoch boundaries, with a grace
    period.** The window is counted at every tip, so a single block can
    switch the mode or the relay list, nodes switch a few seconds apart

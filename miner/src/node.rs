@@ -516,6 +516,9 @@ pub struct Node<V: ProofVerifier> {
     /// Tests: no standing circuits, for tests that drive circuits by hand.
     #[cfg(test)]
     quiet: bool,
+    /// Tests: transactions this node announced, by its own `TxInv`s.
+    #[cfg(test)]
+    announced: Arc<AtomicU64>,
     last_channel_poll: Instant,
 }
 
@@ -742,6 +745,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             part: participant::Participant::default(),
             #[cfg(test)]
             quiet: false,
+            #[cfg(test)]
+            announced: Arc::new(AtomicU64::new(0)),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
@@ -2147,34 +2152,53 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Pools a transaction and announces it if new.
+    /// Puts a transaction in the pool against the tip; `None` when the
+    /// chain cannot be read.
+    fn pool_transaction(&mut self, tx: Transaction) -> Option<Result<Digest, Reject>> {
+        let rtxn = match self.chain.env().read_txn() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log(&format!("mempool: {e}"));
+                return None;
+            }
+        };
+        let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
+        Some(self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), self.chain.names(), &rtxn, height))
+    }
+
+    /// Announces a pooled transaction to every live peer but `except`;
+    /// returns how many.
+    fn announce_transaction(&self, txid: Digest, except: Option<SocketAddr>) -> usize {
+        let peers = self.peers.sample(net::MAX_PEERS, except, Instant::now());
+        #[cfg(test)]
+        self.announced.fetch_add(1, Ordering::Relaxed);
+        for addr in &peers {
+            self.send(*addr, &Message::TxInv(txid));
+        }
+        peers.len()
+    }
+
     fn handle_transaction(&mut self, tx: Transaction, from: Option<SocketAddr>) {
         let txid = tx.txid();
-        let result = {
-            let rtxn = match self.chain.env().read_txn() {
-                Ok(t) => t,
-                Err(e) => {
-                    self.log(&format!("mempool: {e}"));
-                    return;
-                }
-            };
-            let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
-            self.mempool.lock().unwrap().insert(tx, self.chain.utxo(), self.chain.names(), &rtxn, height)
-        };
+        // Ours goes over a circuit in onion mode, so keep its bytes.
+        let ours = from.is_none().then(|| tx.to_bytes());
+        let Some(result) = self.pool_transaction(tx) else { return };
         match result {
-            // Ours may have been pooled already, by the prompt: announce it.
+            // Ours may have been pooled already, by the prompt. In onion
+            // mode a relay announces it, never this node: the first to
+            // announce a transaction is taken for its sender.
             Ok(_) | Err(Reject::Known) if from.is_none() => {
                 self.log(&format!("our transaction {} pooled", short(&txid)));
-                let now = Instant::now();
-                for addr in self.peers.sample(net::MAX_PEERS, None, now) {
-                    self.send(addr, &Message::TxInv(txid));
+                if self.broadcasts_privately() {
+                    self.onion_broadcast(txid, ours.unwrap_or_default(), Instant::now());
+                } else {
+                    let n = self.announce_transaction(txid, None);
+                    self.rv.note(Note::Broadcast { txid, how: Ok(format!("announced to {n} peers")) });
                 }
             }
             Ok(txid) => {
                 self.log(&format!("transaction from {} {} pooled", from.unwrap(), short(&txid)));
-                let now = Instant::now();
-                for addr in self.peers.sample(net::MAX_PEERS, from, now) {
-                    self.send(addr, &Message::TxInv(txid));
-                }
+                self.announce_transaction(txid, from);
             }
             Err(Reject::Known) => {}
             Err(e) => {
@@ -2195,6 +2219,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     && !honest
                 {
                     self.peers.strike(from);
+                }
+                if from.is_none() {
+                    self.rv.note(Note::Broadcast { txid, how: Err(format!("the pool refused it: {e}")) });
                 }
             }
         }
@@ -4217,6 +4244,7 @@ mod tests {
                 Note::Received(o) => return o,
                 Note::Failed { why, .. } => panic!("{why}"),
                 Note::Delivered { tag, .. } => delivered.lock().unwrap().push(tag),
+                Note::Broadcast { .. } => {}
             }
         };
         let out = Outbound { tag: 1, to: id(4), kind: onion::KIND_SLATE, inner: b"a slate".to_vec(), recipient: None };
@@ -4248,6 +4276,82 @@ mod tests {
         }
         for n in nodes {
             n.4.join().unwrap();
+        }
+    }
+
+    /// In onion mode a wallet's own transaction goes to a relay over a
+    /// circuit, which pools and announces it; the wallet's node never
+    /// announces it itself.
+    #[test]
+    fn our_transactions_are_announced_by_a_relay() {
+        use crate::wallet::Wallet;
+        let fixtures: Vec<Fixture> = (0..4).map(|i| open(&format!("bcast-{i}"))).collect();
+        let (alice, _) = Wallet::open(&fixtures[3].dir.0.join("wallet")).unwrap();
+        let (bob, _) = Wallet::open(&fixtures[3].dir.0.join("bob")).unwrap();
+        // alice's funds, in a block every node has.
+        let funds = alice.receive(60_000_000).unwrap();
+        let body = Body { inputs: vec![], outputs: vec![funds.block_output()], proof: vec![1; 2500], ..Default::default() };
+        let block = mine_body(&fixtures[3], body, T0 + 600);
+        for f in &fixtures {
+            f.chain.apply_block(&block, unix_now()).unwrap();
+        }
+        let (_, first, outputs) = fixtures[3].chain.main_outputs(1).unwrap().unwrap();
+        alice.locate(first, &outputs).unwrap();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(if i < 3 { key(i as u8 + 1) } else { alice.identity_key() });
+            let mempool = pool();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), Arc::clone(&mempool), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let (stats, announced) = (node.stats(), Arc::clone(&node.announced));
+            nodes.push((addr, tx, notes, stats, mempool, announced, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let live = || nodes[3].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).count() == 3;
+        while !live() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live());
+        // alice pays bob, by slate files; the transaction is finished.
+        let mut slate = {
+            let rtxn = fixtures[3].chain.env().read_txn().unwrap();
+            alice.send(20_000_000, None, fixtures[3].chain.utxo(), &rtxn).unwrap()
+        };
+        bob.receive_slate(&mut slate).unwrap();
+        let signed = alice.finalize(&slate).unwrap();
+        let txid = signed.tx.txid();
+        nodes[3].1.send(Event::Transaction(signed.tx)).unwrap();
+        match nodes[3].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+            Note::Broadcast { txid: t, how: Ok(how) } => {
+                assert_eq!(t, txid);
+                assert!(how.starts_with("announced by relay"), "{how}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A relay pooled it; alice's node pooled it and announced nothing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let relays_have = || (0..3).filter(|&i| nodes[i].4.lock().unwrap().contains(&txid)).count();
+        while relays_have() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(relays_have(), 3, "the relays pass it on among themselves");
+        assert!(nodes[3].4.lock().unwrap().contains(&txid));
+        assert_eq!(nodes[3].5.load(Ordering::Relaxed), 0, "alice's node announced it");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.6.join().unwrap();
         }
     }
 
