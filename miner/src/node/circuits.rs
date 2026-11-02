@@ -511,7 +511,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.log(&format!("circuit {handle}: built, {n} hops"));
             #[cfg(test)]
             self.circuits.seen.lock().unwrap().push(Seen::Ready(handle));
-            self.onion_circuit_ready(handle);
+            self.onion_circuit_ready(handle, now);
             for (hop, data) in queued {
                 if let Err(e) = self.circuit_send(handle, hop, circuit::DATA, &data, now) {
                     self.log(&format!("circuit {handle}: {e}"));

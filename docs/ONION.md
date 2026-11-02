@@ -480,6 +480,16 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
 7. **Faster recovery.** Rotate standing circuits on a timer, notice a
    dead hop from an unanswered keepalive in seconds rather than when the
    channel gives up, and keep a spare circuit to each point.
+
+   Done (2026-11-01), but for the spare circuit (`node/participant.rs`):
+   a keepalive unanswered for 10 s marks the circuit dead and it is built
+   again at once (around the dead hop, by chance of the random hops); each
+   standing circuit is replaced after a random two to four hours, the new
+   one built and the session moved onto it (the point holds one session
+   per id, so the new circuit's announce takes it over) before the old
+   one is closed, without a new Kyber key. A dead hop is still noticed
+   only at the next keepalive, up to 30 s and 10 more; a spare circuit
+   per point would cut that to nothing and is left for later.
 8. **Traffic analysis.** Padding cells and cover traffic, a tag per
    layer against tagging, and a minimum number of relays (and of
    operators) before onion mode is worth calling private.

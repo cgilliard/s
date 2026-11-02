@@ -278,16 +278,11 @@ Found while building it (2026-11-01).
   queue. Fix: drop hops idle for an hour, cap hops per channel, and
   window cells per circuit.
 
-- **Standing circuits are not rotated on a timer.** `node/participant.rs`
-  rebuilds a circuit only when it dies or its session is lost; the
-  design says circuits also rotate on a timer, so a long-lived circuit
-  keeps the same hops for as long as they stay up. Fix: rebuild each
-  standing circuit after a random few hours, the new one first.
-- **A dead relay is noticed slowly.** A participant learns that a hop
-  went down when its channel gives up (twelve resends, about 45 s) or
-  its session falls silent (90 s); sends in the meantime may time out.
-  Fix: treat an unanswered `Session` keepalive after a few seconds as a
-  failed circuit, and keep a spare circuit to each point.
+- **A dead relay is noticed at the next keepalive.** A participant
+  takes a circuit for dead 10 s after a `Session` keepalive goes
+  unanswered (`node/participant.rs`), so up to 40 s after a hop goes
+  down; sends in that time may fail. Fix: keep a spare circuit to each
+  point, through other hops, and switch to it at once.
 - **A relay's own wallet skips itself as a rendezvous point,** in both
   modes: a seed or relay does not hold a session for its own id, so it
   is reachable only through its other points (with one seed, not at

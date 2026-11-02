@@ -323,6 +323,9 @@ pub enum Event {
     /// Tests: keep no standing circuits.
     #[cfg(test)]
     TestQuiet,
+    /// Tests: keepalives and circuit replacement sooner.
+    #[cfg(test)]
+    TestTiming(Duration, Duration),
     /// Tests: the relay lists in force given by hand (`None` for init
     /// mode): the current one, the one before while a switch lasts, and
     /// whether the current one is tried first.
@@ -803,6 +806,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::TestRelays(relays)) => self.rv.set_relays(relays),
                 #[cfg(test)]
                 Ok(Event::TestQuiet) => self.quiet = true,
+                #[cfg(test)]
+                Ok(Event::TestTiming(keepalive, rotate)) => self.part.set_timing(keepalive, rotate),
                 #[cfg(test)]
                 Ok(Event::TestEpoch(current, previous, prefer)) => self.rv.set_sets(current, previous, prefer),
                 #[cfg(test)]
@@ -4580,6 +4585,102 @@ mod tests {
         }
         for n in nodes {
             n.4.join().unwrap();
+        }
+    }
+
+    /// Standing circuits are replaced on a timer without losing the
+    /// session, and a circuit whose hop goes down is noticed by its
+    /// unanswered keepalive and built again around it.
+    #[test]
+    fn standing_circuits_are_replaced_and_rebuilt() {
+        use crate::onion;
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("rotate-{i}"))).collect();
+        let mut handles = Vec::new();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 4;
+            cfg.identity = Some(key(i as u8 + 1));
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let (stats, seen) = (node.stats(), Arc::clone(&node.circuits.seen));
+            nodes.push((addr, tx, notes, stats, seen));
+            handles.push(Some(std::thread::spawn(move || node.run())));
+        }
+        let mut list: Vec<consensus::Relay> =
+            (0..4).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        list.sort_by_key(|r| digest_to_bytes(&r.id));
+        let (p, q) = (4usize, 5usize);
+        for n in &nodes {
+            n.1.send(Event::TestRelays(list.clone())).unwrap();
+        }
+        for n in [p, q] {
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3))).unwrap();
+        }
+        let live = |secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                let s = nodes[p].3.lock().unwrap().rendezvous.clone();
+                if s.len() == 3 && s.iter().all(|(_, l)| *l) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "p: {s:?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let mut tag = 0u64;
+        let mut message = |round: &str| {
+            tag += 1;
+            let out = Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            nodes[q].1.send(Event::Send(out)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            loop {
+                match nodes[p].2.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
+                    _ => {}
+                }
+                if let Ok(Note::Failed { why, .. }) = nodes[q].2.try_recv() {
+                    panic!("{round}: {why}");
+                }
+                assert!(Instant::now() < deadline, "{round}: nothing arrived");
+            }
+        };
+        live(30);
+        message("first");
+        // Replaced: each of p's three circuits at least once, sessions kept.
+        let built = || nodes[p].4.lock().unwrap().iter().filter(|s| matches!(s, circuits::Seen::Ready(_))).count();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while built() < 6 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(built() >= 6, "{} circuits built", built());
+        live(20);
+        message("after replacement");
+        // The relay that is none of p's points is only ever a hop: stop it.
+        let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
+        let points: Vec<Digest> = onion::rendezvous_relays(&id(5), &ids).into_iter().map(|i| ids[i]).collect();
+        let hop = (0..4).find(|&i| !points.contains(&id(i as u8 + 1))).unwrap();
+        for n in [p, q] {
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600))).unwrap();
+        }
+        nodes[hop].1.send(Event::Stop).unwrap();
+        handles[hop].take().unwrap().join().unwrap();
+        let stopped = Instant::now();
+        // Circuits through it die; p notices, builds around it.
+        std::thread::sleep(Duration::from_secs(2));
+        live(90);
+        message("around the stopped relay");
+        eprintln!("reachable again {:?} after the relay stopped", stopped.elapsed());
+        for (i, n) in nodes.iter().enumerate() {
+            if i != hop {
+                n.1.send(Event::Stop).unwrap();
+            }
+        }
+        for h in handles.into_iter().flatten() {
+            h.join().unwrap();
         }
     }
 

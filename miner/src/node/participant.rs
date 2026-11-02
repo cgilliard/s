@@ -10,7 +10,11 @@
 //! the same Kyber key at every point, rotated as in init mode: at start,
 //! when a session is lost (a circuit that dies, a point that forgets us)
 //! and after half its lifetime. A circuit that dies is built again after
-//! a few seconds.
+//! a few seconds; one whose keepalive goes unanswered for [`DEAD_AFTER`]
+//! is taken for dead (a hop gone) and built again, rather than waiting
+//! for its channel to give up. Every circuit is replaced after a random
+//! two to four hours, the new one built and the session moved onto it
+//! before the old one is closed.
 //!
 //! The node's own transactions go the same way in onion mode: up a live
 //! circuit to the rendezvous point, which pools and announces it as its
@@ -48,6 +52,13 @@ const ROTATE_AFTER: Duration = Duration::from_secs(onion::ANNOUNCE_LIFETIME_SECS
 const REBUILD_WAIT: Duration = Duration::from_secs(3);
 /// Random hops before the rendezvous point.
 const HOPS: usize = 2;
+/// A keepalive unanswered this long means the circuit is dead.
+const DEAD_AFTER: Duration = Duration::from_secs(10);
+/// A circuit is replaced after this, plus up to as much again at random.
+const ROTATE_EVERY: Duration = Duration::from_secs(2 * 3600);
+/// An old circuit is closed once the session is live on its replacement,
+/// or after this.
+const RETIRE_WAIT: Duration = Duration::from_secs(30);
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SENDS: usize = 64;
@@ -70,6 +81,14 @@ struct Standing {
     /// Not before then: a circuit to build again, or a refusal.
     wait: Option<Instant>,
     was_live: bool,
+    /// Since when a keepalive has gone unanswered.
+    unanswered: Option<Instant>,
+    /// When the circuit is to be replaced.
+    rotate_at: Option<Instant>,
+    /// Its replacement, being built.
+    next: Option<u64>,
+    /// The circuit it replaced, closed once the session is live again.
+    retiring: Option<(u64, Instant)>,
 }
 
 impl Standing {
@@ -106,11 +125,41 @@ struct Broadcast {
     why: String,
 }
 
-#[derive(Default)]
 pub(super) struct Participant {
     standing: Vec<Standing>,
     jobs: Vec<Job>,
     broadcasts: Vec<Broadcast>,
+    /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
+    keepalive: Duration,
+    rotate_every: Duration,
+}
+
+impl Default for Participant {
+    fn default() -> Participant {
+        Participant {
+            standing: Vec::new(),
+            jobs: Vec::new(),
+            broadcasts: Vec::new(),
+            keepalive: KEEPALIVE,
+            rotate_every: ROTATE_EVERY,
+        }
+    }
+}
+
+impl Participant {
+    /// Tests: keepalives and rotation sooner.
+    #[cfg(test)]
+    pub(super) fn set_timing(&mut self, keepalive: Duration, rotate_every: Duration) {
+        self.keepalive = keepalive;
+        self.rotate_every = rotate_every;
+    }
+
+    /// A time to replace a circuit built now: two to four hours on.
+    fn rotate_at(&self, now: Instant) -> Instant {
+        let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+        let spread = self.rotate_every.as_millis() as u64;
+        now + self.rotate_every + Duration::from_millis(x % spread.max(1))
+    }
 }
 
 impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
@@ -233,6 +282,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             offered: None,
                             wait: None,
                             was_live: false,
+                            unanswered: None,
+                            rotate_at: None,
+                            next: None,
+                            retiring: None,
                         });
                     }
                 }
@@ -248,8 +301,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let seq = self.rv.me.as_ref().unwrap().seq;
         let mut lost = Vec::new();
         let mut build = Vec::new();
+        let mut replace = Vec::new();
+        let mut retire = Vec::new();
         let mut ask = Vec::new();
+        let keepalive = self.part.keepalive;
         for (i, s) in self.part.standing.iter_mut().enumerate() {
+            if let Some((old, since)) = s.retiring
+                && (s.live(seq, now) || now.duration_since(since) >= RETIRE_WAIT)
+            {
+                s.retiring = None;
+                retire.push(old);
+            }
             if s.wait.is_some_and(|t| now < t) {
                 continue;
             }
@@ -260,13 +322,20 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             if !s.ready {
                 continue;
             }
-            if s.was_live && !s.live(seq, now) && s.held == seq {
+            // A keepalive unanswered: a hop is gone, or the point.
+            if s.unanswered.is_some_and(|t| now.duration_since(t) >= DEAD_AFTER)
+                || (s.was_live && !s.live(seq, now) && s.held == seq)
+            {
                 lost.push(h);
                 continue;
             }
-            let wait = if s.live(seq, now) { KEEPALIVE } else { SESSION_RETRY };
+            if s.next.is_none() && s.retiring.is_none() && s.rotate_at.is_some_and(|t| now >= t) && s.live(seq, now) {
+                replace.push(i);
+            }
+            let wait = if s.live(seq, now) { keepalive } else { SESSION_RETRY };
             if s.asked.is_none_or(|t| now.duration_since(t) >= wait) {
                 s.asked = Some(now);
+                s.unanswered.get_or_insert(now);
                 ask.push(h);
             }
         }
@@ -274,8 +343,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.log("onion: a rendezvous session went quiet; building its circuit again");
             self.close_circuit(h, "its session went quiet", now);
         }
+        for h in retire {
+            self.close_circuit(h, "replaced", now);
+        }
         for i in build {
             self.build_standing(i, now);
+        }
+        for i in replace {
+            if let Some(path) = self.standing_path(i) {
+                match self.build_circuit(path, Vec::new(), now) {
+                    Ok(h) => self.part.standing[i].next = Some(h),
+                    Err(e) => self.log(&format!("onion: no replacement circuit: {e}")),
+                }
+            }
         }
         for h in ask {
             let last = self.circuit_hops(h).saturating_sub(1);
@@ -285,14 +365,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.progress_broadcasts(now);
     }
 
-    /// Builds the circuit to standing point `i`: random hops, then it.
-    fn build_standing(&mut self, i: usize, now: Instant) {
+    /// A path to standing point `i`: random hops from the list the point
+    /// is in (the preferred one first), then it.
+    fn standing_path(&self, i: usize) -> Option<Vec<Digest>> {
         let point = self.part.standing[i].point;
         let me = self.rv.me.as_ref().map(|m| m.id);
-        // Hops from the list the point is in (the preferred one first).
-        let Some(relays) = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point)) else {
-            return;
-        };
+        let relays = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point))?;
         let mut others: Vec<Digest> =
             relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
         let mut path = Vec::new();
@@ -301,6 +379,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             path.push(others.swap_remove((x % others.len() as u64) as usize));
         }
         path.push(point);
+        Some(path)
+    }
+
+    /// Builds the circuit to standing point `i`.
+    fn build_standing(&mut self, i: usize, now: Instant) {
+        let point = self.part.standing[i].point;
+        let Some(path) = self.standing_path(i) else { return };
+        let rotate_at = self.part.rotate_at(now);
         let s = &mut self.part.standing[i];
         s.wait = Some(now + REBUILD_WAIT);
         match self.build_circuit(path, Vec::new(), now) {
@@ -312,17 +398,36 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 s.asked = None;
                 s.answered = None;
                 s.offered = None;
+                s.unanswered = None;
+                s.rotate_at = Some(rotate_at);
             }
             Err(e) => self.log(&format!("onion: no circuit to {}: {e}", onion::short(&point))),
         }
     }
 
     /// A circuit of ours is built.
-    pub(super) fn onion_circuit_ready(&mut self, handle: u64) {
+    pub(super) fn onion_circuit_ready(&mut self, handle: u64, now: Instant) {
+        let rotate_at = self.part.rotate_at(now);
         if let Some(s) = self.part.standing.iter_mut().find(|s| s.circuit == Some(handle)) {
             s.ready = true;
             s.asked = None;
             s.wait = None;
+        } else if let Some(s) = self.part.standing.iter_mut().find(|s| s.next == Some(handle)) {
+            // A replacement: the session moves onto it, then the old one
+            // goes. The point holds nothing on the new circuit yet, which
+            // is not a lost session: no new key.
+            s.retiring = s.circuit.map(|old| (old, now));
+            s.was_live = false;
+            s.circuit = Some(handle);
+            s.next = None;
+            s.ready = true;
+            s.held = 0;
+            s.asked = None;
+            s.answered = None;
+            s.offered = None;
+            s.unanswered = None;
+            s.rotate_at = Some(rotate_at);
+            self.chatter("onion: a standing circuit replaced");
         }
     }
 
@@ -330,6 +435,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// session was live; sends on it go to another.
     pub(super) fn onion_circuit_gone(&mut self, handle: u64, now: Instant) {
         let mut rotate = false;
+        for s in self.part.standing.iter_mut().filter(|s| s.next == Some(handle)) {
+            // A replacement that failed: the next try a minute on.
+            s.next = None;
+            s.rotate_at = Some(now + Duration::from_secs(60));
+        }
         for s in self.part.standing.iter_mut().filter(|s| s.circuit == Some(handle)) {
             rotate |= s.was_live;
             s.circuit = None;
@@ -358,7 +468,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     pub(super) fn onion_message(&mut self, handle: u64, cmd: u8, msg: &[u8], now: Instant) -> bool {
         let standing = self.part.standing.iter().position(|s| s.circuit == Some(handle));
         let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle));
-        if standing.is_none() && !job {
+        // A circuit being replaced is still ours: what comes down it while
+        // the session moves to the new one is taken.
+        let retiring = self.part.standing.iter().any(|s| s.retiring.is_some_and(|(h, _)| h == handle));
+        if standing.is_none() && !job && !retiring {
             return false;
         }
         // The answer to a broadcast of ours.
@@ -460,6 +573,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(me) = self.rv.me.as_ref() else { return };
         let s = &mut self.part.standing[i];
         s.answered = Some(now);
+        s.unanswered = None;
         s.held = seq;
         if seq == me.seq {
             if !s.was_live {
