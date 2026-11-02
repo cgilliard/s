@@ -2402,13 +2402,18 @@ impl<V: ProofVerifier> Chain<V> {
     /// 0 where its leaves are held, and which blocks' leaves are missing
     /// (`docs/ONION.md`).
     pub fn consensus_votes(&self, window: u32) -> Result<crate::consensus::Votes> {
-        let rtxn = self.env.read_txn()?;
-        let Some(tip) = self.tip_in(&rtxn)? else {
+        let Some(tip) = self.tip()? else {
             return Ok(crate::consensus::Votes::default());
         };
-        let first = (tip.height + 1).saturating_sub(window);
+        self.consensus_votes_at(tip.height, window)
+    }
+
+    /// The votes of the `window` main-chain blocks ending at `end`.
+    pub fn consensus_votes_at(&self, end: u32, window: u32) -> Result<crate::consensus::Votes> {
+        let rtxn = self.env.read_txn()?;
+        let first = (end + 1).saturating_sub(window);
         let mut blocks = Vec::with_capacity(window as usize);
-        for h in first..=tip.height {
+        for h in first..=end {
             let Some(header) = self.header_at_in(&rtxn, h)? else {
                 return Err(ChainError::Corrupt("main chain height"));
             };
@@ -2420,7 +2425,30 @@ impl<V: ProofVerifier> Chain<V> {
             };
             blocks.push((id, h, vote));
         }
-        Ok(crate::consensus::Votes::tally((first, tip.height), blocks.into_iter()))
+        Ok(crate::consensus::Votes::tally((first, end), blocks.into_iter()))
+    }
+
+    /// What the votes of the window ending at main-chain height `end`
+    /// decide, with the files held.
+    pub fn consensus_at(&self, end: u32) -> Result<(crate::consensus::Votes, crate::consensus::Current)> {
+        let votes = self.consensus_votes_at(end, crate::consensus::WINDOW)?;
+        let rtxn = self.env.read_txn()?;
+        let current = crate::consensus::Current::decide(&votes, |h| {
+            self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec())
+        });
+        Ok((votes, current))
+    }
+
+    /// The files in force (`docs/ONION.md`): the one decided at the last
+    /// boundary at or below the tip and, during the switch after it, the
+    /// one decided at the boundary before.
+    pub fn consensus_epoch(&self) -> Result<crate::consensus::Epoch> {
+        use crate::consensus::{EPOCH, Epoch, boundary};
+        let height = self.tip()?.map_or(0, |t| t.height);
+        let b = boundary(height);
+        let (votes, current) = self.consensus_at(b)?;
+        let before = if b >= EPOCH { Some(self.consensus_at(b - EPOCH)?.1) } else { None };
+        Ok(Epoch::new(height, votes, current, before))
     }
 
     /// The consensus file in force (`docs/ONION.md`): the votes of the last

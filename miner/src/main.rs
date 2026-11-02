@@ -156,8 +156,9 @@ const HELP: &str = "commands:
                             their Merkle root goes in the headers this node mines
   set-leaf-value INDEX HEX  set aux leaf INDEX to a 32-byte value given in hex
   leaves                    the aux leaves and their root
-  consensus                 the consensus file in force (docs/ONION.md): the window's
-                            votes, the winning file and its text
+  consensus                 the consensus file in force (docs/ONION.md), decided at the
+                            last 144-block boundary, any switch under way, and the
+                            running count for the next boundary
   policies                  this wallet's policy outputs: multisigs, channels
   channel-key [HEIGHT]      a fresh channel key for a policy: its nonce and key
                             hash (HEIGHT levels, 16 by default, 20 at most)
@@ -1010,14 +1011,42 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("id {}", hex_digest(&ctx.wallet.id()));
         }
         "consensus" => {
-            use tabminer::consensus::hex;
-            let (votes, current) = ctx.chain.consensus()?;
+            use tabminer::consensus::{EPOCH, GRACE, Mode, SWITCH, hex};
+            let epoch = ctx.chain.consensus_epoch()?;
+            let (votes, running) = ctx.chain.consensus()?;
             let stats = ctx.stats.lock().unwrap().clone();
+            let mode_of = |c: &tabminer::consensus::Current| match &c.file {
+                Some(f) if f.mode == Mode::Onion => format!("onion: {} relays", f.relays.len()),
+                _ => "init".to_string(),
+            };
+            // In force: decided at the last boundary.
+            let current = &epoch.current;
             println!(
-                "window   heights {} to {}: {} blocks, {} voting{}",
+                "mode     {} since block {} (decided by heights {} to {})",
+                mode_of(current),
+                epoch.boundary,
+                epoch.votes.range.0,
+                epoch.votes.range.1
+            );
+            match &current.winner {
+                Some((hash, n)) => println!("in force {}  ({n} of {} votes)", hex(hash), epoch.votes.blocks),
+                None if epoch.votes.counts.is_empty() => println!("in force none: no block of that window voted"),
+                None => println!("in force none: no file that window voted for is fetched and valid"),
+            }
+            if let Some(p) = &epoch.previous {
+                println!(
+                    "switch   from {} until block {}; the new file is tried first from block {}",
+                    mode_of(p),
+                    epoch.boundary + GRACE - 1,
+                    epoch.boundary + SWITCH
+                );
+            }
+            // The running count, for the next boundary.
+            let next = epoch.boundary + EPOCH;
+            println!(
+                "next     block {next}: heights {} to {} so far, {} voting{}",
                 votes.range.0,
                 votes.range.1,
-                votes.blocks,
                 votes.counts.iter().map(|c| c.1).sum::<u32>(),
                 if votes.missing.is_empty() {
                     String::new()
@@ -1026,40 +1055,27 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 }
             );
             for (hash, n, last) in &votes.counts {
-                let state = match (&current.winner, current.skipped.iter().find(|s| s.0 == *hash)) {
-                    (Some((w, _)), _) if w == hash => "  (in force)".to_string(),
+                let state = match (&running.winner, running.skipped.iter().find(|s| s.0 == *hash)) {
+                    (Some((w, _)), _) if w == hash => "  (leading)".to_string(),
                     (_, Some((_, _, why))) => format!("  ({why})"),
                     _ => String::new(),
                 };
                 println!("vote     {}  {n:>3} blocks, last at height {last}{state}", hex(hash));
             }
-            match (&current.winner, &current.file) {
-                (Some((hash, n)), Some(f)) => {
-                    println!(
-                        "mode     {}{}",
-                        f.mode,
-                        if f.mode == tabminer::consensus::Mode::Onion {
-                            format!(": {} relays", f.relays.len())
-                        } else {
-                            String::new()
+            if let Some((hash, _)) = &current.winner {
+                let bytes = ctx.chain.consensus_file(hash)?.unwrap_or_default();
+                println!("file     {} bytes:", bytes.len());
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) => {
+                        for line in text.lines().take(64) {
+                            println!("  | {line}");
                         }
-                    );
-                    let bytes = ctx.chain.consensus_file(hash)?.unwrap_or_default();
-                    println!("current  {}  ({} bytes, {n} of {} blocks)", hex(hash), bytes.len(), votes.blocks);
-                    match std::str::from_utf8(&bytes) {
-                        Ok(text) => {
-                            for line in text.lines().take(64) {
-                                println!("  | {line}");
-                            }
-                            if text.lines().count() > 64 {
-                                println!("  | ... ({} lines in all)", text.lines().count());
-                            }
+                        if text.lines().count() > 64 {
+                            println!("  | ... ({} lines in all)", text.lines().count());
                         }
-                        Err(_) => println!("  (not text)"),
                     }
+                    Err(_) => println!("  (not text)"),
                 }
-                _ if votes.counts.is_empty() => println!("mode     init: no block of the window votes for a file"),
-                _ => println!("mode     init: no file voted for is fetched and valid"),
             }
         }
         "leaves" => {

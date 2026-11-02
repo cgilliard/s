@@ -19,6 +19,19 @@ use crate::xmss::Digest;
 
 /// Blocks over which votes are counted.
 pub const WINDOW: u32 = 144;
+/// The file in force changes only at heights that are multiples of this,
+/// decided from the window ending there.
+pub const EPOCH: u32 = WINDOW;
+/// Blocks from a boundary `B` over which a change is made: both files
+/// stand from `B` to `B + GRACE - 2`, the old one goes at `B + GRACE - 1`.
+pub const GRACE: u32 = 6;
+/// From `B + SWITCH` senders prefer the new file.
+pub const SWITCH: u32 = 2;
+
+/// The last boundary at or below `height`.
+pub fn boundary(height: u32) -> u32 {
+    height / EPOCH * EPOCH
+}
 /// Largest file.
 pub const MAX_CONSENSUS: usize = 1 << 20;
 /// Most relays a file may list.
@@ -309,6 +322,37 @@ impl Current {
     }
 }
 
+/// The files in force at a height: the one decided at the last boundary
+/// and, while the switch from the one before lasts, that one too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Epoch {
+    /// The main chain's tip.
+    pub height: u32,
+    /// The last boundary at or below it.
+    pub boundary: u32,
+    /// The votes of the window ending at the boundary.
+    pub votes: Votes,
+    /// What they decided.
+    pub current: Current,
+    /// The file decided at the boundary before, while the switch lasts and
+    /// only if it differs.
+    pub previous: Option<Current>,
+    /// Whether senders try `current` first: from `boundary + SWITCH`.
+    pub prefer_current: bool,
+}
+
+impl Epoch {
+    /// From the decisions at the last boundary and the one before.
+    pub fn new(height: u32, votes: Votes, current: Current, before: Option<Current>) -> Epoch {
+        let boundary = boundary(height);
+        let into = height - boundary;
+        let same = |a: &Current, b: &Current| a.mode == b.mode && a.winner.map(|w| w.0) == b.winner.map(|w| w.0);
+        let previous = before.filter(|b| into + 1 < GRACE && !same(b, &current));
+        let prefer_current = previous.is_none() || into >= SWITCH;
+        Epoch { height, boundary, votes, current, previous, prefer_current }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +481,32 @@ mod tests {
         let c = Current::decide(&votes, files(Some(b"x"), Some(b"y"), Some(b"z")));
         assert_eq!((c.mode, c.winner, c.skipped.len()), (Mode::Init, None, 3));
         assert_eq!(c.skipped[2].2.to_string(), "invalid: the first directive must be `mode init` or `mode onion`");
+    }
+
+    /// The switch at a boundary: both files from `B` to `B + 4`, the new
+    /// one preferred from `B + 2`, the old one gone at `B + 5`; no switch
+    /// when the file is the same, and none between boundaries.
+    #[test]
+    fn files_change_only_at_boundaries_with_a_grace_period() {
+        let init = Current { mode: Mode::Init, winner: None, file: None, skipped: vec![] };
+        let onion = Current { mode: Mode::Onion, winner: Some(([1u8; 32], 1)), file: None, skipped: vec![] };
+        assert_eq!(boundary(143), 0);
+        assert_eq!(boundary(144), 144);
+        assert_eq!(boundary(287), 144);
+        let at = |h: u32| Epoch::new(h, Votes::default(), onion.clone(), Some(init.clone()));
+        for h in 144..=148 {
+            let e = at(h);
+            assert_eq!(e.boundary, 144);
+            assert_eq!(e.previous, Some(init.clone()), "both stand at {h}");
+            assert_eq!(e.prefer_current, h >= 146, "at {h}");
+        }
+        for h in [149, 150, 200, 287] {
+            assert_eq!(at(h).previous, None, "the old one is gone at {h}");
+            assert!(at(h).prefer_current);
+        }
+        // The same file again: nothing to switch.
+        let same = Epoch::new(145, Votes::default(), onion.clone(), Some(onion.clone()));
+        assert_eq!((same.previous, same.prefer_current), (None, true));
     }
 
     #[test]

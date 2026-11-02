@@ -39,6 +39,7 @@ pub const KIND_SLATE: u8 = 1;
 
 const DOM_OBJECT: u32 = 19;
 const DOM_RENDEZVOUS: u32 = 20;
+const DOM_WEIGHT: u32 = 21;
 const ANNOUNCE_CONTEXT: &[u8] = b"tab-announce";
 const PAYLOAD_CONTEXT: &[u8] = b"tab-payload";
 const TAG_ANNOUNCE: u8 = 1;
@@ -333,6 +334,25 @@ pub fn rendezvous_indexes(id: &Digest, n: usize) -> Vec<usize> {
     out
 }
 
+/// A participant's rendezvous points among the listed relays, by
+/// rendezvous (highest random weight) hashing: every relay is weighed by
+/// `H(id ‖ relay id)` and the [`RENDEZVOUS`] heaviest are the points,
+/// heaviest first. Adding or removing a relay moves only the ids that had
+/// it among their points, unlike reducing a hash modulo the number of
+/// relays. Returns indexes into `relays`.
+pub fn rendezvous_relays(id: &Digest, relays: &[Digest]) -> Vec<usize> {
+    let weight = |r: &Digest| {
+        let mut input = [Fp::ZERO; 16];
+        input[..8].copy_from_slice(id);
+        input[8..].copy_from_slice(r);
+        let bytes = digest_to_bytes(&hash_domain(DOM_WEIGHT, &input));
+        u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    };
+    let mut ranked: Vec<(u64, usize)> = relays.iter().enumerate().map(|(i, r)| (weight(r), i)).collect();
+    ranked.sort_by(|a, b| b.cmp(a));
+    ranked.into_iter().take(RENDEZVOUS).map(|(_, i)| i).collect()
+}
+
 /// A digest's canonical text for logs: its address form.
 pub fn short(id: &Digest) -> String {
     let a = address::encode(id);
@@ -447,6 +467,27 @@ mod tests {
         let hex: String = digest_to_bytes(&id).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(parse_id(&hex), Some(id));
         assert_eq!(parse_id("nope"), None);
+        // Weighed: a relay added or removed moves only the ids that had it.
+        let relays: Vec<Digest> = (0..20u8).map(|t| address::id_of(keys(100 + t).0.public_key())).collect();
+        let ids: Vec<Digest> = (0..200u8).map(|t| address::id_of(&[t; 40])).collect();
+        let points = |rs: &[Digest], id: &Digest| -> Vec<Digest> {
+            rendezvous_relays(id, rs).into_iter().map(|i| rs[i]).collect()
+        };
+        let removed = &relays[1..];
+        let mut moved = 0;
+        for id in &ids {
+            let before = points(&relays, id);
+            assert_eq!(before.len(), 3);
+            let after = points(removed, id);
+            if before.contains(&relays[0]) {
+                moved += 1;
+                assert_eq!(after.iter().filter(|p| before.contains(p)).count(), 2);
+            } else {
+                assert_eq!(after, before, "an id that did not have the removed relay keeps its points");
+            }
+        }
+        assert!(moved > 0 && moved < 80, "{moved}");
+        assert_eq!(rendezvous_relays(&ids[0], &relays[..2]).len(), 2);
         assert!(short(&id).starts_with("tab1"));
     }
 }

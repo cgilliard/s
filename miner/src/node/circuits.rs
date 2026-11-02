@@ -106,7 +106,7 @@ impl Circuits {
 impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// The listed relay `id`'s address, in onion mode.
     pub(super) fn relay_addr(&mut self, id: &Digest) -> Option<SocketAddr> {
-        let name = self.rv.relays()?.iter().find(|r| r.id == *id)?.addr.clone();
+        let name = self.rv.listed(id)?.addr.clone();
         name.to_socket_addrs().ok()?.next()
     }
 

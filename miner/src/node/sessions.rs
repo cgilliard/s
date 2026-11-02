@@ -247,10 +247,33 @@ pub(super) struct State {
     sends: Vec<Job>,
     notes: SyncSender<Note>,
     notes_rx: Option<Receiver<Note>>,
-    /// The relays of an onion-mode file in force, sorted by id; `None` in
-    /// init mode, where the seeds stand in.
-    relays: Option<Vec<consensus::Relay>>,
+    /// The relay set decided at the last boundary.
+    current: RelaySet,
+    /// The one decided before it, while the switch lasts.
+    previous: Option<RelaySet>,
+    /// Whether `current` is tried first: from the switch's third block.
+    prefer_current: bool,
+    /// Tests: sets given by hand rather than followed from the chain.
+    #[cfg(test)]
+    pinned: bool,
+    /// Sends that may be tried again in the other mode while a switch
+    /// between modes lasts: by tag and recipient.
+    fallback: Vec<Outbound>,
+    /// Sends to try again in the other mode.
+    pub(super) retry: Vec<Outbound>,
     resolved: HashMap<String, Option<SocketAddr>>,
+}
+
+/// A file's relays, sorted by id, in onion mode; `None` in init mode,
+/// where the seeds stand in.
+pub(super) type RelaySet = Option<Vec<consensus::Relay>>;
+
+/// A decided file's relay set.
+fn relay_set(c: &consensus::Current) -> RelaySet {
+    match (&c.mode, &c.file) {
+        (consensus::Mode::Onion, Some(f)) => Some(f.relays.clone()),
+        _ => None,
+    }
 }
 
 impl State {
@@ -267,20 +290,69 @@ impl State {
             sends: Vec::new(),
             notes,
             notes_rx: Some(notes_rx),
-            relays: None,
+            current: None,
+            previous: None,
+            prefer_current: true,
+            #[cfg(test)]
+            pinned: false,
+            fallback: Vec::new(),
+            retry: Vec::new(),
             resolved: HashMap::new(),
         })
     }
 
-    /// The relays of the onion-mode file in force, sorted by id.
-    pub(super) fn relays(&self) -> Option<&[consensus::Relay]> {
-        self.relays.as_deref()
+    /// The sets in force, the preferred first: the current one and, while
+    /// a switch lasts, the one before.
+    fn sets(&self) -> Vec<&RelaySet> {
+        let mut out = vec![&self.current];
+        if let Some(p) = &self.previous {
+            if self.prefer_current {
+                out.push(p);
+            } else {
+                out.insert(0, p);
+            }
+        }
+        out
     }
 
-    /// Tests: relays as if an onion-mode file were in force.
+    /// The onion-mode relay lists in force, the preferred first.
+    pub(super) fn onion_sets(&self) -> Vec<&[consensus::Relay]> {
+        self.sets().into_iter().filter_map(|s| s.as_deref()).collect()
+    }
+
+    /// Whether a set in force is init mode's: the seeds serve sessions.
+    pub(super) fn init_active(&self) -> bool {
+        self.sets().iter().any(|s| s.is_none())
+    }
+
+    /// Whether a set in force is onion mode's.
+    pub(super) fn onion_active(&self) -> bool {
+        !self.onion_sets().is_empty()
+    }
+
+    /// Whether the preferred set is onion mode's.
+    pub(super) fn prefers_onion(&self) -> bool {
+        self.sets()[0].is_some()
+    }
+
+    /// The listed relay `id`, in any set in force.
+    pub(super) fn listed(&self, id: &Digest) -> Option<&consensus::Relay> {
+        self.onion_sets().into_iter().flat_map(|s| s.iter()).find(|r| r.id == *id)
+    }
+
+    /// Tests: relays as if an onion-mode file were in force, alone.
     #[cfg(test)]
     pub(super) fn set_relays(&mut self, relays: Vec<consensus::Relay>) {
-        self.relays = Some(relays);
+        self.set_sets(Some(relays), None, true);
+    }
+
+    /// Tests: the sets in force given by hand.
+    #[cfg(test)]
+    pub(super) fn set_sets(&mut self, current: RelaySet, previous: Option<RelaySet>, prefer_current: bool) {
+        self.current = current;
+        self.previous = previous;
+        self.prefer_current = prefer_current;
+        self.pinned = true;
     }
 
     /// Forgets resolved addresses: the seeds are being looked up again.
@@ -288,13 +360,27 @@ impl State {
         self.resolved.clear();
     }
 
-    /// Follows the file in force: its relays in onion mode, the seeds
-    /// otherwise.
-    pub(super) fn set_consensus(&mut self, current: &consensus::Current) {
-        self.relays = match (&current.mode, &current.file) {
-            (consensus::Mode::Onion, Some(f)) => Some(f.relays.clone()),
-            _ => None,
-        };
+    /// Follows the files in force (`docs/ONION.md`): decided at the last
+    /// boundary, and the one before while the switch lasts.
+    pub(super) fn set_epoch(&mut self, epoch: &consensus::Epoch) {
+        #[cfg(test)]
+        if self.pinned {
+            return;
+        }
+        self.current = relay_set(&epoch.current);
+        self.previous = epoch.previous.as_ref().map(relay_set);
+        self.prefer_current = epoch.prefer_current;
+        if self.previous.is_none() {
+            self.fallback.clear();
+        }
+    }
+
+    /// Keeps a send to be tried in the other mode if this one fails,
+    /// while a switch between the modes lasts.
+    pub(super) fn keep_fallback(&mut self, out: &Outbound) {
+        if self.init_active() && self.onion_active() {
+            self.fallback.push(out.clone());
+        }
     }
 
     /// For the prompt: each rendezvous point and whether its session is
@@ -307,7 +393,20 @@ impl State {
         (points, self.held.len())
     }
 
-    pub(super) fn note(&self, note: Note) {
+    pub(super) fn note(&mut self, note: Note) {
+        // A send that failed in one mode during a switch is tried in the
+        // other before the wallet hears of it.
+        match &note {
+            Note::Failed { tag, to, .. } => {
+                if let Some(i) = self.fallback.iter().position(|o| o.tag == *tag && o.to == *to) {
+                    let out = self.fallback.remove(i);
+                    self.retry.push(out);
+                    return;
+                }
+            }
+            Note::Delivered { tag, to, .. } => self.fallback.retain(|o| !(o.tag == *tag && o.to == *to)),
+            _ => {}
+        }
         if let Err(TrySendError::Full(_)) = self.notes.try_send(note) {
             crate::log::line("net: message layer: the wallet is not taking notes; one dropped");
         }
@@ -356,36 +455,50 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         a
     }
 
-    /// `id`'s rendezvous points that can be reached: resolved, and not
-    /// this node. They are chosen among the seeds by name in init mode,
-    /// the relays by id in onion mode; only the chosen are resolved.
+    /// `id`'s init-mode rendezvous points that can be reached: resolved,
+    /// and not this node. They are chosen among the seeds by name; only
+    /// the chosen are resolved.
     fn points_for(&mut self, id: &Digest) -> Vec<SocketAddr> {
-        let names: Vec<String> = match &self.rv.relays {
-            Some(relays) => {
-                onion::rendezvous_indexes(id, relays.len()).into_iter().map(|i| relays[i].addr.clone()).collect()
-            }
-            None => {
-                let mut seeds = self.config.seeds.clone();
-                seeds.sort();
-                seeds.dedup();
-                onion::rendezvous_indexes(id, seeds.len()).into_iter().map(|i| seeds[i].clone()).collect()
-            }
+        let names: Vec<String> = {
+            let mut seeds = self.config.seeds.clone();
+            seeds.sort();
+            seeds.dedup();
+            onion::rendezvous_indexes(id, seeds.len()).into_iter().map(|i| seeds[i].clone()).collect()
         };
         let addrs: Vec<SocketAddr> = names.iter().filter_map(|n| self.resolve(n)).collect();
         addrs.into_iter().filter(|a| !self.peers.is_self(a)).collect()
     }
 
-    /// Whether this node, as a relay, is a rendezvous point of `id`: any id
-    /// in init mode, where the seeds cannot tell which seed name they are;
-    /// in onion mode, only an id whose points include this node's own.
-    pub(super) fn serves(&self, id: &Digest) -> bool {
-        match (&self.rv.relays, &self.rv.me) {
-            (None, _) => true,
-            (Some(relays), Some(me)) => {
-                onion::rendezvous_indexes(id, relays.len()).into_iter().any(|i| relays[i].id == me.id)
+    /// Whether this node, as a relay, holds init-mode sessions: for any id,
+    /// since the seeds cannot tell which seed name they are, while init
+    /// mode is in force.
+    fn serves_init(&self) -> bool {
+        self.rv.init_active()
+    }
+
+    /// `id`'s onion-mode rendezvous points: under each relay list in
+    /// force, the preferred first, each point once.
+    pub(super) fn onion_points_of(&self, id: &Digest) -> Vec<Digest> {
+        let mut out: Vec<Digest> = Vec::new();
+        for relays in self.rv.onion_sets() {
+            let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
+            for i in onion::rendezvous_relays(id, &ids) {
+                if !out.contains(&ids[i]) {
+                    out.push(ids[i]);
+                }
             }
-            (Some(_), None) => false,
         }
+        out
+    }
+
+    /// Whether this node, as a relay, is a rendezvous point of `id` in
+    /// onion mode: under any relay list in force, during a switch too.
+    pub(super) fn serves(&self, id: &Digest) -> bool {
+        let Some(me) = &self.rv.me else { return false };
+        self.rv.onion_sets().into_iter().any(|relays| {
+            let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
+            onion::rendezvous_relays(id, &ids).into_iter().any(|i| relays[i].id == me.id)
+        })
     }
 
     /// Re-requests stalled object chunks, with each download's token.
@@ -410,12 +523,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.chatter(&format!("message layer: {} sessions went quiet", before - self.rv.held.len()));
         }
         self.rv.outbox.retain(|_, o| now.duration_since(o.at) < OUTBOX_TIME);
-        // Onion mode keeps sessions over circuits, init mode directly.
-        if self.rv.relays.is_some() {
+        // Onion mode keeps sessions over circuits, init mode directly; both
+        // while a switch between them lasts.
+        if self.rv.onion_active() {
             self.onion_participate(now);
         } else {
             self.onion_stand_down(now);
+        }
+        if self.rv.init_active() {
             self.participate(now);
+        }
+        for out in std::mem::take(&mut self.rv.retry) {
+            self.chatter(&format!("message layer: trying {} in the other mode", onion::short(&out.to)));
+            if self.rv.prefers_onion() {
+                self.init_send(out, now);
+            } else {
+                self.onion_send(out, now);
+            }
         }
         self.progress_sends(now);
     }
@@ -497,7 +621,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     pub(super) fn on_session(&mut self, addr: SocketAddr, id: Digest, back: u64, now: Instant) {
-        if !self.config.relay || !self.serves(&id) {
+        if !self.config.relay || !self.serves_init() {
             self.send(addr, &Message::Notice { subject: id, code: NOTICE_REFUSED });
             return;
         }
@@ -703,7 +827,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn hold(&mut self, from: SocketAddr, object: Digest, a: Announce, bytes: Vec<u8>, back: u64, now: Instant) {
         let older = self.rv.held.get(&a.id).is_some_and(|h| h.announce.seq > a.seq);
         let full = self.rv.held.len() >= MAX_SESSIONS && !self.rv.held.contains_key(&a.id);
-        if a.nonce != self.session_nonce(&from, &a.id) || older || !self.serves(&a.id) || !a.verify(unix_now()) {
+        if a.nonce != self.session_nonce(&from, &a.id) || older || !self.serves_init() || !a.verify(unix_now()) {
             self.chatter(&format!("message layer: {from} offered an announce that does not hold"));
             self.send(from, &Message::Notice { subject: object, code: NOTICE_REJECTED });
             return;
@@ -779,9 +903,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.rv.me.is_none() {
             return self.rv.note(fail("this node has no identity"));
         }
-        if self.rv.relays.is_some() {
+        self.rv.keep_fallback(&out);
+        if self.rv.prefers_onion() {
             return self.onion_send(out, now);
         }
+        self.init_send(out, now);
+    }
+
+    /// A send by init mode's direct sessions.
+    fn init_send(&mut self, out: Outbound, now: Instant) {
+        let fail = |why: &str| Note::Failed { tag: out.tag, to: out.to, why: why.to_string() };
         if self.rv.sends.len() >= MAX_SENDS {
             return self.rv.note(fail("too many sends in progress"));
         }

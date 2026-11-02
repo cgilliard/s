@@ -252,12 +252,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.session_state(link, &id, seq, now);
     }
 
-    /// The listed relays that are `id`'s rendezvous points, in order.
+    /// The listed relays that are `id`'s rendezvous points, in the order
+    /// they are asked: the preferred list's first, then, during a switch,
+    /// the other's (`docs/ONION.md`).
     fn points_of(&self, id: &Digest) -> Vec<Digest> {
-        match self.rv.relays() {
-            Some(relays) => onion::rendezvous_indexes(id, relays.len()).into_iter().map(|i| relays[i].id).collect(),
-            None => Vec::new(),
-        }
+        self.onion_points_of(id)
     }
 
     fn my_id(&self) -> Option<Digest> {
@@ -336,7 +335,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A `Rendezvous` cell from another relay.
     pub(super) fn on_rendezvous_cell(&mut self, key: (SocketAddr, u64), peer: Option<Digest>, cell: &Cell, now: Instant) {
         // Only from a listed relay that proved its id.
-        let listed = peer.is_some_and(|p| self.rv.relays().is_some_and(|r| r.iter().any(|r| r.id == p)));
+        let listed = peer.is_some_and(|p| self.rv.listed(&p).is_some());
         if !self.config.relay || !listed {
             return;
         }

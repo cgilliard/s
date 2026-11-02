@@ -124,7 +124,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Whether our own transactions go out over a circuit: in onion mode,
     /// with a wallet.
     pub(super) fn broadcasts_privately(&self) -> bool {
-        self.rv.relays().is_some() && self.rv.me.is_some()
+        self.rv.onion_active() && self.rv.me.is_some()
     }
 
     /// A transaction of ours, pooled: to a relay over a circuit.
@@ -212,12 +212,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 s.asked = None;
             }
         }
-        let Some(relays) = self.rv.relays() else { return };
-        let points: Vec<Digest> = onion::rendezvous_indexes(&id, relays.len())
-            .into_iter()
-            .map(|i| relays[i].id)
-            .filter(|p| *p != id)
-            .collect();
+        // Our points under every relay list in force: during a switch, the
+        // old list's and the new one's.
+        let points: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| *p != id).collect();
         if points.iter().ne(self.part.standing.iter().map(|s| &s.point)) {
             let mut old = std::mem::take(&mut self.part.standing);
             for p in &points {
@@ -292,10 +289,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn build_standing(&mut self, i: usize, now: Instant) {
         let point = self.part.standing[i].point;
         let me = self.rv.me.as_ref().map(|m| m.id);
-        let mut others: Vec<Digest> = match self.rv.relays() {
-            Some(r) => r.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect(),
-            None => return,
+        // Hops from the list the point is in (the preferred one first).
+        let Some(relays) = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point)) else {
+            return;
         };
+        let mut others: Vec<Digest> =
+            relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
         let mut path = Vec::new();
         while path.len() < HOPS && !others.is_empty() {
             let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);

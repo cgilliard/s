@@ -326,8 +326,11 @@ An address names three rendezvous points, chosen from it by hash among
 the nodes that relay. A wallet's node keeps a session at each, which
 forwards what is sent to the address. What relays exist, and so which
 mode the network is in, is a file the miners vote for in aux leaf 0
-(above): the most voted `consensus.txt` that is fetched and valid is in
-force, one vote is enough, and with none the network is in init mode.
+(above). The file in force changes only every 144 blocks: at each
+multiple of 144, the most voted `consensus.txt` of the 144 blocks ending
+there that is fetched and valid takes over (one vote is enough; with
+none, init mode), over a grace period of six blocks during which both
+files stand, and stays until the next.
 
 - **Init mode** (`mode init`, or no file): the seed nodes are the
   rendezvous points, run with `--relay`, and wallets connect to them
@@ -360,7 +363,8 @@ A miner votes with `set-leaf 0 consensus.txt`, which checks the file first;
 votes for a file that does not parse, or that no peer serves, count for
 nothing, and a file saying `mode init` votes the network back to init
 mode. `status` shows the wallet's rendezvous sessions and, on a relay, the
-sessions it holds; `consensus` the vote. The known gaps (no cover traffic,
+sessions it holds; `consensus` the file in force since the last
+boundary and the running count for the next. The known gaps (no cover traffic,
 a hop could tag cells for a later one, circuits not rotated on a timer)
 are in `miner/SECURITY.md` and `docs/HARDENING.md`.
 

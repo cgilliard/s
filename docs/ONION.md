@@ -124,20 +124,29 @@ uses for blocks (`Kind::Consensus`, keyed by the file's hash), so it
 arrives in windows of datagrams and is checked once whole. Files that
 won at any time are kept for good.
 
-**Which file is current.** Over the last `WINDOW` (144) main-chain blocks,
-count the nonzero leaf-0 hashes. Only votes for a file that has been
+**Which file is current.** The file in force changes only at a boundary:
+a main-chain height `B` that is a multiple of `EPOCH` (144, the window).
+At `B` the file is decided from the `WINDOW` (144) blocks ending at `B`:
+count their nonzero leaf-0 hashes. Only votes for a file that has been
 fetched, checked and parses count: votes for a file that is corrupt, or
 that no peer serves, count for nothing. Of the files that count, the
 most voted is current, ties to the one committed most recently; one vote
 is enough. A file saying `mode init` counts like any other, so miners
 can vote the network back into init mode. With no vote that counts in
-the window the network is in init mode. A node fetches the files voted
-for more than the current one, most voted first, and passes over for
-ten minutes a file no live peer serves. The window moves with the
-chain, so the current file follows the main chain through
-reorganizations without any special case. The file is whatever the
-miners choose, as with any aux leaf; in practice miners and pools agree
-on it among themselves.
+the window the network is in init mode. That file stays in force until
+the next boundary, however the votes move meanwhile: votes cast at
+block 150 count toward the decision at 288. A change is made over a
+grace period of `GRACE` (6) blocks: from `B` to `B + 4` both files
+stand (participants hold sessions under both, relays serve the ids of
+either), senders try the new one first from `B + SWITCH` (`B + 2`) and
+fall back to the other, and the old one goes at `B + 5`. A node fetches
+the files voted for more than the one that counts, in the deciding
+window and in the running count for the next boundary, most voted first,
+and passes over for ten minutes a file no live peer serves. The decision
+belongs to the main-chain block at `B`, so it follows a reorganization
+that replaces that block; within the grace period both files still
+stand. The file is whatever the miners choose, as with any aux leaf; in
+practice miners and pools agree on it among themselves.
 
 **Why propagate rather than embed.** The header carries 32 bytes; the file
 is the thing those bytes commit to. Propagating it with the block gives
@@ -148,9 +157,12 @@ block's body has: committed to by the work, and by a day of it.
 
 Both modes work the same way; only the set of nodes differs. A
 participant's three rendezvous points are chosen from the available
-nodes (the seeds in init mode, the relays in onion mode) by the hash of
-its 32-byte id: `H(id ‖ k)` for `k` in 0, 1, 2, each reduced to an index
-into the list sorted by id, skipping repeats. Anyone holding the
+nodes by the hash of its 32-byte id. In onion mode every listed relay is
+weighed by `H(id ‖ relay id)` and the three heaviest are the points
+(rendezvous, or highest random weight, hashing), so adding or removing a
+relay moves only the ids that had it among their three. In init mode the
+seeds, sorted by name, are indexed by `H(id ‖ k)` for `k` in 0, 1, 2,
+reduced modulo their number, skipping repeats. Anyone holding the
 consensus and the id computes the same three.
 
 A participant that wants to be reached is online: it opens a session to
@@ -440,12 +452,24 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    nodes may still decide differently if one has not; deciding from the
    window ending a few blocks before `B` would give the file time to
    spread, at the cost of those blocks' votes.
+
+   Done (2026-11-01): `consensus::Epoch` and `Chain::consensus_epoch`
+   decide; the node follows both relay lists during the switch
+   (`node/sessions.rs`, `RelaySet`): relays serve the ids and accept the
+   relays of either, participants keep circuits to their points under
+   both, and a sender's rendezvous point asks the recipient's points
+   under the preferred list first, then the other's. A switch between
+   init and onion mode keeps both kinds of session, and a send that fails
+   in the mode tried first is tried once in the other before the wallet
+   hears of it. `consensus` at the prompt shows the file in force since
+   the last boundary, a switch under way and the running count.
 3. **Rendezvous points that survive a change of relays.** A point is
    `H(id ‖ k)` modulo the number of relays, so adding or removing one
    relay moves the points of nearly every id. Choose them by rendezvous
    (highest random weight) hashing instead: rank the relays by
    `H(id ‖ relay id)` and take the top three, so a change of one relay
-   moves only the ids that had it among their three.
+   moves only the ids that had it among their three. Done (2026-11-01):
+   `onion::rendezvous_relays`; init mode keeps indexing the seeds.
 4. **A relay key apart from the wallet.** A relay's listed id is now its
    operator's payment address. Give the relay its own Dilithium key
    (derived under another domain tag, or random in `DIR/relay.key`).
