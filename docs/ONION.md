@@ -378,6 +378,81 @@ Settled on 2026-11-01, before onion mode.
 3. **Cover traffic and timing.** Whether relays and wallets send padding
    cells, and at what rate. None for now.
 
+## Enhancements
+
+Found while trying the network out (2026-11-01), most pressing first.
+Smaller gaps, and the details of these, are in `docs/HARDENING.md`
+("Message layer").
+
+1. **Broadcast transactions over a circuit.** Finalizing pools the
+   signed transaction in the sender's own node, which announces it to
+   its peers as a `TxInv` from its own address (`main.rs`, `submit`).
+   The first node to announce a transaction is likely its sender, so
+   the network address is tied to the payment's inputs, undoing what the
+   circuits hid. Send the finished transaction up one of the wallet's
+   standing circuits to its rendezvous point (a new relay message), which
+   pools and announces it as its own; the wallet's node pools it only
+   once a peer announces it back. In init mode, a seed does the same
+   over the session.
+2. **Change the file in force at epoch boundaries, with a grace
+   period.** The window is counted at every tip, so a single block can
+   switch the mode or the relay list, nodes switch a few seconds apart
+   (each when it has fetched the file), and a reorganization can switch
+   back; every switch moves rendezvous points and so drops sessions.
+   Instead, with `B` a multiple of `EPOCH` (144, the window):
+
+   - **At `B`** the file is decided once, by the rule above, from the
+     window ending at `B`: votes for a file the node has not fetched,
+     or that does not parse, are not counted at all; the most voted of
+     the rest wins, ties to the most recent; with none left, init mode.
+     Whether that is the current file, another or init depends only on
+     what the other blocks voted. If it differs from the current one,
+     participants start building circuits and sessions for it beside
+     the old ones.
+   - **From `B` to `B + GRACE − 2`** (144 to 148, `GRACE` 6) both sets
+     stand: participants hold sessions under both files, relays serve
+     ids that are rendezvous points under either, and in a switch
+     between modes the seeds keep their init-mode service up.
+   - **From `B + SWITCH`** (146, `SWITCH` 2) senders look recipients up
+     under the new file first, falling back to the old one on offline
+     (before then, the other way round), so a node a block ahead of or
+     behind another does no harm.
+   - **At `B + GRACE − 1`** (149) the old file's circuits and sessions
+     are closed.
+
+   Between boundaries nothing switches: a file that wins mid-epoch waits
+   for the next one, up to a day, emergencies included. A reorganization
+   that replaces block `B` decides again; within the grace period both
+   sets still stand, so only one deeper than that switches for real.
+   What remains subjective is whether a node holds the winning file at
+   `B`: nodes fetch every file voted for more than the current one as
+   the votes come in, so they normally hold it long before, but two
+   nodes may still decide differently if one has not; deciding from the
+   window ending a few blocks before `B` would give the file time to
+   spread, at the cost of those blocks' votes.
+3. **Rendezvous points that survive a change of relays.** A point is
+   `H(id ‖ k)` modulo the number of relays, so adding or removing one
+   relay moves the points of nearly every id. Choose them by rendezvous
+   (highest random weight) hashing instead: rank the relays by
+   `H(id ‖ relay id)` and take the top three, so a change of one relay
+   moves only the ids that had it among their three.
+4. **A relay key apart from the wallet.** A relay's listed id is now its
+   operator's payment address. Give the relay its own Dilithium key
+   (derived under another domain tag, or random in `DIR/relay.key`).
+5. **`--no-wallet`.** Seeds and relays need no wallet and should not keep
+   a phrase on a server; with 4, a relay needs none.
+6. **A relay is its own wallet's rendezvous point**, held locally, rather
+   than skipped (in both modes).
+7. **Faster recovery.** Rotate standing circuits on a timer, notice a
+   dead hop from an unanswered keepalive in seconds rather than when the
+   channel gives up, and keep a spare circuit to each point.
+8. **Traffic analysis.** Padding cells and cover traffic, a tag per
+   layer against tagging, and a minimum number of relays (and of
+   operators) before onion mode is worth calling private.
+9. **Limits.** A cookie round trip before a relay's handshake work, per
+   address caps on channels, hops and sessions, and a limit on the
+   stage-1 slates a wallet answers per sender.
+
 ## Implementation order
 
 0. **Primitives.** Done (2026-11-01): `chacha20poly1305.rs` (RFC 8439,
