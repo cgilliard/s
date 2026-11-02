@@ -29,6 +29,10 @@ use crate::wallet::random_bytes;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hops a relay serves at once.
 pub const MAX_HOPS: usize = 16_384;
+/// Circuits a participant's channel may carry: a participant keeps three
+/// standing, and a few more while they are replaced. A relay's channel
+/// carries many people's circuits and has no such limit.
+pub const MAX_HOPS_PER_PARTICIPANT: usize = 64;
 /// Hops a client circuit may have.
 pub const MAX_PATH: usize = 8;
 
@@ -298,7 +302,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         }
         let hello = self.circuits.creating.remove(&link).unwrap().0;
-        if self.circuits.hops.len() >= MAX_HOPS {
+        let participant = self.channels.peer(&link.0) == Some(None);
+        if self.circuits.hops.len() >= MAX_HOPS
+            || participant
+                && self.circuits.hops.keys().filter(|l| l.0 == link.0).count() >= MAX_HOPS_PER_PARTICIPANT
+        {
             return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
         }
         let (Some(key), Ok(m)) = (self.config.identity.as_ref(), random_bytes::<32>()) else { return };

@@ -61,6 +61,8 @@ const RESULT: u8 = 4;
 const ASK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Questions out to other rendezvous points at once.
 const MAX_ASKS: usize = 4096;
+/// Sessions a relay holds over circuits; more are refused.
+const MAX_SESSIONS: usize = 10_000;
 
 /// A session this relay holds over a circuit.
 struct Held {
@@ -238,6 +240,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return self.hop_reply(link, circuit::NOTICE, &result(&a.id, NOTICE_REJECTED), now);
         }
         let (id, seq) = (a.id, a.seq);
+        if self.rdv.held.len() >= MAX_SESSIONS && !self.rdv.held.contains_key(&id) {
+            return self.hop_reply(link, circuit::NOTICE, &result(&id, NOTICE_REFUSED), now);
+        }
         if let Some(old) = self.rdv.held.get(&id)
             && old.link != link
         {

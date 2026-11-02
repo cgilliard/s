@@ -4058,14 +4058,14 @@ mod tests {
             assert_eq!(cs[k], (None, format!("from c {k}").into_bytes()));
         }
         assert!(sink_d.lock().unwrap().is_empty());
-        // b's, c's, and the one c abandoned when a's key was not the one
-        // it expected (a drops it once it falls silent). Stats refresh once
-        // a second.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while stats_a.lock().unwrap().channels != 3 && Instant::now() < deadline {
+        // b's and c's: the one c abandoned when a's key was not the one it
+        // expected carries no frame, and a closes it (after 3 s in tests).
+        // Stats refresh once a second.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stats_a.lock().unwrap().channels != 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(stats_a.lock().unwrap().channels, 3);
+        assert_eq!(stats_a.lock().unwrap().channels, 2);
         for tx in [tx_a, tx_b, tx_c, tx_d] {
             tx.send(Event::Stop).unwrap();
         }

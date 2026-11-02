@@ -353,6 +353,34 @@ pub fn rendezvous_relays(id: &Digest, relays: &[Digest]) -> Vec<usize> {
     ranked.into_iter().take(RENDEZVOUS).map(|(_, i)| i).collect()
 }
 
+/// Stage-1 slates a wallet answers from one sender, and in all, within
+/// [`SLATE_WINDOW`]: answering creates an output, so anyone who knows an
+/// address could otherwise make its wallet create them at will.
+pub const SLATES_PER_SENDER: usize = 5;
+pub const SLATES_TOTAL: usize = 60;
+pub const SLATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Counts what was answered, to refuse what is over the limits.
+#[derive(Debug, Default)]
+pub struct SlateLimit {
+    answered: std::collections::VecDeque<(Digest, std::time::Instant)>,
+}
+
+impl SlateLimit {
+    /// Whether a stage-1 slate from `from` may be answered now; if so, it
+    /// is counted.
+    pub fn allow(&mut self, from: &Digest, now: std::time::Instant) -> bool {
+        while self.answered.front().is_some_and(|(_, t)| now.duration_since(*t) >= SLATE_WINDOW) {
+            self.answered.pop_front();
+        }
+        if self.answered.len() >= SLATES_TOTAL || self.answered.iter().filter(|(f, _)| f == from).count() >= SLATES_PER_SENDER {
+            return false;
+        }
+        self.answered.push_back((*from, now));
+        true
+    }
+}
+
 /// A digest's canonical text for logs: its address form.
 pub fn short(id: &Digest) -> String {
     let a = address::encode(id);
@@ -448,6 +476,24 @@ mod tests {
         let mut bad = recipient.clone();
         bad.kyber.truncate(10);
         assert!(Payload::seal(&bad, None, 0, b"", &[0u8; 32], [0u8; 12]).is_none());
+    }
+
+    #[test]
+    fn slates_are_answered_within_limits() {
+        let t = std::time::Instant::now();
+        let mut l = SlateLimit::default();
+        let a = [Fp::new(1); 8];
+        for _ in 0..SLATES_PER_SENDER {
+            assert!(l.allow(&a, t));
+        }
+        assert!(!l.allow(&a, t), "too many from one sender");
+        // Others still are, up to the total.
+        for i in 0..(SLATES_TOTAL - SLATES_PER_SENDER) as u32 {
+            assert!(l.allow(&[Fp::new(i + 2); 8], t));
+        }
+        assert!(!l.allow(&[Fp::new(9999); 8], t), "the total");
+        // A window later, all over again.
+        assert!(l.allow(&a, t + SLATE_WINDOW));
     }
 
     #[test]

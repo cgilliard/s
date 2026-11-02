@@ -445,6 +445,8 @@ struct Ctx {
     outgoing: Mutex<std::collections::HashMap<[u8; 32], Digest>>,
     /// Whether a prompt is on the terminal (else the log is).
     prompt: bool,
+    /// Stage-1 slates answered lately, to refuse a flood.
+    slates: Mutex<onion::SlateLimit>,
 }
 
 /// Runs the node, the miner if `mining`, and the prompt (or waits) until
@@ -593,6 +595,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         in_flight: Mutex::new(None),
         outgoing: Mutex::new(std::collections::HashMap::new()),
         prompt: !args.no_prompt,
+        slates: Mutex::new(onion::SlateLimit::default()),
     });
     if let Some(notes) = notes {
         let ctx = Arc::clone(&ctx);
@@ -1589,7 +1592,12 @@ fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
     }
     let from = opened.from.ok_or("a slate from someone unnamed, which cannot be answered")?;
     let who = tabminer::address::encode(&from.id);
-    let id = Slate::from_bytes(&opened.inner).ok_or("a malformed slate")?.id;
+    let slate = Slate::from_bytes(&opened.inner).ok_or("a malformed slate")?;
+    let id = slate.id;
+    // Answering creates an output: a flood of slates is refused.
+    if slate.stage == 1 && !ctx.slates.lock().unwrap().allow(&from.id, Instant::now()) {
+        return Err(format!("too many slates from {who} lately; ignored").into());
+    }
     let sent_to = ctx.outgoing.lock().unwrap().get(&id).copied();
     sync_wallet(ctx)?;
     match ctx.wallet.take_slate(&opened.inner, &from.id, sent_to.as_ref())? {

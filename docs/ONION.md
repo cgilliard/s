@@ -497,6 +497,16 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    address caps on channels, hops and sessions, and a limit on the
    stage-1 slates a wallet answers per sender.
 
+   Done (2026-11-01), but for the cookie, which the request token already
+   is: every handshake fragment must carry the token this node gave the
+   sending address, so a forged address gets no work done; a real one is
+   bounded by the caps. A relay holds at most 32 channels from one IP
+   address and closes one that carries no frame within 15 s; a
+   participant's channel carries at most 64 circuits (a relay's carries
+   many people's and is not limited); onion-mode sessions are capped at
+   10,000 as init mode's are. A wallet answers at most 5 stage-1 slates
+   from one sender and 60 in all per 10 minutes (`onion::SlateLimit`).
+
 ## Implementation order
 
 0. **Primitives.** Done (2026-11-01): `chacha20poly1305.rs` (RFC 8439,

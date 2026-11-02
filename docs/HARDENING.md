@@ -185,11 +185,9 @@ history and the README; this file holds what is left.
   pruned: `receive_slate` trusts `slate.amount` and the inputs. Expected of
   a slate design; show "unconfirmed, unverifiable until it lands" rather
   than counting it, or verify the inputs against the UTXO set when the
-  recipient's node has it. Over the message layer this needs no access to
-  the victim's files: an online wallet answers every stage-1 slate it is
-  sent (`main.rs`, `on_message`), so anyone who knows its address can make
-  it create outputs at will. Also limit answers per sending id and per
-  minute, or ask at the prompt above some count.
+  recipient's node has it. Over the message layer an online wallet
+  answers stage-1 slates by itself, at most 5 per sender and 60 in all per
+  10 minutes (`onion::SlateLimit`): a sender with many ids still gets 60.
 - **Minor.** `wallet.rs`: `cancel_sent` does not check the inputs are
   still held (the prompt filters through `sent`, the library does not);
   `cancel ID` prefix match takes the first hit; `send` writes the change
@@ -253,15 +251,12 @@ Found while building it (2026-11-01).
   a while and skip it when choosing hops, and strike only if the same
   peer fails against the id that the current file names and that file is
   recent.
-- **Abandoned channels hold relay state until they time out.**
-  `node/channels.rs`: a relay keeps a channel whose initiator gave up
-  (a failed handshake on the initiator's side, a crash) until two minutes
-  of silence, so a client can occupy up to `MAX_CHANNELS` (4,096) slots
-  with hellos it never follows. Each hello also costs the relay a Kyber
-  encapsulation and a Dilithium signature. Fix: a short timeout for a
-  channel that has not yet received a frame (a few seconds), a per-address
-  limit on channels, and perhaps a cheap cookie round trip before the
-  relay does the expensive work.
+- **Handshakes cost a relay work no one pays for.** `node/channels.rs`:
+  each hello costs a Kyber encapsulation and a Dilithium signature. An
+  address must have answered the relay's ping, a host holds at most 32
+  channels and an unused one goes after 15 s, but a host can open them as
+  fast as they close. Fix: a rate per host, or a proof of work in the
+  hello under load.
 
 - **Relay layers are not authenticated hop by hop.** `circuit.rs`: a
   layer is a bare ChaCha20 stream; only the target hop checks a tag. A
@@ -272,11 +267,10 @@ Found while building it (2026-11-01).
   onion proposal), at the cost of cell space.
 - **Idle hops live as long as their channels.** `node/circuits.rs`: a
   relay drops a hop only on `Destroy` or when a channel under it
-  closes; a client that keeps its channel open can hold up to
-  `MAX_HOPS` (16,384) hops with circuits it never uses. There is no
-  flow control per circuit either: one circuit can fill a channel's
-  queue. Fix: drop hops idle for an hour, cap hops per channel, and
-  window cells per circuit.
+  closes. A participant's channel holds at most 64, but a relay's is not
+  limited, and there is no flow control per circuit: one circuit can
+  fill a channel's queue. Fix: drop hops idle for an hour, and window
+  cells per circuit.
 
 - **A dead relay is noticed at the next keepalive.** A participant
   takes a circuit for dead 10 s after a `Session` keepalive goes

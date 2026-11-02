@@ -36,6 +36,16 @@ const MAX_REASSEMBLY: usize = 1024;
 const REASSEMBLY_TIME: Duration = Duration::from_secs(10);
 /// Bodies held for a channel still opening.
 const MAX_WAITING: usize = 256;
+/// Channels a relay holds from one IP address. A handshake already needs
+/// the token this node gave the address, so a forged address gets
+/// nothing; this bounds what a real one can take.
+pub const MAX_PER_HOST: usize = 32;
+/// A channel a relay answered that carries no frame by then is closed: its
+/// initiator gave up, or never meant to use it.
+#[cfg(not(test))]
+const UNUSED_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const UNUSED_TIMEOUT: Duration = Duration::from_secs(3);
 
 const STAGE_HELLO: u8 = 1;
 const STAGE_REPLY: u8 = 2;
@@ -50,6 +60,9 @@ struct Open {
     reply: Option<Vec<u8>>,
     /// An initiating relay's auth, until the other end acknowledges.
     auth: Option<(Vec<u8>, Instant)>,
+    opened: Instant,
+    /// A frame has come.
+    used: bool,
 }
 
 /// A channel we are opening.
@@ -93,6 +106,12 @@ impl Channels {
 
     pub(super) fn count(&self) -> usize {
         self.open.len()
+    }
+
+    /// The proven id of the other end of channel `key`: `Some(None)` for a
+    /// participant, `None` for no such channel.
+    pub(super) fn peer(&self, key: &(SocketAddr, u64)) -> Option<Option<Digest>> {
+        self.open.get(key).map(|o| o.ch.peer)
     }
 
     /// Whether we opened channel `key`: `None` for no such channel.
@@ -205,6 +224,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut out = Vec::new();
         let mut auths = Vec::new();
         for (key, o) in self.channels.open.iter_mut() {
+            if !o.ch.initiator && !o.used && now.duration_since(o.opened) >= UNUSED_TIMEOUT {
+                dead.push((*key, ChannelError::Dead));
+                continue;
+            }
             match o.ch.poll(now) {
                 Ok(frames) => out.push((key.0, frames)),
                 Err(e) => dead.push((*key, e)),
@@ -300,6 +323,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.chatter(&format!("channel: refusing {addr}: {MAX_CHANNELS} channels open"));
             return;
         }
+        if self.channels.open.keys().filter(|k| k.0.ip() == addr.ip()).count() >= MAX_PER_HOST {
+            self.chatter(&format!("channel: refusing {addr}: {MAX_PER_HOST} channels from its host"));
+            return;
+        }
         let Some(key) = self.config.identity.as_ref() else { return };
         let m = match random_bytes::<32>() {
             Ok(m) => m,
@@ -311,7 +338,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 for m in fragments(chan, STAGE_REPLY, &reply, self.token_for(&addr)) {
                     self.send_with(addr, m, back);
                 }
-                self.channels.open.insert((addr, chan), Open { ch, back, reply: Some(reply), auth: None });
+                self.channels.open.insert((addr, chan), Open { ch, back, reply: Some(reply), auth: None, opened: now, used: false });
                 self.chatter(&format!(
                     "channel: {chan:016x} from {addr} open{}",
                     if mutual { ", waiting for its auth" } else { "" }
@@ -336,7 +363,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     (a, now)
                 });
                 let mutual = auth.is_some();
-                self.channels.open.insert(key, Open { ch, back, reply: None, auth });
+                self.channels.open.insert(key, Open { ch, back, reply: None, auth, opened: now, used: true });
                 // Something for the relay to acknowledge once it has our
                 // auth, which ends its resending.
                 if mutual {
@@ -376,6 +403,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         // The relay acknowledges only once it has our auth.
         o.auth = None;
+        o.used = true;
         let peer = o.ch.peer;
         self.send_frames(addr, got.send);
         for body in got.delivered {
