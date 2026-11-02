@@ -638,9 +638,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let sender = tx.clone();
         std::thread::Builder::new().name("net-reader".into()).spawn(move || {
             let mut buf = [0u8; 2048];
+            let mut last_error: Option<std::io::ErrorKind> = None;
             while flag.load(Ordering::Relaxed) {
                 match reader.recv_from(&mut buf) {
                     Ok((n, addr)) => {
+                        last_error = None;
                         // A full queue (the loop busy applying a block, or
                         // a flood) drops the datagram: requests are retried.
                         if let Err(TrySendError::Disconnected(_)) =
@@ -649,10 +651,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             break;
                         }
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    // Anything else (the network gone while the machine
+                    // slept, an ICMP error reported on the socket) passes:
+                    // the reader keeps reading until the node stops, logging
+                    // each kind of error once and pausing so as not to spin.
                     Err(e) => {
-                        eprintln!("net: socket error: {e}");
-                        break;
+                        if last_error != Some(e.kind()) {
+                            crate::log::line(&format!("net: socket error: {e}; still listening"));
+                            last_error = Some(e.kind());
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
