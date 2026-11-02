@@ -43,7 +43,7 @@ tabminer show [--data DIR]
 tabminer restore [--data DIR]
 
 options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--no-seeds] [--relay]
-         [--verbose] [--no-prompt]
+         [--no-wallet] [--verbose] [--no-prompt]
 ```
 
 `tabminer` with no command mines: it syncs to the heaviest chain its peers
@@ -54,7 +54,9 @@ announces them, starting over whenever the network delivers a better tip.
 mining. Both listen on UDP port 3737 by default, contact the seed nodes in
 `miner/src/node.rs` and any `--peer`, and keep the peers they found in
 `DIR/peers` for next time. `show` prints the main chain. `--relay` makes
-the node relay for others on the message layer (below).
+the node relay for others on the message layer (below). `--no-wallet`
+runs the node without a wallet, and so without mining; seeds and relays
+are best run that way.
 
 Logs go to `DIR/tabminer.log`; the terminal shows a prompt (`help` lists
 the commands). `--no-prompt` logs to the terminal instead, for scripts.
@@ -338,8 +340,9 @@ files stand, and stays until the next.
   from which network addresses.
 - **Onion mode**: the file lists the relays, at least three, each as
   `relay ID HOST:PORT`, where the id is the hash of the relay's Dilithium
-  key. A node started with `--relay` prints its line at startup, ready to
-  paste:
+  key: derived from the node's phrase, but not its wallet's address. A
+  node started with `--relay` (best with `--no-wallet`) prints its line
+  at startup, ready to paste, and `address` shows it:
 
   ```
   mode onion

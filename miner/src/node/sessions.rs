@@ -494,10 +494,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Whether this node, as a relay, is a rendezvous point of `id` in
     /// onion mode: under any relay list in force, during a switch too.
     pub(super) fn serves(&self, id: &Digest) -> bool {
-        let Some(me) = &self.rv.me else { return false };
+        let Some(me) = self.config.relay_id() else { return false };
         self.rv.onion_sets().into_iter().any(|relays| {
             let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
-            onion::rendezvous_relays(id, &ids).into_iter().any(|i| relays[i].id == me.id)
+            onion::rendezvous_relays(id, &ids).into_iter().any(|i| relays[i].id == me)
         })
     }
 

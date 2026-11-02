@@ -265,7 +265,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn my_id(&self) -> Option<Digest> {
-        self.config.identity.as_ref().map(|k| crate::address::id_of(k.public_key()))
+        self.config.relay_id()
     }
 
     fn start_ask(&mut self, client: Link, to: Digest, what: Asking, now: Instant) {

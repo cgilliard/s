@@ -148,7 +148,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Ok(*key);
         }
         let chan = u64::from_le_bytes(random_bytes::<8>()?);
-        let mutual = self.config.relay && self.config.identity.is_some();
+        let mutual = self.config.relay && self.config.relay_key.is_some();
         let opening = Opening::new(chan, id, mutual, &random_bytes::<64>()?, random_bytes::<32>()?);
         let key = (addr, chan);
         self.peers.add(addr, true);
@@ -209,6 +209,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for key in failed {
             let p = self.channels.pending.remove(&key).unwrap();
             self.channels.to.retain(|_, k| *k != key);
+            self.avoid_relay(p.opening.expect, now);
             self.log(&format!(
                 "channel: {} at {} did not answer the handshake",
                 crate::onion::short(&p.opening.expect),
@@ -250,6 +251,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for (key, e) in dead {
             let o = self.channels.open.remove(&key).unwrap();
             self.channels.to.retain(|_, k| *k != key);
+            if o.ch.initiator
+                && let Some(id) = o.ch.peer
+            {
+                self.avoid_relay(id, now);
+            }
             let who = o.ch.peer.map_or("a participant".to_string(), |id| crate::onion::short(&id));
             self.log(&format!("channel: {:016x} with {who} at {} closed: {e}", key.1, key.0));
             self.channel_closed(key, now);
@@ -280,7 +286,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // Only what we can use: a hello at a relay, a reply to our hello,
         // an auth on a channel waiting for one.
         let wanted = match stage {
-            STAGE_HELLO => self.config.relay && self.config.identity.is_some(),
+            STAGE_HELLO => self.config.relay && self.config.relay_key.is_some(),
             STAGE_REPLY => self.channels.pending.contains_key(&(addr, chan)),
             _ => self.channels.open.get(&(addr, chan)).is_some_and(|o| o.ch.awaiting_auth),
         };
@@ -327,7 +333,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.chatter(&format!("channel: refusing {addr}: {MAX_PER_HOST} channels from its host"));
             return;
         }
-        let Some(key) = self.config.identity.as_ref() else { return };
+        let Some(key) = self.config.relay_key.as_ref() else { return };
         let m = match random_bytes::<32>() {
             Ok(m) => m,
             Err(e) => return self.log(&format!("channel: no randomness: {e}")),
@@ -352,7 +358,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let key = (addr, chan);
         let Some(p) = self.channels.pending.remove(&key) else { return };
         let expect = p.opening.expect;
-        let auth_key = if p.opening.mutual() { self.config.identity.as_ref() } else { None };
+        let auth_key = if p.opening.mutual() { self.config.relay_key.as_ref() } else { None };
         match p.opening.finish(reply, auth_key, now) {
             Ok((ch, auth)) => {
                 self.log(&format!("channel: {chan:016x} to {} at {addr} open", crate::onion::short(&expect)));

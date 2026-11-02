@@ -299,9 +299,12 @@ kind inside a cell's encrypted body; relays never see kinds.
 Without it a node is a participant: it keeps its own channels and
 circuits, never accepts a circuit or forwards a cell. With it the node
 runs the relay service on its UDP port and forwards for anyone. The
-relay's id is its wallet's id (the seed-derived Dilithium key, shown by
-`address`), which is what an operator puts in the `relay` line of a
-`consensus.txt`. A node started with `--relay` prints that line ready to
+relay's id is the hash of its own Dilithium key, derived from the
+wallet's phrase under its own domain tag (so a restore keeps it) and
+apart from the wallet's address, which it does not reveal (shown by
+`address` as `relay …`); it is what an operator puts in the `relay` line
+of a `consensus.txt`. A relay is best run with `--no-wallet`: the phrase
+is kept only to derive the relay key, and no funds are kept there. A node started with `--relay` prints that line ready to
 paste at startup, its id as a `tab1…` address with its listening
 address, and logs it, so an operator can hand it to whoever is
 assembling the next file. A node listed in the file but not started
@@ -473,10 +476,20 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
 4. **A relay key apart from the wallet.** A relay's listed id is now its
    operator's payment address. Give the relay its own Dilithium key
    (derived under another domain tag, or random in `DIR/relay.key`).
+   Done (2026-11-01): `Wallet::relay_key`, derived from the phrase under
+   its own domain tag; `Config::relay_key` is what a relay answers
+   handshakes, authenticates to relays and serves rendezvous with, the
+   wallet's key only its own sessions and payments.
 5. **`--no-wallet`.** Seeds and relays need no wallet and should not keep
-   a phrase on a server; with 4, a relay needs none.
+   a phrase on a server; with 4, a relay needs none. Done (2026-11-01):
+   `--no-wallet` implies `--no-mine`; wallet commands are refused, and
+   the node takes no part in the message layer but as a relay. With
+   `--relay` the wallet's phrase is still kept, only to derive the relay
+   key; without it no wallet is opened.
 6. **A relay is its own wallet's rendezvous point**, held locally, rather
-   than skipped (in both modes).
+   than skipped (in both modes). Not to be done: a relay is best run
+   without a wallet (5), and a wallet on a relay simply skips that relay
+   as one of its points.
 7. **Faster recovery.** Rotate standing circuits on a timer, notice a
    dead hop from an unanswered keepalive in seconds rather than when the
    channel gives up, and keep a spare circuit to each point.
@@ -594,7 +607,8 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      bitmap past it, the body sealed under the nonce `0 ‖ seq` (ack-only
      frames under `1 ‖ n`), at most 1,178 bytes of body per datagram. A
      frame is resent as the very bytes first sent, after 0.4 s doubling
-     to 5 s, twelve times before the channel is given up; at most 64 are
+     to 5 s; a frame unacknowledged 15 s after it was first sent (or after
+     twelve tries) ends the channel; at most 64 are
      in flight, none past the oldest unacknowledged by 64 or more;
      bodies are delivered in order; the initiator keeps the channel alive
      every 30 s, and two minutes of silence ends it. A relay takes no

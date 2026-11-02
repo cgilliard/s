@@ -59,6 +59,9 @@ const ROTATE_EVERY: Duration = Duration::from_secs(2 * 3600);
 /// An old circuit is closed once the session is live on its replacement,
 /// or after this.
 const RETIRE_WAIT: Duration = Duration::from_secs(30);
+/// A relay whose channel failed is not chosen as a hop for this long, while
+/// enough others are left.
+const AVOID: Duration = Duration::from_secs(300);
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SENDS: usize = 64;
@@ -132,6 +135,8 @@ pub(super) struct Participant {
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
     keepalive: Duration,
     rotate_every: Duration,
+    /// Relays whose channel failed lately, and when.
+    avoid: std::collections::HashMap<Digest, Instant>,
 }
 
 impl Default for Participant {
@@ -142,6 +147,7 @@ impl Default for Participant {
             broadcasts: Vec::new(),
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
+            avoid: std::collections::HashMap::new(),
         }
     }
 }
@@ -263,7 +269,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         // Our points under every relay list in force: during a switch, the
         // old list's and the new one's.
-        let points: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| *p != id).collect();
+        // Not this node's own relay: a circuit cannot end where it starts
+        // (a relay is best run without a wallet in any case).
+        let relay = self.config.relay_id();
+        let points: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| Some(*p) != relay).collect();
         if points.iter().ne(self.part.standing.iter().map(|s| &s.point)) {
             let mut old = std::mem::take(&mut self.part.standing);
             for p in &points {
@@ -365,14 +374,29 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.progress_broadcasts(now);
     }
 
+    /// A relay whose channel failed: not a hop for a while.
+    pub(super) fn avoid_relay(&mut self, id: Digest, now: Instant) {
+        self.part.avoid.insert(id, now);
+    }
+
     /// A path to standing point `i`: random hops from the list the point
-    /// is in (the preferred one first), then it.
+    /// is in (the preferred one first), then it; relays whose channel
+    /// failed lately are left out while enough others remain.
     fn standing_path(&self, i: usize) -> Option<Vec<Digest>> {
         let point = self.part.standing[i].point;
-        let me = self.rv.me.as_ref().map(|m| m.id);
+        let me = self.config.relay_id();
         let relays = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point))?;
         let mut others: Vec<Digest> =
             relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
+        let now = Instant::now();
+        let healthy: Vec<Digest> = others
+            .iter()
+            .copied()
+            .filter(|r| self.part.avoid.get(r).is_none_or(|t| now.duration_since(*t) >= AVOID))
+            .collect();
+        if healthy.len() >= HOPS.min(others.len()) {
+            others = healthy;
+        }
         let mut path = Vec::new();
         while path.len() < HOPS && !others.is_empty() {
             let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);

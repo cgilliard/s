@@ -287,7 +287,9 @@ Every exchange is post-quantum: no Diffie-Hellman anywhere, so traffic
 recorded today does not open to a quantum computer later.
 
 **Identities and announces.** An id is the hash of a Dilithium key
-derived from the wallet's phrase. An announce is a fresh Kyber key signed
+derived from the wallet's phrase. A relay's listed id is the hash of
+another key, derived from the phrase under its own domain tag, so the
+public relay list reveals no operator's payment address. An announce is a fresh Kyber key signed
 by it with a sequence number (milliseconds, rising across restarts), an
 expiry (a day) and the nonce of the session it is offered on, which binds
 it to one session (a SipHash under the relay's secret of the

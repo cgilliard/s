@@ -148,7 +148,20 @@ pub struct Config {
     pub relay: bool,
     /// The wallet's Dilithium key: with it the node keeps rendezvous
     /// sessions for the wallet's id and sends and receives its messages.
+    /// `None` without a wallet (`--no-wallet`).
     pub identity: Option<crate::mldsa::SecretKey>,
+    /// The relay's Dilithium key, apart from the wallet's (derived from the
+    /// same phrase under another domain tag): the id a relay is listed
+    /// under in `consensus.txt`, proven in every handshake. Set with
+    /// `--relay`.
+    pub relay_key: Option<crate::mldsa::SecretKey>,
+}
+
+impl Config {
+    /// The relay's id, the hash of its key.
+    pub fn relay_id(&self) -> Option<Digest> {
+        self.relay_key.as_ref().map(|k| crate::address::id_of(k.public_key()))
+    }
 }
 
 /// Default depth of the fast-sync snapshot: a day of blocks.
@@ -1648,6 +1661,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     if self.last_consensus != Some(decided) {
                         let first = self.last_consensus.is_none();
                         let changed = self.last_consensus.is_none_or(|l| (l.1, l.2) != (decided.1, decided.2));
+                        let was_switching = self.last_consensus.is_some_and(|l| l.3);
                         self.last_consensus = Some(decided);
                         let by = match &current.winner {
                             None if epoch.votes.counts.is_empty() => "no block of its window voted".to_string(),
@@ -1672,7 +1686,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                                 epoch.boundary + consensus::GRACE - 1,
                                 if epoch.prefer_current { "now".to_string() } else { format!("from block {}", epoch.boundary + consensus::SWITCH) }
                             )),
-                            None if !first && !changed => self.log("consensus: the switch is done"),
+                            None if was_switching => self.log("consensus: the switch is done"),
                             None => {}
                         }
                     }
@@ -3112,6 +3126,7 @@ mod tests {
             sync_point: None,
             relay: false,
             identity: None,
+            relay_key: None,
         }
     }
 
@@ -3834,6 +3849,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.seeds = vec![seed.to_string()];
             cfg.identity = Some(crate::mldsa::keygen(&[tag; 32]));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let notes = node.take_notes().unwrap();
             let stats = node.stats();
@@ -3943,6 +3959,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.seeds = vec![addr_r.to_string()];
             cfg.identity = Some(w.identity_key());
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let notes = node.take_notes().unwrap();
             let stats = node.stats();
@@ -4023,6 +4040,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = relay;
             cfg.identity = Some(key(tag));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let sink = Arc::clone(&node.channels.sink);
@@ -4088,6 +4106,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 4;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let seen = Arc::clone(&node.circuits.seen);
@@ -4152,6 +4171,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 3;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let seen = Arc::clone(&node.circuits.seen);
@@ -4252,6 +4272,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 3;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let notes = node.take_notes().unwrap();
@@ -4339,6 +4360,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 3;
             cfg.identity = Some(if i < 3 { key(i as u8 + 1) } else { alice.identity_key() });
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let mempool = pool();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), Arc::clone(&mempool), cfg).unwrap();
             let addr = node.local_addr().unwrap();
@@ -4405,6 +4427,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 4;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let notes = node.take_notes().unwrap();
@@ -4507,6 +4530,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 3;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             if i == 0 {
                 cfg.listen = seed;
             } else {
@@ -4603,6 +4627,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.relay = i < 4;
             cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let addr = node.local_addr().unwrap();
             let notes = node.take_notes().unwrap();
@@ -4669,9 +4694,12 @@ mod tests {
         nodes[hop].1.send(Event::Stop).unwrap();
         handles[hop].take().unwrap().join().unwrap();
         let stopped = Instant::now();
-        // Circuits through it die; p notices, builds around it.
-        std::thread::sleep(Duration::from_secs(2));
+        // Circuits through it die; p notices (10 s after an unanswered
+        // keepalive, sent every second here), builds around it. Until it
+        // notices, a circuit through the stopped relay still looks live.
+        std::thread::sleep(Duration::from_secs(13));
         live(90);
+        eprintln!("p live again {:?} after the relay stopped", stopped.elapsed());
         message("around the stopped relay");
         eprintln!("reachable again {:?} after the relay stopped", stopped.elapsed());
         for (i, n) in nodes.iter().enumerate() {
@@ -4707,6 +4735,7 @@ mod tests {
             let mut cfg = config(vec![], &f.dir);
             cfg.seeds = vec![addr_r.to_string()];
             cfg.identity = Some(crate::mldsa::keygen(&[tag; 32]));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
             let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
             let notes = node.take_notes().unwrap();
             let stats = node.stats();

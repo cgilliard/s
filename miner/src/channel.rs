@@ -59,6 +59,12 @@ pub const RTO: Duration = Duration::from_millis(400);
 const MAX_RTO: Duration = Duration::from_secs(5);
 /// Sends of one frame before the channel is given up.
 pub const MAX_TRIES: u32 = 12;
+/// A frame unacknowledged this long after it was first sent ends the
+/// channel, however many tries that took: the other end is gone, and the
+/// circuits over the channel are better built elsewhere at once. About six
+/// tries; at a tenth of datagrams lost each way, a live channel is taken
+/// for dead once in some twenty thousand frames.
+pub const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// An initiator sends a keepalive after this long without sending.
 pub const KEEPALIVE: Duration = Duration::from_secs(30);
 /// A channel that hears nothing for this long is gone.
@@ -304,6 +310,7 @@ pub fn respond_keys(
 /// A frame sent and not yet acknowledged.
 struct InFlight {
     frame: Frame,
+    first: Instant,
     sent: Instant,
     tries: u32,
     rto: Duration,
@@ -398,7 +405,7 @@ impl Channel {
         let (ack, sack) = self.acks();
         let mut f = Frame { chan: self.chan, kind: KIND_DATA, seq, ack, sack, sealed: Vec::new() };
         f.sealed = chacha20poly1305::seal(&self.send_key, &nonce(KIND_DATA, seq), &f.header(), body);
-        self.in_flight.insert(seq, InFlight { frame: f.clone(), sent: now, tries: 1, rto: RTO });
+        self.in_flight.insert(seq, InFlight { frame: f.clone(), first: now, sent: now, tries: 1, rto: RTO });
         self.last_sent = now;
         f
     }
@@ -485,7 +492,7 @@ impl Channel {
             if now.duration_since(f.sent) < f.rto {
                 continue;
             }
-            if f.tries >= MAX_TRIES {
+            if f.tries >= MAX_TRIES || now.duration_since(f.first) >= DEAD_AFTER {
                 return Err(ChannelError::Dead);
             }
             f.tries += 1;

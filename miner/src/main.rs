@@ -94,7 +94,12 @@ options:
   --seed HOST:PORT  an extra seed node to resolve; may repeat
   --no-seeds        do not contact the built-in seed nodes (for a local network)
   --relay           relay for others on the message layer (docs/ONION.md); prints
-                    this node's `relay` line for consensus.txt at startup
+                    this node's `relay` line for consensus.txt at startup. The
+                    relay's key is derived from the wallet's phrase, apart from
+                    the wallet's own address
+  --no-wallet       run without a wallet (implies --no-mine): no payments, no
+                    names, no part in the message layer but as a relay. With
+                    --relay the wallet's phrase is still kept, for the relay key
   --sync-point N    when starting from genesis, fast-sync from the state N blocks
                     below the best header, checked by that block's chain proof
                     (default 144); 0 replays every block instead
@@ -163,6 +168,7 @@ const HELP: &str = "commands:
   channel-key [HEIGHT]      a fresh channel key for a policy: its nonce and key
                             hash (HEIGHT levels, 16 by default, 20 at most)
   address                   this wallet's tab1… address (the hash of its Dilithium key)
+                            and, on a relay, the relay's id: a different one
   phrase                    show the wallet's 12-word recovery phrase
   storage                   disk use of the chain database, part by part
   quit                      stop the node
@@ -198,6 +204,8 @@ struct Args {
     no_seeds: bool,
     /// Relay for others on the message layer (`docs/ONION.md`).
     relay: bool,
+    /// Run without a wallet; implies `no_mine`.
+    no_wallet: bool,
     debug_unchecked: bool,
     /// Random outputs to add, and earlier ones to spend, per mined block.
     debug_fill: Option<(usize, usize)>,
@@ -229,6 +237,7 @@ fn parse_args() -> Result<Args, String> {
         max_undo: DEFAULT_MAX_UNDO,
         no_seeds: false,
         relay: false,
+        no_wallet: false,
         debug_unchecked: false,
         debug_fill: None,
         debug_fill_names: 0,
@@ -254,6 +263,11 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,
             "--relay" => a.relay = true,
+            // No wallet, so no reward to pay: never mining.
+            "--no-wallet" => {
+                a.no_wallet = true;
+                a.no_mine = true;
+            }
             "--debug-no-validate-proofs" => a.debug_unchecked = true,
             "--debug-fill" => {
                 let v = value()?;
@@ -375,6 +389,7 @@ fn net_config(args: &Args) -> Config {
         verbose: args.verbose,
         relay: args.relay,
         identity: None,
+        relay_key: None,
         sync_point: (args.sync_point > 0).then_some(args.sync_point),
     }
 }
@@ -427,7 +442,8 @@ struct Ctx {
     params: ChainParams,
     chain: Arc<Chain<AggregateVerifier>>,
     mempool: Arc<Mutex<Mempool>>,
-    wallet: Arc<Wallet>,
+    /// `None` with `--no-wallet`.
+    wallet: Option<Arc<Wallet>>,
     events: SyncSender<Event>,
     stats: Arc<Mutex<Stats>>,
     tip_changes: Arc<AtomicU64>,
@@ -436,6 +452,8 @@ struct Ctx {
     mining: bool,
     /// Started with `--relay`.
     relay: bool,
+    /// The relay's `tab1…` id, with `--relay`.
+    relay_address: Option<String>,
     /// Debugging: random outputs to add and earlier ones to spend per block.
     debug_fill: Option<(usize, usize)>,
     /// The reward output of the block being mined, forgotten on quit.
@@ -447,6 +465,13 @@ struct Ctx {
     prompt: bool,
     /// Stage-1 slates answered lately, to refuse a flood.
     slates: Mutex<onion::SlateLimit>,
+}
+
+impl Ctx {
+    /// The wallet, or why there is none.
+    fn wallet(&self) -> AnyResult<&Wallet> {
+        self.wallet.as_deref().ok_or_else(|| "this node runs with --no-wallet".into())
+    }
 }
 
 /// Runs the node, the miner if `mining`, and the prompt (or waits) until
@@ -546,16 +571,29 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         }
         log::line(&format!("plan ready in {}", secs(t.elapsed())));
     }
-    let (wallet, created) = Wallet::open(&args.data.join("wallet"))?;
-    if let Some(phrase) = created {
-        log::line("created a new wallet");
-        println!("\nnew wallet; its recovery phrase is:\n\n    {phrase}\n");
-        println!("write it down and keep it safe: it is the only way to restore the wallet's funds\n");
-    }
-    let wallet = Arc::new(wallet);
+    // The wallet, unless --no-wallet; a relay derives its key from the
+    // phrase either way.
+    let opened = if args.no_wallet && !args.relay {
+        None
+    } else {
+        let (wallet, created) = Wallet::open(&args.data.join("wallet"))?;
+        if let Some(phrase) = created {
+            log::line("created a new wallet");
+            println!("\nnew wallet; its recovery phrase is:\n\n    {phrase}\n");
+            if args.no_wallet {
+                println!("write it down: it restores this relay's id; keep no funds in it\n");
+            } else {
+                println!("write it down and keep it safe: it is the only way to restore the wallet's funds\n");
+            }
+        }
+        Some(wallet)
+    };
     let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
     let mut config = net_config(args);
-    config.identity = Some(wallet.identity_key());
+    config.relay_key = opened.as_ref().filter(|_| args.relay).map(|w| w.relay_key());
+    let relay_address = config.relay_id().map(|id| tabminer::address::encode(&id));
+    let wallet = if args.no_wallet { None } else { opened.map(Arc::new) };
+    config.identity = wallet.as_ref().map(|w| w.identity_key());
     let (mut node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), config)?;
     let notes = node.take_notes();
     let stats = node.stats();
@@ -570,8 +608,8 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     if !args.no_prompt {
         println!("{listening}; {tip_line}; type help for commands");
     }
-    if args.relay {
-        for line in relay_lines(&wallet.address(), args.listen) {
+    if let Some(address) = &relay_address {
+        for line in relay_lines(address, args.listen) {
             log::line(&line);
             if !args.no_prompt {
                 println!("{line}");
@@ -591,6 +629,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         stop: Arc::new(AtomicBool::new(false)),
         mining,
         relay: args.relay,
+        relay_address: relay_address.clone(),
         debug_fill: args.debug_fill,
         in_flight: Mutex::new(None),
         outgoing: Mutex::new(std::collections::HashMap::new()),
@@ -625,7 +664,9 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         })?;
     }
     // A restored wallet finds its outputs once the node has caught up.
-    if ctx.wallet.scan_pending()? {
+    if let Some(wallet) = ctx.wallet.clone()
+        && wallet.scan_pending()?
+    {
         let ctx = Arc::clone(&ctx);
         std::thread::Builder::new().name("restore-scan".into()).spawn(move || {
             loop {
@@ -642,14 +683,14 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
                     .env()
                     .read_txn()
                     .map_err(|e| e.to_string())
-                    .and_then(|rtxn| ctx.wallet.scan(ctx.chain.utxo(), &rtxn).map_err(|e| e.to_string()));
+                    .and_then(|rtxn| wallet.scan(ctx.chain.utxo(), &rtxn).map_err(|e| e.to_string()));
                 match found {
                     Ok((n, total)) => {
                         log::line(&format!("restored wallet: found {n} outputs worth {}", fmt_coins(total)));
                         if let Some(tip) = tip {
-                            ctx.wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash())).ok();
+                            wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash())).ok();
                         }
-                        ctx.wallet.clear_scan_pending().ok();
+                        wallet.clear_scan_pending().ok();
                     }
                     Err(e) => log::line(&format!("restored wallet: scan failed: {e}")),
                 }
@@ -696,17 +737,19 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         drop(miner);
         // The block being mined will never land: drop its reward record,
         // unless its block already did.
-        if let Some(c) = ctx.in_flight.lock().unwrap().take() {
+        if let Some(c) = ctx.in_flight.lock().unwrap().take()
+            && let Some(wallet) = &ctx.wallet
+        {
             sync_wallet(&ctx).ok();
-            let held = ctx.wallet.owned(&c).ok().flatten().is_some_and(|o| {
+            let held = wallet.owned(&c).ok().flatten().is_some_and(|o| {
                 ctx.chain
                     .env()
                     .read_txn()
                     .ok()
-                    .is_some_and(|r| ctx.wallet.held(&o, ctx.chain.utxo(), &r).unwrap_or(false))
+                    .is_some_and(|r| wallet.held(&o, ctx.chain.utxo(), &r).unwrap_or(false))
             });
             if !held {
-                ctx.wallet.forget(&c).ok();
+                wallet.forget(&c).ok();
             }
         }
         events.send(Event::Stop).ok();
@@ -763,7 +806,7 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
     };
     // The last block looked at that is still on the main chain.
     let mut from = None;
-    if let Some((mut height, mut hash)) = ctx.wallet.synced()? {
+    if let Some((mut height, mut hash)) = ctx.wallet()?.synced()? {
         loop {
             if chain.header_at(height)?.is_some_and(|h| digest_to_bytes(&h.hash()) == hash) {
                 from = Some(height);
@@ -786,19 +829,19 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         }
         match chain.main_outputs(height)? {
             Some((_, first, outputs)) => {
-                ctx.wallet.locate(first, &outputs)?;
+                ctx.wallet()?.locate(first, &outputs)?;
             }
             None => gap = true,
         }
     }
-    if gap && !ctx.wallet.outputs()?.is_empty() {
+    if gap && !ctx.wallet()?.outputs()?.is_empty() {
         log::line("wallet: finding its outputs by their memos");
         let rtxn = chain.env().read_txn()?;
-        ctx.wallet.relocate(chain.utxo(), &rtxn)?;
+        ctx.wallet()?.relocate(chain.utxo(), &rtxn)?;
     }
-    ctx.wallet.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
+    ctx.wallet()?.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
     let rtxn = chain.env().read_txn()?;
-    ctx.wallet.sync_names(chain.names(), &rtxn)?;
+    ctx.wallet()?.sync_names(chain.names(), &rtxn)?;
     Ok(())
 }
 
@@ -819,7 +862,7 @@ fn parse_value(s: Option<&str>) -> AnyResult<tabminer::pow::Digest> {
 /// Carries name operations in a transaction of the wallet's and pools it.
 fn carry(ctx: &Ctx, ops: Vec<NameOp>, fee: Option<u64>) -> AnyResult<()> {
     let rtxn = ctx.chain.env().read_txn()?;
-    let signed = ctx.wallet.carry(ops, fee, ctx.chain.utxo(), &rtxn)?;
+    let signed = ctx.wallet()?.carry(ops, fee, ctx.chain.utxo(), &rtxn)?;
     drop(rtxn);
     println!("transaction {} pays a fee of {}", short(&signed.tx.txid()), fmt_coins(signed.tx.balance() as u128));
     submit(ctx, signed);
@@ -843,7 +886,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             | "name-update"
             | "name-offer"
             | "name-transfer"
-    ) {
+    ) && (ctx.wallet.is_some() || cmd != "status")
+    {
         sync_wallet(ctx)?;
     }
     match cmd {
@@ -856,7 +900,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let stats = ctx.stats.lock().unwrap().clone();
             let pool = ctx.mempool.lock().unwrap();
             let rtxn = ctx.chain.env().read_txn()?;
-            let b = ctx.wallet.balance(ctx.chain.utxo(), &rtxn)?;
+            let b = match &ctx.wallet {
+                Some(w) => Some(w.balance(ctx.chain.utxo(), &rtxn)?),
+                None => None,
+            };
             println!(
                 "tip      height {} {} at {}, work 2^{work:.1}",
                 tip.height,
@@ -881,13 +928,16 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 _ => println!("sync     up to date"),
             }
             println!("mempool  {} transactions, {} KB", pool.len(), pool.bytes() / 1000);
-            println!(
-                "wallet   {} confirmed, {} pending, {} reserved, {} locked",
-                fmt_coins(b.confirmed),
-                fmt_coins(b.pending),
-                fmt_coins(b.reserved),
-                fmt_coins(b.locked)
-            );
+            match b {
+                Some(b) => println!(
+                    "wallet   {} confirmed, {} pending, {} reserved, {} locked",
+                    fmt_coins(b.confirmed),
+                    fmt_coins(b.pending),
+                    fmt_coins(b.reserved),
+                    fmt_coins(b.locked)
+                ),
+                None => println!("wallet   none (--no-wallet)"),
+            }
             println!("mining   {}", if ctx.mining { "on" } else { "off" });
             let live = stats.rendezvous.iter().filter(|(_, l)| *l).count();
             print!("messages {live} of {} rendezvous sessions live", stats.rendezvous.len());
@@ -957,7 +1007,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "balance" => {
             let rtxn = ctx.chain.env().read_txn()?;
-            let b = ctx.wallet.balance(ctx.chain.utxo(), &rtxn)?;
+            let b = ctx.wallet()?.balance(ctx.chain.utxo(), &rtxn)?;
             println!("confirmed {}  spendable", fmt_coins(b.confirmed));
             println!("pending   {}  incoming, not yet on chain", fmt_coins(b.pending));
             println!("reserved  {}  held for a slate not yet finalized", fmt_coins(b.reserved));
@@ -1010,8 +1060,16 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("root     {}  (in the headers mined from now on)", hex(&root));
         }
         "address" => {
-            println!("{}", ctx.wallet.address());
-            println!("id {}", hex_digest(&ctx.wallet.id()));
+            if let Some(w) = &ctx.wallet {
+                println!("{}", w.address());
+                println!("id {}", hex_digest(&w.id()));
+            }
+            if let Some(relay) = &ctx.relay_address {
+                println!("relay {relay}  (the id this node is listed under in consensus.txt; not for payments)");
+            }
+            if ctx.wallet.is_none() && ctx.relay_address.is_none() {
+                return Err("this node runs with --no-wallet".into());
+            }
         }
         "consensus" => {
             use tabminer::consensus::{EPOCH, GRACE, Mode, SWITCH, hex};
@@ -1090,7 +1148,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("root     {}", hex(&ctx.chain.aux_root()?));
         }
         "policies" => {
-            let outputs = ctx.wallet.policy_outputs()?;
+            let outputs = ctx.wallet()?.policy_outputs()?;
             if outputs.is_empty() {
                 println!("no policy outputs");
             }
@@ -1123,7 +1181,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
             let nonce = Wallet::fresh_nonce()?;
             let t = Instant::now();
-            let hash = ctx.wallet.channel_key_hash(&nonce, height);
+            let hash = ctx.wallet()?.channel_key_hash(&nonce, height);
             let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let nonce_bytes: Vec<u8> = nonce.iter().flat_map(|x| x.to_le_bytes()).collect();
             println!("nonce     {}", hex(&nonce_bytes));
@@ -1132,12 +1190,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "outputs" => {
             let rtxn = ctx.chain.env().read_txn()?;
-            let outputs = ctx.wallet.outputs()?;
+            let outputs = ctx.wallet()?.outputs()?;
             if outputs.is_empty() {
                 println!("no outputs");
             }
             for o in outputs {
-                let held = ctx.wallet.held(&o, ctx.chain.utxo(), &rtxn)?;
+                let held = ctx.wallet()?.held(&o, ctx.chain.utxo(), &rtxn)?;
                 let state = match (o.state, held) {
                     (State::Unspent, true) => "confirmed",
                     (State::Unspent, false) => "pending",
@@ -1164,13 +1222,13 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let amount = parse_coins(amount).ok_or("bad amount")?;
             let to = recipient(ctx, file)?;
             let rtxn = ctx.chain.env().read_txn()?;
-            let slate = ctx.wallet.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
+            let slate = ctx.wallet()?.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             if let Some(to) = to {
                 ctx.outgoing.lock().unwrap().insert(slate.id, to);
                 let out = Outbound { tag: slate_tag(&slate.id), to, kind: onion::KIND_SLATE, inner: slate.to_bytes(), recipient: None };
                 if ctx.events.send(Event::Send(out)).is_err() {
-                    ctx.wallet.cancel_slate(&slate.id)?;
+                    ctx.wallet()?.cancel_slate(&slate.id)?;
                     return Err("the node has stopped".into());
                 }
                 println!(
@@ -1205,7 +1263,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let file = file.as_str();
             let out = out.as_str();
             let mut slate = read_slate(file)?;
-            ctx.wallet.receive_slate(&mut slate)?;
+            ctx.wallet()?.receive_slate(&mut slate)?;
             std::fs::write(out, slate.to_bytes())?;
             println!(
                 "receiving {} coins (fee {}); answered slate written to {}; return it to the sender",
@@ -1219,7 +1277,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 return Err("usage: finalize FILE".into());
             };
             let slate = read_slate(file)?;
-            let signed = ctx.wallet.finalize(&slate)?;
+            let signed = ctx.wallet()?.finalize(&slate)?;
             submit(ctx, signed);
         }
         "cancel" => {
@@ -1229,20 +1287,20 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 _ => return Err("usage: cancel ID [FEE]".into()),
             };
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-            let slate = ctx.wallet.pending_slates()?.into_iter().map(|(s, _)| s).find(|s| hex(s).starts_with(id));
+            let slate = ctx.wallet()?.pending_slates()?.into_iter().map(|(s, _)| s).find(|s| hex(s).starts_with(id));
             if let Some(slate) = slate {
-                ctx.wallet.cancel_slate(&slate)?;
+                ctx.wallet()?.cancel_slate(&slate)?;
                 println!("slate cancelled; its inputs are spendable again");
                 return Ok(());
             }
             let rtxn = ctx.chain.env().read_txn()?;
-            let sent = ctx.wallet.sent(ctx.chain.utxo(), &rtxn)?;
+            let sent = ctx.wallet()?.sent(ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             let s = sent
                 .into_iter()
                 .find(|s| hex(&digest_to_bytes(&s.txid)).starts_with(id))
                 .ok_or("no pending slate or unconfirmed payment starts with that id")?;
-            let signed = ctx.wallet.cancel_sent(&s.txid, fee)?;
+            let signed = ctx.wallet()?.cancel_sent(&s.txid, fee)?;
             println!(
                 "payment {} replaced; the inputs come back less a fee of {}",
                 short(&s.txid),
@@ -1252,7 +1310,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "sent" => {
             let rtxn = ctx.chain.env().read_txn()?;
-            let sent = ctx.wallet.sent(ctx.chain.utxo(), &rtxn)?;
+            let sent = ctx.wallet()?.sent(ctx.chain.utxo(), &rtxn)?;
             if sent.is_empty() {
                 println!("no unconfirmed payments");
             }
@@ -1269,8 +1327,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "scan" => {
             let rtxn = ctx.chain.env().read_txn()?;
-            let (n, total) = ctx.wallet.scan(ctx.chain.utxo(), &rtxn)?;
-            let (names, commits) = ctx.wallet.scan_names(ctx.chain.utxo(), ctx.chain.names(), &rtxn)?;
+            let (n, total) = ctx.wallet()?.scan(ctx.chain.utxo(), &rtxn)?;
+            let (names, commits) = ctx.wallet()?.scan_names(ctx.chain.utxo(), ctx.chain.names(), &rtxn)?;
             println!("found {n} outputs worth {}, {names} names and {commits} pending commits", fmt_coins(total));
             if commits > 0 {
                 println!("a pending commit's name is matched when you reveal it: name-reveal NAME");
@@ -1286,9 +1344,9 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             // By default the name points at this wallet, so @NAME reaches it.
             let value = match value {
                 Some(v) => parse_value(Some(v))?,
-                None => ctx.wallet.id(),
+                None => ctx.wallet()?.id(),
             };
-            let op = ctx.wallet.name_commit(name.as_bytes(), value)?;
+            let op = ctx.wallet()?.name_commit(name.as_bytes(), value)?;
             carry(ctx, vec![op], fee)?;
             println!("committed to {name}; reveal it with name-reveal {name} once the commit is 12 blocks old");
         }
@@ -1304,7 +1362,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let height = ctx.chain.tip()?.map_or(1, |t| t.height + 1);
             let op = {
                 let rtxn = ctx.chain.env().read_txn()?;
-                ctx.wallet.name_reveal(name.as_bytes(), wait, ctx.chain.names(), &rtxn, height)?
+                ctx.wallet()?.name_reveal(name.as_bytes(), wait, ctx.chain.names(), &rtxn, height)?
             };
             if wait <= tabminer::names::MIN_REVEAL {
                 println!(
@@ -1321,7 +1379,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [name, value, fee] => (*name, *value, Some(parse_coins(fee).ok_or("bad fee")?)),
                 _ => return Err("usage: name-update NAME VALUE [FEE]".into()),
             };
-            let (op, last) = ctx.wallet.name_update(name.as_bytes(), parse_value(Some(value))?)?;
+            let (op, last) = ctx.wallet()?.name_update(name.as_bytes(), parse_value(Some(value))?)?;
             carry(ctx, vec![op], fee)?;
             println!("updating {name}; its owner key rotates when the update confirms");
             if last {
@@ -1336,7 +1394,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [name, file, value] => (*name, *file, Some(*value)),
                 _ => return Err("usage: name-offer NAME FILE [VALUE]".into()),
             };
-            let record = ctx.wallet.name_offer(name.as_bytes(), parse_value(value)?)?;
+            let record = ctx.wallet()?.name_offer(name.as_bytes(), parse_value(value)?)?;
             std::fs::write(file, record.to_bytes())?;
             println!("record for {name} written to {file}; give it to the name's owner to sign over");
         }
@@ -1348,7 +1406,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             };
             let record = tabminer::names::Record::from_bytes(&std::fs::read(file)?).ok_or("not a name record")?;
             let name = String::from_utf8_lossy(&record.name).into_owned();
-            let (op, last) = ctx.wallet.name_transfer(record)?;
+            let (op, last) = ctx.wallet()?.name_transfer(record)?;
             carry(ctx, vec![op], fee)?;
             println!("transferring {name}; it leaves this wallet when the update confirms");
             if last {
@@ -1361,8 +1419,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             // One chain read transaction per thread: the tip comes first.
             let height = ctx.chain.tip()?.map_or(0, |t| t.height);
             let rtxn = ctx.chain.env().read_txn()?;
-            let names = ctx.wallet.owned_names()?;
-            let commits = ctx.wallet.pending_commits()?;
+            let names = ctx.wallet()?.owned_names()?;
+            let commits = ctx.wallet()?.pending_commits()?;
             if names.is_empty() && commits.is_empty() {
                 println!("no names");
             }
@@ -1414,7 +1472,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             match ctx.chain.names().lookup(&rtxn, name.as_bytes())? {
                 None => println!("{name} is not registered"),
                 Some(r) => {
-                    let ours = ctx.wallet.owned_name(name.as_bytes())?.is_some();
+                    let ours = ctx.wallet()?.owned_name(name.as_bytes())?.is_some();
                     println!("owner {}", hex_digest(&r.owner));
                     println!("value {}", hex_digest(&r.value));
                     println!("      {}", tabminer::address::encode(&r.value));
@@ -1423,7 +1481,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
         }
         "slates" => {
-            let slates = ctx.wallet.pending_slates()?;
+            let slates = ctx.wallet()?.pending_slates()?;
             if slates.is_empty() {
                 println!("no pending slates");
             }
@@ -1442,11 +1500,11 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 ctx.mempool.lock().unwrap().entries().flat_map(|e| e.tx.outputs.iter().map(|o| o.commitment)).collect();
             keep.extend(*ctx.in_flight.lock().unwrap());
             let rtxn = ctx.chain.env().read_txn()?;
-            let n = ctx.wallet.prune_pending(ctx.chain.utxo(), &rtxn, &keep)?;
+            let n = ctx.wallet()?.prune_pending(ctx.chain.utxo(), &rtxn, &keep)?;
             println!("{n} pending outputs forgotten");
         }
         "phrase" => {
-            println!("{}", ctx.wallet.phrase()?);
+            println!("{}", ctx.wallet()?.phrase()?);
             println!("anyone with these words (and the passphrase, if one was used) can take the funds");
         }
         _ => println!("unknown command {cmd}; type help"),
@@ -1564,7 +1622,7 @@ fn on_note(ctx: &Ctx, note: Note) {
             match id.and_then(|id| outgoing.remove(&id).map(|_| id)) {
                 // It never reached the recipient: its inputs are freed.
                 Some(id) => {
-                    let freed = ctx.wallet.cancel_slate(&id).is_ok();
+                    let freed = ctx.wallet().is_ok_and(|w| w.cancel_slate(&id).is_ok());
                     say(
                         ctx,
                         &format!(
@@ -1600,7 +1658,7 @@ fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
     }
     let sent_to = ctx.outgoing.lock().unwrap().get(&id).copied();
     sync_wallet(ctx)?;
-    match ctx.wallet.take_slate(&opened.inner, &from.id, sent_to.as_ref())? {
+    match ctx.wallet()?.take_slate(&opened.inner, &from.id, sent_to.as_ref())? {
         Incoming::Answered(slate) => {
             let out = Outbound {
                 tag: 0,
@@ -1704,7 +1762,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
     let params = ctx.params;
     let agg = params.aggregator;
     let chain = &ctx.chain;
-    let wallet = &ctx.wallet;
+    let wallet = ctx.wallet()?;
     let tip = chain.tip()?.unwrap();
     log::line(&format!(
         "mining from height {}; segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",

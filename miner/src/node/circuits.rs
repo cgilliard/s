@@ -202,6 +202,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .map(|(h, _)| *h)
             .collect();
         for h in late {
+            // The hop being added never answered: most likely it is down.
+            if let Some(m) = self.circuits.mine.get(&h) {
+                let hop = m.path[m.hops.len()];
+                self.avoid_relay(hop, now);
+            }
             self.drop_mine(h, "not built in time", true, now);
         }
         self.circuits.creating.retain(|_, (_, t)| now.duration_since(*t) < BUILD_TIMEOUT);
@@ -214,6 +219,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.send_cell(m.first, Cell::new(m.first.1, circuit::DESTROY), now);
         }
         self.log(&format!("circuit {handle}: closed after {} of {} hops: {why}", m.hops.len(), m.path.len()));
+        // Failed while a hop was being added: most likely that hop is
+        // down, so it is left out of the next paths for a while.
+        if !m.ready() && !destroy {
+            self.avoid_relay(m.path[m.hops.len()], now);
+        }
         #[cfg(test)]
         self.circuits.seen.lock().unwrap().push(Seen::Failed(handle));
         self.onion_circuit_gone(handle, now);
@@ -309,7 +319,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         {
             return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
         }
-        let (Some(key), Ok(m)) = (self.config.identity.as_ref(), random_bytes::<32>()) else { return };
+        let (Some(key), Ok(m)) = (self.config.relay_key.as_ref(), random_bytes::<32>()) else { return };
         match channel::respond_keys(Domain::Circuit, 0, &hello, key, &m) {
             Ok(((out, inn, _), reply)) => {
                 let keys = HopKeys { forward: Layer::new(inn), backward: Layer::new(out) };
@@ -408,7 +418,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Err("extended already".into());
         }
         let id = digest_from_bytes(&msg[..32]).ok_or("malformed id")?;
-        if self.config.identity.as_ref().is_some_and(|k| crate::address::id_of(k.public_key()) == id) {
+        if self.config.relay_id() == Some(id) {
             return Err("to itself".into());
         }
         let addr = self.relay_addr(&id).ok_or("not a listed relay")?;

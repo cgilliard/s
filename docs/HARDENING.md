@@ -227,21 +227,6 @@ history and the README; this file holds what is left.
 
 Found while building it (2026-11-01).
 
-- **A relay's id is its operator's payment address.** `main.rs`: the
-  node's identity is the wallet's (`Wallet::identity_key`), so the id a
-  relay is listed under in `consensus.txt`, public to everyone, is also
-  the address its operator is paid at: anyone can link the two, and the
-  relay key that has to sit on an exposed server is the wallet's own,
-  derived from its phrase. Fix: give the relay its own Dilithium key,
-  separate from the wallet's: derived from the phrase under another
-  domain tag (so a restore keeps the relay's id), or made at random and
-  kept in `DIR/relay.key` (so a relay needs no wallet at all, see
-  `--no-wallet` below). `--relay` prints that key's id; the node keeps
-  using the wallet's key for its own sessions and payments. (The node
-  can then be one of its own wallet's rendezvous points under another
-  id, which still needs the local handling in "skips itself as a
-  rendezvous point" below.)
-
 - **A relay whose key does not match its listed id is not penalized.**
   `node/channels.rs`, `on_reply`: a handshake that fails with `WrongKey`
   is logged and the channel dropped, but the address takes no strike,
@@ -272,29 +257,32 @@ Found while building it (2026-11-01).
   fill a channel's queue. Fix: drop hops idle for an hour, and window
   cells per circuit.
 
+- **A message down a dead circuit is lost, and reported delivered.**
+  A rendezvous point answers forwarded once it sends a payload down the
+  recipient's circuit; if a hop of that circuit is down and the recipient
+  has not noticed yet (below), the payload is lost and the sender's
+  wallet still hears "delivered". A slate then waits for an answer that
+  never comes, until cancelled. Fix: an end-to-end acknowledgement from
+  the recipient's node, and a resend over another of its points.
 - **A dead relay is noticed at the next keepalive.** A participant
   takes a circuit for dead 10 s after a `Session` keepalive goes
   unanswered (`node/participant.rs`), so up to 40 s after a hop goes
-  down; sends in that time may fail. Fix: keep a spare circuit to each
-  point, through other hops, and switch to it at once.
-- **A relay's own wallet skips itself as a rendezvous point,** in both
-  modes: a seed or relay does not hold a session for its own id, so it
-  is reachable only through its other points (with one seed, not at
-  all). Fix: hold the own session locally and answer lookups and
-  payloads for it directly.
+  down; a channel goes 15 s after a frame is first left unacknowledged;
+  a relay whose channel failed, or that a circuit failed to extend to,
+  is avoided as a hop for five minutes. Rebuilt paths are random, so a
+  few may still try the dead relay first. Fix: keep a spare circuit to
+  each point, through other hops, and switch to it at once.
+- **A wallet on a relay skips that relay as a rendezvous point,** in
+  both modes, so it is reachable only through its other points (with one
+  seed, not at all). By design: run relays with `--no-wallet`.
 
 ## Deployment and operations
 
-- **Every node runs a wallet.** `main.rs`, `run`: the wallet is opened
-  (and created, with a phrase) on every start, so a seed or relay keeps a
-  12-word phrase on a server that has no use for one. Fix: a
-  `--no-wallet` mode that opens no wallet and starts no prompt commands
-  that need one (balance, send, names, policies; the prompt says why).
-  Such a node takes no part in the message layer as a participant
-  (`Config::identity` is `None`); as a relay it needs its own key, from
-  `DIR/relay.key` (see "A relay's id is its operator's payment address"
-  above). `mine` has nowhere to pay its reward without a wallet: refuse
-  `--no-wallet` with mining, or take a payout address.
+- **A relay keeps a phrase on its server.** `--no-wallet --relay` still
+  opens the wallet, only to derive the relay key from its phrase, so the
+  phrase sits on an exposed machine. It should hold no funds. Fix if it
+  matters: keep only the derived relay seed in `DIR/relay.key`, written
+  once from the phrase.
 
 - **Seeds** run an old binary. They need the current one, started with
   `--relay` so that wallets hold their init-mode sessions there (protocol v5,

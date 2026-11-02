@@ -108,6 +108,7 @@ const DOM_OWNER: u32 = 0x33;
 const DOM_SALT: u32 = 0x34;
 const DOM_CHANNEL: u32 = 0x35;
 const DOM_IDENTITY: u32 = 0x36;
+const DOM_RELAY: u32 = 0x37;
 /// Tree height of the channel keys this wallet makes unless told
 /// otherwise: 65,536 states.
 pub const CHANNEL_HEIGHT: usize = 16;
@@ -832,6 +833,15 @@ impl Wallet {
     /// wallet restored from its phrase has the same key, id and address.
     pub fn identity_key(&self) -> mldsa::SecretKey {
         let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_IDENTITY, &self.master));
+        mldsa::keygen(&seed)
+    }
+
+    /// The relay's Dilithium (ML-DSA-65) key, from the master key under its
+    /// own domain tag: apart from the wallet's identity, so a relay's
+    /// listed id is not its operator's payment address, and kept by a
+    /// restore from the phrase (`docs/ONION.md`).
+    pub fn relay_key(&self) -> mldsa::SecretKey {
+        let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_RELAY, &self.master));
         mldsa::keygen(&seed)
     }
 
@@ -2421,6 +2431,10 @@ mod tests {
         assert_ne!(other.address(), address);
         let restored = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
         assert_eq!(restored.address(), address);
+        // The relay's key: from the phrase too, but not the wallet's.
+        let relay = address::id_of(w.relay_key().public_key());
+        assert_ne!(relay, w.id());
+        assert_eq!(address::id_of(restored.relay_key().public_key()), relay);
         let key = w.identity_key();
         assert_eq!(address::id_of(key.public_key()), w.id());
         assert!(mldsa::verify(key.public_key(), b"hello", b"", &key.sign(b"hello", b"")));
