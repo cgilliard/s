@@ -1083,6 +1083,23 @@ impl Wallet {
         Ok(n)
     }
 
+    /// Forgets pending commits that never reached the chain: not in the
+    /// registry, and not among `pooled` (commits carried by pooled
+    /// transactions, which may yet land). Returns the names forgotten.
+    pub fn prune_commits(&self, registry: &NameSet, rtxn: &RoTxn, pooled: &HashSet<Commitment>) -> Result<Vec<String>> {
+        let mut gone = Vec::new();
+        let mut wtxn = self.env.write_txn()?;
+        for c in self.pending_commits()? {
+            let on_chain = registry.commit_position(rtxn, &c.commit).map_err(|e| WalletError::Name(e.to_string()))?.is_some();
+            if !on_chain && !pooled.contains(&c.commit) && !c.recovered {
+                self.commits.delete(&mut wtxn, &digest_to_bytes(&c.commit))?;
+                gone.push(c.name.as_deref().map_or("?".to_string(), |n| String::from_utf8_lossy(n).into_owned()));
+            }
+        }
+        wtxn.commit()?;
+        Ok(gone)
+    }
+
     /// Finds this wallet's unspent outputs in the UTXO set by their memos
     /// and records the ones it does not know, as recovered, and where the
     /// known ones are. Returns how many were added and their total.
@@ -1650,6 +1667,45 @@ impl Wallet {
         self.commits.delete(&mut wtxn, &digest_to_bytes(&entry.commit))?;
         wtxn.commit()?;
         Ok(op)
+    }
+
+    /// Undoes what [`Wallet::name_commit`], [`Wallet::name_reveal`],
+    /// [`Wallet::name_update`] or [`Wallet::name_transfer`] recorded, when
+    /// no transaction could carry the operation (too few funds, say): a
+    /// commit is forgotten, a revealed name goes back to its commit, an
+    /// update or transfer is no longer signed. A signing leaf an update used
+    /// stays used: the signature was made, and a leaf signs once.
+    pub fn undo_name_op(&self, op: &NameOp) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        match op {
+            NameOp::Commit { commit, .. } => {
+                self.commits.delete(&mut wtxn, &digest_to_bytes(commit))?;
+            }
+            NameOp::Reveal { record, .. } => {
+                if let Some(entry) = self.name_in(&wtxn, &record.name)?.filter(|n| n.stage == NameStage::Revealed) {
+                    let commit = self.commit_of(&entry.name, &entry.nonce).ok_or(WalletError::Corrupt("name"))?;
+                    let back = PendingCommit {
+                        commit,
+                        nonce: entry.nonce,
+                        name: Some(entry.name.clone()),
+                        value: entry.value,
+                        created: entry.created,
+                        recovered: entry.recovered,
+                    };
+                    self.put_commit(&mut wtxn, &back)?;
+                    self.names.delete(&mut wtxn, &record.name)?;
+                }
+            }
+            NameOp::Update { record, .. } => {
+                if let Some(mut entry) = self.name_in(&wtxn, &record.name)? {
+                    entry.pending = None;
+                    entry.transferring = false;
+                    self.put_name(&mut wtxn, &entry)?;
+                }
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// Signs `record` as the current owner of its name with the key's next
@@ -2613,6 +2669,38 @@ mod tests {
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 0);
         assert!(matches!(alice.cancel_slate(&s2.id), Err(WalletError::Unknown)));
         assert_eq!(digest_from_hex(&s2.id_hex()), Some(s2.id));
+    }
+
+    /// A name operation no transaction could carry (no funds) is undone, so
+    /// it can be tried again; a commit that never reached the chain is
+    /// pruned.
+    #[test]
+    fn name_operations_without_funds_are_undone() {
+        use crate::names::NameSet;
+        let dir = TempDir::new("names-undo");
+        let (env, u) = utxo(&dir);
+        let registry = {
+            let mut wtxn = env.write_txn().unwrap();
+            let n = NameSet::open(&env, &mut wtxn, "n").unwrap();
+            wtxn.commit().unwrap();
+            n
+        };
+        let (w, _) = Wallet::open(&dir.0.join("w")).unwrap();
+        let op = w.name_commit(b"bob", w.id()).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert!(matches!(w.carry(vec![op.clone()], None, &u, &rtxn), Err(WalletError::Insufficient { .. })));
+        drop(rtxn);
+        // Without the undo, the commit stays and a retry is refused.
+        assert!(w.name_commit(b"bob", w.id()).is_err());
+        w.undo_name_op(&op).unwrap();
+        assert!(w.pending_commits().unwrap().is_empty());
+        w.name_commit(b"bob", w.id()).unwrap();
+        // A commit carried by nothing: pruned; one in the pool: kept.
+        let pooled: HashSet<Commitment> = w.pending_commits().unwrap().iter().map(|c| c.commit).collect();
+        let rtxn = env.read_txn().unwrap();
+        assert!(w.prune_commits(&registry, &rtxn, &pooled).unwrap().is_empty());
+        assert_eq!(w.prune_commits(&registry, &rtxn, &HashSet::new()).unwrap(), vec!["bob".to_string()]);
+        assert!(w.pending_commits().unwrap().is_empty());
     }
 
     #[test]

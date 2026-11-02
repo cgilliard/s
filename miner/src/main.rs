@@ -141,7 +141,8 @@ const HELP: &str = "commands:
   slates                    pending slates
   sent                      unconfirmed payments that can be cancelled
   scan                      find this wallet's outputs and names on chain (after a restore)
-  prune                     forget unspent outputs the chain does not hold
+  prune                     forget unspent outputs the chain does not hold, and name
+                            commits that never reached it
   name-commit NAME [VALUE] [FEE]
                             start registering NAME: pool a transaction committing to it
                             (VALUE: a tab1… address or 64 hex digits, the id payments
@@ -862,7 +863,17 @@ fn parse_value(s: Option<&str>) -> AnyResult<tabminer::pow::Digest> {
 /// Carries name operations in a transaction of the wallet's and pools it.
 fn carry(ctx: &Ctx, ops: Vec<NameOp>, fee: Option<u64>) -> AnyResult<()> {
     let rtxn = ctx.chain.env().read_txn()?;
-    let signed = ctx.wallet()?.carry(ops, fee, ctx.chain.utxo(), &rtxn)?;
+    let signed = match ctx.wallet()?.carry(ops.clone(), fee, ctx.chain.utxo(), &rtxn) {
+        Ok(s) => s,
+        Err(e) => {
+            // No transaction carries them: what preparing them recorded
+            // in the wallet is undone, so they can be tried again.
+            for op in &ops {
+                ctx.wallet()?.undo_name_op(op)?;
+            }
+            return Err(e.into());
+        }
+    };
     drop(rtxn);
     println!("transaction {} pays a fee of {}", short(&signed.tx.txid()), fmt_coins(signed.tx.balance() as u128));
     submit(ctx, signed);
@@ -1499,9 +1510,23 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let mut keep: std::collections::HashSet<_> =
                 ctx.mempool.lock().unwrap().entries().flat_map(|e| e.tx.outputs.iter().map(|o| o.commitment)).collect();
             keep.extend(*ctx.in_flight.lock().unwrap());
+            // Commits a pooled transaction carries may yet land too.
+            let pooled: std::collections::HashSet<_> = ctx
+                .mempool
+                .lock()
+                .unwrap()
+                .entries()
+                .flat_map(|e| e.tx.ops.iter().filter_map(|op| match op {
+                    NameOp::Commit { commit, .. } => Some(*commit),
+                    _ => None,
+                }).collect::<Vec<_>>())
+                .collect();
             let rtxn = ctx.chain.env().read_txn()?;
             let n = ctx.wallet()?.prune_pending(ctx.chain.utxo(), &rtxn, &keep)?;
             println!("{n} pending outputs forgotten");
+            for name in ctx.wallet()?.prune_commits(ctx.chain.names(), &rtxn, &pooled)? {
+                println!("commit to {name} forgotten: it never reached the chain");
+            }
         }
         "phrase" => {
             println!("{}", ctx.wallet()?.phrase()?);
