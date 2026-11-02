@@ -335,8 +335,13 @@ two messages. A frame that does not open is dropped; a replayed one is
 recognized by its number.
 
 **Circuits.** Each hop holds a key per direction and counts the cells it
-passes; a layer is ChaCha20 with the count as nonce, and the cell for a
-hop carries a Poly1305 tag under that hop's key inside all the layers.
+passes; a layer is ChaCha20 with the count as nonce. Toward the far end
+each layer carries its own Poly1305 tag, which the hop checks before
+passing the cell on (16 bytes of its keystream replace the tag, so the
+cell keeps its size, the client having computed every hop's tag ahead,
+as in Sphinx), and the cell for a hop carries an inner tag by which it
+knows its own; toward the client the originating hop's tag is checked
+by the client. Messages are padded to a power of two of cells.
 What each party learns:
 
 - the first hop: the participant's network address, and that it keeps a
@@ -349,7 +354,8 @@ What each party learns:
   sender's rendezvous points, which narrows the sender to the ids that
   relay serves, the cost of having no exits;
 - every relay: the number of cells, which says roughly how large a
-  message is (a slate is a few cells).
+  message is: rounded up to a power of two of cells, a slate is one or
+  two, an announce eight.
 
 **Gaps.** Known weaknesses, all in `docs/HARDENING.md`:
 
@@ -357,10 +363,11 @@ What each party learns:
   watches many links, can match a payment's cells by timing. With few
   relays (three is the minimum, meant for testing) there is little
   anonymity to speak of.
-- **Tagging.** The layers carry no tag of their own, so a hop can flip
-  bits in a cell for a later hop. The tag at the end fails and the circuit
-  dies, but a colluding later hop that sees the failure learns the two
-  are on one circuit.
+- **Tagging toward the client.** Toward the far end a flipped bit is
+  caught by the next hop. Toward the client only the end is checked, so
+  a hop that flips bits there ends the circuit unnoticed, and a hop that
+  colludes with the client's first hop learns from the circuit ending
+  that they share it.
 - **The relay list is the miners'.** The file in force is the most voted
   valid one over 144 blocks, and one vote is enough: a miner who mines
   the only votes of a window, or most miners together, chooses every

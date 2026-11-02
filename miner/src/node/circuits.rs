@@ -34,7 +34,7 @@ pub const MAX_HOPS: usize = 16_384;
 /// carries many people's circuits and has no such limit.
 pub const MAX_HOPS_PER_PARTICIPANT: usize = 64;
 /// Hops a client circuit may have.
-pub const MAX_PATH: usize = 8;
+pub const MAX_PATH: usize = circuit::MAX_PATH;
 
 /// A circuit on one channel: the channel and the circuit's number on it.
 pub(super) type Link = ((SocketAddr, u64), u32);
@@ -338,18 +338,27 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A relay cell from the previous hop: ours to read, or to pass on.
     fn on_forward(&mut self, link: Link, mut cell: Cell, now: Instant) {
         let Some(h) = self.circuits.hops.get_mut(&link) else { return };
-        if !h.keys.forward.take(&mut cell.payload) {
-            match h.next {
-                Some(next) => {
-                    cell.circ = next.1;
-                    self.send_cell(next, cell, now);
+        let body = match circuit::hop_forward(&mut h.keys.forward, &mut cell.payload) {
+            circuit::Forward::Mine(body) => body,
+            circuit::Forward::Pass => {
+                match h.next {
+                    Some(next) => {
+                        cell.circ = next.1;
+                        self.send_cell(next, cell, now);
+                    }
+                    // For nobody: the circuit is broken.
+                    None => self.destroy_hop(link, true, true, now),
                 }
-                // For nobody: the circuit is broken.
-                None => self.destroy_hop(link, true, true, now),
+                return;
             }
-            return;
-        }
-        let done = match circuit::relay_piece(&cell.payload[circuit::PAYLOAD - circuit::BODY..]) {
+            // A hop before flipped bits, or the cell is forged: the
+            // circuit ends.
+            circuit::Forward::Tampered => {
+                self.chatter(&format!("circuit: a tampered cell from {}; ending the circuit", link.0.0));
+                return self.destroy_hop(link, true, true, now);
+            }
+        };
+        let done = match circuit::relay_piece(&body[..]) {
             Some((cmd, more, data)) => h.message.add(cmd, more, data),
             None => Err(circuit::Malformed),
         };
@@ -473,7 +482,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let Some(j) = circuit::open_from(&mut m.hops, &mut cell.payload) else {
                     return self.drop_mine(handle, "a cell no hop sent", true, now);
                 };
-                let Some((cmd, more, data)) = circuit::relay_piece(&cell.payload[circuit::PAYLOAD - circuit::BODY..])
+                // The body follows the originating hop's tag.
+                let body = &cell.payload[crate::chacha20poly1305::TAG_LEN..][..circuit::BODY];
+                let Some((cmd, more, data)) = circuit::relay_piece(body)
                 else {
                     return;
                 };

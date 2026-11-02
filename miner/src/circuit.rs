@@ -21,9 +21,21 @@
 //! matches by chance once in 2^128), any other passes the cell on. Back
 //! toward the client a hop tags and layers what it originates, every hop
 //! before it adds its layer, and the client takes them off in order until
-//! a tag holds, which names the hop that sent it. The layers carry no tag
-//! of their own, so a hop could flip bits for the hops after it; the tag
-//! at the end catches that, but not which hop did it.
+//! a tag holds, which names the hop that sent it.
+//!
+//! Toward the far end every layer carries a tag of its own too, so that a
+//! hop cannot flip bits in a cell for a later one (a tagging attack): the
+//! next hop finds its tag wrong and ends the circuit. A hop takes its tag
+//! (16 bytes) off the front, takes its layer off, and puts 16 bytes of its
+//! own keystream on the end, so the cell keeps its size; the client
+//! computes those bytes ahead (Sphinx's filler) and so every hop's tag.
+//! What a hop recognizes as its own is then told by a second, inner tag.
+//! The body leaves room for [`MAX_PATH`] hops' fillers. Back toward the
+//! client only the originating hop's tag is checked: a hop that flips bits
+//! there is found by the client, though not which hop it was.
+//!
+//! Every relay message is padded to a power of two of cells, so the count
+//! of cells tells less about what a message is.
 
 use crate::chacha20poly1305::{self, KEY_LEN, NONCE_LEN, TAG_LEN};
 
@@ -31,8 +43,11 @@ use crate::chacha20poly1305::{self, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub const CELL_BYTES: usize = 1024;
 /// A cell's payload after its circuit number and command.
 pub const PAYLOAD: usize = CELL_BYTES - 5;
-/// A relay cell's body after its tag.
-pub const BODY: usize = PAYLOAD - TAG_LEN;
+/// Hops a circuit may have.
+pub const MAX_PATH: usize = 8;
+/// A relay cell's body: what is left after a hop's tag, the inner tag, and
+/// the fillers of the hops before the one it is for.
+pub const BODY: usize = PAYLOAD - 2 * TAG_LEN - TAG_LEN * (MAX_PATH - 1);
 /// Message bytes in one relay cell, after its command, flag and length.
 pub const RELAY_DATA: usize = BODY - 4;
 /// Handshake bytes in one `Create` or `Created` cell.
@@ -122,7 +137,8 @@ pub fn handshake_piece(c: &Cell) -> Option<(bool, &[u8])> {
 /// A relay message cut into cell bodies: command, a flag for more to
 /// come, a length, the bytes, zeros.
 pub fn relay_bodies(cmd: u8, msg: &[u8]) -> Vec<[u8; BODY]> {
-    let n = msg.len().div_ceil(RELAY_DATA).max(1);
+    // Padded to a power of two of cells with empty pieces.
+    let n = msg.len().div_ceil(RELAY_DATA).max(1).next_power_of_two();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let part = &msg[(i * RELAY_DATA).min(msg.len())..((i + 1) * RELAY_DATA).min(msg.len())];
@@ -186,9 +202,29 @@ impl Layer {
     }
 
     fn nonce(&self) -> [u8; NONCE_LEN] {
+        self.nonce_in(0)
+    }
+
+    /// The nonce at this count in domain `d`: 0 for the layer and its tag,
+    /// 1 for the inner tag.
+    fn nonce_in(&self, d: u8) -> [u8; NONCE_LEN] {
         let mut n = [0u8; NONCE_LEN];
+        n[0] = d;
         n[4..].copy_from_slice(&self.count.to_le_bytes());
         n
+    }
+
+    /// The layer's keystream at this count, `n` bytes.
+    fn keystream(&self, n: usize) -> Vec<u8> {
+        let mut s = vec![0u8; n];
+        chacha20poly1305::xor_stream(&self.key, 1, &self.nonce(), &mut s);
+        s
+    }
+
+    /// The inner tag, by which a hop knows a cell for itself.
+    fn inner_tag(&self, body: &[u8]) -> [u8; TAG_LEN] {
+        let block = chacha20poly1305::block(&self.key, 0, &self.nonce_in(1));
+        chacha20poly1305::poly1305(block[..32].try_into().unwrap(), body)
     }
 
     fn xor(&self, p: &mut [u8; PAYLOAD]) {
@@ -203,8 +239,9 @@ impl Layer {
     /// Puts on what this hop originates: the tag, then the layer.
     pub fn originate(&mut self, body: &[u8; BODY]) -> Box<[u8; PAYLOAD]> {
         let mut p = Box::new([0u8; PAYLOAD]);
-        p[..TAG_LEN].copy_from_slice(&self.tag(body));
-        p[TAG_LEN..].copy_from_slice(body);
+        p[TAG_LEN..TAG_LEN + BODY].copy_from_slice(body);
+        let tag = self.tag(&p[TAG_LEN..]);
+        p[..TAG_LEN].copy_from_slice(&tag);
         self.xor(&mut p);
         self.count += 1;
         p
@@ -232,15 +269,90 @@ pub struct HopKeys {
     pub backward: Layer,
 }
 
-/// The client's side: seals `body` for hop `t` under the layers of hops
-/// `t` down to the first.
+/// What a hop makes of a cell coming from the client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Forward {
+    /// For this hop: its body.
+    Mine(Box<[u8; BODY]>),
+    /// For a later hop: the cell, as that hop is to receive it, is in place.
+    Pass,
+    /// Its tag is wrong: a hop before flipped bits, or it is forged.
+    Tampered,
+}
+
+/// A hop's side, toward the far end: checks its tag, takes its layer off,
+/// and either finds the cell its own or makes it what the next hop is to
+/// receive.
+pub fn hop_forward(layer: &mut Layer, p: &mut [u8; PAYLOAD]) -> Forward {
+    let n = PAYLOAD - TAG_LEN;
+    let tagged = layer.tag(&p[TAG_LEN..]) == p[..TAG_LEN];
+    let s = layer.keystream(PAYLOAD);
+    let out = if !tagged {
+        Forward::Tampered
+    } else {
+        // Y = X ⊕ S: either its inner tag holds, or it goes on with the
+        // end of the keystream after it.
+        let y: Vec<u8> = p[TAG_LEN..].iter().zip(&s).map(|(a, b)| a ^ b).collect();
+        if layer.inner_tag(&y[TAG_LEN..]) == y[..TAG_LEN] {
+            let mut body = Box::new([0u8; BODY]);
+            body.copy_from_slice(&y[TAG_LEN..TAG_LEN + BODY]);
+            Forward::Mine(body)
+        } else {
+            p[..n].copy_from_slice(&y);
+            p[n..].copy_from_slice(&s[n..]);
+            Forward::Pass
+        }
+    };
+    layer.count += 1;
+    out
+}
+
+/// The client's side: the cell carrying `body` to hop `t`, as the first
+/// hop is to receive it. Works back from hop `t`: what it receives ends in
+/// the fillers the hops before it will have appended, which the client
+/// computes from their keystreams; each hop's tag is over what follows it.
 pub fn seal_for(hops: &mut [HopKeys], t: usize, body: &[u8; BODY]) -> Box<[u8; PAYLOAD]> {
-    let mut p = hops[t].forward.originate(body);
-    for h in hops[..t].iter_mut().rev() {
-        h.forward.pass(&mut p);
+    const L: usize = PAYLOAD;
+    let n = L - TAG_LEN;
+    let streams: Vec<Vec<u8>> = hops[..=t].iter().map(|h| h.forward.keystream(L)).collect();
+    // The end of what hop t receives: each hop before appended 16 bytes
+    // of its keystream, which the hops after it took their layers off.
+    let mut filler: Vec<u8> = Vec::new();
+    for s in &streams[..t] {
+        filler.extend_from_slice(&[0u8; TAG_LEN]);
+        let k = filler.len();
+        for (f, x) in filler.iter_mut().zip(&s[L - k..]) {
+            *f ^= x;
+        }
+    }
+    // Hop t: the inner tag, the body, zeros, and the end that makes what
+    // it receives end in the filler.
+    let mut y = vec![0u8; n];
+    y[TAG_LEN..TAG_LEN + BODY].copy_from_slice(body);
+    let k = filler.len();
+    for i in 0..k {
+        y[n - k + i] = filler[i] ^ streams[t][n - k + i];
+    }
+    let inner = hops[t].forward.inner_tag(&y[TAG_LEN..]);
+    y[..TAG_LEN].copy_from_slice(&inner);
+    let mut x: Vec<u8> = y.iter().zip(&streams[t]).map(|(a, b)| a ^ b).collect();
+    let mut p = Box::new([0u8; L]);
+    p[..TAG_LEN].copy_from_slice(&hops[t].forward.tag(&x));
+    p[TAG_LEN..].copy_from_slice(&x);
+    // Each hop before: what it receives is its tag and what, its layer
+    // taken off and its filler appended, the next hop receives.
+    for j in (0..t).rev() {
+        x = p.iter().zip(&streams[j]).take(n).map(|(a, b)| a ^ b).collect();
+        debug_assert!(p.iter().zip(&streams[j]).skip(n).all(|(a, b)| a == b));
+        p[..TAG_LEN].copy_from_slice(&hops[j].forward.tag(&x));
+        p[TAG_LEN..].copy_from_slice(&x);
+    }
+    for h in &mut hops[..=t] {
+        h.forward.count += 1;
     }
     p
 }
+
 
 /// The client's side: takes the layers off a cell coming back, hop by
 /// hop, until one's tag holds; the hop that sent it.
@@ -283,7 +395,7 @@ mod tests {
         assert!(Cell::from_bytes(&[3u8; CELL_BYTES - 1]).is_none());
         let mut r = Reassembly::default();
         let bodies = relay_bodies(DATA, &[5u8; 2 * RELAY_DATA + 1]);
-        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies.len(), 4, "three, padded to four");
         let mut done = None;
         for b in &bodies {
             let (cmd, more, data) = relay_piece(b).unwrap();
@@ -305,16 +417,21 @@ mod tests {
             for t in 0..3 {
                 let body = relay_bodies(DATA, &[round, t as u8])[0];
                 let mut p = seal_for(&mut client, t, &body);
-                // Forward: each hop takes its layer and checks the tag.
+                // Forward: each hop checks its tag and takes its layer off.
                 let mut found = None;
                 for (j, hop) in relays.iter_mut().enumerate() {
-                    if hop.forward.take(&mut p) {
-                        found = Some(j);
-                        break;
+                    match hop_forward(&mut hop.forward, &mut p) {
+                        Forward::Mine(b) => {
+                            found = Some((j, b));
+                            break;
+                        }
+                        Forward::Pass => {}
+                        Forward::Tampered => panic!("hop {j} found its tag wrong"),
                     }
                 }
-                assert_eq!(found, Some(t));
-                assert_eq!(relay_piece(&p[TAG_LEN..]).unwrap().2, &[round, t as u8]);
+                let (j, b) = found.expect("a hop finds it");
+                assert_eq!(j, t);
+                assert_eq!(relay_piece(&b[..]).unwrap().2, &[round, t as u8]);
                 // Back: hop t answers, the hops before add their layers.
                 let answer = relay_bodies(DATA, &[round, 9, t as u8])[0];
                 let mut p = relays[t].backward.originate(&answer);
@@ -322,15 +439,51 @@ mod tests {
                     hop.backward.pass(&mut p);
                 }
                 assert_eq!(open_from(&mut client, &mut p), Some(t));
-                assert_eq!(relay_piece(&p[TAG_LEN..]).unwrap().2, &[round, 9, t as u8]);
+                assert_eq!(relay_piece(&p[TAG_LEN..TAG_LEN + BODY]).unwrap().2, &[round, 9, t as u8]);
             }
         }
-        // A flipped bit anywhere is found by nobody.
-        let body = relay_bodies(DATA, b"tamper")[0];
-        let mut p = seal_for(&mut client, 2, &body);
-        p[500] ^= 1;
-        assert!(!relays[0].forward.take(&mut p));
-        assert!(!relays[1].forward.take(&mut p));
-        assert!(!relays[2].forward.take(&mut p));
     }
+
+    /// A hop that flips bits in a cell for a later hop is caught by the
+    /// next one, wherever the bits are; so is a flip anywhere at the first.
+    #[test]
+    fn a_tagged_cell_is_caught_by_the_next_hop() {
+        for at in [0usize, 20, 500, PAYLOAD - 1] {
+            let (mut client, mut relays) = keys(3);
+            let body = relay_bodies(DATA, b"for the last hop")[0];
+            let mut p = seal_for(&mut client, 2, &body);
+            let mut first = p.clone();
+            first[at] ^= 1;
+            assert_eq!(hop_forward(&mut relays[0].forward.clone(), &mut first), Forward::Tampered, "at {at}");
+            assert_eq!(hop_forward(&mut relays[0].forward, &mut p), Forward::Pass);
+            p[at] ^= 1;
+            assert_eq!(hop_forward(&mut relays[1].forward, &mut p), Forward::Tampered, "at {at}");
+        }
+        // Up to the longest circuit, a cell reaches its hop intact.
+        let (mut client, mut relays) = keys(MAX_PATH);
+        let body = relay_bodies(DATA, b"far")[0];
+        let mut p = seal_for(&mut client, MAX_PATH - 1, &body);
+        for hop in relays[..MAX_PATH - 1].iter_mut() {
+            assert_eq!(hop_forward(&mut hop.forward, &mut p), Forward::Pass);
+        }
+        let Forward::Mine(b) = hop_forward(&mut relays[MAX_PATH - 1].forward, &mut p) else { panic!() };
+        assert_eq!(relay_piece(&b[..]).unwrap().2, b"far");
+    }
+
+    #[test]
+    fn messages_are_padded_to_a_power_of_two_of_cells() {
+        for (len, cells) in [(0, 1), (RELAY_DATA, 1), (RELAY_DATA + 1, 2), (3 * RELAY_DATA, 4), (5 * RELAY_DATA, 8)] {
+            let msg = vec![7u8; len];
+            let bodies = relay_bodies(DATA, &msg);
+            assert_eq!(bodies.len(), cells, "{len} bytes");
+            let mut r = Reassembly::default();
+            let mut done = None;
+            for b in &bodies {
+                let (cmd, more, data) = relay_piece(b).unwrap();
+                done = r.add(cmd, more, data).unwrap();
+            }
+            assert_eq!(done, Some((DATA, msg)));
+        }
+    }
+
 }

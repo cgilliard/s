@@ -506,6 +506,20 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
 8. **Traffic analysis.** Padding cells and cover traffic, a tag per
    layer against tagging, and a minimum number of relays (and of
    operators) before onion mode is worth calling private.
+
+   Done (2026-11-01) for the tag and the padding (`circuit.rs`). Toward
+   the far end every layer carries its own Poly1305 tag: a hop checks
+   it, takes its 16 bytes and its layer off and appends 16 bytes of its
+   keystream so the cell keeps its size, the client having computed
+   those fillers and every tag ahead (as Sphinx does); a cell whose tag
+   is wrong ends the circuit, so bits flipped for a later hop are found
+   by the very next one. A hop knows a cell for itself by a second,
+   inner tag. Room is kept for eight hops' fillers, so a cell carries
+   871 bytes of a message rather than 999. Back toward the client only
+   the originating hop's tag is checked, as before. Every relay message,
+   and every message between rendezvous points, is padded with empty
+   cells to a power of two of them. Cover traffic, and a minimum number
+   of relays, remain open (open point 3).
 9. **Limits.** A cookie round trip before a relay's handshake work, per
    address caps on channels, hops and sessions, and a limit on the
    stage-1 slates a wallet answers per sender.

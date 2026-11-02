@@ -243,13 +243,14 @@ Found while building it (2026-11-01).
   fast as they close. Fix: a rate per host, or a proof of work in the
   hello under load.
 
-- **Relay layers are not authenticated hop by hop.** `circuit.rs`: a
-  layer is a bare ChaCha20 stream; only the target hop checks a tag. A
-  hop can flip bits in a cell for a later hop (a tagging attack): the
-  tag at the end fails and the circuit dies, but a colluding later hop
-  that sees the flip learns the two are on one circuit. Fix: a
-  wide-block cipher per layer, or a tag per layer (Tor's counter galois
-  onion proposal), at the cost of cell space.
+- **Cells toward the client are checked only at the end.** `circuit.rs`:
+  toward the far end every layer is tagged and a flipped bit is caught by
+  the next hop, but toward the client only the originating hop's tag is
+  checked, by the client: a hop that flips bits there ends the circuit
+  without being found, and a hop toward the far end that colludes with
+  the client's first hop learns, from the circuit ending, that they share
+  it. Fix: tag the backward layers too, with fillers as forward, or a
+  wide-block cipher per layer (Tor's counter galois onion).
 - **Idle hops live as long as their channels.** `node/circuits.rs`: a
   relay drops a hop only on `Destroy` or when a channel under it
   closes. A participant's channel holds at most 64, but a relay's is not

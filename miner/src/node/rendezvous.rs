@@ -119,7 +119,23 @@ impl Rendezvous {
 fn rendezvous_cells(kind: u8, body: &[u8]) -> Vec<Cell> {
     let mut msg = vec![kind];
     msg.extend_from_slice(body);
-    circuit::handshake_cells(0, circuit::RENDEZVOUS, &msg)
+    let mut cells = circuit::handshake_cells(0, circuit::RENDEZVOUS, &msg);
+    // Padded to a power of two of cells, as relay messages are: empty
+    // pieces before the last.
+    let want = cells.len().next_power_of_two();
+    if want > cells.len() {
+        let last = cells.pop().unwrap();
+        while cells.len() + 1 < want {
+            let mut c = Cell::new(0, circuit::RENDEZVOUS);
+            c.payload[0] = 1;
+            cells.push(c);
+        }
+        for c in &mut cells {
+            c.payload[0] = 1;
+        }
+        cells.push(last);
+    }
+    cells
 }
 
 fn result(subject: &Digest, code: u8) -> Vec<u8> {
