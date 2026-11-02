@@ -1505,6 +1505,12 @@ pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
     hash_log_n: 15,
 });
 
+/// Mainnet's plan leaves ([`plan_leaves`]), 32 bytes each: fixed by the
+/// circuits like [`MAINNET_CHAIN`] and regenerated with it, so a miner
+/// need not plan every segment count when it starts. Checked against
+/// [`MAINNET_CHAIN`]'s plan root before use.
+const MAINNET_PLAN: &[u8] = include_bytes!("mainnet_plan.bin");
+
 /// [`ChainSetup`] as plain integers, for a constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainSetupConst {
@@ -1591,22 +1597,34 @@ impl AggregateVerifier {
         self.params == AggregatorParams::MAINNET && self.emission == crate::chain::MAINNET_EMISSION
     }
 
-    /// The tree of allowed wraps, which proving needs (computed once:
-    /// about a minute on mainnet). `leaves` may give it precomputed, as
-    /// from [`AggregateVerifier::plan_leaves_bytes`]; they are checked.
-    pub fn plan_tree(&self, leaves: Option<Vec<Digest>>) -> &crate::merkle::MerkleTree {
+    /// The tree of allowed wraps, which proving needs: on mainnet from
+    /// the leaves built into the binary ([`MAINNET_PLAN`]), checked against
+    /// the plan root; otherwise, or if they do not match, planned (about a
+    /// minute on mainnet).
+    pub fn plan_tree(&self) -> &crate::merkle::MerkleTree {
         self.tree.get_or_init(|| {
-            if let Some(leaves) = leaves {
-                let t = crate::merkle::MerkleTree::from_leaf_hashes(leaves);
-                if self.setup.get().is_none_or(|s| s.plan_root == t.root())
-                    && self.const_root().is_none_or(|r| r == t.root())
-                {
-                    return t;
-                }
+            if let Some(t) = self.embedded_plan() {
+                return t;
             }
             let mut plans = self.plans.lock().unwrap();
             crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&self.params, &mut plans.0))
         })
+    }
+
+    /// Whether the plan tree comes built in, without planning.
+    pub fn plan_is_built_in(&self) -> bool {
+        self.tree.get().is_some() || self.embedded_plan().is_some()
+    }
+
+    fn embedded_plan(&self) -> Option<crate::merkle::MerkleTree> {
+        let root = self.const_root()?;
+        let leaves = MAINNET_PLAN
+            .chunks_exact(32)
+            .map(crate::poseidon2::digest_from_bytes)
+            .collect::<Option<Vec<_>>>()
+            .filter(|l| l.len() == self.params.max_segments.next_power_of_two())?;
+        let t = crate::merkle::MerkleTree::from_leaf_hashes(leaves);
+        (t.root() == root).then_some(t)
     }
 
     fn const_root(&self) -> Option<Digest> {
@@ -1619,22 +1637,11 @@ impl AggregateVerifier {
             if let Some(c) = self.is_mainnet().then_some(MAINNET_CHAIN).flatten() {
                 return c.setup();
             }
-            let tree = self.plan_tree(None);
+            let tree = self.plan_tree();
             let (root, depth) = (tree.root(), tree.height());
             let mut plans = self.plans.lock().unwrap();
             chain_setup(&self.params, self.emission, &root, depth, &mut plans.0)
         })
-    }
-
-    /// The plan tree's leaves as bytes, to save and reload with
-    /// [`AggregateVerifier::plan_tree`].
-    pub fn plan_leaves_bytes(&self) -> Vec<u8> {
-        let tree = self.plan_tree(None);
-        let mut w = Writer::default();
-        for i in 0..tree.len() {
-            w.digest(&tree.leaf(i));
-        }
-        w.finish()
     }
 
     /// Verifies a block proof: the chain proof of the block at `height`.
@@ -1672,7 +1679,7 @@ impl AggregateVerifier {
             None => None,
         };
         let setup = *self.setup();
-        let tree = self.plan_tree(None);
+        let tree = self.plan_tree();
         let index = segments.len() - 1;
         let w = ChainWitness {
             height,
@@ -2390,8 +2397,19 @@ mod tests {
         (w, statement, names)
     }
 
+    /// The plan built into the binary is mainnet's: its root is
+    /// [`MAINNET_CHAIN`]'s, so a miner starts without planning.
+    #[test]
+    fn mainnet_plan_is_built_in() {
+        let v = AggregateVerifier::new(AggregatorParams::MAINNET, crate::chain::MAINNET_EMISSION);
+        assert!(v.plan_is_built_in(), "src/mainnet_plan.bin is stale: run mainnet_chain_constants");
+        assert_eq!(v.plan_tree().root(), MAINNET_CHAIN.unwrap().setup().plan_root);
+        assert_eq!(v.plan_tree().height(), MAINNET_CHAIN.unwrap().plan_depth);
+    }
+
     /// Computes mainnet's chain-proof constants ([`MAINNET_CHAIN`]) and
-    /// checks the source has them; prints them when it does not.
+    /// plan leaves ([`MAINNET_PLAN`]) and checks the source has them;
+    /// prints the constants and rewrites the leaves' file when it does not.
     #[test]
     #[ignore = "plans every mainnet segment count (about a minute); run with --release"]
     fn mainnet_chain_constants() {
@@ -2408,8 +2426,19 @@ mod tests {
             log_n: s.log_n,
             hash_log_n: s.hash_log_n,
         };
+        // The plan leaves built into the binary: rewritten when they differ.
+        let mut bytes = Vec::with_capacity(32 * tree.len());
+        for i in 0..tree.len() {
+            bytes.extend_from_slice(&crate::poseidon2::digest_to_bytes(&tree.leaf(i)));
+        }
+        if bytes != MAINNET_PLAN {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mainnet_plan.bin");
+            std::fs::write(path, &bytes).unwrap();
+            println!("wrote {path}: rebuild");
+        }
         println!("pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some({c:?});");
         assert_eq!(MAINNET_CHAIN, Some(c), "update MAINNET_CHAIN to the line printed above");
+        assert!(bytes == MAINNET_PLAN, "src/mainnet_plan.bin was rewritten; rebuild");
     }
 
     /// Chain proofs at mainnet parameters (with the plan cut to 16 segment

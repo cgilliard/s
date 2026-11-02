@@ -551,25 +551,16 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     }
     if mining && !args.debug_unchecked {
         // The miner proves membership of its wrap in the plan of every
-        // segment count: computed once (about a minute), then kept.
+        // segment count: built into the binary, else planned (a minute).
         let t = Instant::now();
-        let path = args.data.join("plan");
-        let saved = std::fs::read(&path).ok();
-        let leaves = saved
-            .as_ref()
-            .and_then(|b| b.chunks_exact(32).map(tabminer::poseidon2::digest_from_bytes).collect::<Option<Vec<_>>>());
-        if leaves.is_none() {
-            let msg = "planning every segment count for the chain proofs (once per data directory)...";
+        if !chain.verifier().plan_is_built_in() {
+            let msg = "planning every segment count for the chain proofs...";
             if !args.no_prompt {
                 println!("{msg}");
             }
             log::line(msg);
         }
-        chain.verifier().plan_tree(leaves);
-        let bytes = chain.verifier().plan_leaves_bytes();
-        if saved.as_deref() != Some(&bytes[..]) {
-            std::fs::write(&path, &bytes)?;
-        }
+        chain.verifier().plan_tree();
         log::line(&format!("plan ready in {}", secs(t.elapsed())));
     }
     // The wallet, unless --no-wallet; a relay derives its key from the
