@@ -209,13 +209,71 @@ pub fn subtree_path(level: usize, first: u64, leaves: &[(u64, Digest)], key: u64
     (nodes.first().map_or(default_hashes()[level], |&(_, v)| v), siblings)
 }
 
+/// Smallest map size [`fit_map_size`] falls back to.
+const MIN_MAP_SIZE: usize = 1 << 30;
+
+/// Whether `size` bytes of address space can be reserved now: a mapping
+/// with no access and no backing, made and released at once.
+#[cfg(target_os = "linux")]
+fn reservable(size: usize) -> bool {
+    unsafe extern "C" {
+        fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+        fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+    }
+    const PROT_NONE: i32 = 0;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_NORESERVE: i32 = 0x4000;
+    // SAFETY: an anonymous mapping at an address of the kernel's choosing,
+    // never touched, unmapped before returning.
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if p as isize == -1 {
+            return false;
+        }
+        munmap(p, size);
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reservable(_size: usize) -> bool {
+    true
+}
+
+/// The map size to open with: `want` if that much address space can be
+/// reserved, else three quarters of the largest power-of-two fraction of
+/// it that can, leaving room for the process's other maps. A 64-bit
+/// process normally has room for a terabyte; a riscv64 kernel with Sv39
+/// paging gives a process 256 GiB in all.
+pub fn fit_map_size(want: usize) -> usize {
+    if reservable(want) {
+        return want;
+    }
+    let mut size = want / 2;
+    while size > MIN_MAP_SIZE && !reservable(size) {
+        size /= 2;
+    }
+    (size / 4 * 3).max(MIN_MAP_SIZE)
+}
+
 /// Opens (creating if needed) an LMDB environment at `path` with the given
-/// maximum map size in bytes. The map size is an upper bound on the file
-/// size, not an allocation; choose it generously.
+/// maximum map size in bytes, or less where the address space is smaller
+/// ([`fit_map_size`]). The map size is an upper bound on the file size,
+/// not an allocation; choose it generously.
 pub fn open_env(path: &Path, map_size: usize) -> Result<Env> {
     std::fs::create_dir_all(path).map_err(heed::Error::Io)?;
+    let fitted = fit_map_size(map_size);
+    if fitted < map_size {
+        crate::log::line(&format!(
+            "{}: {} GiB of address space is not available; mapping {} GiB instead",
+            path.display(),
+            map_size >> 30,
+            fitted >> 30
+        ));
+    }
     let mut options = EnvOpenOptions::new();
-    options.map_size(map_size).max_dbs(32);
+    options.map_size(fitted).max_dbs(32);
     // SAFETY: NO_READ_AHEAD only advises the kernel not to read ahead of
     // page faults in the map: reads are random, so a fault should fetch
     // its page, not the next hundred kilobytes with it.
@@ -564,6 +622,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    /// A map size that fits is kept; one past any address space falls back
+    /// to one that can be reserved.
+    #[test]
+    fn map_sizes_fit_the_address_space() {
+        assert_eq!(fit_map_size(1 << 30), 1 << 30);
+        let want = 1usize << 62;
+        assert!(!reservable(want));
+        let got = fit_map_size(want);
+        assert!(got < want && got >= MIN_MAP_SIZE && reservable(got), "{got}");
+    }
 
     struct TempDir(PathBuf);
 

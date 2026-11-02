@@ -229,6 +229,21 @@ history and the README; this file holds what is left.
 
 Found while building it (2026-11-01).
 
+- **A relay's id is its operator's payment address.** `main.rs`: the
+  node's identity is the wallet's (`Wallet::identity_key`), so the id a
+  relay is listed under in `consensus.txt`, public to everyone, is also
+  the address its operator is paid at: anyone can link the two, and the
+  relay key that has to sit on an exposed server is the wallet's own,
+  derived from its phrase. Fix: give the relay its own Dilithium key,
+  separate from the wallet's: derived from the phrase under another
+  domain tag (so a restore keeps the relay's id), or made at random and
+  kept in `DIR/relay.key` (so a relay needs no wallet at all, see
+  `--no-wallet` below). `--relay` prints that key's id; the node keeps
+  using the wallet's key for its own sessions and payments. (The node
+  can then be one of its own wallet's rendezvous points under another
+  id, which still needs the local handling in "skips itself as a
+  rendezvous point" below.)
+
 - **A relay whose key does not match its listed id is not penalized.**
   `node/channels.rs`, `on_reply`: a handshake that fails with `WrongKey`
   is logged and the channel dropped, but the address takes no strike,
@@ -280,6 +295,17 @@ Found while building it (2026-11-01).
   payloads for it directly.
 
 ## Deployment and operations
+
+- **Every node runs a wallet.** `main.rs`, `run`: the wallet is opened
+  (and created, with a phrase) on every start, so a seed or relay keeps a
+  12-word phrase on a server that has no use for one. Fix: a
+  `--no-wallet` mode that opens no wallet and starts no prompt commands
+  that need one (balance, send, names, policies; the prompt says why).
+  Such a node takes no part in the message layer as a participant
+  (`Config::identity` is `None`); as a relay it needs its own key, from
+  `DIR/relay.key` (see "A relay's id is its operator's payment address"
+  above). `mine` has nowhere to pay its reward without a wallet: refuse
+  `--no-wallet` with mining, or take a payout address.
 
 - **Seeds** run an old binary. They need the current one, started with
   `--relay` so that wallets hold their init-mode sessions there (protocol v5,
