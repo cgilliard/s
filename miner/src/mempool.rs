@@ -641,7 +641,7 @@ mod tests {
         let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
         // Outputs: key 1 with 100000, key 2 with 50, key 3 with 10.
         for (tag, amount) in [(1u8, 100_000u64), (2, 50), (3, 10)] {
-            utxo.add(&mut wtxn, &Output::new(&pk(tag), amount).commitment).unwrap();
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), amount).block_output(), 0).unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -749,7 +749,7 @@ mod tests {
         let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
         // Keys 1 to 6 each own an output of 1000 at positions 0 to 5.
         for tag in 1..=6u8 {
-            utxo.add(&mut wtxn, &Output::new(&pk(tag), 1000).commitment).unwrap();
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 1000).block_output(), 0).unwrap();
         }
         let d = |n: u32| -> Digest { core::array::from_fn(|i| crate::poseidon2::Fp::new(n * 10 + i as u32)) };
         let mut o1 = key(21);
@@ -760,7 +760,15 @@ mod tests {
         let c = commit_hash(&name_hash(&alice.elements().unwrap()), &salt, &owner1);
         // The chain made alice's commit at position 6 in block 10, and
         // registered bob.
-        names.apply(&utxo, &mut wtxn, 10, &[BlockNameOp::Commit { commit: c, memo: d(3) }], &[]).unwrap();
+        names
+            .apply(
+                &utxo,
+                &mut wtxn,
+                10,
+                &[BlockNameOp::Commit { commit: c, memo: crate::transaction::memo5(d(3)) }],
+                &[],
+            )
+            .unwrap();
         let bob = Record::new(b"bob", owner2, d(4), d(5)).unwrap();
         names.register(&mut wtxn, &bob).unwrap();
         let root = names.root(&wtxn).unwrap();
@@ -794,7 +802,15 @@ mod tests {
         assert_eq!(pool.insert(moved, &utxo, &names, &rtxn, 15), Err(Reject::Name(NameReject::NoCommit)));
         let bob_c = commit_hash(&name_hash(&bob.elements().unwrap()), &salt, &owner2);
         let mut wtxn = env.write_txn().unwrap();
-        names.apply(&utxo, &mut wtxn, 11, &[BlockNameOp::Commit { commit: bob_c, memo: d(3) }], &[]).unwrap();
+        names
+            .apply(
+                &utxo,
+                &mut wtxn,
+                11,
+                &[BlockNameOp::Commit { commit: bob_c, memo: crate::transaction::memo5(d(3)) }],
+                &[],
+            )
+            .unwrap();
         wtxn.commit().unwrap();
         drop(rtxn);
         let rtxn = env.read_txn().unwrap();
@@ -815,10 +831,10 @@ mod tests {
         let again = with(3, vec![NameOp::update(bob2.clone(), &mut o2).unwrap()]);
         assert_eq!(pool.insert(again, &utxo, &names, &rtxn, 15), Err(Reject::NameConflict));
         // Commits pool freely; more than the cap in one transaction do not.
-        let t3 = with(3, vec![NameOp::Commit { commit: d(50), memo: d(51) }]);
+        let t3 = with(3, vec![NameOp::Commit { commit: d(50), memo: crate::transaction::memo5(d(51)) }]);
         let id3 = pool.insert(t3, &utxo, &names, &rtxn, 15).unwrap();
         let many: Vec<NameOp> = (0..crate::names::MAX_COMMITS as u32 + 1)
-            .map(|i| NameOp::Commit { commit: d(60 + i), memo: d(1) })
+            .map(|i| NameOp::Commit { commit: d(60 + i), memo: crate::transaction::memo5(d(1)) })
             .collect();
         assert_eq!(pool.insert(with(4, many), &utxo, &names, &rtxn, 15), Err(Reject::Malformed));
         // Selection at height 15 skips the closed reveal; at 22 takes it;
@@ -827,8 +843,9 @@ mod tests {
         let picked = ids(pool.select(&names, &rtxn, 15, |_| true));
         assert!(!picked.contains(&id1) && picked.contains(&id2) && picked.contains(&id3));
         assert!(ids(pool.select(&names, &rtxn, 22, |_| true)).contains(&id1));
-        let big: Vec<NameOp> =
-            (0..crate::names::MAX_COMMITS as u32).map(|i| NameOp::Commit { commit: d(70 + i), memo: d(1) }).collect();
+        let big: Vec<NameOp> = (0..crate::names::MAX_COMMITS as u32)
+            .map(|i| NameOp::Commit { commit: d(70 + i), memo: crate::transaction::memo5(d(1)) })
+            .collect();
         let t4 = with(4, big);
         // t4 pays a higher rate than t3? Same fee, larger size: lower rate,
         // so t3 comes first and t4's eight commits do not fit beside it.

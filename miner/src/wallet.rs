@@ -70,17 +70,17 @@ use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::address;
 use crate::bip39;
-use crate::mldsa;
-use crate::mlkem;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
+use crate::mldsa;
+use crate::mlkem;
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
 use crate::policy::{Cond, CondWitness, Mode, Policy as SpendPolicy, Signer, rebind_message};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::state_tree::open_env;
 use crate::transaction::{
-    Commitment, INPUT_SIZE, Key, Memo, OUTPUT_SIZE, Output, Transaction, UnsignedTransaction, amount_fps, hash_domain,
-    key_commitment, pubkey_hash,
+    Commitment, EMPTY_MEMO, INPUT_SIZE, Key, Memo, OUTPUT_SIZE, Output, Transaction, UnsignedTransaction, hash_domain,
+    key_commitment, memo_slot, pubkey_hash, slot_parts,
 };
 use crate::utxo::{self, UtxoSet};
 use crate::xmss::{Digest, PublicKey, SEED_SIZE};
@@ -99,10 +99,10 @@ const META_SYNCED: &str = "synced";
 const FORMAT: u8 = 6;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
-const SLATE_MAGIC: &[u8; 8] = b"tabslt03";
+const SLATE_MAGIC: &[u8; 8] = b"tabslt04";
 
 const DOM_MASTER: u32 = 0x30;
-const DOM_PAD: u32 = 0x31;
+const DOM_TAG: u32 = 0x31;
 const DOM_KEY: u32 = 0x32;
 const DOM_OWNER: u32 = 0x33;
 const DOM_SALT: u32 = 0x34;
@@ -238,7 +238,7 @@ impl PolicyOutput {
         w.u32(policy.len() as u32);
         w.0.extend_from_slice(&policy);
         w.u64(self.amount);
-        w.digest(&self.memo);
+        w.fps(&self.memo);
         w.0.push(self.state.to_u8());
         w.u64(self.created);
         w.0.push(self.position.is_some() as u8);
@@ -258,7 +258,7 @@ impl PolicyOutput {
         let n = r.u32()? as usize;
         let policy = SpendPolicy::from_bytes(r.take(n)?)?;
         let amount = r.u64()?;
-        let memo = r.digest()?;
+        let memo = [r.fp()?, r.fp()?, r.fp()?, r.fp()?, r.fp()?];
         let state = State::from_u8(r.take(1)?[0])?;
         let created = r.u64()?;
         let has = r.take(1)?[0];
@@ -862,7 +862,12 @@ impl Wallet {
     /// `nonce` (`docs/ONION.md`). The Kyber key is random, never derived
     /// or stored: a key compromised later opens nothing sent before it
     /// was rotated.
-    pub fn fresh_announce(&self, seq: u64, expiry: u64, nonce: u64) -> Result<(mlkem::SecretKey, crate::onion::Announce)> {
+    pub fn fresh_announce(
+        &self,
+        seq: u64,
+        expiry: u64,
+        nonce: u64,
+    ) -> Result<(mlkem::SecretKey, crate::onion::Announce)> {
         let kyber = mlkem::keygen(&random_bytes::<64>()?);
         let announce = crate::onion::Announce::make(&self.identity_key(), kyber.public_key(), seq, expiry, nonce);
         Ok((kyber, announce))
@@ -874,30 +879,36 @@ impl Wallet {
         Key::generate(&seed)
     }
 
-    fn memo(&self, nonce: &[Fp; NONCE], amount: u64) -> Memo {
-        let pad = self.with_master(DOM_PAD, nonce);
-        let mut memo = [Fp::ZERO; DIGEST];
+    /// The memo of the output with nonce `nonce`: the nonce, then a tag
+    /// from the master key by which a scan tells this wallet's outputs
+    /// from others' (a stranger's matches once in 2^31; the commitment
+    /// confirms a match). The amount is public (`docs/AMOUNTS.md`).
+    fn memo(&self, nonce: &[Fp; NONCE]) -> Memo {
+        let mut memo = EMPTY_MEMO;
         memo[..NONCE].copy_from_slice(nonce);
-        for (i, a) in amount_fps(amount).iter().enumerate() {
-            memo[NONCE + i] = a.add(&pad[i]);
-        }
-        memo[DIGEST - 1] = pad[3];
+        memo[NONCE] = self.with_master(DOM_TAG, nonce)[0];
         memo
     }
 
-    /// The nonce and amount a memo holds, if it is one of this wallet's.
-    fn open_memo(&self, memo: &Memo) -> Option<([Fp; NONCE], u64)> {
+    /// The nonce a memo holds, if its tag is this wallet's.
+    fn open_memo(&self, memo: &Memo) -> Option<[Fp; NONCE]> {
         let nonce: [Fp; NONCE] = memo[..NONCE].try_into().unwrap();
-        let pad = self.with_master(DOM_PAD, &nonce);
-        if memo[DIGEST - 1] != pad[3] {
-            return None;
+        (memo[NONCE] == self.with_master(DOM_TAG, &nonce)[0]).then_some(nonce)
+    }
+
+    /// The 32-byte memo of a name record: the memo padded with zeros, as a
+    /// memo slot of amount zero.
+    fn name_memo(&self, nonce: &[Fp; NONCE]) -> Digest {
+        memo_slot(&self.memo(nonce), 0)
+    }
+
+    /// The nonce a name memo ([`Wallet::name_memo`]) holds, if it is one of
+    /// this wallet's.
+    fn open_name_memo(&self, memo: &Digest) -> Option<[Fp; NONCE]> {
+        match slot_parts(memo)? {
+            (m, 0) => self.open_memo(&m),
+            _ => None,
         }
-        let limb = |i: usize| (memo[NONCE + i] - pad[i]).to_canonical() as u64;
-        let (lo, mid, hi) = (limb(0), limb(1), limb(2));
-        if lo >= 1 << 30 || mid >= 1 << 30 || hi >= 1 << 4 {
-            return None;
-        }
-        Some((nonce, lo | mid << 30 | hi << 60))
     }
 
     /// A fresh output paying `amount` to this wallet, with its memo,
@@ -905,7 +916,7 @@ impl Wallet {
     pub fn receive(&self, amount: u64) -> Result<Output> {
         let nonce = [random_fp()?, random_fp()?, random_fp()?, random_fp()?];
         let pk = self.key(&nonce).public_key();
-        let out = Output::with_memo(&pubkey_hash(&pk), amount, self.memo(&nonce, amount));
+        let out = Output::with_memo(&pubkey_hash(&pk), amount, self.memo(&nonce));
         let mut wtxn = self.env.write_txn()?;
         let o = Owned {
             commitment: out.commitment,
@@ -1090,7 +1101,8 @@ impl Wallet {
         let mut gone = Vec::new();
         let mut wtxn = self.env.write_txn()?;
         for c in self.pending_commits()? {
-            let on_chain = registry.commit_position(rtxn, &c.commit).map_err(|e| WalletError::Name(e.to_string()))?.is_some();
+            let on_chain =
+                registry.commit_position(rtxn, &c.commit).map_err(|e| WalletError::Name(e.to_string()))?.is_some();
             if !on_chain && !pooled.contains(&c.commit) && !c.recovered {
                 self.commits.delete(&mut wtxn, &digest_to_bytes(&c.commit))?;
                 gone.push(c.name.as_deref().map_or("?".to_string(), |n| String::from_utf8_lossy(n).into_owned()));
@@ -1117,11 +1129,10 @@ impl Wallet {
     fn memo_scan(&self, utxo: &UtxoSet, rtxn: &RoTxn, add: bool) -> Result<(usize, u128)> {
         let mut found = Vec::new();
         let mut moved = Vec::new();
-        for (position, memo) in utxo.memos(rtxn)? {
-            let Some((nonce, amount)) = self.open_memo(&memo) else {
+        for (position, commitment, memo, amount) in utxo.memos(rtxn)? {
+            let Some(nonce) = self.open_memo(&memo) else {
                 continue;
             };
-            let commitment = utxo.get(rtxn, position)?;
             let pk = self.key(&nonce).public_key();
             if key_commitment(&pubkey_hash(&pk), amount) != commitment {
                 continue;
@@ -1378,7 +1389,7 @@ impl Wallet {
             Some(c) => {
                 let o = self.owned(&c)?.ok_or(WalletError::Corrupt("change output"))?;
                 let pk = self.key(&o.nonce).public_key();
-                let ours = Output::with_memo(&pubkey_hash(&pk), o.amount, self.memo(&o.nonce, o.amount));
+                let ours = Output::with_memo(&pubkey_hash(&pk), o.amount, self.memo(&o.nonce));
                 slate.change == 1 && slate.outputs[0].to_bytes() == ours.to_bytes()
             }
             None => slate.change == 0,
@@ -1540,7 +1551,7 @@ impl Wallet {
 
     /// The record this wallet writes for `name` under the key of `nonce`.
     fn name_record(&self, name: &[u8], nonce: &[Fp; NONCE], value: &Commitment) -> Result<Record> {
-        Record::new(name, self.owner_hash(nonce), *value, self.memo(nonce, 0))
+        Record::new(name, self.owner_hash(nonce), *value, self.name_memo(nonce))
             .ok_or_else(|| WalletError::Name(format!("{} is not a valid name", String::from_utf8_lossy(name))))
     }
 
@@ -1617,7 +1628,7 @@ impl Wallet {
         let mut wtxn = self.env.write_txn()?;
         self.put_commit(&mut wtxn, &entry)?;
         wtxn.commit()?;
-        Ok(NameOp::Commit { commit, memo: self.memo(&nonce, 0) })
+        Ok(NameOp::Commit { commit, memo: self.memo(&nonce) })
     }
 
     /// Reveals `name` from its commit, for a block at `height`, once the
@@ -1842,7 +1853,7 @@ impl Wallet {
         let err = |e: names::Error| WalletError::Name(e.to_string());
         let mut found_names = Vec::new();
         for record in registry.records_in(rtxn, 0, crate::name_trie::Key::MAX).map_err(err)? {
-            let Some((nonce, 0)) = self.open_memo(&record.memo) else {
+            let Some(nonce) = self.open_name_memo(&record.memo) else {
                 continue;
             };
             if record.owner != self.owner_hash(&nonce) || self.owned_name(&record.name)?.is_some() {
@@ -1864,7 +1875,7 @@ impl Wallet {
         let mut found_commits = Vec::new();
         let known = self.pending_commits()?;
         for (position, commit) in registry.commits(rtxn).map_err(err)? {
-            let Some((nonce, 0)) = self.open_memo(&utxo.memo(rtxn, position)?) else {
+            let Some(nonce) = self.open_name_memo(&utxo.slot(rtxn, position)?) else {
                 continue;
             };
             if known.iter().any(|c| c.commit == commit.hash) {
@@ -2329,7 +2340,7 @@ mod tests {
         let key_b = || PolicyKey { index: 1, nonce: nb, height: H as u8, used: 0 };
         let channel = d(1);
         let state_policy = |n: u32, settle: &[Output]| {
-            let pairs: Vec<(Commitment, Memo)> = settle.iter().map(|o| (o.commitment, o.memo)).collect();
+            let pairs: Vec<(Commitment, Digest)> = settle.iter().map(|o| (o.commitment, o.slot())).collect();
             SpendPolicy::new(vec![
                 Leaf::new(vec![
                     Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: vec![ka, kb] },
@@ -2343,8 +2354,8 @@ mod tests {
         // Open: A funds 5000; state 0 refunds A.
         let refund0 = a.receive(5000).unwrap();
         let p0 = state_policy(0, &[refund0]);
-        let funding = a.track_policy(&p0, 5000, d(50), vec![key_a()]).unwrap();
-        assert_eq!(b.track_policy(&p0, 5000, d(50), vec![key_b()]).unwrap(), funding);
+        let funding = a.track_policy(&p0, 5000, crate::transaction::memo5(d(50)), vec![key_a()]).unwrap();
+        assert_eq!(b.track_policy(&p0, 5000, crate::transaction::memo5(d(50)), vec![key_b()]).unwrap(), funding);
         let signed = {
             let rtxn = env.read_txn().unwrap();
             a.fund(vec![funding], None, &u, &rtxn).unwrap()
@@ -2362,8 +2373,8 @@ mod tests {
         let refund1 = a.receive(3000).unwrap();
         let pay1 = b.receive(2000).unwrap();
         let p1 = state_policy(1, &[refund1, pay1]);
-        let state1 = a.track_policy(&p1, 5000, d(51), vec![key_a()]).unwrap();
-        b.track_policy(&p1, 5000, d(51), vec![key_b()]).unwrap();
+        let state1 = a.track_policy(&p1, 5000, crate::transaction::memo5(d(51)), vec![key_a()]).unwrap();
+        b.track_policy(&p1, 5000, crate::transaction::memo5(d(51)), vec![key_b()]).unwrap();
         let mut update = b.policy_spend(&funding.commitment, 0, vec![state1], 1, (0, 1)).unwrap();
         assert_eq!(b.sign_policy(&mut update).unwrap(), 1);
         assert_eq!(update.check_policy_inputs(1, |_| Some(0)), Err(PolicyError::Signatures));
@@ -2401,10 +2412,10 @@ mod tests {
 
         // A factory of A, B and C settling into two channel outputs (A with
         // B, A with C), 3-of-3 to update.
-        let chan_ab = state_policy(0, &[refund0]).output(3000, d(60));
+        let chan_ab = state_policy(0, &[refund0]).output(3000, crate::transaction::memo5(d(60)));
         let chan_ac =
             SpendPolicy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: vec![ka, kc] }])])
-                .output(2000, d(61));
+                .output(2000, crate::transaction::memo5(d(61)));
         let factory = SpendPolicy::new(vec![
             Leaf::new(vec![
                 Cond::Thresh { mode: Mode::Rebindable { channel: d(2) }, m: 3, keys: vec![ka, kb, kc] },
@@ -2412,14 +2423,19 @@ mod tests {
             ]),
             Leaf::new(vec![
                 Cond::Older(10),
-                Cond::Outputs(vec![(chan_ab.commitment, chan_ab.memo), (chan_ac.commitment, chan_ac.memo)]),
+                Cond::Outputs(vec![(chan_ab.commitment, chan_ab.slot()), (chan_ac.commitment, chan_ac.slot())]),
             ]),
             Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 3, keys: vec![ka, kb, kc] }]),
         ]);
-        let fout = a.track_policy(&factory, 5000, d(70), vec![key_a()]).unwrap();
-        b.track_policy(&factory, 5000, d(70), vec![key_b()]).unwrap();
-        c.track_policy(&factory, 5000, d(70), vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }])
-            .unwrap();
+        let fout = a.track_policy(&factory, 5000, crate::transaction::memo5(d(70)), vec![key_a()]).unwrap();
+        b.track_policy(&factory, 5000, crate::transaction::memo5(d(70)), vec![key_b()]).unwrap();
+        c.track_policy(
+            &factory,
+            5000,
+            crate::transaction::memo5(d(70)),
+            vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }],
+        )
+        .unwrap();
         land_all(&[&fout], &[&a, &b, &c]);
         let mut regroup = a.policy_spend(&fout.commitment, 2, vec![chan_ab, chan_ac], 0, (0, 0)).unwrap();
         for w in [&a, &b, &c] {
@@ -2433,9 +2449,14 @@ mod tests {
         // A 2-of-3 multisig, A and C signing.
         let multisig =
             SpendPolicy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: vec![ka, kb, kc] }])]);
-        let mout = a.track_policy(&multisig, 1000, d(80), vec![key_a()]).unwrap();
-        c.track_policy(&multisig, 1000, d(80), vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }])
-            .unwrap();
+        let mout = a.track_policy(&multisig, 1000, crate::transaction::memo5(d(80)), vec![key_a()]).unwrap();
+        c.track_policy(
+            &multisig,
+            1000,
+            crate::transaction::memo5(d(80)),
+            vec![PolicyKey { index: 2, nonce: nc, height: H as u8, used: 0 }],
+        )
+        .unwrap();
         land_all(&[&mout], &[&a, &c]);
         let mut spend = c.policy_spend(&mout.commitment, 0, vec![c.receive(990).unwrap()], 0, (0, 0)).unwrap();
         assert_eq!(c.sign_policy(&mut spend).unwrap(), 1);
@@ -2459,8 +2480,8 @@ mod tests {
             let a = w.receive(100).unwrap();
             let b = w.receive(u64::MAX).unwrap();
             assert_ne!(a.memo, b.memo);
-            assert_eq!(w.open_memo(&a.memo), Some((a.memo[..4].try_into().unwrap(), 100)));
-            assert_eq!(w.open_memo(&b.memo).unwrap().1, u64::MAX);
+            assert_eq!(w.open_memo(&a.memo), Some(a.memo[..4].try_into().unwrap()));
+            assert!(w.open_memo(&b.memo).is_some());
             land(&env, &u, &w, &[&a]);
             assert_eq!(w.owned(&a.commitment).unwrap().unwrap().position, Some(0));
             assert_eq!(w.owned(&b.commitment).unwrap().unwrap().position, None);
@@ -2478,7 +2499,7 @@ mod tests {
         // Another wallet cannot read the memo.
         let (other, _) = Wallet::open(&dir.0.join("other")).unwrap();
         let o = w.owned(&a_commitment).unwrap().unwrap();
-        assert!(other.open_memo(&w.memo(&o.nonce, 100)).is_none());
+        assert!(other.open_memo(&w.memo(&o.nonce)).is_none());
         // The identity comes from the phrase: a restore has the same
         // address, another wallet a different one, and the key signs.
         let address = w.address();
@@ -2611,7 +2632,7 @@ mod tests {
         assert!(matches!(alice.finalize(&greedy), Err(WalletError::BadSlate("amount or fee changed"))));
         // Nor touch the change's memo, which a restored wallet needs.
         let mut spoiled = received.clone();
-        spoiled.outputs[0].memo[5] = spoiled.outputs[0].memo[5].add(&Fp::ONE);
+        spoiled.outputs[0].memo[4] = spoiled.outputs[0].memo[4].add(&Fp::ONE);
         assert_eq!(spoiled.outputs[0].commitment, received.outputs[0].commitment);
         assert!(matches!(alice.finalize(&spoiled), Err(WalletError::BadSlate("change output changed"))));
         // Nor add what the pool would refuse.
@@ -2767,7 +2788,7 @@ mod tests {
         assert_eq!((owned.stage, owned.value), (NameStage::Owned, value(1)));
         let on_chain = registry.lookup(&rtxn, b"alice").unwrap().unwrap();
         assert_eq!(on_chain.owner, alice.owner_hash(&owned.nonce));
-        assert_eq!(alice.open_memo(&on_chain.memo), Some((owned.nonce, 0)));
+        assert_eq!(alice.open_name_memo(&on_chain.memo), Some(owned.nonce));
 
         // Update: the key rotates once the chain shows the new owner.
         let (update, last) = alice.name_update(b"alice", value(2)).unwrap();

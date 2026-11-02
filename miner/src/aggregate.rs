@@ -1497,10 +1497,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1988072124, 742274853, 1154908393, 268409728, 1815481072, 787271082, 21707773, 526048172],
+    plan_root: [1036812889, 272199423, 141536014, 701931626, 585382509, 1077559644, 1719650181, 1492275923],
     plan_depth: 14,
-    base: [1716336543, 708301632, 1586392367, 1595975372, 1834481717, 1588379706, 1153034480, 121278388],
-    step: [981075344, 42996742, 647483301, 320133933, 572712437, 1669517614, 700302691, 1902592081],
+    base: [1363582107, 108805095, 1632390072, 1459947995, 1118989553, 549101129, 1917969891, 1217329271],
+    step: [592323897, 669170957, 1487653464, 1641175130, 1403597084, 1003792182, 26953000, 17170090],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -2065,7 +2065,7 @@ mod tests {
             assert_eq!(v.verify_statement(&without, &proof), Err(AggregateError::Rejected));
             statement
         };
-        let st1 = block(1, vec![NameOp::Commit { commit: c, memo: [Fp::new(8); DIGEST] }]);
+        let st1 = block(1, vec![NameOp::Commit { commit: c, memo: [Fp::new(8); crate::transaction::MEMO_LEN] }]);
         assert_eq!(st1.end_output_position, 2);
         let st2 = block(1 + crate::names::MIN_REVEAL, vec![NameOp::Reveal { record: alice.clone(), salt, commit: 1 }]);
         assert_eq!(st2.end_output_position, 3);

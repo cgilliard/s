@@ -3,8 +3,9 @@
 //!
 //! Every output ever created gets the next position from a monotonically
 //! increasing counter (positions are never reused), and its leaf, the
-//! commitment and memo compressed ([`crate::transaction::leaf`]), is at
-//! that position in the tree, so the root covers memos too. Spending an
+//! commitment and memo slot (memo and amount) compressed
+//! ([`crate::transaction::leaf`]), is at that position in the tree, so the
+//! root covers memos and amounts too. Spending an
 //! output clears the leaf. Outputs are found by position only: blocks list
 //! their inputs' positions, and a transaction input carries its output's
 //! position, which nodes check against its commitment ([`UtxoSet::holds`]).
@@ -18,10 +19,10 @@
 //!   endian, so byte order is numeric order); it holds the outputs from
 //!   there up to the next bucket's key, each a varint, its distance from
 //!   the previous position (from the key for the first), then its
-//!   commitment and memo (64 bytes). A bucket is at most [`BUCKET_MAX`]
-//!   bytes, one LMDB overflow page; full buckets split and emptied ones are
-//!   repacked with their neighbours, so pages stay mostly full however
-//!   outputs are spent (LMDB's own pages stay about half full under random
+//!   commitment, memo, amount and creation height (64 bytes). A bucket is
+//!   at most [`BUCKET_MAX`] bytes, one LMDB overflow page; full buckets
+//!   split and emptied ones are repacked with their neighbours, so pages
+//!   stay mostly full however outputs are spent (LMDB's own pages stay about half full under random
 //!   deletion).
 //! - `<prefix>.tree`: the Merkle tree's nodes from level [`GROUP_LOG`] up
 //!   (subtrees of 256 positions). The levels below are recomputed from the
@@ -37,7 +38,7 @@ use std::collections::BTreeMap;
 use crate::block::BlockOutput;
 use crate::poseidon2::digest_from_bytes;
 use crate::state_tree::EMPTY;
-use crate::transaction::{Memo, height_digest, leaf};
+use crate::transaction::{height_digest, leaf, memo_from_bytes, memo_slot, memo_to_bytes, slot_parts};
 use heed::byteorder::{BigEndian, LittleEndian};
 use heed::types::{Bytes, Str, U64};
 use heed::{Database, Env, RoTxn, RwTxn};
@@ -51,8 +52,8 @@ const META_NEXT_POSITION: &str = "next_position";
 const META_COUNT: &str = "count";
 /// Height of the subtrees whose roots are the lowest stored tree level.
 pub const GROUP_LOG: usize = 8;
-/// A stored output: commitment, memo and creation height.
-const RECORD: usize = 2 * COMMITMENT_BYTES + 4;
+/// A stored output: commitment, memo, amount and creation height.
+const RECORD: usize = COMMITMENT_BYTES + crate::transaction::MEMO_BYTES + 8 + 4;
 /// Largest bucket: one LMDB overflow page, 4096 bytes less its 16-byte
 /// header, so a full bucket wastes nothing.
 pub const BUCKET_MAX: usize = 4080;
@@ -63,7 +64,7 @@ const BUCKET_LOW: usize = BUCKET_MAX * 3 / 4;
 /// rather than compute, so there are more of them than cores.
 const PREFETCH_THREADS: usize = 32;
 
-/// An output's commitment and memo, as stored.
+/// An output's commitment, memo, amount and creation height, as stored.
 type Record = [u8; RECORD];
 
 /// Errors from UTXO set operations.
@@ -113,31 +114,45 @@ impl From<heed::Error> for Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// An unspent output as stored: commitment, memo and creation height.
-pub type Stored = (Commitment, Memo, u32);
+/// An output's memo slot ([`crate::transaction::memo_slot`]): its memo and
+/// its amount, as its leaf hashes them.
+pub type Slot = Digest;
 
-fn record_bytes(commitment: &Commitment, memo: &Memo, height: u32) -> Record {
+/// An unspent output as stored: commitment, memo slot and creation height.
+pub type Stored = (Commitment, Slot, u32);
+
+const MEMO_AT: usize = COMMITMENT_BYTES;
+const AMOUNT_AT: usize = MEMO_AT + crate::transaction::MEMO_BYTES;
+const HEIGHT_AT: usize = AMOUNT_AT + 8;
+
+/// A record: the commitment, the memo, the amount (the slot split back
+/// into the two) and the creation height.
+fn record_bytes(commitment: &Commitment, slot: &Slot, height: u32) -> Record {
+    let (memo, amount) = slot_parts(slot).expect("a slot made by memo_slot");
     let mut rec = [0u8; RECORD];
-    rec[..COMMITMENT_BYTES].copy_from_slice(&digest_to_bytes(commitment));
-    rec[COMMITMENT_BYTES..2 * COMMITMENT_BYTES].copy_from_slice(&digest_to_bytes(memo));
-    rec[2 * COMMITMENT_BYTES..].copy_from_slice(&height.to_le_bytes());
+    rec[..MEMO_AT].copy_from_slice(&digest_to_bytes(commitment));
+    rec[MEMO_AT..AMOUNT_AT].copy_from_slice(&memo_to_bytes(&memo));
+    rec[AMOUNT_AT..HEIGHT_AT].copy_from_slice(&amount.to_le_bytes());
+    rec[HEIGHT_AT..].copy_from_slice(&height.to_le_bytes());
     rec
 }
 
-fn parse_record(rec: &[u8]) -> Result<(Commitment, Memo, u32)> {
+fn parse_record(rec: &[u8]) -> Result<(Commitment, Slot, u32)> {
     if rec.len() != RECORD {
         return Err(Error::CorruptIndex);
     }
+    let memo = memo_from_bytes(&rec[MEMO_AT..AMOUNT_AT]).ok_or(Error::CorruptIndex)?;
+    let amount = u64::from_le_bytes(rec[AMOUNT_AT..HEIGHT_AT].try_into().unwrap());
     Ok((
-        digest_from_bytes(&rec[..COMMITMENT_BYTES]).ok_or(Error::CorruptIndex)?,
-        digest_from_bytes(&rec[COMMITMENT_BYTES..2 * COMMITMENT_BYTES]).ok_or(Error::CorruptIndex)?,
-        u32::from_le_bytes(rec[2 * COMMITMENT_BYTES..].try_into().unwrap()),
+        digest_from_bytes(&rec[..MEMO_AT]).ok_or(Error::CorruptIndex)?,
+        memo_slot(&memo, amount),
+        u32::from_le_bytes(rec[HEIGHT_AT..].try_into().unwrap()),
     ))
 }
 
-/// The leaves of `records`: commitment and memo compressed, then
+/// The leaves of `records`: commitment and memo slot compressed, then
 /// compressed with the creation height ([`leaf`]), hashed eight at a time.
-fn leaves_of(records: &[(Commitment, Memo, u32)]) -> Vec<Digest> {
+fn leaves_of(records: &[(Commitment, Slot, u32)]) -> Vec<Digest> {
     let pairs: Vec<(&Digest, &Digest)> = records.iter().map(|(c, m, _)| (c, m)).collect();
     let inner = compress_all(&pairs);
     let heights: Vec<Digest> = records.iter().map(|r| height_digest(r.2)).collect();
@@ -218,7 +233,7 @@ fn pack_buckets(key: u64, entries: &[(u64, Record)]) -> Vec<(u64, Vec<u8>)> {
 /// outputs at `positions` (ascending) with `records`; groups without
 /// outputs are left out. The leaves and every level are hashed across
 /// groups, eight at a time, with the groups split among threads.
-fn group_roots(positions: &[u64], records: &[(Commitment, Memo, u32)]) -> Vec<(u64, Digest)> {
+fn group_roots(positions: &[u64], records: &[(Commitment, Slot, u32)]) -> Vec<(u64, Digest)> {
     // Cut into pieces of whole groups, about one per thread.
     let per = positions.len().div_ceil(crate::parallel::threads()).max(1 << GROUP_LOG);
     let mut cuts = vec![0];
@@ -299,7 +314,7 @@ impl UtxoSet {
     /// Adds an output with an empty memo created at height 0 (for tests);
     /// returns its position.
     pub fn add(&self, wtxn: &mut RwTxn, commitment: &Commitment) -> Result<u64> {
-        self.add_output(wtxn, &BlockOutput { commitment: *commitment, memo: EMPTY }, 0)
+        self.add_output(wtxn, &BlockOutput::from(*commitment), 0)
     }
 
     /// Adds an output created at `height` at the next position: its leaf
@@ -320,7 +335,7 @@ impl UtxoSet {
         }
         let mut edit = Edit::default();
         for (i, o) in outputs.iter().enumerate() {
-            self.put_record(wtxn, &mut edit, first + i as u64, &o.commitment, &o.memo, height)?;
+            self.put_record(wtxn, &mut edit, first + i as u64, &o.commitment, &o.slot(), height)?;
         }
         self.write(wtxn, edit)?;
         self.meta.put(wtxn, META_NEXT_POSITION, &end)?;
@@ -340,7 +355,7 @@ impl UtxoSet {
         &self,
         wtxn: &mut RwTxn,
         positions: &[u64],
-    ) -> Result<core::result::Result<Vec<(Commitment, Memo, u32)>, u64>> {
+    ) -> Result<core::result::Result<Vec<(Commitment, Slot, u32)>, u64>> {
         self.prefetch(positions.iter().map(|p| p >> GROUP_LOG).collect());
         let mut edit = Edit::default();
         let mut spent = Vec::with_capacity(positions.len());
@@ -357,7 +372,7 @@ impl UtxoSet {
 
     /// Restores spent outputs `(position, commitment, memo)`: the inverse
     /// of [`UtxoSet::spend_positions`].
-    pub fn restore(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Memo, u32)]) -> Result<()> {
+    pub fn restore(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Slot, u32)]) -> Result<()> {
         self.prefetch(outputs.iter().map(|o| o.0 >> GROUP_LOG).collect());
         let mut edit = Edit::default();
         for (p, c, m, h) in outputs {
@@ -377,7 +392,7 @@ impl UtxoSet {
         wtxn: &mut RwTxn,
         position: u64,
         commitment: &Commitment,
-        memo: &Memo,
+        memo: &Slot,
         height: u32,
     ) -> Result<()> {
         if position >= OUTPUT_CAPACITY {
@@ -392,7 +407,7 @@ impl UtxoSet {
     /// Fills an empty set from a snapshot: `outputs` ascending by position,
     /// all below `next`, which becomes the counter. Writes each stored tree
     /// node once, so it stays fast for a set of any size.
-    pub fn install(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Memo, u32)], next: u64) -> Result<()> {
+    pub fn install(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Slot, u32)], next: u64) -> Result<()> {
         if !self.is_empty(wtxn)? || self.next_position(wtxn)? != 0 || next > OUTPUT_CAPACITY {
             return Err(Error::CorruptIndex);
         }
@@ -416,7 +431,7 @@ impl UtxoSet {
         wtxn: &mut RwTxn,
         level: usize,
         index: u64,
-        outputs: &[(u64, Commitment, Memo, u32)],
+        outputs: &[(u64, Commitment, Slot, u32)],
         next: u64,
     ) -> Result<Digest> {
         let (first, end) = (index << level, ((index + 1) << level).min(next));
@@ -432,12 +447,12 @@ impl UtxoSet {
 
     /// Removes a staged part, the subtree of height `level` at `index`:
     /// its outputs and its tree nodes. Returns the outputs, ascending.
-    pub fn unstage(&self, wtxn: &mut RwTxn, level: usize, index: u64) -> Result<Vec<(u64, Commitment, Memo, u32)>> {
+    pub fn unstage(&self, wtxn: &mut RwTxn, level: usize, index: u64) -> Result<Vec<(u64, Commitment, Slot, u32)>> {
         if level < GROUP_LOG {
             return Err(Error::CorruptIndex);
         }
         let (first, end) = (index << level, (index + 1) << level);
-        let outputs: Vec<(u64, Commitment, Memo, u32)> =
+        let outputs: Vec<(u64, Commitment, Slot, u32)> =
             self.unspent_in(wtxn, first, end)?.into_iter().map(|(p, (c, m, h))| (p, c, m, h)).collect();
         // Staged buckets hold one part's outputs each, keyed within it.
         self.outputs.delete_range(wtxn, &(first..end))?;
@@ -484,7 +499,7 @@ impl UtxoSet {
     /// Stores `outputs` (ascending, at positions holding nothing, after
     /// every stored bucket's outputs or before the next bucket's key) in
     /// full buckets of their own: for installing a snapshot.
-    fn put_packed(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Memo, u32)]) -> Result<()> {
+    fn put_packed(&self, wtxn: &mut RwTxn, outputs: &[(u64, Commitment, Slot, u32)]) -> Result<()> {
         let Some(&(first, _, _, _)) = outputs.first() else {
             return Ok(());
         };
@@ -537,7 +552,7 @@ impl UtxoSet {
         edit: &mut Edit,
         position: u64,
         commitment: &Commitment,
-        memo: &Memo,
+        memo: &Slot,
         height: u32,
     ) -> Result<()> {
         let rec = record_bytes(commitment, memo, height);
@@ -554,14 +569,14 @@ impl UtxoSet {
 
     /// Removes the output at `position` in `edit`, if there is one and, when
     /// given, its commitment is `commitment`; the tree is not updated.
-    /// Returns its commitment and memo.
+    /// Returns its commitment, memo slot and creation height.
     fn remove_record(
         &self,
         wtxn: &mut RwTxn,
         edit: &mut Edit,
         position: u64,
         commitment: Option<&Commitment>,
-    ) -> Result<Option<(Commitment, Memo, u32)>> {
+    ) -> Result<Option<(Commitment, Slot, u32)>> {
         let bucket = self.load(wtxn, edit, position)?;
         let Ok(i) = bucket.binary_search_by_key(&position, |e| e.0) else {
             return Ok(None);
@@ -681,9 +696,9 @@ impl UtxoSet {
     }
 
     /// The roots of the groups holding `outputs` (ascending by position).
-    fn roots_of(outputs: &[(u64, Commitment, Memo, u32)]) -> Vec<(u64, Digest)> {
+    fn roots_of(outputs: &[(u64, Commitment, Slot, u32)]) -> Vec<(u64, Digest)> {
         let positions: Vec<u64> = outputs.iter().map(|o| o.0).collect();
-        let records: Vec<(Commitment, Memo, u32)> = outputs.iter().map(|o| (o.1, o.2, o.3)).collect();
+        let records: Vec<(Commitment, Slot, u32)> = outputs.iter().map(|o| (o.1, o.2, o.3)).collect();
         group_roots(&positions, &records)
     }
 
@@ -694,7 +709,7 @@ impl UtxoSet {
         rtxn: &RoTxn,
         group: u64,
         positions: &mut Vec<u64>,
-        records: &mut Vec<(Commitment, Memo, u32)>,
+        records: &mut Vec<(Commitment, Slot, u32)>,
     ) -> Result<()> {
         self.scan(rtxn, group << GROUP_LOG, (group + 1) << GROUP_LOG, |p, rec| {
             positions.push(p);
@@ -743,7 +758,7 @@ impl UtxoSet {
 
     /// Commitment, memo and creation height of the unspent output at
     /// `position`.
-    pub fn output_at(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo, u32)>> {
+    pub fn output_at(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Slot, u32)>> {
         self.record(rtxn, position)
     }
 
@@ -770,14 +785,14 @@ impl UtxoSet {
         &self,
         wtxn: &mut RwTxn,
         commitment: &Commitment,
-        memo: &Memo,
+        memo: &Slot,
         height: u32,
         position: u64,
     ) -> Result<()> {
         self.insert_at(wtxn, position, commitment, memo, height)
     }
 
-    fn record(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Memo, u32)>> {
+    fn record(&self, rtxn: &RoTxn, position: u64) -> Result<Option<(Commitment, Slot, u32)>> {
         let Some(key) = self.bucket_key(rtxn, position)? else {
             return Ok(None);
         };
@@ -788,24 +803,36 @@ impl UtxoSet {
         }
     }
 
-    /// The memo of the unspent output at `position` (empty if none).
-    pub fn memo(&self, rtxn: &RoTxn, position: u64) -> Result<Memo> {
+    /// The memo slot of the unspent output at `position` (empty if none).
+    pub fn slot(&self, rtxn: &RoTxn, position: u64) -> Result<Slot> {
         Ok(self.record(rtxn, position)?.map_or(EMPTY, |(_, m, _)| m))
     }
 
-    /// Every unspent output's non-empty memo with its position, in
-    /// position order.
-    pub fn memos(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Memo)>> {
+    /// Every unspent output with a non-empty memo, in position order: its
+    /// position, commitment, memo and amount.
+    pub fn memos(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Commitment, crate::transaction::Memo, u64)>> {
         let mut out = Vec::new();
-        for (position, (_, memo, _)) in self.unspent(rtxn)? {
-            if memo != EMPTY {
-                out.push((position, memo));
+        for (position, (commitment, slot, _)) in self.unspent(rtxn)? {
+            let (memo, amount) = slot_parts(&slot).ok_or(Error::CorruptIndex)?;
+            if memo != crate::transaction::EMPTY_MEMO {
+                out.push((position, commitment, memo, amount));
             }
         }
         Ok(out)
     }
 
-    /// Every unspent output, position order: commitment and memo.
+    /// The total amount of every unspent output (`docs/AMOUNTS.md`): the
+    /// supply, which must equal what was issued. A full pass over the set.
+    pub fn total(&self, rtxn: &RoTxn) -> Result<u128> {
+        let mut total = 0u128;
+        for (_, (_, slot, _)) in self.unspent(rtxn)? {
+            total += slot_parts(&slot).ok_or(Error::CorruptIndex)?.1 as u128;
+        }
+        Ok(total)
+    }
+
+    /// Every unspent output, position order: commitment, memo slot and
+    /// creation height.
     pub fn unspent(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Stored)>> {
         self.unspent_in(rtxn, 0, OUTPUT_CAPACITY)
     }
@@ -848,7 +875,7 @@ impl UtxoSet {
         Ok(self.record(rtxn, position)?.map_or(EMPTY, |(c, _, _)| c))
     }
 
-    /// The tree leaf at `position`: commitment and memo compressed, or the
+    /// The tree leaf at `position`: commitment and memo slot compressed, or the
     /// empty digest.
     pub fn leaf_at(&self, rtxn: &RoTxn, position: u64) -> Result<Digest> {
         Ok(self.record(rtxn, position)?.map_or(EMPTY, |(c, m, h)| leaf(&c, &m, h)))
@@ -1070,18 +1097,23 @@ mod tests {
             d[3] = crate::poseidon2::Fp::new((x >> 20) as u32 % 1000);
             d
         };
-        let mut live: Vec<(u64, Commitment, Memo, u32)> = Vec::new();
+        let mut live: Vec<(u64, Commitment, Slot, u32)> = Vec::new();
         for round in 0..60 {
             // Append a run, sometimes long enough to span several groups.
             let n = 1 + next() % if round % 7 == 0 { 150 } else { 9 };
             let first = set.next_position(&wtxn).unwrap();
-            let outs: Vec<BlockOutput> =
-                (0..n).map(|_| BlockOutput { commitment: digest(next() % 40), memo: digest(next()) }).collect();
+            let outs: Vec<BlockOutput> = (0..n)
+                .map(|_| BlockOutput {
+                    commitment: digest(next() % 40),
+                    memo: crate::transaction::memo5(digest(next())),
+                    amount: next() % 1000,
+                })
+                .collect();
             set.add_outputs(&mut wtxn, &outs, 0).unwrap();
             for (i, o) in outs.iter().enumerate() {
                 let p = first + i as u64;
-                plain.update(&mut wtxn, p, &leaf(&o.commitment, &o.memo, 0)).unwrap();
-                live.push((p, o.commitment, o.memo, 0));
+                plain.update(&mut wtxn, p, &leaf(&o.commitment, &o.slot(), 0)).unwrap();
+                live.push((p, o.commitment, o.slot(), 0));
             }
             // Spend a few at random.
             for _ in 0..next() % 6 {
@@ -1099,7 +1131,7 @@ mod tests {
             }
             // A block's worth of spends at once, sometimes restored at once.
             if round % 3 == 1 && live.len() > 8 {
-                let mut batch: Vec<(u64, Commitment, Memo, u32)> = Vec::new();
+                let mut batch: Vec<(u64, Commitment, Slot, u32)> = Vec::new();
                 for _ in 0..1 + next() % 8 {
                     batch.push(live.swap_remove((next() % live.len() as u64) as usize));
                 }
@@ -1247,8 +1279,13 @@ mod tests {
             d
         };
         let total = 200_000u64;
-        let outs: Vec<BlockOutput> =
-            (0..total).map(|_| BlockOutput { commitment: digest(&mut next), memo: digest(&mut next) }).collect();
+        let outs: Vec<BlockOutput> = (0..total)
+            .map(|_| BlockOutput {
+                commitment: digest(&mut next),
+                memo: crate::transaction::memo5(digest(&mut next)),
+                amount: 7,
+            })
+            .collect();
         set.add_outputs(&mut wtxn, &outs, 0).unwrap();
         wtxn.commit().unwrap();
         let mut wtxn = env.write_txn().unwrap();
@@ -1264,14 +1301,19 @@ mod tests {
             assert!(set.spend_at(&mut wtxn, &outs[p as usize].commitment, p).unwrap());
         }
         let spend = t.elapsed();
-        let new: Vec<BlockOutput> =
-            (0..4000).map(|_| BlockOutput { commitment: digest(&mut next), memo: digest(&mut next) }).collect();
+        let new: Vec<BlockOutput> = (0..4000)
+            .map(|_| BlockOutput {
+                commitment: digest(&mut next),
+                memo: crate::transaction::memo5(digest(&mut next)),
+                amount: 7,
+            })
+            .collect();
         let t = std::time::Instant::now();
         set.add_outputs(&mut wtxn, &new, 0).unwrap();
         let add = t.elapsed();
         // The same spends as a block applies them: at once.
-        let back: Vec<(u64, Commitment, Memo, u32)> =
-            picks.iter().map(|&p| (p, outs[p as usize].commitment, outs[p as usize].memo, 0)).collect();
+        let back: Vec<(u64, Commitment, Slot, u32)> =
+            picks.iter().map(|&p| (p, outs[p as usize].commitment, outs[p as usize].slot(), 0)).collect();
         let t = std::time::Instant::now();
         set.restore(&mut wtxn, &back).unwrap();
         let restore = t.elapsed();
@@ -1417,7 +1459,7 @@ mod tests {
             let mut roots = Vec::with_capacity(parts as usize);
             let mut wtxn = env.write_txn().unwrap();
             for part in 0..parts {
-                let outputs: Vec<(u64, Commitment, Memo, u32)> = ((part << level)..((part + 1) << level).min(span))
+                let outputs: Vec<(u64, Commitment, Slot, u32)> = ((part << level)..((part + 1) << level).min(span))
                     .filter(|p| p % 5 == 0)
                     .map(|p| (p, digest(&mut next), digest(&mut next), 0))
                     .collect();
@@ -1470,8 +1512,13 @@ mod tests {
         }
         let mut picks: Vec<u64> = chosen.into_iter().collect();
         picks.sort_by_key(|p| p.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let new: Vec<BlockOutput> =
-            (0..add).map(|_| BlockOutput { commitment: digest(&mut next), memo: digest(&mut next) }).collect();
+        let new: Vec<BlockOutput> = (0..add)
+            .map(|_| BlockOutput {
+                commitment: digest(&mut next),
+                memo: crate::transaction::memo5(digest(&mut next)),
+                amount: 7,
+            })
+            .collect();
         let total = std::time::Instant::now();
         let mut wtxn = env.write_txn().unwrap();
         let t = std::time::Instant::now();
@@ -1549,17 +1596,22 @@ mod tests {
             x ^= x << 17;
             x
         };
-        let mut model: BTreeMap<u64, (Commitment, Memo, u32)> = BTreeMap::new();
+        let mut model: BTreeMap<u64, (Commitment, Slot, u32)> = BTreeMap::new();
         for round in 0..60 {
             let d = |n: u64| -> Digest {
                 core::array::from_fn(|i| crate::poseidon2::Fp::new((n as u32 + i as u32) % 1000))
             };
             let first = set.next_position(&wtxn).unwrap();
-            let outs: Vec<BlockOutput> =
-                (0..1 + next() % 400).map(|i| BlockOutput { commitment: d(first + i), memo: d(round) }).collect();
+            let outs: Vec<BlockOutput> = (0..1 + next() % 400)
+                .map(|i| BlockOutput {
+                    commitment: d(first + i),
+                    memo: crate::transaction::memo5(d(round)),
+                    amount: round,
+                })
+                .collect();
             set.add_outputs(&mut wtxn, &outs, 0).unwrap();
             for (i, o) in outs.iter().enumerate() {
-                model.insert(first + i as u64, (o.commitment, o.memo, 0));
+                model.insert(first + i as u64, (o.commitment, o.slot(), 0));
             }
             let live: Vec<u64> = model.keys().copied().collect();
             let mut picks: Vec<u64> = (0..next() % (live.len() as u64 * 3 / 4 + 1))
@@ -1575,7 +1627,7 @@ mod tests {
             }
             if round % 3 == 0 {
                 // Put a few back, as a disconnected block does.
-                let back: Vec<(u64, Commitment, Memo, u32)> =
+                let back: Vec<(u64, Commitment, Slot, u32)> =
                     picks.iter().zip(&spent).take(50).map(|(p, (c, m, h))| (*p, *c, *m, *h)).collect();
                 set.restore(&mut wtxn, &back).unwrap();
                 for (p, c, m, _) in back {
@@ -1594,7 +1646,7 @@ mod tests {
                 }
             }
             check_buckets(&set, &wtxn);
-            let got: BTreeMap<u64, (Commitment, Memo, u32)> = set.unspent(&wtxn).unwrap().into_iter().collect();
+            let got: BTreeMap<u64, (Commitment, Slot, u32)> = set.unspent(&wtxn).unwrap().into_iter().collect();
             assert_eq!(got, model, "round {round}");
             let leaves: Vec<(u64, Digest)> = model.iter().map(|(p, (c, m, h))| (*p, leaf(c, m, *h))).collect();
             assert_eq!(set.root(&wtxn).unwrap(), subtree_root(state_tree::DEPTH, 0, &leaves), "round {round}");
@@ -1647,7 +1699,7 @@ mod tests {
                             crate::poseidon2::Fp::new((next() % crate::poseidon2::P as u64) as u32)
                         })
                     };
-                    BlockOutput { commitment: d(), memo: d() }
+                    BlockOutput { commitment: d(), memo: crate::transaction::memo5(d()), amount: 3 }
                 })
                 .collect();
             set.add_outputs(&mut wtxn, &outs, 0).unwrap();
@@ -1705,12 +1757,12 @@ mod tests {
                     let mut d = EMPTY;
                     d[0] = crate::poseidon2::Fp::new((first + i) as u32 + 1);
                     d[1] = crate::poseidon2::Fp::new((next() % 1000) as u32);
-                    BlockOutput { commitment: d, memo: EMPTY }
+                    BlockOutput::from(d)
                 })
                 .collect();
             set.add_outputs(&mut wtxn, &outs, 0).unwrap();
             for (i, o) in outs.iter().enumerate() {
-                live.insert(first + i as u64, leaf(&o.commitment, &o.memo, 0));
+                live.insert(first + i as u64, leaf(&o.commitment, &o.slot(), 0));
             }
             let leaves: Vec<(u64, Digest)> = live.iter().map(|(p, l)| (*p, *l)).collect();
             assert_eq!(set.root(&wtxn).unwrap(), subtree_root(state_tree::DEPTH, 0, &leaves), "block {block}");

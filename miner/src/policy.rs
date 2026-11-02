@@ -20,7 +20,7 @@
 //! | `After` | the block's height is at least it (CLTV) |
 //! | `Older` | the block's height is at least the output's creation height plus it (CSV) |
 //! | `State` | the spending transaction's state number exceeds it |
-//! | `Outputs` | the spend's covered outputs (a run of the transaction's outputs the input names) are exactly the listed ones, commitment and memo |
+//! | `Outputs` | the spend's covered outputs (a run of the transaction's outputs the input names) are exactly the listed ones, commitment and memo slot (memo and amount) |
 //!
 //! The covered run is hashed once, [`covered_digest`], and serves both the
 //! covenant (its digest is what the leaf holds) and the rebindable
@@ -63,7 +63,7 @@
 //!         | u8 2 | u32 height
 //!         | u8 3 | u32 age
 //!         | u8 4 | u32 state
-//!         | u8 5 | u8 k | k * (commitment (32) | memo (32))      (hashed into the leaf as its covered digest)
+//!         | u8 5 | u8 k | k * (commitment (32) | memo slot (32))  (hashed into the leaf as its covered digest)
 //! input  := u64 amount | u64 position | u8 leaf index | POLICY_DEPTH * sibling (32)
 //!         | u32 state | u8 covered start | u8 covered count | leaf | per condition: witness
 //! witness:= Thresh: u8 count, count * (u8 key, pubkey (49), signature)
@@ -113,7 +113,7 @@ pub enum Cond {
     After(u32),
     Older(u32),
     State(u32),
-    Outputs(Vec<(Commitment, Memo)>),
+    Outputs(Vec<(Commitment, Digest)>),
 }
 
 /// A conjunction of conditions.
@@ -209,10 +209,11 @@ pub fn hash_lock(preimage: &Digest) -> Digest {
     hash_domain(DOM_HASHLOCK, preimage)
 }
 
-/// The digest of a run of outputs, commitment and memo each: what a
-/// covenant holds and a rebindable message covers. `[count, 0, …]`, then
-/// a block per commitment and per memo.
-pub fn covered_digest(outputs: &[(Commitment, Memo)]) -> Digest {
+/// The digest of a run of outputs, commitment and memo slot (memo and
+/// amount, [`crate::transaction::memo_slot`]) each: what a covenant holds
+/// and a rebindable message covers. `[count, 0, …]`, then a block per
+/// commitment and per slot.
+pub fn covered_digest(outputs: &[(Commitment, Digest)]) -> Digest {
     let mut v = Vec::with_capacity(DIGEST + 2 * DIGEST * outputs.len());
     v.push(Fp::new(outputs.len() as u32));
     v.extend_from_slice(&[Fp::ZERO; DIGEST - 1]);
@@ -225,7 +226,7 @@ pub fn covered_digest(outputs: &[(Commitment, Memo)]) -> Digest {
 
 /// The message rebindable signatures sign: the channel, the state number
 /// and the digest of the outputs the spend must create.
-pub fn rebind_message(channel: &Digest, state: u32, outputs: &[(Commitment, Memo)]) -> Digest {
+pub fn rebind_message(channel: &Digest, state: u32, outputs: &[(Commitment, Digest)]) -> Digest {
     let mut v = Vec::with_capacity(2 * DIGEST + 1);
     v.extend_from_slice(channel);
     v.push(Fp::new(state));
@@ -611,10 +612,10 @@ impl PolicyInput {
     }
 
     /// The outputs a rebindable signature of this input covers.
-    pub fn covered_outputs(&self, outputs: &[Output]) -> Option<Vec<(Commitment, Memo)>> {
+    pub fn covered_outputs(&self, outputs: &[Output]) -> Option<Vec<(Commitment, Digest)>> {
         let (start, count) = (self.covered.0 as usize, self.covered.1 as usize);
         let run = outputs.get(start..start.checked_add(count)?)?;
-        Some(run.iter().map(|o| (o.commitment, o.memo)).collect())
+        Some(run.iter().map(|o| (o.commitment, o.slot())).collect())
     }
 
     /// Whether the leaf is satisfied: `body` is the transaction's body hash,
@@ -858,7 +859,9 @@ mod tests {
         let keys: Vec<Digest> = [&a, &b, &c].iter().map(|k| pubkey_hash(&k.public_key())).collect();
         let preimage = d(77);
         let channel = d(5);
-        let settle = vec![(d(11), d(12)), (d(13), d(14))];
+        // The covered outputs' commitments and slots: memos and amounts.
+        let slot = |n: u32, amount: u64| crate::transaction::memo_slot(&crate::transaction::memo5(d(n)), amount);
+        let settle = vec![(d(11), slot(12, 500)), (d(13), slot(14, 490))];
         let policy = Policy::new(vec![
             // 0: 2-of-3, body mode.
             Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: keys.clone() }]),
@@ -877,9 +880,9 @@ mod tests {
         ]);
         let amount = 1000;
         let outputs: Vec<Output> = vec![
-            Output::with_memo(&d(1), 10, d(2)),
-            Output::with_memo(&d(11), 500, d(12)),
-            Output::with_memo(&d(13), 490, d(14)),
+            Output::with_memo(&d(1), 10, crate::transaction::memo5(d(2))),
+            Output::with_memo(&d(11), 500, crate::transaction::memo5(d(12))),
+            Output::with_memo(&d(13), 490, crate::transaction::memo5(d(14))),
         ];
         // Fix the commitments to the covenant's: with_memo derives them.
         let outputs: Vec<Output> = outputs

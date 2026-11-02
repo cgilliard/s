@@ -2,7 +2,8 @@
 
 A design note, 2026-11-02: put every output's amount on chain, in the
 clear, so that every node checks the money supply with plain arithmetic,
-outside the validity proof. Not implemented yet.
+outside the validity proof. Implemented 2026-11-02; the sections below
+describe it as built.
 
 ## Why
 
@@ -31,9 +32,12 @@ transaction graph is already visible and only gains its amounts.
 
 ## The supply invariant
 
-Let `issued(h)` be the subsidies of blocks 1 to `h` (`ChainParams::subsidy`),
-so `issued(0)` is zero: genesis creates no outputs, as a fair launch
-has none. Any change to genesis would have to be counted in it.
+Let `issued(h)` be what genesis created plus the subsidies of blocks 1 to
+`h` (`Chain::issued`, from `ChainParams::issued`). On mainnet genesis is
+empty, as a fair launch has nothing before its first block, so `issued(0)`
+is zero; the chain records what its genesis created (test chains start
+with coins) and counts it, which is sound because a network's genesis is
+fixed by its parameters (`WrongGenesis` otherwise).
 Fees move value from a transaction's inputs to the reward output, so they
 create nothing. Then after every block `h`:
 
@@ -54,11 +58,11 @@ being able to say who burned them, which is no use to anyone. Burning is
 done instead by an output nobody can spend, attributable and provable
 (below).
 
-Every sum is taken in 128 bits (or with checked arithmetic): an amount is
-a `u64`, but a block's outputs, the amounts it spends, the unspent total
-and `issued(h)` are sums of them, and a sum that wrapped around 2⁶⁴ could
-make the equality hold for a block that mints. A block whose sums
-overflow is refused.
+Every sum is taken in 128 bits: an amount is a `u64`, but a block's
+outputs, the amounts it spends, the unspent total and `issued(h)` are
+sums of them, and a sum that wrapped around 2⁶⁴ could make the equality
+hold for a block that mints. In 128 bits no sum of a block's amounts can
+wrap, so such a block simply fails the equality.
 
 A counterfeit then has nowhere to hide: the public ledger of amounts is
 the one the equality runs over, and the amount a later spend is
@@ -76,13 +80,13 @@ amount, and the memo shrinks (below): 60 bytes instead of 64. The body
 commitment covers the amount. Name commits occupy positions with amount
 zero.
 
-**The memo.** It holds today a nonce (four field elements, from which the
+**The memo.** It held a nonce (four field elements, from which the
 wallet derives the output's key), the amount encrypted under a pad from
 the wallet's master key (three), and a recognition tag (one), by which a
 scan tells the wallet's outputs from others' in one comparison
 (`Wallet::memo`). With the amount public the middle three are dead
-weight, so the memo becomes the nonce and the tag: five elements, 20
-bytes. Neither is a secret, and 128-bit strength is not the measure: the
+weight, so the memo is now the nonce and the tag: five elements, 20
+bytes (`transaction::Memo`). Neither is a secret, and 128-bit strength is not the measure: the
 nonce is in the clear and the keys' security rests on the master key,
 so the nonce need only be unique (about 124 bits: two of a wallet's
 outputs sharing one, which would reuse a key, is about `n²/2¹²⁵`); the
@@ -92,55 +96,71 @@ from the derived key and the public amount. Nothing else needs the 32
 bytes: name commits use the wallet's memo; policy and channel outputs
 take whatever the caller gives and nothing reads it; covenants and
 rebindable signatures hash an output's memo as a digest; a burn's tag
-(`docs/PROOFS.md`) fits in five elements (about 155 bits). The leaf and
-the body hash still take a memo of eight elements, the last three zero,
-and the circuit constrains them so. A name's record keeps its own memo,
-apart from outputs'.
+(`docs/PROOFS.md`) fits in five elements (about 155 bits). A name's
+record keeps its own 32-byte memo, apart from outputs'; the wallet writes
+its five elements there padded with zeros.
 
-**State leaves.** A leaf is today `compress(compress(commitment, memo),
-height_digest(height))`, the height in one element of a digest of eight
-(`transaction::leaf`). The amount goes into the spare elements of that
-second digest (a `u64` as three 30-bit limbs, each below the BabyBear
-modulus), so the state root, and so the chain proof, covers it. A spend
-reads the amount from the leaf it opens.
+**The memo slot.** Everywhere an output's memo was hashed as eight
+elements (its state leaf, the block's outputs sponge, the transaction
+body the signatures cover, covenants and rebindable messages), what is
+hashed now is its slot (`transaction::memo_slot`): the memo's five
+elements, then the amount as three limbs of 30, 30 and 4 bits, each
+below the BabyBear modulus. The amount is then bound wherever the memo
+was, with no new hashing:
 
-**The circuit.** The transaction AIR exposes each output's amount as a
-public value bound to the block's list, and checks it is the amount inside
-the output's commitment; the state-update rows hash the amount into the
-leaf. The balance constraint inside the circuit stays, as a second line
-of defence: the in-circuit and out-of-circuit checks then have to fail
-together for a counterfeit to land. To check in the code: where the AIR's
-public values come from today (`block_air.rs`, `aggregate.rs`), and what
-the recursion passes up.
+```
+slot = memo(5) ‖ amount limbs(3)
+leaf = compress(compress(commitment, slot), height_digest(created))
+```
 
-**Consensus.** `Chain::apply_block` reads the amounts of the positions the
-block spends from the state, sums both sides, and refuses the block unless
-the equality holds, before the proof is checked (a cheap check first).
-The chain keeps the unspent total in its database, updated with each
-block and restored from the block's undo record when a reorganization
-rolls the block back, so the total always matches the main chain's tip
-without summing the whole state again.
+so the state root, and so the chain proof, covers each output's amount,
+and a spend reads the amount from the leaf it opens. A name commit is an
+output of amount zero, its slot the memo and three zeros.
+
+**The circuit.** One constraint, on the rows that hash an amount into a
+commitment (an input's or policy input's `cm1`, an output's `ocm1`): the
+memo register's last three elements equal the amount's limbs there
+(`block_air.rs`, "the memo slot's last three elements"). Since that
+register is what the leaf and the outputs sponge take, the amount in a
+spent leaf, and the amount a block lists, is the amount the commitment
+hides and the in-circuit sums count. Nothing new is public: the block's
+listed amounts reach the proof through the outputs sponge, whose final
+state the chain statement already carries (`block_air::outputs_state`).
+The balance constraint inside the circuit stays, as a second line of
+defence: the in-circuit and out-of-circuit checks have to fail together
+for a counterfeit to land. The test
+`the_amount_in_the_leaf_is_the_committed_one` spends an output whose leaf
+holds another amount than its commitment, which the constraint alone
+refuses.
+
+**Consensus.** `Chain::connect` reads the amounts of the positions the
+block spends from the state, sums both sides, and refuses the block
+(`ChainError::Supply`) unless the equality holds, after the state root
+and before the proof is checked (cheap checks first). The chain keeps the
+unspent total in its database (`supply`), updated with each block and
+restored from the spent log when a reorganization rolls a block back, and
+checks it against `issued(h)` both ways, so the total always matches the
+main chain's tip without summing the whole state again.
 The UTXO set keeps each output's amount with its commitment and memo
-(`utxo.rs`): with the shorter memo, four bytes less an entry.
+(`utxo.rs`): 64 bytes a record with the creation height, four less than
+before.
 
-**Fast sync.** A snapshot part carries each output's amount (with the
-shorter memo, `PART_ENTRY` shrinks by 4 bytes), checked against the
-part's root like the rest. Once every part is in, the node sums the
-amounts and refuses the snapshot
-unless the total is exactly `issued(h)` for its height: a node that fast
-syncs checks the supply of everything before it without replaying it. The
-manifest may carry the total too, as a convenience; the sum of the parts
+**Fast sync.** A snapshot part carries each output's memo and amount
+(`PART_ENTRY` 4 bytes shorter), checked against the part's root like the
+rest. Once every part is in, the node sums the amounts and refuses the
+snapshot unless the total is exactly `issued(h)` for its height: a node
+that fast syncs checks the supply of everything before it without
+replaying it. The manifest does not carry the total; the sum of the parts
 is what counts.
 
 **State proofs.** A `Proof` message (`GetProof`, which payment proofs in
-`docs/PROOFS.md` use) carries the output's amount, and the leaf it checks
-includes it.
+`docs/PROOFS.md` use) carries the output's memo and amount, and the leaf
+it checks includes them.
 
 **The wallet.** The memo carries the nonce and the tag only; `scan` reads
 an output's amount from the chain and confirms a tag's match by the
 commitment. `balance` and `outputs` are unchanged.
-`status` shows a supply line: the unspent total beside `issued(h)`, which
-every node can now compute.
+`status` shows a supply line: the unspent total beside `issued(h)`.
 
 ## Burns
 
@@ -156,9 +176,8 @@ The amount's eight bytes less the memo's twelve: an output on chain goes
 from 64 bytes to 60, so blocks get a little smaller (some 80 KB at
 10,000 two-output transactions). The same in the state: four bytes less
 per unspent output (about 0.7 GB less at a Bitcoin-sized set of 170
-million). A few more trace
-columns in the transaction AIR and the state-update rows; the proof's
-size hardly moves. The check itself is one sum per block.
+million). No new trace columns: three constraints of degree two in the
+transaction AIR. The check itself is one sum per block.
 
 ## Privacy
 
@@ -179,9 +198,10 @@ crossed the mempool with its amounts in the clear.
 ## Migration
 
 The block format, the state leaf, the AIR and the snapshot format all
-change: a new chain format and protocol version, wiped data directories,
-a regenerated genesis, and the seeds updated. Before launch this is a
-rebuild, not a fork.
+change: chain format 14, protocol version 6, slate format `tabslt04`,
+regenerated `MAINNET_CHAIN` constants, wiped data directories and
+wallets, and the seeds updated. Genesis, empty, is unchanged. Before
+launch this is a rebuild, not a fork.
 
 ## Decisions
 
@@ -195,24 +215,18 @@ Settled on 2026-11-02.
   amount goes.
 - **`status` shows the supply.**
 
-## Implementation order
+## Tests
 
-1. The leaf and the block output with an amount, the memo of five
-   elements (the last three of the leaf's and body's memo constrained
-   zero); the body commitment.
-2. The transaction AIR: amounts as public values, bound to the
-   commitments and hashed into the leaves; the in-circuit balance kept.
-3. `apply_block`: amounts from the state for the inputs, the equality.
-4. The UTXO set and snapshot parts with amounts; the total checked on
-   fast sync.
-5. State proofs, the wallet's `scan`, `status`'s supply line; the unspent
-   total in the chain's database, undone with the block on a
-   reorganization.
-6. Tests: a block that inflates by one base unit, or claims one too few,
-   is refused before its proof is checked, whatever the proof says (with
-   the proof checker that accepts anything); a block whose outputs sum
-   past 2⁶⁴ is refused; a snapshot whose total is not `issued(h)` is
-   refused; the chain's unspent total equals `issued(h)` after every
-   block, and again after a reorganization rolls blocks back.
-7. Docs: README, SECURITY.md (the supply no longer rests on the proof),
-   HARDENING.md.
+- `chain::tests::blocks_keep_the_supply`: with the proof checker that
+  accepts anything, a block that inflates by one base unit, claims one
+  too few, claims nothing, or whose outputs wrap past 2⁶⁴ to the right
+  sum is refused; the unspent total equals `issued(h)` after each block
+  and after a reorganization replaces two blocks with three.
+- `chain::tests::fast_sync_from_a_snapshot`: the total arrives with the
+  snapshot; a node whose schedule issues more by that height refuses the
+  same snapshot.
+- `chain::tests::issued_sums_the_schedule`.
+- `block_air::tests::the_amount_in_the_leaf_is_the_committed_one`: the
+  circuit refuses a spend whose leaf amount is not its commitment's.
+- `node::tests::state_proofs_verify_against_the_tip`: a proof with
+  another amount does not verify.

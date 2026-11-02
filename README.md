@@ -1,7 +1,9 @@
 # s
 
-A proof-of-work chain whose blocks carry only output commitments and a
-zero-knowledge validity proof. `miner/` holds the node, the prover and the
+A proof-of-work chain whose blocks carry output commitments, their amounts
+and a zero-knowledge validity proof: keys and signatures stay off chain,
+while the amounts are public so that every node checks the money supply
+itself (`docs/AMOUNTS.md`). `miner/` holds the node, the prover and the
 wallet; `miner/SECURITY.md` analyses the proofs and the message layer;
 `docs/HARDENING.md` lists the known gaps still to close; `docs/NAMES.md`
 is the design of the name registry, `docs/ONION.md` of the message layer
@@ -171,7 +173,8 @@ node with it, decades of headers and a full undo window stays under 20 GB.
 The unspent outputs are kept in buckets of consecutive ones, each one LMDB
 page of 4 KB at most, split when full and repacked with their neighbours as
 spending thins them, so pages stay about 80% full; each output costs its
-68 bytes of commitment, memo and creation height plus a byte or two. The
+64 bytes of commitment, memo, amount and creation height plus a byte or
+two (the per-output figure in the table was measured at 68). The
 state tree is stored only from subtrees of 256 positions up, the levels
 below being recomputed from the outputs when needed. There is no index by commitment:
 blocks name their inputs by position, a transaction input carries its
@@ -202,8 +205,9 @@ about 205 KB and verifies in under 10 ms.
 Each node has a wallet in `DIR/wallet`. It is created on first run with a
 12-word BIP39 recovery phrase, shown once in the terminal and again with
 `phrase`. Every output the wallet creates has its own one-time key, derived
-from the phrase and a random nonce, and carries a 32-byte memo on chain that
-only the phrase can read: it holds the nonce and the encrypted amount.
+from the phrase and a random nonce, and carries a 20-byte memo on chain: the
+nonce and a tag from the phrase by which the wallet recognises its outputs
+(the amount is on chain in the clear, `docs/AMOUNTS.md`).
 
 To recover a wallet from its phrase:
 
@@ -254,7 +258,10 @@ nothing half done.
 
 `balance` shows confirmed, pending (incoming), reserved (held for a slate)
 and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
-`mempool`, `peers` and `status` show the rest. The reward of a mined block goes to the miner's wallet.
+`mempool`, `peers` and `status` show the rest; `status` includes the
+supply, the unspent amounts summed beside what the blocks issued, which
+every node keeps equal. The reward of a mined block goes to the miner's
+wallet: it claims the whole subsidy and every fee, as a block must.
 
 ## Policies and channels
 

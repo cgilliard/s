@@ -10,7 +10,8 @@ Every output is a leaf of the state tree (depth 40), and every header
 carries the tree's root after its block:
 
 ```
-leaf = compress(compress(commitment, memo), height_digest(created))
+leaf = compress(compress(commitment, slot), height_digest(created))
+slot = memo ‖ amount            (transaction::memo_slot, docs/AMOUNTS.md)
 commitment = key_commitment(key_hash, amount)
 ```
 
@@ -52,7 +53,7 @@ About 6.7 KB, most of it the receipt (a Dilithium key and signature).
    many confirmations it has (the tip's height less `height`, plus one)
    and imposes no threshold: how many are enough is the verifier's call.
 2. `commitment = key_commitment(key_hash, amount)`.
-3. The leaf from `commitment`, `memo` and `height` (the creation height
+3. The leaf from `commitment`, `memo`, `amount` and `height` (the creation height
    must be the proof's height) and `path` lead to that header's state
    root at `position`.
 4. The receipt's key hashes to the recipient's address
@@ -108,8 +109,8 @@ naming what it is for:
 
 ```
 key_hash  =  0
-memo      =  H(beneficiary's address ‖ purpose ‖ nonce), its first five
-             elements once memos are five long (docs/AMOUNTS.md)
+memo      =  the first five elements of
+             H(beneficiary's address ‖ purpose ‖ nonce)
 ```
 
 The memo is bound to the transaction by the validity proof and is in the
@@ -122,8 +123,8 @@ and the memo's preimage (the beneficiary, the purpose and the nonce)
 instead: the verifier checks steps 1 to 3, that the key hash is zero, and
 that the memo is the hash of the preimage given. The transaction that
 made the burn need not be shown: it would only tell which outputs funded
-it. With public amounts (`docs/AMOUNTS.md`) the amount is on chain as
-well; without, the commitment checks the amount the burner states.
+it. The amount is on chain (`docs/AMOUNTS.md`), in the leaf the path
+checks.
 
 ## In the wallet
 

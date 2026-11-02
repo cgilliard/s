@@ -84,10 +84,16 @@ use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, compress};
 use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
 use crate::stark::{Air, Builder, Trace};
 use crate::state_tree::{DEPTH, Digest, EMPTY};
+use crate::transaction::memo_slot;
 use crate::transaction::{DOM_PUBKEY, Sig};
 use crate::utxo::UtxoSet;
 use crate::xmss::{PUB_SEED_LEN, PublicKey};
 use crate::xmss_fragment::{self, Cols as XCols, Types as XTypes, bits_value};
+
+/// A commit's memo from its slot (the memo, then amount zero's limbs).
+fn memo_of(slot: &Digest) -> crate::transaction::Memo {
+    slot[..crate::transaction::MEMO_LEN].try_into().unwrap()
+}
 
 /// Every name segment trace has this many rows.
 pub const NAME_LOG_ROWS: usize = 15;
@@ -931,9 +937,13 @@ impl NameWitness {
                     let position = utxo.next_position(wtxn)?;
                     let path = utxo.prove(wtxn, position)?.siblings;
                     let leaf = commit_leaf(commit, height);
-                    utxo.add_output(wtxn, &crate::block::BlockOutput { commitment: leaf, memo: *memo }, height)?;
+                    utxo.add_output(
+                        wtxn,
+                        &crate::block::BlockOutput { commitment: leaf, memo: *memo, amount: 0 },
+                        height,
+                    )?;
                     names.add_commit(wtxn, position, Commit { hash: *commit, height })?;
-                    OpWitness::Commit { commit: *commit, memo: *memo, path }
+                    OpWitness::Commit { commit: *commit, memo: memo_slot(memo, 0), path }
                 }
                 NameOp::Reveal { record, salt, commit: position } => {
                     let elements = record.elements().ok_or(ApplyError::BadName)?;
@@ -959,7 +969,7 @@ impl NameWitness {
                     let left = utxo.output_root(wtxn)?;
                     let root = names.register(wtxn, record)?;
                     utxo.set_name_root(wtxn, &root)?;
-                    let commit_memo = utxo.memo(wtxn, position)?;
+                    let commit_memo = utxo.slot(wtxn, position)?;
                     if !utxo.spend_at(wtxn, &commit_leaf(&c, commit.height), position)? {
                         return Err(ApplyError::NoCommit);
                     }
@@ -1000,7 +1010,7 @@ impl NameWitness {
             if !names::expired(height, commit.height) {
                 return Err(ApplyError::NotExpired(commit.height));
             }
-            let memo = utxo.memo(wtxn, position)?;
+            let memo = utxo.slot(wtxn, position)?;
             if !utxo.spend_at(wtxn, &commit_leaf(&commit.hash, commit.height), position)? {
                 return Err(ApplyError::NoCommit);
             }
@@ -1021,7 +1031,9 @@ impl NameWitness {
         self.ops
             .iter()
             .filter_map(|op| match op {
-                OpWitness::Commit { commit, memo, .. } => BlockNameOp::Commit { commit: *commit, memo: *memo }.digest(),
+                OpWitness::Commit { commit, memo, .. } => {
+                    BlockNameOp::Commit { commit: *commit, memo: memo_of(memo) }.digest()
+                }
                 OpWitness::Reveal { record, commit_position, .. } => {
                     BlockNameOp::Reveal { record: record.clone(), commit: *commit_position }.digest()
                 }
@@ -1036,7 +1048,9 @@ impl NameWitness {
         self.ops
             .iter()
             .filter_map(|op| match op {
-                OpWitness::Commit { commit, memo, .. } => Some(BlockNameOp::Commit { commit: *commit, memo: *memo }),
+                OpWitness::Commit { commit, memo, .. } => {
+                    Some(BlockNameOp::Commit { commit: *commit, memo: memo_of(memo) })
+                }
                 OpWitness::Reveal { record, commit_position, .. } => {
                     Some(BlockNameOp::Reveal { record: record.clone(), commit: *commit_position })
                 }
@@ -1545,7 +1559,7 @@ impl Gen {
                 let (position, cleaf) = (self.r.wpos, self.r.cleaf);
                 self.output_walk(position, path, &EMPTY, &cleaf);
                 self.r.opx = self.r.c;
-                self.digest_rows(&BlockNameOp::Commit { commit: *commit, memo: *memo });
+                self.digest_rows(&BlockNameOp::Commit { commit: *commit, memo: memo_of(memo) });
             }
             OpWitness::Sweep { commit, memo, height: ch, position, path } => {
                 let r = &mut self.r;
@@ -1949,9 +1963,9 @@ mod tests {
 
         // Block 10: three commits.
         let commits = vec![
-            NameOp::Commit { commit: commit_of(&alice, &salt(1)), memo: d(41) },
-            NameOp::Commit { commit: commit_of(&bob, &salt(2)), memo: d(42) },
-            NameOp::Commit { commit: commit_of(&carol, &salt(3)), memo: d(43) },
+            NameOp::Commit { commit: commit_of(&alice, &salt(1)), memo: crate::transaction::memo5(d(41)) },
+            NameOp::Commit { commit: commit_of(&bob, &salt(2)), memo: crate::transaction::memo5(d(42)) },
+            NameOp::Commit { commit: commit_of(&carol, &salt(3)), memo: crate::transaction::memo5(d(43)) },
         ];
         let p = block(&w, 10, &commits, &[]);
         assert_eq!(p.counts, [3, 0, 0, 0]);
@@ -1983,7 +1997,7 @@ mod tests {
         let o4 = pubkey_hash(&k4.public_key());
         let alice2 = Record::new(b"alice", o4, d(13), d(14)).unwrap();
         let update = NameOp::update(alice2.clone(), &mut k1).unwrap();
-        let ops = vec![update, NameOp::Commit { commit: d(77), memo: d(78) }];
+        let ops = vec![update, NameOp::Commit { commit: d(77), memo: crate::transaction::memo5(d(78)) }];
         let p = block(&w, 23, &ops, &[]);
         assert_eq!(p.counts, [1, 0, 1, 0]);
         assert_eq!((p.pos_in, p.pos_out), (8, 9));
@@ -2030,7 +2044,7 @@ mod tests {
         assert!(matches!(fail(&mut wtxn, &[unknown], &[]), ApplyError::NotRegistered));
         // A commit revealed too early or too late.
         let late = Record::new(b"late", o2, d(1), d(2)).unwrap();
-        let ops = [NameOp::Commit { commit: commit_of(&late, &salt(9)), memo: d(1) }];
+        let ops = [NameOp::Commit { commit: commit_of(&late, &salt(9)), memo: crate::transaction::memo5(d(1)) }];
         NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301, &ops, &[]).unwrap();
         let reveal = [NameOp::Reveal { record: late.clone(), salt: salt(9), commit: 9 }];
         assert!(matches!(
@@ -2043,7 +2057,7 @@ mod tests {
         ));
         NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301 + MAX_REVEAL, &reveal, &[]).unwrap();
         // Re-registering a revealed name: the trie has it.
-        let again = [NameOp::Commit { commit: commit_of(&late, &salt(10)), memo: d(1) }];
+        let again = [NameOp::Commit { commit: commit_of(&late, &salt(10)), memo: crate::transaction::memo5(d(1)) }];
         NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 600, &again, &[]).unwrap();
         let reveal = [NameOp::Reveal { record: late.clone(), salt: salt(10), commit: 10 }];
         assert!(matches!(
@@ -2053,8 +2067,9 @@ mod tests {
         wtxn.abort();
         // Beyond the caps.
         let mut wtxn = w.env.write_txn().unwrap();
-        let many: Vec<NameOp> =
-            (0..names::MAX_COMMITS as u32 + 1).map(|i| NameOp::Commit { commit: d(900 + i), memo: d(1) }).collect();
+        let many: Vec<NameOp> = (0..names::MAX_COMMITS as u32 + 1)
+            .map(|i| NameOp::Commit { commit: d(900 + i), memo: crate::transaction::memo5(d(1)) })
+            .collect();
         assert!(matches!(fail(&mut wtxn, &many, &[]), ApplyError::TooMany(names::OpKind::Commit)));
         wtxn.abort();
         let _ = (k2, o1);
@@ -2082,10 +2097,21 @@ mod tests {
             height: 1,
             ops: vec![],
         };
-        block(&w, 1, &[NameOp::Commit { commit: c, memo: d(1) }, NameOp::Commit { commit: d(2), memo: d(3) }], &[]);
+        block(
+            &w,
+            1,
+            &[
+                NameOp::Commit { commit: c, memo: crate::transaction::memo5(d(1)) },
+                NameOp::Commit { commit: d(2), memo: crate::transaction::memo5(d(3)) },
+            ],
+            &[],
+        );
         block(&w, 13, &[NameOp::Reveal { record: alice.clone(), salt, commit: 5 }], &[]);
         let alice2 = Record::new(b"alice", o2, d(13), d(14)).unwrap();
-        let ops = [NameOp::update(alice2, &mut k1).unwrap(), NameOp::Commit { commit: d(4), memo: d(5) }];
+        let ops = [
+            NameOp::update(alice2, &mut k1).unwrap(),
+            NameOp::Commit { commit: d(4), memo: crate::transaction::memo5(d(5)) },
+        ];
         let mut wtxn = w.env.write_txn().unwrap();
         let full = NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 400, &ops, &[6]).unwrap();
         wtxn.abort();
@@ -2119,7 +2145,7 @@ mod tests {
         let o1 = pubkey_hash(&k1.public_key());
         let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
         let c = commit_hash(&name_hash(&alice.elements().unwrap()), &d(5), &o1);
-        block(&w, 10, &[NameOp::Commit { commit: c, memo: d(41) }], &[]);
+        block(&w, 10, &[NameOp::Commit { commit: c, memo: crate::transaction::memo5(d(41)) }], &[]);
         let mut wtxn = w.env.write_txn().unwrap();
         let ops = [NameOp::Reveal { record: alice.clone(), salt: d(5), commit: 5 }];
         let witness = NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 30, &ops, &[]).unwrap();

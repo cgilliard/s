@@ -68,7 +68,7 @@ use crate::names::{NAME_PART_RECORDS, Record};
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
@@ -167,7 +167,8 @@ pub const MAX_MANIFEST: usize = 32 << 20;
 /// Largest part: every position of an output part unspent and a commit,
 /// which also bounds a name part of [`NAME_PART_RECORDS`] records.
 pub const MAX_PART: usize = 8 + (1 << crate::chain::SNAPSHOT_PART_LOG) * (PART_ENTRY + COMMIT_ENTRY);
-const PART_ENTRY: usize = 8 + 32 + 32 + 4;
+/// An output in a part: position, commitment, memo, amount, height.
+const PART_ENTRY: usize = 8 + 32 + crate::transaction::MEMO_BYTES + 8 + 4;
 const COMMIT_ENTRY: usize = 8 + 32 + 4;
 const _: () = assert!(MAX_PART >= 4 + NAME_PART_RECORDS * (1 + 32 + 96));
 
@@ -208,10 +209,12 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
 pub fn encode_part(outputs: &[(u64, Digest, Digest, u32)], commits: &[(u64, Digest, u32)]) -> Vec<u8> {
     let mut w = Writer::with_capacity(8 + PART_ENTRY * outputs.len() + COMMIT_ENTRY * commits.len());
     w.u32(outputs.len() as u32);
-    for (p, c, m, h) in outputs {
+    for (p, c, slot, h) in outputs {
+        let (memo, amount) = crate::transaction::slot_parts(slot).expect("a stored slot");
         w.u64(*p);
         w.digest(c);
-        w.digest(m);
+        w.fps(&memo);
+        w.u64(amount);
         w.u32(*h);
     }
     w.u32(commits.len() as u32);
@@ -227,10 +230,19 @@ pub fn encode_part(outputs: &[(u64, Digest, Digest, u32)], commits: &[(u64, Dige
 pub fn decode_part(bytes: &[u8]) -> Option<(Vec<(u64, Digest, Digest, u32)>, PartCommits)> {
     let mut r = Reader(bytes);
     let n = r.len(PART_ENTRY)?;
-    let out = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.digest()?, r.u32()?))).collect::<Option<Vec<_>>>()?;
+    let out = (0..n)
+        .map(|_| {
+            let (p, c, memo) = (r.u64()?, r.digest()?, memo(&mut r)?);
+            Some((p, c, crate::transaction::memo_slot(&memo, r.u64()?), r.u32()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
     let n = r.len(COMMIT_ENTRY)?;
     let commits = (0..n).map(|_| Some((r.u64()?, r.digest()?, r.u32()?))).collect::<Option<Vec<_>>>()?;
     r.is_empty().then_some((out, commits))
+}
+
+fn memo(r: &mut Reader) -> Option<crate::transaction::Memo> {
+    Some([r.fp()?, r.fp()?, r.fp()?, r.fp()?, r.fp()?])
 }
 
 /// A name part: its records, in key order.
@@ -319,15 +331,17 @@ pub enum Message {
         position: u64,
         token: u64,
     },
-    /// The output at `position` (commitment, memo and creation height; all
-    /// zero when the position is spent or unassigned) and its path in the
+    /// The output at `position` (commitment, memo, amount and creation
+    /// height; all zero when the position is spent or unassigned) and its
+    /// path in the
     /// state after block `tip`, in two parts of
     /// [`PROOF_SIBLINGS_PER_MESSAGE`] siblings each, bottom up.
     Proof {
         position: u64,
         tip: Digest,
         commitment: Digest,
-        memo: Digest,
+        memo: crate::transaction::Memo,
+        amount: u64,
         created: u32,
         part: u8,
         siblings: Vec<Digest>,
@@ -523,12 +537,13 @@ impl Message {
                 w.u64(*position);
                 w.u64(*token);
             }
-            Message::Proof { position, tip, commitment, memo, created, part, siblings } => {
+            Message::Proof { position, tip, commitment, memo, amount, created, part, siblings } => {
                 w.0.push(T_PROOF);
                 w.u64(*position);
                 w.digest(tip);
                 w.digest(commitment);
-                w.digest(memo);
+                w.fps(memo);
+                w.u64(*amount);
                 w.u32(*created);
                 w.0.push(*part);
                 w.0.push(siblings.len() as u8);
@@ -661,7 +676,8 @@ impl Message {
                 let position = r.u64()?;
                 let tip = r.digest()?;
                 let commitment = r.digest()?;
-                let memo = r.digest()?;
+                let memo = memo(&mut r)?;
+                let amount = r.u64()?;
                 let created = r.u32()?;
                 let part = r.take(1)?[0];
                 let n = r.take(1)?[0] as usize;
@@ -669,7 +685,7 @@ impl Message {
                     return None;
                 }
                 let siblings = (0..n).map(|_| r.digest()).collect::<Option<Vec<_>>>()?;
-                Message::Proof { position, tip, commitment, memo, created, part, siblings }
+                Message::Proof { position, tip, commitment, memo, amount, created, part, siblings }
             }
             T_GET_AUX => {
                 let token = r.u64()?;

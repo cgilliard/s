@@ -24,10 +24,12 @@
 //! 1. Inputs: positions in the state tree of the outputs being spent, five
 //!    bytes each (little endian, below 2^39), in transaction order and
 //!    without repeats.
-//! 2. Outputs: a commitment and a memo, 32 bytes each, in the order they
-//!    are appended to the state tree. The memo is opaque to consensus (its
-//!    owner's wallet uses it for recovery); the proof binds it to the
-//!    transaction that created the output.
+//! 2. Outputs: a commitment (32 bytes), a memo (20) and an amount (8,
+//!    public: `docs/AMOUNTS.md`), in the order they are appended to the
+//!    state tree. The memo is opaque to consensus (its owner's wallet uses
+//!    it for recovery); the proof binds it, and the amount, to the
+//!    transaction that created the output, and the amount to the one the
+//!    output's commitment hides.
 //! 3. Name operations, in order (see [`crate::names::BlockNameOp`]), at
 //!    most the cap of each kind. A commit occupies the counter position
 //!    after the block's outputs, in operation order; a reveal names the
@@ -37,8 +39,9 @@
 //!    sweeps.
 //! 5. The validity proof.
 //!
-//! Keys, amounts, signatures, salts and transaction boundaries are not on
-//! chain; the proof attests to them and reveals nothing else about them.
+//! Keys, input amounts, signatures, salts and transaction boundaries are
+//! not on chain; the proof attests to them. Output amounts are, so every
+//! node checks the supply outside the proof.
 //!
 //! The body commitment hashes all five.
 
@@ -51,20 +54,30 @@ use crate::transaction::{Commitment, Memo, hash_domain};
 pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32 + 32;
 pub const POSITION_SIZE: usize = 5;
 pub const COMMITMENT_SIZE: usize = 4 * DIGEST;
-/// Serialized size of a block output: commitment and memo.
-pub const BLOCK_OUTPUT_SIZE: usize = 2 * COMMITMENT_SIZE;
+/// Serialized size of a block output: commitment, memo and amount.
+pub const BLOCK_OUTPUT_SIZE: usize = COMMITMENT_SIZE + crate::transaction::MEMO_BYTES + 8;
 
 /// An output as a block lists it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockOutput {
     pub commitment: Commitment,
     pub memo: Memo,
+    /// Public (`docs/AMOUNTS.md`): every node sums these to check the
+    /// supply, and the proof binds it to the amount the commitment hides.
+    pub amount: u64,
+}
+
+impl BlockOutput {
+    /// Its memo slot: the memo and the amount, as leaves and sponges take it.
+    pub fn slot(&self) -> Digest {
+        crate::transaction::memo_slot(&self.memo, self.amount)
+    }
 }
 
 impl From<Commitment> for BlockOutput {
-    /// An output with an empty memo.
+    /// An output with an empty memo and amount zero.
     fn from(commitment: Commitment) -> BlockOutput {
-        BlockOutput { commitment, memo: [Fp::ZERO; DIGEST] }
+        BlockOutput { commitment, memo: crate::transaction::EMPTY_MEMO, amount: 0 }
     }
 }
 
@@ -295,7 +308,7 @@ impl Body {
         v.push(Fp::from_u64(self.outputs.len() as u64));
         for o in &self.outputs {
             v.extend_from_slice(&o.commitment);
-            v.extend_from_slice(&o.memo);
+            v.extend_from_slice(&o.slot());
         }
         v.push(Fp::from_u64(self.ops.len() as u64));
         for op in &self.ops {
@@ -329,7 +342,8 @@ impl Body {
         out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
             out.extend_from_slice(&digest_to_bytes(&o.commitment));
-            out.extend_from_slice(&digest_to_bytes(&o.memo));
+            out.extend_from_slice(&crate::transaction::memo_to_bytes(&o.memo));
+            out.extend_from_slice(&o.amount.to_le_bytes());
         }
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         for op in &self.ops {
@@ -360,10 +374,12 @@ impl Body {
         let mut outputs = Vec::with_capacity(n_out.min(bytes.len() / BLOCK_OUTPUT_SIZE));
         for _ in 0..n_out {
             let c = r.take(COMMITMENT_SIZE).ok_or(BodyError::Malformed)?;
-            let m = r.take(COMMITMENT_SIZE).ok_or(BodyError::Malformed)?;
+            let m = r.take(crate::transaction::MEMO_BYTES).ok_or(BodyError::Malformed)?;
+            let a = r.u64().ok_or(BodyError::Malformed)?;
             outputs.push(BlockOutput {
                 commitment: digest_from_bytes(c).ok_or(BodyError::Malformed)?,
-                memo: digest_from_bytes(m).ok_or(BodyError::Malformed)?,
+                memo: crate::transaction::memo_from_bytes(m).ok_or(BodyError::Malformed)?,
+                amount: a,
             });
         }
         let n_ops = r.u32().ok_or(BodyError::Malformed)? as usize;
@@ -431,6 +447,10 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
     fn digest(&mut self) -> Option<Digest> {
@@ -524,10 +544,10 @@ mod tests {
 
     fn ops() -> Vec<BlockNameOp> {
         vec![
-            BlockNameOp::Commit { commit: d(10), memo: d(11) },
+            BlockNameOp::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
             BlockNameOp::Reveal { record: record("alice", 20), commit: 12 },
             BlockNameOp::Update(record("bob_99", 30)),
-            BlockNameOp::Commit { commit: d(12), memo: d(13) },
+            BlockNameOp::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
         ]
     }
 
@@ -549,7 +569,7 @@ mod tests {
 
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
-        assert_eq!(bytes.len(), 20 + 4 * 5 + 2 * 64 + 3);
+        assert_eq!(bytes.len(), 20 + 4 * 5 + 2 * 60 + 3);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
         assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(BodyError::DuplicateInput(1)));
         assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
@@ -568,8 +588,8 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
-        assert_eq!(ok.names_size(), 2 * 65 + (98 + 5 + 5) + (98 + 6) + 2 * 5);
-        assert_eq!(bytes.len(), 20 + 5 + 2 * 64 + ok.names_size() + 1);
+        assert_eq!(ok.names_size(), 2 * 53 + (98 + 5 + 5) + (98 + 6) + 2 * 5);
+        assert_eq!(bytes.len(), 20 + 5 + 2 * 60 + ok.names_size() + 1);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
         assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
         assert_eq!(ok.op_digests().len(), 4);

@@ -42,7 +42,7 @@
 //!
 //! ```text
 //! block op := tag (1) | fields
-//!   commit (1):  commit (32) | memo (32)
+//!   commit (1):  commit (32) | memo (20)
 //!   reveal (2):  len (1) | name | owner (32) | value (32) | memo (32) | commit position (5)
 //!   update (3):  len (1) | name | owner (32) | value (32) | memo (32)
 //! name op  := block op | witness
@@ -68,7 +68,9 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use crate::name_trie::{self, KEY_BITS, Key, NameProof, NameTrie, key_of};
 use crate::poseidon2::{DIGEST, Fp, digest_from_bytes, digest_to_bytes};
 use crate::state_tree::Digest;
-use crate::transaction::{Key as OwnerKey, Sig, hash_domain, pubkey_hash};
+use crate::transaction::{
+    Key as OwnerKey, MEMO_BYTES, Memo, Sig, hash_domain, memo_from_bytes, memo_slot, memo_to_bytes, pubkey_hash,
+};
 use crate::utxo::UtxoSet;
 use crate::xmss::{KeyExhausted, PublicKey};
 
@@ -94,7 +96,7 @@ pub const MIN_REVEAL: u32 = 12;
 pub const MAX_REVEAL: u32 = 288;
 
 /// Serialized size of a commit operation.
-pub const COMMIT_OP_SIZE: usize = 1 + 2 * DIGEST_BYTES;
+pub const COMMIT_OP_SIZE: usize = 1 + DIGEST_BYTES + MEMO_BYTES;
 /// Bytes of a position in an operation.
 const POSITION_BYTES: usize = 5;
 /// Serialized size of a reveal or update as a block lists it, less the name.
@@ -318,9 +320,9 @@ pub fn update_message(record: &Record) -> Option<Digest> {
 /// A name operation as a block lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockNameOp {
-    /// Stores `commit` with the block height and `memo` as an output at
-    /// the next counter position.
-    Commit { commit: Digest, memo: Digest },
+    /// Stores `commit` with the block height and `memo` as an output of
+    /// amount zero at the next counter position.
+    Commit { commit: Digest, memo: Memo },
     /// Registers the record; the commit at `commit` must be its, in the
     /// window.
     Reveal { record: Record, commit: u64 },
@@ -334,7 +336,7 @@ pub enum BlockNameOp {
 pub enum NameOp {
     Commit {
         commit: Digest,
-        memo: Digest,
+        memo: Memo,
     },
     /// `commit` is the position of the commit's output, unsigned like an
     /// input's position.
@@ -451,7 +453,7 @@ impl BlockNameOp {
     ///
     /// ```text
     /// [tag, 0, 0, 0, 0, 0, 0, 0]
-    /// commit:         [commit(8)] [memo(8)]
+    /// commit:         [commit(8)] [memo slot(8): the memo and amount zero]
     /// reveal, update: [record leaf value(8)]
     /// ```
     ///
@@ -464,7 +466,7 @@ impl BlockNameOp {
         match self {
             BlockNameOp::Commit { commit, memo } => {
                 v.extend_from_slice(commit);
-                v.extend_from_slice(memo);
+                v.extend_from_slice(&memo_slot(memo, 0));
             }
             BlockNameOp::Reveal { record, .. } => v.extend_from_slice(&record.leaf_value()?),
             BlockNameOp::Update(r) => v.extend_from_slice(&r.leaf_value()?),
@@ -493,7 +495,7 @@ impl BlockNameOp {
         match self {
             BlockNameOp::Commit { commit, memo } => {
                 out.extend_from_slice(&digest_to_bytes(commit));
-                out.extend_from_slice(&digest_to_bytes(memo));
+                out.extend_from_slice(&memo_to_bytes(memo));
             }
             BlockNameOp::Reveal { record, commit } => {
                 write_record(&mut out, record);
@@ -510,7 +512,8 @@ impl BlockNameOp {
         match tag {
             TAG_COMMIT => {
                 let (commit, rest) = read_digest(rest)?;
-                let (memo, rest) = read_digest(rest)?;
+                let (memo, rest) = rest.split_at_checked(MEMO_BYTES)?;
+                let memo = memo_from_bytes(memo)?;
                 Some((BlockNameOp::Commit { commit, memo }, rest))
             }
             TAG_REVEAL => {
@@ -1160,7 +1163,7 @@ impl NameSet {
                     let c = Commit { hash: *commit, height };
                     utxo.add_output(
                         wtxn,
-                        &crate::block::BlockOutput { commitment: commit_leaf(commit, height), memo: *memo },
+                        &crate::block::BlockOutput { commitment: commit_leaf(commit, height), memo: *memo, amount: 0 },
                         height,
                     )?;
                     self.add_commit(wtxn, position, c)?;
@@ -1210,7 +1213,7 @@ impl NameSet {
         position: u64,
         commit: &Commit,
     ) -> core::result::Result<Digest, ApplyError> {
-        let memo = utxo.memo(wtxn, position)?;
+        let memo = utxo.slot(wtxn, position)?;
         if !utxo.spend_at(wtxn, &commit_leaf(&commit.hash, commit.height), position)? {
             return Err(ApplyError::NoCommit);
         }
@@ -1452,7 +1455,7 @@ mod tests {
 
     #[test]
     fn operations_encode_digest_and_count() {
-        let commit = NameOp::Commit { commit: d(1), memo: d(2) };
+        let commit = NameOp::Commit { commit: d(1), memo: crate::transaction::memo5(d(2)) };
         let reveal = NameOp::Reveal { record: record("alice", 3), salt: d(4), commit: 77 };
         let mut k = owner_key(1);
         let update = NameOp::update(record("alice", 5), &mut k).unwrap();
@@ -1483,7 +1486,7 @@ mod tests {
         assert_eq!(other_salt.digest(), reveal.digest());
         assert_ne!(reveal.digest(), NameOp::Reveal { record: record("alicf", 3), salt: d(4), commit: 77 }.digest());
         assert_ne!(BlockNameOp::Reveal { record: record("alice", 5), commit: 0 }.digest(), update.digest());
-        assert_ne!(commit.digest(), NameOp::Commit { commit: d(2), memo: d(1) }.digest());
+        assert_ne!(commit.digest(), NameOp::Commit { commit: d(2), memo: crate::transaction::memo5(d(1)) }.digest());
         let mut digests: Vec<_> = [&commit, &reveal, &update].iter().map(|op| op.digest().unwrap()).collect();
         digests.dedup();
         assert_eq!(digests.len(), 3);
@@ -1538,7 +1541,7 @@ mod tests {
             unreachable!()
         }
         // Operations without a signature pass the owner check.
-        assert!(NameOp::Commit { commit: d(1), memo: d(2) }.verify_owner(&d(3)));
+        assert!(NameOp::Commit { commit: d(1), memo: crate::transaction::memo5(d(2)) }.verify_owner(&d(3)));
         assert!(NameOp::Reveal { record: new, salt: d(1), commit: 0 }.verify_owner(&d(3)));
     }
 
@@ -1551,7 +1554,10 @@ mod tests {
         utxo.add(&mut wtxn, &d(1)).unwrap();
         let root0 = utxo.root(&wtxn).unwrap();
         // Block 10: two commits at positions 1 and 2.
-        let ops10 = [Op::Commit { commit: d(10), memo: d(11) }, Op::Commit { commit: d(12), memo: d(13) }];
+        let ops10 = [
+            Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
+            Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
+        ];
         let u10 = set.apply(&utxo, &mut wtxn, 10, &ops10, &[]).unwrap();
         assert_eq!(u10.commits.len(), 2);
         assert_eq!(utxo.next_position(&wtxn).unwrap(), 3);
@@ -1563,7 +1569,9 @@ mod tests {
         let alice2 = record("alice", 30);
         let ops22 = [Op::Reveal { record: alice.clone(), commit: 1 }, Op::Update(alice2.clone())];
         let u22 = set.apply(&utxo, &mut wtxn, 22, &ops22, &[]).unwrap();
-        assert_eq!(u22.consumed, vec![(1, Commit { hash: d(10), height: 10 }, d(11))]);
+        // The commit's memo slot: its memo, then amount zero.
+        let slot11 = crate::transaction::memo_slot(&crate::transaction::memo5(d(11)), 0);
+        assert_eq!(u22.consumed, vec![(1, Commit { hash: d(10), height: 10 }, slot11)]);
         assert_eq!(u22.registered, vec![alice.key().unwrap()]);
         assert_eq!(u22.updated, vec![alice.clone()]);
         assert_eq!(set.lookup(&wtxn, b"alice").unwrap(), Some(alice2.clone()));
@@ -1586,7 +1594,7 @@ mod tests {
             err(set.apply(&utxo, &mut wtxn, 301, &[Op::Update(record("bob", 1))], &[])),
             ApplyError::NotRegistered
         ));
-        let c = [Op::Commit { commit: d(40), memo: d(41) }];
+        let c = [Op::Commit { commit: d(40), memo: crate::transaction::memo5(d(41)) }];
         set.apply(&utxo, &mut wtxn, 301, &c, &[]).unwrap();
         assert!(matches!(
             err(set.apply(&utxo, &mut wtxn, 302, &[Op::Reveal { record: record("bob", 1), commit: 3 }], &[])),

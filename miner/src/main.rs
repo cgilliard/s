@@ -743,11 +743,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         {
             sync_wallet(&ctx).ok();
             let held = wallet.owned(&c).ok().flatten().is_some_and(|o| {
-                ctx.chain
-                    .env()
-                    .read_txn()
-                    .ok()
-                    .is_some_and(|r| wallet.held(&o, ctx.chain.utxo(), &r).unwrap_or(false))
+                ctx.chain.env().read_txn().ok().is_some_and(|r| wallet.held(&o, ctx.chain.utxo(), &r).unwrap_or(false))
             });
             if !held {
                 wallet.forget(&c).ok();
@@ -908,6 +904,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             // One LMDB read transaction per thread at a time: the work is
             // read before the one the balance needs.
             let work = log2_u256(ctx.chain.tip_work()?);
+            let (supply, issued) = (ctx.chain.supply()?, ctx.chain.issued(tip.height)?);
             let stats = ctx.stats.lock().unwrap().clone();
             let pool = ctx.mempool.lock().unwrap();
             let rtxn = ctx.chain.env().read_txn()?;
@@ -920,6 +917,13 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 tip.height,
                 short(&tip.hash()),
                 log::timestamp_of(tip.timestamp)
+            );
+            // Every node checks the supply with each block (docs/AMOUNTS.md).
+            println!(
+                "supply   {} unspent, {} issued{}",
+                fmt_coins(supply),
+                fmt_coins(issued),
+                if supply == issued { "" } else { " (MISMATCH)" }
             );
             println!(
                 "peers    {} live of {} known; {} downloads, {} blocks to fetch, {} waiting for a parent",
@@ -1237,7 +1241,13 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             drop(rtxn);
             if let Some(to) = to {
                 ctx.outgoing.lock().unwrap().insert(slate.id, to);
-                let out = Outbound { tag: slate_tag(&slate.id), to, kind: onion::KIND_SLATE, inner: slate.to_bytes(), recipient: None };
+                let out = Outbound {
+                    tag: slate_tag(&slate.id),
+                    to,
+                    kind: onion::KIND_SLATE,
+                    inner: slate.to_bytes(),
+                    recipient: None,
+                };
                 if ctx.events.send(Event::Send(out)).is_err() {
                     ctx.wallet()?.cancel_slate(&slate.id)?;
                     return Err("the node has stopped".into());
@@ -1516,10 +1526,15 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 .lock()
                 .unwrap()
                 .entries()
-                .flat_map(|e| e.tx.ops.iter().filter_map(|op| match op {
-                    NameOp::Commit { commit, .. } => Some(*commit),
-                    _ => None,
-                }).collect::<Vec<_>>())
+                .flat_map(|e| {
+                    e.tx.ops
+                        .iter()
+                        .filter_map(|op| match op {
+                            NameOp::Commit { commit, .. } => Some(*commit),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
                 .collect();
             let rtxn = ctx.chain.env().read_txn()?;
             let n = ctx.wallet()?.prune_pending(ctx.chain.utxo(), &rtxn, &keep)?;
@@ -1602,7 +1617,8 @@ fn restore(args: &Args) -> AnyResult<()> {
 fn recipient(ctx: &Ctx, to: &str) -> AnyResult<Option<Digest>> {
     if let Some(name) = to.strip_prefix('@') {
         let rtxn = ctx.chain.env().read_txn()?;
-        let record = ctx.chain.names().lookup(&rtxn, name.as_bytes())?.ok_or_else(|| format!("{name} is not registered"))?;
+        let record =
+            ctx.chain.names().lookup(&rtxn, name.as_bytes())?.ok_or_else(|| format!("{name} is not registered"))?;
         if record.value == [tabminer::poseidon2::Fp::ZERO; 8] {
             return Err(format!("{name} has no value: its owner has not set an address").into());
         }
@@ -1630,14 +1646,21 @@ fn on_note(ctx: &Ctx, note: Note) {
         }
         Note::Delivered { tag, to, via } => {
             if ctx.outgoing.lock().unwrap().keys().any(|id| slate_tag(id) == tag) {
-                say(ctx, &format!("slate delivered to {} via {via}; waiting for the answer", tabminer::address::encode(&to)));
+                say(
+                    ctx,
+                    &format!("slate delivered to {} via {via}; waiting for the answer", tabminer::address::encode(&to)),
+                );
             }
         }
         Note::Broadcast { txid, how } => match how {
             Ok(how) => say(ctx, &format!("transaction {} {how}", short(&txid))),
             Err(why) => say(
                 ctx,
-                &format!("transaction {} not broadcast: {why} (it stays pooled here; cancel {} to free its inputs)", short(&txid), short(&txid)),
+                &format!(
+                    "transaction {} not broadcast: {why} (it stays pooled here; cancel {} to free its inputs)",
+                    short(&txid),
+                    short(&txid)
+                ),
             ),
         },
         Note::Failed { tag, to, why } => {
@@ -2004,24 +2027,33 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             let mut taken: std::collections::HashSet<u64> = inputs.iter().copied().collect();
             let rtxn = chain.env().read_txn()?;
             let made = chain.utxo().next_position(&rtxn)?;
-            let mut spends = 0;
+            let (mut spends, mut spent) = (0, 0u128);
             for _ in 0..n_spend * 4 {
                 if spends == n_spend || made == 0 {
                     break;
                 }
                 let from = next_random() % made;
                 let window = chain.utxo().unspent_in(&rtxn, from, (from + 256).min(made))?;
-                if let Some((p, _)) = window.iter().find(|(p, (c, _, _))| !taken.contains(p) && !ours.contains(c)) {
+                if let Some((p, (_, slot, _))) =
+                    window.iter().find(|(p, (c, _, _))| !taken.contains(p) && !ours.contains(c))
+                {
                     taken.insert(*p);
                     inputs.push(*p);
+                    spent += tabminer::transaction::slot_parts(slot).map_or(0, |(_, a)| a as u128);
                     spends += 1;
                 }
             }
             drop(rtxn);
-            for _ in 0..n_out {
-                let mut random_digest =
-                    || core::array::from_fn(|_| tabminer::poseidon2::Fp::new((next_random() % P as u64) as u32));
-                outputs.push(BlockOutput { commitment: random_digest(), memo: random_digest() });
+            // The random outputs carry what the random spends took, so the
+            // supply still balances (docs/AMOUNTS.md).
+            let n_out = if spent > 0 { n_out.max(1) } else { n_out };
+            for i in 0..n_out {
+                let mut random_fp = || tabminer::poseidon2::Fp::new((next_random() % P as u64) as u32);
+                let commitment = core::array::from_fn(|_| random_fp());
+                let memo = core::array::from_fn(|_| random_fp());
+                let share = spent / n_out as u128 + if i == 0 { spent % n_out as u128 } else { 0 };
+                let amount = u64::try_from(share).unwrap_or(u64::MAX);
+                outputs.push(BlockOutput { commitment, memo, amount });
             }
             log::line(&format!("  debug fill: {n_out} random outputs, {spends} random spends"));
         }

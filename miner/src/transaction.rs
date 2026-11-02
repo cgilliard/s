@@ -39,7 +39,7 @@
 //! ```text
 //! transaction := u32 n_in, n_in * input, u32 n_out, n_out * output, u32 n_ops, n_ops * op
 //! input       := pubkey (48) | amount u64 (8) | position u64 (8) | signature (2312)
-//! output      := key hash (32) | amount u64 (8) | memo (32)
+//! output      := key hash (32) | amount u64 (8) | memo (20)
 //! op          := see `crate::names::NameOp`
 //! ```
 //!
@@ -65,8 +65,12 @@ pub type Sig = Signature;
 pub type Key = SecretKey;
 /// An output commitment `H(H(pubkey) || amount)`.
 pub type Commitment = Digest;
+/// Elements of an output's memo: a nonce of four and a recognition tag.
+pub const MEMO_LEN: usize = 5;
 /// An output's recovery memo: opaque to consensus.
-pub type Memo = Digest;
+pub type Memo = [Fp; MEMO_LEN];
+/// The empty memo.
+pub const EMPTY_MEMO: Memo = [Fp::ZERO; MEMO_LEN];
 
 /// Serialized size of a field element.
 const FP_BYTES: usize = 4;
@@ -75,8 +79,10 @@ const DIGEST_BYTES: usize = DIGEST * FP_BYTES;
 /// Serialized size of an [`Input`] whose key has [`TREE_HEIGHT`]; an input
 /// is [`Input::size`] bytes in general.
 pub const INPUT_SIZE: usize = PublicKey::SIZE + 8 + 8 + Signature::size(TREE_HEIGHT);
+/// Serialized size of a memo.
+pub const MEMO_BYTES: usize = MEMO_LEN * FP_BYTES;
 /// Serialized size of an [`Output`].
-pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8 + DIGEST_BYTES;
+pub const OUTPUT_SIZE: usize = DIGEST_BYTES + 8 + MEMO_BYTES;
 
 pub(crate) const DOM_PUBKEY: u32 = 1;
 pub(crate) const DOM_COMMITMENT: u32 = 2;
@@ -138,10 +144,65 @@ pub fn commitment(pk: &PublicKey, amount: u64) -> Commitment {
     key_commitment(&pubkey_hash(pk), amount)
 }
 
-/// The state tree leaf of an unspent output: its commitment and memo
-/// compressed, so the state root covers the memo too.
-pub fn leaf(commitment: &Commitment, memo: &Memo, height: u32) -> Digest {
-    crate::poseidon2::compress(&crate::poseidon2::compress(commitment, memo), &height_digest(height))
+/// What a leaf, a block's outputs sponge and a body hash take for an
+/// output's memo: the memo's five elements, then the amount's three limbs
+/// (`docs/AMOUNTS.md`), so that the amount, public, is bound wherever the
+/// memo is. An output of amount zero (a name commit) has the memo padded
+/// with zeros.
+pub fn memo_slot(memo: &Memo, amount: u64) -> Digest {
+    let mut slot = [Fp::ZERO; DIGEST];
+    slot[..MEMO_LEN].copy_from_slice(memo);
+    slot[MEMO_LEN..].copy_from_slice(&amount_fps(amount));
+    slot
+}
+
+/// The memo and the amount a slot holds; `None` for limbs that are not an
+/// amount's (each of the first two below 2^30, the third below 2^4).
+pub fn slot_parts(slot: &Digest) -> Option<(Memo, u64)> {
+    let memo: Memo = slot[..MEMO_LEN].try_into().unwrap();
+    let limb = |i: usize| slot[MEMO_LEN + i].to_canonical() as u64;
+    let (lo, mid, hi) = (limb(0), limb(1), limb(2));
+    (lo < 1 << 30 && mid < 1 << 30 && hi < 1 << 4).then_some((memo, lo | mid << 30 | hi << 60))
+}
+
+/// A memo from a digest's first five elements (tests).
+#[cfg(test)]
+pub(crate) fn memo5(d: Digest) -> Memo {
+    d[..MEMO_LEN].try_into().unwrap()
+}
+
+/// A memo's bytes.
+pub fn memo_to_bytes(memo: &Memo) -> [u8; MEMO_BYTES] {
+    let mut out = [0u8; MEMO_BYTES];
+    for (chunk, x) in out.chunks_exact_mut(FP_BYTES).zip(memo) {
+        chunk.copy_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// A memo from its bytes: `None` on a wrong length or a non-canonical
+/// element.
+pub fn memo_from_bytes(bytes: &[u8]) -> Option<Memo> {
+    if bytes.len() != MEMO_BYTES {
+        return None;
+    }
+    let mut out = EMPTY_MEMO;
+    for (x, chunk) in out.iter_mut().zip(bytes.chunks_exact(FP_BYTES)) {
+        *x = Fp::from_le_bytes(chunk.try_into().unwrap())?;
+    }
+    Some(out)
+}
+
+/// The state tree leaf from a commitment, a memo slot ([`memo_slot`]) and
+/// a creation height: the commitment and the slot compressed, then that
+/// with the height, so the state root covers the memo and the amount too.
+pub fn leaf(commitment: &Commitment, slot: &Digest, height: u32) -> Digest {
+    crate::poseidon2::compress(&crate::poseidon2::compress(commitment, slot), &height_digest(height))
+}
+
+/// The state tree leaf of an unspent output.
+pub fn output_leaf(commitment: &Commitment, memo: &Memo, amount: u64, height: u32) -> Digest {
+    leaf(commitment, &memo_slot(memo, amount), height)
 }
 
 /// A block height as a digest: one element, then zeros. The second half
@@ -230,12 +291,17 @@ impl Output {
     /// Creates an output paying `amount` to the key with hash `key_hash`,
     /// with an empty memo.
     pub fn to_key_hash(key_hash: &Digest, amount: u64) -> Output {
-        Output::with_memo(key_hash, amount, [Fp::ZERO; DIGEST])
+        Output::with_memo(key_hash, amount, EMPTY_MEMO)
     }
 
-    /// The part a block lists: the commitment and the memo.
+    /// The part a block lists: the commitment, the memo and the amount.
     pub fn block_output(&self) -> crate::block::BlockOutput {
-        crate::block::BlockOutput { commitment: self.commitment, memo: self.memo }
+        crate::block::BlockOutput { commitment: self.commitment, memo: self.memo, amount: self.amount }
+    }
+
+    /// Its memo slot ([`memo_slot`]).
+    pub fn slot(&self) -> Digest {
+        memo_slot(&self.memo, self.amount)
     }
 
     /// Creates an output with a memo.
@@ -248,7 +314,7 @@ impl Output {
         let mut out = [0u8; OUTPUT_SIZE];
         out[..DIGEST_BYTES].copy_from_slice(&digest_to_bytes(&self.key_hash));
         out[DIGEST_BYTES..DIGEST_BYTES + 8].copy_from_slice(&self.amount.to_le_bytes());
-        out[DIGEST_BYTES + 8..].copy_from_slice(&digest_to_bytes(&self.memo));
+        out[DIGEST_BYTES + 8..].copy_from_slice(&memo_to_bytes(&self.memo));
         out
     }
 
@@ -258,7 +324,7 @@ impl Output {
         }
         let key_hash = digest_from_bytes(&bytes[..DIGEST_BYTES])?;
         let (amount, _) = read_u64(&bytes[DIGEST_BYTES..DIGEST_BYTES + 8])?;
-        let memo = digest_from_bytes(&bytes[DIGEST_BYTES + 8..])?;
+        let memo = memo_from_bytes(&bytes[DIGEST_BYTES + 8..])?;
         Some(Output::with_memo(&key_hash, amount, memo))
     }
 }
@@ -344,7 +410,7 @@ pub(crate) fn body_elements(
         body.extend_from_slice(&out.commitment);
         body.extend_from_slice(&amount_fps(out.amount));
         body.extend_from_slice(&[Fp::ZERO; 5]);
-        body.extend_from_slice(&out.memo);
+        body.extend_from_slice(&out.slot());
     }
     for op in ops {
         body.extend_from_slice(&op.digest().unwrap_or([Fp::ZERO; DIGEST]));
@@ -611,7 +677,7 @@ mod tests {
 
     #[test]
     fn sizes() {
-        assert_eq!(OUTPUT_SIZE, 72);
+        assert_eq!(OUTPUT_SIZE, 60);
         assert_eq!(INPUT_SIZE, 49 + 8 + 8 + 2312);
         assert_eq!(TREE_HEIGHT, 4);
         assert_eq!(Key::generate(&[7; 32]).leaves(), 16);
@@ -752,7 +818,7 @@ mod tests {
         let d = |n: u32| -> Digest { core::array::from_fn(|i| Fp::new(n + i as u32)) };
         let mut ka = key(11);
         let mut owner = key(12);
-        let commit = NameOp::Commit { commit: d(1), memo: d(2) };
+        let commit = NameOp::Commit { commit: d(1), memo: crate::transaction::memo5(d(2)) };
         let reveal = NameOp::Reveal { record: Record::new(b"alice", d(3), d(4), d(5)).unwrap(), salt: d(6), commit: 1 };
         let update = NameOp::update(Record::new(b"bob", d(7), d(8), d(9)).unwrap(), &mut owner).unwrap();
         let ops = vec![commit.clone(), reveal.clone(), update.clone()];
@@ -778,7 +844,7 @@ mod tests {
         t.ops.pop();
         assert!(!t.verify_signatures());
         let mut t = tx.clone();
-        t.ops[0] = NameOp::Commit { commit: d(2), memo: d(2) };
+        t.ops[0] = NameOp::Commit { commit: d(2), memo: crate::transaction::memo5(d(2)) };
         assert!(!t.verify_signatures());
         let mut t = tx.clone();
         t.ops[1] = NameOp::Reveal { record: Record::new(b"alice", d(3), d(4), d(5)).unwrap(), salt: d(60), commit: 2 };

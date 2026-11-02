@@ -37,14 +37,18 @@
 //! Within a segment, for every input the prover shows an XMSS signature by
 //! the revealed key over the body hash of its transaction, derives the
 //! commitment `H(H(key) || amount)`, compresses it with the output's memo
-//! (a witness) into the tree leaf, proves that leaf sits at the input's
-//! position in the current tree, and clears it. For every output it
-//! derives the commitment `H(key_hash || amount)` from a witness key hash
-//! and appends its leaf, commitment and memo compressed, at the next
-//! position. Positions are absorbed
-//! into the inputs sponge, and output commitments and memos (never amounts)
-//! into the outputs sponge. A memo is a free witness, also absorbed into
-//! the body, so the signatures cover it. Per transaction, the body sponge is rebuilt from the
+//! slot (a witness) into the tree leaf, proves that leaf sits at the
+//! input's position in the current tree, and clears it. For every output
+//! it derives the commitment `H(key_hash || amount)` from a witness key
+//! hash and appends its leaf, commitment and memo slot compressed, at the
+//! next position. Positions are absorbed into the inputs sponge, and
+//! output commitments and memo slots into the outputs sponge. A memo slot
+//! ([`crate::transaction::memo_slot`]) is the memo's five elements, free,
+//! and the amount's three limbs, constrained to be the amount the
+//! commitment hides: so the amount the block lists (public, through the
+//! outputs sponge) and the amount a spent leaf holds are the amounts the
+//! commitments and the sums use (`docs/AMOUNTS.md`). The slot is also
+//! absorbed into the body, so the signatures cover it. Per transaction, the body sponge is rebuilt from the
 //! same registers the signatures and commitments use and must equal the
 //! signed message.
 //!
@@ -89,7 +93,7 @@ use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
 use crate::stark::{Air, Builder, Trace};
 use crate::state_tree::{DEPTH, EMPTY};
 use crate::transaction::{
-    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, Memo, Output, Sig, Transaction, amount_fps,
+    Commitment, DOM_BODY, DOM_COMMITMENT, DOM_PUBKEY, MEMO_LEN, Output, Sig, Transaction, amount_fps,
 };
 use crate::utxo::{self, UtxoSet};
 use crate::xmss::{Digest, PUB_SEED_LEN, PublicKey};
@@ -465,7 +469,7 @@ pub fn body_absorb_input(state: &mut [Fp; WIDTH], pubkey: &PublicKey, amount: u6
 pub fn body_absorb_output(state: &mut [Fp; WIDTH], output: &Output) {
     absorb_block(state, &output.commitment);
     absorb_block(state, &amt_block(output.amount));
-    absorb_block(state, &output.memo);
+    absorb_block(state, &output.slot());
 }
 
 fn pow2<F: Field>(k: usize) -> F {
@@ -545,11 +549,11 @@ pub fn absorb_position(state: &mut [Fp; WIDTH], position: u64) {
     *state = permute(*state);
 }
 
-/// Absorbs one output's commitment, then its memo, into the outputs
-/// sponge. Amounts stay off chain.
-pub fn absorb_output(state: &mut [Fp; WIDTH], commitment: &Commitment, memo: &Memo) {
+/// Absorbs one output's commitment, then its memo slot (memo and public
+/// amount), into the outputs sponge.
+pub fn absorb_output(state: &mut [Fp; WIDTH], commitment: &Commitment, slot: &Digest) {
     absorb_block(state, commitment);
-    absorb_block(state, memo);
+    absorb_block(state, slot);
 }
 
 /// Inputs sponge state after absorbing all of a block's positions.
@@ -565,7 +569,7 @@ pub fn inputs_state(positions: &[u64]) -> [Fp; WIDTH] {
 pub fn outputs_state(outputs: &[BlockOutput]) -> [Fp; WIDTH] {
     let mut state = initial_outputs_state();
     for o in outputs {
-        absorb_output(&mut state, &o.commitment, &o.memo);
+        absorb_output(&mut state, &o.commitment, &o.slot());
     }
     state
 }
@@ -925,6 +929,13 @@ impl Air for BlockAir {
             let body_in1_data = [pub_seed[0], pub_seed[1], pub_seed[2], pub_seed[3], amt_lo, amt_mid, amt_hi, F::ZERO];
             let body_pol_data = [F::ZERO, F::ZERO, F::ZERO, F::ZERO, amt_lo, amt_mid, amt_hi, one];
             b.assert_zero(body_in1 * (l[COL_DATA + i] - ((one - pin) * body_in1_data[i] + pin * body_pol_data[i])));
+        }
+        // The memo slot's last three elements are the amount's limbs: the
+        // amount a spent leaf holds and a block lists is the one the
+        // commitment hides and the sums count.
+        let limbs3 = [amt_lo, amt_mid, amt_hi];
+        for (k, limb) in limbs3.iter().enumerate() {
+            b.assert_zero((cm1 + ocm1) * (l[R_MEMO + MEMO_LEN + k] - *limb));
         }
         // amount sums: zero at the start of the segment, exported at the end
         for j in 0..LIMBS {
@@ -1363,8 +1374,9 @@ impl Air for BlockAir {
 pub struct InputWitness {
     pub pubkey: PublicKey,
     pub amount: u64,
-    /// Memo of the output being spent, part of its leaf.
-    pub memo: Memo,
+    /// Memo slot (memo and amount) of the output being spent, part of its
+    /// leaf.
+    pub memo: Digest,
     /// Creation height of the output being spent, part of its leaf.
     pub height: u32,
     pub signature: Sig,
@@ -1384,7 +1396,8 @@ pub struct OutputWitness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyWitness {
     pub input: PolicyInput,
-    pub memo: Memo,
+    /// The spent output's memo slot.
+    pub memo: Digest,
     pub created: u32,
     pub siblings: [Digest; DEPTH],
     pub rmsg: Digest,
@@ -1777,7 +1790,7 @@ impl SegmentWitness {
                         let position = utxo.next_position(wtxn)?;
                         let proof = utxo.prove(wtxn, position)?;
                         utxo.add_output(wtxn, &o.block_output(), height)?;
-                        absorb_output(&mut osp, &o.commitment, &o.memo);
+                        absorb_output(&mut osp, &o.commitment, &o.slot());
                         body_absorb_output(&mut bsp, o);
                         outputs.push(OutputWitness { output: *o, siblings: proof.siblings });
                     } else {
@@ -1822,7 +1835,7 @@ impl SegmentWitness {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.commitment)).collect()
     }
 
-    /// The outputs as a block lists them: commitment and memo.
+    /// The outputs as a block lists them: commitment, memo and amount.
     pub fn block_outputs(&self) -> Vec<BlockOutput> {
         self.txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.output.block_output())).collect()
     }
@@ -1864,7 +1877,8 @@ struct Regs {
     in_left: u32,
     out_left: u32,
     open: bool,
-    memo: Memo,
+    /// The current item's memo slot.
+    memo: Digest,
     leaf: Digest,
     opd: Digest,
     nsp: [Fp; WIDTH],
@@ -2545,7 +2559,7 @@ impl Gen {
             r.inrun = false;
         }
         r.ocm = o.commitment;
-        r.memo = o.memo;
+        r.memo = o.slot();
         r.amount = o.amount;
         r.is_out = true;
         r.out_left -= 1;
@@ -2569,14 +2583,14 @@ impl Gen {
         for (acc, limb) in self.regs.sum_out.iter_mut().zip(limbs16(o.amount)) {
             *acc += limb.to_canonical();
         }
-        let out = self.absorb(o.memo, T_OLIST2);
+        let out = self.absorb(o.slot(), T_OLIST2);
         self.regs.osp = out;
         let bsp = self.regs.bsp;
         let out = self.sponge_start(bsp, o.commitment, T_BODY_OUT0);
         self.regs.bsp = out;
         let out = self.absorb(amt_block(o.amount), T_BODY_OUT1);
         self.regs.bsp = out;
-        let out = self.absorb(o.memo, T_BODY_OUT2);
+        let out = self.absorb(o.slot(), T_BODY_OUT2);
         self.regs.bsp = out;
         let position = self.regs.opos;
         self.regs.old = EMPTY;
@@ -2853,9 +2867,9 @@ mod tests {
         let mut bk = key(2);
         let c = key(3).public_key();
         let miner = key(4).public_key();
-        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 100).commitment).unwrap();
-        utxo.add(&mut wtxn, &Output::new(&bk.public_key(), 50).commitment).unwrap();
-        utxo.add(&mut wtxn, &Output::new(&a.public_key(), 30).commitment).unwrap();
+        utxo.add_output(&mut wtxn, &Output::new(&a.public_key(), 100).block_output(), 0).unwrap();
+        utxo.add_output(&mut wtxn, &Output::new(&bk.public_key(), 50).block_output(), 0).unwrap();
+        utxo.add_output(&mut wtxn, &Output::new(&a.public_key(), 30).block_output(), 0).unwrap();
 
         let mut tx1 = UnsignedTransaction::new(
             vec![(a.public_key(), 100), (bk.public_key(), 50)],
@@ -2887,7 +2901,6 @@ mod tests {
     /// number does not.
     #[test]
     fn policy_spends_satisfy_constraints() {
-        use crate::block::BlockOutput;
         use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer, covered_digest, hash_lock, rebind_message};
         use crate::transaction::pubkey_hash;
         let dir = TempDir::new("policy");
@@ -2916,8 +2929,11 @@ mod tests {
             Leaf::new(vec![Cond::After(100), Cond::Thresh { mode: Mode::Body, m: 1, keys: keys[..1].to_vec() }]),
         ]);
         let channel = d(5);
-        let settle_outputs = [Output::with_memo(&keys[0], 600, memo(1)), Output::with_memo(&keys[1], 400, memo(2))];
-        let settle: Vec<(Commitment, Memo)> = settle_outputs.iter().map(|o| (o.commitment, o.memo)).collect();
+        let settle_outputs = [
+            Output::with_memo(&keys[0], 600, crate::transaction::memo5(memo(1))),
+            Output::with_memo(&keys[1], 400, crate::transaction::memo5(memo(2))),
+        ];
+        let settle: Vec<(Commitment, Digest)> = settle_outputs.iter().map(|o| (o.commitment, o.slot())).collect();
         let state = Policy::new(vec![
             Leaf::new(vec![
                 Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: keys[..2].to_vec() },
@@ -2932,8 +2948,8 @@ mod tests {
             (state.root(), 1000, memo(13)),
         ];
         for (policy, amount, m) in &outs {
-            let o = Output::with_memo(policy, *amount, *m);
-            utxo.add_output(&mut wtxn, &BlockOutput { commitment: o.commitment, memo: o.memo }, 0).unwrap();
+            let o = Output::with_memo(policy, *amount, crate::transaction::memo5(*m));
+            utxo.add_output(&mut wtxn, &o.block_output(), 0).unwrap();
         }
 
         // 2-of-3 in body mode: a and c sign the body hash.
@@ -2969,11 +2985,11 @@ mod tests {
 
         // Eltoo update to state 4: a and b sign the rebindable message with
         // leaf 4, over the new state output as the covered run.
-        let new_state = Output::with_memo(&state.root(), 1000, memo(14));
+        let new_state = Output::with_memo(&state.root(), 1000, crate::transaction::memo5(memo(14)));
         let mut update = state.spend(0, 1000, 2);
         update.state = 4;
         update.covered = (0, 1);
-        let msg = rebind_message(&channel, 4, &[(new_state.commitment, new_state.memo)]);
+        let msg = rebind_message(&channel, 4, &[(new_state.commitment, new_state.slot())]);
         let mut a4 = key(1);
         a4.set_next_index(4);
         let mut b4 = key(2);
@@ -3042,8 +3058,8 @@ mod tests {
         // plain key's height are in use.
         tall.set_next_index(1000);
         let dest = key(3).public_key();
-        utxo.add(&mut wtxn, &Output::new(&tall.public_key(), 70).commitment).unwrap();
-        utxo.add(&mut wtxn, &Output::new(&short.public_key(), 30).commitment).unwrap();
+        utxo.add_output(&mut wtxn, &Output::new(&tall.public_key(), 70).block_output(), 0).unwrap();
+        utxo.add_output(&mut wtxn, &Output::new(&short.public_key(), 30).block_output(), 0).unwrap();
         let mut tx = UnsignedTransaction::new(
             vec![(tall.public_key(), 70), (short.public_key(), 30)],
             vec![Output::new(&dest, 100)],
@@ -3060,6 +3076,36 @@ mod tests {
         let (trace, public) = BlockAir::generate_trace(&segments[0]);
         assert_eq!(trace.height(), segments[0].num_rows().next_power_of_two());
         assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()));
+    }
+
+    /// An output whose state leaf holds another amount than its
+    /// commitment hides cannot be spent: the amount the supply check
+    /// counted is the one the proof's sums use (`docs/AMOUNTS.md`).
+    #[test]
+    fn the_amount_in_the_leaf_is_the_committed_one() {
+        let dir = TempDir::new("leaf-amount");
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut a = key(1);
+        let dest = key(3).public_key();
+        let spend = |recorded: u64, a: &mut Key| {
+            let mut wtxn = env.write_txn().unwrap();
+            let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+            let mut listed = Output::new(&a.public_key(), 100).block_output();
+            listed.amount = recorded;
+            utxo.add_output(&mut wtxn, &listed, 0).unwrap();
+            let mut tx = UnsignedTransaction::new(vec![(a.public_key(), 100)], vec![Output::new(&dest, 100)])
+                .sign_with(a)
+                .unwrap();
+            tx.set_positions(&[0]);
+            let segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, 1).unwrap();
+            wtxn.abort();
+            let (trace, public) = BlockAir::generate_trace(&segments[0]);
+            check_constraints(&BlockAir, &trace, &public.to_values())
+        };
+        assert_eq!(spend(100, &mut a), Ok(()));
+        // The leaf (so the state root) says 1, the commitment 100.
+        let err = spend(1, &mut a).unwrap_err();
+        assert_eq!(err.2, "key hash / commitment / amounts");
     }
 
     #[test]

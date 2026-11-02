@@ -203,8 +203,12 @@ history and the README; this file holds what is left.
 ## Proof system
 
 - **The circuit has not been independently reviewed.** Fast sync trusts
-  the chain proof completely; nothing replays history to catch a circuit
-  bug. This is the largest remaining trust gap. `block_air.rs` (SMT
+  the chain proof for ownership, the state's history and names; nothing
+  replays history to catch a circuit bug. The supply no longer rests on
+  it: amounts are public and every node, fast-synced or not, checks that
+  the unspent amounts sum to what was issued (`docs/AMOUNTS.md`). A
+  circuit bug could still let someone spend outputs that are not theirs,
+  but not mint unseen. This is the largest remaining trust gap. `block_air.rs` (SMT
   empty-leaf handling on insert, XMSS digit decomposition, carry between
   segments) was only spot-checked in the review.
 - **Negative end-to-end tests are all `#[ignore]`.** No non-ignored test

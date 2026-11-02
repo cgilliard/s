@@ -19,6 +19,14 @@ separate Fiat-Shamir argument with its own transcript. The level of the whole
 is therefore the level of the weakest proof type: an attacker gains nothing
 by attacking many proofs at once that it would not gain by attacking one.
 
+What a forged proof could buy is narrower than it was. Output amounts are
+public (`docs/AMOUNTS.md`): every node checks, outside the proof, that a
+block's outputs sum to the amounts the state holds for the outputs it spends
+plus its subsidy, and a fast-syncing node that the unspent amounts sum to
+everything issued. A forged proof, or a circuit bug, could still spend
+outputs without their keys, or break the name registry, but could not
+create coins without every node seeing it.
+
 ## Summary
 
 The target is 120 bits of conjectured classical security for every proof:

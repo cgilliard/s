@@ -60,7 +60,8 @@ use crate::names::{ApplyError, Commit, NameSet, NameUndo, Record, commit_leaf, p
 use crate::poseidon2::digest_from_bytes;
 use crate::pow::{Digest, PowParams, SeedText, Target};
 use crate::state_tree::{EMPTY, empty_root, open_env};
-use crate::transaction::{Commitment, Memo};
+use crate::transaction::Commitment;
+use crate::utxo::Slot;
 use crate::utxo::{self, UtxoSet};
 
 /// Base units per coin.
@@ -138,6 +139,22 @@ impl ChainParams {
             first += blocks as u64;
         }
         0
+    }
+
+    /// The subsidies of blocks 1 to `height`. With what genesis creates
+    /// (nothing on mainnet), what the amounts of the unspent outputs after
+    /// block `height` sum to exactly ([`Chain::issued`], `docs/AMOUNTS.md`).
+    pub fn issued(&self, height: u32) -> u128 {
+        let (mut total, mut first) = (0u128, 1u64);
+        for &(blocks, subsidy) in self.emission {
+            if (height as u64) < first {
+                break;
+            }
+            let n = (blocks as u64).min(height as u64 + 1 - first);
+            total += n as u128 * subsidy as u128;
+            first += blocks as u64;
+        }
+        total
     }
 
     /// Height of the last block the chain can have.
@@ -245,6 +262,13 @@ pub enum ChainError {
     BadSnapshot,
     /// A snapshot is being installed; blocks wait until it is done.
     SnapshotInProgress,
+    /// The block's outputs do not sum to what it spends plus its subsidy
+    /// (`docs/AMOUNTS.md`): it would mint or burn.
+    Supply {
+        created: u128,
+        spent: u128,
+        subsidy: u64,
+    },
     /// The block was found invalid before.
     KnownInvalid,
     BadHeight {
@@ -329,6 +353,9 @@ impl core::fmt::Display for ChainError {
             ChainError::BelowSnapshot => f.write_str("cannot reorganize below the fast-sync snapshot"),
             ChainError::BeyondUndo => f.write_str("cannot reorganize deeper than the undo records kept"),
             ChainError::BadSnapshot => f.write_str("snapshot does not match its block"),
+            ChainError::Supply { created, spent, subsidy } => {
+                write!(f, "outputs of {created} do not equal inputs of {spent} plus the subsidy of {subsidy}")
+            }
             ChainError::SnapshotInProgress => f.write_str("a snapshot is being installed"),
             ChainError::KnownInvalid => f.write_str("block is known to be invalid"),
             ChainError::BadHeight { expected, got } => {
@@ -408,6 +435,12 @@ pub const SNAPSHOT_PART_LOG: usize = 14;
 // Part roots are read from the stored tree, which starts at this level.
 const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
 const META_FORMAT: &str = "format";
+/// The amounts of every unspent output summed, a `u128`: `issued(h)` at
+/// the tip `h`, kept with each block connected and disconnected.
+const META_SUPPLY: &str = "supply";
+/// The amounts of genesis's outputs summed, a `u128`: zero on mainnet,
+/// whose genesis is empty; test chains start with coins.
+const META_GENESIS_SUPPLY: &str = "genesis_supply";
 /// The miner's 16 aux leaves, 32 bytes each (see [`Chain::aux_root`]).
 const META_AUX_LEAVES: &str = "aux_leaves";
 /// Leaves of the aux tree.
@@ -420,7 +453,7 @@ pub const AUX_LEAVES: usize = 16;
 /// records and snapshot manifests with the name half; 12 keeps the
 /// registry's bucket table; 13 stores each output's creation height, part
 /// of its leaf.
-const FORMAT: u8 = 13;
+const FORMAT: u8 = 14;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -472,11 +505,21 @@ impl Undo {
     }
 }
 
+/// The amounts that memo slots hold, summed.
+fn amounts<'a>(slots: impl Iterator<Item = &'a Slot>) -> Result<u128> {
+    let mut total = 0u128;
+    for slot in slots {
+        total += crate::transaction::slot_parts(slot).ok_or(ChainError::Corrupt("output amount"))?.1 as u128;
+    }
+    Ok(total)
+}
+
 /// A spent-log entry: the height of the block spending the output, the
-/// height that created it, then its commitment and memo.
+/// height that created it, then its commitment and memo slot (memo and
+/// amount).
 const SPENT_ENTRY: usize = 4 + 4 + 64;
 
-fn spent_entry(height: u32, created: u32, commitment: &Commitment, memo: &Memo) -> [u8; SPENT_ENTRY] {
+fn spent_entry(height: u32, created: u32, commitment: &Commitment, memo: &Slot) -> [u8; SPENT_ENTRY] {
     let mut value = [0u8; SPENT_ENTRY];
     value[..4].copy_from_slice(&height.to_le_bytes());
     value[4..8].copy_from_slice(&created.to_le_bytes());
@@ -485,8 +528,8 @@ fn spent_entry(height: u32, created: u32, commitment: &Commitment, memo: &Memo) 
     value
 }
 
-/// Spending height, creation height, commitment and memo.
-fn read_spent_entry(value: &[u8]) -> Option<(u32, u32, Commitment, Memo)> {
+/// Spending height, creation height, commitment and memo slot.
+fn read_spent_entry(value: &[u8]) -> Option<(u32, u32, Commitment, Slot)> {
     if value.len() != SPENT_ENTRY {
         return None;
     }
@@ -982,6 +1025,11 @@ impl<V: ProofVerifier> Chain<V> {
         if root != block.header.state_root {
             return Err(ChainError::StateRootMismatch { expected: root, got: block.header.state_root });
         }
+        // What genesis creates counts as issued at height 0: nothing on
+        // mainnet, whose genesis is fixed and empty.
+        let created = block.body.outputs.iter().map(|o| o.amount as u128).sum::<u128>();
+        self.meta.put(&mut wtxn, META_SUPPLY, &created.to_le_bytes())?;
+        self.meta.put(&mut wtxn, META_GENESIS_SUPPLY, &created.to_le_bytes())?;
         let id = digest_bytes(&block.header.hash());
         self.headers.put(&mut wtxn, &id, &block.header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
@@ -1105,7 +1153,7 @@ impl<V: ProofVerifier> Chain<V> {
         wtxn: &mut RwTxn,
         body: &Body,
         height: u32,
-    ) -> Result<(Digest, Vec<(Commitment, Memo, u32)>, NameUndo)> {
+    ) -> Result<(Digest, Vec<(Commitment, Slot, u32)>, NameUndo)> {
         let spent = self.utxo.spend_positions(wtxn, &body.inputs)?.map_err(ChainError::UnknownInput)?;
         self.utxo.add_outputs(wtxn, &body.outputs, height)?;
         let names = self.names.apply(&self.utxo, wtxn, height, &body.ops, &body.sweeps).map_err(ChainError::Name)?;
@@ -1277,6 +1325,20 @@ impl<V: ProofVerifier> Chain<V> {
         if new_root != header.state_root {
             return Err(ChainError::StateRootMismatch { expected: new_root, got: header.state_root });
         }
+        // The supply, outside the proof and before it: the amounts spent are the ones
+        // the state held, and the outputs must sum to them plus the
+        // subsidy. A commit a reveal or sweep consumes holds amount zero.
+        let subsidy = self.params.subsidy(header.height);
+        let spent_sum = amounts(spent.iter().map(|(_, slot, _)| slot))?;
+        let created = body.outputs.iter().map(|o| o.amount as u128).sum::<u128>();
+        if created != spent_sum + subsidy as u128 {
+            return Err(ChainError::Supply { created, spent: spent_sum, subsidy });
+        }
+        let supply = self.supply_in(wtxn)? + subsidy as u128;
+        if supply != self.issued_in(wtxn, header.height)? {
+            return Err(ChainError::Corrupt("supply"));
+        }
+        self.meta.put(wtxn, META_SUPPLY, &supply.to_le_bytes())?;
         let statement = BlockStatement {
             height: header.height,
             prev_state_root,
@@ -1381,6 +1443,13 @@ impl<V: ProofVerifier> Chain<V> {
         let mut commitments: Vec<Commitment> = body.outputs.iter().map(|o| o.commitment).collect();
         commitments.extend(undo.names.commits.iter().map(|c| commit_leaf(&c.hash, c.height)));
         self.utxo.truncate(wtxn, undo.first_output_position, &commitments)?;
+        let restored = amounts(spent.iter().map(|(_, _, slot, _)| slot))?;
+        let created = body.outputs.iter().map(|o| o.amount as u128).sum::<u128>();
+        let supply = (self.supply_in(wtxn)? + restored).checked_sub(created).ok_or(ChainError::Corrupt("supply"))?;
+        if supply != self.issued_in(wtxn, height - 1)? {
+            return Err(ChainError::Corrupt("supply after disconnect"));
+        }
+        self.meta.put(wtxn, META_SUPPLY, &supply.to_le_bytes())?;
         self.utxo.restore(wtxn, &spent)?;
         for (p, _, _, _) in &spent {
             self.spent.delete(wtxn, p)?;
@@ -1400,6 +1469,31 @@ impl<V: ProofVerifier> Chain<V> {
         self.by_height.delete(wtxn, &height)?;
         self.meta.put(wtxn, META_TIP, &digest_bytes(&header.prev_hash))?;
         Ok(())
+    }
+
+    /// The amounts of every unspent output summed, as kept: `issued(h)`
+    /// at the tip `h`.
+    pub fn supply(&self) -> Result<u128> {
+        self.supply_in(&self.env.read_txn()?)
+    }
+
+    fn supply_in(&self, rtxn: &RoTxn) -> Result<u128> {
+        self.meta_u128(rtxn, META_SUPPLY)
+    }
+
+    /// Every coin issued up to block `height`: what genesis created and
+    /// the subsidies since. The unspent amounts after the block sum to it.
+    pub fn issued(&self, height: u32) -> Result<u128> {
+        self.issued_in(&self.env.read_txn()?, height)
+    }
+
+    fn issued_in(&self, rtxn: &RoTxn, height: u32) -> Result<u128> {
+        Ok(self.meta_u128(rtxn, META_GENESIS_SUPPLY)? + self.params.issued(height))
+    }
+
+    fn meta_u128(&self, rtxn: &RoTxn, key: &'static str) -> Result<u128> {
+        let bytes = self.meta.get(rtxn, key)?.ok_or(ChainError::Corrupt(key))?;
+        Ok(u128::from_le_bytes(bytes.try_into().map_err(|_| ChainError::Corrupt(key))?))
     }
 
     fn floor_in(&self, rtxn: &RoTxn) -> Result<Option<u32>> {
@@ -1688,7 +1782,7 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn install_snapshot(
         &self,
         block: &Block,
-        outputs: &[(u64, Commitment, Memo, u32)],
+        outputs: &[(u64, Commitment, Slot, u32)],
         commits: &[(u64, Digest, u32)],
         records: &[Record],
         next_position: u64,
@@ -1788,7 +1882,7 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn stage_snapshot_part(
         &self,
         part: u64,
-        outputs: &[(u64, Commitment, Memo, u32)],
+        outputs: &[(u64, Commitment, Slot, u32)],
         commits: &[(u64, Digest, u32)],
         next_position: u64,
         expected: Option<&Digest>,
@@ -1961,6 +2055,13 @@ impl<V: ProofVerifier> Chain<V> {
         if self.utxo.root(&wtxn)? != header.state_root {
             return Err(ChainError::BadSnapshot);
         }
+        // Everything before the snapshot, checked without replaying it:
+        // the unspent amounts sum to what the blocks issued.
+        let supply = self.utxo.total(&wtxn)?;
+        if supply != self.issued_in(&wtxn, header.height)? {
+            return Err(ChainError::BadSnapshot);
+        }
+        self.meta.put(&mut wtxn, META_SUPPLY, &supply.to_le_bytes())?;
         self.meta.delete(&mut wtxn, META_STAGING)?;
         // The main chain up to the snapshot: proven by its block's proof.
         let mut h = header;
@@ -2098,7 +2199,7 @@ impl<V: ProofVerifier> Chain<V> {
         &self,
         id: &Digest,
         part: u64,
-    ) -> Result<Option<(Vec<(u64, Commitment, Memo, u32)>, PartCommits)>> {
+    ) -> Result<Option<(Vec<(u64, Commitment, Slot, u32)>, PartCommits)>> {
         let rtxn = self.env.read_txn()?;
         let Some((height, manifest)) = self.snapshot_in(&rtxn, id)? else {
             return Ok(None);
@@ -2108,7 +2209,7 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let first = part << SNAPSHOT_PART_LOG;
         let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
-        let mut out: Vec<(u64, Commitment, Memo, u32)> =
+        let mut out: Vec<(u64, Commitment, Slot, u32)> =
             self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m, h))| (p, c, m, h)).collect();
         let before = out.len();
         for e in self.spent.range(&rtxn, &(first..end))? {
@@ -2187,7 +2288,7 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn output_proof(
         &self,
         position: u64,
-    ) -> Result<Option<(Header, Option<(Commitment, Memo, u32)>, crate::state_tree::Proof)>> {
+    ) -> Result<Option<(Header, Option<(Commitment, Slot, u32)>, crate::state_tree::Proof)>> {
         let rtxn = self.env.read_txn()?;
         let Some(tip) = self.tip_in(&rtxn)? else {
             return Ok(None);
@@ -2433,9 +2534,8 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn consensus_at(&self, end: u32) -> Result<(crate::consensus::Votes, crate::consensus::Current)> {
         let votes = self.consensus_votes_at(end, crate::consensus::WINDOW)?;
         let rtxn = self.env.read_txn()?;
-        let current = crate::consensus::Current::decide(&votes, |h| {
-            self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec())
-        });
+        let current =
+            crate::consensus::Current::decide(&votes, |h| self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec()));
         Ok((votes, current))
     }
 
@@ -2456,9 +2556,8 @@ impl<V: ProofVerifier> Chain<V> {
     pub fn consensus(&self) -> Result<(crate::consensus::Votes, crate::consensus::Current)> {
         let votes = self.consensus_votes(crate::consensus::WINDOW)?;
         let rtxn = self.env.read_txn()?;
-        let current = crate::consensus::Current::decide(&votes, |h| {
-            self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec())
-        });
+        let current =
+            crate::consensus::Current::decide(&votes, |h| self.files.get(&rtxn, h).ok().flatten().map(|b| b.to_vec()));
         Ok((votes, current))
     }
 
@@ -2564,7 +2663,10 @@ mod tests {
         assert_eq!(hash, crate::bip39::sha256(file));
         assert_eq!(f.chain.consensus_file(&hash).unwrap().as_deref(), Some(&file[..]));
         assert!(f.chain.has_consensus_file(&hash).unwrap());
-        assert_eq!(f.chain.consensus_file_by_id(&crate::consensus::file_id(&hash)).unwrap().as_deref(), Some(&file[..]));
+        assert_eq!(
+            f.chain.consensus_file_by_id(&crate::consensus::file_id(&hash)).unwrap().as_deref(),
+            Some(&file[..])
+        );
         assert_eq!(f.chain.consensus_file_by_id(&crate::consensus::file_id(&[9u8; 32])).unwrap(), None);
         assert!(matches!(
             f.chain.put_consensus_file(&vec![0u8; crate::consensus::MAX_CONSENSUS + 1]),
@@ -2611,7 +2713,10 @@ mod tests {
         // A zero-root header takes no leaves; an unknown block neither.
         let zero = [[0u8; 32]; AUX_LEAVES];
         assert!(matches!(f.chain.put_aux_leaves(&leaves_of[4].0.hash(), &zero), Err(ChainError::AuxMismatch)));
-        assert!(matches!(f.chain.put_aux_leaves(&[crate::poseidon2::Fp::new(5); crate::poseidon2::DIGEST], &zero), Err(ChainError::AuxMismatch)));
+        assert!(matches!(
+            f.chain.put_aux_leaves(&[crate::poseidon2::Fp::new(5); crate::poseidon2::DIGEST], &zero),
+            Err(ChainError::AuxMismatch)
+        ));
         let votes = f.chain.consensus_votes(144).unwrap();
         assert!(votes.missing.is_empty());
         assert_eq!(votes.counts, vec![(hash, 2, 3), (other, 1, 2)]);
@@ -2763,8 +2868,40 @@ mod tests {
     }
 
     fn mine(f: &Fixture, body: Body, timestamp: u64) -> Block {
+        mine_exact(f, balance(f, body), timestamp)
+    }
+
+    /// Mines `body` as it is, balanced or not.
+    fn mine_exact(f: &Fixture, body: Body, timestamp: u64) -> Block {
         let header = f.chain.template(&body, timestamp).unwrap();
         Block { header: solve(f, header), body }
+    }
+
+    /// What a block on `f`'s tip spending `inputs` must create: their
+    /// amounts and the subsidy.
+    fn claim(f: &Fixture, inputs: &[u64]) -> u64 {
+        let height = f.chain.tip().unwrap().unwrap().height + 1;
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let spent: u64 = inputs
+            .iter()
+            .map(|&p| crate::transaction::slot_parts(&f.chain.utxo().slot(&rtxn, p).unwrap()).unwrap().1)
+            .sum();
+        spent + f.chain.params().subsidy(height)
+    }
+
+    /// `body` made to keep the supply on `f`'s tip: its first output
+    /// carries all it may create and the others nothing (an output
+    /// added if it has none). With every proof accepted, nothing ties
+    /// a commitment to its amount, so the fixtures' commitments stay.
+    fn balance(f: &Fixture, mut body: Body) -> Body {
+        let total = claim(f, &body.inputs);
+        if body.outputs.is_empty() && total > 0 {
+            body.outputs.push(BlockOutput::from([crate::poseidon2::Fp::new(0xba1); crate::poseidon2::DIGEST]));
+        }
+        for (i, o) in body.outputs.iter_mut().enumerate() {
+            o.amount = if i == 0 { total } else { 0 };
+        }
+        body
     }
 
     /// Like `mine` but with a caller-supplied state root, for bodies the
@@ -2921,7 +3058,8 @@ mod tests {
             ..Default::default()
         };
         let b = mine(&f, many, GENESIS_TIME + 600);
-        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(544))));
+        let size = HEADER_SIZE + Body::size_of(0, 5, 0, 0);
+        assert!(matches!(f.chain.apply_block(&b, now), Err(ChainError::TooLarge(n)) if n == size));
 
         // The good block still applies afterwards.
         f.chain.apply_block(&good, now).unwrap();
@@ -2997,7 +3135,7 @@ mod tests {
         let target = chain.expected_target(&tip).unwrap();
         let make = |proof: Vec<u8>| {
             let body =
-                Body { inputs: vec![], outputs: vec![Output::new(&a, 3).block_output()], proof, ..Default::default() };
+                Body { inputs: vec![], outputs: vec![Output::new(&a, 50).block_output()], proof, ..Default::default() };
             let mut header = chain.template(&body, GENESIS_TIME + 600).unwrap();
             let (nonce, out) =
                 pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
@@ -3694,6 +3832,19 @@ mod tests {
         }
         assert_eq!(b.chain.tip().unwrap().unwrap(), blocks[11].header);
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        // The supply came with the snapshot, checked, and kept since.
+        assert_eq!(b.chain.supply().unwrap(), b.chain.issued(12).unwrap());
+        assert_eq!(b.chain.supply().unwrap(), a.chain.supply().unwrap());
+        // A node that counts more issued by then refuses the same snapshot:
+        // the unspent amounts must sum to exactly what was issued.
+        let e_dir = TempDir::new("fast-e");
+        let more = ChainParams { emission: &[(10, 51), (10, 25), (5, 12)], ..params() };
+        let e = Chain::open(&e_dir.0, 64 << 20, more, seed(), AcceptAllProofs).unwrap();
+        e.init_genesis(&genesis_block(vec![])).unwrap();
+        for block in &blocks {
+            e.accept_header(&block.header, t + 1).unwrap();
+        }
+        assert!(matches!(e.install_snapshot(&blocks[7], &part, &[], &[], next), Err(ChainError::BadSnapshot)));
         // b now serves snapshots from its floor on, the same as a's.
         assert_eq!(b.chain.snapshot_manifest(&s8.hash()).unwrap(), Some(manifest.clone()));
         assert_eq!(b.chain.snapshot_part(&s8.hash(), 0).unwrap(), Some((part, vec![])));
@@ -3864,7 +4015,8 @@ mod tests {
     #[test]
     fn snapshots_carry_names() {
         use crate::names::{BlockNameOp as Op, Record};
-        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 50)], ..params() };
+        // No subsidy: blocks of name operations alone keep the supply.
+        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 0)], ..params() };
         let open_long = |name: &str| {
             let dir = TempDir::new(name);
             let chain = Chain::open(&dir.0, 64 << 20, long, seed(), AcceptAllProofs).unwrap();
@@ -3891,9 +4043,9 @@ mod tests {
         // another snapshot, after the update.
         mine_on(Body {
             ops: vec![
-                Op::Commit { commit: d(10), memo: d(11) },
-                Op::Commit { commit: d(12), memo: d(13) },
-                Op::Commit { commit: d(14), memo: d(15) },
+                Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
+                Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
+                Op::Commit { commit: d(14), memo: crate::transaction::memo5(d(15)) },
             ],
             ..Default::default()
         });
@@ -4000,7 +4152,8 @@ mod tests {
     #[test]
     fn name_operations_apply_and_reorganize() {
         use crate::names::{BlockNameOp as Op, Record};
-        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 50)], ..params() };
+        // No subsidy: blocks of name operations alone keep the supply.
+        let long = ChainParams { max_block_size: 1 << 20, emission: &[(1000, 0)], ..params() };
         let open_long = |name: &str| {
             let dir = TempDir::new(name);
             let chain = Chain::open(&dir.0, 64 << 20, long, seed(), AcceptAllProofs).unwrap();
@@ -4023,7 +4176,10 @@ mod tests {
             block
         };
         // Block 1: two commits, at positions 2 and 3.
-        let ops = vec![Op::Commit { commit: d(10), memo: d(11) }, Op::Commit { commit: d(12), memo: d(13) }];
+        let ops = vec![
+            Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
+            Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
+        ];
         let b1 = mine_on(&a, Body { ops, ..Default::default() });
         {
             let rtxn = a.chain.env().read_txn().unwrap();
@@ -4127,6 +4283,81 @@ mod tests {
         let hex: String = g.nonce.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, crate::genesis::BITCOIN_HASH_HEX);
         assert!(crate::genesis::BITCOIN_TIME <= g.timestamp, "the Bitcoin block must come first");
+    }
+
+    #[test]
+    fn issued_sums_the_schedule() {
+        let p = params();
+        assert_eq!(p.issued(0), 0);
+        assert_eq!(p.issued(1), 50);
+        assert_eq!(p.issued(10), 500);
+        assert_eq!(p.issued(11), 525);
+        assert_eq!(p.issued(25), 500 + 250 + 60);
+        assert_eq!(p.issued(1000), p.total_supply());
+        for h in 0..30 {
+            assert_eq!(p.issued(h), (1..=h).map(|i| p.subsidy(i) as u128).sum::<u128>());
+        }
+    }
+
+    /// A block's outputs must sum to what it spends (as the state holds
+    /// it) plus its subsidy, whatever its proof says; the unspent total
+    /// is what was issued after every block, and after a reorganization.
+    #[test]
+    fn blocks_keep_the_supply() {
+        let a = open("supply-a");
+        let b = open("supply-b");
+        let k = pk(3);
+        let genesis = genesis_block(vec![Output::new(&k, 100), Output::new(&k, 7)]);
+        a.chain.init_genesis(&genesis).unwrap();
+        b.chain.init_genesis(&genesis).unwrap();
+        assert_eq!(a.chain.supply().unwrap(), 107);
+        assert_eq!(a.chain.issued(0).unwrap(), 107);
+        let t = GENESIS_TIME + 600;
+        let body = |inputs: Vec<u64>, amounts: &[u64]| Body {
+            inputs,
+            outputs: amounts
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| Output::new(&pk(i as u8 + 10), x).block_output())
+                .collect(),
+            proof: vec![],
+            ..Default::default()
+        };
+        let refused = |blk: &Block| matches!(a.chain.apply_block(blk, t + 1), Err(ChainError::Supply { .. }));
+        // One base unit more, or one less, than the spent 100 and the 50.
+        assert!(refused(&mine_exact(&a, body(vec![0], &[100, 51]), t)));
+        assert!(refused(&mine_exact(&a, body(vec![0], &[100, 49]), t)));
+        assert!(refused(&mine_exact(&a, body(vec![], &[]), t)));
+        // Outputs whose sum wraps past 2^64 to exactly the right amount.
+        assert!(refused(&mine_exact(&a, body(vec![0], &[u64::MAX, 151]), t)));
+        // Amounts spent are the state's: a body cannot claim them.
+        let a1 = mine_exact(&a, body(vec![0], &[120, 30]), t);
+        a.chain.apply_block(&a1, t + 1).unwrap();
+        assert_eq!(a.chain.supply().unwrap(), a.chain.issued(1).unwrap());
+        assert_eq!(a.chain.supply().unwrap(), 157);
+        let a2 = mine(&a, body(vec![1, 2], &[1]), t + 600);
+        a.chain.apply_block(&a2, t + 601).unwrap();
+        assert_eq!(a.chain.supply().unwrap(), a.chain.issued(2).unwrap());
+        let total = a.chain.utxo().total(&a.chain.env().read_txn().unwrap()).unwrap();
+        assert_eq!(total, a.chain.supply().unwrap());
+
+        // b's longer branch replaces a's two blocks; the total follows.
+        let mut bt = GENESIS_TIME;
+        let mut branch = Vec::new();
+        for i in 0..3u64 {
+            bt += 550;
+            let blk = mine(&b, body(if i == 1 { vec![1] } else { vec![] }, &[1]), bt);
+            b.chain.apply_block(&blk, bt + 1).unwrap();
+            branch.push(blk);
+        }
+        for blk in &branch {
+            a.chain.apply_block(blk, bt + 1).unwrap();
+        }
+        assert_eq!(a.chain.tip().unwrap().unwrap(), branch[2].header);
+        assert_eq!(a.chain.supply().unwrap(), a.chain.issued(3).unwrap());
+        let total = a.chain.utxo().total(&a.chain.env().read_txn().unwrap()).unwrap();
+        assert_eq!(total, a.chain.issued(3).unwrap());
+        assert_eq!(a.chain.supply().unwrap(), b.chain.supply().unwrap());
     }
 
     #[test]

@@ -351,7 +351,6 @@ mod tests {
     fn policy_spend_block_proves_and_applies() {
         use crate::mempool::{Mempool, Policy as PoolPolicy};
         use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer};
-        use crate::poseidon2::DIGEST;
         use crate::transaction::{Transaction, pubkey_hash};
         use crate::xmss::Digest;
         let dir = TempDir::new("e2e-policy");
@@ -421,7 +420,7 @@ mod tests {
         };
 
         // Block 1: A pays 90 into the multisig, fee 10; the miner takes 60.
-        let funding = multisig.output(90, [Fp::new(7); DIGEST]);
+        let funding = multisig.output(90, [Fp::new(7); crate::transaction::MEMO_LEN]);
         let mut tx1 = UnsignedTransaction::new(vec![(a.public_key(), 100)], vec![funding]).sign_with(&mut a).unwrap();
         tx1.set_positions(&[0]);
         let reward1 =

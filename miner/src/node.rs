@@ -273,7 +273,8 @@ pub fn proof_messages<V: ProofVerifier>(chain: &Chain<V>, position: u64) -> Resu
     let Some((tip, output, proof)) = chain.output_proof(position)? else {
         return Ok(None);
     };
-    let (commitment, memo, created) = output.unwrap_or((crate::state_tree::EMPTY, crate::state_tree::EMPTY, 0));
+    let (commitment, slot, created) = output.unwrap_or((crate::state_tree::EMPTY, crate::state_tree::EMPTY, 0));
+    let (memo, amount) = crate::transaction::slot_parts(&slot).ok_or(ChainError::Corrupt("output amount"))?;
     let tip = tip.hash();
     let msgs = proof
         .siblings
@@ -284,6 +285,7 @@ pub fn proof_messages<V: ProofVerifier>(chain: &Chain<V>, position: u64) -> Resu
             tip,
             commitment,
             memo,
+            amount,
             created,
             part: part as u8,
             siblings: s.to_vec(),
@@ -292,13 +294,14 @@ pub fn proof_messages<V: ProofVerifier>(chain: &Chain<V>, position: u64) -> Resu
     Ok(Some(msgs))
 }
 
-/// Whether a state proof's output (zero for none) and full path put the
-/// leaf at `position` under `state_root`.
+/// Whether a state proof's output (zero for none; `slot` its memo and
+/// amount, [`crate::transaction::memo_slot`]) and full path put the leaf
+/// at `position` under `state_root`.
 pub fn verify_proof(
     state_root: &Digest,
     position: u64,
     commitment: &Digest,
-    memo: &Digest,
+    slot: &Digest,
     created: u32,
     siblings: &[Digest],
 ) -> bool {
@@ -308,7 +311,7 @@ pub fn verify_proof(
     let leaf = if *commitment == crate::state_tree::EMPTY {
         crate::state_tree::EMPTY
     } else {
-        crate::transaction::leaf(commitment, memo, created)
+        crate::transaction::leaf(commitment, slot, created)
     };
     crate::state_tree::Proof { siblings }.verify(state_root, position, &leaf)
 }
@@ -1504,8 +1507,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     Err(e) => self.log(&format!("proof: {e}")),
                 }
             }
-            Message::Proof { position, tip, commitment, memo, created, part, siblings } => {
+            Message::Proof { position, tip, commitment, memo, amount, created, part, siblings } => {
                 self.peers.seen(addr, now);
+                let memo = crate::transaction::memo_slot(&memo, amount);
                 // Two parts, the second completing the path; checked against
                 // the header the proof names, if we have it.
                 let key = (addr, position, tip);
@@ -1650,9 +1654,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Err(e) => self.log(&format!("keeping our aux leaves for {}: {e}", short(&id))),
             }
         }
-        self.aux_wants
-            .entry(id)
-            .or_insert(AuxWant { height: header.height, from, asked: None, tries: 0, tried: Vec::new() });
+        self.aux_wants.entry(id).or_insert(AuxWant {
+            height: header.height,
+            from,
+            asked: None,
+            tries: 0,
+            tried: Vec::new(),
+        });
     }
 
     /// Fetches the aux leaves of the window's blocks that lack them and the
@@ -1680,7 +1688,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         self.last_consensus = Some(decided);
                         let by = match &current.winner {
                             None if epoch.votes.counts.is_empty() => "no block of its window voted".to_string(),
-                            None => format!("none of the {} files its window voted for counts", epoch.votes.counts.len()),
+                            None => {
+                                format!("none of the {} files its window voted for counts", epoch.votes.counts.len())
+                            }
                             Some((h, n)) => format!(
                                 "file {} with {n} of its window's {} votes{}",
                                 consensus::hex(h),
@@ -1691,7 +1701,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         if changed || first {
                             self.log(&format!("consensus: {} mode from block {}: {by}", current.mode, epoch.boundary));
                             for (h, n, why) in &current.skipped {
-                                self.log(&format!("consensus: file {} with {n} votes does not count: {why}", consensus::hex(h)));
+                                self.log(&format!(
+                                    "consensus: file {} with {n} votes does not count: {why}",
+                                    consensus::hex(h)
+                                ));
                             }
                         }
                         match &epoch.previous {
@@ -1699,7 +1712,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                                 "consensus: switching from {} mode until block {}; the new file is tried first {}",
                                 p.mode,
                                 epoch.boundary + consensus::GRACE - 1,
-                                if epoch.prefer_current { "now".to_string() } else { format!("from block {}", epoch.boundary + consensus::SWITCH) }
+                                if epoch.prefer_current {
+                                    "now".to_string()
+                                } else {
+                                    format!("from block {}", epoch.boundary + consensus::SWITCH)
+                                }
                             )),
                             None if was_switching => self.log("consensus: the switch is done"),
                             None => {}
@@ -1724,7 +1741,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     if want != self.file_want {
                         self.file_failed.clear();
                         if let Some(hash) = want {
-                            let n = running.skipped.iter().chain(&current.skipped).find(|s| s.0 == hash).map_or(0, |s| s.1);
+                            let n =
+                                running.skipped.iter().chain(&current.skipped).find(|s| s.0 == hash).map_or(0, |s| s.1);
                             self.log(&format!("consensus: file {} has {n} votes; fetching it", consensus::hex(&hash)));
                         }
                     }
@@ -1744,8 +1762,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut requests = Vec::new();
         let mut given_up = Vec::new();
         for (id, w) in self.aux_wants.iter_mut() {
-            if w.asked.is_some_and(|t| now.duration_since(t) < AUX_RETRY) || requests.len() >= AUX_REQUESTS_PER_TICK
-            {
+            if w.asked.is_some_and(|t| now.duration_since(t) < AUX_RETRY) || requests.len() >= AUX_REQUESTS_PER_TICK {
                 continue;
             }
             if w.tries >= AUX_MAX_TRIES {
@@ -1784,7 +1801,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     None => {
                         // No live peer serves it: it counts for nothing
                         // for a while, and the next is fetched.
-                        self.log(&format!("consensus: no peer serves file {}; passing it over for now", consensus::hex(&hash)));
+                        self.log(&format!(
+                            "consensus: no peer serves file {}; passing it over for now",
+                            consensus::hex(&hash)
+                        ));
                         self.file_unavailable.insert(hash, now);
                         self.file_want = None;
                         self.file_failed.clear();
@@ -3035,11 +3055,11 @@ mod tests {
     use crate::aggregate::AggregatorParams;
     use crate::block::{Body, HEADER_SIZE};
     use crate::chain::{AcceptAllProofs, ChainParams};
+    use crate::circuit;
+    use crate::poseidon2::digest_to_bytes;
     use crate::pow::{self, Dataset, PowParams, SeedText, nonce_from_u64};
     use crate::state_tree::EMPTY;
     use crate::transaction::{Key, Output};
-    use crate::circuit;
-    use crate::poseidon2::digest_to_bytes;
     use std::path::PathBuf;
 
     struct TempDir(PathBuf);
@@ -3074,7 +3094,8 @@ mod tests {
             max_block_size: HEADER_SIZE + 12 + 4 * crate::block::COMMITMENT_SIZE + 3000,
             max_future_drift: 7200,
             median_time_window: 11,
-            emission: &[(1000, 50)],
+            // A subsidy a wallet can pay from.
+            emission: &[(1000, SUBSIDY)],
             aggregator: AggregatorParams::MAINNET,
         }
     }
@@ -3110,10 +3131,26 @@ mod tests {
     }
 
     /// Mines a block with one output and a padding "proof" on the tip.
+    const SUBSIDY: u64 = 60_000_000;
+
+    /// What the next block on `f` must create when it spends `inputs`:
+    /// their amounts and the subsidy.
+    fn claim(f: &Fixture, inputs: &[u64]) -> u64 {
+        let height = f.chain.tip().unwrap().unwrap().height + 1;
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let spent: u64 = inputs
+            .iter()
+            .map(|&p| crate::transaction::slot_parts(&f.chain.utxo().slot(&rtxn, p).unwrap()).unwrap().1)
+            .sum();
+        spent + f.chain.params().subsidy(height)
+    }
+
+    /// A block whose one output claims the subsidy, to `pk(tag)`.
     fn mine(f: &Fixture, tag: u8, timestamp: u64) -> Block {
+        let height = f.chain.tip().unwrap().unwrap().height + 1;
         let body = Body {
             inputs: vec![],
-            outputs: vec![Output::new(&pk(tag), 1).block_output()],
+            outputs: vec![Output::new(&pk(tag), f.chain.params().subsidy(height)).block_output()],
             proof: vec![tag; 2500],
             ..Default::default()
         };
@@ -3213,7 +3250,7 @@ mod tests {
 
         // A transaction spending block 1's output, submitted on a, reaches
         // b's pool; a block spending that output clears both pools.
-        let spent = Output::new(&pk(1), 1);
+        let spent = Output::new(&pk(1), SUBSIDY);
         let mut k = Key::generate(&{
             let mut s = [0u8; 32];
             s[0] = 1;
@@ -3224,10 +3261,12 @@ mod tests {
             let unspent = a.chain.utxo().unspent(&rtxn).unwrap();
             unspent.iter().find(|(_, (c, _, _))| *c == spent.commitment).unwrap().0
         };
-        let mut tx =
-            crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), 1)], vec![Output::new(&pk(50), 1)])
-                .sign_with(&mut k)
-                .unwrap();
+        let mut tx = crate::transaction::UnsignedTransaction::new(
+            vec![(k.public_key(), SUBSIDY)],
+            vec![Output::new(&pk(50), SUBSIDY)],
+        )
+        .sign_with(&mut k)
+        .unwrap();
         tx.set_positions(&[position]);
         let txid = tx.txid();
         tx_a.send(Event::Transaction(tx)).unwrap();
@@ -3242,7 +3281,7 @@ mod tests {
             &a,
             Body {
                 inputs: vec![position],
-                outputs: vec![Output::new(&pk(50), 1).block_output()],
+                outputs: vec![Output::new(&pk(50), claim(&a, &[position])).block_output()],
                 proof: vec![5; 2500],
                 ..Default::default()
             },
@@ -3330,14 +3369,21 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
                 let v = chain.consensus_votes(consensus::WINDOW).unwrap();
-                if v.missing.is_empty() && v.counts.first().map(|c| c.0) == Some(want) && chain.has_consensus_file(&want).unwrap() {
+                if v.missing.is_empty()
+                    && v.counts.first().map(|c| c.0) == Some(want)
+                    && chain.has_consensus_file(&want).unwrap()
+                {
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             false
         };
-        assert!(settled(&b.chain, hash, 20), "b did not fetch the leaves and the file: {:?}", b.chain.consensus_votes(144));
+        assert!(
+            settled(&b.chain, hash, 20),
+            "b did not fetch the leaves and the file: {:?}",
+            b.chain.consensus_votes(144)
+        );
         for block in &blocks {
             assert_eq!(b.chain.aux_leaves_of(&block.header.hash()).unwrap(), Some(leaves));
             assert_eq!(a.chain.aux_leaves_of(&block.header.hash()).unwrap(), Some(leaves), "a keeps its own");
@@ -3440,14 +3486,14 @@ mod tests {
             for (i, m) in msgs.iter().enumerate() {
                 let bytes = m.encode();
                 assert!(bytes.len() <= net::MAX_DATAGRAM);
-                let Some(Message::Proof { position: p, tip: h, commitment, memo, created, part, siblings: s }) =
+                let Some(Message::Proof { position: p, tip: h, commitment, memo, amount, created, part, siblings: s }) =
                     Message::decode(&bytes)
                 else {
                     panic!("not a proof");
                 };
                 assert_eq!((p, h, part as usize), (position, tip.hash(), i));
                 siblings.extend(s);
-                output = Some((commitment, memo, created));
+                output = Some((commitment, crate::transaction::memo_slot(&memo, amount), created));
             }
             (output.unwrap(), siblings)
         };
@@ -3458,6 +3504,10 @@ mod tests {
         assert!(!verify_proof(&tip.state_root, occupied, &c, &m, created + 1, &siblings));
         assert!(!verify_proof(&tip.state_root, occupied + 1, &c, &m, created, &siblings));
         assert!(!verify_proof(&EMPTY, occupied, &c, &m, created, &siblings));
+        // The amount is in the leaf: another one does not verify.
+        let (memo, amount) = crate::transaction::slot_parts(&m).unwrap();
+        let other = crate::transaction::memo_slot(&memo, amount + 1);
+        assert!(!verify_proof(&tip.state_root, occupied, &c, &other, created, &siblings));
         let ((c, m, created), siblings) = fetch(empty);
         assert_eq!((c, m, created), (EMPTY, EMPTY, 0));
         assert!(verify_proof(&tip.state_root, empty, &c, &m, created, &siblings));
@@ -3481,14 +3531,14 @@ mod tests {
                 let pos = (tag as u64 - 3) * 1;
                 Body {
                     inputs: vec![pos],
-                    outputs: vec![Output::new(&pk(tag), 1).block_output()],
+                    outputs: vec![Output::new(&pk(tag), claim(&a, &[pos])).block_output()],
                     proof: vec![tag; 2500],
                     ..Default::default()
                 }
             } else {
                 Body {
                     inputs: vec![],
-                    outputs: vec![Output::new(&pk(tag), 1).block_output()],
+                    outputs: vec![Output::new(&pk(tag), claim(&a, &[])).block_output()],
                     proof: vec![tag; 2500],
                     ..Default::default()
                 }
@@ -3538,16 +3588,22 @@ mod tests {
         for tag in 1..=20u8 {
             t += 600;
             let ops = match tag {
-                1 => vec![Op::Commit { commit: d(10), memo: d(11) }, Op::Commit { commit: d(12), memo: d(13) }],
-                13 => vec![Op::Reveal { record: alice.clone(), commit: 1 }, Op::Commit { commit: d(14), memo: d(15) }],
+                1 => vec![
+                    Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
+                    Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
+                ],
+                13 => vec![
+                    Op::Reveal { record: alice.clone(), commit: 1 },
+                    Op::Commit { commit: d(14), memo: crate::transaction::memo5(d(15)) },
+                ],
                 14 => vec![Op::Update(alice2.clone())],
                 15 => vec![Op::Reveal { record: bob.clone(), commit: 2 }],
                 _ => vec![],
             };
             let inputs = if (3..=12).contains(&tag) { vec![tag as u64] } else { vec![] };
             let body = Body {
+                outputs: vec![Output::new(&pk(tag), claim(&a, &inputs)).block_output()],
                 inputs,
-                outputs: vec![Output::new(&pk(tag), 1).block_output()],
                 ops,
                 proof: vec![tag; 2500],
                 ..Default::default()
@@ -3604,12 +3660,28 @@ mod tests {
             t += 600;
             let n = if h == 1 { 20_000 } else { 1 };
             let key = pk(h as u8);
-            let outputs = (0..n).map(|i| Output::new(&key, i).block_output()).collect();
             let inputs = match h {
                 10 => vec![5],
                 14 => vec![7],
                 _ => vec![],
             };
+            // The first output claims it all; the rest, of amount zero,
+            // are made distinct by their memos.
+            let total = claim(a, &inputs);
+            let outputs = (0..n)
+                .map(|i| {
+                    let memo = [
+                        crate::poseidon2::Fp::from_u64(i),
+                        crate::poseidon2::Fp::ZERO,
+                        crate::poseidon2::Fp::ZERO,
+                        crate::poseidon2::Fp::ZERO,
+                        crate::poseidon2::Fp::ZERO,
+                    ];
+                    let mut o = Output::new(&key, if i == 0 { total } else { 0 }).block_output();
+                    o.memo = memo;
+                    o
+                })
+                .collect();
             let block = mine_body(a, Body { inputs, outputs, proof: vec![h as u8; 100], ..Default::default() }, t);
             match via {
                 // Through a's node, which announces it.
@@ -3911,7 +3983,13 @@ mod tests {
         let q_announce = got.from.expect("q names itself");
         assert_eq!(q_announce.id, id_q);
         // p answers to the key q carried; q need not ask for it.
-        let out = Outbound { tag: 8, to: id_q, kind: onion::KIND_SLATE, inner: b"answered".to_vec(), recipient: Some(q_announce) };
+        let out = Outbound {
+            tag: 8,
+            to: id_q,
+            kind: onion::KIND_SLATE,
+            inner: b"answered".to_vec(),
+            recipient: Some(q_announce),
+        };
         tx_p.send(Event::Send(out)).unwrap();
         let mut answer = None;
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -3955,13 +4033,9 @@ mod tests {
         let (alice, _) = Wallet::open(&p.dir.0.join("wallet")).unwrap();
         let (bob, _) = Wallet::open(&q.dir.0.join("wallet")).unwrap();
         // alice holds an output on her node's chain.
-        let funds = alice.receive(60_000_000).unwrap();
-        let body = Body {
-            inputs: vec![],
-            outputs: vec![funds.block_output()],
-            proof: vec![1; 2500],
-            ..Default::default()
-        };
+        let funds = alice.receive(SUBSIDY).unwrap();
+        let body =
+            Body { inputs: vec![], outputs: vec![funds.block_output()], proof: vec![1; 2500], ..Default::default() };
         let block = mine_body(&p, body, T0 + 600);
         p.chain.apply_block(&block, unix_now()).unwrap();
         let (_, first, outputs) = p.chain.main_outputs(1).unwrap().unwrap();
@@ -3982,7 +4056,8 @@ mod tests {
         };
         let (node_a, tx_a, notes_a, stats_a) = participant(&p, &alice);
         let (node_b, tx_b, notes_b, stats_b) = participant(&q, &bob);
-        let handles: Vec<_> = [node_r, node_a, node_b].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
+        let handles: Vec<_> =
+            [node_r, node_a, node_b].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
         let deadline = Instant::now() + Duration::from_secs(15);
         let live = |s: &Arc<Mutex<Stats>>| s.lock().unwrap().rendezvous.iter().any(|(_, l)| *l);
         while !(live(&stats_a) && live(&stats_b)) && Instant::now() < deadline {
@@ -4014,7 +4089,13 @@ mod tests {
             Incoming::Finalized(..) => panic!("bob had nothing to finalize"),
         };
         assert_eq!((answered.id, answered.stage), (slate.id, 2));
-        let out = Outbound { tag: 2, to: from.id, kind: onion::KIND_SLATE, inner: answered.to_bytes(), recipient: Some(from) };
+        let out = Outbound {
+            tag: 2,
+            to: from.id,
+            kind: onion::KIND_SLATE,
+            inner: answered.to_bytes(),
+            recipient: Some(from),
+        };
         tx_b.send(Event::Send(out)).unwrap();
         // alice's wallet signs the answer; only bob's id may give it.
         let o = received(&notes_a);
@@ -4081,10 +4162,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let got = sink_a.lock().unwrap().clone();
         let from = |who: &str| -> Vec<(Option<Digest>, Vec<u8>)> {
-            got.iter().filter(|(_, _, b)| b.starts_with(format!("from {who}").as_bytes())).map(|(_, p, b)| (*p, b.clone())).collect()
+            got.iter()
+                .filter(|(_, _, b)| b.starts_with(format!("from {who}").as_bytes()))
+                .map(|(_, p, b)| (*p, b.clone()))
+                .collect()
         };
         let (bs, cs) = (from("b"), from("c"));
-        assert_eq!((bs.len(), cs.len(), got.len()), (n, n, 2 * n), "{:?}", got.iter().map(|g| &g.2).collect::<Vec<_>>());
+        assert_eq!(
+            (bs.len(), cs.len(), got.len()),
+            (n, n, 2 * n),
+            "{:?}",
+            got.iter().map(|g| &g.2).collect::<Vec<_>>()
+        );
         for k in 0..n {
             // b proved it is the relay with id 2; c is nobody.
             assert_eq!(bs[k], (Some(id(2)), format!("from b {k}").into_bytes()));
@@ -4150,7 +4239,9 @@ mod tests {
         assert_eq!(got.len(), 4);
         assert_eq!(got[0], Seen::Ready(0));
         // In order from each hop; the middle one's answer may come first.
-        let from = |hop: usize| got.iter().filter(|s| matches!(s, Seen::Data(0, h, _) if *h == hop)).cloned().collect::<Vec<_>>();
+        let from = |hop: usize| {
+            got.iter().filter(|s| matches!(s, Seen::Data(0, h, _) if *h == hop)).cloned().collect::<Vec<_>>()
+        };
         assert_eq!(from(1), vec![Seen::Data(0, 1, b"echoed:mid".to_vec())]);
         assert_eq!(from(2), vec![Seen::Data(0, 2, b"echoed:one".to_vec()), Seen::Data(0, 2, echoed)]);
         // Each hop saw only what was for it.
@@ -4176,8 +4267,8 @@ mod tests {
     /// which its relay forwards to p's point and down p's circuit.
     #[test]
     fn rendezvous_points_meet_over_circuits() {
-        use circuits::Seen;
         use crate::onion::{Announce, Object, Payload};
+        use circuits::Seen;
         let fixtures: Vec<Fixture> = (0..5).map(|i| open(&format!("rdv-{i}"))).collect();
         let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
         let id = |tag: u8| crate::address::id_of(key(tag).public_key());
@@ -4308,7 +4399,12 @@ mod tests {
         while !(live(p) && live(q)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(live(p) && live(q), "{:?} {:?}", nodes[p].3.lock().unwrap().rendezvous, nodes[q].3.lock().unwrap().rendezvous);
+        assert!(
+            live(p) && live(q),
+            "{:?} {:?}",
+            nodes[p].3.lock().unwrap().rendezvous,
+            nodes[q].3.lock().unwrap().rendezvous
+        );
         let delivered = Mutex::new(Vec::new());
         let received = |n: usize| loop {
             match nodes[n].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
@@ -4324,7 +4420,13 @@ mod tests {
         assert_eq!((o.kind, &o.inner[..]), (onion::KIND_SLATE, &b"a slate"[..]));
         let from = o.from.expect("q names itself");
         assert_eq!(from.id, id(5));
-        let out = Outbound { tag: 2, to: from.id, kind: onion::KIND_SLATE, inner: b"answered".to_vec(), recipient: Some(from) };
+        let out = Outbound {
+            tag: 2,
+            to: from.id,
+            kind: onion::KIND_SLATE,
+            inner: b"answered".to_vec(),
+            recipient: Some(from),
+        };
         nodes[p].1.send(Event::Send(out)).unwrap();
         let o = received(q);
         assert_eq!(&o.inner[..], b"answered");
@@ -4360,8 +4462,9 @@ mod tests {
         let (alice, _) = Wallet::open(&fixtures[3].dir.0.join("wallet")).unwrap();
         let (bob, _) = Wallet::open(&fixtures[3].dir.0.join("bob")).unwrap();
         // alice's funds, in a block every node has.
-        let funds = alice.receive(60_000_000).unwrap();
-        let body = Body { inputs: vec![], outputs: vec![funds.block_output()], proof: vec![1; 2500], ..Default::default() };
+        let funds = alice.receive(SUBSIDY).unwrap();
+        let body =
+            Body { inputs: vec![], outputs: vec![funds.block_output()], proof: vec![1; 2500], ..Default::default() };
         let block = mine_body(&fixtures[3], body, T0 + 600);
         for f in &fixtures {
             f.chain.apply_block(&block, unix_now()).unwrap();
@@ -4482,7 +4585,8 @@ mod tests {
         let mut tag = 0u64;
         let mut message = |round: &str| {
             tag += 1;
-            let out = Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            let out =
+                Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
@@ -4575,7 +4679,13 @@ mod tests {
         let mut tag = 0u64;
         let mut message_to = |to: usize, round: &str| {
             tag += 1;
-            let out = Outbound { tag, to: id(to as u8 + 1), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            let out = Outbound {
+                tag,
+                to: id(to as u8 + 1),
+                kind: onion::KIND_SLATE,
+                inner: round.as_bytes().to_vec(),
+                recipient: None,
+            };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
             loop {
@@ -4589,7 +4699,10 @@ mod tests {
                 assert!(Instant::now() < deadline, "{round}: nothing arrived");
             }
         };
-        let set = |n: usize, current: Option<&Vec<consensus::Relay>>, previous: Option<Option<&Vec<consensus::Relay>>>, prefer: bool| {
+        let set = |n: usize,
+                   current: Option<&Vec<consensus::Relay>>,
+                   previous: Option<Option<&Vec<consensus::Relay>>>,
+                   prefer: bool| {
             nodes[n].1.send(Event::TestEpoch(current.cloned(), previous.map(|p| p.cloned()), prefer)).unwrap();
         };
         // r is in onion mode from the start: it never holds an init session.
@@ -4674,7 +4787,8 @@ mod tests {
         let mut tag = 0u64;
         let mut message = |round: &str| {
             tag += 1;
-            let out = Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            let out =
+                Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
             loop {
