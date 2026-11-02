@@ -77,6 +77,7 @@ use crate::mlkem;
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
 use crate::policy::{Cond, CondWitness, Mode, Policy as SpendPolicy, Signer, rebind_message};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
+use crate::proofs::{Burn, Claim, Receipt};
 use crate::state_tree::open_env;
 use crate::transaction::{
     Commitment, EMPTY_MEMO, INPUT_SIZE, Key, Memo, OUTPUT_SIZE, Output, Transaction, UnsignedTransaction, hash_domain,
@@ -93,13 +94,17 @@ const META_SCAN_PENDING: &str = "scan_pending";
 /// Height and hash of the block up to which the wallet has looked for its
 /// outputs' positions.
 const META_SYNCED: &str = "synced";
+/// The counter the identity key is derived with (`docs/PRIVACY.md`, fix
+/// 5), a `u64`, and whether the address is off (present: off).
+const META_ADDRESS: &str = "address";
+const META_ADDRESS_OFF: &str = "address_off";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys;
 /// 5 adds the name tables; 6 stores keys with their tree height (slate
 /// format 3).
-const FORMAT: u8 = 6;
+const FORMAT: u8 = 7;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
-const SLATE_MAGIC: &[u8; 8] = b"tabslt04";
+const SLATE_MAGIC: &[u8; 8] = b"tabslt05";
 
 const DOM_MASTER: u32 = 0x30;
 const DOM_TAG: u32 = 0x31;
@@ -429,6 +434,12 @@ pub struct Slate {
     pub outputs: Vec<Output>,
     /// How many of `outputs` are the sender's change.
     pub change: u32,
+    /// The sender's id (its address's 32 bytes), or the hash of a secret
+    /// it keeps when it does not name itself: what the receipt binds.
+    pub sender: Digest,
+    /// The recipient's receipt for its output (`docs/PROOFS.md`): every
+    /// answered (stage-2) slate carries one.
+    pub receipt: Option<Receipt>,
 }
 
 impl Slate {
@@ -436,6 +447,7 @@ impl Slate {
         let mut w = Writer::default();
         w.0.extend_from_slice(SLATE_MAGIC);
         w.0.extend_from_slice(&self.id);
+        w.digest(&self.sender);
         w.0.push(self.stage);
         w.u64(self.amount);
         w.u64(self.fee);
@@ -449,15 +461,21 @@ impl Slate {
         for o in &self.outputs {
             w.0.extend_from_slice(&o.to_bytes());
         }
+        if let Some(r) = &self.receipt {
+            r.write(&mut w);
+        }
         w.finish()
     }
 
+    /// A slate from its bytes; `None` if malformed, as an answered slate
+    /// without a receipt is.
     pub fn from_bytes(bytes: &[u8]) -> Option<Slate> {
         let mut r = Reader(bytes);
         if r.take(8)? != SLATE_MAGIC {
             return None;
         }
         let id: [u8; 32] = r.take(32)?.try_into().ok()?;
+        let sender = r.digest()?;
         let stage = r.take(1)?[0];
         let amount = r.u64()?;
         let fee = r.u64()?;
@@ -476,7 +494,8 @@ impl Slate {
         if (change as usize) > outputs.len() || !(1..=2).contains(&stage) {
             return None;
         }
-        r.is_empty().then_some(Slate { id, stage, amount, fee, inputs, outputs, change })
+        let receipt = if stage == 2 { Some(Receipt::read(&mut r)?) } else { None };
+        r.is_empty().then_some(Slate { id, stage, amount, fee, inputs, outputs, change, sender, receipt })
     }
 
     /// The unsigned transaction a stage-2 slate describes.
@@ -501,6 +520,13 @@ struct Pending {
     change: Option<Commitment>,
     amount: u64,
     fee: u64,
+    /// What the slate names as its sender: our address then (it may
+    /// change before the answer, `docs/PRIVACY.md` fix 5), or the tag of
+    /// `secret`.
+    sender: Digest,
+    /// The secret whose tag the slate names in place of our address, if
+    /// it does not name us (`docs/PRIVACY.md`, fix 4).
+    secret: Option<[u8; 32]>,
 }
 
 /// What the sender keeps about a finalized payment, to cancel it.
@@ -535,6 +561,10 @@ impl Pending {
         }
         w.u64(self.amount);
         w.u64(self.fee);
+        w.digest(&self.sender);
+        if let Some(s) = &self.secret {
+            w.0.extend_from_slice(s);
+        }
         w.finish()
     }
 
@@ -548,7 +578,13 @@ impl Pending {
         };
         let amount = r.u64()?;
         let fee = r.u64()?;
-        r.is_empty().then_some(Pending { inputs, change, amount, fee })
+        let sender = r.digest()?;
+        let secret = match r.0.len() {
+            0 => None,
+            32 => Some(r.take(32)?.try_into().ok()?),
+            _ => return None,
+        };
+        Some(Pending { inputs, change, amount, fee, sender, secret })
     }
 }
 
@@ -569,6 +605,83 @@ impl Sent {
         let size = r.u64()? as usize;
         let created = r.u64()?;
         r.is_empty().then_some(Sent { txid, inputs, fee, size, created })
+    }
+}
+
+/// A payment this wallet made, or a burn, kept for its proof
+/// (`docs/PROOFS.md`): the output it created and whose it is, and where
+/// it landed once the chain has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payment {
+    pub txid: Commitment,
+    /// The recipient's output, or the burn output.
+    pub output: Output,
+    pub claim: Claim,
+    pub created: u64,
+    /// The main-chain block that created the output, and its position.
+    pub landed: Option<(u32, u64)>,
+    /// The output's path to that block's state root.
+    pub path: Option<crate::state_tree::Proof>,
+}
+
+impl Payment {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.0.extend_from_slice(&self.output.to_bytes());
+        self.claim.write(&mut w);
+        w.u64(self.created);
+        match self.landed {
+            Some((h, p)) => {
+                w.0.push(1);
+                w.u32(h);
+                w.u64(p);
+            }
+            None => w.0.push(0),
+        }
+        match &self.path {
+            Some(p) => {
+                w.0.push(1);
+                w.0.extend_from_slice(&p.to_bytes());
+            }
+            None => w.0.push(0),
+        }
+        w.finish()
+    }
+
+    fn from_bytes(txid: Commitment, bytes: &[u8]) -> Option<Payment> {
+        let mut r = Reader(bytes);
+        let output = Output::from_bytes(r.take(OUTPUT_SIZE)?)?;
+        let claim = Claim::read(&mut r)?;
+        let created = r.u64()?;
+        let landed = match r.take(1)?[0] {
+            0 => None,
+            1 => Some((r.u32()?, r.u64()?)),
+            _ => return None,
+        };
+        let path = match r.take(1)?[0] {
+            0 => None,
+            1 => Some(crate::state_tree::Proof::from_bytes(r.take(crate::state_tree::Proof::SIZE)?)?),
+            _ => return None,
+        };
+        r.is_empty().then_some(Payment { txid, output, claim, created, landed, path })
+    }
+
+    /// Its proof, once it has landed and its path is known.
+    pub fn proof(&self) -> Option<crate::proofs::Proof> {
+        let (height, position) = self.landed?;
+        Some(crate::proofs::Proof {
+            height,
+            position,
+            key_hash: self.output.key_hash,
+            amount: self.output.amount,
+            memo: self.output.memo,
+            path: self.path.clone()?,
+            claim: self.claim.clone(),
+        })
+    }
+
+    pub fn is_burn(&self) -> bool {
+        matches!(self.claim, Claim::Burn(_))
     }
 }
 
@@ -697,6 +810,12 @@ pub struct Wallet {
     names: Database<Bytes, Bytes>,
     /// Policy outputs by commitment.
     policies: Database<Bytes, Bytes>,
+    /// Payments and burns by txid, kept for their proofs.
+    payments: Database<Bytes, Bytes>,
+    /// The identity key's counter and whether the address is off, as
+    /// stored.
+    address: std::sync::atomic::AtomicU64,
+    address_off: std::sync::atomic::AtomicBool,
 }
 
 fn unix_now() -> u64 {
@@ -727,7 +846,7 @@ fn master_of(seed: &[u8; 64]) -> [Fp; DIGEST] {
 
 impl Wallet {
     #[allow(clippy::type_complexity)]
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 6])> {
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 7])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
@@ -740,14 +859,15 @@ impl Wallet {
         let commits = env.create_database(&mut wtxn, Some("commits"))?;
         let names = env.create_database(&mut wtxn, Some("names"))?;
         let policies = env.create_database(&mut wtxn, Some("policies"))?;
+        let payments = env.create_database(&mut wtxn, Some("payments"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent, commits, names, policies]))
+        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments]))
     }
 
     /// Opens the wallet in `dir`, creating one with a fresh phrase if there
     /// is none. Returns the wallet and, if it was just created, its phrase.
     pub fn open(dir: &Path) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent, commits, names, policies]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         let created = match meta.get(&wtxn, META_SEED)? {
             Some(_) => {
@@ -774,8 +894,29 @@ impl Wallet {
             .ok_or(WalletError::Corrupt("seed"))?
             .try_into()
             .map_err(|_| WalletError::Corrupt("seed"))?;
+        let address = match meta.get(&wtxn, META_ADDRESS)? {
+            Some(b) => u64::from_le_bytes(b.try_into().map_err(|_| WalletError::Corrupt("address"))?),
+            None => 0,
+        };
+        let off = meta.get(&wtxn, META_ADDRESS_OFF)?.is_some();
         wtxn.commit()?;
-        Ok((Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names, policies }, created))
+        Ok((
+            Wallet {
+                env,
+                master: master_of(&seed),
+                meta,
+                outputs,
+                slates,
+                sent,
+                commits,
+                names,
+                policies,
+                payments,
+                address: address.into(),
+                address_off: off.into(),
+            },
+            created,
+        ))
     }
 
     /// Creates a wallet in `dir` from a phrase and passphrase; the outputs
@@ -783,7 +924,7 @@ impl Wallet {
     pub fn restore(dir: &Path, phrase: &str, passphrase: &str) -> Result<Wallet> {
         let entropy = bip39::entropy(phrase)?;
         let seed = bip39::seed(phrase, passphrase)?;
-        let (env, meta, [outputs, slates, sent, commits, names, policies]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         if meta.get(&wtxn, META_SEED)?.is_some() || !outputs.is_empty(&wtxn)? {
             return Err(WalletError::Exists);
@@ -792,8 +933,25 @@ impl Wallet {
         meta.put(&mut wtxn, META_SEED, &seed)?;
         meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
         meta.put(&mut wtxn, META_SCAN_PENDING, &[1])?;
+        // Old addresses are abandoned, never reused: a restore starts from
+        // a fresh one (`docs/PRIVACY.md`, fix 5).
+        let address = u64::from_le_bytes(random_bytes::<8>()?) >> 4;
+        meta.put(&mut wtxn, META_ADDRESS, &address.to_le_bytes())?;
         wtxn.commit()?;
-        Ok(Wallet { env, master: master_of(&seed), meta, outputs, slates, sent, commits, names, policies })
+        Ok(Wallet {
+            env,
+            master: master_of(&seed),
+            meta,
+            outputs,
+            slates,
+            sent,
+            commits,
+            names,
+            policies,
+            payments,
+            address: address.into(),
+            address_off: false.into(),
+        })
     }
 
     /// Whether a restore is waiting for its first scan.
@@ -829,11 +987,47 @@ impl Wallet {
         hash_domain(domain, &input)
     }
 
-    /// The wallet's Dilithium (ML-DSA-65) key, from the master key: a
-    /// wallet restored from its phrase has the same key, id and address.
+    /// The wallet's Dilithium (ML-DSA-65) key, from the master key and
+    /// the address counter (`docs/PRIVACY.md`, fix 5): its hash is the
+    /// wallet's address.
     pub fn identity_key(&self) -> mldsa::SecretKey {
-        let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_IDENTITY, &self.master));
+        let i = self.address.load(std::sync::atomic::Ordering::Acquire);
+        let mut input = self.master.to_vec();
+        input.extend_from_slice(&[Fp::new((i & ((1 << 30) - 1)) as u32), Fp::new((i >> 30 & ((1 << 30) - 1)) as u32)]);
+        let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_IDENTITY, &input));
         mldsa::keygen(&seed)
+    }
+
+    /// Whether the address is off: no sessions, nobody can reach the
+    /// wallet, though it can still pay.
+    pub fn address_off(&self) -> bool {
+        self.address_off.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Moves to a new address: the counter goes up one and the address is
+    /// on. The old address is abandoned, never used again. Returns the new
+    /// key.
+    pub fn next_address(&self) -> Result<mldsa::SecretKey> {
+        let i = self.address.load(std::sync::atomic::Ordering::Acquire) + 1;
+        if i >= 1 << 60 {
+            return Err(WalletError::Corrupt("address counter"));
+        }
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, META_ADDRESS, &i.to_le_bytes())?;
+        self.meta.delete(&mut wtxn, META_ADDRESS_OFF)?;
+        wtxn.commit()?;
+        self.address.store(i, std::sync::atomic::Ordering::Release);
+        self.address_off.store(false, std::sync::atomic::Ordering::Release);
+        Ok(self.identity_key())
+    }
+
+    /// Turns the address off; [`Wallet::next_address`] turns a new one on.
+    pub fn turn_address_off(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, META_ADDRESS_OFF, &[1])?;
+        wtxn.commit()?;
+        self.address_off.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// The relay's Dilithium (ML-DSA-65) key, from the master key under its
@@ -1241,7 +1435,10 @@ impl Wallet {
     /// takes, if `None`): picks confirmed inputs largest first, reserves
     /// them, adds change to a fresh output, and returns the stage-1 slate
     /// for the recipient. Change below the dust limit goes to the fee.
-    pub fn send(&self, amount: u64, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
+    /// With `named` the slate names our address, which the recipient's
+    /// receipt then binds; otherwise it names the hash of a secret we keep
+    /// (`docs/PRIVACY.md`, fix 4), and the recipient learns nothing of us.
+    pub fn send(&self, amount: u64, fee: Option<u64>, named: bool, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
         if amount == 0 {
             return Err(WalletError::BadSlate("amount is zero"));
         }
@@ -1302,15 +1499,29 @@ impl Wallet {
             self.set_state(&mut wtxn, &c.commitment, State::Reserved)?;
         }
         let id = random_bytes::<32>()?;
-        let pending = Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change, amount, fee };
+        let secret = if named { None } else { Some(random_bytes::<32>()?) };
+        let sender = secret.as_ref().map_or_else(|| self.id(), crate::proofs::sender_tag);
+        let pending =
+            Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change, amount, fee, sender, secret };
         self.slates.put(&mut wtxn, &id, &pending.to_bytes())?;
         wtxn.commit()?;
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
-        Ok(Slate { id, stage: 1, amount, fee, inputs, outputs, change: u32::from(change.is_some()) })
+        Ok(Slate {
+            id,
+            stage: 1,
+            amount,
+            fee,
+            inputs,
+            outputs,
+            change: u32::from(change.is_some()),
+            sender,
+            receipt: None,
+        })
     }
 
     /// The recipient's step: adds an output for the slate's amount, recorded
-    /// as unspent, and advances the slate to stage 2.
+    /// as unspent, signs its receipt for it (`docs/PROOFS.md`) and advances
+    /// the slate to stage 2.
     pub fn receive_slate(&self, slate: &mut Slate) -> Result<()> {
         if slate.stage != 1 {
             return Err(WalletError::BadSlate("not a stage-1 slate"));
@@ -1319,17 +1530,24 @@ impl Wallet {
             return Err(WalletError::BadSlate("already has a recipient output"));
         }
         let out = self.receive(slate.amount)?;
+        slate.receipt = Some(Receipt::sign(&self.identity_key(), &out, &slate.id, &slate.sender));
         slate.outputs.push(out);
         slate.stage = 2;
         Ok(())
     }
 
-    /// A slate that came over the message layer (`docs/ONION.md`) from the
-    /// id `from`: a stage-1 slate gets our output and is to go back; a
-    /// stage-2 one, the answer to ours, is signed. `sent_to` is the id
-    /// this wallet sent that slate to over the network, if it did: only
-    /// that id may answer it.
-    pub fn take_slate(&self, bytes: &[u8], from: &Commitment, sent_to: Option<&Commitment>) -> Result<Incoming> {
+    /// A slate that came over the message layer (`docs/ONION.md`), from
+    /// the id `from` when known (a named sender, or the id an answer is
+    /// from): a stage-1 slate gets our output and is to go back; a stage-2
+    /// one, the answer to ours, is signed. `sent_to` is the id this wallet
+    /// sent that slate to over the network, if it did: only that id may
+    /// answer it.
+    pub fn take_slate(
+        &self,
+        bytes: &[u8],
+        from: Option<&Commitment>,
+        sent_to: Option<&Commitment>,
+    ) -> Result<Incoming> {
         let mut slate = Slate::from_bytes(bytes).ok_or(WalletError::BadSlate("malformed"))?;
         match slate.stage {
             1 => {
@@ -1337,8 +1555,12 @@ impl Wallet {
                 Ok(Incoming::Answered(slate))
             }
             2 => {
+                let from = from.ok_or(WalletError::BadSlate("an answer from no one known"))?;
                 if sent_to.is_some_and(|to| to != from) {
                     return Err(WalletError::BadSlate("answered by an id it was not sent to"));
+                }
+                if slate.receipt.as_ref().is_some_and(|r| r.recipient() != *from) {
+                    return Err(WalletError::BadSlate("the receipt is another id's"));
                 }
                 let signed = self.finalize(&slate)?;
                 Ok(Incoming::Finalized(slate, signed))
@@ -1407,6 +1629,16 @@ impl Wallet {
         if 12 + slate.inputs.len() * INPUT_SIZE + slate.outputs.len() * OUTPUT_SIZE > MAX_TX_SIZE {
             return Err(WalletError::BadSlate("too many outputs for one transaction"));
         }
+        // The receipt: the recipient acknowledges its one output as a
+        // payment from us in this slate (`docs/PROOFS.md`).
+        if slate.outputs.len() != slate.change as usize + 1 {
+            return Err(WalletError::BadSlate("not one recipient output"));
+        }
+        let receipt = slate.receipt.clone().ok_or(WalletError::BadSlate("no receipt"))?;
+        let paid_to = slate.outputs[slate.change as usize];
+        if slate.sender != pending.sender || !receipt.verify(&paid_to, &slate.id, &slate.sender) {
+            return Err(WalletError::BadSlate("the receipt does not hold"));
+        }
         let mut wtxn = self.env.write_txn()?;
         let signed = self.sign(&mut wtxn, slate.unsigned(), &pending.inputs)?;
         self.slates.delete(&mut wtxn, &slate.id)?;
@@ -1418,6 +1650,10 @@ impl Wallet {
             created: unix_now(),
         };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
+        let claim = Claim::Payment { sender: slate.sender, secret: pending.secret, slate_id: slate.id, receipt };
+        let payment =
+            Payment { txid: sent.txid, output: paid_to, claim, created: sent.created, landed: None, path: None };
+        self.payments.put(&mut wtxn, &digest_to_bytes(&payment.txid), &payment.to_bytes())?;
         wtxn.commit()?;
         Ok(signed)
     }
@@ -1482,9 +1718,179 @@ impl Wallet {
             }
         };
         self.sent.delete(&mut wtxn, &digest_to_bytes(txid))?;
+        // Cancelled: the payment (or burn) will not land.
+        self.payments.delete(&mut wtxn, &digest_to_bytes(txid))?;
         let next =
             Sent { txid: signed.tx.txid(), inputs: sent.inputs, fee, size: signed.tx.size(), created: unix_now() };
         self.sent.put(&mut wtxn, &digest_to_bytes(&next.txid), &next.to_bytes())?;
+        wtxn.commit()?;
+        Ok(signed)
+    }
+
+    /// Every payment and burn this wallet made that was not cancelled,
+    /// oldest first.
+    pub fn payments(&self) -> Result<Vec<Payment>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.payments.iter(&rtxn)? {
+            let (k, b) = item?;
+            let txid = crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("payment key"))?;
+            out.push(Payment::from_bytes(txid, b).ok_or(WalletError::Corrupt("payment"))?);
+        }
+        out.sort_by_key(|p| p.created);
+        Ok(out)
+    }
+
+    /// Notes which payments' outputs are among `outputs`, the outputs the
+    /// main-chain block at `height` added from position `first` on (by
+    /// commitment and memo: burns of one amount share a commitment).
+    /// Returns those that landed there anew, whose paths are to be made.
+    pub fn land_payments(
+        &self,
+        height: u32,
+        first: u64,
+        outputs: &[crate::block::BlockOutput],
+    ) -> Result<Vec<Payment>> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut landed = Vec::new();
+        let mut all = Vec::new();
+        for item in self.payments.iter(&wtxn)? {
+            let (k, b) = item?;
+            let txid = crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("payment key"))?;
+            all.push(Payment::from_bytes(txid, b).ok_or(WalletError::Corrupt("payment"))?);
+        }
+        for mut p in all {
+            let Some(i) = outputs.iter().position(|o| o.commitment == p.output.commitment && o.memo == p.output.memo)
+            else {
+                continue;
+            };
+            let at = (height, first + i as u64);
+            if p.landed == Some(at) {
+                continue;
+            }
+            p.landed = Some(at);
+            p.path = None;
+            self.payments.put(&mut wtxn, &digest_to_bytes(&p.txid), &p.to_bytes())?;
+            landed.push(p);
+        }
+        if !landed.is_empty() {
+            wtxn.commit()?;
+        }
+        Ok(landed)
+    }
+
+    /// Keeps the path of payment `txid`'s output, which landed in block
+    /// `height` at `position`: checked to lead to `state_root`, that
+    /// block's, from the output's leaf.
+    pub fn set_payment_path(
+        &self,
+        txid: &Commitment,
+        height: u32,
+        position: u64,
+        path: crate::state_tree::Proof,
+        state_root: &Digest,
+    ) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let b = self.payments.get(&wtxn, &digest_to_bytes(txid))?.ok_or(WalletError::Unknown)?;
+        let mut p = Payment::from_bytes(*txid, b).ok_or(WalletError::Corrupt("payment"))?;
+        let o = &p.output;
+        let leaf = crate::transaction::output_leaf(&o.commitment, &o.memo, o.amount, height);
+        if p.landed != Some((height, position)) || !path.verify(state_root, position, &leaf) {
+            return Err(WalletError::Corrupt("payment path"));
+        }
+        p.path = Some(path);
+        self.payments.put(&mut wtxn, &digest_to_bytes(txid), &p.to_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Burns `amount` for `beneficiary` with `purpose` (`docs/PROOFS.md`):
+    /// a transaction of this wallet's paying an output to the key hash
+    /// zero, which nobody can spend, whose memo names the beneficiary. The
+    /// burn is recorded for its proof like a payment.
+    pub fn burn(
+        &self,
+        amount: u64,
+        beneficiary: &Digest,
+        purpose: &[u8],
+        fee: Option<u64>,
+        utxo: &UtxoSet,
+        rtxn: &RoTxn,
+    ) -> Result<Signed> {
+        if purpose.len() > crate::proofs::MAX_PURPOSE {
+            return Err(WalletError::BadSlate("the purpose is longer than 255 bytes"));
+        }
+        let dust = Policy::MAINNET.dust;
+        if amount < dust {
+            return Err(WalletError::BadSlate("amount is below the dust limit"));
+        }
+        let burn = Burn { beneficiary: *beneficiary, nonce: random_bytes::<32>()?, purpose: purpose.to_vec() };
+        let burned = burn.output(amount);
+        let coins = self.spendable(utxo, rtxn)?;
+        let mut inputs = 1;
+        let given = fee;
+        let fee = loop {
+            let fee = given.unwrap_or_else(|| Self::min_fee(inputs));
+            let need = amount as u128 + fee as u128;
+            let mut picked = 0usize;
+            let mut total = 0u128;
+            for c in &coins {
+                if total >= need {
+                    break;
+                }
+                total += c.amount as u128;
+                picked += 1;
+            }
+            if total < need {
+                return Err(WalletError::Insufficient { have: total, need });
+            }
+            let min = Self::min_fee(picked.max(1));
+            if given.is_some() && fee < min {
+                return Err(WalletError::FeeTooLow { min });
+            }
+            if picked <= inputs {
+                break fee;
+            }
+            inputs = picked;
+        };
+        let need = amount as u128 + fee as u128;
+        let mut picked = Vec::new();
+        let mut total = 0u128;
+        for c in coins {
+            if total >= need {
+                break;
+            }
+            total += c.amount as u128;
+            picked.push(c);
+        }
+        let change_amount = (total - need) as u64;
+        let (fee, mut outputs, change) = if change_amount >= dust {
+            let out = self.receive(change_amount)?;
+            (fee, vec![out], Some(out.commitment))
+        } else {
+            (fee + change_amount, vec![], None)
+        };
+        outputs.push(burned);
+        let inputs: Vec<(PublicKey, u64)> =
+            picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
+        let commitments: Vec<Commitment> = picked.iter().map(|c| c.commitment).collect();
+        let mut wtxn = self.env.write_txn()?;
+        let signed = match self.sign(&mut wtxn, UnsignedTransaction::new(inputs, outputs), &commitments) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(wtxn);
+                if let Some(c) = change {
+                    self.forget(&c)?;
+                }
+                return Err(e);
+            }
+        };
+        let created = unix_now();
+        let sent = Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created };
+        self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
+        let payment =
+            Payment { txid: sent.txid, output: burned, claim: Claim::Burn(burn), created, landed: None, path: None };
+        self.payments.put(&mut wtxn, &digest_to_bytes(&payment.txid), &payment.to_bytes())?;
         wtxn.commit()?;
         Ok(signed)
     }
@@ -2500,14 +2906,15 @@ mod tests {
         let (other, _) = Wallet::open(&dir.0.join("other")).unwrap();
         let o = w.owned(&a_commitment).unwrap().unwrap();
         assert!(other.open_memo(&w.memo(&o.nonce)).is_none());
-        // The identity comes from the phrase: a restore has the same
-        // address, another wallet a different one, and the key signs.
+        // The identity comes from the phrase and the address counter:
+        // another wallet has a different one, the next address another,
+        // and a restore starts from a fresh one, never an old one.
         let address = w.address();
         assert_eq!(address.len(), address::LEN);
         assert_eq!(address::decode(&address), Some(w.id()));
         assert_ne!(other.address(), address);
         let restored = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
-        assert_eq!(restored.address(), address);
+        assert_ne!(restored.address(), address);
         // The relay's key: from the phrase too, but not the wallet's.
         let relay = address::id_of(w.relay_key().public_key());
         assert_ne!(relay, w.id());
@@ -2515,6 +2922,16 @@ mod tests {
         let key = w.identity_key();
         assert_eq!(address::id_of(key.public_key()), w.id());
         assert!(mldsa::verify(key.public_key(), b"hello", b"", &key.sign(b"hello", b"")));
+        // The next address; off and on again.
+        let first = w.id();
+        assert!(!w.address_off());
+        w.turn_address_off().unwrap();
+        assert!(w.address_off());
+        let next = address::id_of(w.next_address().unwrap().public_key());
+        assert_ne!(next, first);
+        assert_eq!(w.id(), next);
+        assert!(!w.address_off());
+        w.turn_address_off().unwrap();
         // Announcements: a fresh Kyber key each time, signed under the id.
         let (k1, a1) = w.fresh_announce(1, unix_now() + 60, 9).unwrap();
         let (_, a2) = w.fresh_announce(2, unix_now() + 60, 9).unwrap();
@@ -2522,7 +2939,7 @@ mod tests {
         assert!(a1.verify(unix_now()) && a2.verify(unix_now()));
         assert_ne!(a1.kyber, a2.kyber);
         assert_eq!(k1.public_key(), &a1.kyber[..]);
-        assert_eq!(restored.fresh_announce(1, unix_now() + 60, 9).unwrap().1.id, w.id());
+        assert_eq!(restored.fresh_announce(1, unix_now() + 60, 9).unwrap().1.id, restored.id());
         let rtxn = env.read_txn().unwrap();
         // What is kept, as being in flight, is not pruned.
         let b_commitment = w.outputs().unwrap().into_iter().find(|o| o.commitment != a_commitment).unwrap().commitment;
@@ -2594,19 +3011,19 @@ mod tests {
         let rtxn = env.read_txn().unwrap();
         let fee = Wallet::min_fee(2);
         assert!(matches!(
-            alice.send(200_000_000, Some(1), &u, &rtxn),
+            alice.send(200_000_000, Some(1), false, &u, &rtxn),
             Err(WalletError::Insufficient { have: 110_000_000, need }) if need == 200_000_001
         ));
         assert!(
-            matches!(alice.send(70_000_000, Some(fee - 1), &u, &rtxn), Err(WalletError::FeeTooLow { min }) if min == fee)
+            matches!(alice.send(70_000_000, Some(fee - 1), false, &u, &rtxn), Err(WalletError::FeeTooLow { min }) if min == fee)
         );
-        assert!(matches!(alice.send(DUST - 1, None, &u, &rtxn), Err(WalletError::BadSlate(_))));
+        assert!(matches!(alice.send(DUST - 1, None, false, &u, &rtxn), Err(WalletError::BadSlate(_))));
         // Without a fee given, the smallest one for the inputs it takes.
-        assert_eq!(alice.send(70_000_000, None, &u, &rtxn).unwrap().fee, fee);
+        assert_eq!(alice.send(70_000_000, None, false, &u, &rtxn).unwrap().fee, fee);
         for (id, _) in alice.pending_slates().unwrap() {
             alice.cancel_slate(&id).unwrap();
         }
-        let slate = alice.send(70_000_000, Some(fee), &u, &rtxn).unwrap();
+        let slate = alice.send(70_000_000, Some(fee), false, &u, &rtxn).unwrap();
         let change = 110_000_000 - 70_000_000 - fee;
         assert_eq!((slate.stage, slate.inputs.len(), slate.change), (1, 2, 1));
         assert_eq!(slate.outputs[0].amount, change);
@@ -2684,7 +3101,7 @@ mod tests {
         let a3 = alice.receive(9_000_000).unwrap();
         land(&env, &u, &alice, &[&a3]);
         let rtxn = env.read_txn().unwrap();
-        let s2 = alice.send(4_000_000, None, &u, &rtxn).unwrap();
+        let s2 = alice.send(4_000_000, None, false, &u, &rtxn).unwrap();
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 9_000_000);
         alice.cancel_slate(&s2.id).unwrap();
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 0);

@@ -13,7 +13,17 @@
 //! Send(payload)        → Notice(object, forwarded or offline)
 //!                        Deliver(payload)               to the recipient
 //! Broadcast(tx)        → Notice(txid, forwarded or rejected)
+//! Route(token)         (remembered for one answer, a couple of minutes)
+//! Reply(relay, token, payload)
+//!                      → Notice(object, forwarded or offline)
+//!                        Deliver(payload)               down the token's circuit
 //! ```
+//!
+//! A return route (`docs/PRIVACY.md`, fix 4) lets a recipient answer a
+//! sender it cannot name: the sender's outbound circuit leaves a token at
+//! its last relay, the payload carries that relay's id and the token, and
+//! the answer goes up the recipient's own outbound circuit, relay to
+//! relay to the token's, and down the sender's circuit.
 //!
 //! A broadcast transaction is pooled and announced by this relay as if
 //! it were its own, so that its sender's address is never the first to
@@ -32,6 +42,7 @@
 //! ```text
 //! Lookup(id)          → Found(announce) or Result(id, offline)
 //! Forward(payload)    → Result(object, forwarded or offline)
+//! Reply(token, payload) → Result(object, forwarded or offline)
 //! ```
 //!
 //! A sender's rendezvous point asks the recipient's points in the order
@@ -48,34 +59,94 @@ use crate::chain::ProofVerifier;
 use crate::circuit::{self, Cell, Reassembly};
 use crate::net::{NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECTED};
 use crate::onion::{self, Announce, Object};
-use crate::pow::Digest;
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
+use crate::pow::Digest;
 
 /// Messages between rendezvous points.
 const LOOKUP: u8 = 1;
 const FOUND: u8 = 2;
 const FORWARD: u8 = 3;
 const RESULT: u8 = 4;
+const REPLY: u8 = 5;
+
+/// How long a return route is kept.
+const ROUTE_LIFETIME: Duration = Duration::from_secs(120);
+/// Return routes a relay keeps; more are refused.
+const MAX_ROUTES: usize = 10_000;
 
 /// How long a sender's rendezvous point waits on one of the recipient's.
 const ASK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Questions out to other rendezvous points at once.
 const MAX_ASKS: usize = 4096;
-/// Sessions a relay holds over circuits; more are refused.
-const MAX_SESSIONS: usize = 10_000;
-
-/// A session this relay holds over a circuit.
+/// A session this relay holds over a circuit; its announce is in
+/// [`Announces`].
 struct Held {
     link: Link,
-    announce: Announce,
-    bytes: Vec<u8>,
+    seq: u64,
     seen: Instant,
+}
+
+/// Where a relay keeps its sessions' announces (`docs/SCALING.md`): in
+/// an LMDB of its own in the data directory, `rendezvous`, apart from the
+/// chain's so a block being applied never holds up the network thread,
+/// and emptied at start (sessions do not outlive the process); in memory
+/// when there is no data directory. Memory then holds only each session's
+/// circuit, sequence number and time, about a hundred bytes.
+#[derive(Default)]
+pub(super) struct Announces {
+    disk: Option<(heed::Env, heed::Database<heed::types::Bytes, heed::types::Bytes>)>,
+    memory: HashMap<Digest, Vec<u8>>,
+}
+
+impl Announces {
+    /// The store in `dir`, emptied.
+    pub(super) fn open(dir: &std::path::Path) -> Result<Announces, String> {
+        let env = crate::state_tree::open_env(dir, 16 << 30).map_err(|e| e.to_string())?;
+        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+        let db = env.create_database(&mut wtxn, Some("announces")).map_err(|e| e.to_string())?;
+        db.clear(&mut wtxn).map_err(|e| e.to_string())?;
+        wtxn.commit().map_err(|e| e.to_string())?;
+        Ok(Announces { disk: Some((env, db)), memory: HashMap::new() })
+    }
+
+    fn put(&mut self, id: &Digest, bytes: &[u8]) -> Result<(), String> {
+        let Some((env, db)) = &self.disk else {
+            self.memory.insert(*id, bytes.to_vec());
+            return Ok(());
+        };
+        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+        db.put(&mut wtxn, &digest_to_bytes(id), bytes).map_err(|e| e.to_string())?;
+        wtxn.commit().map_err(|e| e.to_string())
+    }
+
+    fn get(&self, id: &Digest) -> Option<Vec<u8>> {
+        let Some((env, db)) = &self.disk else {
+            return self.memory.get(id).cloned();
+        };
+        let rtxn = env.read_txn().ok()?;
+        db.get(&rtxn, &digest_to_bytes(id)).ok().flatten().map(<[u8]>::to_vec)
+    }
+
+    fn remove(&mut self, id: &Digest) {
+        let Some((env, db)) = &self.disk else {
+            self.memory.remove(id);
+            return;
+        };
+        if let Ok(mut wtxn) = env.write_txn()
+            && db.delete(&mut wtxn, &digest_to_bytes(id)).is_ok()
+        {
+            let _ = wtxn.commit();
+        }
+    }
 }
 
 enum Asking {
     Lookup,
     /// The payload, and its object id.
     Forward(Vec<u8>, Digest),
+    /// An answer along a return route: the token, the payload and its
+    /// object id.
+    Reply([u8; circuit::TOKEN_LEN], Vec<u8>, Digest),
 }
 
 /// A sender's question to the recipient's rendezvous points.
@@ -94,7 +165,7 @@ impl Ask {
     fn subject(&self) -> Digest {
         match &self.what {
             Asking::Lookup => self.to,
-            Asking::Forward(_, object) => *object,
+            Asking::Forward(_, object) | Asking::Reply(_, _, object) => *object,
         }
     }
 }
@@ -104,6 +175,9 @@ pub(super) struct Rendezvous {
     held: HashMap<Digest, Held>,
     by_link: HashMap<Link, Digest>,
     asks: Vec<Ask>,
+    pub(super) announces: Announces,
+    /// Return routes: a token's circuit, and when it was left.
+    routes: HashMap<[u8; circuit::TOKEN_LEN], (Link, Instant)>,
     /// Messages from other rendezvous points coming together, by channel.
     incoming: HashMap<(SocketAddr, u64), Reassembly>,
 }
@@ -120,9 +194,11 @@ fn rendezvous_cells(kind: u8, body: &[u8]) -> Vec<Cell> {
     let mut msg = vec![kind];
     msg.extend_from_slice(body);
     let mut cells = circuit::handshake_cells(0, circuit::RENDEZVOUS, &msg);
-    // Padded to a power of two of cells, as relay messages are: empty
-    // pieces before the last.
-    let want = cells.len().next_power_of_two();
+    // Padded to a power of two of cells, and at least a payment's
+    // (`circuit::PAYMENT_CELLS`), as a payment's relay messages are: empty
+    // pieces before the last. Every message between rendezvous points is
+    // a payment's.
+    let want = cells.len().next_power_of_two().max(circuit::PAYMENT_CELLS);
     if want > cells.len() {
         let last = cells.pop().unwrap();
         while cells.len() + 1 < want {
@@ -151,14 +227,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .rdv
             .held
             .iter()
-            .filter(|(_, h)| now.duration_since(h.seen) >= Duration::from_secs(onion::SESSION_TIMEOUT_SECS))
+            .filter(|(_, h)| now.duration_since(h.seen) >= Duration::from_secs(onion::CIRCUIT_SESSION_TIMEOUT_SECS))
             .map(|(id, _)| *id)
             .collect();
         for id in quiet {
             if let Some(h) = self.rdv.held.remove(&id) {
                 self.rdv.by_link.remove(&h.link);
+                self.rdv.announces.remove(&id);
             }
         }
+        self.rdv.routes.retain(|_, (_, t)| now.duration_since(*t) < ROUTE_LIFETIME);
         let late: Vec<usize> = (0..self.rdv.asks.len())
             .filter(|&i| self.rdv.asks[i].asked.is_some_and(|(_, t)| now.duration_since(t) >= ASK_TIMEOUT))
             .collect();
@@ -168,17 +246,42 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// The channels questions to other rendezvous points wait on.
+    pub(super) fn rendezvous_channels(&self) -> Vec<(SocketAddr, u64)> {
+        self.rdv.asks.iter().filter_map(|a| a.asked.map(|(k, _)| k)).collect()
+    }
+
     /// A circuit through us ended: a session on it ends too.
     pub(super) fn rendezvous_link_gone(&mut self, link: &Link) {
         if let Some(id) = self.rdv.by_link.remove(link) {
             self.rdv.held.remove(&id);
+            self.rdv.announces.remove(&id);
         }
         self.rdv.asks.retain(|a| a.client != *link);
+        self.rdv.routes.retain(|_, (l, _)| l != link);
+    }
+
+    /// An answer along the return route `token`, if it is still here:
+    /// down its circuit, once.
+    fn deliver_reply(&mut self, token: &[u8; circuit::TOKEN_LEN], payload: &[u8], now: Instant) -> bool {
+        match self.rdv.routes.remove(token) {
+            Some((link, _)) => {
+                self.hop_reply(link, circuit::DELIVER, payload, now);
+                true
+            }
+            None => false,
+        }
     }
 
     /// A relay message at the end of a participant's circuit, other than
     /// extending it. `true` if it was one of the rendezvous service's.
     pub(super) fn rendezvous_message(&mut self, link: Link, cmd: u8, msg: &[u8], now: Instant) -> bool {
+        #[cfg(test)]
+        self.circuits.seen.lock().unwrap().push(super::circuits::Seen::AtEnd(
+            cmd,
+            self.rdv.by_link.get(&link).copied(),
+            msg.to_vec(),
+        ));
         match cmd {
             circuit::SESSION => {
                 let Some(id) = (msg.len() == 32).then(|| digest_from_bytes(msg)).flatten() else { return true };
@@ -189,7 +292,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let seq = match self.rdv.held.get_mut(&id) {
                     Some(h) if h.link == link => {
                         h.seen = now;
-                        h.announce.seq
+                        h.seq
                     }
                     _ => 0,
                 };
@@ -207,6 +310,39 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 _ => self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), NOTICE_REJECTED), now),
             },
+            circuit::ROUTE => {
+                let Ok(token) = <[u8; circuit::TOKEN_LEN]>::try_from(msg) else { return true };
+                if self.config.relay && self.rdv.routes.len() < MAX_ROUTES {
+                    self.rdv.routes.insert(token, (link, now));
+                }
+            }
+            circuit::REPLY => {
+                if msg.len() < 32 + circuit::TOKEN_LEN {
+                    return true;
+                }
+                let payload = &msg[32 + circuit::TOKEN_LEN..];
+                let object = Object::id_of(payload);
+                let (Some(relay), Some(Object::Payload(_))) =
+                    (digest_from_bytes(&msg[..32]), Object::from_bytes(payload))
+                else {
+                    self.hop_reply(link, circuit::NOTICE, &result(&object, NOTICE_REJECTED), now);
+                    return true;
+                };
+                let token: [u8; circuit::TOKEN_LEN] = msg[32..32 + circuit::TOKEN_LEN].try_into().unwrap();
+                if self.my_id() == Some(relay) {
+                    let code = if self.deliver_reply(&token, payload, now) { NOTICE_FORWARDED } else { NOTICE_OFFLINE };
+                    self.hop_reply(link, circuit::NOTICE, &result(&object, code), now);
+                    return true;
+                }
+                if self.rdv.asks.len() >= MAX_ASKS {
+                    self.hop_reply(link, circuit::NOTICE, &result(&object, NOTICE_REFUSED), now);
+                    return true;
+                }
+                let what = Asking::Reply(token, payload.to_vec(), object);
+                self.rdv.asks.push(Ask { client: link, to: relay, what, left: vec![relay], asked: None });
+                let i = self.rdv.asks.len() - 1;
+                self.ask_next(i, now);
+            }
             circuit::BROADCAST => {
                 if !self.config.relay {
                     return true;
@@ -246,7 +382,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(a) = Announce::from_bytes(bytes) else {
             return self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(bytes), NOTICE_REJECTED), now);
         };
-        let older = self.rdv.held.get(&a.id).is_some_and(|h| h.announce.seq > a.seq);
+        let older = self.rdv.held.get(&a.id).is_some_and(|h| h.seq > a.seq);
         if !self.config.relay
             || a.nonce != self.link_nonce(&link, &a.id)
             || older
@@ -256,7 +392,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return self.hop_reply(link, circuit::NOTICE, &result(&a.id, NOTICE_REJECTED), now);
         }
         let (id, seq) = (a.id, a.seq);
-        if self.rdv.held.len() >= MAX_SESSIONS && !self.rdv.held.contains_key(&id) {
+        if self.rdv.held.len() >= self.config.max_sessions && !self.rdv.held.contains_key(&id) {
+            return self.hop_reply(link, circuit::NOTICE, &result(&id, NOTICE_REFUSED), now);
+        }
+        if let Err(e) = self.rdv.announces.put(&id, bytes) {
+            self.log(&format!("rendezvous: keeping an announce: {e}"));
             return self.hop_reply(link, circuit::NOTICE, &result(&id, NOTICE_REFUSED), now);
         }
         if let Some(old) = self.rdv.held.get(&id)
@@ -265,7 +405,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.rdv.by_link.remove(&old.link);
         }
         let new = self.rdv.held.get(&id).is_none_or(|h| h.link != link);
-        self.rdv.held.insert(id, Held { link, announce: a, bytes: bytes.to_vec(), seen: now });
+        self.rdv.held.insert(id, Held { link, seq, seen: now });
         self.rdv.by_link.insert(link, id);
         if new {
             self.log(&format!("rendezvous: session for {} over a circuit", onion::short(&id)));
@@ -288,7 +428,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.rdv.asks.len() >= MAX_ASKS {
             let subject = match &what {
                 Asking::Lookup => to,
-                Asking::Forward(_, o) => *o,
+                Asking::Forward(_, o) | Asking::Reply(_, _, o) => *o,
             };
             return self.hop_reply(client, circuit::NOTICE, &result(&subject, NOTICE_REFUSED), now);
         }
@@ -326,6 +466,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let cells = match &a.what {
                 Asking::Lookup => rendezvous_cells(LOOKUP, &digest_to_bytes(&to)),
                 Asking::Forward(bytes, _) => rendezvous_cells(FORWARD, bytes),
+                Asking::Reply(token, bytes, _) => {
+                    let mut body = token.to_vec();
+                    body.extend_from_slice(bytes);
+                    rendezvous_cells(REPLY, &body)
+                }
             };
             for c in cells {
                 if let Err(e) = self.channel_send(key, &c.to_bytes(), now) {
@@ -340,21 +485,29 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// the payload goes down the recipient's circuit.
     fn answer_locally(&mut self, a: Ask, now: Instant) {
         let Some(h) = self.rdv.held.get(&a.to) else { return };
+        let link = h.link;
         match a.what {
             Asking::Lookup => {
-                let bytes = h.bytes.clone();
+                let Some(bytes) = self.rdv.announces.get(&a.to) else { return };
                 self.hop_reply(a.client, circuit::ANNOUNCE, &bytes, now);
             }
             Asking::Forward(bytes, object) => {
-                let link = h.link;
                 self.hop_reply(link, circuit::DELIVER, &bytes, now);
                 self.hop_reply(a.client, circuit::NOTICE, &result(&object, NOTICE_FORWARDED), now);
             }
+            // Asked of the route's own relay only, which is not this one.
+            Asking::Reply(..) => {}
         }
     }
 
     /// A `Rendezvous` cell from another relay.
-    pub(super) fn on_rendezvous_cell(&mut self, key: (SocketAddr, u64), peer: Option<Digest>, cell: &Cell, now: Instant) {
+    pub(super) fn on_rendezvous_cell(
+        &mut self,
+        key: (SocketAddr, u64),
+        peer: Option<Digest>,
+        cell: &Cell,
+        now: Instant,
+    ) {
         // Only from a listed relay that proved its id.
         let listed = peer.is_some_and(|p| self.rv.listed(&p).is_some());
         if !self.config.relay || !listed {
@@ -371,8 +524,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match kind {
             LOOKUP => {
                 let Some(id) = (body.len() == 32).then(|| digest_from_bytes(body)).flatten() else { return };
-                let reply = match self.rdv.held.get(&id) {
-                    Some(h) => rendezvous_cells(FOUND, &h.bytes),
+                let found = self.rdv.held.contains_key(&id).then(|| self.rdv.announces.get(&id)).flatten();
+                let reply = match found {
+                    Some(bytes) => rendezvous_cells(FOUND, &bytes),
                     None => rendezvous_cells(RESULT, &result(&id, NOTICE_OFFLINE)),
                 };
                 for c in reply {
@@ -396,6 +550,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     let _ = self.channel_send(key, &c.to_bytes(), now);
                 }
             }
+            REPLY => {
+                if body.len() < circuit::TOKEN_LEN {
+                    return;
+                }
+                let (token, payload) = body.split_at(circuit::TOKEN_LEN);
+                let object = Object::id_of(payload);
+                let code = match Object::from_bytes(payload) {
+                    Some(Object::Payload(_)) => {
+                        if self.deliver_reply(&token.try_into().unwrap(), payload, now) {
+                            NOTICE_FORWARDED
+                        } else {
+                            NOTICE_OFFLINE
+                        }
+                    }
+                    _ => NOTICE_REJECTED,
+                };
+                for c in rendezvous_cells(RESULT, &result(&object, code)) {
+                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
             FOUND => {
                 let Some(a) = Announce::from_bytes(body) else { return };
                 let Some(i) = self.rdv.asks.iter().position(|q| {
@@ -412,7 +586,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 let Some(subject) = digest_from_bytes(&body[..32]) else { return };
                 let code = body[32];
-                let Some(i) = self.rdv.asks.iter().position(|q| q.asked.is_some_and(|(k, _)| k == key) && q.subject() == subject)
+                let Some(i) =
+                    self.rdv.asks.iter().position(|q| q.asked.is_some_and(|(k, _)| k == key) && q.subject() == subject)
                 else {
                     return;
                 };

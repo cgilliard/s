@@ -21,13 +21,13 @@ use super::Node;
 use crate::chain::ProofVerifier;
 use crate::channel::{self, Domain, Opening};
 use crate::circuit::{self, Cell, HopKeys, Layer, Reassembly};
-use crate::pow::Digest;
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
+use crate::pow::Digest;
 use crate::wallet::random_bytes;
 
 /// A circuit not built by then is given up.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30);
-/// Hops a relay serves at once.
+/// Hops a relay serves at once by default (`--max-hops`).
 pub const MAX_HOPS: usize = 16_384;
 /// Circuits a participant's channel may carry: a participant keeps three
 /// standing, and a few more while they are replaced. A relay's channel
@@ -81,6 +81,9 @@ pub(super) enum Seen {
     AtHop(Vec<u8>),
     /// Another message from hop `.1` of circuit `.0`: its command, bytes.
     Msg(u64, usize, u8, Vec<u8>),
+    /// At a relay, a message at the end of a circuit through it: its
+    /// command, the session the circuit holds here if any, its bytes.
+    AtEnd(u8, Option<crate::pow::Digest>, Vec<u8>),
 }
 
 #[derive(Default)]
@@ -95,6 +98,9 @@ pub(super) struct Circuits {
     next_handle: u64,
     #[cfg(test)]
     pub(super) seen: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// Tests: the paths of the circuits this node built.
+    #[cfg(test)]
+    pub(super) paths: std::sync::Arc<std::sync::Mutex<Vec<Vec<crate::pow::Digest>>>>,
 }
 
 impl Circuits {
@@ -134,17 +140,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Builds a circuit through the listed relays `path`, in order; data
     /// queued for it goes once it is built. Returns its handle. (The
     /// wallet's standing circuits use it, step 4e.)
-    pub(super) fn build_circuit(&mut self, path: Vec<Digest>, queued: Vec<(usize, Vec<u8>)>, now: Instant) -> Result<u64, String> {
+    pub(super) fn build_circuit(
+        &mut self,
+        path: Vec<Digest>,
+        queued: Vec<(usize, Vec<u8>)>,
+        now: Instant,
+    ) -> Result<u64, String> {
         if path.is_empty() || path.len() > MAX_PATH {
             return Err(format!("a circuit has 1 to {MAX_PATH} hops"));
         }
         if (1..path.len()).any(|i| path[..i].contains(&path[i])) {
             return Err("a relay twice in one circuit".into());
         }
+        #[cfg(test)]
+        self.circuits.paths.lock().unwrap().push(path.clone());
         let addr = self.relay_addr(&path[0]).ok_or("the first hop is not a listed relay")?;
         let key = self.channel_to(addr, path[0], now).map_err(|e| e.to_string())?;
         let circ = self.new_circ(key).map_err(|e| e.to_string())?;
-        let opening = Opening::circuit(path[0], &random_bytes::<64>().map_err(|e| e.to_string())?, random_bytes::<32>().map_err(|e| e.to_string())?);
+        let opening = Opening::circuit(
+            path[0],
+            &random_bytes::<64>().map_err(|e| e.to_string())?,
+            random_bytes::<32>().map_err(|e| e.to_string())?,
+        );
         let handle = self.circuits.next_handle;
         self.circuits.next_handle += 1;
         let first = (key, circ);
@@ -154,7 +171,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let n = path.len();
         self.circuits.mine.insert(
             handle,
-            Mine { path, first, hops: Vec::new(), adding: Some((opening, Vec::new())), messages: (0..n).map(|_| Reassembly::default()).collect(), started: now, queued },
+            Mine {
+                path,
+                first,
+                hops: Vec::new(),
+                adding: Some((opening, Vec::new())),
+                messages: (0..n).map(|_| Reassembly::default()).collect(),
+                started: now,
+                queued,
+            },
         );
         self.circuits.by_link.insert(first, handle);
         Ok(handle)
@@ -176,7 +201,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Sends `data` to hop `hop` of circuit `handle`.
-    pub(super) fn circuit_send(&mut self, handle: u64, hop: usize, cmd: u8, data: &[u8], now: Instant) -> Result<(), String> {
+    pub(super) fn circuit_send(
+        &mut self,
+        handle: u64,
+        hop: usize,
+        cmd: u8,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<(), String> {
         let m = self.circuits.mine.get_mut(&handle).ok_or("no such circuit")?;
         if hop >= m.hops.len() {
             return Err("no such hop yet".into());
@@ -224,9 +256,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if !m.ready() && !destroy {
             self.avoid_relay(m.path[m.hops.len()], now);
         }
+        // Failed adding its last hop: the far end is at fault.
+        let at_end = !m.ready() && m.hops.len() + 1 == m.path.len();
         #[cfg(test)]
         self.circuits.seen.lock().unwrap().push(Seen::Failed(handle));
-        self.onion_circuit_gone(handle, now);
+        self.onion_circuit_gone(handle, at_end, now);
+    }
+
+    /// The channels a circuit runs over, ours or through us, or one being
+    /// built, or a question to another rendezvous point waits on.
+    pub(super) fn channels_in_use(&self) -> std::collections::HashSet<(SocketAddr, u64)> {
+        let mut busy: std::collections::HashSet<(SocketAddr, u64)> = std::collections::HashSet::new();
+        busy.extend(self.circuits.hops.keys().map(|l| l.0));
+        busy.extend(self.circuits.by_next.keys().map(|l| l.0));
+        busy.extend(self.circuits.by_link.keys().map(|l| l.0));
+        busy.extend(self.circuits.creating.keys().map(|l| l.0));
+        busy.extend(self.rendezvous_channels());
+        busy
     }
 
     /// Every circuit over a channel that closed: ours are dropped, and a
@@ -313,9 +359,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         let hello = self.circuits.creating.remove(&link).unwrap().0;
         let participant = self.channels.peer(&link.0) == Some(None);
-        if self.circuits.hops.len() >= MAX_HOPS
-            || participant
-                && self.circuits.hops.keys().filter(|l| l.0 == link.0).count() >= MAX_HOPS_PER_PARTICIPANT
+        if self.circuits.hops.len() >= self.config.max_hops
+            || participant && self.circuits.hops.keys().filter(|l| l.0 == link.0).count() >= MAX_HOPS_PER_PARTICIPANT
         {
             return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
         }
@@ -323,7 +368,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match channel::respond_keys(Domain::Circuit, 0, &hello, key, &m) {
             Ok(((out, inn, _), reply)) => {
                 let keys = HopKeys { forward: Layer::new(inn), backward: Layer::new(out) };
-                self.circuits.hops.insert(link, Hop { keys, next: None, extending: None, message: Reassembly::default() });
+                self.circuits
+                    .hops
+                    .insert(link, Hop { keys, next: None, extending: None, message: Reassembly::default() });
                 for c in circuit::handshake_cells(link.1, circuit::CREATED, &reply) {
                     self.send_cell(link, c, now);
                 }
@@ -484,8 +531,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 };
                 // The body follows the originating hop's tag.
                 let body = &cell.payload[crate::chacha20poly1305::TAG_LEN..][..circuit::BODY];
-                let Some((cmd, more, data)) = circuit::relay_piece(body)
-                else {
+                let Some((cmd, more, data)) = circuit::relay_piece(body) else {
                     return;
                 };
                 match m.messages[j].add(cmd, more, data) {
@@ -530,7 +576,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn hop_added(&mut self, handle: u64, opening: Opening, reply: &[u8], now: Instant) {
         let (out, inn) = match opening.keys(reply) {
             Ok((out, inn, _)) => (out, inn),
-            Err(e) => return self.drop_mine(handle, &format!("hop {} failed its handshake: {e}", crate::onion::short(&opening.expect)), true, now),
+            Err(e) => {
+                return self.drop_mine(
+                    handle,
+                    &format!("hop {} failed its handshake: {e}", crate::onion::short(&opening.expect)),
+                    true,
+                    now,
+                );
+            }
         };
         let m = self.circuits.mine.get_mut(&handle).unwrap();
         m.hops.push(HopKeys { forward: Layer::new(out), backward: Layer::new(inn) });

@@ -238,6 +238,7 @@ Without the message layer, slates go as files by any channel:
 
 ```
 > send 10 /tmp/pay.slate            # sender: 10 coins at the smallest fee; reserves inputs
+> send 10 /tmp/pay.slate named      # the same, naming this wallet's address to the recipient
 > send 10 0.5 /tmp/pay.slate        # the same with a 0.5 fee
 > receive /tmp/pay.slate            # recipient: adds their output, writes /tmp/pay.slate.received
 > finalize /tmp/pay.slate.received  # sender: signs and pools the transaction
@@ -262,6 +263,35 @@ and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
 supply, the unspent amounts summed beside what the blocks issued, which
 every node keeps equal. The reward of a mined block goes to the miner's
 wallet: it claims the whole subsidy and every fee, as a block must.
+
+### Payment proofs and burns
+
+The recipient signs a receipt when it answers a slate: its address's key
+acknowledges its output as a payment from the sender in that slate (the
+sender's address with `send … named`; otherwise the hash of a secret the
+sender keeps and the proof shows, so the recipient learns nothing of the
+sender), and `finalize` refuses an answer without one that holds. When the
+payment lands in a block, the sender's wallet keeps the output's path to
+that block's state root, which any node can rebuild for a week after (its
+undo window; an archive node, `--max-undo-blocks 0`, for good). Together
+they prove the payment to anyone with the chain's headers
+(`docs/PROOFS.md`):
+
+```
+> payments                          # payments and burns, where they landed
+> payment-proof TXID                # the proof, as text to paste
+> payment-proof TXID /tmp/pay.proof # or written to a file
+> verify-proof                      # paste one: what it shows, and its confirmations
+> verify-proof /tmp/pay.proof
+> burn 5 credit tab1…               # burn 5 coins, crediting an address
+> burn-proof TXID                   # the burn's proof
+```
+
+A proof shows the amount, both addresses (or a burn's beneficiary and
+purpose) and the block to whoever reads it: it is meant to be shown. A
+burn is an output to the key hash zero, which nobody can spend, with a
+memo naming its beneficiary and purpose, so it cannot be claimed for
+anyone else.
 
 ## Policies and channels
 
@@ -325,15 +355,26 @@ Wallets reach each other without a server and, once relays exist,
 without learning each other's network address (`docs/ONION.md`). Each
 wallet has an address, `tab1…` (`address` at the prompt): bech32m with a
 checksum, the hash of an ML-DSA-65 (Dilithium) key derived from the
-phrase, so a restore keeps it. Messages to it are sealed with ML-KEM-768
+phrase and a counter. `address next` moves the wallet to a new address
+(its sessions open at the new address's rendezvous points over new
+circuits, then the old ones close, and the old address answers nothing
+again), so whoever paid or was paid at the old one cannot follow it;
+`address off` closes them all, leaving a wallet that can pay but cannot
+be reached until `address next`. A restore starts on a fresh address, an
+old one never coming back; a name pointing at the old address needs a
+`name-update`, which `address next` points out. Messages to it are sealed with ML-KEM-768
 (Kyber) keys the wallet makes fresh, signs and rotates, and
 ChaCha20-Poly1305; the primitives are the crate's own, tested against the
 standard vectors. There is no mailbox: a wallet is reached while it is
 online and not otherwise.
 
 An address names three rendezvous points, chosen from it by hash among
-the nodes that relay. A wallet's node keeps a session at each, which
-forwards what is sent to the address. What relays exist, and so which
+the nodes that relay. In init mode a wallet's node keeps a session at
+each; in onion mode at the first only, moving to the next if it fails,
+since senders try the three in turn (`docs/SCALING.md`). A session
+forwards what is sent to the address. A relay keeps its sessions'
+announces on disk and takes `--max-sessions`, `--max-hops` and
+`--max-channels` to size what it holds to its memory. What relays exist, and so which
 mode the network is in, is a file the miners vote for in aux leaf 0
 (above). The file in force changes only every 144 blocks: at each
 multiple of 144, the most voted `consensus.txt` of the 144 blocks ending

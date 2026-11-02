@@ -143,6 +143,27 @@ history and the README; this file holds what is left.
 
 ## Wallet
 
+- **Unnamed slates share one answering limit.** A wallet answers at most
+  5 slates per sender and 60 in all per ten minutes (`onion::SlateLimit`);
+  an unnamed sender (the default, `docs/PRIVACY.md` fix 4) cannot be told
+  from another, so a flood of unnamed slates uses up the 60 and honest
+  payers wait. A small fee or proof of work per slate would price it.
+
+- **A payment that lands while the wallet is far behind gets no proof.**
+  `sync_wallet` notes where payments land block by block; after a gap
+  longer than the blocks kept (a fast sync, a long time offline) it finds
+  the wallet's own outputs by their memos, but not payments' outputs,
+  which are the recipients'. `payments` then says "not in a block yet".
+  Fix: look them up by commitment and memo in the UTXO set (positions are
+  then known; the creating block from the output's creation height), and
+  make the path if that block is still in the undo window.
+- **A file slate's recipient is whoever signs its receipt.** Over the
+  message layer the receipt must be the id the slate was sent to; a file
+  slate has no such id, so `finalize` prints the receipt's address and the
+  user must check it is the one meant. A recipient who gives the sender a
+  wrong address gains nothing (the coins go to its output either way),
+  but the proof then names that address.
+
 - **Policy outputs are not recoverable from the seed.** A multisig,
   HTLC or channel output is found again only from the policy the parties
   agreed, which the wallet stores (`policies` table); a wallet restored
@@ -228,6 +249,16 @@ history and the README; this file holds what is left.
   margin left. Revisit when the constants in those results are known.
 
 ## Message layer
+
+- **Guards are not replaced for failing.** A guard whose channel fails is
+  passed over for five minutes and tried again; one that fails for days
+  stays a guard until its time is up or it leaves the list, its circuits
+  starting at other relays meanwhile. Tor drops a guard that has been
+  unreachable for a while; doing so here needs a record of failures over
+  time, kept with the guards.
+- **With few relays listed, guards are most of them.** With three relays
+  every relay is everyone's guard, rendezvous point and last hop: the
+  privacy fixes take effect with tens of relays, not three.
 
 Found while building it (2026-11-01).
 
@@ -328,14 +359,17 @@ Found while building it (2026-11-01).
   wallet still hears "delivered". A slate then waits for an answer that
   never comes, until cancelled. Fix: an end-to-end acknowledgement from
   the recipient's node, and a resend over another of its points.
-- **A dead relay is noticed at the next keepalive.** A participant
-  takes a circuit for dead 10 s after a `Session` keepalive goes
-  unanswered (`node/participant.rs`), so up to 40 s after a hop goes
-  down; a channel goes 15 s after a frame is first left unacknowledged;
-  a relay whose channel failed, or that a circuit failed to extend to,
-  is avoided as a hop for five minutes. Rebuilt paths are random, so a
-  few may still try the dead relay first. Fix: keep a spare circuit to
-  each point, through other hops, and switch to it at once.
+- **A dead hop is noticed when the relays' channel to it fails.** A
+  participant learns of it from the `Destroy` passed back
+  (`docs/SCALING.md`): about 40 s after the hop goes down when the relay
+  before it opened their channel, up to two minutes when the hop did
+  (the listening side waits out two minutes of silence). With one
+  session, the wallet is unreachable meanwhile, and a payload delivered
+  down the dying circuit is lost though reported delivered. A relay that
+  a circuit failed to extend to is avoided as a hop for five minutes.
+  Fix: keepalives on relay channels from both ends, so the listening
+  side notices as soon; or keep a spare circuit to the point, through
+  other hops, and switch to it at once.
 - **A wallet on a relay skips that relay as a rendezvous point,** in
   both modes, so it is reachable only through its other points (with one
   seed, not at all). By design: run relays with `--no-wallet`.

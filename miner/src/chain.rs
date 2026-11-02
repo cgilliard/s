@@ -2209,19 +2209,7 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let first = part << SNAPSHOT_PART_LOG;
         let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
-        let mut out: Vec<(u64, Commitment, Slot, u32)> =
-            self.utxo.unspent_in(&rtxn, first, end)?.into_iter().map(|(p, (c, m, h))| (p, c, m, h)).collect();
-        let before = out.len();
-        for e in self.spent.range(&rtxn, &(first..end))? {
-            let (p, v) = e?;
-            let (spent_at, created, c, m) = read_spent_entry(v).ok_or(ChainError::Corrupt("spent log"))?;
-            if spent_at > height {
-                out.push((p, c, m, created));
-            }
-        }
-        if out.len() > before {
-            out.sort_unstable_by_key(|o| o.0);
-        }
+        let out = self.outputs_then(&rtxn, height, first, end)?;
         let mut commits: PartCommits = self
             .names
             .commits_in(&rtxn, first, end)
@@ -2238,6 +2226,79 @@ impl<V: ProofVerifier> Chain<V> {
         }
         commits.sort_unstable_by_key(|c| c.0);
         Ok(Some((out, commits)))
+    }
+
+    /// The outputs unspent after the main-chain block at `height` at
+    /// positions `first..end`, ascending: those unspent now, with those
+    /// spent since (from the spent log, so `height` must be in the undo
+    /// window), each with its memo slot and creation height.
+    #[allow(clippy::type_complexity)]
+    fn outputs_then(
+        &self,
+        rtxn: &RoTxn,
+        height: u32,
+        first: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, Commitment, Slot, u32)>> {
+        let mut out: Vec<(u64, Commitment, Slot, u32)> =
+            self.utxo.unspent_in(rtxn, first, end)?.into_iter().map(|(p, (c, m, h))| (p, c, m, h)).collect();
+        let before = out.len();
+        for e in self.spent.range(rtxn, &(first..end))? {
+            let (p, v) = e?;
+            let (spent_at, created, c, m) = read_spent_entry(v).ok_or(ChainError::Corrupt("spent log"))?;
+            if spent_at > height {
+                out.push((p, c, m, created));
+            }
+        }
+        if out.len() > before {
+            out.sort_unstable_by_key(|o| o.0);
+        }
+        Ok(out)
+    }
+
+    /// A state proof for `position` against the state after the main-chain
+    /// block at `height` (`docs/PROOFS.md`): that block's header, the output
+    /// there then if unspent (commitment, memo slot, creation height), and
+    /// the path to the header's state root. Rebuilt from the block's
+    /// snapshot manifest and the spent log, so `None` unless the block is
+    /// in the undo window (or this is an archive node).
+    #[allow(clippy::type_complexity)]
+    pub fn output_proof_at(
+        &self,
+        position: u64,
+        height: u32,
+    ) -> Result<Option<(Header, Option<(Commitment, Slot, u32)>, crate::state_tree::Proof)>> {
+        if position >= crate::state_tree::OUTPUT_CAPACITY {
+            return Ok(None);
+        }
+        let rtxn = self.env.read_txn()?;
+        let Some(header) = self.header_at_in(&rtxn, height)? else {
+            return Ok(None);
+        };
+        let Some((_, manifest)) = self.snapshot_in(&rtxn, &header.hash())? else {
+            return Ok(None);
+        };
+        let part = position >> SNAPSHOT_PART_LOG;
+        let first = part << SNAPSHOT_PART_LOG;
+        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
+        let outputs = if first < end { self.outputs_then(&rtxn, height, first, end)? } else { vec![] };
+        let leaves: Vec<(u64, Digest)> =
+            outputs.iter().map(|(p, c, s, h)| (*p, crate::transaction::leaf(c, s, *h))).collect();
+        let (root, mut siblings) = crate::state_tree::subtree_path(SNAPSHOT_PART_LOG, first, &leaves, position);
+        let expected = manifest.roots.get(part as usize).copied().unwrap_or(root);
+        if root != expected {
+            return Err(ChainError::Corrupt("snapshot part root"));
+        }
+        siblings.extend(crate::state_tree::path_from_subtrees(
+            SNAPSHOT_PART_LOG,
+            &manifest.roots,
+            &manifest.name_root,
+            part,
+        ));
+        let siblings: [Digest; crate::state_tree::DEPTH] =
+            siblings.try_into().map_err(|_| ChainError::Corrupt("state path"))?;
+        let output = outputs.iter().find(|o| o.0 == position).map(|&(_, c, s, h)| (c, s, h));
+        Ok(Some((header, output, crate::state_tree::Proof { siblings })))
     }
 
     /// Name part `part` of the snapshot after the main-chain block `id`:
@@ -4283,6 +4344,57 @@ mod tests {
         let hex: String = g.nonce.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, crate::genesis::BITCOIN_HASH_HEX);
         assert!(crate::genesis::BITCOIN_TIME <= g.timestamp, "the Bitcoin block must come first");
+    }
+
+    /// A path against an earlier block's state, rebuilt from its manifest
+    /// and the spent log: outputs spent since are still there, outputs
+    /// made since are not, and at the tip it is the tip's path.
+    #[test]
+    fn output_proofs_at_earlier_blocks() {
+        let a = open("proof-at");
+        let k = pk(4);
+        a.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let mut t = GENESIS_TIME;
+        let mut made = Vec::new();
+        for h in 1..=8u64 {
+            t += 600;
+            // Two outputs a block; from block 4 on, one made earlier is spent.
+            let outs = (0..2).map(|i| Output::new(&k, h * 10 + i).block_output()).collect();
+            let inputs = if h >= 4 { vec![(h - 4) * 2] } else { vec![] };
+            let block = mine(&a, Body { inputs, outputs: outs, proof: vec![], ..Default::default() }, t);
+            a.chain.apply_block(&block, t + 1).unwrap();
+            made.push(block);
+        }
+        let tip = a.chain.tip().unwrap().unwrap();
+        for p in [0, 1, 7, 15, 16, 1 << 20] {
+            let (h, out, proof) = a.chain.output_proof(p).unwrap().unwrap();
+            let (h2, out2, proof2) = a.chain.output_proof_at(p, tip.height).unwrap().unwrap();
+            assert_eq!((h, out, proof), (h2, out2, proof2), "position {p}");
+        }
+        // After block 3: positions 0..6 made, none spent yet.
+        let b3 = made[2].header;
+        let check = |p: u64, present: bool| {
+            let (h, out, proof) = a.chain.output_proof_at(p, 3).unwrap().unwrap();
+            assert_eq!(h, b3);
+            assert_eq!(out.is_some(), present, "position {p}");
+            let leaf = out.map_or(EMPTY, |(c, s, created)| crate::transaction::leaf(&c, &s, created));
+            assert!(proof.verify(&b3.state_root, p, &leaf), "position {p}");
+            out
+        };
+        let (c, slot, created) = check(0, true).unwrap();
+        assert_eq!((created, crate::transaction::slot_parts(&slot).unwrap().1), (1, made[0].body.outputs[0].amount));
+        assert_eq!(c, Output::new(&k, 10).commitment);
+        check(5, true);
+        check(6, false);
+        check(9, false);
+        // Spent since, gone from the tip, still proven after block 3.
+        assert!(a.chain.output_proof(0).unwrap().unwrap().1.is_none());
+        // Not against another block's root.
+        let (_, out, proof) = a.chain.output_proof_at(2, 3).unwrap().unwrap();
+        let (c, s, created) = out.unwrap();
+        assert!(!proof.verify(&made[3].header.state_root, 2, &crate::transaction::leaf(&c, &s, created)));
+        // Beyond the chain, nothing.
+        assert!(a.chain.output_proof_at(0, 9).unwrap().is_none());
     }
 
     #[test]

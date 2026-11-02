@@ -50,8 +50,8 @@ use crate::mldsa;
 use crate::mlkem;
 use crate::net::{self, Download, Kind, Message, NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECTED};
 use crate::onion::{self, Announce, MAX_OBJECT, Object, Opened, Payload};
-use crate::pow::Digest;
 use crate::poseidon2::digest_to_bytes;
+use crate::pow::Digest;
 use crate::wallet::random_bytes;
 
 const KEEPALIVE: Duration = Duration::from_secs(onion::KEEPALIVE_SECS);
@@ -71,7 +71,7 @@ const MAX_OUTBOX: usize = 1024;
 const MAX_TAKERS: usize = 64;
 const MAX_OBJECT_DOWNLOADS: usize = 64;
 const MAX_OBJECT_DOWNLOADS_PER_PEER: usize = 4;
-/// Sessions a relay holds; more are refused.
+/// Sessions a relay holds by default; more are refused (`--max-sessions`).
 pub const MAX_SESSIONS: usize = 10_000;
 /// How long a sender waits on one rendezvous point before the next.
 const POINT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -92,6 +92,9 @@ pub struct Outbound {
     /// The recipient's announce, when known (from a payload it sent):
     /// sealed to at once rather than asked of its rendezvous points.
     pub recipient: Option<Announce>,
+    /// An answer to an unnamed sender, along the route its payload gave
+    /// (`docs/PRIVACY.md`, fix 4); `to` is then the route's reply id.
+    pub reply: Option<onion::Route>,
 }
 
 /// What the node tells the wallet.
@@ -171,11 +174,24 @@ struct Point {
     refused: Option<Instant>,
     /// It held our current announce: losing it is a reconnect.
     was_live: bool,
+    /// The wait before the next keepalive, drawn when the last went
+    /// (`docs/PRIVACY.md`, fix 3).
+    interval: Duration,
 }
 
 impl Point {
     fn new(addr: SocketAddr) -> Point {
-        Point { addr, nonce: None, held: 0, asked: None, answered: None, offered: None, refused: None, was_live: false }
+        Point {
+            addr,
+            nonce: None,
+            held: 0,
+            asked: None,
+            answered: None,
+            offered: None,
+            refused: None,
+            was_live: false,
+            interval: KEEPALIVE,
+        }
     }
 
     fn live(&self, seq: u64, now: Instant) -> bool {
@@ -237,6 +253,8 @@ impl Job {
 /// The node's message-layer state.
 pub(super) struct State {
     pub(super) me: Option<Me>,
+    /// Whether the node has a wallet, whose address may be off.
+    pub(super) wallet: bool,
     points: Vec<Point>,
     held: HashMap<Digest, Held>,
     nonce_key: RandomState,
@@ -277,10 +295,11 @@ fn relay_set(c: &consensus::Current) -> RelaySet {
 }
 
 impl State {
-    pub(super) fn new(identity: Option<mldsa::SecretKey>, now: Instant) -> std::io::Result<State> {
+    pub(super) fn new(identity: Option<mldsa::SecretKey>, wallet: bool, now: Instant) -> std::io::Result<State> {
         let (notes, notes_rx) = sync_channel(NOTES);
         Ok(State {
             me: identity.map(|k| Me::new(k, now)).transpose()?,
+            wallet,
             points: Vec::new(),
             held: HashMap::new(),
             nonce_key: RandomState::new(),
@@ -588,9 +607,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             // Asked and not answered: lost, or it restarted and our token
             // for it is stale, so it is pinged for a fresh one.
             let unanswered = p.asked.is_some_and(|a| p.answered.is_none_or(|t| t < a));
-            let wait = if p.live(seq, now) && !unanswered { KEEPALIVE } else { SESSION_RETRY };
+            let wait = if p.live(seq, now) && !unanswered { p.interval } else { SESSION_RETRY };
             if p.asked.is_none_or(|t| now.duration_since(t) >= wait) {
                 p.asked = Some(now);
+                p.interval = super::participant::jitter(KEEPALIVE);
                 asks.push((p.addr, unanswered));
             }
         }
@@ -625,7 +645,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.send(addr, &Message::Notice { subject: id, code: NOTICE_REFUSED });
             return;
         }
-        if self.rv.held.len() >= MAX_SESSIONS && !self.rv.held.contains_key(&id) {
+        if self.rv.held.len() >= self.config.max_sessions && !self.rv.held.contains_key(&id) {
             self.send(addr, &Message::Notice { subject: id, code: NOTICE_REFUSED });
             return;
         }
@@ -739,7 +759,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
-    pub(super) fn on_object_chunk(&mut self, from: SocketAddr, id: Digest, len: u32, index: u16, data: Vec<u8>, now: Instant) {
+    pub(super) fn on_object_chunk(
+        &mut self,
+        from: SocketAddr,
+        id: Digest,
+        len: u32,
+        index: u16,
+        data: Vec<u8>,
+        now: Instant,
+    ) {
         let Some(d) = self.rv.downloads.get_mut(&id) else { return };
         if d.from != from {
             return;
@@ -775,9 +803,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn on_object(&mut self, from: SocketAddr, object: Digest, bytes: Vec<u8>, back: u64, now: Instant) {
         match Object::from_bytes(&bytes) {
             Some(Object::Announce(a)) => {
-                if let Some(j) = self.rv.sends.iter().position(|j| {
-                    j.point() == Some(from) && matches!(j.stage, Stage::Asked) && j.out.to == a.id
-                }) {
+                if let Some(j) = self
+                    .rv
+                    .sends
+                    .iter()
+                    .position(|j| j.point() == Some(from) && matches!(j.stage, Stage::Asked) && j.out.to == a.id)
+                {
                     let job = &mut self.rv.sends[j];
                     if a.verify(unix_now()) {
                         job.out.recipient = Some(a);
@@ -815,7 +846,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let ours = self.token_for(&addr);
                 self.send_with(addr, Message::Offer { object, len: bytes.len() as u32, back: ours, token: 0 }, back);
                 self.send(from, &Message::Notice { subject: object, code: NOTICE_FORWARDED });
-                self.chatter(&format!("message layer: payload {} forwarded to {}", short(&object), onion::short(&p.to)));
+                self.chatter(&format!(
+                    "message layer: payload {} forwarded to {}",
+                    short(&object),
+                    onion::short(&p.to)
+                ));
             }
             None => {
                 self.send(from, &Message::Notice { subject: object, code: NOTICE_REJECTED });
@@ -826,7 +861,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// An announce offered for a session at this relay.
     fn hold(&mut self, from: SocketAddr, object: Digest, a: Announce, bytes: Vec<u8>, back: u64, now: Instant) {
         let older = self.rv.held.get(&a.id).is_some_and(|h| h.announce.seq > a.seq);
-        let full = self.rv.held.len() >= MAX_SESSIONS && !self.rv.held.contains_key(&a.id);
+        let full = self.rv.held.len() >= self.config.max_sessions && !self.rv.held.contains_key(&a.id);
         if a.nonce != self.session_nonce(&from, &a.id) || older || !self.serves_init() || !a.verify(unix_now()) {
             self.chatter(&format!("message layer: {from} offered an announce that does not hold"));
             self.send(from, &Message::Notice { subject: object, code: NOTICE_REJECTED });
@@ -897,11 +932,39 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// The wallet's new address, or none (`docs/PRIVACY.md`, fix 5). The
+    /// old address answers nothing from now on: its sessions are not kept
+    /// alive and what comes for it is not opened. In onion mode its
+    /// circuits stay until the new address's sessions are live.
+    pub(super) fn set_identity(&mut self, key: Option<mldsa::SecretKey>, now: Instant) {
+        let me = match key.map(|k| Me::new(k, now)).transpose() {
+            Ok(me) => me,
+            Err(e) => return self.log(&format!("message layer: no new identity: {e}")),
+        };
+        match &me {
+            Some(m) => self.log(&format!("message layer: a new address, {}", onion::short(&m.id))),
+            None => self.log("message layer: the address is off"),
+        }
+        self.rv.me = me;
+        for p in &mut self.rv.points {
+            p.held = 0;
+            p.was_live = false;
+            p.asked = None;
+        }
+        if self.rv.me.is_none() {
+            self.rv.points.clear();
+        }
+    }
+
     /// A message from the wallet.
     pub(super) fn start_send(&mut self, out: Outbound, now: Instant) {
         let fail = |why: &str| Note::Failed { tag: out.tag, to: out.to, why: why.to_string() };
-        if self.rv.me.is_none() {
-            return self.rv.note(fail("this node has no identity"));
+        if !self.rv.wallet {
+            return self.rv.note(fail("this node has no wallet"));
+        }
+        // Init mode names the sender, to be answered: it needs an address.
+        if self.rv.me.is_none() && !self.rv.prefers_onion() {
+            return self.rv.note(fail("the address is off, and init mode needs one: address next"));
         }
         self.rv.keep_fallback(&out);
         if self.rv.prefers_onion() {
@@ -987,12 +1050,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
-    /// A payload to `to`, naming us with our current key for the reply.
+    /// A payload to `to`, naming us with our current key for the reply:
+    /// how init mode sends, without circuits to answer along.
     pub(super) fn seal(&self, to: &Announce, kind: u8, inner: &[u8]) -> Result<Vec<u8>, String> {
         let me = self.rv.me.as_ref().ok_or("no identity")?;
         let m = random_bytes::<32>().map_err(|e| e.to_string())?;
         let nonce = random_bytes::<12>().map_err(|e| e.to_string())?;
-        let p = Payload::seal(to, Some((&me.key, &me.carried)), kind, inner, &m, nonce)
+        let p = Payload::seal(to, Some((&me.key, &me.carried)), None, kind, inner, &m, nonce)
             .ok_or("the recipient's Kyber key is malformed")?;
         let bytes = Object::Payload(p).to_bytes();
         if bytes.len() > MAX_OBJECT {

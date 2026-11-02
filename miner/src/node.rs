@@ -93,7 +93,9 @@ mod circuits;
 mod participant;
 mod rendezvous;
 mod sessions;
-pub use sessions::{Note, Outbound};
+pub use channels::MAX_CHANNELS;
+pub use circuits::MAX_HOPS;
+pub use sessions::{MAX_SESSIONS, Note, Outbound};
 
 /// UDP port nodes listen on by default.
 pub const DEFAULT_PORT: u16 = 3737;
@@ -148,8 +150,17 @@ pub struct Config {
     pub relay: bool,
     /// The wallet's Dilithium key: with it the node keeps rendezvous
     /// sessions for the wallet's id and sends and receives its messages.
-    /// `None` without a wallet (`--no-wallet`).
+    /// `None` without a wallet (`--no-wallet`), or while its address is
+    /// off (`docs/PRIVACY.md`, fix 5).
     pub identity: Option<crate::mldsa::SecretKey>,
+    /// Whether the node has a wallet, address or not: its transactions go
+    /// out over circuits in onion mode.
+    pub wallet: bool,
+    /// A relay's caps (`docs/SCALING.md`), sized to its memory: sessions
+    /// it holds, circuit hops through it, channels open at once.
+    pub max_sessions: usize,
+    pub max_hops: usize,
+    pub max_channels: usize,
     /// The relay's Dilithium key, apart from the wallet's (derived from the
     /// same phrase under another domain tag): the id a relay is listed
     /// under in `consensus.txt`, proven in every handshake. Set with
@@ -325,6 +336,9 @@ pub enum Event {
     Transaction(Transaction),
     /// A message for an id, from the wallet (`docs/ONION.md`).
     Send(Outbound),
+    /// The wallet's new address (`docs/PRIVACY.md`, fix 5), or none: its
+    /// sessions move to the new address's rendezvous points, or close.
+    Identity(Option<crate::mldsa::SecretKey>),
     /// Tests: a body for the relay with this id at this address, over a
     /// channel opened for it if need be.
     #[cfg(test)]
@@ -543,6 +557,9 @@ pub struct Node<V: ProofVerifier> {
     /// Tests: transactions this node announced, by its own `TxInv`s.
     #[cfg(test)]
     announced: Arc<AtomicU64>,
+    /// Tests: channel frames this node sent.
+    #[cfg(test)]
+    frames_sent: Arc<AtomicU64>,
     last_channel_poll: Instant,
 }
 
@@ -724,7 +741,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             })?
         };
         let now = Instant::now();
-        let rv = sessions::State::new(config.identity.clone(), now)?;
+        let rv = sessions::State::new(config.identity.clone(), config.wallet || config.identity.is_some(), now)?;
         let mut node = Node {
             chain,
             mempool,
@@ -786,11 +803,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             quiet: false,
             #[cfg(test)]
             announced: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            frames_sent: Arc::new(AtomicU64::new(0)),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
             node.mode = Mode::Headers;
             node.log("fast sync: downloading headers");
+        }
+        // A relay keeps its sessions' announces on disk (`docs/SCALING.md`).
+        if node.config.relay
+            && let Some(dir) = node.config.peers_file.as_ref().and_then(|p| p.parent())
+        {
+            match rendezvous::Announces::open(&dir.join("rendezvous")) {
+                Ok(a) => node.rdv.announces = a,
+                Err(e) => node.log(&format!("rendezvous: announces kept in memory: {e}")),
+            }
         }
         node.resolve_seeds(now);
         Ok((node, tx))
@@ -827,6 +855,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Mined(block)) => self.submit_block(block, None),
                 Ok(Event::Transaction(tx)) => self.handle_transaction(tx, None),
                 Ok(Event::Send(out)) => self.start_send(out, Instant::now()),
+                Ok(Event::Identity(key)) => self.set_identity(key, Instant::now()),
                 #[cfg(test)]
                 Ok(Event::TestChannel(addr, id, body)) => {
                     let now = Instant::now();
@@ -3178,7 +3207,11 @@ mod tests {
             sync_point: None,
             relay: false,
             identity: None,
+            wallet: false,
             relay_key: None,
+            max_sessions: MAX_SESSIONS,
+            max_hops: MAX_HOPS,
+            max_channels: MAX_CHANNELS,
         }
     }
 
@@ -3963,7 +3996,14 @@ mod tests {
         assert!(live(&stats_p, 15), "p's session did not go live: {:?}", stats_p.lock().unwrap().rendezvous);
         let wait = |rx: &Receiver<Note>| rx.recv_timeout(Duration::from_secs(20)).expect("a note");
         // q reaches p by id alone: q's node asks the point for p's announce.
-        let out = Outbound { tag: 7, to: id_p, kind: onion::KIND_SLATE, inner: b"a slate".to_vec(), recipient: None };
+        let out = Outbound {
+            tag: 7,
+            to: id_p,
+            kind: onion::KIND_SLATE,
+            inner: b"a slate".to_vec(),
+            recipient: None,
+            reply: None,
+        };
         tx_q.send(Event::Send(out)).unwrap();
         let mut got = None;
         let mut delivered = false;
@@ -3989,6 +4029,7 @@ mod tests {
             kind: onion::KIND_SLATE,
             inner: b"answered".to_vec(),
             recipient: Some(q_announce),
+            reply: None,
         };
         tx_p.send(Event::Send(out)).unwrap();
         let mut answer = None;
@@ -4004,7 +4045,8 @@ mod tests {
         assert!(matches!(wait(&notes_p), Note::Delivered { tag: 8, .. }));
         // An id with no session anywhere: offline.
         let nobody = crate::address::id_of(crate::mldsa::keygen(&[9; 32]).public_key());
-        tx_q.send(Event::Send(Outbound { tag: 9, to: nobody, kind: 1, inner: vec![], recipient: None })).unwrap();
+        tx_q.send(Event::Send(Outbound { tag: 9, to: nobody, kind: 1, inner: vec![], recipient: None, reply: None }))
+            .unwrap();
         match wait(&notes_q) {
             Note::Failed { tag: 9, why, .. } => assert!(why.contains("offline"), "{why}"),
             other => panic!("{other:?}"),
@@ -4076,15 +4118,22 @@ mod tests {
         // alice sends a slate to bob's id, as `send AMOUNT tab1…` does.
         let slate = {
             let rtxn = p.chain.env().read_txn().unwrap();
-            alice.send(20_000_000, None, p.chain.utxo(), &rtxn).unwrap()
+            alice.send(20_000_000, None, false, p.chain.utxo(), &rtxn).unwrap()
         };
-        let out = Outbound { tag: 1, to: bob.id(), kind: onion::KIND_SLATE, inner: slate.to_bytes(), recipient: None };
+        let out = Outbound {
+            tag: 1,
+            to: bob.id(),
+            kind: onion::KIND_SLATE,
+            inner: slate.to_bytes(),
+            recipient: None,
+            reply: None,
+        };
         tx_a.send(Event::Send(out)).unwrap();
         // bob's wallet answers it, to the key alice carried.
         let o = received(&notes_b);
         let from = o.from.expect("alice names herself");
         assert_eq!(from.id, alice.id());
-        let answered = match bob.take_slate(&o.inner, &from.id, None).unwrap() {
+        let answered = match bob.take_slate(&o.inner, Some(&from.id), None).unwrap() {
             Incoming::Answered(s) => s,
             Incoming::Finalized(..) => panic!("bob had nothing to finalize"),
         };
@@ -4095,6 +4144,7 @@ mod tests {
             kind: onion::KIND_SLATE,
             inner: answered.to_bytes(),
             recipient: Some(from),
+            reply: None,
         };
         tx_b.send(Event::Send(out)).unwrap();
         // alice's wallet signs the answer; only bob's id may give it.
@@ -4102,8 +4152,8 @@ mod tests {
         let bob_id = o.from.as_ref().expect("bob names himself").id;
         assert_eq!(bob_id, bob.id());
         let stranger = crate::address::id_of(crate::mldsa::keygen(&[9; 32]).public_key());
-        assert!(alice.take_slate(&o.inner, &stranger, Some(&bob.id())).is_err());
-        let (finished, signed) = match alice.take_slate(&o.inner, &bob_id, Some(&bob.id())).unwrap() {
+        assert!(alice.take_slate(&o.inner, Some(&stranger), Some(&bob.id())).is_err());
+        let (finished, signed) = match alice.take_slate(&o.inner, Some(&bob_id), Some(&bob.id())).unwrap() {
             Incoming::Finalized(s, signed) => (s, signed),
             Incoming::Answered(_) => panic!("alice had nothing to answer"),
         };
@@ -4119,6 +4169,55 @@ mod tests {
             tx.send(Event::Stop).unwrap();
         }
         for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// A channel that carries no circuit and nothing but keepalives for a
+    /// while is closed (`docs/SCALING.md`), at both ends; a body opens one
+    /// again.
+    #[test]
+    fn idle_channels_are_closed() {
+        let (a, b) = (open("idle-ch-a"), open("idle-ch-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let start = |f: &Fixture, tag: u8| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = true;
+            cfg.identity = Some(key(tag));
+            cfg.relay_key = cfg.identity.clone();
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let (sink, stats) = (Arc::clone(&node.channels.sink), node.stats());
+            (addr, tx, sink, stats, std::thread::spawn(move || node.run()))
+        };
+        let (addr_a, tx_a, sink_a, stats_a, h_a) = start(&a, 1);
+        let (_, tx_b, _, stats_b, h_b) = start(&b, 2);
+        let channels = |s: &Arc<Mutex<Stats>>| s.lock().unwrap().channels;
+        let wait = |want: usize, secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while !(channels(&stats_a) == want && channels(&stats_b) == want) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} and {} channels, wanted {want}",
+                    channels(&stats_a),
+                    channels(&stats_b)
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"hello".to_vec())).unwrap();
+        wait(1, 20);
+        // Idle past the timeout (seconds in tests), with keepalives going.
+        wait(0, 30);
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"again".to_vec())).unwrap();
+        wait(1, 20);
+        let got: Vec<Vec<u8>> = sink_a.lock().unwrap().iter().map(|d| d.2.clone()).collect();
+        assert_eq!(got, vec![b"hello".to_vec(), b"again".to_vec()]);
+        for tx in [tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [h_a, h_b] {
             h.join().unwrap();
         }
     }
@@ -4337,7 +4436,8 @@ mod tests {
         let found = Announce::from_bytes(&msg(q, circuit::ANNOUNCE)).unwrap();
         assert_eq!(found, announce);
         let q_announce = Announce::make(&key_q, crate::mlkem::keygen(&[8u8; 64]).public_key(), 1, unix_now() + 3600, 0);
-        let payload = Payload::seal(&found, Some((&key_q, &q_announce)), 1, b"a slate", &[3u8; 32], [4u8; 12]).unwrap();
+        let payload =
+            Payload::seal(&found, Some((&key_q, &q_announce)), None, 1, b"a slate", &[3u8; 32], [4u8; 12]).unwrap();
         let bytes = Object::Payload(payload).to_bytes();
         nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::SEND, bytes.clone())).unwrap();
         let notice = msg(q, circuit::NOTICE);
@@ -4393,7 +4493,7 @@ mod tests {
         let (p, q) = (3usize, 4usize);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 3 && s.rendezvous.iter().all(|(_, l)| *l)
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + Duration::from_secs(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
@@ -4414,23 +4514,33 @@ mod tests {
                 Note::Broadcast { .. } => {}
             }
         };
-        let out = Outbound { tag: 1, to: id(4), kind: onion::KIND_SLATE, inner: b"a slate".to_vec(), recipient: None };
+        let out = Outbound {
+            tag: 1,
+            to: id(4),
+            kind: onion::KIND_SLATE,
+            inner: b"a slate".to_vec(),
+            recipient: None,
+            reply: None,
+        };
         nodes[q].1.send(Event::Send(out)).unwrap();
         let o = received(p);
         assert_eq!((o.kind, &o.inner[..]), (onion::KIND_SLATE, &b"a slate"[..]));
-        let from = o.from.expect("q names itself");
-        assert_eq!(from.id, id(5));
+        // q is not named: p answers along the route the payload gave.
+        assert_eq!(o.from, None);
+        let route = o.route.expect("a way back");
         let out = Outbound {
             tag: 2,
-            to: from.id,
+            to: route.reply_id(),
             kind: onion::KIND_SLATE,
             inner: b"answered".to_vec(),
-            recipient: Some(from),
+            recipient: None,
+            reply: Some(route),
         };
         nodes[p].1.send(Event::Send(out)).unwrap();
         let o = received(q);
         assert_eq!(&o.inner[..], b"answered");
-        assert_eq!(o.from.map(|a| a.id), Some(id(4)));
+        // The answer came down q's own circuit: it is from whom q sent to.
+        assert_eq!((o.from, o.answers), (None, Some(id(4))));
         // Each send was confirmed delivered.
         if let Ok(Note::Delivered { tag, .. }) = nodes[p].2.recv_timeout(Duration::from_secs(5)) {
             delivered.lock().unwrap().push(tag);
@@ -4439,7 +4549,10 @@ mod tests {
         tags.sort();
         assert_eq!(tags, vec![1, 2]);
         // Nobody holds a session for this id.
-        nodes[q].1.send(Event::Send(Outbound { tag: 3, to: id(9), kind: 1, inner: vec![], recipient: None })).unwrap();
+        nodes[q]
+            .1
+            .send(Event::Send(Outbound { tag: 3, to: id(9), kind: 1, inner: vec![], recipient: None, reply: None }))
+            .unwrap();
         match nodes[q].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
             Note::Failed { tag: 3, why, .. } => assert!(why.contains("offline"), "{why}"),
             other => panic!("{other:?}"),
@@ -4450,6 +4563,466 @@ mod tests {
         for n in nodes {
             n.4.join().unwrap();
         }
+    }
+
+    /// `docs/SCALING.md`: an idle participant sends only its channels'
+    /// keepalives (its session's comes once an hour here), and when a hop
+    /// of its standing circuit dies it learns so from the `Destroy` the
+    /// relays pass back, and is reachable again, with no keepalive of its
+    /// own to notice.
+    #[test]
+    fn an_idle_participant_is_quiet_and_learns_of_a_dead_hop() {
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("idle-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        let mut handles = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 4;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let (stats, paths, frames) =
+                (node.stats(), Arc::clone(&node.circuits.paths), Arc::clone(&node.frames_sent));
+            nodes.push((addr, tx, notes, stats, paths, frames));
+            handles.push(Some(std::thread::spawn(move || node.run())));
+        }
+        let mut list: Vec<consensus::Relay> =
+            (0..4).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        list.sort_by_key(|r| digest_to_bytes(&r.id));
+        let (p, q) = (4usize, 5usize);
+        for n in &nodes {
+            n.1.send(Event::TestRelays(list.clone())).unwrap();
+        }
+        let hour = Duration::from_secs(3600);
+        for n in [p, q] {
+            nodes[n].1.send(Event::TestTiming(hour, hour)).unwrap();
+        }
+        let live = |secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                let s = nodes[p].3.lock().unwrap().rendezvous.clone();
+                if s.len() == 1 && s[0].1 {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "p: {s:?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        live(30);
+        // Idle: only keepalive frames on its channels (one each per
+        // `channel::KEEPALIVE`, at most three channels: its guards).
+        std::thread::sleep(Duration::from_secs(3));
+        let before = nodes[p].5.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(15));
+        let sent = nodes[p].5.load(Ordering::Relaxed) - before;
+        let per_channel = 15 / crate::channel::KEEPALIVE.as_secs() + 1;
+        assert!(sent <= 3 * per_channel, "{sent} frames in 15 s idle");
+        // The standing circuit's middle hop dies.
+        let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
+        let point = ids[crate::onion::rendezvous_relays(&id(5), &ids)[0]];
+        let path =
+            nodes[p].4.lock().unwrap().iter().rev().find(|path| *path.last().unwrap() == point).cloned().unwrap();
+        assert_eq!(path.len(), 3, "a guard, a hop, the point: {path:?}");
+        let middle = (0..4).find(|&i| id(i as u8 + 1) == path[1]).unwrap();
+        nodes[middle].1.send(Event::Stop).unwrap();
+        handles[middle].take().unwrap().join().unwrap();
+        let stopped = Instant::now();
+        // The `Destroy` reaches p: its session is down until it rebuilds.
+        let deadline = stopped + Duration::from_secs(60);
+        while nodes[p].3.lock().unwrap().rendezvous.iter().all(|(_, l)| *l) {
+            assert!(Instant::now() < deadline, "p never heard its circuit was gone");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("p heard {:?} after its hop stopped", stopped.elapsed());
+        live(60);
+        // And it is reached there.
+        let out = Outbound { tag: 1, to: id(5), kind: 1, inner: b"after".to_vec(), recipient: None, reply: None };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'sent: loop {
+            nodes[q].1.send(Event::Send(out.clone())).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                if let Ok(Note::Received(o)) = nodes[p].2.recv_timeout(Duration::from_millis(200))
+                    && o.inner == b"after"
+                {
+                    break 'sent;
+                }
+            }
+            assert!(Instant::now() < deadline, "p not reached after the hop died");
+        }
+        for (i, n) in nodes.iter().enumerate() {
+            if i != middle {
+                n.1.send(Event::Stop).unwrap();
+            }
+        }
+        for h in handles.into_iter().flatten() {
+            h.join().unwrap();
+        }
+    }
+
+    /// Keepalives come 20 to 40 s apart at random (`docs/PRIVACY.md`, fix 3).
+    #[test]
+    fn keepalives_are_jittered() {
+        let d = Duration::from_secs(30);
+        let waits: Vec<Duration> = (0..2000).map(|_| participant::jitter(d)).collect();
+        assert!(waits.iter().all(|w| *w >= Duration::from_secs(20) && *w < Duration::from_secs(40)));
+        let lo = waits.iter().filter(|w| **w < Duration::from_secs(25)).count();
+        let hi = waits.iter().filter(|w| **w >= Duration::from_secs(35)).count();
+        assert!(lo > 300 && hi > 300, "spread over the range: {lo} low, {hi} high");
+    }
+
+    /// What the relays learn of a payment (`docs/PRIVACY.md`, fixes 1, 2
+    /// and 4), with six relays so that a sender's outbound circuits can end
+    /// away from its rendezvous points: none of its sends goes over a
+    /// circuit holding its session, its points see none of them, no relay
+    /// sees its id, and the answer comes back down its own circuit.
+    #[test]
+    fn relays_learn_nothing_of_the_sender() {
+        use crate::onion;
+        use circuits::Seen;
+        const RELAYS: usize = 6;
+        let fixtures: Vec<Fixture> = (0..RELAYS + 2).map(|i| open(&format!("priv-{i}"))).collect();
+        let mut paths = Vec::new();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < RELAYS;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let (stats, seen) = (node.stats(), Arc::clone(&node.circuits.seen));
+            paths.push(Arc::clone(&node.circuits.paths));
+            nodes.push((addr, tx, notes, stats, seen, std::thread::spawn(move || node.run())));
+        }
+        let mut listed: Vec<consensus::Relay> =
+            (0..RELAYS).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        listed.sort_by_key(|r| digest_to_bytes(&r.id));
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        // p receives, q pays.
+        let (p, q) = (RELAYS, RELAYS + 1);
+        let (id_p, id_q) = (id(p as u8 + 1), id(q as u8 + 1));
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(live(p) && live(q)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(p) && live(q));
+        let received = |n: usize| loop {
+            match nodes[n].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+                Note::Received(o) => return o,
+                Note::Failed { why, .. } => panic!("{why}"),
+                _ => {}
+            }
+        };
+        let out = Outbound {
+            tag: 1,
+            to: id_p,
+            kind: onion::KIND_SLATE,
+            inner: b"a slate".to_vec(),
+            recipient: None,
+            reply: None,
+        };
+        nodes[q].1.send(Event::Send(out)).unwrap();
+        let o = received(p);
+        assert_eq!((o.from.as_ref(), &o.inner[..]), (None, &b"a slate"[..]), "the recipient learns nothing of q");
+        let route = o.route.expect("a way back");
+        let answer = Outbound {
+            tag: 2,
+            to: route.reply_id(),
+            kind: onion::KIND_SLATE,
+            inner: b"answered".to_vec(),
+            recipient: None,
+            reply: Some(route),
+        };
+        nodes[p].1.send(Event::Send(answer)).unwrap();
+        let o = received(q);
+        assert_eq!((&o.inner[..], o.answers), (&b"answered"[..], Some(id_p)));
+
+        let ids: Vec<Digest> = listed.iter().map(|r| r.id).collect();
+        let points = |who: &Digest| -> Vec<Digest> {
+            crate::onion::rendezvous_relays(who, &ids).into_iter().map(|i| ids[i]).collect()
+        };
+        let (points_p, points_q) = (points(&id_p), points(&id_q));
+        let q_bytes = digest_to_bytes(&id_q);
+        let mut sends = 0;
+        for r in 0..RELAYS {
+            let me = id(r as u8 + 1);
+            for s in nodes[r].4.lock().unwrap().iter() {
+                let Seen::AtEnd(cmd, session, msg) = s else { continue };
+                let what = [circuit::GET_ANNOUNCE, circuit::SEND, circuit::ROUTE, circuit::REPLY, circuit::BROADCAST];
+                if !what.contains(cmd) {
+                    continue;
+                }
+                sends += 1;
+                assert_eq!(*session, None, "command {cmd} at {} over a circuit holding a session", onion::short(&me));
+                assert!(!msg.windows(32).any(|w| w == q_bytes), "q's id at a relay");
+                // q's sends (the lookup, the payload, the route) never at
+                // q's points; p's answer never at p's.
+                if [circuit::GET_ANNOUNCE, circuit::SEND, circuit::ROUTE].contains(cmd) {
+                    assert!(!points_q.contains(&me), "q's command {cmd} at its own point");
+                }
+                if *cmd == circuit::REPLY {
+                    assert!(!points_p.contains(&me), "p's answer at its own point");
+                }
+            }
+        }
+        assert!(sends >= 3, "the route, the payload and the answer went up circuits: {sends}");
+        // Every circuit of p's and q's starts at one of its guards, kept in
+        // its data directory: three at most, for all its circuits.
+        for n in [p, q] {
+            let text = std::fs::read_to_string(fixtures[n].dir.0.join("guards")).expect("guards saved");
+            let guards: Vec<String> = text.lines().map(|l| l.split(' ').next().unwrap().to_string()).collect();
+            assert_eq!(guards.len(), 3);
+            let hex = |d: &Digest| digest_to_bytes(d).iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let mut first: Vec<String> = paths[n].lock().unwrap().iter().map(|path| hex(&path[0])).collect();
+            assert!(first.len() >= 2, "standing and outbound circuits: {}", first.len());
+            first.sort();
+            first.dedup();
+            assert!(first.iter().all(|f| guards.contains(f)), "a first hop that is not a guard");
+        }
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.5.join().unwrap();
+        }
+    }
+
+    /// A new address (`docs/PRIVACY.md`, fix 5): reachable once its
+    /// sessions are live, the old one then unreachable, no circuit moving
+    /// from one id to the other at any relay; with the address off nobody
+    /// reaches the wallet, which can still pay.
+    #[test]
+    fn a_new_address_leaves_the_old_one_behind() {
+        use circuits::Seen;
+        const RELAYS: usize = 6;
+        let fixtures: Vec<Fixture> = (0..RELAYS + 2).map(|i| open(&format!("addr-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < RELAYS;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let (stats, seen) = (node.stats(), Arc::clone(&node.circuits.seen));
+            nodes.push((addr, tx, notes, stats, seen, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..RELAYS).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let (p, q) = (RELAYS, RELAYS + 1);
+        let (old, new, id_q) = (id(p as u8 + 1), id(99), id(q as u8 + 1));
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(live(p) && live(q)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(p) && live(q));
+        // `from` sends to `to` until it is delivered (`true`) or offline.
+        let mut tag = 0u64;
+        let mut send = |from: usize, to: Digest| -> bool {
+            tag += 1;
+            let out = Outbound { tag, to, kind: 1, inner: vec![1], recipient: None, reply: None };
+            nodes[from].1.send(Event::Send(out)).unwrap();
+            loop {
+                match nodes[from].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
+                    Note::Delivered { tag: t, .. } if t == tag => return true,
+                    Note::Failed { tag: t, why, .. } if t == tag => {
+                        assert!(why.contains("offline"), "{why}");
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let until = |want: bool, from: usize, to: Digest, send: &mut dyn FnMut(usize, Digest) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while send(from, to) != want {
+                assert!(Instant::now() < deadline, "never {}", if want { "delivered" } else { "offline" });
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        };
+        assert!(send(q, old));
+        nodes[p].1.send(Event::Identity(Some(key(99)))).unwrap();
+        until(true, q, new, &mut send);
+        until(false, q, old, &mut send);
+        // At no relay did a circuit holding the old id's session ask for
+        // the new one's.
+        for r in 0..RELAYS {
+            for s in nodes[r].4.lock().unwrap().iter() {
+                if let Seen::AtEnd(cmd, Some(held), msg) = s
+                    && *cmd == circuit::SESSION
+                {
+                    assert!(!(*held == old && msg[..] == digest_to_bytes(&new)[..]), "a circuit moved from old to new");
+                }
+            }
+        }
+        // Off: nobody reaches p, which still pays.
+        nodes[p].1.send(Event::Identity(None)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !nodes[p].3.lock().unwrap().rendezvous.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(nodes[p].3.lock().unwrap().rendezvous.is_empty());
+        until(false, q, new, &mut send);
+        assert!(send(p, id_q), "an address that is off still pays");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.5.join().unwrap();
+        }
+    }
+
+    /// Payment proofs and proofs of burn (`docs/PROOFS.md`), end to end on a
+    /// chain: made from the block that created the output, checked against
+    /// its header, and refused when anything in them is changed.
+    #[test]
+    fn payment_and_burn_proofs_verify_against_their_block() {
+        use crate::proofs::{Claim, Proof, ProofError, Receipt};
+        use crate::wallet::{Slate, Wallet};
+        let f = open("proofs");
+        let (alice, _) = Wallet::open(&f.dir.0.join("alice")).unwrap();
+        let (bob, _) = Wallet::open(&f.dir.0.join("bob")).unwrap();
+        let now = unix_now();
+        let t = std::cell::Cell::new(T0);
+        // Mines `txs` with a reward taking the rest; returns the block.
+        let block_with = |txs: &[&crate::transaction::Transaction], inputs: Vec<u64>| {
+            t.set(t.get() + 600);
+            let mut outputs: Vec<_> = txs.iter().flat_map(|tx| tx.outputs.iter().map(|o| o.block_output())).collect();
+            let made: u64 = outputs.iter().map(|o| o.amount).sum();
+            outputs.push(Output::new(&pk(9), claim(&f, &inputs) - made).block_output());
+            let block = mine_body(&f, Body { inputs, outputs, proof: vec![1; 2500], ..Default::default() }, t.get());
+            f.chain.apply_block(&block, now).unwrap();
+            let (_, first, outs) = f.chain.main_outputs(block.header.height).unwrap().unwrap();
+            alice.locate(first, &outs).unwrap();
+            let landed = alice.land_payments(block.header.height, first, &outs).unwrap();
+            for p in &landed {
+                let (h, position) = p.landed.unwrap();
+                let (header, _, path) = f.chain.output_proof_at(position, h).unwrap().unwrap();
+                alice.set_payment_path(&p.txid, h, position, path, &header.state_root).unwrap();
+            }
+            (block, first, landed.len())
+        };
+        // alice's funds, from block 1.
+        let funds = alice.receive(SUBSIDY).unwrap();
+        t.set(t.get() + 600);
+        let b1 = mine_body(
+            &f,
+            Body { outputs: vec![funds.block_output()], proof: vec![1; 2500], ..Default::default() },
+            t.get(),
+        );
+        f.chain.apply_block(&b1, now).unwrap();
+        alice.locate(0, &[funds.block_output()]).unwrap();
+
+        // A payment to bob by file slates: bob's receipt comes back with it.
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let mut slate = alice.send(10_000_000, None, true, f.chain.utxo(), &rtxn).unwrap();
+        drop(rtxn);
+        assert_eq!(slate.sender, alice.id());
+        bob.receive_slate(&mut slate).unwrap();
+        let mut unsigned = slate.clone();
+        unsigned.receipt = None;
+        assert!(Slate::from_bytes(&unsigned.to_bytes()).is_none(), "an answered slate without a receipt");
+        let mut forged = slate.clone();
+        forged.receipt.as_mut().unwrap().signature[7] ^= 1;
+        assert!(alice.finalize(&forged).is_err());
+        let mut elsewhere = slate.clone();
+        elsewhere.sender = bob.id();
+        assert!(alice.finalize(&elsewhere).is_err());
+        let signed = alice.finalize(&slate).unwrap();
+        let (b2, first2, landed) = block_with(&[&signed.tx], vec![0]);
+        assert_eq!(landed, 1);
+        let payment = alice.payments().unwrap().into_iter().find(|p| !p.is_burn()).unwrap();
+        assert_eq!(payment.landed, Some((2, first2 + 1)));
+        let proof = payment.proof().expect("made when it landed");
+        assert_eq!(proof.check(&b2.header.state_root), Ok(()));
+        let Claim::Payment { sender, receipt, .. } = &proof.claim else { panic!() };
+        assert_eq!((*sender, receipt.recipient()), (alice.id(), bob.id()));
+        assert_eq!(proof.amount, 10_000_000);
+        // As text, whatever surrounds it.
+        let text = proof.to_text();
+        assert!(text.starts_with("-----BEGIN TAB PAYMENT PROOF-----\n"));
+        assert_eq!(Proof::from_text(&format!("from alice:\n{text}thanks\n")), Some(proof.clone()));
+        assert!(Proof::from_text(&text.replace("PAYMENT", "BURN")).is_none());
+        // Only against its own block, and only as it is.
+        assert_eq!(proof.check(&b1.header.state_root), Err(ProofError::NotInBlock));
+        let tweak = |change: &dyn Fn(&mut Proof)| {
+            let mut p = proof.clone();
+            change(&mut p);
+            p.check(&b2.header.state_root)
+        };
+        assert_eq!(tweak(&|p| p.amount += 1), Err(ProofError::NotInBlock));
+        assert_eq!(tweak(&|p| p.memo[0] += crate::poseidon2::Fp::ONE), Err(ProofError::NotInBlock));
+        assert_eq!(tweak(&|p| p.position += 1), Err(ProofError::NotInBlock));
+        let other = alice.id();
+        assert_eq!(
+            tweak(&|p| if let Claim::Payment { sender, .. } = &mut p.claim {
+                *sender = bob.id()
+            }),
+            Err(ProofError::Receipt)
+        );
+        // A receipt claimed for another address: its key, the same signature.
+        let theirs = Receipt::sign(&alice.identity_key(), &proof.output(), &[0; 32], &other);
+        assert_eq!(
+            tweak(&|p| if let Claim::Payment { receipt, .. } = &mut p.claim {
+                receipt.key = theirs.key.clone()
+            }),
+            Err(ProofError::Receipt)
+        );
+
+        // A burn for bob, from alice's change.
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let burn = alice.burn(1_000_000, &bob.id(), b"credit", None, f.chain.utxo(), &rtxn).unwrap();
+        drop(rtxn);
+        let (b3, _, landed) = block_with(&[&burn.tx], vec![first2]);
+        assert_eq!(landed, 1);
+        let burned = alice.payments().unwrap().into_iter().find(|p| p.is_burn()).unwrap();
+        let proof = burned.proof().unwrap();
+        assert_eq!(proof.key_hash, crate::proofs::BURN_KEY_HASH);
+        assert_eq!(proof.check(&b3.header.state_root), Ok(()));
+        let Claim::Burn(b) = &proof.claim else { panic!() };
+        assert_eq!((b.beneficiary, &b.purpose[..]), (bob.id(), &b"credit"[..]));
+        assert_eq!(Proof::from_text(&proof.to_text()), Some(proof.clone()));
+        let mut other = proof.clone();
+        if let Claim::Burn(b) = &mut other.claim {
+            b.beneficiary = alice.id();
+        }
+        assert_eq!(other.check(&b3.header.state_root), Err(ProofError::Burn));
+        // A proof against a later block than the one that made the output
+        // fails, the output still unspent there.
+        let mut later = proof.clone();
+        let (_, _, path) = f.chain.output_proof_at(proof.position, 3).unwrap().unwrap();
+        later.path = path;
+        later.height = 3;
+        assert_eq!(later.check(&b3.header.state_root), Ok(()));
+        let (b4, _, _) = block_with(&[], vec![]);
+        let (_, _, path) = f.chain.output_proof_at(proof.position, 4).unwrap().unwrap();
+        later.path = path;
+        later.height = 4;
+        assert_eq!(later.check(&b4.header.state_root), Err(ProofError::NotInBlock));
     }
 
     /// In onion mode a wallet's own transaction goes to a relay over a
@@ -4492,7 +5065,7 @@ mod tests {
             n.1.send(Event::TestRelays(listed.clone())).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(30);
-        let live = || nodes[3].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).count() == 3;
+        let live = || nodes[3].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).count() == 1;
         while !live() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -4500,7 +5073,7 @@ mod tests {
         // alice pays bob, by slate files; the transaction is finished.
         let mut slate = {
             let rtxn = fixtures[3].chain.env().read_txn().unwrap();
-            alice.send(20_000_000, None, fixtures[3].chain.utxo(), &rtxn).unwrap()
+            alice.send(20_000_000, None, false, fixtures[3].chain.utxo(), &rtxn).unwrap()
         };
         bob.receive_slate(&mut slate).unwrap();
         let signed = alice.finalize(&slate).unwrap();
@@ -4585,8 +5158,14 @@ mod tests {
         let mut tag = 0u64;
         let mut message = |round: &str| {
             tag += 1;
-            let out =
-                Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            let out = Outbound {
+                tag,
+                to: id(5),
+                kind: onion::KIND_SLATE,
+                inner: round.as_bytes().to_vec(),
+                recipient: None,
+                reply: None,
+            };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
@@ -4605,25 +5184,21 @@ mod tests {
                 n.1.send(Event::TestEpoch(Some(current.clone()), previous.map(|p| Some(p.clone())), prefer)).unwrap();
             }
         };
-        // List a alone.
+        // One session (`docs/SCALING.md`), at the first point of the list
+        // preferred. List a alone.
         epoch(&a, None, true);
-        live_at(&points(&a, id(5)));
+        live_at(&points(&a, id(5))[..1]);
         message("under a");
         // The switch to b: both stand, a tried first, then b.
         epoch(&b, Some(&a), false);
-        let mut both = points(&a, id(5));
-        for x in points(&b, id(5)) {
-            if !both.contains(&x) {
-                both.push(x);
-            }
-        }
-        live_at(&both);
+        live_at(&points(&a, id(5))[..1]);
         message("switching, a first");
         epoch(&b, Some(&a), true);
+        live_at(&points(&b, id(5))[..1]);
         message("switching, b first");
         // The switch is over: b alone.
         epoch(&b, None, true);
-        live_at(&points(&b, id(5)));
+        live_at(&points(&b, id(5))[..1]);
         message("under b");
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
@@ -4685,6 +5260,7 @@ mod tests {
                 kind: onion::KIND_SLATE,
                 inner: round.as_bytes().to_vec(),
                 recipient: None,
+                reply: None,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
@@ -4717,8 +5293,9 @@ mod tests {
         for n in 0..5 {
             set(n, Some(&list), Some(None), false);
         }
-        live(p, 4);
-        live(r, 3);
+        // The seed's session, and one onion session (`docs/SCALING.md`).
+        live(p, 2);
+        live(r, 1);
         message_to(p, "switching, init first");
         // r is reachable only by onion mode: the sender tries init first,
         // the seed has no session for r, and the send goes by onion mode.
@@ -4730,7 +5307,7 @@ mod tests {
         for n in 0..5 {
             set(n, Some(&list), None, true);
         }
-        live(p, 3);
+        live(p, 1);
         message_to(p, "onion");
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
@@ -4777,7 +5354,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(secs);
             loop {
                 let s = nodes[p].3.lock().unwrap().rendezvous.clone();
-                if s.len() == 3 && s.iter().all(|(_, l)| *l) {
+                if s.len() == 1 && s.iter().all(|(_, l)| *l) {
                     return;
                 }
                 assert!(Instant::now() < deadline, "p: {s:?}");
@@ -4787,8 +5364,14 @@ mod tests {
         let mut tag = 0u64;
         let mut message = |round: &str| {
             tag += 1;
-            let out =
-                Outbound { tag, to: id(5), kind: onion::KIND_SLATE, inner: round.as_bytes().to_vec(), recipient: None };
+            let out = Outbound {
+                tag,
+                to: id(5),
+                kind: onion::KIND_SLATE,
+                inner: round.as_bytes().to_vec(),
+                recipient: None,
+                reply: None,
+            };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
             loop {
@@ -4804,13 +5387,14 @@ mod tests {
         };
         live(30);
         message("first");
-        // Replaced: each of p's three circuits at least once, sessions kept.
+        // Replaced, the session kept: p's standing circuit and its spare
+        // outbound one, then the replacement at least.
         let built = || nodes[p].4.lock().unwrap().iter().filter(|s| matches!(s, circuits::Seen::Ready(_))).count();
         let deadline = Instant::now() + Duration::from_secs(40);
-        while built() < 6 && Instant::now() < deadline {
+        while built() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
         }
-        assert!(built() >= 6, "{} circuits built", built());
+        assert!(built() >= 3, "{} circuits built", built());
         live(20);
         message("after replacement");
         // The relay that is none of p's points is only ever a hop: stop it.
@@ -4884,7 +5468,7 @@ mod tests {
             false
         };
         let deliver = |tag: u64, recipient: Option<onion::Announce>| {
-            let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient };
+            let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient, reply: None };
             tx_q.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut opened = None;

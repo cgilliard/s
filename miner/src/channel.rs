@@ -65,10 +65,18 @@ pub const MAX_TRIES: u32 = 12;
 /// tries; at a tenth of datagrams lost each way, a live channel is taken
 /// for dead once in some twenty thousand frames.
 pub const DEAD_AFTER: Duration = Duration::from_secs(15);
-/// An initiator sends a keepalive after this long without sending.
-pub const KEEPALIVE: Duration = Duration::from_secs(30);
+/// An initiator sends a keepalive after this long without sending: under
+/// the 30 s a home router may keep a quiet UDP mapping, so a participant's
+/// channel to its guard keeps its NAT open (`docs/SCALING.md`).
+#[cfg(not(test))]
+pub const KEEPALIVE: Duration = Duration::from_secs(25);
+#[cfg(test)]
+pub const KEEPALIVE: Duration = Duration::from_secs(5);
 /// A channel that hears nothing for this long is gone.
+#[cfg(not(test))]
 pub const TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+pub const TIMEOUT: Duration = Duration::from_secs(20);
 
 const RELAY_CONTEXT: &[u8] = b"tab-channel-relay";
 const INITIATOR_CONTEXT: &[u8] = b"tab-channel-initiator";
@@ -90,6 +98,8 @@ pub enum ChannelError {
     Dead,
     /// The send queue is full.
     Full,
+    /// Closed by this end: nothing used it for a while.
+    Idle,
 }
 
 impl std::fmt::Display for ChannelError {
@@ -102,6 +112,7 @@ impl std::fmt::Display for ChannelError {
             ChannelError::NotAuthenticated => "not authenticated yet",
             ChannelError::Dead => "the other end stopped answering",
             ChannelError::Full => "too much queued",
+            ChannelError::Idle => "idle",
         })
     }
 }
@@ -144,8 +155,14 @@ impl Frame {
         let kind = r.take(1)?[0];
         let (seq, ack, sack) = (r.u64()?, r.u64()?, r.u64()?);
         let sealed = r.take(r.0.len())?.to_vec();
-        (sealed.len() >= TAG_LEN && sealed.len() <= MAX_BODY + TAG_LEN && kind <= KIND_ACK)
-            .then_some(Frame { chan, kind, seq, ack, sack, sealed })
+        (sealed.len() >= TAG_LEN && sealed.len() <= MAX_BODY + TAG_LEN && kind <= KIND_ACK).then_some(Frame {
+            chan,
+            kind,
+            seq,
+            ack,
+            sack,
+            sealed,
+        })
     }
 }
 
@@ -174,7 +191,10 @@ fn transcript(domain: Domain, chan: u64, hello: &[u8], relay_pk: &[u8], ct: &[u8
         Domain::Channel => b"tab-channel",
         Domain::Circuit => b"tab-circuit",
     })
-    .absorb(&chan.to_le_bytes()).absorb(hello).absorb(relay_pk).absorb(ct);
+    .absorb(&chan.to_le_bytes())
+    .absorb(hello)
+    .absorb(relay_pk)
+    .absorb(ct);
     let mut out = [0u8; 32];
     s.squeeze(&mut out);
     out
@@ -461,7 +481,8 @@ impl Channel {
         }
         self.last_heard = now;
         // What the other end has: everything below `ack`, and the bitmap.
-        self.in_flight.retain(|&s, _| s >= f.ack && !(s > f.ack && s - f.ack - 1 < 64 && f.sack >> (s - f.ack - 1) & 1 == 1));
+        self.in_flight
+            .retain(|&s, _| s >= f.ack && !(s > f.ack && s - f.ack - 1 < 64 && f.sack >> (s - f.ack - 1) & 1 == 1));
         let mut out = Received::default();
         if f.kind == KIND_DATA {
             if f.seq >= self.recv_next && f.seq < self.recv_next + WINDOW {
@@ -598,8 +619,7 @@ mod tests {
         assert!(again.delivered.is_empty() && again.send.len() == 1);
         // Tampering with the header or the body, or the wrong direction.
         let f = i.send(b"x", now).unwrap().remove(0);
-        let tampered: [fn(&mut Frame); 4] =
-            [|f| f.ack += 1, |f| f.sack ^= 1, |f| f.seq += 1, |f| f.kind = KIND_ACK];
+        let tampered: [fn(&mut Frame); 4] = [|f| f.ack += 1, |f| f.sack ^= 1, |f| f.seq += 1, |f| f.kind = KIND_ACK];
         for t in tampered {
             let mut bad = f.clone();
             t(&mut bad);

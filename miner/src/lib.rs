@@ -37,6 +37,7 @@ pub mod onion;
 pub mod packed;
 pub mod parallel;
 pub mod policy;
+pub mod proofs;
 pub mod poseidon2;
 pub mod poseidon2_air;
 pub mod pow;

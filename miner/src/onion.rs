@@ -27,6 +27,14 @@ pub const RENDEZVOUS: usize = 3;
 pub const KEEPALIVE_SECS: u64 = 30;
 /// A session with no keepalive for this long is gone.
 pub const SESSION_TIMEOUT_SECS: u64 = 3 * KEEPALIVE_SECS;
+/// In onion mode, between keepalives on a session held over a circuit,
+/// give or take a third (`docs/SCALING.md`): the circuit's channels keep
+/// themselves alive, and a hop that dies destroys the circuit, which the
+/// participant hears; the keepalive only catches a point that forgot it.
+pub const CIRCUIT_KEEPALIVE_SECS: u64 = 15 * 60;
+/// A session held over a circuit with no keepalive for this long is gone;
+/// it ends with its circuit in any case.
+pub const CIRCUIT_SESSION_TIMEOUT_SECS: u64 = 3 * CIRCUIT_KEEPALIVE_SECS;
 /// How long a wallet's announce is valid; it is renewed well before.
 pub const ANNOUNCE_LIFETIME_SECS: u64 = 86_400;
 /// Largest object: an announce is about 6.5 KB, a payload a slate plus
@@ -40,6 +48,7 @@ pub const KIND_SLATE: u8 = 1;
 const DOM_OBJECT: u32 = 19;
 const DOM_RENDEZVOUS: u32 = 20;
 const DOM_WEIGHT: u32 = 21;
+const DOM_REPLY: u32 = 23;
 const ANNOUNCE_CONTEXT: &[u8] = b"tab-announce";
 const PAYLOAD_CONTEXT: &[u8] = b"tab-payload";
 const TAG_ANNOUNCE: u8 = 1;
@@ -104,7 +113,14 @@ impl Announce {
     }
 
     fn put(&self, w: &mut Writer) {
-        w.0.extend_from_slice(&Self::signed_part(&self.id, &self.dilithium, &self.kyber, self.seq, self.expiry, self.nonce));
+        w.0.extend_from_slice(&Self::signed_part(
+            &self.id,
+            &self.dilithium,
+            &self.kyber,
+            self.seq,
+            self.expiry,
+            self.nonce,
+        ));
         w.0.extend_from_slice(&self.sig);
     }
 
@@ -132,73 +148,145 @@ impl Announce {
     }
 }
 
+/// The way back to a sender that does not name itself (`docs/PRIVACY.md`,
+/// fix 4): the last relay of the circuit its payload came up, the token
+/// that relay keeps for that circuit, and a Kyber key made for this one
+/// answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub relay: Digest,
+    pub token: [u8; crate::circuit::TOKEN_LEN],
+    pub kyber: Vec<u8>,
+}
+
+impl Route {
+    const SIZE: usize = 32 + crate::circuit::TOKEN_LEN + mlkem::EK_LEN;
+
+    fn put(&self, w: &mut Writer) {
+        w.digest(&self.relay);
+        w.0.extend_from_slice(&self.token);
+        w.0.extend_from_slice(&self.kyber);
+    }
+
+    fn get(r: &mut Reader) -> Option<Route> {
+        let relay = r.digest()?;
+        let token = r.take(crate::circuit::TOKEN_LEN)?.try_into().ok()?;
+        let kyber = r.take(mlkem::EK_LEN)?.to_vec();
+        Some(Route { relay, token, kyber })
+    }
+
+    /// The id an answer along the route is addressed to: a hash of its
+    /// Kyber key, naming no one.
+    pub fn reply_id(&self) -> Digest {
+        reply_id(&self.kyber)
+    }
+}
+
+/// The id of an answer sealed to the one-time Kyber key `kyber`.
+pub fn reply_id(kyber: &[u8]) -> Digest {
+    hash_domain(DOM_REPLY, &crate::pow::pack_bytes(kyber))
+}
+
 /// What a payload carries once opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Opened {
-    /// The sender's announce, when it named itself; verified, and its id
-    /// is the payload's `from`.
+    /// The sender's announce, when it named itself; verified.
     pub from: Option<Announce>,
+    /// The way back to the sender, when it gave one.
+    pub route: Option<Route>,
+    /// When this is the answer to a payload of ours, the id we sent that
+    /// one to (only it could open it, so only it could answer).
+    pub answers: Option<Digest>,
     pub kind: u8,
     pub inner: Vec<u8>,
 }
 
-/// A message to an id, sealed to its announced Kyber key.
+/// A message to an id, sealed to its announced Kyber key. Only what
+/// routing needs is in the clear (`docs/PRIVACY.md`, fix 1): a relay sees
+/// whom a payload is for, never whom it is from. A named sender's
+/// announce and signature travel inside the sealed body, as does a return
+/// route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payload {
     pub to: Digest,
-    /// The sender's id, or [`NOBODY`].
-    pub from: Digest,
     /// The Kyber ciphertext.
     pub ct: Vec<u8>,
     pub nonce: [u8; chacha20poly1305::NONCE_LEN],
-    /// Sealed: kind, the sender's announce if any, the inner bytes.
+    /// Sealed: kind, flags (a return route, a named sender), the route,
+    /// the sender's announce and its signature, then the inner bytes.
     pub body: Vec<u8>,
-    /// By the sender's Dilithium key over everything above, when `from`
-    /// is set; empty otherwise.
-    pub sig: Vec<u8>,
 }
 
 impl Payload {
-    fn signed_part(to: &Digest, from: &Digest, ct: &[u8], nonce: &[u8; 12], body: &[u8]) -> Vec<u8> {
-        let mut w = Writer::with_capacity(64 + ct.len() + 12 + body.len());
+    /// The associated data: what travels in the clear.
+    fn aad(to: &Digest, ct: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
+        let mut w = Writer::with_capacity(32 + ct.len() + 12);
         w.digest(to);
-        w.digest(from);
         w.0.extend_from_slice(ct);
         w.0.extend_from_slice(nonce);
-        w.0.extend_from_slice(body);
         w.0
     }
 
+    /// What a named sender signs: the clear part, then everything sealed
+    /// but the signature (kind, flags, route, announce, inner bytes).
+    fn signed_part(aad: &[u8], head: &[u8], inner: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(aad.len() + head.len() + inner.len());
+        m.extend_from_slice(aad);
+        m.extend_from_slice(head);
+        m.extend_from_slice(inner);
+        m
+    }
+
     /// Seals `inner` of `kind` to `to`'s Kyber key. With `from`, the
-    /// sender's key and its announce (for the reply) go inside and the
-    /// payload is signed. `m` is the encapsulation's randomness.
+    /// sender's announce (for the reply) and its signature go inside; with
+    /// `route`, the way back to an unnamed sender. `m` is the
+    /// encapsulation's randomness.
     pub fn seal(
         to: &Announce,
         from: Option<(&mldsa::SecretKey, &Announce)>,
+        route: Option<&Route>,
         kind: u8,
         inner: &[u8],
         m: &[u8; 32],
         nonce: [u8; 12],
     ) -> Option<Payload> {
-        let (shared, ct) = mlkem::encapsulate_with(&to.kyber, m)?;
-        let mut plain = Writer::with_capacity(1 + Announce::FIXED + inner.len());
-        plain.0.push(kind);
-        match from {
-            Some((_, announce)) => {
-                plain.0.push(1);
-                announce.put(&mut plain);
-            }
-            None => plain.0.push(0),
+        Self::seal_to(&to.id, &to.kyber, from, route, kind, inner, m, nonce)
+    }
+
+    /// An answer along `route`: anonymous, sealed to its one-time key.
+    pub fn seal_reply(route: &Route, kind: u8, inner: &[u8], m: &[u8; 32], nonce: [u8; 12]) -> Option<Payload> {
+        Self::seal_to(&route.reply_id(), &route.kyber, None, None, kind, inner, m, nonce)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seal_to(
+        to: &Digest,
+        kyber: &[u8],
+        from: Option<(&mldsa::SecretKey, &Announce)>,
+        route: Option<&Route>,
+        kind: u8,
+        inner: &[u8],
+        m: &[u8; 32],
+        nonce: [u8; 12],
+    ) -> Option<Payload> {
+        let (shared, ct) = mlkem::encapsulate_with(kyber, m)?;
+        let aad = Self::aad(to, &ct, &nonce);
+        let mut head = Writer::with_capacity(2 + Route::SIZE + Announce::FIXED);
+        head.0.push(kind);
+        head.0.push(u8::from(route.is_some()) | u8::from(from.is_some()) << 1);
+        if let Some(r) = route {
+            r.put(&mut head);
         }
-        plain.0.extend_from_slice(inner);
-        let from_id = from.map_or(NOBODY, |(_, a)| a.id);
-        let aad = Self::signed_part(&to.id, &from_id, &ct, &nonce, &[]);
-        let body = chacha20poly1305::seal(&shared, &nonce, &aad, &plain.0);
-        let sig = match from {
-            Some((key, _)) => key.sign(&Self::signed_part(&to.id, &from_id, &ct, &nonce, &body), PAYLOAD_CONTEXT),
-            None => Vec::new(),
-        };
-        Some(Payload { to: to.id, from: from_id, ct, nonce, body, sig })
+        if let Some((_, announce)) = from {
+            announce.put(&mut head);
+        }
+        let mut plain = head.0.clone();
+        if let Some((key, _)) = from {
+            plain.extend_from_slice(&key.sign(&Self::signed_part(&aad, &head.0, inner), PAYLOAD_CONTEXT));
+        }
+        plain.extend_from_slice(inner);
+        let body = chacha20poly1305::seal(&shared, &nonce, &aad, &plain);
+        Some(Payload { to: *to, ct, nonce, body })
     }
 
     /// Opens a payload with the recipient's Kyber secret: `None` if it was
@@ -206,53 +294,40 @@ impl Payload {
     /// signature does not hold at time `now`.
     pub fn open(&self, kyber: &mlkem::SecretKey, now: u64) -> Option<Opened> {
         let shared = kyber.decapsulate(&self.ct)?;
-        let aad = Self::signed_part(&self.to, &self.from, &self.ct, &self.nonce, &[]);
+        let aad = Self::aad(&self.to, &self.ct, &self.nonce);
         let plain = chacha20poly1305::open(&shared, &self.nonce, &aad, &self.body)?;
         let mut r = Reader(&plain);
         let kind = r.take(1)?[0];
-        let named = r.take(1)?[0];
-        let from = match named {
-            0 => None,
-            1 => Some(Announce::get(&mut r)?),
-            _ => return None,
-        };
-        let inner = r.0.to_vec();
-        match &from {
-            None => {
-                if self.from != NOBODY || !self.sig.is_empty() {
-                    return None;
-                }
-            }
-            Some(a) => {
-                if a.id != self.from
-                    || !a.verify(now)
-                    || !mldsa::verify(
-                        &a.dilithium,
-                        &Self::signed_part(&self.to, &self.from, &self.ct, &self.nonce, &self.body),
-                        PAYLOAD_CONTEXT,
-                        &self.sig,
-                    )
-                {
-                    return None;
-                }
-            }
+        let flags = r.take(1)?[0];
+        if flags > 3 {
+            return None;
         }
-        Some(Opened { from, kind, inner })
+        let route = if flags & 1 == 1 { Some(Route::get(&mut r)?) } else { None };
+        let from = if flags & 2 == 2 {
+            let announce = Announce::get(&mut r)?;
+            let head = &plain[..plain.len() - r.0.len()];
+            let sig = r.take(mldsa::SIG_LEN)?;
+            let signed = Self::signed_part(&aad, head, r.0);
+            if !announce.verify(now) || !mldsa::verify(&announce.dilithium, &signed, PAYLOAD_CONTEXT, sig) {
+                return None;
+            }
+            Some(announce)
+        } else {
+            None
+        };
+        Some(Opened { from, route, answers: None, kind, inner: r.0.to_vec() })
     }
 
     fn put(&self, w: &mut Writer) {
         w.digest(&self.to);
-        w.digest(&self.from);
         w.0.extend_from_slice(&self.ct);
         w.0.extend_from_slice(&self.nonce);
         w.u32(self.body.len() as u32);
         w.0.extend_from_slice(&self.body);
-        w.0.extend_from_slice(&self.sig);
     }
 
     fn get(r: &mut Reader) -> Option<Payload> {
         let to = r.digest()?;
-        let from = r.digest()?;
         let ct = r.take(mlkem::CT_LEN)?.to_vec();
         let nonce: [u8; 12] = r.take(12)?.try_into().unwrap();
         let len = r.u32()? as usize;
@@ -260,8 +335,7 @@ impl Payload {
             return None;
         }
         let body = r.take(len)?.to_vec();
-        let sig = if from == NOBODY { Vec::new() } else { r.take(mldsa::SIG_LEN)?.to_vec() };
-        Some(Payload { to, from, ct, nonce, body, sig })
+        Some(Payload { to, ct, nonce, body })
     }
 }
 
@@ -373,7 +447,9 @@ impl SlateLimit {
         while self.answered.front().is_some_and(|(_, t)| now.duration_since(*t) >= SLATE_WINDOW) {
             self.answered.pop_front();
         }
-        if self.answered.len() >= SLATES_TOTAL || self.answered.iter().filter(|(f, _)| f == from).count() >= SLATES_PER_SENDER {
+        if self.answered.len() >= SLATES_TOTAL
+            || self.answered.iter().filter(|(f, _)| f == from).count() >= SLATES_PER_SENDER
+        {
             return false;
         }
         self.answered.push_back((*from, now));
@@ -441,12 +517,19 @@ mod tests {
         let (sd, sk) = keys(2);
         let recipient = Announce::make(&rd, rk.public_key(), 1, 1000, 5);
         let sender = Announce::make(&sd, sk.public_key(), 1, 1000, 0);
-        let p = Payload::seal(&recipient, Some((&sd, &sender)), 7, b"hello", &[9u8; 32], [1u8; 12]).unwrap();
+        let p = Payload::seal(&recipient, Some((&sd, &sender)), None, 7, b"hello", &[9u8; 32], [1u8; 12]).unwrap();
         assert_eq!(p.to, recipient.id);
-        assert_eq!(p.from, sender.id);
-        assert_eq!(p.sig.len(), mldsa::SIG_LEN);
+        // Nothing of the sender's in the clear: not its id, not its key.
+        let bytes = Object::Payload(p.clone()).to_bytes();
+        let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(&crate::poseidon2::digest_to_bytes(&sender.id)));
+        assert!(!contains(&sender.dilithium[..64]));
+        assert!(contains(&crate::poseidon2::digest_to_bytes(&recipient.id)));
         let o = p.open(&rk, 500).unwrap();
-        assert_eq!(o, Opened { from: Some(sender.clone()), kind: 7, inner: b"hello".to_vec() });
+        assert_eq!(
+            o,
+            Opened { from: Some(sender.clone()), route: None, answers: None, kind: 7, inner: b"hello".to_vec() }
+        );
         assert_eq!(p.open(&sk, 500), None, "another key");
         assert_eq!(p.open(&rk, 1000), None, "the sender's announce expired");
         let bytes = Object::Payload(p.clone()).to_bytes();
@@ -456,26 +539,28 @@ mod tests {
         t.body[3] ^= 1;
         assert_eq!(t.open(&rk, 500), None);
         let mut t = p.clone();
-        t.from = NOBODY;
-        assert_eq!(t.open(&rk, 500), None);
-        let mut t = p.clone();
-        t.sig[10] ^= 1;
-        assert_eq!(t.open(&rk, 500), None);
-        let mut t = p.clone();
         t.nonce[0] ^= 1;
         assert_eq!(t.open(&rk, 500), None);
+        let mut t = p.clone();
+        t.to = sender.id;
+        assert_eq!(t.open(&rk, 500), None);
+        // A signature that does not hold, sealed properly all the same.
+        let other = Announce::make(&keys(3).0, sk.public_key(), 1, 1000, 0);
+        let forged = Payload::seal(&recipient, Some((&sd, &other)), None, 7, b"hello", &[9u8; 32], [1u8; 12]).unwrap();
+        assert_eq!(forged.open(&rk, 500), None);
         // An anonymous payload: no announce inside, no signature.
-        let p = Payload::seal(&recipient, None, 2, b"anon", &[3u8; 32], [2u8; 12]).unwrap();
-        assert_eq!(p.from, NOBODY);
-        assert!(p.sig.is_empty());
-        assert_eq!(p.open(&rk, 500), Some(Opened { from: None, kind: 2, inner: b"anon".to_vec() }));
+        let p = Payload::seal(&recipient, None, None, 2, b"anon", &[3u8; 32], [2u8; 12]).unwrap();
+        assert_eq!(
+            p.open(&rk, 500),
+            Some(Opened { from: None, route: None, answers: None, kind: 2, inner: b"anon".to_vec() })
+        );
         let bytes = Object::Payload(p.clone()).to_bytes();
         assert_eq!(Object::from_bytes(&bytes), Some(Object::Payload(p)));
         // Objects have ids; a malformed recipient key cannot be sealed to.
         assert_ne!(Object::id_of(&bytes), Object::id_of(&bytes[1..]));
         let mut bad = recipient.clone();
         bad.kyber.truncate(10);
-        assert!(Payload::seal(&bad, None, 0, b"", &[0u8; 32], [0u8; 12]).is_none());
+        assert!(Payload::seal(&bad, None, None, 0, b"", &[0u8; 32], [0u8; 12]).is_none());
     }
 
     #[test]

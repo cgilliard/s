@@ -2,7 +2,9 @@
 
 A note, 2026-11-02, on what the message layer of onion mode costs as the
 number of wallets online grows, what dominates it, and how to make an
-idle wallet nearly free. Not implemented yet. The design is in
+idle wallet nearly free. Changes 1 to 4 are done (2026-11-02, notes
+under each); 5, wallets reachable only when expecting a payment, is a
+matter for wallets and services, not the protocol. The design is in
 `docs/ONION.md`; `docs/PRIVACY.md` adds guards and outbound circuits,
 which this builds on.
 
@@ -62,17 +64,32 @@ one a circuit. From about 600 B/s a wallet to about 5: some hundred
 times less. It also ends the 30 s rhythm a hostile first hop and point
 could match (`docs/PRIVACY.md`).
 
+Done: `channel::KEEPALIVE` is 25 s; `onion::CIRCUIT_KEEPALIVE_SECS` is
+15 minutes, give or take a third, and a session held over a circuit
+lasts 45 minutes without one (`CIRCUIT_SESSION_TIMEOUT_SECS`), ending
+with its circuit in any case. Init mode keeps its 30 s keepalives: its
+sessions are over direct UDP to the seeds, whose NAT mapping they hold.
+A participant learns of a dead hop from the `Destroy` (17 to 20 s in the
+test with channels' test timings, `an_idle_participant_is_quiet_and_
+learns_of_a_dead_hop`, which also counts the frames it sends idle).
+
 **2. One standing session, not three.** A participant keeps a session at
 one of its three points, the first that is alive, rather than all three;
 senders already try the points in turn, and a lookup at one without the
 session costs a hop or two more. Three times fewer circuits, sessions and
 announces held, at the cost of a moment unreachable while that circuit is
 rebuilt. A dead hop is noticed when the relays' channel to it fails:
-within about 45 s on the side that sends the channel's keepalives (a
+within about 40 s on the side that sends the channel's keepalives (a
 frame unanswered for 15 s), within two minutes on the side that only
 listens (two minutes of silence), then rebuilt at once. Shortening the
 relays' own channel timeouts would bring that down, at a cost shared by
 every circuit over the channel.
+
+Done: `node/participant.rs`. The session is at the first of the three
+points; it moves to the next when that point fails twice running, a
+circuit failing as it reaches the point or the point refusing (a
+circuit failing at a hop on the way is not the point's doing). Outbound
+circuits still avoid all three points.
 
 **3. Announces on disk.** A point needs a session's announce only to
 answer lookups; it can keep it in its database rather than in memory,
@@ -80,11 +97,21 @@ with the circuit link and the sequence number in memory. The caps on
 sessions, hops and channels become settings, sized to the relay's
 memory, rather than constants.
 
+Done: `rendezvous::Announces`, an LMDB of the relay's own in
+`DATA/rendezvous`, apart from the chain's so a block being applied never
+holds up the network thread, emptied at start; `--max-sessions`,
+`--max-hops` and `--max-channels`.
+
 **4. Channels between relays on demand.** At a thousand relays each may
 hold a channel to every other; at a hundred thousand that is too many.
 Relays open a channel to another when a circuit or a rendezvous message
 needs it, as now, and close one idle for some minutes, as a participant's
 unused channels are closed.
+
+Done: `node/channels.rs`. A channel that carries no circuit, no
+question to another rendezvous point waits on, and has moved nothing
+but keepalives for five minutes is closed, at either end; it is opened
+again when next needed.
 
 **5. Reachable only when expecting to be paid.** A wallet that is only
 spending needs no session between payments, and one that receives can be

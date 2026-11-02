@@ -258,7 +258,9 @@ may share relays.
 
 **Standing circuits.** Building a circuit costs a round trip per hop, so
 none is built per payment. Each participant keeps a circuit to each of
-its three rendezvous points, through two relays chosen at random:
+its three rendezvous points, through two relays chosen at random (since
+`docs/SCALING.md`, to the first of them only, the first hop a guard, and
+its keepalive every 10 to 20 minutes):
 
 ```
 participant → r1 → r2 → rendezvous point
@@ -266,7 +268,12 @@ participant → r1 → r2 → rendezvous point
 
 Its keys are announced over the circuit, and the rendezvous point holds
 the session for its id over it, as a seed does over a direct connection
-in init mode. The same circuits carry what the participant sends:
+in init mode. What the participant sends goes another way since
+`docs/PRIVACY.md`, fixes 2 and 4: up an outbound circuit of its own, to
+a last relay that is none of its rendezvous points, which asks the
+recipient's points; the answer comes back along a return route down the
+same circuit, never through the sender's points. As first built, the
+same circuits carried what the participant sends:
 
 ```
 S → r1 → r2 → rend(S) → rend(R) → r3 → r4 → R

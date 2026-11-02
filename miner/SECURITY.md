@@ -308,11 +308,15 @@ more minutes and is then dropped, so a key taken later opens nothing
 older (forward secrecy within that window).
 
 **Payloads.** A payload is encapsulated to the recipient's announced
-Kyber key and sealed with ChaCha20-Poly1305, the ids, ciphertext and
-nonce as associated data. A sender that names itself puts its own
-announce inside and signs the whole, so the recipient knows who sent it
-and can answer forward-secretly; relays see neither the kind nor the
-content. A wallet answers a stage-1 slate automatically (see the gaps
+Kyber key and sealed with ChaCha20-Poly1305, the recipient's id, the
+ciphertext and the nonce as associated data: only the recipient's id is
+in the clear. In onion mode a payload names no sender: it carries,
+sealed, a return route (its circuit's last relay, a token that relay
+keeps for the circuit, and a Kyber key made for the one answer), and the
+answer, sealed to that key, comes back along it (`docs/PRIVACY.md`). In
+init mode a sender names itself: its announce and its signature over the
+whole go inside, so the recipient can answer it. Relays see neither the
+kind, nor the content, nor the sender. A wallet answers a stage-1 slate automatically (see the gaps
 below) and finalizes a stage-2 slate only from the id it sent the slate
 to.
 
@@ -349,21 +353,28 @@ passing the cell on (16 bytes of its keystream replace the tag, so the
 cell keeps its size, the client having computed every hop's tag ahead,
 as in Sphinx), and the cell for a hop carries an inner tag by which it
 knows its own; toward the client the originating hop's tag is checked
-by the client. Messages are padded to a power of two of cells.
-What each party learns:
+by the client. Messages are padded to a power of two of cells, and every
+message of a payment (a lookup and its answer, a payload, a notice, a
+transaction, a return route and an answer along it) to at least 16
+cells, about 14 KB, so that they all look alike (`docs/PRIVACY.md`).
+A participant's first hops are always one of three guards it keeps for
+one to two months, and its keepalives come at random intervals of 20 to
+40 s. What each party learns:
 
 - the first hop: the participant's network address, and that it keeps a
-  circuit, never its id;
+  circuit, never its id; a relay sees a given participant's address only
+  if it is one of that participant's guards;
 - a middle hop: its two neighbours;
 - a rendezvous point: the id whose session it holds (it must, to route
-  by it), and when messages for it come; for a payload it forwards, the
-  recipient's id and the relay it came from;
-- the recipient's rendezvous point: that the payload came from one of the
-  sender's rendezvous points, which narrows the sender to the ids that
-  relay serves, the cost of having no exits;
-- every relay: the number of cells, which says roughly how large a
-  message is: rounded up to a power of two of cells, a slate is one or
-  two, an announce eight.
+  by it), and when messages for it come; never what that id sends, which
+  goes up outbound circuits ending elsewhere;
+- the last relay of a sender's outbound circuit: the recipient's id, and
+  when and how much was sent; never the sender's id;
+- the recipient: nothing of the sender's, unless the sender names its
+  address in the slate;
+- every relay: the number of cells, which tells a keepalive from a
+  payment's message but not one payment message from another, nor
+  roughly how large it is, short of the rare one over 14 KB.
 
 **Gaps.** Known weaknesses, all in `docs/HARDENING.md`:
 

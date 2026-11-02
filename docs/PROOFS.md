@@ -2,7 +2,8 @@
 
 A design note, 2026-11-02: proving that you paid an address, or burned
 coins for someone, to anyone who holds the chain's headers. No consensus
-change is needed; it is wallet work. Not implemented yet.
+change is needed; it is wallet work. Implemented 2026-11-02
+(`miner/src/proofs.rs`, the wallet's `Payment`, `Chain::output_proof_at`).
 
 ## What exists
 
@@ -39,13 +40,16 @@ amount     its amount
 memo       its memo
 path       40 siblings from its leaf to the header's state root
 receipt    the recipient's Dilithium key and its signature over
-           H(commitment ‖ amount ‖ memo ‖ slate id ‖ sender's address)
+           H(commitment ‖ amount ‖ memo ‖ slate id ‖ sender)
            under the context "tab-receipt"
-sender     the sender's address, as the receipt names it
+sender     the sender's address, as the receipt names it, or for a sender
+           that did not name itself the secret whose hash the receipt
+           names (docs/PRIVACY.md, fix 4)
 slate id
 ```
 
 About 6.7 KB, most of it the receipt (a Dilithium key and signature).
+The exact layout is in `proofs.rs`.
 
 **Checking it**, with the chain's headers:
 
@@ -92,9 +96,23 @@ travels back in the answered slate; the sender checks it before
 finalizing and keeps it with the payment. The sender's address in it is
 the one the slate came from over the message layer, or the one the
 sender puts in a file slate. The receipt is part of the slate's format
-(the wallet's, not the chain's): an answered slate always carries one,
-and one without, or with a receipt that does not hold, is malformed and
-refused. There is nothing to be compatible with: the change ships before
+(the wallet's, not the chain's; `tabslt05`): a slate carries its sender
+from the start, an answered slate always carries a receipt, and one
+without, or with a receipt that does not hold, is malformed and refused.
+Over the message layer the sender refuses a receipt from another id than
+the one it sent to. A slate pays one recipient output, which the receipt
+is for.
+
+**Unnamed senders.** By default a slate does not name its sender
+(`docs/PRIVACY.md`, fix 4): the wallet draws a secret, keeps it with the
+payment, and the slate carries its hash where the address would be. The
+receipt binds that hash, and the payment proof carries the secret, which
+`verify-proof` checks against it: the proof then shows that the recipient
+acknowledged a payment from whoever holds the proof, without naming the
+sender to the recipient or to anyone. `send AMOUNT TO named` names the
+sender's address instead. The recipient cannot tell the two apart and
+does not check either: a sender naming someone else's address only
+credits that address with its own payment. There is nothing to be compatible with: the change ships before
 launch, with every test wallet and node started afresh.
 
 The receipt's message binds the output's commitment (so its key and
@@ -110,7 +128,7 @@ naming what it is for:
 ```
 key_hash  =  0
 memo      =  the first five elements of
-             H(beneficiary's address ‖ purpose ‖ nonce)
+             H(beneficiary's address ‖ nonce ‖ purpose)
 ```
 
 The memo is bound to the transaction by the validity proof and is in the
@@ -119,7 +137,7 @@ without it, whoever saw a burn's proof could present it as their own.
 Outputs with equal commitments are fine (the state spends by position).
 
 A proof of burn is a payment proof with `key_hash` zero and no receipt,
-and the memo's preimage (the beneficiary, the purpose and the nonce)
+and the memo's preimage (the beneficiary, the nonce and the purpose)
 instead: the verifier checks steps 1 to 3, that the key hash is zero, and
 that the memo is the hash of the preimage given. The transaction that
 made the burn need not be shown: it would only tell which outputs funded
@@ -131,17 +149,27 @@ checks.
 - **Receipts**: signed when answering a slate, checked when finalizing,
   kept with the payment.
 - **Making proofs**: when `sync_wallet` finds a payment's (or a burn's)
-  output in a newly applied block, the wallet asks the chain for the
-  path at that block and keeps it with the payment. The chain needs one
-  function, `output_proof_at(position, height)`: the path against the
-  state after block `height`, rebuilt from the undo records, for any
-  block of the undo window.
-- **Commands**: `payment-proof TXID [FILE]` prints (or writes) a
-  payment's proof; `burn AMOUNT TAG` burns (an output to key hash zero,
-  the memo from the tag), and `burn-proof TXID [FILE]` prints its proof;
-  `verify-proof [FILE]` checks a proof, pasted or from a file, against
+  output in a newly applied block (by commitment and memo: burns of one
+  amount share a commitment), the wallet asks the chain for the path at
+  that block and keeps it with the payment (`Wallet::land_payments`,
+  `set_payment_path`). `Chain::output_proof_at(position, height)` gives
+  the path against the state after block `height`: the leaves of the
+  output's snapshot part as they stood then (the part as fast sync
+  serves it, from the spent log), then the block's manifest's part roots
+  up to the state root. A reorganization that moves the output lands it
+  again, and the path is remade. A cancelled payment's record goes.
+- **Commands**: `payments` lists them, where they landed and whether
+  the proof is ready; `payment-proof TXID [FILE]` prints (or writes) a
+  payment's proof, making it then if it can; `burn AMOUNT PURPOSE [FOR]
+  [FEE]` burns for FOR (an address or `@NAME`, this wallet's by
+  default), and `burn-proof TXID [FILE]` gives its proof; `verify-proof
+  [FILE]` checks a proof, pasted at the prompt or from a file, against
   the node's headers and says what it shows: the amount, the addresses
-  (or the beneficiary), the block and its confirmations.
+  (or the beneficiary and purpose), the block and its confirmations.
+
+A burn's memo is the first five elements of a Poseidon2 hash (domain 22)
+of the beneficiary's id, a random 32-byte nonce and the purpose (up to
+255 bytes), three bytes to an element.
 
 ## The text form
 
@@ -173,20 +201,22 @@ Settled on 2026-11-02.
 - **A proof is meant to be shown**: it reveals the amount, both addresses
   and the block to whoever sees it, which is its purpose.
 
-## Implementation order
+## Tests
 
-1. `Chain::output_proof_at(position, height)` over the undo window, and
-   its test against `output_proof` at the tip and against a block a few
-   back.
-2. The receipt in the slate: signed, checked, kept; a slate without one
-   refused.
-3. Proofs made when a payment confirms, kept with it.
-4. The proof's bytes and its text form, `payment-proof` and
-   `verify-proof` (with its confirmations).
-5. Burns: `burn`, `burn-proof`, and their check in `verify-proof`.
-6. Tests: a proof verifies against its header and fails against any
-   other; a changed amount, memo, position or sender fails; a receipt
-   from another address fails; a proof against a later header than the
-   creation height is refused; a burn's proof verifies and its output
-   cannot be spent.
-7. Docs: the README's wallet section.
+- `chain::tests::output_proofs_at_earlier_blocks`: at the tip the path is
+  `output_proof`'s; after an earlier block, outputs spent since are
+  proven present, outputs made since absent, against that block's root
+  only.
+- `node::tests::payment_and_burn_proofs_verify_against_their_block`: a
+  payment by slates and a burn, landed in blocks, their paths made as the
+  wallet syncs; each proof verifies against its block and fails against
+  another, or with a changed amount, memo, position, sender, receipt key
+  or beneficiary, or against a later block than its own; the text form
+  round-trips through surrounding text; an answered slate without a
+  receipt is malformed, and one with a tampered receipt or another
+  sender is refused.
+- `proofs::tests`: base64, and burn memos binding beneficiary, nonce and
+  purpose.
+
+A burn output cannot be spent because no key hashes to zero; there is no
+test that tries.

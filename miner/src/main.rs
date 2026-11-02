@@ -97,6 +97,9 @@ options:
                     this node's `relay` line for consensus.txt at startup. The
                     relay's key is derived from the wallet's phrase, apart from
                     the wallet's own address
+  --max-sessions N  a relay's caps, sized to its memory (docs/SCALING.md):
+  --max-hops N      sessions it holds (10000), circuit hops through it (16384)
+  --max-channels N  and channels open at once (4096)
   --no-wallet       run without a wallet (implies --no-mine): no payments, no
                     names, no part in the message layer but as a relay. With
                     --relay the wallet's phrase is still kept, for the relay key
@@ -128,11 +131,15 @@ const HELP: &str = "commands:
   mempool                   pooled transactions
   balance                   confirmed, pending, reserved and locked funds
   outputs                   the wallet's outputs
-  send AMOUNT [FEE] TO      start a payment: TO is a file to write the slate to for
+  send AMOUNT [FEE] TO [named]
+                            start a payment: TO is a file to write the slate to for
                             the recipient, or a tab1… address or @NAME to send it to
                             over the message layer, where the recipient's wallet
                             answers it and this one finalizes it, if both are online
-                            (the fee defaults to the smallest the pool takes)
+                            (the fee defaults to the smallest the pool takes); the
+                            recipient learns nothing of the sender unless it adds
+                            `named`, which puts this wallet's address in the slate
+                            and so in the receipt
   receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
   cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
@@ -140,6 +147,19 @@ const HELP: &str = "commands:
                             (FEE defaults to the smallest the network accepts)
   slates                    pending slates
   sent                      unconfirmed payments that can be cancelled
+  payments                  payments and burns made, where they landed, and whether
+                            their proofs are ready
+  payment-proof TXID [FILE] a payment's proof (docs/PROOFS.md): the block that made the
+                            recipient's output, its path there, and the recipient's
+                            receipt; printed as text to paste, or written to FILE
+  burn AMOUNT PURPOSE [FOR] [FEE]
+                            burn AMOUNT: an output nobody can spend, whose memo names
+                            FOR (a tab1… address or @NAME, default this wallet) and
+                            PURPOSE (one word, up to 255 bytes)
+  burn-proof TXID [FILE]    a burn's proof, as payment-proof
+  verify-proof [FILE]       check a payment proof or proof of burn, from FILE or pasted
+                            at the prompt, against this node's chain: what it shows,
+                            and its block's confirmations
   scan                      find this wallet's outputs and names on chain (after a restore)
   prune                     forget unspent outputs the chain does not hold, and name
                             commits that never reached it
@@ -170,6 +190,11 @@ const HELP: &str = "commands:
                             hash (HEIGHT levels, 16 by default, 20 at most)
   address                   this wallet's tab1… address (the hash of its Dilithium key)
                             and, on a relay, the relay's id: a different one
+  address next              move to a new address (docs/PRIVACY.md): sessions open at
+                            its rendezvous points, then the old address's close, and
+                            it answers nothing again; a restore starts on a new one
+  address off               close the address's sessions: the wallet can pay but
+                            nobody can reach it, until address next
   phrase                    show the wallet's 12-word recovery phrase
   storage                   disk use of the chain database, part by part
   quit                      stop the node
@@ -205,6 +230,10 @@ struct Args {
     no_seeds: bool,
     /// Relay for others on the message layer (`docs/ONION.md`).
     relay: bool,
+    /// A relay's caps (`docs/SCALING.md`).
+    max_sessions: usize,
+    max_hops: usize,
+    max_channels: usize,
     /// Run without a wallet; implies `no_mine`.
     no_wallet: bool,
     debug_unchecked: bool,
@@ -238,6 +267,9 @@ fn parse_args() -> Result<Args, String> {
         max_undo: DEFAULT_MAX_UNDO,
         no_seeds: false,
         relay: false,
+        max_sessions: tabminer::node::MAX_SESSIONS,
+        max_hops: tabminer::node::MAX_HOPS,
+        max_channels: tabminer::node::MAX_CHANNELS,
         no_wallet: false,
         debug_unchecked: false,
         debug_fill: None,
@@ -264,6 +296,9 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,
             "--relay" => a.relay = true,
+            "--max-sessions" => a.max_sessions = number(value()?)?.max(1) as usize,
+            "--max-hops" => a.max_hops = number(value()?)?.max(1) as usize,
+            "--max-channels" => a.max_channels = number(value()?)?.max(1) as usize,
             // No wallet, so no reward to pay: never mining.
             "--no-wallet" => {
                 a.no_wallet = true;
@@ -390,7 +425,11 @@ fn net_config(args: &Args) -> Config {
         verbose: args.verbose,
         relay: args.relay,
         identity: None,
+        wallet: false,
         relay_key: None,
+        max_sessions: args.max_sessions,
+        max_hops: args.max_hops,
+        max_channels: args.max_channels,
         sync_point: (args.sync_point > 0).then_some(args.sync_point),
     }
 }
@@ -585,7 +624,8 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     config.relay_key = opened.as_ref().filter(|_| args.relay).map(|w| w.relay_key());
     let relay_address = config.relay_id().map(|id| tabminer::address::encode(&id));
     let wallet = if args.no_wallet { None } else { opened.map(Arc::new) };
-    config.identity = wallet.as_ref().map(|w| w.identity_key());
+    config.identity = wallet.as_ref().filter(|w| !w.address_off()).map(|w| w.identity_key());
+    config.wallet = wallet.is_some();
     let (mut node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), config)?;
     let notes = node.take_notes();
     let stats = node.stats();
@@ -818,6 +858,11 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         match chain.main_outputs(height)? {
             Some((_, first, outputs)) => {
                 ctx.wallet()?.locate(first, &outputs)?;
+                for p in ctx.wallet()?.land_payments(height, first, &outputs)? {
+                    if let Err(e) = make_payment_path(ctx, &p) {
+                        log::line(&format!("wallet: no proof yet for {}: {e}", short(&p.txid)));
+                    }
+                }
             }
             None => gap = true,
         }
@@ -831,6 +876,75 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
     let rtxn = chain.env().read_txn()?;
     ctx.wallet()?.sync_names(chain.names(), &rtxn)?;
     Ok(())
+}
+
+/// Makes and keeps the path of a payment's (or burn's) output against the
+/// block it landed in (`docs/PROOFS.md`): possible while that block is in
+/// the undo window.
+fn make_payment_path(ctx: &Ctx, p: &tabminer::wallet::Payment) -> AnyResult<()> {
+    let (height, position) = p.landed.ok_or("not yet in a block")?;
+    let (header, _, path) = ctx
+        .chain
+        .output_proof_at(position, height)?
+        .ok_or("its block has left this node's undo window: an archive node (--max-undo-blocks 0) can still make it")?;
+    ctx.wallet()?.set_payment_path(&p.txid, height, position, path, &header.state_root)?;
+    Ok(())
+}
+
+/// The payment (or burn, with `burn`) whose txid starts with `prefix`, with
+/// its proof made now if it was not.
+fn payment_by_prefix(ctx: &Ctx, prefix: &str, burn: bool) -> AnyResult<tabminer::proofs::Proof> {
+    let what = if burn { "burn" } else { "payment" };
+    let matches: Vec<_> = ctx
+        .wallet()?
+        .payments()?
+        .into_iter()
+        .filter(|p| p.is_burn() == burn && hex_digest(&p.txid).starts_with(prefix))
+        .collect();
+    let p = match &matches[..] {
+        [p] => p.clone(),
+        [] => return Err(format!("no {what} with a txid starting {prefix}").into()),
+        _ => return Err(format!("{} {what}s have txids starting {prefix}: give more digits", matches.len()).into()),
+    };
+    if let Some(proof) = p.proof() {
+        return Ok(proof);
+    }
+    if p.landed.is_none() {
+        return Err(format!("the {what} is not in a block yet").into());
+    }
+    make_payment_path(ctx, &p)?;
+    let p = ctx.wallet()?.payments()?.into_iter().find(|q| q.txid == p.txid).ok_or("payment gone")?;
+    Ok(p.proof().ok_or("no proof")?)
+}
+
+/// What a proof that holds shows, with its block's confirmations; or why
+/// it does not hold.
+fn check_proof(ctx: &Ctx, proof: &tabminer::proofs::Proof) -> AnyResult<String> {
+    use tabminer::proofs::Claim;
+    let tip = ctx.chain.tip()?.ok_or("no genesis")?;
+    let header = ctx
+        .chain
+        .header_at(proof.height)?
+        .ok_or_else(|| format!("block {} is not on this node's main chain (is it synced?)", proof.height))?;
+    proof.check(&header.state_root).map_err(|e| format!("the proof does not hold: {e}"))?;
+    let confirmations = tip.height - proof.height + 1;
+    let block = format!("in block {} ({}), {confirmations} confirmations", proof.height, short(&header.hash()));
+    let amount = fmt_coins(proof.amount as u128);
+    Ok(match &proof.claim {
+        Claim::Payment { sender, secret, receipt, .. } => format!(
+            "payment proof holds: {amount} coins from {} to {}, {block}",
+            match secret {
+                None => tabminer::address::encode(sender),
+                Some(_) => "an unnamed sender (whoever shows this proof holds its secret)".to_string(),
+            },
+            tabminer::address::encode(&receipt.recipient())
+        ),
+        Claim::Burn(b) => format!(
+            "proof of burn holds: {amount} coins burned for {}, purpose \"{}\", {block}",
+            tabminer::address::encode(&b.beneficiary),
+            String::from_utf8_lossy(&b.purpose)
+        ),
+    })
 }
 
 /// A 32-byte value from 64 hex digits, or zeros when absent.
@@ -878,6 +992,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             | "cancel"
             | "sent"
             | "prune"
+            | "payments"
+            | "payment-proof"
+            | "burn"
+            | "burn-proof"
             | "names"
             | "name-commit"
             | "name-reveal"
@@ -1065,10 +1183,45 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("leaf {index}  {}", hex(&value));
             println!("root     {}  (in the headers mined from now on)", hex(&root));
         }
+        "address" if !args.is_empty() => {
+            let w = ctx.wallet.as_ref().ok_or("this node runs with --no-wallet")?;
+            let old = w.id();
+            match args {
+                ["next"] => {
+                    let key = w.next_address()?;
+                    ctx.events.send(Event::Identity(Some(key))).map_err(|_| "the node has stopped")?;
+                    println!("new address {}", w.address());
+                    println!("the old one answers nothing from now on; payments under way are unaffected");
+                }
+                ["off"] => {
+                    if w.address_off() {
+                        return Err("the address is already off".into());
+                    }
+                    w.turn_address_off()?;
+                    ctx.events.send(Event::Identity(None)).map_err(|_| "the node has stopped")?;
+                    println!("address off: nobody can reach this wallet, though it can still pay;");
+                    println!("address next brings it back under a new address");
+                }
+                _ => return Err("usage: address [next|off]".into()),
+            }
+            // Names pointing at the old address need to follow.
+            for n in w.owned_names()?.into_iter().filter(|n| n.value == old) {
+                println!(
+                    "{} points at the old address: name-update {} {} to follow",
+                    String::from_utf8_lossy(&n.name),
+                    String::from_utf8_lossy(&n.name),
+                    if w.address_off() { "NEW-ADDRESS".to_string() } else { w.address() }
+                );
+            }
+        }
         "address" => {
             if let Some(w) = &ctx.wallet {
-                println!("{}", w.address());
-                println!("id {}", hex_digest(&w.id()));
+                if w.address_off() {
+                    println!("off (address next for a new one; the last was {})", w.address());
+                } else {
+                    println!("{}", w.address());
+                    println!("id {}", hex_digest(&w.id()));
+                }
             }
             if let Some(relay) = &ctx.relay_address {
                 println!("relay {relay}  (the id this node is listed under in consensus.txt; not for payments)");
@@ -1220,15 +1373,19 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
         }
         "send" => {
+            let (args, named) = match args {
+                [rest @ .., "named"] => (rest, true),
+                _ => (args, false),
+            };
             let (amount, fee, file) = match args {
                 [amount, file] => (*amount, None, *file),
                 [amount, fee, file] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *file),
-                _ => return Err("usage: send AMOUNT [FEE] FILE|ADDRESS|@NAME".into()),
+                _ => return Err("usage: send AMOUNT [FEE] FILE|ADDRESS|@NAME [named]".into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
             let to = recipient(ctx, file)?;
             let rtxn = ctx.chain.env().read_txn()?;
-            let slate = ctx.wallet()?.send(amount, fee, ctx.chain.utxo(), &rtxn)?;
+            let slate = ctx.wallet()?.send(amount, fee, named, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             if let Some(to) = to {
                 ctx.outgoing.lock().unwrap().insert(slate.id, to);
@@ -1238,6 +1395,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     kind: onion::KIND_SLATE,
                     inner: slate.to_bytes(),
                     recipient: None,
+                    reply: None,
                 };
                 if ctx.events.send(Event::Send(out)).is_err() {
                     ctx.wallet()?.cancel_slate(&slate.id)?;
@@ -1290,6 +1448,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             };
             let slate = read_slate(file)?;
             let signed = ctx.wallet()?.finalize(&slate)?;
+            // A file slate's recipient is whoever signed its receipt.
+            if let Some(r) = &slate.receipt {
+                println!(
+                    "paying {} coins to {} (its receipt is kept for payment-proof)",
+                    fmt_coins(slate.amount as u128),
+                    tabminer::address::encode(&r.recipient())
+                );
+            }
             submit(ctx, signed);
         }
         "cancel" => {
@@ -1336,6 +1502,100 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     fmt_coins(Wallet::min_replacement_fee(&s) as u128)
                 );
             }
+        }
+        "payments" => {
+            let tip = ctx.chain.tip()?.map_or(0, |t| t.height);
+            let payments = ctx.wallet()?.payments()?;
+            if payments.is_empty() {
+                println!("no payments or burns");
+            }
+            for p in payments {
+                let what = match &p.claim {
+                    tabminer::proofs::Claim::Payment { receipt, .. } => {
+                        format!("to {}", tabminer::address::encode(&receipt.recipient()))
+                    }
+                    tabminer::proofs::Claim::Burn(b) => {
+                        format!(
+                            "burned for {} ({})",
+                            tabminer::address::encode(&b.beneficiary),
+                            String::from_utf8_lossy(&b.purpose)
+                        )
+                    }
+                };
+                let status = match (p.landed, &p.path) {
+                    (None, _) => "not in a block yet".to_string(),
+                    (Some((h, _)), Some(_)) => {
+                        format!("block {h}, {} confirmations, proof ready", tip.saturating_sub(h) + 1)
+                    }
+                    (Some((h, _)), None) => format!("block {h}, no proof (its block left the undo window)"),
+                };
+                println!("{}  {}  {what}  {status}", hex_digest(&p.txid), fmt_coins(p.output.amount as u128));
+            }
+        }
+        "payment-proof" | "burn-proof" => {
+            let (prefix, file) = match args {
+                [prefix] => (*prefix, None),
+                [prefix, file] => (*prefix, Some(*file)),
+                _ => return Err(format!("usage: {cmd} TXID [FILE]").into()),
+            };
+            let proof = payment_by_prefix(ctx, prefix, cmd == "burn-proof")?;
+            let text = proof.to_text();
+            match file {
+                Some(f) => {
+                    std::fs::write(f, &text)?;
+                    println!("proof written to {f}: {}", check_proof(ctx, &proof)?);
+                }
+                None => print!("{text}"),
+            }
+        }
+        "burn" => {
+            let (amount, purpose, rest) = match args {
+                [amount, purpose, rest @ ..] if rest.len() <= 2 => (*amount, *purpose, rest),
+                _ => return Err("usage: burn AMOUNT PURPOSE [FOR] [FEE]".into()),
+            };
+            let amount = parse_coins(amount).ok_or("bad amount")?;
+            let (beneficiary, fee) = match rest {
+                [] => (ctx.wallet()?.id(), None),
+                [one] => match recipient(ctx, one)? {
+                    Some(id) => (id, None),
+                    None => (ctx.wallet()?.id(), Some(parse_coins(one).ok_or("FOR is a tab1… address or @NAME")?)),
+                },
+                [who, fee] => (
+                    recipient(ctx, who)?.ok_or("FOR is a tab1… address or @NAME")?,
+                    Some(parse_coins(fee).ok_or("bad fee")?),
+                ),
+                _ => unreachable!(),
+            };
+            let rtxn = ctx.chain.env().read_txn()?;
+            let signed = ctx.wallet()?.burn(amount, &beneficiary, purpose.as_bytes(), fee, ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            println!(
+                "burning {} coins for {} (transaction {}); burn-proof {} once it is in a block",
+                fmt_coins(amount as u128),
+                tabminer::address::encode(&beneficiary),
+                short(&signed.tx.txid()),
+                &hex_digest(&signed.tx.txid())[..16]
+            );
+            submit(ctx, signed);
+        }
+        "verify-proof" => {
+            let text = match args {
+                [file] => std::fs::read_to_string(file)?,
+                [] => {
+                    println!("paste the proof; it ends at its END line");
+                    let mut text = String::new();
+                    let stdin = std::io::stdin();
+                    while !tabminer::proofs::Proof::text_ends(&text) {
+                        if stdin.lock().read_line(&mut text)? == 0 {
+                            break;
+                        }
+                    }
+                    text
+                }
+                _ => return Err("usage: verify-proof [FILE]".into()),
+            };
+            let proof = tabminer::proofs::Proof::from_text(&text).ok_or("no proof between BEGIN and END markers")?;
+            println!("{}", check_proof(ctx, &proof)?);
         }
         "scan" => {
             let rtxn = ctx.chain.env().read_txn()?;
@@ -1687,24 +1947,49 @@ fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
     if opened.kind != onion::KIND_SLATE {
         return Err(format!("a message of unknown kind {}", opened.kind).into());
     }
-    let from = opened.from.ok_or("a slate from someone unnamed, which cannot be answered")?;
-    let who = tabminer::address::encode(&from.id);
+    // Who it is from, if anyone: a sender that named itself (init mode), or
+    // the id we sent the payload this answers to.
+    let from = opened.answers.or(opened.from.as_ref().map(|a| a.id));
+    let who = from.map_or("an unnamed sender".to_string(), |id| tabminer::address::encode(&id));
     let slate = Slate::from_bytes(&opened.inner).ok_or("a malformed slate")?;
     let id = slate.id;
-    // Answering creates an output: a flood of slates is refused.
-    if slate.stage == 1 && !ctx.slates.lock().unwrap().allow(&from.id, Instant::now()) {
+    if slate.stage == 1 && opened.route.is_none() && opened.from.is_none() {
+        return Err("a slate with no way to answer it".into());
+    }
+    // Answering creates an output: a flood of slates is refused. An
+    // unnamed sender is counted by its route, so only the total binds.
+    let key = match (&opened.from, &opened.route) {
+        (Some(a), _) => a.id,
+        (None, Some(r)) => r.reply_id(),
+        (None, None) => onion::NOBODY,
+    };
+    if slate.stage == 1 && !ctx.slates.lock().unwrap().allow(&key, Instant::now()) {
         return Err(format!("too many slates from {who} lately; ignored").into());
     }
     let sent_to = ctx.outgoing.lock().unwrap().get(&id).copied();
     sync_wallet(ctx)?;
-    match ctx.wallet()?.take_slate(&opened.inner, &from.id, sent_to.as_ref())? {
+    match ctx.wallet()?.take_slate(&opened.inner, from.as_ref(), sent_to.as_ref())? {
         Incoming::Answered(slate) => {
-            let out = Outbound {
-                tag: 0,
-                to: from.id,
-                kind: onion::KIND_SLATE,
-                inner: slate.to_bytes(),
-                recipient: Some(from),
+            // Back along the payload's own path when it gave one
+            // (docs/PRIVACY.md, fix 4); to the named sender otherwise.
+            let out = match (opened.route, opened.from) {
+                (Some(route), _) => Outbound {
+                    tag: 0,
+                    to: route.reply_id(),
+                    kind: onion::KIND_SLATE,
+                    inner: slate.to_bytes(),
+                    recipient: None,
+                    reply: Some(route),
+                },
+                (None, Some(a)) => Outbound {
+                    tag: 0,
+                    to: a.id,
+                    kind: onion::KIND_SLATE,
+                    inner: slate.to_bytes(),
+                    recipient: Some(a),
+                    reply: None,
+                },
+                (None, None) => unreachable!(),
             };
             ctx.events.send(Event::Send(out)).map_err(|_| "the node has stopped")?;
             say(

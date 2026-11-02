@@ -29,7 +29,7 @@ const HANDSHAKE_RETRY: Duration = Duration::from_secs(1);
 const HANDSHAKE_TRIES: u32 = 8;
 /// An opening waits this long for the relay to answer our ping first.
 const PING_WAIT: Duration = Duration::from_secs(10);
-/// Channels held at once, either end.
+/// Channels held at once, either end, by default (`--max-channels`).
 pub const MAX_CHANNELS: usize = 4096;
 /// Handshake messages being reassembled at once, and for how long.
 const MAX_REASSEMBLY: usize = 1024;
@@ -47,6 +47,15 @@ const UNUSED_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const UNUSED_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A channel that carries no circuit and has moved nothing but keepalives
+/// for this long is closed (`docs/SCALING.md`): channels between relays
+/// are opened when a circuit or a rendezvous message needs one, so a
+/// relay among many does not hold one to every other.
+#[cfg(not(test))]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+
 const STAGE_HELLO: u8 = 1;
 const STAGE_REPLY: u8 = 2;
 const STAGE_AUTH: u8 = 3;
@@ -63,6 +72,8 @@ struct Open {
     opened: Instant,
     /// A frame has come.
     used: bool,
+    /// A body last went either way.
+    last_used: Instant,
 }
 
 /// A channel we are opening.
@@ -92,6 +103,8 @@ pub(super) struct Channels {
     fragments: HashMap<(SocketAddr, u64, u8), Fragments>,
     /// Our channel to each relay, by its id.
     to: HashMap<Digest, (SocketAddr, u64)>,
+    /// When idle channels were last looked for.
+    idle_check: Option<Instant>,
     /// Tests: what the channels delivered, with the other end's address
     /// and proven id.
     #[cfg(test)]
@@ -141,7 +154,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Opens a channel to the relay `id` at `addr`, or finds the one open
     /// or opening, and returns its key. A relay's channel to a relay is
     /// mutual: it authenticates too.
-    pub(super) fn channel_to(&mut self, addr: SocketAddr, id: Digest, now: Instant) -> std::io::Result<(SocketAddr, u64)> {
+    pub(super) fn channel_to(
+        &mut self,
+        addr: SocketAddr,
+        id: Digest,
+        now: Instant,
+    ) -> std::io::Result<(SocketAddr, u64)> {
         if let Some(key) = self.channels.to.get(&id)
             && (self.channels.open.contains_key(key) || self.channels.pending.contains_key(key))
         {
@@ -160,7 +178,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Sends `body` on a channel, or holds it until the channel is open.
-    pub(super) fn channel_send(&mut self, key: (SocketAddr, u64), body: &[u8], now: Instant) -> Result<(), ChannelError> {
+    pub(super) fn channel_send(
+        &mut self,
+        key: (SocketAddr, u64),
+        body: &[u8],
+        now: Instant,
+    ) -> Result<(), ChannelError> {
         if let Some(p) = self.channels.pending.get_mut(&key) {
             if p.waiting.len() >= MAX_WAITING {
                 return Err(ChannelError::Full);
@@ -169,12 +192,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Ok(());
         }
         let o = self.channels.open.get_mut(&key).ok_or(ChannelError::Dead)?;
+        o.last_used = now;
         let frames = o.ch.send(body, now)?;
         self.send_frames(key.0, frames);
         Ok(())
     }
 
     fn send_frames(&self, addr: SocketAddr, frames: Vec<Frame>) {
+        #[cfg(test)]
+        self.frames_sent.fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
         for f in frames {
             self.send(addr, &Message::Frame(f));
         }
@@ -201,7 +227,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     pub(super) fn poll_channels(&mut self, now: Instant) {
         let mut failed = Vec::new();
         for (key, p) in &self.channels.pending {
-            let waited = if self.peers.handshaken(&key.0) { p.tries >= HANDSHAKE_TRIES } else { now.duration_since(p.started) >= PING_WAIT };
+            let waited = if self.peers.handshaken(&key.0) {
+                p.tries >= HANDSHAKE_TRIES
+            } else {
+                now.duration_since(p.started) >= PING_WAIT
+            };
             if waited && p.sent.is_none_or(|t| now.duration_since(t) >= HANDSHAKE_RETRY) {
                 failed.push(*key);
             }
@@ -222,9 +252,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.pump_pending(key, now);
         }
         let mut dead = Vec::new();
+        // Idle channels, looked for once a second.
+        if self.channels.idle_check.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            self.channels.idle_check = Some(now);
+            let busy = self.channels_in_use();
+            for (key, o) in &self.channels.open {
+                if now.duration_since(o.last_used) >= IDLE_TIMEOUT && !busy.contains(key) {
+                    dead.push((*key, ChannelError::Idle));
+                }
+            }
+        }
         let mut out = Vec::new();
         let mut auths = Vec::new();
         for (key, o) in self.channels.open.iter_mut() {
+            if dead.iter().any(|(k, _)| k == key) {
+                continue;
+            }
             if !o.ch.initiator && !o.used && now.duration_since(o.opened) >= UNUSED_TIMEOUT {
                 dead.push((*key, ChannelError::Dead));
                 continue;
@@ -252,6 +295,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let o = self.channels.open.remove(&key).unwrap();
             self.channels.to.retain(|_, k| *k != key);
             if o.ch.initiator
+                && e != ChannelError::Idle
                 && let Some(id) = o.ch.peer
             {
                 self.avoid_relay(id, now);
@@ -311,12 +355,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 return;
             }
         }
-        let f = self.channels.fragments.entry(fkey).or_insert_with(|| Fragments { parts: vec![None; count as usize], at: now });
+        let f = self
+            .channels
+            .fragments
+            .entry(fkey)
+            .or_insert_with(|| Fragments { parts: vec![None; count as usize], at: now });
         f.parts[index as usize] = Some(data);
         if f.parts.iter().any(|p| p.is_none()) {
             return;
         }
-        let msg: Vec<u8> = self.channels.fragments.remove(&fkey).unwrap().parts.into_iter().flatten().flatten().collect();
+        let msg: Vec<u8> =
+            self.channels.fragments.remove(&fkey).unwrap().parts.into_iter().flatten().flatten().collect();
         match stage {
             STAGE_HELLO => self.on_hello(addr, chan, &msg, back, now),
             STAGE_REPLY => self.on_reply(addr, chan, &msg, back, now),
@@ -325,8 +374,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn on_hello(&mut self, addr: SocketAddr, chan: u64, hello: &[u8], back: u64, now: Instant) {
-        if self.channels.open.len() >= MAX_CHANNELS {
-            self.chatter(&format!("channel: refusing {addr}: {MAX_CHANNELS} channels open"));
+        if self.channels.open.len() >= self.config.max_channels {
+            self.chatter(&format!("channel: refusing {addr}: {} channels open", self.config.max_channels));
             return;
         }
         if self.channels.open.keys().filter(|k| k.0.ip() == addr.ip()).count() >= MAX_PER_HOST {
@@ -344,7 +393,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 for m in fragments(chan, STAGE_REPLY, &reply, self.token_for(&addr)) {
                     self.send_with(addr, m, back);
                 }
-                self.channels.open.insert((addr, chan), Open { ch, back, reply: Some(reply), auth: None, opened: now, used: false });
+                self.channels.open.insert(
+                    (addr, chan),
+                    Open { ch, back, reply: Some(reply), auth: None, opened: now, used: false, last_used: now },
+                );
                 self.chatter(&format!(
                     "channel: {chan:016x} from {addr} open{}",
                     if mutual { ", waiting for its auth" } else { "" }
@@ -369,7 +421,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     (a, now)
                 });
                 let mutual = auth.is_some();
-                self.channels.open.insert(key, Open { ch, back, reply: None, auth, opened: now, used: true });
+                self.channels
+                    .open
+                    .insert(key, Open { ch, back, reply: None, auth, opened: now, used: true, last_used: now });
                 // Something for the relay to acknowledge once it has our
                 // auth, which ends its resending.
                 if mutual {
@@ -419,6 +473,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A body a channel delivered, in order: a cell of a circuit.
     fn on_channel_body(&mut self, key: (SocketAddr, u64), peer: Option<Digest>, body: Vec<u8>, now: Instant) {
+        if let Some(o) = self.channels.open.get_mut(&key) {
+            o.last_used = now;
+        }
         if let Some(cell) = crate::circuit::Cell::from_bytes(&body) {
             return self.on_cell(key, peer, cell, now);
         }

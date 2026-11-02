@@ -2,7 +2,8 @@
 
 A note, 2026-11-02, on what the relays of onion mode, and a payment's
 recipient, learn about who pays whom: two leaks found in what was built,
-their fixes, and what else would make a payer harder to follow. Not fixed yet.
+their fixes, and what else would make a payer harder to follow. All six
+fixes are done (2026-11-02, below).
 The design is in `docs/ONION.md`; its cryptography and remaining gaps are
 in `miner/SECURITY.md` and `docs/HARDENING.md`.
 
@@ -56,6 +57,8 @@ a thousand. The guard against it is the list itself: the relays in
 
 ## Fix 1: the sender inside the encryption
 
+Done (2026-11-02): `onion.rs`, `Payload`.
+
 The payload's wire form keeps only what routing needs in the clear:
 
 ```
@@ -74,6 +77,14 @@ the announce inside. A relay then sees whom a payload is for, never whom
 it is from.
 
 ## Fix 2: an outbound circuit
+
+Done (2026-11-02): `node/participant.rs`, `Out`. One circuit is kept
+ready beyond those sends are waiting for, at most eight at once, and a
+ready one unused for ten minutes is replaced. With too few relays listed
+for a last hop that is none of the participant's points (three relays,
+as on a test network, are everyone's points), one of them ends the
+circuit, and the node says so once in its log: the circuit is still the
+payment's own, but its end knows the sender's id.
 
 A participant sends over circuits that carry no session of its own: two
 random hops and a random last relay that is none of its rendezvous
@@ -97,6 +108,13 @@ and a thousand relays, about a tenth of a handshake a second per relay.
 
 ## Fix 3: guards and jittered keepalives
 
+Done (2026-11-02): `node/participant.rs`. Three guards, each kept 30 to
+60 days, in the file `guards` beside the peers file in the data
+directory; a guard that leaves the list or whose time is up is replaced,
+one whose channel failed is passed over for five minutes like any relay,
+and a circuit whose last hop is the only guard left starts at any relay.
+Keepalives, in onion and init mode, come every 20 to 40 s at random.
+
 These are timing, not leaks of the same kind, but go with them.
 
 - **Guards.** A participant's first hops are random and change with every
@@ -111,6 +129,19 @@ These are timing, not leaks of the same kind, but go with them.
   Its interval is drawn at random between 20 and 40 s.
 
 ## Fix 4: answers back along the payment's own path
+
+Done (2026-11-02): `Route` and `Reply` (`circuit.rs`,
+`node/rendezvous.rs`), `onion::Route` in the payload,
+`node/participant.rs`. The sender holds its outbound circuit open a
+minute for the answer. In init mode, which has no circuits, payloads
+still name their sender and answers go to its id. A slate names the
+sender only with `send … named`; otherwise the wallet keeps a secret and
+the slate carries its hash, which the receipt binds (`docs/PROOFS.md`).
+The recipient does not check what a slate names: a sender that names
+another's address only credits that address with its own payment.
+Unnamed slates are counted against the 60 a wallet answers in ten
+minutes in all, not per sender, since nothing tells two unnamed senders
+apart.
 
 The recipient answers a slate today by sending it to the sender's id:
 its rendezvous points route the answer, and the sender's announce
@@ -157,6 +188,16 @@ by showing the secret.
 
 ## Fix 5: a next address
 
+Done (2026-11-02): `Wallet::next_address` and `turn_address_off`, the
+node's `Event::Identity`, `address next` and `address off` at the prompt.
+On a new address every standing circuit is replaced, even one to a point
+the new address shares with the old, so that no point sees a circuit
+move from one id to the other; the old circuits close once the new
+sessions are live, or after 30 s. While the address is off a node in
+onion mode still sends and broadcasts, naming no one; in init mode it
+cannot send, since init mode names the sender. A pending slate keeps the
+sender it named, so a payment under way finishes across the change.
+
 A wallet's address is the hash of a Dilithium key derived from its
 phrase, the same for good, so whoever is paid at it, or pays it, can
 link every payment to it. A wallet gets a new one at will:
@@ -190,6 +231,10 @@ abandoned, never reused, so a restored wallet starts from a fresh one
 The relay's key (`Wallet::relay_key`) is apart from all of this.
 
 ## Fix 6: one size for every message of a payment
+
+Done (2026-11-02): `circuit::PAYMENT_CELLS` and `circuit::is_payment`,
+for relay messages; messages between rendezvous points are padded the
+same.
 
 Messages are padded to a power of two of cells (`circuit.rs`), which
 hides a message's exact length but not its kind: a notice is one cell, a

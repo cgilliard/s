@@ -81,6 +81,29 @@ pub const NOTICE: u8 = 10;
 /// A participant's finished transaction, for the last hop to pool and
 /// announce as its own; answered by `Notice(txid, forwarded or rejected)`.
 pub const BROADCAST: u8 = 11;
+/// A return route (`docs/PRIVACY.md`, fix 4): `Route(token)` asks the
+/// last hop to remember that the 16-byte token means this circuit, for
+/// one answer; `Reply(relay id, token, payload)` asks it to take the
+/// payload to that relay, which delivers it down the circuit the token
+/// means. Answered by `Notice(object, forwarded or offline)`.
+pub const ROUTE: u8 = 12;
+pub const REPLY: u8 = 13;
+/// A return route's token.
+pub const TOKEN_LEN: usize = 16;
+
+/// The cells every message of a payment takes, or the next power of two
+/// above for the rare larger one (`docs/PRIVACY.md`, fix 6): a lookup, its
+/// answer, a payload, a notice and a transaction then look alike, so a
+/// relay cannot tell from counts what a circuit is doing. About 14 KB, a
+/// slate and its answer with room to spare.
+pub const PAYMENT_CELLS: usize = 16;
+
+/// Whether `cmd` is one of a payment's messages, padded to
+/// [`PAYMENT_CELLS`]. Keepalives (`Session`, `SessionState`) and building
+/// a circuit (`Extend`, `Extended`) are not, and stay small.
+pub fn is_payment(cmd: u8) -> bool {
+    matches!(cmd, ANNOUNCE | GET_ANNOUNCE | SEND | DELIVER | NOTICE | BROADCAST | ROUTE | REPLY)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -137,8 +160,10 @@ pub fn handshake_piece(c: &Cell) -> Option<(bool, &[u8])> {
 /// A relay message cut into cell bodies: command, a flag for more to
 /// come, a length, the bytes, zeros.
 pub fn relay_bodies(cmd: u8, msg: &[u8]) -> Vec<[u8; BODY]> {
-    // Padded to a power of two of cells with empty pieces.
+    // Padded with empty pieces to a power of two of cells, and a payment's
+    // messages to at least `PAYMENT_CELLS`.
     let n = msg.len().div_ceil(RELAY_DATA).max(1).next_power_of_two();
+    let n = if is_payment(cmd) { n.max(PAYMENT_CELLS) } else { n };
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let part = &msg[(i * RELAY_DATA).min(msg.len())..((i + 1) * RELAY_DATA).min(msg.len())];
@@ -353,7 +378,6 @@ pub fn seal_for(hops: &mut [HopKeys], t: usize, body: &[u8; BODY]) -> Box<[u8; P
     p
 }
 
-
 /// The client's side: takes the layers off a cell coming back, hop by
 /// hop, until one's tag holds; the hop that sent it.
 pub fn open_from(hops: &mut [HopKeys], p: &mut [u8; PAYLOAD]) -> Option<usize> {
@@ -374,6 +398,30 @@ mod tests {
             .map(|i| HopKeys { forward: Layer::new([i as u8; 32]), backward: Layer::new([100 + i as u8; 32]) })
             .collect();
         (client.clone(), client)
+    }
+
+    /// Every message of a payment is the same number of cells, whatever
+    /// it holds; a larger one the next power of two; keepalives stay one.
+    #[test]
+    fn payment_messages_are_one_size() {
+        for cmd in [ANNOUNCE, GET_ANNOUNCE, SEND, DELIVER, NOTICE, BROADCAST, ROUTE, REPLY] {
+            for len in [0, 16, 33, 6600, 14 * 870] {
+                assert_eq!(relay_bodies(cmd, &vec![1u8; len]).len(), PAYMENT_CELLS, "command {cmd}, {len} bytes");
+            }
+            assert_eq!(relay_bodies(cmd, &vec![1u8; PAYMENT_CELLS * RELAY_DATA + 1]).len(), 2 * PAYMENT_CELLS);
+        }
+        for cmd in [SESSION, SESSION_STATE, DATA] {
+            assert_eq!(relay_bodies(cmd, &[1u8; 48]).len(), 1, "command {cmd}");
+        }
+        // Each payment message still comes together as it was.
+        let msg = vec![9u8; 5000];
+        let mut r = Reassembly::default();
+        let mut done = None;
+        for b in relay_bodies(SEND, &msg) {
+            let (cmd, more, data) = relay_piece(&b).unwrap();
+            done = r.add(cmd, more, data).unwrap();
+        }
+        assert_eq!(done, Some((SEND, msg)));
     }
 
     #[test]
@@ -485,5 +533,4 @@ mod tests {
             assert_eq!(done, Some((DATA, msg)));
         }
     }
-
 }

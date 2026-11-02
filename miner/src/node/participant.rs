@@ -1,10 +1,14 @@
 //! Onion mode's participant (`docs/ONION.md`): the wallet's node keeps a
-//! circuit standing to each of its rendezvous points, holds its session
-//! over it, and sends and receives over them.
+//! circuit standing to one of its rendezvous points, holds its session
+//! over it, and receives over it (`docs/SCALING.md`: one session, not
+//! three; senders try the recipient's points in turn, so a session at the
+//! first is found first, and at another a hop or two later). The point is
+//! the first of the three, the next taken when one fails twice running
+//! (a circuit failing as it reaches the point, or the point refusing).
 //!
 //! Each circuit runs through two listed relays chosen at random (fewer
 //! when the file lists too few others) to the point, which the id names.
-//! Over it the node asks for a session every [`onion::KEEPALIVE_SECS`]
+//! Over it the node asks for a session every [`onion::CIRCUIT_KEEPALIVE_SECS`]
 //! (every few seconds while the point does not hold its current
 //! announce) and offers its announce bound to the nonce the point gives,
 //! the same Kyber key at every point, rotated as in init mode: at start,
@@ -16,19 +20,46 @@
 //! two to four hours, the new one built and the session moved onto it
 //! before the old one is closed.
 //!
-//! The node's own transactions go the same way in onion mode: up a live
-//! circuit to the rendezvous point, which pools and announces it as its
-//! own, so that the first node to announce it is a relay and not the
-//! sender. One that no circuit takes in [`BROADCAST_TIMEOUT`] is left in
-//! the node's pool unannounced, and the wallet told: it is never
-//! announced from the node's own address.
+//! What the node sends goes up outbound circuits instead, which carry no
+//! session of ours (`docs/PRIVACY.md`, fix 2): two random hops and a
+//! random last relay that is none of our rendezvous points, so the points
+//! that know our id never see whom we pay. Each is used for one send (the
+//! recipient's announce asked of its last relay, unless the wallet gave
+//! it, then the payload sealed to it; the relay answers forwarded, or
+//! offline once every point of the recipient was tried) or one
+//! broadcast, then closed; one is kept ready meanwhile. A transaction of
+//! ours goes up a circuit of its own to a relay that pools and announces
+//! it as its own, so the first node to announce it is a relay, not the
+//! one that saw the payment's payload, and not the sender. One that no
+//! circuit takes in [`BROADCAST_TIMEOUT`] is left in the node's pool
+//! unannounced, and the wallet told: it is never announced from the
+//! node's own address. With too few relays listed for a last hop that is
+//! not one of our points, one of them ends the circuit.
 //!
-//! A send goes over any live circuit: the recipient's announce is asked
-//! of our point (unless the wallet gave it, from a payload it answers),
-//! the payload sealed to it and sent; the point answers forwarded, or
-//! offline once every point of the recipient was tried. A payload
-//! delivered down a circuit is opened with our keys and handed to the
-//! wallet.
+//! A send names no one (`docs/PRIVACY.md`, fix 4): it leaves a token with
+//! its circuit's last relay (`Route`) and puts the way back (that relay,
+//! the token, a Kyber key made for the one answer) inside the payload,
+//! sealed. The circuit is then held open for the answer, which comes down
+//! it, sealed to that key; our rendezvous points never see it. An answer
+//! of ours to such a payload goes up an outbound circuit as a `Reply`,
+//! which the relays carry to the route's relay and down the sender's
+//! circuit.
+//!
+//! A payload delivered down a standing circuit is opened with our keys
+//! and handed to the wallet.
+//!
+//! Every circuit's first hop, standing or outbound, is one of [`GUARDS`]
+//! relays the node keeps for one to two months (`docs/PRIVACY.md`, fix
+//! 3), saved in the data directory beside the peers file: a hostile relay
+//! then sees the node's network address only if it is a guard, not
+//! sooner or later by chance. A guard that leaves the list, or whose time
+//! is up, is replaced; one whose channel fails is passed over a while like
+//! any relay. Keepalives come at random intervals of two thirds to four
+//! thirds of [`onion::CIRCUIT_KEEPALIVE_SECS`], not on a beat a hostile
+//! first hop and point could match. The channel to the guard keeps itself
+//! alive (and the NAT mapping open) every [`crate::channel::KEEPALIVE`];
+//! a hop that dies destroys the circuit, and the `Destroy` reaching us
+//! has it built again, without a keepalive needing to notice.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -39,12 +70,14 @@ use crate::chain::ProofVerifier;
 use crate::circuit;
 use crate::net::{NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECTED};
 use crate::onion::{self, Announce, Object};
-use crate::pow::Digest;
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
+use crate::pow::Digest;
 use crate::wallet::random_bytes;
 
-const KEEPALIVE: Duration = Duration::from_secs(onion::KEEPALIVE_SECS);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(onion::SESSION_TIMEOUT_SECS);
+const KEEPALIVE: Duration = Duration::from_secs(onion::CIRCUIT_KEEPALIVE_SECS);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(onion::CIRCUIT_SESSION_TIMEOUT_SECS);
+/// Failures in a row at a point before the session moves to the next.
+const POINT_FAILS: u32 = 2;
 const SESSION_RETRY: Duration = Duration::from_secs(3);
 const REFUSED_RETRY: Duration = Duration::from_secs(60);
 const ROTATE_AFTER: Duration = Duration::from_secs(onion::ANNOUNCE_LIFETIME_SECS / 2);
@@ -69,6 +102,32 @@ const MAX_SENDS: usize = 64;
 const BROADCAST_WAIT: Duration = Duration::from_secs(15);
 /// One no circuit took by then is given up.
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Outbound circuits kept ready, beyond those sends are waiting for.
+const SPARE_OUTBOUND: usize = 1;
+/// Most outbound circuits at once.
+const MAX_OUTBOUND: usize = 8;
+/// A ready outbound circuit unused this long is replaced.
+const OUTBOUND_IDLE: Duration = Duration::from_secs(600);
+/// How long a delivered payload's circuit is held open for its answer.
+const ANSWER_WAIT: Duration = Duration::from_secs(60);
+/// First hops a node keeps.
+const GUARDS: usize = 3;
+/// A guard is kept this long, plus up to as much again at random.
+const GUARD_LIFETIME: u64 = 30 * 86_400;
+
+/// `d` give or take a third, at random: a keepalive's interval.
+pub(super) fn jitter(d: Duration) -> Duration {
+    let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+    let third = (d.as_millis() as u64 / 3).max(1);
+    d - Duration::from_millis(third) + Duration::from_millis(x % (2 * third))
+}
+
+/// A relay kept as a first hop, until a unix time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Guard {
+    id: Digest,
+    until: u64,
+}
 
 /// A circuit standing to one of our rendezvous points, and our session
 /// over it.
@@ -86,6 +145,8 @@ struct Standing {
     was_live: bool,
     /// Since when a keepalive has gone unanswered.
     unanswered: Option<Instant>,
+    /// The wait before the next keepalive, drawn when the last went.
+    interval: Duration,
     /// When the circuit is to be replaced.
     rotate_at: Option<Instant>,
     /// Its replacement, being built.
@@ -107,6 +168,8 @@ enum Stage {
     Lookup,
     /// Sent, by the payload's object id.
     Sent(Digest),
+    /// Delivered; the circuit held open for the answer, since then.
+    Awaiting(Instant),
 }
 
 struct Job {
@@ -114,6 +177,20 @@ struct Job {
     circuit: Option<u64>,
     stage: Stage,
     started: Instant,
+    /// The return route the payload carries, and the one-time key its
+    /// answer is sealed to.
+    route: Option<(onion::Route, crate::mlkem::SecretKey)>,
+}
+
+/// A circuit for one send or one broadcast, carrying no session of ours.
+struct Out {
+    handle: u64,
+    /// Its last relay.
+    last: Digest,
+    ready: bool,
+    /// Taken by a send or a broadcast: closed when that is done.
+    taken: bool,
+    built: Instant,
 }
 
 /// A transaction of ours to be announced by a relay.
@@ -130,6 +207,22 @@ struct Broadcast {
 
 pub(super) struct Participant {
     standing: Vec<Standing>,
+    /// Standing circuits to points we no longer have (a new address, or a
+    /// new relay list), closed once the new points' sessions are live or
+    /// after [`RETIRE_WAIT`]: we stay reachable throughout.
+    leaving: Vec<(u64, Instant)>,
+    /// Which of our points holds the session, and how many times in a row
+    /// it failed.
+    which: usize,
+    fails: u32,
+    /// The id the standing circuits hold sessions for: on a new address
+    /// every one is replaced, even to the same point, so that no point
+    /// sees one circuit move from the old id to the new.
+    standing_id: Option<Digest>,
+    outbound: Vec<Out>,
+    /// Whether an outbound circuit had to end at one of our points, logged
+    /// once.
+    short_list: bool,
     jobs: Vec<Job>,
     broadcasts: Vec<Broadcast>,
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
@@ -137,17 +230,26 @@ pub(super) struct Participant {
     rotate_every: Duration,
     /// Relays whose channel failed lately, and when.
     avoid: std::collections::HashMap<Digest, Instant>,
+    /// First hops, loaded from the data directory on first use.
+    guards: Option<Vec<Guard>>,
 }
 
 impl Default for Participant {
     fn default() -> Participant {
         Participant {
             standing: Vec::new(),
+            leaving: Vec::new(),
+            which: 0,
+            fails: 0,
+            standing_id: None,
+            outbound: Vec::new(),
+            short_list: false,
             jobs: Vec::new(),
             broadcasts: Vec::new(),
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
             avoid: std::collections::HashMap::new(),
+            guards: None,
         }
     }
 }
@@ -179,7 +281,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Whether our own transactions go out over a circuit: in onion mode,
     /// with a wallet.
     pub(super) fn broadcasts_privately(&self) -> bool {
-        self.rv.onion_active() && self.rv.me.is_some()
+        self.rv.onion_active() && self.rv.wallet
     }
 
     /// A transaction of ours, pooled: to a relay over a circuit.
@@ -187,15 +289,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.broadcasts.iter().any(|b| b.txid == txid) {
             return;
         }
-        self.part.broadcasts.push(Broadcast { txid, bytes, sent: None, tried: Vec::new(), started: now, why: String::new() });
+        self.part.broadcasts.push(Broadcast {
+            txid,
+            bytes,
+            sent: None,
+            tried: Vec::new(),
+            started: now,
+            why: String::new(),
+        });
         self.progress_broadcasts(now);
     }
 
     /// Sends each broadcast not yet out over a live circuit it was not
     /// tried on; gives up those out of time.
     fn progress_broadcasts(&mut self, now: Instant) {
-        let Some(seq) = self.rv.me.as_ref().map(|m| m.seq) else { return };
-        let live: Vec<u64> = self.part.standing.iter().filter(|s| s.live(seq, now)).filter_map(|s| s.circuit).collect();
+        if !self.rv.wallet {
+            return;
+        }
         let mut i = 0;
         while i < self.part.broadcasts.len() {
             let b = &mut self.part.broadcasts[i];
@@ -203,40 +313,151 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let (h, _) = b.sent.take().unwrap();
                 b.tried.push(h);
                 b.why = "no answer from the relay".into();
+                self.release_outbound(h, "broadcast unanswered", now);
             }
+            let b = &mut self.part.broadcasts[i];
             if b.sent.is_none() && now.duration_since(b.started) >= BROADCAST_TIMEOUT {
                 let b = self.part.broadcasts.remove(i);
                 let why = if b.why.is_empty() { "no circuit to send it over".to_string() } else { b.why };
                 self.log(&format!(
                     "onion: transaction {} not broadcast: {why}; it stays in this node's pool, unannounced",
-                    crate::poseidon2::digest_to_bytes(&b.txid).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>()
+                    crate::poseidon2::digest_to_bytes(&b.txid)
+                        .iter()
+                        .take(8)
+                        .map(|x| format!("{x:02x}"))
+                        .collect::<String>()
                 ));
                 self.rv.note(Note::Broadcast { txid: b.txid, how: Err(why) });
                 continue;
             }
-            if b.sent.is_none() {
-                // Circuits not yet tried first; all of them again once each was.
-                let fresh: Vec<u64> = live.iter().copied().filter(|h| !b.tried.contains(h)).collect();
-                let pool = if fresh.is_empty() { live.clone() } else { fresh };
-                if !pool.is_empty() {
-                    let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) as usize;
-                    let h = pool[x % pool.len()];
-                    b.sent = Some((h, now));
-                    let bytes = b.bytes.clone();
-                    let last = self.circuit_hops(h).saturating_sub(1);
-                    if let Err(e) = self.circuit_send(h, last, circuit::BROADCAST, &bytes, now) {
-                        self.part.broadcasts[i].sent = None;
-                        self.part.broadcasts[i].why = e;
-                    }
+            if b.sent.is_none()
+                && let Some(h) = self.take_outbound()
+            {
+                // A circuit of its own: not the one the payment's payload
+                // went up, so its relay cannot tie the two.
+                let b = &mut self.part.broadcasts[i];
+                b.sent = Some((h, now));
+                let bytes = b.bytes.clone();
+                let last = self.circuit_hops(h).saturating_sub(1);
+                if let Err(e) = self.circuit_send(h, last, circuit::BROADCAST, &bytes, now) {
+                    self.part.broadcasts[i].sent = None;
+                    self.part.broadcasts[i].why = e;
+                    self.release_outbound(h, "broadcast not sent", now);
                 }
             }
             i += 1;
         }
     }
 
+    /// A ready outbound circuit no send or broadcast has, now taken.
+    fn take_outbound(&mut self) -> Option<u64> {
+        let o = self.part.outbound.iter_mut().find(|o| o.ready && !o.taken)?;
+        o.taken = true;
+        Some(o.handle)
+    }
+
+    /// An outbound circuit's send or broadcast is done: it is closed, never
+    /// used for another.
+    fn release_outbound(&mut self, handle: u64, why: &str, now: Instant) {
+        if let Some(i) = self.part.outbound.iter().position(|o| o.handle == handle) {
+            self.part.outbound.remove(i);
+            self.close_circuit(handle, why, now);
+        }
+    }
+
+    /// Keeps outbound circuits ready: one spare, and one for each send or
+    /// broadcast waiting; replaces spares idle too long.
+    fn keep_outbound(&mut self, now: Instant) {
+        let stale: Vec<u64> = self
+            .part
+            .outbound
+            .iter()
+            .filter(|o| o.ready && !o.taken && now.duration_since(o.built) >= OUTBOUND_IDLE)
+            .map(|o| o.handle)
+            .collect();
+        for h in stale {
+            self.release_outbound(h, "idle", now);
+        }
+        let waiting = self.part.jobs.iter().filter(|j| matches!(j.stage, Stage::Waiting)).count()
+            + self.part.broadcasts.iter().filter(|b| b.sent.is_none()).count();
+        let free = self.part.outbound.iter().filter(|o| !o.taken).count();
+        let want = (SPARE_OUTBOUND + waiting).saturating_sub(free);
+        for _ in 0..want {
+            if self.part.outbound.len() >= MAX_OUTBOUND {
+                break;
+            }
+            let Some(path) = self.outbound_path() else { break };
+            let last = *path.last().unwrap();
+            match self.build_circuit(path, Vec::new(), now) {
+                Ok(handle) => self.part.outbound.push(Out { handle, last, ready: false, taken: false, built: now }),
+                Err(e) => {
+                    self.log(&format!("onion: no outbound circuit: {e}"));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A path for an outbound circuit: a random last relay that is none of
+    /// our rendezvous points (one of them only when the list has no other),
+    /// and two hops before it, the first a guard; relays whose channel
+    /// failed lately are left out while enough others remain.
+    fn outbound_path(&mut self) -> Option<Vec<Digest>> {
+        let me = self.config.relay_id();
+        // All three of our points, not only the one holding our session:
+        // the session moves to another when one fails.
+        let points: Vec<Digest> = match self.rv.me.as_ref() {
+            Some(m) => self.onion_points_of(&m.id),
+            None => Vec::new(),
+        };
+        let relays = self.rv.onion_sets().into_iter().next()?;
+        let now = Instant::now();
+        let mut all: Vec<Digest> = relays.iter().map(|r| r.id).filter(|r| Some(*r) != me).collect();
+        let healthy: Vec<Digest> = all
+            .iter()
+            .copied()
+            .filter(|r| self.part.avoid.get(r).is_none_or(|t| now.duration_since(*t) >= AVOID))
+            .collect();
+        if healthy.len() > HOPS {
+            all = healthy;
+        }
+        let pick = |v: &mut Vec<Digest>| {
+            let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+            v.swap_remove((x % v.len() as u64) as usize)
+        };
+        let mut lasts: Vec<Digest> = all.iter().copied().filter(|r| !points.contains(r)).collect();
+        if lasts.is_empty() {
+            if !self.part.short_list {
+                self.part.short_list = true;
+                self.log("onion: too few relays listed for a last hop that is not one of our rendezvous points");
+            }
+            lasts = all.clone();
+        }
+        if lasts.is_empty() {
+            return None;
+        }
+        let last = pick(&mut lasts);
+        let mut others: Vec<Digest> = all.into_iter().filter(|r| *r != last).collect();
+        let mut path = Vec::new();
+        if let Some(g) = self.guard(&[last]) {
+            others.retain(|r| *r != g);
+            path.push(g);
+        }
+        while path.len() < HOPS && !others.is_empty() {
+            path.push(pick(&mut others));
+        }
+        path.push(last);
+        Some(path)
+    }
+
     /// Back in init mode: the standing circuits go, sends fail.
     pub(super) fn onion_stand_down(&mut self, now: Instant) {
-        if self.part.standing.is_empty() && self.part.jobs.is_empty() && self.part.broadcasts.is_empty() {
+        if self.part.standing.is_empty()
+            && self.part.leaving.is_empty()
+            && self.part.outbound.is_empty()
+            && self.part.jobs.is_empty()
+            && self.part.broadcasts.is_empty()
+        {
             return;
         }
         for b in std::mem::take(&mut self.part.broadcasts) {
@@ -248,8 +469,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.close_circuit(h, "init mode", now);
             }
         }
+        for o in std::mem::take(&mut self.part.outbound) {
+            self.close_circuit(o.handle, "init mode", now);
+        }
+        for (h, _) in std::mem::take(&mut self.part.leaving) {
+            self.close_circuit(h, "init mode", now);
+        }
         for j in std::mem::take(&mut self.part.jobs) {
-            self.rv.note(Note::Failed { tag: j.out.tag, to: j.out.to, why: "the network went back to init mode".into() });
+            self.rv.note(Note::Failed {
+                tag: j.out.tag,
+                to: j.out.to,
+                why: "the network went back to init mode".into(),
+            });
         }
     }
 
@@ -259,7 +490,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.quiet {
             return;
         }
-        let Some(me) = self.rv.me.as_ref() else { return };
+        let Some(me) = self.rv.me.as_ref() else {
+            // No address (`address off`): no sessions anywhere, though
+            // sends and broadcasts go on, naming no one.
+            let standing = std::mem::take(&mut self.part.standing);
+            self.part.standing_id = None;
+            for h in standing.iter().flat_map(|s| [s.circuit, s.next, s.retiring.map(|r| r.0)]).flatten() {
+                self.close_circuit(h, "the address is off", now);
+            }
+            for (h, _) in std::mem::take(&mut self.part.leaving) {
+                self.close_circuit(h, "the address is off", now);
+            }
+            self.keep_outbound(now);
+            self.progress_onion_sends(now);
+            self.progress_broadcasts(now);
+            return;
+        };
         let (id, made) = (me.id, me.made);
         if me.rotate || now.duration_since(made) >= ROTATE_AFTER {
             self.rotate(now);
@@ -272,9 +518,27 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // Not this node's own relay: a circuit cannot end where it starts
         // (a relay is best run without a wallet in any case).
         let relay = self.config.relay_id();
-        let points: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| Some(*p) != relay).collect();
-        if points.iter().ne(self.part.standing.iter().map(|s| &s.point)) {
+        let all: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| Some(*p) != relay).collect();
+        let new_id = self.part.standing_id.is_some_and(|s| s != id);
+        self.part.standing_id = Some(id);
+        if new_id {
+            (self.part.which, self.part.fails) = (0, 0);
+        }
+        // One session: at the point in turn (`docs/SCALING.md`).
+        let points: Vec<Digest> = all.get(self.part.which % all.len().max(1)).copied().into_iter().collect();
+        if new_id || points.iter().ne(self.part.standing.iter().map(|s| &s.point)) {
             let mut old = std::mem::take(&mut self.part.standing);
+            if new_id {
+                // Nothing of the old address's carries over.
+                for s in std::mem::take(&mut old) {
+                    for h in [s.circuit, s.retiring.map(|r| r.0)].into_iter().flatten() {
+                        self.part.leaving.push((h, now));
+                    }
+                    if let Some(h) = s.next {
+                        self.close_circuit(h, "a new address", now);
+                    }
+                }
+            }
             for p in &points {
                 match old.iter().position(|s| s.point == *p) {
                     Some(i) => self.part.standing.push(old.swap_remove(i)),
@@ -292,6 +556,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             wait: None,
                             was_live: false,
                             unanswered: None,
+                            interval: KEEPALIVE,
                             rotate_at: None,
                             next: None,
                             retiring: None,
@@ -299,8 +564,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     }
                 }
             }
+            // The old points' circuits stay until the new sessions are live.
             for s in old {
-                if let Some(h) = s.circuit {
+                for h in [s.circuit, s.retiring.map(|r| r.0)].into_iter().flatten() {
+                    self.part.leaving.push((h, now));
+                }
+                if let Some(h) = s.next {
                     self.close_circuit(h, "no longer a rendezvous point", now);
                 }
             }
@@ -308,6 +577,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.log(&format!("onion: rendezvous points {}", names.join(", ")));
         }
         let seq = self.rv.me.as_ref().unwrap().seq;
+        let all_live = self.part.standing.iter().all(|s| s.live(seq, now));
+        let gone: Vec<u64> = self
+            .part
+            .leaving
+            .iter()
+            .filter(|(_, since)| all_live || now.duration_since(*since) >= RETIRE_WAIT)
+            .map(|(h, _)| *h)
+            .collect();
+        self.part.leaving.retain(|(h, _)| !gone.contains(h));
+        for h in gone {
+            self.close_circuit(h, "no longer a rendezvous point", now);
+        }
         let mut lost = Vec::new();
         let mut build = Vec::new();
         let mut replace = Vec::new();
@@ -341,9 +622,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             if s.next.is_none() && s.retiring.is_none() && s.rotate_at.is_some_and(|t| now >= t) && s.live(seq, now) {
                 replace.push(i);
             }
-            let wait = if s.live(seq, now) { keepalive } else { SESSION_RETRY };
+            let wait = if s.live(seq, now) { s.interval } else { SESSION_RETRY };
             if s.asked.is_none_or(|t| now.duration_since(t) >= wait) {
                 s.asked = Some(now);
+                s.interval = jitter(keepalive);
                 s.unanswered.get_or_insert(now);
                 ask.push(h);
             }
@@ -370,8 +652,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let last = self.circuit_hops(h).saturating_sub(1);
             let _ = self.circuit_send(h, last, circuit::SESSION, &digest_to_bytes(&id), now);
         }
+        self.keep_outbound(now);
         self.progress_onion_sends(now);
         self.progress_broadcasts(now);
+    }
+
+    /// Our point did not take the circuit (it failed adding the point, the
+    /// last hop), or refused our session: twice in a row, and the session
+    /// moves to the next point. A circuit failing at a hop on the way
+    /// says nothing of the point.
+    fn point_failed(&mut self) {
+        self.part.fails += 1;
+        if self.part.fails >= POINT_FAILS {
+            self.part.fails = 0;
+            self.part.which += 1;
+            self.log("onion: our rendezvous point keeps failing; trying the next");
+        }
     }
 
     /// A relay whose channel failed: not a hop for a while.
@@ -379,15 +675,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.part.avoid.insert(id, now);
     }
 
-    /// A path to standing point `i`: random hops from the list the point
-    /// is in (the preferred one first), then it; relays whose channel
-    /// failed lately are left out while enough others remain.
-    fn standing_path(&self, i: usize) -> Option<Vec<Digest>> {
+    /// A path to standing point `i`: a guard, a random hop from the list
+    /// the point is in (the preferred one first), then it; relays whose
+    /// channel failed lately are left out while enough others remain.
+    fn standing_path(&mut self, i: usize) -> Option<Vec<Digest>> {
         let point = self.part.standing[i].point;
         let me = self.config.relay_id();
         let relays = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point))?;
-        let mut others: Vec<Digest> =
-            relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
+        let mut others: Vec<Digest> = relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
         let now = Instant::now();
         let healthy: Vec<Digest> = others
             .iter()
@@ -398,12 +693,87 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             others = healthy;
         }
         let mut path = Vec::new();
+        if let Some(g) = self.guard(&[point]) {
+            others.retain(|r| *r != g);
+            path.push(g);
+        }
         while path.len() < HOPS && !others.is_empty() {
             let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
             path.push(others.swap_remove((x % others.len() as u64) as usize));
         }
         path.push(point);
         Some(path)
+    }
+
+    /// Where the guards are kept: beside the peers file.
+    fn guards_file(&self) -> Option<std::path::PathBuf> {
+        Some(self.config.peers_file.as_ref()?.with_file_name("guards"))
+    }
+
+    /// A guard to start a circuit with, not one of `exclude` (the
+    /// circuit's last hop) nor one whose channel failed lately; `None`
+    /// when no guard will do, and the first hop is then any relay. The
+    /// guards are kept up first: loaded, those gone from the list or out
+    /// of time replaced, the set saved when it changed.
+    fn guard(&mut self, exclude: &[Digest]) -> Option<Digest> {
+        let now_unix = unix_now();
+        let listed: Vec<Digest> = self.rv.onion_sets().into_iter().next()?.iter().map(|r| r.id).collect();
+        let me = self.config.relay_id();
+        if self.part.guards.is_none() {
+            let loaded = self
+                .guards_file()
+                .and_then(|f| std::fs::read_to_string(f).ok())
+                .map(|text| {
+                    text.lines()
+                        .filter_map(|l| {
+                            let (id, until) = l.split_once(' ')?;
+                            let id = crate::wallet::digest_from_hex(id).and_then(|b| digest_from_bytes(&b))?;
+                            Some(Guard { id, until: until.trim().parse().ok()? })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.part.guards = Some(loaded);
+        }
+        let mut guards = self.part.guards.clone().unwrap_or_default();
+        let before = guards.clone();
+        guards.retain(|g| g.until > now_unix && listed.contains(&g.id) && Some(g.id) != me);
+        let mut candidates: Vec<Digest> =
+            listed.iter().copied().filter(|r| Some(*r) != me && !guards.iter().any(|g| g.id == *r)).collect();
+        while guards.len() < GUARDS && !candidates.is_empty() {
+            let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+            let id = candidates.swap_remove((x % candidates.len() as u64) as usize);
+            guards.push(Guard { id, until: now_unix + GUARD_LIFETIME + x % GUARD_LIFETIME });
+        }
+        if guards != before {
+            if let Some(f) = self.guards_file() {
+                let text: String = guards
+                    .iter()
+                    .map(|g| {
+                        let hex: String = digest_to_bytes(&g.id).iter().map(|b| format!("{b:02x}")).collect();
+                        format!("{hex} {}\n", g.until)
+                    })
+                    .collect();
+                if let Err(e) = std::fs::write(&f, text) {
+                    self.log(&format!("onion: saving guards: {e}"));
+                }
+            }
+            let names: Vec<String> = guards.iter().map(|g| onion::short(&g.id)).collect();
+            self.log(&format!("onion: guards {}", names.join(", ")));
+        }
+        self.part.guards = Some(guards.clone());
+        let now = Instant::now();
+        let usable: Vec<Digest> = guards
+            .iter()
+            .map(|g| g.id)
+            .filter(|g| !exclude.contains(g))
+            .filter(|g| self.part.avoid.get(g).is_none_or(|t| now.duration_since(*t) >= AVOID))
+            .collect();
+        if usable.is_empty() {
+            return None;
+        }
+        let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+        Some(usable[(x % usable.len() as u64) as usize])
     }
 
     /// Builds the circuit to standing point `i`.
@@ -432,7 +802,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A circuit of ours is built.
     pub(super) fn onion_circuit_ready(&mut self, handle: u64, now: Instant) {
         let rotate_at = self.part.rotate_at(now);
-        if let Some(s) = self.part.standing.iter_mut().find(|s| s.circuit == Some(handle)) {
+        if let Some(o) = self.part.outbound.iter_mut().find(|o| o.handle == handle) {
+            o.ready = true;
+            o.built = now;
+            self.progress_onion_sends(now);
+            self.progress_broadcasts(now);
+        } else if let Some(s) = self.part.standing.iter_mut().find(|s| s.circuit == Some(handle)) {
             s.ready = true;
             s.asked = None;
             s.wait = None;
@@ -457,19 +832,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A circuit of ours ended: built again later, with a new key if its
     /// session was live; sends on it go to another.
-    pub(super) fn onion_circuit_gone(&mut self, handle: u64, now: Instant) {
+    /// `at_end`: it failed while its last hop was being added, so for a
+    /// standing circuit the point is at fault, not a hop on the way.
+    pub(super) fn onion_circuit_gone(&mut self, handle: u64, at_end: bool, now: Instant) {
+        self.part.outbound.retain(|o| o.handle != handle);
+        self.part.leaving.retain(|(h, _)| *h != handle);
         let mut rotate = false;
         for s in self.part.standing.iter_mut().filter(|s| s.next == Some(handle)) {
             // A replacement that failed: the next try a minute on.
             s.next = None;
             s.rotate_at = Some(now + Duration::from_secs(60));
         }
+        let mut failed = false;
         for s in self.part.standing.iter_mut().filter(|s| s.circuit == Some(handle)) {
+            failed |= at_end;
             rotate |= s.was_live;
             s.circuit = None;
             s.ready = false;
             s.was_live = false;
             s.wait = Some(now + REBUILD_WAIT);
+        }
+        if failed {
+            self.point_failed();
         }
         if rotate {
             self.rotate(now);
@@ -491,10 +875,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// was the participant's.
     pub(super) fn onion_message(&mut self, handle: u64, cmd: u8, msg: &[u8], now: Instant) -> bool {
         let standing = self.part.standing.iter().position(|s| s.circuit == Some(handle));
-        let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle));
+        let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle))
+            || self.part.outbound.iter().any(|o| o.handle == handle);
         // A circuit being replaced is still ours: what comes down it while
         // the session moves to the new one is taken.
-        let retiring = self.part.standing.iter().any(|s| s.retiring.is_some_and(|(h, _)| h == handle));
+        let retiring = self.part.standing.iter().any(|s| s.retiring.is_some_and(|(h, _)| h == handle))
+            || self.part.leaving.iter().any(|(h, _)| *h == handle);
         if standing.is_none() && !job && !retiring {
             return false;
         }
@@ -502,13 +888,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if cmd == circuit::NOTICE
             && msg.len() == 33
             && let Some(subject) = digest_from_bytes(&msg[..32])
-            && let Some(i) = self.part.broadcasts.iter().position(|b| b.txid == subject && b.sent.is_some_and(|(h, _)| h == handle))
+            && let Some(i) =
+                self.part.broadcasts.iter().position(|b| b.txid == subject && b.sent.is_some_and(|(h, _)| h == handle))
         {
+            let relay = self.part.outbound.iter().find(|o| o.handle == handle).map_or(crate::onion::NOBODY, |o| o.last);
+            self.release_outbound(handle, "broadcast answered", now);
             if msg[32] == NOTICE_FORWARDED {
                 let b = self.part.broadcasts.remove(i);
-                let point = standing.map_or(crate::onion::NOBODY, |s| self.part.standing[s].point);
-                self.log(&format!("onion: our transaction announced by {}", onion::short(&point)));
-                self.rv.note(Note::Broadcast { txid: b.txid, how: Ok(format!("announced by relay {}", onion::short(&point))) });
+                self.log(&format!("onion: our transaction announced by {}", onion::short(&relay)));
+                self.rv.note(Note::Broadcast {
+                    txid: b.txid,
+                    how: Ok(format!("announced by relay {}", onion::short(&relay))),
+                });
             } else {
                 let b = &mut self.part.broadcasts[i];
                 b.sent = None;
@@ -530,11 +921,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             circuit::ANNOUNCE => {
                 let Some(a) = Announce::from_bytes(msg) else { return true };
-                let Some(j) = self
-                    .part
-                    .jobs
-                    .iter()
-                    .position(|j| j.circuit == Some(handle) && matches!(j.stage, Stage::Lookup) && j.out.to == a.id)
+                let Some(j) =
+                    self.part.jobs.iter().position(|j| {
+                        j.circuit == Some(handle) && matches!(j.stage, Stage::Lookup) && j.out.to == a.id
+                    })
                 else {
                     return true;
                 };
@@ -555,18 +945,25 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         && match j.stage {
                             Stage::Lookup => j.out.to == subject,
                             Stage::Sent(o) => o == subject,
-                            Stage::Waiting => false,
+                            Stage::Waiting | Stage::Awaiting(_) => false,
                         }
                 }) {
                     if code == NOTICE_FORWARDED {
-                        let j = self.part.jobs.remove(j);
                         let via = self.circuit_first(handle).unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
-                        self.log(&format!("onion: delivered to {}", onion::short(&j.out.to)));
-                        self.rv.note(Note::Delivered { tag: j.out.tag, to: j.out.to, via });
+                        let (tag, to) = (self.part.jobs[j].out.tag, self.part.jobs[j].out.to);
+                        self.log(&format!("onion: delivered to {}", onion::short(&to)));
+                        self.rv.note(Note::Delivered { tag, to, via });
+                        if self.part.jobs[j].route.is_some() {
+                            // The answer comes down this circuit.
+                            self.part.jobs[j].stage = Stage::Awaiting(now);
+                        } else {
+                            self.part.jobs.remove(j);
+                            self.release_outbound(handle, "sent", now);
+                        }
                     } else {
                         let why = match code {
                             NOTICE_OFFLINE => "offline: none of its rendezvous points holds a session for it",
-                            NOTICE_REFUSED => "refused by our rendezvous point",
+                            NOTICE_REFUSED => "refused by the relay",
                             NOTICE_REJECTED => "rejected",
                             _ => "an unknown answer",
                         };
@@ -576,15 +973,39 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     && let Some(i) = standing
                     && self.rv.me.as_ref().is_some_and(|m| m.id == subject)
                 {
-                    // Our point refused or rejected our session.
-                    self.log(&format!("onion: {} would not hold our session", onion::short(&self.part.standing[i].point)));
+                    // Our point refused or rejected our session: the next.
+                    self.log(&format!(
+                        "onion: {} would not hold our session",
+                        onion::short(&self.part.standing[i].point)
+                    ));
                     self.part.standing[i].wait = Some(now + REFUSED_RETRY);
+                    self.part.fails = POINT_FAILS - 1;
                     self.close_circuit(handle, "refused", now);
                 }
             }
             circuit::DELIVER => match Object::from_bytes(msg) {
                 Some(Object::Payload(p)) if self.rv.me.as_ref().is_some_and(|m| m.id == p.to) => {
                     self.open(format!("circuit {handle}"), p);
+                }
+                // The answer to a payload of ours, down its circuit.
+                Some(Object::Payload(p)) => {
+                    let Some(j) = self.part.jobs.iter().position(|j| {
+                        j.circuit == Some(handle) && j.route.as_ref().is_some_and(|(r, _)| r.reply_id() == p.to)
+                    }) else {
+                        self.chatter("onion: a delivery that is not a payload for us");
+                        return true;
+                    };
+                    let job = self.part.jobs.remove(j);
+                    self.release_outbound(handle, "answered", now);
+                    let (_, key) = job.route.unwrap();
+                    match p.open(&key, unix_now()) {
+                        Some(mut opened) => {
+                            opened.answers = Some(job.out.to);
+                            self.log(&format!("onion: an answer from {}", onion::short(&job.out.to)));
+                            self.rv.note(Note::Received(opened));
+                        }
+                        None => self.log("onion: an answer that our one-time key does not open"),
+                    }
                 }
                 _ => self.chatter("onion: a delivery that is not a payload for us"),
             },
@@ -600,6 +1021,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         s.unanswered = None;
         s.held = seq;
         if seq == me.seq {
+            self.part.fails = 0;
+            let s = &mut self.part.standing[i];
             if !s.was_live {
                 s.was_live = true;
                 let point = s.point;
@@ -632,28 +1055,53 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.jobs.len() >= MAX_SENDS {
             return self.rv.note(Note::Failed { tag: out.tag, to: out.to, why: "too many sends in progress".into() });
         }
-        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now });
+        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None });
         self.progress_onion_sends(now);
     }
 
     fn progress_onion_sends(&mut self, now: Instant) {
-        let Some(seq) = self.rv.me.as_ref().map(|m| m.seq) else { return };
-        let live: Vec<u64> = self.part.standing.iter().filter(|s| s.live(seq, now)).filter_map(|s| s.circuit).collect();
+        if !self.rv.wallet {
+            return;
+        }
         let mut i = 0;
         while i < self.part.jobs.len() {
+            if let Stage::Awaiting(since) = self.part.jobs[i].stage {
+                if now.duration_since(since) >= ANSWER_WAIT {
+                    // Delivered, unanswered: the circuit goes.
+                    let job = self.part.jobs.remove(i);
+                    self.chatter(&format!("onion: no answer from {}", onion::short(&job.out.to)));
+                    if let Some(h) = job.circuit {
+                        self.release_outbound(h, "no answer", now);
+                    }
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
             if now.duration_since(self.part.jobs[i].started) >= SEND_TIMEOUT {
                 let why = match self.part.jobs[i].stage {
-                    Stage::Waiting => "no rendezvous session to send over",
-                    _ => "no answer from our rendezvous point",
+                    Stage::Waiting => "no circuit to send over",
+                    _ => "no answer from the relay",
                 };
                 self.fail_send(i, why.into());
                 continue;
             }
-            if matches!(self.part.jobs[i].stage, Stage::Waiting) && !live.is_empty() {
-                let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) as usize;
-                let h = live[x % live.len()];
+            if matches!(self.part.jobs[i].stage, Stage::Waiting)
+                && let Some(h) = self.take_outbound()
+            {
                 let j = &mut self.part.jobs[i];
                 j.circuit = Some(h);
+                if j.out.reply.is_some() {
+                    self.send_reply(i, h, now);
+                    if i < self.part.jobs.len() && !matches!(self.part.jobs[i].stage, Stage::Waiting) {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // The way back: a token left with the circuit's last relay.
+                let route = self.leave_route(h, now);
+                let j = &mut self.part.jobs[i];
+                j.route = route;
                 match j.out.recipient.clone().filter(|a| a.verify(unix_now())) {
                     Some(_) => self.seal_and_send(i, h, now),
                     None => {
@@ -672,10 +1120,64 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// Leaves a return route's token with the last relay of outbound
+    /// circuit `h`: the route, and the key made for its one answer.
+    fn leave_route(&mut self, h: u64, now: Instant) -> Option<(onion::Route, crate::mlkem::SecretKey)> {
+        let relay = self.part.outbound.iter().find(|o| o.handle == h)?.last;
+        let token = random_bytes::<{ circuit::TOKEN_LEN }>().ok()?;
+        let key = crate::mlkem::keygen(&random_bytes::<64>().ok()?);
+        let last = self.circuit_hops(h).saturating_sub(1);
+        self.circuit_send(h, last, circuit::ROUTE, &token, now).ok()?;
+        Some((onion::Route { relay, token, kyber: key.public_key().to_vec() }, key))
+    }
+
+    /// Sends job `j`, an answer along a return route, up circuit `h`.
+    fn send_reply(&mut self, j: usize, h: u64, now: Instant) {
+        let job = &self.part.jobs[j];
+        let Some(route) = job.out.reply.clone() else { return };
+        let (m, nonce) = match (random_bytes::<32>(), random_bytes::<12>()) {
+            (Ok(m), Ok(n)) => (m, n),
+            _ => {
+                self.fail_send(j, "no randomness".into());
+                return;
+            }
+        };
+        let Some(p) = onion::Payload::seal_reply(&route, job.out.kind, &job.out.inner, &m, nonce) else {
+            self.fail_send(j, "the route's key is malformed".into());
+            return;
+        };
+        let bytes = Object::Payload(p).to_bytes();
+        let mut msg = digest_to_bytes(&route.relay).to_vec();
+        msg.extend_from_slice(&route.token);
+        msg.extend_from_slice(&bytes);
+        self.part.jobs[j].stage = Stage::Sent(Object::id_of(&bytes));
+        let last = self.circuit_hops(h).saturating_sub(1);
+        if let Err(e) = self.circuit_send(h, last, circuit::REPLY, &msg, now) {
+            self.fail_send(j, e);
+        }
+    }
+
     fn seal_and_send(&mut self, j: usize, handle: u64, now: Instant) {
         let job = &self.part.jobs[j];
         let Some(a) = job.out.recipient.clone() else { return };
-        match self.seal(&a, job.out.kind, &job.out.inner) {
+        // Unnamed: the way back is inside, no id or key of ours.
+        let sealed = match (&job.route, random_bytes::<32>(), random_bytes::<12>()) {
+            (Some((route, _)), Ok(m), Ok(nonce)) => {
+                onion::Payload::seal(&a, None, Some(route), job.out.kind, &job.out.inner, &m, nonce)
+                    .map(|p| Object::Payload(p).to_bytes())
+                    .ok_or_else(|| "the recipient's Kyber key is malformed".to_string())
+                    .and_then(|b| {
+                        if b.len() > onion::MAX_OBJECT {
+                            Err(format!("the message is too large: {} bytes", b.len()))
+                        } else {
+                            Ok(b)
+                        }
+                    })
+            }
+            (None, ..) => Err("no return route".to_string()),
+            _ => Err("no randomness".to_string()),
+        };
+        match sealed {
             Ok(bytes) => {
                 let object = Object::id_of(&bytes);
                 self.part.jobs[j].stage = Stage::Sent(object);
@@ -692,6 +1194,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn fail_send(&mut self, j: usize, why: String) -> bool {
         let job = self.part.jobs.remove(j);
+        if let Some(h) = job.circuit {
+            self.release_outbound(h, "send failed", Instant::now());
+        }
         self.log(&format!("onion: could not reach {}: {why}", onion::short(&job.out.to)));
         self.rv.note(Note::Failed { tag: job.out.tag, to: job.out.to, why });
         true

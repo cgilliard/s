@@ -160,6 +160,27 @@ pub fn root_from_subtrees(level: usize, roots: &[Digest], right: &Digest) -> Dig
     compress(&left, right)
 }
 
+/// The siblings from level `level` up of the subtree `index` of height
+/// `level`, in the tree that [`root_from_subtrees`] composes from `roots`
+/// and `right`: the last is `right`. With a path inside that subtree
+/// ([`subtree_path`]) before them, a whole path of [`DEPTH`] siblings.
+pub fn path_from_subtrees(level: usize, roots: &[Digest], right: &Digest, index: u64) -> Vec<Digest> {
+    let mut nodes: Vec<(u64, Digest)> = roots.iter().enumerate().map(|(i, r)| (i as u64, *r)).collect();
+    let mut idx = index;
+    let mut siblings = Vec::with_capacity(DEPTH - level);
+    for l in level..DEPTH - 1 {
+        let want = idx ^ 1;
+        siblings.push(match nodes.binary_search_by_key(&want, |&(k, _)| k) {
+            Ok(i) => nodes[i].1,
+            Err(_) => default_hashes()[l],
+        });
+        nodes = parents(l, &nodes);
+        idx >>= 1;
+    }
+    siblings.push(*right);
+    siblings
+}
+
 fn node_key(level: usize, index: u64) -> u64 {
     // Lowest levels last: new nodes there, the most numerous, are then
     // appended at the end of the database, which LMDB packs tightly.
@@ -217,7 +238,14 @@ const MIN_MAP_SIZE: usize = 1 << 30;
 #[cfg(target_os = "linux")]
 fn reservable(size: usize) -> bool {
     unsafe extern "C" {
-        fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+        fn mmap(
+            addr: *mut std::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut std::ffi::c_void;
         fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
     }
     const PROT_NONE: i32 = 0;
