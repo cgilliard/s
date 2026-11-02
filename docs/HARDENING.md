@@ -227,6 +227,65 @@ history and the README; this file holds what is left.
 
 Found while building it (2026-11-01).
 
+- **ML-DSA signing is not constant-time.** `mldsa.rs`, `sign_internal`:
+  the bound checks on `z` and `ct0` stop at the first coefficient over
+  the bound (`iter().any`), so a rejected attempt takes a time that
+  depends on where, which depends on the secret key; `centered`,
+  `decompose`, `make_hint` and the `r0_max` computation branch on values
+  derived from `s2` and `t0` (`if r0 > GAMMA2`, `if r - r0 == Q - 1`), in
+  accepted signatures too. Deterministic signing makes the same input
+  take exactly the same path, so measurements can be repeated and
+  averaged. The relay key is the exposed one: anyone can make a relay
+  sign as often as it likes, every channel hello and every circuit hop a
+  signature over a transcript that includes the requester's own data. Over
+  the internet the differences are small beside network jitter; a
+  co-tenant on the same host (a VPS) measures far finer. A recovered relay
+  key lets an attacker pass for that relay (sit in circuits and sessions
+  through it, drop or follow traffic), not touch funds, and it says
+  nothing of the phrase (it is derived under its own domain tag). The
+  wallet's identity key signs rarely and not on demand (announces, and
+  receipts once `docs/PROOFS.md` is built), but is worth more: it could
+  announce an attacker's Kyber key for the wallet's address and take its
+  slates; `address next` (`docs/PRIVACY.md`, fix 5) bounds how long a
+  leaked one serves. Kyber is in better shape: decapsulation compares in
+  constant time (the implicit-rejection mask) and `compress` divides by
+  the constant `Q`, which optimized builds turn into a multiply (no
+  KyberSlash), and its keys are short-lived. XMSS and the prover hash
+  secrets in fixed patterns; funds are not at stake. Fixes:
+  1. **Constant-time attempts.** Evaluate every norm and hint check in
+     full, with mask arithmetic instead of branches (`centered`,
+     `decompose`, `make_hint`, the norms), and decide to accept or reject
+     once, at the end. The number of attempts may still show, which FIPS
+     204 accepts. The ACVP known answers check the result.
+  2. **Hedged signing for the relay key.** FIPS 204's hedged mode mixes
+     32 fresh random bytes into each signature (`rnd` in
+     `sign_internal`, zero today), so identical inputs no longer take
+     identical paths and repeated measurements cannot be averaged.
+     Signatures verify the same. Only the relay key: the wallet keeps
+     deterministic signing.
+  3. **Keep the handshake limits.** The per-host caps on channels
+     (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
+     the collection of samples; a rate per host would slow it more.
+  4. **Check the machine code.** Inspect the generated assembly of the
+     signing and decapsulation paths on x86-64 and riscv64 once, for
+     divisions and data-dependent branches the source does not show.
+- **A participant's session Kyber key lives up to 12 hours.** The key a
+  participant announces at its rendezvous points (`node/sessions.rs`,
+  `node/participant.rs`) is replaced on a reconnect and otherwise after
+  half the announce's lifetime (`ROTATE_AFTER`, 12 hours of
+  `onion::ANNOUNCE_LIFETIME_SECS`'s day). Unlike the handshake keys, which
+  decapsulate once, it decapsulates every payload anyone sends to the
+  address meanwhile: chosen ciphertexts against one key, for a timing
+  attack on decapsulation. The implementation shows no known leak (the
+  implicit-rejection comparison is constant-time, `compress` divides by
+  the constant `Q`), and a recovered key reads only the slates sent until
+  the next rotation (it cannot redirect payments, the announce being
+  signed by the identity key). Fix: rotate it every hour, with the
+  announce's lifetime cut to match (two hours, say); a retired key still
+  opens payloads for its ten minutes' grace (`KEY_GRACE`). The cost is one
+  re-announce an hour, a Dilithium signature for each rendezvous point
+  (one, with `docs/SCALING.md`'s single session).
+
 - **A relay whose key does not match its listed id is not penalized.**
   `node/channels.rs`, `on_reply`: a handshake that fails with `WrongKey`
   is logged and the channel dropped, but the address takes no strike,
