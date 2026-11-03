@@ -367,7 +367,7 @@ pub enum Event {
     /// mode): the current one, the one before while a switch lasts, and
     /// whether the current one is tried first.
     #[cfg(test)]
-    TestEpoch(Option<Vec<consensus::Relay>>, Option<Option<Vec<consensus::Relay>>>, bool),
+    TestEpoch(Option<Vec<consensus::Relay>>, Option<Option<Vec<consensus::Relay>>>, bool, u32),
     /// Tests: a relay message to a hop of a circuit built.
     #[cfg(test)]
     TestCircuitSend(u64, usize, u8, Vec<u8>),
@@ -966,7 +966,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 #[cfg(test)]
                 Ok(Event::TestTiming(keepalive, rotate)) => self.part.set_timing(keepalive, rotate),
                 #[cfg(test)]
-                Ok(Event::TestEpoch(current, previous, prefer)) => self.rv.set_sets(current, previous, prefer),
+                Ok(Event::TestEpoch(current, previous, prefer, epoch)) => {
+                    self.rv.set_sets(current, previous, prefer, epoch)
+                }
                 #[cfg(test)]
                 Ok(Event::TestCircuit(path, queued)) => {
                     if let Err(e) = self.build_circuit(path, queued, Instant::now()) {
@@ -4854,7 +4856,7 @@ mod tests {
         let (id_p, key_p, key_q) = (id(4), key(4), key(5));
         // p's first rendezvous point; q's circuit ends elsewhere.
         let ids: Vec<Digest> = listed.iter().map(|r| r.id).collect();
-        let rp = listed[crate::onion::rendezvous_relays(&id_p, &ids)[0]].id;
+        let rp = listed[crate::onion::rendezvous_relays(&id_p, 0, &ids)[0]].id;
         let others: Vec<Digest> = listed.iter().map(|r| r.id).filter(|r| *r != rp).collect();
         let wait = |n: usize, pred: &dyn Fn(&Seen) -> bool| {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5096,7 +5098,7 @@ mod tests {
         assert!(sent <= 3 * per_channel, "{sent} frames in 15 s idle");
         // The standing circuit's middle hop dies.
         let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
-        let point = ids[crate::onion::rendezvous_relays(&id(5), &ids)[0]];
+        let point = ids[crate::onion::rendezvous_relays(&id(5), 0, &ids)[0]];
         let path =
             nodes[p].4.lock().unwrap().iter().rev().find(|path| *path.last().unwrap() == point).cloned().unwrap();
         assert_eq!(path.len(), 3, "a guard, a hop, the point: {path:?}");
@@ -5265,7 +5267,7 @@ mod tests {
 
         let ids: Vec<Digest> = listed.iter().map(|r| r.id).collect();
         let points = |who: &Digest| -> Vec<Digest> {
-            crate::onion::rendezvous_relays(who, &ids).into_iter().map(|i| ids[i]).collect()
+            crate::onion::rendezvous_relays(who, 0, &ids).into_iter().map(|i| ids[i]).collect()
         };
         let (points_p, points_q) = (points(&id_p), points(&id_q));
         let q_bytes = digest_to_bytes(&id_q);
@@ -5661,10 +5663,11 @@ mod tests {
         let a = sorted((0..3).map(relay).collect());
         let b = sorted((1..4).map(relay).collect());
         let (p, q) = (4usize, 5usize);
-        let points = |list: &[consensus::Relay], who: Digest| -> Vec<Digest> {
+        let points_in = |list: &[consensus::Relay], who: Digest, e: u32| -> Vec<Digest> {
             let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
-            onion::rendezvous_relays(&who, &ids).into_iter().map(|i| ids[i]).collect()
+            onion::rendezvous_relays(&who, e, &ids).into_iter().map(|i| ids[i]).collect()
         };
+        let points = |list: &[consensus::Relay], who: Digest| points_in(list, who, 0);
         let addr_of = |d: &Digest| (0..4).find(|&i| id(i as u8 + 1) == *d).map(|i| nodes[i].0).unwrap();
         // p's sessions are live at exactly these points.
         let live_at = |want: &[Digest]| {
@@ -5707,10 +5710,15 @@ mod tests {
                 assert!(Instant::now() < deadline, "{round}: nothing arrived");
             }
         };
+        let epoch_in =
+            |current: &Vec<consensus::Relay>, previous: Option<&Vec<consensus::Relay>>, prefer: bool, e: u32| {
+                for n in &nodes {
+                    n.1.send(Event::TestEpoch(Some(current.clone()), previous.map(|p| Some(p.clone())), prefer, e))
+                        .unwrap();
+                }
+            };
         let epoch = |current: &Vec<consensus::Relay>, previous: Option<&Vec<consensus::Relay>>, prefer: bool| {
-            for n in &nodes {
-                n.1.send(Event::TestEpoch(Some(current.clone()), previous.map(|p| Some(p.clone())), prefer)).unwrap();
-            }
+            epoch_in(current, previous, prefer, 0)
         };
         // One session (`docs/SCALING.md`), at the first point of the list
         // preferred. List a alone.
@@ -5728,6 +5736,19 @@ mod tests {
         epoch(&b, None, true);
         live_at(&points(&b, id(5))[..1]);
         message("under b");
+        // A new epoch with b unchanged (`docs/SUBNAMES.md`): the points
+        // move all the same, through the same grace period. The first
+        // epoch where p's first point moves, to see the session follow.
+        let e = (1..).find(|&e| points_in(&b, id(5), e)[0] != points(&b, id(5))[0]).unwrap();
+        epoch_in(&b, Some(&b), false, e);
+        live_at(&points_in(&b, id(5), e - 1)[..1]);
+        message("a new epoch, the old one first");
+        epoch_in(&b, Some(&b), true, e);
+        live_at(&points_in(&b, id(5), e)[..1]);
+        message("a new epoch, the new one first");
+        epoch_in(&b, None, true, e);
+        live_at(&points_in(&b, id(5), e)[..1]);
+        message("the new epoch alone");
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
         }
@@ -5807,7 +5828,7 @@ mod tests {
                    current: Option<&Vec<consensus::Relay>>,
                    previous: Option<Option<&Vec<consensus::Relay>>>,
                    prefer: bool| {
-            nodes[n].1.send(Event::TestEpoch(current.cloned(), previous.map(|p| p.cloned()), prefer)).unwrap();
+            nodes[n].1.send(Event::TestEpoch(current.cloned(), previous.map(|p| p.cloned()), prefer, 0)).unwrap();
         };
         // r is in onion mode from the start: it never holds an init session.
         set(r, Some(&list), None, true);
@@ -5927,7 +5948,7 @@ mod tests {
         message("after replacement");
         // The relay that is none of p's points is only ever a hop: stop it.
         let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
-        let points: Vec<Digest> = onion::rendezvous_relays(&id(5), &ids).into_iter().map(|i| ids[i]).collect();
+        let points: Vec<Digest> = onion::rendezvous_relays(&id(5), 0, &ids).into_iter().map(|i| ids[i]).collect();
         let hop = (0..4).find(|&i| !points.contains(&id(i as u8 + 1))).unwrap();
         for n in [p, q] {
             nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600))).unwrap();

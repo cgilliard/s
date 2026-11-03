@@ -28,7 +28,7 @@ the same value a registered name resolves to (`docs/NAMES.md`), so a name
 is a human handle for an onion identity. The id is the address: what a
 payer is given (or a name that resolves to it), what every message is
 addressed by, and what the holder's rendezvous points are derived from
-(`H(id ‖ k)`, see "Rendezvous"), so an id alone is enough to reach its
+(`H(id ‖ epoch ‖ k)`, see "Rendezvous"), so an id alone is enough to reach its
 holder. The Dilithium key is long-lived
 and signs everything the holder publishes. Encryption to the holder uses
 Kyber keys that are ephemeral: made fresh, signed by the Dilithium key
@@ -157,13 +157,22 @@ block's body has: committed to by the work, and by a day of it.
 
 Both modes work the same way; only the set of nodes differs. A
 participant's three rendezvous points are chosen from the available
-nodes by the hash of its 32-byte id. In onion mode every listed relay is
-weighed by `H(id ‖ relay id)` and the three heaviest are the points
-(rendezvous, or highest random weight, hashing), so adding or removing a
-relay moves only the ids that had it among their three. In init mode the
-seeds, sorted by name, are indexed by `H(id ‖ k)` for `k` in 0, 1, 2,
-reduced modulo their number, skipping repeats. Anyone holding the
-consensus and the id computes the same three.
+nodes by the hash of its 32-byte id and the **epoch**, the counter of
+144-block windows (`height / 144`). In onion mode every listed relay is
+weighed by `H(id ‖ epoch ‖ relay id)` and the three heaviest are the
+points (rendezvous, or highest random weight, hashing), so adding or
+removing a relay moves only the ids that had it among their three. In
+init mode the seeds, sorted by name, are indexed by `H(id ‖ epoch ‖ k)`
+for `k` in 0, 1, 2, reduced modulo their number, skipping repeats.
+Anyone holding the consensus and the id computes the same three.
+
+The epoch moves every id's points at each boundary, so no relay is an
+id's point for good (`docs/SUBNAMES.md`, section 2). It depends on
+height alone, so a reorganization never moves them, and the switch at a
+boundary is the one a change of file gets (change 2 below): both
+epochs' points stand from `B` to `B + 4`, the new one's are tried first
+from `B + 2`, and the old one's close at `B + 5`. When the file changes
+too, the two sets are (old file, old epoch) and (new file, new epoch).
 
 A participant that wants to be reached is online: it opens a session to
 each of its rendezvous points (a circuit in onion mode, a direct
@@ -385,7 +394,7 @@ Settled on 2026-11-01, before onion mode.
 | `KEEPALIVE` | 30 seconds between pings on a rendezvous session |
 | circuit length | 2 random relays plus the participant's rendezvous point |
 | path | sender's 2 hops, both rendezvous points, recipient's 2 hops: 6 relays |
-| `RENDEZVOUS` | 3 points per participant, from `H(id ‖ k)` |
+| `RENDEZVOUS` | 3 points per participant, from `H(id ‖ epoch ‖ k)` |
 | `CELL_BYTES` | 1,024 |
 | aux leaf 0 | `SHA-256(consensus.txt)`; zero is no vote |
 

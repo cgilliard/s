@@ -24,7 +24,7 @@
 //! A node with the wallet's identity keeps a session at each of its
 //! rendezvous points: the seeds (by name, sorted) in init mode, the listed
 //! relays (sorted by id) in onion mode until circuits exist (step 4), each
-//! chosen by [`onion::rendezvous_indexes`] of its id. It announces one
+//! chosen by [`onion::rendezvous_indexes`] of its id and the epoch. It announces one
 //! Kyber key at all of them, made fresh at start, whenever a session it had
 //! is lost (a reconnect) and when half its lifetime has passed; a retired
 //! key still opens payloads for [`KEY_GRACE`], those in flight. Sends go to
@@ -267,7 +267,11 @@ pub(super) struct State {
     notes_rx: Option<Receiver<Note>>,
     /// The relay set decided at the last boundary.
     current: RelaySet,
-    /// The one decided before it, while the switch lasts.
+    /// The rendezvous epoch since the last boundary
+    /// ([`onion::rendezvous_epoch`]); `previous` is under the one before.
+    epoch: u32,
+    /// The one decided before it, while the switch lasts: every boundary
+    /// switches, since points move each epoch even when the file stays.
     previous: Option<RelaySet>,
     /// Whether `current` is tried first: from the switch's third block.
     prefer_current: bool,
@@ -294,6 +298,19 @@ fn relay_set(c: &consensus::Current) -> RelaySet {
     }
 }
 
+/// The sets in force at `epoch`'s height: the current one, the one before
+/// while the grace period lasts (the old file, or the same one when it did
+/// not change, under the epoch before), whether the current is preferred,
+/// and the current epoch.
+fn sets_of(epoch: &consensus::Epoch) -> (RelaySet, Option<RelaySet>, bool, u32) {
+    let n = onion::rendezvous_epoch(epoch.boundary);
+    let into = epoch.height - epoch.boundary;
+    let previous =
+        (n > 0 && into + 1 < consensus::GRACE).then(|| relay_set(epoch.previous.as_ref().unwrap_or(&epoch.current)));
+    let prefer_current = previous.is_none() || into >= consensus::SWITCH;
+    (relay_set(&epoch.current), previous, prefer_current, n)
+}
+
 impl State {
     pub(super) fn new(identity: Option<mldsa::SecretKey>, wallet: bool, now: Instant) -> std::io::Result<State> {
         let (notes, notes_rx) = sync_channel(NOTES);
@@ -310,6 +327,7 @@ impl State {
             notes,
             notes_rx: Some(notes_rx),
             current: None,
+            epoch: 0,
             previous: None,
             prefer_current: true,
             #[cfg(test)]
@@ -320,11 +338,12 @@ impl State {
         })
     }
 
-    /// The sets in force, the preferred first: the current one and, while
-    /// a switch lasts, the one before.
-    fn sets(&self) -> Vec<&RelaySet> {
-        let mut out = vec![&self.current];
+    /// The sets in force, each with its rendezvous epoch, the preferred
+    /// first: the current one and, while a switch lasts, the one before.
+    fn sets(&self) -> Vec<(&RelaySet, u32)> {
+        let mut out = vec![(&self.current, self.epoch)];
         if let Some(p) = &self.previous {
+            let p = (p, self.epoch.saturating_sub(1));
             if self.prefer_current {
                 out.push(p);
             } else {
@@ -336,12 +355,23 @@ impl State {
 
     /// The onion-mode relay lists in force, the preferred first.
     pub(super) fn onion_sets(&self) -> Vec<&[consensus::Relay]> {
-        self.sets().into_iter().filter_map(|s| s.as_deref()).collect()
+        self.onion_epochs().into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// The onion-mode relay lists in force with their epochs, the
+    /// preferred first.
+    pub(super) fn onion_epochs(&self) -> Vec<(&[consensus::Relay], u32)> {
+        self.sets().into_iter().filter_map(|(s, e)| Some((s.as_deref()?, e))).collect()
+    }
+
+    /// The epochs of the init-mode sets in force, the preferred first.
+    fn init_epochs(&self) -> Vec<u32> {
+        self.sets().into_iter().filter(|(s, _)| s.is_none()).map(|(_, e)| e).collect()
     }
 
     /// Whether a set in force is init mode's: the seeds serve sessions.
     pub(super) fn init_active(&self) -> bool {
-        self.sets().iter().any(|s| s.is_none())
+        !self.init_epochs().is_empty()
     }
 
     /// Whether a set in force is onion mode's.
@@ -351,7 +381,7 @@ impl State {
 
     /// Whether the preferred set is onion mode's.
     pub(super) fn prefers_onion(&self) -> bool {
-        self.sets()[0].is_some()
+        self.sets()[0].0.is_some()
     }
 
     /// The listed relay `id`, in any set in force.
@@ -362,13 +392,14 @@ impl State {
     /// Tests: relays as if an onion-mode file were in force, alone.
     #[cfg(test)]
     pub(super) fn set_relays(&mut self, relays: Vec<consensus::Relay>) {
-        self.set_sets(Some(relays), None, true);
+        self.set_sets(Some(relays), None, true, 0);
     }
 
-    /// Tests: the sets in force given by hand.
+    /// Tests: the sets in force given by hand, `current` under `epoch`.
     #[cfg(test)]
-    pub(super) fn set_sets(&mut self, current: RelaySet, previous: Option<RelaySet>, prefer_current: bool) {
+    pub(super) fn set_sets(&mut self, current: RelaySet, previous: Option<RelaySet>, prefer_current: bool, epoch: u32) {
         self.current = current;
+        self.epoch = epoch;
         self.previous = previous;
         self.prefer_current = prefer_current;
         self.pinned = true;
@@ -380,15 +411,20 @@ impl State {
     }
 
     /// Follows the files in force (`docs/ONION.md`): decided at the last
-    /// boundary, and the one before while the switch lasts.
+    /// boundary, and the one before while the switch lasts. Rendezvous
+    /// points move at every boundary (`docs/SUBNAMES.md`, section 2), so
+    /// the set before stands through every grace period, with the same
+    /// file when it did not change.
     pub(super) fn set_epoch(&mut self, epoch: &consensus::Epoch) {
         #[cfg(test)]
         if self.pinned {
             return;
         }
-        self.current = relay_set(&epoch.current);
-        self.previous = epoch.previous.as_ref().map(relay_set);
-        self.prefer_current = epoch.prefer_current;
+        let (current, previous, prefer_current, n) = sets_of(epoch);
+        self.current = current;
+        self.previous = previous;
+        self.prefer_current = prefer_current;
+        self.epoch = n;
         if self.previous.is_none() {
             self.fallback.clear();
         }
@@ -475,14 +511,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// `id`'s init-mode rendezvous points that can be reached: resolved,
-    /// and not this node. They are chosen among the seeds by name; only
-    /// the chosen are resolved.
+    /// and not this node. They are chosen among the seeds by name, under
+    /// each init-mode epoch in force, the preferred first; only the chosen
+    /// are resolved.
     fn points_for(&mut self, id: &Digest) -> Vec<SocketAddr> {
         let names: Vec<String> = {
             let mut seeds = self.config.seeds.clone();
             seeds.sort();
             seeds.dedup();
-            onion::rendezvous_indexes(id, seeds.len()).into_iter().map(|i| seeds[i].clone()).collect()
+            let mut names: Vec<String> = Vec::new();
+            for e in self.rv.init_epochs() {
+                for i in onion::rendezvous_indexes(id, e, seeds.len()) {
+                    if !names.contains(&seeds[i]) {
+                        names.push(seeds[i].clone());
+                    }
+                }
+            }
+            names
         };
         let addrs: Vec<SocketAddr> = names.iter().filter_map(|n| self.resolve(n)).collect();
         addrs.into_iter().filter(|a| !self.peers.is_self(a)).collect()
@@ -496,12 +541,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// `id`'s onion-mode rendezvous points: under each relay list in
-    /// force, the preferred first, each point once.
+    /// force with its epoch, the preferred first, each point once.
     pub(super) fn onion_points_of(&self, id: &Digest) -> Vec<Digest> {
         let mut out: Vec<Digest> = Vec::new();
-        for relays in self.rv.onion_sets() {
+        for (relays, epoch) in self.rv.onion_epochs() {
             let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
-            for i in onion::rendezvous_relays(id, &ids) {
+            for i in onion::rendezvous_relays(id, epoch, &ids) {
                 if !out.contains(&ids[i]) {
                     out.push(ids[i]);
                 }
@@ -511,12 +556,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Whether this node, as a relay, is a rendezvous point of `id` in
-    /// onion mode: under any relay list in force, during a switch too.
+    /// onion mode: under any relay list in force with its epoch, during a
+    /// switch too.
     pub(super) fn serves(&self, id: &Digest) -> bool {
         let Some(me) = self.config.relay_id() else { return false };
-        self.rv.onion_sets().into_iter().any(|relays| {
+        self.rv.onion_epochs().into_iter().any(|(relays, epoch)| {
             let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
-            onion::rendezvous_relays(id, &ids).into_iter().any(|i| relays[i].id == me)
+            onion::rendezvous_relays(id, epoch, &ids).into_iter().any(|i| relays[i].id == me)
         })
     }
 
@@ -1063,5 +1109,35 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Err(format!("the message is too large: {} bytes, at most {MAX_OBJECT}", bytes.len()));
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::{Current, Epoch, Mode, Votes};
+
+    /// Points move at every boundary, the file changed or not: the epoch
+    /// before stands from `B` to `B + 4`, is tried first until `B + 2`,
+    /// and is gone at `B + 5`; the first epoch has none before it.
+    #[test]
+    fn every_boundary_switches_epochs_with_a_grace_period() {
+        let init = Current { mode: Mode::Init, winner: None, file: None, skipped: vec![] };
+        let at = |h: u32| sets_of(&Epoch::new(h, Votes::default(), init.clone(), Some(init.clone())));
+        for h in [0, 5, 143] {
+            let (_, previous, prefer, n) = at(h);
+            assert_eq!((previous.is_some(), prefer, n), (false, true, 0), "at {h}");
+        }
+        for b in [144, 288] {
+            for h in b..b + 5 {
+                let (_, previous, prefer, n) = at(h);
+                assert!(previous.is_some(), "both stand at {h}");
+                assert_eq!((prefer, n), (h >= b + 2, b / 144), "at {h}");
+            }
+            for h in [b + 5, b + 100, b + 143] {
+                let (_, previous, prefer, _) = at(h);
+                assert_eq!((previous.is_some(), prefer), (false, true), "at {h}");
+            }
+        }
     }
 }

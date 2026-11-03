@@ -271,6 +271,16 @@ the existing switch code carry both changes at once.
 1. Epoch counter in rendezvous selection, and the epoch switch in
    `node/sessions.rs` beside the file switch; a test on `--network dev`
    crossing several boundaries with payments in flight.
+   Done (2026-11-03, protocol 8): `onion::rendezvous_epoch`, the epoch
+   in `rendezvous_relays` and `rendezvous_indexes`, and every boundary a
+   switch in `node/sessions.rs` (`sets_of`): the set before stands
+   through the grace period under the epoch before, the same file when
+   it did not change. Tested by `a_switch_of_relays_keeps_messages_flowing`
+   (now also across an epoch with the file unchanged) and
+   `every_boundary_switches_epochs_with_a_grace_period`. Not yet: the
+   random spread of moves over the grace period (with one session, a
+   participant moves when the preferred set flips at `B + 2`), and the
+   `--network dev` run across boundaries.
 2. The delegation and the signed answer (`onion.rs`), with tests for a
    forged, stale, expired and other-name delegation, and a forged or
    stale answer.

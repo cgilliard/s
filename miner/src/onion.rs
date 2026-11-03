@@ -383,11 +383,19 @@ impl Object {
     }
 }
 
-/// A participant's rendezvous points among `n` nodes sorted by id (or by
-/// address, in init mode): the indexes `H(id ‖ k)` for `k` from 0 on,
-/// each reduced modulo `n`, skipping repeats, [`RENDEZVOUS`] of them or
-/// every node when there are fewer.
-pub fn rendezvous_indexes(id: &Digest, n: usize) -> Vec<usize> {
+/// The rendezvous epoch at main-chain height `height`: the counter of
+/// [`crate::consensus::EPOCH`]-block windows. Points are chosen afresh
+/// each epoch (`docs/SUBNAMES.md`, section 2), from height alone, so a
+/// reorganization never moves them.
+pub fn rendezvous_epoch(height: u32) -> u32 {
+    height / crate::consensus::EPOCH
+}
+
+/// A participant's rendezvous points in `epoch` among `n` nodes sorted by
+/// id (or by address, in init mode): the indexes `H(id ‖ epoch ‖ k)` for
+/// `k` from 0 on, each reduced modulo `n`, skipping repeats,
+/// [`RENDEZVOUS`] of them or every node when there are fewer.
+pub fn rendezvous_indexes(id: &Digest, epoch: u32, n: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(RENDEZVOUS);
     if n == 0 {
         return out;
@@ -395,9 +403,10 @@ pub fn rendezvous_indexes(id: &Digest, n: usize) -> Vec<usize> {
     let want = RENDEZVOUS.min(n);
     let mut k = 0u32;
     while out.len() < want {
-        let mut input = [Fp::ZERO; 9];
+        let mut input = [Fp::ZERO; 10];
         input[..8].copy_from_slice(id);
-        input[8] = Fp::new(k);
+        input[8] = Fp::new(epoch);
+        input[9] = Fp::new(k);
         let h = hash_domain(DOM_RENDEZVOUS, &input);
         let bytes = digest_to_bytes(&h);
         let x = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -411,16 +420,18 @@ pub fn rendezvous_indexes(id: &Digest, n: usize) -> Vec<usize> {
 }
 
 /// A participant's rendezvous points among the listed relays, by
-/// rendezvous (highest random weight) hashing: every relay is weighed by
-/// `H(id ‖ relay id)` and the [`RENDEZVOUS`] heaviest are the points,
-/// heaviest first. Adding or removing a relay moves only the ids that had
-/// it among their points, unlike reducing a hash modulo the number of
-/// relays. Returns indexes into `relays`.
-pub fn rendezvous_relays(id: &Digest, relays: &[Digest]) -> Vec<usize> {
+/// rendezvous (highest random weight) hashing: in `epoch` every relay is
+/// weighed by `H(id ‖ epoch ‖ relay id)` and the [`RENDEZVOUS`] heaviest
+/// are the points, heaviest first. Adding or removing a relay moves only
+/// the ids that had it among their points, unlike reducing a hash modulo
+/// the number of relays; a new epoch moves them all, so no relay is an
+/// id's point for good. Returns indexes into `relays`.
+pub fn rendezvous_relays(id: &Digest, epoch: u32, relays: &[Digest]) -> Vec<usize> {
     let weight = |r: &Digest| {
-        let mut input = [Fp::ZERO; 16];
+        let mut input = [Fp::ZERO; 17];
         input[..8].copy_from_slice(id);
-        input[8..].copy_from_slice(r);
+        input[8] = Fp::new(epoch);
+        input[9..].copy_from_slice(r);
         let bytes = digest_to_bytes(&hash_domain(DOM_WEIGHT, &input));
         u64::from_le_bytes(bytes[..8].try_into().unwrap())
     };
@@ -586,16 +597,16 @@ mod tests {
     #[test]
     fn rendezvous_points_are_distinct_and_deterministic() {
         let id = address::id_of(keys(1).0.public_key());
-        let r = rendezvous_indexes(&id, 10);
+        let r = rendezvous_indexes(&id, 0, 10);
         assert_eq!(r.len(), 3);
         assert!(r.iter().all(|i| *i < 10));
         assert_eq!(r.iter().collect::<std::collections::HashSet<_>>().len(), 3);
-        assert_eq!(rendezvous_indexes(&id, 10), r);
-        assert_eq!(rendezvous_indexes(&id, 2).len(), 2);
-        assert_eq!(rendezvous_indexes(&id, 1), vec![0]);
-        assert_eq!(rendezvous_indexes(&id, 0), Vec::<usize>::new());
+        assert_eq!(rendezvous_indexes(&id, 0, 10), r);
+        assert_eq!(rendezvous_indexes(&id, 0, 2).len(), 2);
+        assert_eq!(rendezvous_indexes(&id, 0, 1), vec![0]);
+        assert_eq!(rendezvous_indexes(&id, 0, 0), Vec::<usize>::new());
         let other = address::id_of(keys(2).0.public_key());
-        assert_ne!(rendezvous_indexes(&other, 1000), rendezvous_indexes(&id, 1000));
+        assert_ne!(rendezvous_indexes(&other, 0, 1000), rendezvous_indexes(&id, 0, 1000));
         assert_eq!(parse_id(&address::encode(&id)), Some(id));
         let hex: String = digest_to_bytes(&id).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(parse_id(&hex), Some(id));
@@ -604,7 +615,7 @@ mod tests {
         let relays: Vec<Digest> = (0..20u8).map(|t| address::id_of(keys(100 + t).0.public_key())).collect();
         let ids: Vec<Digest> = (0..200u8).map(|t| address::id_of(&[t; 40])).collect();
         let points = |rs: &[Digest], id: &Digest| -> Vec<Digest> {
-            rendezvous_relays(id, rs).into_iter().map(|i| rs[i]).collect()
+            rendezvous_relays(id, 0, rs).into_iter().map(|i| rs[i]).collect()
         };
         let removed = &relays[1..];
         let mut moved = 0;
@@ -620,7 +631,32 @@ mod tests {
             }
         }
         assert!(moved > 0 && moved < 80, "{moved}");
-        assert_eq!(rendezvous_relays(&ids[0], &relays[..2]).len(), 2);
+        assert_eq!(rendezvous_relays(&ids[0], 0, &relays[..2]).len(), 2);
         assert!(short(&id).starts_with("tab1"));
+    }
+
+    #[test]
+    fn rendezvous_points_move_each_epoch() {
+        assert_eq!(rendezvous_epoch(0), 0);
+        assert_eq!(rendezvous_epoch(143), 0);
+        assert_eq!(rendezvous_epoch(144), 1);
+        assert_eq!(rendezvous_epoch(300), 2);
+        let relays: Vec<Digest> = (0..20u8).map(|t| address::id_of(keys(100 + t).0.public_key())).collect();
+        let ids: Vec<Digest> = (0..100u8).map(|t| address::id_of(&[t; 40])).collect();
+        let points = |id: &Digest, e: u32| -> Vec<Digest> {
+            rendezvous_relays(id, e, &relays).into_iter().map(|i| relays[i]).collect()
+        };
+        // The same epoch, the same points; the next, nearly always others.
+        let mut moved = 0;
+        for id in &ids {
+            assert_eq!(points(id, 7), points(id, 7));
+            if points(id, 7) != points(id, 8) {
+                moved += 1;
+            }
+        }
+        assert!(moved > 90, "{moved}");
+        // Init mode's seeds too.
+        let moved = ids.iter().filter(|id| rendezvous_indexes(id, 7, 1000) != rendezvous_indexes(id, 8, 1000)).count();
+        assert_eq!(moved, ids.len());
     }
 }
