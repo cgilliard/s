@@ -166,18 +166,19 @@ the record by name or by scan.
 
 ## Sub-names
 
-Sub-names are a payment-layer feature, not a chain feature. A name's
-owner publishes a signed zone to its rendezvous points: a sequence
-number and `label → payment hash` entries, signed by the Dilithium key
-whose hash is the name's value. Resolving `cool.example` is a chain
-lookup of `example`, a fetch of the zone from `example`'s rendezvous
-points with a signature check (the sequence number stops a stale zone),
-then the normal handshake at `cool.example`'s own rendezvous points.
+Sub-names are a message-layer feature, not a chain feature, specified in
+`docs/SUBNAMES.md`. The holder of a name's value may delegate its
+sub-names to up to three servers, by a signed delegation held at its
+rendezvous points; with none, its own node answers. Resolving
+`cool.example` is a chain lookup of `example`, the delegation from its
+value's rendezvous points, a sealed query to a server, whose signed
+answer gives an id, then the normal payment to that id.
 
 Sub-names are therefore free, unlimited and changeable at runtime, and
 entirely under the parent's control; anyone wanting an identity the
-parent cannot touch registers a top-level name. The zone format belongs
-to the rendezvous layer's specification.
+parent cannot touch registers a top-level name. They exist because a
+block admits five reveals: one name can carry as many users as its
+owner admits.
 
 ## The proof
 

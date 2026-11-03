@@ -567,7 +567,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn hold_delegation(&mut self, bytes: &[u8], now: Instant) -> Result<Digest, u8> {
         let d = Delegation::from_bytes(bytes).ok_or(NOTICE_REJECTED)?;
         let owner = d.owner();
-        if !self.config.relay || !self.serves(&owner) || !d.verify(&d.name, &owner, super::unix_now()) {
+        if !self.config.relay || !self.serves(&owner) || !d.verify(&owner, super::unix_now()) {
             return Err(NOTICE_REJECTED);
         }
         match self.rdv.delegations.get(&owner) {

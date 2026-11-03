@@ -373,6 +373,24 @@ from their outputs; a recovered commit is matched to its name when you
 reveal it. Names must be revealed within 288 blocks of their commit or the
 commit is swept.
 
+### Sub-names
+
+A name's owner can point sub-names under it at any address, off chain
+(`docs/SUBNAMES.md`): `send 5 @cool.example` asks `example`'s sub-name
+server what `cool` is, checks its signed answer, and pays that. By
+default the owner's own node is the server, answering from the entries
+its wallet keeps in `DIR/subnames`; an owner can instead delegate to up
+to three always-on servers, which then answer while its wallet is
+offline (onion mode only).
+
+```
+> subname set cool.example tab1…    # cool.example pays tab1…, as this node answers it
+> subname del cool.example
+> subnames                          # the entries answered here, and the servers
+> subname server tab1… @srv2        # delegate: these servers answer this address's names
+> subname server none               # answer here again
+```
+
 ## Message layer
 
 Wallets reach each other without a server and, once relays exist,

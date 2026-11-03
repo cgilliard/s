@@ -5691,7 +5691,7 @@ mod tests {
         }
         assert!(live(owner) && live(server) && live(resolver));
         let now = unix_now();
-        let d = Delegation::make(&key(4), b"example", 1, now + 3600, &[id(5)]).unwrap();
+        let d = Delegation::make(&key(4), 1, now + 3600, &[id(5)]).unwrap();
         nodes[owner].1.send(Event::Delegate(Some(d.to_bytes()))).unwrap();
         let mut tag = 0;
         let mut fetch = |who: Digest| -> Option<Delegation> {
@@ -5717,7 +5717,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
         };
         assert_eq!(got, d);
-        assert!(got.verify(b"example", &id(4), now));
+        assert!(got.verify(&id(4), now));
         // An id with none.
         assert_eq!(fetch(id(9)), None);
         // The owner goes offline: its points still hold the delegation.
@@ -5734,7 +5734,7 @@ mod tests {
             let out = Outbound {
                 tag,
                 to: id(5),
-                kind: onion::KIND_SUBNAME,
+                kind: onion::KIND_SUBNAME_QUERY,
                 inner: crate::subnames::query(b"example", label),
                 recipient: None,
                 reply: None,
@@ -5742,7 +5742,7 @@ mod tests {
             nodes[resolver].1.send(Event::Send(out)).unwrap();
             loop {
                 match nodes[resolver].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
-                    Note::Received(o) if o.kind == onion::KIND_SUBNAME => {
+                    Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
                         assert_eq!(o.answers, Some(id(5)));
                         return Answer::from_bytes(&o.inner).expect("an answer");
                     }

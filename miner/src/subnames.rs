@@ -1,9 +1,9 @@
 //! Sub-names (`docs/SUBNAMES.md`): `label.name` resolved off chain.
 //!
-//! The owner of a registered name (the key whose hash is the name's value
-//! on chain) may publish a [`Delegation`] at its rendezvous points naming
-//! up to [`MAX_SERVERS`] sub-name servers by id; with none, the owner's
-//! own node is the server. A server answers a lookup of one label with an
+//! The holder of an id (the key whose hash it is) may publish a
+//! [`Delegation`] at its rendezvous points naming up to [`MAX_SERVERS`]
+//! sub-name servers by id, for every name whose value on chain is that id;
+//! with none, the id's own node is the server. A server answers a lookup of one label with an
 //! [`Answer`] signed by its own key: the label's type and value, or none.
 //! Both carry the signer's Dilithium key, so each is checked alone: by
 //! one hash against the id it must have and one signature.
@@ -54,11 +54,12 @@ fn in_force(expiry: u64, now: u64) -> bool {
     expiry > now && expiry - now <= MAX_LIFETIME_SECS
 }
 
-/// A name's sub-name servers, signed by the name's owner.
+/// An id's sub-name servers, signed by the id's key: for every name whose
+/// value is the id. Answers name their name, so one name's answer cannot
+/// stand for another's; names pointing at one id share its servers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delegation {
-    pub name: Vec<u8>,
-    /// The owner's key: its hash is the name's value on chain.
+    /// The owner's key: its hash is the names' value on chain.
     pub dilithium: Vec<u8>,
     /// Rises with every new delegation (the time in milliseconds, as
     /// announces use); a rendezvous point keeps the highest.
@@ -71,9 +72,8 @@ pub struct Delegation {
 }
 
 impl Delegation {
-    fn signed_part(name: &[u8], dilithium: &[u8], seq: u64, expiry: u64, servers: &[Digest]) -> Vec<u8> {
-        let mut w = Writer::with_capacity(1 + name.len() + mldsa::PK_LEN + 17 + 32 * servers.len());
-        put_name(&mut w, name);
+    fn signed_part(dilithium: &[u8], seq: u64, expiry: u64, servers: &[Digest]) -> Vec<u8> {
+        let mut w = Writer::with_capacity(mldsa::PK_LEN + 17 + 32 * servers.len());
         w.0.extend_from_slice(dilithium);
         w.u64(seq);
         w.u64(expiry);
@@ -88,15 +88,15 @@ impl Delegation {
         (1..=MAX_SERVERS).contains(&servers.len()) && servers.iter().enumerate().all(|(i, s)| !servers[..i].contains(s))
     }
 
-    /// Signs a delegation of `name` to `servers` by `key`; `None` for a
-    /// malformed name or server list.
-    pub fn make(key: &mldsa::SecretKey, name: &[u8], seq: u64, expiry: u64, servers: &[Digest]) -> Option<Delegation> {
-        if !valid_name(name) || !Self::servers_ok(servers) {
+    /// Signs a delegation of `key`'s id to `servers`; `None` for a
+    /// malformed server list.
+    pub fn make(key: &mldsa::SecretKey, seq: u64, expiry: u64, servers: &[Digest]) -> Option<Delegation> {
+        if !Self::servers_ok(servers) {
             return None;
         }
         let dilithium = key.public_key().to_vec();
-        let sig = key.sign(&Self::signed_part(name, &dilithium, seq, expiry, servers), DELEGATION_CONTEXT);
-        Some(Delegation { name: name.to_vec(), dilithium, seq, expiry, servers: servers.to_vec(), sig })
+        let sig = key.sign(&Self::signed_part(&dilithium, seq, expiry, servers), DELEGATION_CONTEXT);
+        Some(Delegation { dilithium, seq, expiry, servers: servers.to_vec(), sig })
     }
 
     /// The id of the key that signed it.
@@ -104,31 +104,29 @@ impl Delegation {
         address::id_of(&self.dilithium)
     }
 
-    /// Whether it is a sound delegation of `name`, whose value on chain is
-    /// `value`, at time `now`: for that name, signed by the key `value`
-    /// is the hash of, in force, and naming a well-formed server list.
-    pub fn verify(&self, name: &[u8], value: &Digest, now: u64) -> bool {
-        self.name == name
-            && self.owner() == *value
+    /// Whether it is a sound delegation of `value` (a name's value on
+    /// chain) at time `now`: signed by the key `value` is the hash of, in
+    /// force, and naming a well-formed server list.
+    pub fn verify(&self, value: &Digest, now: u64) -> bool {
+        self.owner() == *value
             && in_force(self.expiry, now)
             && Self::servers_ok(&self.servers)
             && mldsa::verify(
                 &self.dilithium,
-                &Self::signed_part(&self.name, &self.dilithium, self.seq, self.expiry, &self.servers),
+                &Self::signed_part(&self.dilithium, self.seq, self.expiry, &self.servers),
                 DELEGATION_CONTEXT,
                 &self.sig,
             )
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Self::signed_part(&self.name, &self.dilithium, self.seq, self.expiry, &self.servers);
+        let mut out = Self::signed_part(&self.dilithium, self.seq, self.expiry, &self.servers);
         out.extend_from_slice(&self.sig);
         out
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Delegation> {
         let mut r = Reader(bytes);
-        let name = get_name(&mut r)?;
         let dilithium = r.take(mldsa::PK_LEN)?.to_vec();
         let seq = r.u64()?;
         let expiry = r.u64()?;
@@ -138,7 +136,7 @@ impl Delegation {
         }
         let servers = (0..n).map(|_| digest_from_bytes(r.take(32)?)).collect::<Option<Vec<_>>>()?;
         let sig = r.take(mldsa::SIG_LEN)?.to_vec();
-        r.is_empty().then_some(Delegation { name, dilithium, seq, expiry, servers, sig })
+        r.is_empty().then_some(Delegation { dilithium, seq, expiry, servers, sig })
     }
 }
 
@@ -302,8 +300,9 @@ impl Answer {
 }
 
 /// A query for `label.name`: the inner bytes of a payload of kind
-/// [`crate::onion::KIND_SUBNAME`] to the server, answered along the
-/// payload's way back by one whose inner bytes are an [`Answer`].
+/// [`crate::onion::KIND_SUBNAME_QUERY`] to the server, answered (along the
+/// payload's way back, or to its named sender) by one of kind
+/// [`crate::onion::KIND_SUBNAME_ANSWER`] whose inner bytes are an [`Answer`].
 pub fn query(name: &[u8], label: &[u8]) -> Vec<u8> {
     let mut w = Writer::with_capacity(2 + name.len() + label.len());
     put_name(&mut w, name);
@@ -359,40 +358,35 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     #[test]
-    fn delegations_verify_only_for_their_name_owner_and_time() {
+    fn delegations_verify_only_for_their_owner_and_time() {
         let (owner, s1, s2) = (key(1), id(2), id(3));
-        let d = Delegation::make(&owner, b"example", 5, NOW + 3600, &[s1, s2]).unwrap();
-        assert!(d.verify(b"example", &id(1), NOW));
+        let d = Delegation::make(&owner, 5, NOW + 3600, &[s1, s2]).unwrap();
+        assert!(d.verify(&id(1), NOW));
         assert_eq!(Delegation::from_bytes(&d.to_bytes()), Some(d.clone()));
-        // Another name with the same value, or another value.
-        assert!(!d.verify(b"other", &id(1), NOW));
-        assert!(!d.verify(b"example", &id(9), NOW));
-        // Signed by a key that is not the name's value.
-        let other = Delegation::make(&key(9), b"example", 5, NOW + 3600, &[s1]).unwrap();
-        assert!(!other.verify(b"example", &id(1), NOW));
+        // Another value, or signed by a key that is not the value's.
+        assert!(!d.verify(&id(9), NOW));
+        let other = Delegation::make(&key(9), 5, NOW + 3600, &[s1]).unwrap();
+        assert!(!other.verify(&id(1), NOW));
         // Expired, or valid for too long.
-        assert!(!d.verify(b"example", &id(1), NOW + 3600));
-        let long = Delegation::make(&owner, b"example", 5, NOW + MAX_LIFETIME_SECS + 1, &[s1]).unwrap();
-        assert!(!long.verify(b"example", &id(1), NOW));
+        assert!(!d.verify(&id(1), NOW + 3600));
+        let long = Delegation::make(&owner, 5, NOW + MAX_LIFETIME_SECS + 1, &[s1]).unwrap();
+        assert!(!long.verify(&id(1), NOW));
         // Forged: any signed field changed, or the signature.
         for f in [
             |d: &mut Delegation| d.seq += 1,
             |d: &mut Delegation| d.expiry += 1,
             |d: &mut Delegation| d.servers[0] = id(7),
             |d: &mut Delegation| d.servers.truncate(1),
-            |d: &mut Delegation| d.name = b"exampl".to_vec(),
             |d: &mut Delegation| d.sig[0] ^= 1,
         ] {
             let mut forged = d.clone();
             f(&mut forged);
-            let name = forged.name.clone();
-            assert!(!forged.verify(&name, &id(1), NOW), "{forged:?}");
+            assert!(!forged.verify(&id(1), NOW), "{forged:?}");
         }
-        // Malformed server lists and names are refused when made and read.
-        assert!(Delegation::make(&owner, b"example", 5, NOW + 60, &[]).is_none());
-        assert!(Delegation::make(&owner, b"example", 5, NOW + 60, &[s1, s1]).is_none());
-        assert!(Delegation::make(&owner, b"example", 5, NOW + 60, &[s1, s2, id(4), id(5)]).is_none());
-        assert!(Delegation::make(&owner, b"Example", 5, NOW + 60, &[s1]).is_none());
+        // Malformed server lists are refused when made and read.
+        assert!(Delegation::make(&owner, 5, NOW + 60, &[]).is_none());
+        assert!(Delegation::make(&owner, 5, NOW + 60, &[s1, s1]).is_none());
+        assert!(Delegation::make(&owner, 5, NOW + 60, &[s1, s2, id(4), id(5)]).is_none());
         let bytes = d.to_bytes();
         assert!(Delegation::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         assert!(Delegation::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());

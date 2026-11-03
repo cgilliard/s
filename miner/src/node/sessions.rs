@@ -953,7 +953,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(me) = &self.rv.me else { return };
         let now = unix_now();
         match me.keys.iter().find_map(|(k, _)| p.open(k, now)) {
-            Some(opened) if opened.kind == onion::KIND_SUBNAME && opened.answers.is_none() => {
+            Some(opened) if opened.kind == onion::KIND_SUBNAME_QUERY => {
                 self.answer_subname(opened);
             }
             Some(opened) => {
@@ -992,7 +992,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         let tag = NODE_TAG | (random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) >> 1);
         let inner = answer.to_bytes();
-        self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME, inner, recipient, reply }, now);
+        self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME_ANSWER, inner, recipient, reply }, now);
     }
 
     pub(super) fn on_notice(&mut self, addr: SocketAddr, subject: Digest, code: u8, now: Instant) {
@@ -1047,6 +1047,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             None => self.log("message layer: the address is off"),
         }
         self.rv.me = me;
+        // The old address's delegation is for the old id.
+        self.part.delegation = None;
         for p in &mut self.rv.points {
             p.held = 0;
             p.was_live = false;

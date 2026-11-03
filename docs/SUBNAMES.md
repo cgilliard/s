@@ -52,16 +52,18 @@ session; the answer comes back along the query's return route. The
 points carry it without reading it. It can run on a home machine with
 no inbound ports.
 
-The owner of a name with value `V` publishes at `V`'s points a
+The holder of `V`, the value of a name, publishes at `V`'s points a
 **delegation**:
 
 ```text
-name ‖ owner key ‖ seq ‖ expiry ‖ server ids (1 to 3)
+owner key ‖ seq ‖ expiry ‖ server ids (1 to 3)
 ```
 
-signed by the key whose hash is `V`. Binding the name stops a
-delegation for `example` being served for another name with the same
-value. The owner's node sends it up its standing circuit (`Publish`)
+signed by the key whose hash is `V`. It is the id's, not one name's:
+points hold one delegation per id, and every name whose value is `V`
+shares its servers (a wallet owning several names pointing at its
+address delegates once). Answers name their name, so a server's answer
+for `example` cannot stand for another name. The owner's node sends it up its standing circuit (`Publish`)
 whenever its session there goes live; that point passes it to `V`'s
 other points (`Store`). Each holds it apart from the session, until
 `expiry`, so it is found while the owner is offline; each keeps the
@@ -116,7 +118,7 @@ address.
 2. It asks for `V`'s delegation over an outbound circuit; that
    circuit's last relay asks `V`'s points (`P1`, then the others) and
    returns it. The wallet checks the key hashes to `V`, and the
-   signature, name and expiry. It learns `S`.
+   signature and expiry. It learns `S`.
 3. It sends a query for `cool.example` to `S`, as any payload: `S`'s
    announce from `Q1`, the query sealed to it, forwarded over the
    server's session. The answer comes back down the wallet's circuit;
@@ -168,10 +170,13 @@ payload for `S`, as for a payment.
 ### Commands and limits
 
 - `subname server ADDRESS…` / `subname server none`: set or clear the
-  delegation for a name the wallet owns.
-- `subname set LABEL ADDRESS`, `subname del LABEL`, `subnames`: edit the
-  entries when the wallet is its own server (or runs one).
-- `send cool.example …`: resolved as above, with the same `@` as names.
+  delegation of the wallet's id, for every name pointing at it; the
+  wallet signs it for a day and renews it every six hours while it runs.
+- `subname set LABEL.NAME TO`, `subname del LABEL.NAME`, `subnames`: the
+  entries the wallet's node answers for, for its own names or any that
+  delegate to it, kept in `DIR/subnames`.
+- `send 5 @cool.example`: resolved as above (and anywhere `@NAME` is
+  taken, as `burn`'s `FOR`).
 - Labels follow the chain's alphabet and length; one level to begin
   with (nested labels later, each level delegated by its parent).
 - Points take a delegation update per id at most every 10 seconds, and
@@ -317,7 +322,19 @@ the existing switch code carry both changes at once.
    included.
 4. Wallet commands, `send` resolution with caching, warm circuits and
    racing (`main.rs`, `wallet.rs`); a timing test on `--network dev`.
+   Done (2026-11-03): the commands above (`main.rs`); `@LABEL.NAME`
+   resolves through the delegation (cached ten minutes) and a query to
+   every server at once, the first sound answer cached until it expires.
+   Queries and answers are payloads of two kinds (`KIND_SUBNAME_QUERY`,
+   `KIND_SUBNAME_ANSWER`), so an answer to a named sender (init mode)
+   is not taken for a query. The delegation is the id's, not one name's
+   (the name came out of it). Tried on `--network dev` in init mode: a
+   payment to `@cool.example` from the owner's wallet and from another's,
+   a missing label refused, a repeat sent from the cache. Not yet:
+   warm circuits (each lookup uses a fresh outbound circuit) and a timed
+   run in onion mode.
 5. README, and `docs/NAMES.md`'s sub-names section pointing here.
+   Done (2026-11-03).
 
 Self-published sub-names (section 1, "Later") come after, outside the
 reference implementation.

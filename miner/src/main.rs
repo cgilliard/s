@@ -147,7 +147,7 @@ const HELP: &str = "commands:
   outputs                   the wallet's outputs
   send AMOUNT [FEE] TO [named]
                             start a payment: TO is a file to write the slate to for
-                            the recipient, or a tab1… address or @NAME to send it to
+                            the recipient, or a tab1… address, @NAME or @LABEL.NAME to send it to
                             over the message layer, where the recipient's wallet
                             answers it and this one finalizes it, if both are online
                             (the fee defaults to the smallest the pool takes); the
@@ -194,6 +194,15 @@ const HELP: &str = "commands:
   name-transfer FILE [FEE]  sign a name over to the record in FILE
   names                     this wallet's names and pending commits
   name NAME                 look a name up on chain
+  subname server ADDRESS…   name up to 3 sub-name servers (tab1… addresses or @NAMEs)
+                            for every name pointing at this wallet's address
+                            (docs/SUBNAMES.md); without, this wallet answers itself
+  subname server none       answer this wallet's sub-names itself again
+  subname set LABEL.NAME TO point LABEL.NAME at TO (a tab1… address or @NAME), as
+                            this wallet's node answers it, for its own names or
+                            any that delegate to it
+  subname del LABEL.NAME    forget a sub-name
+  subnames                  the servers and the sub-names this wallet answers for
   set-leaf INDEX FILE       set aux leaf INDEX (0 to 15) to the SHA-256 of FILE:
                             their Merkle root goes in the headers this node mines
   set-leaf-value INDEX HEX  set aux leaf INDEX to a 32-byte value given in hex
@@ -626,6 +635,13 @@ struct Ctx {
     prompt: bool,
     /// Stage-1 slates answered lately, to refuse a flood.
     slates: Mutex<onion::SlateLimit>,
+    /// The wallet's sub-names, and the file they are kept in.
+    subnames: Mutex<Subnames>,
+    subnames_file: std::path::PathBuf,
+    /// Sub-name lookups waiting on the message layer.
+    waiting: Mutex<std::collections::HashMap<Wait, std::sync::mpsc::Sender<Note>>>,
+    /// Answers and delegations resolved lately, until they expire.
+    resolved: Mutex<Resolved>,
 }
 
 impl Ctx {
@@ -827,7 +843,22 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         outgoing: Mutex::new(std::collections::HashMap::new()),
         prompt: !args.no_prompt,
         slates: Mutex::new(onion::SlateLimit::default()),
+        subnames: Mutex::new(Subnames::load(&args.data.join("subnames"))?),
+        subnames_file: args.data.join("subnames"),
+        waiting: Mutex::new(std::collections::HashMap::new()),
+        resolved: Mutex::new(Resolved::default()),
     });
+    // The wallet's sub-names, and its delegation renewed well before it
+    // expires.
+    if ctx.wallet.is_some() {
+        let ctx = Arc::clone(&ctx);
+        std::thread::Builder::new().name("subnames".into()).spawn(move || {
+            loop {
+                publish_subnames(&ctx);
+                std::thread::sleep(DELEGATION_RENEW);
+            }
+        })?;
+    }
     if let Some(notes) = notes {
         let ctx = Arc::clone(&ctx);
         std::thread::Builder::new().name("messages".into()).spawn(move || {
@@ -1396,6 +1427,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 ["next"] => {
                     let key = w.next_address()?;
                     ctx.events.send(Event::Identity(Some(key))).map_err(|_| "the node has stopped")?;
+                    // A delegation, if any, signed again for the new id.
+                    publish_subnames(ctx);
                     println!("new address {}", w.address());
                     println!("the old one answers nothing from now on; payments under way are unaffected");
                 }
@@ -1994,6 +2027,111 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 }
             }
         }
+        "subname" => {
+            let w = ctx.wallet()?;
+            let changed = match args {
+                ["server", "none"] => {
+                    ctx.subnames.lock().unwrap().servers.clear();
+                    println!("this wallet's node answers its sub-names itself");
+                    true
+                }
+                ["server", ids @ ..] if !ids.is_empty() && ids.len() <= tabminer::subnames::MAX_SERVERS => {
+                    let mut servers = Vec::new();
+                    for a in ids {
+                        let id = recipient(ctx, a)?.ok_or_else(|| format!("{a} is not a tab1… address or @NAME"))?;
+                        if !servers.contains(&id) {
+                            servers.push(id);
+                        }
+                    }
+                    if w.address_off() {
+                        return Err("the address is off: there is no id to delegate".into());
+                    }
+                    let list: Vec<String> = servers.iter().map(tabminer::address::encode).collect();
+                    ctx.subnames.lock().unwrap().servers = servers;
+                    println!("sub-names of every name pointing at {} are answered by {}", w.address(), list.join(", "));
+                    println!(
+                        "(the delegation is held at this address's rendezvous points while this wallet renews it)"
+                    );
+                    true
+                }
+                ["set", sub, to] => {
+                    let (label, name) = parse_subname(sub)?;
+                    let id = recipient(ctx, to)?.ok_or_else(|| format!("{to} is not a tab1… address or @NAME"))?;
+                    let mut s = ctx.subnames.lock().unwrap();
+                    let zone = s.table.entry(name.clone()).or_default();
+                    zone.entries.insert(label, id);
+                    zone.seq = unix_millis().max(zone.seq + 1);
+                    drop(s);
+                    println!("{sub} is {}, as this wallet's node answers it", tabminer::address::encode(&id));
+                    let rtxn = ctx.chain.env().read_txn()?;
+                    let value = ctx.chain.names().lookup(&rtxn, &name)?.map(|r| r.value);
+                    let servers = ctx.subnames.lock().unwrap().servers.clone();
+                    if value != Some(w.id()) {
+                        println!(
+                            "note: {} does not point at this wallet's address: only a delegation of its",
+                            String::from_utf8_lossy(&name)
+                        );
+                        println!("value's to this wallet makes resolvers ask here");
+                    } else if !servers.is_empty() && !servers.contains(&w.id()) {
+                        println!(
+                            "note: this wallet delegates its sub-names to other servers; they answer, not this one"
+                        );
+                    }
+                    true
+                }
+                ["del", sub] => {
+                    let (label, name) = parse_subname(sub)?;
+                    let mut s = ctx.subnames.lock().unwrap();
+                    let zone = s
+                        .table
+                        .get_mut(&name)
+                        .ok_or_else(|| format!("no sub-names of {}", String::from_utf8_lossy(&name)))?;
+                    if zone.entries.remove(&label).is_none() {
+                        return Err(format!("no sub-name {sub}").into());
+                    }
+                    zone.seq = unix_millis().max(zone.seq + 1);
+                    if zone.entries.is_empty() {
+                        s.table.remove(&name);
+                    }
+                    println!("{sub} forgotten");
+                    true
+                }
+                _ => {
+                    return Err(
+                        "usage: subname server ADDRESS… | subname server none | subname set LABEL.NAME TO | subname del LABEL.NAME"
+                            .into(),
+                    );
+                }
+            };
+            if changed {
+                ctx.subnames.lock().unwrap().save(&ctx.subnames_file)?;
+                publish_subnames(ctx);
+            }
+        }
+        "subnames" => {
+            let s = ctx.subnames.lock().unwrap();
+            match s.servers.as_slice() {
+                [] => println!("server   this wallet's node (no delegation)"),
+                ids => {
+                    let list: Vec<String> = ids.iter().map(tabminer::address::encode).collect();
+                    println!("servers  {}", list.join(", "));
+                }
+            }
+            let mut names: Vec<&Vec<u8>> = s.table.keys().collect();
+            names.sort();
+            if names.is_empty() {
+                println!("no sub-names answered here");
+            }
+            for name in names {
+                for (label, id) in &s.table[name].entries {
+                    println!(
+                        "{:<40}  {}",
+                        format!("{}.{}", String::from_utf8_lossy(label), String::from_utf8_lossy(name)),
+                        tabminer::address::encode(id)
+                    );
+                }
+            }
+        }
         "slates" => {
             let slates = ctx.wallet()?.pending_slates()?;
             if slates.is_empty() {
@@ -2200,15 +2338,297 @@ fn restore(args: &Args) -> AnyResult<()> {
 /// registered `@name`'s value; `None` for a file.
 fn recipient(ctx: &Ctx, to: &str) -> AnyResult<Option<Digest>> {
     if let Some(name) = to.strip_prefix('@') {
-        let rtxn = ctx.chain.env().read_txn()?;
-        let record =
-            ctx.chain.names().lookup(&rtxn, name.as_bytes())?.ok_or_else(|| format!("{name} is not registered"))?;
-        if record.value == [tabminer::poseidon2::Fp::ZERO; 8] {
-            return Err(format!("{name} has no value: its owner has not set an address").into());
+        if let Some((label, name)) = name.split_once('.') {
+            return resolve_subname(ctx, label, name).map(Some);
         }
-        return Ok(Some(record.value));
+        return name_value(ctx, name).map(Some);
     }
     Ok(onion::parse_id(to))
+}
+
+/// A registered name's value.
+fn name_value(ctx: &Ctx, name: &str) -> AnyResult<Digest> {
+    let rtxn = ctx.chain.env().read_txn()?;
+    let record =
+        ctx.chain.names().lookup(&rtxn, name.as_bytes())?.ok_or_else(|| format!("{name} is not registered"))?;
+    if record.value == [tabminer::poseidon2::Fp::ZERO; 8] {
+        return Err(format!("{name} has no value: its owner has not set an address").into());
+    }
+    Ok(record.value)
+}
+
+/// How long a delegation is signed for, and how often it is renewed.
+const DELEGATION_LIFETIME: u64 = 86_400;
+const DELEGATION_RENEW: Duration = Duration::from_secs(6 * 3600);
+/// How long a sub-name lookup waits on the message layer.
+const RESOLVE_WAIT: Duration = Duration::from_secs(45);
+/// How long a delegation found (or found missing) is used before it is
+/// asked for again.
+const DELEGATION_CACHE: u64 = 600;
+
+/// The wallet's sub-names (`docs/SUBNAMES.md`), kept in the data
+/// directory: the servers its id delegates to, and the entries its node
+/// answers for as a server.
+#[derive(Default)]
+struct Subnames {
+    servers: Vec<Digest>,
+    table: tabminer::subnames::Table,
+}
+
+impl Subnames {
+    /// Lines `server ID…` and `entry NAME LABEL ID`, ids as tab1…
+    /// addresses; none when the file is missing. Every zone's sequence
+    /// number is the file's time.
+    fn load(path: &std::path::Path) -> AnyResult<Subnames> {
+        let mut out = Subnames::default();
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        let bad = |n: usize| format!("{}: line {}: malformed", path.display(), n + 1);
+        for (n, line) in text.lines().enumerate() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.as_slice() {
+                [] => {}
+                ["server", ids @ ..] => {
+                    out.servers = ids.iter().map(|a| onion::parse_id(a).ok_or(bad(n))).collect::<Result<_, _>>()?;
+                }
+                ["entry", name, label, id] => {
+                    let id = onion::parse_id(id).ok_or(bad(n))?;
+                    if !tabminer::names::valid_name(name.as_bytes()) || !tabminer::names::valid_name(label.as_bytes()) {
+                        return Err(bad(n).into());
+                    }
+                    let zone = out.table.entry(name.as_bytes().to_vec()).or_default();
+                    zone.entries.insert(label.as_bytes().to_vec(), id);
+                }
+                _ => return Err(bad(n).into()),
+            }
+        }
+        // Every zone at least as new as the file, so answers made after a
+        // restart are never older than those before it.
+        let seq = std::fs::metadata(path)?
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        for z in out.table.values_mut() {
+            z.seq = z.seq.max(seq);
+        }
+        Ok(out)
+    }
+
+    fn save(&self, path: &std::path::Path) -> AnyResult<()> {
+        let mut text = String::new();
+        if !self.servers.is_empty() {
+            let ids: Vec<String> = self.servers.iter().map(tabminer::address::encode).collect();
+            text.push_str(&format!("server {}\n", ids.join(" ")));
+        }
+        let mut names: Vec<&Vec<u8>> = self.table.keys().collect();
+        names.sort();
+        for name in names {
+            for (label, id) in &self.table[name].entries {
+                text.push_str(&format!(
+                    "entry {} {} {}\n",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(label),
+                    tabminer::address::encode(id)
+                ));
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// What a sub-name lookup waits for: a note under its tag, or a server's
+/// answer for a label.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Wait {
+    Tag(u64),
+    Answer(Digest, Vec<u8>, Vec<u8>),
+}
+
+/// Sub-names resolved lately: answers by name and label, and delegations
+/// (or none) by id with when to ask again.
+#[derive(Default)]
+struct Resolved {
+    answers: std::collections::HashMap<(Vec<u8>, Vec<u8>), tabminer::subnames::Answer>,
+    delegations: std::collections::HashMap<Digest, (Option<tabminer::subnames::Delegation>, u64)>,
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A tag for a lookup of ours: random, clear of the node's own.
+fn lookup_tag() -> u64 {
+    tabminer::wallet::random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(1) >> 1
+}
+
+/// Hands the node the sub-names it answers for, and this wallet's
+/// delegation (signed afresh) or none.
+fn publish_subnames(ctx: &Ctx) {
+    let Some(w) = &ctx.wallet else { return };
+    let (table, servers) = {
+        let s = ctx.subnames.lock().unwrap();
+        (s.table.clone(), s.servers.clone())
+    };
+    let _ = ctx.events.send(Event::Subnames(table));
+    let delegation = (!servers.is_empty() && !w.address_off())
+        .then(|| {
+            tabminer::subnames::Delegation::make(
+                &w.identity_key(),
+                unix_millis(),
+                now() + DELEGATION_LIFETIME,
+                &servers,
+            )
+        })
+        .flatten();
+    let _ = ctx.events.send(Event::Delegate(delegation.map(|d| d.to_bytes())));
+}
+
+/// Waits for what `keys` name, registered for the time of the wait.
+struct Waiter<'a> {
+    ctx: &'a Ctx,
+    keys: Vec<Wait>,
+    rx: std::sync::mpsc::Receiver<Note>,
+    tx: std::sync::mpsc::Sender<Note>,
+}
+
+impl<'a> Waiter<'a> {
+    fn new(ctx: &'a Ctx) -> Waiter<'a> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Waiter { ctx, keys: Vec::new(), rx, tx }
+    }
+
+    fn add(&mut self, key: Wait) {
+        self.ctx.waiting.lock().unwrap().insert(key.clone(), self.tx.clone());
+        self.keys.push(key);
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut w = self.ctx.waiting.lock().unwrap();
+        for k in &self.keys {
+            w.remove(k);
+        }
+    }
+}
+
+/// `label.name` resolved to an id (`docs/SUBNAMES.md`): the name's value
+/// from the chain, its delegation from its rendezvous points (none: the
+/// value's own node answers), then a query to every server it names at
+/// once, the first sound answer taken. Answers and delegations are cached
+/// until they expire.
+fn resolve_subname(ctx: &Ctx, label: &str, name: &str) -> AnyResult<Digest> {
+    use tabminer::subnames::{Answer, Entry};
+    let (l, n) = (label.as_bytes().to_vec(), name.as_bytes().to_vec());
+    if !tabminer::names::valid_name(&l) {
+        return Err(format!("{label} is not a sub-name label: 1 to 32 of a-z, 0-9 and _").into());
+    }
+    let value = name_value(ctx, name)?;
+    let id_of = |a: &Answer| -> AnyResult<Digest> {
+        match a.entry() {
+            Entry::Id(id) => Ok(id),
+            Entry::None => {
+                Err(format!("{label}.{name} does not exist: {name}'s sub-name server has no {label}").into())
+            }
+            Entry::Other(k) => Err(format!("{label}.{name} is of a type this wallet does not know ({k})").into()),
+        }
+    };
+    let cached = ctx.resolved.lock().unwrap().answers.get(&(n.clone(), l.clone())).cloned();
+    if let Some(a) = cached.filter(|a| a.expiry > now()) {
+        return id_of(&a);
+    }
+    // The servers: the delegation's, or the value alone.
+    let cached = ctx.resolved.lock().unwrap().delegations.get(&value).cloned();
+    let delegation = match cached.filter(|(_, until)| *until > now()) {
+        Some((d, _)) => d,
+        None => {
+            let mut wait = Waiter::new(ctx);
+            let tag = lookup_tag();
+            wait.add(Wait::Tag(tag));
+            ctx.events.send(Event::GetDelegation(tag, value)).map_err(|_| "the node has stopped")?;
+            let d = loop {
+                match wait.rx.recv_timeout(RESOLVE_WAIT) {
+                    Ok(Note::Delegation { result, .. }) => {
+                        break result.map_err(|e| format!("{name}'s delegation: {e}"))?;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(format!("{name}'s delegation: no answer").into()),
+                }
+            };
+            if let Some(d) = &d
+                && !d.verify(&value, now())
+            {
+                return Err(format!("{name}'s delegation does not verify").into());
+            }
+            let until = d.as_ref().map_or(now() + DELEGATION_CACHE, |d| d.expiry.min(now() + DELEGATION_CACHE));
+            ctx.resolved.lock().unwrap().delegations.insert(value, (d.clone(), until));
+            d
+        }
+    };
+    let servers = delegation.map_or(vec![value], |d| d.servers);
+    // Every server at once.
+    let mut wait = Waiter::new(ctx);
+    let mut tags = Vec::new();
+    for s in &servers {
+        let tag = lookup_tag();
+        wait.add(Wait::Tag(tag));
+        wait.add(Wait::Answer(*s, n.clone(), l.clone()));
+        tags.push(tag);
+        let out = Outbound {
+            tag,
+            to: *s,
+            kind: onion::KIND_SUBNAME_QUERY,
+            inner: tabminer::subnames::query(&n, &l),
+            recipient: None,
+            reply: None,
+        };
+        ctx.events.send(Event::Send(out)).map_err(|_| "the node has stopped")?;
+    }
+    let deadline = std::time::Instant::now() + RESOLVE_WAIT;
+    let (mut failed, mut why) = (0, String::from("no server answered"));
+    let answer = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match wait.rx.recv_timeout(left) {
+            Ok(Note::Received(o)) => {
+                if let Some(a) = Answer::from_bytes(&o.inner)
+                    && a.verify(&n, &l, &servers, now())
+                    && o.answers.or(o.from.as_ref().map(|f| f.id)) == Some(a.server())
+                {
+                    break a;
+                }
+                why = "a server's answer does not verify".into();
+            }
+            Ok(Note::Failed { tag, why: w, .. }) if tags.contains(&tag) => {
+                failed += 1;
+                why = w;
+                if failed == servers.len() {
+                    return Err(format!("{label}.{name}: {why}").into());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return Err(format!("{label}.{name}: {why}").into()),
+        }
+    };
+    let mut r = ctx.resolved.lock().unwrap();
+    r.answers.retain(|_, a| a.expiry > now());
+    r.answers.insert((n, l), answer.clone());
+    drop(r);
+    id_of(&answer)
+}
+
+/// `LABEL.NAME`, each well formed.
+fn parse_subname(s: &str) -> AnyResult<(Vec<u8>, Vec<u8>)> {
+    let (label, name) = s.trim_start_matches('@').split_once('.').ok_or("LABEL.NAME, as cool.example")?;
+    if !tabminer::names::valid_name(label.as_bytes()) || !tabminer::names::valid_name(name.as_bytes()) {
+        return Err("a label and a name are 1 to 32 of a-z, 0-9 and _".into());
+    }
+    Ok((label.as_bytes().to_vec(), name.as_bytes().to_vec()))
 }
 
 /// Says something from the message layer: logged, and shown at the prompt.
@@ -2222,7 +2642,26 @@ fn say(ctx: &Ctx, msg: &str) {
 /// What the message layer delivers: a slate to answer or to finalize, or
 /// what became of a send.
 fn on_note(ctx: &Ctx, note: Note) {
+    // A sub-name lookup's: to the command waiting for it.
+    let key = match &note {
+        Note::Delegation { tag, .. } | Note::Failed { tag, .. } | Note::Delivered { tag, .. } => Some(Wait::Tag(*tag)),
+        // From whoever answers: the id sent to (onion mode, along the
+        // way back) or the sender named (init mode).
+        Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
+            let server = o.answers.or(o.from.as_ref().map(|a| a.id));
+            let Some((server, a)) = server.zip(tabminer::subnames::Answer::from_bytes(&o.inner)) else { return };
+            Some(Wait::Answer(server, a.name, a.label))
+        }
+        _ => None,
+    };
+    if let Some(key) = key
+        && let Some(tx) = ctx.waiting.lock().unwrap().get(&key)
+    {
+        let _ = tx.send(note);
+        return;
+    }
     match note {
+        Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {}
         Note::Received(opened) => {
             if let Err(e) = on_message(ctx, opened) {
                 say(ctx, &format!("message: {e}"));
@@ -2247,8 +2686,7 @@ fn on_note(ctx: &Ctx, note: Note) {
                 ),
             ),
         },
-        // Sub-name resolution (`docs/SUBNAMES.md`, step 4) is not yet the
-        // wallet's.
+        // A lookup given up on.
         Note::Delegation { .. } => {}
         Note::Failed { tag, to, why } => {
             let to = tabminer::address::encode(&to);
