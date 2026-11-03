@@ -304,8 +304,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--peer" => {
                 let v = value()?;
-                let mut addrs = v.to_socket_addrs().map_err(|e| format!("--peer {v}: {e}"))?;
-                a.peers.push(addrs.next().ok_or(format!("--peer {v}: no address"))?);
+                // Every address it resolves to: the node keeps those of its
+                // socket's family.
+                let before = a.peers.len();
+                a.peers.extend(v.to_socket_addrs().map_err(|e| format!("--peer {v}: {e}"))?);
+                if a.peers.len() == before {
+                    return Err(format!("--peer {v}: no address"));
+                }
             }
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,

@@ -185,6 +185,10 @@ const MAX_PART_DOWNLOADS: usize = 32;
 /// (a range read and the undo records since the snapshot), so enough for
 /// two syncers at once; name parts are the largest, under a megabyte.
 const SERVED_SNAPSHOTS: usize = 2 * MAX_PART_DOWNLOADS;
+/// Chunks served to one peer a second, at most (8 MB/s), with a burst of
+/// [`SERVE_BURST`]: past it requests are dropped, and the peer asks again.
+const SERVE_RATE: f64 = 8192.0;
+const SERVE_BURST: f64 = 1024.0;
 
 /// Blocks a snapshot target keeps clear of the start of a peer's undo
 /// window: a window moves with its tip, and the blocks after the snapshot
@@ -379,6 +383,20 @@ struct HeaderBatch {
     /// [`MAX_HEADERS`] on.
     end: u32,
     headers: std::collections::BTreeMap<u32, Header>,
+    /// The missing heights were asked for again once.
+    retried: bool,
+}
+
+/// Bytes served to several peers without copying.
+type Shared = Arc<Vec<u8>>;
+
+/// A change to the snapshot that waits for the applier (see
+/// `Node::deferred`).
+enum Deferred {
+    Move(Box<Header>, String),
+    Restart(String),
+    /// Restart, then leave the snapshot for header sync.
+    Abandon(String),
 }
 
 /// A block handed to the applier thread, with who sent it.
@@ -488,12 +506,28 @@ pub struct Node<V: ProofVerifier> {
     jobs: Option<std::sync::mpsc::Sender<Job>>,
     outcomes: Receiver<Outcome>,
     applier: Option<std::thread::JoinHandle<()>>,
-    served: VecDeque<(Digest, Vec<u8>)>,
-    served_snapshots: VecDeque<((Kind, Digest), Vec<u8>)>,
+    served: VecDeque<(Digest, Arc<Vec<u8>>)>,
+    served_snapshots: VecDeque<((Kind, Digest), Shared)>,
+    /// Chunks each peer may still be served: a bucket refilled at
+    /// [`SERVE_RATE`] a second up to [`SERVE_BURST`], and when last
+    /// refilled.
+    serve_budget: HashMap<SocketAddr, (f64, Instant)>,
     mode: Mode,
     snap: Option<Snap>,
     snap_downloads: HashMap<(Kind, Digest), Download>,
     snap_attempts: u32,
+    /// Fast sync was left for want of peers: it is taken up again when the
+    /// first one appears, if no block has been replayed meanwhile.
+    alone: bool,
+    /// A change to the snapshot waiting for the parts still with the
+    /// applier to land: nothing new is fetched or staged meanwhile, and
+    /// the network thread goes on.
+    deferred: Option<Deferred>,
+    /// Peers whose headers were dated in this node's future, lately; with
+    /// several, this node's clock is the likelier fault. When that was
+    /// last said.
+    too_new: HashMap<SocketAddr, Instant>,
+    skew_said: Option<Instant>,
     /// Tests: fetch at most this many parts of the first snapshot, so that
     /// a move to a later one finds parts staged.
     #[cfg(test)]
@@ -599,7 +633,11 @@ fn enlarge_buffers(socket: &UdpSocket) {
 /// Re-requests the window of downloads that stalled; returns the requests
 /// to send and the downloads to give up: no progress after
 /// [`net::MAX_RETRIES`] retries, or, for a block, crawling.
-fn stalled(downloads: &mut HashMap<Digest, Download>, now: Instant) -> (Vec<(SocketAddr, Message)>, Vec<Digest>) {
+fn stalled(
+    downloads: &mut HashMap<Digest, Download>,
+    now: Instant,
+    retry: impl Fn(&SocketAddr) -> Duration,
+) -> (Vec<(SocketAddr, Message)>, Vec<Digest>) {
     let mut requests = Vec::new();
     let mut abandoned = Vec::new();
     for d in downloads.values_mut() {
@@ -607,7 +645,8 @@ fn stalled(downloads: &mut HashMap<Digest, Download>, now: Instant) -> (Vec<(Soc
             abandoned.push(d.id);
             continue;
         }
-        if now.duration_since(d.last_progress) < net::RETRY || now.duration_since(d.last_request) < net::RETRY {
+        let wait = retry(&d.from);
+        if now.duration_since(d.last_progress) < wait || now.duration_since(d.last_request) < wait {
             continue;
         }
         d.retries += 1;
@@ -640,6 +679,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .ok_or_else(|| std::io::Error::other("chain has no genesis"))?
             .hash();
         let mut peers = Peers::new();
+        peers.set_family(socket.local_addr()?.is_ipv6());
         if let Some(path) = &config.peers_file {
             let n = peers.load(path)?;
             if n > 0 {
@@ -763,10 +803,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             applier: Some(applier),
             served: VecDeque::new(),
             served_snapshots: VecDeque::new(),
+            serve_budget: HashMap::new(),
             mode: Mode::Normal,
             snap: None,
             snap_downloads: HashMap::new(),
             snap_attempts: 0,
+            alone: false,
+            deferred: None,
+            too_new: HashMap::new(),
+            skew_said: None,
             #[cfg(test)]
             hold_parts: None,
             #[cfg(test)]
@@ -1139,6 +1184,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Fetches headers while a peer claims more work than our best header,
     /// and the blocks of the best header's branch.
     fn sync(&mut self, now: Instant) {
+        if self.alone && self.peers.trusted(now).any(|p| p.status.is_some_and(|s| s.height > 0)) {
+            self.alone = false;
+            // Only if nothing was replayed from genesis meanwhile.
+            if self.mode == Mode::Normal && self.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
+                self.log("fast sync: a peer answered; fast-syncing after all");
+                self.mode = Mode::Headers;
+                return self.header_sync(now);
+            }
+        }
         self.pump_headers(now);
         self.start_downloads(now);
     }
@@ -1155,6 +1209,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .map(|(s, _)| *s)
             .collect();
         for start in late {
+            // A lost datagram: ask once more from the first height missing
+            // before giving the batch to another peer.
+            let b = self.header_batches.get_mut(&start).unwrap();
+            if !b.retried {
+                b.retried = true;
+                b.asked = now;
+                let from = (b.start..=b.end).find(|h| !b.headers.contains_key(h)).unwrap_or(b.start);
+                let peer = b.peer;
+                self.send(peer, &Message::GetHeadersFrom { height: from, token: 0 });
+                self.peers.asked_headers(peer, now);
+                continue;
+            }
             let b = self.header_batches.remove(&start).unwrap();
             let misses = self.slow_batches.entry(b.peer).or_insert(0);
             *misses += 1;
@@ -1200,7 +1266,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let end = height.min(start + step - 1);
             self.header_batches.insert(
                 start,
-                HeaderBatch { start, peer, asked: now, end, headers: std::collections::BTreeMap::new() },
+                HeaderBatch {
+                    start,
+                    peer,
+                    asked: now,
+                    end,
+                    headers: std::collections::BTreeMap::new(),
+                    retried: false,
+                },
             );
             start += step;
         }
@@ -1214,6 +1287,24 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .collect();
         for peer in probes {
             self.request_headers(peer, now);
+        }
+    }
+
+    /// `peer` sent a header dated more than the allowed drift past this
+    /// node's clock. Not held against it: it is not passed over for the
+    /// headers it could not give. With several peers doing so lately, the
+    /// fault is likelier this node's clock, and the log says so.
+    fn timestamp_too_new(&mut self, peer: SocketAddr, now: Instant) {
+        const WINDOW: Duration = Duration::from_secs(600);
+        self.peers.headers_arrived(peer);
+        self.too_new.insert(peer, now);
+        self.too_new.retain(|_, t| now.duration_since(*t) < WINDOW);
+        if self.too_new.len() >= 2 && self.skew_said.is_none_or(|t| now.duration_since(t) >= WINDOW) {
+            self.skew_said = Some(now);
+            self.log(&format!(
+                "{} peers sent headers dated in this node's future: its clock may be behind (check the system time)",
+                self.too_new.len()
+            ));
         }
     }
 
@@ -1257,7 +1348,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     return;
                 }
                 // Clocks differ: not a fault; asked again later.
-                Some(ChainError::TimestampTooNew { .. }) => return,
+                Some(ChainError::TimestampTooNew { .. }) => return self.timestamp_too_new(b.peer, now),
                 Some(e) => {
                     self.log(&format!("headers from {} refused: {e}", b.peer));
                     self.peers.strike(b.peer);
@@ -1346,7 +1437,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         && passed_over != self.peers.may_serve(&p.addr, now)
                         && load(&p.addr) < MAX_PER_PEER
                 })
-                .min_by_key(|p| (load(&p.addr), std::cmp::Reverse(p.status.unwrap().work)))
+                // Least loaded; then one that has delivered blocks before
+                // one that only claims work, then the most work.
+                .min_by_key(|p| (load(&p.addr), p.delivered == 0, std::cmp::Reverse(p.status.unwrap().work)))
                 .map(|p| p.addr)
         };
         // Peers passed over after a failure only if no other holds it.
@@ -1388,8 +1481,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn retry_downloads(&mut self, now: Instant) {
-        let (mut requests, blocks) = stalled(&mut self.downloads, now);
-        let (tx_requests, txs) = stalled(&mut self.tx_downloads, now);
+        let retry = |a: &SocketAddr| self.peers.retry(a);
+        let (mut requests, blocks) = stalled(&mut self.downloads, now, retry);
+        let (tx_requests, txs) = stalled(&mut self.tx_downloads, now, retry);
         requests.extend(tx_requests);
         for (to, msg) in requests {
             self.send(to, &msg);
@@ -1913,6 +2007,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             for h in headers.into_iter().filter(|h| h.height >= start && h.height < start + step) {
                 b.1.headers.insert(h.height, h);
             }
+            // Complete, it has answered, even if it waits behind slower
+            // batches before it is verified.
+            if (b.1.start..=b.1.end).all(|h| b.1.headers.contains_key(&h)) {
+                self.peers.headers_arrived(from);
+            }
         } else {
             let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
             let (new, stop) = self.chain.accept_headers(&headers, unix_now());
@@ -1921,7 +2020,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             let mut refused = false;
             match stop {
-                None | Some(ChainError::TimestampTooNew { .. }) => {}
+                None => {}
+                Some(ChainError::TimestampTooNew { .. }) => self.timestamp_too_new(from, now),
                 // A reply comes in several datagrams, which may arrive out
                 // of order or not at all: a header whose parent is still on
                 // its way is no fault.
@@ -1995,20 +2095,35 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn serve_chunks(&mut self, to: SocketAddr, kind: Kind, id: Digest, indexes: &[u16]) {
-        let bytes = match kind {
+        let wanted = indexes.len().min(WINDOW);
+        if kind != Kind::Object {
+            let now = Instant::now();
+            if self.serve_budget.len() > 4 * net::MAX_PEERS {
+                self.serve_budget.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(10));
+            }
+            let (tokens, at) = self.serve_budget.entry(to).or_insert((SERVE_BURST, now));
+            *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * SERVE_RATE).min(SERVE_BURST);
+            *at = now;
+            if *tokens < wanted as f64 {
+                return;
+            }
+            *tokens -= wanted as f64;
+        }
+        let bytes: Arc<Vec<u8>> = match kind {
             Kind::Tx => match self.mempool.lock().unwrap().get(&id) {
-                Some(tx) => tx.to_bytes(),
+                Some(tx) => Arc::new(tx.to_bytes()),
                 None => return,
             },
             Kind::Block => match self.served.iter().position(|(i, _)| *i == id) {
                 Some(pos) => {
                     let entry = self.served.remove(pos).unwrap();
                     self.served.push_front(entry);
-                    self.served.front().unwrap().1.clone()
+                    Arc::clone(&self.served.front().unwrap().1)
                 }
                 None => match self.chain.block_bytes(&id) {
                     Ok(Some(bytes)) => {
-                        self.served.push_front((id, bytes.clone()));
+                        let bytes = Arc::new(bytes);
+                        self.served.push_front((id, Arc::clone(&bytes)));
                         self.served.truncate(SERVED_CACHE);
                         bytes
                     }
@@ -2020,7 +2135,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 None => return,
             },
             Kind::Consensus => match self.chain.consensus_file_by_id(&id) {
-                Ok(Some(b)) => b,
+                Ok(Some(b)) => Arc::new(b),
                 _ => return,
             },
             Kind::Object => return self.serve_object(to, &id, indexes),
@@ -2070,7 +2185,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 downloads.remove(&id);
                 match kind {
                     Kind::Block => match Block::from_bytes(&bytes) {
-                        Ok(block) if block.header.hash() == id => self.receive_block(block, from),
+                        Ok(block) if block.header.hash() == id => {
+                            self.peers.delivered(from);
+                            self.receive_block(block, from)
+                        }
                         _ => {
                             self.log(&format!("{from} sent a malformed block for {}", short(&id)));
                             self.peers.strike(from);
@@ -2151,12 +2269,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Outcome::Block(block, from, result) => self.on_applied(*block, from, result),
             Outcome::Part { index, from, result } => {
                 self.record_part(index, from, result);
+                self.run_deferred();
                 self.snapshot_sync(Instant::now());
             }
-            Outcome::Carry { indexes, result } => match self.record_carry(indexes, result) {
-                Ok(()) => self.snapshot_sync(Instant::now()),
-                Err(why) => self.restart_snapshot(&why),
-            },
+            Outcome::Carry { indexes, result } => {
+                let carried = self.record_carry(indexes, result);
+                self.run_deferred();
+                match carried {
+                    Ok(()) => self.snapshot_sync(Instant::now()),
+                    Err(why) => self.restart_snapshot(&why),
+                }
+            }
         }
     }
 
@@ -2174,11 +2297,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 #[cfg(test)]
                 self.parts_staged.fetch_add(1, Ordering::Relaxed);
             }
-            Err(e) => {
-                self.log(&format!("fast sync: part {index} from {from} refused: {e}"));
+            // Only a part that fails its checks is the peer's fault; a
+            // local error (the database, a snapshot no longer staging) is
+            // not, and the part is fetched again.
+            Err(ChainError::BadSnapshot) => {
+                self.log(&format!("fast sync: part {index} from {from} refused: {}", ChainError::BadSnapshot));
                 self.peers.strike(from);
                 self.peers.fetch_failed(from, Instant::now());
             }
+            Err(e) => self.log(&format!("fast sync: storing part {index}: {e}")),
         }
     }
 
@@ -2200,21 +2327,46 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Waits for the parts with the applier, recording what became of
     /// them; blocks applied meanwhile are taken too.
-    fn drain_staging(&mut self) -> Result<(), String> {
-        let mut failed = Ok(());
-        while self.snap.as_ref().is_some_and(|s| !s.staging.is_empty()) {
-            match self.outcomes.recv() {
-                Ok(Outcome::Part { index, from, result }) => self.record_part(index, from, result),
-                Ok(Outcome::Carry { indexes, result }) => {
-                    if let Err(e) = self.record_carry(indexes, result) {
-                        failed = Err(e);
-                    }
-                }
-                Ok(Outcome::Block(b, f, r)) => self.on_applied(*b, f, r),
-                Err(_) => break,
-            }
+    /// Holds `change` back while parts are with the applier, returning
+    /// whether it did: downloads stop, and [`Node::run_deferred`] makes the
+    /// change once they have landed. A restart supersedes a move.
+    fn defer(&mut self, change: Deferred) -> bool {
+        if self.snap.as_ref().is_none_or(|s| s.staging.is_empty()) {
+            return false;
         }
-        failed
+        self.snap_downloads.clear();
+        self.deferred = match (self.deferred.take(), change) {
+            (Some(d @ (Deferred::Restart(_) | Deferred::Abandon(_))), Deferred::Move(..)) => Some(d),
+            (Some(Deferred::Abandon(w)), Deferred::Restart(_)) => Some(Deferred::Abandon(w)),
+            (_, c) => Some(c),
+        };
+        true
+    }
+
+    /// Makes the deferred change once the applier holds no part.
+    fn run_deferred(&mut self) {
+        if self.snap.as_ref().is_some_and(|s| !s.staging.is_empty()) {
+            return;
+        }
+        match self.deferred.take() {
+            None => {}
+            Some(Deferred::Move(target, why)) => self.move_snapshot(*target, &why),
+            Some(Deferred::Restart(why)) => self.restart_snapshot(&why),
+            Some(Deferred::Abandon(why)) => self.abandon_snapshot(&why),
+        }
+    }
+
+    /// Starts over from header sync: the snapshot block left the best
+    /// chain.
+    fn abandon_snapshot(&mut self, why: &str) {
+        if self.defer(Deferred::Abandon(why.to_string())) {
+            return;
+        }
+        self.restart_snapshot(why);
+        if self.mode == Mode::Snapshot {
+            self.snap = None;
+            self.mode = Mode::Headers;
+        }
     }
 
     fn on_applied(&mut self, block: Block, from: Option<SocketAddr>, result: Result<Applied, ChainError>) {
@@ -2450,8 +2602,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // node: start from genesis.
         if !self.peers.trusted(now).any(|p| p.status.is_some()) {
             if now.duration_since(self.started) >= Duration::from_secs(10) {
-                self.log("fast sync: no peers answered; starting from genesis");
+                self.log("fast sync: no peers answered; starting from genesis until one does");
                 self.mode = Mode::Normal;
+                self.alone = true;
             }
             return;
         }
@@ -2591,20 +2744,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// carry needs, go at the same time) or none serves it, and starts over
     /// if the best chain no longer holds it.
     fn check_snapshot_target(&mut self, now: Instant) {
+        if self.deferred.is_some() {
+            return;
+        }
         let Some(snap) = self.snap.as_ref() else { return };
         let Ok(best) = self.chain.best_header() else { return };
         let target = snap.target;
         if self.chain.ancestor(&best, target.height).ok().flatten() != Some(target) {
-            self.restart_snapshot("the best chain no longer holds the snapshot block");
-            if self.mode == Mode::Snapshot {
-                self.snap = None;
-                self.mode = Mode::Headers;
-            }
-            return;
+            return self.abandon_snapshot("the best chain no longer holds the snapshot block");
         }
-        let Some(later) = self.snapshot_target(&best, now).filter(|h| h.height > target.height) else {
-            return;
-        };
+        let later = self.snapshot_target(&best, now).filter(|h| h.height > target.height);
         let at: Vec<SocketAddr> = self
             .peers
             .trusted(now)
@@ -2621,10 +2770,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 })
             });
         let unserved = !at.is_empty() && at.iter().all(|a| snap.unserved.contains(a));
-        if expiring {
-            self.move_snapshot(later, "peers are about to drop the snapshot");
-        } else if unserved {
-            self.move_snapshot(later, "no peer serves the snapshot");
+        match later {
+            Some(later) if expiring => self.move_snapshot(later, "peers are about to drop the snapshot"),
+            Some(later) if unserved => self.move_snapshot(later, "no peer serves the snapshot"),
+            // No later snapshot to move to yet: a failed attempt, towards
+            // giving up on fast sync, and the peers get another chance.
+            None if unserved => {
+                if let Some(s) = self.snap.as_mut() {
+                    s.unserved.clear();
+                }
+                self.restart_snapshot("no peer serves the snapshot");
+            }
+            _ => {}
         }
     }
 
@@ -2632,9 +2789,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// instead: the parts already staged are carried forward once the
     /// bodies in between are in, rather than fetched again.
     fn move_snapshot(&mut self, target: Header, why: &str) {
-        // Parts with the applier belong to the old snapshot: let them land.
-        if let Err(e) = self.drain_staging() {
-            return self.restart_snapshot(&e);
+        // Parts with the applier belong to the old snapshot: let them land
+        // first.
+        if self.defer(Deferred::Move(Box::new(target), why.to_string())) {
+            return;
         }
         self.snap_downloads.clear();
         #[cfg(test)]
@@ -2792,6 +2950,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Fast sync, snapshot: fetch what is missing, verify, install.
     fn snapshot_sync(&mut self, now: Instant) {
+        if self.deferred.is_some() {
+            return;
+        }
         let Some(snap) = self.snap.as_ref() else {
             self.mode = Mode::Normal;
             return;
@@ -2916,7 +3077,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn restart_snapshot(&mut self, why: &str) {
         // Parts still with the applier belong to this attempt: let them
         // land before the partial state is cleared.
-        let _ = self.drain_staging();
+        if self.defer(Deferred::Restart(why.to_string())) {
+            return;
+        }
         self.snap_attempts += 1;
         self.snap_downloads.clear();
         if let Err(e) = self.chain.abort_snapshot() {
@@ -2954,16 +3117,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut requests = Vec::new();
         for (&(kind, id), d) in self.snap_downloads.iter_mut() {
             if d.too_slow(now) {
-                abandoned.push((kind, id, d.from));
+                abandoned.push((kind, id, d.from, true));
                 continue;
             }
-            if now.duration_since(d.last_progress) < net::RETRY || now.duration_since(d.last_request) < net::RETRY {
+            let wait = self.peers.retry(&d.from);
+            if now.duration_since(d.last_progress) < wait || now.duration_since(d.last_request) < wait {
                 continue;
             }
             d.retries += 1;
             d.last_request = now;
             if d.retries > net::MAX_RETRIES {
-                abandoned.push((kind, id, d.from));
+                // Something came, then nothing: slow; nothing at all: it
+                // does not serve it.
+                abandoned.push((kind, id, d.from, d.received() > 0));
             } else {
                 d.reset_window();
                 let indexes = d.request(now);
@@ -2973,10 +3139,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for (to, msg) in requests {
             self.send(to, &msg);
         }
-        for (kind, id, from) in abandoned {
+        for (kind, id, from, slow) in abandoned {
             self.snap_downloads.remove(&(kind, id));
             match self.snap.as_mut() {
-                Some(s) if s.target.hash() == id => {
+                // A slow peer is passed over for a while and asked again
+                // when no other can serve: only a peer that sends nothing
+                // counts towards moving the snapshot.
+                Some(s) if s.target.hash() == id && !slow => {
                     s.unserved.insert(from);
                 }
                 // A body between snapshots: like any block download.
@@ -3115,10 +3284,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A manifest or part this node serves, for the state after block `id`.
-    fn snapshot_bytes(&mut self, kind: Kind, id: &Digest) -> Option<Vec<u8>> {
+    fn snapshot_bytes(&mut self, kind: Kind, id: &Digest) -> Option<Arc<Vec<u8>>> {
         if let Some(pos) = self.served_snapshots.iter().position(|(k, _)| *k == (kind, *id)) {
             let entry = self.served_snapshots.remove(pos).unwrap();
-            let bytes = entry.1.clone();
+            let bytes = Arc::clone(&entry.1);
             self.served_snapshots.push_front(entry);
             return Some(bytes);
         }
@@ -3136,7 +3305,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             _ => return None,
         };
-        self.served_snapshots.push_front(((kind, *id), bytes.clone()));
+        let bytes = Arc::new(bytes);
+        self.served_snapshots.push_front(((kind, *id), Arc::clone(&bytes)));
         self.served_snapshots.truncate(SERVED_SNAPSHOTS);
         Some(bytes)
     }

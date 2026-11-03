@@ -788,6 +788,8 @@ pub fn chunk_of(kind: Kind, id: &Digest, bytes: &[u8], index: u16) -> Option<Mes
 /// How long a download may go without a new chunk before its window is
 /// requested again.
 pub const RETRY: Duration = Duration::from_millis(400);
+/// The longest a retry waits, however slow the path.
+pub const MAX_RETRY: Duration = Duration::from_secs(4);
 /// Retries without progress before a download is abandoned.
 pub const MAX_RETRIES: u32 = 8;
 /// A block download averaging under this many bytes a second after
@@ -963,6 +965,18 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_PEERS: usize = 64;
 /// Most peer entries one public host may hold, over all its ports.
 pub const MAX_PER_HOST: usize = 2;
+/// Most peer entries one network group may hold (a /16 for IPv4, a /32
+/// for IPv6): an attacker with addresses in one network cannot fill the
+/// table and surround the node.
+pub const MAX_PER_GROUP: usize = 8;
+
+/// The network group of an address, for [`MAX_PER_GROUP`].
+fn group(ip: std::net::IpAddr) -> u32 {
+    match ip {
+        std::net::IpAddr::V4(v4) => u32::from(v4) >> 16,
+        std::net::IpAddr::V6(v6) => (u128::from(v6) >> 96) as u32 | 1 << 31,
+    }
+}
 
 /// What a ban is keyed by: the host, for a public address (a new port
 /// would get around it), the socket address for loopback, where many
@@ -985,6 +999,11 @@ pub const TARGET_PEERS: usize = 8;
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub addr: SocketAddr,
+    /// Blocks it delivered whole (by hash): a peer that has delivered is
+    /// asked before one that only claims.
+    pub delivered: u32,
+    /// Smoothed round trip, from our pings to its pongs.
+    pub rtt: Option<Duration>,
     /// When a well-formed message last arrived; `None` until the first.
     pub last_seen: Option<Instant>,
     pub last_ping: Option<Instant>,
@@ -1025,6 +1044,11 @@ pub struct Peers {
     banned: HashMap<SocketAddr, Instant>,
     /// Pings to unverified addresses left this tick.
     budget: usize,
+    /// Whether the socket is IPv6: addresses of the other family cannot
+    /// be reached from it and are not taken. `None` takes both.
+    v6: Option<bool>,
+    /// State of the generator that samples peers.
+    rng: std::cell::Cell<u64>,
 }
 
 impl Peers {
@@ -1034,6 +1058,26 @@ impl Peers {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Takes only addresses of the socket's family from now on.
+    pub fn set_family(&mut self, v6: bool) {
+        self.v6 = Some(v6);
+        self.map.retain(|a, _| a.is_ipv6() == v6);
+    }
+
+    /// A pseudorandom number, for sampling: xorshift, seeded from the
+    /// process's random hash keys.
+    fn next_random(&self) -> u64 {
+        let mut x = self.rng.get();
+        if x == 0 {
+            x = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), 0u8) | 1;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng.set(x);
+        x
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1051,6 +1095,9 @@ impl Peers {
         if addr.ip().is_unspecified() || addr.port() == 0 || self.selves.contains(&addr) {
             return false;
         }
+        if self.v6.is_some_and(|v6| addr.is_ipv6() != v6) {
+            return false;
+        }
         if self.banned.get(&ban_key(&addr)).is_some_and(|t| t.elapsed() < BAN_TIME) {
             return false;
         }
@@ -1060,7 +1107,9 @@ impl Peers {
         }
         if !seed
             && !addr.ip().is_loopback()
-            && self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
+            && (self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
+                || self.map.values().filter(|p| !p.seed && group(p.addr.ip()) == group(addr.ip())).count()
+                    >= MAX_PER_GROUP)
         {
             return false;
         }
@@ -1076,6 +1125,8 @@ impl Peers {
             addr,
             Peer {
                 addr,
+                delivered: 0,
+                rtt: None,
                 last_seen: None,
                 last_ping: None,
                 pending: None,
@@ -1116,7 +1167,16 @@ impl Peers {
         p.pending = None;
         p.status = Some(status);
         p.handshaken = true;
+        if let Some(sample) = p.last_ping.map(|t| t.elapsed()) {
+            p.rtt = Some(p.rtt.map_or(sample, |r| (r * 7 + sample) / 8));
+        }
         true
+    }
+
+    /// How long to wait for a chunk from `addr` before asking again: twice
+    /// its round trip, at least [`RETRY`] and at most [`MAX_RETRY`].
+    pub fn retry(&self, addr: &SocketAddr) -> Duration {
+        self.map.get(addr).and_then(|p| p.rtt).map_or(RETRY, |r| (2 * r).clamp(RETRY, MAX_RETRY))
     }
 
     /// The token `addr` gave us to put in requests (0 before its status).
@@ -1178,6 +1238,13 @@ impl Peers {
     }
 
     /// Notes that a block download from `addr` was abandoned.
+    /// Notes that `addr` delivered a block matching its hash.
+    pub fn delivered(&mut self, addr: SocketAddr) {
+        if let Some(p) = self.map.get_mut(&addr) {
+            p.delivered = p.delivered.saturating_add(1);
+        }
+    }
+
     pub fn fetch_failed(&mut self, addr: SocketAddr, now: Instant) {
         if let Some(p) = self.map.get_mut(&addr) {
             p.failed_fetch = Some(now);
@@ -1253,9 +1320,17 @@ impl Peers {
         self.map.retain(|_, p| p.seed || !banned.contains_key(&ban_key(&p.addr)));
     }
 
-    /// Up to `n` live peers other than `exclude`, in table order.
+    /// Up to `n` live peers other than `exclude`, at random.
     pub fn sample(&self, n: usize, exclude: Option<SocketAddr>, now: Instant) -> Vec<SocketAddr> {
-        self.live(now).map(|p| p.addr).filter(|a| Some(*a) != exclude).take(n).collect()
+        let mut all: Vec<SocketAddr> = self.live(now).map(|p| p.addr).filter(|a| Some(*a) != exclude).collect();
+        // A partial shuffle: a random `n`, not the table's first.
+        let n = n.min(all.len());
+        for i in 0..n {
+            let j = i + (self.next_random() % (all.len() - i) as u64) as usize;
+            all.swap(i, j);
+        }
+        all.truncate(n);
+        all
     }
 
     /// The live peer claiming the most work, if it exceeds `work`.
@@ -1457,13 +1532,23 @@ mod tests {
         assert!(peers.get(&host(1)).is_none() && peers.get(&host(2)).is_none());
         assert!(!peers.add(host(3), false));
         assert_eq!(peers.len(), 4);
+        // One network gets a few entries, however many hosts it has; a
+        // seed is taken regardless.
+        let net = |i: u8| -> SocketAddr { format!("10.7.0.{i}:1").parse().unwrap() };
+        for i in 1..=MAX_PER_GROUP as u8 {
+            assert!(peers.add(net(i), false));
+        }
+        assert!(!peers.add(net(100), false));
+        assert!(peers.add("10.7.9.9:1".parse().unwrap(), true));
+        assert!(peers.add("10.8.0.1:1".parse().unwrap(), false));
     }
 
     #[test]
     fn forged_addresses_cannot_crowd_the_table() {
         let t0 = Instant::now();
         let mut peers = Peers::new();
-        let addr = |i: u32| -> SocketAddr { SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)), 1) };
+        // Each in a network of its own.
+        let addr = |i: u32| -> SocketAddr { SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + (i << 16))), 1) };
         // One real peer, proven by answering our ping.
         let real = addr(1);
         peers.add(real, false);

@@ -1894,12 +1894,14 @@ impl<V: ProofVerifier> Chain<V> {
     ) -> Result<Digest> {
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
-            return Err(ChainError::BadSnapshot);
+            return Err(ChainError::Corrupt("no snapshot is staging"));
         }
-        let root = self
-            .utxo
-            .stage(&mut wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position)
-            .map_err(|_| ChainError::BadSnapshot)?;
+        // A database error is this node's; anything else, the part's.
+        let root =
+            self.utxo.stage(&mut wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position).map_err(|e| match e {
+                utxo::Error::Heed(_) => ChainError::Utxo(e),
+                _ => ChainError::BadSnapshot,
+            })?;
         if expected.is_some_and(|e| *e != root) {
             return Err(ChainError::BadSnapshot);
         }
@@ -1926,7 +1928,7 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
-            return Err(ChainError::BadSnapshot);
+            return Err(ChainError::Corrupt("no snapshot is staging"));
         }
         for r in records {
             self.names.register_unindexed(&mut wtxn, r).map_err(|_| ChainError::BadSnapshot)?;

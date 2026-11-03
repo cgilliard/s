@@ -522,7 +522,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Re-requests stalled object chunks, with each download's token.
     pub(super) fn retry_objects(&mut self, now: Instant) {
-        let (requests, abandoned) = stalled(&mut self.rv.downloads, now);
+        let (requests, abandoned) = stalled(&mut self.rv.downloads, now, |a| self.peers.retry(a));
         for (to, msg) in requests {
             let Message::GetChunks { id, .. } = &msg else { continue };
             let token = self.rv.tokens.get(id).copied().unwrap_or(0);

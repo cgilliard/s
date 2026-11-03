@@ -33,66 +33,25 @@ history and the README; this file holds what is left.
   trie proof against the name root as they arrive, or have the manifest's
   part hashes cross-checked among peers before fetching.
 
-- **One slow peer is taken for no peer.** `node.rs`,
-  `check_snapshot_target`: a part download abandoned for slowness marks
-  its peer unserving, and with a single peer that moves the snapshot. Fix:
-  back off and retry the only peer; move only when it refuses or drops
-  the snapshot.
+- **A whole part cache miss costs a 1.2 MB encode.** `snapshot_bytes`
+  keeps `SERVED_SNAPSHOTS` (64) parts; a node serving several fast syncs
+  at once re-reads and re-encodes parts it dropped. Serving is otherwise
+  bounded: chunks come from shared cached bytes, and each peer is served
+  at most 8 MB/s (`SERVE_RATE`). Fix if it shows: a larger cache while
+  serving many.
 
-- **The staging drain blocks the network thread.** `node.rs`,
-  `drain_staging`: a blocking `recv` while the applier stages up to 32
-  parts or applies a block. No pongs go out meanwhile and the event queue
-  can fill and drop datagrams. Fix: make the move or restart a state the
-  tick advances when the applier reports idle, instead of waiting inline.
-- **"No peer serves the snapshot" never counts as a failed attempt.**
-  `node.rs`, `check_snapshot_target`: with the chain less than an interval
-  past the target, the node cycles the same peers indefinitely instead of
-  counting towards the fallback. Fix: count it in `snap_attempts`.
-- **A fresh node silently gives up fast sync after 10 s without peers.**
-  `node.rs`, `header_sync`: it drops to `Normal` and replays from genesis
-  for good. Slow seed resolution is enough to trigger it. Fix: keep
-  retrying the handshake, and only start from genesis when told to (a
-  flag), or go back to `Headers` mode when the first peer appears.
-- **Clock skew is blamed on peers.** `TimestampTooNew` is silent; with
-  our clock more than two hours behind, every header batch is dropped and
-  each peer is passed over with "sent no headers for the work it claims".
-  Fix: count `TimestampTooNew` per tick and log "this node's clock may be
-  behind" when several peers hit it; do not pass peers over for it.
-- **Header batches can mark honest peers as liars.** A complete batch
-  waiting more than 15 s behind slower ones (the dataset still building,
-  or a late batch at the front) hits `expire_header_requests`. And a
-  batch has no per-header retransmit: one lost datagram makes it late,
-  two in a row pass the peer over. Fix: clear `headers_asked` when a
-  batch arrives complete, not only when it is verified; re-ask for the
-  missing heights of a batch before giving it up.
-- **Local errors strike peers.** `node.rs`, part staging: any `Err`
-  including an LMDB or storage error strikes the serving peer. Fix: strike
-  only on a part that fails its root check.
-- **Serving cost is unbounded per peer.** `serve_chunks` clones a whole
-  block per request; a snapshot part costs two range reads and a 1.2 MB
-  encode per cache miss with an 8-entry cache; there is no per-peer
-  request rate limit. Fix: serve chunks from the cached bytes without a
-  clone (an `Arc<Vec<u8>>`), bound requests per peer per second, and
-  consider a larger part cache during a sync.
-- **IPv6 addresses learned from peer lists are pinged forever** from a v4
-  socket, consuming the unverified-ping budget. Fix: drop addresses of a
-  family the socket cannot reach when they are learned.
-- **`--peer` keeps only the first resolved address;** `GetPeers` always
-  goes to the first live peer in table order; `RETRY` is a fixed 400 ms so
-  paths with a longer round trip re-send every window and stay at the
-  minimum window. Fixes: keep every resolved address; pick the peer at
-  random; estimate the round trip from ping to pong and set the retry to a
-  multiple of it.
-- **A max-work liar with a high height is picked first by `block_source`**
-  for every block, costing a few seconds and a `syncing` flip every ten
-  minutes. Fix: prefer peers that have delivered.
-- **Eclipse resistance rests on the two seeds.** Hard-code a checkpoint
-  or an `assumevalid` header hash per release once the chain is live, and
-  prefer outbound peers from distinct /16 (or /32 for v6) groups.
+- **Eclipse resistance rests on the two seeds.** The peer table takes
+  at most 8 entries per network group (a /16, or a /32 for IPv6) and 2
+  per host, so one network cannot fill it. Still to do once the chain is
+  live: hard-code a checkpoint or an `assumevalid` header hash per
+  release.
 - **Untested paths.** No test for: a reorganization past the snapshot
   during a fast sync; a reorganization below the floor after install; the
   "no peer serves" and `drop_carry` paths; the bad-manifest path; the
-  genesis fallback and "keep trying" paths of `restart_snapshot`; any lossy
+  genesis fallback and "keep trying" paths of `restart_snapshot`; a
+  deferred move or restart while parts are with the applier; a fresh node
+  going back to fast sync when its first peer appears after 10 s; the
+  header batch retry; clock-skew logging; any lossy
   or reordering network (every test is clean loopback); strikes leading to
   a ban at node level; malformed datagrams reaching the node; peers-file
   poisoning; IPv6; NAT.
