@@ -53,7 +53,7 @@ The owner of a name with value `V` publishes, beside its announce at
 `V`'s points, a **delegation**:
 
 ```text
-name ‖ seq ‖ expiry ‖ server ids (1 to 3)
+name ‖ owner key ‖ seq ‖ expiry ‖ server ids (1 to 3)
 ```
 
 signed by the key whose hash is `V`. Binding the name stops a
@@ -69,13 +69,15 @@ always-on machine.
 The server answers `GetEntry(name, label)` with
 
 ```text
-name ‖ label ‖ type ‖ value ‖ seq ‖ ttl        (or name ‖ label ‖ none ‖ seq)
+name ‖ label ‖ type ‖ value ‖ seq ‖ expiry ‖ server key
 ```
 
-signed by its own key. `type` is one byte; the only type defined is
-`id` (the value is a 32-byte id to pay), and a resolver refuses types
-it does not know, so new ones (a text value, say) can be added later
-without changing the format. The server signs, not the owner, so
+signed by its own key. `type` is one byte: `none` (no such label, an
+empty value) or `id` (the value is a 32-byte id to pay); a resolver
+refuses types it does not know, and values are length-prefixed, so new
+ones (a text value, say) can be added later without changing the
+format. `expiry` is absolute Unix time, as announces use, so a cached
+answer is checked without trusting when it was fetched. The server signs, not the owner, so
 registrations do not need the owner's key online; the cost is that a
 server can lie about an entry (point it elsewhere, or deny it) until
 the owner withdraws it by publishing a delegation with a higher `seq`.
@@ -129,8 +131,8 @@ or two more on real paths, likely the same order as the slate exchange
 and transaction proof that follow. To be measured on `--network dev`
 before designing further. Without changing the design:
 
-- **Caching.** The delegation is good until its expiry, an entry for its
-  `ttl`; a repeat send to `cool.example` goes straight to step 4.
+- **Caching.** The delegation is good until its expiry, an entry until
+  its own; a repeat send to `cool.example` goes straight to step 4.
 - **Warm circuits.** Reuse an existing circuit, extending its last hop
   to each point in turn, rather than building one per step.
 - **Racing.** Ask two of `V`'s points, and every listed server, at
@@ -183,7 +185,7 @@ To take the parent out of the lookup path, its server signs a
 **certificate** once and hands it to the holder:
 
 ```text
-name ‖ label ‖ type ‖ value ‖ not_after        (signed by the server key S)
+name ‖ label ‖ type ‖ value ‖ seq ‖ expiry ‖ server key        (signed by S)
 ```
 
 The holder publishes it itself, at points computed from the full name,
@@ -204,8 +206,8 @@ are short (about a delegation's lifetime); one cannot be withdrawn
 before `not_after`, and a parent that wants that must keep answering
 lookups itself (the design above). Resolvers that find no certificate
 fall back to asking the server, so both can run side by side. The
-signed answer already carries everything a certificate needs but
-`not_after`, which can take the place of `ttl`.
+signed answer is already such a certificate: its expiry is the
+`not_after`, so the holder publishes the answer itself.
 
 ## 2. Rendezvous points that rotate by epoch
 
@@ -281,9 +283,13 @@ the existing switch code carry both changes at once.
    random spread of moves over the grace period (with one session, a
    participant moves when the preferred set flips at `B + 2`), and the
    `--network dev` run across boundaries.
-2. The delegation and the signed answer (`onion.rs`), with tests for a
-   forged, stale, expired and other-name delegation, and a forged or
-   stale answer.
+2. The delegation and the signed answer (`subnames.rs`), with tests for
+   a forged, expired and other-name delegation, and a forged or expired
+   answer. Done (2026-11-03): `Delegation` and `Answer` each carry the
+   signer's key, so each verifies alone; both are valid at most
+   `MAX_LIFETIME_SECS` (two days), which bounds how long a withdrawn
+   server's answers count. Keeping the highest `seq` (stale ones) is
+   the holder's job, in step 3.
 3. Points hold and serve delegations and forward `GetEntry` over a
    session (`node/rendezvous.rs`); the server side in the node, with the
    wallet as its own server by default.

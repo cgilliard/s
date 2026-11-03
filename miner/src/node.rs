@@ -5016,9 +5016,15 @@ mod tests {
         assert_eq!(&o.inner[..], b"answered");
         // The answer came down q's own circuit: it is from whom q sent to.
         assert_eq!((o.from, o.answers), (None, Some(id(4))));
-        // Each send was confirmed delivered.
-        if let Ok(Note::Delivered { tag, .. }) = nodes[p].2.recv_timeout(Duration::from_secs(5)) {
-            delivered.lock().unwrap().push(tag);
+        // Each send was confirmed delivered; the confirmation of one may
+        // come after the answer to it.
+        for (n, tag) in [(q, 1), (p, 2)] {
+            if delivered.lock().unwrap().contains(&tag) {
+                continue;
+            }
+            if let Ok(Note::Delivered { tag, .. }) = nodes[n].2.recv_timeout(Duration::from_secs(5)) {
+                delivered.lock().unwrap().push(tag);
+            }
         }
         let mut tags = delivered.lock().unwrap().clone();
         tags.sort();

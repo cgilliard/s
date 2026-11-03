@@ -45,6 +45,7 @@ pub mod recursion;
 pub mod smt_air;
 pub mod stark;
 pub mod state_tree;
+pub mod subnames;
 pub mod transaction;
 pub mod utxo;
 pub mod vm_air;
