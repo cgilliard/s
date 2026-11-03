@@ -21,7 +21,7 @@ then, 28 now. Most that remain are accepted, for launch, or tests; some were nar
 | 4 | Networking and sync: non-blocking snapshot changes, slow vs unserving peers, fast-sync fallback, clock skew, header retry, serving limits, peer groups | 23f0a39 |
 | 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
 | 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
-| 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | (this commit) |
+| 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | 84792e7 |
 
 Still to do, as code: the untested paths listed below (fast-sync edge
 cases, a reordering network, the message layer under loss, crash
