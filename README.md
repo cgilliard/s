@@ -58,7 +58,10 @@ mining. Both listen on UDP port 3737 by default, contact the seed nodes in
 `DIR/peers` for next time. `show` prints the main chain. `--relay` makes
 the node relay for others on the message layer (below). `--no-wallet`
 runs the node without a wallet, and so without mining; seeds and relays
-are best run that way.
+are best run that way. A relay started with `--no-wallet` writes its
+relay key's seed to `DIR/relay.key` (mode 0600) from the wallet's phrase
+on its first start and never reads the wallet again: keep the phrase
+elsewhere, and remove `DIR/wallet` from the server.
 
 Logs go to `DIR/tabminer.log`; the terminal shows a prompt (`help` lists
 the commands). `--no-prompt` logs to the terminal instead, for scripts.
@@ -271,8 +274,10 @@ can be cancelled. The signatures, the leaves they use and the record of
 the payment are written in one wallet transaction, so a crash leaves
 nothing half done.
 
-`balance` shows confirmed, pending (incoming), reserved (held for a slate)
-and locked (signed and being sent) funds; `outputs`, `slates`, `sent`,
+`balance` shows confirmed, pending (incoming change and rewards),
+unverified (paid to us in slates we answered, which can claim anything
+until they land), reserved (held for a slate) and locked (signed and
+being sent) funds; `outputs`, `slates`, `sent`,
 `mempool`, `peers` and `status` show the rest; `status` includes the
 supply, the unspent amounts summed beside what the blocks issued, which
 every node keeps equal. The reward of a mined block goes to the miner's

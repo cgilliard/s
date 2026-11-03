@@ -11,7 +11,7 @@ history and the README; this file holds what is left.
 ## Progress
 
 Closed in batches since the design docs were built (bb8738c); 56 entries
-then, 34 now (some entries were narrowed rather than removed, and new narrower ones added):
+then, 30 now. Most that remain are accepted, for launch, or tests; some were narrowed rather than removed, and a few narrower ones added:
 
 | Batch | Area | Commit |
 |---|---|---|
@@ -19,14 +19,11 @@ then, 34 now (some entries were narrowed rather than removed, and new narrower o
 | 2 | Wallet: password-locked phrase, 0700 directory, cancel undoes name ops, orphaned rewards, payments found after a gap | c00641b |
 | 3 | Side channels: constant-time ML-DSA signing, hedged relay key, hourly Kyber rotation | bf39007 |
 | 4 | Networking and sync: non-blocking snapshot changes, slow vs unserving peers, fast-sync fallback, clock skew, header retry, serving limits, peer groups | 23f0a39 |
-| 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | (this commit) |
+| 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
+| 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | (this commit) |
 
 Still to do, as code:
 
-- **6, wallet and chain:** side blocks' proofs, the slate limit and fake
-  stage-1 slates, a relay keeping only its relay key, leaf-reuse
-  detection after a rollback, the leaf/node hash domain, batched LMDB
-  commits.
 - **7, tests:** the untested paths below, and the ignored negative
   end-to-end proof tests.
 
@@ -34,7 +31,9 @@ Not code, or for launch: the independent circuit review, the soundness
 conjecture, a checkpoint per release, seeds, genesis regeneration, the
 small-VPS and full-size sync tests. Accepted as they are: no coinbase
 maturity, PBKDF2, unrecoverable policy outputs, file slates' recipients,
-name parts checked at the end (a design change).
+name parts checked at the end (a design change), side blocks stored
+before their proofs, the shared leaf/node hash domain. Open but not
+planned: pricing unnamed slates (a fee or proof of work per slate).
 
 ## Consensus and chain
 
@@ -48,7 +47,9 @@ name parts checked at the end (a design change).
   `apply_block`: a block with valid proof of work on a side branch is kept
   (header and up to 2 MB body) and served to peers before its proof is
   checked. Bounded by the work needed to make one; bodies are pruned at
-  the window edge. Acceptable; noted so nobody relies on a stored body
+  the window edge. Accepted: the proof's statement needs the block's
+  first output position, which the header does not carry and only
+  executing the branch gives. Noted so nobody relies on a stored body
   being valid.
 
 ## Networking and sync
@@ -120,24 +121,19 @@ name parts checked at the end (a design change).
   Argon2 would cost more per guess. Only the phrase and seed are
   encrypted: outputs, nonces, payments and names are readable from the
   directory (a privacy loss, not a theft), as is a `--password-file`.
-- **A wallet-directory rollback reuses XMSS leaves** (a backup restore, a
-  VM snapshot) and nothing detects it. Inherent to few-time signatures;
-  the README should warn loudly, and the wallet could keep a leaf-use
-  journal outside the directory (or refuse to sign when the chain shows a
-  signature from a leaf it believes unused).
+- **A wallet-directory rollback is caught only through the pool.** After a
+  backup restore or a VM snapshot the wallet may take a used leaf for
+  unused; before every command it skips leaves that pooled spends of its
+  outputs signed from (`observe_signatures`). A cancellation that left
+  the pool (replaced, expired, or never seen by this node) is not caught.
+  The rest would need a leaf-use journal outside the directory.
 - **Two restored copies share leaves 8 to 15.** Each starts at a random
   leaf, so two copies spending the same output collide with probability
-  1/8 on their first spends, as the module doc admits. Document; or derive
+  1/8 on their first spends, as the module doc admits; a copy that sees
+  the other's spend pooled skips its leaf (above). Document; or derive
   the start from something both copies agree on only when they are the
   same copy (a per-restore random salt stored on chain in the first spend's
   memo).
-- **A fake stage-1 slate inflates the recipient's pending balance** until
-  pruned: `receive_slate` trusts `slate.amount` and the inputs. Expected of
-  a slate design; show "unconfirmed, unverifiable until it lands" rather
-  than counting it, or verify the inputs against the UTXO set when the
-  recipient's node has it. Over the message layer an online wallet
-  answers stage-1 slates by itself, at most 5 per sender and 60 in all per
-  10 minutes (`onion::SlateLimit`): a sender with many ids still gets 60.
 - **Minor.** `wallet.rs`: `send` writes the change record in a separate
   transaction before reserving the inputs, leaving an orphan record on a
   crash between them (`prune` removes it).
@@ -169,8 +165,9 @@ name parts checked at the end (a design change).
   check that the number of opened values per column is below the blind
   rows for every configuration with `zk`.
 - **Leaf hash and node compress share a domain.** `poseidon2.rs`:
-  benign because every verifier fixes the path length, but a domain tag
-  on `compress` costs nothing.
+  benign because every verifier fixes the path length. Accepted: a tag on
+  `compress` would change every circuit, the built-in mainnet plan and
+  genesis.
 - **Soundness rests on the ethSTARK conjecture at |K| = 2^123.6**; the
   near-capacity failures of 2026 are acknowledged in SECURITY.md, with
   margin left. Revisit when the constants in those results are known.
@@ -226,12 +223,6 @@ Found while building it (2026-11-01).
 
 ## Deployment and operations
 
-- **A relay keeps a phrase on its server.** `--no-wallet --relay` still
-  opens the wallet, only to derive the relay key from its phrase, so the
-  phrase sits on an exposed machine. It should hold no funds. Fix if it
-  matters: keep only the derived relay seed in `DIR/relay.key`, written
-  once from the phrase.
-
 - **Seeds** need the current binary at every format change (now protocol
   7, chain format 14, wallet format 8, slate format `tabslt05`), started
   with `--relay`, and wiped data directories. Fresh nodes cannot sync
@@ -244,9 +235,6 @@ Found while building it (2026-11-01).
   random-read speed.
 - **A real 170M-output fast sync** to turn the scaled 20 to 30 minute
   estimate into a measurement.
-- **Batch the per-part and per-header-batch LMDB commits** (each waits on
-  the disk; about 60,000 commits at ten-year scale).
-
 ## Features deferred
 
 - Cover for the address a transaction is first sent from, in init mode:

@@ -102,7 +102,9 @@ options:
   --max-channels N  and channels open at once (4096)
   --no-wallet       run without a wallet (implies --no-mine): no payments, no
                     names, no part in the message layer but as a relay. With
-                    --relay the wallet's phrase is still kept, for the relay key
+                    --relay the relay key's seed is written once from the
+                    wallet's phrase to DIR/relay.key, and the wallet is not
+                    read again: keep the phrase elsewhere and remove DIR/wallet
   --sync-point N    when starting from genesis, fast-sync from the state N blocks
                     below the best header, checked by that block's chain proof
                     (default 144); 0 replays every block instead
@@ -645,9 +647,13 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         chain.verifier().plan_tree();
         log::line(&format!("plan ready in {}", secs(t.elapsed())));
     }
+    // A relay without a wallet keeps only its relay key's seed, in
+    // DIR/relay.key, written once from the wallet's phrase.
+    let relay_file = args.data.join("relay.key");
+    let relay_seed = if args.no_wallet && args.relay { read_relay_seed(&relay_file)? } else { None };
     // The wallet, unless --no-wallet; a relay derives its key from the
-    // phrase either way.
-    let opened = if args.no_wallet && !args.relay {
+    // phrase the first time.
+    let opened = if args.no_wallet && (!args.relay || relay_seed.is_some()) {
         None
     } else {
         let dir = args.data.join("wallet");
@@ -672,7 +678,24 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     };
     let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
     let mut config = net_config(args);
-    config.relay_key = opened.as_ref().filter(|_| args.relay).map(|w| w.relay_key());
+    config.relay_key = match (relay_seed, opened.as_ref()) {
+        _ if !args.relay => None,
+        (Some(seed), _) => Some(tabminer::wallet::relay_key_from(&seed)),
+        (None, Some(w)) if args.no_wallet => {
+            write_relay_seed(&relay_file, &w.relay_seed())?;
+            let msg = format!(
+                "relay key saved in {}; this relay no longer reads its wallet: keep the phrase, and remove {} from the server",
+                relay_file.display(),
+                args.data.join("wallet").display()
+            );
+            log::line(&msg);
+            if !args.no_prompt {
+                println!("{msg}");
+            }
+            Some(w.relay_key())
+        }
+        (None, w) => w.map(|w| w.relay_key()),
+    };
     let relay_address = config.relay_id().map(|id| tabminer::address::encode(&id));
     let wallet = if args.no_wallet { None } else { opened.map(Arc::new) };
     config.identity = wallet.as_ref().filter(|w| !w.address_off()).map(|w| w.identity_key());
@@ -936,6 +959,22 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         }
     }
     ctx.wallet()?.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
+    // Pooled spends of our outputs: a leaf signed elsewhere (a copy of
+    // this wallet, or its state before a backup was restored) is never
+    // signed from again.
+    let seen: Vec<(tabminer::transaction::Commitment, u64)> = ctx
+        .mempool
+        .lock()
+        .unwrap()
+        .entries()
+        .flat_map(|e| e.tx.spent_commitments().into_iter().zip(e.tx.inputs.iter().map(|i| i.signature.index)))
+        .collect();
+    let behind = ctx.wallet()?.observe_signatures(&seen)?;
+    if behind > 0 {
+        log::line(&format!(
+            "wallet: {behind} outputs were signed from leaves this wallet took for unused (a restored backup?); skipped"
+        ));
+    }
     let rtxn = chain.env().read_txn()?;
     ctx.wallet()?.sync_names(chain.names(), &rtxn)?;
     // Rewards of blocks that will not make the main chain: never found
@@ -1130,9 +1169,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!("mempool  {} transactions, {} KB", pool.len(), pool.bytes() / 1000);
             match b {
                 Some(b) => println!(
-                    "wallet   {} confirmed, {} pending, {} reserved, {} locked",
+                    "wallet   {} confirmed, {} pending, {} unverified, {} reserved, {} locked",
                     fmt_coins(b.confirmed),
                     fmt_coins(b.pending),
+                    fmt_coins(b.unverified),
                     fmt_coins(b.reserved),
                     fmt_coins(b.locked)
                 ),
@@ -1210,6 +1250,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let b = ctx.wallet()?.balance(ctx.chain.utxo(), &rtxn)?;
             println!("confirmed {}  spendable", fmt_coins(b.confirmed));
             println!("pending   {}  incoming, not yet on chain", fmt_coins(b.pending));
+            println!(
+                "unverified {} paid to us in slates, not yet on chain: unverifiable until they land",
+                fmt_coins(b.unverified)
+            );
             println!("reserved  {}  held for a slate not yet finalized", fmt_coins(b.reserved));
             println!("locked    {}  signed, being sent, not yet confirmed", fmt_coins(b.locked));
         }
@@ -2017,6 +2061,32 @@ fn wallet_password(args: &Args, ask: Ask) -> Result<String, tabminer::wallet::Wa
             new_password().map_err(|e| io(std::io::Error::other(e.to_string())))
         }
     }
+}
+
+/// A relay's key seed from `file` (64 hex digits), if there is one.
+fn read_relay_seed(file: &std::path::Path) -> AnyResult<Option<[u8; 32]>> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => {
+            let bytes = tabminer::wallet::digest_from_hex(text.trim())
+                .ok_or_else(|| format!("{}: not a relay key", file.display()))?;
+            Ok(Some(bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", file.display()).into()),
+    }
+}
+
+/// Writes a relay's key seed, readable by its owner only.
+fn write_relay_seed(file: &std::path::Path, seed: &[u8; 32]) -> AnyResult<()> {
+    use std::io::Write as _;
+    let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(file)?;
+    writeln!(f, "{hex}")?;
+    Ok(())
 }
 
 /// Rebuilds a wallet from its phrase in an empty data directory.

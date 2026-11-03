@@ -1893,15 +1893,61 @@ impl<V: ProofVerifier> Chain<V> {
         expected: Option<&Digest>,
     ) -> Result<Digest> {
         let mut wtxn = self.env.write_txn()?;
-        if !self.staging_in(&wtxn)? {
+        let root = self.stage_part_in(&mut wtxn, part, outputs, commits, next_position, expected)?;
+        wtxn.commit()?;
+        Ok(root)
+    }
+
+    /// Stages several output parts in one transaction, each in a nested
+    /// one: a part refused leaves nothing, the others land together (one
+    /// wait on the disk instead of one each). A result per part.
+    #[allow(clippy::type_complexity)]
+    pub fn stage_snapshot_parts(
+        &self,
+        parts: &[(u64, Vec<(u64, Commitment, Slot, u32)>, Vec<(u64, Digest, u32)>, u64, Digest)],
+    ) -> Vec<Result<Digest>> {
+        let mut wtxn = match self.env.write_txn() {
+            Ok(t) => t,
+            Err(e) => {
+                crate::log::line(&format!("staging parts: {e}"));
+                return parts.iter().map(|_| Err(ChainError::Corrupt("staging transaction failed"))).collect();
+            }
+        };
+        let mut results = Vec::with_capacity(parts.len());
+        for (part, outputs, commits, next, root) in parts {
+            let r = match self.env.nested_write_txn(&mut wtxn) {
+                Ok(mut nested) => match self.stage_part_in(&mut nested, *part, outputs, commits, *next, Some(root)) {
+                    Ok(d) => nested.commit().map(|_| d).map_err(ChainError::Heed),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(ChainError::Heed(e)),
+            };
+            results.push(r);
+        }
+        if let Err(e) = wtxn.commit() {
+            crate::log::line(&format!("staging parts: {e}"));
+            return parts.iter().map(|_| Err(ChainError::Corrupt("staging transaction failed"))).collect();
+        }
+        results
+    }
+
+    fn stage_part_in(
+        &self,
+        wtxn: &mut RwTxn,
+        part: u64,
+        outputs: &[(u64, Commitment, Slot, u32)],
+        commits: &[(u64, Digest, u32)],
+        next_position: u64,
+        expected: Option<&Digest>,
+    ) -> Result<Digest> {
+        if !self.staging_in(wtxn)? {
             return Err(ChainError::Corrupt("no snapshot is staging"));
         }
         // A database error is this node's; anything else, the part's.
-        let root =
-            self.utxo.stage(&mut wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position).map_err(|e| match e {
-                utxo::Error::Heed(_) => ChainError::Utxo(e),
-                _ => ChainError::BadSnapshot,
-            })?;
+        let root = self.utxo.stage(wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position).map_err(|e| match e {
+            utxo::Error::Heed(_) => ChainError::Utxo(e),
+            _ => ChainError::BadSnapshot,
+        })?;
         if expected.is_some_and(|e| *e != root) {
             return Err(ChainError::BadSnapshot);
         }
@@ -1910,9 +1956,8 @@ impl<V: ProofVerifier> Chain<V> {
             if outputs[i].1 != commit_leaf(&hash, height) {
                 return Err(ChainError::BadSnapshot);
             }
-            self.names.add_commit(&mut wtxn, p, Commit { hash, height }).map_err(|e| ChainError::Name(e.into()))?;
+            self.names.add_commit(wtxn, p, Commit { hash, height }).map_err(|e| ChainError::Name(e.into()))?;
         }
-        wtxn.commit()?;
         Ok(root)
     }
 
@@ -3867,7 +3912,12 @@ mod tests {
             b.chain.stage_snapshot_part(0, &part, &fake, next, Some(&roots[0])),
             Err(ChainError::BadSnapshot)
         ));
-        assert_eq!(b.chain.stage_snapshot_part(0, &part, &[], next, Some(&roots[0])).unwrap(), roots[0]);
+        // Several in one transaction: a refused one leaves nothing behind,
+        // the next lands.
+        let batch = vec![(0, part.clone(), vec![], next, wrong), (0, part.clone(), vec![], next, roots[0])];
+        let results = b.chain.stage_snapshot_parts(&batch);
+        assert!(matches!(results[0], Err(ChainError::BadSnapshot)));
+        assert_eq!(results[1].as_ref().unwrap(), &roots[0]);
         b.chain.finish_snapshot(&blocks[7], &manifest).unwrap();
         assert!(!b.chain.staging().unwrap());
         assert_eq!(b.chain.utxo().len(&b.chain.env().read_txn().unwrap()).unwrap(), 10);

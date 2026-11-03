@@ -221,6 +221,9 @@ struct AuxWant {
     tries: u32,
     tried: Vec<SocketAddr>,
 }
+/// Output parts the applier stages in one transaction, at most.
+const PART_BATCH: usize = 16;
+
 /// Staged parts carried forward in one job (one transaction).
 const CARRY_BATCH: usize = 64;
 
@@ -741,21 +744,60 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let chain = Arc::clone(&chain);
             let wake = tx.clone();
             std::thread::Builder::new().name("applier".into()).spawn(move || {
-                for job in job_rx {
+                let mut held: Option<Job> = None;
+                loop {
+                    let job = match held.take() {
+                        Some(j) => j,
+                        None => match job_rx.recv() {
+                            Ok(j) => j,
+                            Err(_) => break,
+                        },
+                    };
                     let outcome = match job {
                         Job::Block(block, from) => {
                             let result = chain.apply_block(&block, unix_now());
                             crate::parallel::release_free_memory();
                             Outcome::Block(Box::new(block), from, result)
                         }
-                        Job::Part { index, bytes, next, root, from } => {
-                            let result = match net::decode_part(&bytes) {
-                                Some((outputs, commits)) => chain
-                                    .stage_snapshot_part(index as u64, &outputs, &commits, next, Some(&root))
-                                    .map(|_| ()),
-                                None => Err(ChainError::BadSnapshot),
-                            };
-                            Outcome::Part { index, from, result }
+                        // Output parts queued together are staged in one
+                        // transaction: one wait on the disk, not one each.
+                        part @ Job::Part { .. } => {
+                            let mut batch = vec![part];
+                            while batch.len() < PART_BATCH {
+                                match job_rx.try_recv() {
+                                    Ok(p @ Job::Part { .. }) => batch.push(p),
+                                    Ok(other) => {
+                                        held = Some(other);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let mut decoded = Vec::new();
+                            let mut outcomes: Vec<Outcome> = Vec::new();
+                            let mut slots = Vec::new();
+                            for (n, job) in batch.into_iter().enumerate() {
+                                let Job::Part { index, bytes, next, root, from } = job else { unreachable!() };
+                                if let Some((outputs, commits)) = net::decode_part(&bytes) {
+                                    decoded.push((index as u64, outputs, commits, next, root));
+                                    slots.push(n);
+                                }
+                                outcomes.push(Outcome::Part { index, from, result: Err(ChainError::BadSnapshot) });
+                            }
+                            for (n, r) in slots.into_iter().zip(chain.stage_snapshot_parts(&decoded)) {
+                                if let Outcome::Part { result, .. } = &mut outcomes[n] {
+                                    *result = r.map(|_| ());
+                                }
+                            }
+                            let mut gone = false;
+                            for o in outcomes {
+                                gone |= outcome_tx.send(o).is_err();
+                            }
+                            if gone {
+                                break;
+                            }
+                            let _ = wake.try_send(Event::Wake);
+                            continue;
                         }
                         Job::NamePart { index, bytes, lo, hi, hash, from } => {
                             let result = match net::decode_name_part(&bytes) {

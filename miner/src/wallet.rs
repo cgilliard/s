@@ -794,8 +794,12 @@ pub type Result<T> = core::result::Result<T, WalletError>;
 pub struct Balance {
     /// Unspent and on chain: spendable.
     pub confirmed: u128,
-    /// Unspent and not yet on chain: incoming.
+    /// Unspent and not yet on chain: incoming (change, rewards).
     pub pending: u128,
+    /// Outputs this wallet added to others' slates, not yet on chain: a
+    /// slate can claim anything until its transaction lands, so these are
+    /// not counted as pending.
+    pub unverified: u128,
     /// Picked as inputs of a pending slate, not yet signed.
     pub reserved: u128,
     /// Signed away by a payment that has not confirmed: about to leave.
@@ -827,6 +831,9 @@ pub struct Wallet {
     /// Rewards of blocks this wallet mined, until settled: commitment →
     /// height ‖ block hash (zero until the block is found).
     rewards: Database<Bytes, Bytes>,
+    /// Outputs this wallet added to others' slates (commitments), until
+    /// they land or are pruned: unverified until then.
+    answered: Database<Bytes, Bytes>,
     /// The identity key's counter and whether the address is off, as
     /// stored.
     address: std::sync::atomic::AtomicU64,
@@ -852,6 +859,12 @@ fn random_fp() -> std::io::Result<Fp> {
             return Ok(x);
         }
     }
+}
+
+/// A relay's key from its seed ([`Wallet::relay_seed`]). It signs
+/// whatever anyone asks (every channel and hop), so in hedged mode.
+pub fn relay_key_from(seed: &[u8; mldsa::SEED_LEN]) -> mldsa::SecretKey {
+    mldsa::keygen(seed).hedged()
 }
 
 /// The master secret of a BIP39 seed.
@@ -968,7 +981,7 @@ fn restrict(dir: &Path) -> std::io::Result<()> {
 
 impl Wallet {
     #[allow(clippy::type_complexity)]
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 8])> {
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 9])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
@@ -984,8 +997,9 @@ impl Wallet {
         let policies = env.create_database(&mut wtxn, Some("policies"))?;
         let payments = env.create_database(&mut wtxn, Some("payments"))?;
         let rewards = env.create_database(&mut wtxn, Some("rewards"))?;
+        let answered = env.create_database(&mut wtxn, Some("answered"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]))
+        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]))
     }
 
     /// Opens the wallet in `dir` without a password, creating one with a
@@ -1000,7 +1014,8 @@ impl Wallet {
     /// created with a fresh phrase. Returns the wallet and, if it was just
     /// created, its phrase.
     pub fn open_with(dir: &Path, ask: &mut dyn FnMut(Ask) -> Result<String>) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]) =
+            Self::open_env(dir)?;
         let rtxn = env.read_txn()?;
         let record = meta.get(&rtxn, META_SECRET)?.map(<[u8]>::to_vec);
         let fresh = record.is_none() && meta.len(&rtxn)? == 0 && outputs.is_empty(&rtxn)?;
@@ -1048,6 +1063,7 @@ impl Wallet {
                 policies,
                 payments,
                 rewards,
+                answered,
                 address: address.into(),
                 address_off: off.into(),
             },
@@ -1060,7 +1076,8 @@ impl Wallet {
     /// [`Wallet::scan`] once the chain is synced.
     pub fn restore(dir: &Path, phrase: &str, passphrase: &str, password: &str) -> Result<Wallet> {
         let secret = Secret { entropy: bip39::entropy(phrase)?, seed: bip39::seed(phrase, passphrase)? };
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]) = Self::open_env(dir)?;
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]) =
+            Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         if meta.get(&wtxn, META_SECRET)?.is_some() || !outputs.is_empty(&wtxn)? {
             return Err(WalletError::Exists);
@@ -1085,6 +1102,7 @@ impl Wallet {
             policies,
             payments,
             rewards,
+            answered,
             address: address.into(),
             address_off: false.into(),
         })
@@ -1189,9 +1207,13 @@ impl Wallet {
     /// listed id is not its operator's payment address, and kept by a
     /// restore from the phrase (`docs/ONION.md`). It signs in hedged mode.
     pub fn relay_key(&self) -> mldsa::SecretKey {
-        let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_RELAY, &self.master));
-        // It signs whatever anyone asks (every channel and hop): hedged.
-        mldsa::keygen(&seed).hedged()
+        relay_key_from(&self.relay_seed())
+    }
+
+    /// The seed of [`Wallet::relay_key`]: all a relay needs to keep
+    /// (`DIR/relay.key`), apart from the phrase.
+    pub fn relay_seed(&self) -> [u8; mldsa::SEED_LEN] {
+        digest_to_bytes(&hash_domain(DOM_RELAY, &self.master))
     }
 
     /// The wallet's id on the message layer: the hash of its Dilithium
@@ -1392,10 +1414,21 @@ impl Wallet {
     /// the UTXO set) totals.
     pub fn balance(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Balance> {
         let mut b = Balance::default();
+        let answered: HashSet<Vec<u8>> = {
+            let wrtxn = self.env.read_txn()?;
+            let mut set = HashSet::new();
+            for item in self.answered.iter(&wrtxn)? {
+                set.insert(item?.0.to_vec());
+            }
+            set
+        };
         for o in self.outputs()? {
             let held = self.held(&o, utxo, rtxn)?;
             match (o.state, held) {
                 (State::Unspent, true) => b.confirmed += o.amount as u128,
+                (State::Unspent, false) if answered.contains(&digest_to_bytes(&o.commitment)[..]) => {
+                    b.unverified += o.amount as u128
+                }
                 (State::Unspent, false) => b.pending += o.amount as u128,
                 (State::Reserved, _) => b.reserved += o.amount as u128,
                 (State::Spent, true) => b.locked += o.amount as u128,
@@ -1523,9 +1556,13 @@ impl Wallet {
         let mut n = 0;
         for o in self.outputs()? {
             let in_flight = keep.contains(&o.commitment) || pending_change.contains(&o.commitment);
-            if o.state == State::Unspent && !in_flight && !self.held(&o, utxo, rtxn)? {
+            let held = self.held(&o, utxo, rtxn)?;
+            if o.state == State::Unspent && !in_flight && !held {
                 self.outputs.delete(&mut wtxn, &digest_to_bytes(&o.commitment))?;
                 n += 1;
+            }
+            if held || (o.state == State::Unspent && !in_flight) {
+                self.answered.delete(&mut wtxn, &digest_to_bytes(&o.commitment))?;
             }
         }
         wtxn.commit()?;
@@ -1619,6 +1656,32 @@ impl Wallet {
         let mut key = self.key(&o.nonce);
         key.set_next_index(u64::from(leaf));
         Ok((key, last))
+    }
+
+    /// Notes signatures seen on the network (pooled spends) from the
+    /// wallet's outputs, `(commitment, leaf)`: a leaf the wallet took for
+    /// unused (its directory rolled back to a backup, a VM snapshot) is
+    /// skipped, with every leaf before it, so it never signs twice.
+    /// Returns how many outputs were behind.
+    pub fn observe_signatures(&self, seen: &[(Commitment, u64)]) -> Result<usize> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut behind = 0;
+        for (c, leaf) in seen {
+            let Some(mut o) = self.owned_in(&wtxn, c)? else { continue };
+            let base = if o.recovered { LEAVES_PER_HALF } else { 0 };
+            let Some(offset) = (*leaf as u32).checked_sub(base).filter(|&x| x < LEAVES_PER_HALF) else { continue };
+            // Its place in this copy's order, from the start leaf.
+            let k = (offset + LEAVES_PER_HALF - u32::from(o.start)) % LEAVES_PER_HALF;
+            if u32::from(o.used) <= k {
+                o.used = (k + 1) as u8;
+                self.record(&mut wtxn, &o)?;
+                behind += 1;
+            }
+        }
+        if behind > 0 {
+            wtxn.commit()?;
+        }
+        Ok(behind)
     }
 
     /// [`Wallet::signing_key`] in a transaction of its own.
@@ -1774,6 +1837,9 @@ impl Wallet {
             return Err(WalletError::BadSlate("already has a recipient output"));
         }
         let out = self.receive(slate.amount)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.answered.put(&mut wtxn, &digest_to_bytes(&out.commitment), &[])?;
+        wtxn.commit()?;
         slate.receipt = Some(Receipt::sign(&self.identity_key(), &out, &slate.id, &slate.sender));
         slate.outputs.push(out);
         slate.stage = 2;
@@ -3251,6 +3317,21 @@ mod tests {
     }
 
     #[test]
+    fn signatures_seen_elsewhere_skip_their_leaves() {
+        let dir = TempDir::new("observe");
+        let (w, _) = Wallet::open(&dir.0.join("wallet")).unwrap();
+        let o = w.receive(1_000).unwrap();
+        // Another copy of the wallet signed from leaves 0 and 2.
+        assert_eq!(w.observe_signatures(&[(o.commitment, 0), (o.commitment, 2)]).unwrap(), 2);
+        assert_eq!(w.owned(&o.commitment).unwrap().unwrap().used, 3);
+        // Nothing new: an older leaf, a recovered copy's leaf, another output.
+        assert_eq!(w.observe_signatures(&[(o.commitment, 1), (o.commitment, 9), ([Fp::ONE; DIGEST], 5)]).unwrap(), 0);
+        let (key, last) = w.next_signing_key(&o.commitment).unwrap();
+        assert!(!last);
+        assert_eq!(key.next_index(), 3);
+    }
+
+    #[test]
     fn rewards_of_blocks_that_lose_are_forgotten() {
         let dir = TempDir::new("rewards");
         let (env, u) = utxo(&dir);
@@ -3354,7 +3435,7 @@ mod tests {
             let rtxn = env.read_txn().unwrap();
             assert_eq!(
                 w.balance(&u, &rtxn).unwrap(),
-                Balance { confirmed: 100, pending: u64::MAX as u128, reserved: 0, locked: 0 }
+                Balance { confirmed: 100, pending: u64::MAX as u128, reserved: 0, locked: 0, unverified: 0 }
             );
             (phrase, a.commitment)
         };
@@ -3489,13 +3570,19 @@ mod tests {
         assert_eq!(slate.outputs[0].amount, change);
         assert_eq!(
             alice.balance(&u, &rtxn).unwrap(),
-            Balance { confirmed: 0, pending: change as u128, reserved: 110_000_000, locked: 0 }
+            Balance { confirmed: 0, pending: change as u128, reserved: 110_000_000, locked: 0, unverified: 0 }
         );
         let mut received = Slate::from_bytes(&slate.to_bytes()).unwrap();
         assert_eq!(received, slate);
         assert!(matches!(bob.finalize(&received), Err(WalletError::BadSlate(_))));
         bob.receive_slate(&mut received).unwrap();
         assert!(matches!(bob.receive_slate(&mut received), Err(WalletError::BadSlate(_))));
+        // Until it lands, what bob answered is unverified, not pending: a
+        // slate can claim anything.
+        assert_eq!(
+            bob.balance(&u, &rtxn).unwrap(),
+            Balance { confirmed: 0, pending: 0, reserved: 0, locked: 0, unverified: 70_000_000 }
+        );
         let received = Slate::from_bytes(&received.to_bytes()).unwrap();
         assert!(matches!(bob.finalize(&received), Err(WalletError::Unknown)));
         let mut greedy = received.clone();
@@ -3530,7 +3617,7 @@ mod tests {
         // Signed but not confirmed: the inputs are locked, not reserved.
         assert_eq!(
             alice.balance(&u, &rtxn).unwrap(),
-            Balance { confirmed: 0, pending: change as u128, reserved: 0, locked: 110_000_000 }
+            Balance { confirmed: 0, pending: change as u128, reserved: 0, locked: 110_000_000, unverified: 0 }
         );
         // The recipient's output carries a memo only bob can open.
         assert!(bob.open_memo(&tx.outputs[1].memo).is_some());
