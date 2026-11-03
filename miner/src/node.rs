@@ -597,6 +597,10 @@ pub struct Node<V: ProofVerifier> {
     /// Tests: channel frames this node sent.
     #[cfg(test)]
     frames_sent: Arc<AtomicU64>,
+    /// Tests: datagrams dropped on the way out, per thousand, and the
+    /// generator's state.
+    #[cfg(test)]
+    loss: std::cell::Cell<(u64, u64)>,
     last_channel_poll: Instant,
 }
 
@@ -892,6 +896,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             announced: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             frames_sent: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            loss: std::cell::Cell::new((0, 0x9e37_79b9_7f4a_7c15)),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
@@ -1055,8 +1061,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// Tests: whether to drop the next datagram, as a lossy network would.
+    #[cfg(test)]
+    fn lost(&self) -> bool {
+        let (per_mille, mut x) = self.loss.get();
+        if per_mille == 0 {
+            return false;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.loss.set((per_mille, x));
+        x % 1000 < per_mille
+    }
+
     /// Sends a message, giving a request the token its receiver gave us.
     fn send(&self, addr: SocketAddr, msg: &Message) {
+        #[cfg(test)]
+        if self.lost() {
+            return;
+        }
         let bytes = match msg.token() {
             Some(_) => msg.clone().with_token(self.peers.token(&addr)).encode(),
             None => msg.encode(),
@@ -1070,6 +1094,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// table holds: the token an offer, a session request or a handshake
     /// carried.
     fn send_with(&self, addr: SocketAddr, msg: Message, token: u64) {
+        #[cfg(test)]
+        if self.lost() {
+            return;
+        }
         if let Err(e) = self.socket.send_to(&msg.with_token(token).encode(), addr) {
             self.chatter(&format!("send to {addr} failed: {e}"));
         }
@@ -3877,6 +3905,144 @@ mod tests {
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();
         hb.join().unwrap();
+    }
+
+    /// The same over a network that loses a tenth of the datagrams each
+    /// way: every request is retried, and the sync completes.
+    #[test]
+    fn a_fresh_node_fast_syncs_over_a_lossy_network() {
+        let a = open("lossy-a");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=12u8 {
+            t += 600;
+            let inputs = if tag >= 3 { vec![tag as u64 - 3] } else { vec![] };
+            let body = Body {
+                outputs: vec![Output::new(&pk(tag), claim(&a, &inputs)).block_output()],
+                inputs,
+                proof: vec![tag; 2500],
+                ..Default::default()
+            };
+            let block = mine_body(&a, body, t);
+            a.chain.apply_block(&block, now).unwrap();
+        }
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let b = open("lossy-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        node_a.loss.set((100, 1));
+        node_b.loss.set((100, 2));
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 120), "b did not fast-sync to a's tip over a lossy network");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    /// A fresh node whose peer answers only after 10 s starts from genesis
+    /// meanwhile, and goes back to fast sync when the peer appears: it ends
+    /// on a snapshot, not a replay.
+    #[test]
+    fn a_fresh_node_fast_syncs_when_its_first_peer_comes_late() {
+        let a = open("late-a");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=12u8 {
+            t += 600;
+            let body = Body {
+                outputs: vec![Output::new(&pk(tag), claim(&a, &[])).block_output()],
+                proof: vec![tag; 2500],
+                ..Default::default()
+            };
+            a.chain.apply_block(&mine_body(&a, body, t), now).unwrap();
+        }
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let b = open("late-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let hb = std::thread::spawn(move || node_b.run());
+        // a is bound but not running: b hears nothing and gives up waiting.
+        std::thread::sleep(Duration::from_secs(11));
+        assert_eq!(b.chain.tip().unwrap().unwrap().height, 0);
+        let ha = std::thread::spawn(move || node_a.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not sync once a answered");
+        assert_eq!(b.chain.floor().unwrap(), Some(8), "b fast-synced rather than replaying from genesis");
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    /// Garbage reaching the node, random or a real message cut or bent,
+    /// is dropped: the node keeps answering.
+    #[test]
+    fn malformed_datagrams_are_dropped() {
+        let a = open("garbage");
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let genesis = a.chain.header_at(0).unwrap().unwrap().hash();
+        let st = Status {
+            nonce: 7,
+            version: PROTOCOL_VERSION,
+            token: 0,
+            genesis,
+            height: 0,
+            oldest: 1,
+            tip: genesis,
+            work: U256::ZERO,
+        };
+        let real = [
+            Message::Ping(st).encode(),
+            Message::GetPeers { token: 0 }.encode(),
+            Message::GetHeadersFrom { height: 0, token: 0 }.encode(),
+        ];
+        let mut x = 0x1234_5678_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..3000 {
+            let bytes: Vec<u8> = match i % 3 {
+                0 => (0..next() % 1500).map(|_| next() as u8).collect(),
+                1 => {
+                    let m = &real[(next() % 3) as usize];
+                    m[..(next() as usize % m.len())].to_vec()
+                }
+                _ => {
+                    let mut m = real[(next() % 3) as usize].clone();
+                    let at = next() as usize % m.len();
+                    m[at] ^= 1 << (next() % 8);
+                    m
+                }
+            };
+            sock.send_to(&bytes, addr_a).unwrap();
+        }
+        // Still answering.
+        std::thread::sleep(Duration::from_millis(200));
+        sock.send_to(&Message::Ping(Status { nonce: 99, ..st }).encode(), addr_a).unwrap();
+        let mut buf = [0u8; net::MAX_DATAGRAM];
+        loop {
+            let (n, _) = sock.recv_from(&mut buf).expect("the node still answers");
+            if matches!(Message::decode(&buf[..n]), Some(Message::Pong(s)) if s.nonce == 99) {
+                break;
+            }
+        }
+        tx_a.send(Event::Stop).unwrap();
+        ha.join().unwrap();
     }
 
     /// Fast sync with names: the snapshot carries the records, a pending

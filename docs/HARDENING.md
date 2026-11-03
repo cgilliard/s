@@ -11,7 +11,7 @@ history and the README; this file holds what is left.
 ## Progress
 
 Closed in batches since the design docs were built (bb8738c); 56 entries
-then, 30 now. Most that remain are accepted, for launch, or tests; some were narrowed rather than removed, and a few narrower ones added:
+then, 28 now. Most that remain are accepted, for launch, or tests; some were narrowed rather than removed, and a few narrower ones added:
 
 | Batch | Area | Commit |
 |---|---|---|
@@ -20,12 +20,13 @@ then, 30 now. Most that remain are accepted, for launch, or tests; some were nar
 | 3 | Side channels: constant-time ML-DSA signing, hedged relay key, hourly Kyber rotation | bf39007 |
 | 4 | Networking and sync: non-blocking snapshot changes, slow vs unserving peers, fast-sync fallback, clock skew, header retry, serving limits, peer groups | 23f0a39 |
 | 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
-| 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | (this commit) |
+| 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
+| 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | (this commit) |
 
-Still to do, as code:
-
-- **7, tests:** the untested paths below, and the ignored negative
-  end-to-end proof tests.
+Still to do, as code: the untested paths listed below (fast-sync edge
+cases, a reordering network, the message layer under loss, crash
+injection in the wallet). The proof tests that take seconds run with
+`cargo test --release` and are skipped in debug builds.
 
 Not code, or for launch: the independent circuit review, the soundness
 conjecture, a checkpoint per release, seeds, genesis regeneration, the
@@ -78,11 +79,10 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   during a fast sync; a reorganization below the floor after install; the
   "no peer serves" and `drop_carry` paths; the bad-manifest path; the
   genesis fallback and "keep trying" paths of `restart_snapshot`; a
-  deferred move or restart while parts are with the applier; a fresh node
-  going back to fast sync when its first peer appears after 10 s; the
-  header batch retry; clock-skew logging; any lossy
-  or reordering network (every test is clean loopback); strikes leading to
-  a ban at node level; malformed datagrams reaching the node; peers-file
+  deferred move or restart while parts are with the applier; the header
+  batch retry; clock-skew logging; a reordering network (loss is tested:
+  a fast sync with a tenth of datagrams lost); the message layer over a
+  lossy network; strikes leading to a ban at node level; peers-file
   poisoning; IPv6; NAT.
 
 ## Wallet
@@ -139,10 +139,8 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   crash between them (`prune` removes it).
 - **Untested.** The `sync_wallet` fork walk and stale positions after a
   reorganization; crash injection between the steps of `send`;
-  concurrent original and restored wallets; the restore-scan thread;
-  pool acceptance of a recovered-output (leaf 8 to 15) spend end to end;
-  `Slate::from_bytes` on malformed input beyond the stage and change
-  bounds. There are no integration tests (`miner/tests` does not exist).
+  concurrent original and restored wallets; the restore-scan thread.
+  There are no integration tests (`miner/tests` does not exist).
 
 ## Proof system
 
@@ -155,15 +153,11 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   but not mint unseen. This is the largest remaining trust gap. `block_air.rs` (SMT
   empty-leaf handling on insert, XMSS digit decomposition, carry between
   segments) was only spot-checked in the review.
-- **Negative end-to-end tests are all `#[ignore]`.** No non-ignored test
-  pushes a tampered chain proof (wrong statement, height, plan membership,
-  stale proof) through `Chain::connect` with the real verifier. Add a
-  small-parameter configuration that proves in seconds so these can run in
-  the default suite.
-- **Zero knowledge is argued, not tested.** `zero_knowledge_tables` only
-  checks that two proofs differ. A simulatability test is hard; at least
-  check that the number of opened values per column is below the blind
-  rows for every configuration with `zk`.
+- **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
+  checks that two proofs differ and counts what a real proof opens of a
+  column against the blinding rows; `zero_knowledge_configurations_blind_enough`
+  checks every zk configuration in use. No test simulates a proof from
+  the statement alone.
 - **Leaf hash and node compress share a domain.** `poseidon2.rs`:
   benign because every verifier fixes the path length. Accepted: a tag on
   `compress` would change every circuit, the built-in mainnet plan and

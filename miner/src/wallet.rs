@@ -3540,6 +3540,80 @@ mod tests {
         assert_eq!(wrong.scan(&u, &rtxn).unwrap(), (0, 0));
     }
 
+    /// A restored copy's spend of an output it found (signed from leaves 8
+    /// to 15) is a transaction the pool takes.
+    #[test]
+    fn a_recovered_output_is_spent_through_the_pool() {
+        use crate::mempool::{DEFAULT_CAPACITY, Mempool};
+        use crate::names::NameSet;
+        let dir = TempDir::new("recovered-spend");
+        let (env, u) = utxo(&dir);
+        let names = {
+            let mut wtxn = env.write_txn().unwrap();
+            let n = NameSet::open(&env, &mut wtxn, "n").unwrap();
+            wtxn.commit().unwrap();
+            n
+        };
+        let (w, created) = Wallet::open(&dir.0.join("wallet")).unwrap();
+        let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
+        let coin = w.receive(60_000_000).unwrap();
+        land(&env, &u, &w, &[&coin]);
+        let r = Wallet::restore(&dir.0.join("restored"), &created.unwrap(), "", "").unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(r.scan(&u, &rtxn).unwrap(), (1, 60_000_000));
+        let mut slate = r.send(10_000_000, None, false, &u, &rtxn).unwrap();
+        bob.receive_slate(&mut slate).unwrap();
+        let tx = r.finalize(&slate).unwrap().tx;
+        assert!((8..16).contains(&tx.inputs[0].signature.index));
+        let mut pool = Mempool::new(DEFAULT_CAPACITY);
+        assert!(pool.insert(tx, &u, &names, &rtxn, 1).is_ok());
+    }
+
+    /// Whatever arrives as a slate, cut short or with bits flipped, is
+    /// refused or read, never a panic.
+    #[test]
+    fn malformed_slates_are_refused() {
+        let dir = TempDir::new("slate-bytes");
+        let (env, u) = utxo(&dir);
+        let (alice, _) = Wallet::open(&dir.0.join("alice")).unwrap();
+        let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
+        let coin = alice.receive(60_000_000).unwrap();
+        land(&env, &u, &alice, &[&coin]);
+        let rtxn = env.read_txn().unwrap();
+        let mut slate = alice.send(10_000_000, None, true, &u, &rtxn).unwrap();
+        let stage1 = slate.to_bytes();
+        bob.receive_slate(&mut slate).unwrap();
+        let stage2 = slate.to_bytes();
+        let mut x = 0x5eed_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for bytes in [&stage1, &stage2] {
+            assert!(Slate::from_bytes(bytes).is_some());
+            for len in 0..bytes.len() {
+                assert!(Slate::from_bytes(&bytes[..len]).is_none(), "cut to {len}");
+            }
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(Slate::from_bytes(&longer).is_none());
+            for _ in 0..2000 {
+                let mut b = bytes.clone();
+                for _ in 0..1 + next() % 4 {
+                    let at = next() as usize % b.len();
+                    b[at] ^= 1 << (next() % 8);
+                }
+                let _ = Slate::from_bytes(&b);
+            }
+            for _ in 0..500 {
+                let junk: Vec<u8> = (0..next() % 4000).map(|_| next() as u8).collect();
+                let _ = Slate::from_bytes(&junk);
+            }
+        }
+    }
+
     #[test]
     fn slate_finalize_and_cancel() {
         let dir = TempDir::new("slate");

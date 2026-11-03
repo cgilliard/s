@@ -347,7 +347,7 @@ mod tests {
     /// A policy output (2-of-3 multisig) made in one proven block is spent
     /// in the next through the pool, the proof and the chain.
     #[test]
-    #[ignore = "proves blocks; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
     fn policy_spend_block_proves_and_applies() {
         use crate::mempool::{Mempool, Policy as PoolPolicy};
         use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer};
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves blocks; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
     fn mine_prove_and_apply_segmented_block() {
         let dir = TempDir::new("e2e");
         let p = params();

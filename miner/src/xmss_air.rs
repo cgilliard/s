@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow in debug builds; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
     fn prove_and_verify_signature() {
         let config = StarkConfig { log_blowup: 1, num_queries: 20, pow_bits: 0, zk: false, commit_bits: 0 };
         let mut sk = key(4);

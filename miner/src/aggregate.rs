@@ -1897,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves two blocks and their chain proofs; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves two blocks and their chain proofs; run with --release")]
     fn chain_proofs_cover_history() {
         let dir = TempDir::new("chain");
         let env = open_env(&dir.0, 16 << 20).unwrap();
@@ -1988,6 +1988,117 @@ mod tests {
         assert!(VmAir::execute(&c.prog, &c.inputs).is_err());
     }
 
+    /// Every zero-knowledge configuration in use blinds more rows than its
+    /// openings can reveal of a column (`stark::tests::zero_knowledge_tables`
+    /// counts them on a real proof).
+    #[test]
+    fn zero_knowledge_configurations_blind_enough() {
+        for (name, c) in [("mainnet wrap", AggregatorParams::MAINNET.wrap), ("small wrap", SMALL.wrap)] {
+            assert!(c.zk, "{name}");
+            assert!(4 * 2 + 2 * c.num_queries <= c.blind_rows(), "{name}");
+        }
+        for c in [AggregatorParams::MAINNET.segment, AggregatorParams::MAINNET.outer] {
+            assert!(!c.zk, "only the published wrap proof needs zero knowledge");
+        }
+    }
+
+    /// The node's own path, end to end: blocks with real chain proofs go
+    /// through `Chain::apply_block` with the aggregate verifier; a stale
+    /// proof, a tampered one, or a proof for another body is refused.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "proves two blocks; run with --release")]
+    fn the_chain_connects_only_proven_blocks() {
+        use crate::block::Block;
+        use crate::chain::{Chain, ChainError, ChainParams};
+        use crate::difficulty::U256;
+        use crate::pow::{self, Dataset, PowParams, SeedText, nonce_from_u64};
+        const EMISSION: &[(u32, u64)] = &[(10, 55)];
+        let pow_params = PowParams { log_dataset_items: 8, parents: 32, accesses: 64 };
+        let params = ChainParams {
+            pow: pow_params,
+            genesis_timestamp: 1_700_000_000,
+            genesis_nonce: [0u8; 32],
+            genesis_target: U256([0, 0, 0, 1 << 48]),
+            max_target: ChainParams::MAINNET.max_target,
+            max_block_size: 16 << 20,
+            max_future_drift: 7200,
+            median_time_window: 11,
+            emission: EMISSION,
+            aggregator: SMALL,
+        };
+        let seed = SeedText::from_bytes(pow_params, (0..20_000u32).map(|i| (i * 31 % 253) as u8).collect());
+        let dataset = Dataset::generate(&seed);
+        let dir = TempDir::new("connect");
+        let chain = Chain::open(&dir.0, 64 << 20, params, seed, AggregateVerifier::new(SMALL, EMISSION)).unwrap();
+        chain.init_genesis(&params.genesis()).unwrap();
+        let miner = key(9).public_key();
+        let t0 = params.genesis_timestamp;
+        // The body of the block on the tip paying `amount`, its statement,
+        // and its proof on `prev`.
+        let build = |amount: u64, prev: Option<(u32, &Statement, &[u8])>| {
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let mut wtxn = chain.env().write_txn().unwrap();
+            let prev_root = chain.utxo().root(&wtxn).unwrap();
+            let first = chain.utxo().next_position(&wtxn).unwrap();
+            let txs = vec![reward(&miner, amount)];
+            let segments =
+                SegmentWitness::collect_by_rows(chain.utxo(), &mut wtxn, &txs, SMALL.segment_rows(), height).unwrap();
+            let new_root = chain.utxo().root(&wtxn).unwrap();
+            wtxn.abort();
+            let names = empty_names(&segments, height);
+            let mut body = Body {
+                inputs: vec![],
+                outputs: segments.iter().flat_map(|s| s.block_outputs()).collect(),
+                proof: vec![],
+                ..Default::default()
+            };
+            let statement = Statement::from_block(&BlockStatement {
+                height,
+                prev_state_root: prev_root,
+                new_state_root: new_root,
+                first_output_position: first,
+                subsidy: 55,
+                body: &body,
+            });
+            body.proof = chain
+                .verifier()
+                .prove_block(height, &statement, &segments, &names, prev, 2, &|_| {}, &|| false)
+                .unwrap();
+            (height, body, statement)
+        };
+        let mine = |body: &Body, timestamp: u64| {
+            let mut header = chain.template(body, timestamp).unwrap();
+            let target = chain.expected_target(&chain.tip().unwrap().unwrap()).unwrap();
+            let (nonce, out) =
+                pow::mine(&dataset, &header.pow_hash(), &target, (0..1_000_000).map(nonce_from_u64)).unwrap();
+            header.nonce = nonce;
+            header.mix = out.mix;
+            Block { header, body: body.clone() }
+        };
+        let (h1, body1, st1) = build(55, None);
+        chain.apply_block(&mine(&body1, t0 + 600), t0 + 700).unwrap();
+        assert_eq!(chain.tip().unwrap().unwrap().height, 1);
+        let (_, body2, _) = build(55, Some((h1, &st1, &body1.proof)));
+        // Block 1's proof on block 2's body: another statement.
+        let stale = Body { proof: body1.proof.clone(), ..body2.clone() };
+        assert!(matches!(chain.apply_block(&mine(&stale, t0 + 1200), t0 + 1300), Err(ChainError::BadProof)));
+        // Block 2's proof with one byte changed, anywhere.
+        for at in [0, body2.proof.len() / 2, body2.proof.len() - 1] {
+            let mut tampered = body2.clone();
+            tampered.proof[at] ^= 1;
+            let r = chain.apply_block(&mine(&tampered, t0 + 1200), t0 + 1300);
+            assert!(matches!(r, Err(ChainError::BadProof)), "byte {at}: {r:?}");
+        }
+        // Block 2's proof on a body paying the reward elsewhere: the
+        // outputs, and so the statement, differ.
+        let mut moved = body2.clone();
+        moved.outputs[0] = TxOutput::new(&key(8).public_key(), 55).block_output();
+        assert!(matches!(chain.apply_block(&mine(&moved, t0 + 1200), t0 + 1300), Err(ChainError::BadProof)));
+        // The real one connects.
+        chain.apply_block(&mine(&body2, t0 + 1200), t0 + 1300).unwrap();
+        assert_eq!(chain.tip().unwrap().unwrap().height, 2);
+    }
+
     #[test]
     #[ignore = "proves a four-level tree; run with --release"]
     fn deep_tree_roundtrip() {
@@ -2012,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves an aggregate; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves an aggregate; run with --release")]
     fn spanning_transaction_roundtrip() {
         let s = spanning_setup("span-roundtrip");
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
@@ -2301,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves an aggregate; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves an aggregate; run with --release")]
     fn aggregate_proof_roundtrip() {
         let s = setup("roundtrip", &[30, 25], 55);
         let t = std::time::Instant::now();
@@ -2323,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves a two-level tree; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves a two-level tree; run with --release")]
     fn aggregate_tree_roundtrip() {
         // Three segments with fan-in two: leaves of 2 and 1 segments, then
         // the root verifies one node proof and one segment proof.

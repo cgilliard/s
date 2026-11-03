@@ -3002,6 +3002,20 @@ mod tests {
             assert!(a.trace_at_zeta.iter().zip(&b.trace_at_zeta).all(|(x, y)| x != y));
         }
         assert_ne!(proof.fri.final_value, again.fri.final_value);
+        // What the proof opens of any column stays within the blinding
+        // rows: four Fp-linear functions at each of zeta and g*zeta, and
+        // at each query row one value (a single point per leaf) and, through
+        // the quotient, the next row's.
+        let rows: std::collections::HashSet<usize> = proof.query_indices.iter().copied().collect();
+        assert!(rows.len() <= ZK.num_queries);
+        for (t, table) in proof.tables.iter().enumerate() {
+            assert_eq!(table.trace_at_zeta.len(), table.trace_at_zeta_next.len());
+            for o in &proof.openings {
+                assert_eq!(o[t].trace_row.len(), table.trace_at_zeta.len(), "one value per column per query");
+            }
+            let revealed = 4 * 2 + 2 * rows.len();
+            assert!(revealed <= ZK.blind_rows(), "table {t}: {revealed} values revealed, {} blind", ZK.blind_rows());
+        }
         // The totals still cancel.
         assert!((proof.tables[0].lookup_sum + proof.tables[1].lookup_sum).is_zero());
 
