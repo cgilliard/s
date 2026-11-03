@@ -349,9 +349,9 @@ pub enum Event {
     /// The wallet's sub-name delegation, published at its rendezvous
     /// points, or none (`docs/SUBNAMES.md`).
     Delegate(Option<Vec<u8>>),
-    /// The wallet asks for an id's delegation, under a tag: answered by
-    /// `Note::Delegation`.
-    GetDelegation(u64, Digest),
+    /// The wallet asks for an id's delegation, under a tag and in a group
+    /// (`Outbound::group`): answered by `Note::Delegation`.
+    GetDelegation(u64, Digest, u64),
     /// The sub-names this node answers for as a server.
     Subnames(crate::subnames::Table),
     /// Tests: a body for the relay with this id at this address, over a
@@ -475,6 +475,8 @@ pub struct Stats {
     pub channels: usize,
     /// Onion-mode circuits: ours built, and hops served for others.
     pub circuits: (usize, usize),
+    /// Outbound circuits of ours built since start.
+    pub outbound_built: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -962,7 +964,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Send(out)) => self.start_send(out, Instant::now()),
                 Ok(Event::Identity(key)) => self.set_identity(key, Instant::now()),
                 Ok(Event::Delegate(d)) => self.set_delegation(d),
-                Ok(Event::GetDelegation(tag, owner)) => self.get_delegation(tag, owner, Instant::now()),
+                Ok(Event::GetDelegation(tag, owner, group)) => self.get_delegation(tag, owner, group, Instant::now()),
                 Ok(Event::Subnames(table)) => self.rv.subnames = table,
                 #[cfg(test)]
                 Ok(Event::TestChannel(addr, id, body)) => {
@@ -1265,6 +1267,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             sessions: sessions + self.rdv.sessions(),
             channels: self.channels.count(),
             circuits: self.circuits.counts(),
+            outbound_built: self.outbound_built(),
         };
     }
 
@@ -4477,6 +4480,7 @@ mod tests {
             inner: b"a slate".to_vec(),
             recipient: None,
             reply: None,
+            group: 0,
         };
         tx_q.send(Event::Send(out)).unwrap();
         let mut got = None;
@@ -4504,6 +4508,7 @@ mod tests {
             inner: b"answered".to_vec(),
             recipient: Some(q_announce),
             reply: None,
+            group: 0,
         };
         tx_p.send(Event::Send(out)).unwrap();
         let mut answer = None;
@@ -4519,8 +4524,16 @@ mod tests {
         assert!(matches!(wait(&notes_p), Note::Delivered { tag: 8, .. }));
         // An id with no session anywhere: offline.
         let nobody = crate::address::id_of(crate::mldsa::keygen(&[9; 32]).public_key());
-        tx_q.send(Event::Send(Outbound { tag: 9, to: nobody, kind: 1, inner: vec![], recipient: None, reply: None }))
-            .unwrap();
+        tx_q.send(Event::Send(Outbound {
+            tag: 9,
+            to: nobody,
+            kind: 1,
+            inner: vec![],
+            recipient: None,
+            reply: None,
+            group: 0,
+        }))
+        .unwrap();
         match wait(&notes_q) {
             Note::Failed { tag: 9, why, .. } => assert!(why.contains("offline"), "{why}"),
             other => panic!("{other:?}"),
@@ -4601,6 +4614,7 @@ mod tests {
             inner: slate.to_bytes(),
             recipient: None,
             reply: None,
+            group: 0,
         };
         tx_a.send(Event::Send(out)).unwrap();
         // bob's wallet answers it, to the key alice carried.
@@ -4619,6 +4633,7 @@ mod tests {
             inner: answered.to_bytes(),
             recipient: Some(from),
             reply: None,
+            group: 0,
         };
         tx_b.send(Event::Send(out)).unwrap();
         // alice's wallet signs the answer; only bob's id may give it.
@@ -5007,6 +5022,7 @@ mod tests {
             inner: b"a slate".to_vec(),
             recipient: None,
             reply: None,
+            group: 0,
         };
         nodes[q].1.send(Event::Send(out)).unwrap();
         let o = received(p);
@@ -5021,6 +5037,7 @@ mod tests {
             inner: b"answered".to_vec(),
             recipient: None,
             reply: Some(route),
+            group: 0,
         };
         nodes[p].1.send(Event::Send(out)).unwrap();
         let o = received(q);
@@ -5043,7 +5060,15 @@ mod tests {
         // Nobody holds a session for this id.
         nodes[q]
             .1
-            .send(Event::Send(Outbound { tag: 3, to: id(9), kind: 1, inner: vec![], recipient: None, reply: None }))
+            .send(Event::Send(Outbound {
+                tag: 3,
+                to: id(9),
+                kind: 1,
+                inner: vec![],
+                recipient: None,
+                reply: None,
+                group: 0,
+            }))
             .unwrap();
         match nodes[q].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
             Note::Failed { tag: 3, why, .. } => assert!(why.contains("offline"), "{why}"),
@@ -5132,7 +5157,8 @@ mod tests {
         eprintln!("p heard {:?} after its hop stopped", stopped.elapsed());
         live(60);
         // And it is reached there.
-        let out = Outbound { tag: 1, to: id(5), kind: 1, inner: b"after".to_vec(), recipient: None, reply: None };
+        let out =
+            Outbound { tag: 1, to: id(5), kind: 1, inner: b"after".to_vec(), recipient: None, reply: None, group: 0 };
         let deadline = Instant::now() + Duration::from_secs(60);
         'sent: loop {
             nodes[q].1.send(Event::Send(out.clone())).unwrap();
@@ -5265,6 +5291,7 @@ mod tests {
             inner: b"a slate".to_vec(),
             recipient: None,
             reply: None,
+            group: 0,
         };
         nodes[q].1.send(Event::Send(out)).unwrap();
         let o = received(p);
@@ -5277,6 +5304,7 @@ mod tests {
             inner: b"answered".to_vec(),
             recipient: None,
             reply: Some(route),
+            group: 0,
         };
         nodes[p].1.send(Event::Send(answer)).unwrap();
         let o = received(q);
@@ -5375,7 +5403,7 @@ mod tests {
         let mut tag = 0u64;
         let mut send = |from: usize, to: Digest| -> bool {
             tag += 1;
-            let out = Outbound { tag, to, kind: 1, inner: vec![1], recipient: None, reply: None };
+            let out = Outbound { tag, to, kind: 1, inner: vec![1], recipient: None, reply: None, group: 0 };
             nodes[from].1.send(Event::Send(out)).unwrap();
             loop {
                 match nodes[from].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
@@ -5696,7 +5724,7 @@ mod tests {
         let mut tag = 0;
         let mut fetch = |who: Digest| -> Option<Delegation> {
             tag += 1;
-            nodes[resolver].1.send(Event::GetDelegation(tag, who)).unwrap();
+            nodes[resolver].1.send(Event::GetDelegation(tag, who, 0)).unwrap();
             loop {
                 match nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
                     Note::Delegation { tag: t, owner: o, result } if t == tag => {
@@ -5730,7 +5758,7 @@ mod tests {
         zone.entries.insert(b"cool".to_vec(), id(9));
         table.insert(b"example".to_vec(), zone);
         nodes[server].1.send(Event::Subnames(table)).unwrap();
-        let ask = |label: &[u8], tag: u64| -> Answer {
+        let ask = |label: &[u8], tag: u64, group: u64| -> Answer {
             let out = Outbound {
                 tag,
                 to: id(5),
@@ -5738,6 +5766,7 @@ mod tests {
                 inner: crate::subnames::query(b"example", label),
                 recipient: None,
                 reply: None,
+                group,
             };
             nodes[resolver].1.send(Event::Send(out)).unwrap();
             loop {
@@ -5751,10 +5780,28 @@ mod tests {
                 }
             }
         };
-        let a = ask(b"cool", 100);
+        let a = ask(b"cool", 100, 0);
         assert!(a.verify(b"example", b"cool", &d.servers, unix_now()));
         assert_eq!((a.entry(), a.seq), (Entry::Id(id(9)), 7));
-        let a = ask(b"nope", 101);
+        // One send's steps in a group share one outbound circuit: the
+        // delegation, then the query, cost one circuit, not two.
+        let built = || nodes[resolver].3.lock().unwrap().outbound_built;
+        std::thread::sleep(Duration::from_secs(2));
+        let before = built();
+        nodes[resolver].1.send(Event::GetDelegation(500, id(4), 77)).unwrap();
+        loop {
+            if let Note::Delegation { tag: 500, result, .. } =
+                nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note")
+            {
+                assert_eq!(result.unwrap().as_ref(), Some(&d));
+                break;
+            }
+        }
+        let a = ask(b"cool", 501, 77);
+        assert_eq!(a.entry(), Entry::Id(id(9)));
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(built() - before, 1, "the query went over the delegation's circuit");
+        let a = ask(b"nope", 101, 0);
         assert!(a.verify(b"example", b"nope", &d.servers, unix_now()));
         assert_eq!(a.entry(), Entry::None);
         for (i, n) in nodes.iter().enumerate() {
@@ -5830,6 +5877,7 @@ mod tests {
                 inner: round.as_bytes().to_vec(),
                 recipient: None,
                 reply: None,
+                group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5944,6 +5992,7 @@ mod tests {
                 inner: round.as_bytes().to_vec(),
                 recipient: None,
                 reply: None,
+                group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
@@ -6054,6 +6103,7 @@ mod tests {
                 inner: round.as_bytes().to_vec(),
                 recipient: None,
                 reply: None,
+                group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(40);
@@ -6151,7 +6201,7 @@ mod tests {
             false
         };
         let deliver = |tag: u64, recipient: Option<onion::Announce>| {
-            let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient, reply: None };
+            let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient, reply: None, group: 0 };
             tx_q.send(Event::Send(out)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut opened = None;

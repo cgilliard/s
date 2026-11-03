@@ -95,6 +95,11 @@ pub struct Outbound {
     /// An answer to an unnamed sender, along the route its payload gave
     /// (`docs/PRIVACY.md`, fix 4); `to` is then the route's reply id.
     pub reply: Option<onion::Route>,
+    /// Steps of one action (a sub-name's delegation, its query, then the
+    /// payment) share a group, nonzero, and so one outbound circuit in
+    /// onion mode: its last relay sees one action, as for any send. Zero:
+    /// a circuit of its own.
+    pub group: u64,
 }
 
 /// What the node tells the wallet.
@@ -992,7 +997,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         };
         let tag = NODE_TAG | (random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) >> 1);
         let inner = answer.to_bytes();
-        self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME_ANSWER, inner, recipient, reply }, now);
+        self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME_ANSWER, inner, recipient, reply, group: 0 }, now);
     }
 
     pub(super) fn on_notice(&mut self, addr: SocketAddr, subject: Digest, code: u8, now: Instant) {

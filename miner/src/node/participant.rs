@@ -27,7 +27,10 @@
 //! recipient's announce asked of its last relay, unless the wallet gave
 //! it, then the payload sealed to it; the relay answers forwarded, or
 //! offline once every point of the recipient was tried) or one
-//! broadcast, then closed; one is kept ready meanwhile. A transaction of
+//! broadcast, then closed; one is kept ready meanwhile. The steps of one
+//! send share a circuit when the wallet groups them (a sub-name's
+//! delegation, its query, then the payment), kept up to
+//! [`KEEP_FOR_GROUP`] between them: its last relay still sees one send. A transaction of
 //! ours goes up a circuit of its own to a relay that pools and announces
 //! it as its own, so the first node to announce it is a relay, not the
 //! one that saw the payment's payload, and not the sender. One that no
@@ -114,6 +117,9 @@ const MAX_OUTBOUND: usize = 8;
 const OUTBOUND_IDLE: Duration = Duration::from_secs(600);
 /// How long a delivered payload's circuit is held open for its answer.
 const ANSWER_WAIT: Duration = Duration::from_secs(60);
+/// How long an outbound circuit is kept, after a step of a group, for the
+/// group's next step; then closed.
+const KEEP_FOR_GROUP: Duration = Duration::from_secs(30);
 /// First hops a node keeps.
 const GUARDS: usize = 3;
 /// A guard is kept this long, plus up to as much again at random.
@@ -207,6 +213,8 @@ struct Out {
 struct Fetch {
     tag: u64,
     owner: Digest,
+    /// Its group (`Outbound::group`), zero for none.
+    group: u64,
     circuit: Option<u64>,
     started: Instant,
 }
@@ -246,6 +254,11 @@ pub(super) struct Participant {
     /// Our sub-name delegation, published at our points while it is set.
     pub(super) delegation: Option<Vec<u8>>,
     fetches: Vec<Fetch>,
+    /// Outbound circuits a group's step is done with, kept for its next:
+    /// the circuit, the group and until when.
+    kept: Vec<(u64, u64, Instant)>,
+    /// Outbound circuits built since start.
+    built: u64,
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
     keepalive: Duration,
     rotate_every: Duration,
@@ -270,6 +283,8 @@ impl Default for Participant {
             broadcasts: Vec::new(),
             delegation: None,
             fetches: Vec::new(),
+            kept: Vec::new(),
+            built: 0,
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
             avoid: std::collections::HashMap::new(),
@@ -300,6 +315,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(seq) = self.rv.me.as_ref().map(|m| m.seq) else { return Vec::new() };
         let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
         self.part.standing.iter().map(|s| (s.addr.unwrap_or(unknown), s.live(seq, now))).collect()
+    }
+
+    /// Outbound circuits built since start.
+    pub(super) fn outbound_built(&self) -> u64 {
+        self.part.built
     }
 
     /// Whether our own transactions go out over a circuit: in onion mode,
@@ -380,9 +400,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         Some(o.handle)
     }
 
+    /// The circuit kept for `group`'s next step, if any, else a ready one.
+    fn take_outbound_for(&mut self, group: u64) -> Option<u64> {
+        if group != 0
+            && let Some(i) = self.part.kept.iter().position(|(_, g, _)| *g == group)
+        {
+            let (h, _, _) = self.part.kept.remove(i);
+            self.chatter("onion: a circuit used again for the next step of one send");
+            return Some(h);
+        }
+        self.take_outbound()
+    }
+
+    /// A step on outbound circuit `handle` is done: kept a while for the
+    /// next step of its group, or closed.
+    fn finish_outbound(&mut self, handle: u64, group: u64, why: &str, now: Instant) {
+        if group != 0 && self.part.outbound.iter().any(|o| o.handle == handle) {
+            self.part.kept.retain(|(h, _, _)| *h != handle);
+            self.part.kept.push((handle, group, now + KEEP_FOR_GROUP));
+            return;
+        }
+        self.release_outbound(handle, why, now);
+    }
+
     /// An outbound circuit's send or broadcast is done: it is closed, never
-    /// used for another.
+    /// used for another (but within a group: [`Self::finish_outbound`]).
     fn release_outbound(&mut self, handle: u64, why: &str, now: Instant) {
+        self.part.kept.retain(|(h, _, _)| *h != handle);
         if let Some(i) = self.part.outbound.iter().position(|o| o.handle == handle) {
             self.part.outbound.remove(i);
             self.close_circuit(handle, why, now);
@@ -402,7 +446,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for h in stale {
             self.release_outbound(h, "idle", now);
         }
-        let waiting = self.part.jobs.iter().filter(|j| matches!(j.stage, Stage::Waiting)).count()
+        let done: Vec<u64> = self.part.kept.iter().filter(|(_, _, t)| now >= *t).map(|(h, _, _)| *h).collect();
+        for h in done {
+            self.release_outbound(h, "its group is done", now);
+        }
+        let kept = |g: u64| g != 0 && self.part.kept.iter().any(|(_, k, _)| *k == g);
+        let waiting = self.part.jobs.iter().filter(|j| matches!(j.stage, Stage::Waiting) && !kept(j.out.group)).count()
             + self.part.broadcasts.iter().filter(|b| b.sent.is_none()).count()
             + self.part.fetches.iter().filter(|f| f.circuit.is_none()).count();
         let free = self.part.outbound.iter().filter(|o| !o.taken).count();
@@ -414,7 +463,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let Some(path) = self.outbound_path() else { break };
             let last = *path.last().unwrap();
             match self.build_circuit(path, Vec::new(), now) {
-                Ok(handle) => self.part.outbound.push(Out { handle, last, ready: false, taken: false, built: now }),
+                Ok(handle) => {
+                    self.part.built += 1;
+                    self.part.outbound.push(Out { handle, last, ready: false, taken: false, built: now })
+                }
                 Err(e) => {
                     self.log(&format!("onion: no outbound circuit: {e}"));
                     break;
@@ -491,6 +543,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.close_circuit(h, "init mode", now);
             }
         }
+        self.part.kept.clear();
         for o in std::mem::take(&mut self.part.outbound) {
             self.close_circuit(o.handle, "init mode", now);
         }
@@ -708,7 +761,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// The wallet asks for `owner`'s delegation.
-    pub(super) fn get_delegation(&mut self, tag: u64, owner: Digest, now: Instant) {
+    pub(super) fn get_delegation(&mut self, tag: u64, owner: Digest, group: u64, now: Instant) {
         if !self.rv.onion_active() {
             // Init mode holds none: the owner is its own server.
             return self.rv.note(Note::Delegation { tag, owner, result: Ok(None) });
@@ -716,7 +769,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.fetches.len() >= MAX_SENDS {
             return self.rv.note(Note::Delegation { tag, owner, result: Err("too many lookups in progress".into()) });
         }
-        self.part.fetches.push(Fetch { tag, owner, circuit: None, started: now });
+        self.part.fetches.push(Fetch { tag, owner, group, circuit: None, started: now });
         self.progress_fetches(now);
     }
 
@@ -734,8 +787,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result: Err(why.into()) });
                 continue;
             }
+            let group = self.part.fetches[i].group;
             if self.part.fetches[i].circuit.is_none()
-                && let Some(h) = self.take_outbound()
+                && let Some(h) = self.take_outbound_for(group)
             {
                 self.part.fetches[i].circuit = Some(h);
                 let owner = self.part.fetches[i].owner;
@@ -753,7 +807,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn fetched(&mut self, i: usize, result: Result<Option<crate::subnames::Delegation>, String>, now: Instant) {
         let f = self.part.fetches.remove(i);
         if let Some(h) = f.circuit {
-            self.release_outbound(h, "lookup answered", now);
+            self.finish_outbound(h, f.group, "lookup answered", now);
         }
         self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result });
     }
@@ -979,6 +1033,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// standing circuit the point is at fault, not a hop on the way.
     pub(super) fn onion_circuit_gone(&mut self, handle: u64, at_end: bool, now: Instant) {
         self.part.outbound.retain(|o| o.handle != handle);
+        self.part.kept.retain(|(h, _, _)| *h != handle);
         self.part.leaving.retain(|(h, _)| *h != handle);
         let mut rotate = false;
         for s in self.part.standing.iter_mut().filter(|s| s.next == Some(handle)) {
@@ -1141,8 +1196,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             // The answer comes down this circuit.
                             self.part.jobs[j].stage = Stage::Awaiting(now);
                         } else {
-                            self.part.jobs.remove(j);
-                            self.release_outbound(handle, "sent", now);
+                            let job = self.part.jobs.remove(j);
+                            self.finish_outbound(handle, job.out.group, "sent", now);
                         }
                     } else {
                         let why = match code {
@@ -1187,7 +1242,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             return true;
                         };
                         let job = self.part.jobs.remove(j);
-                        self.release_outbound(handle, "answered", now);
+                        self.finish_outbound(handle, job.out.group, "answered", now);
                         let (_, key) = job.route.unwrap();
                         match p.open(&key, unix_now()) {
                             Some(mut opened) => {
@@ -1278,8 +1333,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.fail_send(i, why.into());
                 continue;
             }
+            let group = self.part.jobs[i].out.group;
             if matches!(self.part.jobs[i].stage, Stage::Waiting)
-                && let Some(h) = self.take_outbound()
+                && let Some(h) = self.take_outbound_for(group)
             {
                 let j = &mut self.part.jobs[i];
                 j.circuit = Some(h);

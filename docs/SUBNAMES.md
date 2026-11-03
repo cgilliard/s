@@ -330,9 +330,14 @@ the existing switch code carry both changes at once.
    is not taken for a query. The delegation is the id's, not one name's
    (the name came out of it). Tried on `--network dev` in init mode: a
    payment to `@cool.example` from the owner's wallet and from another's,
-   a missing label refused, a repeat sent from the cache. Not yet:
-   warm circuits (each lookup uses a fresh outbound circuit) and a timed
-   run in onion mode.
+   a missing label refused, a repeat sent from the cache. Not yet: a
+   timed run in onion mode.
+   Warm circuits (2026-11-03): a send's steps share one outbound circuit
+   (`Outbound::group`): the delegation, the first server's query and the
+   slate, the circuit kept up to 30 seconds between them and closed
+   after. Its last relay sees one send, as before; the other servers'
+   queries go over circuits of their own. Tested by the end-to-end test
+   counting the circuits built.
 5. README, and `docs/NAMES.md`'s sub-names section pointing here.
    Done (2026-11-03).
 

@@ -1622,7 +1622,9 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 _ => return Err("usage: send AMOUNT [FEE] FILE|ADDRESS|@NAME [named]".into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
-            let to = recipient(ctx, file)?;
+            // A sub-name's lookups and the slate go over one circuit.
+            let group = lookup_tag() | 1;
+            let to = recipient_in(ctx, file, group)?;
             let rtxn = ctx.chain.env().read_txn()?;
             let slate = ctx.wallet()?.send(amount, fee, named, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
@@ -1635,6 +1637,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     inner: slate.to_bytes(),
                     recipient: None,
                     reply: None,
+                    group,
                 };
                 if ctx.events.send(Event::Send(out)).is_err() {
                     ctx.wallet()?.cancel_slate(&slate.id)?;
@@ -2337,9 +2340,15 @@ fn restore(args: &Args) -> AnyResult<()> {
 /// Where `send` sends: an id (a `tab1…` address or 64 hex digits) or a
 /// registered `@name`'s value; `None` for a file.
 fn recipient(ctx: &Ctx, to: &str) -> AnyResult<Option<Digest>> {
+    recipient_in(ctx, to, 0)
+}
+
+/// [`recipient`], a sub-name's lookups in `group` (`Outbound::group`):
+/// over the circuit the send that follows them then takes.
+fn recipient_in(ctx: &Ctx, to: &str, group: u64) -> AnyResult<Option<Digest>> {
     if let Some(name) = to.strip_prefix('@') {
         if let Some((label, name)) = name.split_once('.') {
-            return resolve_subname(ctx, label, name).map(Some);
+            return resolve_subname(ctx, label, name, group).map(Some);
         }
         return name_value(ctx, name).map(Some);
     }
@@ -2522,8 +2531,10 @@ impl Drop for Waiter<'_> {
 /// from the chain, its delegation from its rendezvous points (none: the
 /// value's own node answers), then a query to every server it names at
 /// once, the first sound answer taken. Answers and delegations are cached
-/// until they expire.
-fn resolve_subname(ctx: &Ctx, label: &str, name: &str) -> AnyResult<Digest> {
+/// until they expire. The delegation, the first server's query and the
+/// send after them share one circuit by `group`; the other servers' go
+/// over circuits of their own.
+fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<Digest> {
     use tabminer::subnames::{Answer, Entry};
     let (l, n) = (label.as_bytes().to_vec(), name.as_bytes().to_vec());
     if !tabminer::names::valid_name(&l) {
@@ -2551,7 +2562,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str) -> AnyResult<Digest> {
             let mut wait = Waiter::new(ctx);
             let tag = lookup_tag();
             wait.add(Wait::Tag(tag));
-            ctx.events.send(Event::GetDelegation(tag, value)).map_err(|_| "the node has stopped")?;
+            ctx.events.send(Event::GetDelegation(tag, value, group)).map_err(|_| "the node has stopped")?;
             let d = loop {
                 match wait.rx.recv_timeout(RESOLVE_WAIT) {
                     Ok(Note::Delegation { result, .. }) => {
@@ -2575,7 +2586,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str) -> AnyResult<Digest> {
     // Every server at once.
     let mut wait = Waiter::new(ctx);
     let mut tags = Vec::new();
-    for s in &servers {
+    for (i, s) in servers.iter().enumerate() {
         let tag = lookup_tag();
         wait.add(Wait::Tag(tag));
         wait.add(Wait::Answer(*s, n.clone(), l.clone()));
@@ -2587,6 +2598,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str) -> AnyResult<Digest> {
             inner: tabminer::subnames::query(&n, &l),
             recipient: None,
             reply: None,
+            group: if i == 0 { group } else { 0 },
         };
         ctx.events.send(Event::Send(out)).map_err(|_| "the node has stopped")?;
     }
@@ -2754,6 +2766,7 @@ fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
                     inner: slate.to_bytes(),
                     recipient: None,
                     reply: Some(route),
+                    group: 0,
                 },
                 (None, Some(a)) => Outbound {
                     tag: 0,
@@ -2762,6 +2775,7 @@ fn on_message(ctx: &Ctx, opened: onion::Opened) -> AnyResult<()> {
                     inner: slate.to_bytes(),
                     recipient: Some(a),
                     reply: None,
+                    group: 0,
                 },
                 (None, None) => unreachable!(),
             };
