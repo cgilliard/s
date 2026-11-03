@@ -278,7 +278,15 @@ pub(super) struct State {
     current: RelaySet,
     /// The rendezvous epoch since the last boundary
     /// ([`onion::rendezvous_epoch`]); `previous` is under the one before.
-    epoch: u32,
+    pub(super) epoch: u32,
+    /// When this node moves its own session to the current set's points,
+    /// while a switch lasts: a random moment in the first
+    /// [`MOVE_WITHIN`] blocks after the boundary, so that participants do
+    /// not all move in the block senders switch at; at [`MOVE_WITHIN`]
+    /// blocks in, it moves in any case. The last boundary, and how far in.
+    move_at: Option<Instant>,
+    boundary: u32,
+    into: u32,
     /// The one decided before it, while the switch lasts: every boundary
     /// switches, since points move each epoch even when the file stays.
     previous: Option<RelaySet>,
@@ -302,6 +310,10 @@ pub(super) struct State {
 /// The tag of a send the node makes itself (a sub-name answer): what
 /// becomes of it is not the wallet's.
 pub(super) const NODE_TAG: u64 = 1 << 63;
+/// Blocks after a boundary within which every participant moves its
+/// session to the new points, each at a random moment (`docs/SUBNAMES.md`,
+/// section 2): before the old points close at `GRACE − 1`.
+pub(super) const MOVE_WITHIN: u32 = 3;
 /// Sub-name answers a server gives a minute, at most: each costs a
 /// signature.
 const ANSWERS_PER_MINUTE: usize = 600;
@@ -316,6 +328,20 @@ fn relay_set(c: &consensus::Current) -> RelaySet {
         (consensus::Mode::Onion, Some(f)) => Some(f.relays.clone()),
         _ => None,
     }
+}
+
+/// `id`'s points under each of `sets` with its epoch, in order, each once.
+fn points_under(id: &Digest, sets: Vec<(&[consensus::Relay], u32)>) -> Vec<Digest> {
+    let mut out: Vec<Digest> = Vec::new();
+    for (relays, epoch) in sets {
+        let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
+        for i in onion::rendezvous_relays(id, epoch, &ids) {
+            if !out.contains(&ids[i]) {
+                out.push(ids[i]);
+            }
+        }
+    }
+    out
 }
 
 /// The sets in force at `epoch`'s height: the current one, the one before
@@ -348,6 +374,9 @@ impl State {
             notes_rx: Some(notes_rx),
             current: None,
             epoch: 0,
+            move_at: None,
+            boundary: 0,
+            into: 0,
             previous: None,
             prefer_current: true,
             #[cfg(test)]
@@ -363,10 +392,14 @@ impl State {
     /// The sets in force, each with its rendezvous epoch, the preferred
     /// first: the current one and, while a switch lasts, the one before.
     fn sets(&self) -> Vec<(&RelaySet, u32)> {
+        self.sets_ordered(self.prefer_current)
+    }
+
+    fn sets_ordered(&self, prefer_current: bool) -> Vec<(&RelaySet, u32)> {
         let mut out = vec![(&self.current, self.epoch)];
         if let Some(p) = &self.previous {
             let p = (p, self.epoch.saturating_sub(1));
-            if self.prefer_current {
+            if prefer_current {
                 out.push(p);
             } else {
                 out.insert(0, p);
@@ -378,6 +411,30 @@ impl State {
     /// The onion-mode relay lists in force, the preferred first.
     pub(super) fn onion_sets(&self) -> Vec<&[consensus::Relay]> {
         self.onion_epochs().into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// Whether a switch between sets is under way.
+    pub(super) fn switching(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    /// Whether this node's own session is at the current set's points:
+    /// once it has moved (`move_at`), or, with no move drawn (tests, a
+    /// switch between modes), as senders prefer.
+    pub(super) fn moved(&self, now: Instant) -> bool {
+        if self.previous.is_none() {
+            return true;
+        }
+        match self.move_at {
+            Some(t) => now >= t || self.into >= MOVE_WITHIN,
+            None => self.prefer_current,
+        }
+    }
+
+    /// The onion-mode relay lists in force with their epochs, in the order
+    /// this node's own session takes them ([`Self::moved`]).
+    pub(super) fn own_onion_epochs(&self, now: Instant) -> Vec<(&[consensus::Relay], u32)> {
+        self.sets_ordered(self.moved(now)).into_iter().filter_map(|(s, e)| Some((s.as_deref()?, e))).collect()
     }
 
     /// The onion-mode relay lists in force with their epochs, the
@@ -437,7 +494,7 @@ impl State {
     /// points move at every boundary (`docs/SUBNAMES.md`, section 2), so
     /// the set before stands through every grace period, with the same
     /// file when it did not change.
-    pub(super) fn set_epoch(&mut self, epoch: &consensus::Epoch) {
+    pub(super) fn set_epoch(&mut self, epoch: &consensus::Epoch, block_time: Duration, now: Instant) {
         #[cfg(test)]
         if self.pinned {
             return;
@@ -447,6 +504,18 @@ impl State {
         self.previous = previous;
         self.prefer_current = prefer_current;
         self.epoch = n;
+        self.into = epoch.height - epoch.boundary;
+        // A new boundary: a moment to move at, at random in what is left
+        // of the first `MOVE_WITHIN` blocks.
+        if self.previous.is_none() {
+            self.move_at = None;
+        } else if self.move_at.is_none() || self.boundary != epoch.boundary {
+            let left = MOVE_WITHIN.saturating_sub(self.into);
+            let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+            let span = (block_time * left).as_millis() as u64;
+            self.move_at = Some(now + Duration::from_millis(x % span.max(1)));
+        }
+        self.boundary = epoch.boundary;
         if self.previous.is_none() {
             self.fallback.clear();
         }
@@ -570,16 +639,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// `id`'s onion-mode rendezvous points: under each relay list in
     /// force with its epoch, the preferred first, each point once.
     pub(super) fn onion_points_of(&self, id: &Digest) -> Vec<Digest> {
-        let mut out: Vec<Digest> = Vec::new();
-        for (relays, epoch) in self.rv.onion_epochs() {
-            let ids: Vec<Digest> = relays.iter().map(|r| r.id).collect();
-            for i in onion::rendezvous_relays(id, epoch, &ids) {
-                if !out.contains(&ids[i]) {
-                    out.push(ids[i]);
-                }
-            }
-        }
-        out
+        points_under(id, self.rv.onion_epochs())
+    }
+
+    /// Our own points, in the order our session takes them: the new
+    /// set's first once we have moved ([`State::moved`]).
+    pub(super) fn own_points_of(&self, id: &Digest, now: Instant) -> Vec<Digest> {
+        points_under(id, self.rv.own_onion_epochs(now))
     }
 
     /// Whether this node, as a relay, is a rendezvous point of `id` in
@@ -1201,5 +1267,41 @@ mod tests {
                 assert_eq!((previous.is_some(), prefer), (false, true), "at {h}");
             }
         }
+    }
+
+    /// Each node moves its own session at its own random moment in the
+    /// first `MOVE_WITHIN` blocks after a boundary, and at `MOVE_WITHIN`
+    /// blocks in whatever it drew; with no switch under way it has moved.
+    #[test]
+    fn participants_move_at_random_within_the_first_blocks() {
+        let init = Current { mode: Mode::Init, winner: None, file: None, skipped: vec![] };
+        let epoch = |h: u32| Epoch::new(h, Votes::default(), init.clone(), Some(init.clone()));
+        let block = Duration::from_secs(10);
+        let now = Instant::now();
+        let mut draws = Vec::new();
+        for _ in 0..20 {
+            let mut s = State::new(None, false, now).unwrap();
+            s.set_epoch(&epoch(144), block, now);
+            let at = s.move_at.unwrap();
+            assert!(at >= now && at < now + block * MOVE_WITHIN, "{:?}", at - now);
+            assert!(s.moved(at));
+            if at > now {
+                assert!(!s.moved(now));
+            }
+            // The same boundary seen again keeps the moment drawn.
+            s.set_epoch(&epoch(145), block, now);
+            assert_eq!(s.move_at, Some(at));
+            // Three blocks in: moved, whatever was drawn.
+            s.move_at = Some(now + Duration::from_secs(3600));
+            s.set_epoch(&epoch(144 + MOVE_WITHIN), block, now);
+            assert!(s.moved(now));
+            // The switch over: nothing to move.
+            s.set_epoch(&epoch(150), block, now);
+            assert!(s.moved(now) && s.move_at.is_none());
+            draws.push(at - now);
+        }
+        draws.sort();
+        draws.dedup();
+        assert!(draws.len() > 10, "moments spread at random: {draws:?}");
     }
 }

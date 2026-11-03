@@ -259,6 +259,15 @@ pub(super) struct Participant {
     kept: Vec<(u64, u64, Instant)>,
     /// Outbound circuits built since start.
     built: u64,
+    /// The epoch whose new points this node, as a sub-name server, has
+    /// republished the delegations naming it at.
+    republished: Option<u32>,
+    /// Delegations republished: the circuit, the delegation's object id
+    /// and since when, until the relay answers.
+    pushes: Vec<(u64, Digest, Instant)>,
+    /// Tests: the owners a server republishes for, without names on chain.
+    #[cfg(test)]
+    pub(super) test_owners: Option<Vec<Digest>>,
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
     keepalive: Duration,
     rotate_every: Duration,
@@ -285,6 +294,10 @@ impl Default for Participant {
             fetches: Vec::new(),
             kept: Vec::new(),
             built: 0,
+            republished: None,
+            pushes: Vec::new(),
+            #[cfg(test)]
+            test_owners: None,
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
             avoid: std::collections::HashMap::new(),
@@ -597,8 +610,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // old list's and the new one's.
         // Not this node's own relay: a circuit cannot end where it starts
         // (a relay is best run without a wallet in any case).
+        // A server carries the delegations naming it to the points of a
+        // new epoch, once it has moved itself: their owners may be away.
+        if self.rv.switching() && self.part.republished != Some(self.rv.epoch) && self.rv.moved(now) {
+            self.part.republished = Some(self.rv.epoch);
+            self.republish_delegations(id, now);
+        }
         let relay = self.config.relay_id();
-        let all: Vec<Digest> = self.onion_points_of(&id).into_iter().filter(|p| Some(*p) != relay).collect();
+        let all: Vec<Digest> = self.own_points_of(&id, now).into_iter().filter(|p| Some(*p) != relay).collect();
         let new_id = self.part.standing_id.is_some_and(|s| s != id);
         self.part.standing_id = Some(id);
         if new_id {
@@ -776,6 +795,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Asks for each delegation not yet asked, over an outbound circuit of
     /// its own; gives up those out of time.
     fn progress_fetches(&mut self, now: Instant) {
+        let late: Vec<u64> =
+            self.part.pushes.iter().filter(|(_, _, t)| now.duration_since(*t) >= SEND_TIMEOUT).map(|p| p.0).collect();
+        for h in late {
+            self.part.pushes.retain(|p| p.0 != h);
+            self.release_outbound(h, "republish unanswered", now);
+        }
         let mut i = 0;
         while i < self.part.fetches.len() {
             if now.duration_since(self.part.fetches[i].started) >= SEND_TIMEOUT {
@@ -803,9 +828,61 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// As a sub-name server: asks for the delegation of every name it
+    /// answers for (by the name's value on chain), to publish again those
+    /// that name it ([`Self::fetched`]).
+    fn republish_delegations(&mut self, me: Digest, now: Instant) {
+        #[cfg(test)]
+        if let Some(owners) = self.part.test_owners.clone() {
+            for (i, owner) in owners.into_iter().enumerate() {
+                self.get_delegation(super::sessions::NODE_TAG | i as u64, owner, 1000 + i as u64, now);
+            }
+            return;
+        }
+        if self.rv.subnames.is_empty() {
+            return;
+        }
+        let mut owners: Vec<Digest> = Vec::new();
+        if let Ok(rtxn) = self.chain.env().read_txn() {
+            for name in self.rv.subnames.keys() {
+                if let Ok(Some(r)) = self.chain.names().lookup(&rtxn, name)
+                    && r.value != me
+                    && r.value != onion::NOBODY
+                    && !owners.contains(&r.value)
+                {
+                    owners.push(r.value);
+                }
+            }
+        }
+        for owner in owners {
+            let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
+            let tag = super::sessions::NODE_TAG | (x >> 1);
+            self.get_delegation(tag, owner, x | 1, now);
+        }
+    }
+
     /// The answer to fetch `i`: done, its circuit closed.
     fn fetched(&mut self, i: usize, result: Result<Option<crate::subnames::Delegation>, String>, now: Instant) {
         let f = self.part.fetches.remove(i);
+        if f.tag & super::sessions::NODE_TAG != 0 {
+            // Our own, to republish: up the same circuit, if it names us.
+            let me = self.rv.me.as_ref().map(|m| m.id);
+            match (result, f.circuit) {
+                (Ok(Some(d)), Some(h))
+                    if me.is_some_and(|m| d.servers.contains(&m)) && d.verify(&f.owner, unix_now()) =>
+                {
+                    let bytes = d.to_bytes();
+                    let last = self.circuit_hops(h).saturating_sub(1);
+                    match self.circuit_send(h, last, circuit::PUBLISH, &bytes, now) {
+                        Ok(()) => self.part.pushes.push((h, Object::id_of(&bytes), now)),
+                        Err(_) => self.release_outbound(h, "republish not sent", now),
+                    }
+                }
+                (_, Some(h)) => self.release_outbound(h, "nothing to republish", now),
+                _ => {}
+            }
+            return;
+        }
         if let Some(h) = f.circuit {
             self.finish_outbound(h, f.group, "lookup answered", now);
         }
@@ -1070,6 +1147,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for f in self.part.fetches.iter_mut().filter(|f| f.circuit == Some(handle)) {
             f.circuit = None;
         }
+        self.part.pushes.retain(|(h, _, _)| *h != handle);
     }
 
     /// A message from the last hop of one of our circuits: `true` if it
@@ -1116,6 +1194,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 b.tried.push(handle);
                 b.why = "a relay refused it".into();
                 self.progress_broadcasts(now);
+            }
+            return true;
+        }
+        // The answer to republishing another's delegation.
+        if cmd == circuit::NOTICE
+            && msg.len() == 33
+            && let Some(i) =
+                self.part.pushes.iter().position(|(h, o, _)| *h == handle && digest_from_bytes(&msg[..32]) == Some(*o))
+        {
+            self.part.pushes.remove(i);
+            self.release_outbound(handle, "republished", now);
+            if msg[32] == NOTICE_FORWARDED {
+                self.chatter("onion: a delegation naming us republished at its owner's new points");
+            } else {
+                self.log("onion: a relay would not take a delegation we republished");
             }
             return true;
         }

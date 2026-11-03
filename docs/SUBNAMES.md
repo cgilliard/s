@@ -270,19 +270,30 @@ the existing switch code carry both changes at once.
 ### Costs and cautions
 
 - Every participant now moves at every boundary, not only when the file
-  changes: about one new circuit and session per participant per epoch,
-  and a burst at `B`. Participants should spread their moves over the
-  first blocks of the grace period (a random delay up to `SWITCH`
-  blocks), so relays are not hit all at once.
+  changes: about one new circuit and session per participant per epoch.
+  So that relays are not hit all at once, each participant moves its own
+  session at a random moment between `B` and `B + 3` (`MOVE_WITHIN`),
+  drawn when it first sees the boundary, and at `B + 3` whatever it
+  drew: before the old points close. Senders still switch at `B + 2`;
+  a session not yet moved, or moved early, is found all the same, since
+  a sender's point asks both sets during the grace period.
 - The counter is predictable, so a relay key can still be ground for a
   future epoch; it only buys one epoch in a few, not every one. Mixing in
   the hash of block `B − EPOCH` (`H(id ‖ epoch ‖ hash ‖ relay)`) would
   make that unpredictable a day ahead, at the cost of depending on which
   block is there (a reorganization deeper than the grace period would
   move points). Start with the counter alone.
-- Delegations move with the announce, so the owner's node must be
-  online at a boundary (or within the grace period) to republish them;
-  the server's sessions move on their own.
+- A delegation is held at the owner's points, which move: the new
+  epoch's points start without it. The owner's node publishes it at its
+  new point when it moves; and since the owner may be away, every server
+  a delegation names carries it there too. Once moved itself, a server
+  asks for the delegation of each name it answers for (by the name's
+  value on chain) from the points still in force and, if it names the
+  server, publishes it again over the same circuit; the relay that takes
+  it, a point of the owner's or not, passes it to the owner's points
+  under both sets. The owner must still renew the signature within the
+  delegation's lifetime (a day, at most two), so it comes online about
+  daily, but not at any boundary in particular.
 
 ## Implementation order
 
@@ -295,10 +306,14 @@ the existing switch code carry both changes at once.
    through the grace period under the epoch before, the same file when
    it did not change. Tested by `a_switch_of_relays_keeps_messages_flowing`
    (now also across an epoch with the file unchanged) and
-   `every_boundary_switches_epochs_with_a_grace_period`. Not yet: the
-   random spread of moves over the grace period (with one session, a
-   participant moves when the preferred set flips at `B + 2`), and the
-   `--network dev` run across boundaries.
+   `every_boundary_switches_epochs_with_a_grace_period`.
+   Also done (2026-11-03): moves spread at random over `B` to `B + 3`
+   (`participants_move_at_random_within_the_first_blocks`); servers
+   carrying delegations to new points
+   (`a_server_carries_a_delegation_to_new_points`); a `--network dev`
+   run of seven nodes from init mode through the switch to onion mode at
+   block 144 and two rotations (288, 432), payments to an address and
+   to a sub-name every 15 seconds, none lost to a rotation.
 2. The delegation and the signed answer (`subnames.rs`), with tests for
    a forged, expired and other-name delegation, and a forged or expired
    answer. Done (2026-11-03): `Delegation` and `Answer` each carry the

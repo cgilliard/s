@@ -52,9 +52,11 @@
 //!
 //! A sub-name delegation (`docs/SUBNAMES.md`) is held by the owner's
 //! points apart from its session, so it is found while the owner is
-//! offline: a point that takes one by `Publish` passes it to the owner's
-//! other points by `Store`, and each keeps the highest sequence number
-//! until it expires. `GetDelegation` asks the owner's points in turn, as a
+//! offline: a relay that takes one by `Publish` holds it if it is one of
+//! the owner's points and passes it to the others by `Store` (to all of
+//! them if it is not one, as when a server republishes it at the points
+//! of a new epoch), and each keeps the highest sequence number until it
+//! expires. `GetDelegation` asks the owner's points in turn, as a
 //! lookup does, until one holds it.
 //!
 //! A sender's rendezvous point asks the recipient's points in the order
@@ -428,21 +430,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.start_ask(link, id, Asking::Delegation, now);
             }
             circuit::PUBLISH => {
-                let code = match self.hold_delegation(msg, now) {
-                    Ok(owner) => {
-                        // The owner's other points hold it too.
-                        let me = self.my_id();
-                        for point in self.points_of(&owner).into_iter().filter(|p| Some(*p) != me) {
-                            let Some(addr) = self.relay_addr(&point) else { continue };
-                            let Ok(key) = self.channel_to(addr, point, now) else { continue };
-                            for c in rendezvous_cells(STORE, msg) {
-                                let _ = self.channel_send(key, &c.to_bytes(), now);
-                            }
-                        }
-                        NOTICE_FORWARDED
-                    }
-                    Err(code) => code,
-                };
+                let code = self.publish_delegation(msg, now);
                 self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), code), now);
             }
             circuit::SEND => match Object::from_bytes(msg) {
@@ -558,6 +546,34 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.log(&format!("rendezvous: session for {} over a circuit", onion::short(&id)));
         }
         self.session_state(link, &id, seq, now);
+    }
+
+    /// A delegation published over a circuit: held here if this relay is
+    /// one of the owner's points, and passed to the owner's other points
+    /// (all of them, under every set in force, if it is not one: a server
+    /// republishing it after the points moved, `docs/SUBNAMES.md`).
+    fn publish_delegation(&mut self, bytes: &[u8], now: Instant) -> u8 {
+        let Some(d) = Delegation::from_bytes(bytes).filter(|d| d.verify(&d.owner(), super::unix_now())) else {
+            return NOTICE_REJECTED;
+        };
+        let owner = d.owner();
+        if !self.config.relay {
+            return NOTICE_REJECTED;
+        }
+        if self.serves(&owner)
+            && let Err(code) = self.hold_delegation(bytes, now)
+        {
+            return code;
+        }
+        let me = self.my_id();
+        for point in self.points_of(&owner).into_iter().filter(|p| Some(*p) != me) {
+            let Some(addr) = self.relay_addr(&point) else { continue };
+            let Ok(key) = self.channel_to(addr, point, now) else { continue };
+            for c in rendezvous_cells(STORE, bytes) {
+                let _ = self.channel_send(key, &c.to_bytes(), now);
+            }
+        }
+        NOTICE_FORWARDED
     }
 
     /// A delegation to hold, published or passed on by another point: the

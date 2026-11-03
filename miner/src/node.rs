@@ -379,6 +379,10 @@ pub enum Event {
     /// Tests: a relay message to a hop of a circuit built.
     #[cfg(test)]
     TestCircuitSend(u64, usize, u8, Vec<u8>),
+    /// Tests: the owners this node, as a sub-name server, republishes the
+    /// delegations of, without their names on chain.
+    #[cfg(test)]
+    TestServes(Vec<Digest>),
     /// The applier thread has a result: nothing else to do but take it.
     Wake,
     Stop,
@@ -976,6 +980,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::TestRelays(relays)) => self.rv.set_relays(relays),
                 #[cfg(test)]
                 Ok(Event::TestQuiet) => self.quiet = true,
+                #[cfg(test)]
+                Ok(Event::TestServes(owners)) => self.part.test_owners = Some(owners),
                 #[cfg(test)]
                 Ok(Event::TestTiming(keepalive, rotate)) => self.part.set_timing(keepalive, rotate),
                 #[cfg(test)]
@@ -1933,7 +1939,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.aux_scanned_at = changes;
             match (self.chain.consensus_epoch(), self.chain.consensus()) {
                 (Ok(epoch), Ok((votes, running))) => {
-                    self.rv.set_epoch(&epoch);
+                    let block_time = Duration::from_secs(self.chain.params().schedule.block_time.max(1) as u64);
+                    self.rv.set_epoch(&epoch, block_time, now);
                     let current = &epoch.current;
                     let decided = (
                         epoch.boundary,
@@ -5804,6 +5811,98 @@ mod tests {
         let a = ask(b"nope", 101, 0);
         assert!(a.verify(b"example", b"nope", &d.servers, unix_now()));
         assert_eq!(a.entry(), Entry::None);
+        for (i, n) in nodes.iter().enumerate() {
+            if i != owner {
+                n.1.send(Event::Stop).unwrap();
+            }
+        }
+        for n in nodes {
+            n.4.join().unwrap();
+        }
+    }
+
+    /// A delegation outlives its owner's absence across a boundary
+    /// (`docs/SUBNAMES.md`): the owner publishes and goes; at the next
+    /// epoch, whose points are none of the old ones, the server it names
+    /// carries the delegation there, and a resolver asking only the new
+    /// points finds it.
+    #[test]
+    fn a_server_carries_a_delegation_to_new_points() {
+        use crate::subnames::Delegation;
+        let fixtures: Vec<Fixture> = (0..9).map(|i| open(&format!("carry-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 6;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let mut listed: Vec<consensus::Relay> =
+            (0..6).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        listed.sort_by_key(|r| digest_to_bytes(&r.id));
+        let ids: Vec<Digest> = listed.iter().map(|r| r.id).collect();
+        let (owner, server, resolver) = (6usize, 7usize, 8usize);
+        let v = id(7);
+        let points = |e: u32| -> Vec<Digest> {
+            crate::onion::rendezvous_relays(&v, e, &ids).into_iter().map(|i| ids[i]).collect()
+        };
+        // An epoch whose points for the owner are none of epoch 0's.
+        let e = (1..).find(|&e| points(e).iter().all(|p| !points(0).contains(p))).unwrap();
+        let epoch = |previous: bool, prefer: bool, n: u32| {
+            for x in &nodes {
+                let p = previous.then(|| Some(listed.clone()));
+                // A stopped node takes nothing.
+                let _ = x.1.send(Event::TestEpoch(Some(listed.clone()), p, prefer, n));
+            }
+        };
+        epoch(false, true, 0);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(owner) && live(server) && live(resolver));
+        let d = Delegation::make(&key(7), 1, unix_now() + 3600, &[id(8)]).unwrap();
+        nodes[owner].1.send(Event::Delegate(Some(d.to_bytes()))).unwrap();
+        let mut tag = 0;
+        let mut fetch = || -> Option<Delegation> {
+            tag += 1;
+            nodes[resolver].1.send(Event::GetDelegation(tag, v, 0)).unwrap();
+            loop {
+                if let Note::Delegation { tag: t, result, .. } =
+                    nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note")
+                    && t == tag
+                {
+                    return result.expect("asked");
+                }
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fetch().is_none() {
+            assert!(Instant::now() < deadline, "the delegation never appeared");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // The owner goes; the server knows whose delegations name it.
+        nodes[owner].1.send(Event::Stop).unwrap();
+        nodes[server].1.send(Event::TestServes(vec![v])).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        // The boundary: both sets stand, and the server has moved.
+        epoch(true, true, e);
+        std::thread::sleep(Duration::from_secs(4));
+        // The grace period over: only the new points are asked.
+        epoch(false, true, e);
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(fetch().as_ref(), Some(&d), "the server carried it to the new points");
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
                 n.1.send(Event::Stop).unwrap();
