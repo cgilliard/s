@@ -346,6 +346,14 @@ pub enum Event {
     /// The wallet's new address (`docs/PRIVACY.md`, fix 5), or none: its
     /// sessions move to the new address's rendezvous points, or close.
     Identity(Option<crate::mldsa::SecretKey>),
+    /// The wallet's sub-name delegation, published at its rendezvous
+    /// points, or none (`docs/SUBNAMES.md`).
+    Delegate(Option<Vec<u8>>),
+    /// The wallet asks for an id's delegation, under a tag: answered by
+    /// `Note::Delegation`.
+    GetDelegation(u64, Digest),
+    /// The sub-names this node answers for as a server.
+    Subnames(crate::subnames::Table),
     /// Tests: a body for the relay with this id at this address, over a
     /// channel opened for it if need be.
     #[cfg(test)]
@@ -953,6 +961,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Transaction(tx)) => self.handle_transaction(tx, None),
                 Ok(Event::Send(out)) => self.start_send(out, Instant::now()),
                 Ok(Event::Identity(key)) => self.set_identity(key, Instant::now()),
+                Ok(Event::Delegate(d)) => self.set_delegation(d),
+                Ok(Event::GetDelegation(tag, owner)) => self.get_delegation(tag, owner, Instant::now()),
+                Ok(Event::Subnames(table)) => self.rv.subnames = table,
                 #[cfg(test)]
                 Ok(Event::TestChannel(addr, id, body)) => {
                     let now = Instant::now();
@@ -4986,7 +4997,7 @@ mod tests {
                 Note::Received(o) => return o,
                 Note::Failed { why, .. } => panic!("{why}"),
                 Note::Delivered { tag, .. } => delivered.lock().unwrap().push(tag),
-                Note::Broadcast { .. } => {}
+                Note::Broadcast { .. } | Note::Delegation { .. } => {}
             }
         };
         let out = Outbound {
@@ -5636,6 +5647,123 @@ mod tests {
         }
         for n in nodes {
             n.6.join().unwrap();
+        }
+    }
+
+    /// Sub-names end to end (`docs/SUBNAMES.md`): the owner of a name
+    /// publishes a delegation at its rendezvous points; a resolver finds
+    /// it there, while the owner is online and after it has gone, and asks
+    /// the server it names for a label, answered along the query's way
+    /// back and signed by the server.
+    #[test]
+    fn sub_names_resolve_through_a_delegated_server() {
+        use crate::onion;
+        use crate::subnames::{Answer, Delegation, Entry, Table, Zone};
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("subnames-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        // The owner of `example`, its server, a resolver.
+        let (owner, server, resolver) = (3usize, 4usize, 5usize);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(owner) && live(server) && live(resolver));
+        let now = unix_now();
+        let d = Delegation::make(&key(4), b"example", 1, now + 3600, &[id(5)]).unwrap();
+        nodes[owner].1.send(Event::Delegate(Some(d.to_bytes()))).unwrap();
+        let mut tag = 0;
+        let mut fetch = |who: Digest| -> Option<Delegation> {
+            tag += 1;
+            nodes[resolver].1.send(Event::GetDelegation(tag, who)).unwrap();
+            loop {
+                match nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
+                    Note::Delegation { tag: t, owner: o, result } if t == tag => {
+                        assert_eq!(o, who);
+                        return result.expect("asked");
+                    }
+                    _ => {}
+                }
+            }
+        };
+        // Published once the owner's session is live: soon.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let got = loop {
+            if let Some(got) = fetch(id(4)) {
+                break got;
+            }
+            assert!(Instant::now() < deadline, "the delegation never appeared");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert_eq!(got, d);
+        assert!(got.verify(b"example", &id(4), now));
+        // An id with none.
+        assert_eq!(fetch(id(9)), None);
+        // The owner goes offline: its points still hold the delegation.
+        nodes[owner].1.send(Event::Stop).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(fetch(id(4)).as_ref(), Some(&d));
+        // The server answers for `cool.example`.
+        let mut table = Table::new();
+        let mut zone = Zone { seq: 7, ..Zone::default() };
+        zone.entries.insert(b"cool".to_vec(), id(9));
+        table.insert(b"example".to_vec(), zone);
+        nodes[server].1.send(Event::Subnames(table)).unwrap();
+        let ask = |label: &[u8], tag: u64| -> Answer {
+            let out = Outbound {
+                tag,
+                to: id(5),
+                kind: onion::KIND_SUBNAME,
+                inner: crate::subnames::query(b"example", label),
+                recipient: None,
+                reply: None,
+            };
+            nodes[resolver].1.send(Event::Send(out)).unwrap();
+            loop {
+                match nodes[resolver].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
+                    Note::Received(o) if o.kind == onion::KIND_SUBNAME => {
+                        assert_eq!(o.answers, Some(id(5)));
+                        return Answer::from_bytes(&o.inner).expect("an answer");
+                    }
+                    Note::Failed { why, .. } => panic!("{why}"),
+                    _ => {}
+                }
+            }
+        };
+        let a = ask(b"cool", 100);
+        assert!(a.verify(b"example", b"cool", &d.servers, unix_now()));
+        assert_eq!((a.entry(), a.seq), (Entry::Id(id(9)), 7));
+        let a = ask(b"nope", 101);
+        assert!(a.verify(b"example", b"nope", &d.servers, unix_now()));
+        assert_eq!(a.entry(), Entry::None);
+        for (i, n) in nodes.iter().enumerate() {
+            if i != owner {
+                n.1.send(Event::Stop).unwrap();
+            }
+        }
+        for n in nodes {
+            n.4.join().unwrap();
         }
     }
 

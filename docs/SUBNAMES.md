@@ -45,12 +45,15 @@ A sub-name server is an ordinary participant, not a relay, and is
 never listed in `consensus.txt`. It has its own identity key (id `S`),
 runs in onion mode, and holds sessions at `S`'s rendezvous points,
 moving them each epoch like any wallet. Resolvers reach it the way a
-payment reaches a wallet: a circuit to one of `S`'s points, which
-forwards over the server's session. It can run on a home machine with
+payment reaches a wallet: a query is a payload like any other (kind
+`KIND_SUBNAME`), sealed to the server's announced key, through a
+circuit to one of `S`'s points, which forwards it over the server's
+session; the answer comes back along the query's return route. The
+points carry it without reading it. It can run on a home machine with
 no inbound ports.
 
-The owner of a name with value `V` publishes, beside its announce at
-`V`'s points, a **delegation**:
+The owner of a name with value `V` publishes at `V`'s points a
+**delegation**:
 
 ```text
 name ‖ owner key ‖ seq ‖ expiry ‖ server ids (1 to 3)
@@ -58,15 +61,22 @@ name ‖ owner key ‖ seq ‖ expiry ‖ server ids (1 to 3)
 
 signed by the key whose hash is `V`. Binding the name stops a
 delegation for `example` being served for another name with the same
-value. A point keeps the highest `seq` it has seen, until `expiry`.
+value. The owner's node sends it up its standing circuit (`Publish`)
+whenever its session there goes live; that point passes it to `V`'s
+other points (`Store`). Each holds it apart from the session, until
+`expiry`, so it is found while the owner is offline; each keeps the
+highest `seq` and takes an update at most every 10 seconds. A resolver
+asks for it (`GetDelegation`) and the point it asks tries `V`'s points
+in turn, as a lookup does. Points check the delegation is sound and for
+an id they serve; the resolver checks it against the chain. Onion mode
+only: in init mode there are no delegations, so the owner answers.
 
 **With no delegation, the owner's own node is the server** (`S = V`):
-the point forwards `GetEntry` over the owner's session, as it forwards
-payments. A small name needs nothing new published; an owner who wants
+the query is sent to `V`, as a payment is. A small name needs nothing new published; an owner who wants
 sub-names to resolve while its wallet is offline delegates to an
 always-on machine.
 
-The server answers `GetEntry(name, label)` with
+The server answers a query for `label.name` with
 
 ```text
 name ‖ label ‖ type ‖ value ‖ seq ‖ expiry ‖ server key
@@ -87,7 +97,7 @@ redundancy; resolvers try or race them.
 
 How a holder gets an entry onto a server (free, paid, first come) is
 between them and the server's operator, outside the protocol. The
-protocol defines only the delegation, `GetEntry` and its answer.
+protocol defines only the delegation, the query and its answer.
 
 ### Example: `send cool.example 5`
 
@@ -103,20 +113,20 @@ address.
 
 1. The wallet splits the input into label `cool` and name `example`,
    and reads `example → V` from the chain.
-2. It builds a circuit to `P1` and asks for `example`'s delegation.
-   `P1` returns the owner's announce and the delegation; the wallet
-   checks the announce's key hashes to `V`, and the delegation's
+2. It asks for `V`'s delegation over an outbound circuit; that
+   circuit's last relay asks `V`'s points (`P1`, then the others) and
+   returns it. The wallet checks the key hashes to `V`, and the
    signature, name and expiry. It learns `S`.
-3. It builds a circuit to `Q1`, gets the server's announce (its key
-   hashes to `S`) and sends `GetEntry(example, cool)`, which `Q1`
-   forwards over the server's session. It checks the signed answer and
-   learns `T`.
+3. It sends a query for `cool.example` to `S`, as any payload: `S`'s
+   announce from `Q1`, the query sealed to it, forwarded over the
+   server's session. The answer comes back down the wallet's circuit;
+   it checks the server's signature and learns `T`.
 4. It pays `T` as any id: `T`'s announce at `R1`, then the payment.
 
 ```text
 wallet ──chain──▶ example = V
 wallet ──circuit──▶ P1 ──▶ delegation: servers [S]
-wallet ──circuit──▶ Q1 ══session══▶ server ──▶ cool = T
+wallet ──circuit──▶ Q1 ══session══▶ server ──▶ cool = T   (sealed)
 wallet ──circuit──▶ R1 ══session══▶ holder's node   (the payment)
 ```
 
@@ -150,10 +160,10 @@ amplification. Kept as a fallback.
 
 ### Privacy
 
-The name's points see lookups of `example`, as they see lookups now.
-The server sees which labels are asked, but not by whom, since
-requests arrive through circuits. Points and servers answer circuits
-only, as for lookups.
+The name's points see that `V`'s delegation is asked for, as they see
+lookups now. The server sees which labels are asked, but not by whom,
+since queries arrive through circuits; its points see only a sealed
+payload for `S`, as for a payment.
 
 ### Commands and limits
 
@@ -164,9 +174,10 @@ only, as for lookups.
 - `send cool.example …`: resolved as above, with the same `@` as names.
 - Labels follow the chain's alphabet and length; one level to begin
   with (nested labels later, each level delegated by its parent).
-- Points rate limit delegation updates per id (as announces) and
-  `GetEntry` per session, so a busy name cannot flood its server's
-  points; a popular server can spread over several ids.
+- Points take a delegation update per id at most every 10 seconds, and
+  hold as many delegations as sessions at most; a server gives at most
+  600 answers a minute (each costs a signature). A popular server can
+  spread over several ids.
 
 ### Later: self-published sub-names
 
@@ -293,6 +304,17 @@ the existing switch code carry both changes at once.
 3. Points hold and serve delegations and forward `GetEntry` over a
    session (`node/rendezvous.rs`); the server side in the node, with the
    wallet as its own server by default.
+   Done (2026-11-03): `Publish`, `GetDelegation` and `Delegation` at the
+   last hop, padded as a payment's messages are; `Store`, `Fetch`,
+   `Held` and `None` between points (`node/rendezvous.rs`), delegations
+   kept in the rendezvous LMDB beside announces; the participant
+   publishes over its standing circuit and fetches over an outbound one
+   (`node/participant.rs`); the query is a `KIND_SUBNAME` payload, so it
+   needs no forwarding of its own, and the node answers it from the
+   table the wallet gives (`Event::Subnames`), signed with its identity
+   key (`node/sessions.rs`). Tested end to end by
+   `sub_names_resolve_through_a_delegated_server`, the owner offline
+   included.
 4. Wallet commands, `send` resolution with caching, warm circuits and
    racing (`main.rs`, `wallet.rs`); a timing test on `--network dev`.
 5. README, and `docs/NAMES.md`'s sub-names section pointing here.

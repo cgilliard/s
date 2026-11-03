@@ -109,6 +109,10 @@ pub enum Note {
     /// What became of a transaction of ours: how it was announced, or
     /// why it was not.
     Broadcast { txid: Digest, how: Result<String, String> },
+    /// The sub-name delegation asked for (`docs/SUBNAMES.md`): the one
+    /// held, none (no point of the owner's holds one, or init mode), or
+    /// why it could not be asked. Not yet checked against the chain.
+    Delegation { tag: u64, owner: Digest, result: Result<Option<crate::subnames::Delegation>, String> },
 }
 
 /// The participant: its Dilithium key and its Kyber keys.
@@ -284,7 +288,18 @@ pub(super) struct State {
     /// Sends to try again in the other mode.
     pub(super) retry: Vec<Outbound>,
     resolved: HashMap<String, Option<SocketAddr>>,
+    /// The sub-names this node answers for, as a server.
+    pub(super) subnames: crate::subnames::Table,
+    /// Sub-name answers given in the current minute, and since when.
+    answered: (usize, Option<Instant>),
 }
+
+/// The tag of a send the node makes itself (a sub-name answer): what
+/// becomes of it is not the wallet's.
+pub(super) const NODE_TAG: u64 = 1 << 63;
+/// Sub-name answers a server gives a minute, at most: each costs a
+/// signature.
+const ANSWERS_PER_MINUTE: usize = 600;
 
 /// A file's relays, sorted by id, in onion mode; `None` in init mode,
 /// where the seeds stand in.
@@ -335,6 +350,8 @@ impl State {
             fallback: Vec::new(),
             retry: Vec::new(),
             resolved: HashMap::new(),
+            subnames: crate::subnames::Table::new(),
+            answered: (0, None),
         })
     }
 
@@ -461,6 +478,11 @@ impl State {
             }
             Note::Delivered { tag, to, .. } => self.fallback.retain(|o| !(o.tag == *tag && o.to == *to)),
             _ => {}
+        }
+        if let Note::Delivered { tag, .. } | Note::Failed { tag, .. } = &note
+            && tag & NODE_TAG != 0
+        {
+            return;
         }
         if let Err(TrySendError::Full(_)) = self.notes.try_send(note) {
             crate::log::line("net: message layer: the wallet is not taking notes; one dropped");
@@ -931,6 +953,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let Some(me) = &self.rv.me else { return };
         let now = unix_now();
         match me.keys.iter().find_map(|(k, _)| p.open(k, now)) {
+            Some(opened) if opened.kind == onion::KIND_SUBNAME && opened.answers.is_none() => {
+                self.answer_subname(opened);
+            }
             Some(opened) => {
                 let who = opened.from.as_ref().map_or("someone unnamed".to_string(), |a| onion::short(&a.id));
                 self.log(&format!("message layer: a message of kind {} from {who} via {from}", opened.kind));
@@ -938,6 +963,36 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             None => self.log(&format!("message layer: a payload via {from} that none of our keys opens")),
         }
+    }
+
+    /// A sub-name query to this node as a server (`docs/SUBNAMES.md`):
+    /// answered from its table, signed with its identity key, along the
+    /// query's way back (or to the sender, when it named itself).
+    fn answer_subname(&mut self, q: Opened) {
+        let Some(me) = &self.rv.me else { return };
+        let Some((name, label)) = crate::subnames::parse_query(&q.inner) else {
+            return self.chatter("message layer: a malformed sub-name query");
+        };
+        let now = Instant::now();
+        let (count, since) = &mut self.rv.answered;
+        if since.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+            (*count, *since) = (0, Some(now));
+        }
+        if *count >= ANSWERS_PER_MINUTE {
+            return self.chatter("message layer: a sub-name query over the rate, unanswered");
+        }
+        *count += 1;
+        let Some(answer) = crate::subnames::answer(&me.key, &self.rv.subnames, &name, &label, unix_now()) else {
+            return;
+        };
+        let (to, recipient, reply) = match (q.route, q.from) {
+            (Some(route), _) => (route.reply_id(), None, Some(route)),
+            (None, Some(a)) => (a.id, Some(a), None),
+            (None, None) => return,
+        };
+        let tag = NODE_TAG | (random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) >> 1);
+        let inner = answer.to_bytes();
+        self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME, inner, recipient, reply }, now);
     }
 
     pub(super) fn on_notice(&mut self, addr: SocketAddr, subject: Digest, code: u8, now: Instant) {

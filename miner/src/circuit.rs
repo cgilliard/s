@@ -99,6 +99,14 @@ pub const REPLY: u8 = 13;
 /// `forwarded` (an end-to-end acknowledgement: a payload down a dead
 /// circuit is not reported delivered).
 pub const RECEIVED: u8 = 14;
+/// Sub-name delegations (`docs/SUBNAMES.md`): `Publish(delegation)` asks
+/// the last hop, one of the owner's rendezvous points, to hold it (and
+/// pass it to the owner's other points), answered by `Notice(object,
+/// forwarded or rejected)`; `GetDelegation(id)` asks for the one held for
+/// an id, answered by `Delegation(delegation)` or `Notice(id, offline)`.
+pub const PUBLISH: u8 = 15;
+pub const GET_DELEGATION: u8 = 16;
+pub const DELEGATION: u8 = 17;
 /// A return route's token.
 pub const TOKEN_LEN: usize = 16;
 
@@ -113,7 +121,21 @@ pub const PAYMENT_CELLS: usize = 16;
 /// [`PAYMENT_CELLS`]. Keepalives (`Session`, `SessionState`) and building
 /// a circuit (`Extend`, `Extended`) are not, and stay small.
 pub fn is_payment(cmd: u8) -> bool {
-    matches!(cmd, ANNOUNCE | GET_ANNOUNCE | SEND | DELIVER | NOTICE | BROADCAST | ROUTE | REPLY | RECEIVED)
+    matches!(
+        cmd,
+        ANNOUNCE
+            | GET_ANNOUNCE
+            | SEND
+            | DELIVER
+            | NOTICE
+            | BROADCAST
+            | ROUTE
+            | REPLY
+            | RECEIVED
+            | PUBLISH
+            | GET_DELEGATION
+            | DELEGATION
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,7 +472,20 @@ mod tests {
     /// it holds; a larger one the next power of two; keepalives stay one.
     #[test]
     fn payment_messages_are_one_size() {
-        for cmd in [ANNOUNCE, GET_ANNOUNCE, SEND, DELIVER, NOTICE, BROADCAST, ROUTE, REPLY, RECEIVED] {
+        for cmd in [
+            ANNOUNCE,
+            GET_ANNOUNCE,
+            SEND,
+            DELIVER,
+            NOTICE,
+            BROADCAST,
+            ROUTE,
+            REPLY,
+            RECEIVED,
+            PUBLISH,
+            GET_DELEGATION,
+            DELEGATION,
+        ] {
             for len in [0, 16, 33, 6600, 14 * 870] {
                 assert_eq!(relay_bodies(cmd, &vec![1u8; len]).len(), PAYMENT_CELLS, "command {cmd}, {len} bytes");
             }

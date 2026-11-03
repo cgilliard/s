@@ -46,6 +46,9 @@ pub const MAX_OBJECT: usize = 64 << 10;
 /// A payload's kind: a payment slate (`crate::wallet::Slate`), answered
 /// at stage 1 and finalized at stage 2.
 pub const KIND_SLATE: u8 = 1;
+/// A payload's kind: a sub-name query to a server, or its answer
+/// (`crate::subnames`, `docs/SUBNAMES.md`).
+pub const KIND_SUBNAME: u8 = 2;
 
 const DOM_OBJECT: u32 = 19;
 const DOM_RENDEZVOUS: u32 = 20;

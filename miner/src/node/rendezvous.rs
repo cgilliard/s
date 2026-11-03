@@ -13,6 +13,8 @@
 //! Send(payload)        → Notice(object, forwarded or offline)
 //!                        Deliver(payload)               to the recipient
 //! Received(object)     (from the recipient: the payload arrived)
+//! Publish(delegation)  → Notice(object, forwarded or rejected)
+//! GetDelegation(id)    → Delegation(delegation) or Notice(id, offline)
 //! Broadcast(tx)        → Notice(txid, forwarded or rejected)
 //! Route(token)         (remembered for one answer, a couple of minutes)
 //! Reply(relay, token, payload)
@@ -44,7 +46,16 @@
 //! Lookup(id)          → Found(announce) or Result(id, offline)
 //! Forward(payload)    → Result(object, forwarded or offline)
 //! Reply(token, payload) → Result(object, forwarded or offline)
+//! Store(delegation)   (no answer)
+//! Fetch(id)           → Held(delegation) or None(id)
 //! ```
+//!
+//! A sub-name delegation (`docs/SUBNAMES.md`) is held by the owner's
+//! points apart from its session, so it is found while the owner is
+//! offline: a point that takes one by `Publish` passes it to the owner's
+//! other points by `Store`, and each keeps the highest sequence number
+//! until it expires. `GetDelegation` asks the owner's points in turn, as a
+//! lookup does, until one holds it.
 //!
 //! A sender's rendezvous point asks the recipient's points in the order
 //! their id gives, itself first if it is one, until one holds a session;
@@ -67,6 +78,7 @@ use crate::net::{NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECT
 use crate::onion::{self, Announce, Object};
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
 use crate::pow::Digest;
+use crate::subnames::Delegation;
 
 /// Messages between rendezvous points.
 const LOOKUP: u8 = 1;
@@ -74,6 +86,13 @@ const FOUND: u8 = 2;
 const FORWARD: u8 = 3;
 const RESULT: u8 = 4;
 const REPLY: u8 = 5;
+const STORE: u8 = 6;
+const FETCH: u8 = 7;
+const HELD: u8 = 8;
+const NONE: u8 = 9;
+
+/// Between updates of one id's delegation, at least.
+const DELEGATION_EVERY: Duration = Duration::from_secs(10);
 
 /// How long a return route is kept.
 const ROUTE_LIFETIME: Duration = Duration::from_secs(120);
@@ -103,54 +122,89 @@ struct Held {
 /// circuit, sequence number and time, about a hundred bytes.
 #[derive(Default)]
 pub(super) struct Announces {
-    disk: Option<(heed::Env, heed::Database<heed::types::Bytes, heed::types::Bytes>)>,
-    memory: HashMap<Digest, Vec<u8>>,
+    disk: Option<(heed::Env, [heed::Database<heed::types::Bytes, heed::types::Bytes>; 2])>,
+    memory: [HashMap<Digest, Vec<u8>>; 2],
+}
+
+/// Which of [`Announces`]' tables: sessions' announces, or delegations.
+#[derive(Clone, Copy)]
+enum Table {
+    Announce = 0,
+    Delegation = 1,
 }
 
 impl Announces {
-    /// The store in `dir`, emptied.
+    /// The store in `dir`, emptied: an announce table, and one of
+    /// delegations.
     pub(super) fn open(dir: &std::path::Path) -> Result<Announces, String> {
         let env = crate::state_tree::open_env(dir, 16 << 30).map_err(|e| e.to_string())?;
         let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
-        let db = env.create_database(&mut wtxn, Some("announces")).map_err(|e| e.to_string())?;
-        db.clear(&mut wtxn).map_err(|e| e.to_string())?;
+        let mut dbs = Vec::new();
+        for name in ["announces", "delegations"] {
+            let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
+                env.create_database(&mut wtxn, Some(name)).map_err(|e| e.to_string())?;
+            db.clear(&mut wtxn).map_err(|e| e.to_string())?;
+            dbs.push(db);
+        }
         wtxn.commit().map_err(|e| e.to_string())?;
-        Ok(Announces { disk: Some((env, db)), memory: HashMap::new() })
+        Ok(Announces { disk: Some((env, [dbs[0], dbs[1]])), memory: Default::default() })
     }
 
     fn put(&mut self, id: &Digest, bytes: &[u8]) -> Result<(), String> {
-        let Some((env, db)) = &self.disk else {
-            self.memory.insert(*id, bytes.to_vec());
-            return Ok(());
-        };
-        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
-        db.put(&mut wtxn, &digest_to_bytes(id), bytes).map_err(|e| e.to_string())?;
-        wtxn.commit().map_err(|e| e.to_string())
+        self.put_in(Table::Announce, id, bytes)
     }
 
     fn get(&self, id: &Digest) -> Option<Vec<u8>> {
-        let Some((env, db)) = &self.disk else {
-            return self.memory.get(id).cloned();
-        };
-        let rtxn = env.read_txn().ok()?;
-        db.get(&rtxn, &digest_to_bytes(id)).ok().flatten().map(<[u8]>::to_vec)
+        self.get_in(Table::Announce, id)
     }
 
     fn remove(&mut self, id: &Digest) {
-        let Some((env, db)) = &self.disk else {
-            self.memory.remove(id);
+        self.remove_in(Table::Announce, id)
+    }
+
+    fn put_in(&mut self, t: Table, id: &Digest, bytes: &[u8]) -> Result<(), String> {
+        let Some((env, dbs)) = &self.disk else {
+            self.memory[t as usize].insert(*id, bytes.to_vec());
+            return Ok(());
+        };
+        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+        dbs[t as usize].put(&mut wtxn, &digest_to_bytes(id), bytes).map_err(|e| e.to_string())?;
+        wtxn.commit().map_err(|e| e.to_string())
+    }
+
+    fn get_in(&self, t: Table, id: &Digest) -> Option<Vec<u8>> {
+        let Some((env, dbs)) = &self.disk else {
+            return self.memory[t as usize].get(id).cloned();
+        };
+        let rtxn = env.read_txn().ok()?;
+        dbs[t as usize].get(&rtxn, &digest_to_bytes(id)).ok().flatten().map(<[u8]>::to_vec)
+    }
+
+    fn remove_in(&mut self, t: Table, id: &Digest) {
+        let Some((env, dbs)) = &self.disk else {
+            self.memory[t as usize].remove(id);
             return;
         };
         if let Ok(mut wtxn) = env.write_txn()
-            && db.delete(&mut wtxn, &digest_to_bytes(id)).is_ok()
+            && dbs[t as usize].delete(&mut wtxn, &digest_to_bytes(id)).is_ok()
         {
             let _ = wtxn.commit();
         }
     }
 }
 
+/// A delegation held, its bytes in [`Announces`]: its sequence number,
+/// its expiry, and when it was last updated.
+struct Delegated {
+    seq: u64,
+    expiry: u64,
+    updated: Instant,
+}
+
 enum Asking {
     Lookup,
+    /// The id's delegation.
+    Delegation,
     /// The payload, and its object id.
     Forward(Vec<u8>, Digest),
     /// An answer along a return route: the token, the payload and its
@@ -181,7 +235,7 @@ struct Ask {
 impl Ask {
     fn subject(&self) -> Digest {
         match &self.what {
-            Asking::Lookup => self.to,
+            Asking::Lookup | Asking::Delegation => self.to,
             Asking::Forward(_, object) | Asking::Reply(_, _, object) => *object,
         }
     }
@@ -200,11 +254,19 @@ pub(super) struct Rendezvous {
     /// Payloads delivered and not yet acknowledged, by the recipient's
     /// circuit and the object: who to answer, and since when.
     delivering: HashMap<(Link, Digest), (Waiter, Instant)>,
+    /// Delegations held, by owner id.
+    delegations: HashMap<Digest, Delegated>,
 }
 
 impl Rendezvous {
     pub(super) fn sessions(&self) -> usize {
         self.held.len()
+    }
+
+    /// The delegation held for `id`, in force.
+    fn delegation(&self, id: &Digest) -> Option<Vec<u8>> {
+        let d = self.delegations.get(id)?;
+        (d.expiry > super::unix_now()).then(|| self.announces.get_in(Table::Delegation, id)).flatten()
     }
 }
 
@@ -257,6 +319,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
         }
         self.rdv.routes.retain(|_, (_, t)| now.duration_since(*t) < ROUTE_LIFETIME);
+        let unix = super::unix_now();
+        let expired: Vec<Digest> =
+            self.rdv.delegations.iter().filter(|(_, d)| d.expiry <= unix).map(|(id, _)| *id).collect();
+        for id in expired {
+            self.rdv.delegations.remove(&id);
+            self.rdv.announces.remove_in(Table::Delegation, &id);
+        }
         let late: Vec<usize> = (0..self.rdv.asks.len())
             .filter(|&i| self.rdv.asks[i].asked.is_some_and(|(_, t)| now.duration_since(t) >= ASK_TIMEOUT))
             .collect();
@@ -353,6 +422,28 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             circuit::GET_ANNOUNCE => {
                 let Some(id) = (msg.len() == 32).then(|| digest_from_bytes(msg)).flatten() else { return true };
                 self.start_ask(link, id, Asking::Lookup, now);
+            }
+            circuit::GET_DELEGATION => {
+                let Some(id) = (msg.len() == 32).then(|| digest_from_bytes(msg)).flatten() else { return true };
+                self.start_ask(link, id, Asking::Delegation, now);
+            }
+            circuit::PUBLISH => {
+                let code = match self.hold_delegation(msg, now) {
+                    Ok(owner) => {
+                        // The owner's other points hold it too.
+                        let me = self.my_id();
+                        for point in self.points_of(&owner).into_iter().filter(|p| Some(*p) != me) {
+                            let Some(addr) = self.relay_addr(&point) else { continue };
+                            let Ok(key) = self.channel_to(addr, point, now) else { continue };
+                            for c in rendezvous_cells(STORE, msg) {
+                                let _ = self.channel_send(key, &c.to_bytes(), now);
+                            }
+                        }
+                        NOTICE_FORWARDED
+                    }
+                    Err(code) => code,
+                };
+                self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), code), now);
             }
             circuit::SEND => match Object::from_bytes(msg) {
                 Some(Object::Payload(p)) => {
@@ -469,6 +560,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.session_state(link, &id, seq, now);
     }
 
+    /// A delegation to hold, published or passed on by another point: the
+    /// owner's id once held, or why not. It must be sound in itself (the
+    /// resolver checks it against the chain) and for an id this relay is a
+    /// point of, newer than the one held, and not too soon after it.
+    fn hold_delegation(&mut self, bytes: &[u8], now: Instant) -> Result<Digest, u8> {
+        let d = Delegation::from_bytes(bytes).ok_or(NOTICE_REJECTED)?;
+        let owner = d.owner();
+        if !self.config.relay || !self.serves(&owner) || !d.verify(&d.name, &owner, super::unix_now()) {
+            return Err(NOTICE_REJECTED);
+        }
+        match self.rdv.delegations.get(&owner) {
+            Some(h) if h.seq == d.seq => return Ok(owner),
+            Some(h) if h.seq > d.seq || now.duration_since(h.updated) < DELEGATION_EVERY => {
+                return Err(NOTICE_REFUSED);
+            }
+            None if self.rdv.delegations.len() >= self.config.max_sessions => return Err(NOTICE_REFUSED),
+            _ => {}
+        }
+        if let Err(e) = self.rdv.announces.put_in(Table::Delegation, &owner, bytes) {
+            self.log(&format!("rendezvous: keeping a delegation: {e}"));
+            return Err(NOTICE_REFUSED);
+        }
+        self.rdv.delegations.insert(owner, Delegated { seq: d.seq, expiry: d.expiry, updated: now });
+        self.chatter(&format!("rendezvous: a delegation for {}", onion::short(&owner)));
+        Ok(owner)
+    }
+
     /// The listed relays that are `id`'s rendezvous points, in the order
     /// they are asked: the preferred list's first, then, during a switch,
     /// the other's (`docs/ONION.md`).
@@ -483,7 +601,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn start_ask(&mut self, client: Link, to: Digest, what: Asking, now: Instant) {
         if self.rdv.asks.len() >= MAX_ASKS {
             let subject = match &what {
-                Asking::Lookup => to,
+                Asking::Lookup | Asking::Delegation => to,
                 Asking::Forward(_, o) | Asking::Reply(_, _, o) => *o,
             };
             return self.hop_reply(client, circuit::NOTICE, &result(&subject, NOTICE_REFUSED), now);
@@ -509,6 +627,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let to = a.to;
             if Some(point) == me {
                 // This relay is one of the recipient's points.
+                if matches!(a.what, Asking::Delegation) {
+                    if let Some(bytes) = self.rdv.delegation(&to) {
+                        let a = self.rdv.asks.remove(i);
+                        return self.hop_reply(a.client, circuit::DELEGATION, &bytes, now);
+                    }
+                    continue;
+                }
                 if self.rdv.held.contains_key(&to) {
                     let a = self.rdv.asks.remove(i);
                     return self.answer_locally(a, now);
@@ -521,6 +646,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             a.asked = Some((key, now));
             let cells = match &a.what {
                 Asking::Lookup => rendezvous_cells(LOOKUP, &digest_to_bytes(&to)),
+                Asking::Delegation => rendezvous_cells(FETCH, &digest_to_bytes(&to)),
                 Asking::Forward(bytes, _) => rendezvous_cells(FORWARD, bytes),
                 Asking::Reply(token, bytes, _) => {
                     let mut body = token.to_vec();
@@ -548,8 +674,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.hop_reply(a.client, circuit::ANNOUNCE, &bytes, now);
             }
             Asking::Forward(bytes, _) => self.deliver(link, &bytes, Waiter::Client(a.client), now),
-            // Asked of the route's own relay only, which is not this one.
-            Asking::Reply(..) => {}
+            // Asked of the route's own relay only, which is not this one;
+            // delegations are answered in `ask_next`.
+            Asking::Reply(..) | Asking::Delegation => {}
         }
     }
 
@@ -609,6 +736,38 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         self.deliver_reply(&token.try_into().unwrap(), payload, Waiter::Point(key), now)
                     }
                     _ => self.answer_delivery(Waiter::Point(key), &Object::id_of(payload), NOTICE_REJECTED, now),
+                }
+            }
+            STORE => {
+                let _ = self.hold_delegation(body, now);
+            }
+            FETCH => {
+                let Some(id) = (body.len() == 32).then(|| digest_from_bytes(body)).flatten() else { return };
+                let reply = match self.rdv.delegation(&id) {
+                    Some(bytes) => rendezvous_cells(HELD, &bytes),
+                    None => rendezvous_cells(NONE, body),
+                };
+                for c in reply {
+                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
+            HELD | NONE => {
+                let owner = match kind {
+                    HELD => Delegation::from_bytes(body).map(|d| d.owner()),
+                    _ => (body.len() == 32).then(|| digest_from_bytes(body)).flatten(),
+                };
+                let Some(owner) = owner else { return };
+                let Some(i) = self.rdv.asks.iter().position(|q| {
+                    q.asked.is_some_and(|(k, _)| k == key) && matches!(q.what, Asking::Delegation) && q.to == owner
+                }) else {
+                    return;
+                };
+                if kind == HELD {
+                    let q = self.rdv.asks.remove(i);
+                    self.hop_reply(q.client, circuit::DELEGATION, body, now);
+                } else {
+                    self.rdv.asks[i].asked = None;
+                    self.ask_next(i, now);
                 }
             }
             FOUND => {

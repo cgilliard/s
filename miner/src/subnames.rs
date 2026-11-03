@@ -30,6 +30,10 @@ pub const TYPE_ID: u8 = 1;
 /// The largest value an answer carries, of any type.
 pub const MAX_VALUE: usize = 256;
 
+/// How long a server's answer is valid, and so cached: an entry changed
+/// reaches resolvers within this.
+pub const ANSWER_LIFETIME_SECS: u64 = 3600;
+
 const DELEGATION_CONTEXT: &[u8] = b"tab-delegation";
 const ANSWER_CONTEXT: &[u8] = b"tab-subname";
 
@@ -297,6 +301,49 @@ impl Answer {
     }
 }
 
+/// A query for `label.name`: the inner bytes of a payload of kind
+/// [`crate::onion::KIND_SUBNAME`] to the server, answered along the
+/// payload's way back by one whose inner bytes are an [`Answer`].
+pub fn query(name: &[u8], label: &[u8]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(2 + name.len() + label.len());
+    put_name(&mut w, name);
+    put_name(&mut w, label);
+    w.0
+}
+
+/// The name and label a query asks for.
+pub fn parse_query(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut r = Reader(bytes);
+    let name = get_name(&mut r)?;
+    let label = get_name(&mut r)?;
+    r.is_empty().then_some((name, label))
+}
+
+/// One name's sub-names, as a server holds them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Zone {
+    /// Rises with every change (the time in milliseconds): every answer
+    /// carries it, so a resolver keeps the newest.
+    pub seq: u64,
+    pub entries: std::collections::BTreeMap<Vec<u8>, Digest>,
+}
+
+/// What a server answers for, by name.
+pub type Table = std::collections::HashMap<Vec<u8>, Zone>;
+
+/// The server `key`'s answer to a query for `label.name` at time `now`:
+/// the label's id, or none (for a name it does not hold too: harmless,
+/// since only a server the name delegates to counts).
+pub fn answer(key: &mldsa::SecretKey, table: &Table, name: &[u8], label: &[u8], now: u64) -> Option<Answer> {
+    let zone = table.get(name);
+    let seq = zone.map_or(0, |z| z.seq);
+    let expiry = now + ANSWER_LIFETIME_SECS;
+    match zone.and_then(|z| z.entries.get(label)) {
+        Some(id) => Answer::id(key, name, label, id, seq, expiry),
+        None => Answer::none(key, name, label, seq, expiry),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +446,24 @@ mod tests {
         let bytes = a.to_bytes();
         assert!(Answer::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         assert!(Answer::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
+    }
+
+    #[test]
+    fn a_server_answers_from_its_table() {
+        let q = query(b"example", b"cool");
+        assert_eq!(parse_query(&q), Some((b"example".to_vec(), b"cool".to_vec())));
+        assert_eq!(parse_query(&q[..q.len() - 1]), None);
+        assert_eq!(parse_query(&query(b"example", b"Cool")), None);
+        let mut table = Table::new();
+        let mut zone = Zone { seq: 42, ..Zone::default() };
+        zone.entries.insert(b"cool".to_vec(), id(5));
+        table.insert(b"example".to_vec(), zone);
+        let a = answer(&key(2), &table, b"example", b"cool", NOW).unwrap();
+        assert!(a.verify(b"example", b"cool", &[id(2)], NOW));
+        assert_eq!((a.entry(), a.seq), (Entry::Id(id(5)), 42));
+        let a = answer(&key(2), &table, b"example", b"nope", NOW).unwrap();
+        assert_eq!((a.entry(), a.seq), (Entry::None, 42));
+        let a = answer(&key(2), &table, b"other", b"cool", NOW).unwrap();
+        assert_eq!((a.entry(), a.seq), (Entry::None, 0));
     }
 }

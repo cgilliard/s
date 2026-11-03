@@ -2247,6 +2247,9 @@ fn on_note(ctx: &Ctx, note: Note) {
                 ),
             ),
         },
+        // Sub-name resolution (`docs/SUBNAMES.md`, step 4) is not yet the
+        // wallet's.
+        Note::Delegation { .. } => {}
         Note::Failed { tag, to, why } => {
             let to = tabminer::address::encode(&to);
             let mut outgoing = ctx.outgoing.lock().unwrap();

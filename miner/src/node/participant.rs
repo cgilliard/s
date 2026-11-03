@@ -161,6 +161,8 @@ struct Standing {
     next: Option<u64>,
     /// The circuit it replaced, closed once the session is live again.
     retiring: Option<(u64, Instant)>,
+    /// Whether our delegation went up the circuit since it was built.
+    published: bool,
 }
 
 impl Standing {
@@ -201,6 +203,14 @@ struct Out {
     built: Instant,
 }
 
+/// A delegation asked for (`docs/SUBNAMES.md`), over an outbound circuit.
+struct Fetch {
+    tag: u64,
+    owner: Digest,
+    circuit: Option<u64>,
+    started: Instant,
+}
+
 /// A transaction of ours to be announced by a relay.
 struct Broadcast {
     txid: Digest,
@@ -233,6 +243,9 @@ pub(super) struct Participant {
     short_list: bool,
     jobs: Vec<Job>,
     broadcasts: Vec<Broadcast>,
+    /// Our sub-name delegation, published at our points while it is set.
+    pub(super) delegation: Option<Vec<u8>>,
+    fetches: Vec<Fetch>,
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
     keepalive: Duration,
     rotate_every: Duration,
@@ -255,6 +268,8 @@ impl Default for Participant {
             short_list: false,
             jobs: Vec::new(),
             broadcasts: Vec::new(),
+            delegation: None,
+            fetches: Vec::new(),
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
             avoid: std::collections::HashMap::new(),
@@ -388,7 +403,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.release_outbound(h, "idle", now);
         }
         let waiting = self.part.jobs.iter().filter(|j| matches!(j.stage, Stage::Waiting)).count()
-            + self.part.broadcasts.iter().filter(|b| b.sent.is_none()).count();
+            + self.part.broadcasts.iter().filter(|b| b.sent.is_none()).count()
+            + self.part.fetches.iter().filter(|f| f.circuit.is_none()).count();
         let free = self.part.outbound.iter().filter(|o| !o.taken).count();
         let want = (SPARE_OUTBOUND + waiting).saturating_sub(free);
         for _ in 0..want {
@@ -488,6 +504,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 why: "the network went back to init mode".into(),
             });
         }
+        // Init mode holds no delegations: none, so the owner is asked.
+        for f in std::mem::take(&mut self.part.fetches) {
+            self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result: Ok(None) });
+        }
     }
 
     /// Once a second: circuits built, sessions kept, sends moved on.
@@ -510,6 +530,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.keep_outbound(now);
             self.progress_onion_sends(now);
             self.progress_broadcasts(now);
+            self.progress_fetches(now);
             return;
         };
         let (id, made) = (me.id, me.made);
@@ -566,6 +587,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             rotate_at: None,
                             next: None,
                             retiring: None,
+                            published: false,
                         });
                     }
                 }
@@ -600,7 +622,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut replace = Vec::new();
         let mut retire = Vec::new();
         let mut ask = Vec::new();
+        let mut publish = Vec::new();
         let keepalive = self.part.keepalive;
+        let delegated = self.part.delegation.is_some();
         for (i, s) in self.part.standing.iter_mut().enumerate() {
             if let Some((old, since)) = s.retiring
                 && (s.live(seq, now) || now.duration_since(since) >= RETIRE_WAIT)
@@ -627,6 +651,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             if s.next.is_none() && s.retiring.is_none() && s.rotate_at.is_some_and(|t| now >= t) && s.live(seq, now) {
                 replace.push(i);
+            }
+            if delegated && !s.published && s.live(seq, now) {
+                s.published = true;
+                publish.push(h);
             }
             let wait = if s.live(seq, now) { s.interval } else { SESSION_RETRY };
             if s.asked.is_none_or(|t| now.duration_since(t) >= wait) {
@@ -658,9 +686,76 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let last = self.circuit_hops(h).saturating_sub(1);
             let _ = self.circuit_send(h, last, circuit::SESSION, &digest_to_bytes(&id), now);
         }
+        if let Some(d) = self.part.delegation.clone() {
+            for h in publish {
+                let last = self.circuit_hops(h).saturating_sub(1);
+                let _ = self.circuit_send(h, last, circuit::PUBLISH, &d, now);
+            }
+        }
         self.keep_outbound(now);
         self.progress_onion_sends(now);
         self.progress_broadcasts(now);
+        self.progress_fetches(now);
+    }
+
+    /// Our delegation, or none: published at our point once its session
+    /// is live, again on every new circuit or point.
+    pub(super) fn set_delegation(&mut self, d: Option<Vec<u8>>) {
+        self.part.delegation = d;
+        for s in &mut self.part.standing {
+            s.published = false;
+        }
+    }
+
+    /// The wallet asks for `owner`'s delegation.
+    pub(super) fn get_delegation(&mut self, tag: u64, owner: Digest, now: Instant) {
+        if !self.rv.onion_active() {
+            // Init mode holds none: the owner is its own server.
+            return self.rv.note(Note::Delegation { tag, owner, result: Ok(None) });
+        }
+        if self.part.fetches.len() >= MAX_SENDS {
+            return self.rv.note(Note::Delegation { tag, owner, result: Err("too many lookups in progress".into()) });
+        }
+        self.part.fetches.push(Fetch { tag, owner, circuit: None, started: now });
+        self.progress_fetches(now);
+    }
+
+    /// Asks for each delegation not yet asked, over an outbound circuit of
+    /// its own; gives up those out of time.
+    fn progress_fetches(&mut self, now: Instant) {
+        let mut i = 0;
+        while i < self.part.fetches.len() {
+            if now.duration_since(self.part.fetches[i].started) >= SEND_TIMEOUT {
+                let f = self.part.fetches.remove(i);
+                if let Some(h) = f.circuit {
+                    self.release_outbound(h, "lookup unanswered", now);
+                }
+                let why = if f.circuit.is_some() { "no answer from the relay" } else { "no circuit to ask over" };
+                self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result: Err(why.into()) });
+                continue;
+            }
+            if self.part.fetches[i].circuit.is_none()
+                && let Some(h) = self.take_outbound()
+            {
+                self.part.fetches[i].circuit = Some(h);
+                let owner = self.part.fetches[i].owner;
+                let last = self.circuit_hops(h).saturating_sub(1);
+                if self.circuit_send(h, last, circuit::GET_DELEGATION, &digest_to_bytes(&owner), now).is_err() {
+                    self.part.fetches[i].circuit = None;
+                    self.release_outbound(h, "lookup not sent", now);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// The answer to fetch `i`: done, its circuit closed.
+    fn fetched(&mut self, i: usize, result: Result<Option<crate::subnames::Delegation>, String>, now: Instant) {
+        let f = self.part.fetches.remove(i);
+        if let Some(h) = f.circuit {
+            self.release_outbound(h, "lookup answered", now);
+        }
+        self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result });
     }
 
     /// Our point did not take the circuit (it failed adding the point, the
@@ -834,6 +929,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let s = &mut self.part.standing[i];
                 s.circuit = Some(h);
                 s.ready = false;
+                s.published = false;
                 s.held = 0;
                 s.asked = None;
                 s.answered = None;
@@ -866,6 +962,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             s.circuit = Some(handle);
             s.next = None;
             s.ready = true;
+            s.published = false;
             s.held = 0;
             s.asked = None;
             s.answered = None;
@@ -915,6 +1012,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             b.sent = None;
             b.tried.push(handle);
         }
+        for f in self.part.fetches.iter_mut().filter(|f| f.circuit == Some(handle)) {
+            f.circuit = None;
+        }
     }
 
     /// A message from the last hop of one of our circuits: `true` if it
@@ -961,6 +1061,35 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 b.tried.push(handle);
                 b.why = "a relay refused it".into();
                 self.progress_broadcasts(now);
+            }
+            return true;
+        }
+        // The answer to publishing our delegation.
+        if cmd == circuit::NOTICE
+            && msg.len() == 33
+            && let Some(d) = &self.part.delegation
+            && digest_from_bytes(&msg[..32]) == Some(Object::id_of(d))
+        {
+            if msg[32] == NOTICE_FORWARDED {
+                self.chatter("onion: our delegation is held at our rendezvous point");
+            } else {
+                self.log("onion: our rendezvous point would not hold our delegation");
+            }
+            return true;
+        }
+        // The answer to a delegation asked for.
+        if let Some(i) = self.part.fetches.iter().position(|f| f.circuit == Some(handle)) {
+            let owner = self.part.fetches[i].owner;
+            match cmd {
+                circuit::DELEGATION => match crate::subnames::Delegation::from_bytes(msg) {
+                    Some(d) if d.owner() == owner => self.fetched(i, Ok(Some(d)), now),
+                    _ => self.fetched(i, Err("a malformed delegation".into()), now),
+                },
+                circuit::NOTICE if msg.len() == 33 && digest_from_bytes(&msg[..32]) == Some(owner) => match msg[32] {
+                    NOTICE_OFFLINE => self.fetched(i, Ok(None), now),
+                    _ => self.fetched(i, Err("refused by the relay".into()), now),
+                },
+                _ => {}
             }
             return true;
         }
