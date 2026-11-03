@@ -1132,10 +1132,20 @@ fn chain_transcript() -> Challenger {
 
 /// The allowed wraps: one leaf `H(wrap digest || wrap tree)` per segment
 /// count `1..=max_segments`, padded with empty leaves to a power of two.
+///
+/// Panics if a count's wrap has other table heights than one segment's:
+/// the chain program verifies every wrap at those heights
+/// ([`wrap_heights`]), so such a count could never be proven.
 pub fn plan_leaves(params: &AggregatorParams, cache: &mut PlanCache) -> Vec<Digest> {
+    let heights = wrap_heights(params, cache);
     let mut leaves: Vec<Digest> = (1..=params.max_segments)
         .map(|k| {
             let w = plan_with(params, k, cache).wrap.expect("planned root");
+            assert_eq!(
+                (w.log_n, w.hash_log_n),
+                heights,
+                "the wrap of {k} segments has other table heights than one segment's"
+            );
             let mut v = w.digest.to_vec();
             v.extend_from_slice(&w.tree);
             crate::poseidon2::hash(&v)

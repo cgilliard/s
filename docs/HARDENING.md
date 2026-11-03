@@ -10,62 +10,18 @@ history and the README; this file holds what is left.
 
 ## Consensus and chain
 
-- **Pooled transactions die on a reorganization that moves their inputs.**
-  `mempool.rs`, the shelf: a shelved transaction is restored only if its
-  input is unspent at the *same* position. After a reorganization that
-  recreates an output at a new position the transaction is never
-  restored, and peers' copies are refused as `UnknownInput`. The wallet
-  corrects its own records (`wallet.rs`, `relocate`) but nothing
-  re-positions and re-pools a transaction already signed. Positions are
-  unsigned precisely so this is possible. Fix: when a shelved transaction
-  is re-checked, look its input commitments up near their old positions
-  (the outputs of the reorganized blocks are known: walk the undo window),
-  rewrite the positions and re-insert. Also let the wallet resend a
-  payment from `sent` (store the signed transaction in `Sent`) rather than
-  only cancel it.
-- **The pool is not persisted.** `node.rs`: a restart drops every pending
-  payment, which then shows as "locked" in the wallet until cancelled.
-  Fix: write the pool to `DIR/mempool` on exit and every few minutes, and
-  reload it through `insert` at start (which re-checks everything).
-- **No coinbase maturity.** A reward can be spent in the next block; a
-  reorganization then invalidates the whole chain of spends, which only
-  the shelf can rescue. A Rust-only rule would be one more thing a
-  fast-syncing node cannot check, so it would have to go in the circuit
-  (the segment knows the input's position, and the block's first output
-  position; a height per output is not stored). Decide whether it is
-  wanted at all; a pool policy (do not pool a spend of an output younger
-  than N blocks, judged by position against recent blocks' first output
-  positions) gets most of the benefit without touching consensus.
-- **Duplicate commitments confuse the pool.** `mempool.rs`, `spends`:
-  conflicts are keyed by commitment, the chain spends by position. Two
-  distinct unspent outputs with the same key hash and amount (anyone can
-  make them) are treated as one: a transaction spending both is
-  `Malformed`, and a spend of one looks like a conflict with a pooled spend
-  of the other. No double spend gets through, but it is wrong. Fix: key
-  `spends` by position.
+- **No coinbase maturity, by decision.** A reward can be spent in the
+  next block; a reorganization then invalidates the whole chain of spends,
+  which only the shelf can rescue. Left to mining pools to hold back
+  payouts. A consensus rule would have to go in the circuit (a
+  fast-syncing node could not check it otherwise); a pool policy (do not
+  pool a spend of an output younger than N blocks) remains an option.
 - **Side blocks are stored without proof verification.** `chain.rs`,
   `apply_block`: a block with valid proof of work on a side branch is kept
   (header and up to 2 MB body) and served to peers before its proof is
   checked. Bounded by the work needed to make one; bodies are pruned at
   the window edge. Acceptable; noted so nobody relies on a stored body
   being valid.
-- **Intermediate headers' state roots are verified by nobody on a fast
-  sync.** The chain proof binds state transitions, not headers: a
-  fast-syncing node checks proof of work, difficulty and timestamps of
-  every header, and the statement pins the snapshot block's parent state
-  root and its own, but the state roots of headers below that are
-  unverified data, and historic block sizes are never checked. Not
-  exploitable (the proof chain is still needed), but document it in the
-  README, which says "nothing about the past is taken on trust".
-- **`--debug-no-validate-proofs` is live in release builds** and also
-  disables snapshot verification. Gate it behind a feature or
-  `cfg(debug_assertions)` before launch, or at least refuse it when the
-  data directory already holds a verified chain.
-- **Every segment count's wrap is assumed to have the same table
-  heights.** `aggregate.rs`: the chain-step program takes its heights from
-  `plan(1)`. A segment count whose wrap came out a different height would
-  fail at mining time with a digest mismatch, not at planning. Assert it
-  in `mainnet_chain_constants` over every count.
 
 ## Networking and sync
 
@@ -149,14 +105,12 @@ history and the README; this file holds what is left.
   from another, so a flood of unnamed slates uses up the 60 and honest
   payers wait. A small fee or proof of work per slate would price it.
 
-- **A payment that lands while the wallet is far behind gets no proof.**
-  `sync_wallet` notes where payments land block by block; after a gap
-  longer than the blocks kept (a fast sync, a long time offline) it finds
-  the wallet's own outputs by their memos, but not payments' outputs,
-  which are the recipients'. `payments` then says "not in a block yet".
-  Fix: look them up by commitment and memo in the UTXO set (positions are
-  then known; the creating block from the output's creation height), and
-  make the path if that block is still in the undo window.
+- **A payment that lands and is spent while the wallet is far behind gets
+  no proof.** After a gap (a fast sync, a long time offline) `sync_wallet`
+  finds payments' outputs in the UTXO set by commitment and memo
+  (`find_payments`); one the recipient already spent is not there, and
+  `payments` says "not in a block yet". Fix: keep an index of spent
+  outputs' commitments within the undo window, or ask the recipient.
 - **A file slate's recipient is whoever signs its receipt.** Over the
   message layer the receipt must be the id the slate was sent to; a file
   slate has no such id, so `finalize` prints the receipt's address and the
@@ -173,19 +127,12 @@ history and the README; this file holds what is left.
   shared memos the wallet can scan for and fetch policies from the
   counterparty.
 
-- **Cancelling a carried name operation leaves its wallet state pending.**
-  `cancel` on a transaction that carried a reveal or an update pays the
-  inputs back but the name entry stays "revealed, awaiting the chain" or
-  "update pending" with the leaf consumed; the user must re-issue the
-  operation (a new reveal re-signs nothing; a new update takes another
-  leaf). Fix: have `cancel_sent` revert the entries of the operations the
-  transaction carried (reveal: back to a pending commit; update: drop the
-  pending nonce).
-
-- **Seed and entropy are stored in plaintext LMDB**, and `restore` reads
-  the phrase and passphrase with terminal echo. Fix: encrypt the seed at
-  rest under a passphrase (a PBKDF2 or Argon2 key, XChaCha or a Poseidon
-  stream), read it without echo, and set the wallet directory mode to 0700.
+- **The wallet password's key is PBKDF2, not memory-hard.** 200,000
+  rounds of HMAC-SHA512 (about a quarter of a second) cost a GPU attacker
+  holding the wallet directory little per guess; a weak password falls.
+  Argon2 would cost more per guess. Only the phrase and seed are
+  encrypted: outputs, nonces, payments and names are readable from the
+  directory (a privacy loss, not a theft), as is a `--password-file`.
 - **A wallet-directory rollback reuses XMSS leaves** (a backup restore, a
   VM snapshot) and nothing detects it. Inherent to few-time signatures;
   the README should warn loudly, and the wallet could keep a leaf-use
@@ -197,11 +144,6 @@ history and the README; this file holds what is left.
   the start from something both copies agree on only when they are the
   same copy (a per-restore random salt stored on chain in the first spend's
   memo).
-- **Orphaned rewards and side-block rewards linger as "pending".** A
-  reward of a side block that never wins is kept forever; `--no-prompt`
-  exit and crashes skip the in-flight forget. Fix: forget a reward when its
-  block leaves the undo window without becoming main; run the in-flight
-  check on every start.
 - **A fake stage-1 slate inflates the recipient's pending balance** until
   pruned: `receive_slate` trusts `slate.amount` and the inputs. Expected of
   a slate design; show "unconfirmed, unverifiable until it lands" rather
@@ -209,11 +151,9 @@ history and the README; this file holds what is left.
   recipient's node has it. Over the message layer an online wallet
   answers stage-1 slates by itself, at most 5 per sender and 60 in all per
   10 minutes (`onion::SlateLimit`): a sender with many ids still gets 60.
-- **Minor.** `wallet.rs`: `cancel_sent` does not check the inputs are
-  still held (the prompt filters through `sent`, the library does not);
-  `cancel ID` prefix match takes the first hit; `send` writes the change
-  record in a separate transaction before reserving the inputs, leaving an
-  orphan record on a crash between them.
+- **Minor.** `wallet.rs`: `send` writes the change record in a separate
+  transaction before reserving the inputs, leaving an orphan record on a
+  crash between them (`prune` removes it).
 - **Untested.** The `sync_wallet` fork walk and stale positions after a
   reorganization; crash injection between the steps of `send`;
   concurrent original and restored wallets; the restore-scan thread;
@@ -382,10 +322,10 @@ Found while building it (2026-11-01).
   matters: keep only the derived relay seed in `DIR/relay.key`, written
   once from the phrase.
 
-- **Seeds** run an old binary. They need the current one, started with
-  `--relay` so that wallets hold their init-mode sessions there (protocol v5,
-  wallet format 6 (keys carry a tree height; slate format 3), chain format 13 (a snapshot manifest for every block in the undo window; output leaves carry the creation height; policy inputs, keys of any height to 20), new genesis id (17980c69…, the header carries 32 aux bytes under the proof of work), new `MAINNET_CHAIN`) and wiped data
-  directories. Fresh nodes cannot sync until then.
+- **Seeds** need the current binary at every format change (now protocol
+  6, chain format 14, wallet format 8, slate format `tabslt05`), started
+  with `--relay`, and wiped data directories. Fresh nodes cannot sync
+  until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
   expected network rate (README, Genesis).
 - **Single-core and small-VPS tests.** Dataset build on one core is about
@@ -399,8 +339,6 @@ Found while building it (2026-11-01).
 
 ## Features deferred
 
-- Payment proofs: the transaction, a Merkle path to the header, and a
-  signature with the output's key over an agreed message.
 - Cover for the address a transaction is first sent from, in init mode:
   onion mode hands it to a relay over a circuit (`docs/ONION.md`,
   enhancement 1), but in init mode the node announces it itself.

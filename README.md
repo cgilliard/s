@@ -45,7 +45,7 @@ tabminer show [--data DIR]
 tabminer restore [--data DIR]
 
 options: [--listen ADDR] [--peer ADDR]... [--seed HOST:PORT]... [--no-seeds] [--relay]
-         [--no-wallet] [--verbose] [--no-prompt]
+         [--no-wallet] [--verbose] [--no-prompt] [--password-file FILE]
 ```
 
 `tabminer` with no command mines: it syncs to the heaviest chain its peers
@@ -89,7 +89,12 @@ verifies that block's chain proof, downloads the state after it from its
 peers in parallel parts (each checked against the block's state root, memos
 included, and written to disk as it arrives, so memory stays small whatever
 the state's size; a node stopped midway starts the state over cleanly), and
-then fetches the blocks after it. Nothing about the past is taken on trust.
+then fetches the blocks after it. The chain proof covers every state
+transition before the snapshot and the supply check every coin issued, so
+no past state is taken on trust; what is not checked is data that does not
+matter once the proof holds: the state roots and sizes recorded in the
+headers below the snapshot block (the proof binds transitions, not
+headers).
 `--sync-point 0` replays every block instead, which needs a peer that keeps
 every body (`--max-undo-blocks 0`); a fast sync that keeps failing falls back
 to that only when such a peer is known, and otherwise tries again. A miner waits until its node has caught
@@ -209,10 +214,19 @@ from the phrase and a random nonce, and carries a 20-byte memo on chain: the
 nonce and a tag from the phrase by which the wallet recognises its outputs
 (the amount is on chain in the clear, `docs/AMOUNTS.md`).
 
+A new wallet asks for a password (typed without echo; empty for none). With
+one, the phrase and seed are stored encrypted (ChaCha20-Poly1305 under a
+PBKDF2 key) and the password is asked at every start; `password` sets,
+changes or removes it, and `phrase` asks for it. A node started with
+`--no-prompt` reads it from `--password-file FILE` (its first line), or
+leaves a new wallet unlocked. The wallet directory is private to its owner
+(mode 0700). Only the phrase is encrypted: the wallet's outputs, payments
+and names are readable by whoever can read the directory.
+
 To recover a wallet from its phrase:
 
 ```
-tabminer restore --data DIR2       # asks for the phrase and an optional passphrase
+tabminer restore --data DIR2       # asks for the phrase, an optional passphrase and a password
 tabminer --data DIR2               # sync, then at the prompt:
 > scan                             # finds the wallet's unspent outputs from their memos
 ```

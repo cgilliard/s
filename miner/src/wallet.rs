@@ -70,6 +70,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::address;
 use crate::bip39;
+use crate::chacha20poly1305;
 use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, Policy};
 use crate::mldsa;
@@ -86,8 +87,7 @@ use crate::transaction::{
 use crate::utxo::{self, UtxoSet};
 use crate::xmss::{Digest, PublicKey, SEED_SIZE};
 
-const META_ENTROPY: &str = "entropy";
-const META_SEED: &str = "seed";
+const META_SECRET: &str = "secret";
 const META_FORMAT: &str = "format";
 /// Set by a restore: the wallet's outputs are still to be found on chain.
 const META_SCAN_PENDING: &str = "scan_pending";
@@ -101,7 +101,7 @@ const META_ADDRESS_OFF: &str = "address_off";
 /// Version of the on-disk layout: 3 is BIP39 phrases and per-output keys;
 /// 5 adds the name tables; 6 stores keys with their tree height (slate
 /// format 3).
-const FORMAT: u8 = 7;
+const FORMAT: u8 = 8;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
 const SLATE_MAGIC: &[u8; 8] = b"tabslt05";
@@ -537,6 +537,8 @@ pub struct Sent {
     pub fee: u64,
     pub size: usize,
     pub created: u64,
+    /// The signed transaction, to send again ([`Wallet::resend`]).
+    pub tx: Transaction,
 }
 
 fn write_commitments(w: &mut Writer, cs: &[Commitment]) {
@@ -595,6 +597,7 @@ impl Sent {
         w.u64(self.fee);
         w.u64(self.size as u64);
         w.u64(self.created);
+        w.0.extend_from_slice(&self.tx.to_bytes());
         w.finish()
     }
 
@@ -604,7 +607,8 @@ impl Sent {
         let fee = r.u64()?;
         let size = r.u64()? as usize;
         let created = r.u64()?;
-        r.is_empty().then_some(Sent { txid, inputs, fee, size, created })
+        let tx = Transaction::from_bytes(r.0)?;
+        Some(Sent { txid, inputs, fee, size, created, tx })
     }
 }
 
@@ -717,10 +721,16 @@ pub enum WalletError {
     },
     /// The wallet was written by an incompatible version.
     OldFormat,
+    /// The wallet's password is wrong (or none was given for a locked
+    /// wallet).
+    WrongPassword,
     /// Restoring over an existing wallet.
     Exists,
     /// An input has not been seen in a block yet.
     Unconfirmed,
+    /// The transaction's inputs are no longer unspent on chain: it (or
+    /// another spend of them) has landed.
+    Landed,
     /// A name operation the wallet cannot make.
     Name(String),
     /// A policy spend could not be made.
@@ -741,8 +751,10 @@ impl core::fmt::Display for WalletError {
             WalletError::Exhausted => f.write_str("an input has no signatures left"),
             WalletError::FeeTooLow { min } => write!(f, "the fee must be at least {min} base units"),
             WalletError::OldFormat => f.write_str("wallet database is from an older format"),
+            WalletError::WrongPassword => f.write_str("wrong wallet password"),
             WalletError::Exists => f.write_str("a wallet already exists in that directory"),
             WalletError::Unconfirmed => f.write_str("an input is not confirmed yet"),
+            WalletError::Landed => f.write_str("the inputs are already spent on chain"),
             WalletError::Name(m) => f.write_str(m),
             WalletError::Policy(m) => write!(f, "policy: {m}"),
         }
@@ -812,6 +824,9 @@ pub struct Wallet {
     policies: Database<Bytes, Bytes>,
     /// Payments and burns by txid, kept for their proofs.
     payments: Database<Bytes, Bytes>,
+    /// Rewards of blocks this wallet mined, until settled: commitment →
+    /// height ‖ block hash (zero until the block is found).
+    rewards: Database<Bytes, Bytes>,
     /// The identity key's counter and whether the address is off, as
     /// stored.
     address: std::sync::atomic::AtomicU64,
@@ -844,13 +859,121 @@ fn master_of(seed: &[u8; 64]) -> [Fp; DIGEST] {
     hash_domain(DOM_MASTER, &crate::pow::pack_bytes(seed))
 }
 
+/// PBKDF2 rounds for a wallet password's key: about a quarter of a second on
+/// a desktop core. The count is stored with the record, so it can change.
+const PASSWORD_ROUNDS: u32 = 200_000;
+
+/// What [`Wallet::open_with`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// A password for a new wallet; empty for none.
+    New,
+    /// The password of an existing, locked wallet.
+    Unlock,
+}
+
+/// The wallet's secret: the phrase's entropy and its BIP39 seed (which
+/// also depends on the BIP39 passphrase), stored as one record:
+///
+/// ```text
+/// 0 | entropy (16) | seed (64)                                 no password
+/// 1 | rounds (4) | salt (16) | nonce (12) | sealed entropy|seed (80 + 16)
+/// ```
+///
+/// Locked under ChaCha20-Poly1305 with a key PBKDF2-HMAC-SHA512 makes from
+/// the password; the header is the associated data.
+struct Secret {
+    entropy: [u8; bip39::ENTROPY_BYTES],
+    seed: [u8; 64],
+}
+
+impl Secret {
+    fn plain(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bip39::ENTROPY_BYTES + 64);
+        out.extend_from_slice(&self.entropy);
+        out.extend_from_slice(&self.seed);
+        out
+    }
+
+    fn from_plain(b: &[u8]) -> Option<Secret> {
+        if b.len() != bip39::ENTROPY_BYTES + 64 {
+            return None;
+        }
+        Some(Secret {
+            entropy: b[..bip39::ENTROPY_BYTES].try_into().ok()?,
+            seed: b[bip39::ENTROPY_BYTES..].try_into().ok()?,
+        })
+    }
+
+    fn key(password: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
+        let mut s = b"tabminer wallet".to_vec();
+        s.extend_from_slice(salt);
+        bip39::pbkdf2_hmac_sha512(password.as_bytes(), &s, rounds)[..32].try_into().unwrap()
+    }
+
+    /// The record, locked under `password` unless it is empty.
+    fn seal(&self, password: &str) -> std::io::Result<Vec<u8>> {
+        if password.is_empty() {
+            let mut out = vec![0];
+            out.extend_from_slice(&self.plain());
+            return Ok(out);
+        }
+        let salt = random_bytes::<16>()?;
+        let nonce = random_bytes::<{ chacha20poly1305::NONCE_LEN }>()?;
+        let mut out = vec![1];
+        out.extend_from_slice(&PASSWORD_ROUNDS.to_le_bytes());
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        let key = Self::key(password, &salt, PASSWORD_ROUNDS);
+        let sealed = chacha20poly1305::seal(&key, &nonce, &out, &self.plain());
+        out.extend_from_slice(&sealed);
+        Ok(out)
+    }
+
+    /// Whether a record is locked.
+    fn locked(b: &[u8]) -> bool {
+        b.first() == Some(&1)
+    }
+
+    /// Opens a record; a plain one ignores the password.
+    fn open(b: &[u8], password: &str) -> Result<Secret> {
+        const HEADER: usize = 1 + 4 + 16 + chacha20poly1305::NONCE_LEN;
+        match b.first() {
+            Some(0) => Secret::from_plain(&b[1..]).ok_or(WalletError::Corrupt("secret")),
+            Some(1) if b.len() > HEADER => {
+                let rounds = u32::from_le_bytes(b[1..5].try_into().unwrap());
+                let salt = &b[5..21];
+                let nonce: [u8; chacha20poly1305::NONCE_LEN] = b[21..HEADER].try_into().unwrap();
+                let key = Self::key(password, salt, rounds);
+                let plain = chacha20poly1305::open(&key, &nonce, &b[..HEADER], &b[HEADER..])
+                    .ok_or(WalletError::WrongPassword)?;
+                Secret::from_plain(&plain).ok_or(WalletError::Corrupt("secret"))
+            }
+            _ => Err(WalletError::Corrupt("secret")),
+        }
+    }
+}
+
+/// Makes the wallet directory private to its owner.
+fn restrict(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 impl Wallet {
     #[allow(clippy::type_complexity)]
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 7])> {
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 8])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
         })?;
+        restrict(dir)?;
         let mut wtxn = env.write_txn()?;
         let meta = env.create_database(&mut wtxn, Some("meta"))?;
         let outputs = env.create_database(&mut wtxn, Some("outputs"))?;
@@ -860,50 +983,62 @@ impl Wallet {
         let names = env.create_database(&mut wtxn, Some("names"))?;
         let policies = env.create_database(&mut wtxn, Some("policies"))?;
         let payments = env.create_database(&mut wtxn, Some("payments"))?;
+        let rewards = env.create_database(&mut wtxn, Some("rewards"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments]))
+        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]))
     }
 
-    /// Opens the wallet in `dir`, creating one with a fresh phrase if there
-    /// is none. Returns the wallet and, if it was just created, its phrase.
+    /// Opens the wallet in `dir` without a password, creating one with a
+    /// fresh phrase if there is none. Returns the wallet and, if it was
+    /// just created, its phrase.
     pub fn open(dir: &Path) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments]) = Self::open_env(dir)?;
-        let mut wtxn = env.write_txn()?;
-        let created = match meta.get(&wtxn, META_SEED)? {
-            Some(_) => {
-                if meta.get(&wtxn, META_FORMAT)? != Some(&[FORMAT][..]) {
+        Self::open_with(dir, &mut |_| Ok(String::new()))
+    }
+
+    /// Opens the wallet in `dir`, asking `ask` for its password if it is
+    /// locked, or for a new one if there is no wallet yet and one is
+    /// created with a fresh phrase. Returns the wallet and, if it was just
+    /// created, its phrase.
+    pub fn open_with(dir: &Path, ask: &mut dyn FnMut(Ask) -> Result<String>) -> Result<(Wallet, Option<String>)> {
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]) = Self::open_env(dir)?;
+        let rtxn = env.read_txn()?;
+        let record = meta.get(&rtxn, META_SECRET)?.map(<[u8]>::to_vec);
+        let fresh = record.is_none() && meta.len(&rtxn)? == 0 && outputs.is_empty(&rtxn)?;
+        drop(rtxn);
+        let (secret, created) = match record {
+            Some(record) => {
+                let rtxn = env.read_txn()?;
+                if meta.get(&rtxn, META_FORMAT)? != Some(&[FORMAT][..]) {
                     return Err(WalletError::OldFormat);
                 }
-                None
+                drop(rtxn);
+                let password = if Secret::locked(&record) { ask(Ask::Unlock)? } else { String::new() };
+                (Secret::open(&record, &password)?, None)
             }
+            None if !fresh => return Err(WalletError::OldFormat),
             None => {
-                if meta.get(&wtxn, META_ENTROPY)?.is_some() || !outputs.is_empty(&wtxn)? {
-                    return Err(WalletError::OldFormat);
-                }
                 let entropy = random_bytes::<{ bip39::ENTROPY_BYTES }>()?;
                 let phrase = bip39::phrase(&entropy);
-                let seed = bip39::seed(&phrase, "")?;
-                meta.put(&mut wtxn, META_ENTROPY, &entropy)?;
-                meta.put(&mut wtxn, META_SEED, &seed)?;
+                let secret = Secret { entropy, seed: bip39::seed(&phrase, "")? };
+                let record = secret.seal(&ask(Ask::New)?)?;
+                let mut wtxn = env.write_txn()?;
+                meta.put(&mut wtxn, META_SECRET, &record)?;
                 meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
-                Some(phrase)
+                wtxn.commit()?;
+                (secret, Some(phrase))
             }
         };
-        let seed: [u8; 64] = meta
-            .get(&wtxn, META_SEED)?
-            .ok_or(WalletError::Corrupt("seed"))?
-            .try_into()
-            .map_err(|_| WalletError::Corrupt("seed"))?;
-        let address = match meta.get(&wtxn, META_ADDRESS)? {
+        let rtxn = env.read_txn()?;
+        let address = match meta.get(&rtxn, META_ADDRESS)? {
             Some(b) => u64::from_le_bytes(b.try_into().map_err(|_| WalletError::Corrupt("address"))?),
             None => 0,
         };
-        let off = meta.get(&wtxn, META_ADDRESS_OFF)?.is_some();
-        wtxn.commit()?;
+        let off = meta.get(&rtxn, META_ADDRESS_OFF)?.is_some();
+        drop(rtxn);
         Ok((
             Wallet {
                 env,
-                master: master_of(&seed),
+                master: master_of(&secret.seed),
                 meta,
                 outputs,
                 slates,
@@ -912,6 +1047,7 @@ impl Wallet {
                 names,
                 policies,
                 payments,
+                rewards,
                 address: address.into(),
                 address_off: off.into(),
             },
@@ -919,18 +1055,17 @@ impl Wallet {
         ))
     }
 
-    /// Creates a wallet in `dir` from a phrase and passphrase; the outputs
-    /// come back with [`Wallet::scan`] once the chain is synced.
-    pub fn restore(dir: &Path, phrase: &str, passphrase: &str) -> Result<Wallet> {
-        let entropy = bip39::entropy(phrase)?;
-        let seed = bip39::seed(phrase, passphrase)?;
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments]) = Self::open_env(dir)?;
+    /// Creates a wallet in `dir` from a phrase and BIP39 passphrase, locked
+    /// under `password` unless it is empty; the outputs come back with
+    /// [`Wallet::scan`] once the chain is synced.
+    pub fn restore(dir: &Path, phrase: &str, passphrase: &str, password: &str) -> Result<Wallet> {
+        let secret = Secret { entropy: bip39::entropy(phrase)?, seed: bip39::seed(phrase, passphrase)? };
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards]) = Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
-        if meta.get(&wtxn, META_SEED)?.is_some() || !outputs.is_empty(&wtxn)? {
+        if meta.get(&wtxn, META_SECRET)?.is_some() || !outputs.is_empty(&wtxn)? {
             return Err(WalletError::Exists);
         }
-        meta.put(&mut wtxn, META_ENTROPY, &entropy)?;
-        meta.put(&mut wtxn, META_SEED, &seed)?;
+        meta.put(&mut wtxn, META_SECRET, &secret.seal(password)?)?;
         meta.put(&mut wtxn, META_FORMAT, &[FORMAT])?;
         meta.put(&mut wtxn, META_SCAN_PENDING, &[1])?;
         // Old addresses are abandoned, never reused: a restore starts from
@@ -940,7 +1075,7 @@ impl Wallet {
         wtxn.commit()?;
         Ok(Wallet {
             env,
-            master: master_of(&seed),
+            master: master_of(&secret.seed),
             meta,
             outputs,
             slates,
@@ -949,6 +1084,7 @@ impl Wallet {
             names,
             policies,
             payments,
+            rewards,
             address: address.into(),
             address_off: false.into(),
         })
@@ -968,16 +1104,34 @@ impl Wallet {
         Ok(())
     }
 
-    /// The wallet's 12-word phrase.
-    pub fn phrase(&self) -> Result<String> {
+    fn secret_record(&self) -> Result<Vec<u8>> {
         let rtxn = self.env.read_txn()?;
-        let e: [u8; bip39::ENTROPY_BYTES] = self
-            .meta
-            .get(&rtxn, META_ENTROPY)?
-            .ok_or(WalletError::Corrupt("entropy"))?
-            .try_into()
-            .map_err(|_| WalletError::Corrupt("entropy"))?;
-        Ok(bip39::phrase(&e))
+        Ok(self.meta.get(&rtxn, META_SECRET)?.ok_or(WalletError::Corrupt("secret"))?.to_vec())
+    }
+
+    /// Whether the wallet's secret is locked under a password.
+    pub fn locked(&self) -> Result<bool> {
+        Ok(Secret::locked(&self.secret_record()?))
+    }
+
+    /// The wallet's 12-word phrase; `password` is checked if the wallet is
+    /// locked.
+    pub fn phrase(&self, password: &str) -> Result<String> {
+        Ok(bip39::phrase(&Secret::open(&self.secret_record()?, password)?.entropy))
+    }
+
+    /// Locks the wallet's secret under `new` instead of `old` (either may
+    /// be empty, for none).
+    pub fn set_password(&self, old: &str, new: &str) -> Result<()> {
+        let record = self.secret_record()?;
+        let sealed = Secret::open(&record, old)?.seal(new)?;
+        let mut wtxn = self.env.write_txn()?;
+        if self.meta.get(&wtxn, META_SECRET)? != Some(&record[..]) {
+            return Err(WalletError::Corrupt("secret changed meanwhile"));
+        }
+        self.meta.put(&mut wtxn, META_SECRET, &sealed)?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     fn with_master(&self, domain: u32, nonce: &[Fp; NONCE]) -> [Fp; DIGEST] {
@@ -1258,8 +1412,97 @@ impl Wallet {
             Some(o) if o.state == State::Unspent => self.outputs.delete(&mut wtxn, &digest_to_bytes(c))?,
             _ => false,
         };
+        self.rewards.delete(&mut wtxn, &digest_to_bytes(c))?;
         wtxn.commit()?;
         Ok(gone)
+    }
+
+    /// Notes that the output `c` is the reward of a block being built at
+    /// `height`, to be forgotten if the block never makes the main chain
+    /// ([`Wallet::prune_rewards`]).
+    pub fn note_reward(&self, c: &Commitment, height: u32) -> Result<()> {
+        let mut v = height.to_le_bytes().to_vec();
+        v.extend_from_slice(&[0; 32]);
+        let mut wtxn = self.env.write_txn()?;
+        self.rewards.put(&mut wtxn, &digest_to_bytes(c), &v)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Notes the hash of the block whose reward is `c`, once it is found and
+    /// before it is submitted.
+    pub fn reward_found(&self, c: &Commitment, hash: &[u8; 32]) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        if let Some(b) = self.rewards.get(&wtxn, &digest_to_bytes(c))? {
+            let mut v = b[..4].to_vec();
+            v.extend_from_slice(hash);
+            self.rewards.put(&mut wtxn, &digest_to_bytes(c), &v)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Settles the rewards of blocks this wallet mined, `tip` being the main
+    /// chain's height and `settle` the depth below which no
+    /// reorganization reaches. A reward is forgotten when its block was
+    /// never found (a crash or an exit while mining), is unknown to the
+    /// chain or invalid (`known` says), or is still off the main chain once
+    /// `settle` blocks deep; a reward that landed and is that deep is
+    /// simply no longer tracked. `keep` is the reward of the block being
+    /// mined. Returns how many rewards were forgotten.
+    pub fn prune_rewards(
+        &self,
+        utxo: &UtxoSet,
+        rtxn: &RoTxn,
+        tip: u32,
+        settle: u32,
+        known: impl Fn(&[u8; 32]) -> bool,
+        keep: Option<Commitment>,
+    ) -> Result<usize> {
+        let mut records = Vec::new();
+        {
+            let wrtxn = self.env.read_txn()?;
+            for item in self.rewards.iter(&wrtxn)? {
+                let (k, v) = item?;
+                let c = crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("reward key"))?;
+                if v.len() != 36 {
+                    return Err(WalletError::Corrupt("reward"));
+                }
+                let height = u32::from_le_bytes(v[..4].try_into().unwrap());
+                let hash: [u8; 32] = v[4..].try_into().unwrap();
+                records.push((c, height, hash));
+            }
+        }
+        let mut forgotten = 0;
+        for (c, height, hash) in records {
+            if keep == Some(c) {
+                continue;
+            }
+            let settled = tip >= height.saturating_add(settle);
+            let drop_record = |w: &Self| -> Result<()> {
+                let mut wtxn = w.env.write_txn()?;
+                w.rewards.delete(&mut wtxn, &digest_to_bytes(&c))?;
+                wtxn.commit()?;
+                Ok(())
+            };
+            let o = match self.owned(&c)? {
+                Some(o) if o.state == State::Unspent => o,
+                // Spent by the wallet: it landed.
+                _ => {
+                    drop_record(self)?;
+                    continue;
+                }
+            };
+            if self.held(&o, utxo, rtxn)? {
+                if settled {
+                    drop_record(self)?;
+                }
+            } else if hash == [0; 32] || !known(&hash) || settled {
+                self.forget(&c)?;
+                forgotten += 1;
+            }
+        }
+        Ok(forgotten)
     }
 
     /// Deletes unspent records the UTXO set does not hold: outputs of blocks
@@ -1648,6 +1891,7 @@ impl Wallet {
             fee: slate.fee,
             size: signed.tx.size(),
             created: unix_now(),
+            tx: signed.tx.clone(),
         };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
         let claim = Claim::Payment { sender: slate.sender, secret: pending.secret, slate_id: slate.id, receipt };
@@ -1686,7 +1930,7 @@ impl Wallet {
     /// wallet with `fee` (at least [`Wallet::min_replacement_fee`]), using
     /// each input's next leaf. The payment's record now points at the
     /// replacement, which can itself be cancelled while leaves remain.
-    pub fn cancel_sent(&self, txid: &Commitment, fee: Option<u64>) -> Result<Signed> {
+    pub fn cancel_sent(&self, txid: &Commitment, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
         let sent = {
             let rtxn = self.env.read_txn()?;
             let b = self.sent.get(&rtxn, &digest_to_bytes(txid))?.ok_or(WalletError::Unknown)?;
@@ -1701,6 +1945,9 @@ impl Wallet {
         let mut total = 0u128;
         for c in &sent.inputs {
             let o = self.owned(c)?.ok_or(WalletError::Corrupt("sent input"))?;
+            if !self.held(&o, utxo, rtxn)? {
+                return Err(WalletError::Landed);
+            }
             total += o.amount as u128;
             inputs.push((self.key(&o.nonce).public_key(), o.amount));
         }
@@ -1720,11 +1967,50 @@ impl Wallet {
         self.sent.delete(&mut wtxn, &digest_to_bytes(txid))?;
         // Cancelled: the payment (or burn) will not land.
         self.payments.delete(&mut wtxn, &digest_to_bytes(txid))?;
-        let next =
-            Sent { txid: signed.tx.txid(), inputs: sent.inputs, fee, size: signed.tx.size(), created: unix_now() };
+        let next = Sent {
+            txid: signed.tx.txid(),
+            inputs: sent.inputs,
+            fee,
+            size: signed.tx.size(),
+            created: unix_now(),
+            tx: signed.tx.clone(),
+        };
         self.sent.put(&mut wtxn, &digest_to_bytes(&next.txid), &next.to_bytes())?;
         wtxn.commit()?;
+        // The replacement carries none of the original's name operations:
+        // their entries go back to where they were before it was signed.
+        // Should the original land after all, `sync_names` adopts what it
+        // wrote.
+        for op in &sent.tx.ops {
+            self.undo_name_op(op)?;
+        }
         Ok(signed)
+    }
+
+    /// A sent transaction as it was signed, to send again: its inputs at
+    /// the positions this wallet now knows for their outputs (a
+    /// reorganization may have moved them; positions are not signed).
+    pub fn resend(&self, txid: &Commitment) -> Result<Transaction> {
+        let sent = {
+            let rtxn = self.env.read_txn()?;
+            let b = self.sent.get(&rtxn, &digest_to_bytes(txid))?.ok_or(WalletError::Unknown)?;
+            Sent::from_bytes(*txid, b).ok_or(WalletError::Corrupt("sent"))?
+        };
+        let mut tx = sent.tx;
+        let mut positions = tx.spent_positions();
+        if sent.inputs.len() == positions.len() {
+            for (p, c) in positions.iter_mut().zip(&sent.inputs) {
+                let known = match self.owned(c)? {
+                    Some(o) => o.position,
+                    None => self.policy_output(c)?.and_then(|o| o.position),
+                };
+                if let Some(q) = known {
+                    *p = q;
+                }
+            }
+            tx.set_positions(&positions);
+        }
+        Ok(tx)
     }
 
     /// Every payment and burn this wallet made that was not cancelled,
@@ -1777,6 +2063,43 @@ impl Wallet {
             wtxn.commit()?;
         }
         Ok(landed)
+    }
+
+    /// Finds payments not yet seen landing among the unspent outputs, by
+    /// commitment and memo, with the height of the block that created
+    /// each: after a gap [`Wallet::land_payments`] could not follow block
+    /// by block (a fast sync, a long time offline). A payment whose output
+    /// was spent meanwhile is not found. Returns those found.
+    pub fn find_payments(&self, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Vec<Payment>> {
+        let waiting: Vec<Payment> = self.payments()?.into_iter().filter(|p| p.landed.is_none()).collect();
+        if waiting.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for (position, commitment, memo, _) in utxo.memos(rtxn)? {
+            let Some(i) = waiting.iter().position(|p| p.output.commitment == commitment && p.output.memo == memo)
+            else {
+                continue;
+            };
+            if found.iter().any(|p: &Payment| p.txid == waiting[i].txid) {
+                continue;
+            }
+            let Some((_, _, height)) = utxo.output_at(rtxn, position)? else {
+                continue;
+            };
+            let mut p = waiting[i].clone();
+            p.landed = Some((height, position));
+            p.path = None;
+            found.push(p);
+        }
+        if !found.is_empty() {
+            let mut wtxn = self.env.write_txn()?;
+            for p in &found {
+                self.payments.put(&mut wtxn, &digest_to_bytes(&p.txid), &p.to_bytes())?;
+            }
+            wtxn.commit()?;
+        }
+        Ok(found)
     }
 
     /// Keeps the path of payment `txid`'s output, which landed in block
@@ -1886,7 +2209,14 @@ impl Wallet {
             }
         };
         let created = unix_now();
-        let sent = Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created };
+        let sent = Sent {
+            txid: signed.tx.txid(),
+            inputs: commitments,
+            fee,
+            size: signed.tx.size(),
+            created,
+            tx: signed.tx.clone(),
+        };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
         let payment =
             Payment { txid: sent.txid, output: burned, claim: Claim::Burn(burn), created, landed: None, path: None };
@@ -2215,16 +2545,49 @@ impl Wallet {
     /// Brings the wallet's names in line with the chain's records: a reveal
     /// or a rotation seen on chain settles, an offered name arrives, a
     /// transferred one leaves, and a name whose record names someone else's
-    /// key is dropped. Returns how many entries changed.
+    /// key is dropped. A reveal or rotation the wallet cancelled but that
+    /// landed anyway is adopted from the record's memo. Returns how many
+    /// entries changed.
     pub fn sync_names(&self, registry: &NameSet, rtxn: &RoTxn) -> Result<usize> {
         let mut changed = 0;
         let mut wtxn = self.env.write_txn()?;
+        // A pending commit whose reveal landed after all.
+        for c in self.pending_commits()? {
+            let Some(name) = &c.name else { continue };
+            let Some(record) = registry.lookup(rtxn, name).map_err(|e| WalletError::Name(e.to_string()))? else {
+                continue;
+            };
+            if record.owner == self.owner_hash(&c.nonce) && self.name_in(&wtxn, name)?.is_none() {
+                let entry = OwnedName {
+                    name: name.clone(),
+                    nonce: c.nonce,
+                    value: record.value,
+                    created: c.created,
+                    stage: NameStage::Owned,
+                    recovered: c.recovered,
+                    start: if c.recovered { random_bytes::<1>()?[0] % LEAVES_PER_HALF as u8 } else { 0 },
+                    used: 0,
+                    pending: None,
+                    transferring: false,
+                };
+                self.put_name(&mut wtxn, &entry)?;
+                self.commits.delete(&mut wtxn, &digest_to_bytes(&c.commit))?;
+                changed += 1;
+            }
+        }
         for mut entry in self.owned_names()? {
             let Some(record) = registry.lookup(rtxn, &entry.name).map_err(|e| WalletError::Name(e.to_string()))? else {
                 continue;
             };
             let mine = record.owner == self.owner_hash(&entry.nonce);
-            let rotated = entry.pending.as_ref().is_some_and(|(n, _)| record.owner == self.owner_hash(n));
+            let mut rotated = entry.pending.as_ref().is_some_and(|(n, _)| record.owner == self.owner_hash(n));
+            if !mine && !rotated && !entry.transferring {
+                // A rotation whose pending entry a cancel dropped.
+                if let Some(n) = self.open_name_memo(&record.memo).filter(|n| record.owner == self.owner_hash(n)) {
+                    entry.pending = Some((n, record.value));
+                    rotated = true;
+                }
+            }
             if rotated {
                 let (nonce, value) = entry.pending.take().unwrap();
                 entry.nonce = nonce;
@@ -2378,8 +2741,14 @@ impl Wallet {
                 return Err(e);
             }
         };
-        let sent =
-            Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created: unix_now() };
+        let sent = Sent {
+            txid: signed.tx.txid(),
+            inputs: commitments,
+            fee,
+            size: signed.tx.size(),
+            created: unix_now(),
+            tx: signed.tx.clone(),
+        };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
         wtxn.commit()?;
         Ok(signed)
@@ -2538,8 +2907,14 @@ impl Wallet {
                 return Err(e);
             }
         };
-        let sent =
-            Sent { txid: signed.tx.txid(), inputs: commitments, fee, size: signed.tx.size(), created: unix_now() };
+        let sent = Sent {
+            txid: signed.tx.txid(),
+            inputs: commitments,
+            fee,
+            size: signed.tx.size(),
+            created: unix_now(),
+            tx: signed.tx.clone(),
+        };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
         wtxn.commit()?;
         Ok(signed)
@@ -2644,7 +3019,7 @@ impl Wallet {
         let fee = tx.balance().max(0) as u64;
         let mut wtxn = self.env.write_txn()?;
         self.record_policy(&mut wtxn, &p)?;
-        let sent = Sent { txid: tx.txid(), inputs: vec![c], fee, size: tx.size(), created: unix_now() };
+        let sent = Sent { txid: tx.txid(), inputs: vec![c], fee, size: tx.size(), created: unix_now(), tx: tx.clone() };
         self.sent.put(&mut wtxn, &digest_to_bytes(&sent.txid), &sent.to_bytes())?;
         wtxn.commit()?;
         Ok(())
@@ -2875,6 +3250,90 @@ mod tests {
     }
 
     #[test]
+    fn rewards_of_blocks_that_lose_are_forgotten() {
+        let dir = TempDir::new("rewards");
+        let (env, u) = utxo(&dir);
+        let (w, _) = Wallet::open(&dir.0.join("wallet")).unwrap();
+        let reward = |height: u32, hash: Option<u8>| {
+            let o = w.receive(1_000).unwrap();
+            w.note_reward(&o.commitment, height).unwrap();
+            if let Some(h) = hash {
+                w.reward_found(&o.commitment, &[h; 32]).unwrap();
+            }
+            o
+        };
+        let never_found = reward(5, None).commitment;
+        let unknown = reward(6, Some(1)).commitment;
+        let side = reward(7, Some(2)).commitment;
+        let mining = reward(9, None).commitment;
+        let o = reward(8, Some(3));
+        let main = o.commitment;
+        land(&env, &u, &w, &[&o]);
+        let known = |h: &[u8; 32]| h[0] != 1;
+        let prune = |tip| {
+            let rtxn = env.read_txn().unwrap();
+            w.prune_rewards(&u, &rtxn, tip, 100, known, Some(mining)).unwrap()
+        };
+        let have = |c: &Commitment| w.owned(c).unwrap().is_some();
+        assert_eq!(prune(10), 2);
+        assert!(!have(&never_found) && !have(&unknown));
+        assert!(have(&side) && have(&main) && have(&mining));
+        // Past the reorganization depth the side block's reward goes; the
+        // landed one stays, no longer tracked.
+        assert_eq!(prune(107), 1);
+        assert!(!have(&side) && have(&main) && have(&mining));
+        assert_eq!(prune(108), 0);
+        let rtxn = w.env.read_txn().unwrap();
+        assert!(w.rewards.get(&rtxn, &digest_to_bytes(&main)).unwrap().is_none());
+        assert!(w.rewards.get(&rtxn, &digest_to_bytes(&mining)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_password_locks_the_secret() {
+        let dir = TempDir::new("password");
+        let path = dir.0.join("wallet");
+        let (w, created) = Wallet::open_with(&path, &mut |a| {
+            assert_eq!(a, Ask::New);
+            Ok("hunter2".into())
+        })
+        .unwrap();
+        let phrase = created.unwrap();
+        let master = w.master;
+        assert!(w.locked().unwrap());
+        assert_eq!(w.phrase("hunter2").unwrap(), phrase);
+        assert!(matches!(w.phrase(""), Err(WalletError::WrongPassword)));
+        // The record holds neither the entropy nor the seed in the clear.
+        let record = w.secret_record().unwrap();
+        let entropy = bip39::entropy(&phrase).unwrap();
+        assert!(!record.windows(entropy.len()).any(|x| x == entropy));
+        drop(w);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert!(matches!(Wallet::open(&path), Err(WalletError::WrongPassword)));
+        let (w, created) = Wallet::open_with(&path, &mut |a| {
+            assert_eq!(a, Ask::Unlock);
+            Ok("hunter2".into())
+        })
+        .unwrap();
+        assert!(created.is_none());
+        assert_eq!(w.master, master);
+        // Changing it needs the old one; removing it leaves a plain record.
+        assert!(matches!(w.set_password("wrong", "x"), Err(WalletError::WrongPassword)));
+        w.set_password("hunter2", "").unwrap();
+        assert!(!w.locked().unwrap());
+        drop(w);
+        let (w, _) = Wallet::open(&path).unwrap();
+        assert_eq!(w.master, master);
+        // A restore can be locked too.
+        let r = Wallet::restore(&dir.0.join("restored"), &phrase, "", "pw").unwrap();
+        assert!(r.locked().unwrap());
+        assert_eq!(r.master, master);
+    }
+
+    #[test]
     fn phrase_memos_and_persistence() {
         let dir = TempDir::new("basic");
         let (env, u) = utxo(&dir);
@@ -2882,7 +3341,7 @@ mod tests {
             let (w, created) = Wallet::open(&dir.0.join("wallet")).unwrap();
             let phrase = created.expect("a new wallet has a phrase");
             assert_eq!(phrase.split(' ').count(), 12);
-            assert_eq!(w.phrase().unwrap(), phrase);
+            assert_eq!(w.phrase("").unwrap(), phrase);
             let a = w.receive(100).unwrap();
             let b = w.receive(u64::MAX).unwrap();
             assert_ne!(a.memo, b.memo);
@@ -2900,7 +3359,7 @@ mod tests {
         };
         let (w, created) = Wallet::open(&dir.0.join("wallet")).unwrap();
         assert!(created.is_none());
-        assert_eq!(w.phrase().unwrap(), phrase);
+        assert_eq!(w.phrase("").unwrap(), phrase);
         assert_eq!(w.outputs().unwrap().len(), 2);
         // Another wallet cannot read the memo.
         let (other, _) = Wallet::open(&dir.0.join("other")).unwrap();
@@ -2913,7 +3372,7 @@ mod tests {
         assert_eq!(address.len(), address::LEN);
         assert_eq!(address::decode(&address), Some(w.id()));
         assert_ne!(other.address(), address);
-        let restored = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
+        let restored = Wallet::restore(&dir.0.join("restored"), &phrase, "", "").unwrap();
         assert_ne!(restored.address(), address);
         // The relay's key: from the phrase too, but not the wallet's.
         let relay = address::id_of(w.relay_key().public_key());
@@ -2946,7 +3405,7 @@ mod tests {
         assert_eq!(w.prune_pending(&u, &rtxn, &HashSet::from([b_commitment])).unwrap(), 0);
         assert_eq!(w.prune_pending(&u, &rtxn, &HashSet::new()).unwrap(), 1);
         assert_eq!(w.outputs().unwrap().len(), 1);
-        assert!(matches!(Wallet::restore(&dir.0.join("wallet"), &phrase, ""), Err(WalletError::Exists)));
+        assert!(matches!(Wallet::restore(&dir.0.join("wallet"), &phrase, "", ""), Err(WalletError::Exists)));
     }
 
     #[test]
@@ -2966,7 +3425,7 @@ mod tests {
         assert!(matches!(w.next_signing_key(&a.commitment), Err(WalletError::Exhausted)));
         // A restored copy finds it and signs from 8..15, from a random start,
         // wrapping within that half, eight times.
-        let r = Wallet::restore(&dir.0.join("restored"), &phrase, "").unwrap();
+        let r = Wallet::restore(&dir.0.join("restored"), &phrase, "", "").unwrap();
         assert!(r.scan_pending().unwrap());
         assert!(!w.scan_pending().unwrap());
         let rtxn = env.read_txn().unwrap();
@@ -2995,7 +3454,7 @@ mod tests {
         assert_eq!(seen, (8..16).collect::<Vec<_>>());
         assert!(matches!(r.next_signing_key(&a.commitment), Err(WalletError::Exhausted)));
         // A wrong passphrase finds nothing.
-        let wrong = Wallet::restore(&dir.0.join("wrong"), &phrase, "x").unwrap();
+        let wrong = Wallet::restore(&dir.0.join("wrong"), &phrase, "x", "").unwrap();
         assert_eq!(wrong.scan(&u, &rtxn).unwrap(), (0, 0));
     }
 
@@ -3064,6 +3523,8 @@ mod tests {
         assert!(tx.verify_signatures() && tx.balance() == fee as i128 && signed.last_signatures.is_empty());
         // Each input names where its output is.
         assert_eq!(tx.spent_positions(), vec![0, 1]);
+        // Kept as signed, to send again.
+        assert_eq!(alice.resend(&tx.txid()).unwrap(), tx);
         assert!(matches!(alice.finalize(&received), Err(WalletError::Unknown)));
         // Signed but not confirmed: the inputs are locked, not reserved.
         assert_eq!(
@@ -3078,23 +3539,23 @@ mod tests {
         let sent = alice.sent(&u, &rtxn).unwrap();
         assert_eq!(sent.len(), 1);
         let min = Wallet::min_replacement_fee(&sent[0]);
-        assert!(matches!(alice.cancel_sent(&tx.txid(), Some(min - 1)), Err(WalletError::FeeTooLow { .. })));
-        let replaced = alice.cancel_sent(&tx.txid(), None).unwrap().tx;
+        assert!(matches!(alice.cancel_sent(&tx.txid(), Some(min - 1), &u, &rtxn), Err(WalletError::FeeTooLow { .. })));
+        let replaced = alice.cancel_sent(&tx.txid(), None, &u, &rtxn).unwrap().tx;
         assert!(replaced.verify_signatures());
         assert_eq!(replaced.spent_commitments(), tx.spent_commitments());
         assert_eq!(replaced.spent_positions(), tx.spent_positions());
         assert_eq!(replaced.balance() as u64, min);
         assert_eq!(replaced.inputs[0].signature.index, 1);
-        assert!(matches!(alice.cancel_sent(&tx.txid(), None), Err(WalletError::Unknown)));
+        assert!(matches!(alice.cancel_sent(&tx.txid(), None, &u, &rtxn), Err(WalletError::Unknown)));
         // It can be cancelled again until the leaves run out: 8 signatures
         // in all, the last one flagged.
         let mut id = replaced.txid();
         for n in 2..8 {
-            let s = alice.cancel_sent(&id, Some(min * n)).unwrap();
+            let s = alice.cancel_sent(&id, Some(min * n), &u, &rtxn).unwrap();
             assert_eq!(s.last_signatures.len(), if n == 7 { 2 } else { 0 });
             id = s.tx.txid();
         }
-        assert!(matches!(alice.cancel_sent(&id, Some(min * 9)), Err(WalletError::Exhausted)));
+        assert!(matches!(alice.cancel_sent(&id, Some(min * 9), &u, &rtxn), Err(WalletError::Exhausted)));
 
         // Cancelling a slate frees its inputs.
         drop(rtxn);
@@ -3197,6 +3658,13 @@ mod tests {
         drop(rtxn);
         assert!(alice.pending_commits().unwrap().is_empty());
         assert_eq!(alice.owned_name(b"alice").unwrap().unwrap().stage, NameStage::Revealed);
+        // Cancelled, the reveal goes back to its commit; the original
+        // landing anyway is adopted below.
+        let rtxn = env.read_txn().unwrap();
+        alice.cancel_sent(&signed.tx.txid(), None, &u, &rtxn).unwrap();
+        drop(rtxn);
+        assert!(alice.owned_name(b"alice").unwrap().is_none());
+        assert_eq!(alice.pending_commits().unwrap()[0].commit, *c);
         let (first, outs) = apply(&signed.tx, 13);
         alice.locate(first, &outs).unwrap();
         let rtxn = env.read_txn().unwrap();
@@ -3213,8 +3681,17 @@ mod tests {
         assert!(alice.name_update(b"alice", value(3)).is_err());
         assert!(update.verify_owner(&on_chain.owner));
         let signed = alice.carry(vec![update], None, &u, &rtxn).unwrap();
+        // Cancelled, the update is no longer pending (its leaf stays used);
+        // the original landing anyway is adopted from its memo.
+        let replacement = alice.cancel_sent(&signed.tx.txid(), None, &u, &rtxn).unwrap().tx.txid();
         drop(rtxn);
+        let entry = alice.owned_name(b"alice").unwrap().unwrap();
+        assert!(entry.pending.is_none() && entry.used == 1);
         let (first, outs) = apply(&signed.tx, 14);
+        // Its inputs spent on chain, the replacement cannot be cancelled.
+        let rtxn = env.read_txn().unwrap();
+        assert!(matches!(alice.cancel_sent(&replacement, None, &u, &rtxn), Err(WalletError::Landed)));
+        drop(rtxn);
         alice.locate(first, &outs).unwrap();
         let rtxn = env.read_txn().unwrap();
         assert_eq!(alice.sync_names(&registry, &rtxn).unwrap(), 1);
@@ -3250,8 +3727,8 @@ mod tests {
         let signed = bob.carry(vec![commit], None, &u, &rtxn).unwrap();
         drop(rtxn);
         apply(&signed.tx, 20);
-        let (_, bob_phrase) = (0, bob.phrase().unwrap());
-        let restored = Wallet::restore(&dir.0.join("bob2"), &bob_phrase, "").unwrap();
+        let (_, bob_phrase) = (0, bob.phrase("").unwrap());
+        let restored = Wallet::restore(&dir.0.join("bob2"), &bob_phrase, "", "").unwrap();
         let rtxn = env.read_txn().unwrap();
         assert_eq!(restored.scan_names(&u, &registry, &rtxn).unwrap(), (1, 1));
         assert_eq!(restored.scan_names(&u, &registry, &rtxn).unwrap(), (0, 0));
@@ -3264,7 +3741,7 @@ mod tests {
         let NameOp::Reveal { record, .. } = &reveal else { unreachable!() };
         assert_eq!(record.owner, restored.owner_hash(&pending.nonce));
         // Alice's restored wallet finds nothing: the name left her.
-        let alice2 = Wallet::restore(&dir.0.join("alice2"), &phrase.unwrap(), "").unwrap();
+        let alice2 = Wallet::restore(&dir.0.join("alice2"), &phrase.unwrap(), "", "").unwrap();
         assert_eq!(alice2.scan_names(&u, &registry, &rtxn).unwrap(), (0, 0));
     }
 }

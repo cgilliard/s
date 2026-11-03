@@ -811,6 +811,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             node.mode = Mode::Headers;
             node.log("fast sync: downloading headers");
         }
+        let pooled = node.load_mempool();
+        if pooled > 0 {
+            node.log(&format!("mempool: {pooled} saved transactions pooled again"));
+        }
         // A relay keeps its sessions' announces on disk (`docs/SCALING.md`).
         if node.config.relay
             && let Some(dir) = node.config.peers_file.as_ref().and_then(|p| p.parent())
@@ -909,6 +913,49 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let _ = h.join();
         }
         self.save_peers();
+        self.save_mempool();
+    }
+
+    /// The pool's file, beside the peers file.
+    fn mempool_file(&self) -> Option<PathBuf> {
+        Some(self.config.peers_file.as_ref()?.with_file_name("mempool"))
+    }
+
+    /// Writes the pooled transactions to the data directory, so a restart
+    /// keeps pending payments: each as its length and its bytes.
+    fn save_mempool(&self) {
+        let Some(path) = self.mempool_file() else { return };
+        let mut bytes = Vec::new();
+        for e in self.mempool.lock().unwrap().entries() {
+            let tx = e.tx.to_bytes();
+            bytes.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&tx);
+        }
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
+            self.log(&format!("saving the pool: {e}"));
+        }
+    }
+
+    /// Pools the transactions saved by [`Node::save_mempool`], each checked
+    /// again as if it had just arrived; returns how many were taken.
+    fn load_mempool(&mut self) -> usize {
+        let Some(bytes) = self.mempool_file().and_then(|p| std::fs::read(p).ok()) else { return 0 };
+        let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
+        let Ok(rtxn) = self.chain.env().read_txn() else { return 0 };
+        let mut pool = self.mempool.lock().unwrap();
+        let (mut rest, mut taken) = (&bytes[..], 0);
+        while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+            let len = u32::from_le_bytes(*len) as usize;
+            let Some((tx, tail)) = tail.split_at_checked(len) else { break };
+            rest = tail;
+            if let Some(tx) = Transaction::from_bytes(tx)
+                && pool.insert(tx, self.chain.utxo(), self.chain.names(), &rtxn, height).is_ok()
+            {
+                taken += 1;
+            }
+        }
+        taken
     }
 
     fn log(&self, msg: &str) {
@@ -1047,6 +1094,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if now.duration_since(self.last_save) >= SAVE_INTERVAL {
             self.last_save = now;
             self.save_peers();
+            self.save_mempool();
         }
         let live: std::collections::HashSet<SocketAddr> = self.peers.live(now).map(|p| p.addr).collect();
         let peers = self
@@ -2190,12 +2238,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     )),
                     _ => self.log(&format!("{whose} {} is the tip at height {height}", short(&id))),
                 }
+                let fork = match applied {
+                    Applied::Reorganized { fork_height, .. } => Some(fork_height),
+                    _ => None,
+                };
                 self.tip_changes.fetch_add(1, Ordering::Release);
                 let told = self.announce(&block.header, from);
                 if from.is_none() {
                     self.log(&format!("announced block {height} to {told} peers"));
                 }
-                self.revalidate_mempool();
+                self.revalidate_mempool(fork);
                 true
             }
             Err(ChainError::UnknownParent(_) | ChainError::MissingBody) => {
@@ -2340,13 +2392,25 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// After the tip moved: drop pooled transactions the chain has spent,
-    /// restore shelved ones a reorganization freed.
-    fn revalidate_mempool(&mut self) {
+    /// restore shelved ones a reorganization freed, at the positions the
+    /// new branch gave their outputs (`fork`: the height it forked at).
+    fn revalidate_mempool(&mut self, fork: Option<u32>) {
+        let tip = self.chain.tip().ok().flatten().map_or(0, |t| t.height);
+        let mut moved: HashMap<crate::transaction::Commitment, Vec<u64>> = HashMap::new();
+        if let Some(fork) = fork {
+            for h in fork + 1..=tip {
+                if let Ok(Some((_, first, outputs))) = self.chain.main_outputs(h) {
+                    for (i, o) in outputs.iter().enumerate() {
+                        moved.entry(o.commitment).or_default().push(first + i as u64);
+                    }
+                }
+            }
+        }
         let Ok(rtxn) = self.chain.env().read_txn() else {
             return;
         };
-        let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
-        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), self.chain.names(), &rtxn, height) {
+        let height = tip + 1;
+        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), self.chain.names(), &rtxn, height, &moved) {
             Ok((gone, back)) if gone + back > 0 => {
                 self.chatter(&format!("mempool: {gone} transactions confirmed or conflicted, {back} restored"));
             }
@@ -2837,7 +2901,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 ));
                 self.mode = Mode::Normal;
                 self.tip_changes.fetch_add(1, Ordering::Release);
-                self.revalidate_mempool();
+                self.revalidate_mempool(None);
                 self.sync(Instant::now());
             }
             Err(e) => {
@@ -4664,6 +4728,45 @@ mod tests {
         }
     }
 
+    /// The pool outlives a restart: saved on the way out, pooled again,
+    /// checked, when the node starts.
+    #[test]
+    fn the_pool_is_kept_across_a_restart() {
+        let f = open("pool-kept");
+        let block = mine(&f, 1, T0 + 600);
+        f.chain.apply_block(&block, unix_now()).unwrap();
+        let mut k = Key::generate(&{
+            let mut s = [0u8; 32];
+            s[0] = 1;
+            s
+        });
+        let mut tx = crate::transaction::UnsignedTransaction::new(
+            vec![(k.public_key(), SUBSIDY)],
+            vec![Output::new(&pk(50), SUBSIDY - 1000)],
+        )
+        .sign_with(&mut k)
+        .unwrap();
+        tx.set_positions(&[0]);
+        let txid = tx.txid();
+        let mempool = pool();
+        let (node, events) = Node::bind(Arc::clone(&f.chain), Arc::clone(&mempool), config(vec![], &f.dir)).unwrap();
+        let h = std::thread::spawn(move || node.run());
+        events.send(Event::Transaction(tx)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !mempool.lock().unwrap().contains(&txid) {
+            assert!(Instant::now() < deadline, "not pooled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        events.send(Event::Stop).unwrap();
+        h.join().unwrap();
+        // A fresh pool, the same data directory: the transaction is back.
+        let again = pool();
+        let (node, events) = Node::bind(Arc::clone(&f.chain), Arc::clone(&again), config(vec![], &f.dir)).unwrap();
+        assert!(again.lock().unwrap().contains(&txid));
+        drop(node);
+        drop(events);
+    }
+
     /// Keepalives come 20 to 40 s apart at random (`docs/PRIVACY.md`, fix 3).
     #[test]
     fn keepalives_are_jittered() {
@@ -4908,6 +5011,8 @@ mod tests {
         let (bob, _) = Wallet::open(&f.dir.0.join("bob")).unwrap();
         let now = unix_now();
         let t = std::cell::Cell::new(T0);
+        // Whether the wallet follows the blocks as they come.
+        let follow = std::cell::Cell::new(true);
         // Mines `txs` with a reward taking the rest; returns the block.
         let block_with = |txs: &[&crate::transaction::Transaction], inputs: Vec<u64>| {
             t.set(t.get() + 600);
@@ -4917,6 +5022,9 @@ mod tests {
             let block = mine_body(&f, Body { inputs, outputs, proof: vec![1; 2500], ..Default::default() }, t.get());
             f.chain.apply_block(&block, now).unwrap();
             let (_, first, outs) = f.chain.main_outputs(block.header.height).unwrap().unwrap();
+            if !follow.get() {
+                return (block, first, 0);
+            }
             alice.locate(first, &outs).unwrap();
             let landed = alice.land_payments(block.header.height, first, &outs).unwrap();
             for p in &landed {
@@ -4997,8 +5105,19 @@ mod tests {
         let rtxn = f.chain.env().read_txn().unwrap();
         let burn = alice.burn(1_000_000, &bob.id(), b"credit", None, f.chain.utxo(), &rtxn).unwrap();
         drop(rtxn);
-        let (b3, _, landed) = block_with(&[&burn.tx], vec![first2]);
-        assert_eq!(landed, 1);
+        // The wallet misses the block (a fast sync, say): the burn is found
+        // in the output set afterwards, with the block that made it.
+        follow.set(false);
+        let (b3, _, _) = block_with(&[&burn.tx], vec![first2]);
+        follow.set(true);
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let found = alice.find_payments(f.chain.utxo(), &rtxn).unwrap();
+        drop(rtxn);
+        assert_eq!(found.len(), 1);
+        let (h, position) = found[0].landed.unwrap();
+        assert_eq!(h, 3);
+        let (header, _, path) = f.chain.output_proof_at(position, h).unwrap().unwrap();
+        alice.set_payment_path(&found[0].txid, h, position, path, &header.state_root).unwrap();
         let burned = alice.payments().unwrap().into_iter().find(|p| p.is_burn()).unwrap();
         let proof = burned.proof().unwrap();
         assert_eq!(proof.key_hash, crate::proofs::BURN_KEY_HASH);

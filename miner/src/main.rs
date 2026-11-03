@@ -70,7 +70,7 @@ use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
 use tabminer::utxo;
-use tabminer::wallet::{Incoming, Signed, Slate, State, Wallet};
+use tabminer::wallet::{Ask, Incoming, Signed, Slate, State, Wallet};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -112,10 +112,14 @@ options:
                     are served only within them; 0 keeps everything (archive)
   --verbose         log every network message handled
   --no-prompt       no wallet prompt; log to the terminal instead of the file
+  --password-file FILE  the wallet's password, the file's first line: for a
+                    locked wallet started with --no-prompt (a new wallet
+                    started so is locked under it, or left unlocked without it)
 
 debugging (a node so started can be fed any block; never use with real funds):
   --debug-no-validate-proofs  accept block proofs without checking them, and
-                    mine without proving (a 205 KB stand-in instead)
+                    mine without proving (a 205 KB stand-in instead); only on a
+                    data directory of its own, which is marked unchecked for good
   --debug-fill N[,S]  with the above, fill each mined block with N random
                     outputs and spend S of the earlier ones at random (default
                     S = 0), up to the block size limit: for simulating large
@@ -147,6 +151,8 @@ const HELP: &str = "commands:
                             (FEE defaults to the smallest the network accepts)
   slates                    pending slates
   sent                      unconfirmed payments that can be cancelled
+  resend TXID               send an unconfirmed payment again, as signed (after a
+                            restart dropped it, or a reorganization moved its inputs)
   payments                  payments and burns made, where they landed, and whether
                             their proofs are ready
   payment-proof TXID [FILE] a payment's proof (docs/PROOFS.md): the block that made the
@@ -195,7 +201,11 @@ const HELP: &str = "commands:
                             it answers nothing again; a restore starts on a new one
   address off               close the address's sessions: the wallet can pay but
                             nobody can reach it, until address next
-  phrase                    show the wallet's 12-word recovery phrase
+  phrase                    show the wallet's 12-word recovery phrase (asks the
+                            password of a locked wallet)
+  password                  lock the wallet's phrase under a password, change it,
+                            or remove it (an empty new one); the password is
+                            asked at every start
   storage                   disk use of the chain database, part by part
   quit                      stop the node
 amounts are coins with up to eight decimals, e.g. 1.5";
@@ -236,6 +246,8 @@ struct Args {
     max_channels: usize,
     /// Run without a wallet; implies `no_mine`.
     no_wallet: bool,
+    /// Where the wallet's password is read from with `no_prompt`.
+    password_file: Option<PathBuf>,
     debug_unchecked: bool,
     /// Random outputs to add, and earlier ones to spend, per mined block.
     debug_fill: Option<(usize, usize)>,
@@ -271,6 +283,7 @@ fn parse_args() -> Result<Args, String> {
         max_hops: tabminer::node::MAX_HOPS,
         max_channels: tabminer::node::MAX_CHANNELS,
         no_wallet: false,
+        password_file: None,
         debug_unchecked: false,
         debug_fill: None,
         debug_fill_names: 0,
@@ -284,6 +297,7 @@ fn parse_args() -> Result<Args, String> {
             "--jobs" => a.jobs = number(value()?)?.max(1) as usize,
             "--no-mine" => a.no_mine = true,
             "--no-prompt" => a.no_prompt = true,
+            "--password-file" => a.password_file = Some(PathBuf::from(value()?)),
             "--listen" => {
                 let v = value()?;
                 a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
@@ -401,6 +415,30 @@ fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc
     let chain = Chain::open(&args.data.join("chain"), MAP_SIZE, params, seed, verifier)?
         .with_max_undo((args.max_undo > 0).then_some(args.max_undo));
     chain.init_or_check_genesis()?;
+    // A data directory is checked or unchecked for good: unchecked blocks
+    // must never pass for verified ones, nor a verified chain take
+    // unchecked blocks.
+    let marker = args.data.join("unchecked");
+    let past_genesis = chain.tip()?.is_some_and(|t| t.height > 0);
+    match (args.debug_unchecked, marker.exists()) {
+        (true, false) if past_genesis => {
+            return Err(format!(
+                "{} holds a verified chain: --debug-no-validate-proofs needs a data directory of its own",
+                args.data.display()
+            )
+            .into());
+        }
+        (true, false) => std::fs::write(&marker, "blocks here were taken without checking their proofs\n")?,
+        (false, true) => {
+            return Err(format!(
+                "{} was run with --debug-no-validate-proofs: its blocks were never checked; \
+                 use another data directory, or the flag again",
+                args.data.display()
+            )
+            .into());
+        }
+        _ => {}
+    }
     if args.debug_fill_names > 0 {
         let t = Instant::now();
         chain.debug_fill_names(args.debug_fill_names, &|done| {
@@ -607,7 +645,15 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let opened = if args.no_wallet && !args.relay {
         None
     } else {
-        let (wallet, created) = Wallet::open(&args.data.join("wallet"))?;
+        let dir = args.data.join("wallet");
+        let mut tries = if args.no_prompt || args.password_file.is_some() { 1 } else { 3 };
+        let (wallet, created) = loop {
+            tries -= 1;
+            match Wallet::open_with(&dir, &mut |ask| wallet_password(args, ask)) {
+                Err(tabminer::wallet::WalletError::WrongPassword) if tries > 0 => println!("wrong password"),
+                r => break r?,
+            }
+        };
         if let Some(phrase) = created {
             log::line("created a new wallet");
             println!("\nnew wallet; its recovery phrase is:\n\n    {phrase}\n");
@@ -872,9 +918,33 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         let rtxn = chain.env().read_txn()?;
         ctx.wallet()?.relocate(chain.utxo(), &rtxn)?;
     }
+    if gap {
+        // Payments that landed in the gap, while their outputs are unspent;
+        // their paths can be made while the blocks are in the undo window.
+        let rtxn = chain.env().read_txn()?;
+        let found = ctx.wallet()?.find_payments(chain.utxo(), &rtxn)?;
+        drop(rtxn);
+        for p in found {
+            if let Err(e) = make_payment_path(ctx, &p) {
+                log::line(&format!("wallet: no proof for {}: {e}", short(&p.txid)));
+            }
+        }
+    }
     ctx.wallet()?.set_synced(tip.height, &digest_to_bytes(&tip.hash()))?;
     let rtxn = chain.env().read_txn()?;
     ctx.wallet()?.sync_names(chain.names(), &rtxn)?;
+    // Rewards of blocks that will not make the main chain: never found
+    // (the miner stopped), never accepted, or side blocks past the depth a
+    // reorganization reaches. The block being mined is kept.
+    let keep = *ctx.in_flight.lock().unwrap();
+    let known = |hash: &[u8; 32]| {
+        digest_from_bytes(hash).is_some_and(|d| chain.entry(&d).ok().flatten().is_some_and(|e| !e.invalid))
+    };
+    let settle = chain.max_undo().unwrap_or(DEFAULT_MAX_UNDO);
+    let n = ctx.wallet()?.prune_rewards(chain.utxo(), &rtxn, tip.height, settle, known, keep)?;
+    if n > 0 {
+        log::line(&format!("wallet: forgot {n} rewards of blocks that will not make the main chain"));
+    }
     Ok(())
 }
 
@@ -993,6 +1063,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             | "sent"
             | "prune"
             | "payments"
+            | "resend"
             | "payment-proof"
             | "burn"
             | "burn-proof"
@@ -1465,20 +1536,35 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 _ => return Err("usage: cancel ID [FEE]".into()),
             };
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-            let slate = ctx.wallet()?.pending_slates()?.into_iter().map(|(s, _)| s).find(|s| hex(s).starts_with(id));
-            if let Some(slate) = slate {
-                ctx.wallet()?.cancel_slate(&slate)?;
+            let slates: Vec<_> = ctx
+                .wallet()?
+                .pending_slates()?
+                .into_iter()
+                .map(|(s, _)| s)
+                .filter(|s| hex(s).starts_with(id))
+                .collect();
+            let rtxn = ctx.chain.env().read_txn()?;
+            let sent: Vec<_> = ctx
+                .wallet()?
+                .sent(ctx.chain.utxo(), &rtxn)?
+                .into_iter()
+                .filter(|s| hex(&digest_to_bytes(&s.txid)).starts_with(id))
+                .collect();
+            drop(rtxn);
+            if slates.len() + sent.len() > 1 {
+                return Err(
+                    "more than one pending slate or unconfirmed payment starts with that id; give more of it".into()
+                );
+            }
+            if let Some(slate) = slates.first() {
+                ctx.wallet()?.cancel_slate(slate)?;
                 println!("slate cancelled; its inputs are spendable again");
                 return Ok(());
             }
+            let s = sent.into_iter().next().ok_or("no pending slate or unconfirmed payment starts with that id")?;
             let rtxn = ctx.chain.env().read_txn()?;
-            let sent = ctx.wallet()?.sent(ctx.chain.utxo(), &rtxn)?;
+            let signed = ctx.wallet()?.cancel_sent(&s.txid, fee, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
-            let s = sent
-                .into_iter()
-                .find(|s| hex(&digest_to_bytes(&s.txid)).starts_with(id))
-                .ok_or("no pending slate or unconfirmed payment starts with that id")?;
-            let signed = ctx.wallet()?.cancel_sent(&s.txid, fee)?;
             println!(
                 "payment {} replaced; the inputs come back less a fee of {}",
                 short(&s.txid),
@@ -1502,6 +1588,27 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     fmt_coins(Wallet::min_replacement_fee(&s) as u128)
                 );
             }
+        }
+        "resend" => {
+            let [prefix] = args else {
+                return Err("usage: resend TXID".into());
+            };
+            let rtxn = ctx.chain.env().read_txn()?;
+            let sent = ctx.wallet()?.sent(ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            let found: Vec<_> = sent.iter().filter(|s| hex_digest(&s.txid).starts_with(prefix)).collect();
+            let s = match &found[..] {
+                [s] => *s,
+                [] => return Err(format!("no unconfirmed payment with a txid starting {prefix}").into()),
+                _ => {
+                    return Err(
+                        format!("{} payments have txids starting {prefix}: give more digits", found.len()).into()
+                    );
+                }
+            };
+            let tx = ctx.wallet()?.resend(&s.txid)?;
+            println!("sending {} again", short(&s.txid));
+            submit(ctx, Signed { tx, last_signatures: Vec::new() });
         }
         "payments" => {
             let tip = ctx.chain.tip()?.map_or(0, |t| t.height);
@@ -1795,8 +1902,22 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
         }
         "phrase" => {
-            println!("{}", ctx.wallet()?.phrase()?);
+            let w = ctx.wallet()?;
+            let password = if w.locked()? { read_secret("wallet password: ")? } else { String::new() };
+            println!("{}", w.phrase(&password)?);
             println!("anyone with these words (and the passphrase, if one was used) can take the funds");
+        }
+        "password" => {
+            let w = ctx.wallet()?;
+            let old = if w.locked()? { read_secret("current password: ")? } else { String::new() };
+            w.phrase(&old)?;
+            let new = new_password()?;
+            w.set_password(&old, &new)?;
+            if new.is_empty() {
+                println!("the wallet's phrase is no longer locked");
+            } else {
+                println!("the wallet's phrase is locked; the password is asked at every start");
+            }
         }
         _ => println!("unknown command {cmd}; type help"),
     }
@@ -1839,25 +1960,72 @@ fn submit(ctx: &Ctx, signed: Signed) {
     }
 }
 
+/// Reads a line from the terminal without echoing it (stty turns the echo
+/// off when stdin is a terminal), without its line ending.
+fn read_secret(prompt: &str) -> std::io::Result<String> {
+    use std::process::{Command, Stdio};
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let stty = |arg: &str| Command::new("stty").arg(arg).stdin(Stdio::inherit()).stderr(Stdio::null()).status();
+    let hidden = matches!(stty("-echo"), Ok(s) if s.success());
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if hidden {
+        let _ = stty("echo");
+        println!();
+    }
+    read?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Asks for a new wallet password, twice; empty for none.
+fn new_password() -> AnyResult<String> {
+    loop {
+        let p = read_secret("new wallet password, asked at every start (empty for none): ")?;
+        if p.is_empty() {
+            println!("the phrase is kept unlocked: anyone who reads the wallet directory can take the funds");
+            return Ok(p);
+        }
+        if read_secret("again: ")? == p {
+            return Ok(p);
+        }
+        println!("the two differ; again");
+    }
+}
+
+/// The wallet's password at startup: from --password-file, else asked
+/// unless --no-prompt (a new wallet is then left unlocked).
+fn wallet_password(args: &Args, ask: Ask) -> Result<String, tabminer::wallet::WalletError> {
+    let io = tabminer::wallet::WalletError::Io;
+    if let Some(file) = &args.password_file {
+        let text = std::fs::read_to_string(file).map_err(io)?;
+        return Ok(text.lines().next().unwrap_or("").to_string());
+    }
+    match (ask, args.no_prompt) {
+        (Ask::Unlock, true) => {
+            Err(io(std::io::Error::other("the wallet is locked: give --password-file with --no-prompt")))
+        }
+        (Ask::New, true) => Ok(String::new()),
+        (Ask::Unlock, false) => read_secret("wallet password: ").map_err(io),
+        (Ask::New, false) => {
+            println!("a new wallet is being created");
+            new_password().map_err(|e| io(std::io::Error::other(e.to_string())))
+        }
+    }
+}
+
 /// Rebuilds a wallet from its phrase in an empty data directory.
 fn restore(args: &Args) -> AnyResult<()> {
     let dir = args.data.join("wallet");
     if dir.join("data.mdb").exists() {
         return Err(format!("{} already has a wallet; restore into another --data directory", dir.display()).into());
     }
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    print!("recovery phrase (12 words): ");
-    std::io::stdout().flush()?;
-    stdin.lock().read_line(&mut line)?;
-    let phrase = line.trim().to_string();
+    let phrase = read_secret("recovery phrase (12 words): ")?.split_whitespace().collect::<Vec<_>>().join(" ");
     tabminer::bip39::entropy(&phrase)?;
-    let mut pass = String::new();
-    print!("passphrase (empty if none): ");
-    std::io::stdout().flush()?;
-    stdin.lock().read_line(&mut pass)?;
+    let pass = read_secret("BIP39 passphrase (empty if none): ")?;
+    let password = new_password()?;
     std::fs::create_dir_all(&args.data)?;
-    Wallet::restore(&dir, &phrase, pass.trim_end_matches(['\r', '\n']))?;
+    Wallet::restore(&dir, &phrase, &pass, &password)?;
     println!("wallet restored in {}", dir.display());
     println!("start tabminer with this --data directory: once it has synced, it finds the wallet's outputs");
     Ok(())
@@ -2114,6 +2282,11 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             continue;
         }
         waited = false;
+        // Follow the chain: rewards land or are settled, also without a
+        // prompt.
+        if let Err(e) = sync_wallet(ctx) {
+            log::line(&format!("wallet: {e}"));
+        }
         let started = Instant::now();
         let generation = ctx.tip_changes.load(Ordering::Acquire);
         let cancel = || ctx.stop.load(Ordering::Acquire) || ctx.tip_changes.load(Ordering::Acquire) != generation;
@@ -2163,6 +2336,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             wallet.balance(chain.utxo(), &rtxn)?
         };
         let (reward_tx, reward_out) = reward(wallet, subsidy + fees)?;
+        wallet.note_reward(&reward_out.commitment, height)?;
         *ctx.in_flight.lock().unwrap() = Some(reward_out.commitment);
         // A block that never gets mined leaves no record behind.
         let abandon = || {
@@ -2370,6 +2544,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
 
         // The node applies and announces it; wait for the tip to move.
         let t = Instant::now();
+        wallet.reward_found(&reward_out.commitment, &digest_to_bytes(&header.hash()))?;
         ctx.events.send(Event::Mined(block))?;
         while !cancel() && t.elapsed() < ACCEPT_TIMEOUT {
             std::thread::sleep(Duration::from_millis(10));

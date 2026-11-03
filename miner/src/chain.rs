@@ -767,6 +767,11 @@ impl<V: ProofVerifier> Chain<V> {
         self
     }
 
+    /// Undo records kept, counting back from the tip; `None` keeps all.
+    pub fn max_undo(&self) -> Option<u32> {
+        self.max_undo
+    }
+
     /// Deletes undo records and bodies outside the window: those of blocks
     /// at least `max_undo` below the tip. Returns how many undo records
     /// went.

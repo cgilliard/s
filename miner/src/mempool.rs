@@ -215,8 +215,9 @@ impl Entry {
 
 pub struct Mempool {
     txs: HashMap<Digest, Entry>,
-    /// Spent commitment to the pooled transaction spending it.
-    spends: HashMap<Commitment, Digest>,
+    /// Spent position to the pooled transaction spending it: the chain
+    /// spends by position, and two unspent outputs may share a commitment.
+    spends: HashMap<u64, Digest>,
     /// Name or commit to the pooled transaction claiming it.
     claims: HashMap<Claim, Digest>,
     bytes: usize,
@@ -256,8 +257,8 @@ fn check_static(tx: &Transaction, policy: &Policy) -> Result<u64, Reject> {
     if tx.outputs.iter().any(|o| o.amount < policy.dust) {
         return Err(Reject::Dust { min: policy.dust });
     }
-    let mut spent = tx.spent_commitments();
-    spent.sort_unstable_by_key(|c| crate::poseidon2::digest_to_bytes(c));
+    let mut spent = tx.spent_positions();
+    spent.sort_unstable();
     if spent.windows(2).any(|w| w[0] == w[1]) {
         return Err(Reject::Malformed);
     }
@@ -396,7 +397,7 @@ impl Mempool {
         let fee = check_static(&tx, &self.policy)?;
         let mut conflicts: Vec<Digest> = Vec::new();
         for (c, p) in tx.spent_commitments().into_iter().zip(tx.spent_positions()) {
-            if let Some(other) = self.spends.get(&c)
+            if let Some(other) = self.spends.get(&p)
                 && !conflicts.contains(other)
             {
                 conflicts.push(*other);
@@ -459,8 +460,8 @@ impl Mempool {
     }
 
     fn add(&mut self, entry: Entry) {
-        for c in entry.tx.spent_commitments() {
-            self.spends.insert(c, entry.txid);
+        for p in entry.tx.spent_positions() {
+            self.spends.insert(p, entry.txid);
         }
         for c in &entry.claims {
             self.claims.insert(*c, entry.txid);
@@ -472,8 +473,8 @@ impl Mempool {
     /// Removes a transaction; returns it if it was pooled.
     pub fn remove(&mut self, txid: &Digest) -> Option<Entry> {
         let entry = self.txs.remove(txid)?;
-        for c in entry.tx.spent_commitments() {
-            self.spends.remove(&c);
+        for p in entry.tx.spent_positions() {
+            self.spends.remove(&p);
         }
         for c in &entry.claims {
             self.claims.remove(c);
@@ -485,13 +486,19 @@ impl Mempool {
     /// After the tip changed: drops transactions whose inputs are no longer
     /// unspent or whose name operations the chain has settled otherwise,
     /// shelving them, and brings back shelved ones that became valid again.
-    /// Returns how many left and how many returned.
+    /// `moved` holds, after a reorganization, the positions the new
+    /// branch's blocks gave their outputs, by commitment: a shelved
+    /// transaction whose input is no longer at its position is moved to
+    /// where the same output is now (positions are not signed, so the
+    /// signatures stand) and comes back too. Returns how many left and
+    /// how many returned.
     pub fn revalidate(
         &mut self,
         utxo: &UtxoSet,
         names: &NameSet,
         rtxn: &RoTxn,
         height: u32,
+        moved: &HashMap<Commitment, Vec<u64>>,
     ) -> utxo::Result<(usize, usize)> {
         let mut gone = Vec::new();
         for e in self.txs.values() {
@@ -516,13 +523,39 @@ impl Mempool {
         }
         let mut back = 0;
         let mut keep = Vec::with_capacity(self.shelf.len());
-        for e in std::mem::take(&mut self.shelf) {
+        for mut e in std::mem::take(&mut self.shelf) {
             let mut ok = !self.txs.contains_key(&e.txid);
-            for (c, p) in e.tx.spent_commitments().iter().zip(e.tx.spent_positions()) {
+            let mut positions = e.tx.spent_positions();
+            let mut relocated = false;
+            for (i, c) in e.tx.spent_commitments().iter().enumerate() {
                 if !ok {
                     break;
                 }
-                ok = utxo.holds(rtxn, p, c)? && !self.spends.contains_key(c);
+                let p = positions[i];
+                ok = utxo.holds(rtxn, p, c)? && !self.spends.contains_key(&p);
+                if !ok && let Some(candidates) = moved.get(c) {
+                    // The same output, replayed at a new position.
+                    for &q in candidates {
+                        if !positions.contains(&q) && !self.spends.contains_key(&q) && utxo.holds(rtxn, q, c)? {
+                            positions[i] = q;
+                            relocated = true;
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok && relocated {
+                let mut tx = e.tx.clone();
+                tx.set_positions(&positions);
+                // A policy input's timelocks count from its output's
+                // creation, which the move may have changed.
+                ok = tx
+                    .check_policy_inputs(height, |p| utxo.output_at(rtxn, p).ok().flatten().map(|(_, _, h)| h))
+                    .is_ok();
+                if ok {
+                    e.tx = tx;
+                }
             }
             if ok && !e.tx.ops.is_empty() {
                 ok = check_ops(&e.tx, names, rtxn, height).is_ok()
@@ -531,8 +564,6 @@ impl Mempool {
             if ok && self.make_room(&e).is_ok() {
                 self.add(e);
                 back += 1;
-            } else if ok {
-                keep.push(e);
             } else {
                 keep.push(e);
             }
@@ -630,6 +661,91 @@ mod tests {
         tx
     }
 
+    /// Two unspent outputs with one commitment (one key hash, one amount)
+    /// are two outputs: spending one does not conflict with spending the
+    /// other, a transaction may spend both, and a conflict is a second
+    /// spend of the same position.
+    #[test]
+    fn outputs_sharing_a_commitment_are_told_apart() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-twins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for _ in 0..2 {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(1), 500).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let mut k = key(1);
+        let mut spend_at = |positions: &[u64], fee: u64| {
+            let inputs = positions.iter().map(|_| (pk(1), 500)).collect();
+            let total = 500 * positions.len() as u64;
+            // Paid to a key by its first position: the txid covers neither
+            // positions nor signatures, so these differ only by output.
+            let to = pk(100 + positions[0] as u8);
+            let mut tx = UnsignedTransaction::new(inputs, vec![Output::new(&to, total - fee)])
+                .sign(|_, _, m| k.sign(m))
+                .unwrap();
+            tx.set_positions(positions);
+            tx
+        };
+        let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+        pool.insert(spend_at(&[0], 5), &utxo, &names, &rtxn, 1).unwrap();
+        pool.insert(spend_at(&[1], 5), &utxo, &names, &rtxn, 1).unwrap();
+        assert_eq!(pool.len(), 2);
+        // A second spend of position 0 conflicts with the first.
+        let again = spend_at(&[0], 6);
+        assert!(matches!(pool.insert(again, &utxo, &names, &rtxn, 1), Err(Reject::ReplacementFee { .. })));
+        // Both at once is no duplicate; the same position twice is.
+        let mut other = Mempool::with_policy(1 << 20, Policy::NONE);
+        other.insert(spend_at(&[0, 1], 5), &utxo, &names, &rtxn, 1).unwrap();
+        assert_eq!(other.insert(spend_at(&[1, 1], 5), &utxo, &names, &rtxn, 1), Err(Reject::Malformed));
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reorganization that replays an output at a new position: the
+    /// transaction spending it leaves the pool for the shelf, and comes
+    /// back spending it where it now is.
+    #[test]
+    fn shelved_transactions_follow_their_outputs() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        let out = Output::new(&pk(1), 1000);
+        utxo.add_output(&mut wtxn, &out.block_output(), 0).unwrap();
+        wtxn.commit().unwrap();
+        let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+        let rtxn = env.read_txn().unwrap();
+        let id = pool.insert(spend(1, 1000, 5), &utxo, &names, &rtxn, 1).unwrap();
+        drop(rtxn);
+        // The block that made it is replaced: the output is gone from
+        // position 0, and the new branch makes it again at position 2.
+        let mut wtxn = env.write_txn().unwrap();
+        assert!(utxo.spend_at(&mut wtxn, &out.commitment, 0).unwrap());
+        utxo.add_output(&mut wtxn, &Output::new(&pk(9), 7).block_output(), 0).unwrap();
+        let at = utxo.add_output(&mut wtxn, &out.block_output(), 0).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new()).unwrap(), (1, 0));
+        // Told nothing moved, it stays shelved; told where, it comes back.
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new()).unwrap(), (0, 0));
+        let moved = HashMap::from([(out.commitment, vec![1, at])]);
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &moved).unwrap(), (0, 1));
+        assert_eq!(pool.get(&id).unwrap().spent_positions(), vec![at]);
+        // The signature still holds: positions are not signed.
+        assert!(pool.get(&id).unwrap().verify_signatures());
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pool_validates_orders_and_revalidates() {
         let dir = std::env::temp_dir().join(format!("tabminer-mempool-{}", std::process::id()));
@@ -700,14 +816,14 @@ mod tests {
         assert!(utxo.spend_at(&mut wtxn, &c1, 0).unwrap());
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0, 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new()).unwrap(), (0, 1));
         assert!(pool.contains(&id1));
 
         // Replacement: paying the old fee plus a byte's worth per byte
@@ -870,14 +986,14 @@ mod tests {
         names.apply(&utxo, &mut wtxn, 22, &[BlockNameOp::Reveal { record: alice.clone(), commit: 6 }], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23, &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         names.apply(&utxo, &mut wtxn, 23, &[BlockNameOp::Update(bob2.clone())], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24, &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id2));
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);
