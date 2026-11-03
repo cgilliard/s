@@ -35,8 +35,10 @@ pub const CIRCUIT_KEEPALIVE_SECS: u64 = 15 * 60;
 /// A session held over a circuit with no keepalive for this long is gone;
 /// it ends with its circuit in any case.
 pub const CIRCUIT_SESSION_TIMEOUT_SECS: u64 = 3 * CIRCUIT_KEEPALIVE_SECS;
-/// How long a wallet's announce is valid; it is renewed well before.
-pub const ANNOUNCE_LIFETIME_SECS: u64 = 86_400;
+/// How long a wallet's announce is valid: two hours. Its Kyber key is
+/// replaced after half that, so a key decapsulates what anyone sends the
+/// address for an hour at most (chosen ciphertexts for a timing attack).
+pub const ANNOUNCE_LIFETIME_SECS: u64 = 2 * 3600;
 /// Largest object: an announce is about 6.5 KB, a payload a slate plus
 /// an announce.
 pub const MAX_OBJECT: usize = 64 << 10;

@@ -593,7 +593,7 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    tell which seed name it is), and forwards a payload only down a live
    session. A node with a wallet keeps sessions at its points (the
    seeds, sorted by name), announcing one Kyber key at all of them,
-   rotated at start, on every reconnect and after 12 hours; a retired
+   rotated at start, on every reconnect and after an hour; a retired
    key opens payloads for ten more minutes. Sequence numbers are the
    time in milliseconds, so they rise across restarts. A request left
    unanswered pings the point again, since a restarted relay has new
@@ -675,7 +675,7 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      each as in init mode: `Session` every 30 s, every 3 s while the
      point does not hold the current announce, the same Kyber key at
      every point, rotated at start, when a live session or its circuit
-     is lost, and after 12 hours. A circuit that dies is built again
+     is lost, and after an hour. A circuit that dies is built again
      after 3 s; a point that refuses is left for a minute. A send goes
      over a live circuit picked at random: `GetAnnounce` unless the
      wallet gave the recipient's announce, then `Send`, and the wallet

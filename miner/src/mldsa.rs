@@ -44,14 +44,38 @@ pub const SEED_LEN: usize = 32;
 
 type Poly = [i64; N];
 
+// Signing handles secret values: the arithmetic below has no branches
+// on data, and divisions are by constants, which compile to multiplies.
+
+/// All ones if `x < 0`, else zero.
+fn neg_mask(x: i64) -> i64 {
+    x >> 63
+}
+
+/// All ones if `a == b`, else zero.
+fn eq_mask(a: i64, b: i64) -> i64 {
+    let d = a ^ b;
+    !neg_mask(d | d.wrapping_neg())
+}
+
+fn ct_abs(x: i64) -> i64 {
+    let m = neg_mask(x);
+    (x ^ m) - m
+}
+
+fn ct_max(a: i64, b: i64) -> i64 {
+    a ^ ((a ^ b) & neg_mask(a - b))
+}
+
 fn modq(a: i64) -> i64 {
-    a.rem_euclid(Q)
+    let r = a % Q;
+    r + (neg_mask(r) & Q)
 }
 
 /// `a mod± q`: the representative in `(-q/2, q/2]`.
 fn centered(a: i64) -> i64 {
     let r = modq(a);
-    if r > Q / 2 { r - Q } else { r }
+    r - (neg_mask(Q / 2 - r) & Q)
 }
 
 fn powq(mut base: i64, mut exp: u64) -> i64 {
@@ -132,7 +156,7 @@ fn poly_sub(a: &Poly, b: &Poly) -> Poly {
 }
 
 fn infinity_norm(a: &Poly) -> i64 {
-    a.iter().map(|&x| centered(x).abs()).max().unwrap_or(0)
+    a.iter().fold(0, |m, &x| ct_max(m, ct_abs(centered(x))))
 }
 
 // ---------------------------------------------------------------------------
@@ -244,11 +268,11 @@ fn power2round(r: i64) -> (i64, i64) {
 /// `(r1, r0)` with `r = r1·2γ2 + r0`, `r0` centered, `r1` in `[0, 16)`.
 fn decompose(r: i64) -> (i64, i64) {
     let r = modq(r);
-    let mut r0 = r.rem_euclid(2 * GAMMA2);
-    if r0 > GAMMA2 {
-        r0 -= 2 * GAMMA2;
-    }
-    if r - r0 == Q - 1 { (0, r0 - 1) } else { ((r - r0) / (2 * GAMMA2), r0) }
+    let mut r0 = r % (2 * GAMMA2);
+    r0 -= neg_mask(GAMMA2 - r0) & (2 * GAMMA2);
+    // The top end wraps to r1 = 0: r - r0 = q - 1 gives (0, r0 - 1).
+    let edge = eq_mask(r - r0, Q - 1);
+    (((r - r0) / (2 * GAMMA2)) & !edge, r0 + edge)
 }
 
 fn high_bits(r: i64) -> i64 {
@@ -259,8 +283,9 @@ fn low_bits(r: i64) -> i64 {
     decompose(r).1
 }
 
-fn make_hint(z: i64, r: i64) -> bool {
-    high_bits(r) != high_bits(r + z)
+/// The hint bit, 0 or 1.
+fn make_hint(z: i64, r: i64) -> i64 {
+    1 + eq_mask(high_bits(r), high_bits(r + z))
 }
 
 fn use_hint(h: bool, r: i64) -> i64 {
@@ -392,6 +417,8 @@ fn w1_encode(w1: &[Poly; K]) -> Vec<u8> {
 pub struct SecretKey {
     sk: Vec<u8>,
     pk: Vec<u8>,
+    /// Mix fresh randomness into each signature (FIPS 204's hedged mode).
+    hedged: bool,
 }
 
 impl std::fmt::Debug for SecretKey {
@@ -450,7 +477,7 @@ pub fn keygen(seed: &[u8; SEED_LEN]) -> SecretKey {
     for t in &t0 {
         bit_pack(t, D as usize, 1 << (D - 1), &mut sk);
     }
-    SecretKey { sk, pk }
+    SecretKey { sk, pk, hedged: false }
 }
 
 /// The message as signed: a domain byte, the context's length, the
@@ -479,13 +506,31 @@ impl SecretKey {
         if sk.len() != SK_LEN || pk.len() != PK_LEN || shake256(pk, 64) != sk[64..128] || sk[..32] != pk[..32] {
             return None;
         }
-        Some(SecretKey { sk: sk.to_vec(), pk: pk.to_vec() })
+        Some(SecretKey { sk: sk.to_vec(), pk: pk.to_vec(), hedged: false })
     }
 
-    /// Signs `msg` under `ctx` (at most 255 bytes), deterministically.
+    /// The key, signing in FIPS 204's hedged mode: 32 fresh random bytes
+    /// go into each signature, so the same message never takes the same
+    /// path twice and a timing measurement cannot be repeated and
+    /// averaged. For a key that signs whatever anyone asks (a relay's).
+    pub fn hedged(mut self) -> SecretKey {
+        self.hedged = true;
+        self
+    }
+
+    /// Signs `msg` under `ctx` (at most 255 bytes): deterministically,
+    /// unless the key is [`SecretKey::hedged`].
     pub fn sign(&self, msg: &[u8], ctx: &[u8]) -> Vec<u8> {
         assert!(ctx.len() <= 255, "context too long");
-        self.sign_internal(&framed(msg, ctx), &[0u8; 32])
+        let mut rnd = [0u8; 32];
+        if self.hedged {
+            // Without randomness the signature is still valid, only
+            // deterministic.
+            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                std::io::Read::read_exact(&mut f, &mut rnd).ok();
+            }
+        }
+        self.sign_internal(&framed(msg, ctx), &rnd)
     }
 
     fn sign_internal(&self, m: &[u8], rnd: &[u8; 32]) -> Vec<u8> {
@@ -545,39 +590,41 @@ impl SecretKey {
                 inv_ntt(&mut cs1);
                 poly_add(&y[i], &cs1)
             });
-            if z.iter().any(|p| infinity_norm(p) >= GAMMA1 - BETA) {
-                continue;
-            }
+            // Every check runs in full and the attempt is accepted or
+            // rejected once, at the end: where a bound fails, which
+            // depends on the key, does not show in the time taken.
+            let z_norm = z.iter().fold(0, |m, p| ct_max(m, infinity_norm(p)));
             let w_minus_cs2: [Poly; K] = core::array::from_fn(|i| {
                 let mut cs2 = mul_ntt(&c_hat, &s2_hat[i]);
                 inv_ntt(&mut cs2);
                 poly_sub(&w[i], &cs2)
             });
-            let r0_max =
-                w_minus_cs2.iter().map(|p| p.iter().map(|&x| low_bits(x).abs()).max().unwrap()).max().unwrap();
-            if r0_max >= GAMMA2 - BETA {
-                continue;
-            }
+            let r0_max = w_minus_cs2.iter().flatten().fold(0, |m, &x| ct_max(m, ct_abs(low_bits(x))));
             let ct0: [Poly; K] = core::array::from_fn(|i| {
                 let mut p = mul_ntt(&c_hat, &t0_hat[i]);
                 inv_ntt(&mut p);
                 p
             });
-            if ct0.iter().any(|p| infinity_norm(p) >= GAMMA2) {
-                continue;
-            }
-            let mut h = [[false; N]; K];
+            let ct0_norm = ct0.iter().fold(0, |m, p| ct_max(m, infinity_norm(p)));
+            let mut hints = [[0i64; N]; K];
             let mut weight = 0;
             for i in 0..K {
                 for c in 0..N {
                     let bit = make_hint(modq(-ct0[i][c]), modq(w_minus_cs2[i][c] + ct0[i][c]));
-                    h[i][c] = bit;
-                    weight += usize::from(bit);
+                    hints[i][c] = bit;
+                    weight += bit;
                 }
             }
-            if weight > OMEGA {
+            // Each term is all ones when its bound is broken.
+            let reject = !neg_mask(z_norm - (GAMMA1 - BETA))
+                | !neg_mask(r0_max - (GAMMA2 - BETA))
+                | !neg_mask(ct0_norm - GAMMA2)
+                | neg_mask(OMEGA as i64 - weight);
+            if reject != 0 {
                 continue;
             }
+            // Accepted: the hint is part of the signature, public from here.
+            let h: [[bool; N]; K] = core::array::from_fn(|i| core::array::from_fn(|c| hints[i][c] == 1));
             let mut sig = Vec::with_capacity(SIG_LEN);
             sig.extend_from_slice(&c_tilde);
             for zi in &z {
@@ -691,7 +738,7 @@ mod tests {
                 }
                 "sign" => {
                     let sk_bytes = hex(f["sk"]);
-                    let sk = SecretKey { sk: sk_bytes.clone(), pk: vec![] };
+                    let sk = SecretKey { sk: sk_bytes.clone(), pk: vec![], hedged: false };
                     let sig = sk.sign(&hex(f["message"]), &hex(f["context"]));
                     assert_eq!(sig, hex(f["signature"]));
                 }
@@ -704,6 +751,50 @@ mod tests {
             cases += 1;
         }
         assert!(cases >= 10, "{cases} cases");
+    }
+
+    #[test]
+    fn hedged_signatures_differ_and_verify() {
+        let sk = keygen(&[7; 32]);
+        let plain = sk.sign(b"m", b"c");
+        assert_eq!(plain, sk.sign(b"m", b"c"));
+        let hedged = sk.clone().hedged();
+        let (a, b) = (hedged.sign(b"m", b"c"), hedged.sign(b"m", b"c"));
+        assert_ne!(a, b);
+        assert_ne!(a, plain);
+        assert!(verify(sk.public_key(), b"m", b"c", &a) && verify(sk.public_key(), b"m", b"c", &b));
+    }
+
+    /// The branchless helpers agree with the plain definitions.
+    #[test]
+    fn constant_time_helpers_match_their_definitions() {
+        let reference = |r: i64| {
+            let r = r.rem_euclid(Q);
+            let mut r0 = r.rem_euclid(2 * GAMMA2);
+            if r0 > GAMMA2 {
+                r0 -= 2 * GAMMA2;
+            }
+            if r - r0 == Q - 1 { (0, r0 - 1) } else { ((r - r0) / (2 * GAMMA2), r0) }
+        };
+        let mut x = 0x1234_5678_9abc_u64;
+        let mut values: Vec<i64> = (-3..=3).flat_map(|k| (-2..=2).map(move |d| k * Q + d)).collect();
+        values.extend((0..=32).flat_map(|k| (-2..=2).map(move |d| k * GAMMA2 + d)));
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push((x % (1 << 50)) as i64 - (1 << 49));
+        }
+        for &v in &values {
+            assert_eq!(modq(v), v.rem_euclid(Q), "{v}");
+            let r = v.rem_euclid(Q);
+            assert_eq!(centered(v), if r > Q / 2 { r - Q } else { r }, "{v}");
+            assert_eq!(decompose(v), reference(v), "{v}");
+            assert_eq!(ct_abs(v), v.abs());
+            assert_eq!(ct_max(v, v / 3), v.max(v / 3));
+            let z = (v >> 7).rem_euclid(Q);
+            assert_eq!(make_hint(z, r) == 1, reference(r).0 != reference(r + z).0, "{v}");
+        }
     }
 
     #[test]

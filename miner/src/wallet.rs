@@ -1187,10 +1187,11 @@ impl Wallet {
     /// The relay's Dilithium (ML-DSA-65) key, from the master key under its
     /// own domain tag: apart from the wallet's identity, so a relay's
     /// listed id is not its operator's payment address, and kept by a
-    /// restore from the phrase (`docs/ONION.md`).
+    /// restore from the phrase (`docs/ONION.md`). It signs in hedged mode.
     pub fn relay_key(&self) -> mldsa::SecretKey {
         let seed: [u8; mldsa::SEED_LEN] = digest_to_bytes(&hash_domain(DOM_RELAY, &self.master));
-        mldsa::keygen(&seed)
+        // It signs whatever anyone asks (every channel and hop): hedged.
+        mldsa::keygen(&seed).hedged()
     }
 
     /// The wallet's id on the message layer: the hash of its Dilithium
