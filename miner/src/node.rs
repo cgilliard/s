@@ -1204,7 +1204,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.circuits_tick(now);
         self.rendezvous_tick(now);
         let behind = self.peers.claimants(self.chain.tip_work().unwrap_or(U256::ZERO), now).next().is_some();
-        let fresh = self.peers.live_count(now) == 0 && now.duration_since(self.started) < Duration::from_secs(5);
+        // Just started, peers not heard yet: unless there are none to hear
+        // (none configured).
+        let expecting = !self.config.peers.is_empty() || !self.config.seeds.is_empty();
+        let fresh =
+            expecting && self.peers.live_count(now) == 0 && now.duration_since(self.started) < Duration::from_secs(5);
         self.syncing.store(self.mode != Mode::Normal || behind || fresh, Ordering::Release);
         if now.duration_since(self.last_save) >= SAVE_INTERVAL {
             self.last_save = now;
@@ -2671,7 +2675,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         // said so. With no peer at all for a while, this may be the first
         // node: start from genesis.
         if !self.peers.trusted(now).any(|p| p.status.is_some()) {
-            if now.duration_since(self.started) >= Duration::from_secs(10) {
+            // Nobody to wait for (no peer or seed configured, a dev node):
+            // at once.
+            let nobody = self.config.peers.is_empty() && self.config.seeds.is_empty();
+            if nobody || now.duration_since(self.started) >= Duration::from_secs(10) {
                 self.log("fast sync: no peers answered; starting from genesis until one does");
                 self.mode = Mode::Normal;
                 self.alone = true;
@@ -3430,6 +3437,7 @@ mod tests {
             // A subsidy a wallet can pay from.
             emission: &[(1000, SUBSIDY)],
             aggregator: AggregatorParams::MAINNET,
+            schedule: crate::difficulty::Schedule::MAINNET,
         }
     }
 
@@ -4031,16 +4039,27 @@ mod tests {
             };
             sock.send_to(&bytes, addr_a).unwrap();
         }
-        // Still answering.
-        std::thread::sleep(Duration::from_millis(200));
-        sock.send_to(&Message::Ping(Status { nonce: 99, ..st }).encode(), addr_a).unwrap();
+        // Still answering others (the garbage's sender may rightly be
+        // banned by now), a ping or two lost to a full receive buffer
+        // aside.
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        other.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut buf = [0u8; net::MAX_DATAGRAM];
-        loop {
-            let (n, _) = sock.recv_from(&mut buf).expect("the node still answers");
-            if matches!(Message::decode(&buf[..n]), Some(Message::Pong(s)) if s.nonce == 99) {
+        let ping = Message::Ping(Status { nonce: 99, ..st }).encode();
+        let mut answered = false;
+        for _ in 0..5 {
+            other.send_to(&ping, addr_a).unwrap();
+            while let Ok((n, _)) = other.recv_from(&mut buf) {
+                if matches!(Message::decode(&buf[..n]), Some(Message::Pong(s)) if s.nonce == 99) {
+                    answered = true;
+                    break;
+                }
+            }
+            if answered {
                 break;
             }
         }
+        assert!(answered, "the node still answers");
         tx_a.send(Event::Stop).unwrap();
         ha.join().unwrap();
     }

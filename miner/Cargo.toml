@@ -8,6 +8,11 @@ default-run = "tabminer"
 name = "genesis"
 path = "tools/genesis.rs"
 
+[features]
+# The dev networks (`--network dev`, `dev-recursive`): their built-in
+# dataset and plan. Off by default, so release builds carry none of it.
+dev = []
+
 [dependencies]
 heed = { version = "0.20", default-features = false }
 

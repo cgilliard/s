@@ -39,6 +39,13 @@ pub type Nonce = [u8; 32];
 /// Compressed seed text, embedded at build time.
 pub const SEED_TEXT_GZ: &[u8] = include_bytes!("../../resources/akjv.txt.gz");
 
+/// The dev dataset ([`PowParams::DEV`]), generated once from the seed text
+/// and built in (with the `dev` feature), so a dev node starts at once.
+/// `dev_dataset_is_built_in` checks it; `write_dev_dataset` (an ignored
+/// test) regenerates it.
+#[cfg(feature = "dev")]
+pub const DEV_DATASET: &[u8] = include_bytes!("../../resources/dev_dataset.bin");
+
 /// Size of the decompressed seed text, checked when loading.
 pub const SEED_TEXT_LEN: usize = 4_340_917;
 
@@ -64,6 +71,10 @@ pub struct PowParams {
 impl PowParams {
     /// 64 MB dataset.
     pub const MAINNET: PowParams = PowParams { log_dataset_items: 20, parents: 256, accesses: 64 };
+
+    /// The dev networks' (`--network dev`): a 64 KB dataset, built into
+    /// the binary ([`DEV_DATASET`]).
+    pub const DEV: PowParams = PowParams { log_dataset_items: 10, parents: 256, accesses: 64 };
 
     pub const fn dataset_items(&self) -> usize {
         1 << self.log_dataset_items
@@ -218,6 +229,9 @@ impl Dataset {
     /// through it match the text.
     pub fn load_or_generate(seed: &SeedText, path: &std::path::Path) -> std::io::Result<Dataset> {
         let params = *seed.params();
+        if let Some(d) = Self::built_in(params) {
+            return Ok(d);
+        }
         if let Ok(bytes) = std::fs::read(path)
             && bytes.len() > CHECKSUM_BYTES
             && let (body, sum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES)
@@ -236,6 +250,17 @@ impl Dataset {
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(d)
+    }
+
+    /// The dataset built into the binary for `params`, if any: the dev
+    /// networks', in a build with the `dev` feature.
+    pub fn built_in(params: PowParams) -> Option<Dataset> {
+        #[cfg(feature = "dev")]
+        if params == PowParams::DEV {
+            return Self::from_bytes(params, DEV_DATASET);
+        }
+        let _ = params;
+        None
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -451,6 +476,23 @@ const _: () = assert!(P > 0x0100_0193);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in dev dataset is the one the seed text gives.
+    #[test]
+    #[cfg(feature = "dev")]
+    fn dev_dataset_is_built_in() {
+        let built = Dataset::built_in(PowParams::DEV).expect("the dev dataset decodes");
+        assert_eq!(built, Dataset::generate(&SeedText::new(PowParams::DEV)), "regenerate it: write_dev_dataset");
+        assert!(Dataset::built_in(PowParams::MAINNET).is_none());
+    }
+
+    /// Writes `resources/dev_dataset.bin` from the seed text.
+    #[test]
+    #[ignore = "writes resources/dev_dataset.bin"]
+    fn write_dev_dataset() {
+        let d = Dataset::generate(&SeedText::new(PowParams::DEV));
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../resources/dev_dataset.bin"), d.to_bytes()).unwrap();
+    }
     use std::sync::OnceLock;
 
     const SMALL: PowParams = PowParams { log_dataset_items: 10, parents: 256, accesses: 64 };

@@ -54,7 +54,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::aggregate::AggregatorParams;
 use crate::block::{Block, BlockOutput, Body, BodyError, HEADER_SIZE, Header};
-use crate::difficulty::{Asert, U256};
+use crate::difficulty::{Asert, Schedule, U256};
 use crate::name_trie::Key;
 use crate::names::{ApplyError, Commit, NameSet, NameUndo, Record, commit_leaf, part_hash};
 use crate::poseidon2::digest_from_bytes;
@@ -106,6 +106,8 @@ pub struct ChainParams {
     pub emission: &'static [(u32, u64)],
     /// Parameters of the block validity proof.
     pub aggregator: AggregatorParams,
+    /// The block time and difficulty schedule.
+    pub schedule: Schedule,
 }
 
 impl ChainParams {
@@ -123,6 +125,37 @@ impl ChainParams {
         median_time_window: 11,
         emission: MAINNET_EMISSION,
         aggregator: AggregatorParams::MAINNET,
+        schedule: Schedule::MAINNET,
+    };
+
+    /// The dev network (`--network dev`), for rapid testing on a machine
+    /// or a few: a block a second (the schedule starting at block 1), the
+    /// built-in 64 KB dataset, direct proofs in a fraction of a second, an
+    /// easy target. Its own genesis, so its nodes never mix with mainnet's.
+    pub const DEV: ChainParams = ChainParams {
+        pow: PowParams::DEV,
+        genesis_timestamp: 1_767_225_600, // 2026-01-01
+        genesis_nonce: *b"tabminer dev network, direct....",
+        genesis_target: U256([0, 0, 0, 1 << 36]), // 2^20 hashes, about a second on 12 cores
+        max_target: ChainParams::MAINNET.max_target,
+        max_block_size: 2_000_000,
+        max_future_drift: 2 * 3600,
+        median_time_window: 11,
+        emission: MAINNET_EMISSION,
+        aggregator: AggregatorParams::DEV,
+        schedule: Schedule { block_time: 1, half_life: 60, from_first_block: true },
+    };
+
+    /// The recursive dev network (`--network dev-recursive`): as
+    /// [`ChainParams::DEV`], but blocks carry chain proofs made the mainnet
+    /// way at the smallest parameters (about six seconds a block), every
+    /// ten seconds. For testing the proof path and fast sync's reliance on
+    /// it.
+    pub const DEV_RECURSIVE: ChainParams = ChainParams {
+        genesis_nonce: *b"tabminer dev network, recursive.",
+        aggregator: AggregatorParams::DEV_RECURSIVE,
+        schedule: Schedule { block_time: 10, half_life: 300, from_first_block: true },
+        ..Self::DEV
     };
 
     /// Subsidy paid by the block at `height`: zero for genesis and above
@@ -687,6 +720,9 @@ pub struct Chain<V: ProofVerifier> {
     /// header in microseconds instead of tens of milliseconds from the
     /// seed text.
     dataset: std::sync::RwLock<Option<std::sync::Arc<crate::pow::Dataset>>>,
+    /// Headers' block 1, by header hash, for a schedule anchored there
+    /// ([`Schedule::from_first_block`]).
+    first_blocks: Mutex<std::collections::HashMap<Digest, Header>>,
 }
 
 /// Default undo window: a week of blocks.
@@ -752,6 +788,7 @@ impl<V: ProofVerifier> Chain<V> {
             files,
             branch: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
+            first_blocks: Mutex::new(std::collections::HashMap::new()),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
         chain.abort_snapshot()?;
@@ -992,14 +1029,56 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(self.median_time_past(&rtxn, parent)? + 1)
     }
 
-    /// ASERT schedule anchored at genesis.
-    fn asert(&self, genesis: &Header) -> Asert {
-        Asert::from_genesis(genesis.timestamp as i64, self.params.genesis_target, self.params.max_target)
+    fn target_after(&self, rtxn: &RoTxn, parent: &Header) -> Result<Target> {
+        let (p, schedule) = (&self.params, self.params.schedule);
+        let asert = match self.schedule_anchor(rtxn, parent)? {
+            Some(first) => Asert::anchored(1, first.timestamp as i64, p.genesis_target, p.max_target, schedule),
+            None => {
+                let genesis = self.header_at_in(rtxn, 0)?.ok_or(ChainError::NoGenesis)?;
+                Asert::anchored(0, genesis.timestamp as i64, p.genesis_target, p.max_target, schedule)
+            }
+        };
+        Ok(asert.next_target(parent.height as u64, parent.timestamp as i64).into())
     }
 
-    fn target_after(&self, rtxn: &RoTxn, parent: &Header) -> Result<Target> {
-        let genesis = self.header_at_in(rtxn, 0)?.ok_or(ChainError::NoGenesis)?;
-        Ok(self.asert(&genesis).next_target(parent.height as u64, parent.timestamp as i64).into())
+    /// Block 1 of `parent`'s branch, where a schedule that starts at the
+    /// first block is anchored (block 1's target is genesis's either way);
+    /// `None` for genesis anchoring. Each header's block 1 is remembered,
+    /// so a run of headers looks it up from its parent's.
+    fn schedule_anchor(&self, rtxn: &RoTxn, parent: &Header) -> Result<Option<Header>> {
+        if !self.params.schedule.from_first_block || parent.height == 0 {
+            return Ok(None);
+        }
+        // Block 1 may be a header being checked, not stored yet: kept as
+        // the walk finds it.
+        let mut firsts = self.first_blocks.lock().unwrap();
+        let mut walked = Vec::new();
+        let mut h = *parent;
+        let first = loop {
+            if h.height == 1 {
+                walked.push(h.hash());
+                break h;
+            }
+            if let Some(f) = firsts.get(&h.hash()) {
+                break *f;
+            }
+            walked.push(h.hash());
+            // Headers are checked in order: the parent's parent's block 1 is
+            // known, even while those headers are not stored yet.
+            if let Some(f) = firsts.get(&h.prev_hash) {
+                break *f;
+            }
+            h = self
+                .header_by_hash_in(rtxn, &digest_bytes(&h.prev_hash))?
+                .ok_or(ChainError::Corrupt("header parent"))?;
+        };
+        if firsts.len() > 100_000 {
+            firsts.clear();
+        }
+        for w in walked {
+            firsts.insert(w, first);
+        }
+        Ok(Some(first))
     }
 
     /// Target the block after `parent` must meet.
@@ -2917,6 +2996,7 @@ mod tests {
             median_time_window: 11,
             emission: &[(10, 50), (10, 25), (5, 12)],
             aggregator: AggregatorParams::MAINNET,
+            schedule: crate::difficulty::Schedule::MAINNET,
         }
     }
 
@@ -2943,6 +3023,46 @@ mod tests {
         let dataset = Dataset::generate(&seed);
         let chain = Chain::open(&dir.0, 64 << 20, params(), seed, AcceptAllProofs).unwrap();
         Fixture { _dir: dir, chain, dataset }
+    }
+
+    /// A schedule that starts at block 1 (the dev networks'): blocks mined
+    /// one after another on one chain, and their headers taken in one run
+    /// by another, agree on every target; block 1's own target is
+    /// genesis's.
+    #[test]
+    fn a_schedule_from_block_one_agrees_over_a_run_of_headers() {
+        let p = ChainParams { schedule: Schedule { block_time: 1, half_life: 60, from_first_block: true }, ..params() };
+        let open_with = |name: &str| {
+            let dir = TempDir::new(name);
+            let chain = Chain::open(&dir.0, 64 << 20, p, seed(), AcceptAllProofs).unwrap();
+            chain.init_genesis(&genesis_block(vec![])).unwrap();
+            (dir, chain)
+        };
+        let (_da, a) = open_with("first-a");
+        let dataset = Dataset::generate(&seed());
+        let mut t = GENESIS_TIME + 10_000;
+        for _ in 0..12 {
+            t += 1;
+            let tip = a.tip().unwrap().unwrap();
+            let reward = Output::new(&pk(1), p.subsidy(tip.height + 1)).block_output();
+            let body = Body { outputs: vec![reward], proof: vec![1; 8], ..Default::default() };
+            let mut header = a.template(&body, t).unwrap();
+            let target = a.expected_target(&tip).unwrap();
+            if tip.height == 0 {
+                assert_eq!(target, Target::from(p.genesis_target));
+            }
+            let (nonce, out) =
+                pow::mine(&dataset, &header.pow_hash(), &target, (0..10_000_000).map(nonce_from_u64)).unwrap();
+            header.nonce = nonce;
+            header.mix = out.mix;
+            a.apply_block(&Block { header, body }, t).unwrap();
+        }
+        let headers: Vec<Header> = (1..=12).map(|h| a.header_at(h).unwrap().unwrap()).collect();
+        let (_db, b) = open_with("first-b");
+        let (n, stop) = b.accept_headers(&headers, t);
+        assert!(stop.is_none(), "{stop:?}");
+        assert_eq!(n, 12);
+        assert_eq!(b.best_header().unwrap(), headers[11]);
     }
 
     fn genesis_block(outputs: Vec<Output>) -> Block {

@@ -229,6 +229,25 @@ pub fn target_to_compact(target: U256) -> u32 {
     (compact as u32) | (size << 24)
 }
 
+/// When blocks are due and how fast the target follows a chain that is
+/// ahead of its schedule or behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    /// Seconds between blocks.
+    pub block_time: i64,
+    /// Seconds ahead of (behind) schedule that halve (double) the target.
+    pub half_life: i64,
+    /// The schedule starts at block 1 rather than genesis: for a network
+    /// whose genesis is fixed long before it runs (`--network dev`), which
+    /// would otherwise be behind schedule, at the easiest target, for good.
+    pub from_first_block: bool,
+}
+
+impl Schedule {
+    pub const MAINNET: Schedule =
+        Schedule { block_time: IDEAL_BLOCK_TIME, half_life: HALF_LIFE, from_first_block: false };
+}
+
 /// Fixed parameters of an ASERT schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Asert {
@@ -246,13 +265,20 @@ impl Asert {
     /// Schedule anchored at a genesis block with the given timestamp and
     /// target, using mainnet constants.
     pub fn from_genesis(genesis_time: i64, genesis_target: U256, max_target: U256) -> Asert {
+        Self::anchored(0, genesis_time, genesis_target, max_target, Schedule::MAINNET)
+    }
+
+    /// Schedule anchored at the block at `height` with timestamp `time`
+    /// and target `target`: its parent is taken to be one block time
+    /// before it.
+    pub fn anchored(height: u64, time: i64, target: U256, max_target: U256, schedule: Schedule) -> Asert {
         Asert {
-            anchor_height: 0,
-            anchor_parent_time: genesis_time - IDEAL_BLOCK_TIME,
-            anchor_target: genesis_target,
+            anchor_height: height,
+            anchor_parent_time: time - schedule.block_time,
+            anchor_target: target,
             max_target,
-            half_life: HALF_LIFE,
-            ideal_block_time: IDEAL_BLOCK_TIME,
+            half_life: schedule.half_life,
+            ideal_block_time: schedule.block_time,
         }
     }
 

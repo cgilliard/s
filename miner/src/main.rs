@@ -80,7 +80,15 @@ const USAGE: &str = "usage:
   tabminer show [--data DIR]
   tabminer restore [--data DIR]     rebuild a wallet from its 12-word phrase
 
-  --data DIR        chain, wallet and log directory (default ~/.tabernacle/tabminer)
+  --data DIR        chain, wallet and log directory (default ~/.tabernacle/tabminer,
+                    or tabminer-dev / tabminer-dev-recursive beside it)
+  --network NAME    mainnet (default); dev: a test chain of its own with a block a
+                    second, proofs checked segment by segment (no chain proof),
+                    the proof-of-work dataset built in, port 3747, no seeds;
+                    dev-recursive: the same with the mainnet proof path at the
+                    smallest parameters (about six seconds a block, every ten
+                    seconds), port 3757. Dev coins are worth nothing. Both need
+                    a build with `--features dev`
   --blocks N        blocks to mine, 0 for no limit (default 0)
   --jobs N          segments proven at once (default 2)
   TABMINER_THREADS=N  (environment) threads for hashing and proving, all
@@ -226,8 +234,48 @@ const PROOF_SIZE_ALLOWANCE: usize = 256 << 10;
 /// on.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Which chain a node is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Network {
+    Mainnet,
+    /// Rapid blocks for testing: direct proofs, a block a second.
+    Dev,
+    /// The mainnet proof path at the smallest parameters.
+    DevRecursive,
+}
+
+impl Network {
+    fn params(self) -> ChainParams {
+        match self {
+            Network::Mainnet => ChainParams::MAINNET,
+            Network::Dev => ChainParams::DEV,
+            Network::DevRecursive => ChainParams::DEV_RECURSIVE,
+        }
+    }
+
+    /// The default data directory's name, under ~/.tabernacle.
+    fn dir_name(self) -> &'static str {
+        match self {
+            Network::Mainnet => "tabminer",
+            Network::Dev => "tabminer-dev",
+            Network::DevRecursive => "tabminer-dev-recursive",
+        }
+    }
+
+    /// The default UDP port: apart, so a mainnet and a dev node can run on
+    /// one machine.
+    fn port(self) -> u16 {
+        match self {
+            Network::Mainnet => DEFAULT_PORT,
+            Network::Dev => DEFAULT_PORT + 10,
+            Network::DevRecursive => DEFAULT_PORT + 20,
+        }
+    }
+}
+
 struct Args {
     command: String,
+    network: Network,
     data: PathBuf,
     blocks: u64,
     jobs: usize,
@@ -266,8 +314,10 @@ fn parse_args() -> Result<Args, String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let data = home.map(|h| h.join(".tabernacle").join("tabminer")).unwrap_or_else(|| PathBuf::from("tabminer-data"));
+    let (mut data_given, mut listen_given) = (false, false);
     let mut a = Args {
         command,
+        network: Network::Mainnet,
         data,
         blocks: 0,
         jobs: 2,
@@ -294,13 +344,28 @@ fn parse_args() -> Result<Args, String> {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<u64>().map_err(|_| format!("{flag}: not a number: {v}"));
         match flag.as_str() {
-            "--data" => a.data = PathBuf::from(value()?),
+            "--data" => {
+                a.data = PathBuf::from(value()?);
+                data_given = true;
+            }
+            "--network" => {
+                a.network = match value()?.as_str() {
+                    "mainnet" => Network::Mainnet,
+                    "dev" => Network::Dev,
+                    "dev-recursive" => Network::DevRecursive,
+                    other => return Err(format!("--network: unknown network {other} (mainnet, dev or dev-recursive)")),
+                };
+                if a.network != Network::Mainnet && !cfg!(feature = "dev") {
+                    return Err("the dev networks need a build with them: cargo build --release --features dev".into());
+                }
+            }
             "--blocks" => a.blocks = number(value()?)?,
             "--jobs" => a.jobs = number(value()?)?.max(1) as usize,
             "--no-mine" => a.no_mine = true,
             "--no-prompt" => a.no_prompt = true,
             "--password-file" => a.password_file = Some(PathBuf::from(value()?)),
             "--listen" => {
+                listen_given = true;
                 let v = value()?;
                 a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
             }
@@ -338,6 +403,17 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
         }
+    }
+    // A dev network has its own directory, port and no seeds (the built-in
+    // ones are mainnet's).
+    if a.network != Network::Mainnet {
+        if !data_given {
+            a.data = a.data.with_file_name(a.network.dir_name());
+        }
+        if !listen_given {
+            a.listen.set_port(a.network.port());
+        }
+        a.no_seeds = true;
     }
     if (a.debug_fill.is_some() || a.debug_fill_names > 0) && !a.debug_unchecked {
         return Err(
@@ -480,7 +556,7 @@ fn net_config(args: &Args) -> Config {
 }
 
 fn show(args: &Args) -> AnyResult<()> {
-    let params = ChainParams::MAINNET;
+    let params = args.network.params();
     let chain = open_chain(args, params, SeedText::new(params.pow))?;
     let Some(tip) = chain.tip()? else {
         println!("no chain in {}", args.data.display());
@@ -562,7 +638,7 @@ impl Ctx {
 /// Runs the node, the miner if `mining`, and the prompt (or waits) until
 /// `quit`.
 fn run(args: &Args, mining: bool) -> AnyResult<()> {
-    let params = ChainParams::MAINNET;
+    let params = args.network.params();
     std::fs::create_dir_all(&args.data)?;
     let log_path = args.data.join("tabminer.log");
     log::init(Some(&log_path), args.no_prompt)?;
@@ -570,6 +646,16 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         println!("logging to {}", log_path.display());
     }
     log::line(&format!("tabminer starting in {}", args.data.display()));
+    if args.network != Network::Mainnet {
+        let msg = format!(
+            "network {:?}: a test chain of its own, a block every {} s; its coins are worth nothing",
+            args.network, params.schedule.block_time
+        );
+        log::line(&msg);
+        if !args.no_prompt {
+            println!("{msg}");
+        }
+    }
 
     let seed = SeedText::new(params.pow);
     let dataset = if mining {
@@ -633,7 +719,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         }
         log::line(msg);
     }
-    if mining && !args.debug_unchecked {
+    if mining && chain.verifier().needs_plan() {
         // The miner proves membership of its wrap in the plan of every
         // segment count: built into the binary, else planned (a minute).
         let t = Instant::now();
@@ -2043,7 +2129,8 @@ fn new_password() -> AnyResult<String> {
 }
 
 /// The wallet's password at startup: from --password-file, else asked
-/// unless --no-prompt (a new wallet is then left unlocked).
+/// unless --no-prompt (a new wallet is then left unlocked). A new dev
+/// wallet is left unlocked without asking.
 fn wallet_password(args: &Args, ask: Ask) -> Result<String, tabminer::wallet::WalletError> {
     let io = tabminer::wallet::WalletError::Io;
     if let Some(file) = &args.password_file {
@@ -2051,6 +2138,9 @@ fn wallet_password(args: &Args, ask: Ask) -> Result<String, tabminer::wallet::Wa
         return Ok(text.lines().next().unwrap_or("").to_string());
     }
     match (ask, args.no_prompt) {
+        // Dev coins are worth nothing: a dev wallet is made unlocked,
+        // without asking (one locked later with `password` still asks).
+        (Ask::New, _) if args.network != Network::Mainnet => Ok(String::new()),
         (Ask::Unlock, true) => {
             Err(io(std::io::Error::other("the wallet is locked: give --password-file with --no-prompt")))
         }
@@ -2098,7 +2188,7 @@ fn restore(args: &Args) -> AnyResult<()> {
     let phrase = read_secret("recovery phrase (12 words): ")?.split_whitespace().collect::<Vec<_>>().join(" ");
     tabminer::bip39::entropy(&phrase)?;
     let pass = read_secret("BIP39 passphrase (empty if none): ")?;
-    let password = new_password()?;
+    let password = if args.network == Network::Mainnet { new_password()? } else { String::new() };
     std::fs::create_dir_all(&args.data)?;
     Wallet::restore(&dir, &phrase, &pass, &password)?;
     println!("wallet restored in {}", dir.display());
@@ -2332,13 +2422,16 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
     let wallet = ctx.wallet()?;
     let tip = chain.tip()?.unwrap();
     log::line(&format!(
-        "mining from height {}; segments of 2^{} rows at rate 1/{}, up to {} per block; nodes at rate 1/{}, wrap at 1/{}",
+        "mining from height {}; segments of 2^{} rows at rate 1/{}, up to {} per block; {}",
         tip.height,
         agg.segment_log_n,
         1 << agg.segment.log_blowup,
         agg.max_segments,
-        1 << agg.outer.log_blowup,
-        1 << agg.wrap.log_blowup
+        if agg.direct {
+            "proofs checked segment by segment, no chain proof".to_string()
+        } else {
+            format!("nodes at rate 1/{}, wrap at 1/{}", 1 << agg.outer.log_blowup, 1 << agg.wrap.log_blowup)
+        }
     ));
 
     let mut mined = 0u64;
@@ -2492,9 +2585,10 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             fmt_coins(balance.confirmed)
         ));
         // The chain proof builds on the previous block's.
-        let prev = if height > 1 && !unchecked { chain.proof_statement(height - 1)? } else { None };
+        let planned = chain.verifier().needs_plan();
+        let prev = if height > 1 && planned { chain.proof_statement(height - 1)? } else { None };
         let t = Instant::now();
-        if !unchecked {
+        if planned {
             chain.verifier().shape(segments.len());
         }
         let plan_time = t.elapsed();
