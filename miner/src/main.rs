@@ -84,10 +84,10 @@ const USAGE: &str = "usage:
                     or tabminer-dev / tabminer-dev-recursive beside it)
   --network NAME    mainnet (default); dev: a test chain of its own with a block a
                     second, proofs checked segment by segment (no chain proof),
-                    the proof-of-work dataset built in, port 3747, no seeds;
+                    the proof-of-work dataset built in, no seeds;
                     dev-recursive: the same with the mainnet proof path at the
                     smallest parameters (about six seconds a block, every ten
-                    seconds), port 3757. Dev coins are worth nothing. Both need
+                    seconds). Dev coins are worth nothing. Both need
                     a build with `--features dev`
   --blocks N        blocks to mine, 0 for no limit (default 0)
   --jobs N          segments proven at once (default 2)
@@ -270,16 +270,6 @@ impl Network {
             Network::DevRecursive => "tabminer-dev-recursive",
         }
     }
-
-    /// The default UDP port: apart, so a mainnet and a dev node can run on
-    /// one machine.
-    fn port(self) -> u16 {
-        match self {
-            Network::Mainnet => DEFAULT_PORT,
-            Network::Dev => DEFAULT_PORT + 10,
-            Network::DevRecursive => DEFAULT_PORT + 20,
-        }
-    }
 }
 
 struct Args {
@@ -323,7 +313,7 @@ fn parse_args() -> Result<Args, String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let data = home.map(|h| h.join(".tabernacle").join("tabminer")).unwrap_or_else(|| PathBuf::from("tabminer-data"));
-    let (mut data_given, mut listen_given) = (false, false);
+    let mut data_given = false;
     let mut a = Args {
         command,
         network: Network::Mainnet,
@@ -374,7 +364,6 @@ fn parse_args() -> Result<Args, String> {
             "--no-prompt" => a.no_prompt = true,
             "--password-file" => a.password_file = Some(PathBuf::from(value()?)),
             "--listen" => {
-                listen_given = true;
                 let v = value()?;
                 a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
             }
@@ -413,14 +402,12 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown option {flag}")),
         }
     }
-    // A dev network has its own directory, port and no seeds (the built-in
-    // ones are mainnet's).
+    // A dev network has its own directory and no seeds (the built-in ones
+    // are mainnet's). It keeps the default port, the one a firewall lets
+    // through: a mainnet and a dev node on one machine need `--listen`.
     if a.network != Network::Mainnet {
         if !data_given {
             a.data = a.data.with_file_name(a.network.dir_name());
-        }
-        if !listen_given {
-            a.listen.set_port(a.network.port());
         }
         a.no_seeds = true;
     }
