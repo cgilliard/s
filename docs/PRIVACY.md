@@ -243,7 +243,7 @@ relay on the path can tell from counts alone that a circuit made a
 lookup and then a payment, and what came back.
 
 Every message of a payment (`Route`, `GetAnnounce` and the announce it
-returns, `Send`, `Deliver`, `Reply`, `Notice`, `Broadcast`) is padded to
+returns, `Send`, `Deliver`, `Received`, `Reply`, `Notice`, `Broadcast`) is padded to
 the same size, `PAYMENT_CELLS` (16, about 14 KB), or to the next power of
 two above it for the rare larger one (a slate with many inputs, a large
 transaction). The cost: a payment's cells grow from about 250 relay

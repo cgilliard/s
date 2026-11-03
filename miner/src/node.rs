@@ -4674,13 +4674,25 @@ mod tests {
             Payload::seal(&found, Some((&key_q, &q_announce)), None, 1, b"a slate", &[3u8; 32], [4u8; 12]).unwrap();
         let bytes = Object::Payload(payload).to_bytes();
         nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::SEND, bytes.clone())).unwrap();
-        let notice = msg(q, circuit::NOTICE);
-        assert_eq!((&notice[..32], notice[32]), (&digest_to_bytes(&Object::id_of(&bytes))[..], net::NOTICE_FORWARDED));
         let delivered = msg(p, circuit::DELIVER);
         let Some(Object::Payload(got)) = Object::from_bytes(&delivered) else { panic!() };
         let opened = got.open(&kyber, unix_now()).unwrap();
         assert_eq!((opened.kind, &opened.inner[..]), (1, &b"a slate"[..]));
         assert_eq!(opened.from.map(|a| a.id), Some(id(5)));
+        // Forwarded once p's node says it arrived.
+        let object = digest_to_bytes(&Object::id_of(&bytes)).to_vec();
+        nodes[p].1.send(Event::TestCircuitSend(0, 1, circuit::RECEIVED, object.clone())).unwrap();
+        let notice = msg(q, circuit::NOTICE);
+        assert_eq!((&notice[..32], notice[32]), (&object[..], net::NOTICE_FORWARDED));
+        // Unacknowledged, a delivery is reported offline: the payload may
+        // have gone down a dead circuit.
+        let again =
+            Payload::seal(&found, Some((&key_q, &q_announce)), None, 1, b"lost", &[5u8; 32], [6u8; 12]).unwrap();
+        let bytes = Object::Payload(again).to_bytes();
+        nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::SEND, bytes.clone())).unwrap();
+        msg(p, circuit::DELIVER);
+        let notice = msg(q, circuit::NOTICE);
+        assert_eq!((&notice[..32], notice[32]), (&digest_to_bytes(&Object::id_of(&bytes))[..], net::NOTICE_OFFLINE));
         // Nobody holds a session for this id.
         nodes[q].1.send(Event::TestCircuitSend(0, 1, circuit::GET_ANNOUNCE, digest_to_bytes(&id(9)).to_vec())).unwrap();
         let notice = msg(q, circuit::NOTICE);

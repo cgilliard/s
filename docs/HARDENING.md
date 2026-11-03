@@ -8,6 +8,34 @@ timestamp rules, request tokens, per-host peer limits, strike policy, slate
 checks, fee policy, dust, blind rows, the dataset checksum) are in the
 history and the README; this file holds what is left.
 
+## Progress
+
+Closed in batches since the design docs were built (bb8738c); 56 entries
+then, 34 now (some entries were narrowed rather than removed, and new narrower ones added):
+
+| Batch | Area | Commit |
+|---|---|---|
+| 1 | Pool and chain: conflicts by position, reorg relocation, pool kept across restarts, `resend`, unchecked-data marker, wrap-height assert | c00641b |
+| 2 | Wallet: password-locked phrase, 0700 directory, cancel undoes name ops, orphaned rewards, payments found after a gap | c00641b |
+| 3 | Side channels: constant-time ML-DSA signing, hedged relay key, hourly Kyber rotation | bf39007 |
+| 4 | Networking and sync: non-blocking snapshot changes, slow vs unserving peers, fast-sync fallback, clock skew, header retry, serving limits, peer groups | 23f0a39 |
+| 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | (this commit) |
+
+Still to do, as code:
+
+- **6, wallet and chain:** side blocks' proofs, the slate limit and fake
+  stage-1 slates, a relay keeping only its relay key, leaf-reuse
+  detection after a rollback, the leaf/node hash domain, batched LMDB
+  commits.
+- **7, tests:** the untested paths below, and the ignored negative
+  end-to-end proof tests.
+
+Not code, or for launch: the independent circuit review, the soundness
+conjecture, a checkpoint per release, seeds, genesis regeneration, the
+small-VPS and full-size sync tests. Accepted as they are: no coinbase
+maturity, PBKDF2, unrecoverable policy outputs, file slates' recipients,
+name parts checked at the end (a design change).
+
 ## Consensus and chain
 
 - **No coinbase maturity, by decision.** A reward can be spent in the
@@ -149,12 +177,6 @@ history and the README; this file holds what is left.
 
 ## Message layer
 
-- **Guards are not replaced for failing.** A guard whose channel fails is
-  passed over for five minutes and tried again; one that fails for days
-  stays a guard until its time is up or it leaves the list, its circuits
-  starting at other relays meanwhile. Tor drops a guard that has been
-  unreachable for a while; doing so here needs a record of failures over
-  time, kept with the guards.
 - **With few relays listed, guards are most of them.** With three relays
   every relay is everyone's guard, rendezvous point and last hop: the
   privacy fixes take effect with tens of relays, not three.
@@ -186,55 +208,18 @@ Found while building it (2026-11-01).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
-- **A relay whose key does not match its listed id is not penalized.**
-  `node/channels.rs`, `on_reply`: a handshake that fails with `WrongKey`
-  is logged and the channel dropped, but the address takes no strike,
-  since the client's consensus file may be the stale one and the address
-  an honest chain peer. A relay at that address can make clients retry
-  it forever. Fix: remember the (address, expected id) pair as failed for
-  a while and skip it when choosing hops, and strike only if the same
-  peer fails against the id that the current file names and that file is
-  recent.
-- **Handshakes cost a relay work no one pays for.** `node/channels.rs`:
-  each hello costs a Kyber encapsulation and a Dilithium signature. An
-  address must have answered the relay's ping, a host holds at most 32
-  channels and an unused one goes after 15 s, but a host can open them as
-  fast as they close. Fix: a rate per host, or a proof of work in the
-  hello under load.
-
-- **Cells toward the client are checked only at the end.** `circuit.rs`:
-  toward the far end every layer is tagged and a flipped bit is caught by
-  the next hop, but toward the client only the originating hop's tag is
-  checked, by the client: a hop that flips bits there ends the circuit
-  without being found, and a hop toward the far end that colludes with
-  the client's first hop learns, from the circuit ending, that they share
-  it. Fix: tag the backward layers too, with fillers as forward, or a
-  wide-block cipher per layer (Tor's counter galois onion).
-- **Idle hops live as long as their channels.** `node/circuits.rs`: a
-  relay drops a hop only on `Destroy` or when a channel under it
-  closes. A participant's channel holds at most 64, but a relay's is not
-  limited, and there is no flow control per circuit: one circuit can
-  fill a channel's queue. Fix: drop hops idle for an hour, and window
-  cells per circuit.
-
-- **A message down a dead circuit is lost, and reported delivered.**
-  A rendezvous point answers forwarded once it sends a payload down the
-  recipient's circuit; if a hop of that circuit is down and the recipient
-  has not noticed yet (below), the payload is lost and the sender's
-  wallet still hears "delivered". A slate then waits for an answer that
-  never comes, until cancelled. Fix: an end-to-end acknowledgement from
-  the recipient's node, and a resend over another of its points.
-- **A dead hop is noticed when the relays' channel to it fails.** A
-  participant learns of it from the `Destroy` passed back
-  (`docs/SCALING.md`): about 40 s after the hop goes down when the relay
-  before it opened their channel, up to two minutes when the hop did
-  (the listening side waits out two minutes of silence). With one
-  session, the wallet is unreachable meanwhile, and a payload delivered
-  down the dying circuit is lost though reported delivered. A relay that
-  a circuit failed to extend to is avoided as a hop for five minutes.
-  Fix: keepalives on relay channels from both ends, so the listening
-  side notices as soon; or keep a spare circuit to the point, through
-  other hops, and switch to it at once.
+- **Flow control is a budget, not a window.** `node/circuits.rs`: a
+  hop ends a circuit whose client sends more than 1024 cells at once or
+  128 a second after, and drops hops idle for an hour; cells toward the
+  client are not limited per circuit (a sender flooding a recipient is
+  bounded by the slate limits). A per-circuit window (Tor's SENDME)
+  would pace rather than cut.
+- **A lost acknowledgement duplicates a payload.** A recipient's point
+  reports a delivery offline when `Received` does not come back within
+  5 s, and the sender's point tries the recipient's next point; if the
+  payload did arrive, the recipient may get it twice. Harmless for
+  slates: a stage-1 slate is answered twice, the sender finalizes the
+  first answer and refuses the second, whose output `prune` removes.
 - **A wallet on a relay skips that relay as a rendezvous point,** in
   both modes, so it is reachable only through its other points (with one
   seed, not at all). By design: run relays with `--no-wallet`.
@@ -248,7 +233,7 @@ Found while building it (2026-11-01).
   once from the phrase.
 
 - **Seeds** need the current binary at every format change (now protocol
-  6, chain format 14, wallet format 8, slate format `tabslt05`), started
+  7, chain format 14, wallet format 8, slate format `tabslt05`), started
   with `--relay`, and wiped data directories. Fresh nodes cannot sync
   until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the

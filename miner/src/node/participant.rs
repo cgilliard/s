@@ -95,6 +95,10 @@ const RETIRE_WAIT: Duration = Duration::from_secs(30);
 /// A relay whose channel failed is not chosen as a hop for this long, while
 /// enough others are left.
 const AVOID: Duration = Duration::from_secs(300);
+/// A relay that answered with a key other than its listed id's is not
+/// chosen for this long: its address may be an honest chain peer and our
+/// list the stale one, so it is not struck, only left alone.
+const WRONG_KEY_AVOID: Duration = Duration::from_secs(3600);
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SENDS: usize = 64;
@@ -114,6 +118,8 @@ const ANSWER_WAIT: Duration = Duration::from_secs(60);
 const GUARDS: usize = 3;
 /// A guard is kept this long, plus up to as much again at random.
 const GUARD_LIFETIME: u64 = 30 * 86_400;
+/// A guard unreachable this long without a success between is replaced.
+const GUARD_DOWN: u64 = 86_400;
 
 /// `d` give or take a third, at random: a keepalive's interval.
 pub(super) fn jitter(d: Duration) -> Duration {
@@ -127,6 +133,8 @@ pub(super) fn jitter(d: Duration) -> Duration {
 struct Guard {
     id: Digest,
     until: u64,
+    /// Since when (unix) its channel has failed with no success since.
+    down_since: Option<u64>,
 }
 
 /// A circuit standing to one of our rendezvous points, and our session
@@ -229,6 +237,7 @@ pub(super) struct Participant {
     keepalive: Duration,
     rotate_every: Duration,
     /// Relays whose channel failed lately, and when.
+    /// Relays not chosen as hops until a time.
     avoid: std::collections::HashMap<Digest, Instant>,
     /// First hops, loaded from the data directory on first use.
     guards: Option<Vec<Guard>>,
@@ -413,11 +422,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let relays = self.rv.onion_sets().into_iter().next()?;
         let now = Instant::now();
         let mut all: Vec<Digest> = relays.iter().map(|r| r.id).filter(|r| Some(*r) != me).collect();
-        let healthy: Vec<Digest> = all
-            .iter()
-            .copied()
-            .filter(|r| self.part.avoid.get(r).is_none_or(|t| now.duration_since(*t) >= AVOID))
-            .collect();
+        let healthy: Vec<Digest> =
+            all.iter().copied().filter(|r| self.part.avoid.get(r).is_none_or(|t| now >= *t)).collect();
         if healthy.len() > HOPS {
             all = healthy;
         }
@@ -672,7 +678,53 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A relay whose channel failed: not a hop for a while.
     pub(super) fn avoid_relay(&mut self, id: Digest, now: Instant) {
-        self.part.avoid.insert(id, now);
+        self.avoid_relay_for(id, now, AVOID);
+    }
+
+    /// A relay that answered with another key than its listed id's.
+    pub(super) fn relay_key_mismatch(&mut self, id: Digest, now: Instant) {
+        self.avoid_relay_for(id, now, WRONG_KEY_AVOID);
+    }
+
+    fn avoid_relay_for(&mut self, id: Digest, now: Instant, wait: Duration) {
+        let until = self.part.avoid.get(&id).map_or(now + wait, |t| (*t).max(now + wait));
+        self.part.avoid.insert(id, until);
+        self.part.avoid.retain(|_, t| *t > now);
+        // A guard's failures are counted in time: one down for a day
+        // goes.
+        if let Some(guards) = self.part.guards.as_mut()
+            && let Some(g) = guards.iter_mut().find(|g| g.id == id && g.down_since.is_none())
+        {
+            g.down_since = Some(unix_now());
+            self.save_guards();
+        }
+    }
+
+    /// A channel to relay `id` opened: a guard down until now is up.
+    pub(super) fn relay_reached(&mut self, id: Digest) {
+        if let Some(guards) = self.part.guards.as_mut()
+            && let Some(g) = guards.iter_mut().find(|g| g.id == id && g.down_since.is_some())
+        {
+            g.down_since = None;
+            self.save_guards();
+        }
+    }
+
+    fn save_guards(&mut self) {
+        let (Some(f), Some(guards)) = (self.guards_file(), self.part.guards.as_ref()) else { return };
+        let text: String = guards
+            .iter()
+            .map(|g| {
+                let hex: String = digest_to_bytes(&g.id).iter().map(|b| format!("{b:02x}")).collect();
+                match g.down_since {
+                    Some(d) => format!("{hex} {} {d}\n", g.until),
+                    None => format!("{hex} {}\n", g.until),
+                }
+            })
+            .collect();
+        if let Err(e) = std::fs::write(&f, text) {
+            self.log(&format!("onion: saving guards: {e}"));
+        }
     }
 
     /// A path to standing point `i`: a guard, a random hop from the list
@@ -684,11 +736,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let relays = self.rv.onion_sets().into_iter().find(|s| s.iter().any(|r| r.id == point))?;
         let mut others: Vec<Digest> = relays.iter().map(|r| r.id).filter(|r| *r != point && Some(*r) != me).collect();
         let now = Instant::now();
-        let healthy: Vec<Digest> = others
-            .iter()
-            .copied()
-            .filter(|r| self.part.avoid.get(r).is_none_or(|t| now.duration_since(*t) >= AVOID))
-            .collect();
+        let healthy: Vec<Digest> =
+            others.iter().copied().filter(|r| self.part.avoid.get(r).is_none_or(|t| now >= *t)).collect();
         if healthy.len() >= HOPS.min(others.len()) {
             others = healthy;
         }
@@ -726,9 +775,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 .map(|text| {
                     text.lines()
                         .filter_map(|l| {
-                            let (id, until) = l.split_once(' ')?;
-                            let id = crate::wallet::digest_from_hex(id).and_then(|b| digest_from_bytes(&b))?;
-                            Some(Guard { id, until: until.trim().parse().ok()? })
+                            let mut f = l.split_whitespace();
+                            let id = crate::wallet::digest_from_hex(f.next()?).and_then(|b| digest_from_bytes(&b))?;
+                            let until = f.next()?.parse().ok()?;
+                            let down_since = f.next().and_then(|d| d.parse().ok());
+                            Some(Guard { id, until, down_since })
                         })
                         .collect()
                 })
@@ -737,27 +788,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         let mut guards = self.part.guards.clone().unwrap_or_default();
         let before = guards.clone();
-        guards.retain(|g| g.until > now_unix && listed.contains(&g.id) && Some(g.id) != me);
+        guards.retain(|g| {
+            g.until > now_unix
+                && listed.contains(&g.id)
+                && Some(g.id) != me
+                && g.down_since.is_none_or(|d| now_unix < d + GUARD_DOWN)
+        });
         let mut candidates: Vec<Digest> =
             listed.iter().copied().filter(|r| Some(*r) != me && !guards.iter().any(|g| g.id == *r)).collect();
         while guards.len() < GUARDS && !candidates.is_empty() {
             let x = random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0);
             let id = candidates.swap_remove((x % candidates.len() as u64) as usize);
-            guards.push(Guard { id, until: now_unix + GUARD_LIFETIME + x % GUARD_LIFETIME });
+            guards.push(Guard { id, until: now_unix + GUARD_LIFETIME + x % GUARD_LIFETIME, down_since: None });
         }
         if guards != before {
-            if let Some(f) = self.guards_file() {
-                let text: String = guards
-                    .iter()
-                    .map(|g| {
-                        let hex: String = digest_to_bytes(&g.id).iter().map(|b| format!("{b:02x}")).collect();
-                        format!("{hex} {}\n", g.until)
-                    })
-                    .collect();
-                if let Err(e) = std::fs::write(&f, text) {
-                    self.log(&format!("onion: saving guards: {e}"));
-                }
-            }
+            self.part.guards = Some(guards.clone());
+            self.save_guards();
             let names: Vec<String> = guards.iter().map(|g| onion::short(&g.id)).collect();
             self.log(&format!("onion: guards {}", names.join(", ")));
         }
@@ -767,7 +813,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .iter()
             .map(|g| g.id)
             .filter(|g| !exclude.contains(g))
-            .filter(|g| self.part.avoid.get(g).is_none_or(|t| now.duration_since(*t) >= AVOID))
+            .filter(|g| self.part.avoid.get(g).is_none_or(|t| now >= *t))
             .collect();
         if usable.is_empty() {
             return None;
@@ -873,6 +919,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A message from the last hop of one of our circuits: `true` if it
     /// was the participant's.
+    /// Tells the circuit's last hop that payload `msg` arrived.
+    fn acknowledge(&mut self, handle: u64, msg: &[u8], now: Instant) {
+        let last = self.circuit_hops(handle).saturating_sub(1);
+        let object = digest_to_bytes(&Object::id_of(msg));
+        if let Err(e) = self.circuit_send(handle, last, circuit::RECEIVED, &object, now) {
+            self.chatter(&format!("onion: acknowledging a delivery: {e}"));
+        }
+    }
+
     pub(super) fn onion_message(&mut self, handle: u64, cmd: u8, msg: &[u8], now: Instant) -> bool {
         let standing = self.part.standing.iter().position(|s| s.circuit == Some(handle));
         let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle))
@@ -983,32 +1038,40 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     self.close_circuit(handle, "refused", now);
                 }
             }
-            circuit::DELIVER => match Object::from_bytes(msg) {
-                Some(Object::Payload(p)) if self.rv.me.as_ref().is_some_and(|m| m.id == p.to) => {
-                    self.open(format!("circuit {handle}"), p);
+            circuit::DELIVER => {
+                let object = Object::from_bytes(msg);
+                // Acknowledged to the hop that delivered it, before
+                // anything else (an answer releases its circuit).
+                if matches!(object, Some(Object::Payload(_))) {
+                    self.acknowledge(handle, msg, now);
                 }
-                // The answer to a payload of ours, down its circuit.
-                Some(Object::Payload(p)) => {
-                    let Some(j) = self.part.jobs.iter().position(|j| {
-                        j.circuit == Some(handle) && j.route.as_ref().is_some_and(|(r, _)| r.reply_id() == p.to)
-                    }) else {
-                        self.chatter("onion: a delivery that is not a payload for us");
-                        return true;
-                    };
-                    let job = self.part.jobs.remove(j);
-                    self.release_outbound(handle, "answered", now);
-                    let (_, key) = job.route.unwrap();
-                    match p.open(&key, unix_now()) {
-                        Some(mut opened) => {
-                            opened.answers = Some(job.out.to);
-                            self.log(&format!("onion: an answer from {}", onion::short(&job.out.to)));
-                            self.rv.note(Note::Received(opened));
-                        }
-                        None => self.log("onion: an answer that our one-time key does not open"),
+                match object {
+                    Some(Object::Payload(p)) if self.rv.me.as_ref().is_some_and(|m| m.id == p.to) => {
+                        self.open(format!("circuit {handle}"), p);
                     }
+                    // The answer to a payload of ours, down its circuit.
+                    Some(Object::Payload(p)) => {
+                        let Some(j) = self.part.jobs.iter().position(|j| {
+                            j.circuit == Some(handle) && j.route.as_ref().is_some_and(|(r, _)| r.reply_id() == p.to)
+                        }) else {
+                            self.chatter("onion: a delivery that is not a payload for us");
+                            return true;
+                        };
+                        let job = self.part.jobs.remove(j);
+                        self.release_outbound(handle, "answered", now);
+                        let (_, key) = job.route.unwrap();
+                        match p.open(&key, unix_now()) {
+                            Some(mut opened) => {
+                                opened.answers = Some(job.out.to);
+                                self.log(&format!("onion: an answer from {}", onion::short(&job.out.to)));
+                                self.rv.note(Note::Received(opened));
+                            }
+                            None => self.log("onion: an answer that our one-time key does not open"),
+                        }
+                    }
+                    _ => self.chatter("onion: a delivery that is not a payload for us"),
                 }
-                _ => self.chatter("onion: a delivery that is not a payload for us"),
-            },
+            }
             _ => return false,
         }
         true

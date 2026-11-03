@@ -501,9 +501,12 @@ impl Channel {
         Ok(out)
     }
 
-    /// Frames due again, and a keepalive when this end opened the channel
-    /// and has been quiet; [`ChannelError::Dead`] when a frame ran out of
-    /// tries or the other end fell silent.
+    /// Frames due again, and a keepalive when this end has been quiet and
+    /// either opened the channel or proved the other end a relay (between
+    /// relays both ends send them, so either notices the other gone within
+    /// a keepalive and [`DEAD_AFTER`], not [`TIMEOUT`]);
+    /// [`ChannelError::Dead`] when a frame ran out of tries or the other
+    /// end fell silent.
     pub fn poll(&mut self, now: Instant) -> Result<Vec<Frame>, ChannelError> {
         if now.duration_since(self.last_heard) >= TIMEOUT {
             return Err(ChannelError::Dead);
@@ -524,7 +527,8 @@ impl Channel {
         if !out.is_empty() {
             self.last_sent = now;
         }
-        if self.initiator && self.in_flight.is_empty() && now.duration_since(self.last_sent) >= KEEPALIVE {
+        let keeps_alive = self.initiator || (self.peer.is_some() && !self.awaiting_auth);
+        if keeps_alive && self.in_flight.is_empty() && now.duration_since(self.last_sent) >= KEEPALIVE {
             out.extend(self.send(&[], now)?);
         }
         Ok(out)
@@ -714,7 +718,10 @@ mod tests {
         assert_eq!(ka.len(), 1);
         let got = r.receive(&ka[0], now + KEEPALIVE).unwrap();
         assert!(got.delivered.is_empty());
-        assert!(r.poll(now + KEEPALIVE).unwrap().is_empty(), "a relay sends no keepalives");
+        assert!(r.poll(now + KEEPALIVE).unwrap().is_empty(), "a relay sends none to a participant");
+        // Between relays both ends do.
+        let (_, mut r2, now2) = open_pair(true);
+        assert_eq!(r2.poll(now2 + KEEPALIVE).unwrap().len(), 1);
         // Unanswered frames run out of tries.
         i.send(b"lost", now).unwrap();
         let mut t = now;

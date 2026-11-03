@@ -40,6 +40,11 @@ const MAX_WAITING: usize = 256;
 /// the token this node gave the address, so a forged address gets
 /// nothing; this bounds what a real one can take.
 pub const MAX_PER_HOST: usize = 32;
+/// Handshakes a relay answers per host: a bucket of [`MAX_PER_HOST`]
+/// refilled at one a second. Each costs a Kyber encapsulation and a
+/// Dilithium signature, and a host could otherwise open channels as fast
+/// as they close.
+const HELLOS_PER_SEC: f64 = 1.0;
 /// A channel a relay answered that carries no frame by then is closed: its
 /// initiator gave up, or never meant to use it.
 #[cfg(not(test))]
@@ -105,6 +110,8 @@ pub(super) struct Channels {
     to: HashMap<Digest, (SocketAddr, u64)>,
     /// When idle channels were last looked for.
     idle_check: Option<Instant>,
+    /// Handshakes each host may still open, and when last refilled.
+    hellos: HashMap<std::net::IpAddr, (f64, Instant)>,
     /// Tests: what the channels delivered, with the other end's address
     /// and proven id.
     #[cfg(test)]
@@ -382,6 +389,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.chatter(&format!("channel: refusing {addr}: {MAX_PER_HOST} channels from its host"));
             return;
         }
+        if self.config.relay_key.is_none() {
+            return;
+        }
+        if self.channels.hellos.len() > 4 * self.config.max_channels {
+            self.channels.hellos.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(60));
+        }
+        let burst = MAX_PER_HOST as f64;
+        let (tokens, at) = self.channels.hellos.entry(addr.ip()).or_insert((burst, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * HELLOS_PER_SEC).min(burst);
+        *at = now;
+        if *tokens < 1.0 {
+            self.chatter(&format!("channel: refusing {addr}: too many handshakes from its host lately"));
+            return;
+        }
+        *tokens -= 1.0;
         let Some(key) = self.config.relay_key.as_ref() else { return };
         let m = match random_bytes::<32>() {
             Ok(m) => m,
@@ -414,6 +436,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match p.opening.finish(reply, auth_key, now) {
             Ok((ch, auth)) => {
                 self.log(&format!("channel: {chan:016x} to {} at {addr} open", crate::onion::short(&expect)));
+                self.relay_reached(expect);
                 let auth = auth.map(|a| {
                     for m in fragments(chan, STAGE_AUTH, &a, self.token_for(&addr)) {
                         self.send(addr, &m);
@@ -440,6 +463,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // No strike: the address may be an honest peer, and our
                 // consensus file the stale one.
                 self.log(&format!("channel: {} at {addr} failed the handshake: {e}", crate::onion::short(&expect)));
+                if e == ChannelError::WrongKey {
+                    self.relay_key_mismatch(expect, now);
+                } else {
+                    self.avoid_relay(expect, now);
+                }
                 self.channel_closed(key, now);
             }
         }

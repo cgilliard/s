@@ -12,6 +12,7 @@
 //! GetAnnounce(id)      → Announce(announce) or Notice(id, offline)
 //! Send(payload)        → Notice(object, forwarded or offline)
 //!                        Deliver(payload)               to the recipient
+//! Received(object)     (from the recipient: the payload arrived)
 //! Broadcast(tx)        → Notice(txid, forwarded or rejected)
 //! Route(token)         (remembered for one answer, a couple of minutes)
 //! Reply(relay, token, payload)
@@ -48,6 +49,11 @@
 //! A sender's rendezvous point asks the recipient's points in the order
 //! their id gives, itself first if it is one, until one holds a session;
 //! it answers the sender when one does, or when none did.
+//!
+//! A payload counts as forwarded only once the recipient's node answers
+//! the `Deliver` with `Received` (within [`ACK_WAIT`]): a payload sent
+//! down a circuit that died unnoticed is reported offline, and the
+//! sender's point tries the recipient's next point.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -74,8 +80,11 @@ const ROUTE_LIFETIME: Duration = Duration::from_secs(120);
 /// Return routes a relay keeps; more are refused.
 const MAX_ROUTES: usize = 10_000;
 
-/// How long a sender's rendezvous point waits on one of the recipient's.
-const ASK_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a recipient's point waits for `Received` after a `Deliver`.
+const ACK_WAIT: Duration = Duration::from_secs(5);
+/// How long a sender's rendezvous point waits on one of the recipient's:
+/// longer than [`ACK_WAIT`].
+const ASK_TIMEOUT: Duration = Duration::from_secs(12);
 /// Questions out to other rendezvous points at once.
 const MAX_ASKS: usize = 4096;
 /// A session this relay holds over a circuit; its announce is in
@@ -149,6 +158,14 @@ enum Asking {
     Reply([u8; circuit::TOKEN_LEN], Vec<u8>, Digest),
 }
 
+/// Who hears whether a delivered payload arrived: the sender's circuit
+/// (this relay is the sender's point too) or the sender's point.
+#[derive(Clone, Copy)]
+enum Waiter {
+    Client(Link),
+    Point((SocketAddr, u64)),
+}
+
 /// A sender's question to the recipient's rendezvous points.
 struct Ask {
     /// The sender's circuit, where the answer goes.
@@ -180,6 +197,9 @@ pub(super) struct Rendezvous {
     routes: HashMap<[u8; circuit::TOKEN_LEN], (Link, Instant)>,
     /// Messages from other rendezvous points coming together, by channel.
     incoming: HashMap<(SocketAddr, u64), Reassembly>,
+    /// Payloads delivered and not yet acknowledged, by the recipient's
+    /// circuit and the object: who to answer, and since when.
+    delivering: HashMap<(Link, Digest), (Waiter, Instant)>,
 }
 
 impl Rendezvous {
@@ -244,6 +264,40 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.rdv.asks[i].asked = None;
             self.ask_next(i, now);
         }
+        let unacknowledged: Vec<(Link, Digest)> = self
+            .rdv
+            .delivering
+            .iter()
+            .filter(|(_, (_, t))| now.duration_since(*t) >= ACK_WAIT)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in unacknowledged {
+            let (waiter, _) = self.rdv.delivering.remove(&k).unwrap();
+            self.answer_delivery(waiter, &k.1, NOTICE_OFFLINE, now);
+        }
+    }
+
+    /// Delivers `payload` down the recipient's circuit `link`; `waiter`
+    /// hears once it is acknowledged, or not.
+    fn deliver(&mut self, link: Link, payload: &[u8], waiter: Waiter, now: Instant) {
+        let object = Object::id_of(payload);
+        if self.rdv.delivering.len() >= MAX_ASKS {
+            return self.answer_delivery(waiter, &object, NOTICE_REFUSED, now);
+        }
+        self.hop_reply(link, circuit::DELIVER, payload, now);
+        self.rdv.delivering.insert((link, object), (waiter, now));
+    }
+
+    /// Tells the sender's side what became of a delivery.
+    fn answer_delivery(&mut self, waiter: Waiter, object: &Digest, code: u8, now: Instant) {
+        match waiter {
+            Waiter::Client(link) => self.hop_reply(link, circuit::NOTICE, &result(object, code), now),
+            Waiter::Point(key) => {
+                for c in rendezvous_cells(RESULT, &result(object, code)) {
+                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
+        }
     }
 
     /// The channels questions to other rendezvous points wait on.
@@ -263,13 +317,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// An answer along the return route `token`, if it is still here:
     /// down its circuit, once.
-    fn deliver_reply(&mut self, token: &[u8; circuit::TOKEN_LEN], payload: &[u8], now: Instant) -> bool {
+    fn deliver_reply(&mut self, token: &[u8; circuit::TOKEN_LEN], payload: &[u8], waiter: Waiter, now: Instant) {
         match self.rdv.routes.remove(token) {
-            Some((link, _)) => {
-                self.hop_reply(link, circuit::DELIVER, payload, now);
-                true
-            }
-            None => false,
+            Some((link, _)) => self.deliver(link, payload, waiter, now),
+            None => self.answer_delivery(waiter, &Object::id_of(payload), NOTICE_OFFLINE, now),
         }
     }
 
@@ -330,8 +381,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 };
                 let token: [u8; circuit::TOKEN_LEN] = msg[32..32 + circuit::TOKEN_LEN].try_into().unwrap();
                 if self.my_id() == Some(relay) {
-                    let code = if self.deliver_reply(&token, payload, now) { NOTICE_FORWARDED } else { NOTICE_OFFLINE };
-                    self.hop_reply(link, circuit::NOTICE, &result(&object, code), now);
+                    self.deliver_reply(&token, payload, Waiter::Client(link), now);
                     return true;
                 }
                 if self.rdv.asks.len() >= MAX_ASKS {
@@ -342,6 +392,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.rdv.asks.push(Ask { client: link, to: relay, what, left: vec![relay], asked: None });
                 let i = self.rdv.asks.len() - 1;
                 self.ask_next(i, now);
+            }
+            circuit::RECEIVED => {
+                let Some(object) = (msg.len() == 32).then(|| digest_from_bytes(msg)).flatten() else { return true };
+                if let Some((waiter, _)) = self.rdv.delivering.remove(&(link, object)) {
+                    self.answer_delivery(waiter, &object, NOTICE_FORWARDED, now);
+                }
             }
             circuit::BROADCAST => {
                 if !self.config.relay {
@@ -491,10 +547,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let Some(bytes) = self.rdv.announces.get(&a.to) else { return };
                 self.hop_reply(a.client, circuit::ANNOUNCE, &bytes, now);
             }
-            Asking::Forward(bytes, object) => {
-                self.hop_reply(link, circuit::DELIVER, &bytes, now);
-                self.hop_reply(a.client, circuit::NOTICE, &result(&object, NOTICE_FORWARDED), now);
-            }
+            Asking::Forward(bytes, _) => self.deliver(link, &bytes, Waiter::Client(a.client), now),
             // Asked of the route's own relay only, which is not this one.
             Asking::Reply(..) => {}
         }
@@ -535,19 +588,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             FORWARD => {
                 let object = Object::id_of(body);
-                let code = match Object::from_bytes(body) {
+                match Object::from_bytes(body) {
                     Some(Object::Payload(p)) => match self.rdv.held.get(&p.to) {
                         Some(h) => {
                             let link = h.link;
-                            self.hop_reply(link, circuit::DELIVER, body, now);
-                            NOTICE_FORWARDED
+                            self.deliver(link, body, Waiter::Point(key), now);
                         }
-                        None => NOTICE_OFFLINE,
+                        None => self.answer_delivery(Waiter::Point(key), &object, NOTICE_OFFLINE, now),
                     },
-                    _ => NOTICE_REJECTED,
-                };
-                for c in rendezvous_cells(RESULT, &result(&object, code)) {
-                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                    _ => self.answer_delivery(Waiter::Point(key), &object, NOTICE_REJECTED, now),
                 }
             }
             REPLY => {
@@ -555,19 +604,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     return;
                 }
                 let (token, payload) = body.split_at(circuit::TOKEN_LEN);
-                let object = Object::id_of(payload);
-                let code = match Object::from_bytes(payload) {
+                match Object::from_bytes(payload) {
                     Some(Object::Payload(_)) => {
-                        if self.deliver_reply(&token.try_into().unwrap(), payload, now) {
-                            NOTICE_FORWARDED
-                        } else {
-                            NOTICE_OFFLINE
-                        }
+                        self.deliver_reply(&token.try_into().unwrap(), payload, Waiter::Point(key), now)
                     }
-                    _ => NOTICE_REJECTED,
-                };
-                for c in rendezvous_cells(RESULT, &result(&object, code)) {
-                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                    _ => self.answer_delivery(Waiter::Point(key), &Object::id_of(payload), NOTICE_REJECTED, now),
                 }
             }
             FOUND => {

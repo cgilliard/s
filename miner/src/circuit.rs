@@ -30,9 +30,15 @@
 //! own keystream on the end, so the cell keeps its size; the client
 //! computes those bytes ahead (Sphinx's filler) and so every hop's tag.
 //! What a hop recognizes as its own is then told by a second, inner tag.
-//! The body leaves room for [`MAX_PATH`] hops' fillers. Back toward the
-//! client only the originating hop's tag is checked: a hop that flips bits
-//! there is found by the client, though not which hop it was.
+//! The body leaves room for [`MAX_PATH`] hops' fillers.
+//!
+//! Back toward the client no relay can check a tag (it shares keys with
+//! the client only), so each backward layer is a wide-block cipher over
+//! the whole payload instead of a stream: LIONESS, with ChaCha20 and
+//! SHAKE256 rounds keyed afresh for each cell. A bit a hop flips turns
+//! the whole cell to noise at the next honest hop, so a hop nearer the
+//! client cannot flip it back to learn that it shares the circuit; the
+//! client finds no tag holds and ends the circuit.
 //!
 //! Every relay message is padded to a power of two of cells, so the count
 //! of cells tells less about what a message is.
@@ -88,6 +94,11 @@ pub const BROADCAST: u8 = 11;
 /// means. Answered by `Notice(object, forwarded or offline)`.
 pub const ROUTE: u8 = 12;
 pub const REPLY: u8 = 13;
+/// `Received(object)`: a participant got a `Deliver`, told to the hop
+/// that delivered it, which only then answers the sender's side
+/// `forwarded` (an end-to-end acknowledgement: a payload down a dead
+/// circuit is not reported delivered).
+pub const RECEIVED: u8 = 14;
 /// A return route's token.
 pub const TOKEN_LEN: usize = 16;
 
@@ -102,7 +113,7 @@ pub const PAYMENT_CELLS: usize = 16;
 /// [`PAYMENT_CELLS`]. Keepalives (`Session`, `SessionState`) and building
 /// a circuit (`Extend`, `Extended`) are not, and stay small.
 pub fn is_payment(cmd: u8) -> bool {
-    matches!(cmd, ANNOUNCE | GET_ANNOUNCE | SEND | DELIVER | NOTICE | BROADCAST | ROUTE | REPLY)
+    matches!(cmd, ANNOUNCE | GET_ANNOUNCE | SEND | DELIVER | NOTICE | BROADCAST | ROUTE | REPLY | RECEIVED)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,35 +263,70 @@ impl Layer {
         chacha20poly1305::poly1305(block[..32].try_into().unwrap(), body)
     }
 
-    fn xor(&self, p: &mut [u8; PAYLOAD]) {
-        chacha20poly1305::xor_stream(&self.key, 1, &self.nonce(), &mut p[..]);
-    }
-
     fn tag(&self, body: &[u8]) -> [u8; TAG_LEN] {
         let block = chacha20poly1305::block(&self.key, 0, &self.nonce());
         chacha20poly1305::poly1305(block[..32].try_into().unwrap(), body)
     }
 
-    /// Puts on what this hop originates: the tag, then the layer.
+    /// LIONESS round `i`'s key at this count.
+    fn round_key(&self, i: u8) -> [u8; 32] {
+        chacha20poly1305::block(&self.key, 0, &self.nonce_in(2 + i))[..32].try_into().unwrap()
+    }
+
+    /// The wide-block layer, on (`encrypt`) or off: LIONESS over the
+    /// payload split as 32 bytes `L` and the rest `R`,
+    /// `R ^= S(k0 ^ L); L ^= H(k1, R); R ^= S(k2 ^ L); L ^= H(k3, R)`, with
+    /// `S` ChaCha20's keystream and `H` SHAKE256. Any change to the input
+    /// changes all of the output, unpredictably.
+    fn wide(&self, p: &mut [u8; PAYLOAD], encrypt: bool) {
+        let k: [[u8; 32]; 4] = core::array::from_fn(|i| self.round_key(i as u8));
+        let (l, r) = p.split_at_mut(32);
+        let stream = |k: &[u8; 32], l: &[u8], r: &mut [u8]| {
+            let key: [u8; 32] = core::array::from_fn(|i| k[i] ^ l[i]);
+            chacha20poly1305::xor_stream(&key, 0, &[0u8; NONCE_LEN], r);
+        };
+        let hash = |k: &[u8; 32], r: &[u8], l: &mut [u8]| {
+            let mut input = k.to_vec();
+            input.extend_from_slice(r);
+            for (a, b) in l.iter_mut().zip(crate::keccak::shake256(&input, 32)) {
+                *a ^= b;
+            }
+        };
+        if encrypt {
+            stream(&k[0], l, r);
+            hash(&k[1], r, l);
+            stream(&k[2], l, r);
+            hash(&k[3], r, l);
+        } else {
+            hash(&k[3], r, l);
+            stream(&k[2], l, r);
+            hash(&k[1], r, l);
+            stream(&k[0], l, r);
+        }
+    }
+
+    /// Puts on what this hop originates toward the client: the tag, then
+    /// the layer.
     pub fn originate(&mut self, body: &[u8; BODY]) -> Box<[u8; PAYLOAD]> {
         let mut p = Box::new([0u8; PAYLOAD]);
         p[TAG_LEN..TAG_LEN + BODY].copy_from_slice(body);
         let tag = self.tag(&p[TAG_LEN..]);
         p[..TAG_LEN].copy_from_slice(&tag);
-        self.xor(&mut p);
+        self.wide(&mut p, true);
         self.count += 1;
         p
     }
 
-    /// Takes this layer off, or puts it on (the same): passing a cell on.
+    /// Puts this hop's layer on a cell passing back toward the client.
     pub fn pass(&mut self, p: &mut [u8; PAYLOAD]) {
-        self.xor(p);
+        self.wide(p, true);
         self.count += 1;
     }
 
-    /// Takes this layer off and says whether the cell is for this hop.
+    /// The client: takes this hop's layer off a cell coming back and says
+    /// whether the hop sent it.
     pub fn take(&mut self, p: &mut [u8; PAYLOAD]) -> bool {
-        self.xor(p);
+        self.wide(p, false);
         let mine = self.tag(&p[TAG_LEN..]) == p[..TAG_LEN];
         self.count += 1;
         mine
@@ -404,7 +450,7 @@ mod tests {
     /// it holds; a larger one the next power of two; keepalives stay one.
     #[test]
     fn payment_messages_are_one_size() {
-        for cmd in [ANNOUNCE, GET_ANNOUNCE, SEND, DELIVER, NOTICE, BROADCAST, ROUTE, REPLY] {
+        for cmd in [ANNOUNCE, GET_ANNOUNCE, SEND, DELIVER, NOTICE, BROADCAST, ROUTE, REPLY, RECEIVED] {
             for len in [0, 16, 33, 6600, 14 * 870] {
                 assert_eq!(relay_bodies(cmd, &vec![1u8; len]).len(), PAYMENT_CELLS, "command {cmd}, {len} bytes");
             }
@@ -516,6 +562,34 @@ mod tests {
         }
         let Forward::Mine(b) = hop_forward(&mut relays[MAX_PATH - 1].forward, &mut p) else { panic!() };
         assert_eq!(relay_piece(&b[..]).unwrap().2, b"far");
+    }
+
+    /// Back toward the client a flipped bit cannot be flipped back by a
+    /// hop nearer the client: after an honest hop's layer the whole cell
+    /// differs, and no tag holds.
+    #[test]
+    fn a_flipped_cell_coming_back_cannot_be_restored() {
+        for at in [0usize, 31, 32, 500, PAYLOAD - 1] {
+            let (mut client, mut relays) = keys(3);
+            let answer = relay_bodies(DATA, b"from the far end")[0];
+            let mut p = relays[2].backward.originate(&answer);
+            let clean = {
+                let mut q = p.clone();
+                relays[1].backward.clone().pass(&mut q);
+                q
+            };
+            // Hop 2 (or whoever is past hop 1) flips a bit; honest hop 1
+            // adds its layer.
+            p[at] ^= 1;
+            relays[1].backward.pass(&mut p);
+            let differ = p.iter().zip(clean.iter()).filter(|(a, b)| a != b).count();
+            assert!(differ > PAYLOAD / 2, "at {at}: only {differ} bytes differ");
+            // A hop nearer the client flipping the same bit back does not
+            // restore it.
+            p[at] ^= 1;
+            relays[0].backward.pass(&mut p);
+            assert_eq!(open_from(&mut client, &mut p), None, "at {at}");
+        }
     }
 
     #[test]

@@ -522,8 +522,12 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    is wrong ends the circuit, so bits flipped for a later hop are found
    by the very next one. A hop knows a cell for itself by a second,
    inner tag. Room is kept for eight hops' fillers, so a cell carries
-   871 bytes of a message rather than 999. Back toward the client only
-   the originating hop's tag is checked, as before. Every relay message,
+   871 bytes of a message rather than 999. Back toward the client no
+   relay can check a tag, so each backward layer is a wide-block cipher
+   (LIONESS of ChaCha20 and SHAKE256, keyed per cell) instead of a
+   stream: a bit flipped by one hop turns the cell to noise at the next
+   honest one, and cannot be flipped back by a colluding hop nearer the
+   client (hardening, 2026-11-02). Every relay message,
    and every message between rendezvous points, is padded with empty
    cells to a power of two of them. Cover traffic, and a minimum number
    of relays, remain open (open point 3).
@@ -659,14 +663,16 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      init mode and held while the circuit lives and keepalives come;
      `GetAnnounce(id)` answered by `Announce` or `Notice(offline)`;
      `Send(payload)` answered by `Notice(forwarded or offline)`, the
-     recipient getting `Deliver(payload)` down its circuit. Between
+     recipient getting `Deliver(payload)` down its circuit and answering
+     `Received(object)` (forwarded is reported only then, within 5 s;
+     hardening, 2026-11-02, protocol 7). Between
      rendezvous points, `Rendezvous` cells on circuit number 0 of their
      mutual channel, taken only from a listed relay: `Lookup(id)` →
      `Found(announce)` or `Result(offline)`, `Forward(payload)` →
      `Result(forwarded or offline)`. A sender's point asks the
      recipient's points in the order the id gives them, answering at
      once when it is one of them and holds the session, and moves to
-     the next on offline or after 8 s; a relay serves sessions only for
+     the next on offline or after 12 s; a relay serves sessions only for
      ids whose points include it.
    - 4e. Done (2026-11-01): `node/participant.rs`. While an onion-mode
      file is in force a node with a wallet keeps a circuit to each of its

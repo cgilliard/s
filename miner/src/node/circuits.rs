@@ -35,6 +35,14 @@ pub const MAX_HOPS: usize = 16_384;
 pub const MAX_HOPS_PER_PARTICIPANT: usize = 64;
 /// Hops a client circuit may have.
 pub const MAX_PATH: usize = circuit::MAX_PATH;
+/// A hop that carries no cell for this long is dropped: a standing
+/// circuit's session keepalive passes every 10 to 20 minutes.
+const HOP_IDLE: Duration = Duration::from_secs(3600);
+/// Cells a client may push through a hop: a bucket of this many (six
+/// largest messages), refilled at [`HOP_CELLS_PER_SEC`]. Past it the
+/// circuit ends, so one circuit cannot fill a channel's queue.
+const HOP_BURST: f64 = 1024.0;
+const HOP_CELLS_PER_SEC: f64 = 128.0;
 
 /// A circuit on one channel: the channel and the circuit's number on it.
 pub(super) type Link = ((SocketAddr, u64), u32);
@@ -47,6 +55,10 @@ struct Hop {
     extending: Option<Vec<u8>>,
     /// A relay message for this hop, coming together.
     message: Reassembly,
+    /// When a cell last passed, either way.
+    last_used: Instant,
+    /// Cells the client may still send, and when last refilled.
+    budget: (f64, Instant),
 }
 
 /// A circuit this node built, or is building.
@@ -242,6 +254,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.drop_mine(h, "not built in time", true, now);
         }
         self.circuits.creating.retain(|_, (_, t)| now.duration_since(*t) < BUILD_TIMEOUT);
+        let idle: Vec<Link> = self
+            .circuits
+            .hops
+            .iter()
+            .filter(|(_, h)| now.duration_since(h.last_used) >= HOP_IDLE)
+            .map(|(l, _)| *l)
+            .collect();
+        for link in idle {
+            self.destroy_hop(link, true, true, now);
+        }
     }
 
     fn drop_mine(&mut self, handle: u64, why: &str, destroy: bool, now: Instant) {
@@ -325,6 +347,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             match cell.cmd {
                 circuit::RELAY => {
                     let h = self.circuits.hops.get_mut(&prev).unwrap();
+                    h.last_used = now;
                     h.keys.backward.pass(&mut cell.payload);
                     cell.circ = prev.1;
                     self.send_cell(prev, cell, now);
@@ -368,9 +391,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match channel::respond_keys(Domain::Circuit, 0, &hello, key, &m) {
             Ok(((out, inn, _), reply)) => {
                 let keys = HopKeys { forward: Layer::new(inn), backward: Layer::new(out) };
-                self.circuits
-                    .hops
-                    .insert(link, Hop { keys, next: None, extending: None, message: Reassembly::default() });
+                self.circuits.hops.insert(
+                    link,
+                    Hop {
+                        keys,
+                        next: None,
+                        extending: None,
+                        message: Reassembly::default(),
+                        last_used: now,
+                        budget: (HOP_BURST, now),
+                    },
+                );
                 for c in circuit::handshake_cells(link.1, circuit::CREATED, &reply) {
                     self.send_cell(link, c, now);
                 }
@@ -385,6 +416,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A relay cell from the previous hop: ours to read, or to pass on.
     fn on_forward(&mut self, link: Link, mut cell: Cell, now: Instant) {
         let Some(h) = self.circuits.hops.get_mut(&link) else { return };
+        h.last_used = now;
+        let (tokens, at) = &mut h.budget;
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * HOP_CELLS_PER_SEC).min(HOP_BURST);
+        *at = now;
+        if *tokens < 1.0 {
+            self.chatter(&format!("circuit: {} sent cells too fast; ending the circuit", link.0.0));
+            return self.destroy_hop(link, true, true, now);
+        }
+        *tokens -= 1.0;
         let body = match circuit::hop_forward(&mut h.keys.forward, &mut cell.payload) {
             circuit::Forward::Mine(body) => body,
             circuit::Forward::Pass => {
@@ -419,6 +459,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Originates a relay message back toward the client.
     pub(super) fn hop_reply(&mut self, link: Link, cmd: u8, msg: &[u8], now: Instant) {
         let Some(h) = self.circuits.hops.get_mut(&link) else { return };
+        h.last_used = now;
         let cells: Vec<Cell> = circuit::relay_bodies(cmd, msg)
             .iter()
             .map(|b| Cell { circ: link.1, cmd: circuit::RELAY, payload: h.keys.backward.originate(b) })
