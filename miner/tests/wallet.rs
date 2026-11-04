@@ -180,6 +180,26 @@ impl Proc {
         }
     }
 
+    /// Waits up to `secs` for the chain to reach `at_least`.
+    fn reach(&mut self, at_least: u64, secs: u64) {
+        let deadline = Instant::now() + guard(secs);
+        while self.height() < at_least {
+            assert!(Instant::now() < deadline, "{}: height {at_least} never came", self.name);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Waits up to `secs` for the wallet to hold nothing: no outputs, none
+    /// confirmed, none pending.
+    fn holds_nothing(&mut self, secs: u64) {
+        self.poll("outputs", "no outputs", secs, |l| l == "no outputs");
+        self.send("balance");
+        let confirmed = self.expect("the confirmed line", 10, |l| l.starts_with("confirmed"));
+        let pending = self.expect("the pending line", 10, |l| l.starts_with("pending"));
+        assert_eq!(amount(&confirmed, "confirmed"), Some(0.0), "{}: {confirmed}", self.name);
+        assert_eq!(amount(&pending, "pending"), Some(0.0), "{}: {pending}", self.name);
+    }
+
     /// The chain's height, from `status`.
     fn height(&mut self) -> u64 {
         self.send("status");
@@ -389,4 +409,52 @@ fn sub_names_resolve_in_both_modes() {
     assert!(a.exit(30).success());
     p.pay("1", "@ex2.example", 180);
     c.poll("balance", "the second coin", 180, |l| amount(l, "confirmed").is_some_and(|c| c == 2.0));
+}
+
+/// A reorganization takes the rewards of lost blocks out of the wallet,
+/// without a `scan`: B mines three blocks alone and stops; A mines a longer
+/// chain alone; B comes back as a node peered with A, its node switches to
+/// A's chain while it runs, and B's wallet forgets those rewards.
+#[test]
+fn a_reorganization_takes_lost_rewards_out_of_the_wallet() {
+    let (dir_a, dir_b) = (TempDir::new("reorg-a"), TempDir::new("reorg-b"));
+    let mut b = Proc::start("B", &dir_b.0, &["mine", "--blocks", "3"]);
+    b.reach(3, 120);
+    b.poll("balance", "its rewards", 30, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+    assert!(b.exit(30).success());
+    drop(b);
+    let mut a = Proc::start("A", &dir_a.0, &["mine"]);
+    a.reach(12, 120);
+    let mut b = Proc::start("B", &dir_b.0, &["node", "--peer", &a.addr]);
+    b.reach(12, 120);
+    b.holds_nothing(60);
+    a.poll("balance", "its rewards", 30, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+}
+
+/// A reorganization takes a payment received in a lost block out of the
+/// wallet, without a `scan`: C mines alone from the start; A mines and
+/// pays B on a chain of their own, then both stop; B comes back peered
+/// with C only, whose heavier chain lacks the payment (and can never hold
+/// it: its inputs are A's rewards on the lost chain).
+#[test]
+fn a_reorganization_takes_a_lost_payment_out_of_the_wallet() {
+    let dirs = ["lost-s", "lost-a", "lost-b", "lost-c"].map(TempDir::new);
+    let mut c = Proc::start("C", &dirs[3].0, &["mine"]);
+    // A and B meet at S, their seed relay (init mode), for the slate.
+    let s = Proc::start("S", &dirs[0].0, &["node", "--no-wallet", "--relay"]);
+    let mut b = Proc::start("B", &dirs[2].0, &["node", "--seed", &s.addr, "--peer", &s.addr]);
+    let mut a = Proc::start("A", &dirs[1].0, &["mine", "--seed", &s.addr, "--peer", &s.addr, "--peer", &b.addr]);
+    a.poll("balance", "spendable coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+    let to = b.address();
+    a.send(&format!("send 1 {to}"));
+    a.expect("the slate sent", 30, |l| l.starts_with("slate ") && l.contains("sent to"));
+    b.poll("balance", "the coin", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
+    let lost = b.height();
+    assert!(a.exit(30).success());
+    assert!(b.exit(30).success());
+    drop((a, b));
+    c.reach(lost + 10, 120);
+    let mut b = Proc::start("B", &dirs[2].0, &["node", "--peer", &c.addr]);
+    b.reach(lost + 10, 120);
+    b.holds_nothing(60);
 }

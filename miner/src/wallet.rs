@@ -834,6 +834,12 @@ pub struct Wallet {
     /// Outputs this wallet added to others' slates (commitments), until
     /// they land or are pruned: unverified until then.
     answered: Database<Bytes, Bytes>,
+    /// Outputs that landed and are no longer on the main chain, nor waiting
+    /// in the pool to land again: commitment → the tip's height when found
+    /// so. Hidden from the balance and the list; found again if the chain
+    /// switches back ([`Wallet::locate`]); forgotten past the undo window
+    /// ([`Wallet::prune_lost`]).
+    lost: Database<Bytes, Bytes>,
     /// The identity key's counter and whether the address is off, as
     /// stored.
     address: std::sync::atomic::AtomicU64,
@@ -981,7 +987,7 @@ fn restrict(dir: &Path) -> std::io::Result<()> {
 
 impl Wallet {
     #[allow(clippy::type_complexity)]
-    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 9])> {
+    fn open_env(dir: &Path) -> Result<(Env, Database<Str, Bytes>, [Database<Bytes, Bytes>; 10])> {
         let env = open_env(dir, MAP_SIZE).map_err(|e| match e {
             crate::state_tree::Error::Heed(h) => WalletError::Heed(h),
             other => WalletError::Utxo(utxo::Error::Tree(other)),
@@ -998,8 +1004,9 @@ impl Wallet {
         let payments = env.create_database(&mut wtxn, Some("payments"))?;
         let rewards = env.create_database(&mut wtxn, Some("rewards"))?;
         let answered = env.create_database(&mut wtxn, Some("answered"))?;
+        let lost = env.create_database(&mut wtxn, Some("lost"))?;
         wtxn.commit()?;
-        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]))
+        Ok((env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered, lost]))
     }
 
     /// Opens the wallet in `dir` without a password, creating one with a
@@ -1014,7 +1021,7 @@ impl Wallet {
     /// created with a fresh phrase. Returns the wallet and, if it was just
     /// created, its phrase.
     pub fn open_with(dir: &Path, ask: &mut dyn FnMut(Ask) -> Result<String>) -> Result<(Wallet, Option<String>)> {
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]) =
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered, lost]) =
             Self::open_env(dir)?;
         let rtxn = env.read_txn()?;
         let record = meta.get(&rtxn, META_SECRET)?.map(<[u8]>::to_vec);
@@ -1064,6 +1071,7 @@ impl Wallet {
                 payments,
                 rewards,
                 answered,
+                lost,
                 address: address.into(),
                 address_off: off.into(),
             },
@@ -1076,7 +1084,7 @@ impl Wallet {
     /// [`Wallet::scan`] once the chain is synced.
     pub fn restore(dir: &Path, phrase: &str, passphrase: &str, password: &str) -> Result<Wallet> {
         let secret = Secret { entropy: bip39::entropy(phrase)?, seed: bip39::seed(phrase, passphrase)? };
-        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered]) =
+        let (env, meta, [outputs, slates, sent, commits, names, policies, payments, rewards, answered, lost]) =
             Self::open_env(dir)?;
         let mut wtxn = env.write_txn()?;
         if meta.get(&wtxn, META_SECRET)?.is_some() || !outputs.is_empty(&wtxn)? {
@@ -1103,6 +1111,7 @@ impl Wallet {
             payments,
             rewards,
             answered,
+            lost,
             address: address.into(),
             address_off: false.into(),
         })
@@ -1384,6 +1393,7 @@ impl Wallet {
             if let Some(mut o) = self.owned_in(&wtxn, &out.commitment)? {
                 o.position = Some(first + i as u64);
                 self.record(&mut wtxn, &o)?;
+                self.lost.delete(&mut wtxn, &digest_to_bytes(&out.commitment))?;
                 n += 1;
             }
             if let Some(mut p) = self.policy_in(&wtxn, &out.commitment)? {
@@ -1422,7 +1432,11 @@ impl Wallet {
             }
             set
         };
+        let lost = self.lost_set()?;
         for o in self.outputs()? {
+            if lost.contains(&o.commitment) {
+                continue;
+            }
             let held = self.held(&o, utxo, rtxn)?;
             match (o.state, held) {
                 (State::Unspent, true) => b.confirmed += o.amount as u128,
@@ -1438,6 +1452,70 @@ impl Wallet {
         Ok(b)
     }
 
+    /// The commitments of outputs lost to a reorganization ([`Wallet::mark_lost`]).
+    pub fn lost_set(&self) -> Result<HashSet<Commitment>> {
+        let rtxn = self.env.read_txn()?;
+        let mut set = HashSet::new();
+        for item in self.lost.iter(&rtxn)? {
+            let (k, _) = item?;
+            set.insert(crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("lost key"))?);
+        }
+        Ok(set)
+    }
+
+    /// After following the chain to `tip`: marks lost the unspent outputs
+    /// that landed (they have a position) but that the main chain no
+    /// longer holds, unless they are `waiting` (outputs of pooled
+    /// transactions, which may land again); clears the mark of any held
+    /// again or waiting. Returns how many were newly marked.
+    pub fn mark_lost(&self, utxo: &UtxoSet, rtxn: &RoTxn, tip: u32, waiting: &HashSet<Commitment>) -> Result<usize> {
+        let lost = self.lost_set()?;
+        let mut wtxn = self.env.write_txn()?;
+        let mut n = 0;
+        for o in self.outputs()? {
+            let key = digest_to_bytes(&o.commitment);
+            let gone = o.state == State::Unspent
+                && o.position.is_some()
+                && !waiting.contains(&o.commitment)
+                && !self.held(&o, utxo, rtxn)?;
+            match (gone, lost.contains(&o.commitment)) {
+                (true, false) => {
+                    self.lost.put(&mut wtxn, &key, &tip.to_le_bytes())?;
+                    n += 1;
+                }
+                (false, true) => {
+                    self.lost.delete(&mut wtxn, &key)?;
+                }
+                _ => {}
+            }
+        }
+        wtxn.commit()?;
+        Ok(n)
+    }
+
+    /// Forgets the outputs lost at least `settle` blocks before `tip`: past
+    /// the depth a reorganization reaches, they cannot come back. Returns
+    /// how many.
+    pub fn prune_lost(&self, tip: u32, settle: u32) -> Result<usize> {
+        let mut old = Vec::new();
+        {
+            let rtxn = self.env.read_txn()?;
+            for item in self.lost.iter(&rtxn)? {
+                let (k, v) = item?;
+                let at = u32::from_le_bytes(v.try_into().map_err(|_| WalletError::Corrupt("lost"))?);
+                if tip >= at.saturating_add(settle) {
+                    old.push(crate::poseidon2::digest_from_bytes(k).ok_or(WalletError::Corrupt("lost key"))?);
+                }
+            }
+        }
+        let mut n = 0;
+        for c in old {
+            self.forget(&c)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Forgets an unspent output that will never land, by commitment: the
     /// reward of a block the miner abandoned. Returns whether a record went.
     pub fn forget(&self, c: &Commitment) -> Result<bool> {
@@ -1447,6 +1525,7 @@ impl Wallet {
             _ => false,
         };
         self.rewards.delete(&mut wtxn, &digest_to_bytes(c))?;
+        self.lost.delete(&mut wtxn, &digest_to_bytes(c))?;
         wtxn.commit()?;
         Ok(gone)
     }
@@ -1553,8 +1632,13 @@ impl Wallet {
                 pending_change.insert(c);
             }
         }
+        // Lost outputs go with prune_lost: the chain may yet switch back.
+        let lost = self.lost_set()?;
         let mut n = 0;
         for o in self.outputs()? {
+            if lost.contains(&o.commitment) {
+                continue;
+            }
             let in_flight = keep.contains(&o.commitment) || pending_change.contains(&o.commitment);
             let held = self.held(&o, utxo, rtxn)?;
             if o.state == State::Unspent && !in_flight && !held {
@@ -3368,6 +3452,49 @@ mod tests {
         let rtxn = w.env.read_txn().unwrap();
         assert!(w.rewards.get(&rtxn, &digest_to_bytes(&main)).unwrap().is_none());
         assert!(w.rewards.get(&rtxn, &digest_to_bytes(&mining)).unwrap().is_some());
+    }
+
+    /// Outputs a reorganization takes off the main chain are hidden, unless
+    /// their transactions wait in the pool; found again if the chain
+    /// switches back; forgotten past the undo window.
+    #[test]
+    fn outputs_lost_to_a_reorganization_hide_return_and_go() {
+        let dir = TempDir::new("lost");
+        let (env, u) = utxo(&dir);
+        let (w, _) = Wallet::open(&dir.0.join("wallet")).unwrap();
+        let (a, b, c) = (w.receive(1_000).unwrap(), w.receive(2_000).unwrap(), w.receive(4_000).unwrap());
+        land(&env, &u, &w, &[&a, &b, &c]);
+        // The blocks that held them are replaced.
+        let mut wtxn = env.write_txn().unwrap();
+        for o in [&a, &b, &c] {
+            let at = w.owned(&o.commitment).unwrap().unwrap().position.unwrap();
+            assert!(u.spend_at(&mut wtxn, &o.commitment, at).unwrap());
+        }
+        wtxn.commit().unwrap();
+        let mark = |tip: u32, waiting: &HashSet<Commitment>| {
+            let rtxn = env.read_txn().unwrap();
+            w.mark_lost(&u, &rtxn, tip, waiting).unwrap()
+        };
+        let balance = || {
+            let rtxn = env.read_txn().unwrap();
+            w.balance(&u, &rtxn).unwrap()
+        };
+        // c's transaction is back in the pool: pending, not lost.
+        let waiting = HashSet::from([c.commitment]);
+        assert_eq!(mark(10, &waiting), 2);
+        assert_eq!((balance().confirmed, balance().pending), (0, 4_000));
+        assert_eq!(mark(10, &waiting), 0, "marked once");
+        // The chain switches back for a: found again, confirmed.
+        land(&env, &u, &w, &[&a]);
+        assert_eq!(mark(11, &waiting), 0);
+        assert_eq!((balance().confirmed, balance().pending), (1_000, 4_000));
+        assert_eq!(w.lost_set().unwrap(), HashSet::from([b.commitment]));
+        // b goes once the undo window has passed since it was lost.
+        assert_eq!(w.prune_lost(109, 100).unwrap(), 0);
+        assert_eq!(w.prune_lost(110, 100).unwrap(), 1);
+        assert!(w.owned(&b.commitment).unwrap().is_none());
+        assert!(w.owned(&a.commitment).unwrap().is_some() && w.owned(&c.commitment).unwrap().is_some());
+        assert!(w.lost_set().unwrap().is_empty());
     }
 
     #[test]

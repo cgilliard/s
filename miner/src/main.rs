@@ -1088,6 +1088,20 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
         ));
     }
     let rtxn = chain.env().read_txn()?;
+    // Outputs a reorganization took off the main chain, unless their
+    // transactions wait in the pool to land again: hidden, then forgotten
+    // past the undo window (kept till then: the chain may switch back).
+    let waiting: std::collections::HashSet<_> =
+        ctx.mempool.lock().unwrap().entries().flat_map(|e| e.tx.outputs.iter().map(|o| o.commitment)).collect();
+    let settle = chain.max_undo().unwrap_or(DEFAULT_MAX_UNDO);
+    let lost = ctx.wallet()?.mark_lost(chain.utxo(), &rtxn, tip.height, &waiting)?;
+    if lost > 0 {
+        log::line(&format!("wallet: {lost} outputs left the main chain in a reorganization"));
+    }
+    let forgotten = ctx.wallet()?.prune_lost(tip.height, settle)?;
+    if forgotten > 0 {
+        log::line(&format!("wallet: forgot {forgotten} outputs lost to a reorganization {settle} blocks ago"));
+    }
     ctx.wallet()?.sync_names(chain.names(), &rtxn)?;
     // Rewards of blocks that will not make the main chain: never found
     // (the miner stopped), never accepted, or side blocks past the depth a
@@ -1096,7 +1110,6 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
     let known = |hash: &[u8; 32]| {
         digest_from_bytes(hash).is_some_and(|d| chain.entry(&d).ok().flatten().is_some_and(|e| !e.invalid))
     };
-    let settle = chain.max_undo().unwrap_or(DEFAULT_MAX_UNDO);
     let n = ctx.wallet()?.prune_rewards(chain.utxo(), &rtxn, tip.height, settle, known, keep)?;
     if n > 0 {
         log::line(&format!("wallet: forgot {n} rewards of blocks that will not make the main chain"));
@@ -1583,7 +1596,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "outputs" => {
             let rtxn = ctx.chain.env().read_txn()?;
-            let outputs = ctx.wallet()?.outputs()?;
+            // Lost to a reorganization: as good as gone (`Wallet::mark_lost`).
+            let lost = ctx.wallet()?.lost_set()?;
+            let outputs: Vec<_> =
+                ctx.wallet()?.outputs()?.into_iter().filter(|o| !lost.contains(&o.commitment)).collect();
             if outputs.is_empty() {
                 println!("no outputs");
             }
