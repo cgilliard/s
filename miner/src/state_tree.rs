@@ -652,8 +652,10 @@ mod tests {
     use std::path::PathBuf;
 
     /// A map size that fits is kept; one past any address space falls back
-    /// to one that can be reserved.
+    /// to one that can be reserved. Linux only: elsewhere `reservable`
+    /// does not probe.
     #[test]
+    #[cfg(target_os = "linux")]
     fn map_sizes_fit_the_address_space() {
         assert_eq!(fit_map_size(1 << 30), 1 << 30);
         let want = 1usize << 62;

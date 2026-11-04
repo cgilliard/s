@@ -847,7 +847,7 @@ fn unix_now() -> u64 {
 /// `N` bytes from the system's random source.
 pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     let mut out = [0u8; N];
-    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut out)?;
+    crate::random::fill(&mut out)?;
     Ok(out)
 }
 

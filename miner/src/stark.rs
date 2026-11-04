@@ -555,8 +555,7 @@ struct Rng {
 impl Rng {
     fn new() -> Rng {
         let mut bytes = [0u8; 4 * crate::poseidon2::DIGEST];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").expect("no /dev/urandom"), &mut bytes)
-            .expect("reading /dev/urandom");
+        crate::random::fill(&mut bytes).expect("the system's random source");
         let key = core::array::from_fn(|i| {
             Fp::from_u64(u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()) as u64)
         });

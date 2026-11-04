@@ -41,6 +41,7 @@ pub mod proofs;
 pub mod poseidon2;
 pub mod poseidon2_air;
 pub mod pow;
+pub mod random;
 pub mod recursion;
 pub mod smt_air;
 pub mod stark;

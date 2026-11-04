@@ -526,9 +526,7 @@ impl SecretKey {
         if self.hedged {
             // Without randomness the signature is still valid, only
             // deterministic.
-            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-                std::io::Read::read_exact(&mut f, &mut rnd).ok();
-            }
+            crate::random::fill(&mut rnd).ok();
         }
         self.sign_internal(&framed(msg, ctx), &rnd)
     }

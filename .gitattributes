@@ -1,0 +1,4 @@
+# Every text file with LF line endings on every platform: the wordlist,
+# the test vectors and the other files built in with include_str! must be
+# the same bytes on Windows as elsewhere.
+* text=auto eol=lf
