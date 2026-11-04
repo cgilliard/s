@@ -304,6 +304,9 @@ pub enum ChainError {
     },
     /// The block was found invalid before.
     KnownInvalid,
+    /// The block, or an ancestor, was set aside: its branch forks below
+    /// what this node can unwind.
+    SetAside,
     BadHeight {
         expected: u32,
         got: u32,
@@ -363,6 +366,7 @@ impl ChainError {
                 | ChainError::MissingBody
                 | ChainError::BelowSnapshot
                 | ChainError::BeyondUndo
+                | ChainError::SetAside
                 | ChainError::BadSnapshot
                 | ChainError::SnapshotInProgress
         )
@@ -391,6 +395,7 @@ impl core::fmt::Display for ChainError {
             }
             ChainError::SnapshotInProgress => f.write_str("a snapshot is being installed"),
             ChainError::KnownInvalid => f.write_str("block is known to be invalid"),
+            ChainError::SetAside => f.write_str("its branch forks below what this node keeps, so it was set aside"),
             ChainError::BadHeight { expected, got } => {
                 write!(f, "height {got}, expected {expected}")
             }
@@ -495,6 +500,10 @@ const STATUS_INVALID: u8 = 2;
 /// A header checked on its own (proof of work, difficulty, timestamps),
 /// stored without its body during a fast sync.
 const STATUS_HEADER_ONLY: u8 = 3;
+/// A block this node can never connect, though it may be valid: its
+/// branch forks below the fast-sync snapshot or the undo records kept.
+/// Treated as invalid, but no peer is at fault for it.
+const STATUS_ASIDE: u8 = 4;
 
 /// A stored header with its index record.
 #[derive(Clone, Copy, Debug)]
@@ -504,7 +513,10 @@ pub struct Entry {
     pub work: U256,
     /// Whether the block has been connected (its state rules checked).
     pub validated: bool,
+    /// Never to connect: found invalid, or set aside.
     pub invalid: bool,
+    /// Set aside (see `STATUS_ASIDE`) rather than found invalid.
+    pub aside: bool,
     /// Stored as a header alone (fast sync), its body not yet seen.
     pub header_only: bool,
 }
@@ -974,7 +986,8 @@ impl<V: ProofVerifier> Chain<V> {
             header,
             work,
             validated: status == STATUS_VALID,
-            invalid: status == STATUS_INVALID,
+            invalid: status == STATUS_INVALID || status == STATUS_ASIDE,
+            aside: status == STATUS_ASIDE,
             header_only: status == STATUS_HEADER_ONLY,
         }))
     }
@@ -1281,7 +1294,7 @@ impl<V: ProofVerifier> Chain<V> {
         pow: Option<bool>,
     ) -> Result<U256> {
         if parent.invalid {
-            return Err(ChainError::InvalidParent);
+            return Err(if parent.aside { ChainError::SetAside } else { ChainError::InvalidParent });
         }
         let expected_height = parent
             .header
@@ -1317,16 +1330,22 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::SnapshotInProgress);
         }
         let result = self.apply_block_inner(block, now);
-        if let Err(e) = &result
-            && e.is_invalid_block()
-        {
-            // Remember the verdict so the block is not validated again.
+        // Remember the verdict so the block is not validated again: invalid,
+        // or set aside when its branch forks below what can be unwound
+        // (else it stays the best header, and the main chain's next blocks
+        // are never fetched).
+        let status = match &result {
+            Err(e) if e.is_invalid_block() => Some(STATUS_INVALID),
+            Err(ChainError::BelowSnapshot | ChainError::BeyondUndo) => Some(STATUS_ASIDE),
+            _ => None,
+        };
+        if let Some(status) = status {
             let mut wtxn = self.env.write_txn()?;
             let id = digest_bytes(&block.header.hash());
             if self.headers.get(&wtxn, &id)?.is_none() {
                 self.headers.put(&mut wtxn, &id, &block.header.to_bytes())?;
             }
-            self.put_index(&mut wtxn, &id, U256::ZERO, STATUS_INVALID)?;
+            self.put_index(&mut wtxn, &id, U256::ZERO, status)?;
             wtxn.commit()?;
         }
         result
@@ -1343,7 +1362,11 @@ impl<V: ProofVerifier> Chain<V> {
         if let Some(e) = known
             && !e.header_only
         {
-            return if e.invalid { Err(ChainError::KnownInvalid) } else { Ok(Applied::Known) };
+            return match (e.invalid, e.aside) {
+                (true, true) => Err(ChainError::SetAside),
+                (true, false) => Err(ChainError::KnownInvalid),
+                _ => Ok(Applied::Known),
+            };
         }
         let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
         // A header stored alone had its proof of work checked then.
@@ -1688,7 +1711,7 @@ impl<V: ProofVerifier> Chain<V> {
             let id = digest_bytes(&h.hash());
             let work = match self.entry_in(&wtxn, &h.hash())? {
                 Some(e) if e.invalid => {
-                    stop = Some(ChainError::KnownInvalid);
+                    stop = Some(if e.aside { ChainError::SetAside } else { ChainError::KnownInvalid });
                     break;
                 }
                 Some(e) => e.work,
@@ -1790,9 +1813,21 @@ impl<V: ProofVerifier> Chain<V> {
             }
             let e = self.entry_in(&rtxn, &h.hash())?.ok_or(ChainError::Corrupt("best branch header"))?;
             if e.invalid {
+                // Its stored descendants go the same way, so that a peer
+                // offering their headers again cannot make them the best.
+                let status = if e.aside { STATUS_ASIDE } else { STATUS_INVALID };
+                let after: Vec<[u8; 32]> = branch
+                    .iter()
+                    .skip_while(|b| b.hash() != h.hash())
+                    .skip(1)
+                    .map(|b| digest_bytes(&b.hash()))
+                    .collect();
                 branch.clear();
                 drop(rtxn);
                 let mut wtxn = self.env.write_txn()?;
+                for id in &after {
+                    self.put_index(&mut wtxn, id, U256::ZERO, status)?;
+                }
                 self.meta.delete(&mut wtxn, META_BEST_HEADER)?;
                 wtxn.commit()?;
                 return Ok(vec![]);
@@ -4122,9 +4157,14 @@ mod tests {
         for block in &fork {
             match b.chain.apply_block(block, tc + 1) {
                 Ok(_) => {}
-                Err(ChainError::BelowSnapshot | ChainError::MissingBody | ChainError::UnknownParent(_)) => {
-                    refused = true
-                }
+                // The block that would reorganize is set aside, and its
+                // descendants with it.
+                Err(
+                    ChainError::BelowSnapshot
+                    | ChainError::SetAside
+                    | ChainError::MissingBody
+                    | ChainError::UnknownParent(_),
+                ) => refused = true,
                 Err(e) => panic!("{e}"),
             }
         }
@@ -4212,7 +4252,7 @@ mod tests {
             g.chain.apply_block(&b, tg + 1).unwrap();
             match f.chain.apply_block(&b, tg + 1) {
                 Ok(_) => {}
-                Err(ChainError::BeyondUndo | ChainError::UnknownParent(_)) => refused = true,
+                Err(ChainError::BeyondUndo | ChainError::SetAside | ChainError::UnknownParent(_)) => refused = true,
                 Err(e) => panic!("{e}"),
             }
         }

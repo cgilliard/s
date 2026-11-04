@@ -573,6 +573,16 @@ pub struct Node<V: ProofVerifier> {
     /// Tests: parts fetched and staged.
     #[cfg(test)]
     parts_staged: Arc<AtomicU64>,
+    /// Tests: serve manifests whose output counter is one too high (the
+    /// state root, which does not commit to it, still matches).
+    #[cfg(test)]
+    lie_manifest: bool,
+    /// Tests: serve no manifest or part.
+    #[cfg(test)]
+    withhold_snapshots: bool,
+    /// Tests: what the fast sync went through.
+    #[cfg(test)]
+    seen: Arc<Seen>,
     /// State proofs received in part, by peer, position and tip.
     #[allow(clippy::type_complexity)]
     proof_parts: HashMap<(SocketAddr, u64, Digest), [Option<(Digest, Digest, u32, Vec<Digest>)>; 2]>,
@@ -725,6 +735,20 @@ fn stalled(
         }
     }
     (requests, abandoned)
+}
+
+/// Tests: counts of what a fast sync went through.
+#[cfg(test)]
+#[derive(Default)]
+struct Seen {
+    /// Snapshot blocks verified against their manifest.
+    verified: AtomicU64,
+    /// Manifests that did not fit the snapshot block's proof.
+    refused: AtomicU64,
+    /// Attempts used up with no peer keeping every block.
+    kept_trying: AtomicU64,
+    /// Snapshots abandoned for leaving the best chain.
+    abandoned: AtomicU64,
 }
 
 impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
@@ -924,6 +948,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             moved: false,
             #[cfg(test)]
             parts_staged: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            lie_manifest: false,
+            #[cfg(test)]
+            withhold_snapshots: false,
+            #[cfg(test)]
+            seen: Arc::default(),
             proof_parts: HashMap::new(),
             proofs_verified: Arc::new(AtomicU64::new(0)),
             last_header_request: None,
@@ -1294,7 +1324,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Mode::Snapshot => {
                 self.pump_headers(now);
                 self.check_snapshot_target(now);
-                self.snapshot_sync(now);
+                // An abandoned snapshot goes back to header sync, not on.
+                if self.mode == Mode::Snapshot {
+                    self.snapshot_sync(now);
+                }
             }
         }
         self.sessions_tick(now);
@@ -1539,6 +1572,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 // Clocks differ: not a fault; asked again later.
                 Some(ChainError::TimestampTooNew { .. }) => return self.timestamp_too_new(b.peer, now),
+                Some(ChainError::SetAside) => {
+                    self.header_batches.clear();
+                    return;
+                }
                 Some(e) => {
                     self.log(&format!("headers from {} refused: {e}", b.peer));
                     self.peers.strike(b.peer);
@@ -1632,16 +1669,35 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 .min_by_key(|p| (load(&p.addr), p.delivered == 0, std::cmp::Reverse(p.status.unwrap().work)))
                 .map(|p| p.addr)
         };
-        // Peers passed over after a failure only if no other holds it.
-        pick(false).or_else(|| pick(true))
+        // Peers passed over after a failure only if no other holds it; the
+        // one that announced it first among them (a failure may have been
+        // for a block of another branch, and its height is as of its last
+        // ping).
+        let announcer = self
+            .sources
+            .get(id)
+            .filter(|a| self.peers.may_serve_passed_over(a, now) && load(a) < MAX_PER_PEER)
+            .copied();
+        pick(false).or(announcer).or_else(|| pick(true))
     }
 
-    /// Remembers that `from` announced block `id`.
+    /// Remembers that `from` sent block `id`'s header, unless another
+    /// peer did first.
     fn note_source(&mut self, id: Digest, from: SocketAddr) {
         if self.sources.len() >= MAX_SOURCES {
             self.sources.clear();
         }
         self.sources.entry(id).or_insert(from);
+    }
+
+    /// Remembers that `from` announced block `id`: it holds the body,
+    /// which a peer that only passed on the header (on a branch of its
+    /// own) may not, so it becomes the source.
+    fn note_announcer(&mut self, id: Digest, from: SocketAddr) {
+        if self.sources.len() >= MAX_SOURCES {
+            self.sources.clear();
+        }
+        self.sources.insert(id, from);
     }
 
     fn start_download(&mut self, kind: Kind, id: Digest, from: SocketAddr, now: Instant) {
@@ -2243,6 +2299,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // of order or not at all: a header whose parent is still on
                 // its way is no fault.
                 Some(ChainError::UnknownParent(_)) => refused = true,
+                // A branch this node cannot follow: no fault of the peer.
+                Some(ChainError::SetAside) => refused = true,
                 Some(e) => {
                     refused = true;
                     self.log(&format!("headers from {from} refused: {e}"));
@@ -2283,16 +2341,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         }
         let id = header.hash();
-        if self.have_block(&id)
-            || self.downloads.contains_key(&id)
-            || self.pending.contains_key(&id)
-            || self.applying.contains(&id)
-        {
+        if self.have_block(&id) || self.pending.contains_key(&id) || self.applying.contains(&id) {
             return;
+        }
+        // On its way already, perhaps from a peer that has the header
+        // alone: the announcer is asked if that fails.
+        if self.downloads.contains_key(&id) {
+            return self.note_announcer(id, from);
         }
         match self.chain.accept_header(&header, unix_now()) {
             Ok(_) => {
-                self.note_source(id, from);
+                self.note_announcer(id, from);
                 if self.sizes.len() >= MAX_SOURCES {
                     self.sizes.clear();
                 }
@@ -2308,7 +2367,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     self.request_headers(from, now);
                 }
             }
-            Err(ChainError::KnownInvalid | ChainError::TimestampTooNew { .. }) => {}
+            Err(ChainError::KnownInvalid | ChainError::SetAside | ChainError::TimestampTooNew { .. }) => {}
             Err(e) => {
                 self.chatter(&format!("{from} announced a bad header {}: {e}", short(&id)));
                 self.peers.strike(from);
@@ -2595,6 +2654,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.mode == Mode::Snapshot {
             self.snap = None;
             self.mode = Mode::Headers;
+        }
+        #[cfg(test)]
+        {
+            self.seen.abandoned.fetch_add(1, Ordering::Relaxed);
+            self.moved = true;
         }
     }
 
@@ -3211,6 +3275,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         next,
                         snap.parts.len()
                     ));
+                    #[cfg(test)]
+                    self.seen.verified.fetch_add(1, Ordering::Relaxed);
                     if !self.snap.as_ref().unwrap().begun {
                         if let Err(e) = self.chain.begin_snapshot() {
                             return self.restart_snapshot(&format!("cannot start installing the snapshot: {e}"));
@@ -3223,6 +3289,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // the manifest's counter is at fault: one peer's lie, not a
                 // failed attempt, unless manifest after manifest fails.
                 Err(e) => {
+                    #[cfg(test)]
+                    self.seen.refused.fetch_add(1, Ordering::Relaxed);
                     let snap = self.snap.as_mut().unwrap();
                     snap.bad_manifests += 1;
                     snap.manifest = None;
@@ -3332,6 +3400,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 return;
             }
             self.log(&format!("fast sync: {why}; no peer keeps every block to validate instead"));
+            #[cfg(test)]
+            self.seen.kept_trying.fetch_add(1, Ordering::Relaxed);
             self.snap_attempts = 0;
         }
         self.log(&format!("fast sync: {why}; trying again"));
@@ -3529,7 +3599,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.served_snapshots.push_front(entry);
             return Some(bytes);
         }
+        #[cfg(test)]
+        if self.withhold_snapshots {
+            return None;
+        }
         let bytes = match kind {
+            #[cfg(test)]
+            Kind::Manifest if self.lie_manifest => {
+                let mut m = self.chain.snapshot_manifest(id).ok().flatten()?;
+                m.next += 1;
+                net::encode_manifest(&m)
+            }
             Kind::Manifest => net::encode_manifest(&self.chain.snapshot_manifest(id).ok().flatten()?),
             Kind::Part(i) => {
                 let manifest = self.chain.snapshot_manifest(id).ok().flatten()?;
@@ -3555,7 +3635,7 @@ mod tests {
     use super::*;
     use crate::aggregate::AggregatorParams;
     use crate::block::{Body, HEADER_SIZE};
-    use crate::chain::{AcceptAllProofs, ChainParams};
+    use crate::chain::{AcceptAllProofs, BlockStatement, ChainParams};
     use crate::circuit;
     use crate::poseidon2::digest_to_bytes;
     use crate::pow::{self, Dataset, PowParams, SeedText, nonce_from_u64};
@@ -3696,7 +3776,7 @@ mod tests {
         }
     }
 
-    fn wait_for_tip(chain: &Chain<AcceptAllProofs>, want: &Header, secs: u64) -> bool {
+    fn wait_for_tip<V: ProofVerifier>(chain: &Chain<V>, want: &Header, secs: u64) -> bool {
         let deadline = Instant::now() + guard(secs);
         while Instant::now() < deadline {
             if chain.tip().unwrap().as_ref() == Some(want) {
@@ -6766,5 +6846,240 @@ mod tests {
         tx_b.send(Event::Stop).unwrap();
         ha.join().unwrap();
         hb.join().unwrap();
+    }
+
+    /// A verifier for the fast-sync tests that checks what a lying
+    /// manifest gets wrong: the block's first output position, which the
+    /// "proof" of [`grow`] carries in its first eight bytes.
+    struct PositionProofs;
+
+    impl ProofVerifier for PositionProofs {
+        fn verify(&self, statement: &BlockStatement<'_>, proof: &[u8]) -> bool {
+            proof.get(..8).is_some_and(|b| b == statement.first_output_position.to_le_bytes())
+        }
+    }
+
+    /// Mines blocks `tags` on `chains[0]`, each with one output and a proof
+    /// [`PositionProofs`] accepts, and applies each to every chain.
+    fn grow<V: ProofVerifier>(f: &Fixture, others: &[&Chain<V>], tags: std::ops::RangeInclusive<u8>) {
+        let now = unix_now();
+        for tag in tags {
+            let tip = f.chain.tip().unwrap().unwrap();
+            let first = f.chain.utxo().next_position(&f.chain.env().read_txn().unwrap()).unwrap();
+            let mut proof = first.to_le_bytes().to_vec();
+            proof.resize(2500, tag);
+            let body = Body {
+                outputs: vec![Output::new(&pk(tag), claim(f, &[])).block_output()],
+                proof,
+                ..Default::default()
+            };
+            let block = mine_body(f, body, tip.timestamp.max(T0) + 600);
+            f.chain.apply_block(&block, now).unwrap();
+            for c in others {
+                c.apply_block(&block, now).unwrap();
+            }
+        }
+    }
+
+    /// A chain checked by [`PositionProofs`], keeping `window` blocks of
+    /// undo.
+    fn open_checked(name: &str, window: Option<u32>) -> (TempDir, Arc<Chain<PositionProofs>>) {
+        let dir = TempDir::new(name);
+        let chain = Chain::open(&dir.0.join("chain"), 64 << 20, params(), seed(), PositionProofs).unwrap();
+        let chain = chain.with_max_undo(window);
+        chain.init_or_check_genesis().unwrap();
+        (dir, Arc::new(chain))
+    }
+
+    /// A fixture keeping `window` blocks of undo.
+    fn open_window(name: &str, window: Option<u32>) -> Fixture {
+        let dir = TempDir::new(name);
+        let seed = seed();
+        let dataset = Dataset::generate(&seed);
+        let chain = Chain::open(&dir.0.join("chain"), 64 << 20, params(), seed, AcceptAllProofs).unwrap();
+        let chain = chain.with_max_undo(window);
+        chain.init_or_check_genesis().unwrap();
+        Fixture { dir, chain: Arc::new(chain), dataset }
+    }
+
+    fn wait_for(what: &str, secs: u64, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + guard(secs);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} within {secs} s");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_fit_the_proof_is_passed_over() {
+        // l and a hold the same twelve blocks; l serves manifests with the
+        // output counter one too high, which the state root does not catch
+        // but block 8's proof does. b hears from l first: it refuses l's
+        // manifest, then takes a's once a answers, and installs the
+        // snapshot (not a replay from genesis).
+        let l = open("liar-l");
+        let a = open("liar-a");
+        grow(&l, &[&a.chain], 1..=12);
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (mut node_l, tx_l) = Node::bind(Arc::clone(&l.chain), pool(), config(vec![], &l.dir)).unwrap();
+        node_l.lie_manifest = true;
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let (dir_b, chain_b) = open_checked("liar-b", None);
+        let mut cb = config(vec![node_l.local_addr().unwrap(), node_a.local_addr().unwrap()], &dir_b);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&chain_b), pool(), cb).unwrap();
+        let seen = Arc::clone(&node_b.seen);
+        let hl = std::thread::spawn(move || node_l.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        wait_for("b refused l's manifest", 30, || seen.refused.load(Ordering::Relaxed) >= 1);
+        let ha = std::thread::spawn(move || node_a.run());
+        assert!(wait_for_tip(&chain_b, &a_tip, 60), "b did not fast-sync to a's tip");
+        assert_eq!(chain_b.state_root().unwrap(), a.chain.state_root().unwrap());
+        assert_eq!(chain_b.floor().unwrap(), Some(8), "b installed a snapshot");
+        assert_eq!(seen.verified.load(Ordering::Relaxed), 1, "only a's manifest fitted");
+        for tx in [tx_l, tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [hl, ha, hb] {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn with_no_snapshot_served_a_fresh_node_validates_every_block() {
+        // a keeps every block but serves no snapshot: b's attempts run out
+        // and, a keeping every block, it validates from genesis instead.
+        let a = open("unserved-a");
+        grow(&a, &[] as &[&Chain<AcceptAllProofs>], 1..=12);
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (mut node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        node_a.withhold_snapshots = true;
+        let b = open("unserved-b");
+        let mut cb = config(vec![node_a.local_addr().unwrap()], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 120), "b did not reach a's tip");
+        assert_eq!(b.chain.floor().unwrap(), None, "b validated every block");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    #[test]
+    fn with_no_snapshot_served_and_no_archive_a_fresh_node_keeps_trying() {
+        // a keeps nine blocks of undo and serves no snapshot: b's attempts
+        // run out with nothing to validate from genesis, so b keeps trying,
+        // and takes c's snapshot once c answers.
+        let a = open_window("keep-a", Some(9));
+        let c = open_window("keep-c", Some(9));
+        grow(&a, &[&c.chain], 1..=16);
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (mut node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        node_a.withhold_snapshots = true;
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![], &c.dir)).unwrap();
+        let b = open("keep-b");
+        let mut cb = config(vec![node_a.local_addr().unwrap(), node_c.local_addr().unwrap()], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let seen = Arc::clone(&node_b.seen);
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        wait_for("b ran out of attempts", 120, || seen.kept_trying.load(Ordering::Relaxed) >= 1);
+        assert_eq!(b.chain.tip().unwrap().unwrap().height, 0, "b did not give up on fast sync");
+        let hc = std::thread::spawn(move || node_c.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not fast-sync once c answered");
+        assert!(b.chain.floor().unwrap().is_some(), "b installed a snapshot");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        for tx in [tx_a, tx_b, tx_c] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [ha, hb, hc] {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_reorganization_past_the_snapshot_during_a_fast_sync_starts_over() {
+        // b verifies block 8's snapshot from a but fetches no part of it;
+        // then c, on a heavier branch from genesis, answers: block 8 leaves
+        // the best chain, and b starts over and installs c's state.
+        let a = open("past-a");
+        grow(&a, &[] as &[&Chain<AcceptAllProofs>], 1..=12);
+        let c = open("past-c");
+        grow(&c, &[] as &[&Chain<AcceptAllProofs>], 101..=114);
+        let c_tip = c.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![], &c.dir)).unwrap();
+        let b = open("past-b");
+        let mut cb = config(vec![node_a.local_addr().unwrap(), node_c.local_addr().unwrap()], &b.dir);
+        cb.sync_point = Some(4);
+        let (mut node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        node_b.hold_parts = Some(0);
+        let seen = Arc::clone(&node_b.seen);
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        wait_for("b verified a's snapshot", 30, || seen.verified.load(Ordering::Relaxed) >= 1);
+        let hc = std::thread::spawn(move || node_c.run());
+        assert!(wait_for_tip(&b.chain, &c_tip, 60), "b did not sync to c's tip");
+        assert!(seen.abandoned.load(Ordering::Relaxed) >= 1, "b abandoned a's snapshot");
+        assert_eq!(b.chain.floor().unwrap(), Some(10), "b installed c's snapshot");
+        assert_eq!(b.chain.state_root().unwrap(), c.chain.state_root().unwrap());
+        for tx in [tx_a, tx_b, tx_c] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [ha, hb, hc] {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_heavier_branch_below_the_floor_is_refused_after_install() {
+        // b fast-syncs a's twelve blocks (floor 8). c shares blocks 1 and
+        // 2 and goes on to 14 of its own: heavier, but forking below b's
+        // floor (and below a's nine blocks of undo, so a stays too), so b
+        // stays on a's chain and goes on following it.
+        let a = open_window("floor-a", Some(9));
+        let c = open("floor-c");
+        grow(&a, &[&c.chain], 1..=2);
+        grow(&a, &[] as &[&Chain<AcceptAllProofs>], 3..=12);
+        grow(&c, &[] as &[&Chain<AcceptAllProofs>], 103..=114);
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let b = open("floor-b");
+        let mut cb = config(vec![node_a.local_addr().unwrap()], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        assert!(wait_for_tip(&b.chain, &a_tip, 30), "b did not fast-sync to a's tip");
+        assert!(b.chain.floor().unwrap().is_some_and(|f| f > 2));
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![addr_b], &c.dir)).unwrap();
+        let hc = std::thread::spawn(move || node_c.run());
+        wait_for("b heard of c's branch", 30, || b.chain.best_header().is_ok_and(|h| h.height == 14));
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(b.chain.tip().unwrap().unwrap(), a_tip, "b reorganized below its floor");
+        assert_eq!(a.chain.tip().unwrap().unwrap(), a_tip, "a reorganized past its undo window");
+        // a's next block still reaches b.
+        let tip = a.chain.tip().unwrap().unwrap();
+        let first = a.chain.utxo().next_position(&a.chain.env().read_txn().unwrap()).unwrap();
+        let mut proof = first.to_le_bytes().to_vec();
+        proof.resize(2500, 13);
+        let body =
+            Body { outputs: vec![Output::new(&pk(13), claim(&a, &[])).block_output()], proof, ..Default::default() };
+        let block = mine_body(&a, body, tip.timestamp + 600);
+        let next = block.header;
+        tx_a.send(Event::Mined(block)).unwrap();
+        assert!(wait_for_tip(&b.chain, &next, 30), "b stopped following a");
+        for tx in [tx_a, tx_b, tx_c] {
+            tx.send(Event::Stop).unwrap();
+        }
+        for h in [ha, hb, hc] {
+            h.join().unwrap();
+        }
     }
 }

@@ -1655,6 +1655,13 @@ impl Peers {
         })
     }
 
+    /// Whether `addr` may be asked for a block once passed over: trusted.
+    pub fn may_serve_passed_over(&self, addr: &SocketAddr, now: Instant) -> bool {
+        self.map
+            .get(addr)
+            .is_some_and(|p| p.handshaken && p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TIMEOUT))
+    }
+
     /// Notes that `addr` was asked for headers, unless already waiting.
     pub fn asked_headers(&mut self, addr: SocketAddr, now: Instant) {
         if let Some(p) = self.map.get_mut(&addr) {
