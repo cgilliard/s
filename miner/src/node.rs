@@ -374,6 +374,10 @@ pub enum Event {
     /// Tests: keep no standing circuits.
     #[cfg(test)]
     TestQuiet,
+    /// Tests: close the channels that carry no circuit now, as if idle
+    /// for the whole timeout.
+    #[cfg(test)]
+    TestExpireIdle,
     /// Tests: keepalives and circuit replacement sooner.
     #[cfg(test)]
     TestTiming(Duration, Duration),
@@ -994,6 +998,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::TestRelays(relays)) => self.rv.set_relays(relays),
                 #[cfg(test)]
                 Ok(Event::TestQuiet) => self.quiet = true,
+                #[cfg(test)]
+                Ok(Event::TestExpireIdle) => self.channels.expire_idle = true,
                 #[cfg(test)]
                 Ok(Event::TestServes(owners)) => self.part.test_owners = Some(owners),
                 #[cfg(test)]
@@ -3590,6 +3596,14 @@ mod tests {
         Block { header, body }
     }
 
+    /// How long a test waits for something that must happen before it
+    /// calls the node stuck: only a hang guard, so generous, and three
+    /// times as long in debug builds, where the proving tests running
+    /// alongside leave the nodes little CPU.
+    fn guard(secs: u64) -> Duration {
+        Duration::from_secs(if cfg!(debug_assertions) { 3 * secs } else { secs })
+    }
+
     fn config(peers: Vec<SocketAddr>, dir: &TempDir) -> Config {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -3609,7 +3623,7 @@ mod tests {
     }
 
     fn wait_for_tip(chain: &Chain<AcceptAllProofs>, want: &Header, secs: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(secs);
+        let deadline = Instant::now() + guard(secs);
         while Instant::now() < deadline {
             if chain.tip().unwrap().as_ref() == Some(want) {
                 return true;
@@ -3696,7 +3710,7 @@ mod tests {
         tx.set_positions(&[position]);
         let txid = tx.txid();
         tx_a.send(Event::Transaction(tx)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + guard(20);
         while !pool_b.lock().unwrap().contains(&txid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -3792,7 +3806,7 @@ mod tests {
         blocks.push(b3.clone());
         assert!(wait_for_tip(&b.chain, &b3.header, 20), "b did not sync");
         let settled = |chain: &Chain<AcceptAllProofs>, want: consensus::Hash, secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             while Instant::now() < deadline {
                 let v = chain.consensus_votes(consensus::WINDOW).unwrap();
                 if v.missing.is_empty()
@@ -4285,7 +4299,7 @@ mod tests {
         let staged = Arc::clone(&node_b.parts_staged);
         let ha = std::thread::spawn(move || node_a.run());
         let hb = std::thread::spawn(move || node_b.run());
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while staged.load(Ordering::Relaxed) < 1 {
             assert!(Instant::now() < deadline, "b staged no part of block 8's snapshot");
             std::thread::sleep(Duration::from_millis(50));
@@ -4525,7 +4539,7 @@ mod tests {
         let handles: Vec<_> =
             [node_r, node_n, node_p, node_q, node_x].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
         let live = |stats: &Arc<Mutex<Stats>>, secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             while Instant::now() < deadline {
                 let s = stats.lock().unwrap().clone();
                 if !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l) {
@@ -4536,7 +4550,7 @@ mod tests {
             false
         };
         assert!(live(&stats_p, 15), "p's session did not go live: {:?}", stats_p.lock().unwrap().rendezvous);
-        let wait = |rx: &Receiver<Note>| rx.recv_timeout(Duration::from_secs(20)).expect("a note");
+        let wait = |rx: &Receiver<Note>| rx.recv_timeout(guard(20)).expect("a note");
         // q reaches p by id alone: q's node asks the point for p's announce.
         let out = Outbound {
             tag: 7,
@@ -4550,7 +4564,7 @@ mod tests {
         tx_q.send(Event::Send(out)).unwrap();
         let mut got = None;
         let mut delivered = false;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + guard(20);
         while (got.is_none() || !delivered) && Instant::now() < deadline {
             if let Ok(Note::Received(o)) = notes_p.recv_timeout(Duration::from_millis(100)) {
                 got = Some(o);
@@ -4577,7 +4591,7 @@ mod tests {
         };
         tx_p.send(Event::Send(out)).unwrap();
         let mut answer = None;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + guard(20);
         while answer.is_none() && Instant::now() < deadline {
             if let Ok(Note::Received(o)) = notes_q.recv_timeout(Duration::from_millis(100)) {
                 answer = Some(o);
@@ -4652,14 +4666,14 @@ mod tests {
         let (node_b, tx_b, notes_b, stats_b) = participant(&q, &bob);
         let handles: Vec<_> =
             [node_r, node_a, node_b].into_iter().map(|n| std::thread::spawn(move || n.run())).collect();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + guard(15);
         let live = |s: &Arc<Mutex<Stats>>| s.lock().unwrap().rendezvous.iter().any(|(_, l)| *l);
         while !(live(&stats_a) && live(&stats_b)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(live(&stats_a) && live(&stats_b), "the sessions did not go live");
         let received = |rx: &Receiver<Note>| {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + guard(20);
             while Instant::now() < deadline {
                 if let Ok(Note::Received(o)) = rx.recv_timeout(Duration::from_millis(100)) {
                     return o;
@@ -4749,7 +4763,7 @@ mod tests {
         let (_, tx_b, _, stats_b, h_b) = start(&b, 2);
         let channels = |s: &Arc<Mutex<Stats>>| s.lock().unwrap().channels;
         let wait = |want: usize, secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             while !(channels(&stats_a) == want && channels(&stats_b) == want) {
                 assert!(
                     Instant::now() < deadline,
@@ -4762,7 +4776,10 @@ mod tests {
         };
         tx_b.send(Event::TestChannel(addr_a, id(1), b"hello".to_vec())).unwrap();
         wait(1, 20);
-        // Idle past the timeout (seconds in tests), with keepalives going.
+        // Idle: closed at both ends, by hand rather than after the timeout.
+        for tx in [&tx_a, &tx_b] {
+            tx.send(Event::TestExpireIdle).unwrap();
+        }
         wait(0, 30);
         tx_b.send(Event::TestChannel(addr_a, id(1), b"again".to_vec())).unwrap();
         wait(1, 20);
@@ -4808,7 +4825,7 @@ mod tests {
         // c expects another key at a's address; nobody relays at d.
         tx_c.send(Event::TestChannel(addr_a, id(9), b"to an impostor".to_vec())).unwrap();
         tx_c.send(Event::TestChannel(addr_d, id(4), b"to a non-relay".to_vec())).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + guard(20);
         while sink_a.lock().unwrap().len() < 2 * n && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -4836,7 +4853,7 @@ mod tests {
         // b's and c's: the one c abandoned when a's key was not the one it
         // expected carries no frame, and a closes it (after 3 s in tests).
         // Stats refresh once a second.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + guard(10);
         while stats_a.lock().unwrap().channels != 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -4880,7 +4897,7 @@ mod tests {
         let queued = vec![(2, b"echo:one".to_vec()), (1, b"echo:mid".to_vec()), (2, big.clone())];
         nodes[4].1.send(Event::TestCircuit(vec![id(1), id(2), id(3)], queued)).unwrap();
         let wait = |seen: &Arc<Mutex<Vec<Seen>>>, n: usize| {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + guard(30);
             while seen.lock().unwrap().len() < n && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -4950,7 +4967,7 @@ mod tests {
         let rp = listed[crate::onion::rendezvous_relays(&id_p, 0, &ids)[0]].id;
         let others: Vec<Digest> = listed.iter().map(|r| r.id).filter(|r| *r != rp).collect();
         let wait = |n: usize, pred: &dyn Fn(&Seen) -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + guard(30);
             loop {
                 if let Some(s) = nodes[n].2.lock().unwrap().iter().find(|s| pred(s)).cloned() {
                     return s;
@@ -5061,7 +5078,7 @@ mod tests {
             let s = nodes[n].3.lock().unwrap().clone();
             s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -5073,7 +5090,7 @@ mod tests {
         );
         let delivered = Mutex::new(Vec::new());
         let received = |n: usize| loop {
-            match nodes[n].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+            match nodes[n].2.recv_timeout(guard(20)).expect("a note") {
                 Note::Received(o) => return o,
                 Note::Failed { why, .. } => panic!("{why}"),
                 Note::Delivered { tag, .. } => delivered.lock().unwrap().push(tag),
@@ -5135,7 +5152,7 @@ mod tests {
                 group: 0,
             }))
             .unwrap();
-        match nodes[q].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
+        match nodes[q].2.recv_timeout(guard(30)).expect("a note") {
             Note::Failed { tag: 3, why, .. } => assert!(why.contains("offline"), "{why}"),
             other => panic!("{other:?}"),
         }
@@ -5184,7 +5201,7 @@ mod tests {
             nodes[n].1.send(Event::TestTiming(hour, hour)).unwrap();
         }
         let live = |secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             loop {
                 let s = nodes[p].3.lock().unwrap().rendezvous.clone();
                 if s.len() == 1 && s[0].1 {
@@ -5214,7 +5231,7 @@ mod tests {
         handles[middle].take().unwrap().join().unwrap();
         let stopped = Instant::now();
         // The `Destroy` reaches p: its session is down until it rebuilds.
-        let deadline = stopped + Duration::from_secs(60);
+        let deadline = stopped + guard(60);
         while nodes[p].3.lock().unwrap().rendezvous.iter().all(|(_, l)| *l) {
             assert!(Instant::now() < deadline, "p never heard its circuit was gone");
             std::thread::sleep(Duration::from_millis(50));
@@ -5224,10 +5241,10 @@ mod tests {
         // And it is reached there.
         let out =
             Outbound { tag: 1, to: id(5), kind: 1, inner: b"after".to_vec(), recipient: None, reply: None, group: 0 };
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + guard(60);
         'sent: loop {
             nodes[q].1.send(Event::Send(out.clone())).unwrap();
-            let until = Instant::now() + Duration::from_secs(10);
+            let until = Instant::now() + guard(10);
             while Instant::now() < until {
                 if let Ok(Note::Received(o)) = nodes[p].2.recv_timeout(Duration::from_millis(200))
                     && o.inner == b"after"
@@ -5271,7 +5288,7 @@ mod tests {
         let (node, events) = Node::bind(Arc::clone(&f.chain), Arc::clone(&mempool), config(vec![], &f.dir)).unwrap();
         let h = std::thread::spawn(move || node.run());
         events.send(Event::Transaction(tx)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + guard(10);
         while !mempool.lock().unwrap().contains(&txid) {
             assert!(Instant::now() < deadline, "not pooled");
             std::thread::sleep(Duration::from_millis(20));
@@ -5337,13 +5354,13 @@ mod tests {
             let s = nodes[n].3.lock().unwrap().clone();
             s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(live(p) && live(q));
         let received = |n: usize| loop {
-            match nodes[n].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+            match nodes[n].2.recv_timeout(guard(20)).expect("a note") {
                 Note::Received(o) => return o,
                 Note::Failed { why, .. } => panic!("{why}"),
                 _ => {}
@@ -5459,7 +5476,7 @@ mod tests {
             let s = nodes[n].3.lock().unwrap().clone();
             s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -5471,7 +5488,7 @@ mod tests {
             let out = Outbound { tag, to, kind: 1, inner: vec![1], recipient: None, reply: None, group: 0 };
             nodes[from].1.send(Event::Send(out)).unwrap();
             loop {
-                match nodes[from].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
+                match nodes[from].2.recv_timeout(guard(40)).expect("a note") {
                     Note::Delivered { tag: t, .. } if t == tag => return true,
                     Note::Failed { tag: t, why, .. } if t == tag => {
                         assert!(why.contains("offline"), "{why}");
@@ -5482,7 +5499,7 @@ mod tests {
             }
         };
         let until = |want: bool, from: usize, to: Digest, send: &mut dyn FnMut(usize, Digest) -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + guard(60);
             while send(from, to) != want {
                 assert!(Instant::now() < deadline, "never {}", if want { "delivered" } else { "offline" });
                 std::thread::sleep(Duration::from_millis(500));
@@ -5505,7 +5522,7 @@ mod tests {
         }
         // Off: nobody reaches p, which still pays.
         nodes[p].1.send(Event::Identity(None)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + guard(10);
         while !nodes[p].3.lock().unwrap().rendezvous.is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -5704,7 +5721,7 @@ mod tests {
         for n in &nodes {
             n.1.send(Event::TestRelays(listed.clone())).unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         let live = || nodes[3].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).count() == 1;
         while !live() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -5719,7 +5736,7 @@ mod tests {
         let signed = alice.finalize(&slate).unwrap();
         let txid = signed.tx.txid();
         nodes[3].1.send(Event::Transaction(signed.tx)).unwrap();
-        match nodes[3].2.recv_timeout(Duration::from_secs(20)).expect("a note") {
+        match nodes[3].2.recv_timeout(guard(20)).expect("a note") {
             Note::Broadcast { txid: t, how: Ok(how) } => {
                 assert_eq!(t, txid);
                 assert!(how.starts_with("announced by relay"), "{how}");
@@ -5727,7 +5744,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // A relay pooled it; alice's node pooled it and announced nothing.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + guard(10);
         let relays_have = || (0..3).filter(|&i| nodes[i].4.lock().unwrap().contains(&txid)).count();
         while relays_have() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -5778,7 +5795,7 @@ mod tests {
             let s = nodes[n].3.lock().unwrap().clone();
             s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -5791,7 +5808,7 @@ mod tests {
             tag += 1;
             nodes[resolver].1.send(Event::GetDelegation(tag, who, 0)).unwrap();
             loop {
-                match nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note") {
+                match nodes[resolver].2.recv_timeout(guard(40)).expect("a note") {
                     Note::Delegation { tag: t, owner: o, result } if t == tag => {
                         assert_eq!(o, who);
                         return result.expect("asked");
@@ -5801,7 +5818,7 @@ mod tests {
             }
         };
         // Published once the owner's session is live: soon.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         let got = loop {
             if let Some(got) = fetch(id(4)) {
                 break got;
@@ -5835,7 +5852,7 @@ mod tests {
             };
             nodes[resolver].1.send(Event::Send(out)).unwrap();
             loop {
-                match nodes[resolver].2.recv_timeout(Duration::from_secs(30)).expect("a note") {
+                match nodes[resolver].2.recv_timeout(guard(30)).expect("a note") {
                     Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
                         assert_eq!(o.answers, Some(id(5)));
                         return Answer::from_bytes(&o.inner).expect("an answer");
@@ -5856,7 +5873,7 @@ mod tests {
         nodes[resolver].1.send(Event::GetDelegation(500, id(4), 77)).unwrap();
         loop {
             if let Note::Delegation { tag: 500, result, .. } =
-                nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note")
+                nodes[resolver].2.recv_timeout(guard(40)).expect("a note")
             {
                 assert_eq!(result.unwrap().as_ref(), Some(&d));
                 break;
@@ -5925,7 +5942,7 @@ mod tests {
             let s = nodes[n].3.lock().unwrap().clone();
             s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -5938,14 +5955,14 @@ mod tests {
             nodes[resolver].1.send(Event::GetDelegation(tag, v, 0)).unwrap();
             loop {
                 if let Note::Delegation { tag: t, result, .. } =
-                    nodes[resolver].2.recv_timeout(Duration::from_secs(40)).expect("a note")
+                    nodes[resolver].2.recv_timeout(guard(40)).expect("a note")
                     && t == tag
                 {
                     return result.expect("asked");
                 }
             }
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + guard(30);
         while fetch().is_none() {
             assert!(Instant::now() < deadline, "the delegation never appeared");
             std::thread::sleep(Duration::from_millis(500));
@@ -6011,7 +6028,7 @@ mod tests {
         let live_at = |want: &[Digest]| {
             let mut want: Vec<SocketAddr> = want.iter().map(addr_of).collect();
             want.sort();
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + guard(30);
             loop {
                 let mut have: Vec<SocketAddr> =
                     nodes[p].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).map(|(a, _)| *a).collect();
@@ -6037,7 +6054,7 @@ mod tests {
                 group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + guard(30);
             loop {
                 match nodes[p].2.recv_timeout(Duration::from_millis(200)) {
                     Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
@@ -6129,7 +6146,7 @@ mod tests {
         list.sort_by_key(|r| digest_to_bytes(&r.id));
         let (p, q, r) = (3usize, 4usize, 5usize);
         let live = |n: usize, want: usize| {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + guard(30);
             loop {
                 let s = nodes[n].3.lock().unwrap().rendezvous.clone();
                 if s.len() == want && s.iter().all(|(_, l)| *l) {
@@ -6152,7 +6169,7 @@ mod tests {
                 group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(40);
+            let deadline = Instant::now() + guard(40);
             loop {
                 match nodes[to].2.recv_timeout(Duration::from_millis(200)) {
                     Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
@@ -6240,7 +6257,7 @@ mod tests {
             nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3))).unwrap();
         }
         let live = |secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             loop {
                 let s = nodes[p].3.lock().unwrap().rendezvous.clone();
                 if s.len() == 1 && s.iter().all(|(_, l)| *l) {
@@ -6263,7 +6280,7 @@ mod tests {
                 group: 0,
             };
             nodes[q].1.send(Event::Send(out)).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(40);
+            let deadline = Instant::now() + guard(40);
             loop {
                 match nodes[p].2.recv_timeout(Duration::from_millis(200)) {
                     Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
@@ -6280,7 +6297,7 @@ mod tests {
         // Replaced, the session kept: p's standing circuit and its spare
         // outbound one, then the replacement at least.
         let built = || nodes[p].4.lock().unwrap().iter().filter(|s| matches!(s, circuits::Seen::Ready(_))).count();
-        let deadline = Instant::now() + Duration::from_secs(40);
+        let deadline = Instant::now() + guard(40);
         while built() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -6348,7 +6365,7 @@ mod tests {
         let (tx_q, notes_q, _, h_q) = participant(&q, 2);
         let id_p = crate::address::id_of(crate::mldsa::keygen(&[1; 32]).public_key());
         let live = |secs: u64| {
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = Instant::now() + guard(secs);
             while Instant::now() < deadline {
                 if stats_p.lock().unwrap().rendezvous.iter().any(|(_, l)| *l) {
                     return true;
@@ -6360,7 +6377,7 @@ mod tests {
         let deliver = |tag: u64, recipient: Option<onion::Announce>| {
             let out = Outbound { tag, to: id_p, kind: 1, inner: vec![tag as u8], recipient, reply: None, group: 0 };
             tx_q.send(Event::Send(out)).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + guard(20);
             let mut opened = None;
             while Instant::now() < deadline {
                 if let Ok(Note::Received(o)) = notes_p.recv_timeout(Duration::from_millis(100)) {
@@ -6414,7 +6431,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
         let mut buf = [0u8; 2048];
         let mut receive = |want: fn(&Message) -> bool| -> Option<Message> {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + guard(2);
             while Instant::now() < deadline {
                 if let Ok((n, _)) = sock.recv_from(&mut buf)
                     && let Some(m) = Message::decode(&buf[..n])

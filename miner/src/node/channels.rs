@@ -55,11 +55,9 @@ const UNUSED_TIMEOUT: Duration = Duration::from_secs(3);
 /// A channel that carries no circuit and has moved nothing but keepalives
 /// for this long is closed (`docs/SCALING.md`): channels between relays
 /// are opened when a circuit or a rendezvous message needs one, so a
-/// relay among many does not hold one to every other.
-#[cfg(not(test))]
+/// relay among many does not hold one to every other. Tests close idle
+/// channels by hand (`Event::TestExpireIdle`) rather than wait.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-#[cfg(test)]
-const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
 
 const STAGE_HELLO: u8 = 1;
 const STAGE_REPLY: u8 = 2;
@@ -116,6 +114,9 @@ pub(super) struct Channels {
     /// and proven id.
     #[cfg(test)]
     pub(super) sink: std::sync::Arc<std::sync::Mutex<Vec<Delivered>>>,
+    /// Tests: at the next poll, close idle channels whatever their age.
+    #[cfg(test)]
+    pub(super) expire_idle: bool,
 }
 
 impl Channels {
@@ -260,11 +261,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         let mut dead = Vec::new();
         // Idle channels, looked for once a second.
-        if self.channels.idle_check.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+        #[cfg(test)]
+        let expire = std::mem::take(&mut self.channels.expire_idle);
+        #[cfg(not(test))]
+        let expire = false;
+        if expire || self.channels.idle_check.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
             self.channels.idle_check = Some(now);
             let busy = self.channels_in_use();
             for (key, o) in &self.channels.open {
-                if now.duration_since(o.last_used) >= IDLE_TIMEOUT && !busy.contains(key) {
+                if (expire || now.duration_since(o.last_used) >= IDLE_TIMEOUT) && !busy.contains(key) {
                     dead.push((*key, ChannelError::Idle));
                 }
             }
