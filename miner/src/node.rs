@@ -551,6 +551,10 @@ pub struct Node<V: ProofVerifier> {
     mode: Mode,
     snap: Option<Snap>,
     snap_downloads: HashMap<(Kind, Digest), Download>,
+    /// When each peer last delivered a chunk of the snapshot: one that is
+    /// serving it, but at its rate limit, leaves some downloads unanswered
+    /// for a while without failing to serve them.
+    snap_heard: HashMap<SocketAddr, Instant>,
     snap_attempts: u32,
     /// Fast sync was left for want of peers: it is taken up again when the
     /// first one appears, if no block has been replayed meanwhile.
@@ -939,6 +943,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             mode: Mode::Normal,
             snap: None,
             snap_downloads: HashMap::new(),
+            snap_heard: HashMap::new(),
             snap_attempts: 0,
             alone: false,
             deferred: None,
@@ -3435,8 +3440,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             d.last_request = now;
             if d.retries > net::MAX_RETRIES {
                 // Something came, then nothing: slow; nothing at all: it
-                // does not serve it.
-                abandoned.push((kind, id, d.from, d.received() > 0));
+                // does not serve it, unless it is delivering other parts
+                // of it meanwhile (its rate limit dropped these requests).
+                let busy =
+                    self.snap_heard.get(&d.from).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5));
+                abandoned.push((kind, id, d.from, d.received() > 0 || busy));
             } else {
                 d.reset_window();
                 let indexes = d.request(now);
@@ -3479,6 +3487,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if d.from != from || d.id != id {
             return;
         }
+        self.snap_heard.insert(from, now);
         let done = d.insert(len, index, data, now);
         let (path, sample) = (d.path(), d.take_sample());
         let refill = match done {
@@ -3616,7 +3625,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Part(i) => {
                 let manifest = self.chain.snapshot_manifest(id).ok().flatten()?;
                 if (i as usize) < manifest.roots.len() {
-                    let (outputs, commits) = self.chain.snapshot_part(id, i as u64).ok().flatten()?;
+                    let (outputs, commits) = match self.chain.snapshot_part(id, i as u64) {
+                        Ok(p) => p?,
+                        // A part this node should hold: say why it cannot.
+                        Err(e) => {
+                            self.log(&format!("serving part {i} of the snapshot after {}: {e}", short(id)));
+                            return None;
+                        }
+                    };
                     net::encode_part(&outputs, &commits)
                 } else {
                     let j = i as u64 - manifest.roots.len() as u64;
