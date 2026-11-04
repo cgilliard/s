@@ -4,7 +4,9 @@
 //! in time fails the test with every process's output.
 //!
 //! The dev networks are built in with the `dev` feature only, so these
-//! tests are too: `cargo test --release --features dev --test wallet`.
+//! tests are too. Each runs as a job of its own in CI (several miners on
+//! one runner starve each other's blocks): locally,
+//! `cargo test --release --features dev --test wallet -- --ignored`.
 
 #![cfg(feature = "dev")]
 
@@ -282,6 +284,7 @@ impl Net {
 /// A pays B over the message layer: B's wallet answers the slate, A's
 /// finalizes it, and A mines it.
 #[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn a_payment_goes_through_the_prompt() {
     let mut net = Net::start("pay");
     net.funded();
@@ -297,6 +300,7 @@ fn a_payment_goes_through_the_prompt() {
 
 /// A registers a name; B finds it on chain, pointing at A's address.
 #[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn a_name_is_registered_through_the_prompt() {
     let mut net = Net::start("name");
     net.funded();
@@ -316,6 +320,7 @@ fn a_name_is_registered_through_the_prompt() {
 
 /// `exit` while the miner is working ends the process (it once hung).
 #[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn exit_while_mining_ends_the_process() {
     let dir = TempDir::new("exit");
     let mut a = Proc::start("A", &dir.0, &["mine"]);
@@ -416,6 +421,7 @@ fn sub_names_resolve_in_both_modes() {
 /// chain alone; B comes back as a node peered with A, its node switches to
 /// A's chain while it runs, and B's wallet forgets those rewards.
 #[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn a_reorganization_takes_lost_rewards_out_of_the_wallet() {
     let (dir_a, dir_b) = (TempDir::new("reorg-a"), TempDir::new("reorg-b"));
     let mut b = Proc::start("B", &dir_b.0, &["mine", "--blocks", "3"]);
@@ -437,6 +443,7 @@ fn a_reorganization_takes_lost_rewards_out_of_the_wallet() {
 /// with C only, whose heavier chain lacks the payment (and can never hold
 /// it: its inputs are A's rewards on the lost chain).
 #[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn a_reorganization_takes_a_lost_payment_out_of_the_wallet() {
     let dirs = ["lost-s", "lost-a", "lost-b", "lost-c"].map(TempDir::new);
     let mut c = Proc::start("C", &dirs[3].0, &["mine"]);

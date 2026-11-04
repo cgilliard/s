@@ -84,6 +84,11 @@ jobs:
           - { test: aggregate::tests::dev_recursive_chain_constants, features: dev }
           # The binary through its prompt (miner/tests/wallet.rs).
           - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
+          - { test: a_payment_goes_through_the_prompt, features: dev, target: --test wallet }
+          - { test: a_name_is_registered_through_the_prompt, features: dev, target: --test wallet }
+          - { test: exit_while_mining_ends_the_process, features: dev, target: --test wallet }
+          - { test: a_reorganization_takes_lost_rewards_out_of_the_wallet, features: dev, target: --test wallet }
+          - { test: a_reorganization_takes_a_lost_payment_out_of_the_wallet, features: dev, target: --test wallet }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
