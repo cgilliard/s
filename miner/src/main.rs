@@ -2572,8 +2572,13 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
             {
                 return Err(format!("{name}'s delegation does not verify").into());
             }
-            let until = d.as_ref().map_or(now() + DELEGATION_CACHE, |d| d.expiry.min(now() + DELEGATION_CACHE));
-            ctx.resolved.lock().unwrap().delegations.insert(value, (d.clone(), until));
+            // In init mode there are no delegations: that none is the mode's,
+            // not the owner's, and is not kept past it.
+            let onion = ctx.chain.consensus_epoch()?.current.mode == tabminer::consensus::Mode::Onion;
+            if d.is_some() || onion {
+                let until = d.as_ref().map_or(now() + DELEGATION_CACHE, |d| d.expiry.min(now() + DELEGATION_CACHE));
+                ctx.resolved.lock().unwrap().delegations.insert(value, (d.clone(), until));
+            }
             d
         }
     };
