@@ -39,6 +39,19 @@ jobs:
           workspaces: miner
       - run: cargo test --all --release --features "${{ matrix.features }}"
 
+  # A debug build, for the debug_assert!s release builds leave out (the
+  # proof tests skip themselves there; the slow ones are jobs below).
+  debug:
+    name: linux-arm64-debug
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+      - run: cargo test --all
+
   # The tests marked #[ignore = "slow: …"], each in its own job so they
   # run side by side. A test marked slow must be listed here.
   slow:
