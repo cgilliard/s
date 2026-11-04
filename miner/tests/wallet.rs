@@ -28,8 +28,14 @@ impl TempDir {
 }
 
 impl Drop for TempDir {
+    /// Removes the directory, unless the test failed: then it is kept,
+    /// with the logs, for a look.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -142,6 +148,43 @@ impl Proc {
             assert!(Instant::now() < deadline, "{}: still running {secs} s after exit", self.name);
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Waits up to `secs` for a line of its log containing `text`.
+    fn expect_log(&mut self, text: &str, secs: u64) {
+        let deadline = Instant::now() + guard(secs);
+        loop {
+            let log = std::fs::read_to_string(self.data.join("tabminer.log")).unwrap_or_default();
+            if log.contains(text) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{}: no `{text}` in its log within {secs} s", self.name);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Sends `amount` to `to` (an address or @name), trying again while
+    /// the lookup or the send fails, for up to `secs`.
+    fn pay(&mut self, amount: &str, to: &str, secs: u64) {
+        let deadline = Instant::now() + guard(secs);
+        loop {
+            self.send(&format!("send {amount} {to}"));
+            let line = self.expect("the send's outcome", 60, |l| {
+                (l.starts_with("slate ") && l.contains("sent to")) || l.starts_with("error:")
+            });
+            if line.starts_with("slate ") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{}: `send {amount} {to}` kept failing: {line}", self.name);
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// The chain's height, from `status`.
+    fn height(&mut self) -> u64 {
+        self.send("status");
+        let line = self.expect("the tip", 10, |l| l.starts_with("tip      height "));
+        line["tip      height ".len()..].split_whitespace().next().unwrap().parse().unwrap()
     }
 
     /// The wallet's address, from `address`.
@@ -262,4 +305,88 @@ fn exit_while_mining_ends_the_process() {
             .is_some_and(|h| h > 0)
     });
     assert!(a.exit(30).success());
+}
+
+/// Sub-names end to end, in both modes. Init mode: the owner A's own node
+/// answers for `cool.example`, and P pays C through it. Then A votes for a
+/// consensus file listing the four relays, the network switches to onion
+/// mode at block 144, A delegates its sub-names to B, and with A offline P
+/// pays C through `ex2.example`, which only B knows.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn sub_names_resolve_in_both_modes() {
+    let dirs: Vec<TempDir> =
+        ["s1", "s2", "s3", "s4", "a", "b", "c", "p"].iter().map(|n| TempDir::new(&format!("sub-{n}"))).collect();
+    // Four relays, the seeds of init mode and the relays of onion mode,
+    // each a peer of those before it.
+    let mut relays: Vec<Proc> = Vec::new();
+    for (i, name) in ["S1", "S2", "S3", "S4"].into_iter().enumerate() {
+        let mut args: Vec<String> = ["node", "--no-wallet", "--relay"].map(String::from).to_vec();
+        for r in &relays {
+            args.extend(["--peer".to_string(), r.addr.clone()]);
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        relays.push(Proc::start(name, &dirs[i].0, &args));
+    }
+    let mut net: Vec<String> = Vec::new();
+    for r in &relays {
+        net.extend(["--seed".to_string(), r.addr.clone(), "--peer".to_string(), r.addr.clone()]);
+    }
+    let start = |name: &'static str, dir: &TempDir, first: &[&str]| {
+        let args: Vec<&str> = first.iter().copied().chain(net.iter().map(String::as_str)).collect();
+        Proc::start(name, &dir.0, &args)
+    };
+    let mut a = start("A", &dirs[4], &["mine", "--verbose"]);
+    let mut b = start("B", &dirs[5], &["node"]);
+    let mut c = start("C", &dirs[6], &["node"]);
+    let mut p = start("P", &dirs[7], &["mine"]);
+
+    // A votes for onion mode from its first blocks; it takes effect at 144.
+    let mut file = String::from("mode onion\n");
+    for r in &mut relays {
+        r.send("address");
+        let line = r.expect("relay id", 10, |l| l.starts_with("relay tab1"));
+        let id = line.split_whitespace().nth(1).unwrap().to_string();
+        file.push_str(&format!("relay {id} {}\n", r.addr));
+    }
+    let path = dirs[4].0.join("consensus.txt");
+    std::fs::write(&path, &file).unwrap();
+    a.send(&format!("set-leaf 0 {}", path.display()));
+    a.expect("the leaf set", 10, |l| l.starts_with("leaf 0"));
+
+    // Init mode: A registers example and answers cool.example itself.
+    a.poll("balance", "spendable coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+    a.send("name-commit example");
+    a.expect("the commit", 30, |l| l.starts_with("committed to example"));
+    a.poll("names", "the commit ready", 120, |l| l.starts_with("example") && l.contains("ready to reveal"));
+    a.send("name-reveal example");
+    a.expect("the reveal", 30, |l| l == "revealing example");
+    a.poll("names", "the name owned", 120, |l| l.starts_with("example") && l.contains("  owned  "));
+    let c_address = c.address();
+    a.send(&format!("subname set cool.example {c_address}"));
+    a.expect("the sub-name set", 10, |l| l.starts_with("cool.example is"));
+    p.poll("name example", "the name on chain", 60, |l| l.starts_with("value"));
+    p.poll("balance", "spendable coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+    p.pay("1", "@cool.example", 120);
+    c.poll("balance", "the first coin", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
+
+    // The switch, and past its grace period.
+    a.poll("consensus", "onion mode", 600, |l| l.starts_with("mode     onion"));
+    let deadline = Instant::now() + guard(120);
+    while a.height() < 150 {
+        assert!(Instant::now() < deadline, "A: block 150 never came");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // Onion mode: B answers for A's names; A goes offline once its
+    // delegation is held at its rendezvous points.
+    b.send(&format!("subname set ex2.example {c_address}"));
+    b.expect("the sub-name set", 10, |l| l.starts_with("ex2.example is"));
+    let b_address = b.address();
+    a.send(&format!("subname server {b_address}"));
+    a.expect("the delegation", 10, |l| l.contains("are answered by"));
+    a.expect_log("our delegation is held at our rendezvous point", 120);
+    assert!(a.exit(30).success());
+    p.pay("1", "@ex2.example", 180);
+    c.poll("balance", "the second coin", 180, |l| amount(l, "confirmed").is_some_and(|c| c == 2.0));
 }

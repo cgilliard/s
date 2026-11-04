@@ -82,6 +82,8 @@ jobs:
           - test: node::tests::rendezvous_points_meet_over_circuits
           - test: node::tests::a_switch_between_modes_falls_back
           - { test: aggregate::tests::dev_recursive_chain_constants, features: dev }
+          # The binary through its prompt (miner/tests/wallet.rs).
+          - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,7 +91,7 @@ jobs:
         with:
           workspaces: miner
           shared-key: slow
-      - run: cargo test --release --lib --features "${{ matrix.features }}" -- --ignored --exact ${{ matrix.test }}
+      - run: cargo test --release ${{ matrix.target || '--lib' }} --features "${{ matrix.features }}" -- --ignored --exact ${{ matrix.test }}
 
   # Every test marked slow has a job above.
   slow-listed:
@@ -99,6 +101,6 @@ jobs:
       - name: compare the marked tests with the matrix
         working-directory: .
         run: |
-          marked=$(grep -rh -A1 'ignore = "slow: one job each' miner/src | grep -o 'fn [a-z0-9_]*' | sed 's/fn //' | sort)
-          listed=$(grep -o 'test: [a-z_0-9]*::tests::[a-z0-9_]*' .github/workflows/test.yml | sed 's/.*:://' | sort)
+          marked=$(grep -rh -A1 'ignore = "slow: one job each' miner/src miner/tests | grep -o 'fn [a-z0-9_]*' | sed 's/fn //' | sort)
+          listed=$(grep -o 'test: [a-z][a-z_0-9:]*' .github/workflows/test.yml | sed 's/.*[: ]//' | sort)
           diff <(echo "$marked") <(echo "$listed")
