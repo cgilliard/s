@@ -1638,6 +1638,9 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             // A sub-name's lookups and the slate go over one circuit.
             let group = lookup_tag() | 1;
             let to = recipient_in(ctx, file, group)?;
+            if to.is_some() {
+                await_reachable(ctx)?;
+            }
             let rtxn = ctx.chain.env().read_txn()?;
             let slate = ctx.wallet()?.send(amount, fee, named, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
@@ -2348,6 +2351,28 @@ fn restore(args: &Args) -> AnyResult<()> {
     println!("wallet restored in {}", dir.display());
     println!("start tabminer with this --data directory: once it has synced, it finds the wallet's outputs");
     Ok(())
+}
+
+/// Waits up to 15 s for one of the wallet's rendezvous sessions to be
+/// live: the answer to a slate comes back through one, and before it is
+/// (just after a start) the point may still hold the session of the
+/// process before, and the answer would be lost.
+fn await_reachable(ctx: &Ctx) -> AnyResult<()> {
+    let live = || ctx.stats.lock().unwrap().rendezvous.iter().any(|(_, l)| *l);
+    if live() {
+        return Ok(());
+    }
+    println!("waiting for this wallet's rendezvous session, for the answer to come back through");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        if live() {
+            return Ok(());
+        }
+    }
+    Err("no rendezvous session of this wallet is live, so no answer could reach it; try again shortly \
+         (`status` shows the sessions)"
+        .into())
 }
 
 /// Where `send` sends: an id (a `tab1…` address or 64 hex digits) or a

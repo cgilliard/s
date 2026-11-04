@@ -57,8 +57,14 @@ impl Proc {
     /// Starts one on a port of the system's choosing, and waits until it
     /// listens.
     fn start(name: &'static str, data: &Path, args: &[&str]) -> Proc {
+        Proc::start_with(name, data, args, &[])
+    }
+
+    /// [`Proc::start`] with `env` set too.
+    fn start_with(name: &'static str, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Proc {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tabminer"))
             .args(args)
+            .envs(env.iter().copied())
             .args(["--network", "dev", "--no-seeds", "--listen", "127.0.0.1:0", "--data"])
             .arg(data)
             .stdin(Stdio::piped())
@@ -148,6 +154,20 @@ impl Proc {
                 return status;
             }
             assert!(Instant::now() < deadline, "{}: still running {secs} s after exit", self.name);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits up to `secs` for the process to end by itself, and that it
+    /// failed.
+    fn dies(&mut self, secs: u64) {
+        let deadline = Instant::now() + guard(secs);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(!status.success(), "{}: ended cleanly", self.name);
+                return;
+            }
+            assert!(Instant::now() < deadline, "{}: still running after {secs} s", self.name);
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -528,3 +548,50 @@ fn a_restored_wallet_finds_and_spends_beside_its_original() {
     assert!(net.s.exit(30).success());
 }
 
+/// A crash at each step of a payment loses nothing: A dies (an abort, as
+/// a power loss) once the slate's inputs are reserved, while it signs the
+/// answer, and once it has signed but before the pool has the payment.
+/// Started again, A frees the first two slates with `cancel` and sends the
+/// third with `resend`; then a payment goes through as usual.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn a_crash_at_each_step_of_a_payment_loses_nothing() {
+    let mut net = Net::start("crash");
+    net.funded();
+    let to = net.b.address();
+    let dir_a = net.a.data.clone();
+    let (seed, b_addr) = (net.s.addr.clone(), net.b.addr.clone());
+    let args = ["mine", "--seed", &seed, "--peer", &seed, "--peer", &b_addr];
+    assert!(net.a.exit(30).success());
+    for step in ["send:reserved", "finalize:signing", "finalize:signed"] {
+        let mut a = Proc::start_with("A", &dir_a, &args, &[("TABMINER_CRASH_AT", step)]);
+        a.poll("balance", "spendable coins", 60, |l| amount(l, "confirmed").is_some_and(|c| c > 1.0));
+        a.send(&format!("send 1 {to}"));
+        a.dies(120);
+        drop(a);
+        let mut a = Proc::start("A", &dir_a, &args);
+        if step == "finalize:signed" {
+            let line = a.poll("sent", "the signed payment", 30, |l| l.contains("  fee "));
+            let txid = line.split_whitespace().next().unwrap().to_string();
+            a.send(&format!("resend {txid}"));
+            a.expect("the payment sent again", 10, |l| l.starts_with("sending "));
+            a.poll("sent", "the payment confirmed", 120, |l| l == "no unconfirmed payments");
+        } else {
+            let line = a.poll("slates", "the pending slate", 30, |l| l.ends_with(" reserved"));
+            let id = line.split_whitespace().next().unwrap().to_string();
+            a.send(&format!("cancel {id}"));
+            a.expect("the slate cancelled", 10, |l| l.starts_with("slate cancelled"));
+            a.poll("balance", "nothing reserved", 10, |l| amount(l, "reserved") == Some(0.0));
+        }
+        net.a = a;
+        assert!(net.a.exit(30).success(), "{step}");
+    }
+    net.a = Proc::start("A", &dir_a, &args);
+    net.a.pay("1", &to, 60);
+    net.b.poll("balance", "both coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 2.0));
+    net.a.poll("sent", "the payment confirmed", 60, |l| l == "no unconfirmed payments");
+    net.a.poll("slates", "no slate left", 10, |l| l == "no pending slates");
+    assert!(net.a.exit(30).success());
+    assert!(net.b.exit(30).success());
+    assert!(net.s.exit(30).success());
+}

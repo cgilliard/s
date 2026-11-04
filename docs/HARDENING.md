@@ -22,11 +22,10 @@ then, 28 now. Most that remain are accepted, for launch, or tests; some were nar
 | 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
 | 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
 | 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | 84792e7 |
-| 8 | CI and what it found: tests on Linux, macOS and Windows (x64, arm64), release with overflow checks, a debug build, the dev feature, the slow tests and the chain constants one job each; binary tests through the prompt (`miner/tests/wallet.rs`: a payment, a name, sub-names through the switch to onion mode, exit while mining, reorganizations); the name circuit's position in 30-bit limbs; Windows (OS randomness, LF checkouts, LMDB without TLS); the miner waits on verified headers only, never a claim; an init-mode "no delegation" not cached; outputs lost to a reorganization hidden, then forgotten; headers ahead of their parent no fault; first pings retried; fast sync and the message layer over lossy and reordering networks | 4830361 on |
+| 8 | CI and what it found: tests on Linux, macOS and Windows (x64, arm64), release with overflow checks, a debug build, the dev feature, the slow tests and the chain constants one job each; binary tests through the prompt (`miner/tests/wallet.rs`: a payment, a name, sub-names through the switch to onion mode, exit while mining, reorganizations); the name circuit's position in 30-bit limbs; Windows (OS randomness, LF checkouts, LMDB without TLS); the miner waits on verified headers only, never a claim; an init-mode "no delegation" not cached; outputs lost to a reorganization hidden, then forgotten; headers ahead of their parent no fault; first pings retried; fast sync and the message layer over lossy and reordering networks; a restored wallet beside its original; fast sync's edge cases (a manifest that does not fit the proof, no snapshot served with and without a peer keeping every block, a reorganization past the snapshot, a heavier branch below the floor), which found an abandoned snapshot falling through to a replay from genesis and such a branch holding the node off its own chain (now set aside, its peers not struck, an announcer asked for the block it announced); crash injection at each step of a payment (`TABMINER_CRASH_AT`, `dev` builds), the change record now written with the reservation, and a send waiting for the wallet's rendezvous session so the answer is not lost after a start | 4830361 on |
 
-Still to do, as code: the untested paths listed below (fast-sync edge
-cases, crash injection in the wallet, a restored wallet beside its
-original). CI (`.github/workflows/test.yml`) runs the suite in release
+Still to do, as code: the untested paths listed below (the rest of
+fast sync's, and of the network's). CI (`.github/workflows/test.yml`) runs the suite in release
 with overflow checks on five platforms, a debug build and the `dev`
 feature on Linux, and each test marked slow (the proving round trips,
 the multi-node and binary tests, the chain constants) as a job of its
@@ -79,15 +78,16 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   per host, so one network cannot fill it. Still to do once the chain is
   live: hard-code a checkpoint or an `assumevalid` header hash per
   release.
-- **Untested paths.** No test for: a reorganization past the snapshot
-  during a fast sync; a reorganization below the floor after install; the
-  "no peer serves" and `drop_carry` paths; the bad-manifest path; the
-  genesis fallback and "keep trying" paths of `restart_snapshot`; a
-  deferred move or restart while parts are with the applier; the header
-  batch retry; clock-skew logging; strikes leading to a ban at node
-  level; peers-file poisoning; IPv6; NAT. (Loss and reordering are
-  tested: a fast sync and the message layer with a tenth of datagrams
-  lost, or almost a third delivered after the next.)
+- **Untested paths.** No test for: the `drop_carry` path; a deferred
+  move or restart while parts are with the applier; the header batch
+  retry; clock-skew logging; strikes leading to a ban at node level;
+  peers-file poisoning; IPv6; NAT. (Tested: loss and reordering, a fast
+  sync and the message layer with a tenth of datagrams lost or almost a
+  third delivered after the next; a manifest that does not fit the
+  snapshot block's proof; no peer serving the snapshot, with a peer
+  keeping every block (validated from genesis) and without (kept
+  trying); a reorganization past the snapshot during the sync; a heavier
+  branch forking below the floor after the install.)
 
 ## Wallet
 
@@ -138,13 +138,19 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   the start from something both copies agree on only when they are the
   same copy (a per-restore random salt stored on chain in the first spend's
   memo).
-- **Minor.** `wallet.rs`: `send` writes the change record in a separate
-  transaction before reserving the inputs, leaving an orphan record on a
-  crash between them (`prune` removes it).
-- **Untested.** Crash injection between the steps of `send`; concurrent
-  original and restored wallets; the restore-scan thread. (A
-  reorganization's lost rewards and payments are tested through the
-  binary, `miner/tests/wallet.rs`.)
+- **A message to a wallet just started can be lost.** Until its new
+  session is live, its rendezvous point may still hold the session of
+  the process before and pass a message there. A send now waits for the
+  session, so an answer to it is not lost; a slate someone else sends
+  in that window is (the sender's slate stays pending until cancelled).
+  Fix: a rendezvous point holds messages for a session whose datagrams
+  stopped until the new one takes over, or end-to-end acknowledgements.
+- **Tested through the binary** (`miner/tests/wallet.rs`): a
+  reorganization's lost rewards and payments; a restored wallet finding
+  and spending beside its original; a crash after the inputs are
+  reserved, while the answer is signed, and after it is signed but
+  before the pool has it (`cancel` frees the first two, `resend` sends
+  the third).
 
 ## Proof system
 

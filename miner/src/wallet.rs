@@ -846,6 +846,19 @@ pub struct Wallet {
     address_off: std::sync::atomic::AtomicBool,
 }
 
+/// Crash injection for the binary's tests (`miner/tests/wallet.rs`): with
+/// the `dev` feature, the process aborts at the step `TABMINER_CRASH_AT`
+/// names, as if the machine had lost power there.
+fn crash_point(at: &str) {
+    #[cfg(feature = "dev")]
+    if std::env::var("TABMINER_CRASH_AT").is_ok_and(|v| v == at) {
+        eprintln!("crash injected at {at}");
+        std::process::abort();
+    }
+    #[cfg(not(feature = "dev"))]
+    let _ = at;
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -1294,10 +1307,17 @@ impl Wallet {
     /// A fresh output paying `amount` to this wallet, with its memo,
     /// recorded as unspent (and unconfirmed until the UTXO set holds it).
     pub fn receive(&self, amount: u64) -> Result<Output> {
+        let mut wtxn = self.env.write_txn()?;
+        let out = self.receive_in(&mut wtxn, amount)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// [`Wallet::receive`] within `wtxn`.
+    fn receive_in(&self, wtxn: &mut RwTxn, amount: u64) -> Result<Output> {
         let nonce = [random_fp()?, random_fp()?, random_fp()?, random_fp()?];
         let pk = self.key(&nonce).public_key();
         let out = Output::with_memo(&pubkey_hash(&pk), amount, self.memo(&nonce));
-        let mut wtxn = self.env.write_txn()?;
         let o = Owned {
             commitment: out.commitment,
             nonce,
@@ -1309,8 +1329,7 @@ impl Wallet {
             used: 0,
             position: None,
         };
-        self.record(&mut wtxn, &o)?;
-        wtxn.commit()?;
+        self.record(wtxn, &o)?;
         Ok(out)
     }
 
@@ -1878,14 +1897,16 @@ impl Wallet {
         }
         let change_amount = (total - need) as u64;
         let fee = if change_amount < dust { fee + change_amount } else { fee };
+        // The change record, the reservation and the slate in one
+        // transaction: a crash leaves all or none of them.
+        let mut wtxn = self.env.write_txn()?;
         let mut outputs = Vec::new();
         let mut change = None;
         if change_amount >= dust {
-            let out = self.receive(change_amount)?;
+            let out = self.receive_in(&mut wtxn, change_amount)?;
             change = Some(out.commitment);
             outputs.push(out);
         }
-        let mut wtxn = self.env.write_txn()?;
         for c in &picked {
             self.set_state(&mut wtxn, &c.commitment, State::Reserved)?;
         }
@@ -1896,6 +1917,7 @@ impl Wallet {
             Pending { inputs: picked.iter().map(|c| c.commitment).collect(), change, amount, fee, sender, secret };
         self.slates.put(&mut wtxn, &id, &pending.to_bytes())?;
         wtxn.commit()?;
+        crash_point("send:reserved");
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
         Ok(Slate {
             id,
@@ -2049,7 +2071,9 @@ impl Wallet {
         let payment =
             Payment { txid: sent.txid, output: paid_to, claim, created: sent.created, landed: None, path: None };
         self.payments.put(&mut wtxn, &digest_to_bytes(&payment.txid), &payment.to_bytes())?;
+        crash_point("finalize:signing");
         wtxn.commit()?;
+        crash_point("finalize:signed");
         Ok(signed)
     }
 
