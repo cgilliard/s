@@ -22,11 +22,15 @@ then, 28 now. Most that remain are accepted, for launch, or tests; some were nar
 | 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
 | 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
 | 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | 84792e7 |
+| 8 | CI and what it found: tests on Linux, macOS and Windows (x64, arm64), release with overflow checks, a debug build, the dev feature, the slow tests and the chain constants one job each; binary tests through the prompt (`miner/tests/wallet.rs`: a payment, a name, sub-names through the switch to onion mode, exit while mining, reorganizations); the name circuit's position in 30-bit limbs; Windows (OS randomness, LF checkouts, LMDB without TLS); the miner waits on verified headers only, never a claim; an init-mode "no delegation" not cached; outputs lost to a reorganization hidden, then forgotten; headers ahead of their parent no fault; first pings retried; fast sync and the message layer over lossy and reordering networks | 4830361 on |
 
 Still to do, as code: the untested paths listed below (fast-sync edge
-cases, a reordering network, the message layer under loss, crash
-injection in the wallet). The proof tests that take seconds run with
-`cargo test --release` and are skipped in debug builds.
+cases, crash injection in the wallet, a restored wallet beside its
+original). CI (`.github/workflows/test.yml`) runs the suite in release
+with overflow checks on five platforms, a debug build and the `dev`
+feature on Linux, and each test marked slow (the proving round trips,
+the multi-node and binary tests, the chain constants) as a job of its
+own; the proof tests that take seconds are skipped in debug builds.
 
 Not code, or for launch: the independent circuit review, the soundness
 conjecture, a checkpoint per release, seeds, genesis regeneration, the
@@ -80,10 +84,10 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   "no peer serves" and `drop_carry` paths; the bad-manifest path; the
   genesis fallback and "keep trying" paths of `restart_snapshot`; a
   deferred move or restart while parts are with the applier; the header
-  batch retry; clock-skew logging; a reordering network (loss is tested:
-  a fast sync with a tenth of datagrams lost); the message layer over a
-  lossy network; strikes leading to a ban at node level; peers-file
-  poisoning; IPv6; NAT.
+  batch retry; clock-skew logging; strikes leading to a ban at node
+  level; peers-file poisoning; IPv6; NAT. (Loss and reordering are
+  tested: a fast sync and the message layer with a tenth of datagrams
+  lost, or almost a third delivered after the next.)
 
 ## Wallet
 
@@ -137,10 +141,10 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
 - **Minor.** `wallet.rs`: `send` writes the change record in a separate
   transaction before reserving the inputs, leaving an orphan record on a
   crash between them (`prune` removes it).
-- **Untested.** The `sync_wallet` fork walk and stale positions after a
-  reorganization; crash injection between the steps of `send`;
-  concurrent original and restored wallets; the restore-scan thread.
-  There are no integration tests (`miner/tests` does not exist).
+- **Untested.** Crash injection between the steps of `send`; concurrent
+  original and restored wallets; the restore-scan thread. (A
+  reorganization's lost rewards and payments are tested through the
+  binary, `miner/tests/wallet.rs`.)
 
 ## Proof system
 
@@ -218,7 +222,7 @@ Found while building it (2026-11-01).
 ## Deployment and operations
 
 - **Seeds** need the current binary at every format change (now protocol
-  7, chain format 14, wallet format 8, slate format `tabslt05`), started
+  9, chain format 14, wallet format 8, slate format `tabslt05`), started
   with `--relay`, and wiped data directories. Fresh nodes cannot sync
   until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the
