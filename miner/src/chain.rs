@@ -505,6 +505,23 @@ const STATUS_HEADER_ONLY: u8 = 3;
 /// Treated as invalid, but no peer is at fault for it.
 const STATUS_ASIDE: u8 = 4;
 
+/// The synthetic output at `position` of [`Chain::debug_fill_outputs`]:
+/// commitment and memo drawn from the position (splitmix64), amount zero.
+fn debug_output(position: u64) -> (u64, Commitment, Slot, u32) {
+    use crate::poseidon2::{Fp, P};
+    let mut x = position ^ 0x5eed_f111_0000_0000;
+    let mut fp = || {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Fp::new(((z ^ (z >> 31)) % P as u64) as u32)
+    };
+    let commitment: Commitment = core::array::from_fn(|_| fp());
+    let memo: crate::transaction::Memo = core::array::from_fn(|_| fp());
+    (position, commitment, crate::transaction::memo_slot(&memo, 0), 0)
+}
+
 /// A stored header with its index record.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
@@ -1197,11 +1214,82 @@ impl<V: ProofVerifier> Chain<V> {
         let mut wtxn = self.env.write_txn()?;
         self.names.rebuild_buckets(&mut wtxn).map_err(|e| ChainError::Name(e.into()))?;
         wtxn.commit()?;
-        // The state root changed under genesis: rewrite its header, whose
-        // id every record of it is keyed by.
         let mut wtxn = self.env.write_txn()?;
         let root = self.names.root(&wtxn).map_err(|e| ChainError::Name(e.into()))?;
         let state_root = self.utxo.set_name_root(&mut wtxn, &root)?;
+        self.rewrite_genesis(wtxn, state_root)
+    }
+
+    /// Debugging only (the verifier must be unchecked): fills the set with
+    /// `n` synthetic outputs behind genesis, after its own, as if they had
+    /// always been there, for testing at scale without mining them. Each
+    /// output, of amount zero, is made from its position alone, so every
+    /// node filling with the same `n` computes the same state and genesis
+    /// header, whose state root is rewritten. They are staged a snapshot
+    /// part at a time, as a fast sync installs them, so a set of any size
+    /// fits in memory. With `header_only`, only the genesis header is
+    /// rewritten and nothing stored: a fresh node with the filled chain's
+    /// genesis, to fast-sync it from a node that holds it. A chain past
+    /// genesis, or filled already, is left alone; outputs are filled before
+    /// names.
+    pub fn debug_fill_outputs(&self, n: u64, header_only: bool, progress: &dyn Fn(u64)) -> Result<()> {
+        if !self.verifier.is_unchecked() {
+            return Err(ChainError::Corrupt("filling outputs needs an unchecked verifier"));
+        }
+        let rtxn = self.env.read_txn()?;
+        let tip = self.tip_in(&rtxn)?.ok_or(ChainError::NoGenesis)?;
+        if tip.height != 0 || tip != self.params.genesis().header || n == 0 {
+            return Ok(());
+        }
+        let made = self.utxo.next_position(&rtxn)?;
+        let own: Vec<(u64, Commitment, Slot, u32)> =
+            self.utxo.unspent_in(&rtxn, 0, made)?.into_iter().map(|(p, (c, s, h))| (p, c, s, h)).collect();
+        let name_root = self.utxo.name_root(&rtxn)?;
+        drop(rtxn);
+        let next = made + n;
+        let level = SNAPSHOT_PART_LOG;
+        let parts = next.div_ceil(1 << level);
+        let mut roots = Vec::with_capacity(parts as usize);
+        let mut wtxn = if header_only { None } else { Some(self.env.write_txn()?) };
+        for p in 0..parts {
+            let (first, end) = (p << level, ((p + 1) << level).min(next));
+            let mut outputs: Vec<(u64, Commitment, Slot, u32)> =
+                own.iter().filter(|o| o.0 >= first && o.0 < end).copied().collect();
+            outputs.extend((first.max(made)..end).map(debug_output));
+            match wtxn.as_mut() {
+                None => roots.push(UtxoSet::part_root(level, &outputs)),
+                Some(w) => {
+                    if first < made {
+                        self.utxo.unstage(w, level, p)?;
+                    }
+                    roots.push(self.utxo.stage(w, level, p, &outputs, next)?);
+                    // A transaction per 64 parts, about a million outputs.
+                    if p % 64 == 63 {
+                        wtxn.take().unwrap().commit()?;
+                        wtxn = Some(self.env.write_txn()?);
+                    }
+                }
+            }
+            if p % 64 == 63 {
+                progress(end - made);
+            }
+        }
+        let (wtxn, state_root) = match wtxn {
+            None => (self.env.write_txn()?, crate::state_tree::root_from_subtrees(level, &roots, &name_root)),
+            Some(mut w) => {
+                self.utxo.finish_staged(&mut w, level, &roots, next)?;
+                let root = self.utxo.root(&w)?;
+                (w, root)
+            }
+        };
+        progress(n);
+        self.rewrite_genesis(wtxn, state_root)
+    }
+
+    /// The state root changed under genesis (a debugging fill): rewrites
+    /// its header, whose id every record of it is keyed by, in `wtxn`.
+    fn rewrite_genesis(&self, mut wtxn: RwTxn, state_root: Digest) -> Result<()> {
+        let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
         let old = Header { ..tip };
         let new = Header { state_root, ..tip };
         let (old_id, new_id) = (digest_bytes(&old.hash()), digest_bytes(&new.hash()));

@@ -140,7 +140,14 @@ debugging (a node so started can be fed any block; never use with real funds):
   --debug-fill-names N  with the above, start with N synthetic names in the
                     registry behind genesis (the same N on every node of the
                     network, on the first start only): for testing names at
-                    scale";
+                    scale
+  --debug-fill-outputs N  with the above, start with N synthetic outputs in the
+                    set behind genesis (the same N on every node of the
+                    network, on the first start only): for testing a large
+                    state without mining it
+  --debug-genesis-outputs N  with the above, start with the genesis of a chain
+                    filled with N outputs but without the outputs: a fresh
+                    node to fast-sync such a chain";
 
 const HELP: &str = "commands:
   status                    chain tip, peers, mempool, wallet totals
@@ -307,6 +314,8 @@ struct Args {
     debug_fill: Option<(usize, usize)>,
     /// Synthetic names to start the registry with.
     debug_fill_names: usize,
+    debug_fill_outputs: u64,
+    debug_genesis_outputs: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -344,6 +353,8 @@ fn parse_args() -> Result<Args, String> {
         debug_unchecked: false,
         debug_fill: None,
         debug_fill_names: 0,
+        debug_fill_outputs: 0,
+        debug_genesis_outputs: 0,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -404,6 +415,8 @@ fn parse_args() -> Result<Args, String> {
                 a.debug_fill = Some((number(n.to_string())? as usize, number(s.to_string())? as usize));
             }
             "--debug-fill-names" => a.debug_fill_names = number(value()?)? as usize,
+            "--debug-fill-outputs" => a.debug_fill_outputs = number(value()?)?,
+            "--debug-genesis-outputs" => a.debug_genesis_outputs = number(value()?)?,
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
@@ -418,10 +431,12 @@ fn parse_args() -> Result<Args, String> {
     if a.network != Network::Mainnet && !data_given {
         a.data = a.data.with_file_name(a.network.dir_name());
     }
-    if (a.debug_fill.is_some() || a.debug_fill_names > 0) && !a.debug_unchecked {
-        return Err(
-            "--debug-fill and --debug-fill-names need --debug-no-validate-proofs: such a chain cannot be proven".into(),
-        );
+    let fills = a.debug_fill_names > 0 || a.debug_fill_outputs > 0 || a.debug_genesis_outputs > 0;
+    if (a.debug_fill.is_some() || fills) && !a.debug_unchecked {
+        return Err("the --debug-fill flags need --debug-no-validate-proofs: such a chain cannot be proven".into());
+    }
+    if a.debug_fill_outputs > 0 && a.debug_genesis_outputs > 0 {
+        return Err("--debug-fill-outputs and --debug-genesis-outputs: one or the other".into());
     }
     Ok(a)
 }
@@ -524,6 +539,22 @@ fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc
             .into());
         }
         _ => {}
+    }
+    // Outputs before names: the names fill keeps the outputs' root.
+    for (n, header_only) in [(args.debug_fill_outputs, false), (args.debug_genesis_outputs, true)] {
+        if n == 0 {
+            continue;
+        }
+        let (t, logged) = (Instant::now(), std::cell::Cell::new(0));
+        chain.debug_fill_outputs(n, header_only, &|done| {
+            // About every ten million.
+            if done / 10_000_000 > logged.get() {
+                logged.set(done / 10_000_000);
+                log::line(&format!("debug: {done} outputs filled in {}", secs(t.elapsed())));
+            }
+        })?;
+        let what = if header_only { "the genesis of" } else { "a set filled with" };
+        log::line(&format!("debug: {what} {n} outputs ready in {}", secs(t.elapsed())));
     }
     if args.debug_fill_names > 0 {
         let t = Instant::now();

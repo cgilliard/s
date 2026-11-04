@@ -23,6 +23,7 @@ then, 28 now. Most that remain are accepted, for launch, or tests; some were nar
 | 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
 | 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | 84792e7 |
 | 8 | CI and what it found: tests on Linux, macOS and Windows (x64, arm64), release with overflow checks, a debug build, the dev feature, the slow tests and the chain constants one job each; binary tests through the prompt (`miner/tests/wallet.rs`: a payment, a name, sub-names through the switch to onion mode, exit while mining, reorganizations); the name circuit's position in 30-bit limbs; Windows (OS randomness, LF checkouts, LMDB without TLS); the miner waits on verified headers only, never a claim; an init-mode "no delegation" not cached; outputs lost to a reorganization hidden, then forgotten; headers ahead of their parent no fault; first pings retried; fast sync and the message layer over lossy and reordering networks; a restored wallet beside its original; fast sync's edge cases (a manifest that does not fit the proof, no snapshot served with and without a peer keeping every block, a reorganization past the snapshot, a heavier branch below the floor), which found an abandoned snapshot falling through to a replay from genesis and such a branch holding the node off its own chain (now set aside, its peers not struck, an announcer asked for the block it announced); crash injection at each step of a payment (`TABMINER_CRASH_AT`, `dev` builds), the change record now written with the reservation, and a send waiting for the wallet's rendezvous session so the answer is not lost after a start | 4830361 on |
+| 9 | Scale: `--debug-fill-outputs` (a set of any size made behind genesis, staged a part at a time) and `--debug-genesis-outputs` (its genesis alone, to fast-sync it); a full block on a large set and a fresh node fast-syncing it, as binary tests (`miner/tests/scale.rs`) at 2M outputs every push and 170M on every platform nightly (`scale.yml`), timings as `SCALE` lines; found a peer at its serving limit taken for one that does not serve the snapshot (dense parts), now counted slow | (this batch) |
 
 Still to do, as code: the untested paths listed below (the rest of
 fast sync's, and of the network's). CI (`.github/workflows/test.yml`) runs the suite in release
@@ -239,8 +240,9 @@ Found while building it (2026-11-01).
   six minutes, during which headers are checked at 30 ms each; on a 1 GB
   machine a 12 GB state lives on disk and each full block is bound by
   random-read speed.
-- **A real 170M-output fast sync** to turn the scaled 20 to 30 minute
-  estimate into a measurement.
+- **A real 170M-output fast sync**: the nightly `scale.yml` measures one
+  on GitHub's runners (one peer, so bound by its 8 MB/s serving limit);
+  the seeds' VPS still to be measured the same way.
 ## Features deferred
 
 - Cover for the address a transaction is first sent from, in init mode:

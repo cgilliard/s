@@ -189,7 +189,7 @@ fn node_key(level: usize, index: u64) -> u64 {
 
 /// The parents of the non-empty nodes `nodes` (ascending) at `level`,
 /// hashed eight at a time.
-fn parents(level: usize, nodes: &[(u64, Digest)]) -> Vec<(u64, Digest)> {
+pub(crate) fn parents(level: usize, nodes: &[(u64, Digest)]) -> Vec<(u64, Digest)> {
     let default = &default_hashes()[level];
     let mut keys = Vec::with_capacity(nodes.len().div_ceil(2));
     let mut pairs: Vec<(&Digest, &Digest)> = Vec::with_capacity(nodes.len().div_ceil(2));

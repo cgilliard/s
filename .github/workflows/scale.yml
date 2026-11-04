@@ -1,0 +1,86 @@
+name: scale
+
+# The binary with a Bitcoin-sized unspent set, 170,000,000 outputs (about
+# 12 GB; miner/tests/scale.rs): a full block applied on it, and a fresh
+# node fast-syncing it from one peer, on every platform. Nightly, as it
+# takes hours; every push runs the same tests at 2,000,000 (test.yml).
+# The timings are the SCALE lines, gathered in each job's summary.
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      outputs:
+        description: unspent outputs in the set
+        default: "170000000"
+
+defaults:
+  run:
+    working-directory: miner
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C overflow-checks=on
+  TABMINER_SCALE_OUTPUTS: ${{ inputs.outputs || '170000000' }}
+
+jobs:
+  scale:
+    name: ${{ matrix.test }} ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [linux-x64, linux-arm64, macos-arm64, windows-x64, windows-arm64]
+        test: [a_full_block_applies_on_a_large_state, a_fresh_node_fast_syncs_a_large_state]
+        include:
+          - { name: linux-x64, os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: macos-arm64, os: macos-latest }
+          - { name: windows-x64, os: windows-latest }
+          - { name: windows-arm64, os: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+          shared-key: scale
+      # The set needs about 12 GB, twice for the fast sync: the data goes
+      # on the volume with the most room.
+      - name: room for the set
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+            if [ -d /mnt ] && [ "$(df --output=avail -k /mnt | tail -1)" -gt "$(df --output=avail -k "$RUNNER_TEMP" | tail -1)" ]; then
+              sudo mkdir -p /mnt/scale && sudo chown "$USER" /mnt/scale && dir=/mnt/scale
+            else
+              dir="$RUNNER_TEMP/scale"
+            fi
+          else
+            dir="$RUNNER_TEMP/scale"
+          fi
+          mkdir -p "$dir"
+          echo "TMPDIR=$dir" >> "$GITHUB_ENV"
+          echo "TMP=$dir" >> "$GITHUB_ENV"
+          echo "TEMP=$dir" >> "$GITHUB_ENV"
+          df -h "$dir"
+      - run: cargo build --release --features dev --tests
+      - name: ${{ matrix.test }}
+        run: |
+          set -o pipefail
+          cargo test --release --features dev --test scale -- --ignored --exact ${{ matrix.test }} --nocapture 2>&1 | tee scale.log
+      - name: timings
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.test }} on ${{ matrix.name }}"
+            echo
+            echo "| what | value |"
+            echo "|---|---|"
+            grep -o 'SCALE [^ ]* [^ ]* .*' scale.log | awk '{print "| " $3 " | " $4 " |"}'
+            echo
+            df -h "$TMPDIR" | tail -1 | awk '{print "disk left: " $4}'
+          } >> "$GITHUB_STEP_SUMMARY"

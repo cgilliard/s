@@ -696,6 +696,17 @@ impl UtxoSet {
     }
 
     /// The roots of the groups holding `outputs` (ascending by position).
+    /// The root of the subtree of height `level` holding `outputs` (all in
+    /// it, ascending), computed without storing anything: what
+    /// [`UtxoSet::stage`] would return.
+    pub fn part_root(level: usize, outputs: &[(u64, Commitment, Slot, u32)]) -> Digest {
+        let mut nodes = Self::roots_of(outputs);
+        for l in GROUP_LOG..level {
+            nodes = state_tree::parents(l, &nodes);
+        }
+        nodes.first().map_or(state_tree::default_hashes()[level], |&(_, v)| v)
+    }
+
     fn roots_of(outputs: &[(u64, Commitment, Slot, u32)]) -> Vec<(u64, Digest)> {
         let positions: Vec<u64> = outputs.iter().map(|o| o.0).collect();
         let records: Vec<(Commitment, Slot, u32)> = outputs.iter().map(|o| (o.1, o.2, o.3)).collect();
@@ -1383,11 +1394,11 @@ mod tests {
             for pos in first..end {
                 if rnd() % 20 == 0 {
                     let mut c = EMPTY;
-                    let mut m = EMPTY;
-                    for e in c.iter_mut().chain(m.iter_mut()) {
+                    let mut memo = [crate::poseidon2::Fp::ZERO; crate::transaction::MEMO_LEN];
+                    for e in c.iter_mut().chain(memo.iter_mut()) {
                         *e = crate::poseidon2::Fp::new((rnd() % crate::poseidon2::P as u64) as u32);
                     }
-                    outputs.push((pos, c, m, 0));
+                    outputs.push((pos, c, crate::transaction::memo_slot(&memo, rnd() % 1_000_000), 0));
                 }
             }
             count += outputs.len() as u64;
