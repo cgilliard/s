@@ -36,3 +36,51 @@ jobs:
         with:
           workspaces: miner
       - run: cargo test --all --release
+
+  # The tests marked #[ignore = "slow: …"], each in its own job so they
+  # run side by side. A test marked slow must be listed here.
+  slow:
+    name: slow ${{ matrix.test }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - aggregate::tests::chain_proofs_cover_history
+          - aggregate::tests::the_chain_connects_only_proven_blocks
+          - aggregate::tests::name_operations_roundtrip
+          - aggregate::tests::aggregate_tree_roundtrip
+          - aggregate::tests::spanning_transaction_roundtrip
+          - aggregate::tests::proving_can_be_cancelled
+          - aggregate::tests::aggregate_proof_roundtrip
+          - node::tests::an_idle_participant_is_quiet_and_learns_of_a_dead_hop
+          - node::tests::sessions_come_back_after_the_relay_restarts
+          - node::tests::standing_circuits_are_replaced_and_rebuilt
+          - node::tests::a_false_claim_of_work_does_not_stall_the_sync
+          - node::tests::a_false_claim_of_work_at_a_low_height_does_not_stall_the_sync
+          - node::tests::a_switch_of_relays_keeps_messages_flowing
+          - node::tests::a_server_carries_a_delegation_to_new_points
+          - node::tests::sub_names_resolve_through_a_delegated_server
+          - node::tests::a_fresh_node_fast_syncs_when_its_first_peer_comes_late
+          - node::tests::rendezvous_points_meet_over_circuits
+          - node::tests::a_switch_between_modes_falls_back
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+          shared-key: slow
+      - run: cargo test --release --lib -- --ignored --exact ${{ matrix.test }}
+
+  # Every test marked slow has a job above.
+  slow-listed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare the marked tests with the matrix
+        working-directory: .
+        run: |
+          marked=$(grep -rh -A1 'ignore = "slow: one job each' miner/src | grep -o 'fn [a-z0-9_]*' | sed 's/fn //' | sort)
+          listed=$(grep -o '^ *- [a-z_]*::tests::[a-z0-9_]*' .github/workflows/test.yml | sed 's/.*:://' | sort)
+          diff <(echo "$marked") <(echo "$listed")

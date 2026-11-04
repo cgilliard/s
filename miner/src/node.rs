@@ -4052,7 +4052,7 @@ mod tests {
     /// meanwhile, and goes back to fast sync when the peer appears: it ends
     /// on a snapshot, not a replay.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_fresh_node_fast_syncs_when_its_first_peer_comes_late() {
         let a = open("late-a");
         let now = unix_now();
@@ -4435,7 +4435,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_false_claim_of_work_does_not_stall_the_sync() {
         // The liar answers pings claiming all the work there could be, and
         // nothing else. c, knowing it and a, must still sync from a, and
@@ -4444,7 +4444,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_false_claim_of_work_at_a_low_height_does_not_stall_the_sync() {
         // The same liar, claiming its work at height 1: too short for the
         // header pipeline, it used to be neither asked nor passed over.
@@ -4944,7 +4944,7 @@ mod tests {
     /// circuit ends at another relay, looks p up and sends it a payload,
     /// which its relay forwards to p's point and down p's circuit.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn rendezvous_points_meet_over_circuits() {
         use crate::onion::{Announce, Object, Payload};
         use circuits::Seen;
@@ -5179,7 +5179,7 @@ mod tests {
     /// relays pass back, and is reachable again, with no keepalive of its
     /// own to notice.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn an_idle_participant_is_quiet_and_learns_of_a_dead_hop() {
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("idle-{i}"))).collect();
         let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
@@ -5776,7 +5776,7 @@ mod tests {
     /// the server it names for a label, answered along the query's way
     /// back and signed by the server.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn sub_names_resolve_through_a_delegated_server() {
         use crate::onion;
         use crate::subnames::{Answer, Delegation, Entry, Table, Zone};
@@ -5913,7 +5913,7 @@ mod tests {
     /// carries the delegation there, and a resolver asking only the new
     /// points finds it.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_server_carries_a_delegation_to_new_points() {
         use crate::subnames::Delegation;
         let fixtures: Vec<Fixture> = (0..9).map(|i| open(&format!("carry-{i}"))).collect();
@@ -6005,7 +6005,7 @@ mod tests {
     /// through whichever list a sender's rendezvous point tries first; once
     /// it is over, only the new list's points remain.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_switch_of_relays_keeps_messages_flowing() {
         use crate::onion;
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("switch-{i}"))).collect();
@@ -6130,7 +6130,7 @@ mod tests {
     /// both kinds of session, and a send that fails in the mode tried first
     /// is tried in the other before the wallet hears of it.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn a_switch_between_modes_falls_back() {
         use crate::onion;
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("modes-{i}"))).collect();
@@ -6241,7 +6241,7 @@ mod tests {
     /// session, and a circuit whose hop goes down is noticed by its
     /// unanswered keepalive and built again around it.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn standing_circuits_are_replaced_and_rebuilt() {
         use crate::onion;
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("rotate-{i}"))).collect();
@@ -6352,7 +6352,7 @@ mod tests {
     /// see their announce gone, reconnect with a new Kyber key, and are
     /// reachable again within a keepalive or so.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn sessions_come_back_after_the_relay_restarts() {
         use crate::onion;
         let (r, p, q) = (open("rs-relay"), open("rs-p"), open("rs-q"));

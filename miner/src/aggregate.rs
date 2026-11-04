@@ -1940,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn proving_can_be_cancelled() {
         let s = setup("cancel", &[30, 25], 55);
         let shape = plan(&SMALL, 2);
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn chain_proofs_cover_history() {
         let dir = TempDir::new("chain");
         let env = open_env(&dir.0, 16 << 20).unwrap();
@@ -2142,7 +2142,7 @@ mod tests {
     /// through `Chain::apply_block` with the aggregate verifier; a stale
     /// proof, a tampered one, or a proof for another body is refused.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn the_chain_connects_only_proven_blocks() {
         use crate::block::Block;
         use crate::chain::{Chain, ChainError, ChainParams};
@@ -2260,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn spanning_transaction_roundtrip() {
         let s = spanning_setup("span-roundtrip");
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
@@ -2271,7 +2271,7 @@ mod tests {
     /// Blocks whose transactions carry name operations, applied by the name
     /// segment: a commit, its reveal, an update; each proven and verified.
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn name_operations_roundtrip() {
         use crate::name_air::NameWitness;
         use crate::names::{NameOp, NameSet, Record, commit_hash, name_hash};
@@ -2550,7 +2550,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn aggregate_proof_roundtrip() {
         let s = setup("roundtrip", &[30, 25], 55);
         let t = std::time::Instant::now();
@@ -2572,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: one job each in .github/workflows/slow.yml"]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn aggregate_tree_roundtrip() {
         // Three segments with fan-in two: leaves of 2 and 1 segments, then
         // the root verifies one node proof and one segment proof.
