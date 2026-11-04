@@ -5489,11 +5489,11 @@ mod tests {
         // Each send was confirmed delivered; the confirmation of one may
         // come after the answer to it.
         for (n, tag) in [(q, 1), (p, 2)] {
-            if delivered.lock().unwrap().contains(&tag) {
-                continue;
-            }
-            if let Ok(Note::Delivered { tag, .. }) = nodes[n].2.recv_timeout(Duration::from_secs(5)) {
-                delivered.lock().unwrap().push(tag);
+            let deadline = Instant::now() + guard(10);
+            while !delivered.lock().unwrap().contains(&tag) && Instant::now() < deadline {
+                if let Ok(Note::Delivered { tag, .. }) = nodes[n].2.recv_timeout(Duration::from_millis(500)) {
+                    delivered.lock().unwrap().push(tag);
+                }
             }
         }
         let mut tags = delivered.lock().unwrap().clone();

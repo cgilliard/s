@@ -1335,6 +1335,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             return true;
                         };
                         let job = self.part.jobs.remove(j);
+                        // An answer before the point's notice (they race
+                        // down the circuit) proves the delivery too.
+                        if matches!(job.stage, Stage::Sent(_)) {
+                            let via = self.circuit_first(handle).unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
+                            self.log(&format!("onion: delivered to {}, answered first", onion::short(&job.out.to)));
+                            self.rv.note(Note::Delivered { tag: job.out.tag, to: job.out.to, via });
+                        }
                         self.finish_outbound(handle, job.out.group, "answered", now);
                         let (_, key) = job.route.unwrap();
                         match p.open(&key, unix_now()) {
