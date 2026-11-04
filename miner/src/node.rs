@@ -4783,6 +4783,11 @@ mod tests {
         wait(0, 30);
         tx_b.send(Event::TestChannel(addr_a, id(1), b"again".to_vec())).unwrap();
         wait(1, 20);
+        // The channel can be open before the body arrives over it.
+        let deadline = Instant::now() + guard(20);
+        while sink_a.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let got: Vec<Vec<u8>> = sink_a.lock().unwrap().iter().map(|d| d.2.clone()).collect();
         assert_eq!(got, vec![b"hello".to_vec(), b"again".to_vec()]);
         for tx in [tx_a, tx_b] {
