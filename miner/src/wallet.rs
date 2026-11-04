@@ -1707,13 +1707,14 @@ impl Wallet {
     fn memo_scan(&self, utxo: &UtxoSet, rtxn: &RoTxn, add: bool) -> Result<(usize, u128)> {
         let mut found = Vec::new();
         let mut moved = Vec::new();
-        for (position, commitment, memo, amount) in utxo.memos(rtxn)? {
+        // A record at a time: the set may be far larger than memory.
+        utxo.each_memo(rtxn, |position, commitment, memo, amount| -> Result<()> {
             let Some(nonce) = self.open_memo(&memo) else {
-                continue;
+                return Ok(());
             };
             let pk = self.key(&nonce).public_key();
             if key_commitment(&pubkey_hash(&pk), amount) != commitment {
-                continue;
+                return Ok(());
             }
             match self.owned(&commitment)? {
                 Some(mut o) if o.position != Some(position) => {
@@ -1734,7 +1735,8 @@ impl Wallet {
                 }),
                 None => {}
             }
-        }
+            Ok(())
+        })?;
         let mut wtxn = self.env.write_txn()?;
         for o in found.iter().chain(&moved) {
             self.record(&mut wtxn, o)?;
@@ -2250,23 +2252,25 @@ impl Wallet {
         if waiting.is_empty() {
             return Ok(Vec::new());
         }
-        let mut found = Vec::new();
-        for (position, commitment, memo, _) in utxo.memos(rtxn)? {
+        let mut found: Vec<Payment> = Vec::new();
+        // A record at a time: the set may be far larger than memory.
+        utxo.each_memo(rtxn, |position, commitment, memo, _| -> Result<()> {
             let Some(i) = waiting.iter().position(|p| p.output.commitment == commitment && p.output.memo == memo)
             else {
-                continue;
+                return Ok(());
             };
-            if found.iter().any(|p: &Payment| p.txid == waiting[i].txid) {
-                continue;
+            if found.iter().any(|p| p.txid == waiting[i].txid) {
+                return Ok(());
             }
             let Some((_, _, height)) = utxo.output_at(rtxn, position)? else {
-                continue;
+                return Ok(());
             };
             let mut p = waiting[i].clone();
             p.landed = Some((height, position));
             p.path = None;
             found.push(p);
-        }
+            Ok(())
+        })?;
         if !found.is_empty() {
             let mut wtxn = self.env.write_txn()?;
             for p in &found {

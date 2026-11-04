@@ -134,6 +134,7 @@ fn a_full_block_applies_on_a_large_state() {
     let blocks = 5;
     let dir = TempDir::new("scale-block");
     let (mut a, filled) = filled_miner("A", &dir, n, blocks);
+    let heap = watch_heap(&a);
     report(T, "outputs", n);
     report(T, "spacing", spacing());
     report(T, "fill_secs", format!("{:.1}", filled.as_secs_f64()));
@@ -179,6 +180,9 @@ fn a_full_block_applies_on_a_large_state() {
     assert!(max < 300.0, "a full block took {max:.1} s to apply");
     let disk = dir_size(&dir.0);
     report(T, "disk_mb", disk / 1_000_000);
+    if let Some(mb) = heap_mb(&heap) {
+        report(T, "peak_heap_mb", mb);
+    }
     assert!(a.exit(60).success());
 }
 
@@ -192,6 +196,7 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     let blocks = 10;
     let (dir_s, dir_c) = (TempDir::new("scale-sync-s"), TempDir::new("scale-sync-c"));
     let (mut s, filled) = filled_miner("S", &dir_s, n, blocks);
+    let s_heap = watch_heap(&s);
     report(T, "outputs", n);
     report(T, "spacing", spacing());
     report(T, "fill_secs", format!("{:.1}", filled.as_secs_f64()));
@@ -209,6 +214,7 @@ fn a_fresh_node_fast_syncs_a_large_state() {
         "4",
     ];
     let mut c = Proc::start_waiting("C", &dir_c.0, &args, &[], scaled(n));
+    let c_heap = watch_heap(&c);
     let genesis = start.elapsed();
     let headers = wait_log(&mut c, "fast sync: block ", 600) + genesis;
     let installed = wait_sync(&mut c, scaled(n)) + headers;
@@ -230,8 +236,42 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     report(T, "tip_secs", format!("{:.1}", synced.as_secs_f64()));
     report(T, "state_fetch_secs", format!("{fetch:.1}"));
     report(T, "disk_mb", state / 1_000_000);
+    for (who, heap) in [("server", &s_heap), ("syncer", &c_heap)] {
+        if let Some(mb) = heap_mb(heap) {
+            report(T, &format!("{who}_peak_heap_mb"), mb);
+        }
+    }
     assert!(c.exit(60).success());
     assert!(s.exit(60).success());
+}
+
+/// Watches `p`'s heap, its memory less the database file it maps
+/// (Linux only: `RssAnon`, sampled every second until it ends); the most
+/// seen, in MB, is read from the result. A pass that holds the whole set
+/// at once shows here, where the mapped file would hide it.
+fn watch_heap(p: &Proc) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    use std::sync::atomic::Ordering;
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (seen, path) = (std::sync::Arc::clone(&peak), format!("/proc/{}/status", p.child.id()));
+    std::thread::spawn(move || {
+        while let Ok(status) = std::fs::read_to_string(&path) {
+            let kb = status
+                .lines()
+                .find(|l| l.starts_with("RssAnon:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok());
+            match kb {
+                Some(kb) => seen.fetch_max(kb / 1000, Ordering::Relaxed),
+                None => break,
+            };
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    peak
+}
+
+/// The most heap [`watch_heap`] saw, if it saw any.
+fn heap_mb(peak: &std::sync::Arc<std::sync::atomic::AtomicU64>) -> Option<u64> {
+    Some(peak.load(std::sync::atomic::Ordering::Relaxed)).filter(|&mb| mb > 0)
 }
 
 /// Bytes under `dir`.

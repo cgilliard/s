@@ -820,25 +820,55 @@ impl UtxoSet {
     }
 
     /// Every unspent output with a non-empty memo, in position order: its
-    /// position, commitment, memo and amount.
+    /// position, commitment, memo and amount. Held in memory at once: for
+    /// tests and small sets; [`UtxoSet::each_memo`] walks a set of any size.
     pub fn memos(&self, rtxn: &RoTxn) -> Result<Vec<(u64, Commitment, crate::transaction::Memo, u64)>> {
         let mut out = Vec::new();
-        for (position, (commitment, slot, _)) in self.unspent(rtxn)? {
-            let (memo, amount) = slot_parts(&slot).ok_or(Error::CorruptIndex)?;
-            if memo != crate::transaction::EMPTY_MEMO {
-                out.push((position, commitment, memo, amount));
-            }
-        }
+        self.each_memo(rtxn, |p, c, m, a| -> Result<()> {
+            out.push((p, c, m, a));
+            Ok(())
+        })?;
         Ok(out)
     }
 
+    /// Calls `f` with every unspent output that has a non-empty memo, in
+    /// position order (its position, commitment, memo and amount), one at
+    /// a time: a full pass over the set without holding it, stopping at
+    /// `f`'s first error.
+    pub fn each_memo<E: From<Error>>(
+        &self,
+        rtxn: &RoTxn,
+        mut f: impl FnMut(u64, Commitment, crate::transaction::Memo, u64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut failed = None;
+        let walked = self.scan(rtxn, 0, OUTPUT_CAPACITY, |p, rec| {
+            let (commitment, slot, _) = parse_record(rec)?;
+            let (memo, amount) = slot_parts(&slot).ok_or(Error::CorruptIndex)?;
+            if memo != crate::transaction::EMPTY_MEMO
+                && let Err(e) = f(p, commitment, memo, amount)
+            {
+                // Stops the walk; the error returned is `f`'s.
+                failed = Some(e);
+                return Err(Error::CorruptIndex);
+            }
+            Ok(())
+        });
+        match failed {
+            Some(e) => Err(e),
+            None => walked.map_err(E::from),
+        }
+    }
+
     /// The total amount of every unspent output (`docs/AMOUNTS.md`): the
-    /// supply, which must equal what was issued. A full pass over the set.
+    /// supply, which must equal what was issued. A full pass over the set,
+    /// a record at a time.
     pub fn total(&self, rtxn: &RoTxn) -> Result<u128> {
         let mut total = 0u128;
-        for (_, (_, slot, _)) in self.unspent(rtxn)? {
+        self.scan(rtxn, 0, OUTPUT_CAPACITY, |_, rec| {
+            let (_, slot, _) = parse_record(rec)?;
             total += slot_parts(&slot).ok_or(Error::CorruptIndex)?.1 as u128;
-        }
+            Ok(())
+        })?;
         Ok(total)
     }
 
