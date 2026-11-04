@@ -945,7 +945,10 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         drop(miner);
         // The block being mined will never land: drop its reward record,
         // unless its block already did.
-        if let Some(c) = ctx.in_flight.lock().unwrap().take()
+        // Taken first: a guard in the condition would be held through the
+        // block, and `sync_wallet` locks `in_flight` too.
+        let in_flight = ctx.in_flight.lock().unwrap().take();
+        if let Some(c) = in_flight
             && let Some(wallet) = &ctx.wallet
         {
             sync_wallet(&ctx).ok();
