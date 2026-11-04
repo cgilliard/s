@@ -657,6 +657,8 @@ struct Ctx {
     events: SyncSender<Event>,
     stats: Arc<Mutex<Stats>>,
     tip_changes: Arc<AtomicU64>,
+    /// The last block of ours the node refused, and why.
+    refused: Arc<Mutex<Option<(tabminer::pow::Digest, String)>>>,
     syncing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     mining: bool,
@@ -847,6 +849,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let stats = node.stats();
     let syncing = node.syncing();
     let tip_changes = node.tip_changes();
+    let refused = node.refused();
     let listening = format!("listening on {}", node.local_addr()?);
     log::line(&listening);
     let node_thread = std::thread::Builder::new().name("node".into()).spawn(move || node.run())?;
@@ -873,6 +876,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         events: events.clone(),
         stats,
         tip_changes,
+        refused,
         syncing,
         stop: Arc::new(AtomicBool::new(false)),
         mining,
@@ -966,8 +970,15 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
             let ctx = Arc::clone(&ctx);
             let (blocks, jobs, delay) = (args.blocks, args.jobs, Duration::from_secs(args.delay_blocks));
             Some(std::thread::Builder::new().name("miner".into()).spawn(move || {
-                if let Err(e) = mine(&ctx, &dataset, blocks, jobs, delay) {
-                    log::line(&format!("miner stopped: {e}"));
+                // An error ends a round of mining, not mining: a node left
+                // running without its miner would never say so again.
+                // (With --blocks, a restart counts its blocks afresh.)
+                while let Err(e) = mine(&ctx, &dataset, blocks, jobs, delay) {
+                    if ctx.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    log::line(&format!("miner stopped: {e}; starting again in 5 s"));
+                    std::thread::sleep(Duration::from_secs(5));
                 }
             })?)
         }
@@ -2981,6 +2992,9 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
     let unchecked = chain.verifier().is_unchecked();
     // Debugging: a generator for random outputs and spends.
     let mut rng = now() ^ 0x9e37_79b9_7f4a_7c15;
+    // Rounds in a row whose transactions no longer applied: more than a
+    // race with the pool's revalidation, past a few.
+    let mut stale = 0;
     while !ctx.stop.load(Ordering::Acquire) && (blocks == 0 || mined < blocks) {
         // Mining on a stale tip wastes the proof: wait until caught up.
         if ctx.syncing.load(Ordering::Acquire) {
@@ -3067,16 +3081,21 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
             let first_output_position = utxo.next_position(&wtxn)?;
             let segments = match SegmentWitness::collect_by_rows(utxo, &mut wtxn, &txs, agg.segment_rows(), height) {
                 Ok(s) => s,
-                // A block applied since the transactions were chosen spent
-                // or moved one of their inputs; the pool is being revalidated.
-                Err(utxo::Error::CorruptIndex) if cancel() => {
+                // A block applied since the transactions were chosen, or
+                // just before (the node revalidates the pool right after),
+                // spent or moved one of their inputs.
+                Err(utxo::Error::CorruptIndex) if stale < 20 => {
+                    stale += 1;
                     drop(wtxn);
                     abandon();
-                    log::line(&format!("  tip changed while building block {height}; starting over"));
+                    let why = if cancel() { "the tip changed" } else { "a pooled transaction no longer applies" };
+                    log::line(&format!("  {why} while building block {height}; starting over"));
+                    std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
                 Err(e) => return Err(e.into()),
             };
+            stale = 0;
             let ops: Vec<NameOp> = txs.iter().flat_map(|t| t.ops.iter().cloned()).collect();
             let names = match NameWitness::collect(utxo, chain.names(), &mut wtxn, height, &ops, &sweeps) {
                 Ok(n) => n,
@@ -3262,6 +3281,11 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
         let mut said = 0;
         while !ctx.stop.load(Ordering::Acquire) && t.elapsed() < ACCEPT_TIMEOUT {
             if chain.entry(&header.hash())?.is_some_and(|e| !e.header_only) {
+                break;
+            }
+            // Refused with nothing kept of it (a clock or storage fault).
+            if let Some((_, why)) = ctx.refused.lock().unwrap().as_ref().filter(|(id, _)| *id == header.hash()) {
+                log::line(&format!("  block {height}: refused by the node: {why}"));
                 break;
             }
             if t.elapsed().as_secs() / 60 > said {

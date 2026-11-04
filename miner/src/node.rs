@@ -600,6 +600,8 @@ pub struct Node<V: ProofVerifier> {
     syncing: Arc<AtomicBool>,
     rx: Receiver<Event>,
     tip_changes: Arc<AtomicU64>,
+    /// The last block of our own (a miner's) the chain refused, and why.
+    refused: Arc<Mutex<Option<(Digest, String)>>>,
     running: Arc<AtomicBool>,
     /// Ping nonces are this key's SipHash of a counter: a peer seeing its
     /// own cannot predict the next, so cannot answer a ping sent to an
@@ -968,6 +970,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             syncing: Arc::new(AtomicBool::new(true)),
             rx,
             tip_changes: Arc::new(AtomicU64::new(0)),
+            refused: Arc::new(Mutex::new(None)),
             running,
             nonce_key: std::collections::hash_map::RandomState::new(),
             nonce_count: 0,
@@ -1026,6 +1029,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Counter bumped whenever the main chain's tip changes.
     pub fn tip_changes(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.tip_changes)
+    }
+
+    /// The last block fed in as [`Event::Mined`] that the chain refused,
+    /// and why: a miner waiting on its block's verdict learns of a refusal
+    /// that leaves no record in the chain.
+    pub fn refused(&self) -> Arc<Mutex<Option<(Digest, String)>>> {
+        Arc::clone(&self.refused)
     }
 
     /// Whether the node is catching up: fast-syncing, or a live peer
@@ -2674,6 +2684,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let height = block.header.height;
         let header = block.header;
         self.applying.remove(&id);
+        if from.is_none()
+            && let Err(e) = &result
+        {
+            *self.refused.lock().unwrap() = Some((id, e.to_string()));
+        }
         let connected = match result {
             Ok(Applied::Known) => true,
             Ok(Applied::Side) => {
