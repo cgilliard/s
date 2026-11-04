@@ -84,7 +84,7 @@ const USAGE: &str = "usage:
                     or tabminer-dev / tabminer-dev-recursive beside it)
   --network NAME    mainnet (default); dev: a test chain of its own with a block a
                     second, proofs checked segment by segment (no chain proof),
-                    the proof-of-work dataset built in, no seeds;
+                    the proof-of-work dataset built in;
                     dev-recursive: the same with the mainnet proof path at the
                     smallest parameters (about six seconds a block, every ten
                     seconds). Dev coins are worth nothing. Both need
@@ -402,14 +402,12 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown option {flag}")),
         }
     }
-    // A dev network has its own directory and no seeds (the built-in ones
-    // are mainnet's). It keeps the default port, the one a firewall lets
-    // through: a mainnet and a dev node on one machine need `--listen`.
-    if a.network != Network::Mainnet {
-        if !data_given {
-            a.data = a.data.with_file_name(a.network.dir_name());
-        }
-        a.no_seeds = true;
+    // A dev network differs from mainnet in its chain only: its own data
+    // directory, so the two never share a chain or a wallet, and otherwise
+    // the same port and seeds (a node of the other chain is refused at the
+    // handshake, by its genesis).
+    if a.network != Network::Mainnet && !data_given {
+        a.data = a.data.with_file_name(a.network.dir_name());
     }
     if (a.debug_fill.is_some() || a.debug_fill_names > 0) && !a.debug_unchecked {
         return Err(
