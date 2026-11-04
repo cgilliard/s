@@ -67,6 +67,16 @@ jobs:
           echo "TMP=$dir" >> "$GITHUB_ENV"
           echo "TEMP=$dir" >> "$GITHUB_ENV"
           df -h "$dir"
+      # Windows Defender scans every write to the database file, which may
+      # be most of the time there: the data directory is excluded, as a
+      # node operator would.
+      - name: no scanning of the data directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:TMPDIR
+          Add-MpPreference -ExclusionProcess tabminer.exe
+          Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
       - run: cargo build --release --features dev --tests
       - name: ${{ matrix.test }}
         run: |

@@ -141,13 +141,14 @@ debugging (a node so started can be fed any block; never use with real funds):
                     registry behind genesis (the same N on every node of the
                     network, on the first start only): for testing names at
                     scale
-  --debug-fill-outputs N  with the above, start with N synthetic outputs in the
-                    set behind genesis (the same N on every node of the
-                    network, on the first start only): for testing a large
+  --debug-fill-outputs N[,K]  with the above, start with N synthetic outputs in
+                    the set behind genesis, one every K positions (default 5;
+                    the rest as if spent), the same on every node of the
+                    network, on the first start only: for testing a large
                     state without mining it
-  --debug-genesis-outputs N  with the above, start with the genesis of a chain
-                    filled with N outputs but without the outputs: a fresh
-                    node to fast-sync such a chain";
+  --debug-genesis-outputs N[,K]  with the above, start with the genesis of a
+                    chain so filled but without the outputs: a fresh node to
+                    fast-sync such a chain";
 
 const HELP: &str = "commands:
   status                    chain tip, peers, mempool, wallet totals
@@ -249,9 +250,11 @@ const DEBUG_PROOF_SIZE: usize = 205_000;
 /// Room a block template leaves for its proof (about 205 KB).
 const PROOF_SIZE_ALLOWANCE: usize = 256 << 10;
 
-/// How long the miner waits for the node to accept its block before moving
-/// on.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the miner waits for its node's verdict on a block it mined
+/// (the tip, a side block, or refused) before moving on: only a guard, as
+/// a slow machine serving a fast sync can take minutes to apply a full
+/// block, which is no reason to give the block up.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Which chain a node is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +319,8 @@ struct Args {
     debug_fill_names: usize,
     debug_fill_outputs: u64,
     debug_genesis_outputs: u64,
+    /// One filled output every this many positions.
+    debug_fill_spacing: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -355,6 +360,7 @@ fn parse_args() -> Result<Args, String> {
         debug_fill_names: 0,
         debug_fill_outputs: 0,
         debug_genesis_outputs: 0,
+        debug_fill_spacing: 5,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -415,8 +421,17 @@ fn parse_args() -> Result<Args, String> {
                 a.debug_fill = Some((number(n.to_string())? as usize, number(s.to_string())? as usize));
             }
             "--debug-fill-names" => a.debug_fill_names = number(value()?)? as usize,
-            "--debug-fill-outputs" => a.debug_fill_outputs = number(value()?)?,
-            "--debug-genesis-outputs" => a.debug_genesis_outputs = number(value()?)?,
+            "--debug-fill-outputs" | "--debug-genesis-outputs" => {
+                let v = value()?;
+                let (n, k) = v.split_once(',').unwrap_or((&v, "5"));
+                let n = number(n.to_string())?;
+                a.debug_fill_spacing = number(k.to_string())?.max(1);
+                if flag == "--debug-fill-outputs" {
+                    a.debug_fill_outputs = n;
+                } else {
+                    a.debug_genesis_outputs = n;
+                }
+            }
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
@@ -546,7 +561,7 @@ fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc
             continue;
         }
         let (t, logged) = (Instant::now(), std::cell::Cell::new(0));
-        chain.debug_fill_outputs(n, header_only, &|done| {
+        chain.debug_fill_outputs(n, args.debug_fill_spacing, header_only, &|done| {
             // About every ten million.
             if done / 10_000_000 > logged.get() {
                 logged.set(done / 10_000_000);
@@ -3242,7 +3257,17 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
         let t = Instant::now();
         wallet.reward_found(&reward_out.commitment, &digest_to_bytes(&header.hash()))?;
         ctx.events.send(Event::Mined(block))?;
-        while !cancel() && t.elapsed() < ACCEPT_TIMEOUT {
+        // Until the node has applied it, whatever the verdict: a tip change
+        // from a peer's block meanwhile says nothing of ours.
+        let mut said = 0;
+        while !ctx.stop.load(Ordering::Acquire) && t.elapsed() < ACCEPT_TIMEOUT {
+            if chain.entry(&header.hash())?.is_some_and(|e| !e.header_only) {
+                break;
+            }
+            if t.elapsed().as_secs() / 60 > said {
+                said += 1;
+                log::line(&format!("  block {height}: the node is still applying it after {said} min"));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         let accepted = chain.tip()?.unwrap().hash() == header.hash();
@@ -3257,6 +3282,13 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
             }
         }
         mined += u64::from(accepted);
+        if accepted {
+            // Where applying it went, phase by phase.
+            let phases = chain.last_timings();
+            let sum: f64 = phases.iter().map(|(_, s)| s).sum();
+            let parts: Vec<String> = phases.iter().map(|(n, s)| format!("{n} {s:.3}s")).collect();
+            log::line(&format!("  applied in {sum:.3}s: {}", parts.join(", ")));
+        }
         log::line(&format!(
             "  total {} (build {}, plan {}, prove {}, mine {}, accept {})",
             secs(started.elapsed()),

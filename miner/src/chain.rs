@@ -745,6 +745,9 @@ pub struct Chain<V: ProofVerifier> {
     /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
     /// rather than walked again.
     branch: Mutex<Vec<Header>>,
+    /// Seconds each phase of the last block applied took
+    /// ([`Chain::last_timings`]).
+    timings: Mutex<Vec<(&'static str, f64)>>,
     /// The full proof-of-work dataset, once loaded or generated: checks a
     /// header in microseconds instead of tens of milliseconds from the
     /// seed text.
@@ -816,6 +819,7 @@ impl<V: ProofVerifier> Chain<V> {
             aux,
             files,
             branch: Mutex::new(Vec::new()),
+            timings: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
             first_blocks: Mutex::new(std::collections::HashMap::new()),
         };
@@ -1221,7 +1225,8 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Debugging only (the verifier must be unchecked): fills the set with
-    /// `n` synthetic outputs behind genesis, after its own, as if they had
+    /// `n` synthetic outputs behind genesis, after its own, one every
+    /// `spacing` positions (the rest as if spent long ago), as if they had
     /// always been there, for testing at scale without mining them. Each
     /// output, of amount zero, is made from its position alone, so every
     /// node filling with the same `n` computes the same state and genesis
@@ -1232,7 +1237,8 @@ impl<V: ProofVerifier> Chain<V> {
     /// genesis, to fast-sync it from a node that holds it. A chain past
     /// genesis, or filled already, is left alone; outputs are filled before
     /// names.
-    pub fn debug_fill_outputs(&self, n: u64, header_only: bool, progress: &dyn Fn(u64)) -> Result<()> {
+    pub fn debug_fill_outputs(&self, n: u64, spacing: u64, header_only: bool, progress: &dyn Fn(u64)) -> Result<()> {
+        let spacing = spacing.max(1);
         if !self.verifier.is_unchecked() {
             return Err(ChainError::Corrupt("filling outputs needs an unchecked verifier"));
         }
@@ -1246,7 +1252,7 @@ impl<V: ProofVerifier> Chain<V> {
             self.utxo.unspent_in(&rtxn, 0, made)?.into_iter().map(|(p, (c, s, h))| (p, c, s, h)).collect();
         let name_root = self.utxo.name_root(&rtxn)?;
         drop(rtxn);
-        let next = made + n;
+        let next = made + n * spacing;
         let level = SNAPSHOT_PART_LOG;
         let parts = next.div_ceil(1 << level);
         let mut roots = Vec::with_capacity(parts as usize);
@@ -1255,7 +1261,10 @@ impl<V: ProofVerifier> Chain<V> {
             let (first, end) = (p << level, ((p + 1) << level).min(next));
             let mut outputs: Vec<(u64, Commitment, Slot, u32)> =
                 own.iter().filter(|o| o.0 >= first && o.0 < end).copied().collect();
-            outputs.extend((first.max(made)..end).map(debug_output));
+            // The fill's positions in the part: made, made + spacing, ...
+            let from = first.max(made);
+            let from = from + (spacing - (from - made) % spacing) % spacing;
+            outputs.extend((from..end).step_by(spacing as usize).map(debug_output));
             match wtxn.as_mut() {
                 None => roots.push(UtxoSet::part_root(level, &outputs)),
                 Some(w) => {
@@ -1271,7 +1280,7 @@ impl<V: ProofVerifier> Chain<V> {
                 }
             }
             if p % 64 == 63 {
-                progress(end - made);
+                progress((end - made).div_ceil(spacing));
             }
         }
         let (wtxn, state_root) = match wtxn {
@@ -1333,16 +1342,39 @@ impl<V: ProofVerifier> Chain<V> {
     /// of a block at `height`; returns the new root, the commitments the
     /// inputs held and what undoing the name section needs.
     #[allow(clippy::type_complexity)]
+    /// Adds the time since `*t` to phase `name` of the block being applied,
+    /// and restarts `*t`.
+    fn lap(&self, name: &'static str, t: &mut std::time::Instant) {
+        let secs = t.elapsed().as_secs_f64();
+        *t = std::time::Instant::now();
+        let mut timings = self.timings.lock().unwrap();
+        match timings.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, s)) => *s += secs,
+            None => timings.push((name, secs)),
+        }
+    }
+
+    /// Seconds each phase of the last block [`Chain::apply_block`] took, in
+    /// order: for measuring.
+    pub fn last_timings(&self) -> Vec<(&'static str, f64)> {
+        self.timings.lock().unwrap().clone()
+    }
+
     fn apply_body(
         &self,
         wtxn: &mut RwTxn,
         body: &Body,
         height: u32,
     ) -> Result<(Digest, Vec<(Commitment, Slot, u32)>, NameUndo)> {
+        let mut t = std::time::Instant::now();
         let spent = self.utxo.spend_positions(wtxn, &body.inputs)?.map_err(ChainError::UnknownInput)?;
+        self.lap("spends", &mut t);
         self.utxo.add_outputs(wtxn, &body.outputs, height)?;
+        self.lap("outputs", &mut t);
         let names = self.names.apply(&self.utxo, wtxn, height, &body.ops, &body.sweeps).map_err(ChainError::Name)?;
-        Ok((self.utxo.root(wtxn)?, spent, names))
+        let root = self.utxo.root(wtxn)?;
+        self.lap("names", &mut t);
+        Ok((root, spent, names))
     }
 
     /// Uses the full proof-of-work dataset for header checks from now on.
@@ -1441,6 +1473,8 @@ impl<V: ProofVerifier> Chain<V> {
 
     fn apply_block_inner(&self, block: &Block, now: u64) -> Result<Applied> {
         let header = &block.header;
+        self.timings.lock().unwrap().clear();
+        let mut t = std::time::Instant::now();
         let mut wtxn = self.env.write_txn()?;
         let tip = self.tip_in(&wtxn)?.ok_or(ChainError::NoGenesis)?;
         let tip_entry = self.entry_in(&wtxn, &tip.hash())?.ok_or(ChainError::Corrupt("tip index"))?;
@@ -1460,10 +1494,12 @@ impl<V: ProofVerifier> Chain<V> {
         // A header stored alone had its proof of work checked then.
         let pow = known.map(|_| true);
         let work = self.check_header(&wtxn, block, &parent, now, pow)?;
+        self.lap("checks", &mut t);
 
         self.headers.put(&mut wtxn, &id, &header.to_bytes())?;
         self.bodies.put(&mut wtxn, &id, &block.body.to_bytes())?;
         self.put_index(&mut wtxn, &id, work, STATUS_HEADER_VALID)?;
+        self.lap("store", &mut t);
         if work <= tip_entry.work {
             wtxn.commit()?;
             return Ok(Applied::Side);
@@ -1506,7 +1542,9 @@ impl<V: ProofVerifier> Chain<V> {
                 return Err(e);
             }
         }
+        let mut t = std::time::Instant::now();
         wtxn.commit()?;
+        self.lap("commit", &mut t);
         Ok(if unwound == 0 { Applied::Extended } else { Applied::Reorganized { fork_height, unwound } })
     }
 
@@ -1517,6 +1555,7 @@ impl<V: ProofVerifier> Chain<V> {
         let prev_state_root = self.utxo.root(wtxn)?;
         let first_output_position = self.utxo.next_position(wtxn)?;
         let (new_root, spent, names) = self.apply_body(wtxn, body, header.height)?;
+        let mut t = std::time::Instant::now();
         if new_root != header.state_root {
             return Err(ChainError::StateRootMismatch { expected: new_root, got: header.state_root });
         }
@@ -1542,9 +1581,11 @@ impl<V: ProofVerifier> Chain<V> {
             subsidy: self.params.subsidy(header.height),
             body,
         };
+        self.lap("supply", &mut t);
         if !self.verifier.verify(&statement, &body.proof) {
             return Err(ChainError::BadProof);
         }
+        self.lap("proof", &mut t);
         let work = self.entry_in(wtxn, &header.hash())?.ok_or(ChainError::Corrupt("connecting unknown block"))?.work;
         self.put_index(wtxn, &id, work, STATUS_VALID)?;
         for (p, (c, m, created)) in body.inputs.iter().zip(spent) {
@@ -1558,6 +1599,7 @@ impl<V: ProofVerifier> Chain<V> {
         self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, names }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
         self.meta.put(wtxn, META_TIP, &id)?;
+        self.lap("undo", &mut t);
         // A manifest for every block in the undo window, counted from the
         // best header known: an initial sync skips the blocks it would
         // prune at once.
@@ -1568,6 +1610,7 @@ impl<V: ProofVerifier> Chain<V> {
         if within {
             self.take_snapshot(wtxn, header)?;
         }
+        self.lap("manifest", &mut t);
         // The block leaving the undo window keeps only its header.
         if let Some(keep) = self.max_undo
             && header.height > keep
@@ -1578,6 +1621,7 @@ impl<V: ProofVerifier> Chain<V> {
             self.prune_bodies(wtxn, header.height - keep)?;
         }
         self.prune_snapshots(wtxn, header.height)?;
+        self.lap("prune", &mut t);
         Ok(())
     }
 

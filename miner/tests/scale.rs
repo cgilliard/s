@@ -22,6 +22,17 @@ fn outputs() -> u64 {
     std::env::var("TABMINER_SCALE_OUTPUTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000)
 }
 
+/// One output every this many positions: `TABMINER_SCALE_SPACING`, or 5
+/// (the rest as if spent, as on a chain with a history).
+fn spacing() -> u64 {
+    std::env::var("TABMINER_SCALE_SPACING").ok().and_then(|v| v.parse().ok()).unwrap_or(5)
+}
+
+/// The fill flags' value: outputs and spacing.
+fn fill_arg(n: u64) -> String {
+    format!("{n},{}", spacing())
+}
+
 /// Generous bounds for steps that scale with the set: an hour, plus a
 /// minute per million outputs.
 fn scaled(n: u64) -> u64 {
@@ -53,6 +64,40 @@ fn wait_log(p: &mut Proc, text: &str, secs: u64) -> Duration {
     start.elapsed()
 }
 
+/// Waits up to `secs` for `p`'s fast sync to install the state, printing
+/// its progress every 15 s (`PROGRESS` lines, and the last fast-sync line
+/// of its log when it changes); fails once the parts stop coming for ten
+/// minutes. The time it took.
+fn wait_sync(p: &mut Proc, secs: u64) -> Duration {
+    let start = Instant::now();
+    let (mut have, mut moved, mut said) = (String::new(), Instant::now(), String::new());
+    loop {
+        if !log_lines(p, "fast sync: installed the state").is_empty() {
+            return start.elapsed();
+        }
+        assert!(start.elapsed() < Duration::from_secs(secs), "{}: no state installed within {secs} s", p.name);
+        p.send("status");
+        let sync = p.next_matching(&|l: &str| l.starts_with("sync "), Duration::from_secs(10)).unwrap_or_default();
+        let now = sync.split(" of ").next().unwrap_or("").to_string();
+        if now != have {
+            (have, moved) = (now, Instant::now());
+        }
+        let last = log_lines(p, "fast sync: ").pop().unwrap_or_default();
+        println!("PROGRESS {:.0}s {}", start.elapsed().as_secs_f64(), sync.trim());
+        if last != said {
+            println!("PROGRESS {last}");
+            said = last;
+        }
+        assert!(
+            moved.elapsed() < Duration::from_secs(600),
+            "{}: the fast sync made no progress for ten minutes ({})",
+            p.name,
+            sync.trim()
+        );
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
 /// The tip line of `status`: height and hash.
 fn tip(p: &mut Proc) -> String {
     p.send("status");
@@ -63,7 +108,7 @@ fn tip(p: &mut Proc) -> String {
 /// random spends of them and random outputs.
 fn filled_miner(name: &'static str, dir: &TempDir, n: u64, blocks: u64) -> (Proc, Duration) {
     let start = Instant::now();
-    let (n_arg, blocks_arg) = (n.to_string(), blocks.to_string());
+    let (n_arg, blocks_arg) = (fill_arg(n), blocks.to_string());
     let args = [
         "mine",
         "--debug-no-validate-proofs",
@@ -90,6 +135,7 @@ fn a_full_block_applies_on_a_large_state() {
     let dir = TempDir::new("scale-block");
     let (mut a, filled) = filled_miner("A", &dir, n, blocks);
     report(T, "outputs", n);
+    report(T, "spacing", spacing());
     report(T, "fill_secs", format!("{:.1}", filled.as_secs_f64()));
     a.reach(blocks, scaled(n));
     let fills = log_lines(&a, "debug fill: ");
@@ -105,6 +151,24 @@ fn a_full_block_applies_on_a_large_state() {
         report(T, &format!("block{}_build_secs", i + 1), format!("{build:.2}"));
         report(T, &format!("block{}_accept_secs", i + 1), format!("{accept:.2}"));
         accepts.push(accept);
+    }
+    // Each phase of applying a block, its median over the blocks.
+    let mut phases: Vec<(String, Vec<f64>)> = Vec::new();
+    for line in log_lines(&a, "  applied in ") {
+        let Some((_, list)) = line.split_once(": ") else { continue };
+        for part in list.split(", ") {
+            let Some((name, secs)) = part.rsplit_once(' ') else { continue };
+            let secs: f64 = secs.trim_end_matches('s').parse().unwrap_or(0.0);
+            match phases.iter_mut().find(|(n, _)| n == name) {
+                Some((_, v)) => v.push(secs),
+                None => phases.push((name.to_string(), vec![secs])),
+            }
+        }
+    }
+    assert!(!phases.is_empty(), "no applied lines in the log");
+    for (name, mut v) in phases {
+        v.sort_by(f64::total_cmp);
+        report(T, &format!("apply_{name}_secs"), format!("{:.3}", v[v.len() / 2]));
     }
     accepts.sort_by(f64::total_cmp);
     let (median, max) = (accepts[accepts.len() / 2], accepts[accepts.len() - 1]);
@@ -129,9 +193,10 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     let (dir_s, dir_c) = (TempDir::new("scale-sync-s"), TempDir::new("scale-sync-c"));
     let (mut s, filled) = filled_miner("S", &dir_s, n, blocks);
     report(T, "outputs", n);
+    report(T, "spacing", spacing());
     report(T, "fill_secs", format!("{:.1}", filled.as_secs_f64()));
     s.reach(blocks, scaled(n));
-    let n_arg = n.to_string();
+    let n_arg = fill_arg(n);
     let start = Instant::now();
     let args = [
         "node",
@@ -146,13 +211,15 @@ fn a_fresh_node_fast_syncs_a_large_state() {
     let mut c = Proc::start_waiting("C", &dir_c.0, &args, &[], scaled(n));
     let genesis = start.elapsed();
     let headers = wait_log(&mut c, "fast sync: block ", 600) + genesis;
-    let installed = wait_log(&mut c, "fast sync: installed the state", scaled(n)) + headers;
+    let installed = wait_sync(&mut c, scaled(n)) + headers;
     assert!(
         log_lines(&c, "validating every block instead").is_empty(),
         "C gave up on fast sync: {:?}",
         log_lines(&c, "fast sync: ")
     );
-    c.reach(blocks, 600);
+    // The blocks after the snapshot, full ones, at however long this
+    // machine takes for each.
+    c.reach(blocks, scaled(n));
     let synced = start.elapsed();
     assert_eq!(tip(&mut c), tip(&mut s), "C and S on one tip");
     let state = dir_size(&dir_c.0);

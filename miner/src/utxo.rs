@@ -1472,7 +1472,11 @@ mod tests {
             for part in 0..parts {
                 let outputs: Vec<(u64, Commitment, Slot, u32)> = ((part << level)..((part + 1) << level).min(span))
                     .filter(|p| p % 5 == 0)
-                    .map(|p| (p, digest(&mut next), digest(&mut next), 0))
+                    .map(|p| {
+                        let memo: crate::transaction::Memo =
+                            digest(&mut next)[..crate::transaction::MEMO_LEN].try_into().unwrap();
+                        (p, digest(&mut next), crate::transaction::memo_slot(&memo, next() % 1_000_000), 0)
+                    })
                     .collect();
                 roots.push(set.stage(&mut wtxn, level, part, &outputs, span).unwrap());
                 if part % 256 == 255 {
