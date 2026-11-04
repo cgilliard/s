@@ -1188,8 +1188,11 @@ pub const FETCH_BACKOFF: Duration = Duration::from_secs(600);
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Peers kept in the table.
 pub const MAX_PEERS: usize = 64;
-/// Most peer entries one public host may hold, over all its ports.
-pub const MAX_PER_HOST: usize = 2;
+/// Most peer entries one public host may hold, over all its ports: room
+/// for several nodes behind one address (a household, an office, a
+/// carrier's NAT), while the network-group limit below keeps one party
+/// from surrounding a node.
+pub const MAX_PER_HOST: usize = 4;
 /// Most peer entries one network group may hold (a /16 for IPv4, a /32
 /// for IPv6): an attacker with addresses in one network cannot fill the
 /// table and surround the node.
@@ -1911,9 +1914,10 @@ mod tests {
     fn one_host_gets_few_entries_and_a_ban_covers_its_ports() {
         let mut peers = Peers::new();
         let host = |port: u16| -> SocketAddr { format!("10.0.0.9:{port}").parse().unwrap() };
-        assert!(peers.add(host(1), false));
-        assert!(peers.add(host(2), false));
-        assert!(!peers.add(host(3), false));
+        for port in 1..=MAX_PER_HOST as u16 {
+            assert!(peers.add(host(port), false));
+        }
+        assert!(!peers.add(host(MAX_PER_HOST as u16 + 1), false));
         // Loopback is exempt: many nodes may share one machine.
         for port in 1..5 {
             assert!(peers.add(format!("127.0.0.1:{port}").parse().unwrap(), false));
