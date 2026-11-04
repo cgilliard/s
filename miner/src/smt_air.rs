@@ -478,6 +478,26 @@ mod tests {
         assert_ne!(list_hash(&changed), list_hash(&updates));
     }
 
+    /// Degrees-of-freedom audit (`stark::freedom_report`) of an insert,
+    /// an update and a removal: prints each way a row's cells can move
+    /// together unseen.
+    #[test]
+    fn has_no_unintended_freedom() {
+        let ops = [(5u64, leaf(1)), ((1 << 40) - 1, leaf(2)), (5, EMPTY), (1 << 20, leaf(3)), (1 << 20, leaf(4))];
+        let (initial, updates, final_root) = run_updates("audit", &ops);
+        let (trace, _) = SmtAir::generate_trace(initial, &updates);
+        let public = SmtAir::public_values(&initial, &final_root, &updates);
+        // Row kinds: the hash machine's operation flags.
+        let kinds: Vec<usize> = (crate::hash_machine::COL_START..=crate::hash_machine::COL_DIR).collect();
+        let lines = crate::stark::freedom_report(&SmtAir, &trace, None, &public, &kinds, 6, |f| {
+            // A permutation on a row that does not use it is free by design.
+            let row = trace.row(f.row);
+            let unused = row[crate::hash_machine::COL_PASS] == Fp::ONE || row[crate::hash_machine::COL_LOAD] == Fp::ONE;
+            !(unused && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
+        });
+        assert!(lines.is_empty(), "{} freedoms:\n{}", lines.len(), lines.join("\n"));
+    }
+
     #[test]
     fn empty_sequence_keeps_root() {
         let initial = leaf(7);

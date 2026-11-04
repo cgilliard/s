@@ -1144,6 +1144,30 @@ mod tests {
         assert_eq!(NUM_COLS, 92);
     }
 
+    /// Degrees-of-freedom audit (`stark::freedom_report`) of a sample
+    /// program's machine trace and its hash table: no row may let its
+    /// cells move together unseen, but a padding row's unused permutation.
+    #[test]
+    fn has_no_unintended_freedom() {
+        let mut rng = Rng::new(70);
+        let (p, inputs, out) = sample_program(&mut rng);
+        let (trace, hashes) = VmAir::generate_trace(&p, &inputs).unwrap();
+        let table = p.table();
+        let public = VmAir::public_values(&p.digest(1), &out);
+        assert_eq!(
+            crate::stark::check_tables(&[(&VmAir, &trace, Some(&table)), (&HashTableAir, &hashes, None)], &public),
+            Ok(())
+        );
+        let vm = crate::stark::freedom_report(&VmAir, &trace, Some(&table), &public, &[], trace.height(), |_| true);
+        assert!(vm.is_empty(), "machine: {} freedoms:\n{}", vm.len(), vm.join("\n"));
+        let pass = crate::hash_machine::COL_PASS;
+        let h = crate::stark::freedom_report(&HashTableAir, &hashes, None, &public, &[], hashes.height(), |f| {
+            // Padding rows are pass rows: their permutation is not used.
+            !(hashes.row(f.row)[pass] == Fp::ONE && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
+        });
+        assert!(h.is_empty(), "hash table: {} freedoms:\n{}", h.len(), h.join("\n"));
+    }
+
     #[test]
     fn program_executes_and_satisfies_constraints() {
         let mut rng = Rng::new(70);

@@ -1896,6 +1896,10 @@ mod tests {
         World { _dir: dir, env, utxo, names }
     }
 
+    /// The freedom audit's findings while [`has_no_unintended_freedom`] runs: `None`
+    /// otherwise, so the other tests do not pay for it.
+    static AUDIT: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
     /// Applies a block's name section, checks the segment's constraints
     /// and that its exports match the block, and returns the public values.
     fn block(w: &World, height: u32, ops: &[NameOp], sweeps: &[u64]) -> NamePublic {
@@ -1909,6 +1913,25 @@ mod tests {
         let values = public.to_values();
         assert_eq!(NamePublic::from_values(&values), Some(public));
         assert_eq!(check_constraints(&NameAir, &trace, &values), Ok(()), "height {height}");
+        if AUDIT.lock().unwrap().is_some() {
+            use crate::hash_machine::{COL_LOAD, COL_PASS};
+            let kinds: Vec<usize> = (HM_COLS..HM_COLS + NUM_TYPES).chain([COL_PASS, COL_LOAD]).collect();
+            // A permutation on a row that does not use it (pass, load) is
+            // free by design.
+            let keep = |f: &crate::stark::Freedom| {
+                let row = trace.row(f.row);
+                let unused = row[COL_PASS] == Fp::ONE || row[COL_LOAD] == Fp::ONE;
+                !(unused && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
+            };
+            let found = crate::stark::freedom_report(&NameAir, &trace, None, &values, &kinds, 4, keep);
+            let all = crate::stark::freedom_report(&NameAir, &trace, None, &values, &kinds, 4, |_| true).len();
+            eprintln!(
+                "height {height}: {} rows, {all} freedoms, {} not an unused permutation",
+                trace.height(),
+                found.len()
+            );
+            AUDIT.lock().unwrap().as_mut().unwrap().extend(found.into_iter().map(|l| format!("height {height}: {l}")));
+        }
         assert_eq!(public.root_out, root_out);
         assert_eq!(public.pos_out, pos_out);
         let digests: Vec<Digest> = ops.iter().map(|o| o.digest().unwrap()).collect();
@@ -1936,6 +1959,19 @@ mod tests {
             assert!(check_constraints(&NameAir, &trace, &bad).is_err(), "public {i} at height {height}");
         }
         public
+    }
+
+    /// Degrees-of-freedom audit (`stark::freedom_report`) of every name
+    /// section [`commits_reveals_updates_and_sweeps`] builds: no row may
+    /// let its cells move together unseen, but a permutation the row does
+    /// not use.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn has_no_unintended_freedom() {
+        *AUDIT.lock().unwrap() = Some(Vec::new());
+        commits_reveals_updates_and_sweeps();
+        let found = AUDIT.lock().unwrap().take().unwrap();
+        assert!(found.is_empty(), "{} freedoms:\n{}", found.len(), found.join("\n"));
     }
 
     #[test]

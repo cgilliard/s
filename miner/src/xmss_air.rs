@@ -640,6 +640,29 @@ mod tests {
         }
     }
 
+    /// Degrees-of-freedom audit (`stark::freedom_report`) of one
+    /// signature: prints each way a row's cells can move together unseen.
+    #[test]
+    fn has_no_unintended_freedom() {
+        let mut sk = key(1);
+        let pk = sk.public_key();
+        while sk.next_index() < 7 {
+            sk.sign(&msg(99)).unwrap();
+        }
+        let m = msg(5);
+        let sig = sk.sign(&m).unwrap();
+        let trace = XmssAir::generate_trace(&pk, &m, &sig);
+        let public = XmssAir::public_values(&pk, &m);
+        let kinds: Vec<usize> = (crate::hash_machine::COL_START..=crate::hash_machine::COL_DIR).collect();
+        let lines = crate::stark::freedom_report(&XmssAir, &trace, None, &public, &kinds, 6, |f| {
+            // A permutation on a row that does not use it is free by design.
+            let row = trace.row(f.row);
+            let unused = row[crate::hash_machine::COL_PASS] == Fp::ONE || row[crate::hash_machine::COL_LOAD] == Fp::ONE;
+            !(unused && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
+        });
+        assert!(lines.is_empty(), "{} freedoms:\n{}", lines.len(), lines.join("\n"));
+    }
+
     #[test]
     fn forged_witness_fails_constraints() {
         let mut sk = key(2);

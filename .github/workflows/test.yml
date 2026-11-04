@@ -84,6 +84,10 @@ jobs:
           - test: node::tests::messages_meet_over_a_lossy_network
           - test: node::tests::messages_meet_over_a_reordering_network
           - { test: aggregate::tests::dev_recursive_chain_constants, features: dev }
+          # The circuits' soundness audits (stark::freedom_audit, run_audit).
+          - test: block_air::tests::the_block_circuit_has_no_unintended_freedom
+          - test: block_air::tests::a_replaced_permutation_is_caught_where_it_is_used
+          - test: name_air::tests::has_no_unintended_freedom
           # The binary through its prompt (miner/tests/wallet.rs).
           - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
           - { test: a_payment_goes_through_the_prompt, features: dev, target: --test wallet }

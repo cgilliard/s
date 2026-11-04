@@ -166,6 +166,28 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   but not mint unseen. This is the largest remaining trust gap. `block_air.rs` (SMT
   empty-leaf handling on insert, XMSS digit decomposition, carry between
   segments) was only spot-checked in the review.
+- **Audited for unintended freedom (2026-11-04), not yet attacked rule
+  by rule.** `stark::freedom_audit` takes each audited row of an honest
+  trace, computes the exact Jacobian of every constraint and lookup of
+  its row pairs with respect to its cells, and tests each direction in
+  its null space at random distances: the ways several cells can change
+  together unseen (a missing bit, range or sum check shows as an exact
+  one). `stark::run_audit` shifts each column along each run of one row
+  type, for registers carried with neither end pinned. Every production
+  circuit passes (`*::has_no_unintended_freedom`; the block circuit over
+  plain spends and a reward, a transaction split over three segments,
+  and the four policy spends; the name circuit over commits, reveals,
+  updates and sweeps). What remains free is by design: a permutation on
+  a pass or load row (the hash machine does not use it, and a replaced
+  permutation on an active chain step is caught,
+  `a_replaced_permutation_is_caught_where_it_is_used`), a value with its
+  zero-test inverse, and registers left on the padding rows (unseen by
+  the public values and lookups). Limits: freedoms that span rows of
+  different types, and shapes not built (a block circuit segment
+  carrying name operations).
+  The audit finds witnesses that are not unique; whether each rule means
+  what the protocol needs is the next step: attacks rule by rule, and the
+  circuits against the chain's own code on random blocks.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`

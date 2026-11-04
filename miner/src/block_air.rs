@@ -2901,6 +2901,32 @@ mod tests {
     /// number does not.
     #[test]
     fn policy_spends_satisfy_constraints() {
+        let (txs, segments) = policy_segments();
+        assert_eq!(segments.len(), 4);
+        for (k, seg) in segments.iter().enumerate() {
+            assert_eq!(seg.num_rows(), tx_rows(&txs[k]), "rows of transaction {k}");
+            let (trace, public) = BlockAir::generate_trace(seg);
+            assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "transaction {k}");
+            // Tampering with the state number breaks the update's rows.
+            if k == 2 {
+                let mut bad = trace.clone();
+                let width = bad.width;
+                for r in 0..bad.height() {
+                    if bad.values[r * width + R_PSTATE] == Fp::new(4) {
+                        bad.values[r * width + R_PSTATE] = Fp::new(5);
+                    }
+                }
+                assert!(check_constraints(&BlockAir, &bad, &public.to_values()).is_err());
+            }
+        }
+        assert_eq!(txs[2].weight(), 2);
+        assert_eq!(txs[3].weight(), 0);
+    }
+
+    /// The four policy spends of [`policy_spends_satisfy_constraints`]
+    /// (multisig, HTLC claim, eltoo update, covenant settlement), one
+    /// segment each.
+    fn policy_segments() -> (Vec<Transaction>, Vec<SegmentWitness>) {
         use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer, covered_digest, hash_lock, rebind_message};
         use crate::transaction::pubkey_hash;
         let dir = TempDir::new("policy");
@@ -3023,25 +3049,365 @@ mod tests {
         }
         let segments = SegmentWitness::collect(&utxo, &mut wtxn, &txs, 1, height).unwrap();
         wtxn.abort();
-        assert_eq!(segments.len(), 4);
-        for (k, seg) in segments.iter().enumerate() {
-            assert_eq!(seg.num_rows(), tx_rows(&txs[k]), "rows of transaction {k}");
-            let (trace, public) = BlockAir::generate_trace(seg);
-            assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "transaction {k}");
-            // Tampering with the state number breaks the update's rows.
-            if k == 2 {
-                let mut bad = trace.clone();
-                let width = bad.width;
-                for r in 0..bad.height() {
-                    if bad.values[r * width + R_PSTATE] == Fp::new(4) {
-                        bad.values[r * width + R_PSTATE] = Fp::new(5);
-                    }
-                }
-                assert!(check_constraints(&BlockAir, &bad, &public.to_values()).is_err());
+        (txs.to_vec(), segments)
+    }
+
+    /// The block circuit's columns by name: each column is named after the
+    /// constant at or below it, with an offset (for the audit's report).
+    fn column_name(c: usize) -> String {
+        let named: &[(&str, usize)] = &[
+            ("T_TX_START", T_TX_START),
+            ("T_TX_END", T_TX_END),
+            ("T_MSG_START", T_MSG_START),
+            ("T_MSG_ABS", T_MSG_ABS),
+            ("T_LOAD", T_LOAD),
+            ("T_STEP", T_STEP),
+            ("T_LEAF", T_LEAF),
+            ("T_TREE_START", T_TREE_START),
+            ("T_TREE_ABS", T_TREE_ABS),
+            ("T_PKH0", T_PKH0),
+            ("T_PKH1", T_PKH1),
+            ("T_CM0", T_CM0),
+            ("T_CM1", T_CM1),
+            ("T_ILIST", T_ILIST),
+            ("T_OLD", T_OLD),
+            ("T_NEW", T_NEW),
+            ("T_BODY_IN0", T_BODY_IN0),
+            ("T_BODY_IN1", T_BODY_IN1),
+            ("T_OCM0", T_OCM0),
+            ("T_OCM1", T_OCM1),
+            ("T_OLIST", T_OLIST),
+            ("T_BODY_OUT0", T_BODY_OUT0),
+            ("T_BODY_OUT1", T_BODY_OUT1),
+            ("T_DONE", T_DONE),
+            ("T_RESUME", T_RESUME),
+            ("T_OLIST2", T_OLIST2),
+            ("T_BODY_OUT2", T_BODY_OUT2),
+            ("T_ILEAF", T_ILEAF),
+            ("T_OLEAF", T_OLEAF),
+            ("T_OP_BODY", T_OP_BODY),
+            ("T_OP_LIST", T_OP_LIST),
+            ("T_ILEAF2", T_ILEAF2),
+            ("T_OLEAF2", T_OLEAF2),
+            ("T_PSTART", T_PSTART),
+            ("T_CVS", T_CVS),
+            ("T_LHDR", T_LHDR),
+            ("T_THR", T_THR),
+            ("T_CHAN", T_CHAN),
+            ("T_KEY", T_KEY),
+            ("T_KSEL", T_KSEL),
+            ("T_HL", T_HL),
+            ("T_HASH", T_HASH),
+            ("T_AFTER", T_AFTER),
+            ("T_OLDER", T_OLDER),
+            ("T_STATE", T_STATE),
+            ("T_OUTS", T_OUTS),
+            ("T_PP0", T_PP0),
+            ("T_PP1", T_PP1),
+            ("T_PP2", T_PP2),
+            ("T_PP3", T_PP3),
+            ("T_PSIG", T_PSIG),
+            ("T_PEND", T_PEND),
+            ("T_CVC", T_CVC),
+            ("T_CVM", T_CVM),
+            ("T_RB0", T_RB0),
+            ("T_RB1", T_RB1),
+            ("T_RB2", T_RB2),
+            ("R_SIB", R_SIB),
+            ("C_LEVEL", C_LEVEL),
+            ("C_LEVEL_INV", C_LEVEL_INV),
+            ("C_IS_LAST", C_IS_LAST),
+            ("C_SMT_END", C_SMT_END),
+            ("R_PBITS", R_PBITS),
+            ("R_ROOT", R_ROOT),
+            ("R_OLD", R_OLD),
+            ("R_NEW", R_NEW),
+            ("R_IS_OUT", R_IS_OUT),
+            ("C_OUT_END", C_OUT_END),
+            ("R_MSG", R_MSG),
+            ("R_BSP", R_BSP),
+            ("R_ISP", R_ISP),
+            ("R_OSP", R_OSP),
+            ("R_PKROOT", R_PKROOT),
+            ("R_OCM", R_OCM),
+            ("R_ABITS", R_ABITS),
+            ("R_SUM_IN", R_SUM_IN),
+            ("R_SUM_OUT", R_SUM_OUT),
+            ("R_OPOS_LO", R_OPOS_LO),
+            ("R_OPOS_HI", R_OPOS_HI),
+            ("C_WRAP", C_WRAP),
+            ("C_WRAP_INV", C_WRAP_INV),
+            ("R_IN_LEFT", R_IN_LEFT),
+            ("R_OUT_LEFT", R_OUT_LEFT),
+            ("C_IN_ZERO", C_IN_ZERO),
+            ("C_IN_INV", C_IN_INV),
+            ("C_OUT_ZERO", C_OUT_ZERO),
+            ("C_OUT_INV", C_OUT_INV),
+            ("C_GO_OUT", C_GO_OUT),
+            ("C_GO_END", C_GO_END),
+            ("R_OPEN", R_OPEN),
+            ("R_MEMO", R_MEMO),
+            ("R_LEAF", R_LEAF),
+            ("R_OPD", R_OPD),
+            ("R_NSP", R_NSP),
+            ("R_OPS_LEFT", R_OPS_LEFT),
+            ("C_OPS_ZERO", C_OPS_ZERO),
+            ("C_OPS_INV", C_OPS_INV),
+            ("C_GO_OPS", C_GO_OPS),
+            ("R_POL", R_POL),
+            ("R_PIN", R_PIN),
+            ("R_POL_LEFT", R_POL_LEFT),
+            ("C_IN_DONE", C_IN_DONE),
+            ("C_DISP", C_DISP),
+            ("R_PSTATE", R_PSTATE),
+            ("R_CVB", R_CVB),
+            ("R_CVN", R_CVN),
+            ("C_CVB_ZERO", C_CVB_ZERO),
+            ("C_CVB_INV", C_CVB_INV),
+            ("C_CVN_ZERO", C_CVN_ZERO),
+            ("C_CVN_INV", C_CVN_INV),
+            ("R_INRUN", R_INRUN),
+            ("R_CREATED", R_CREATED),
+            ("R_SMSG", R_SMSG),
+            ("R_RMSG", R_RMSG),
+            ("R_PIDX", R_PIDX),
+            ("R_LLEN", R_LLEN),
+            ("R_LCNT", R_LCNT),
+            ("R_LSP", R_LSP),
+            ("R_NC", R_NC),
+            ("C_NC_ZERO", C_NC_ZERO),
+            ("C_NC_INV", C_NC_INV),
+            ("R_TAG", R_TAG),
+            ("R_M", R_M),
+            ("C_M_INV", C_M_INV),
+            ("R_KREM", R_KREM),
+            ("C_KLAST", C_KLAST),
+            ("C_KLAST_INV", C_KLAST_INV),
+            ("R_SREM", R_SREM),
+            ("C_SREM_ZERO", C_SREM_ZERO),
+            ("C_SREM_INV", C_SREM_INV),
+            ("R_HADTHR", R_HADTHR),
+            ("R_REBIND", R_REBIND),
+            ("R_CHAN", R_CHAN),
+            ("R_HASCOV", R_HASCOV),
+            ("R_NEEDRUN", R_NEEDRUN),
+            ("R_RUNDONE", R_RUNDONE),
+            ("R_COV", R_COV),
+            ("R_PROOT", R_PROOT),
+            ("R_KSP", R_KSP),
+            ("R_SSP", R_SSP),
+            ("R_CSP", R_CSP),
+            ("C_CEND", C_CEND),
+            ("C_GO_POL", C_GO_POL),
+            ("hm::COL_START", crate::hash_machine::COL_START),
+            ("hm::COL_ABSORB", crate::hash_machine::COL_ABSORB),
+            ("hm::COL_CHAIN", crate::hash_machine::COL_CHAIN),
+            ("hm::COL_COMPRESS", crate::hash_machine::COL_COMPRESS),
+            ("hm::COL_PASS", crate::hash_machine::COL_PASS),
+            ("hm::COL_LOAD", crate::hash_machine::COL_LOAD),
+            ("hm::COL_DIR", crate::hash_machine::COL_DIR),
+            ("hm::COL_DATA", crate::hash_machine::COL_DATA),
+            ("hm::COL_ACC", crate::hash_machine::COL_ACC),
+            ("perm", 0),
+            ("x::mc", XCOLS.mc()),
+            ("x::active", XCOLS.active()),
+            ("x::rem", XCOLS.rem()),
+            ("x::rem_inv", XCOLS.rem_inv()),
+            ("x::last", XCOLS.last()),
+            ("x::tlast", XCOLS.tlast()),
+            ("x::t3", XCOLS.t3()),
+            ("x::d", XCOLS.d()),
+            ("x::csum", XCOLS.csum()),
+            ("x::ssel", XCOLS.ssel(0)),
+            ("x::ksel", XCOLS.ksel(0)),
+            ("x::esel", XCOLS.esel(0)),
+            ("x::lsel", XCOLS.lsel(0)),
+            ("x::hsel", XCOLS.hsel(0)),
+            ("x::bits", XCOLS.bits(0)),
+            ("x::pub_seed", XCOLS.pub_seed(0)),
+            ("x::idx", XCOLS.idx(0)),
+            ("x::m", XCOLS.m(0)),
+            ("x::sp", XCOLS.sp(0)),
+            ("x::node", XCOLS.node(0)),
+            ("x::sib", XCOLS.sib(0)),
+        ];
+        let (name, at) = named.iter().filter(|(_, v)| *v <= c).max_by_key(|(_, v)| *v).unwrap();
+        if *at == c { name.to_string() } else { format!("{name}+{}", c - at) }
+    }
+
+    /// Runs `f` over `items` in chunks on every core and gathers what it
+    /// returns.
+    fn on_cores<T: Sync, R: Send>(items: &[T], f: impl Fn(&[T]) -> Vec<R> + Sync) -> Vec<R> {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let chunk = items.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = items.chunks(chunk).map(|c| s.spawn(|| f(c))).collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        })
+    }
+
+    /// The soundness audit of one segment (`stark::freedom_audit` and
+    /// `stark::run_audit`): every way its rows' cells can move together
+    /// unseen, but the two kinds the design allows, as lines naming the
+    /// segment, row and cells. Allowed: a hash permutation on a row whose
+    /// permutation is not used (`pass`, `load`), and a value with its
+    /// zero-test inverse (pinned by the product, so only to first order).
+    fn audit_segment(name: &str, seg: &SegmentWitness) -> Vec<String> {
+        use crate::hash_machine::{COL_LOAD, COL_PASS};
+        let (trace, public) = BlockAir::generate_trace(seg);
+        let public = public.to_values();
+        let types: Vec<usize> =
+            (0..NUM_COLS).filter(|&c| column_name(c).starts_with("T_") && !column_name(c).contains('+')).collect();
+        let row_type = |r: usize| types.iter().copied().find(|&c| trace.row(r)[c] == Fp::ONE);
+        // Rows: all of a rare type, eight spread over a common one.
+        let mut of_type: std::collections::BTreeMap<Option<usize>, Vec<usize>> = Default::default();
+        for r in 0..trace.height() {
+            of_type.entry(row_type(r)).or_default().push(r);
+        }
+        let mut rows = Vec::new();
+        for list in of_type.values() {
+            if list.len() <= 8 {
+                rows.extend(list);
+            } else {
+                rows.extend((0..8).map(|k| list[k * (list.len() - 1) / 7]));
             }
         }
-        assert_eq!(txs[2].weight(), 2);
-        assert_eq!(txs[3].weight(), 0);
+        let perm = crate::poseidon2_air::NUM_COLS;
+        let zero_pair = |a: usize, b: usize| {
+            let (na, nb) = (column_name(a), column_name(b));
+            nb == format!("{na}_INV") || (na == "x::rem" && nb == "x::rem_inv")
+        };
+        let mut problems: Vec<String> =
+            on_cores(&rows, |chunk| crate::stark::freedom_audit(&BlockAir, &trace, None, &public, chunk))
+                .into_iter()
+                .filter(|f| {
+                    let unused_perm = f.cells.iter().all(|(c, _)| *c < perm)
+                        && (trace.row(f.row)[COL_PASS] == Fp::ONE || trace.row(f.row)[COL_LOAD] == Fp::ONE);
+                    let inverse = !f.exact && f.cells.len() == 2 && zero_pair(f.cells[0].0, f.cells[1].0);
+                    !(unused_perm || inverse)
+                })
+                .map(|f| {
+                    let cells: Vec<String> = f.cells.iter().map(|(c, _)| column_name(*c)).collect();
+                    format!(
+                        "{name} row {} {}: {} freedom: {}",
+                        f.row,
+                        row_type(f.row).map_or("(none)".into(), column_name),
+                        if f.exact { "exact" } else { "first-order" },
+                        cells.join(" ")
+                    )
+                })
+                .collect();
+        // Runs of one type, two rows or more, every column.
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for r in 1..=trace.height() {
+            if r == trace.height() || row_type(r) != row_type(start) {
+                if r - start >= 2 {
+                    runs.extend((0..NUM_COLS).map(|c| (c, start, r)));
+                }
+                start = r;
+            }
+        }
+        let shifted = on_cores(&runs, |chunk| crate::stark::run_audit(&BlockAir, &trace, None, &public, chunk));
+        for (col, first, end) in shifted {
+            // A column nothing reads in the run can shift freely; one read
+            // there and still unseen is a carried register unpinned. On the
+            // done rows (padding) registers left over from the last item
+            // are carried to the end and read by nothing: the shift was
+            // checked against the last row's public values and every
+            // lookup, so the statement does not change.
+            if row_type(first) == Some(T_DONE) {
+                continue;
+            }
+            if (first..end).any(|r| crate::stark::cell_read(&BlockAir, &trace, None, &public, r, col)) {
+                problems.push(format!(
+                    "{name} rows {first}..{end} {}: {} shifts unseen",
+                    row_type(first).map_or("(none)".into(), column_name),
+                    column_name(col)
+                ));
+            }
+        }
+        problems
+    }
+
+    /// The soundness audit of the block circuit over the transaction
+    /// shapes the tests build: plain spends and a reward in one segment, a
+    /// transaction split over three segments (resume rows, carries), and
+    /// the four policy spends. No row may have a freedom the design does
+    /// not allow, nor any run a register that shifts unseen.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn the_block_circuit_has_no_unintended_freedom() {
+        let mut problems = Vec::new();
+        let (plain, ..) = scenario("audit-plain", 3);
+        let plan = vec![
+            vec![Part { tx: 0, start: 0, end: 1 }],
+            vec![Part { tx: 0, start: 1, end: 3 }],
+            vec![Part { tx: 0, start: 3, end: 4 }, Part { tx: 1, start: 0, end: 1 }, Part { tx: 2, start: 0, end: 2 }],
+        ];
+        let (spanning, ..) = scenario_with("audit-span", |utxo, wtxn, txs| {
+            SegmentWitness::collect_parts(utxo, wtxn, txs, plan, 1).unwrap()
+        });
+        let (_, policy) = policy_segments();
+        let shapes = [("plain", plain), ("span", spanning), ("policy", policy)];
+        for (shape, segments) in &shapes {
+            for (k, seg) in segments.iter().enumerate() {
+                let t = std::time::Instant::now();
+                let found = audit_segment(&format!("{shape} segment {k}"), seg);
+                eprintln!("{shape} segment {k}: {} problems in {:.0} s", found.len(), t.elapsed().as_secs_f64());
+                problems.extend(found);
+            }
+        }
+        assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    }
+
+    /// The hash permutation of each load and step row of a spend, replaced
+    /// by an honest permutation of another input: every active chain step
+    /// notices (a signature chain is linked step to step), and no pass or
+    /// load row does, whose permutation the hash machine does not use.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn a_replaced_permutation_is_caught_where_it_is_used() {
+        let dir = TempDir::new("audit-perm");
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let mut k = Key::generate_with_height(&[9; 32], 4);
+        let dest = key(3).public_key();
+        utxo.add_output(&mut wtxn, &Output::new(&k.public_key(), 70).block_output(), 0).unwrap();
+        let mut tx = UnsignedTransaction::new(vec![(k.public_key(), 70)], vec![Output::new(&dest, 70)])
+            .sign(|_, _, m| k.sign(m))
+            .unwrap();
+        tx.set_positions(&[0]);
+        let segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, 1).unwrap();
+        wtxn.abort();
+        let (trace, public) = BlockAir::generate_trace(&segments[0]);
+        let public = public.to_values();
+        let perm_cols = crate::poseidon2_air::NUM_COLS;
+        let other =
+            crate::poseidon2_air::Poseidon2Air::generate_trace(&[core::array::from_fn(|i| Fp::new(77 + i as u32))]);
+        let mut by_kind = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for r in 0..trace.height() {
+            let kind = if trace.row(r)[T_LOAD] == Fp::ONE {
+                "T_LOAD"
+            } else if trace.row(r)[T_STEP] == Fp::ONE {
+                if trace.row(r)[XCOLS.active()] == Fp::ONE { "T_STEP active" } else { "T_STEP pass" }
+            } else {
+                continue;
+            };
+            let mut bad = trace.clone();
+            bad.values[r * bad.width..r * bad.width + perm_cols].copy_from_slice(&other.row(0)[..perm_cols]);
+            let caught = check_constraints(&BlockAir, &bad, &public).is_err();
+            let e = by_kind.entry(kind.to_string()).or_default();
+            e.0 += 1;
+            if !caught {
+                e.1 += 1;
+            }
+        }
+        let active = by_kind["T_STEP active"];
+        assert!(active.0 > 0 && active.1 == 0, "active steps that miss a replaced permutation: {by_kind:?}");
+        let (pass, load) = (by_kind["T_STEP pass"], by_kind["T_LOAD"]);
+        assert_eq!((pass.1, load.1), (pass.0, load.0), "unused permutations seen: {by_kind:?}");
     }
 
     /// Keys of any height up to the maximum verify; the fragment stops at

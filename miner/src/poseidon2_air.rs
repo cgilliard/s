@@ -243,6 +243,17 @@ mod tests {
         assert_eq!(check_constraints(&Poseidon2Air, &bad, &[]).unwrap_err().0, 1);
     }
 
+    /// Soundness audit (`stark::mutation_audit`): every cell of every row
+    /// is caught when changed; the permutation leaves nothing free.
+    #[test]
+    fn every_column_is_constrained() {
+        let mut rng = Rng::new(53);
+        let inputs: Vec<[Fp; WIDTH]> = (0..5).map(|_| random_state(&mut rng)).collect();
+        let trace = Poseidon2Air::generate_trace(&inputs);
+        let survivors = crate::stark::mutation_audit(&[(&Poseidon2Air, &trace, None)], &[], 64);
+        assert!(survivors.is_empty(), "{}", crate::stark::audit_report(&survivors, |_, c| format!("column {c}")));
+    }
+
     #[test]
     fn prove_and_verify_permutations() {
         let config = StarkConfig { log_blowup: 1, num_queries: 16, pow_bits: 0, zk: false, commit_bits: 0 };
