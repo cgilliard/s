@@ -32,7 +32,7 @@ jobs:
           # The dev networks' code and checks (built-in dataset, plans).
           - { name: linux-x64-dev, os: ubuntu-latest, features: dev }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -45,7 +45,7 @@ jobs:
     name: linux-arm64-debug
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -85,7 +85,7 @@ jobs:
           # The binary through its prompt (miner/tests/wallet.rs).
           - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -97,7 +97,7 @@ jobs:
   slow-listed:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: compare the marked tests with the matrix
         working-directory: .
         run: |
