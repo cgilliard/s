@@ -1651,12 +1651,16 @@ impl<V: ProofVerifier> Chain<V> {
         // run or a stored one. Proofs of work are then checked at once.
         let (targets, known): (Vec<Option<Target>>, Vec<bool>) = {
             let rtxn = self.env.read_txn()?;
-            let mut out = Vec::with_capacity(headers.len());
+            let mut out: Vec<Option<Target>> = Vec::with_capacity(headers.len());
             let mut known = Vec::with_capacity(headers.len());
             for (i, h) in headers.iter().enumerate() {
                 known.push(self.headers.get(&rtxn, &digest_bytes(&h.hash()))?.is_some());
-                let parent = match i.checked_sub(1).map(|j| headers[j]).filter(|p| p.hash() == h.prev_hash) {
-                    Some(p) => Some(p),
+                // A parent earlier in the run counts only if it is linked to
+                // what we hold itself: a run whose first parent is still on
+                // its way (another batch, a datagram behind) stops at that
+                // first header with UnknownParent below.
+                let parent = match i.checked_sub(1).filter(|&j| headers[j].hash() == h.prev_hash) {
+                    Some(j) => out[j].map(|_| headers[j]),
                     None => self.header_by_hash_in(&rtxn, &digest_bytes(&h.prev_hash))?,
                 };
                 out.push(match parent {
@@ -3059,6 +3063,11 @@ mod tests {
         }
         let headers: Vec<Header> = (1..=12).map(|h| a.header_at(h).unwrap().unwrap()).collect();
         let (_db, b) = open_with("first-b");
+        // A later batch first, its parent still on its way: no header to
+        // walk back through is a missing parent, not a corrupt chain.
+        let (n, stop) = b.accept_headers(&headers[6..], t);
+        assert_eq!(n, 0);
+        assert!(matches!(stop, Some(ChainError::UnknownParent(p)) if p == headers[5].hash()), "{stop:?}");
         let (n, stop) = b.accept_headers(&headers, t);
         assert!(stop.is_none(), "{stop:?}");
         assert_eq!(n, 12);
