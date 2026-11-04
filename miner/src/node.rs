@@ -637,11 +637,33 @@ pub struct Node<V: ProofVerifier> {
     /// generator's state.
     #[cfg(test)]
     loss: std::cell::Cell<(u64, u64)>,
+    /// Tests: datagrams per thousand held back and sent after the next one
+    /// (released at the next tick if none follows), as a reordering
+    /// network would; the generator's state; the one held.
+    #[cfg(test)]
+    reorder: std::cell::Cell<(u64, u64)>,
+    #[cfg(test)]
+    held: std::cell::RefCell<Option<(SocketAddr, Vec<u8>)>>,
     last_channel_poll: Instant,
 }
 
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Tests: a draw from `(per_mille, state)`'s xorshift generator, true
+/// `per_mille` times in a thousand.
+#[cfg(test)]
+fn chance(c: &std::cell::Cell<(u64, u64)>) -> bool {
+    let (per_mille, mut x) = c.get();
+    if per_mille == 0 {
+        return false;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    c.set((per_mille, x));
+    x % 1000 < per_mille
 }
 
 fn short(d: &Digest) -> String {
@@ -937,6 +959,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             frames_sent: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             loss: std::cell::Cell::new((0, 0x9e37_79b9_7f4a_7c15)),
+            #[cfg(test)]
+            reorder: std::cell::Cell::new((0, 0x2545_f491_4f6c_dd1d)),
+            #[cfg(test)]
+            held: std::cell::RefCell::new(None),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
@@ -1112,15 +1138,40 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Tests: whether to drop the next datagram, as a lossy network would.
     #[cfg(test)]
     fn lost(&self) -> bool {
-        let (per_mille, mut x) = self.loss.get();
-        if per_mille == 0 {
-            return false;
+        chance(&self.loss)
+    }
+
+    /// Sends a datagram as encoded. Tests: one in `reorder` is held back
+    /// and goes after the next.
+    fn send_bytes(&self, addr: SocketAddr, bytes: &[u8]) {
+        #[cfg(test)]
+        {
+            let before = self.held.borrow_mut().take();
+            if before.is_none() && chance(&self.reorder) {
+                *self.held.borrow_mut() = Some((addr, bytes.to_vec()));
+                return;
+            }
+            self.send_raw(addr, bytes);
+            if let Some((a, b)) = before {
+                self.send_raw(a, &b);
+            }
         }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.loss.set((per_mille, x));
-        x % 1000 < per_mille
+        #[cfg(not(test))]
+        self.send_raw(addr, bytes);
+    }
+
+    fn send_raw(&self, addr: SocketAddr, bytes: &[u8]) {
+        if let Err(e) = self.socket.send_to(bytes, addr) {
+            self.chatter(&format!("send to {addr} failed: {e}"));
+        }
+    }
+
+    /// Tests: sends the datagram held back for reordering, if any.
+    #[cfg(test)]
+    fn release_held(&self) {
+        if let Some((a, b)) = self.held.borrow_mut().take() {
+            self.send_raw(a, &b);
+        }
     }
 
     /// Sends a message, giving a request the token its receiver gave us.
@@ -1133,9 +1184,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Some(_) => msg.clone().with_token(self.peers.token(&addr)).encode(),
             None => msg.encode(),
         };
-        if let Err(e) = self.socket.send_to(&bytes, addr) {
-            self.chatter(&format!("send to {addr} failed: {e}"));
-        }
+        self.send_bytes(addr, &bytes);
     }
 
     /// Sends a request with `token` in it, rather than the one the peer
@@ -1146,9 +1195,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.lost() {
             return;
         }
-        if let Err(e) = self.socket.send_to(&msg.with_token(token).encode(), addr) {
-            self.chatter(&format!("send to {addr} failed: {e}"));
-        }
+        self.send_bytes(addr, &msg.with_token(token).encode());
     }
 
     /// The token `addr` must put in its requests: derived from the address
@@ -1211,6 +1258,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Once a second: pings, pruning, discovery, sync, persistence.
     fn tick(&mut self, now: Instant) {
+        #[cfg(test)]
+        self.release_held();
         self.peers.prune(now);
         let (key, count) = (&self.nonce_key, &mut self.nonce_count);
         let due = self.peers.due_for_ping(now, || {
@@ -4039,7 +4088,20 @@ mod tests {
     /// way: every request is retried, and the sync completes.
     #[test]
     fn a_fresh_node_fast_syncs_over_a_lossy_network() {
-        let a = open("lossy-a");
+        fast_sync_over("lossy", 100, 0);
+    }
+
+    /// The same over a network that delivers almost a third of the
+    /// datagrams after the one sent next.
+    #[test]
+    fn a_fresh_node_fast_syncs_over_a_reordering_network() {
+        fast_sync_over("reorder", 0, 300);
+    }
+
+    /// A fast sync of twelve blocks with datagrams lost and reordered, per
+    /// thousand, each way.
+    fn fast_sync_over(name: &str, loss: u64, reorder: u64) {
+        let a = open(&format!("{name}-a"));
         let now = unix_now();
         let mut t = T0;
         for tag in 1..=12u8 {
@@ -4057,15 +4119,20 @@ mod tests {
         let a_tip = a.chain.tip().unwrap().unwrap();
         let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
         let addr_a = node_a.local_addr().unwrap();
-        let b = open("lossy-b");
+        let b = open(&format!("{name}-b"));
         let mut cb = config(vec![addr_a], &b.dir);
         cb.sync_point = Some(4);
         let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
-        node_a.loss.set((100, 1));
-        node_b.loss.set((100, 2));
+        node_a.loss.set((loss, 1));
+        node_b.loss.set((loss, 2));
+        node_a.reorder.set((reorder, 3));
+        node_b.reorder.set((reorder, 4));
         let ha = std::thread::spawn(move || node_a.run());
         let hb = std::thread::spawn(move || node_b.run());
-        assert!(wait_for_tip(&b.chain, &a_tip, 120), "b did not fast-sync to a's tip over a lossy network");
+        assert!(
+            wait_for_tip(&b.chain, &a_tip, 120),
+            "b did not fast-sync to a's tip ({loss} lost, {reorder} reordered)"
+        );
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         tx_a.send(Event::Stop).unwrap();
         tx_b.send(Event::Stop).unwrap();
@@ -5125,6 +5192,126 @@ mod tests {
     /// Onion mode end to end: two wallets' nodes keep circuits standing
     /// to their rendezvous points among three listed relays, and one
     /// reaches the other by id and is answered, as in init mode.
+    /// The message layer in onion mode over a network that loses a tenth
+    /// of the datagrams each way: sessions come up, and messages and their
+    /// answers along the route back arrive, sent again when a send fails.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn messages_meet_over_a_lossy_network() {
+        messages_over("msg-lossy", 100, 0);
+    }
+
+    /// The same over a network that delivers almost a third of the
+    /// datagrams after the one sent next.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn messages_meet_over_a_reordering_network() {
+        messages_over("msg-reorder", 0, 300);
+    }
+
+    /// Three relays and two participants with datagrams lost and reordered,
+    /// per thousand: q sends p five messages, and p answers each.
+    fn messages_over(name: &str, loss: u64, reorder: u64) {
+        use crate::onion;
+        let fixtures: Vec<Fixture> = (0..5).map(|i| open(&format!("{name}-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            node.loss.set((loss, 10 + i as u64));
+            node.reorder.set((reorder, 20 + i as u64));
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+        }
+        let (p, q) = (3usize, 4usize);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + guard(60);
+        while !(live(p) && live(q)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(p) && live(q), "sessions never came up ({loss} lost, {reorder} reordered)");
+        // Sends `out` from `from`, again whenever a send fails or nothing
+        // arrives, for up to `secs`: what `to` received, if anything. The
+        // reasons sends failed are kept.
+        let failures = Mutex::new(Vec::new());
+        let deliver = |from: usize, to: usize, out: &Outbound, secs: u64| -> Option<onion::Opened> {
+            let deadline = Instant::now() + guard(secs);
+            while Instant::now() < deadline {
+                nodes[from].1.send(Event::Send(out.clone())).unwrap();
+                let until = Instant::now() + guard(15);
+                'wait: while Instant::now() < until {
+                    if let Ok(Note::Received(o)) = nodes[to].2.recv_timeout(Duration::from_millis(100))
+                        && o.inner == out.inner
+                    {
+                        return Some(o);
+                    }
+                    while let Ok(n) = nodes[from].2.try_recv() {
+                        if let Note::Failed { tag, why, .. } = n
+                            && tag == out.tag
+                        {
+                            failures.lock().unwrap().push(why);
+                            break 'wait;
+                        }
+                    }
+                }
+            }
+            None
+        };
+        let outbound = |tag: u64, to: Digest, inner: Vec<u8>, reply: Option<onion::Route>| Outbound {
+            tag,
+            to,
+            kind: onion::KIND_SLATE,
+            inner,
+            recipient: None,
+            reply,
+            group: 0,
+        };
+        // An answer goes back along the route the message gave: if that
+        // route's circuit is gone, the message is sent again for a new one,
+        // as a wallet sends a slate again.
+        let mut fresh_routes = 0;
+        for k in 0..5u64 {
+            let deadline = Instant::now() + guard(180);
+            loop {
+                let msg = format!("message {k}").into_bytes();
+                let o = deliver(q, p, &outbound(100 + k, id(4), msg.clone(), None), 90)
+                    .unwrap_or_else(|| panic!("message {k} never arrived: {:?}", failures.lock().unwrap()));
+                assert_eq!(o.inner, msg);
+                let route = o.route.expect("a way back");
+                let answer = outbound(200 + k, route.reply_id(), format!("answer {k}").into_bytes(), Some(route));
+                if let Some(a) = deliver(p, q, &answer, 30) {
+                    assert_eq!(a.answers, Some(id(4)));
+                    break;
+                }
+                fresh_routes += 1;
+                assert!(Instant::now() < deadline, "answer {k} never arrived: {:?}", failures.lock().unwrap());
+            }
+        }
+        eprintln!(
+            "{loss} lost, {reorder} reordered: {fresh_routes} answers needed a fresh route; sends failed: {:?}",
+            failures.lock().unwrap()
+        );
+        for n in nodes {
+            n.1.send(Event::Stop).unwrap();
+            n.4.join().unwrap();
+        }
+    }
+
     #[test]
     fn messages_meet_in_onion_mode() {
         use crate::onion;

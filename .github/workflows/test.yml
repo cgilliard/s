@@ -81,6 +81,8 @@ jobs:
           - test: node::tests::a_fresh_node_fast_syncs_when_its_first_peer_comes_late
           - test: node::tests::rendezvous_points_meet_over_circuits
           - test: node::tests::a_switch_between_modes_falls_back
+          - test: node::tests::messages_meet_over_a_lossy_network
+          - test: node::tests::messages_meet_over_a_reordering_network
           - { test: aggregate::tests::dev_recursive_chain_constants, features: dev }
           # The binary through its prompt (miner/tests/wallet.rs).
           - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
