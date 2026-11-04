@@ -1179,6 +1179,11 @@ impl Download {
 
 /// A peer waits this long between pings.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// A peer that has not answered a ping yet is pinged again after this,
+/// doubling up to [`PING_INTERVAL`]: a lost first ping or pong would
+/// otherwise keep it from us (and channels to it waiting for its token)
+/// for a whole interval.
+pub const FIRST_PING_RETRY: Duration = Duration::from_secs(2);
 /// A peer silent for this long is dropped (unless it is a seed).
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long a peer a block download failed from, or that did not back its
@@ -1239,6 +1244,8 @@ pub struct Peer {
     pub last_ping: Option<Instant>,
     /// Nonce of the ping awaiting its pong.
     pub pending: Option<u64>,
+    /// Pings sent before its first pong ([`FIRST_PING_RETRY`]).
+    pub first_pings: u32,
     pub status: Option<Status>,
     /// Bad replies to our requests; dropped at [`MAX_STRIKES`].
     pub strikes: u32,
@@ -1377,6 +1384,7 @@ impl Peers {
                 last_seen: None,
                 last_ping: None,
                 pending: None,
+                first_pings: 0,
                 status: None,
                 strikes: 0,
                 last_strike: None,
@@ -1414,9 +1422,13 @@ impl Peers {
         p.pending = None;
         p.status = Some(status);
         p.handshaken = true;
-        if let Some(sample) = p.last_ping.map(|t| t.elapsed()) {
+        // Karn's rule: a ping sent more than once times nothing.
+        if p.first_pings == 0
+            && let Some(sample) = p.last_ping.map(|t| t.elapsed())
+        {
             p.round_trip(sample);
         }
+        p.first_pings = 0;
         true
     }
 
@@ -1537,14 +1549,28 @@ impl Peers {
         let mut out = Vec::new();
         self.budget = UNVERIFIED_PINGS;
         for p in self.map.values_mut() {
-            if p.last_ping.is_none_or(|t| now.duration_since(t) >= PING_INTERVAL) {
+            // Until its first pong, sooner: 2 s, 4 s, 8 s, 16 s, then 30.
+            let interval = if p.handshaken {
+                PING_INTERVAL
+            } else {
+                FIRST_PING_RETRY.saturating_mul(1 << p.first_pings.min(4)).min(PING_INTERVAL)
+            };
+            if p.last_ping.is_none_or(|t| now.duration_since(t) >= interval) {
                 if !p.handshaken && !p.seed {
                     if self.budget == 0 {
                         continue;
                     }
                     self.budget -= 1;
                 }
-                let n = nonce();
+                // Before the first pong, the same ping again: a slow pong to
+                // an earlier copy still counts.
+                let n = match p.pending {
+                    Some(n) if !p.handshaken => {
+                        p.first_pings += 1;
+                        n
+                    }
+                    _ => nonce(),
+                };
                 p.last_ping = Some(now);
                 p.pending = Some(n);
                 out.push((p.addr, n));
@@ -2169,6 +2195,40 @@ mod tests {
         // An announced length over the limit is ignored.
         let mut big = Download::new(Kind::Block, id, from, 100, Some(2500), PeerPath::default(), now);
         assert_eq!(big.request(now).len(), INITIAL_WINDOW);
+    }
+
+    /// A first ping that goes unanswered is sent again after 2, 4, 8 and
+    /// 16 s, then every 30 s, as the same ping, so a pong to any copy
+    /// counts (but times nothing); once answered, every 30 s with a new
+    /// nonce.
+    #[test]
+    fn an_unanswered_first_ping_is_sent_again_sooner() {
+        let t0 = Instant::now();
+        let mut peers = Peers::new();
+        let a: SocketAddr = "10.0.0.1:7417".parse().unwrap();
+        peers.add(a, true);
+        let mut n = 0u64;
+        let mut due = |peers: &mut Peers, at: u64| -> Vec<u64> {
+            peers
+                .due_for_ping(t0 + Duration::from_secs(at), || {
+                    n += 1;
+                    n
+                })
+                .into_iter()
+                .map(|(_, nonce)| nonce)
+                .collect()
+        };
+        assert_eq!(due(&mut peers, 0), vec![1]);
+        for (at, sent) in [(1, false), (2, true), (5, false), (6, true), (13, false), (14, true), (29, false)] {
+            assert_eq!(due(&mut peers, at), if sent { vec![1] } else { vec![] }, "at {at} s");
+        }
+        assert_eq!(due(&mut peers, 30), vec![1]);
+        assert!(due(&mut peers, 59).is_empty());
+        assert_eq!(due(&mut peers, 60), vec![1]);
+        assert!(peers.pong(a, Status { nonce: 1, ..status() }));
+        assert!(peers.get(&a).unwrap().rtt.is_none(), "a ping sent more than once times nothing");
+        assert!(due(&mut peers, 89).is_empty());
+        assert_eq!(due(&mut peers, 90), vec![2]);
     }
 
     #[test]
