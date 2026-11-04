@@ -1649,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves a proof of a proof; run with --release"]
+    #[cfg_attr(debug_assertions, ignore = "proves a proof of a proof; run with --release")]
     fn recursive_proof_roundtrip() {
         let (trace, public) = fib_trace(3);
         let proof = prove(&INNER, &Fibonacci, &trace, &public, &mut Challenger::new());
