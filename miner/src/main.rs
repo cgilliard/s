@@ -3,7 +3,7 @@
 //! mines and proves blocks on it.
 //!
 //! ```text
-//! tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
+//! tabminer [mine] [--data DIR] [--blocks N] [--delay-blocks N] [--jobs N] [--no-mine] [options]
 //! tabminer node [--data DIR] [options]
 //! tabminer show [--data DIR]
 //! tabminer restore [--data DIR]
@@ -75,7 +75,7 @@ use tabminer::wallet::{Ask, Incoming, Signed, Slate, State, Wallet};
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage:
-  tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
+  tabminer [mine] [--data DIR] [--blocks N] [--delay-blocks N] [--jobs N] [--no-mine] [options]
   tabminer node [--data DIR] [options]
   tabminer show [--data DIR]
   tabminer restore [--data DIR]     rebuild a wallet from its 12-word phrase
@@ -90,6 +90,9 @@ const USAGE: &str = "usage:
                     seconds). Dev coins are worth nothing. Both need
                     a build with `--features dev`
   --blocks N        blocks to mine, 0 for no limit (default 0)
+  --delay-blocks N  wait N seconds after each block mined before starting the
+                    next (default 0): slower blocks, for a test network whose
+                    nodes are far apart (the difficulty follows)
   --jobs N          segments proven at once (default 2)
   TABMINER_THREADS=N  (environment) threads for hashing and proving, all
                     cores by default; fewer leaves the node responsive to
@@ -277,6 +280,8 @@ struct Args {
     network: Network,
     data: PathBuf,
     blocks: u64,
+    /// Seconds the miner waits after each block it mines.
+    delay_blocks: u64,
     jobs: usize,
     no_mine: bool,
     no_prompt: bool,
@@ -319,6 +324,7 @@ fn parse_args() -> Result<Args, String> {
         network: Network::Mainnet,
         data,
         blocks: 0,
+        delay_blocks: 0,
         jobs: 2,
         no_mine: false,
         no_prompt: false,
@@ -359,6 +365,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--blocks" => a.blocks = number(value()?)?,
+            "--delay-blocks" => a.delay_blocks = number(value()?)?,
             "--jobs" => a.jobs = number(value()?)?.max(1) as usize,
             "--no-mine" => a.no_mine = true,
             "--no-prompt" => a.no_prompt = true,
@@ -909,9 +916,9 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let miner = match dataset {
         Some(dataset) => {
             let ctx = Arc::clone(&ctx);
-            let (blocks, jobs) = (args.blocks, args.jobs);
+            let (blocks, jobs, delay) = (args.blocks, args.jobs, Duration::from_secs(args.delay_blocks));
             Some(std::thread::Builder::new().name("miner".into()).spawn(move || {
-                if let Err(e) = mine(&ctx, &dataset, blocks, jobs) {
+                if let Err(e) = mine(&ctx, &dataset, blocks, jobs, delay) {
                     log::line(&format!("miner stopped: {e}"));
                 }
             })?)
@@ -2858,7 +2865,7 @@ fn reward(wallet: &Wallet, amount: u64) -> AnyResult<(Transaction, Output)> {
 
 /// The mining loop: builds, proves, mines and submits blocks on the tip
 /// until `blocks` are accepted (0 for no limit) or the node stops.
-fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()> {
+fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration) -> AnyResult<()> {
     let params = ctx.params;
     let agg = params.aggregator;
     let chain = &ctx.chain;
@@ -3182,6 +3189,14 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize) -> AnyResult<()>
             secs(mine_time),
             secs(t.elapsed())
         ));
+        // `--delay-blocks`: a pause before the next block, cut short by a
+        // stop.
+        if !delay.is_zero() && (blocks == 0 || mined < blocks) {
+            let until = Instant::now() + delay;
+            while Instant::now() < until && !ctx.stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
     Ok(())
 }

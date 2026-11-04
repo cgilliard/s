@@ -44,7 +44,7 @@ it and refuses `--network dev`. Their tests run with `cargo test
 ## Run
 
 ```
-tabminer [mine] [--data DIR] [--blocks N] [--jobs N] [--no-mine] [options]
+tabminer [mine] [--data DIR] [--blocks N] [--delay-blocks N] [--jobs N] [--no-mine] [options]
 tabminer node [--data DIR] [options]
 tabminer show [--data DIR]
 tabminer restore [--data DIR]
@@ -515,6 +515,11 @@ tabminer --network dev                            # a miner anywhere
 ```
 
 The first miner waits ten seconds for the seeds, then mines from genesis.
+A block a second is faster than blocks cross the internet (each hop
+takes a few round trips): for nodes far apart, `--delay-blocks N` makes
+the miner wait N seconds after each block before starting the next, and
+the difficulty falls to match (`--delay-blocks 4` gives a block about
+every five seconds).
 On one machine, apart from the seeds, `--no-seeds` and `--peer` (a node
 with neither starts mining at once):
 
