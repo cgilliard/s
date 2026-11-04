@@ -373,15 +373,17 @@ fn parse_args() -> Result<Args, String> {
             "--listen" => {
                 let v = value()?;
                 a.listen = v.parse().map_err(|_| format!("--listen: not an address: {v}"))?;
+                if !a.listen.is_ipv4() {
+                    return Err(format!("--listen {v}: IPv6 is not supported; give an IPv4 address"));
+                }
             }
             "--peer" => {
                 let v = value()?;
-                // Every address it resolves to: the node keeps those of its
-                // socket's family.
+                // Every IPv4 address it resolves to (IPv6 is not spoken).
                 let before = a.peers.len();
-                a.peers.extend(v.to_socket_addrs().map_err(|e| format!("--peer {v}: {e}"))?);
+                a.peers.extend(v.to_socket_addrs().map_err(|e| format!("--peer {v}: {e}"))?.filter(|a| a.is_ipv4()));
                 if a.peers.len() == before {
-                    return Err(format!("--peer {v}: no address"));
+                    return Err(format!("--peer {v}: no IPv4 address (IPv6 is not supported)"));
                 }
             }
             "--seed" => a.seeds.push(value()?),
@@ -2851,11 +2853,7 @@ fn relay_lines(address: &str, listen: SocketAddr) -> Vec<String> {
         lines.push(format!("  relay {address} HOST:{}", listen.port()));
         lines.push("  (replace HOST with this node's public host name or IP)".to_string());
     } else {
-        let addr = match listen {
-            SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
-            SocketAddr::V4(v4) => v4.to_string(),
-        };
-        lines.push(format!("  relay {address} {addr}"));
+        lines.push(format!("  relay {address} {listen}"));
     }
     lines
 }

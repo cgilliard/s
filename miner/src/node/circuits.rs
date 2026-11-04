@@ -129,7 +129,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// The listed relay `id`'s address, in onion mode.
     pub(super) fn relay_addr(&mut self, id: &Digest) -> Option<SocketAddr> {
         let name = self.rv.listed(id)?.addr.clone();
-        name.to_socket_addrs().ok()?.next()
+        name.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
     }
 
     /// A circuit number free on channel `key`, from our half.

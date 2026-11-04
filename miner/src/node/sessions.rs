@@ -599,9 +599,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if let Some(a) = self.rv.resolved.get(name) {
             return *a;
         }
-        let v6 = self.socket.local_addr().is_ok_and(|a| a.is_ipv6());
-        let addrs: Vec<SocketAddr> = name.to_socket_addrs().map(|i| i.collect()).unwrap_or_default();
-        let a = addrs.iter().find(|a| a.is_ipv6() == v6).or(addrs.first()).copied();
+        // IPv4 only (`net`'s module doc).
+        let a = name.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4()));
         self.rv.resolved.insert(name.to_string(), a);
         a
     }

@@ -5,7 +5,9 @@
 //!
 //! Every datagram is `MAGIC`, a type byte and a payload encoded with
 //! [`crate::codec`], and fits in [`MAX_DATAGRAM`] bytes so it crosses any
-//! IPv6 path without fragmentation. Nothing is encrypted or signed: blocks
+//! path without fragmentation. Only IPv4 is spoken: a peer's address is
+//! its four bytes and port, and IPv6 addresses are never taken (cheap in
+//! bulk, they would weaken the network-group limit). Nothing is encrypted or signed: blocks
 //! and headers carry their own proof of work and validity proof, and a peer
 //! table entry is only an address to try.
 //!
@@ -58,7 +60,7 @@
 //! used to amplify traffic.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -71,8 +73,9 @@ use crate::names::{NAME_PART_RECORDS, Record};
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 9;
-/// Largest datagram sent: the IPv6 minimum MTU less its headers.
+pub const PROTOCOL_VERSION: u32 = 10;
+/// Largest datagram sent: the IPv6 minimum MTU less its headers, well
+/// within what IPv4 paths carry unfragmented in practice.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
 pub const CHUNK_BYTES: usize = 1024;
@@ -464,28 +467,18 @@ fn get_status(r: &mut Reader) -> Option<Status> {
     })
 }
 
+/// An IPv4 address and port (the caller leaves IPv6 ones out).
 fn put_addr(w: &mut Writer, a: &SocketAddr) {
-    match a.ip() {
-        IpAddr::V4(ip) => {
-            w.0.push(4);
-            w.0.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            w.0.push(6);
-            w.0.extend_from_slice(&ip.octets());
-        }
+    if let IpAddr::V4(ip) = a.ip() {
+        w.0.extend_from_slice(&ip.octets());
+        w.0.extend_from_slice(&a.port().to_le_bytes());
     }
-    w.0.extend_from_slice(&a.port().to_le_bytes());
 }
 
 fn get_addr(r: &mut Reader) -> Option<SocketAddr> {
-    let ip = match r.take(1)?[0] {
-        4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(r.take(4)?).unwrap())),
-        6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(r.take(16)?).unwrap())),
-        _ => return None,
-    };
+    let ip = Ipv4Addr::from(<[u8; 4]>::try_from(r.take(4)?).unwrap());
     let port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
-    Some(SocketAddr::new(ip, port))
+    Some(SocketAddr::new(IpAddr::V4(ip), port))
 }
 
 impl Message {
@@ -507,8 +500,9 @@ impl Message {
             }
             Message::Peers(addrs) => {
                 w.0.push(T_PEERS);
-                w.0.push(addrs.len().min(MAX_PEERS_MESSAGE) as u8);
-                for a in addrs.iter().take(MAX_PEERS_MESSAGE) {
+                let v4: Vec<&SocketAddr> = addrs.iter().filter(|a| a.is_ipv4()).take(MAX_PEERS_MESSAGE).collect();
+                w.0.push(v4.len() as u8);
+                for a in v4 {
                     put_addr(&mut w, a);
                 }
             }
@@ -1198,16 +1192,16 @@ pub const MAX_PEERS: usize = 64;
 /// carrier's NAT), while the network-group limit below keeps one party
 /// from surrounding a node.
 pub const MAX_PER_HOST: usize = 4;
-/// Most peer entries one network group may hold (a /16 for IPv4, a /32
-/// for IPv6): an attacker with addresses in one network cannot fill the
+/// Most peer entries one network group (a /16) may hold: an attacker with addresses in one network cannot fill the
 /// table and surround the node.
 pub const MAX_PER_GROUP: usize = 8;
 
-/// The network group of an address, for [`MAX_PER_GROUP`].
-fn group(ip: std::net::IpAddr) -> u32 {
+/// The network group of an address, for [`MAX_PER_GROUP`]: its /16. The
+/// table holds IPv4 addresses only.
+fn group(ip: IpAddr) -> u32 {
     match ip {
-        std::net::IpAddr::V4(v4) => u32::from(v4) >> 16,
-        std::net::IpAddr::V6(v6) => (u128::from(v6) >> 96) as u32 | 1 << 31,
+        IpAddr::V4(v4) => u32::from(v4) >> 16,
+        IpAddr::V6(_) => u32::MAX,
     }
 }
 
@@ -1297,9 +1291,6 @@ pub struct Peers {
     banned: HashMap<SocketAddr, Instant>,
     /// Pings to unverified addresses left this tick.
     budget: usize,
-    /// Whether the socket is IPv6: addresses of the other family cannot
-    /// be reached from it and are not taken. `None` takes both.
-    v6: Option<bool>,
     /// State of the generator that samples peers.
     rng: std::cell::Cell<u64>,
 }
@@ -1311,12 +1302,6 @@ impl Peers {
 
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    /// Takes only addresses of the socket's family from now on.
-    pub fn set_family(&mut self, v6: bool) {
-        self.v6 = Some(v6);
-        self.map.retain(|a, _| a.is_ipv6() == v6);
     }
 
     /// A pseudorandom number, for sampling: xorshift, seeded from the
@@ -1348,7 +1333,8 @@ impl Peers {
         if addr.ip().is_unspecified() || addr.port() == 0 || self.selves.contains(&addr) {
             return false;
         }
-        if self.v6.is_some_and(|v6| addr.is_ipv6() != v6) {
+        // IPv4 only (see the module doc).
+        if !addr.is_ipv4() {
             return false;
         }
         if self.banned.get(&ban_key(&addr)).is_some_and(|t| t.elapsed() < BAN_TIME) {
@@ -2085,15 +2071,26 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_addresses_are_neither_taken_nor_sent() {
+        let mut peers = Peers::new();
+        let v6: SocketAddr = "[2001:db8::1]:7417".parse().unwrap();
+        let v4: SocketAddr = "10.1.2.3:7417".parse().unwrap();
+        assert!(!peers.add(v6, true));
+        assert!(peers.add(v4, false));
+        let bytes = Message::Peers(vec![v6, v4]).encode();
+        assert_eq!(Message::decode(&bytes), Some(Message::Peers(vec![v4])));
+    }
+
+    #[test]
     fn messages_roundtrip_within_the_datagram_limit() {
         let v4: SocketAddr = "10.1.2.3:7417".parse().unwrap();
-        let v6: SocketAddr = "[2001:db8::1]:7417".parse().unwrap();
+        let v4b: SocketAddr = "203.0.113.9:65535".parse().unwrap();
         let msgs = vec![
             Message::Ping(status()),
             Message::Pong(status()),
             Message::GetPeers { token: 7 },
-            Message::Peers(vec![v4, v6]),
-            Message::Peers(vec![v6; MAX_PEERS_MESSAGE]),
+            Message::Peers(vec![v4, v4b]),
+            Message::Peers(vec![v4b; MAX_PEERS_MESSAGE]),
             Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect(), token: u64::MAX },
             Message::GetHeadersFrom { height: 123_456, token: 1 },
             Message::Headers((0..HEADERS_PER_MESSAGE as u32).map(header).collect()),

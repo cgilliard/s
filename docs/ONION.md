@@ -82,7 +82,8 @@ relay ID ADDRESS
 Onion mode: `relay` lines list the relays, one per line: its id (a
 `tab1…` address, or 64 hex digits: the hash of its Dilithium key, which
 a node started with `--relay` prints) and its address (`host:port`, UDP,
-the same transport as the chain's; a v6 address in brackets), and
+the same transport as the chain's; a host name or IPv4 address, since
+IPv6 is not spoken), and
 nothing else. There are no flags and no descriptors: the system is flat,
 and every listed relay may be a hop or a rendezvous point. The file
 carries only the key's hash; the key itself is shown, and proven held,

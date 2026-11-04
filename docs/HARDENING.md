@@ -36,7 +36,7 @@ conjecture, a checkpoint per release, seeds, genesis regeneration, the
 small-VPS and full-size sync tests. Accepted as they are: no coinbase
 maturity, PBKDF2, unrecoverable policy outputs, file slates' recipients,
 name parts checked at the end (a design change), side blocks stored
-before their proofs, the shared leaf/node hash domain. Open but not
+before their proofs, the shared leaf/node hash domain, IPv4 only. Open but not
 planned: pricing unnamed slates (a fee or proof of work per slate).
 
 ## Consensus and chain
@@ -74,14 +74,16 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   serving many.
 
 - **Eclipse resistance rests on the two seeds.** The peer table takes
-  at most 8 entries per network group (a /16, or a /32 for IPv6) and 2
-  per host, so one network cannot fill it. Still to do once the chain is
+  at most 8 entries per network group (a /16) and 4 per host, so one
+  network cannot fill it. IPv6 is not supported, by decision: its
+  addresses are cheap in bulk, which would weaken the group limit, and
+  every node and seed has IPv4; an IPv6-only host cannot run a node. Still to do once the chain is
   live: hard-code a checkpoint or an `assumevalid` header hash per
   release.
 - **Untested paths.** No test for: the `drop_carry` path; a deferred
   move or restart while parts are with the applier; the header batch
   retry; clock-skew logging; strikes leading to a ban at node level;
-  peers-file poisoning; IPv6; NAT. (Tested: loss and reordering, a fast
+  peers-file poisoning; NAT. (Tested: loss and reordering, a fast
   sync and the message layer with a tenth of datagrams lost or almost a
   third delivered after the next; a manifest that does not fit the
   snapshot block's proof; no peer serving the snapshot, with a peer
@@ -228,7 +230,7 @@ Found while building it (2026-11-01).
 ## Deployment and operations
 
 - **Seeds** need the current binary at every format change (now protocol
-  9, chain format 14, wallet format 8, slate format `tabslt05`), started
+  10, chain format 14, wallet format 8, slate format `tabslt05`), started
   with `--relay`, and wiped data directories. Fresh nodes cannot sync
   until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the

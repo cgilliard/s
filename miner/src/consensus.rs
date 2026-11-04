@@ -192,8 +192,9 @@ fn parse_id(word: &str) -> Option<Digest> {
     crate::poseidon2::digest_from_bytes(&bytes)
 }
 
-/// Whether `addr` reads as `HOST:PORT`: a host name or an IP (a v6
-/// address in brackets) and a port.
+/// Whether `addr` reads as `HOST:PORT`: a host name or an IPv4 address,
+/// and a port. IPv6 is not spoken (`docs/HARDENING.md`), so a bracketed
+/// address is refused.
 fn address_ok(addr: &str) -> bool {
     let Some((host, port)) = addr.rsplit_once(':') else {
         return false;
@@ -201,13 +202,7 @@ fn address_ok(addr: &str) -> bool {
     if port.parse::<u16>().is_err() {
         return false;
     }
-    if host.starts_with('[') {
-        host.ends_with(']') && host[1..host.len() - 1].parse::<std::net::Ipv6Addr>().is_ok()
-    } else {
-        !host.is_empty()
-            && host.len() <= 253
-            && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-    }
+    !host.is_empty() && host.len() <= 253 && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 impl File {
@@ -395,7 +390,7 @@ mod tests {
         assert_eq!(File::parse(init.as_bytes()).unwrap().mode, Mode::Init);
         let onion = format!(
             "mode onion\nrelay {} relay3.example.org:3737\nrelay {} 10.0.0.2:3737\n\
-             relay {} [2001:db8::1]:3737\nfuture directive\n",
+             relay {} 10.0.0.3:3737\nfuture directive\n",
             addr(2),
             hex(0),
             addr(1)
@@ -425,6 +420,7 @@ mod tests {
         assert_eq!(File::parse(with(&format!("relay {} :3737", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
         assert_eq!(File::parse(with(&format!("relay {} c:99999", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
         assert_eq!(File::parse(with(&format!("relay {} [::1:3737", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
+        assert_eq!(File::parse(with(&format!("relay {} [::1]:3737", addr(2))).as_bytes()), Err(ParseError::BadAddress(4)));
         // No flags: any relay serves any role.
         assert_eq!(File::parse(with(&format!("relay {} c:1 exit", addr(2))).as_bytes()), Err(ParseError::BadRelay(4)));
         assert_eq!(File::parse(with(&format!("relay {} c:1", addr(1))).as_bytes()), Err(ParseError::DuplicateRelay(4)));

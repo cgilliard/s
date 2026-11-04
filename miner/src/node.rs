@@ -760,6 +760,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         mempool: Arc<Mutex<Mempool>>,
         config: Config,
     ) -> std::io::Result<(Node<V>, SyncSender<Event>)> {
+        if !config.listen.is_ipv4() {
+            return Err(std::io::Error::other("IPv6 is not supported: listen on an IPv4 address"));
+        }
         let socket = UdpSocket::bind(config.listen)?;
         enlarge_buffers(&socket);
         let genesis = chain
@@ -768,7 +771,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .ok_or_else(|| std::io::Error::other("chain has no genesis"))?
             .hash();
         let mut peers = Peers::new();
-        peers.set_family(socket.local_addr()?.is_ipv6());
         if let Some(path) = &config.peers_file {
             let n = peers.load(path)?;
             if n > 0 {
