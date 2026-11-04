@@ -727,11 +727,19 @@ impl Air for NameAir {
         // the position's bits, a trie walk as long as the witness says.
         b.when_transition(walk_load * (n[R_LEVEL]));
         b.when_transition(pload * (n[R_WLEN] - F::from_u32(DEPTH as u32)));
-        let mut pos_sum = F::ZERO;
+        // One constraint per 30-bit limb: 40 bits in one sum would exceed
+        // the field, and two bit patterns could meet the same position.
+        let (mut pos_lo, mut pos_hi) = (F::ZERO, F::ZERO);
         for m in 0..DEPTH {
-            pos_sum += n[R_KB + m] * pow2::<F>(DEPTH - 1 - m);
+            let k = DEPTH - 1 - m;
+            if k < 30 {
+                pos_lo += n[R_KB + m] * pow2::<F>(k);
+            } else {
+                pos_hi += n[R_KB + m] * pow2::<F>(k - 30);
+            }
         }
-        b.when_transition(pload * (pos_sum - l[R_WPOS_LO] - l[R_WPOS_HI] * pow2::<F>(30)));
+        b.when_transition(pload * (pos_lo - l[R_WPOS_LO]));
+        b.when_transition(pload * (pos_hi - l[R_WPOS_HI]));
         // An update finds its own key: the second register holds the same.
         for i in 0..KEY_BITS {
             b.assert_zero(tload * is_update * (kb[i] - kb2[i]));
