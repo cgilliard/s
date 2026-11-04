@@ -329,3 +329,69 @@ fn a_crash_at_each_step_of_a_payment_loses_nothing() {
     assert!(net.b.exit(30).success());
     assert!(net.s.exit(30).success());
 }
+
+/// The pool count from `status`.
+fn pooled(p: &mut Proc) -> usize {
+    p.send("status");
+    let line = p.expect("the mempool line", 10, |l| l.starts_with("mempool  "));
+    line["mempool  ".len()..].split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// Registers `name` through the prompt: commit, then reveal once it may.
+fn register(p: &mut Proc, name: &str) {
+    p.send(&format!("name-commit {name}"));
+    p.expect("the commit", 30, |l| l.starts_with(&format!("committed to {name}")));
+    p.poll("names", "the commit ready", 180, |l| l.starts_with(name) && l.contains("ready to reveal"));
+    p.send(&format!("name-reveal {name}"));
+    p.expect("the reveal", 30, |l| l == format!("revealing {name}"));
+    p.poll("names", "the name owned", 120, |l| l.starts_with(name) && l.contains("  owned  "));
+}
+
+/// Miners keep going through a reorganization that strands transactions:
+/// M (slower) and Q mine apart, each registering the name `contested`,
+/// and M burns coins; then Q, heavier, comes back peered with M, which
+/// switches to Q's branch while it runs. M's transactions spend rewards of
+/// its lost blocks and its name lost the race: none may come back to its
+/// pool, nor stop its miner, and its new transactions must still confirm.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn miners_keep_going_through_a_reorganization_that_strands_transactions() {
+    let (dir_m, dir_q) = (TempDir::new("strand-m"), TempDir::new("strand-q"));
+    let mut q = Proc::start("Q", &dir_q.0, &["mine"]);
+    let mut m = Proc::start("M", &dir_m.0, &["mine", "--delay-blocks", "2"]);
+    for p in [&mut m, &mut q] {
+        p.poll("balance", "spendable coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
+    }
+    register(&mut q, "contested");
+    register(&mut m, "contested");
+    m.send("burn 1 first");
+    m.expect("the burn", 30, |l| l.starts_with("burning "));
+    m.poll("status", "the burn mined", 60, |l| l.starts_with("mempool  0 transactions"));
+    m.send("burn 1 second");
+    m.expect("the burn", 30, |l| l.starts_with("burning "));
+    let deadline = Instant::now() + guard(180);
+    while q.height() < m.height() + 5 {
+        assert!(Instant::now() < deadline, "Q never got well ahead of M");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let q_address = q.address();
+    assert!(q.exit(30).success());
+    drop(q);
+    let mut q = Proc::start("Q", &dir_q.0, &["mine", "--peer", &m.addr]);
+    // M is on Q's branch once the name is Q's there.
+    m.poll("name contested", "Q's name", 120, |l| l.trim() == q_address);
+    m.poll("status", "an empty pool", 60, |l| l.starts_with("mempool  0 transactions"));
+    // M mines on Q's chain: Q takes M's blocks as its tip.
+    q.expect_log(&format!("block from {} ", m.addr), 120);
+    m.send("burn 1 third");
+    m.expect("the burn", 30, |l| l.starts_with("burning "));
+    let deadline = Instant::now() + guard(60);
+    while pooled(&mut m) > 0 {
+        assert!(Instant::now() < deadline, "M's new burn never confirmed");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let log = std::fs::read_to_string(dir_m.0.join("tabminer.log")).unwrap();
+    assert!(!log.contains("miner stopped"), "M's miner stopped");
+    assert!(m.exit(30).success());
+    assert!(q.exit(30).success());
+}

@@ -7115,4 +7115,164 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    /// A transaction from key `tag`'s output of `amount` at `position` to
+    /// key 100, less `fee`.
+    fn pooled_spend(tag: u8, amount: u64, fee: u64, position: u64) -> crate::transaction::Transaction {
+        let mut s = [0u8; 32];
+        s[0] = tag;
+        let mut k = Key::generate(&s);
+        let outs = vec![Output::new(&pk(100), amount - fee)];
+        let mut tx = crate::transaction::UnsignedTransaction::new(vec![(k.public_key(), amount)], outs)
+            .sign_with(&mut k)
+            .unwrap();
+        tx.set_positions(&[position]);
+        tx
+    }
+
+    #[test]
+    fn a_reorganization_leaves_only_valid_transactions_in_the_pool() {
+        // a and c share blocks 1 to 3. a goes on to 6 with four pooled
+        // transactions; c, heavier, to 8. Once a follows c:
+        // - T0, spending a's block 6 reward, a lost output, stays out;
+        // - T1, spending a's block 4 reward, which c's block 4 makes too but
+        //   one position later, comes back moved there;
+        // - T2, spending block 2's reward, which c spends otherwise, stays out;
+        // - T3, mined in a's block 5 (so shelved as confirmed), spending block
+        //   1's reward, which c leaves unspent, comes back;
+        // and a block of what the pool then selects applies.
+        let a = open("reorg-pool-a");
+        let c = open("reorg-pool-c");
+        let now = unix_now();
+        let mut t = T0;
+        let next = |f: &Fixture| f.chain.utxo().next_position(&f.chain.env().read_txn().unwrap()).unwrap();
+        let subsidy = |f: &Fixture| f.chain.params().subsidy(f.chain.tip().unwrap().unwrap().height + 1);
+        // Where each block's reward lands, by tag.
+        let mut at = HashMap::new();
+        for tag in 1..=3u8 {
+            t += 600;
+            at.insert(tag, next(&a));
+            let block = mine(&a, tag, t);
+            a.chain.apply_block(&block, now).unwrap();
+            c.chain.apply_block(&block, now).unwrap();
+        }
+        let (fork_t, reward) = (t, subsidy(&a));
+        let pool_a = pool();
+        let fee = 1000;
+        let tx = |tag: u8, pos: u64| pooled_spend(tag, reward, fee, pos);
+        // a's branch: block 4 to pk(40), block 5 carries T3, block 6 to pk(60).
+        let rtxn_insert = |pool: &Arc<Mutex<Mempool>>, f: &Fixture, tx: crate::transaction::Transaction| {
+            let rtxn = f.chain.env().read_txn().unwrap();
+            let height = f.chain.tip().unwrap().unwrap().height + 1;
+            pool.lock().unwrap().insert(tx, f.chain.utxo(), f.chain.names(), &rtxn, height).unwrap()
+        };
+        t += 600;
+        let p40 = next(&a);
+        a.chain.apply_block(&mine(&a, 40, t), now).unwrap();
+        let t3 = tx(1, at[&1]);
+        let t3_id = rtxn_insert(&pool_a, &a, t3.clone());
+        t += 600;
+        let body = Body {
+            inputs: t3.spent_positions(),
+            outputs: t3
+                .outputs
+                .iter()
+                .map(|o| o.block_output())
+                .chain([Output::new(&pk(5), subsidy(&a) + fee).block_output()])
+                .collect(),
+            proof: vec![5; 2500],
+            ..Default::default()
+        };
+        a.chain.apply_block(&mine_body(&a, body, t), now).unwrap();
+        t += 600;
+        let p60 = next(&a);
+        a.chain.apply_block(&mine(&a, 60, t), now).unwrap();
+        // The node would revalidate after each block: T3 is confirmed.
+        {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            let height = a.chain.tip().unwrap().unwrap().height + 1;
+            let (gone, back) = pool_a
+                .lock()
+                .unwrap()
+                .revalidate(a.chain.utxo(), a.chain.names(), &rtxn, height, &HashMap::new())
+                .unwrap();
+            assert_eq!((gone, back), (1, 0), "T3 left the pool, confirmed");
+        }
+        let t0_id = rtxn_insert(&pool_a, &a, tx(60, p60));
+        let t1_id = rtxn_insert(&pool_a, &a, tx(40, p40));
+        let t2_id = rtxn_insert(&pool_a, &a, tx(2, at[&2]));
+        // c's branch: block 4 makes a zero output, then pk(40)'s, one later;
+        // block 5 spends block 2's reward elsewhere; then 6 to 8.
+        let mut t = fork_t;
+        t += 600;
+        let body = Body {
+            outputs: vec![Output::new(&pk(77), 0).block_output(), Output::new(&pk(40), subsidy(&c)).block_output()],
+            proof: vec![41; 2500],
+            ..Default::default()
+        };
+        c.chain.apply_block(&mine_body(&c, body, t), now).unwrap();
+        t += 600;
+        let other = pooled_spend(2, reward, fee, at[&2]);
+        let body = Body {
+            inputs: other.spent_positions(),
+            outputs: vec![
+                Output::new(&pk(101), reward - fee).block_output(),
+                Output::new(&pk(51), subsidy(&c) + fee).block_output(),
+            ],
+            proof: vec![51; 2500],
+            ..Default::default()
+        };
+        c.chain.apply_block(&mine_body(&c, body, t), now).unwrap();
+        for tag in 61..=63u8 {
+            t += 600;
+            c.chain.apply_block(&mine(&c, tag, t), now).unwrap();
+        }
+        let c_tip = c.chain.tip().unwrap().unwrap();
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![], &c.dir)).unwrap();
+        let addr_c = node_c.local_addr().unwrap();
+        let (node_a, tx_a) =
+            Node::bind(Arc::clone(&a.chain), Arc::clone(&pool_a), config(vec![addr_c], &a.dir)).unwrap();
+        let hc = std::thread::spawn(move || node_c.run());
+        let ha = std::thread::spawn(move || node_a.run());
+        assert!(wait_for_tip(&a.chain, &c_tip, 30), "a did not follow c's heavier branch");
+        let pooled = || {
+            let mut ids: Vec<Digest> = pool_a.lock().unwrap().entries().map(|e| e.txid).collect();
+            ids.sort_by_key(digest_to_bytes);
+            ids
+        };
+        let mut want = vec![t1_id, t3_id];
+        want.sort_by_key(digest_to_bytes);
+        let deadline = Instant::now() + guard(10);
+        while pooled() != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(pooled(), want, "T1 and T3 only (T0 {t0_id:?}, T2 {t2_id:?} out)");
+        let p40_c = p40 + 1;
+        assert_eq!(pool_a.lock().unwrap().get(&t1_id).unwrap().spent_positions(), vec![p40_c], "T1 moved");
+        // A block of what the pool selects applies on the new tip.
+        tx_a.send(Event::Stop).unwrap();
+        tx_c.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hc.join().unwrap();
+        let chosen = {
+            let rtxn = a.chain.env().read_txn().unwrap();
+            let height = a.chain.tip().unwrap().unwrap().height + 1;
+            pool_a.lock().unwrap().select(a.chain.names(), &rtxn, height, |_| true)
+        };
+        assert_eq!(chosen.len(), 2);
+        let fees: u64 = chosen.iter().map(|t| t.balance() as u64).sum();
+        let body = Body {
+            inputs: chosen.iter().flat_map(|t| t.spent_positions()).collect(),
+            outputs: chosen
+                .iter()
+                .flat_map(|t| t.outputs.iter().map(|o| o.block_output()))
+                .chain([Output::new(&pk(90), subsidy(&a) + fees).block_output()])
+                .collect(),
+            proof: vec![90; 2500],
+            ..Default::default()
+        };
+        let block = mine_body(&a, body, c_tip.timestamp + 600);
+        a.chain.apply_block(&block, now).unwrap();
+        assert_eq!(a.chain.tip().unwrap().unwrap(), block.header);
+    }
 }

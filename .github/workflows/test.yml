@@ -93,6 +93,7 @@ jobs:
           - { test: a_reorganization_takes_a_lost_payment_out_of_the_wallet, features: dev, target: --test wallet }
           - { test: a_restored_wallet_finds_and_spends_beside_its_original, features: dev, target: --test wallet }
           - { test: a_crash_at_each_step_of_a_payment_loses_nothing, features: dev, target: --test wallet }
+          - { test: miners_keep_going_through_a_reorganization_that_strands_transactions, features: dev, target: --test wallet }
           # At scale (miner/tests/scale.rs), with 2,000,000 outputs here;
           # 170,000,000 nightly on every platform but Windows arm64 (scale.yml).
           - { test: a_full_block_applies_on_a_large_state, features: dev, target: --test scale, nocapture: --nocapture }
