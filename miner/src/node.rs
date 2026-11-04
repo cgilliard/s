@@ -127,6 +127,9 @@ const BATCH_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_SOURCES: usize = 4096;
 /// A fetched block whose parent has not arrived by then is dropped.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long headers with more work than the tip hold the miner back while
+/// the tip does not move: blocks that do not come are not waited for.
+const CATCH_UP_PATIENCE: Duration = Duration::from_secs(10);
 /// Recently served block serializations kept in memory.
 const SERVED_CACHE: usize = 4;
 /// Datagrams and local events queued for the node's loop: about 10 MB.
@@ -594,6 +597,9 @@ pub struct Node<V: ProofVerifier> {
     last_seed_lookup: Option<Instant>,
     last_save: Instant,
     started: Instant,
+    /// While headers with more work than the tip are held: the tip's
+    /// generation ([`Node::tip_changes`]) and when it was last seen to move.
+    catch_up: Option<(u64, Instant)>,
     /// Blocks whose aux leaves are to be fetched (`docs/ONION.md`).
     aux_wants: HashMap<Digest, AuxWant>,
     last_aux_scan: Option<Instant>,
@@ -910,6 +916,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             last_seed_lookup: None,
             last_save: now,
             started: now,
+            catch_up: None,
             aux_wants: HashMap::new(),
             last_aux_scan: None,
             aux_scanned_at: 0,
@@ -1244,7 +1251,25 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.sessions_tick(now);
         self.circuits_tick(now);
         self.rendezvous_tick(now);
-        let behind = self.peers.claimants(self.chain.tip_work().unwrap_or(U256::ZERO), now).next().is_some();
+        // Behind: holding headers, their proof of work checked, with more
+        // work than the tip, and their blocks coming in. A peer's claim of
+        // work alone never holds the miner back (it costs nothing to make),
+        // nor do headers whose blocks stop coming: mining a block on a stale
+        // tip loses only that block.
+        let tip_work = self.chain.tip_work().unwrap_or(U256::ZERO);
+        let ahead = self.chain.best_header_work().unwrap_or(U256::ZERO) > tip_work;
+        let generation = self.tip_changes.load(Ordering::Acquire);
+        let behind = match self.catch_up {
+            _ if !ahead => {
+                self.catch_up = None;
+                false
+            }
+            Some((g, since)) if g == generation => now.duration_since(since) < CATCH_UP_PATIENCE,
+            _ => {
+                self.catch_up = Some((generation, now));
+                true
+            }
+        };
         // Just started, peers not heard yet: unless there are none to hear
         // (none configured).
         let expecting = !self.config.peers.is_empty() || !self.config.seeds.is_empty();
@@ -4451,6 +4476,72 @@ mod tests {
         false_claim_does_not_stall("short-liar", 1);
     }
 
+    /// A peer that answers pings claiming all the work there could be at
+    /// `height`, and nothing else; it lies until the flag is cleared.
+    fn liar(genesis: Digest, height: u32) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let liar = UdpSocket::bind("127.0.0.1:0").unwrap();
+        liar.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let addr = liar.local_addr().unwrap();
+        let lying = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&lying);
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while flag.load(Ordering::Relaxed) {
+                let Ok((n, from)) = liar.recv_from(&mut buf) else { continue };
+                if let Some(Message::Ping(st)) = Message::decode(&buf[..n]) {
+                    let claim = Status {
+                        nonce: st.nonce,
+                        version: PROTOCOL_VERSION,
+                        token: 0,
+                        genesis,
+                        height,
+                        oldest: 1,
+                        tip: genesis,
+                        work: U256([u64::MAX; 4]),
+                    };
+                    let _ = liar.send_to(&Message::Pong(claim).encode(), from);
+                }
+            }
+        });
+        (addr, lying, h)
+    }
+
+    /// A claim of more work, with no header to back it, never holds the
+    /// miner back: a peer could otherwise stop every miner it reaches by
+    /// claiming (`syncing` is what the miner waits on).
+    #[test]
+    fn a_claim_of_work_alone_does_not_hold_the_miner() {
+        let c = open("claim-c");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=3u8 {
+            t += 600;
+            c.chain.apply_block(&mine(&c, tag, t), now).unwrap();
+        }
+        let genesis = c.chain.header_at(0).unwrap().unwrap().hash();
+        let (liar_addr, lying, hl) = liar(genesis, 1_000_000);
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![liar_addr], &c.dir)).unwrap();
+        let syncing = node_c.syncing();
+        let stats = node_c.stats();
+        let hc = std::thread::spawn(move || node_c.run());
+        // Once the liar is a live peer (stats refresh once a second), c
+        // never counts itself behind, before or after HEADER_TIMEOUT.
+        let deadline = Instant::now() + guard(10);
+        while !stats.lock().unwrap().peers.iter().any(|p| p.live) {
+            assert!(Instant::now() < deadline, "the liar never became a peer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let until = Instant::now() + net::HEADER_TIMEOUT + Duration::from_secs(2);
+        while Instant::now() < until {
+            assert!(!syncing.load(Ordering::Acquire), "c counts itself behind a bare claim");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        lying.store(false, Ordering::Relaxed);
+        hl.join().unwrap();
+        tx_c.send(Event::Stop).unwrap();
+        hc.join().unwrap();
+    }
+
     fn false_claim_does_not_stall(name: &str, liar_height: u32) {
         let a = open(&format!("{name}-a"));
         let now = unix_now();
@@ -4464,32 +4555,7 @@ mod tests {
         let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
         let addr_a = node_a.local_addr().unwrap();
         let ha = std::thread::spawn(move || node_a.run());
-        let liar = UdpSocket::bind("127.0.0.1:0").unwrap();
-        liar.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let liar_addr = liar.local_addr().unwrap();
-        let lying = Arc::new(AtomicBool::new(true));
-        let hl = {
-            let lying = Arc::clone(&lying);
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 2048];
-                while lying.load(Ordering::Relaxed) {
-                    let Ok((n, from)) = liar.recv_from(&mut buf) else { continue };
-                    if let Some(Message::Ping(st)) = Message::decode(&buf[..n]) {
-                        let claim = Status {
-                            nonce: st.nonce,
-                            version: PROTOCOL_VERSION,
-                            token: 0,
-                            genesis,
-                            height: liar_height,
-                            oldest: 1,
-                            tip: genesis,
-                            work: U256([u64::MAX; 4]),
-                        };
-                        let _ = liar.send_to(&Message::Pong(claim).encode(), from);
-                    }
-                }
-            })
-        };
+        let (liar_addr, lying, hl) = liar(genesis, liar_height);
         let c = open(&format!("{name}-c"));
         let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![liar_addr, addr_a], &c.dir)).unwrap();
         let syncing = node_c.syncing();
