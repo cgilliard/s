@@ -346,8 +346,10 @@ Settled on 2026-11-01, before implementation.
   size argues otherwise once the cells are designed.
 - **The wallet's Dilithium key is derived from the seed phrase**: ML-DSA
   key generation takes a 32-byte seed, which the wallet derives from its
-  master key under a domain tag, so a wallet restored from its twelve
-  words has the same id and address. Ephemeral Kyber keys are random.
+  master key under a domain tag and the address's counter. A restore
+  starts the counter at a random value, so a restored wallet is on a
+  fresh address, never an old one (`docs/PRIVACY.md`, fix 5). Ephemeral
+  Kyber keys are random.
 - **Sessions ride the chain's UDP transport**: a session layer in the
   node with keepalives, ordering and retransmission, messages of a few
   kilobytes carried as chunked transfers, used by participants towards

@@ -1096,7 +1096,9 @@ fn sync_wallet(ctx: &Ctx) -> AnyResult<()> {
     let settle = chain.max_undo().unwrap_or(DEFAULT_MAX_UNDO);
     let lost = ctx.wallet()?.mark_lost(chain.utxo(), &rtxn, tip.height, &waiting)?;
     if lost > 0 {
-        log::line(&format!("wallet: {lost} outputs left the main chain in a reorganization"));
+        log::line(&format!(
+            "wallet: {lost} outputs are no longer on the main chain (a reorganization, or spent by a copy of this wallet)"
+        ));
     }
     let forgotten = ctx.wallet()?.prune_lost(tip.height, settle)?;
     if forgotten > 0 {

@@ -209,6 +209,19 @@ impl Proc {
         line["tip      height ".len()..].split_whitespace().next().unwrap().parse().unwrap()
     }
 
+    /// The recovery phrase it printed when it made its wallet.
+    fn phrase(&self) -> String {
+        let words = |l: &str| {
+            l.split_whitespace().count() == 12 && l.trim().chars().all(|c| c == ' ' || c.is_ascii_lowercase())
+        };
+        self.seen
+            .iter()
+            .find(|l| words(l))
+            .unwrap_or_else(|| panic!("{}: printed no phrase", self.name))
+            .trim()
+            .to_string()
+    }
+
     /// The wallet's address, from `address`.
     fn address(&mut self) -> String {
         self.send("address");
@@ -237,6 +250,22 @@ impl Drop for Proc {
             }
         }
     }
+}
+
+/// Runs `tabminer restore` into `data` with `phrase` and no passphrase.
+fn restore(data: &Path, phrase: &str) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tabminer"))
+        .args(["restore", "--network", "dev", "--data"])
+        .arg(data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{phrase}\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("wallet restored in"), "restore failed: {text}");
 }
 
 /// How long a step may take before the test calls it stuck: generous, and
@@ -465,3 +494,37 @@ fn a_reorganization_takes_a_lost_payment_out_of_the_wallet() {
     b.reach(lost + 10, 120);
     b.holds_nothing(60);
 }
+
+/// A wallet restored from its phrase while the original runs: the restored
+/// copy, on an address of its own, finds the coin by itself once synced (no
+/// `scan`) and spends it; the original then sees the coin gone, again by
+/// itself.
+#[test]
+#[ignore = "slow: one job each in .github/workflows/test.yml"]
+fn a_restored_wallet_finds_and_spends_beside_its_original() {
+    let mut net = Net::start("restore");
+    net.funded();
+    let to = net.b.address();
+    net.a.send(&format!("send 1 {to}"));
+    net.a.expect("the slate sent", 30, |l| l.starts_with("slate ") && l.contains("sent to"));
+    net.b.poll("balance", "the coin", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
+    let dir_r = TempDir::new("restore-r");
+    restore(&dir_r.0, &net.b.phrase());
+    let seed = net.s.addr.clone();
+    let mut r = Proc::start("R", &dir_r.0, &["node", "--seed", &seed, "--peer", &seed, "--peer", &net.a.addr]);
+    r.expect_log("restored wallet: found 1 outputs", 120);
+    r.poll("balance", "the coin", 30, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
+    r.poll("outputs", "the coin, recovered", 10, |l| l.contains("recovered"));
+    assert_ne!(r.address(), to, "a restore starts on a fresh address");
+    // R spends it to A.
+    let back = net.a.address();
+    r.pay("0.5", &back, 120);
+    r.poll("sent", "the payment confirmed", 120, |l| l == "no unconfirmed payments");
+    r.poll("balance", "the change", 60, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0 && c < 0.5));
+    net.b.holds_nothing(60);
+    assert!(r.exit(30).success());
+    assert!(net.a.exit(30).success());
+    assert!(net.b.exit(30).success());
+    assert!(net.s.exit(30).success());
+}
+

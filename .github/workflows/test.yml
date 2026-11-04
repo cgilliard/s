@@ -91,6 +91,7 @@ jobs:
           - { test: exit_while_mining_ends_the_process, features: dev, target: --test wallet }
           - { test: a_reorganization_takes_lost_rewards_out_of_the_wallet, features: dev, target: --test wallet }
           - { test: a_reorganization_takes_a_lost_payment_out_of_the_wallet, features: dev, target: --test wallet }
+          - { test: a_restored_wallet_finds_and_spends_beside_its_original, features: dev, target: --test wallet }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
