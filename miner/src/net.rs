@@ -47,12 +47,15 @@
 //! token: a forged one does not open.
 //!
 //! A block or transaction (the [`Kind`]) is fetched as [`CHUNK_BYTES`]-byte
-//! chunks of its serialization, pulled by the receiver in windows of
-//! [`WINDOW`] with [`Download`] tracking what arrived. A node only sends
-//! data in reply to a request, never more than the request asked for, and
-//! only to a request carrying the token it gave that address in its own
-//! status (so neither the address nor the request is forged), so it
-//! cannot be used to amplify traffic.
+//! chunks of its serialization, pulled by the receiver with a window of
+//! chunks in flight learned per peer ([`PeerPath`]) and asked for as index
+//! ranges, with [`Download`] tracking what arrived; a block's `Inv` carries
+//! its size, so its chunks are asked for exactly. A node only sends data in
+//! reply to a request, never more than the request asked for (at most
+//! [`MAX_IN_FLIGHT`] chunks a request, within a per-peer budget), and only
+//! to a request carrying the token it gave that address in its own status
+//! (so neither the address nor the request is forged), so it cannot be
+//! used to amplify traffic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -68,18 +71,37 @@ use crate::names::{NAME_PART_RECORDS, Record};
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers.
 pub const MAX_DATAGRAM: usize = 1232;
 /// Block bytes per chunk.
 pub const CHUNK_BYTES: usize = 1024;
-/// Chunks named in one `GetChunks`, and in flight when a download starts.
-pub const WINDOW: usize = 32;
-/// Most chunks a download keeps in flight, asked in several `GetChunks`:
-/// the window doubles each time a whole one arrives without a retry, and
-/// halves when chunks go missing, so a fast path is filled and a lossy one
-/// is not flooded.
-pub const MAX_IN_FLIGHT: usize = 512;
+/// Chunks a download keeps in flight from a peer not yet measured: 64 KiB,
+/// a modest first burst (`docs/HARDENING.md`, "Block relay").
+pub const INITIAL_WINDOW: usize = 64;
+/// The smallest window, however lossy the path.
+pub const MIN_WINDOW: usize = 32;
+/// The largest: a full 2 MiB block in one round trip on a path that
+/// carries it. The window doubles per round trip until a loss (slow
+/// start), halves at one, then grows by an eighth per round trip; it grows
+/// only when a download filled it, and is kept per peer across downloads
+/// ([`PeerPath`]), so a block from a peer already measured goes out in as few
+/// round trips as that path allows.
+pub const MAX_IN_FLIGHT: usize = 2048;
+/// Free slots in the window before more chunks are asked for: topped up as
+/// chunks arrive, in small batches.
+pub const REFILL: usize = 8;
+/// A chunk still missing once this many asked after it have arrived is
+/// taken for lost and asked again at once (fast retransmit).
+pub const REORDER: u8 = 8;
+/// A round that loses more than one chunk in this many halves the window
+/// (2%, as BBR): a full buffer drops much of a burst, a lossy link a few
+/// chunks, and halving on every one would leave a 2 MiB block, which on
+/// most paths loses a chunk or two, with the smallest window. A stall
+/// (nothing for the retry time) halves it in any case.
+pub const LOSS_TOLERANCE: usize = 50;
+/// Index ranges in one `GetChunks`, at most.
+pub const MAX_RANGES: usize = 64;
 /// Headers per `Headers` message.
 pub const HEADERS_PER_MESSAGE: usize = 6;
 /// Most headers a `GetHeaders` is answered with, over several messages.
@@ -310,7 +332,9 @@ pub enum Message {
         token: u64,
     },
     Headers(Vec<Header>),
-    Inv(Header),
+    /// A new block: its header and its size in bytes, so the whole of it
+    /// can be asked for at once.
+    Inv(Header, u32),
     TxInv(Digest),
     GetChunks {
         kind: Kind,
@@ -505,9 +529,10 @@ impl Message {
                     w.0.extend_from_slice(&h.to_bytes());
                 }
             }
-            Message::Inv(h) => {
+            Message::Inv(h, len) => {
                 w.0.push(T_INV);
                 w.0.extend_from_slice(&h.to_bytes());
+                w.u32(*len);
             }
             Message::TxInv(id) => {
                 w.0.push(T_TX_INV);
@@ -518,9 +543,12 @@ impl Message {
                 w.u64(*token);
                 kind.put(&mut w);
                 w.digest(id);
-                w.0.push(indexes.len().min(WINDOW) as u8);
-                for i in indexes.iter().take(WINDOW) {
-                    w.0.extend_from_slice(&i.to_le_bytes());
+                // Runs of consecutive indexes, as (start, count).
+                let runs = runs(indexes);
+                w.0.push(runs.len().min(MAX_RANGES) as u8);
+                for (start, n) in runs.into_iter().take(MAX_RANGES) {
+                    w.0.extend_from_slice(&start.to_le_bytes());
+                    w.0.extend_from_slice(&n.to_le_bytes());
                 }
             }
             Message::Chunk { kind, id, len, index, data } => {
@@ -645,16 +673,20 @@ impl Message {
                 let headers = (0..n).map(|_| Header::from_bytes(r.take(HEADER_SIZE)?)).collect::<Option<Vec<_>>>()?;
                 Message::Headers(headers)
             }
-            T_INV => Message::Inv(Header::from_bytes(r.take(HEADER_SIZE)?)?),
+            T_INV => Message::Inv(Header::from_bytes(r.take(HEADER_SIZE)?)?, r.u32()?),
             T_TX_INV => Message::TxInv(r.digest()?),
             T_GET_CHUNKS => {
                 let token = r.u64()?;
                 let kind = Kind::get(&mut r)?;
                 let id = r.digest()?;
-                let n = count(&mut r, WINDOW)?;
-                let indexes = (0..n)
-                    .map(|_| Some(u16::from_le_bytes(r.take(2)?.try_into().unwrap())))
-                    .collect::<Option<Vec<_>>>()?;
+                let n = count(&mut r, MAX_RANGES)?;
+                let mut indexes = Vec::new();
+                for _ in 0..n {
+                    let start = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+                    let len = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+                    (len > 0 && indexes.len() + len as usize <= MAX_IN_FLIGHT).then_some(())?;
+                    indexes.extend((0..len).map_while(|k| start.checked_add(k)));
+                }
                 Message::GetChunks { kind, id, indexes, token }
             }
             T_CHUNK => {
@@ -730,9 +762,39 @@ impl Message {
     }
 }
 
-/// `GetChunks` messages asking for `indexes`, [`WINDOW`] at a time.
-pub fn chunk_requests(kind: Kind, id: Digest, indexes: &[u16]) -> impl Iterator<Item = Message> + '_ {
-    indexes.chunks(WINDOW).map(move |c| Message::GetChunks { kind, id, indexes: c.to_vec(), token: 0 })
+/// `indexes` as runs of consecutive ones: (start, count).
+fn runs(indexes: &[u16]) -> Vec<(u16, u16)> {
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for &i in indexes {
+        match out.last_mut() {
+            Some((start, n)) if start.checked_add(*n) == Some(i) && *n < u16::MAX => *n += 1,
+            _ => out.push((i, 1)),
+        }
+    }
+    out
+}
+
+/// `GetChunks` messages asking for `indexes`: as runs, [`MAX_RANGES`] of
+/// them and [`MAX_IN_FLIGHT`] chunks at most to a message.
+pub fn chunk_requests(kind: Kind, id: Digest, indexes: &[u16]) -> impl Iterator<Item = Message> {
+    let mut messages = Vec::new();
+    let mut current: Vec<u16> = Vec::new();
+    let mut ranges = 0;
+    for &i in indexes {
+        let starts_run = current.last().is_none_or(|&l| l.checked_add(1) != Some(i));
+        if !current.is_empty() && ((starts_run && ranges == MAX_RANGES) || current.len() == MAX_IN_FLIGHT) {
+            messages.push(std::mem::take(&mut current));
+            ranges = 0;
+        }
+        if current.last().is_none_or(|&l| l.checked_add(1) != Some(i)) {
+            ranges += 1;
+        }
+        current.push(i);
+    }
+    if !current.is_empty() {
+        messages.push(current);
+    }
+    messages.into_iter().map(move |indexes| Message::GetChunks { kind, id, indexes, token: 0 })
 }
 
 impl Message {
@@ -786,10 +848,12 @@ pub fn chunk_of(kind: Kind, id: &Digest, bytes: &[u8], index: u16) -> Option<Mes
 }
 
 /// How long a download may go without a new chunk before its window is
-/// requested again.
+/// requested again, from a peer whose round trip is not yet measured.
 pub const RETRY: Duration = Duration::from_millis(400);
-/// The longest a retry waits, however slow the path.
-pub const MAX_RETRY: Duration = Duration::from_secs(4);
+/// The bounds of a measured retry wait: the smoothed round trip plus four
+/// times its variation (RFC 6298).
+pub const MIN_RETRY: Duration = Duration::from_millis(100);
+pub const MAX_RETRY: Duration = Duration::from_secs(1);
 /// Retries without progress before a download is abandoned.
 pub const MAX_RETRIES: u32 = 8;
 /// A block download averaging under this many bytes a second after
@@ -797,29 +861,72 @@ pub const MAX_RETRIES: u32 = 8;
 pub const MIN_RATE: usize = 8 << 10;
 pub const SLOW_GRACE: Duration = Duration::from_secs(15);
 
-/// A block being fetched chunk by chunk from one peer, with a sliding
-/// window of requested chunks: [`Download::request`] asks for up to
-/// [`WINDOW`] chunks not yet in flight, and the node refills when half the
-/// window has arrived or when nothing has arrived for [`RETRY`].
+/// What a node has learned of the path to one peer, carried from one
+/// download to the next: the window and, after a loss, the slow-start
+/// threshold above which it grows by an eighth per round trip instead of
+/// doubling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerPath {
+    pub window: usize,
+    pub threshold: Option<usize>,
+}
+
+impl Default for PeerPath {
+    fn default() -> PeerPath {
+        PeerPath { window: INITIAL_WINDOW, threshold: None }
+    }
+}
+
+/// A chunk asked for and not yet received.
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    index: u16,
+    at: Instant,
+    /// The order it was asked in: the server sends in that order.
+    seq: u64,
+    /// Chunks asked after it that arrived while it did not: [`REORDER`]
+    /// of them and it is taken for lost.
+    passed: u8,
+    /// Asked before: its arrival is no round-trip sample (Karn).
+    again: bool,
+}
+
+/// A block (or other object) being fetched chunk by chunk from one peer,
+/// with a window of chunks in flight ([`PeerPath`]): [`Download::request`]
+/// asks for the missing chunks that fit, the node tops up once
+/// [`REFILL`] slots are free, and a chunk passed by [`REORDER`] later ones,
+/// or a stall (`node::stalled`), counts as a loss.
 #[derive(Debug)]
 pub struct Download {
     pub kind: Kind,
     pub id: Digest,
     pub from: SocketAddr,
     pub max_len: usize,
-    /// Known once the first chunk arrives.
+    /// Known from the announcement (`Inv`), else once the first chunk
+    /// arrives.
     len: Option<u32>,
     chunks: Vec<Option<Vec<u8>>>,
-    /// Requested and not yet received.
-    in_flight: Vec<u16>,
+    in_flight: Vec<Asked>,
+    /// Indexes asked before, to tell retries from first asks.
+    asked_before: Vec<bool>,
+    /// The next ask's [`Asked::seq`].
+    next_seq: u64,
     pub last_progress: Instant,
     pub last_request: Instant,
     pub retries: u32,
     pub started: Instant,
-    /// Chunks kept in flight, from [`WINDOW`] to [`MAX_IN_FLIGHT`].
-    window: usize,
-    /// Chunks arrived since the window last grew.
+    path: PeerPath,
+    /// Chunks arrived since the window last grew, and whether the window
+    /// was full meanwhile (it grows only if so).
     delivered: usize,
+    filled: bool,
+    /// Chunks taken for lost this round.
+    losses: usize,
+    /// The window was cut this round: no second cut, and no growth, until
+    /// a window arrives.
+    recovering: bool,
+    /// A round-trip sample from the last chunk, for the peer table.
+    sample: Option<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -831,28 +938,57 @@ pub enum ChunkError {
 }
 
 impl Download {
-    pub fn new(kind: Kind, id: Digest, from: SocketAddr, max_len: usize, now: Instant) -> Download {
+    /// A download of `id` from `from` with the window `path` learned of
+    /// it, and the length `len` when announced.
+    pub fn new(
+        kind: Kind,
+        id: Digest,
+        from: SocketAddr,
+        max_len: usize,
+        len: Option<u32>,
+        path: PeerPath,
+        now: Instant,
+    ) -> Download {
+        let len = len.filter(|&l| l > 0 && l as usize <= max_len);
+        let path = PeerPath { window: path.window.clamp(MIN_WINDOW, MAX_IN_FLIGHT), ..path };
         Download {
             kind,
             id,
             from,
             max_len,
-            len: None,
-            chunks: Vec::new(),
+            len,
+            chunks: len.map_or(Vec::new(), |l| vec![None; chunk_count(l)]),
             in_flight: Vec::new(),
+            asked_before: len.map_or(Vec::new(), |l| vec![false; chunk_count(l)]),
+            next_seq: 0,
             last_progress: now,
             last_request: now,
             retries: 0,
             started: now,
-            window: WINDOW,
+            path,
             delivered: 0,
+            filled: false,
+            losses: 0,
+            recovering: false,
+            sample: None,
         }
     }
 
-    /// Indexes still missing, up to `max`, from the start.
+    /// What this download has learned of the path, for the next one.
+    pub fn path(&self) -> PeerPath {
+        self.path
+    }
+
+    /// The round-trip sample of the last chunk received, once.
+    pub fn take_sample(&mut self) -> Option<Duration> {
+        self.sample.take()
+    }
+
+    /// Indexes still missing, up to `max`, from the start: before the
+    /// length is known, the first ones blind.
     pub fn missing(&self, max: usize) -> Vec<u16> {
         match self.len {
-            None => (0..max.min(WINDOW) as u16).collect(),
+            None => (0..max.min(self.path.window) as u16).collect(),
             Some(_) => {
                 self.chunks.iter().enumerate().filter(|(_, c)| c.is_none()).map(|(i, _)| i as u16).take(max).collect()
             }
@@ -863,35 +999,91 @@ impl Download {
     /// part of the window. They become in flight. Send them with
     /// [`chunk_requests`].
     pub fn request(&mut self, now: Instant) -> Vec<u16> {
-        let room = self.window.saturating_sub(self.in_flight.len());
+        let window = self.path.window;
+        let room = window.saturating_sub(self.in_flight.len());
+        if room == 0 {
+            return Vec::new();
+        }
         let fresh: Vec<u16> = self
-            .missing(self.window + self.in_flight.len())
+            .missing(window + self.in_flight.len())
             .into_iter()
-            .filter(|i| !self.in_flight.contains(i))
+            .filter(|i| !self.in_flight.iter().any(|a| a.index == *i))
             .take(room)
             .collect();
-        self.in_flight.extend(&fresh);
+        for &index in &fresh {
+            let again = match self.asked_before.get_mut(index as usize) {
+                Some(b) => std::mem::replace(b, true),
+                None => false,
+            };
+            self.in_flight.push(Asked { index, at: now, seq: self.next_seq, passed: 0, again });
+            self.next_seq += 1;
+        }
+        if self.in_flight.len() >= window {
+            self.filled = true;
+        }
         if !fresh.is_empty() {
             self.last_request = now;
         }
         fresh
     }
 
-    /// Forgets what is in flight, so the next request repeats it: chunks
-    /// went missing, so the window halves.
+    /// Halves the window, once a round, down to [`MIN_WINDOW`]; past it
+    /// the window grows by an eighth per round trip.
+    fn cut(&mut self) {
+        if self.recovering {
+            return;
+        }
+        self.recovering = true;
+        let half = (self.path.window / 2).max(MIN_WINDOW);
+        self.path = PeerPath { window: half, threshold: Some(half) };
+    }
+
+    /// A round ends (a window's worth arrived, or the download did): cut
+    /// if it lost more than [`LOSS_TOLERANCE`] allows, else grow the
+    /// window if it was used.
+    fn end_round(&mut self) {
+        let sent = self.delivered + self.losses;
+        if self.losses * LOSS_TOLERANCE > sent {
+            self.cut();
+        } else if self.filled && !self.recovering {
+            let w = self.path.window;
+            let grown = match self.path.threshold {
+                Some(t) if w >= t => w + w / 8,
+                _ => 2 * w,
+            };
+            self.path.window = grown.min(MAX_IN_FLIGHT);
+        }
+        self.recovering = false;
+        self.delivered = 0;
+        self.losses = 0;
+        self.filled = self.in_flight.len() >= self.path.window;
+    }
+
+    /// Forgets what is in flight, so the next request repeats it: nothing
+    /// arrived for the retry time, a loss whatever the rate.
     pub fn reset_window(&mut self) {
         self.in_flight.clear();
-        self.window = (self.window / 2).max(WINDOW);
-        self.delivered = 0;
+        self.cut();
     }
 
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
     }
 
-    /// Whether enough of the window has arrived to ask for more: half.
+    /// The window now.
+    pub fn window(&self) -> usize {
+        self.path.window
+    }
+
+    /// Whether to ask for more now: [`REFILL`] slots are free, or every
+    /// chunk still missing fits in those that are.
     pub fn wants_refill(&self) -> bool {
-        self.in_flight.len() <= self.window / 2
+        let free = self.path.window.saturating_sub(self.in_flight.len());
+        if free >= REFILL {
+            return true;
+        }
+        let unasked = self.chunks.iter().filter(|c| c.is_none()).count().saturating_sub(self.in_flight.len());
+        free > 0 && self.len.is_some() && unasked > 0 && unasked <= free
     }
 
     /// Records a chunk; `Ok(true)` when the block is complete.
@@ -903,6 +1095,16 @@ impl Download {
             None => {
                 self.len = Some(len);
                 self.chunks = vec![None; chunk_count(len)];
+                let mut before = vec![false; chunk_count(len)];
+                for a in &self.in_flight {
+                    if let Some(b) = before.get_mut(a.index as usize) {
+                        *b = true;
+                    }
+                }
+                self.asked_before = before;
+                // Blind indexes past the end will never come.
+                let n = self.chunks.len();
+                self.in_flight.retain(|a| (a.index as usize) < n);
             }
             Some(l) if l != len => return Err(ChunkError::Malformed),
             Some(_) => {}
@@ -912,18 +1114,41 @@ impl Download {
         if i >= self.chunks.len() || data.len() != expected {
             return Err(ChunkError::Malformed);
         }
+        let asked = self.in_flight.iter().position(|a| a.index == index).map(|p| self.in_flight.remove(p));
         if self.chunks[i].is_none() {
             self.chunks[i] = Some(data);
             self.last_progress = now;
             self.retries = 0;
+            if let Some(a) = asked
+                && !a.again
+            {
+                self.sample = Some(now.duration_since(a.at));
+            }
+            // Chunks asked before this one and still missing have been
+            // passed: past `REORDER`, lost.
+            if let Some(a) = asked {
+                let mut lost = false;
+                for b in self.in_flight.iter_mut().filter(|b| b.seq < a.seq) {
+                    b.passed = b.passed.saturating_add(1);
+                    lost |= b.passed >= REORDER;
+                }
+                if lost {
+                    let before = self.in_flight.len();
+                    self.in_flight.retain(|b| b.passed < REORDER);
+                    self.losses += before - self.in_flight.len();
+                }
+            }
             self.delivered += 1;
-            if self.delivered >= self.window && self.window < MAX_IN_FLIGHT {
-                self.window = (self.window * 2).min(MAX_IN_FLIGHT);
-                self.delivered = 0;
+            if self.delivered >= self.path.window {
+                self.end_round();
             }
         }
-        self.in_flight.retain(|&j| j != index);
-        Ok(self.chunks.iter().all(Option::is_some))
+        let done = self.chunks.iter().all(Option::is_some);
+        if done && self.delivered > 0 {
+            // A block smaller than the window: its losses count too.
+            self.end_round();
+        }
+        Ok(done)
     }
 
     /// The block bytes once every chunk has arrived.
@@ -1002,8 +1227,10 @@ pub struct Peer {
     /// Blocks it delivered whole (by hash): a peer that has delivered is
     /// asked before one that only claims.
     pub delivered: u32,
-    /// Smoothed round trip, from our pings to its pongs.
+    /// Smoothed round trip and its mean deviation (RFC 6298), from our
+    /// pings to its pongs and from chunks asked and received.
     pub rtt: Option<Duration>,
+    pub rtt_var: Duration,
     /// When a well-formed message last arrived; `None` until the first.
     pub last_seen: Option<Instant>,
     pub last_ping: Option<Instant>,
@@ -1027,6 +1254,22 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Folds a round-trip sample into the smoothed estimate (RFC 6298:
+    /// variation by a quarter, mean by an eighth).
+    fn round_trip(&mut self, sample: Duration) {
+        match self.rtt {
+            None => {
+                self.rtt = Some(sample);
+                self.rtt_var = sample / 2;
+            }
+            Some(r) => {
+                let dev = r.abs_diff(sample);
+                self.rtt_var = (self.rtt_var * 3 + dev) / 4;
+                self.rtt = Some((r * 7 + sample) / 8);
+            }
+        }
+    }
+
     /// Whether a block download from it failed within [`FETCH_BACKOFF`].
     fn recently_failed(&self, now: Instant) -> bool {
         self.failed_fetch.is_some_and(|t| now.duration_since(t) < FETCH_BACKOFF)
@@ -1127,6 +1370,7 @@ impl Peers {
                 addr,
                 delivered: 0,
                 rtt: None,
+                rtt_var: Duration::ZERO,
                 last_seen: None,
                 last_ping: None,
                 pending: None,
@@ -1168,15 +1412,26 @@ impl Peers {
         p.status = Some(status);
         p.handshaken = true;
         if let Some(sample) = p.last_ping.map(|t| t.elapsed()) {
-            p.rtt = Some(p.rtt.map_or(sample, |r| (r * 7 + sample) / 8));
+            p.round_trip(sample);
         }
         true
     }
 
-    /// How long to wait for a chunk from `addr` before asking again: twice
-    /// its round trip, at least [`RETRY`] and at most [`MAX_RETRY`].
+    /// A round trip measured to `addr`: a chunk asked once and received.
+    pub fn rtt_sample(&mut self, addr: &SocketAddr, sample: Duration) {
+        if let Some(p) = self.map.get_mut(addr) {
+            p.round_trip(sample);
+        }
+    }
+
+    /// How long to wait for a chunk from `addr` before asking again: its
+    /// smoothed round trip plus four times the deviation, from
+    /// [`MIN_RETRY`] to [`MAX_RETRY`]; [`RETRY`] before one is measured.
     pub fn retry(&self, addr: &SocketAddr) -> Duration {
-        self.map.get(addr).and_then(|p| p.rtt).map_or(RETRY, |r| (2 * r).clamp(RETRY, MAX_RETRY))
+        self.map
+            .get(addr)
+            .and_then(|p| p.rtt.map(|r| r + 4 * p.rtt_var))
+            .map_or(RETRY, |w| w.clamp(MIN_RETRY, MAX_RETRY))
     }
 
     /// The token `addr` gave us to put in requests (0 before its status).
@@ -1478,39 +1733,178 @@ mod tests {
     #[test]
     fn the_window_grows_while_whole_and_halves_on_loss() {
         let t = Instant::now();
-        let len = (CHUNK_BYTES * 4000) as u32;
-        let mut d = Download::new(Kind::Part(0), digest(1), "10.0.0.1:1".parse().unwrap(), len as usize, t);
+        let len = (CHUNK_BYTES * 20_000) as u32;
+        let from: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let mut d = Download::new(Kind::Part(0), digest(1), from, len as usize, Some(len), PeerPath::default(), t);
         let chunk = vec![0u8; CHUNK_BYTES];
-        let mut next = 0u16;
-        let mut deliver = |d: &mut Download, n: usize| {
-            for _ in 0..n {
-                d.insert(len, next, chunk.clone(), t).unwrap();
-                next += 1;
+        // Delivers what is in flight, in order.
+        let round = |d: &mut Download| {
+            let asked = d.request(t);
+            for &i in &asked {
+                d.insert(len, i, chunk.clone(), t).unwrap();
             }
+            asked.len()
         };
-        assert_eq!(d.request(t).len(), WINDOW);
-        deliver(&mut d, WINDOW);
-        // A whole window arrived: the next asks for twice as many, in
-        // messages of at most WINDOW indexes.
-        let asked = d.request(t);
-        assert_eq!(asked.len(), 2 * WINDOW);
-        assert_eq!(chunk_requests(Kind::Part(0), digest(1), &asked).count(), 2);
-        deliver(&mut d, 2 * WINDOW);
-        assert_eq!(d.request(t).len(), 4 * WINDOW);
-        deliver(&mut d, 4 * WINDOW);
-        for _ in 0..4 {
-            d.request(t);
-            let n = d.in_flight();
-            deliver(&mut d, n);
+        // Slow start: the window doubles per round trip, from 64 to 2048.
+        let mut sizes = Vec::new();
+        for _ in 0..7 {
+            sizes.push(round(&mut d));
         }
-        assert_eq!(d.request(t).len(), MAX_IN_FLIGHT);
-        // Chunks went missing: half the window, and so on down to WINDOW.
+        assert_eq!(sizes, vec![64, 128, 256, 512, 1024, 2048, 2048]);
+        // In one message: consecutive indexes are one range.
+        let asked: Vec<u16> = (0..2048).collect();
+        assert_eq!(chunk_requests(Kind::Part(0), digest(1), &asked).count(), 1);
+        // A loss halves it; the window that recovers does not grow, and
+        // after it the window grows by an eighth per round trip.
         d.reset_window();
-        assert_eq!(d.request(t).len(), MAX_IN_FLIGHT / 2);
-        for _ in 0..8 {
+        assert_eq!(d.window(), 1024);
+        assert_eq!(round(&mut d), 1024);
+        assert_eq!(d.window(), 1024);
+        round(&mut d);
+        assert_eq!(d.window(), 1152);
+        round(&mut d);
+        assert_eq!(d.window(), 1296);
+        // Down to the floor, however many losses (one cut per round).
+        for _ in 0..20 {
+            d.reset_window();
+            round(&mut d);
             d.reset_window();
         }
-        assert_eq!(d.request(t).len(), WINDOW);
+        assert!(d.window() >= MIN_WINDOW && d.window() <= 2 * MIN_WINDOW, "{}", d.window());
+        // The next download from the peer starts where this one left off.
+        let path = d.path();
+        let mut next = Download::new(Kind::Part(1), digest(2), from, len as usize, Some(len), path, t);
+        assert_eq!(next.request(t).len(), path.window);
+    }
+
+    /// A window larger than the block is never filled, so it does not
+    /// grow: small blocks teach no window they did not use.
+    #[test]
+    fn the_window_grows_only_when_used() {
+        let t = Instant::now();
+        let from: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let len = (CHUNK_BYTES * 210) as u32;
+        let chunk = vec![0u8; CHUNK_BYTES];
+        let path = PeerPath { window: 256, threshold: None };
+        let mut d = Download::new(Kind::Block, digest(1), from, 1 << 22, Some(len), path, t);
+        let asked = d.request(t);
+        assert_eq!(asked.len(), 210, "the whole block at once");
+        for &i in &asked {
+            d.insert(len, i, chunk.clone(), t).unwrap();
+        }
+        assert_eq!(d.window(), 256);
+        // A 210 KB block from a new peer: 64, 128, then the last 18 (the
+        // third asked as the second arrives, in practice).
+        let mut d = Download::new(Kind::Block, digest(1), from, 1 << 22, Some(len), PeerPath::default(), t);
+        let mut rounds = 0;
+        loop {
+            let asked = d.request(t);
+            if asked.is_empty() {
+                break;
+            }
+            rounds += 1;
+            for &i in &asked {
+                d.insert(len, i, chunk.clone(), t).unwrap();
+            }
+        }
+        assert_eq!((rounds, d.window()), (3, 256));
+    }
+
+    /// A chunk passed by `REORDER` later ones is taken for lost and asked
+    /// again at once; one in a round is noise and the window holds, many
+    /// halve it; a round-trip sample comes only from a chunk asked once.
+    #[test]
+    fn a_gap_is_asked_again_without_waiting() {
+        let t = Instant::now();
+        let from: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let len = (CHUNK_BYTES * 1000) as u32;
+        let chunk = vec![0u8; CHUNK_BYTES];
+        let path = PeerPath { window: 128, threshold: None };
+        let mut d = Download::new(Kind::Block, digest(1), from, 1 << 22, Some(len), path, t);
+        assert_eq!(d.request(t).len(), 128);
+        let later = t + Duration::from_millis(80);
+        for i in 1..REORDER as u16 {
+            d.insert(len, i, chunk.clone(), later).unwrap();
+        }
+        assert_eq!(d.take_sample(), Some(Duration::from_millis(80)));
+        assert_eq!((d.in_flight(), d.window()), (128 - 7, 128), "not yet lost");
+        d.insert(len, REORDER as u16, chunk.clone(), later).unwrap();
+        assert_eq!((d.in_flight(), d.window()), (128 - 9, 128), "chunk 0 lost: out of flight, the window held");
+        assert!(d.wants_refill());
+        assert_eq!(d.request(later).first(), Some(&0), "asked again at once, first");
+        // The round ends with one loss in 128: under 2%, and the window,
+        // filled, grows.
+        for i in (9..128u16).chain([0]) {
+            d.insert(len, i, chunk.clone(), later).unwrap();
+        }
+        assert_eq!(d.window(), 256);
+        // A round that loses more than 2% is halved.
+        let mut d = Download::new(Kind::Block, digest(1), from, 1 << 22, Some(len), path, t);
+        d.request(t);
+        for i in 10..128u16 {
+            d.insert(len, i, chunk.clone(), later).unwrap();
+        }
+        let again = d.request(later);
+        assert_eq!(&again[..10], &(0..10).collect::<Vec<u16>>()[..]);
+        for i in 0..10u16 {
+            d.insert(len, i, chunk.clone(), later).unwrap();
+        }
+        assert_eq!(d.window(), 64, "ten lost in 128");
+        // A stall halves whatever the rate, once a round.
+        d.reset_window();
+        assert_eq!(d.window(), 32);
+        d.reset_window();
+        assert_eq!(d.window(), 32);
+        // Asked twice: no sample.
+        let mut d = Download::new(Kind::Block, digest(1), from, 1 << 22, Some(len), path, t);
+        d.request(t);
+        d.reset_window();
+        d.request(t);
+        d.insert(len, 0, chunk.clone(), later).unwrap();
+        assert_eq!(d.take_sample(), None);
+    }
+
+    #[test]
+    fn retry_waits_the_smoothed_round_trip_plus_four_deviations() {
+        let mut peers = Peers::new();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        peers.add(a, false);
+        assert_eq!(peers.retry(&a), RETRY);
+        peers.rtt_sample(&a, Duration::from_millis(100));
+        // 100 + 4 × 50.
+        assert_eq!(peers.retry(&a), Duration::from_millis(300));
+        for _ in 0..50 {
+            peers.rtt_sample(&a, Duration::from_millis(100));
+        }
+        assert!(peers.retry(&a) < Duration::from_millis(110), "{:?}", peers.retry(&a));
+        for _ in 0..50 {
+            peers.rtt_sample(&a, Duration::from_millis(10));
+        }
+        assert_eq!(peers.retry(&a), MIN_RETRY);
+        for _ in 0..50 {
+            peers.rtt_sample(&a, Duration::from_secs(3));
+        }
+        assert_eq!(peers.retry(&a), MAX_RETRY);
+    }
+
+    #[test]
+    fn chunk_requests_go_as_ranges() {
+        // Scattered indexes: MAX_RANGES runs to a message.
+        let scattered: Vec<u16> = (0..200u16).map(|i| i * 2).collect();
+        let msgs: Vec<Message> = chunk_requests(Kind::Block, digest(1), &scattered).collect();
+        assert_eq!(msgs.len(), 200usize.div_ceil(MAX_RANGES));
+        let mut back = Vec::new();
+        for m in msgs {
+            let bytes = m.encode();
+            match Message::decode(&bytes) {
+                Some(Message::GetChunks { indexes, .. }) => back.extend(indexes),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(back, scattered);
+        // A run longer than a message's worth is split.
+        let long: Vec<u16> = (0..5000).collect();
+        assert_eq!(chunk_requests(Kind::Block, digest(1), &long).count(), 3);
     }
 
     #[test]
@@ -1666,9 +2060,15 @@ mod tests {
             Message::GetHeaders { locator: (0..MAX_LOCATOR as u32).map(digest).collect(), token: u64::MAX },
             Message::GetHeadersFrom { height: 123_456, token: 1 },
             Message::Headers((0..HEADERS_PER_MESSAGE as u32).map(header).collect()),
-            Message::Inv(header(5)),
+            Message::Inv(header(5), 210_000),
             Message::TxInv(digest(6)),
-            Message::GetChunks { kind: Kind::Tx, id: digest(9), indexes: (0..WINDOW as u16).collect(), token: 3 },
+            Message::GetChunks {
+                kind: Kind::Tx,
+                id: digest(9),
+                indexes: (0..MAX_IN_FLIGHT as u16).collect(),
+                token: 3,
+            },
+            Message::GetChunks { kind: Kind::Block, id: digest(9), indexes: vec![0, 1, 2, 7, 9, 10, 65535], token: 3 },
             Message::Chunk { kind: Kind::Block, id: digest(9), len: 200_000, index: 3, data: vec![7u8; CHUNK_BYTES] },
             Message::Chunk { kind: Kind::Part(7), id: digest(9), len: 9, index: 0, data: vec![1u8; 9] },
             Message::GetChunks { kind: Kind::Manifest, id: digest(2), indexes: vec![0, 1], token: 0 },
@@ -1722,25 +2122,28 @@ mod tests {
         let bytes: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
         let id = digest(3);
         let from: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut d = Download::new(Kind::Block, id, from, 1 << 20, now);
+        let mut d = Download::new(Kind::Block, id, from, 1 << 20, None, PeerPath::default(), now);
         assert_eq!(d.missing(4), vec![0, 1, 2, 3]);
         let chunk = |i: u16| match chunk_of(Kind::Block, &id, &bytes, i) {
             Some(Message::Chunk { len, index, data, .. }) => (len, index, data),
             _ => panic!(),
         };
         assert!(chunk_of(Kind::Block, &id, &bytes, 3).is_none());
-        assert_eq!(d.request(now), (0..WINDOW as u16).collect::<Vec<_>>());
-        assert_eq!(d.in_flight(), WINDOW);
+        // The length unknown: the first window blind.
+        assert_eq!(d.request(now), (0..INITIAL_WINDOW as u16).collect::<Vec<_>>());
+        assert_eq!(d.in_flight(), INITIAL_WINDOW);
         assert!(d.request(now).is_empty());
         let (len, i, data) = chunk(2);
         assert_eq!(d.insert(len, i, data.clone(), now), Ok(false));
+        // Known now: indexes past the end are out of flight.
+        assert_eq!(d.in_flight(), 2);
         assert_eq!(d.missing(10), vec![0, 1]);
         assert_eq!(d.insert(len, i, data, now), Ok(false));
         // Wrong length, index or size.
         assert_eq!(d.insert(len + 1, 0, vec![0; CHUNK_BYTES], now), Err(ChunkError::Malformed));
         assert_eq!(d.insert(len, 3, vec![0; 10], now), Err(ChunkError::Malformed));
         assert_eq!(d.insert(len, 0, vec![0; 10], now), Err(ChunkError::Malformed));
-        assert_eq!(d.in_flight(), WINDOW - 1);
+        assert_eq!(d.in_flight(), 2);
         d.reset_window();
         assert_eq!(d.request(now), vec![0, 1]);
         let (_, i, data) = chunk(0);
@@ -1748,10 +2151,20 @@ mod tests {
         let (_, i, data) = chunk(1);
         assert_eq!(d.insert(len, i, data, now), Ok(true));
         assert_eq!(d.in_flight(), 0);
-        assert_eq!(d.assemble(), Some(bytes));
+        assert_eq!(d.assemble().as_ref(), Some(&bytes));
         // Too large for the chain's limit.
-        let mut small = Download::new(Kind::Block, id, from, 100, now);
+        let mut small = Download::new(Kind::Block, id, from, 100, None, PeerPath::default(), now);
         assert_eq!(small.insert(2500, 0, vec![0; CHUNK_BYTES], now), Err(ChunkError::Malformed));
+        // Announced: exactly its chunks asked, and a chunk of another
+        // length refused.
+        let mut told = Download::new(Kind::Block, id, from, 1 << 20, Some(2500), PeerPath::default(), now);
+        assert_eq!(told.request(now), vec![0, 1, 2]);
+        assert_eq!(told.insert(2600, 0, vec![0; CHUNK_BYTES], now), Err(ChunkError::Malformed));
+        let (len, i, data) = chunk(0);
+        assert_eq!(told.insert(len, i, data, now), Ok(false));
+        // An announced length over the limit is ignored.
+        let mut big = Download::new(Kind::Block, id, from, 100, Some(2500), PeerPath::default(), now);
+        assert_eq!(big.request(now).len(), INITIAL_WINDOW);
     }
 
     #[test]

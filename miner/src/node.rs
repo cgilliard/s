@@ -55,9 +55,13 @@
 //! against their roots and stored on the applier thread; the snapshot is
 //! installed and ordinary sync fetches the blocks after it.
 //!
-//! Every transfer keeps [`net::WINDOW`] chunks in flight at first and
-//! doubles that each time a whole window arrives without a retry, up to
-//! [`net::MAX_IN_FLIGHT`], halving when chunks go missing.
+//! Every transfer keeps a window of chunks in flight, learned per peer
+//! ([`net::PeerPath`]): [`net::INITIAL_WINDOW`] for a peer not yet measured,
+//! doubling per round trip until a loss, halving at one, then growing by an
+//! eighth per round trip, up to [`net::MAX_IN_FLIGHT`]. A block's size comes
+//! with its `Inv`, so the window's worth of it is asked for at once; a
+//! chunk passed by later ones is asked again at once, and a stall waits the
+//! peer's smoothed round trip plus four deviations.
 //!
 //! # Seeds
 //!
@@ -83,7 +87,7 @@ use crate::consensus;
 use crate::difficulty::U256;
 use crate::mempool::{MAX_TX_SIZE, Mempool, Reject};
 use crate::net::{
-    self, Download, Kind, MAX_HEADERS, Message, PROTOCOL_VERSION, Peers, Status, TARGET_PEERS, WINDOW, chunk_of,
+    self, Download, Kind, MAX_HEADERS, MAX_IN_FLIGHT, Message, PROTOCOL_VERSION, Peers, Status, TARGET_PEERS, chunk_of,
 };
 use crate::pow::Digest;
 use crate::transaction::Transaction;
@@ -187,8 +191,10 @@ const MAX_PART_DOWNLOADS: usize = 32;
 const SERVED_SNAPSHOTS: usize = 2 * MAX_PART_DOWNLOADS;
 /// Chunks served to one peer a second, at most (8 MB/s), with a burst of
 /// [`SERVE_BURST`]: past it requests are dropped, and the peer asks again.
+/// The burst is twice the largest window, so a peer's full window is never
+/// cut short by it.
 const SERVE_RATE: f64 = 8192.0;
-const SERVE_BURST: f64 = 1024.0;
+const SERVE_BURST: f64 = 2.0 * MAX_IN_FLIGHT as f64;
 
 /// Blocks a snapshot target keeps clear of the start of a peer's undo
 /// window: a window moves with its tip, and the blocks after the snapshot
@@ -509,6 +515,12 @@ pub struct Node<V: ProofVerifier> {
     /// Who announced a block we may fetch: asked first, since its status
     /// may not show the block yet.
     sources: HashMap<Digest, SocketAddr>,
+    /// Block sizes as announced (`Inv`), so a download asks for the whole
+    /// window at once; bounded as `sources`.
+    sizes: HashMap<Digest, u32>,
+    /// What downloads learned of the path to each peer: the window to
+    /// start the next one with.
+    paths: HashMap<SocketAddr, net::PeerPath>,
     /// Blocks of a branch forking below what the chain can unwind: not
     /// fetched again.
     unfollowable: std::collections::HashSet<Digest>,
@@ -854,6 +866,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             tx_downloads: HashMap::new(),
             pending: HashMap::new(),
             sources: HashMap::new(),
+            sizes: HashMap::new(),
+            paths: HashMap::new(),
             unfollowable: std::collections::HashSet::new(),
             applying: std::collections::HashSet::new(),
             header_batches: std::collections::BTreeMap::new(),
@@ -1566,20 +1580,46 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Consensus => consensus::MAX_CONSENSUS,
             Kind::Object => crate::onion::MAX_OBJECT,
         };
-        let mut d = Download::new(kind, id, from, max_len, now);
+        let len = if kind == Kind::Block { self.sizes.get(&id).copied() } else { None };
+        let mut d = Download::new(kind, id, from, max_len, len, self.path_to(&from), now);
         let indexes = d.request(now);
-        self.send(from, &Message::GetChunks { kind, id, indexes, token: 0 });
-        self.chatter(&format!("fetching {kind:?} {} from {from}", short(&id)));
+        for msg in net::chunk_requests(kind, id, &indexes) {
+            self.send(from, &msg);
+        }
+        self.chatter(&format!("fetching {kind:?} {} from {from} ({} chunks asked)", short(&id), indexes.len()));
         match kind {
             Kind::Tx => self.tx_downloads.insert(id, d),
             _ => self.downloads.insert(id, d),
         };
     }
 
+    /// The window to start a download from `peer` with.
+    fn path_to(&self, peer: &SocketAddr) -> net::PeerPath {
+        self.paths.get(peer).copied().unwrap_or_default()
+    }
+
+    /// Keeps what a download learned of the path to its peer, and its
+    /// round-trip sample.
+    fn learn_path(&mut self, peer: SocketAddr, path: net::PeerPath, sample: Option<Duration>) {
+        if self.paths.len() > 4 * net::MAX_PEERS && !self.paths.contains_key(&peer) {
+            self.paths.clear();
+        }
+        self.paths.insert(peer, path);
+        if let Some(s) = sample {
+            self.peers.rtt_sample(&peer, s);
+        }
+    }
+
     fn retry_downloads(&mut self, now: Instant) {
         let retry = |a: &SocketAddr| self.peers.retry(a);
         let (mut requests, blocks) = stalled(&mut self.downloads, now, retry);
         let (tx_requests, txs) = stalled(&mut self.tx_downloads, now, retry);
+        // A stall is a loss: the halved windows are kept.
+        let learned: Vec<(SocketAddr, net::PeerPath)> =
+            self.downloads.values().filter(|d| d.retries > 0).map(|d| (d.from, d.path())).collect();
+        for (from, path) in learned {
+            self.learn_path(from, path, None);
+        }
         requests.extend(tx_requests);
         for (to, msg) in requests {
             self.send(to, &msg);
@@ -1811,9 +1851,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.peers.seen(addr, now);
                 self.handle_headers(addr, headers, now);
             }
-            Message::Inv(header) => {
+            Message::Inv(header, len) => {
                 self.peers.seen(addr, now);
-                self.handle_inv(addr, header, now);
+                self.handle_inv(addr, header, len, now);
             }
             Message::TxInv(txid) => {
                 self.peers.seen(addr, now);
@@ -2158,7 +2198,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A block announced: its header is checked and stored before the
     /// block is fetched. During a snapshot sync only the header is taken,
     /// to keep the snapshot within peers' windows.
-    fn handle_inv(&mut self, from: SocketAddr, header: Header, now: Instant) {
+    fn handle_inv(&mut self, from: SocketAddr, header: Header, len: u32, now: Instant) {
         if self.mode == Mode::Headers {
             return;
         }
@@ -2173,6 +2213,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         match self.chain.accept_header(&header, unix_now()) {
             Ok(_) => {
                 self.note_source(id, from);
+                if self.sizes.len() >= MAX_SOURCES {
+                    self.sizes.clear();
+                }
+                // The size as announced; the first chunk must agree.
+                self.sizes.entry(id).or_insert(len);
                 self.start_downloads(now);
             }
             Err(ChainError::UnknownParent(_)) => {
@@ -2192,7 +2237,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn serve_chunks(&mut self, to: SocketAddr, kind: Kind, id: Digest, indexes: &[u16]) {
-        let wanted = indexes.len().min(WINDOW);
+        let mut wanted = indexes.len().min(MAX_IN_FLIGHT);
         if kind != Kind::Object {
             let now = Instant::now();
             if self.serve_budget.len() > 4 * net::MAX_PEERS {
@@ -2201,7 +2246,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let (tokens, at) = self.serve_budget.entry(to).or_insert((SERVE_BURST, now));
             *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * SERVE_RATE).min(SERVE_BURST);
             *at = now;
-            if *tokens < wanted as f64 {
+            // As many as the budget allows, the first asked first: the rest
+            // the peer takes for lost and asks again with a smaller window.
+            wanted = wanted.min(*tokens as usize);
+            if wanted == 0 {
                 return;
             }
             *tokens -= wanted as f64;
@@ -2237,7 +2285,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             },
             Kind::Object => return self.serve_object(to, &id, indexes),
         };
-        for &i in indexes.iter().take(WINDOW) {
+        for &i in indexes.iter().take(wanted) {
             if let Some(msg) = chunk_of(kind, &id, &bytes, i) {
                 self.send(to, &msg);
             }
@@ -2267,19 +2315,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if d.from != from || d.kind != kind {
             return;
         }
-        match d.insert(len, index, data, now) {
-            Ok(false) => {
-                // Refill the window once half of it has arrived.
-                if d.wants_refill() {
-                    let indexes = d.request(now);
-                    for msg in net::chunk_requests(kind, id, &indexes) {
-                        self.send(from, &msg);
-                    }
-                }
-            }
+        let done = d.insert(len, index, data, now);
+        let (path, sample) = (d.path(), d.take_sample());
+        let refill = match done {
+            // Topped up as chunks arrive (`net::REFILL`).
+            Ok(false) if d.wants_refill() => d.request(now),
+            _ => Vec::new(),
+        };
+        self.learn_path(from, path, sample);
+        for msg in net::chunk_requests(kind, id, &refill) {
+            self.send(from, &msg);
+        }
+        let downloads = if kind == Kind::Tx { &mut self.tx_downloads } else { &mut self.downloads };
+        match done {
+            Ok(false) => {}
             Ok(true) => {
+                let Some(d) = downloads.remove(&id) else { return };
                 let bytes = d.assemble().unwrap_or_default();
-                downloads.remove(&id);
                 match kind {
                     Kind::Block => match Block::from_bytes(&bytes) {
                         Ok(block) if block.header.hash() == id => {
@@ -2492,7 +2544,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     _ => None,
                 };
                 self.tip_changes.fetch_add(1, Ordering::Release);
-                let told = self.announce(&block.header, from);
+                let told = self.announce(&block, from);
                 if from.is_none() {
                     self.log(&format!("announced block {height} to {told} peers"));
                 }
@@ -2669,11 +2721,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Sends `Inv` to every live peer but `except`; returns how many.
-    fn announce(&self, header: &Header, except: Option<SocketAddr>) -> usize {
+    fn announce(&self, block: &Block, except: Option<SocketAddr>) -> usize {
         let now = Instant::now();
         let peers = self.peers.sample(net::MAX_PEERS, except, now);
+        let len = block.size() as u32;
         for addr in &peers {
-            self.send(*addr, &Message::Inv(*header));
+            self.send(*addr, &Message::Inv(block.header, len));
         }
         peers.len()
     }
@@ -2799,9 +2852,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Consensus => consensus::MAX_CONSENSUS,
             Kind::Object => crate::onion::MAX_OBJECT,
         };
-        let mut d = Download::new(kind, id, from, max_len, now);
+        let mut d = Download::new(kind, id, from, max_len, None, self.path_to(&from), now);
         let indexes = d.request(now);
-        self.send(from, &Message::GetChunks { kind, id, indexes, token: 0 });
+        for msg in net::chunk_requests(kind, id, &indexes) {
+            self.send(from, &msg);
+        }
         self.snap_downloads.insert((kind, id), d);
     }
 
@@ -3272,18 +3327,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if d.from != from || d.id != id {
             return;
         }
-        match d.insert(len, index, data, now) {
-            Ok(false) => {
-                if d.wants_refill() {
-                    let indexes = d.request(now);
-                    for msg in net::chunk_requests(kind, id, &indexes) {
-                        self.send(from, &msg);
-                    }
-                }
-            }
+        let done = d.insert(len, index, data, now);
+        let (path, sample) = (d.path(), d.take_sample());
+        let refill = match done {
+            Ok(false) if d.wants_refill() => d.request(now),
+            _ => Vec::new(),
+        };
+        self.learn_path(from, path, sample);
+        for msg in net::chunk_requests(kind, id, &refill) {
+            self.send(from, &msg);
+        }
+        match done {
+            Ok(false) => {}
             Ok(true) => {
+                let Some(d) = self.snap_downloads.remove(&(kind, id)) else { return };
                 let bytes = d.assemble().unwrap_or_default();
-                self.snap_downloads.remove(&(kind, id));
                 if !self.accept_snapshot_object(kind, id, &bytes, from) {
                     self.log(&format!("fast sync: {from} sent a bad {kind:?}"));
                     self.peers.strike(from);

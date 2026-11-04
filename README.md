@@ -136,9 +136,18 @@ on meanwhile. A fast sync of a 1,487-block chain from three peers took
 before. Transaction announcements are ignored until a node has caught up.
 
 The state comes in parts of 16,384 positions, up to 32 at once from every
-peer that can serve them. Each download keeps 32 chunks in flight at first
-and doubles that each time a whole window arrives without a retry, up to
-512, halving when chunks go missing; parts are checked against their roots
+peer that can serve them. Every download (blocks, parts, files) keeps a
+window of 1 KiB chunks in flight, learned per peer as TCP learns a
+connection's: 64 for a peer not yet measured, doubling per round trip until
+a loss, halving when a round loses more than 2% (or stalls), then growing
+by an eighth per round trip, up to 2,048, so a full 2 MiB block can come in
+one round trip. The window is kept from one download to the next, grows
+only when a download fills it, and a block's announcement carries its
+size, so the whole of a block is asked for at once when the window allows.
+A chunk passed by eight later ones is asked again at once; a stall waits
+the peer's smoothed round trip plus four times its variation (100 ms to
+1 s). The figures below are from the earlier fixed scheme (32 chunks,
+doubling to 512). Parts are checked against their roots
 and stored on the applier thread, so the network goes on meanwhile. A fast
 sync of 2.16 million unspent outputs (155 MB) from three peers at 80 ms
 round trips installed the state in 8.6 s, against 57 s with 32 chunks and

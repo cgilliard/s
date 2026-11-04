@@ -405,6 +405,11 @@ pub struct Block {
 }
 
 impl Block {
+    /// Its serialized size: what `to_bytes` makes.
+    pub fn size(&self) -> usize {
+        HEADER_SIZE + self.body.size()
+    }
+
     /// Whether the header commits to this body.
     pub fn body_commitment_matches(&self) -> bool {
         self.header.body_commitment == self.body.commitment()

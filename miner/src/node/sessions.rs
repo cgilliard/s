@@ -878,7 +878,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         {
             return;
         }
-        let mut d = Download::new(Kind::Object, object, addr, MAX_OBJECT, now);
+        let mut d = Download::new(Kind::Object, object, addr, MAX_OBJECT, None, net::PeerPath::default(), now);
         let indexes = d.request(now);
         self.send_with(addr, Message::GetChunks { kind: Kind::Object, id: object, indexes, token: 0 }, back);
         self.rv.downloads.insert(object, d);
@@ -891,7 +891,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if !o.takers.contains(&to) {
             return;
         }
-        for &i in indexes.iter().take(net::WINDOW) {
+        for &i in indexes.iter().take(net::MAX_IN_FLIGHT) {
             if let Some(msg) = net::chunk_of(Kind::Object, id, &o.bytes, i) {
                 self.send(to, &msg);
             }
