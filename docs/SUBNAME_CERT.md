@@ -21,8 +21,8 @@ Under the server model every cold resolve of `cool.example` reaches
 - **Latency.** Three dependent round trips: the delegation, the query,
   the payment.
 
-With certificates the parent signs once a day per sub-name and is out of
-the lookup path. Lookups for `cool.example` go to rendezvous points of
+With certificates the parent signs once a day per sub-name, can be down
+for days without its sub-names lapsing, and is out of the lookup path. Lookups for `cool.example` go to rendezvous points of
 its own, which rotate by epoch, so load spreads over the relays with the
 number of sub-names. A resolve is two round trips: the certificate, then
 the payment.
@@ -41,8 +41,10 @@ renamed issuer key:
   resolver refuses types it does not know, so others can be added later.
 - `seq` orders certificates for one full name; the highest valid one
   wins.
-- `expiry` is absolute Unix time, at most `MAX_LIFETIME_SECS` (two days)
-  ahead. Issued for a day and renewed every six hours.
+- `expiry` is absolute Unix time, at most 30 days ahead
+  (`CERT_MAX_LIFETIME_SECS`). Issued for 7 days and renewed daily, so an
+  owner (or its issuer) can be down for about 6 days, a crash noticed a
+  few days late, before its sub-names lapse (see "Lifetimes" below).
 
 ### Who may issue
 
@@ -58,6 +60,12 @@ Case 1 needs nothing but the chain. Case 2 lets an owner keep its key
 offline and leave renewals to an always-on issuer, as delegating to a
 server did. A resolver needs the delegation only when the issuer key
 does not hash to `V`.
+
+The delegation's lifetime goes up with the certificates': signed for 7
+days and renewed daily, at most 30 days (today it is signed for a day,
+renewed every six hours, at most two). Otherwise an owner relying on an
+issuer would still have to come online every day or two to renew the
+delegation, and gain nothing.
 
 ## Where it is published
 
@@ -77,7 +85,14 @@ period. The point that takes it passes it to `N`'s other points
   (case 1), or is in `V`'s delegation (case 2; the point fetches the
   delegation from `V`'s points, as a server does today when it moves);
 - keeps the highest `seq` per `N` until its expiry, taking an update at
-  most every 10 seconds per `N`.
+  most every 10 seconds per `N`;
+- checks its stored certificates again when the issuer's authority
+  changes: when `name`'s value on chain changes (an update or a transfer:
+  the old owner's certificates stop counting) and when it learns a newer
+  delegation of `V` (a removed issuer's certificates stop counting).
+  Certificates that no longer pass are dropped, so these take effect at
+  once rather than at expiry. A point learns of a value change from its
+  chain, and of a newer delegation when one is published or fetched.
 
 Anyone holding a valid certificate may publish it: the holder normally,
 but also the owner or its issuer, which is how revocation works (below).
@@ -107,13 +122,14 @@ to step 4. No certificate, or a `none` one, means no such sub-name.
 
 - **Issue.** The owner's wallet keeps the table of its sub-names
   (`subname set cool.example T`, as now). For each entry its node signs a
-  certificate for a day and sends it to `T` as a payload of a new kind
+  certificate for 7 days and sends it to `T` as a payload of a new kind
   (`KIND_SUBNAME_CERT`), through `T`'s points as a payment's messages go.
   The holder's node keeps it and publishes it.
-- **Renew.** Every six hours while the issuer runs, the same: a new
-  certificate with a higher `seq`. An owner whose wallet comes online
-  about daily keeps its sub-names alive; one that does not delegates to
-  an always-on issuer.
+- **Renew.** Once a day while the issuer runs, the same: a new
+  certificate with a higher `seq`, sent again until the holder has it.
+  An owner whose wallet comes online at least every few days keeps its
+  sub-names alive; one that does not delegates to an always-on issuer.
+  A holder offline when a renewal is sent gets the next one.
 - **Revoke.** `subname del cool.example`: the issuer signs a `none`
   certificate with a higher `seq` and publishes it at `N`'s points
   itself. It takes effect at once, without waiting for the old
@@ -123,6 +139,26 @@ to step 4. No certificate, or a `none` one, means no such sub-name.
 - **Change.** Pointing `cool.example` at another id is a new certificate
   with a higher `seq`, published by the issuer as a revocation is, and
   sent to the new holder.
+
+### Lifetimes
+
+Under the server model expiry was the only way to withdraw a server that
+lied, so everything lived two days at most. Here expiry is not how a
+sub-name is withdrawn: a `none` certificate replaces it at once, as a new
+one changes it, and the re-checks above handle a name changing hands and
+an issuer removed. What a lifetime still bounds:
+
+- **A compromised issuer key.** It could issue certificates with a `seq`
+  no later one beats. The owner's answer is a delegation without that
+  issuer, which points act on at once (the re-check above); the lifetime
+  bounds what is left, such as certificates cached by resolvers.
+- **A point that missed a change**, until it next checks: the lifetime
+  is its backstop.
+- **Storage.** A dead sub-name's certificate is held until it expires.
+
+None needs a lifetime of a day; 7 days (30 at most) trades a few days of
+these against an owner that can be down for days without its sub-names
+lapsing.
 
 The parent stays in control of its namespace, as before: whoever owns
 `example` decides what `cool.example` means, and can override a holder
@@ -152,13 +188,13 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
   epoch, beside its announce: one more `Publish` per sub-name per epoch,
   over the circuit it already holds.
 - **Relays store certificates.** One small record per active sub-name,
-  held until expiry (at most two days), checked against the chain before
-  it is kept. A point holds at most as many certificates as it holds
+  held until expiry (7 days, at most 30), checked against the chain before
+  it is kept and again when the issuer's authority changes. A point holds at most as many certificates as it holds
   sessions and delegations together, oldest-expiring dropped first.
-- **Issuers sign per sub-name per renewal.** About four signatures a day
-  per sub-name; a name with 100,000 sub-names is 400,000 a day (a few
-  seconds of signing an hour), sent as that many payloads. Large issuers
-  may renew less often, with lifetimes up to the two-day cap.
+- **Issuers sign per sub-name per renewal.** One signature a day per
+  sub-name; a name with 100,000 sub-names is 100,000 a day (about a
+  second of signing an hour), sent as that many payloads. Large issuers
+  may renew less often, with lifetimes up to the 30-day cap.
 - **Cached certificates outlive a revocation** by up to an hour for
   payments (the refetch rule above) and to their expiry otherwise.
 
@@ -183,18 +219,21 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
 ## Implementation order
 
 1. `Cert` in `subnames.rs` (from `Answer`): make, verify against a name's
-   value and an optional delegation, bytes; tests for forged, expired,
-   other-name, other-label and unauthorized-issuer certificates, and the
-   highest-`seq` rule.
+   value and an optional delegation, bytes; lifetimes of 7 days by
+   default and 30 at most, for certificates and delegations alike; tests
+   for forged, expired, too-long, other-name, other-label and
+   unauthorized-issuer certificates, and the highest-`seq` rule.
 2. Points: `Publish`/`Store`/`GetCert` for certificates at `N`'s points,
    the issuer checked against the chain (fetching delegations when
    needed), kept in the rendezvous LMDB beside announces and delegations;
-   carried across epoch boundaries as delegations are.
+   checked again when a name's value or its delegation changes; carried
+   across epoch boundaries as delegations are.
 3. The holder: `KIND_SUBNAME_CERT` received and kept, published at `N`'s
    points every epoch and on renewal.
 4. The issuer: certificates signed from the wallet's table and sent on
-   `subname set` and every six hours; `none` certificates on
-   `subname del`; `subname issuer` for delegation.
+   `subname set` and daily; `none` certificates on `subname del`;
+   `subname issuer` for delegation, the delegation signed for 7 days and
+   renewed daily.
 5. Resolution in `send`: fetch, check, cache, pay; the server path
    removed (`KIND_SUBNAME_QUERY`, `KIND_SUBNAME_ANSWER`, `answer`,
    `Zone`).
