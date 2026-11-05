@@ -115,11 +115,14 @@ fn exit_while_mining_ends_the_process() {
     assert!(a.exit(30).success());
 }
 
-/// Sub-names end to end, in both modes. Init mode: the owner A's own node
-/// answers for `cool.example`, and P pays C through it. Then A votes for a
-/// consensus file listing the four relays, the network switches to onion
-/// mode at block 144, A delegates its sub-names to B, and with A offline P
-/// pays C through `ex2.example`, which only B knows.
+/// Sub-names end to end, in both modes. Init mode: the owner A gives
+/// `cool.example` to C, whose wallet holds the certificate A sends it, and
+/// P pays C through it. Then A votes for a consensus file listing the four
+/// relays, the network switches to onion mode at block 144, A delegates
+/// its sub-names to B, B issues `ex2.example` to C under A's delegation,
+/// and with A offline P pays C through it; B then withdraws it and C gives
+/// it up. (Payments resolve through the server path until
+/// docs/SUBNAME_CERT.md step 5.)
 #[test]
 #[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn sub_names_resolve_in_both_modes() {
@@ -172,7 +175,9 @@ fn sub_names_resolve_in_both_modes() {
     a.poll("names", "the name owned", 120, |l| l.starts_with("example") && l.contains("  owned  "));
     let c_address = c.address();
     a.send(&format!("subname set cool.example {c_address}"));
-    a.expect("the sub-name set", 10, |l| l.starts_with("cool.example is"));
+    a.expect("the sub-name set", 10, |l| l.starts_with("cool.example given to"));
+    // C holds the certificate A sent it (docs/SUBNAME_CERT.md).
+    c.poll("subnames", "the certificate held", 120, |l| l.starts_with("held     cool.example"));
     p.poll("name example", "the name on chain", 60, |l| l.starts_with("value"));
     p.poll("balance", "spendable coins", 120, |l| amount(l, "confirmed").is_some_and(|c| c > 0.0));
     p.pay("1", "@cool.example", 120);
@@ -186,17 +191,25 @@ fn sub_names_resolve_in_both_modes() {
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    // Onion mode: B answers for A's names; A goes offline once its
+    // Onion mode: A delegates to B, which issues ex2.example to C (with
+    // A's delegation) and answers for A's names; A goes offline once its
     // delegation is held at its rendezvous points.
-    b.send(&format!("subname set ex2.example {c_address}"));
-    b.expect("the sub-name set", 10, |l| l.starts_with("ex2.example is"));
     let b_address = b.address();
-    a.send(&format!("subname server {b_address}"));
-    a.expect("the delegation", 10, |l| l.contains("are answered by"));
+    a.send(&format!("subname issuer {b_address}"));
+    a.expect("the delegation", 10, |l| l.contains("may be signed by"));
     a.expect_log("our delegation is held at our rendezvous point", 120);
+    b.send(&format!("subname set ex2.example {c_address}"));
+    b.expect("the sub-name set", 90, |l| l.starts_with("ex2.example given to"));
+    c.poll("subnames", "the issuer's certificate held", 180, |l| l.starts_with("held     ex2.example"));
     assert!(a.exit(30).success());
     p.pay("1", "@ex2.example", 180);
     c.poll("balance", "the second coin", 180, |l| amount(l, "confirmed").is_some_and(|c| c == 2.0));
+    // B withdraws it: C is told, and gives it up.
+    b.send("subname del ex2.example");
+    b.expect("the withdrawal", 90, |l| l.starts_with("ex2.example withdrawn"));
+    c.expect_log("sub-name ex2.example was withdrawn by its owner", 180);
+    c.send("subnames");
+    c.expect("the list", 10, |l| l.starts_with("held     cool.example"));
 }
 
 /// A reorganization takes the rewards of lost blocks out of the wallet,

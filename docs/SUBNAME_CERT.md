@@ -264,6 +264,21 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
    `subname set` and daily; `none` certificates on `subname del`;
    `subname issuer` for delegation, the delegation signed for 7 days and
    renewed daily.
+   Done (2026-11-05): `subname set` checks the wallet may sign for the
+   name (its own, or its owner's delegation names it, fetched from the
+   owner's points and carried in the bundle), then signs and sends the
+   certificate (`KIND_SUBNAME_CERT`) to the holder, and a holder losing
+   the sub-name a certificate saying so. Every hour the wallet sends
+   again what was not delivered and renews what is a day old; its node
+   publishes everything it issued, held and withdrew, so the newest
+   certificate reaches each epoch's points whichever of them is online.
+   `subname del` signs a withdrawal, sends it to the holder and publishes
+   it until what it withdraws would have expired (`withdrawn` lines in
+   `DIR/subnames`). `subname issuer` replaces `subname server`; the
+   delegation is signed for a week and renewed daily. Tested through
+   the prompt by `sub_names_resolve_in_both_modes`: a holder's wallet
+   holds the owner's certificate (init mode) and an issuer's (onion
+   mode), and gives one up when withdrawn.
 5. Resolution in `send`: fetch, check, cache, pay; the server path
    removed (`KIND_SUBNAME_QUERY`, `KIND_SUBNAME_ANSWER`, `answer`,
    `Zone`).

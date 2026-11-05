@@ -205,15 +205,19 @@ const HELP: &str = "commands:
   name-transfer FILE [FEE]  sign a name over to the record in FILE
   names                     this wallet's names and pending commits
   name NAME                 look a name up on chain
-  subname server ADDRESS…   name up to 3 sub-name servers (tab1… addresses or @NAMEs)
-                            for every name pointing at this wallet's address
-                            (docs/SUBNAMES.md); without, this wallet answers itself
-  subname server none       answer this wallet's sub-names itself again
-  subname set LABEL.NAME TO point LABEL.NAME at TO (a tab1… address or @NAME), as
-                            this wallet's node answers it, for its own names or
-                            any that delegate to it
-  subname del LABEL.NAME    forget a sub-name
-  subnames                  the servers and the sub-names this wallet answers for
+  subname issuer ADDRESS…   let up to 3 issuers (tab1… addresses or @NAMEs) sign
+                            certificates for the sub-names of every name pointing at
+                            this wallet's address (docs/SUBNAME_CERT.md), so this
+                            wallet can stay offline; the delegation is signed for a
+                            week and renewed daily while this wallet runs
+  subname issuer none       sign this wallet's sub-names itself only
+  subname set LABEL.NAME TO give LABEL.NAME to TO (a tab1… address or @NAME): sign a
+                            certificate (for a week, renewed daily while this wallet
+                            runs) and send it to TO, whose node publishes it; for this
+                            wallet's own names, or any whose delegation names it
+  subname del LABEL.NAME    withdraw a sub-name, at once
+  subnames                  the issuers, the sub-names this wallet issued, and those
+                            it holds
   set-leaf INDEX FILE       set aux leaf INDEX (0 to 15) to the SHA-256 of FILE:
                             their Merkle root goes in the headers this node mines
   set-leaf-value INDEX HEX  set aux leaf INDEX to a 32-byte value given in hex
@@ -684,6 +688,22 @@ struct Ctx {
     waiting: Mutex<std::collections::HashMap<Wait, std::sync::mpsc::Sender<Note>>>,
     /// Answers and delegations resolved lately, until they expire.
     resolved: Mutex<Resolved>,
+    /// The certificates this wallet issued lately, by name and label.
+    issued: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>), Issued>>,
+    /// This wallet's delegation as last signed: when, for which issuers,
+    /// and its bytes.
+    delegation: Mutex<Option<(u64, Vec<Digest>, Vec<u8>)>>,
+    /// One pass of `publish_subnames` at a time.
+    issuing: Mutex<()>,
+}
+
+/// A certificate this wallet issued: when, under which send tag, and
+/// whether it reached its holder.
+struct Issued {
+    bundle: tabminer::subnames::Bundle,
+    at: u64,
+    tag: u64,
+    delivered: bool,
 }
 
 impl Ctx {
@@ -891,15 +911,19 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         subnames_file: args.data.join("subnames"),
         waiting: Mutex::new(std::collections::HashMap::new()),
         resolved: Mutex::new(Resolved::default()),
+        issued: Mutex::new(std::collections::HashMap::new()),
+        delegation: Mutex::new(None),
+        issuing: Mutex::new(()),
     });
-    // The wallet's sub-names, and its delegation renewed well before it
-    // expires.
+    // The wallet's sub-names: certificates issued, renewed and sent again
+    // until delivered, those held published, and its delegation renewed,
+    // all well before they expire.
     if ctx.wallet.is_some() {
         let ctx = Arc::clone(&ctx);
         std::thread::Builder::new().name("subnames".into()).spawn(move || {
             loop {
                 publish_subnames(&ctx);
-                std::thread::sleep(DELEGATION_RENEW);
+                std::thread::sleep(SUBNAMES_EVERY);
             }
         })?;
     }
@@ -2107,93 +2131,127 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "subname" => {
             let w = ctx.wallet()?;
-            let changed = match args {
-                ["server", "none"] => {
+            match args {
+                ["issuer", "none"] => {
                     ctx.subnames.lock().unwrap().servers.clear();
-                    println!("this wallet's node answers its sub-names itself");
-                    true
+                    println!("this wallet signs its sub-names' certificates itself only");
                 }
-                ["server", ids @ ..] if !ids.is_empty() && ids.len() <= tabminer::subnames::MAX_ISSUERS => {
-                    let mut servers = Vec::new();
+                ["issuer", ids @ ..] if !ids.is_empty() && ids.len() <= tabminer::subnames::MAX_ISSUERS => {
+                    let mut issuers = Vec::new();
                     for a in ids {
                         let id = recipient(ctx, a)?.ok_or_else(|| format!("{a} is not a tab1… address or @NAME"))?;
-                        if !servers.contains(&id) {
-                            servers.push(id);
+                        if !issuers.contains(&id) {
+                            issuers.push(id);
                         }
                     }
                     if w.address_off() {
                         return Err("the address is off: there is no id to delegate".into());
                     }
-                    let list: Vec<String> = servers.iter().map(tabminer::address::encode).collect();
-                    ctx.subnames.lock().unwrap().servers = servers;
-                    println!("sub-names of every name pointing at {} are answered by {}", w.address(), list.join(", "));
+                    let list: Vec<String> = issuers.iter().map(tabminer::address::encode).collect();
+                    ctx.subnames.lock().unwrap().servers = issuers;
                     println!(
-                        "(the delegation is held at this address's rendezvous points while this wallet renews it)"
+                        "certificates for sub-names of every name pointing at {} may be signed by {}",
+                        w.address(),
+                        list.join(", ")
                     );
-                    true
+                    println!("(the delegation is signed for a week and renewed daily while this wallet runs)");
                 }
                 ["set", sub, to] => {
                     let (label, name) = parse_subname(sub)?;
                     let id = recipient(ctx, to)?.ok_or_else(|| format!("{to} is not a tab1… address or @NAME"))?;
+                    let value = chain_value(ctx, &name).ok_or_else(|| format!("{} is not registered", String::from_utf8_lossy(&name)))?;
+                    // Whether this wallet may sign for the name: asked now,
+                    // so a mistake shows here, not in the log.
+                    let delegation = issuing_for(ctx, &name, &value)?;
                     let mut s = ctx.subnames.lock().unwrap();
                     let zone = s.table.entry(name.clone()).or_default();
-                    zone.entries.insert(label, id);
+                    let old = zone.entries.insert(label.clone(), id);
                     zone.seq = unix_millis().max(zone.seq + 1);
                     drop(s);
-                    println!("{sub} is {}, as this wallet's node answers it", tabminer::address::encode(&id));
-                    let rtxn = ctx.chain.env().read_txn()?;
-                    let value = ctx.chain.names().lookup(&rtxn, &name)?.map(|r| r.value);
-                    let servers = ctx.subnames.lock().unwrap().servers.clone();
-                    if value != Some(w.id()) {
-                        println!(
-                            "note: {} does not point at this wallet's address: only a delegation of its",
-                            String::from_utf8_lossy(&name)
-                        );
-                        println!("value's to this wallet makes resolvers ask here");
-                    } else if !servers.is_empty() && !servers.contains(&w.id()) {
-                        println!(
-                            "note: this wallet delegates its sub-names to other servers; they answer, not this one"
-                        );
+                    // A holder that loses it is told so.
+                    if let Some(old) = old.filter(|o| *o != id)
+                        && let Ok(b) = sign_cert(ctx, &name, &label, Some(&id), delegation)
+                    {
+                        send_cert(ctx, &old, &b);
                     }
-                    true
+                    println!(
+                        "{sub} given to {}: its certificate is signed and sent; it holds it once it is online",
+                        tabminer::address::encode(&id)
+                    );
                 }
                 ["del", sub] => {
                     let (label, name) = parse_subname(sub)?;
-                    let mut s = ctx.subnames.lock().unwrap();
-                    let zone = s
+                    let holder = ctx
+                        .subnames
+                        .lock()
+                        .unwrap()
                         .table
-                        .get_mut(&name)
-                        .ok_or_else(|| format!("no sub-names of {}", String::from_utf8_lossy(&name)))?;
-                    if zone.entries.remove(&label).is_none() {
-                        return Err(format!("no sub-name {sub}").into());
+                        .get(&name)
+                        .and_then(|z| z.entries.get(&label).copied())
+                        .ok_or_else(|| format!("no sub-name {sub} issued here"))?;
+                    // The withdrawal: published by this wallet until the
+                    // last certificate it issued for the sub-name would have
+                    // expired, and sent to the holder.
+                    let value = chain_value(ctx, &name).ok_or_else(|| format!("{} is not registered", String::from_utf8_lossy(&name)))?;
+                    let none = sign_cert(ctx, &name, &label, None, issuing_for(ctx, &name, &value)?)?;
+                    send_cert(ctx, &holder, &none);
+                    let mut s = ctx.subnames.lock().unwrap();
+                    s.withdrawn.retain(|b| (b.cert.name.as_slice(), b.cert.label.as_slice()) != (&name[..], &label[..]));
+                    s.withdrawn.push(none);
+                    if let Some(zone) = s.table.get_mut(&name) {
+                        zone.entries.remove(&label);
+                        zone.seq = unix_millis().max(zone.seq + 1);
+                        if zone.entries.is_empty() {
+                            s.table.remove(&name);
+                        }
                     }
-                    zone.seq = unix_millis().max(zone.seq + 1);
-                    if zone.entries.is_empty() {
-                        s.table.remove(&name);
-                    }
-                    println!("{sub} forgotten");
-                    true
+                    drop(s);
+                    println!("{sub} withdrawn: its points take the withdrawal in place of the holder's certificate");
                 }
                 _ => {
                     return Err(
-                        "usage: subname server ADDRESS… | subname server none | subname set LABEL.NAME TO | subname del LABEL.NAME"
+                        "usage: subname issuer ADDRESS… | subname issuer none | subname set LABEL.NAME TO | subname del LABEL.NAME"
                             .into(),
                     );
                 }
-            };
-            if changed {
-                ctx.subnames.lock().unwrap().save(&ctx.subnames_file)?;
-                publish_subnames(ctx);
             }
+            ctx.subnames.lock().unwrap().save(&ctx.subnames_file)?;
+            publish_subnames(ctx);
         }
         "subnames" => {
             let s = ctx.subnames.lock().unwrap();
             match s.servers.as_slice() {
-                [] => println!("server   this wallet's node (no delegation)"),
+                [] => println!("issuers  this wallet only (no delegation)"),
                 ids => {
                     let list: Vec<String> = ids.iter().map(tabminer::address::encode).collect();
-                    println!("servers  {}", list.join(", "));
+                    println!("issuers  {}", list.join(", "));
                 }
+            }
+            let issued = ctx.issued.lock().unwrap();
+            let mut names: Vec<&Vec<u8>> = s.table.keys().collect();
+            names.sort();
+            for name in names {
+                for (label, id) in &s.table[name].entries {
+                    let state = match issued.get(&(name.clone(), label.clone())) {
+                        Some(i) if i.delivered => format!("delivered, valid until {}", log::timestamp_of(i.bundle.cert.expiry)),
+                        Some(_) => "sent, not yet delivered".to_string(),
+                        None => "not yet issued".to_string(),
+                    };
+                    println!(
+                        "issued   {}.{} to {} ({state})",
+                        String::from_utf8_lossy(label),
+                        String::from_utf8_lossy(name),
+                        tabminer::address::encode(id)
+                    );
+                }
+            }
+            for b in &s.withdrawn {
+                println!(
+                    "withdrawn {}.{}, published until {}",
+                    String::from_utf8_lossy(&b.cert.label),
+                    String::from_utf8_lossy(&b.cert.name),
+                    log::timestamp_of(b.cert.expiry)
+                );
             }
             for b in s.held.certs.values() {
                 let full = format!("{}.{}", String::from_utf8_lossy(&b.cert.label), String::from_utf8_lossy(&b.cert.name));
@@ -2203,19 +2261,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     tabminer::address::encode(&b.cert.issuer())
                 );
             }
-            let mut names: Vec<&Vec<u8>> = s.table.keys().collect();
-            names.sort();
-            if names.is_empty() {
-                println!("no sub-names answered here");
-            }
-            for name in names {
-                for (label, id) in &s.table[name].entries {
-                    println!(
-                        "{:<40}  {}",
-                        format!("{}.{}", String::from_utf8_lossy(label), String::from_utf8_lossy(name)),
-                        tabminer::address::encode(id)
-                    );
-                }
+            if s.table.is_empty() && s.held.certs.is_empty() && s.withdrawn.is_empty() {
+                println!("no sub-names issued or held");
             }
         }
         "slates" => {
@@ -2471,9 +2518,10 @@ fn name_value(ctx: &Ctx, name: &str) -> AnyResult<Digest> {
     Ok(record.value)
 }
 
-/// How long a delegation is signed for, and how often it is renewed.
-const DELEGATION_LIFETIME: u64 = 86_400;
-const DELEGATION_RENEW: Duration = Duration::from_secs(6 * 3600);
+/// How often the wallet's sub-names are seen to: certificates not yet
+/// delivered sent again, and those due renewed (`docs/SUBNAME_CERT.md`:
+/// daily, as the delegation).
+const SUBNAMES_EVERY: Duration = Duration::from_secs(3600);
 /// How long a sub-name lookup waits on the message layer.
 const RESOLVE_WAIT: Duration = Duration::from_secs(45);
 /// How long a delegation found (or found missing) is used before it is
@@ -2489,6 +2537,10 @@ struct Subnames {
     servers: Vec<Digest>,
     table: tabminer::subnames::Table,
     held: tabminer::subnames::HeldCerts,
+    /// Withdrawals (`none` certificates) this wallet issued, published
+    /// until the certificates they withdraw would have expired: a
+    /// withdrawn holder cannot put its own back at a later epoch's points.
+    withdrawn: Vec<tabminer::subnames::Bundle>,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -2518,7 +2570,7 @@ impl Subnames {
             let f: Vec<&str> = line.split_whitespace().collect();
             match f.as_slice() {
                 [] => {}
-                ["server", ids @ ..] => {
+                ["issuer", ids @ ..] => {
                     out.servers = ids.iter().map(|a| onion::parse_id(a).ok_or(bad(n))).collect::<Result<_, _>>()?;
                 }
                 ["entry", name, label, id] => {
@@ -2532,6 +2584,10 @@ impl Subnames {
                 ["held", hex] => {
                     let b = from_hex(hex).and_then(|b| tabminer::subnames::Bundle::from_bytes(&b)).ok_or(bad(n))?;
                     out.held.certs.insert((b.cert.name.clone(), b.cert.label.clone()), b);
+                }
+                ["withdrawn", hex] => {
+                    let b = from_hex(hex).and_then(|b| tabminer::subnames::Bundle::from_bytes(&b)).ok_or(bad(n))?;
+                    out.withdrawn.push(b);
                 }
                 _ => return Err(bad(n).into()),
             }
@@ -2552,7 +2608,7 @@ impl Subnames {
         let mut text = String::new();
         if !self.servers.is_empty() {
             let ids: Vec<String> = self.servers.iter().map(tabminer::address::encode).collect();
-            text.push_str(&format!("server {}\n", ids.join(" ")));
+            text.push_str(&format!("issuer {}\n", ids.join(" ")));
         }
         let mut names: Vec<&Vec<u8>> = self.table.keys().collect();
         names.sort();
@@ -2568,6 +2624,9 @@ impl Subnames {
         }
         for b in self.held.certs.values() {
             text.push_str(&format!("held {}\n", to_hex(&b.to_bytes())));
+        }
+        for b in &self.withdrawn {
+            text.push_str(&format!("withdrawn {}\n", to_hex(&b.to_bytes())));
         }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
@@ -2607,35 +2666,177 @@ fn chain_value(ctx: &Ctx, name: &[u8]) -> Option<Digest> {
     ctx.chain.names().lookup(&rtxn, name).ok().flatten().map(|r| r.value)
 }
 
-/// Hands the node the sub-names it answers for, the certificates this
-/// wallet holds (those no longer sound dropped), and this wallet's
-/// delegation (signed afresh) or none.
+/// The delegation under which this wallet may sign certificates for
+/// `name`, whose value is `value`: none needed when the value is this
+/// wallet's own id; the owner's delegation, fetched from its points, when
+/// it names this wallet; an error otherwise.
+fn issuing_for(ctx: &Ctx, name: &[u8], value: &Digest) -> AnyResult<Option<tabminer::subnames::Delegation>> {
+    let me = ctx.wallet()?.id();
+    let shown = String::from_utf8_lossy(name).into_owned();
+    if *value == me {
+        return Ok(None);
+    }
+    let mut wait = Waiter::new(ctx);
+    let tag = lookup_tag();
+    wait.add(Wait::Tag(tag));
+    ctx.events.send(Event::GetDelegation(tag, *value, 0)).map_err(|_| "the node has stopped")?;
+    let d = loop {
+        match wait.rx.recv_timeout(RESOLVE_WAIT) {
+            Ok(Note::Delegation { result, .. }) => break result.map_err(|e| format!("{shown}'s delegation: {e}"))?,
+            Ok(_) => {}
+            Err(_) => return Err(format!("{shown}'s delegation: no answer").into()),
+        }
+    };
+    match d {
+        Some(d) if d.verify(value, now()) && d.issuers.contains(&me) => Ok(Some(d)),
+        _ => Err(format!("{shown} is not this wallet's, and its owner's delegation does not name this wallet").into()),
+    }
+}
+
+/// A certificate for `label.name`, signed by this wallet: `to` gets it,
+/// or none (a withdrawal); with the delegation that lets this wallet sign
+/// it, if any. Its `seq` is above any this wallet issued for it.
+fn sign_cert(
+    ctx: &Ctx,
+    name: &[u8],
+    label: &[u8],
+    to: Option<&Digest>,
+    delegation: Option<tabminer::subnames::Delegation>,
+) -> AnyResult<tabminer::subnames::Bundle> {
+    use tabminer::subnames::{Bundle, Cert, LIFETIME_SECS};
+    let key = ctx.wallet()?.identity_key();
+    let last = ctx.issued.lock().unwrap().get(&(name.to_vec(), label.to_vec())).map_or(0, |i| i.bundle.cert.seq);
+    let seq = unix_millis().max(last + 1);
+    let expiry = now() + LIFETIME_SECS;
+    let cert = match to {
+        Some(id) => Cert::id(&key, name, label, id, seq, expiry),
+        None => Cert::none(&key, name, label, seq, expiry),
+    }
+    .ok_or("a malformed name or label")?;
+    Ok(Bundle { cert, delegation })
+}
+
+/// Sends `b` to `to`, its holder (or the holder it withdraws), as a
+/// certificate payload; the tag it goes under.
+fn send_cert(ctx: &Ctx, to: &Digest, b: &tabminer::subnames::Bundle) -> u64 {
+    let tag = lookup_tag();
+    let out = Outbound {
+        tag,
+        to: *to,
+        kind: onion::KIND_SUBNAME_CERT,
+        inner: b.to_bytes(),
+        recipient: None,
+        reply: None,
+        group: 0,
+    };
+    let _ = ctx.events.send(Event::Send(out));
+    tag
+}
+
+/// Sees to the wallet's sub-names (`docs/SUBNAME_CERT.md`): drops the
+/// certificates it holds that are no longer sound and the withdrawals past
+/// their use; issues a certificate for every entry of its table that has
+/// none, has a new holder, was not delivered (sent again each pass) or is
+/// due for renewal (daily), and sends it to its holder; hands the node
+/// every certificate to publish (held, issued and withdrawn), the sub-names
+/// it answers for, and this wallet's delegation, signed afresh daily or
+/// when its issuers change.
 fn publish_subnames(ctx: &Ctx) {
+    use tabminer::subnames::{LIFETIME_SECS, RENEW_SECS};
     let Some(w) = &ctx.wallet else { return };
-    let (table, servers, gone, held) = {
+    let _one = ctx.issuing.lock().unwrap();
+    let (table, servers, gone) = {
         let mut s = ctx.subnames.lock().unwrap();
         let gone = s.held.prune(|name| chain_value(ctx, name), now());
-        if !gone.is_empty() {
+        let before = s.withdrawn.len();
+        s.withdrawn.retain(|b| b.cert.expiry > now());
+        if !gone.is_empty() || s.withdrawn.len() != before {
             let _ = s.save(&ctx.subnames_file);
         }
-        (s.table.clone(), s.servers.clone(), gone, s.held.bytes())
+        (s.table.clone(), s.servers.clone(), gone)
     };
     for name in gone {
         say(ctx, &format!("sub-name {name} lapsed: its certificate expired or its name changed hands"));
     }
+    // Issue what is due, per name: whether this wallet may, once.
+    if !w.address_off() {
+        let mut names: Vec<&Vec<u8>> = table.keys().collect();
+        names.sort();
+        for name in names {
+            let full = |label: &[u8]| format!("{}.{}", String::from_utf8_lossy(label), String::from_utf8_lossy(name));
+            let due: Vec<(Vec<u8>, Digest)> = {
+                let issued = ctx.issued.lock().unwrap();
+                table[name]
+                    .entries
+                    .iter()
+                    .filter(|(label, id)| match issued.get(&(name.clone(), (*label).clone())) {
+                        Some(i) => {
+                            i.bundle.cert.entry() != tabminer::subnames::Entry::Id(**id)
+                                || !i.delivered
+                                || now().saturating_sub(i.at) >= RENEW_SECS
+                        }
+                        None => true,
+                    })
+                    .map(|(l, id)| (l.clone(), *id))
+                    .collect()
+            };
+            if due.is_empty() {
+                continue;
+            }
+            let Some(value) = chain_value(ctx, name) else {
+                log::line(&format!("sub-names of {}: not registered", String::from_utf8_lossy(name)));
+                continue;
+            };
+            let delegation = match issuing_for(ctx, name, &value) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::line(&format!("sub-names: {e}"));
+                    continue;
+                }
+            };
+            for (label, id) in due {
+                let b = match sign_cert(ctx, name, &label, Some(&id), delegation.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::line(&format!("sub-name {}: {e}", full(&label)));
+                        continue;
+                    }
+                };
+                let tag = send_cert(ctx, &id, &b);
+                log::line(&format!(
+                    "sub-name {}: certificate for {} sent, valid until {}",
+                    full(&label),
+                    tabminer::address::encode(&id),
+                    log::timestamp_of(b.cert.expiry)
+                ));
+                let entry = Issued { bundle: b, at: now(), tag, delivered: false };
+                ctx.issued.lock().unwrap().insert((name.clone(), label), entry);
+            }
+        }
+    }
+    // Issued entries no longer in the table were withdrawn (`subname del`).
+    ctx.issued.lock().unwrap().retain(|(name, label), _| table.get(name).is_some_and(|z| z.entries.contains_key(label)));
+    let mut certs: Vec<Vec<u8>> = {
+        let s = ctx.subnames.lock().unwrap();
+        s.held.bytes().into_iter().chain(s.withdrawn.iter().map(|b| b.to_bytes())).collect()
+    };
+    certs.extend(ctx.issued.lock().unwrap().values().map(|i| i.bundle.to_bytes()));
     let _ = ctx.events.send(Event::Subnames(table));
-    let _ = ctx.events.send(Event::Certs(held));
-    let delegation = (!servers.is_empty() && !w.address_off())
-        .then(|| {
-            tabminer::subnames::Delegation::make(
-                &w.identity_key(),
-                unix_millis(),
-                now() + DELEGATION_LIFETIME,
-                &servers,
-            )
-        })
-        .flatten();
-    let _ = ctx.events.send(Event::Delegate(delegation.map(|d| d.to_bytes())));
+    let _ = ctx.events.send(Event::Certs(certs));
+    // The delegation: signed afresh daily, or when its issuers change.
+    let delegation = if servers.is_empty() || w.address_off() {
+        *ctx.delegation.lock().unwrap() = None;
+        None
+    } else {
+        let mut d = ctx.delegation.lock().unwrap();
+        let stale = d.as_ref().is_none_or(|(at, issuers, _)| *issuers != servers || now().saturating_sub(*at) >= RENEW_SECS);
+        if stale {
+            *d = tabminer::subnames::Delegation::make(&w.identity_key(), unix_millis(), now() + LIFETIME_SECS, &servers)
+                .map(|x| (now(), servers.clone(), x.to_bytes()));
+        }
+        d.as_ref().map(|(_, _, bytes)| bytes.clone())
+    };
+    let _ = ctx.events.send(Event::Delegate(delegation));
 }
 
 /// Waits for what `keys` name, registered for the time of the wait.
@@ -2829,6 +3030,18 @@ fn on_note(ctx: &Ctx, note: Note) {
             }
         }
         Note::Delivered { tag, to, via } => {
+            let mut issued = ctx.issued.lock().unwrap();
+            if let Some(((name, label), i)) = issued.iter_mut().find(|(_, i)| i.tag == tag) {
+                i.delivered = true;
+                log::line(&format!(
+                    "sub-name {}.{}: certificate delivered to {} via {via}",
+                    String::from_utf8_lossy(label),
+                    String::from_utf8_lossy(name),
+                    tabminer::address::encode(&to)
+                ));
+                return;
+            }
+            drop(issued);
             if ctx.outgoing.lock().unwrap().keys().any(|id| slate_tag(id) == tag) {
                 say(
                     ctx,
@@ -2851,6 +3064,16 @@ fn on_note(ctx: &Ctx, note: Note) {
         Note::Delegation { .. } | Note::Cert { .. } => {}
         Note::Failed { tag, to, why } => {
             let to = tabminer::address::encode(&to);
+            if let Some((name, label)) =
+                ctx.issued.lock().unwrap().iter().find(|(_, i)| i.tag == tag).map(|(k, _)| k.clone())
+            {
+                log::line(&format!(
+                    "sub-name {}.{}: certificate not delivered to {to} ({why}); sent again within the hour",
+                    String::from_utf8_lossy(&label),
+                    String::from_utf8_lossy(&name)
+                ));
+                return;
+            }
             let mut outgoing = ctx.outgoing.lock().unwrap();
             let id = outgoing.keys().find(|id| slate_tag(id) == tag).copied();
             match id.and_then(|id| outgoing.remove(&id).map(|_| id)) {
