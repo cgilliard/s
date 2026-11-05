@@ -1869,6 +1869,16 @@ pub(crate) fn freedom_report(
         .collect()
 }
 
+/// Tests: a fuzzer's iterations and seed, from `TABMINER_FUZZ_ITERS`
+/// (else `iters`) and `TABMINER_FUZZ_SEED` (else `seed`); the nightly run
+/// sets both, and prints the seed so a failure can be replayed.
+pub(crate) fn fuzz_params(iters: u64, seed: u64) -> (u64, u64) {
+    let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+    let (iters, seed) = (var("TABMINER_FUZZ_ITERS").unwrap_or(iters), var("TABMINER_FUZZ_SEED").unwrap_or(seed));
+    eprintln!("fuzz: {iters} iterations, seed {seed} (TABMINER_FUZZ_SEED={seed} to replay)");
+    (iters, seed)
+}
+
 /// Tests: [`mutation_audit`]'s survivors as "column: rows" lines, the
 /// columns with the most first.
 #[cfg(test)]

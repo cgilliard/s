@@ -2714,19 +2714,31 @@ impl BlockAir {
         let parts = w.txs.len();
         for (p, tx) in w.txs.iter().enumerate() {
             let (n_in, n_out, n_ops) = (tx.inputs.len() as u32, tx.outputs.len() as u32, tx.ops.len() as u32);
-            assert!(
+            crate::stark::refuse(
                 n_in <= tx.in_left && n_out <= tx.out_left && n_ops <= tx.ops_left,
-                "more items than the transaction has left"
+                "more items than the transaction has left",
             );
-            assert!(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
-            assert!(tx.pol_left == 0 || tx.policy.is_some() || n_out == 0, "outputs before the policy input");
-            assert!(n_ops == 0 || (n_in == tx.in_left && n_out == tx.out_left), "operations before the last output");
-            assert!(
+            crate::stark::refuse(n_out == 0 || n_in == tx.in_left, "outputs before the last input");
+            crate::stark::refuse(
+                tx.pol_left == 0 || tx.policy.is_some() || n_out == 0,
+                "outputs before the policy input",
+            );
+            crate::stark::refuse(
+                n_ops == 0 || (n_in == tx.in_left && n_out == tx.out_left),
+                "operations before the last output",
+            );
+            crate::stark::refuse(
                 !tx.ends || (n_in, n_out, n_ops) == (tx.in_left, tx.out_left, tx.ops_left),
-                "a part that ends has every item left"
+                "a part that ends has every item left",
             );
-            assert!(tx.pol_left <= 1 && (tx.policy.is_some() == (tx.pol_left == 1)), "one policy input, whole");
-            assert!(tx.policy.is_none() || (tx.resume.is_none() && tx.ends), "a policy spend is never split");
+            crate::stark::refuse(
+                tx.pol_left <= 1 && (tx.policy.is_some() == (tx.pol_left == 1)),
+                "one policy input, whole",
+            );
+            crate::stark::refuse(
+                tx.policy.is_none() || (tx.resume.is_none() && tx.ends),
+                "a policy spend is never split",
+            );
             g.regs.msg = tx.message;
             g.regs.in_left = tx.in_left;
             g.regs.out_left = tx.out_left;
@@ -3464,6 +3476,258 @@ mod tests {
         let mut segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, 1).unwrap();
         wtxn.abort();
         segments.remove(0)
+    }
+
+    /// One random change to a field inside a segment's witness (not its
+    /// boundary: root, position, list states and height in, which the
+    /// aggregation pins), described. `None` if the witness has no such
+    /// field to change this time.
+    fn mutate_segment(w: &mut SegmentWitness, rng: &mut crate::test_util::Rng) -> Option<String> {
+        let mut r = |n: usize| (rng.next_u64() % n.max(1) as u64) as usize;
+        let nz = |v: usize| Fp::new(1 + (v as u32) % (crate::poseidon2::P - 1));
+        let t = r(w.txs.len());
+        let k = r(1 << 20);
+        let tx = &mut w.txs[t];
+        let (ni, no) = (tx.inputs.len(), tx.outputs.len());
+        let i = r(ni.max(1));
+        let o = r(no.max(1));
+        let d = r(DIGEST);
+        let delta = nz(k);
+        Some(match r(22) {
+            0 if ni > 0 => {
+                tx.inputs[i].amount = tx.inputs[i].amount.wrapping_add(1 + (k % 3) as u64);
+                format!("tx {t} input {i} amount")
+            }
+            1 if ni > 0 => {
+                tx.inputs[i].memo[d] += delta;
+                format!("tx {t} input {i} memo[{d}]")
+            }
+            2 if ni > 0 => {
+                tx.inputs[i].position ^= 1 << (k % 6);
+                format!("tx {t} input {i} position")
+            }
+            3 if ni > 0 => {
+                let l = k % DEPTH;
+                tx.inputs[i].siblings[l][d] += delta;
+                format!("tx {t} input {i} sibling {l}")
+            }
+            4 if ni > 0 => {
+                let c = k % tx.inputs[i].signature.wots.len();
+                tx.inputs[i].signature.wots[c][d] += delta;
+                format!("tx {t} input {i} signature chain {c}")
+            }
+            5 if ni > 0 && !tx.inputs[i].signature.auth_path.is_empty() => {
+                let l = k % tx.inputs[i].signature.auth_path.len();
+                tx.inputs[i].signature.auth_path[l][d] += delta;
+                format!("tx {t} input {i} signature path {l}")
+            }
+            6 if ni > 0 => {
+                tx.inputs[i].signature.randomizer[d] += delta;
+                format!("tx {t} input {i} signature randomizer")
+            }
+            7 if ni > 0 => {
+                tx.inputs[i].signature.index ^= 1;
+                format!("tx {t} input {i} signature index")
+            }
+            8 if ni > 0 => {
+                tx.inputs[i].pubkey.root[d] += delta;
+                format!("tx {t} input {i} key root")
+            }
+            9 if ni > 0 => {
+                let j = k % tx.inputs[i].pubkey.pub_seed.len();
+                tx.inputs[i].pubkey.pub_seed[j] += delta;
+                format!("tx {t} input {i} key seed")
+            }
+            10 if ni > 0 => {
+                tx.inputs[i].height ^= 1 << (k % 4);
+                format!("tx {t} input {i} creation height")
+            }
+            11 if no > 0 => {
+                tx.outputs[o].output.amount = tx.outputs[o].output.amount.wrapping_add(1 + (k % 3) as u64);
+                format!("tx {t} output {o} amount")
+            }
+            12 if no > 0 => {
+                let j = k % tx.outputs[o].output.memo.len();
+                tx.outputs[o].output.memo[j] += delta;
+                format!("tx {t} output {o} memo[{j}]")
+            }
+            13 if no > 0 => {
+                tx.outputs[o].output.commitment[d] += delta;
+                format!("tx {t} output {o} commitment")
+            }
+            14 if no > 0 => {
+                tx.outputs[o].output.key_hash[d] += delta;
+                format!("tx {t} output {o} key hash")
+            }
+            15 if no > 0 => {
+                let l = k % DEPTH;
+                tx.outputs[o].siblings[l][d] += delta;
+                format!("tx {t} output {o} sibling {l}")
+            }
+            16 => {
+                tx.message[d] += delta;
+                format!("tx {t} message")
+            }
+            17 if !tx.ops.is_empty() => {
+                let j = k % tx.ops.len();
+                tx.ops[j][d] += delta;
+                format!("tx {t} operation {j}")
+            }
+            18 => {
+                match k % 3 {
+                    0 => tx.in_left = tx.in_left.wrapping_add(1),
+                    1 => tx.out_left = tx.out_left.wrapping_add(1),
+                    _ => tx.ops_left = tx.ops_left.wrapping_add(1),
+                }
+                format!("tx {t} items left")
+            }
+            19 if ni > 1 => {
+                tx.inputs.swap(0, 1);
+                format!("tx {t} inputs swapped")
+            }
+            20 if no > 1 => {
+                tx.outputs.swap(0, 1);
+                format!("tx {t} outputs swapped")
+            }
+            21 if tx.policy.is_some() => {
+                let p = tx.policy.as_mut().unwrap();
+                match k % 4 {
+                    0 => p.input.amount = p.input.amount.wrapping_add(1),
+                    1 => p.input.state = p.input.state.wrapping_add(1),
+                    2 => p.memo[d] += delta,
+                    _ => p.created ^= 1,
+                }
+                format!("tx {t} policy input")
+            }
+            _ => return None,
+        })
+    }
+
+    /// A chain of segments (one block) rebuilt from `from` on, as a cheating
+    /// prover would: each later segment starts where the one before it
+    /// ended (root, lists, position) and takes over its open transaction
+    /// (message, body, items left), its trace written leniently. The
+    /// segments' public values, or why the chain fails: `Err(true)` when a
+    /// constraint rejects a segment, `Err(false)` when one has no trace.
+    fn rebuild_chain(
+        chain: &mut [SegmentWitness],
+        from: usize,
+        before: &[SegmentPublic],
+    ) -> Result<Vec<SegmentPublic>, bool> {
+        let mut publics: Vec<SegmentPublic> = before[..from].to_vec();
+        for k in from..chain.len() {
+            if k > from {
+                let prev = publics[k - 1];
+                let w = &mut chain[k];
+                (w.root_in, w.isp_in, w.osp_in, w.nsp_in, w.pos_in) =
+                    (prev.root_out, prev.isp_out, prev.osp_out, prev.nsp_out, prev.pos_out);
+                if prev.carry_out.open {
+                    let c = prev.carry_out;
+                    let tx = &mut w.txs[0];
+                    (tx.message, tx.resume, tx.in_left, tx.out_left, tx.ops_left) =
+                        (c.msg, Some(c.bsp), c.in_left, c.out_left, c.ops_left);
+                }
+            }
+            crate::stark::LENIENT.with(|l| l.set(true));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BlockAir::generate_trace(&chain[k])));
+            crate::stark::LENIENT.with(|l| l.set(false));
+            let (trace, public) = r.map_err(|_| false)?;
+            check_constraints(&BlockAir, &trace, &public.to_values()).map_err(|_| true)?;
+            publics.push(public);
+        }
+        Ok(publics)
+    }
+
+    /// Fuzzes the block circuit's witnesses: 1 to 4 random changes inside
+    /// one segment (`mutate_segment`) of a block, the block's later
+    /// segments rebuilt to follow it (`rebuild_chain`), traces written
+    /// leniently. A block every segment of which holds, whose start, lists,
+    /// closed ends and height are the honest block's, but which ends
+    /// elsewhere (root, position, sums) is a bug: the same body with another
+    /// outcome. Other lists are another body (the node checks the block's
+    /// own); the same outcome is counted as an equivalent witness.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_segment_witnesses() {
+        let (iters, seed) = crate::stark::fuzz_params(150, 0xf022_b10c);
+        let mut rng = crate::test_util::Rng::new(seed);
+        let (plain, ..) = scenario("fuzz-plain", 3);
+        let plan = vec![
+            vec![Part { tx: 0, start: 0, end: 1 }],
+            vec![Part { tx: 0, start: 1, end: 3 }],
+            vec![Part { tx: 0, start: 3, end: 4 }, Part { tx: 1, start: 0, end: 1 }, Part { tx: 2, start: 0, end: 2 }],
+        ];
+        let (span, ..) = scenario_with("fuzz-span", |utxo, wtxn, txs| {
+            SegmentWitness::collect_parts(utxo, wtxn, txs, plan, 1).unwrap()
+        });
+        let (_, policy) = policy_segments();
+        // Blocks: the plain one, the spanning one, each policy spend, the
+        // spend carrying name operations.
+        let mut blocks: Vec<Vec<SegmentWitness>> = vec![plain, span];
+        blocks.extend(policy.into_iter().map(|w| vec![w]));
+        blocks.push(vec![name_ops_segment("fuzz-ops")]);
+        let honest: Vec<Vec<SegmentPublic>> =
+            blocks.iter().map(|b| b.iter().map(|w| BlockAir::generate_trace(w).1).collect()).collect();
+        let pinned = |p: &[SegmentPublic]| {
+            let (f, l) = (&p[0], &p[p.len() - 1]);
+            (
+                f.root_in,
+                f.isp_in,
+                f.osp_in,
+                f.nsp_in,
+                f.pos_in,
+                f.carry_in,
+                l.isp_out,
+                l.osp_out,
+                l.nsp_out,
+                l.carry_out,
+                f.height,
+            )
+        };
+        let outcome = |p: &[SegmentPublic]| {
+            let sum =
+                |f: fn(&SegmentPublic) -> &[u32; LIMBS]| p.iter().map(|x| SegmentPublic::total(f(x))).sum::<u128>();
+            (p[p.len() - 1].root_out, p[p.len() - 1].pos_out, sum(|x| &x.sum_in), sum(|x| &x.sum_out))
+        };
+        let (mut rejected, mut no_trace, mut other, mut bugs) = (0, 0, 0, Vec::new());
+        let mut same: Vec<String> = Vec::new();
+        // The lenient generator panics on witnesses it cannot write: quiet.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut n = 0;
+        while n < iters {
+            let b = (rng.next_u64() % blocks.len() as u64) as usize;
+            let k = (rng.next_u64() % blocks[b].len() as u64) as usize;
+            let mut chain = blocks[b].clone();
+            let mut what = Vec::new();
+            for _ in 0..1 + rng.next_u64() % 4 {
+                if let Some(m) = mutate_segment(&mut chain[k], &mut rng) {
+                    what.push(m);
+                }
+            }
+            if what.is_empty() {
+                continue;
+            }
+            n += 1;
+            let at = format!("block {b} segment {k}: {}", what.join(", "));
+            match rebuild_chain(&mut chain, k, &honest[b]) {
+                Err(true) => rejected += 1,
+                Err(false) => no_trace += 1,
+                Ok(p) if pinned(&p) != pinned(&honest[b]) => other += 1,
+                Ok(p) if outcome(&p) == outcome(&honest[b]) => same.push(at),
+                Ok(_) => bugs.push(at),
+            }
+        }
+        std::panic::set_hook(hook);
+        eprintln!(
+            "{iters} mutants: {rejected} rejected, {} equivalent, {other} another body, {no_trace} without a trace, {} another outcome",
+            same.len(),
+            bugs.len()
+        );
+        for e in &same {
+            eprintln!("  equivalent: {e}");
+        }
+        assert!(bugs.is_empty(), "the same body with another outcome (seed {seed}):\n{}", bugs.join("\n"));
     }
 
     /// The four policy spends of [`policy_spends_satisfy_constraints`]

@@ -1660,7 +1660,11 @@ impl Gen {
                     Terminal::Leaf { .. } => {
                         let old_leaf = self.r.oleaf;
                         let j = first_difference(key, other_key);
-                        assert!(j >= d, "the colliding key shares the prefix");
+                        crate::stark::refuse(j >= d, "the colliding key shares the prefix");
+                        crate::stark::refuse(j < name_trie::KEY_BITS, "the colliding key is another key");
+                        // A lenient generator claims a split at a depth the
+                        // trie has (equal keys differ nowhere).
+                        let j = j.clamp(d, name_trie::KEY_BITS - 1);
                         // chain[t] for t in d..=j
                         let mut chain = vec![EMPTY; j - d + 1];
                         chain[j - d] =
@@ -1981,7 +1985,12 @@ mod tests {
             PUB_HEIGHT,
             PUB_COUNTS + 1,
         ] {
-            if i == PUB_HEIGHT && ops.is_empty() {
+            // Nothing in a section of updates alone (or of nothing) uses the
+            // height; the aggregation pins it to the block's.
+            if i == PUB_HEIGHT
+                && ops.iter().all(|o| matches!(o, NameOp::Update { .. }))
+                && (ops.is_empty() || sweeps.is_empty())
+            {
                 continue;
             }
             let mut bad = values.clone();
@@ -2039,6 +2048,250 @@ mod tests {
             Ok(Ok(Err(_))) => Cheat::Rejected,
             Ok(Ok(Ok(()))) => Cheat::Accepted,
         }
+    }
+
+    /// One random change to a field inside a name section's operations
+    /// (not its boundary: root, position and height in), described.
+    fn mutate_ops(w: &mut NameWitness, rng: &mut crate::test_util::Rng) -> Option<String> {
+        let mut r = |n: usize| (rng.next_u64() % n.max(1) as u64) as usize;
+        if w.ops.is_empty() {
+            return None;
+        }
+        let i = r(w.ops.len());
+        let (k, d) = (r(1 << 20), r(DIGEST));
+        let delta = Fp::new(1 + (k as u32) % (crate::poseidon2::P - 1));
+        let l = k % DEPTH;
+        let bump_record = |rec: &mut Record, which: usize| match which % 4 {
+            0 => rec.owner[d] += delta,
+            1 => rec.value[d] += delta,
+            2 => rec.memo[d] += delta,
+            _ => {
+                // Another letter, so the name stays well formed.
+                let j = k % rec.name.len();
+                rec.name[j] = if rec.name[j] == b'a' { b'b' } else { b'a' };
+            }
+        };
+        Some(match &mut w.ops[i] {
+            OpWitness::Commit { commit, memo, path } => match r(3) {
+                0 => {
+                    commit[d] += delta;
+                    format!("op {i} commit")
+                }
+                1 => {
+                    memo[d] += delta;
+                    format!("op {i} commit memo")
+                }
+                _ => {
+                    path[l][d] += delta;
+                    format!("op {i} commit path {l}")
+                }
+            },
+            OpWitness::Reveal { record, salt, other, trie, commit_height, commit_memo, commit_position, path } => {
+                match r(9) {
+                    0 => {
+                        bump_record(record, k);
+                        format!("op {i} reveal record")
+                    }
+                    1 => {
+                        salt[d] += delta;
+                        format!("op {i} reveal salt")
+                    }
+                    2 if other.is_some() => {
+                        bump_record(other.as_mut().unwrap(), k);
+                        format!("op {i} reveal colliding record")
+                    }
+                    3 => {
+                        trie.left[d] += delta;
+                        format!("op {i} reveal trie left")
+                    }
+                    4 if !trie.proof.siblings.is_empty() => {
+                        let j = k % trie.proof.siblings.len();
+                        trie.proof.siblings[j][d] += delta;
+                        format!("op {i} reveal trie sibling {j}")
+                    }
+                    5 => {
+                        *commit_height ^= 1 << (k % 3);
+                        format!("op {i} reveal commit height")
+                    }
+                    6 => {
+                        commit_memo[d] += delta;
+                        format!("op {i} reveal commit memo")
+                    }
+                    7 => {
+                        *commit_position ^= 1 << (k % 4);
+                        format!("op {i} reveal commit position")
+                    }
+                    _ => {
+                        path[l][d] += delta;
+                        format!("op {i} reveal path {l}")
+                    }
+                }
+            }
+            OpWitness::Update { old, new, pubkey, signature, trie } => match r(8) {
+                0 => {
+                    bump_record(old, k);
+                    format!("op {i} update old record")
+                }
+                1 => {
+                    bump_record(new, k % 3);
+                    format!("op {i} update new record")
+                }
+                2 => {
+                    pubkey.pub_seed[k % pubkey.pub_seed.len()] += delta;
+                    format!("op {i} update key seed")
+                }
+                3 => {
+                    let c = k % signature.wots.len();
+                    signature.wots[c][d] += delta;
+                    format!("op {i} update signature chain {c}")
+                }
+                4 if !signature.auth_path.is_empty() => {
+                    let j = k % signature.auth_path.len();
+                    signature.auth_path[j][d] += delta;
+                    format!("op {i} update signature path {j}")
+                }
+                5 => {
+                    signature.randomizer[d] += delta;
+                    format!("op {i} update signature randomizer")
+                }
+                6 => {
+                    trie.left[d] += delta;
+                    format!("op {i} update trie left")
+                }
+                _ if !trie.proof.siblings.is_empty() => {
+                    let j = k % trie.proof.siblings.len();
+                    trie.proof.siblings[j][d] += delta;
+                    format!("op {i} update trie sibling {j}")
+                }
+                _ => return None,
+            },
+            OpWitness::Sweep { commit, memo, height, position, path } => match r(5) {
+                0 => {
+                    commit[d] += delta;
+                    format!("op {i} sweep commit")
+                }
+                1 => {
+                    memo[d] += delta;
+                    format!("op {i} sweep memo")
+                }
+                2 => {
+                    *height ^= 1 << (k % 3);
+                    format!("op {i} sweep height")
+                }
+                3 => {
+                    *position ^= 1 << (k % 4);
+                    format!("op {i} sweep position")
+                }
+                _ => {
+                    path[l][d] += delta;
+                    format!("op {i} sweep path {l}")
+                }
+            },
+        })
+    }
+
+    /// Fuzzes the name circuit's witnesses: 1 to 4 random changes inside
+    /// the operations (`mutate_ops`) of commits, reveals (one splitting a
+    /// leaf), an update and a sweep, the trace written leniently. A change
+    /// the constraints accept that gives another outcome (end root or
+    /// position) for the same start, operations, sweeps, height and counts
+    /// is a bug; one that changes the operations is another statement,
+    /// which the aggregation holds to the block's list; one that leaves the
+    /// statement identical is counted.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_name_witnesses() {
+        let (iters, seed) = crate::stark::fuzz_params(150, 0xf022_0a3e);
+        let mut rng = crate::test_util::Rng::new(seed);
+        let w = world("fuzz");
+        let mut k1 = owner_key(1);
+        let o1 = pubkey_hash(&k1.public_key());
+        let o2 = pubkey_hash(&owner_key(2).public_key());
+        let o3 = pubkey_hash(&owner_key(3).public_key());
+        let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
+        let bob = Record::new(&colliding_name(b"alice", 3), o2, d(21), d(22)).unwrap();
+        let carol = Record::new(b"carol", o3, d(31), d(32)).unwrap();
+        let salt = |n: u32| d(500 + n);
+        let commit_of = |r: &Record, s: &Digest| commit_hash(&name_hash(&r.elements().unwrap()), s, &r.owner);
+        // Honest witnesses, each collected in a transaction thrown away
+        // before the block is applied for real.
+        let mut pool: Vec<NameWitness> = Vec::new();
+        let mut take = |w: &World, height: u32, ops: &[NameOp], sweeps: &[u64]| {
+            let mut wtxn = w.env.write_txn().unwrap();
+            pool.push(NameWitness::collect(&w.utxo, &w.names, &mut wtxn, height, ops, sweeps).unwrap());
+            wtxn.abort();
+            block(w, height, ops, sweeps);
+        };
+        let commits: Vec<NameOp> = [(&alice, 1), (&bob, 2), (&carol, 3)]
+            .iter()
+            .map(|(r, n)| NameOp::Commit {
+                commit: commit_of(r, &salt(*n)),
+                memo: crate::transaction::memo5(d(40 + n)),
+            })
+            .collect();
+        take(&w, 10, &commits, &[]);
+        let reveals = [
+            NameOp::Reveal { record: alice.clone(), salt: salt(1), commit: 5 },
+            NameOp::Reveal { record: bob.clone(), salt: salt(2), commit: 6 },
+        ];
+        take(&w, 22, &reveals, &[]);
+        let alice2 = Record::new(b"alice", pubkey_hash(&owner_key(4).public_key()), d(13), d(14)).unwrap();
+        take(&w, 23, &[NameOp::update(alice2, &mut k1).unwrap()], &[]);
+        take(&w, 10 + MAX_REVEAL + 1, &[], &[7]);
+        let honest: Vec<NamePublic> = pool.iter().map(|w| NameAir::generate_trace(w).1).collect();
+        let (mut rejected, mut no_trace, mut other, mut bugs) = (0, 0, 0, Vec::new());
+        let mut same: Vec<String> = Vec::new();
+        let pinned = |p: &NamePublic| (p.root_in, p.pos_in, p.nsp, p.ssp, p.height, p.counts);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut n = 0;
+        while n < iters {
+            let s = (rng.next_u64() % pool.len() as u64) as usize;
+            let mut wit = pool[s].clone();
+            let mut what = Vec::new();
+            for _ in 0..1 + rng.next_u64() % 4 {
+                if let Some(m) = mutate_ops(&mut wit, &mut rng) {
+                    what.push(m);
+                }
+            }
+            if what.is_empty() {
+                continue;
+            }
+            n += 1;
+            crate::stark::LENIENT.with(|l| l.set(true));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| NameAir::generate_trace(&wit)));
+            crate::stark::LENIENT.with(|l| l.set(false));
+            match r {
+                Err(_) => no_trace += 1,
+                Ok((trace, public)) => match check_constraints(&NameAir, &trace, &public.to_values()) {
+                    Err(_) => rejected += 1,
+                    Ok(()) if public == honest[s] => same.push(format!("section {s}: {}", what.join(", "))),
+                    // What is pinned from outside (the start, the operations
+                    // and sweeps the block lists, the height, the counts)
+                    // unchanged, but another outcome: a bug.
+                    Ok(()) if pinned(&public) == pinned(&honest[s]) => {
+                        bugs.push(format!("section {s}: {}", what.join(", ")))
+                    }
+                    // Other operations: another statement, which the block's
+                    // own list must match (the aggregation checks it).
+                    Ok(()) => other += 1,
+                },
+            }
+        }
+        std::panic::set_hook(hook);
+        eprintln!(
+            "{iters} mutants: {rejected} rejected, {} equivalent, {other} other operations, {no_trace} without a trace, {} another outcome",
+            same.len(),
+            bugs.len()
+        );
+        for e in &same {
+            eprintln!("  equivalent: {e}");
+        }
+        assert!(
+            bugs.is_empty(),
+            "accepted with another outcome for the same operations (seed {seed}):\n{}",
+            bugs.join("\n")
+        );
     }
 
     /// Step 2 of the circuit review for names (`docs/HARDENING.md`): each
