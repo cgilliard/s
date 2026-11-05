@@ -1,0 +1,122 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/rng.fam — virtio-rng (legacy virtio-mmio): entropy from the host, with the
+\ interrupt as a doorbell.  tools/q32 attaches one whenever it attaches the disk
+\ or the network, after them, so their slots do not move.
+\
+\   rnginit ( -- flag )     find the device and set up its queue; 0 when absent
+\   rngfill ( buf n -- )    fill n bytes with entropy; blocks on the doorbell
+\   rngreq  ( buf n -- )    post one buffer (one request in flight at a time)
+\   rngpoll ( -- len|0 )    the bytes the device wrote into it, once; 0 = not yet
+\   rarm    ( -- )          ack the interrupt and enable its PLIC source
+\   rbit    ( -- mask )     the event bit `wait` returns for it
+\
+\ The device may return fewer bytes than asked for; rngfill loops until the
+\ buffer is full.  This is the seed source: draw a seed here, expand it with a
+\ generator, and come back only to reseed.  Each request is a trap and a host
+\ round trip (see the bench).
+\
+\ Queue 0, QueueNum 8 (QEMU's maximum for this device), one descriptor per
+\ request, head 0 always.  Legacy layout for QueueNum 8 with QueueAlign 4096:
+\   desc @ q+0 (128 B)   avail @ q+0x80 (flags, idx, ring[8])   used @ q+0x1000
+\ State block (the `rng` variable points at it): +0 dev  +4 q  +8 used cursor
+\ Needs src/fence.fam and src/proc.fam compiled before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: rng variable ;
+
+: rngreq ( buf n -- )
+	rng @ 4 lit + @                        \ buf n q
+	tuck 8 lit + !                         \ desc[0].len = n
+	tuck !                                 \ desc[0].addr = buf
+	0 lit over 4 lit + !                   \ addr hi
+	2 lit over C lit + h!                  \ flags: device writes
+	0 lit over E lit + h!                  \ no next
+	dup 82 lit + h@ 7 lit and 1 lit lshift over + 84 lit + 0 lit swap h!   \ ring[idx & 7] = 0
+	fence_io
+	82 lit + dup h@ 1 lit + swap h!        \ avail.idx++
+	fence_io 0 lit rng @ @ 50 lit + !      \ QueueNotify 0
+;
+
+: rngpoll ( -- len|0 )
+	rng @ 4 lit + @                                        \ q
+	dup 1002 lit + h@ rng @ 8 lit + @ FFFF lit and = if drop 0 lit else
+		fence_r
+		rng @ 8 lit + @ dup 1 lit + rng @ 8 lit + !        \ q c   (cursor++)
+		7 lit and 3 lit lshift + 1008 lit + @              \ used.ring[c & 7].len
+	then
+;
+
+: rbit ( -- mask )  rng @ @ virqof 1 lit swap lshift ;
+: rarm ( -- )       rng @ @ dup vack virqof irqon ;
+
+: rngfill ( buf n -- )
+	begin dup while
+		2dup rngreq
+		begin rarm rngpoll ?dup 0= while rbit 989680 lit wait drop repeat   \ buf n len
+		tuck - rot rot + swap                                               \ buf+len n-len
+	repeat
+	2drop
+;
+
+: rnginit ( -- flag )
+	4 lit vfind ?dup if
+		10 lit alloc dup rng ! !                            \ dev
+		2000 lit alloc FFF lit + FFFFF000 lit and           \ q, page-aligned
+		440 lit 0 lit do 0 lit over i 4 lit * + ! loop      \ zeroed through the used ring
+		dup rng @ 4 lit + !
+		0 lit rng @ 8 lit + !
+		rng @ @
+		0 lit over 70 lit + !  1 lit over 70 lit + !  3 lit over 70 lit + !   \ reset, ACK, DRIVER
+		0 lit over 20 lit + !                               \ DriverFeatures: none
+		B lit over 70 lit + !                               \ FEATURES_OK
+		1000 lit over 28 lit + !                            \ GuestPageSize
+		0 lit over 30 lit + !                               \ QueueSel 0
+		8 lit over 38 lit + !                               \ QueueNum
+		1000 lit over 3C lit + !                            \ QueueAlign
+		over C lit rshift over 40 lit + !                   \ QueuePFN
+		F lit swap 70 lit + !                               \ DRIVER_OK
+		drop
+		-1 lit
+	else 0 lit then
+;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Test and bench: real device only (any --disk or --net run has one), self-skip
+\ without it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	rng {
+		: rb  variable ;
+		: rb2 variable ;
+		\ rsame ( a b n -- count )  how many of n bytes are equal
+		: rsame  0 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = if 1 lit + then loop nip nip ;
+		rnginit if
+			40 lit alloc rb !  40 lit alloc rb2 !
+			rb @ 40 lit 0 lit do 0 lit over i + c! loop drop
+			\ one request: 1..8 bytes come back
+			rb @ 8 lit rngreq
+			begin rarm rngpoll ?dup until
+			dup 0 lit u> assert  9 lit u< assert
+			\ a full fill: not zero, halves differ, and a second fill differs too
+			rb @ 40 lit rngfill
+			0 lit 40 lit 0 lit do rb @ i + c@ or loop 0 lit <> assert
+			rb @ rb @ 20 lit + 20 lit rsame 8 lit u< assert
+			rb @ rb2 @ 40 lit mcopy
+			rb @ 40 lit rngfill
+			rb @ rb2 @ 40 lit rsame 8 lit u< assert
+		then
+	}
+}
+
+Bench {
+	\ a 64-byte seed: one request, one doorbell, one host round trip
+	rng64 {
+		rnginit if
+			40 lit alloc bgo
+			64 lit 0 lit do dup 40 lit rngfill loop
+			drop
+			64 lit bops
+		else bskip then
+	}
+}

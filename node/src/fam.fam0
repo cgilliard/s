@@ -246,10 +246,10 @@
 # .endm
 
 # _start:
-#     LOAD_ADDRESS s10, data              # data: the page after the code (the node maps the code
+#     LOAD_ADDRESS s10, data              # data: the page after the code (code and data on
 17 1D 00 00	# auipc s10,0x1
 13 0D 8D 2E	# addi s10,s10,744 # 12e8 <data>
-#     li      t0, 4095                    # read-only up to the next page boundary, src/exec.fam):
+#     li      t0, 4095                    # separate pages)
 B7 12 00 00	# lui t0,0x1
 93 82 F2 FF	# addi t0,t0,-1 # fff <__panic+0x3>
 #     add     s10, s10, t0                # everything the compiler writes is placed from s10
@@ -316,8 +316,7 @@ B3 01 53 00	# add gp,t1,t0
     # gp+5MiB) and a 1 KiB fam stack [gp+5MiB, gp+5MiB+0x400).  sp is the
     # stack top (grows down within its 1 KiB); s3 holds it permanently so the
     # heap ceiling (s3-0x400) is a constant -- no heap/stack relational coupling.
-    # 5 MiB: with the tables above, the whole compiler fits the 8 MiB region
-    # the node runs it in (prog/fam.fam); the host's builds fit it too.
+    # 5 MiB: with the tables above, the whole compiler fits in 8 MiB.
 #     li      sp, 0x500400               # 5 MiB heap + 1 KiB fam stack
 37 01 50 00	# lui sp,0x500
 13 01 01 40	# addi sp,sp,1024 # 500400 <ISLAND_GAP+0x4c0400>

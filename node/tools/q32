@@ -12,8 +12,7 @@
 #                 test fixtures.  A fam program's heap and stacks span all of
 #                 RAM above its image (lib/stdlib.fam init: the data stack ends
 #                 at 0x88000000, the top of the virt machine's default 128 MiB),
-#                 so pick an address the program will not allocate over, or
-#                 use tools/fam --append, which places the file after the image.
+#                 so pick an address the program will not allocate over.
 #   --in=FILE     serial input from FILE  ┐ file-backed serial instead of stdio:
 #   --out=FILE    serial output to FILE   ┘ byte-exact on every platform (QEMU's
 #                 win32 stdio chardev loses bytes on piped stdin); used by
@@ -21,9 +20,8 @@
 #
 # Examples:
 #   q32 program.bin
-#   q32 --net bin/tabernacle
-#   q32 --net --disk=node.bin bin/tabernacle
-#   printf '47653 0 10000 1 10.0.2.2:7701\004' | q32 --net bin/tabernacle
+#   q32 --net program.bin
+#   q32 --disk=disk.img program.bin
 
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
@@ -137,7 +135,7 @@ if [ -n "$DISK" ]; then
 	fi
 	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
 	if [ -n "$DISKRO" ]; then
-		# read only, and without QEMU's image lock: another QEMU (the node)
+		# read only, and without QEMU's image lock: another QEMU
 		# may have it open for writing
 		ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0,readonly=on,file.locking=off"
 	else

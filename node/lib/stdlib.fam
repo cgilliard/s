@@ -100,11 +100,7 @@ abort        \ unterminated: print '?' and halt the compiler
 
 \ init  ( -- )   RUNTIME: set up the return-id (RID) stack used by
 \        every `:`-word call, the bump allocator, and the data stack.
-\          gp  = gp rounded up to 4 KiB: the data starts on a page boundary,
-\                               so a program's PMP boundary between its code
-\                               and its data (src/exec.fam) falls on one too
-\                               (QEMU stops caching a page a PMP boundary
-\                               cuts through: every access to it is slow)
+\          gp  = gp rounded up to 4 KiB: the data starts on a page boundary
 \          s10 = gp             RID-stack floor / overflow bound
 \          s11 = gp + 0x1000    RID-stack top (1024 entries, grows DOWN)
 \          gp  = gp + 0x1000    heap base — first free byte ABOVE the
@@ -115,12 +111,6 @@ abort        \ unterminated: print '?' and halt the compiler
 \          s8  = 0x88000000     loop-control stack top (the last 64 KiB of RAM)
 \        The RAM size is the virt machine's default (QEMU -m 128M, tools/q32
 \        and scripts/build.sh); another machine means another constant here.
-\        A program exec'd by the kernel (src/exec.fam) runs in a region of its
-\        own and is started with a5 = 'EXEC' (0x43455845), a6 = the region's
-\        base, a7 = its size: then the loop stack ends at the region's top and
-\        the data stack 16 KiB below it, with the heap growing up from the
-\        image as before.  (tabernacle hands the node a0..a4; a5 is never that
-\        value by accident.)
 \        runtime fragment; must run before any `:`-word call.
 :M init
 B7120000 ,   \ lui  t0, 0x1             ( gp = (gp + 0xFFF) & ~0xFFF: the next page )
@@ -136,13 +126,6 @@ B38D5100 ,   \ add  s11, gp, t0         ( s11 = gp + 0x1000 = RID top )
 \        hands out fixed cells here, so they live in DATA (not code).
 B7520000 ,   \ lui  t0, 0x5             ( t0 = 0x5000 = 0x1000 RID + 0x4000 vars )
 B3815100 ,   \ add  gp,  gp, t0         ( gp += 0x5000 = heap base, above RID+vars )
-B7624543 ,   \ lui  t0, 0x43456         ( t0 = 'EXEC' ...
-93825284 ,   \ addi t0, t0, -1979       ( ... = 0x43455845 )
-639A5700 ,   \ bne  a5, t0, +20         ( not exec'd: the standalone layout below )
-330C1801 ,   \ add  s8, a6, a7          ( s8 = region top = loop-control stack top )
-B7420000 ,   \ lui  t0, 0x4             ( t0 = 0x4000 = 16 KiB of loop stack )
-33015C40 ,   \ sub  sp, s8, t0          ( sp = region top - 16 KiB = data-stack top )
-6F00C000 ,   \ j    +12                 ( done )
 3701FF87 ,   \ lui  sp, 0x87FF0         ( sp = 0x87FF0000 = data-stack top: RAM top - 64 KiB )
 370C0088 ,   \ lui  s8, 0x88000         ( s8 = 0x88000000 = loop-control stack top = RAM top )
 ;

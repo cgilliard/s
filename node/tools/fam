@@ -17,14 +17,6 @@
 #   -o OUTPUT    output binary (default: ./a.bin)
 #   --load=FILE@ADDR  load FILE's bytes at ADDR when running (forwarded to q32):
 #                test fixtures (tools/fxpack, tests/fx.fam).
-#   --prog         build a program for the node's kernel to exec (src/exec.fam):
-#                lib/sys.fam (the syscalls) follows the stdlib and the program
-#                ends with texit instead of halting the machine
-#   --append=FILE  pad the binary to a page, then append 0x5000 zero bytes and FILE, as
-#                scripts/build.sh appends the Bible text to the node: the
-#                zeros cover the return-id stack and the variables `init` puts
-#                just past the image, so FILE starts exactly at the heap's base
-#                (see src/text.fam).
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
 # `fam prog.fam --test` compiles, runs the tests, and deletes the binary (like
@@ -46,8 +38,6 @@ OUT_GIVEN=0
 IN=""
 TEST=0
 BENCH=0
-PROG=0
-APPEND=""
 QOPTS=""          # extra flags forwarded to q32 on the run (e.g. --disk=, --net)
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -55,9 +45,7 @@ while [ $# -gt 0 ]; do
 		-o*) OUT="${1#-o}"; OUT_GIVEN=1; shift ;;
 		--test) TEST=1; shift ;;
 		--bench) BENCH=1; shift ;;
-		--prog) PROG=1; shift ;;
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
-		--append=*) APPEND="${1#--append=}"; shift ;;
 		--load=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
@@ -117,7 +105,7 @@ if [ ! -f "$HEADER" ]; then echo "fam: header not found: $HEADER" >&2; exit 1; f
 # absolute /tmp paths inside comma-separated qemu args is unreliable).
 if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
 _tdone
-bye'; elif [ "$PROG" = 1 ]; then TAIL='texit'; IN="$ROOT/lib/sys.fam $IN"; else TAIL='bye'; fi
+bye'; else TAIL='bye'; fi
 STREAM="$OUT.in.$$"
 # --test (and --bench, with `Bench { }`): after each file, an empty word and an empty `Test { }` -- so the
 # compiler has a `:` at which to put an island (src/fam.S: it does only at
@@ -144,14 +132,6 @@ if [ "$(head -c 4 "$OUT" 2>/dev/null | xxd -p)" != "13000000" ]; then
 	fi
 fi
 rm -f "$STREAM"
-
-# --- --append: zeros over init's return-id stack and variables, then FILE ---
-if [ -n "$APPEND" ] && [ -f "$OUT" ]; then
-	if [ ! -f "$APPEND" ]; then echo "fam: --append file not found: $APPEND" >&2; exit 1; fi
-	truncate -s $(( ( $(wc -c < "$OUT" | tr -d ' \t') + 4095 ) / 4096 * 4096 )) "$OUT"   # to a page: the data starts on one (stdlib init)
-	head -c 20480 /dev/zero >> "$OUT"
-	cat "$APPEND" >> "$OUT"
-fi
 
 # --- verify the output is a real fam binary (begins with the q32 magic) ---
 MAGIC=$(head -c 4 "$OUT" 2>/dev/null | xxd -p)

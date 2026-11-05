@@ -27,8 +27,7 @@ B7021000 ,   \ lui  t0, 0x100
 \ stdout: [16 B header (NOP magic + jal + PAYLOAD + UNCOMP)]
 \ [200 B fixed stub body]
 \ The stub copies the payload to 0x84800000, unpacks it to 0x80001000 (a page
-\ boundary, so what is packed runs page-aligned: tabernacle's end marker, and
-\ with it the node it loads there, lands on a page) and jumps to it.
+\ boundary, so what is packed runs page-aligned) and jumps to it.
 \ [LZ77 payload]
 \
 \ LZ77 stream:

@@ -31,6 +31,6 @@ done 2>/dev/null
 # output (compiles are far slower than loopback reads), so the buffer is
 # drained by then; correctness is enforced downstream anyway — qemu's exit
 # code carries the guest verdict, and every consumer checks its output
-# (fam0 cmp, the 13000000 magic, gen_hash word count).
+# (fam0 cmp, the 13000000 magic).
 [ "$in" != "-" ] && cat "$in" >&3 2>/dev/null &
 cat <&3 > "$out" 2>/dev/null || :

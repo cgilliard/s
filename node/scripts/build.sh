@@ -50,15 +50,6 @@ run() {
 	rm -f "$stream"
 }
 
-PROGS=""
-prog() {  # prog NAME SOURCES... — build bin/NAME.bin and add it to the store as NAME
-	name=$1; shift
-	out=bin/$name.bin
-	echo "Building $* → $out" >&2
-	./tools/fam --prog -o "$out" "$@"
-	PROGS="$PROGS $name=$out"
-}
-
 # fsize FILE — size in bytes.  Portable: GNU stat spells it `-c %s`, BSD/macOS
 # `-f %z`; `wc -c` works everywhere (tr strips BSD wc's leading padding).
 fsize() { wc -c < "$1" | tr -d ' \t'; }
@@ -73,42 +64,6 @@ pack() {
         } > "$stream"
         serial_qemu "$stream" "$out" -device loader,file=bin/fampack,addr=0x80000000
         rm -f "$stream"
-}
-
-patch_config() {
-        bin=$1; data=$2
-        echo "Patching $bin (bin_size + hash of $data)" >&2
-        N=$(fsize "$data")
-        NCHUNKS=$(( (N + 1023) / 1024 ))      # tabernacle fetches 1 KiB chunks (src/image.fam)
-        TAB_SIZE=$(fsize "$bin")
-        # Layout at end of tabernacle: [nchunks 4B][bin_size 4B][hash 32B]
-        # Write nchunks (LE) at TAB_SIZE-40
-        printf "$(printf '\\%03o' $((NCHUNKS&255)) $(((NCHUNKS>>8)&255)) $(((NCHUNKS>>16)&255)) $(((NCHUNKS>>24)&255)))" \
-                | dd of="$bin" bs=1 seek=$((TAB_SIZE - 40)) conv=notrunc 2>/dev/null
-        # Write bin_size (LE) at TAB_SIZE-36
-        printf "$(printf '\\%03o' $((N&255)) $(((N>>8)&255)) $(((N>>16)&255)) $(((N>>24)&255)))" \
-                | dd of="$bin" bs=1 seek=$((TAB_SIZE - 36)) conv=notrunc 2>/dev/null
-        # Write hash at TAB_SIZE-32.  gen_hash reads its input via the loader
-        # (no serial input, so feed an empty stream) and emits the digest on
-        # the serial output file.
-        ghash_input="$bin.ghin.$$"
-        ghash_out="$bin.ghout.$$"
-        ghash_nul="$bin.ghnul.$$"
-        { printf "$(printf '\\%03o' $((N&255)) $(((N>>8)&255)) $(((N>>16)&255)) $(((N>>24)&255)))"
-          cat "$data"
-        } > "$ghash_input"
-        : > "$ghash_nul"
-        serial_qemu "$ghash_nul" "$ghash_out" \
-                -device loader,file=bin/gen_hash,addr=0x80000000 \
-                -device loader,file="$ghash_input",addr=0x80800000 2>/dev/null
-        HASH=$(cat "$ghash_out")
-        rm -f "$ghash_input" "$ghash_out" "$ghash_nul"
-        [ $(echo $HASH | wc -w) -eq 8 ] || { echo "gen_hash failed"; exit 1; }
-        LEHEX=""
-        for word in $HASH; do
-                LEHEX="${LEHEX}$(echo "$word" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')"
-        done
-        echo "$LEHEX" | xxd -r -p | dd of="$bin" bs=1 seek=$((TAB_SIZE - 32)) conv=notrunc 2>/dev/null
 }
 
 run bin/fam0 fam0.seed src/fam0.fam0
