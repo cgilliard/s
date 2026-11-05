@@ -65,12 +65,25 @@ impl Net {
 }
 
 /// A pays B over the message layer: B's wallet answers the slate, A's
-/// finalizes it, and A mines it.
+/// finalizes it, and A mines it. Before that, `send` refuses what is not
+/// an address or a name (a forgotten `@` once wrote a file named after
+/// it, reserving the inputs), and `send-file` writes a slate to a file.
 #[test]
 #[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn a_payment_goes_through_the_prompt() {
     let mut net = Net::start("pay");
     net.funded();
+    net.a.send("send 1 nobody");
+    let line = net.a.expect("the refusal", 30, |l| l.starts_with("error:") || l.starts_with("slate "));
+    assert!(line.contains("nobody is not a tab1… address, @NAME or @LABEL.NAME"), "A: {line}");
+    let file = net._dirs[1].0.join("pay.slate");
+    net.a.send(&format!("send-file 1 {}", file.display()));
+    let line = net.a.expect("the slate written", 30, |l| l.starts_with("slate ") || l.starts_with("error:"));
+    assert!(line.contains("written to"), "A: {line}");
+    assert!(file.exists());
+    let id = line.split_whitespace().nth(1).unwrap().to_string();
+    net.a.send(&format!("cancel {id}"));
+    net.a.expect("the slate cancelled", 30, |l| l.starts_with("slate cancelled"));
     let to = net.b.address();
     net.a.send(&format!("send 1 {to}"));
     net.a.expect("the slate sent", 30, |l| l.starts_with("slate ") && l.contains("sent to"));

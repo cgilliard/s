@@ -157,14 +157,16 @@ const HELP: &str = "commands:
   balance                   confirmed, pending, reserved and locked funds
   outputs                   the wallet's outputs
   send AMOUNT [FEE] TO [named]
-                            start a payment: TO is a file to write the slate to for
-                            the recipient, or a tab1… address, @NAME or @LABEL.NAME to send it to
-                            over the message layer, where the recipient's wallet
+                            pay TO, a tab1… address, @NAME or @LABEL.NAME: the slate
+                            goes over the message layer, where the recipient's wallet
                             answers it and this one finalizes it, if both are online
                             (the fee defaults to the smallest the pool takes); the
                             recipient learns nothing of the sender unless it adds
                             `named`, which puts this wallet's address in the slate
                             and so in the receipt
+  send-file AMOUNT [FEE] FILE [named]
+                            start a payment by file: write the slate to FILE for the
+                            recipient to `receive`, then `finalize` its answer
   receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
   cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
@@ -1312,6 +1314,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             | "balance"
             | "outputs"
             | "send"
+            | "send-file"
             | "finalize"
             | "cancel"
             | "sent"
@@ -1707,20 +1710,30 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 );
             }
         }
-        "send" => {
+        "send" | "send-file" => {
+            let to_file = cmd == "send-file";
+            let usage = if to_file {
+                "usage: send-file AMOUNT [FEE] FILE [named]"
+            } else {
+                "usage: send AMOUNT [FEE] ADDRESS|@NAME|@LABEL.NAME [named]"
+            };
             let (args, named) = match args {
                 [rest @ .., "named"] => (rest, true),
                 _ => (args, false),
             };
-            let (amount, fee, file) = match args {
-                [amount, file] => (*amount, None, *file),
-                [amount, fee, file] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *file),
-                _ => return Err("usage: send AMOUNT [FEE] FILE|ADDRESS|@NAME [named]".into()),
+            let (amount, fee, target) = match args {
+                [amount, target] => (*amount, None, *target),
+                [amount, fee, target] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *target),
+                _ => return Err(usage.into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
             // A sub-name's lookups and the slate go over one circuit.
             let group = lookup_tag() | 1;
-            let to = recipient_in(ctx, file, group)?;
+            let to = if to_file {
+                None
+            } else {
+                Some(recipient_in(ctx, target, group)?.ok_or_else(|| not_a_recipient(ctx, target))?)
+            };
             if to.is_some() {
                 await_reachable(ctx)?;
             }
@@ -1752,11 +1765,15 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 );
                 return Ok(());
             }
-            std::fs::write(file, slate.to_bytes())?;
+            if let Err(e) = std::fs::write(target, slate.to_bytes()) {
+                // Not written: nothing to answer, so its inputs are freed.
+                ctx.wallet()?.cancel_slate(&slate.id)?;
+                return Err(format!("{target}: {e}").into());
+            }
             println!(
                 "slate {} written to {}: {} coins plus {} fee from {} inputs; send it to the recipient",
                 &slate.id_hex()[..16],
-                file,
+                target,
                 fmt_coins(amount as u128),
                 fmt_coins(slate.fee as u128),
                 slate.inputs.len()
@@ -2505,6 +2522,17 @@ fn recipient_in(ctx: &Ctx, to: &str, group: u64) -> AnyResult<Option<Digest>> {
         return name_value(ctx, name).map(Some);
     }
     Ok(onion::parse_id(to))
+}
+
+/// Why `to` is no one `send` can send to, with a hint when it is a
+/// registered name missing its `@`.
+fn not_a_recipient(ctx: &Ctx, to: &str) -> Box<dyn std::error::Error> {
+    let registered = ctx.chain.env().read_txn().ok().is_some_and(|rtxn| {
+        tabminer::names::valid_name(to.as_bytes())
+            && ctx.chain.names().lookup(&rtxn, to.as_bytes()).ok().flatten().is_some()
+    });
+    let hint = if registered { format!(" (did you mean @{to}?)") } else { String::new() };
+    format!("{to} is not a tab1… address, @NAME or @LABEL.NAME{hint}; to write a slate to a file, use send-file").into()
 }
 
 /// A registered name's value.

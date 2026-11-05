@@ -268,9 +268,9 @@ would take (the recipient is offline) is cancelled and its inputs freed.
 Without the message layer, slates go as files by any channel:
 
 ```
-> send 10 /tmp/pay.slate            # sender: 10 coins at the smallest fee; reserves inputs
-> send 10 /tmp/pay.slate named      # the same, naming this wallet's address to the recipient
-> send 10 0.5 /tmp/pay.slate        # the same with a 0.5 fee
+> send-file 10 /tmp/pay.slate       # sender: 10 coins at the smallest fee; reserves inputs
+> send-file 10 /tmp/pay.slate named # the same, naming this wallet's address to the recipient
+> send-file 10 0.5 /tmp/pay.slate   # the same with a 0.5 fee
 > receive /tmp/pay.slate            # recipient: adds their output, writes /tmp/pay.slate.received
 > finalize /tmp/pay.slate.received  # sender: signs and pools the transaction
 > cancel ID                         # sender: replace it, before it confirms, with
