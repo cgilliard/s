@@ -46,6 +46,9 @@
 \ bye   ( -- )   RUNTIME: clean program shutdown (process exit 0).
 \        a `:` word — called, not inlined (no perf need; saves binary).
 : bye
+8323C1FF ,   \ lw   t2, -4(sp)          ( traps if the program left sp past the data
+\                                         stack's top, in the guard: an underflow `drop`
+\                                         alone never touches memory )
 B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher 0x100000 )
 37530000 ,   \ lui  t1, 0x5
 13035355 ,   \ addi t1, t1, 0x555       ( 0x5555 = PASS -> exit 0 )
@@ -108,7 +111,8 @@ abort        \ unterminated: print '?' and halt the compiler
 \          sp  = 0x87FF0000     data-stack top (grows DOWN toward the heap:
 \                               everything from the heap base to the top of
 \                               the machine's 128 MiB is shared between the two)
-\          s8  = 0x88000000     loop-control stack top (the last 64 KiB of RAM)
+\          s8  = 0x88000000     loop-control stack top (the last 64 KiB of RAM,
+\                               the lowest 4 KiB of it a guard: below)
 \        The RAM size is the virt machine's default (QEMU -m 128M, tools/q32
 \        and scripts/build.sh); another machine means another constant here.
 \        runtime fragment; must run before any `:`-word call.
@@ -179,7 +183,17 @@ E30C03FE ,   \ beq   t1,zero,h3
 130FFFFF ,   \ addi  t5,t5,-1
 E31A0FFC ,   \ bne   t5,zero,h1
 67800F00 ,   \ jalr  zero,0(t6)         ( return )
-\        done:
+\        done: a guard below the loop-control stack.  The 4 KiB just past the
+\        data stack's top, the bottom of the loop stack's 64 KiB, is made
+\        inaccessible by a locked PMP entry (locked: it binds M-mode too), so
+\        a data-stack underflow, or a loop stack over 60 KiB deep, traps
+\        (mcause 5 on a read, 7 on a write) instead of reading or overwriting
+\        the loop stack.
+B7C2FF21 ,   \ lui   t0,0x21ffc
+9382F21F ,   \ addi  t0,t0,511          ( NAPOT 0x87FF0000, 4 KiB: (base >> 2) | 0x1FF )
+7390023B ,   \ csrrw zero,pmpaddr0,t0
+93028009 ,   \ addi  t0,zero,152        ( 0x98: locked, NAPOT, no read/write/execute )
+7390023A ,   \ csrrw zero,pmpcfg0,t0
 ;
 
 

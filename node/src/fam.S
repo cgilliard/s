@@ -634,6 +634,10 @@ compile:
     add     t0, s10, t0
     lw      t0, 4(t0)                   # in-:I flag
     bnez    t0, __panic                 # unclosed ':I' definition
+    # And no control flow left open: an `if` without its `then`, a `begin`
+    # without its end, at the top level or in a Test block, leaves its
+    # placeholder on the cstack, never patched.
+    bne     tp, s8, __panic             # unbalanced control flow
     # Halt at the program end: a program that runs off its end -- or whose
     # final action is a call that returns to the EOT position -- lands here
     # instead of falling into the last island. (A real program exits before this.)
