@@ -1872,6 +1872,7 @@ pub(crate) fn freedom_report(
 /// Tests: a fuzzer's iterations and seed, from `TABMINER_FUZZ_ITERS`
 /// (else `iters`) and `TABMINER_FUZZ_SEED` (else `seed`); the nightly run
 /// sets both, and prints the seed so a failure can be replayed.
+#[cfg(test)]
 pub(crate) fn fuzz_params(iters: u64, seed: u64) -> (u64, u64) {
     let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
     let (iters, seed) = (var("TABMINER_FUZZ_ITERS").unwrap_or(iters), var("TABMINER_FUZZ_SEED").unwrap_or(seed));
