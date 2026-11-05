@@ -2113,7 +2113,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     println!("this wallet's node answers its sub-names itself");
                     true
                 }
-                ["server", ids @ ..] if !ids.is_empty() && ids.len() <= tabminer::subnames::MAX_SERVERS => {
+                ["server", ids @ ..] if !ids.is_empty() && ids.len() <= tabminer::subnames::MAX_ISSUERS => {
                     let mut servers = Vec::new();
                     for a in ids {
                         let id = recipient(ctx, a)?.ok_or_else(|| format!("{a} is not a tab1… address or @NAME"))?;
@@ -2560,7 +2560,7 @@ enum Wait {
 /// (or none) by id with when to ask again.
 #[derive(Default)]
 struct Resolved {
-    answers: std::collections::HashMap<(Vec<u8>, Vec<u8>), tabminer::subnames::Answer>,
+    answers: std::collections::HashMap<(Vec<u8>, Vec<u8>), tabminer::subnames::Cert>,
     delegations: std::collections::HashMap<Digest, (Option<tabminer::subnames::Delegation>, u64)>,
 }
 
@@ -2632,13 +2632,13 @@ impl Drop for Waiter<'_> {
 /// send after them share one circuit by `group`; the other servers' go
 /// over circuits of their own.
 fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<Digest> {
-    use tabminer::subnames::{Answer, Entry};
+    use tabminer::subnames::{Cert, Entry};
     let (l, n) = (label.as_bytes().to_vec(), name.as_bytes().to_vec());
     if !tabminer::names::valid_name(&l) {
         return Err(format!("{label} is not a sub-name label: 1 to 32 of a-z, 0-9 and _").into());
     }
     let value = name_value(ctx, name)?;
-    let id_of = |a: &Answer| -> AnyResult<Digest> {
+    let id_of = |a: &Cert| -> AnyResult<Digest> {
         match a.entry() {
             Entry::Id(id) => Ok(id),
             Entry::None => {
@@ -2684,7 +2684,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
             d
         }
     };
-    let servers = delegation.map_or(vec![value], |d| d.servers);
+    let servers = delegation.map_or(vec![value], |d| d.issuers);
     // Every server at once.
     let mut wait = Waiter::new(ctx);
     let mut tags = Vec::new();
@@ -2710,9 +2710,9 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match wait.rx.recv_timeout(left) {
             Ok(Note::Received(o)) => {
-                if let Some(a) = Answer::from_bytes(&o.inner)
+                if let Some(a) = Cert::from_bytes(&o.inner)
                     && a.verify(&n, &l, &servers, now())
-                    && o.answers.or(o.from.as_ref().map(|f| f.id)) == Some(a.server())
+                    && o.answers.or(o.from.as_ref().map(|f| f.id)) == Some(a.issuer())
                 {
                     break a;
                 }
@@ -2758,12 +2758,15 @@ fn say(ctx: &Ctx, msg: &str) {
 fn on_note(ctx: &Ctx, note: Note) {
     // A sub-name lookup's: to the command waiting for it.
     let key = match &note {
-        Note::Delegation { tag, .. } | Note::Failed { tag, .. } | Note::Delivered { tag, .. } => Some(Wait::Tag(*tag)),
+        Note::Delegation { tag, .. }
+        | Note::Cert { tag, .. }
+        | Note::Failed { tag, .. }
+        | Note::Delivered { tag, .. } => Some(Wait::Tag(*tag)),
         // From whoever answers: the id sent to (onion mode, along the
         // way back) or the sender named (init mode).
         Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
             let server = o.answers.or(o.from.as_ref().map(|a| a.id));
-            let Some((server, a)) = server.zip(tabminer::subnames::Answer::from_bytes(&o.inner)) else { return };
+            let Some((server, a)) = server.zip(tabminer::subnames::Cert::from_bytes(&o.inner)) else { return };
             Some(Wait::Answer(server, a.name, a.label))
         }
         _ => None,
@@ -2801,7 +2804,7 @@ fn on_note(ctx: &Ctx, note: Note) {
             ),
         },
         // A lookup given up on.
-        Note::Delegation { .. } => {}
+        Note::Delegation { .. } | Note::Cert { .. } => {}
         Note::Failed { tag, to, why } => {
             let to = tabminer::address::encode(&to);
             let mut outgoing = ctx.outgoing.lock().unwrap();

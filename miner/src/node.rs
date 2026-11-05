@@ -363,6 +363,16 @@ pub enum Event {
     GetDelegation(u64, Digest, u64),
     /// The sub-names this node answers for as a server.
     Subnames(crate::subnames::Table),
+    /// The sub-name certificates this node holds, as bundles
+    /// (`docs/SUBNAME_CERT.md`): published at their full names' points.
+    Certs(Vec<Vec<u8>>),
+    /// The wallet asks for the certificate of the full name whose point id
+    /// this is, under a tag and in a group: answered by `Note::Cert`.
+    GetCert(u64, Digest, u64),
+    /// Tests: names' values for the rendezvous points to check
+    /// certificates against, instead of the chain's.
+    #[cfg(test)]
+    TestNames(HashMap<Vec<u8>, Digest>),
     /// Tests: a body for the relay with this id at this address, over a
     /// channel opened for it if need be.
     #[cfg(test)]
@@ -1068,6 +1078,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Delegate(d)) => self.set_delegation(d),
                 Ok(Event::GetDelegation(tag, owner, group)) => self.get_delegation(tag, owner, group, Instant::now()),
                 Ok(Event::Subnames(table)) => self.rv.subnames = table,
+                Ok(Event::Certs(certs)) => self.set_certs(certs),
+                Ok(Event::GetCert(tag, point, group)) => self.get_cert(tag, point, group, Instant::now()),
+                #[cfg(test)]
+                Ok(Event::TestNames(names)) => self.rdv.test_names = Some(names),
                 #[cfg(test)]
                 Ok(Event::TestChannel(addr, id, body)) => {
                     let now = Instant::now();
@@ -5469,7 +5483,7 @@ mod tests {
                 Note::Received(o) => return o,
                 Note::Failed { why, .. } => panic!("{why}"),
                 Note::Delivered { tag, .. } => delivered.lock().unwrap().push(tag),
-                Note::Broadcast { .. } | Note::Delegation { .. } => {}
+                Note::Broadcast { .. } | Note::Delegation { .. } | Note::Cert { .. } => {}
             }
         };
         let out = Outbound {
@@ -6145,7 +6159,7 @@ mod tests {
     #[ignore = "slow: one job each in .github/workflows/test.yml"]
     fn sub_names_resolve_through_a_delegated_server() {
         use crate::onion;
-        use crate::subnames::{Answer, Delegation, Entry, Table, Zone};
+        use crate::subnames::{Cert, Delegation, Entry, Table, Zone};
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("subnames-{i}"))).collect();
         let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
         let id = |tag: u8| crate::address::id_of(key(tag).public_key());
@@ -6217,7 +6231,7 @@ mod tests {
         zone.entries.insert(b"cool".to_vec(), id(9));
         table.insert(b"example".to_vec(), zone);
         nodes[server].1.send(Event::Subnames(table)).unwrap();
-        let ask = |label: &[u8], tag: u64, group: u64| -> Answer {
+        let ask = |label: &[u8], tag: u64, group: u64| -> Cert {
             let out = Outbound {
                 tag,
                 to: id(5),
@@ -6232,7 +6246,7 @@ mod tests {
                 match nodes[resolver].2.recv_timeout(guard(30)).expect("a note") {
                     Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
                         assert_eq!(o.answers, Some(id(5)));
-                        return Answer::from_bytes(&o.inner).expect("an answer");
+                        return Cert::from_bytes(&o.inner).expect("an answer");
                     }
                     Note::Failed { why, .. } => panic!("{why}"),
                     _ => {}
@@ -6240,7 +6254,7 @@ mod tests {
             }
         };
         let a = ask(b"cool", 100, 0);
-        assert!(a.verify(b"example", b"cool", &d.servers, unix_now()));
+        assert!(a.verify(b"example", b"cool", &d.issuers, unix_now()));
         assert_eq!((a.entry(), a.seq), (Entry::Id(id(9)), 7));
         // One send's steps in a group share one outbound circuit: the
         // delegation, then the query, cost one circuit, not two.
@@ -6261,10 +6275,146 @@ mod tests {
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(built() - before, 1, "the query went over the delegation's circuit");
         let a = ask(b"nope", 101, 0);
-        assert!(a.verify(b"example", b"nope", &d.servers, unix_now()));
+        assert!(a.verify(b"example", b"nope", &d.issuers, unix_now()));
         assert_eq!(a.entry(), Entry::None);
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
+                n.1.send(Event::Stop).unwrap();
+            }
+        }
+        for n in nodes {
+            n.4.join().unwrap();
+        }
+    }
+
+    /// Sub-name certificates at their full names' points
+    /// (`docs/SUBNAME_CERT.md`): a holder publishes bundles up its own
+    /// circuit; the points check each against their chain and hold the
+    /// sound ones; a resolver finds them, the holder online or not. The
+    /// owner's `none` certificate takes the place of the holder's; an older
+    /// one does not come back; a newer delegation that drops an issuer
+    /// replaces that issuer's certificate; a name that changes hands drops
+    /// its old owner's.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn sub_name_certificates_are_held_at_their_points() {
+        use crate::subnames::{Bundle, Cert, Delegation, Entry, LIFETIME_SECS};
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("certs-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 3;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let listed: Vec<consensus::Relay> =
+            (0..3).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        // `example` is the owner's (key 4) on every chain.
+        let names = |owner: Digest| HashMap::from([(b"example".to_vec(), owner)]);
+        for n in &nodes {
+            n.1.send(Event::TestRelays(listed.clone())).unwrap();
+            n.1.send(Event::TestNames(names(id(4)))).unwrap();
+        }
+        let (owner, holder, resolver) = (3usize, 4usize, 5usize);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + guard(30);
+        while !(live(owner) && live(holder) && live(resolver)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(owner) && live(holder) && live(resolver));
+        let life = unix_now() + LIFETIME_SECS;
+        let bundle = |cert: Cert, delegation: Option<Delegation>| Bundle { cert, delegation };
+        // `cool` by the owner itself; `site` by an issuer (key 7) the
+        // owner's delegation names; `evil` by a key nobody authorized.
+        let cool = bundle(Cert::id(&key(4), b"example", b"cool", &id(5), 10, life).unwrap(), None);
+        let d1 = Delegation::make(&key(4), 1, life, &[id(7)]).unwrap();
+        let site = bundle(Cert::id(&key(7), b"example", b"site", &id(5), 11, life).unwrap(), Some(d1));
+        let evil = bundle(Cert::id(&key(9), b"example", b"evil", &id(9), 99, life).unwrap(), None);
+        nodes[holder].1.send(Event::Certs(vec![cool.to_bytes(), site.to_bytes(), evil.to_bytes()])).unwrap();
+        let mut tag = 0;
+        let mut fetch = |label: &[u8]| -> Option<Bundle> {
+            tag += 1;
+            nodes[resolver].1.send(Event::GetCert(tag, Cert::point(b"example", label), 0)).unwrap();
+            loop {
+                if let Note::Cert { tag: t, result, .. } = nodes[resolver].2.recv_timeout(guard(40)).expect("a note")
+                    && t == tag
+                {
+                    return result.expect("asked");
+                }
+            }
+        };
+        let deadline = Instant::now() + guard(30);
+        let mut wait_for = |label: &[u8], want: &dyn Fn(&Option<Bundle>) -> bool, what: &str| {
+            loop {
+                let got = fetch(label);
+                if want(&got) {
+                    return got;
+                }
+                assert!(Instant::now() < deadline, "{what}: got {got:?}");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        };
+        assert_eq!(wait_for(b"cool", &|g| g.is_some(), "the owner's certificate").as_ref(), Some(&cool));
+        assert_eq!(wait_for(b"site", &|g| g.is_some(), "the issuer's certificate").as_ref(), Some(&site));
+        assert_eq!(fetch(b"evil"), None, "an unauthorized certificate was held");
+        assert_eq!(fetch(b"nope"), None);
+        // The holder goes: its certificates stay with the full names' points.
+        nodes[holder].1.send(Event::Stop).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(fetch(b"cool").as_ref(), Some(&cool));
+        // The owner withdraws `cool` (after the points' update interval).
+        std::thread::sleep(Duration::from_secs(11));
+        let none = bundle(Cert::none(&key(4), b"example", b"cool", 12, life).unwrap(), None);
+        nodes[owner].1.send(Event::Certs(vec![none.to_bytes()])).unwrap();
+        let deadline = Instant::now() + guard(30);
+        let got = loop {
+            let got = fetch(b"cool");
+            if got.as_ref() != Some(&cool) {
+                break got;
+            }
+            assert!(Instant::now() < deadline, "the withdrawal never replaced the certificate");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert_eq!(got.as_ref(), Some(&none));
+        assert_eq!(got.unwrap().cert.entry(), Entry::None);
+        // The holder's older certificate, published again, does not come back.
+        std::thread::sleep(Duration::from_secs(11));
+        nodes[resolver].1.send(Event::Certs(vec![cool.to_bytes()])).unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(fetch(b"cool").as_ref(), Some(&none));
+        // A newer delegation that no longer names key 7 replaces its
+        // certificate for `site`, though with a lower seq.
+        let d2 = Delegation::make(&key(4), 2, life, &[id(8)]).unwrap();
+        let mine = bundle(Cert::id(&key(4), b"example", b"site", &id(6), 3, life).unwrap(), Some(d2));
+        nodes[owner].1.send(Event::Certs(vec![none.to_bytes(), mine.to_bytes()])).unwrap();
+        let deadline = Instant::now() + guard(30);
+        loop {
+            if fetch(b"site").as_ref() == Some(&mine) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the newer delegation never withdrew the issuer's certificate");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // `example` changes hands: the old owner's certificates stop
+        // counting at every point, as soon as they are asked for.
+        for n in nodes.iter().take(3) {
+            n.1.send(Event::TestNames(names(id(9)))).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(fetch(b"cool"), None);
+        assert_eq!(fetch(b"site"), None);
+        for (i, n) in nodes.iter().enumerate() {
+            if i != holder {
                 n.1.send(Event::Stop).unwrap();
             }
         }

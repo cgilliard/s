@@ -107,6 +107,15 @@ pub const RECEIVED: u8 = 14;
 pub const PUBLISH: u8 = 15;
 pub const GET_DELEGATION: u8 = 16;
 pub const DELEGATION: u8 = 17;
+/// Sub-name certificates (`docs/SUBNAME_CERT.md`), as bundles
+/// (`subnames::Bundle`): `PublishCert(bundle)` asks the last hop to pass
+/// it to the full name's rendezvous points (and hold it, if one),
+/// answered by `Notice(object, forwarded or rejected)`; `GetCert(point)`
+/// asks for the one held for a full name's point id, answered by
+/// `Cert(bundle)` or `Notice(point, offline)`.
+pub const PUBLISH_CERT: u8 = 18;
+pub const GET_CERT: u8 = 19;
+pub const CERT: u8 = 20;
 /// A return route's token.
 pub const TOKEN_LEN: usize = 16;
 
@@ -135,6 +144,9 @@ pub fn is_payment(cmd: u8) -> bool {
             | PUBLISH
             | GET_DELEGATION
             | DELEGATION
+            | PUBLISH_CERT
+            | GET_CERT
+            | CERT
     )
 }
 
@@ -485,6 +497,9 @@ mod tests {
             PUBLISH,
             GET_DELEGATION,
             DELEGATION,
+            PUBLISH_CERT,
+            GET_CERT,
+            CERT,
         ] {
             for len in [0, 16, 33, 6600, 14 * 870] {
                 assert_eq!(relay_bodies(cmd, &vec![1u8; len]).len(), PAYMENT_CELLS, "command {cmd}, {len} bytes");

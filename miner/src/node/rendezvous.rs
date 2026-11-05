@@ -15,6 +15,8 @@
 //! Received(object)     (from the recipient: the payload arrived)
 //! Publish(delegation)  → Notice(object, forwarded or rejected)
 //! GetDelegation(id)    → Delegation(delegation) or Notice(id, offline)
+//! PublishCert(bundle)  → Notice(object, forwarded or rejected)
+//! GetCert(point)       → Cert(bundle) or Notice(point, offline)
 //! Broadcast(tx)        → Notice(txid, forwarded or rejected)
 //! Route(token)         (remembered for one answer, a couple of minutes)
 //! Reply(relay, token, payload)
@@ -48,7 +50,21 @@
 //! Reply(token, payload) → Result(object, forwarded or offline)
 //! Store(delegation)   (no answer)
 //! Fetch(id)           → Held(delegation) or None(id)
+//! StoreCert(bundle)   (no answer)
+//! FetchCert(point)    → HeldCert(bundle) or NoCert(point)
 //! ```
+//!
+//! A sub-name certificate (`docs/SUBNAME_CERT.md`), with the delegation
+//! naming its issuer when the issuer is not the name's owner
+//! (`subnames::Bundle`), is held by the points of its full name
+//! (`Cert::point`). Whoever publishes it (the holder, up its standing
+//! circuit) reaches a point of its own, which checks it against its chain
+//! (the name's value, and the delegation) and passes it to the full
+//! name's points, holding it if it is one. Each keeps the highest `seq`,
+//! or a certificate in place of one a newer delegation no longer allows;
+//! drops one whose name no longer has the value it was checked against
+//! (checked again whenever it is asked for); and holds it until it
+//! expires. `GetCert` asks the full name's points in turn.
 //!
 //! A sub-name delegation (`docs/SUBNAMES.md`) is held by the owner's
 //! points apart from its session, so it is found while the owner is
@@ -80,7 +96,7 @@ use crate::net::{NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECT
 use crate::onion::{self, Announce, Object};
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
 use crate::pow::Digest;
-use crate::subnames::Delegation;
+use crate::subnames::{Bundle, Delegation};
 
 /// Messages between rendezvous points.
 const LOOKUP: u8 = 1;
@@ -92,8 +108,13 @@ const STORE: u8 = 6;
 const FETCH: u8 = 7;
 const HELD: u8 = 8;
 const NONE: u8 = 9;
+const STORE_CERT: u8 = 10;
+const FETCH_CERT: u8 = 11;
+const HELD_CERT: u8 = 12;
+const NO_CERT: u8 = 13;
 
-/// Between updates of one id's delegation, at least.
+/// Between updates of one id's delegation, or of one full name's
+/// certificate, at least.
 const DELEGATION_EVERY: Duration = Duration::from_secs(10);
 
 /// How long a return route is kept.
@@ -124,32 +145,34 @@ struct Held {
 /// circuit, sequence number and time, about a hundred bytes.
 #[derive(Default)]
 pub(super) struct Announces {
-    disk: Option<(heed::Env, [heed::Database<heed::types::Bytes, heed::types::Bytes>; 2])>,
-    memory: [HashMap<Digest, Vec<u8>>; 2],
+    disk: Option<(heed::Env, [heed::Database<heed::types::Bytes, heed::types::Bytes>; 3])>,
+    memory: [HashMap<Digest, Vec<u8>>; 3],
 }
 
-/// Which of [`Announces`]' tables: sessions' announces, or delegations.
+/// Which of [`Announces`]' tables: sessions' announces, delegations, or
+/// sub-name certificates (bundles, by point id).
 #[derive(Clone, Copy)]
 enum Table {
     Announce = 0,
     Delegation = 1,
+    Cert = 2,
 }
 
 impl Announces {
-    /// The store in `dir`, emptied: an announce table, and one of
-    /// delegations.
+    /// The store in `dir`, emptied: an announce table, one of delegations
+    /// and one of certificates.
     pub(super) fn open(dir: &std::path::Path) -> Result<Announces, String> {
         let env = crate::state_tree::open_env(dir, 16 << 30).map_err(|e| e.to_string())?;
         let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
         let mut dbs = Vec::new();
-        for name in ["announces", "delegations"] {
+        for name in ["announces", "delegations", "certs"] {
             let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
                 env.create_database(&mut wtxn, Some(name)).map_err(|e| e.to_string())?;
             db.clear(&mut wtxn).map_err(|e| e.to_string())?;
             dbs.push(db);
         }
         wtxn.commit().map_err(|e| e.to_string())?;
-        Ok(Announces { disk: Some((env, [dbs[0], dbs[1]])), memory: Default::default() })
+        Ok(Announces { disk: Some((env, [dbs[0], dbs[1], dbs[2]])), memory: Default::default() })
     }
 
     fn put(&mut self, id: &Digest, bytes: &[u8]) -> Result<(), String> {
@@ -207,6 +230,8 @@ enum Asking {
     Lookup,
     /// The id's delegation.
     Delegation,
+    /// The certificate of the full name whose point id this is.
+    Cert,
     /// The payload, and its object id.
     Forward(Vec<u8>, Digest),
     /// An answer along a return route: the token, the payload and its
@@ -237,7 +262,7 @@ struct Ask {
 impl Ask {
     fn subject(&self) -> Digest {
         match &self.what {
-            Asking::Lookup | Asking::Delegation => self.to,
+            Asking::Lookup | Asking::Delegation | Asking::Cert => self.to,
             Asking::Forward(_, object) | Asking::Reply(_, _, object) => *object,
         }
     }
@@ -258,6 +283,11 @@ pub(super) struct Rendezvous {
     delivering: HashMap<(Link, Digest), (Waiter, Instant)>,
     /// Delegations held, by owner id.
     delegations: HashMap<Digest, Delegated>,
+    /// Certificates held, by point id; their bundles in [`Announces`].
+    certs: HashMap<Digest, Delegated>,
+    /// Tests: names' values, instead of the chain's.
+    #[cfg(test)]
+    pub(super) test_names: Option<HashMap<Vec<u8>, Digest>>,
 }
 
 impl Rendezvous {
@@ -327,6 +357,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for id in expired {
             self.rdv.delegations.remove(&id);
             self.rdv.announces.remove_in(Table::Delegation, &id);
+        }
+        let expired: Vec<Digest> = self.rdv.certs.iter().filter(|(_, c)| c.expiry <= unix).map(|(id, _)| *id).collect();
+        for id in expired {
+            self.drop_cert(&id);
         }
         let late: Vec<usize> = (0..self.rdv.asks.len())
             .filter(|&i| self.rdv.asks[i].asked.is_some_and(|(_, t)| now.duration_since(t) >= ASK_TIMEOUT))
@@ -432,6 +466,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             circuit::PUBLISH => {
                 let code = self.publish_delegation(msg, now);
                 self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), code), now);
+            }
+            circuit::PUBLISH_CERT => {
+                let code = self.publish_cert(msg, now);
+                self.hop_reply(link, circuit::NOTICE, &result(&Object::id_of(msg), code), now);
+            }
+            circuit::GET_CERT => {
+                let Some(point) = (msg.len() == 32).then(|| digest_from_bytes(msg)).flatten() else { return true };
+                self.start_ask(link, point, Asking::Cert, now);
             }
             circuit::SEND => match Object::from_bytes(msg) {
                 Some(Object::Payload(p)) => {
@@ -603,6 +645,106 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         Ok(owner)
     }
 
+    /// A name's value on chain, now.
+    fn name_value(&self, name: &[u8]) -> Option<Digest> {
+        #[cfg(test)]
+        if let Some(names) = &self.rdv.test_names {
+            return names.get(name).copied();
+        }
+        let rtxn = self.chain.env().read_txn().ok()?;
+        self.chain.names().lookup(&rtxn, name).ok().flatten().map(|r| r.value)
+    }
+
+    /// Whether `b` is sound against this relay's chain, now.
+    fn cert_ok(&self, b: &Bundle) -> bool {
+        self.name_value(&b.cert.name).is_some_and(|v| b.verify(&v, super::unix_now()))
+    }
+
+    fn drop_cert(&mut self, point: &Digest) {
+        self.rdv.certs.remove(point);
+        self.rdv.announces.remove_in(Table::Cert, point);
+    }
+
+    /// The bundle held for `point`, checked again against the chain: one
+    /// whose name changed hands, or that expired, is dropped.
+    fn held_cert(&mut self, point: &Digest) -> Option<(Bundle, Vec<u8>)> {
+        self.rdv.certs.get(point)?;
+        let bytes = self.rdv.announces.get_in(Table::Cert, point);
+        match bytes.as_deref().and_then(Bundle::from_bytes).filter(|b| self.cert_ok(b)) {
+            Some(b) => Some((b, bytes.unwrap())),
+            None => {
+                self.drop_cert(point);
+                None
+            }
+        }
+    }
+
+    /// A certificate published over a circuit: checked against the chain,
+    /// held here if this relay is one of the full name's points, and passed
+    /// to the others.
+    fn publish_cert(&mut self, bytes: &[u8], now: Instant) -> u8 {
+        let Some(b) = Bundle::from_bytes(bytes).filter(|b| self.cert_ok(b)) else {
+            return NOTICE_REJECTED;
+        };
+        if !self.config.relay {
+            return NOTICE_REJECTED;
+        }
+        let point = b.point();
+        if self.serves(&point)
+            && let Err(code) = self.hold_cert(bytes, now)
+        {
+            return code;
+        }
+        let me = self.my_id();
+        for p in self.points_of(&point).into_iter().filter(|p| Some(*p) != me) {
+            let Some(addr) = self.relay_addr(&p) else { continue };
+            let Ok(key) = self.channel_to(addr, p, now) else { continue };
+            for c in rendezvous_cells(STORE_CERT, bytes) {
+                let _ = self.channel_send(key, &c.to_bytes(), now);
+            }
+        }
+        NOTICE_FORWARDED
+    }
+
+    /// A certificate to hold, published or passed on by another point: its
+    /// point id once held, or why not. It must be sound against the chain
+    /// and for a full name this relay is a point of; it takes the place of
+    /// the one held if its `seq` is higher (not too soon after the last
+    /// update), or if it carries a newer delegation that no longer allows
+    /// the one held.
+    fn hold_cert(&mut self, bytes: &[u8], now: Instant) -> Result<Digest, u8> {
+        let b = Bundle::from_bytes(bytes).ok_or(NOTICE_REJECTED)?;
+        let point = b.point();
+        if !self.config.relay || !self.serves(&point) || !self.cert_ok(&b) {
+            return Err(NOTICE_REJECTED);
+        }
+        let updated = self.rdv.certs.get(&point).map(|c| c.updated);
+        if let Some((old, _)) = self.held_cert(&point) {
+            if old.cert.seq == b.cert.seq && old.cert.issuer() == b.cert.issuer() {
+                return Ok(point);
+            }
+            let value = self.name_value(&b.cert.name).ok_or(NOTICE_REJECTED)?;
+            let withdrawn = match (&b.delegation, &old.delegation) {
+                (Some(new), Some(was)) => new.seq > was.seq && !old.allowed_by(&value, new),
+                (Some(new), None) => !old.allowed_by(&value, new),
+                _ => false,
+            };
+            let soon = updated.is_some_and(|t| now.duration_since(t) < DELEGATION_EVERY);
+            if !withdrawn && (!b.cert.supersedes(&old.cert) || soon) {
+                return Err(NOTICE_REFUSED);
+            }
+        } else if self.rdv.certs.len() >= self.config.max_sessions {
+            return Err(NOTICE_REFUSED);
+        }
+        if let Err(e) = self.rdv.announces.put_in(Table::Cert, &point, bytes) {
+            self.log(&format!("rendezvous: keeping a certificate: {e}"));
+            return Err(NOTICE_REFUSED);
+        }
+        self.rdv.certs.insert(point, Delegated { seq: b.cert.seq, expiry: b.cert.expiry, updated: now });
+        self.chatter(&format!("rendezvous: a certificate for {}", onion::short(&point)));
+        Ok(point)
+    }
+
     /// The listed relays that are `id`'s rendezvous points, in the order
     /// they are asked: the preferred list's first, then, during a switch,
     /// the other's (`docs/ONION.md`).
@@ -617,7 +759,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn start_ask(&mut self, client: Link, to: Digest, what: Asking, now: Instant) {
         if self.rdv.asks.len() >= MAX_ASKS {
             let subject = match &what {
-                Asking::Lookup | Asking::Delegation => to,
+                Asking::Lookup | Asking::Delegation | Asking::Cert => to,
                 Asking::Forward(_, o) | Asking::Reply(_, _, o) => *o,
             };
             return self.hop_reply(client, circuit::NOTICE, &result(&subject, NOTICE_REFUSED), now);
@@ -650,6 +792,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     }
                     continue;
                 }
+                if matches!(a.what, Asking::Cert) {
+                    if let Some((_, bytes)) = self.held_cert(&to) {
+                        let a = self.rdv.asks.remove(i);
+                        return self.hop_reply(a.client, circuit::CERT, &bytes, now);
+                    }
+                    continue;
+                }
                 if self.rdv.held.contains_key(&to) {
                     let a = self.rdv.asks.remove(i);
                     return self.answer_locally(a, now);
@@ -663,6 +812,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let cells = match &a.what {
                 Asking::Lookup => rendezvous_cells(LOOKUP, &digest_to_bytes(&to)),
                 Asking::Delegation => rendezvous_cells(FETCH, &digest_to_bytes(&to)),
+                Asking::Cert => rendezvous_cells(FETCH_CERT, &digest_to_bytes(&to)),
                 Asking::Forward(bytes, _) => rendezvous_cells(FORWARD, bytes),
                 Asking::Reply(token, bytes, _) => {
                     let mut body = token.to_vec();
@@ -691,8 +841,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Asking::Forward(bytes, _) => self.deliver(link, &bytes, Waiter::Client(a.client), now),
             // Asked of the route's own relay only, which is not this one;
-            // delegations are answered in `ask_next`.
-            Asking::Reply(..) | Asking::Delegation => {}
+            // delegations and certificates are answered in `ask_next`.
+            Asking::Reply(..) | Asking::Delegation | Asking::Cert => {}
         }
     }
 
@@ -765,6 +915,38 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 };
                 for c in reply {
                     let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
+            STORE_CERT => {
+                let _ = self.hold_cert(body, now);
+            }
+            FETCH_CERT => {
+                let Some(point) = (body.len() == 32).then(|| digest_from_bytes(body)).flatten() else { return };
+                let reply = match self.held_cert(&point) {
+                    Some((_, bytes)) => rendezvous_cells(HELD_CERT, &bytes),
+                    None => rendezvous_cells(NO_CERT, body),
+                };
+                for c in reply {
+                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
+            HELD_CERT | NO_CERT => {
+                let point = match kind {
+                    HELD_CERT => Bundle::from_bytes(body).map(|b| b.point()),
+                    _ => (body.len() == 32).then(|| digest_from_bytes(body)).flatten(),
+                };
+                let Some(point) = point else { return };
+                let Some(i) = self.rdv.asks.iter().position(|q| {
+                    q.asked.is_some_and(|(k, _)| k == key) && matches!(q.what, Asking::Cert) && q.to == point
+                }) else {
+                    return;
+                };
+                if kind == HELD_CERT {
+                    let q = self.rdv.asks.remove(i);
+                    self.hop_reply(q.client, circuit::CERT, body, now);
+                } else {
+                    self.rdv.asks[i].asked = None;
+                    self.ask_next(i, now);
                 }
             }
             HELD | NONE => {

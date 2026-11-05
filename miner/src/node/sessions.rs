@@ -118,6 +118,10 @@ pub enum Note {
     /// held, none (no point of the owner's holds one, or init mode), or
     /// why it could not be asked. Not yet checked against the chain.
     Delegation { tag: u64, owner: Digest, result: Result<Option<crate::subnames::Delegation>, String> },
+    /// The sub-name certificate asked for (`docs/SUBNAME_CERT.md`): the
+    /// bundle held for the full name whose point id this is, none, or why
+    /// it could not be asked.
+    Cert { tag: u64, point: Digest, result: Result<Option<crate::subnames::Bundle>, String> },
 }
 
 /// The participant: its Dilithium key and its Kyber keys.

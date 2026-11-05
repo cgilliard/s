@@ -167,7 +167,8 @@ struct Standing {
     next: Option<u64>,
     /// The circuit it replaced, closed once the session is live again.
     retiring: Option<(u64, Instant)>,
-    /// Whether our delegation went up the circuit since it was built.
+    /// Whether our delegation and certificates went up the circuit since
+    /// it was built.
     published: bool,
 }
 
@@ -209,10 +210,13 @@ struct Out {
     built: Instant,
 }
 
-/// A delegation asked for (`docs/SUBNAMES.md`), over an outbound circuit.
+/// A delegation (`docs/SUBNAMES.md`) or a sub-name certificate
+/// (`docs/SUBNAME_CERT.md`) asked for, over an outbound circuit.
 struct Fetch {
     tag: u64,
+    /// The owner's id, or the full name's point id for a certificate.
     owner: Digest,
+    cert: bool,
     /// Its group (`Outbound::group`), zero for none.
     group: u64,
     circuit: Option<u64>,
@@ -253,6 +257,9 @@ pub(super) struct Participant {
     broadcasts: Vec<Broadcast>,
     /// Our sub-name delegation, published at our points while it is set.
     pub(super) delegation: Option<Vec<u8>>,
+    /// Sub-name certificates we hold (bundles), published through our
+    /// points to their full names' points.
+    pub(super) certs: Vec<Vec<u8>>,
     fetches: Vec<Fetch>,
     /// Outbound circuits a group's step is done with, kept for its next:
     /// the circuit, the group and until when.
@@ -291,6 +298,7 @@ impl Default for Participant {
             jobs: Vec::new(),
             broadcasts: Vec::new(),
             delegation: None,
+            certs: Vec::new(),
             fetches: Vec::new(),
             kept: Vec::new(),
             built: 0,
@@ -572,7 +580,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         // Init mode holds no delegations: none, so the owner is asked.
         for f in std::mem::take(&mut self.part.fetches) {
-            self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result: Ok(None) });
+            self.fetch_note(&f, Ok(None));
         }
     }
 
@@ -696,7 +704,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut ask = Vec::new();
         let mut publish = Vec::new();
         let keepalive = self.part.keepalive;
-        let delegated = self.part.delegation.is_some();
+        let delegated = self.part.delegation.is_some() || !self.part.certs.is_empty();
         for (i, s) in self.part.standing.iter_mut().enumerate() {
             if let Some((old, since)) = s.retiring
                 && (s.live(seq, now) || now.duration_since(since) >= RETIRE_WAIT)
@@ -758,10 +766,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let last = self.circuit_hops(h).saturating_sub(1);
             let _ = self.circuit_send(h, last, circuit::SESSION, &digest_to_bytes(&id), now);
         }
-        if let Some(d) = self.part.delegation.clone() {
-            for h in publish {
-                let last = self.circuit_hops(h).saturating_sub(1);
+        let certs = self.part.certs.clone();
+        for h in publish {
+            let last = self.circuit_hops(h).saturating_sub(1);
+            if let Some(d) = self.part.delegation.clone() {
                 let _ = self.circuit_send(h, last, circuit::PUBLISH, &d, now);
+            }
+            for b in &certs {
+                let _ = self.circuit_send(h, last, circuit::PUBLISH_CERT, b, now);
             }
         }
         self.keep_outbound(now);
@@ -779,17 +791,49 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// The sub-name certificates we hold, as bundles: published through
+    /// our points once a session is live, again on every new circuit or
+    /// point.
+    pub(super) fn set_certs(&mut self, certs: Vec<Vec<u8>>) {
+        self.part.certs = certs;
+        for s in &mut self.part.standing {
+            s.published = false;
+        }
+    }
+
     /// The wallet asks for `owner`'s delegation.
     pub(super) fn get_delegation(&mut self, tag: u64, owner: Digest, group: u64, now: Instant) {
+        self.start_fetch(Fetch { tag, owner, cert: false, group, circuit: None, started: now }, now);
+    }
+
+    /// The wallet asks for the certificate of the full name whose point id
+    /// is `point`.
+    pub(super) fn get_cert(&mut self, tag: u64, point: Digest, group: u64, now: Instant) {
+        self.start_fetch(Fetch { tag, owner: point, cert: true, group, circuit: None, started: now }, now);
+    }
+
+    fn start_fetch(&mut self, f: Fetch, now: Instant) {
         if !self.rv.onion_active() {
             // Init mode holds none: the owner is its own server.
-            return self.rv.note(Note::Delegation { tag, owner, result: Ok(None) });
+            return self.fetch_note(&f, Ok(None));
         }
         if self.part.fetches.len() >= MAX_SENDS {
-            return self.rv.note(Note::Delegation { tag, owner, result: Err("too many lookups in progress".into()) });
+            return self.fetch_note(&f, Err("too many lookups in progress".into()));
         }
-        self.part.fetches.push(Fetch { tag, owner, group, circuit: None, started: now });
+        self.part.fetches.push(f);
         self.progress_fetches(now);
+    }
+
+    /// The wallet's answer to fetch `f`: the bytes held (a delegation or a
+    /// bundle), none, or why not.
+    fn fetch_note(&mut self, f: &Fetch, result: Result<Option<Vec<u8>>, String>) {
+        if f.cert {
+            let result = result.map(|b| b.and_then(|b| crate::subnames::Bundle::from_bytes(&b)));
+            self.rv.note(Note::Cert { tag: f.tag, point: f.owner, result });
+        } else {
+            let result = result.map(|b| b.and_then(|b| crate::subnames::Delegation::from_bytes(&b)));
+            self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result });
+        }
     }
 
     /// Asks for each delegation not yet asked, over an outbound circuit of
@@ -809,7 +853,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     self.release_outbound(h, "lookup unanswered", now);
                 }
                 let why = if f.circuit.is_some() { "no answer from the relay" } else { "no circuit to ask over" };
-                self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result: Err(why.into()) });
+                self.fetch_note(&f, Err(why.into()));
                 continue;
             }
             let group = self.part.fetches[i].group;
@@ -818,8 +862,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             {
                 self.part.fetches[i].circuit = Some(h);
                 let owner = self.part.fetches[i].owner;
+                let cmd = if self.part.fetches[i].cert { circuit::GET_CERT } else { circuit::GET_DELEGATION };
                 let last = self.circuit_hops(h).saturating_sub(1);
-                if self.circuit_send(h, last, circuit::GET_DELEGATION, &digest_to_bytes(&owner), now).is_err() {
+                if self.circuit_send(h, last, cmd, &digest_to_bytes(&owner), now).is_err() {
                     self.part.fetches[i].circuit = None;
                     self.release_outbound(h, "lookup not sent", now);
                 }
@@ -861,6 +906,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// The answer to certificate fetch `i`: done, its circuit closed or
+    /// kept for its group's next step.
+    fn fetched_cert(&mut self, i: usize, result: Result<Option<Vec<u8>>, String>, now: Instant) {
+        let f = self.part.fetches.remove(i);
+        if let Some(h) = f.circuit {
+            self.finish_outbound(h, f.group, "lookup answered", now);
+        }
+        self.fetch_note(&f, result);
+    }
+
     /// The answer to fetch `i`: done, its circuit closed.
     fn fetched(&mut self, i: usize, result: Result<Option<crate::subnames::Delegation>, String>, now: Instant) {
         let f = self.part.fetches.remove(i);
@@ -869,7 +924,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let me = self.rv.me.as_ref().map(|m| m.id);
             match (result, f.circuit) {
                 (Ok(Some(d)), Some(h))
-                    if me.is_some_and(|m| d.servers.contains(&m)) && d.verify(&f.owner, unix_now()) =>
+                    if me.is_some_and(|m| d.issuers.contains(&m)) && d.verify(&f.owner, unix_now()) =>
                 {
                     let bytes = d.to_bytes();
                     let last = self.circuit_hops(h).saturating_sub(1);
@@ -1212,6 +1267,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             return true;
         }
+        // The answer to publishing one of our certificates.
+        if cmd == circuit::NOTICE
+            && msg.len() == 33
+            && self.part.certs.iter().any(|b| digest_from_bytes(&msg[..32]) == Some(Object::id_of(b)))
+        {
+            if msg[32] == NOTICE_FORWARDED {
+                self.chatter("onion: a sub-name certificate passed to its points");
+            } else {
+                self.log("onion: a relay would not take our sub-name certificate");
+            }
+            return true;
+        }
         // The answer to publishing our delegation.
         if cmd == circuit::NOTICE
             && msg.len() == 33
@@ -1222,6 +1289,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.chatter("onion: our delegation is held at our rendezvous point");
             } else {
                 self.log("onion: our rendezvous point would not hold our delegation");
+            }
+            return true;
+        }
+        // The answer to a certificate asked for.
+        if let Some(i) = self.part.fetches.iter().position(|f| f.circuit == Some(handle) && f.cert) {
+            let point = self.part.fetches[i].owner;
+            match cmd {
+                circuit::CERT => match crate::subnames::Bundle::from_bytes(msg) {
+                    Some(b) if b.point() == point => self.fetched_cert(i, Ok(Some(msg.to_vec())), now),
+                    _ => self.fetched_cert(i, Err("a malformed certificate".into()), now),
+                },
+                circuit::NOTICE if msg.len() == 33 && digest_from_bytes(&msg[..32]) == Some(point) => match msg[32] {
+                    NOTICE_OFFLINE => self.fetched_cert(i, Ok(None), now),
+                    _ => self.fetched_cert(i, Err("refused by the relay".into()), now),
+                },
+                _ => {}
             }
             return true;
         }

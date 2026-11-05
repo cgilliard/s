@@ -58,8 +58,13 @@ The certificate is valid for `label.name` when its issuer key either:
 
 Case 1 needs nothing but the chain. Case 2 lets an owner keep its key
 offline and leave renewals to an always-on issuer, as delegating to a
-server did. A resolver needs the delegation only when the issuer key
-does not hash to `V`.
+server did.
+
+A certificate travels and is held as a **bundle** (`subnames::Bundle`):
+the certificate, with the delegation naming its issuer in case 2. The
+issuer has that delegation and gives it to the holder with the
+certificate; so a point, and a resolver, check a bundle against the
+chain alone, with no fetch of `V`'s delegation from `V`'s points.
 
 The delegation's lifetime goes up with the certificates': signed for 7
 days and renewed daily, at most 30 days (today it is signed for a day,
@@ -82,8 +87,7 @@ period. The point that takes it passes it to `N`'s other points
 - checks the signature, the expiry, that `N` is computed from the
   certificate's own name and label, and that it serves `N`;
 - checks the issuer against its chain: the key hashes to `name`'s value
-  (case 1), or is in `V`'s delegation (case 2; the point fetches the
-  delegation from `V`'s points, as a server does today when it moves);
+  (case 1), or is in the bundle's delegation, a sound one of `V` (case 2);
 - keeps the highest `seq` per `N` until its expiry, taking an update at
   most every 10 seconds per `N`;
 - checks its stored certificates again when the issuer's authority
@@ -91,8 +95,13 @@ period. The point that takes it passes it to `N`'s other points
   the old owner's certificates stop counting) and when it learns a newer
   delegation of `V` (a removed issuer's certificates stop counting).
   Certificates that no longer pass are dropped, so these take effect at
-  once rather than at expiry. A point learns of a value change from its
-  chain, and of a newer delegation when one is published or fetched.
+  once rather than at expiry. A point checks a held certificate against
+  its chain again whenever it is asked for or replaced, and learns of a
+  newer delegation from a bundle for the same full name that carries
+  one: that bundle takes the place of a certificate the newer delegation
+  no longer allows, whatever the `seq`s. So an owner removing an issuer
+  publishes, for each of the issuer's sub-names, a bundle with the new
+  delegation.
 
 Anyone holding a valid certificate may publish it: the holder normally,
 but also the owner or its issuer, which is how revocation works (below).
@@ -102,10 +111,10 @@ one out with a higher `seq`.
 ## Resolving `send 5 @cool.example`
 
 1. Read `example → V` from the chain.
-2. Ask `N`'s points for the certificate (`GetCert`), over an outbound
+2. Ask `N`'s points for the bundle (`GetCert`), over an outbound
    circuit; the last relay tries `N`'s points in turn, as a lookup does.
 3. Check it: the signature, the expiry, the name and label, and the
-   issuer against `V` (fetching `V`'s delegation only in case 2). Learn
+   issuer against `V` (with the bundle's delegation in case 2). Learn
    `T`.
 4. Pay `T` as any id: `T`'s announce at its own points, then the slate.
 
@@ -223,11 +232,20 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
    default and 30 at most, for certificates and delegations alike; tests
    for forged, expired, too-long, other-name, other-label and
    unauthorized-issuer certificates, and the highest-`seq` rule.
-2. Points: `Publish`/`Store`/`GetCert` for certificates at `N`'s points,
-   the issuer checked against the chain (fetching delegations when
-   needed), kept in the rendezvous LMDB beside announces and delegations;
-   checked again when a name's value or its delegation changes; carried
-   across epoch boundaries as delegations are.
+2. Points: `PublishCert`/`StoreCert`/`GetCert` for bundles at `N`'s
+   points, the issuer checked against the chain, kept in the rendezvous
+   LMDB beside announces and delegations; checked again when a name's
+   value or its delegation changes; carried across epoch boundaries as
+   delegations are.
+   Done (2026-11-05): `subnames::Bundle`; circuit commands
+   `PublishCert`, `GetCert`, `Cert`, between points `StoreCert`,
+   `FetchCert`, `HeldCert`, `NoCert` (`node/rendezvous.rs`); a held
+   bundle checked against the chain when asked for or replaced; the
+   participant publishes its bundles up its standing circuits
+   (`Event::Certs`) and fetches one over an outbound circuit
+   (`Event::GetCert`, `Note::Cert`). Tested end to end by
+   `sub_name_certificates_are_held_at_their_points`. Carrying across
+   epoch boundaries is the holder's republishing each epoch (step 3).
 3. The holder: `KIND_SUBNAME_CERT` received and kept, published at `N`'s
    points every epoch and on renewal.
 4. The issuer: certificates signed from the wallet's table and sent on
