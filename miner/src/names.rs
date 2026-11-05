@@ -82,10 +82,16 @@ pub const CHARSET: &[u8; 37] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
 /// Element values run from 1 to this; 0 is padding.
 pub const CHAR_MAX: u32 = CHARSET.len() as u32;
 
-/// Most reveals in a block.
-pub const MAX_REVEALS: usize = 5;
-/// Most commits in a block.
-pub const MAX_COMMITS: usize = 8;
+/// Most reveals in a block. Every reveal needs a commit, so names come at
+/// most one a block over time ([`MAX_COMMITS`]): 52,560 a year. Two let
+/// reveals catch up after a burst rather than bid for one slot, so a
+/// commit finds one within its window. Sub-names (`docs/SUBNAME_CERT.md`)
+/// give names to as many users as their owners admit, so few top-level
+/// ones are needed; a name never expires, so a slow allocation keeps the
+/// namespace from being taken early (`docs/NAMES.md`).
+pub const MAX_REVEALS: usize = 2;
+/// Most commits in a block: one, the long-run rate of new names.
+pub const MAX_COMMITS: usize = 1;
 /// Most updates in a block.
 pub const MAX_UPDATES: usize = 8;
 /// Most swept commits in a block.
@@ -1519,8 +1525,9 @@ mod tests {
         let kinds = |n: usize, k: OpKind| std::iter::repeat_n(k, n);
         assert_eq!(
             count_ops(kinds(MAX_REVEALS, OpKind::Reveal).chain(kinds(MAX_COMMITS, OpKind::Commit))),
-            Ok([8, 5, 0, 0])
+            Ok([MAX_COMMITS, MAX_REVEALS, 0, 0])
         );
+        assert_eq!(count_ops(kinds(MAX_COMMITS + 1, OpKind::Commit)), Err(OpKind::Commit));
         assert_eq!(count_ops(kinds(MAX_REVEALS + 1, OpKind::Reveal)), Err(OpKind::Reveal));
         assert_eq!(count_ops(kinds(MAX_UPDATES + 1, OpKind::Update)), Err(OpKind::Update));
         assert_eq!(count_ops(kinds(MAX_SWEEPS + 1, OpKind::Sweep)), Err(OpKind::Sweep));
@@ -1565,17 +1572,17 @@ mod tests {
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         utxo.add(&mut wtxn, &d(1)).unwrap();
         let root0 = utxo.root(&wtxn).unwrap();
-        // Block 10: two commits at positions 1 and 2.
-        let ops10 = [
-            Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
-            Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
-        ];
+        // Blocks 10 and 11: a commit each (one a block), at positions 1 and 2.
+        let ops10 = [Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) }];
+        let ops11 = [Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) }];
         let u10 = set.apply(&utxo, &mut wtxn, 10, &ops10, &[]).unwrap();
-        assert_eq!(u10.commits.len(), 2);
-        assert_eq!(utxo.next_position(&wtxn).unwrap(), 3);
-        assert_eq!(set.commit_at(&wtxn, 2).unwrap(), Some(Commit { hash: d(12), height: 10 }));
+        assert_eq!(u10.commits.len(), 1);
         let root10 = utxo.root(&wtxn).unwrap();
         assert_ne!(root10, root0);
+        set.apply(&utxo, &mut wtxn, 11, &ops11, &[]).unwrap();
+        assert_eq!(utxo.next_position(&wtxn).unwrap(), 3);
+        assert_eq!(set.commit_at(&wtxn, 2).unwrap(), Some(Commit { hash: d(12), height: 11 }));
+        let root11 = utxo.root(&wtxn).unwrap();
         // Block 22: reveal at position 1, then update the name.
         let alice = record("alice", 20);
         let alice2 = record("alice", 30);
@@ -1624,6 +1631,7 @@ mod tests {
         utxo.add(&mut wtxn, &d(1)).unwrap();
         set.clear(&mut wtxn).unwrap();
         let u10 = set.apply(&utxo, &mut wtxn, 10, &ops10, &[]).unwrap();
+        let u11 = set.apply(&utxo, &mut wtxn, 11, &ops11, &[]).unwrap();
         let u22 = set.apply(&utxo, &mut wtxn, 22, &ops22, &[]).unwrap();
         let u300 = set.apply(&utxo, &mut wtxn, 300, &[], &[2]).unwrap();
         assert_eq!(utxo.root(&wtxn).unwrap(), root300);
@@ -1633,13 +1641,16 @@ mod tests {
         assert_eq!(NameUndo::from_bytes(&NameUndo::default().to_bytes()), Some(NameUndo::default()));
         set.undo(&utxo, &mut wtxn, &u300, 3).unwrap();
         assert_eq!(utxo.root(&wtxn).unwrap(), root22);
-        assert_eq!(set.commit_at(&wtxn, 2).unwrap(), Some(Commit { hash: d(12), height: 10 }));
+        assert_eq!(set.commit_at(&wtxn, 2).unwrap(), Some(Commit { hash: d(12), height: 11 }));
         set.undo(&utxo, &mut wtxn, &u22, 3).unwrap();
-        assert_eq!(utxo.root(&wtxn).unwrap(), root10);
+        assert_eq!(utxo.root(&wtxn).unwrap(), root11);
         assert_eq!(set.lookup(&wtxn, b"alice").unwrap(), None);
         assert!(utxo.output_at(&wtxn, 1).unwrap().is_some());
-        // The block's commits are removed by the caller's truncate.
-        utxo.truncate(&mut wtxn, 1, &[commit_leaf(&d(10), 10), commit_leaf(&d(12), 10)]).unwrap();
+        // A block's commit is removed by the caller's truncate.
+        utxo.truncate(&mut wtxn, 2, &[commit_leaf(&d(12), 11)]).unwrap();
+        set.undo(&utxo, &mut wtxn, &u11, 2).unwrap();
+        assert_eq!(utxo.root(&wtxn).unwrap(), root10);
+        utxo.truncate(&mut wtxn, 1, &[commit_leaf(&d(10), 10)]).unwrap();
         set.undo(&utxo, &mut wtxn, &u10, 1).unwrap();
         assert_eq!(utxo.root(&wtxn).unwrap(), root0);
         assert!(set.commits(&wtxn).unwrap().is_empty());

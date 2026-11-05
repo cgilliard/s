@@ -552,7 +552,7 @@ mod tests {
             BlockNameOp::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
             BlockNameOp::Reveal { record: record("alice", 20), commit: 12 },
             BlockNameOp::Update(record("bob_99", 30)),
-            BlockNameOp::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
+            BlockNameOp::Reveal { record: record("carol", 40), commit: 14 },
         ]
     }
 
@@ -593,14 +593,14 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
         let bytes = ok.to_bytes();
         assert_eq!(bytes.len(), ok.size());
-        assert_eq!(ok.names_size(), 2 * 53 + (98 + 5 + 5) + (98 + 6) + 2 * 5);
+        assert_eq!(ok.names_size(), 53 + 2 * (98 + 5 + 5) + (98 + 6) + 2 * 5);
         assert_eq!(bytes.len(), 20 + 5 + 2 * 60 + ok.names_size() + 1);
         assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
         assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(BodyError::Malformed));
         assert_eq!(ok.op_digests().len(), 4);
         assert_eq!(ok.op_digests(), ops().iter().map(|o| o.digest().unwrap()).collect::<Vec<_>>());
-        // Commits take the positions after the outputs, in order.
-        assert_eq!(ok.commit_positions(100), vec![102, 103]);
+        // A commit takes the position after the outputs.
+        assert_eq!(ok.commit_positions(100), vec![102]);
         assert_eq!(Body::default().commit_positions(5), Vec::<u64>::new());
 
         // The commitment covers every part of the section.
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(bad.validate(), Err(BodyError::DuplicateSpend(12)));
         let bad = Body { sweeps: vec![OUTPUT_CAPACITY], ..Default::default() };
         assert_eq!(bad.validate(), Err(BodyError::SpendOutOfRange(OUTPUT_CAPACITY)));
-        assert_eq!(ok.spent_positions().collect::<Vec<_>>(), vec![3, 12, 7, 8]);
+        assert_eq!(ok.spent_positions().collect::<Vec<_>>(), vec![3, 12, 14, 7, 8]);
         let bad = Body { sweeps: (0..MAX_SWEEPS as u64 + 1).collect(), ..Default::default() };
         assert_eq!(bad.validate(), Err(BodyError::TooMany(OpKind::Sweep)));
         assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(BodyError::TooMany(OpKind::Sweep)));

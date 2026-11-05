@@ -4388,25 +4388,28 @@ mod tests {
         let alice = Record::new(b"alice", d(1), d(2), d(3)).unwrap();
         let alice2 = Record::new(b"alice", d(4), d(5), d(6)).unwrap();
         let bob = Record::new(b"bob", d(7), d(8), d(9)).unwrap();
-        // Block 1 makes two commits (positions 1 and 2); blocks 3 to 12
-        // spend the output made two blocks before; 13 reveals alice and
-        // commits again (position 15), 14 updates alice, 15 reveals bob.
+        // Blocks 1 and 2 commit (positions 1 and 3; one a block); blocks 3
+        // to 12 spend an output made before (block 2's at 2, then the one
+        // two blocks before); 13 reveals alice and commits again (position
+        // 15), 14 updates alice, 15 reveals bob.
         for tag in 1..=20u8 {
             t += 600;
             let ops = match tag {
-                1 => vec![
-                    Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
-                    Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
-                ],
+                1 => vec![Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) }],
+                2 => vec![Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) }],
                 13 => vec![
                     Op::Reveal { record: alice.clone(), commit: 1 },
                     Op::Commit { commit: d(14), memo: crate::transaction::memo5(d(15)) },
                 ],
                 14 => vec![Op::Update(alice2.clone())],
-                15 => vec![Op::Reveal { record: bob.clone(), commit: 2 }],
+                15 => vec![Op::Reveal { record: bob.clone(), commit: 3 }],
                 _ => vec![],
             };
-            let inputs = if (3..=12).contains(&tag) { vec![tag as u64] } else { vec![] };
+            let inputs = match tag {
+                3 => vec![2],
+                4..=12 => vec![tag as u64],
+                _ => vec![],
+            };
             let body = Body {
                 outputs: vec![Output::new(&pk(tag), claim(&a, &inputs)).block_output()],
                 inputs,

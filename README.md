@@ -355,8 +355,9 @@ on the message layer: `name-commit` sets the wallet's own unless given
 another) and a memo the owner's wallet reads; `send 10 @alice` pays the
 address alice points at. Registering
 takes two transactions: a commit, which hides the name, and a reveal, at
-least 12 blocks later, which names it. A block admits five reveals, so
-registrations are paid for by their fees.
+least 12 blocks later, which names it. A block admits one commit (and
+two reveals, so reveals catch up after a burst): one new name a block over
+time, so registrations are paid for by their fees.
 
 ```
 > name-commit alice                 # pool a commit to "alice" (optionally an address and a fee)

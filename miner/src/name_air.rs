@@ -2222,22 +2222,19 @@ mod tests {
             wtxn.abort();
             block(w, height, ops, sweeps);
         };
-        let commits: Vec<NameOp> = [(&alice, 1), (&bob, 2), (&carol, 3)]
-            .iter()
-            .map(|(r, n)| NameOp::Commit {
-                commit: commit_of(r, &salt(*n)),
-                memo: crate::transaction::memo5(d(40 + n)),
-            })
-            .collect();
-        take(&w, 10, &commits, &[]);
+        // A commit a block at 10, 11 and 12 (positions 5, 6 and 7).
+        for (i, (r, n)) in [(&alice, 1), (&bob, 2), (&carol, 3)].into_iter().enumerate() {
+            let c = NameOp::Commit { commit: commit_of(r, &salt(n)), memo: crate::transaction::memo5(d(40 + n)) };
+            take(&w, 10 + i as u32, &[c], &[]);
+        }
         let reveals = [
             NameOp::Reveal { record: alice.clone(), salt: salt(1), commit: 5 },
             NameOp::Reveal { record: bob.clone(), salt: salt(2), commit: 6 },
         ];
-        take(&w, 22, &reveals, &[]);
+        take(&w, 24, &reveals, &[]);
         let alice2 = Record::new(b"alice", pubkey_hash(&owner_key(4).public_key()), d(13), d(14)).unwrap();
-        take(&w, 23, &[NameOp::update(alice2, &mut k1).unwrap()], &[]);
-        take(&w, 10 + MAX_REVEAL + 1, &[], &[7]);
+        take(&w, 25, &[NameOp::update(alice2, &mut k1).unwrap()], &[]);
+        take(&w, 12 + MAX_REVEAL + 1, &[], &[7]);
         let honest: Vec<NamePublic> = pool.iter().map(|w| NameAir::generate_trace(w).1).collect();
         let (mut rejected, mut no_trace, mut other, mut bugs) = (0, 0, 0, Vec::new());
         let mut same: Vec<String> = Vec::new();
@@ -2311,15 +2308,12 @@ mod tests {
         let carol = Record::new(b"carol", o3, d(31), d(32)).unwrap();
         let salt = |n: u32| d(500 + n);
         let commit_of = |r: &Record, s: &Digest| commit_hash(&name_hash(&r.elements().unwrap()), s, &r.owner);
-        // Block 10: commits to alice (at 5), bob (6) and carol (7).
-        let commits: Vec<NameOp> = [(&alice, 1), (&bob, 2), (&carol, 3)]
-            .iter()
-            .map(|(r, n)| NameOp::Commit {
-                commit: commit_of(r, &salt(*n)),
-                memo: crate::transaction::memo5(d(40 + n)),
-            })
-            .collect();
-        block(&w, 10, &commits, &[]);
+        // Blocks 10, 11 and 12: commits to alice (at 5), bob (6) and carol
+        // (7), one a block.
+        for (i, (r, n)) in [(&alice, 1), (&bob, 2), (&carol, 3)].into_iter().enumerate() {
+            let c = NameOp::Commit { commit: commit_of(r, &salt(n)), memo: crate::transaction::memo5(d(40 + n)) };
+            block(&w, 10 + i as u32, &[c], &[]);
+        }
         let reveal = |r: &Record, n: u32, at: u64| NameOp::Reveal { record: r.clone(), salt: salt(n), commit: at };
         let mut verdicts: Vec<(&str, Cheat)> = Vec::new();
         let none = |_: &mut NameWitness| {};
@@ -2329,7 +2323,7 @@ mod tests {
         ));
         verdicts.push((
             "a reveal after its commit expired",
-            cheat(&w, 10 + MAX_REVEAL + 1, &[reveal(&bob, 2, 6)], &[], none),
+            cheat(&w, 11 + MAX_REVEAL + 1, &[reveal(&bob, 2, 6)], &[], none),
         ));
         verdicts
             .push(("a reveal with another salt than the commit's", cheat(&w, 22, &[reveal(&alice, 9, 5)], &[], none)));
@@ -2337,7 +2331,8 @@ mod tests {
             "a reveal against an ordinary output (no commit)",
             cheat(&w, 22, &[reveal(&alice, 1, 0)], &[], none),
         ));
-        verdicts.push(("a reveal against another name's commit", cheat(&w, 22, &[reveal(&alice, 1, 6)], &[], none)));
+        // At 23, when bob's commit (11) is old enough: only the name is wrong.
+        verdicts.push(("a reveal against another name's commit", cheat(&w, 23, &[reveal(&alice, 1, 6)], &[], none)));
         verdicts.push(("a sweep of a live commit", cheat(&w, 23, &[], &[7], none)));
         // Block 22: alice revealed, honestly.
         assert_eq!(cheat(&w, 22, &[reveal(&alice, 1, 5)], &[], none), Cheat::Accepted, "an honest reveal");
@@ -2410,23 +2405,25 @@ mod tests {
         let salt = |n: u32| d(500 + n);
         let commit_of = |r: &Record, s: &Digest| commit_hash(&name_hash(&r.elements().unwrap()), s, &r.owner);
 
-        // Block 10: three commits.
-        let commits = vec![
+        // Blocks 10, 11 and 12: a commit each (one a block), at 5, 6 and 7.
+        let commits = [
             NameOp::Commit { commit: commit_of(&alice, &salt(1)), memo: crate::transaction::memo5(d(41)) },
             NameOp::Commit { commit: commit_of(&bob, &salt(2)), memo: crate::transaction::memo5(d(42)) },
             NameOp::Commit { commit: commit_of(&carol, &salt(3)), memo: crate::transaction::memo5(d(43)) },
         ];
-        let p = block(&w, 10, &commits, &[]);
-        assert_eq!(p.counts, [3, 0, 0, 0]);
-        assert_eq!((p.pos_in, p.pos_out), (5, 8));
+        for (i, c) in commits.into_iter().enumerate() {
+            let p = block(&w, 10 + i as u32, &[c], &[]);
+            assert_eq!(p.counts, [1, 0, 0, 0]);
+            assert_eq!((p.pos_in, p.pos_out), (5 + i as u64, 6 + i as u64));
+        }
 
-        // Block 22: reveal alice (empty trie) and bob (a split under
+        // Block 24: reveal alice (empty trie) and bob (a split under
         // alice's leaf: the keys share at least three bits).
         let reveals = vec![
             NameOp::Reveal { record: alice.clone(), salt: salt(1), commit: 5 },
             NameOp::Reveal { record: bob.clone(), salt: salt(2), commit: 6 },
         ];
-        let p = block(&w, 22, &reveals, &[]);
+        let p = block(&w, 24, &reveals, &[]);
         assert_eq!(p.counts, [0, 2, 0, 0]);
         assert_eq!((p.pos_in, p.pos_out), (8, 8));
         {
@@ -2441,13 +2438,13 @@ mod tests {
             assert!(w.utxo.output_at(&rtxn, 7).unwrap().is_some());
         }
 
-        // Block 23: alice rotates her key, a commit in the same block.
+        // Block 25: alice rotates her key, a commit in the same block.
         let mut k4 = owner_key(4);
         let o4 = pubkey_hash(&k4.public_key());
         let alice2 = Record::new(b"alice", o4, d(13), d(14)).unwrap();
         let update = NameOp::update(alice2.clone(), &mut k1).unwrap();
         let ops = vec![update, NameOp::Commit { commit: d(77), memo: crate::transaction::memo5(d(78)) }];
-        let p = block(&w, 23, &ops, &[]);
+        let p = block(&w, 25, &ops, &[]);
         assert_eq!(p.counts, [1, 0, 1, 0]);
         assert_eq!((p.pos_in, p.pos_out), (8, 9));
         {
@@ -2455,11 +2452,11 @@ mod tests {
             assert_eq!(w.names.lookup(&rtxn, b"alice").unwrap(), Some(alice2.clone()));
         }
 
-        // Block 300: carol's commit (height 10) has expired: sweep it, and
-        // alice transfers to k3's hash... wait, that is an update by k4.
+        // Block 301: carol's commit (height 12) has expired: sweep it, and
+        // alice transfers to k3's hash, an update by k4.
         let alice3 = Record::new(b"alice", o3, d(15), d(16)).unwrap();
         let transfer = NameOp::update(alice3.clone(), &mut k4).unwrap();
-        let p = block(&w, 300, &[transfer], &[7]);
+        let p = block(&w, 301, &[transfer], &[7]);
         assert_eq!(p.counts, [0, 0, 1, 1]);
         {
             let rtxn = w.env.read_txn().unwrap();
@@ -2468,12 +2465,12 @@ mod tests {
             assert_eq!(w.names.lookup(&rtxn, b"alice").unwrap(), Some(alice3.clone()));
         }
 
-        // Block 301: carol's reveal now fails (no commit); a reveal of a
+        // Block 302: carol's reveal now fails (no commit); a reveal of a
         // registered name fails; an update by a stale key fails; a sweep
         // of a live commit fails; an update keeping the owner fails.
         let mut wtxn = w.env.write_txn().unwrap();
         let fail = |wtxn: &mut heed::RwTxn, ops: &[NameOp], sweeps: &[u64]| {
-            NameWitness::collect(&w.utxo, &w.names, wtxn, 301, ops, sweeps).expect_err("rejected")
+            NameWitness::collect(&w.utxo, &w.names, wtxn, 302, ops, sweeps).expect_err("rejected")
         };
         assert!(matches!(
             fail(&mut wtxn, &[NameOp::Reveal { record: carol.clone(), salt: salt(3), commit: 7 }], &[]),
@@ -2487,24 +2484,24 @@ mod tests {
         assert!(matches!(fail(&mut wtxn, &[stale], &[]), ApplyError::BadOwner));
         let same = NameOp::update(Record::new(b"alice", o3, d(1), d(2)).unwrap(), &mut k3).unwrap();
         assert!(matches!(fail(&mut wtxn, &[same], &[]), ApplyError::BadOwner));
-        assert!(matches!(fail(&mut wtxn, &[], &[8]), ApplyError::NotExpired(23)));
+        assert!(matches!(fail(&mut wtxn, &[], &[8]), ApplyError::NotExpired(25)));
         assert!(matches!(fail(&mut wtxn, &[], &[3]), ApplyError::NoCommit));
         let unknown = NameOp::update(Record::new(b"nobody", o2, d(1), d(2)).unwrap(), &mut k3).unwrap();
         assert!(matches!(fail(&mut wtxn, &[unknown], &[]), ApplyError::NotRegistered));
         // A commit revealed too early or too late.
         let late = Record::new(b"late", o2, d(1), d(2)).unwrap();
         let ops = [NameOp::Commit { commit: commit_of(&late, &salt(9)), memo: crate::transaction::memo5(d(1)) }];
-        NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301, &ops, &[]).unwrap();
+        NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 302, &ops, &[]).unwrap();
         let reveal = [NameOp::Reveal { record: late.clone(), salt: salt(9), commit: 9 }];
         assert!(matches!(
-            NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301 + MIN_REVEAL - 1, &reveal, &[]).err().unwrap(),
-            ApplyError::Window(301)
+            NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 302 + MIN_REVEAL - 1, &reveal, &[]).err().unwrap(),
+            ApplyError::Window(302)
         ));
         assert!(matches!(
-            NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301 + MAX_REVEAL + 1, &reveal, &[]).err().unwrap(),
-            ApplyError::Window(301)
+            NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 302 + MAX_REVEAL + 1, &reveal, &[]).err().unwrap(),
+            ApplyError::Window(302)
         ));
-        NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 301 + MAX_REVEAL, &reveal, &[]).unwrap();
+        NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 302 + MAX_REVEAL, &reveal, &[]).unwrap();
         // Re-registering a revealed name: the trie has it.
         let again = [NameOp::Commit { commit: commit_of(&late, &salt(10)), memo: crate::transaction::memo5(d(1)) }];
         NameWitness::collect(&w.utxo, &w.names, &mut wtxn, 600, &again, &[]).unwrap();

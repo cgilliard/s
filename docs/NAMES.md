@@ -105,14 +105,21 @@ Consensus caps, per block, by count:
 
 | op | cap |
 |---|---|
-| reveal | 5 |
-| commit | 8 |
+| reveal | 2 |
+| commit | 1 |
 | update | 8 |
 | sweep | 16 |
 
-The reveal cap is the one that shapes the system: at most 5 new names a
-block, 720 a day, about 263,000 a year, which at about a kilobyte each
-(record and tree nodes) is about 300 MB a year at saturation. The others
+The commit cap is the one that shapes the system: every reveal needs a
+commit, so at most 1 new name a block over time, 144 a day, 52,560 a year, which at about a kilobyte each (record
+and tree nodes) is about 53 MB a year of disk at saturation, and about
+5.6 MB a year of fast-sync download (a record is 97 bytes and the name;
+the tree is rebuilt from them). Reveals may run at 2 a block, twice the
+commits, so after a burst they catch up instead of bidding for one slot
+and a commit always finds one within its window. The caps were 5 reveals
+and 8 commits until sub-name certificates (`docs/SUBNAME_CERT.md`) made
+top-level names needed by few: names never expire, so a slow allocation
+also keeps the namespace from being taken in the first months. The others
 exist so that the name segment has a fixed size; the miner counts
 operations and never rows.
 
@@ -177,8 +184,8 @@ answer gives an id, then the normal payment to that id.
 Sub-names are therefore free, unlimited and changeable at runtime, and
 entirely under the parent's control; anyone wanting an identity the
 parent cannot touch registers a top-level name. They exist because a
-block admits five reveals: one name can carry as many users as its
-owner admits.
+block admits one new name over time: one name can carry as many users
+as its owner admits.
 
 ## The proof
 
@@ -248,7 +255,7 @@ operation are not.
 | output positions | below `2^39` |
 | `KEY_BITS`, the deepest a name path can be | 120 |
 | `MIN_REVEAL`, `MAX_REVEAL` | 12, 288 blocks |
-| caps per block | 5 reveals, 8 commits, 8 updates, 16 sweeps |
+| caps per block | 2 reveals, 1 commit, 8 updates, 16 sweeps |
 | `NAME_ROWS` | 2^15 |
 
 ## Implementation order

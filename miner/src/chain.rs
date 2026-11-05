@@ -4456,19 +4456,17 @@ mod tests {
             a.chain.apply_block(&block, t.get() + 100).unwrap();
             blocks.borrow_mut().push(block);
         };
-        // Block 1: commits at 1 (alice), 2 (bob), 3 (unused). Blocks 13
-        // and 14: reveals. Block 16: a snapshot (interval 4) with alice,
+        // Blocks 1 to 3: a commit each, at 1 (alice), 2 (bob), 3 (unused).
+        // Blocks 13 and 14: reveals. Block 16: a snapshot (interval 4) with alice,
         // bob and the unused commit. Block 17: alice updated; block 20:
         // another snapshot, after the update.
-        mine_on(Body {
-            ops: vec![
-                Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
-                Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
-                Op::Commit { commit: d(14), memo: crate::transaction::memo5(d(15)) },
-            ],
-            ..Default::default()
-        });
-        for _ in 2..=12 {
+        for c in [10, 12, 14] {
+            mine_on(Body {
+                ops: vec![Op::Commit { commit: d(c), memo: crate::transaction::memo5(d(c + 1)) }],
+                ..Default::default()
+            });
+        }
+        for _ in 4..=12 {
             mine_on(Body::default());
         }
         mine_on(Body { ops: vec![Op::Reveal { record: alice.clone(), commit: 1 }], ..Default::default() });
@@ -4489,7 +4487,7 @@ mod tests {
         assert_eq!((m16.next, m16.roots.len(), m16.names.len()), (4, 1, 1));
         let (outputs16, commits16) = a.chain.snapshot_part(&s16.hash(), 0).unwrap().unwrap();
         assert_eq!(outputs16.iter().map(|o| o.0).collect::<Vec<_>>(), vec![0, 3]);
-        assert_eq!(commits16, vec![(3, d(14), 1)]);
+        assert_eq!(commits16, vec![(3, d(14), 3)]);
         let names16 = a.chain.snapshot_name_part(&s16.hash(), 0).unwrap().unwrap();
         let mut expected = vec![alice.clone(), bob.clone()];
         expected.sort_by_key(|r| r.key().unwrap());
@@ -4594,18 +4592,17 @@ mod tests {
             f.chain.apply_block(&block, t.get() + 100).unwrap();
             block
         };
-        // Block 1: two commits, at positions 2 and 3.
-        let ops = vec![
-            Op::Commit { commit: d(10), memo: crate::transaction::memo5(d(11)) },
-            Op::Commit { commit: d(12), memo: crate::transaction::memo5(d(13)) },
-        ];
-        let b1 = mine_on(&a, Body { ops, ..Default::default() });
+        // Blocks 1 and 2: a commit each (one a block), at positions 2 and 3.
+        let commit = |c: u32| vec![Op::Commit { commit: d(c), memo: crate::transaction::memo5(d(c + 1)) }];
+        let b1 = mine_on(&a, Body { ops: commit(10), ..Default::default() });
+        mine_on(&a, Body { ops: commit(12), ..Default::default() });
         {
             let rtxn = a.chain.env().read_txn().unwrap();
             assert_eq!(a.chain.utxo().next_position(&rtxn).unwrap(), 4);
             assert_eq!(a.chain.names().commit_at(&rtxn, 2).unwrap().map(|c| c.height), Some(1));
+            assert_eq!(a.chain.names().commit_at(&rtxn, 3).unwrap().map(|c| c.height), Some(2));
         }
-        for _ in 2..=12 {
+        for _ in 3..=12 {
             mine_on(&a, Body::default());
         }
         let root12 = a.chain.state_root().unwrap();
@@ -4688,9 +4685,9 @@ mod tests {
             assert_eq!(a.chain.names().lookup(&rtxn, b"alice").unwrap(), Some(alice2));
             assert!(a.chain.names().commit_at(&rtxn, 2).unwrap().is_none());
         }
-        // The proof statement of a block with operations counts its commits.
+        // The proof statement of a block with operations counts its commit.
         let (st, _) = a.chain.proof_statement(1).unwrap().unwrap();
-        assert_eq!((st.first_output_position, st.end_output_position), (2, 4));
+        assert_eq!((st.first_output_position, st.end_output_position), (2, 3));
     }
 
     #[test]
