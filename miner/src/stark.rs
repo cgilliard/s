@@ -729,6 +729,9 @@ impl TableProof {
 
     fn read(r: &mut Reader) -> Option<TableProof> {
         let log_n = r.u32()? as usize;
+        if log_n > 32 {
+            return None;
+        }
         let trace_root = r.digest()?;
         let (aux_root, lookup_sum) = match r.u32()? {
             0 => (None, Fp4::ZERO),
@@ -2905,9 +2908,11 @@ pub fn verify_tables(
             num_terms,
             group,
         };
+        // The height's bound first: the proof's `log_n` is untrusted, and the
+        // zero-knowledge check shifts by it.
         if t.log_n == 0
-            || (config.zk && 1 << t.log_n <= config.chunk_slack())
             || t.log_n + log_blowup > 27
+            || (config.zk && 1 << t.log_n <= config.chunk_slack())
             || log_blowup < log_q
             || t.trace_at_zeta.len() != s.w
             || t.trace_at_zeta_next.len() != s.w

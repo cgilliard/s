@@ -737,6 +737,19 @@ mod tests {
         let fuzz = crate::stark::fuzz_proof(&proof_zk, iters, seed + 1, verifies);
         eprintln!("zk: {fuzz:?}");
         assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "zk, seed {}: {fuzz:?}", seed + 1);
+        // Every value of the first table's height (its `log_n`, from byte
+        // 4): a large one once overflowed the zero-knowledge shape check.
+        let bytes = proof_zk.to_bytes();
+        for v in 0..=255u8 {
+            let mut b = bytes.clone();
+            b[4] = v;
+            if b == bytes {
+                continue;
+            }
+            if let Some(p) = crate::stark::Proof::from_bytes(&b) {
+                assert!(!verifies(&p), "a height of byte {v} verified");
+            }
+        }
         let mut bad = public.clone();
         bad[PUB_MSG] += Fp::ONE;
         assert!(verify(&config, &XmssAir, &bad, &proof, &mut tr()).is_err());
