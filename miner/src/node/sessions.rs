@@ -305,8 +305,6 @@ pub(super) struct State {
     /// Sends to try again in the other mode.
     pub(super) retry: Vec<Outbound>,
     resolved: HashMap<String, Option<SocketAddr>>,
-    /// The sub-names this node answers for, as a server.
-    pub(super) subnames: crate::subnames::Table,
     /// Sub-name answers given in the current minute, and since when.
     answered: (usize, Option<Instant>),
 }
@@ -388,7 +386,6 @@ impl State {
             fallback: Vec::new(),
             retry: Vec::new(),
             resolved: HashMap::new(),
-            subnames: crate::subnames::Table::new(),
             answered: (0, None),
         })
     }
@@ -1039,11 +1036,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
-    /// A sub-name query to this node as a server (`docs/SUBNAMES.md`):
-    /// answered from its table, signed with its identity key, along the
-    /// query's way back (or to the sender, when it named itself).
+    /// A sub-name query to this node (init mode, `docs/SUBNAME_CERT.md`):
+    /// answered with the bundle it holds for the full name (one it issued
+    /// or holds, the highest `seq`), or none, along the query's way back
+    /// (or to the sender, when it named itself). The resolver checks it
+    /// against its chain.
     fn answer_subname(&mut self, q: Opened) {
-        let Some(me) = &self.rv.me else { return };
         let Some((name, label)) = crate::subnames::parse_query(&q.inner) else {
             return self.chatter("message layer: a malformed sub-name query");
         };
@@ -1056,16 +1054,20 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return self.chatter("message layer: a sub-name query over the rate, unanswered");
         }
         *count += 1;
-        let Some(answer) = crate::subnames::answer(&me.key, &self.rv.subnames, &name, &label, unix_now()) else {
-            return;
-        };
+        let bundle = self
+            .part
+            .certs
+            .iter()
+            .filter_map(|b| crate::subnames::Bundle::from_bytes(b))
+            .filter(|b| b.cert.name == name && b.cert.label == label && b.cert.expiry > unix_now())
+            .max_by_key(|b| b.cert.seq);
         let (to, recipient, reply) = match (q.route, q.from) {
             (Some(route), _) => (route.reply_id(), None, Some(route)),
             (None, Some(a)) => (a.id, Some(a), None),
             (None, None) => return,
         };
         let tag = NODE_TAG | (random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(0) >> 1);
-        let inner = answer.to_bytes();
+        let inner = crate::subnames::answer(&name, &label, bundle.as_ref());
         self.start_send(Outbound { tag, to, kind: onion::KIND_SUBNAME_ANSWER, inner, recipient, reply, group: 0 }, now);
     }
 

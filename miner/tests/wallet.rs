@@ -120,9 +120,9 @@ fn exit_while_mining_ends_the_process() {
 /// P pays C through it. Then A votes for a consensus file listing the four
 /// relays, the network switches to onion mode at block 144, A delegates
 /// its sub-names to B, B issues `ex2.example` to C under A's delegation,
-/// and with A offline P pays C through it; B then withdraws it and C gives
-/// it up. (Payments resolve through the server path until
-/// docs/SUBNAME_CERT.md step 5.)
+/// and with A offline P pays C through it, found at the full name's
+/// rendezvous points; B then withdraws it and C gives it up. In init mode
+/// P's wallet asks A's node, which answers with the certificate it issued.
 #[test]
 #[ignore = "slow: one job each in .github/workflows/test.yml"]
 fn sub_names_resolve_in_both_modes() {
@@ -192,8 +192,8 @@ fn sub_names_resolve_in_both_modes() {
     }
 
     // Onion mode: A delegates to B, which issues ex2.example to C (with
-    // A's delegation) and answers for A's names; A goes offline once its
-    // delegation is held at its rendezvous points.
+    // A's delegation); A goes offline once its delegation is held at its
+    // rendezvous points, and P finds the certificate at the full name's.
     let b_address = b.address();
     a.send(&format!("subname issuer {b_address}"));
     a.expect("the delegation", 10, |l| l.contains("may be signed by"));

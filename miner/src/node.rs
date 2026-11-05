@@ -361,8 +361,6 @@ pub enum Event {
     /// The wallet asks for an id's delegation, under a tag and in a group
     /// (`Outbound::group`): answered by `Note::Delegation`.
     GetDelegation(u64, Digest, u64),
-    /// The sub-names this node answers for as a server.
-    Subnames(crate::subnames::Table),
     /// The sub-name certificates this node holds, as bundles
     /// (`docs/SUBNAME_CERT.md`): published at their full names' points.
     Certs(Vec<Vec<u8>>),
@@ -402,7 +400,7 @@ pub enum Event {
     /// Tests: a relay message to a hop of a circuit built.
     #[cfg(test)]
     TestCircuitSend(u64, usize, u8, Vec<u8>),
-    /// Tests: the owners this node, as a sub-name server, republishes the
+    /// Tests: the owners this node, as a sub-name issuer, republishes the
     /// delegations of, without their names on chain.
     #[cfg(test)]
     TestServes(Vec<Digest>),
@@ -1077,7 +1075,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::Identity(key)) => self.set_identity(key, Instant::now()),
                 Ok(Event::Delegate(d)) => self.set_delegation(d),
                 Ok(Event::GetDelegation(tag, owner, group)) => self.get_delegation(tag, owner, group, Instant::now()),
-                Ok(Event::Subnames(table)) => self.rv.subnames = table,
                 Ok(Event::Certs(certs)) => self.set_certs(certs),
                 Ok(Event::GetCert(tag, point, group)) => self.get_cert(tag, point, group, Instant::now()),
                 #[cfg(test)]
@@ -6150,16 +6147,18 @@ mod tests {
         }
     }
 
-    /// Sub-names end to end (`docs/SUBNAMES.md`): the owner of a name
-    /// publishes a delegation at its rendezvous points; a resolver finds
-    /// it there, while the owner is online and after it has gone, and asks
-    /// the server it names for a label, answered along the query's way
-    /// back and signed by the server.
+    /// Delegations and sub-name answers (`docs/SUBNAME_CERT.md`): the
+    /// owner of a name publishes a delegation at its rendezvous points; a
+    /// resolver finds it there (an issuer renews by it), while the owner is
+    /// online and after it has gone. A node asked for a label (as an owner
+    /// is in init mode) answers with the bundle it holds for that full
+    /// name, or none, along the query's way back; one action's steps share
+    /// one outbound circuit.
     #[test]
     #[ignore = "slow: one job each in .github/workflows/test.yml"]
-    fn sub_names_resolve_through_a_delegated_server() {
+    fn delegations_and_sub_name_answers_reach_resolvers() {
         use crate::onion;
-        use crate::subnames::{Cert, Delegation, Entry, Table, Zone};
+        use crate::subnames::{Bundle, Cert, Delegation, Entry};
         let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("subnames-{i}"))).collect();
         let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
         let id = |tag: u8| crate::address::id_of(key(tag).public_key());
@@ -6225,13 +6224,14 @@ mod tests {
         nodes[owner].1.send(Event::Stop).unwrap();
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(fetch(id(4)).as_ref(), Some(&d));
-        // The server answers for `cool.example`.
-        let mut table = Table::new();
-        let mut zone = Zone { seq: 7, ..Zone::default() };
-        zone.entries.insert(b"cool".to_vec(), id(9));
-        table.insert(b"example".to_vec(), zone);
-        nodes[server].1.send(Event::Subnames(table)).unwrap();
-        let ask = |label: &[u8], tag: u64, group: u64| -> Cert {
+        // The issuer (key 5) holds a bundle for `cool.example`, under the
+        // owner's delegation, and answers for it.
+        let cool = Bundle {
+            cert: Cert::id(&key(5), b"example", b"cool", &id(9), 7, unix_now() + 3600).unwrap(),
+            delegation: Some(d.clone()),
+        };
+        nodes[server].1.send(Event::Certs(vec![cool.to_bytes()])).unwrap();
+        let ask = |label: &[u8], tag: u64, group: u64| -> Option<Bundle> {
             let out = Outbound {
                 tag,
                 to: id(5),
@@ -6246,16 +6246,19 @@ mod tests {
                 match nodes[resolver].2.recv_timeout(guard(30)).expect("a note") {
                     Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {
                         assert_eq!(o.answers, Some(id(5)));
-                        return Cert::from_bytes(&o.inner).expect("an answer");
+                        let (n, l, b) = crate::subnames::parse_answer(&o.inner).expect("an answer");
+                        assert_eq!((&n[..], &l[..]), (&b"example"[..], label));
+                        return b;
                     }
                     Note::Failed { why, .. } => panic!("{why}"),
                     _ => {}
                 }
             }
         };
-        let a = ask(b"cool", 100, 0);
-        assert!(a.verify(b"example", b"cool", &d.issuers, unix_now()));
-        assert_eq!((a.entry(), a.seq), (Entry::Id(id(9)), 7));
+        let a = ask(b"cool", 100, 0).expect("the bundle held");
+        assert_eq!(a, cool);
+        assert!(a.verify(&id(4), unix_now()));
+        assert_eq!((a.cert.entry(), a.cert.seq), (Entry::Id(id(9)), 7));
         // One send's steps in a group share one outbound circuit: the
         // delegation, then the query, cost one circuit, not two.
         let built = || nodes[resolver].3.lock().unwrap().outbound_built;
@@ -6270,13 +6273,11 @@ mod tests {
                 break;
             }
         }
-        let a = ask(b"cool", 501, 77);
-        assert_eq!(a.entry(), Entry::Id(id(9)));
+        let a = ask(b"cool", 501, 77).expect("the bundle held");
+        assert_eq!(a.cert.entry(), Entry::Id(id(9)));
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(built() - before, 1, "the query went over the delegation's circuit");
-        let a = ask(b"nope", 101, 0);
-        assert!(a.verify(b"example", b"nope", &d.issuers, unix_now()));
-        assert_eq!(a.entry(), Entry::None);
+        assert_eq!(ask(b"nope", 101, 0), None);
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
                 n.1.send(Event::Stop).unwrap();
@@ -6425,12 +6426,12 @@ mod tests {
 
     /// A delegation outlives its owner's absence across a boundary
     /// (`docs/SUBNAMES.md`): the owner publishes and goes; at the next
-    /// epoch, whose points are none of the old ones, the server it names
+    /// epoch, whose points are none of the old ones, the issuer it names
     /// carries the delegation there, and a resolver asking only the new
     /// points finds it.
     #[test]
     #[ignore = "slow: one job each in .github/workflows/test.yml"]
-    fn a_server_carries_a_delegation_to_new_points() {
+    fn an_issuer_carries_a_delegation_to_new_points() {
         use crate::subnames::Delegation;
         let fixtures: Vec<Fixture> = (0..9).map(|i| open(&format!("carry-{i}"))).collect();
         let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
@@ -6495,17 +6496,17 @@ mod tests {
             assert!(Instant::now() < deadline, "the delegation never appeared");
             std::thread::sleep(Duration::from_millis(500));
         }
-        // The owner goes; the server knows whose delegations name it.
+        // The owner goes; the issuer knows whose delegations name it.
         nodes[owner].1.send(Event::Stop).unwrap();
         nodes[server].1.send(Event::TestServes(vec![v])).unwrap();
         std::thread::sleep(Duration::from_secs(1));
-        // The boundary: both sets stand, and the server has moved.
+        // The boundary: both sets stand, and the issuer has moved.
         epoch(true, true, e);
         std::thread::sleep(Duration::from_secs(4));
         // The grace period over: only the new points are asked.
         epoch(false, true, e);
         std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(fetch().as_ref(), Some(&d), "the server carried it to the new points");
+        assert_eq!(fetch().as_ref(), Some(&d), "the issuer carried it to the new points");
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
                 n.1.send(Event::Stop).unwrap();

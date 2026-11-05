@@ -124,8 +124,16 @@ wallet ──circuit──▶ N's point ──▶ certificate: cool.example = T 
 wallet ──circuit──▶ T's point ══session══▶ holder's node   (the payment)
 ```
 
-A certificate is cached until its expiry, so a repeat send goes straight
-to step 4. No certificate, or a `none` one, means no such sub-name.
+A certificate is cached for an hour at most (and never past its expiry),
+so a repeat send goes straight to step 4 and a withdrawal reaches senders
+within the hour. No certificate, or a `none` one, means no such sub-name.
+
+**Init mode** has no rendezvous points to hold certificates. There the
+resolver asks the name's owner instead: a query (`KIND_SUBNAME_QUERY`) to
+`V`, which its node answers with the bundle it holds for the full name,
+the one it issued, or none (`KIND_SUBNAME_ANSWER`). The resolver checks
+it against the chain exactly as in onion mode, so the owner's node only
+relays what it signed.
 
 ## Issuing, renewing and revoking
 
@@ -282,6 +290,17 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
 5. Resolution in `send`: fetch, check, cache, pay; the server path
    removed (`KIND_SUBNAME_QUERY`, `KIND_SUBNAME_ANSWER`, `answer`,
    `Zone`).
+   Done (2026-11-05): `send @label.name` fetches the bundle from the full
+   name's points (onion mode) or asks the owner's node (init mode), checks
+   it against the name's value on chain, caches it for an hour at most,
+   and pays. The server path is gone: the server-signed answer, the
+   node's table (`Event::Subnames`), the resolver's separate delegation
+   fetch and its cache. The query and answer stay for init mode only, the
+   answer now the bundle a node holds (`subnames::answer`). An issuer
+   still carries the delegations it issues under to an owner's new points
+   at a boundary, finding those owners from its bundles. Tested through
+   the prompt by `sub_names_resolve_in_both_modes` (both modes, the owner
+   offline in onion mode) and by `delegations_and_sub_name_answers_reach_resolvers`.
 6. Tests: the end-to-end tests of sub-names reworked (resolve with the
    owner offline, through a delegated issuer, after an epoch rotation,
    after a revocation and a change), and a timed run on `--network dev`

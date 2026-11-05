@@ -76,8 +76,8 @@ jobs:
           - test: node::tests::a_false_claim_of_work_does_not_stall_the_sync
           - test: node::tests::a_false_claim_of_work_at_a_low_height_does_not_stall_the_sync
           - test: node::tests::a_switch_of_relays_keeps_messages_flowing
-          - test: node::tests::a_server_carries_a_delegation_to_new_points
-          - test: node::tests::sub_names_resolve_through_a_delegated_server
+          - test: node::tests::an_issuer_carries_a_delegation_to_new_points
+          - test: node::tests::delegations_and_sub_name_answers_reach_resolvers
           - test: node::tests::sub_name_certificates_are_held_at_their_points
           - test: node::tests::a_holder_carries_its_certificate_to_new_points
           - test: node::tests::a_fresh_node_fast_syncs_when_its_first_peer_comes_late

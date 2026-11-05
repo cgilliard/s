@@ -10,9 +10,9 @@
 //! Both carry the signer's Dilithium key, so each is checked alone: by
 //! one hash against the id it must have and one signature.
 //!
-//! Until the server path goes (docs/SUBNAME_CERT.md, step 5), a server
-//! also answers lookups with a [`Cert`] signed by its own key, checked as
-//! one from an issuer.
+//! In init mode, with no rendezvous points to hold certificates, a
+//! resolver asks the name's owner ([`query`]): its node answers with the
+//! bundle it holds for the full name, or none ([`answer`]).
 //!
 //! Pure data and cryptography; the node holds, serves and asks for them.
 
@@ -45,10 +45,6 @@ pub const TYPE_NONE: u8 = 0;
 pub const TYPE_ID: u8 = 1;
 /// The largest value a certificate carries, of any type.
 pub const MAX_VALUE: usize = 256;
-
-/// How long a server's answer is valid, and so cached: an entry changed
-/// reaches resolvers within this.
-pub const ANSWER_LIFETIME_SECS: u64 = 3600;
 
 const DELEGATION_CONTEXT: &[u8] = b"tab-delegation";
 const ANSWER_CONTEXT: &[u8] = b"tab-subname";
@@ -468,9 +464,10 @@ impl HeldCerts {
 }
 
 /// A query for `label.name`: the inner bytes of a payload of kind
-/// [`crate::onion::KIND_SUBNAME_QUERY`] to the server, answered (along the
-/// payload's way back, or to its named sender) by one of kind
-/// [`crate::onion::KIND_SUBNAME_ANSWER`] whose inner bytes are an [`Cert`].
+/// [`crate::onion::KIND_SUBNAME_QUERY`] to the name's owner (init mode),
+/// answered (along the payload's way back, or to its named sender) by one
+/// of kind [`crate::onion::KIND_SUBNAME_ANSWER`] whose inner bytes are an
+/// [`answer`].
 pub fn query(name: &[u8], label: &[u8]) -> Vec<u8> {
     let mut w = Writer::with_capacity(2 + name.len() + label.len());
     put_name(&mut w, name);
@@ -486,30 +483,37 @@ pub fn parse_query(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     r.is_empty().then_some((name, label))
 }
 
-/// One name's sub-names, as a server holds them.
+/// The answer to a query for `label.name`: the name and label again, then
+/// the bundle held for it, or nothing when none is held there.
+pub fn answer(name: &[u8], label: &[u8], bundle: Option<&Bundle>) -> Vec<u8> {
+    let mut out = query(name, label);
+    if let Some(b) = bundle {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    out
+}
+
+/// An answer's name and label, and its bundle if any (one for that full
+/// name); `None` if malformed.
+pub fn parse_answer(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Option<Bundle>)> {
+    let mut r = Reader(bytes);
+    let name = get_name(&mut r)?;
+    let label = get_name(&mut r)?;
+    if r.is_empty() {
+        return Some((name, label, None));
+    }
+    let b = Bundle::from_bytes(r.0).filter(|b| b.cert.name == name && b.cert.label == label)?;
+    Some((name, label, Some(b)))
+}
+
+/// One name's sub-names, as its issuer keeps them: label to holder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Zone {
-    /// Rises with every change (the time in milliseconds): every answer
-    /// carries it, so a resolver keeps the newest.
-    pub seq: u64,
     pub entries: std::collections::BTreeMap<Vec<u8>, Digest>,
 }
 
-/// What a server answers for, by name.
+/// What an issuer issues for, by name.
 pub type Table = std::collections::HashMap<Vec<u8>, Zone>;
-
-/// The server `key`'s answer to a query for `label.name` at time `now`:
-/// the label's id, or none (for a name it does not hold too: harmless,
-/// since only a server the name delegates to counts).
-pub fn answer(key: &mldsa::SecretKey, table: &Table, name: &[u8], label: &[u8], now: u64) -> Option<Cert> {
-    let zone = table.get(name);
-    let seq = zone.map_or(0, |z| z.seq);
-    let expiry = now + ANSWER_LIFETIME_SECS;
-    match zone.and_then(|z| z.entries.get(label)) {
-        Some(id) => Cert::id(key, name, label, id, seq, expiry),
-        None => Cert::none(key, name, label, seq, expiry),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -564,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_verify_only_from_a_named_server_for_their_label() {
+    fn certificates_verify_only_from_a_named_issuer_for_their_label() {
         let server = key(2);
         let servers = [id(2), id(3)];
         let t = id(5);
@@ -751,21 +755,20 @@ mod tests {
     }
 
     #[test]
-    fn a_server_answers_from_its_table() {
+    fn queries_and_answers_roundtrip() {
         let q = query(b"example", b"cool");
         assert_eq!(parse_query(&q), Some((b"example".to_vec(), b"cool".to_vec())));
         assert_eq!(parse_query(&q[..q.len() - 1]), None);
         assert_eq!(parse_query(&query(b"example", b"Cool")), None);
-        let mut table = Table::new();
-        let mut zone = Zone { seq: 42, ..Zone::default() };
-        zone.entries.insert(b"cool".to_vec(), id(5));
-        table.insert(b"example".to_vec(), zone);
-        let a = answer(&key(2), &table, b"example", b"cool", NOW).unwrap();
-        assert!(a.verify(b"example", b"cool", &[id(2)], NOW));
-        assert_eq!((a.entry(), a.seq), (Entry::Id(id(5)), 42));
-        let a = answer(&key(2), &table, b"example", b"nope", NOW).unwrap();
-        assert_eq!((a.entry(), a.seq), (Entry::None, 42));
-        let a = answer(&key(2), &table, b"other", b"cool", NOW).unwrap();
-        assert_eq!((a.entry(), a.seq), (Entry::None, 0));
+        let b = Bundle { cert: Cert::id(&key(1), b"example", b"cool", &id(5), 3, NOW + 60).unwrap(), delegation: None };
+        let a = answer(b"example", b"cool", Some(&b));
+        assert_eq!(parse_answer(&a), Some((b"example".to_vec(), b"cool".to_vec(), Some(b.clone()))));
+        let none = answer(b"example", b"nope", None);
+        assert_eq!(parse_answer(&none), Some((b"example".to_vec(), b"nope".to_vec(), None)));
+        // A bundle for another label than the answer claims is refused.
+        assert_eq!(parse_answer(&answer(b"example", b"nope", Some(&b))), None);
+        crate::test_util::fuzz_decoder("parse_answer", &[a, none], 20_000, |x| {
+            parse_answer(x).map(|(n, l, b)| Some(answer(&n, &l, b.as_ref())))
+        });
     }
 }

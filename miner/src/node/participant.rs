@@ -266,7 +266,7 @@ pub(super) struct Participant {
     kept: Vec<(u64, u64, Instant)>,
     /// Outbound circuits built since start.
     built: u64,
-    /// The epoch whose new points this node, as a sub-name server, has
+    /// The epoch whose new points this node, as a sub-name issuer, has
     /// republished the delegations naming it at.
     republished: Option<u32>,
     /// The epoch whose new points this node has carried its certificates
@@ -889,9 +889,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
-    /// As a sub-name server: asks for the delegation of every name it
-    /// answers for (by the name's value on chain), to publish again those
-    /// that name it ([`Self::fetched`]).
+    /// As a sub-name issuer: asks for the delegation of every owner it
+    /// issued certificates under, to publish again those that name it
+    /// ([`Self::fetched`]): an owner away at the boundary would otherwise
+    /// leave its new points without the delegation the issuer renews by.
     fn republish_delegations(&mut self, me: Digest, now: Instant) {
         #[cfg(test)]
         if let Some(owners) = self.part.test_owners.clone() {
@@ -900,19 +901,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             return;
         }
-        if self.rv.subnames.is_empty() {
-            return;
-        }
+        // The owners whose delegations name us, from the certificates we
+        // issued under them.
         let mut owners: Vec<Digest> = Vec::new();
-        if let Ok(rtxn) = self.chain.env().read_txn() {
-            for name in self.rv.subnames.keys() {
-                if let Ok(Some(r)) = self.chain.names().lookup(&rtxn, name)
-                    && r.value != me
-                    && r.value != onion::NOBODY
-                    && !owners.contains(&r.value)
-                {
-                    owners.push(r.value);
-                }
+        for b in self.part.certs.iter().filter_map(|b| crate::subnames::Bundle::from_bytes(b)) {
+            if let Some(d) = &b.delegation
+                && d.issuers.contains(&me)
+                && b.cert.issuer() == me
+                && !owners.contains(&d.owner())
+            {
+                owners.push(d.owner());
             }
         }
         for owner in owners {
