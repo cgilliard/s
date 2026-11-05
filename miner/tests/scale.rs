@@ -49,6 +49,20 @@ fn log_lines(p: &Proc, text: &str) -> Vec<String> {
     log.lines().filter(|l| l.contains(text)).map(str::to_string).collect()
 }
 
+/// Waits up to `secs` for `n` lines of `p`'s log containing `text`, and
+/// returns them: the tip a node reports can be ahead of its log, as a block
+/// becomes the tip when its commit lands and is logged just after.
+fn wait_log_lines(p: &Proc, text: &str, n: usize, secs: u64) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let lines = log_lines(p, text);
+        if lines.len() >= n || Instant::now() >= deadline {
+            return lines;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// The number of seconds in `line` after `label`, as the log prints them
 /// (`accept 1.06s`).
 fn secs_after(line: &str, label: &str) -> Option<f64> {
@@ -139,8 +153,8 @@ fn a_full_block_applies_on_a_large_state() {
     report(T, "spacing", spacing());
     report(T, "fill_secs", format!("{:.1}", filled.as_secs_f64()));
     a.reach(blocks, scaled(n));
+    let totals = wait_log_lines(&a, "  total ", blocks as usize, 300);
     let fills = log_lines(&a, "debug fill: ");
-    let totals = log_lines(&a, "  total ");
     assert_eq!(totals.len() as u64, blocks, "a total line per block");
     let mut accepts = Vec::new();
     for (i, (fill, total)) in fills.iter().zip(&totals).enumerate() {
