@@ -88,6 +88,7 @@ jobs:
           - test: block_air::tests::the_block_circuit_has_no_unintended_freedom
           - test: block_air::tests::a_replaced_permutation_is_caught_where_it_is_used
           - test: name_air::tests::has_no_unintended_freedom
+          - test: block_air::tests::the_circuit_agrees_with_the_chain_on_random_blocks
           # The binary through its prompt (miner/tests/wallet.rs).
           - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
           - { test: a_payment_goes_through_the_prompt, features: dev, target: --test wallet }

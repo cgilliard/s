@@ -185,9 +185,32 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   the public values and lookups). Limits: freedoms that span rows of
   different types, and shapes not built (a block circuit segment
   carrying name operations).
-  The audit finds witnesses that are not unique; whether each rule means
-  what the protocol needs is the next step: attacks rule by rule, and the
-  circuits against the chain's own code on random blocks.
+  The audit finds witnesses that are not unique; the next two steps test
+  what the rules mean.
+- **Attacked rule by rule, and checked against the chain (2026-11-04).**
+  Each rule the witness generator enforces goes through
+  `stark::refuse`, which a test-only lenient switch turns off, so the
+  generator writes the trace a cheating prover would (collecting the
+  witness too, for plain inputs). `broken_rules_are_rejected_by_the_constraints`:
+  fifteen witnesses that break a rule (amounts, commitments, memos, a
+  signature over another message, a signer outside the policy or counted
+  twice, a wrong preimage, an absolute or relative lock not passed, a
+  covenant's outputs, a stale eltoo state, a double spend in a segment,
+  outputs over an occupied position, a resumed transaction skipping an
+  input under the honest statement) are all rejected by the constraints;
+  honest multisig, covenant and eltoo spends are accepted. Rules across
+  segments are the node program's (every boundary field chained, both
+  ends pinned, the balance), tested in `root_program_accepts_and_rejects`.
+  `the_circuit_agrees_with_the_chain_on_random_blocks`: random blocks,
+  packed at random segment sizes, end where the native set does (root,
+  lists, position, sums), and random breakages the chain rejects
+  (a stranger's signature, another output's position, an inflated input,
+  an output changed after signing, a double spend) are rejected by the
+  constraints; 440 blocks over eleven seeds (`TABMINER_DIFF_SEED`).
+  Limits: each attack checks the trace a cheater would naturally write,
+  not every trace for it (the freedom audit covers the rest locally);
+  name operations inside a block segment, and the name circuit's own
+  rules beyond `forged_traces_fail`, are not attacked this way yet.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`

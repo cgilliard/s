@@ -1768,9 +1768,22 @@ impl SegmentWitness {
                     if k < n_in {
                         let inp = &tx.inputs[k];
                         let (commitment, position) = (inp.commitment(), inp.position);
-                        let (_, memo, created) = utxo.output_at(wtxn, position)?.ok_or(utxo::Error::CorruptIndex)?;
+                        let stored = utxo.output_at(wtxn, position)?;
+                        let (memo, created) = match stored {
+                            Some((_, memo, created)) => (memo, created),
+                            // Tests: a lenient generator (`stark::lenient`)
+                            // goes on with what a cheater would claim.
+                            None if crate::stark::lenient() => (EMPTY, 0),
+                            None => return Err(utxo::Error::CorruptIndex),
+                        };
                         if !utxo.spend_at(wtxn, &commitment, position)? {
-                            return Err(utxo::Error::CorruptIndex);
+                            if !crate::stark::lenient() {
+                                return Err(utxo::Error::CorruptIndex);
+                            }
+                            // The claimed output is not there: clear what is.
+                            if let Some((c, ..)) = stored {
+                                utxo.spend_at(wtxn, &c, position)?;
+                            }
                         }
                         // Siblings are unchanged by the removal, so read them after it.
                         let proof = utxo.prove(wtxn, position)?;
@@ -2157,7 +2170,7 @@ impl Gen {
                 self.regs.pbits[DEPTH - 1] = Fp::ZERO;
             }
         }
-        assert_eq!(old_node, self.regs.root, "old path does not reach the current root");
+        crate::stark::refuse(old_node == self.regs.root, "old path does not reach the current root");
         self.regs.root = new_node;
     }
 
@@ -2401,7 +2414,7 @@ impl Gen {
                         row[T_HL] = Fp::ONE;
                         self.regs.write(row);
                     }
-                    debug_assert_eq!(self.b.acc(), blocks[bi], "preimage does not open the hash lock");
+                    crate::stark::refuse(self.b.acc() == blocks[bi], "preimage does not open the hash lock");
                     self.leaf_absorb(blocks[bi], T_HASH);
                     bi += 1;
                 }
@@ -2413,7 +2426,7 @@ impl Gen {
                         Cond::Older(_) => (T_OLDER, height as i64 - self.regs.created as i64 - *v as i64),
                         _ => (T_STATE, self.regs.pstate as i64 - *v as i64 - 1),
                     };
-                    assert!((0..1 << 31).contains(&value), "a policy condition's lock has not passed");
+                    crate::stark::refuse((0..1 << 31).contains(&value), "a policy condition's lock has not passed");
                     self.leaf_absorb(blocks[bi], ty);
                     bi += 1;
                     let ksel = self.regs.xmss.ksel;
@@ -2447,7 +2460,7 @@ impl Gen {
             node = self.b.acc();
         }
         self.regs.proot = node;
-        assert_eq!(node, p.policy(), "policy path does not reach the policy");
+        crate::stark::refuse(node == p.policy(), "policy path does not reach the policy");
         // the signatures, each into the signers sponge
         for wit in &p.witness {
             let CondWitness::Signatures(signers) = wit else { continue };
@@ -2459,7 +2472,7 @@ impl Gen {
                 self.regs.ssp = out;
             }
         }
-        assert_eq!(self.regs.ksp, self.regs.ssp, "signers are not the selected keys");
+        crate::stark::refuse(self.regs.ksp == self.regs.ssp, "signers are not the selected keys");
         self.b.pass();
         {
             let row = self.b.last_row_mut();
@@ -2478,7 +2491,7 @@ impl Gen {
         }
         self.absorb(amt_block(p.amount), T_CM1);
         let commitment = self.b.acc();
-        assert_eq!(commitment, p.commitment(), "policy input commitment");
+        crate::stark::refuse(commitment == p.commitment(), "policy input commitment");
         for (acc, limb) in self.regs.sum_in.iter_mut().zip(limbs16(p.amount)) {
             *acc += limb.to_canonical();
         }
@@ -2538,10 +2551,16 @@ impl Gen {
         blk[0] = self.regs.csp[RATE - 1];
         self.absorb(blk, T_RB2);
         if self.regs.rebind {
-            assert_eq!(self.b.acc(), self.regs.rmsg, "rebindable message does not match the covered outputs");
+            crate::stark::refuse(
+                self.b.acc() == self.regs.rmsg,
+                "rebindable message does not match the covered outputs",
+            );
         }
         if self.regs.hascov {
-            assert_eq!(&self.regs.csp[..DIGEST], &self.regs.cov[..], "covered outputs are not the covenant's");
+            crate::stark::refuse(
+                self.regs.csp[..DIGEST] == self.regs.cov[..],
+                "covered outputs are not the covenant's",
+            );
         }
         self.regs.rundone = true;
     }
@@ -2574,7 +2593,7 @@ impl Gen {
             self.regs.write(row);
         }
         self.absorb(amt_block(o.amount), T_OCM1);
-        assert_eq!(self.b.acc(), o.commitment, "output commitment does not match its key hash and amount");
+        crate::stark::refuse(self.b.acc() == o.commitment, "output commitment does not match its key hash and amount");
         let leaf = self.leaf_rows(o.commitment, self.height, T_OLEAF, T_OLEAF2);
         self.regs.leaf = leaf;
         let out = self.sponge_start(osp, o.commitment, T_OLIST);
@@ -2766,7 +2785,10 @@ impl BlockAir {
                 g.op(op);
             }
             if tx.ends {
-                assert_eq!(&g.regs.bsp[..DIGEST], &tx.message[..], "body digest does not match the signed message");
+                crate::stark::refuse(
+                    g.regs.bsp[..DIGEST] == tx.message[..],
+                    "body digest does not match the signed message",
+                );
                 g.b.pass();
                 let row = g.b.last_row_mut();
                 row[T_TX_END] = Fp::ONE;
@@ -2921,6 +2943,482 @@ mod tests {
         }
         assert_eq!(txs[2].weight(), 2);
         assert_eq!(txs[3].weight(), 0);
+    }
+
+    /// What becomes of a witness that breaks a rule when the generator
+    /// writes its trace anyway, as a cheating prover's would.
+    #[derive(Debug, PartialEq)]
+    enum Cheat {
+        /// The constraints reject the trace: the rule holds in the circuit.
+        Rejected,
+        /// The constraints accept it: a soundness bug.
+        Accepted,
+        /// The generator cannot write a trace for it at all.
+        NoTrace(String),
+    }
+
+    fn cheat(w: &SegmentWitness) -> Cheat {
+        crate::stark::LENIENT.with(|l| l.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BlockAir::generate_trace(w)));
+        crate::stark::LENIENT.with(|l| l.set(false));
+        match r {
+            Err(e) => Cheat::NoTrace(
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or(e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+            ),
+            Ok((trace, public)) => match check_constraints(&BlockAir, &trace, &public.to_values()) {
+                Err(_) => Cheat::Rejected,
+                Ok(()) => Cheat::Accepted,
+            },
+        }
+    }
+
+    /// A segment spending one output of `policy` (created at height 0,
+    /// amount 1000, memo `m`) by the transaction `spend` builds from the
+    /// input, at `height`.
+    fn policy_spend(
+        name: &str,
+        policy: &crate::policy::Policy,
+        height: u32,
+        spend: impl FnOnce(crate::policy::PolicyInput) -> Transaction,
+    ) -> SegmentWitness {
+        let dir = TempDir::new(name);
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let mut memo = EMPTY;
+        memo[0] = Fp::new(42);
+        let o = Output::with_memo(&policy.root(), 1000, crate::transaction::memo5(memo));
+        utxo.add_output(&mut wtxn, &o.block_output(), 0).unwrap();
+        let tx = spend(policy.spend(0, 1000, 0));
+        let mut segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, height).unwrap();
+        wtxn.abort();
+        segments.remove(0)
+    }
+
+    /// Step 2 of the circuit review (`docs/HARDENING.md`): each rule the
+    /// witness generator enforces, broken by a witness the generator then
+    /// writes anyway (as a cheating prover's would), must be rejected by
+    /// the constraints themselves.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn broken_rules_are_rejected_by_the_constraints() {
+        use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer, hash_lock};
+        use crate::transaction::pubkey_hash;
+        let mut verdicts: Vec<(&str, Cheat)> = Vec::new();
+        // The plain spends' forgeries.
+        let (segments, ..) = scenario("attack", 10);
+        let w = &segments[0];
+        let mut greedy = w.clone();
+        greedy.txs[0].inputs[0].amount += 1;
+        verdicts.push(("an input claiming more than its output holds", cheat(&greedy)));
+        let mut inflated = w.clone();
+        let o = &mut inflated.txs[0].outputs[0].output;
+        o.commitment = crate::transaction::key_commitment(&o.key_hash, o.amount + 1_000_000);
+        verdicts.push(("an output hiding more than it counts", cheat(&inflated)));
+        let mut wrong_msg = w.clone();
+        wrong_msg.txs[2].message[0] += Fp::ONE;
+        verdicts.push(("a signature over another message", cheat(&wrong_msg)));
+        let mut wrong_memo = w.clone();
+        wrong_memo.txs[0].inputs[0].memo[1] += Fp::ONE;
+        verdicts.push(("an input with another memo than its leaf's", cheat(&wrong_memo)));
+        let mut swapped = w.clone();
+        swapped.txs[0].outputs[0].output.memo[0] += Fp::ONE;
+        verdicts.push(("an output memo changed after signing", cheat(&swapped)));
+
+        // Policy spends.
+        let k = |t: u8| key(t);
+        let pkh = |t: u8| pubkey_hash(&k(t).public_key());
+        let dest = k(9).public_key();
+        let signed = |input: crate::policy::PolicyInput, sign: &dyn Fn(&Digest) -> CondWitness| {
+            let mut input = input;
+            let body = UnsignedTransaction::new(vec![], vec![Output::new(&dest, 1000)])
+                .with_policy_inputs(vec![input.clone()])
+                .body_hash();
+            let last = input.witness.len() - 1;
+            input.witness[last] = sign(&body);
+            UnsignedTransaction::new(vec![], vec![Output::new(&dest, 1000)])
+                .with_policy_inputs(vec![input])
+                .sign(|_, _, _| Err::<Sig, ()>(()))
+                .unwrap()
+        };
+        let sig = |t: u8, key_index: u8, body: &Digest| {
+            let mut sk = k(t);
+            Signer { key: key_index, pubkey: sk.public_key(), signature: sk.sign(body).unwrap() }
+        };
+        let multisig = Policy::new(vec![Leaf::new(vec![Cond::Thresh {
+            mode: Mode::Body,
+            m: 2,
+            keys: vec![pkh(1), pkh(2), pkh(3)],
+        }])]);
+        // Honest first: the helper's segment holds.
+        let honest = policy_spend("honest-multisig", &multisig, 10, |i| {
+            signed(i, &|b| CondWitness::Signatures(vec![sig(1, 0, b), sig(3, 2, b)]))
+        });
+        assert_eq!(cheat(&honest), Cheat::Accepted, "an honest 2-of-3");
+        let outsider = policy_spend("outsider", &multisig, 10, |i| {
+            signed(i, &|b| CondWitness::Signatures(vec![sig(1, 0, b), sig(7, 1, b)]))
+        });
+        verdicts.push(("a 2-of-3 with a signer whose key is not the policy's", cheat(&outsider)));
+        let twice = policy_spend("twice", &multisig, 10, |i| {
+            signed(i, &|b| CondWitness::Signatures(vec![sig(1, 0, b), sig(1, 0, b)]))
+        });
+        verdicts.push(("a 2-of-3 with one signer counted twice", cheat(&twice)));
+        let mut pre = EMPTY;
+        pre[0] = Fp::new(77);
+        let htlc = Policy::new(vec![Leaf::new(vec![
+            Cond::Hash(hash_lock(&pre)),
+            Cond::Thresh { mode: Mode::Body, m: 1, keys: vec![pkh(2)] },
+        ])]);
+        let wrong_pre = policy_spend("preimage", &htlc, 10, |mut i| {
+            let mut other = pre;
+            other[0] += Fp::ONE;
+            i.witness[0] = CondWitness::Preimage(other);
+            signed(i, &|b| CondWitness::Signatures(vec![sig(2, 0, b)]))
+        });
+        verdicts.push(("an HTLC claimed with the wrong preimage", cheat(&wrong_pre)));
+        let refund = Policy::new(vec![Leaf::new(vec![
+            Cond::After(100),
+            Cond::Thresh { mode: Mode::Body, m: 1, keys: vec![pkh(1)] },
+        ])]);
+        let early = policy_spend("after", &refund, 50, |i| signed(i, &|b| CondWitness::Signatures(vec![sig(1, 0, b)])));
+        verdicts.push(("a refund before its height (After 100 at 50)", cheat(&early)));
+        let relative = Policy::new(vec![Leaf::new(vec![
+            Cond::Older(144),
+            Cond::Thresh { mode: Mode::Body, m: 1, keys: vec![pkh(1)] },
+        ])]);
+        let young =
+            policy_spend("older", &relative, 100, |i| signed(i, &|b| CondWitness::Signatures(vec![sig(1, 0, b)])));
+        verdicts.push(("a spend before its delay (Older 144, 100 blocks old)", cheat(&young)));
+
+        // Covenant: a settlement paying other outputs than the covenant's.
+        let mut m1 = EMPTY;
+        m1[0] = Fp::new(101);
+        let to = |t: u8, amount: u64| Output::with_memo(&pkh(t), amount, crate::transaction::memo5(EMPTY));
+        let settle_to = [Output::with_memo(&pkh(1), 600, crate::transaction::memo5(m1)), to(2, 400)];
+        let covered: Vec<(Commitment, Digest)> = settle_to.iter().map(|o| (o.commitment, o.slot())).collect();
+        let covenant = Policy::new(vec![Leaf::new(vec![Cond::Outputs(covered)])]);
+        let pay = |outs: Vec<Output>| {
+            move |mut i: crate::policy::PolicyInput| {
+                i.covered = (0, outs.len() as u8);
+                UnsignedTransaction::new(vec![], outs.clone())
+                    .with_policy_inputs(vec![i])
+                    .sign(|_, _, _| Err::<Sig, ()>(()))
+                    .unwrap()
+            }
+        };
+        let honest_settle = policy_spend("covenant-ok", &covenant, 10, pay(settle_to.to_vec()));
+        assert_eq!(cheat(&honest_settle), Cheat::Accepted, "an honest settlement");
+        let other = [to(1, 400), to(2, 600)];
+        let robbed = policy_spend("covenant", &covenant, 10, pay(other.to_vec()));
+        verdicts.push(("a settlement paying other outputs than the covenant's", cheat(&robbed)));
+        // Eltoo: an update to a state no newer than the current one.
+        let channel = {
+            let mut c = EMPTY;
+            c[0] = Fp::new(5);
+            c
+        };
+        let state = Policy::new(vec![Leaf::new(vec![
+            Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: vec![pkh(1), pkh(2)] },
+            Cond::State(3),
+        ])]);
+        let state_root = state.root();
+        let update = |to: u32| {
+            move |mut i: crate::policy::PolicyInput| {
+                let new_state = Output::with_memo(&state_root, 1000, crate::transaction::memo5(EMPTY));
+                i.state = to;
+                i.covered = (0, 1);
+                let msg = crate::policy::rebind_message(&channel, to, &[(new_state.commitment, new_state.slot())]);
+                let signer = |t: u8, key_index: u8| {
+                    let mut sk = key(t);
+                    sk.set_next_index(u64::from(to));
+                    Signer { key: key_index, pubkey: sk.public_key(), signature: sk.sign(&msg).unwrap() }
+                };
+                i.witness[0] = CondWitness::Signatures(vec![signer(1, 0), signer(2, 1)]);
+                UnsignedTransaction::new(vec![], vec![new_state])
+                    .with_policy_inputs(vec![i])
+                    .sign(|_, _, _| Err::<Sig, ()>(()))
+                    .unwrap()
+            }
+        };
+        let newer = policy_spend("eltoo-ok", &state, 10, update(4));
+        assert_eq!(cheat(&newer), Cheat::Accepted, "an honest update to state 4");
+        let stale = policy_spend("eltoo", &state, 10, update(3));
+        verdicts.push(("an eltoo update to a state no newer (3 over 3)", cheat(&stale)));
+
+        // A segment resuming a transaction with one input fewer left than
+        // the previous segment carried out, checked against the honest
+        // public values: the carry is bound to the resume row.
+        let plan = vec![
+            vec![Part { tx: 0, start: 0, end: 1 }],
+            vec![Part { tx: 0, start: 1, end: 3 }],
+            vec![Part { tx: 0, start: 3, end: 4 }, Part { tx: 1, start: 0, end: 1 }, Part { tx: 2, start: 0, end: 2 }],
+        ];
+        let (span, ..) = scenario_with("attack-span", |utxo, wtxn, txs| {
+            SegmentWitness::collect_parts(utxo, wtxn, txs, plan, 1).unwrap()
+        });
+        let (_, honest_public) = BlockAir::generate_trace(&span[1]);
+        let mut short = span[1].clone();
+        short.txs[0].inputs.clear();
+        short.txs[0].in_left -= 1;
+        crate::stark::LENIENT.with(|l| l.set(true));
+        let forged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BlockAir::generate_trace(&short)));
+        crate::stark::LENIENT.with(|l| l.set(false));
+        verdicts.push((
+            "a resumed transaction skipping an input, under the honest statement",
+            match forged {
+                Err(e) => Cheat::NoTrace(e.downcast_ref::<String>().cloned().unwrap_or_default()),
+                Ok((trace, _)) => match check_constraints(&BlockAir, &trace, &honest_public.to_values()) {
+                    Err(_) => Cheat::Rejected,
+                    Ok(()) => Cheat::Accepted,
+                },
+            },
+        ));
+        // The same input spent twice in one segment (its path stale).
+        let mut double = w.clone();
+        let again = double.txs[2].clone();
+        double.txs.push(again);
+        verdicts.push(("an input spent twice in one segment", cheat(&double)));
+        // An output inserted over an occupied position.
+        let mut occupied = w.clone();
+        occupied.pos_in = 2;
+        verdicts.push(("outputs inserted from an occupied position", cheat(&occupied)));
+
+        let failures: Vec<String> =
+            verdicts.iter().filter(|(_, v)| *v != Cheat::Rejected).map(|(what, v)| format!("{what}: {v:?}")).collect();
+        for (what, v) in &verdicts {
+            eprintln!("{what}: {v:?}");
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Step 3 of the circuit review (`docs/HARDENING.md`): the circuit
+    /// against the chain's own rules on random blocks. A valid block, its
+    /// transactions packed into segments of a random size (so they often
+    /// split), must give segments that hold, chain, and end where the
+    /// native set does: root, input and output lists, position and sums. A
+    /// block one random change makes invalid by the chain's checks must be
+    /// rejected by the constraints, its trace written by the lenient
+    /// generator (or refused already when the witness is collected).
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn the_circuit_agrees_with_the_chain_on_random_blocks() {
+        use crate::test_util::Rng;
+        // A fixed seed, or another for a wider search (TABMINER_DIFF_SEED).
+        let seed = std::env::var("TABMINER_DIFF_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5eed_b10c);
+        let mut rng = Rng::new(seed);
+        let mut pick = |n: u64| (rng.next_u64() % n.max(1)) as usize;
+        let dir = TempDir::new("differential");
+        let env = open_env(&dir.0, 256 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "circuit").unwrap();
+        let native = UtxoSet::open(&env, &mut wtxn, "native").unwrap();
+        // A fresh key per output, by counter.
+        let mut next_key = 0u64;
+        let mut fresh = || {
+            next_key += 1;
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&next_key.to_le_bytes());
+            seed[8] = 0xd1;
+            Key::generate(&seed)
+        };
+        // Unspent: position, key, amount.
+        let mut unspent: Vec<(u64, Key, u64)> = Vec::new();
+        for _ in 0..24 {
+            let k = fresh();
+            let amount = 1000 + pick(9000) as u64;
+            let o = Output::new(&k.public_key(), amount).block_output();
+            let p = utxo.add_output(&mut wtxn, &o, 0).unwrap();
+            native.add_output(&mut wtxn, &o, 0).unwrap();
+            unspent.push((p, k, amount));
+        }
+        let (mut valid, mut rejected, mut inconclusive) = (0, 0, 0);
+        for round in 0..40u32 {
+            let height = 1 + round;
+            let broken = round % 2 == 1;
+            // A random block of valid transactions.
+            let mut txs: Vec<Transaction> = Vec::new();
+            let mut spent_now: Vec<(u64, Key, u64)> = Vec::new();
+            let mut made: Vec<(Key, u64)> = Vec::new();
+            for _ in 0..1 + pick(3) {
+                if unspent.len() < 2 {
+                    break;
+                }
+                let mut ins: Vec<(u64, Key, u64)> = Vec::new();
+                for _ in 0..1 + pick(2) {
+                    let i = pick(unspent.len() as u64);
+                    ins.push(unspent.remove(i));
+                }
+                let total: u64 = ins.iter().map(|i| i.2).sum();
+                let fee = pick(10) as u64;
+                let n_out = 1 + pick(3);
+                let mut outs: Vec<(Key, u64)> = Vec::new();
+                let mut left = total - fee;
+                for j in 0..n_out {
+                    let a = if j + 1 == n_out { left } else { 1 + pick(left / 2) as u64 };
+                    left -= a;
+                    outs.push((fresh(), a));
+                }
+                let outputs: Vec<Output> = outs.iter().map(|(k, a)| Output::new(&k.public_key(), *a)).collect();
+                let inputs: Vec<(crate::xmss::PublicKey, u64)> =
+                    ins.iter().map(|(_, k, a)| (k.public_key(), *a)).collect();
+                let mut keys: Vec<Key> = ins.iter().map(|i| i.1.clone()).collect();
+                let mut tx = UnsignedTransaction::new(inputs, outputs).sign(|i, _, m| keys[i].sign(m)).unwrap();
+                tx.set_positions(&ins.iter().map(|i| i.0).collect::<Vec<_>>());
+                txs.push(tx);
+                spent_now.extend(ins);
+                made.extend(outs);
+            }
+            if txs.is_empty() {
+                break;
+            }
+            // One change the chain rejects, in a random transaction.
+            let mut what = "";
+            if broken {
+                let t = pick(txs.len() as u64);
+                let tx = &mut txs[t];
+                match pick(5) {
+                    0 => {
+                        // Signed by a key that does not own the output.
+                        let mut stranger = fresh();
+                        let mut un = tx.unsigned();
+                        un = UnsignedTransaction::new(
+                            un.inputs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, x)| if i == 0 { (stranger.public_key(), x.1) } else { *x })
+                                .collect(),
+                            un.outputs.clone(),
+                        );
+                        let positions = tx.spent_positions();
+                        let mut owners: Vec<Key> =
+                            spent_now.iter().filter(|s| positions.contains(&s.0)).map(|s| s.1.clone()).collect();
+                        let signed = un.sign(|i, _, m| if i == 0 { stranger.sign(m) } else { owners[i].sign(m) });
+                        let Ok(mut forged) = signed else {
+                            unspent.append(&mut spent_now);
+                            continue;
+                        };
+                        forged.set_positions(&positions);
+                        *tx = forged;
+                        what = "signed by a stranger";
+                    }
+                    1 => {
+                        // An input pointing at another unspent output.
+                        let Some(other) = unspent.first() else {
+                            unspent.append(&mut spent_now);
+                            continue;
+                        };
+                        let mut ps = tx.spent_positions();
+                        ps[0] = other.0;
+                        tx.set_positions(&ps);
+                        what = "another output's position";
+                    }
+                    2 => {
+                        // An input claiming more than its output holds.
+                        tx.inputs[0].amount += 1;
+                        what = "an input claiming more";
+                    }
+                    3 => {
+                        // An output changed after signing.
+                        let o = &mut tx.outputs[0];
+                        *o = Output::new(&fresh().public_key(), o.amount);
+                        what = "an output changed after signing";
+                    }
+                    _ => {
+                        // The same output spent by two transactions.
+                        let first = txs[0].clone();
+                        txs.push(first);
+                        what = "an output spent twice";
+                    }
+                }
+            }
+            // The chain's verdict: signatures, inputs held, no double spend.
+            let native_ok = {
+                let mut seen = std::collections::HashSet::new();
+                txs.iter().all(|tx| {
+                    tx.verify_signatures()
+                        && tx
+                            .spent_positions()
+                            .iter()
+                            .zip(tx.spent_commitments())
+                            .all(|(p, c)| seen.insert(*p) && native.holds(&wtxn, *p, &c).unwrap())
+                })
+            };
+            assert_eq!(native_ok, !broken, "round {round}: the chain's verdict on {what:?}");
+            let max_rows = [2048, 4096, 8192][pick(3)];
+            let positions: Vec<u64> = txs.iter().flat_map(|t| t.spent_positions()).collect();
+            let block_outputs: Vec<BlockOutput> =
+                txs.iter().flat_map(|t| t.outputs.iter().map(|o| o.block_output())).collect();
+            let root_in = utxo.root(&wtxn).unwrap();
+            let pos_in = utxo.next_position(&wtxn).unwrap();
+            let mut nested = env.nested_write_txn(&mut wtxn).unwrap();
+            // A broken block's witness is collected as a cheater would.
+            crate::stark::LENIENT.with(|l| l.set(broken));
+            let collected = SegmentWitness::collect_by_rows(&utxo, &mut nested, &txs, max_rows, height);
+            crate::stark::LENIENT.with(|l| l.set(false));
+            if broken {
+                nested.abort();
+                // Nothing was spent: the inputs are still there.
+                unspent.append(&mut spent_now);
+                let Ok(segments) = collected else {
+                    inconclusive += 1;
+                    continue;
+                };
+                // Some segment's trace must fail.
+                if segments.iter().any(|w| cheat(w) != Cheat::Accepted) {
+                    rejected += 1;
+                } else {
+                    panic!("round {round}: {what} accepted by every segment");
+                }
+                continue;
+            }
+            let segments = collected.unwrap();
+            let root_out = utxo.root(&nested).unwrap();
+            nested.commit().unwrap();
+            // The native block.
+            native.spend_positions(&mut wtxn, &positions).unwrap().unwrap();
+            native.add_outputs(&mut wtxn, &block_outputs, height).unwrap();
+            assert_eq!(native.root(&wtxn).unwrap(), root_out, "round {round}: roots");
+            let publics: Vec<SegmentPublic> = segments
+                .iter()
+                .map(|w| {
+                    let (trace, public) = BlockAir::generate_trace(w);
+                    assert_eq!(check_constraints(&BlockAir, &trace, &public.to_values()), Ok(()), "round {round}");
+                    public
+                })
+                .collect();
+            for p in publics.windows(2) {
+                assert_eq!(
+                    (p[0].root_out, p[0].isp_out, p[0].osp_out, p[0].pos_out, p[0].carry_out),
+                    (p[1].root_in, p[1].isp_in, p[1].osp_in, p[1].pos_in, p[1].carry_in),
+                    "round {round}: segments chain"
+                );
+            }
+            let (first, last) = (&publics[0], &publics[publics.len() - 1]);
+            assert_eq!((first.root_in, first.pos_in, first.carry_in), (root_in, pos_in, Carry::CLOSED));
+            assert_eq!(last.root_out, native.root(&wtxn).unwrap());
+            assert_eq!(last.isp_out, inputs_state(&positions), "round {round}: inputs list");
+            assert_eq!(last.osp_out, outputs_state(&block_outputs), "round {round}: outputs list");
+            assert_eq!(last.pos_out, native.next_position(&wtxn).unwrap());
+            assert_eq!(last.carry_out, Carry::CLOSED);
+            let sum = |f: fn(&SegmentPublic) -> &[u32; LIMBS]| {
+                publics.iter().map(|p| SegmentPublic::total(f(p))).sum::<u128>()
+            };
+            let ins: u128 = spent_now.iter().map(|s| s.2 as u128).sum();
+            let outs: u128 = made.iter().map(|m| m.1 as u128).sum();
+            assert_eq!((sum(|p| &p.sum_in), sum(|p| &p.sum_out)), (ins, outs), "round {round}: sums");
+            // The new outputs join the unspent set.
+            for (i, (k, a)) in made.into_iter().enumerate() {
+                unspent.push((pos_in + i as u64, k, a));
+            }
+            valid += 1;
+        }
+        eprintln!(
+            "{valid} valid blocks agreed; {rejected} broken ones rejected, {inconclusive} refused when collected"
+        );
+        assert!(valid >= 15 && rejected >= 8, "too few rounds ran: {valid} valid, {rejected} rejected");
     }
 
     /// The four policy spends of [`policy_spends_satisfy_constraints`]

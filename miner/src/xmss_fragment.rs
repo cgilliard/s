@@ -696,6 +696,6 @@ pub fn generate(
         }
     }
     let root = b.acc();
-    assert_eq!(root, pk.root, "signature does not verify under the given key");
+    crate::stark::refuse(root == pk.root, "signature does not verify under the given key");
     root
 }

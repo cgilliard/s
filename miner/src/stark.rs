@@ -264,6 +264,34 @@ impl<'a, F: Field> Builder<'a, F> {
     }
 }
 
+/// A rule of the statement the witness generator checks before writing
+/// the trace: it refuses (panics) on a witness that breaks it. In tests a
+/// lenient generator ([`LENIENT`]) writes the trace anyway, as a cheating
+/// prover's would, so that the attack tests can show the constraints
+/// themselves reject it. Whether it is lenient now.
+pub(crate) fn lenient() -> bool {
+    #[cfg(test)]
+    if LENIENT.with(|l| l.get()) {
+        return true;
+    }
+    false
+}
+
+/// See [`lenient`]: asserts `holds` unless the generator is lenient.
+pub(crate) fn refuse(holds: bool, rule: &str) {
+    #[cfg(test)]
+    if LENIENT.with(|l| l.get()) {
+        return;
+    }
+    assert!(holds, "{rule}");
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the witness generator writes a trace whatever rule it breaks.
+    pub(crate) static LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// An algebraic intermediate representation: constraints over consecutive
 /// trace rows. `eval` must be the same polynomial map for both field types.
 pub trait Air: Sync {
