@@ -959,29 +959,53 @@ impl NameWitness {
                     let key = key_of(&nh);
                     let c = commit_hash(&nh, salt, &record.owner);
                     let position = *position;
-                    let commit = names.commit_at(wtxn, position)?.ok_or(ApplyError::NoCommit)?;
-                    if commit.hash != c {
-                        return Err(ApplyError::NoCommit);
-                    }
-                    if !names::in_window(height, commit.height) {
+                    // Tests: a lenient generator (`stark::lenient`) goes on
+                    // with what a cheater would claim: a commit to this
+                    // record at the position, in the window.
+                    let commit = match names.commit_at(wtxn, position)? {
+                        Some(found) if found.hash == c || crate::stark::lenient() => found,
+                        None if crate::stark::lenient() => {
+                            Commit { hash: c, height: height.saturating_sub(names::MIN_REVEAL) }
+                        }
+                        _ => return Err(ApplyError::NoCommit),
+                    };
+                    if !names::in_window(height, commit.height) && !crate::stark::lenient() {
                         return Err(ApplyError::Window(commit.height));
                     }
                     let proof = names.prove(wtxn, &record.name)?;
                     let other = match proof.terminal {
                         Terminal::Empty => None,
-                        Terminal::Leaf { key: k, .. } if k == key => return Err(ApplyError::Registered),
+                        Terminal::Leaf { key: k, .. } if k == key && !crate::stark::lenient() => {
+                            return Err(ApplyError::Registered);
+                        }
                         Terminal::Leaf { key: k, .. } => {
                             Some(names.record(wtxn, k)?.ok_or(names::Error::Corrupt("record missing for a leaf"))?)
                         }
                     };
                     let left = utxo.output_root(wtxn)?;
-                    let root = names.register(wtxn, record)?;
+                    // A lenient generator goes on past the registry's
+                    // refusal of a name it holds, with the root as it was.
+                    let root = match names.register(wtxn, record) {
+                        Err(_) if crate::stark::lenient() => utxo.name_root(wtxn)?,
+                        r => r?,
+                    };
                     utxo.set_name_root(wtxn, &root)?;
                     let commit_memo = utxo.slot(wtxn, position)?;
                     if !utxo.spend_at(wtxn, &commit_leaf(&c, commit.height), position)? {
-                        return Err(ApplyError::NoCommit);
+                        if !crate::stark::lenient() {
+                            return Err(ApplyError::NoCommit);
+                        }
+                        // The claimed commit is not there: clear what is.
+                        if let Some((stored, ..)) = utxo.output_at(wtxn, position)? {
+                            utxo.spend_at(wtxn, &stored, position)?;
+                        }
                     }
-                    names.remove_commit(wtxn, position)?;
+                    match names.remove_commit(wtxn, position) {
+                        Err(_) if crate::stark::lenient() => {}
+                        r => {
+                            r?;
+                        }
+                    }
                     let path = utxo.prove(wtxn, position)?.siblings;
                     OpWitness::Reveal {
                         record: record.clone(),
@@ -996,7 +1020,7 @@ impl NameWitness {
                 }
                 NameOp::Update { record, pubkey, signature } => {
                     let old = names.lookup(wtxn, &record.name)?.ok_or(ApplyError::NotRegistered)?;
-                    if !op.verify_owner(&old.owner) {
+                    if !op.verify_owner(&old.owner) && !crate::stark::lenient() {
                         return Err(ApplyError::BadOwner);
                     }
                     let proof = names.prove(wtxn, &record.name)?;
@@ -1015,7 +1039,7 @@ impl NameWitness {
         }
         for &position in sweeps {
             let commit = names.commit_at(wtxn, position)?.ok_or(ApplyError::NoCommit)?;
-            if !names::expired(height, commit.height) {
+            if !names::expired(height, commit.height) && !crate::stark::lenient() {
                 return Err(ApplyError::NotExpired(commit.height));
             }
             let memo = utxo.slot(wtxn, position)?;
@@ -1400,7 +1424,7 @@ impl Gen {
 
     /// A window (or expiry) row: `value` must be non-negative.
     fn window_row(&mut self, ty: usize, value: i64) {
-        assert!((0..1 << 31).contains(&value), "commit age out of range");
+        crate::stark::refuse((0..1 << 31).contains(&value), "commit age out of range");
         self.b.pass();
         let row = self.b.last_row_mut();
         xmss_fragment::write_bits(row, &XCOLS, value as u32, self.r.xmss.ksel);
@@ -1424,7 +1448,7 @@ impl Gen {
             let row = self.b.last_row_mut();
             for i in 0..RATE {
                 let v = block[i].to_canonical();
-                assert!(v <= names::CHAR_MAX, "name element out of range");
+                crate::stark::refuse(v <= names::CHAR_MAX, "name element out of range");
                 for bit in 0..CHAR_BITS {
                     row[C_CB + CHAR_BITS * i + bit] = Fp::new((v >> bit) & 1);
                 }
@@ -1491,7 +1515,7 @@ impl Gen {
     ) {
         let old = levels.nodes(old_terminal);
         let new = levels.nodes(new_terminal);
-        assert_eq!(old[0], self.r.root, "old path does not reach the current root");
+        crate::stark::refuse(old[0] == self.r.root, "old path does not reach the current root");
         self.pass(load);
         after_load(self);
         self.r.wk = wk;
@@ -1538,7 +1562,7 @@ impl Gen {
             self.absorb(T_OPD, 2, self.r.cmemo);
         }
         let digest = self.b.acc();
-        assert_eq!(Some(digest), op.digest(), "operation digest does not match the block's");
+        crate::stark::refuse(Some(digest) == op.digest(), "operation digest does not match the block's");
         let mut input = self.r.nsp;
         for (s, x) in input.iter_mut().zip(&digest) {
             *s = s.add(x);
@@ -1617,7 +1641,7 @@ impl Gen {
                 let other_nh = other.as_ref().map(|o| name_hash(&o.elements().unwrap())).unwrap_or(EMPTY);
                 self.r.val2 = self.record(T_REC2, &other_nh, &other_rec);
                 if other.is_some() {
-                    assert_eq!(self.r.val2, other_value, "colliding record does not match its leaf");
+                    crate::stark::refuse(self.r.val2 == other_value, "colliding record does not match its leaf");
                 }
                 self.r.val = self.record(T_REC, &nh, record);
                 let (kb, kb2, val, val2) = (self.r.kb, self.r.kb2, self.r.val, self.r.val2);
@@ -1669,7 +1693,10 @@ impl Gen {
                 self.absorb(T_COMMIT, 1, *salt);
                 self.absorb(T_COMMIT, 2, record.owner);
                 self.r.c = self.b.acc();
-                debug_assert_eq!(self.r.c, commit_hash(&nh, salt, &record.owner));
+                crate::stark::refuse(
+                    self.r.c == commit_hash(&nh, salt, &record.owner),
+                    "the commit is not the record's",
+                );
                 self.commit_leaf_rows();
                 self.window_row(T_WIN, height as i64 - *commit_height as i64 - MIN_REVEAL as i64);
                 self.window_row(T_WIN2, *commit_height as i64 + MAX_REVEAL as i64 - height as i64);
@@ -1682,7 +1709,7 @@ impl Gen {
                 let elements = new.elements().expect("a well-formed name");
                 let nh = name_hash(&elements);
                 let key = key_of(&nh);
-                assert_eq!(old.name, new.name, "an update keeps the name");
+                crate::stark::refuse(old.name == new.name, "an update keeps the name");
                 let r = &mut self.r;
                 r.kind = KIND_UPDATE;
                 r.owner = new.owner;
@@ -1697,17 +1724,20 @@ impl Gen {
                 let (kb, kb2, val, val2) = (self.r.kb, self.r.kb2, self.r.val, self.r.val2);
                 self.r.leaf = self.trie_leaf(T_TLEAF, &kb, &val);
                 self.r.oleaf = self.trie_leaf(T_TLEAF2, &kb2, &val2);
-                match trie.proof.terminal {
-                    Terminal::Leaf { key: k, value } if k == key && value == val2 => {}
-                    _ => panic!("update of a name whose leaf is not the current record"),
-                }
+                crate::stark::refuse(
+                    matches!(trie.proof.terminal, Terminal::Leaf { key: k, value } if k == key && value == val2),
+                    "update of a name whose leaf is not the current record",
+                );
                 let levels = Levels::trie(key, trie);
                 let (old_leaf, new_leaf) = (self.r.oleaf, self.r.leaf);
                 self.walk(T_TLOAD, WK_UPDATE, &levels, &old_leaf, &new_leaf);
                 // the owner's signature over the update message
                 self.start(T_UMSG, names::DOM_UPDATE, DIGEST as u32, val);
                 self.r.msg = self.b.acc();
-                debug_assert_eq!(Some(self.r.msg), names::update_message(new));
+                crate::stark::refuse(
+                    Some(self.r.msg) == names::update_message(new),
+                    "the signed message is the update's",
+                );
                 let msg = self.r.msg;
                 let mut xr = self.r.xmss.clone();
                 let regs = &self.r;
@@ -1735,8 +1765,8 @@ impl Gen {
                 seed_block[..PUB_SEED_LEN].copy_from_slice(&pubkey.pub_seed);
                 seed_block[PUB_SEED_LEN] = Fp::new(pubkey.height as u32);
                 self.absorb(T_PKH1, 0, seed_block);
-                assert_eq!(self.b.acc(), old.owner, "the signer is not the current owner");
-                assert_ne!(new.owner, old.owner, "an update must change the owner");
+                crate::stark::refuse(self.b.acc() == old.owner, "the signer is not the current owner");
+                crate::stark::refuse(new.owner != old.owner, "an update must change the owner");
                 self.r.opx = self.r.val;
                 self.digest_rows(&BlockNameOp::Update(new.clone()));
             }
@@ -1972,6 +2002,128 @@ mod tests {
         commits_reveals_updates_and_sweeps();
         let found = AUDIT.lock().unwrap().take().unwrap();
         assert!(found.is_empty(), "{} freedoms:\n{}", found.len(), found.join("\n"));
+    }
+
+    /// What becomes of a name section that breaks a rule when the witness
+    /// is collected and the trace written anyway, as a cheating prover's
+    /// would (`stark::lenient`).
+    #[derive(Debug, PartialEq)]
+    enum Cheat {
+        Rejected,
+        Accepted,
+        NoTrace(String),
+    }
+
+    /// Collects and writes the name section `ops`, `sweeps` at `height`
+    /// leniently, after `edit` changes the witness, in a transaction that
+    /// is thrown away; checks the trace against its own public values.
+    fn cheat(w: &World, height: u32, ops: &[NameOp], sweeps: &[u64], edit: impl FnOnce(&mut NameWitness)) -> Cheat {
+        let mut wtxn = w.env.write_txn().unwrap();
+        crate::stark::LENIENT.with(|l| l.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut witness = NameWitness::collect(&w.utxo, &w.names, &mut wtxn, height, ops, sweeps)?;
+            edit(&mut witness);
+            let (trace, public) = NameAir::generate_trace(&witness);
+            Ok::<_, ApplyError>(check_constraints(&NameAir, &trace, &public.to_values()))
+        }));
+        crate::stark::LENIENT.with(|l| l.set(false));
+        wtxn.abort();
+        match r {
+            Err(e) => Cheat::NoTrace(
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or(e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+            ),
+            Ok(Err(e)) => Cheat::NoTrace(format!("collect: {e:?}")),
+            Ok(Ok(Err(_))) => Cheat::Rejected,
+            Ok(Ok(Ok(()))) => Cheat::Accepted,
+        }
+    }
+
+    /// Step 2 of the circuit review for names (`docs/HARDENING.md`): each
+    /// rule of a name section, broken by a witness collected and written
+    /// anyway, must be rejected by the constraints themselves.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn broken_name_rules_are_rejected_by_the_constraints() {
+        let w = world("attack");
+        let mut k1 = owner_key(1);
+        let o1 = pubkey_hash(&k1.public_key());
+        let mut k2 = owner_key(2);
+        let o2 = pubkey_hash(&k2.public_key());
+        let o3 = pubkey_hash(&owner_key(3).public_key());
+        let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
+        let bob = Record::new(b"bob", o2, d(21), d(22)).unwrap();
+        let carol = Record::new(b"carol", o3, d(31), d(32)).unwrap();
+        let salt = |n: u32| d(500 + n);
+        let commit_of = |r: &Record, s: &Digest| commit_hash(&name_hash(&r.elements().unwrap()), s, &r.owner);
+        // Block 10: commits to alice (at 5), bob (6) and carol (7).
+        let commits: Vec<NameOp> = [(&alice, 1), (&bob, 2), (&carol, 3)]
+            .iter()
+            .map(|(r, n)| NameOp::Commit {
+                commit: commit_of(r, &salt(*n)),
+                memo: crate::transaction::memo5(d(40 + n)),
+            })
+            .collect();
+        block(&w, 10, &commits, &[]);
+        let reveal = |r: &Record, n: u32, at: u64| NameOp::Reveal { record: r.clone(), salt: salt(n), commit: at };
+        let mut verdicts: Vec<(&str, Cheat)> = Vec::new();
+        let none = |_: &mut NameWitness| {};
+        verdicts.push((
+            "a reveal before its commit is old enough (1 block)",
+            cheat(&w, 11, &[reveal(&alice, 1, 5)], &[], none),
+        ));
+        verdicts.push((
+            "a reveal after its commit expired",
+            cheat(&w, 10 + MAX_REVEAL + 1, &[reveal(&bob, 2, 6)], &[], none),
+        ));
+        verdicts
+            .push(("a reveal with another salt than the commit's", cheat(&w, 22, &[reveal(&alice, 9, 5)], &[], none)));
+        verdicts.push((
+            "a reveal against an ordinary output (no commit)",
+            cheat(&w, 22, &[reveal(&alice, 1, 0)], &[], none),
+        ));
+        verdicts.push(("a reveal against another name's commit", cheat(&w, 22, &[reveal(&alice, 1, 6)], &[], none)));
+        verdicts.push(("a sweep of a live commit", cheat(&w, 23, &[], &[7], none)));
+        // Block 22: alice revealed, honestly.
+        assert_eq!(cheat(&w, 22, &[reveal(&alice, 1, 5)], &[], none), Cheat::Accepted, "an honest reveal");
+        block(&w, 22, &[reveal(&alice, 1, 5)], &[]);
+        // Updates at 23.
+        let o4 = pubkey_hash(&owner_key(4).public_key());
+        let alice2 = Record::new(b"alice", o4, d(13), d(14)).unwrap();
+        let honest = NameOp::update(alice2.clone(), &mut owner_key(1)).unwrap();
+        assert_eq!(cheat(&w, 23, &[honest.clone()], &[], none), Cheat::Accepted, "an honest update");
+        let stranger = NameOp::update(alice2.clone(), &mut k2).unwrap();
+        verdicts.push(("an update signed by another key than the owner's", cheat(&w, 23, &[stranger], &[], none)));
+        let same_owner = Record::new(b"alice", o1, d(15), d(16)).unwrap();
+        let kept = NameOp::update(same_owner, &mut k1).unwrap();
+        verdicts.push(("an update keeping the owner", cheat(&w, 23, &[kept], &[], none)));
+        let renamed = cheat(&w, 23, &[honest], &[], |wit| {
+            if let Some(OpWitness::Update { new, .. }) = wit.ops.first_mut() {
+                *new = Record::new(b"alicf", new.owner, new.value, new.memo).unwrap();
+            }
+        });
+        verdicts.push(("an update that changes the name", renamed));
+        // A second registration of alice, from a commit of its own.
+        block(
+            &w,
+            24,
+            &[NameOp::Commit { commit: commit_of(&alice, &salt(4)), memo: crate::transaction::memo5(d(44)) }],
+            &[],
+        );
+        {
+            // The second commit is at 8, so only the registration is wrong.
+            let rtxn = w.env.read_txn().unwrap();
+            assert_eq!(w.names.commit_at(&rtxn, 8).unwrap().map(|c| c.hash), Some(commit_of(&alice, &salt(4))));
+        }
+        verdicts.push(("a reveal of a name already registered", cheat(&w, 36, &[reveal(&alice, 4, 8)], &[], none)));
+        for (what, v) in &verdicts {
+            eprintln!("{what}: {v:?}");
+        }
+        let failures: Vec<String> =
+            verdicts.iter().filter(|(_, v)| *v != Cheat::Rejected).map(|(what, v)| format!("{what}: {v:?}")).collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

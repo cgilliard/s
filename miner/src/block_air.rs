@@ -3186,6 +3186,19 @@ mod tests {
         occupied.pos_in = 2;
         verdicts.push(("outputs inserted from an occupied position", cheat(&occupied)));
 
+        // Name operations a transaction carries: the digest absorbed into
+        // the body (signed) and the operations list (the name segment's)
+        // is one; changed or dropped after signing, the body breaks.
+        let with_ops = name_ops_segment("attack-ops");
+        assert_eq!(cheat(&with_ops), Cheat::Accepted, "an honest spend carrying name operations");
+        let mut changed = with_ops.clone();
+        changed.txs[0].ops[1][0] += Fp::ONE;
+        verdicts.push(("a name operation changed after signing", cheat(&changed)));
+        let mut dropped = with_ops.clone();
+        dropped.txs[0].ops.pop();
+        dropped.txs[0].ops_left -= 1;
+        verdicts.push(("a name operation dropped from a signed transaction", cheat(&dropped)));
+
         let failures: Vec<String> =
             verdicts.iter().filter(|(_, v)| *v != Cheat::Rejected).map(|(what, v)| format!("{what}: {v:?}")).collect();
         for (what, v) in &verdicts {
@@ -3419,6 +3432,38 @@ mod tests {
             "{valid} valid blocks agreed; {rejected} broken ones rejected, {inconclusive} refused when collected"
         );
         assert!(valid >= 15 && rejected >= 8, "too few rounds ran: {valid} valid, {rejected} rejected");
+    }
+
+    /// A segment of one transaction spending an output to another and
+    /// carrying two name commits.
+    fn name_ops_segment(name: &str) -> SegmentWitness {
+        use crate::names::NameOp;
+        let dir = TempDir::new(name);
+        let env = open_env(&dir.0, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let mut a = key(1);
+        utxo.add_output(&mut wtxn, &Output::new(&a.public_key(), 100).block_output(), 0).unwrap();
+        let d = |x: u32| {
+            let mut v = EMPTY;
+            v[0] = Fp::new(x);
+            v
+        };
+        let ops = vec![
+            NameOp::Commit { commit: d(7), memo: crate::transaction::memo5(d(8)) },
+            NameOp::Commit { commit: d(9), memo: crate::transaction::memo5(d(10)) },
+        ];
+        let mut tx = UnsignedTransaction::with_ops(
+            vec![(a.public_key(), 100)],
+            vec![Output::new(&key(2).public_key(), 99)],
+            ops,
+        )
+        .sign_with(&mut a)
+        .unwrap();
+        tx.set_positions(&[0]);
+        let mut segments = SegmentWitness::collect(&utxo, &mut wtxn, std::slice::from_ref(&tx), 1, 1).unwrap();
+        wtxn.abort();
+        segments.remove(0)
     }
 
     /// The four policy spends of [`policy_spends_satisfy_constraints`]
@@ -3847,7 +3892,8 @@ mod tests {
             SegmentWitness::collect_parts(utxo, wtxn, txs, plan, 1).unwrap()
         });
         let (_, policy) = policy_segments();
-        let shapes = [("plain", plain), ("span", spanning), ("policy", policy)];
+        let ops = vec![name_ops_segment("audit-ops")];
+        let shapes = [("plain", plain), ("span", spanning), ("policy", policy), ("ops", ops)];
         for (shape, segments) in &shapes {
             for (k, seg) in segments.iter().enumerate() {
                 let t = std::time::Instant::now();

@@ -183,8 +183,7 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   `a_replaced_permutation_is_caught_where_it_is_used`), a value with its
   zero-test inverse, and registers left on the padding rows (unseen by
   the public values and lookups). Limits: freedoms that span rows of
-  different types, and shapes not built (a block circuit segment
-  carrying name operations).
+  different types.
   The audit finds witnesses that are not unique; the next two steps test
   what the rules mean.
 - **Attacked rule by rule, and checked against the chain (2026-11-04).**
@@ -207,10 +206,18 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   (a stranger's signature, another output's position, an inflated input,
   an output changed after signing, a double spend) are rejected by the
   constraints; 440 blocks over eleven seeds (`TABMINER_DIFF_SEED`).
-  Limits: each attack checks the trace a cheater would naturally write,
-  not every trace for it (the freedom audit covers the rest locally);
-  name operations inside a block segment, and the name circuit's own
-  rules beyond `forged_traces_fail`, are not attacked this way yet.
+  Names, the same way (the witness collected leniently too):
+  `broken_name_rules_are_rejected_by_the_constraints` rejects a reveal
+  too early, too late, with another salt, against an ordinary output or
+  another name's commit, a sweep of a live commit, and an update signed
+  by another key, keeping the owner, or changing the name, and a second
+  registration of a name; honest reveals
+  and updates are accepted. In a block segment, a name operation changed
+  or dropped after signing is rejected, and the freedom audit covers a
+  transaction carrying operations. Limits: each attack checks the trace
+  a cheater would naturally write, not every trace for it (the freedom
+  audit covers the rest locally). A second registration of a name (the
+  registry's refusal skipped too) is rejected by the constraints.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`
