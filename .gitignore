@@ -1,3 +1,4 @@
 **/*.swp
 miner/target
 miner/tabminer-data
+node/bin
