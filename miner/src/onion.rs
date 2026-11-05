@@ -50,6 +50,10 @@ pub const KIND_SLATE: u8 = 1;
 /// (`crate::subnames`, `docs/SUBNAMES.md`).
 pub const KIND_SUBNAME_QUERY: u8 = 2;
 pub const KIND_SUBNAME_ANSWER: u8 = 3;
+/// A payload's kind: a sub-name certificate for its holder, as a bundle
+/// (`crate::subnames::Bundle`, `docs/SUBNAME_CERT.md`), sent by the
+/// issuer on issue and every renewal.
+pub const KIND_SUBNAME_CERT: u8 = 4;
 
 const DOM_OBJECT: u32 = 19;
 const DOM_RENDEZVOUS: u32 = 20;

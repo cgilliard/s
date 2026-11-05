@@ -2195,6 +2195,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     println!("servers  {}", list.join(", "));
                 }
             }
+            for b in s.held.certs.values() {
+                let full = format!("{}.{}", String::from_utf8_lossy(&b.cert.label), String::from_utf8_lossy(&b.cert.name));
+                println!(
+                    "held     {full}, until {}, signed by {}",
+                    log::timestamp_of(b.cert.expiry),
+                    tabminer::address::encode(&b.cert.issuer())
+                );
+            }
             let mut names: Vec<&Vec<u8>> = s.table.keys().collect();
             names.sort();
             if names.is_empty() {
@@ -2472,18 +2480,31 @@ const RESOLVE_WAIT: Duration = Duration::from_secs(45);
 /// asked for again.
 const DELEGATION_CACHE: u64 = 600;
 
-/// The wallet's sub-names (`docs/SUBNAMES.md`), kept in the data
-/// directory: the servers its id delegates to, and the entries its node
-/// answers for as a server.
+/// The wallet's sub-names (`docs/SUBNAMES.md`, `docs/SUBNAME_CERT.md`),
+/// kept in the data directory: the servers its id delegates to, the
+/// entries its node answers for as a server, and the certificates it
+/// holds for sub-names of others' (published at their points).
 #[derive(Default)]
 struct Subnames {
     servers: Vec<Digest>,
     table: tabminer::subnames::Table,
+    held: tabminer::subnames::HeldCerts,
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    (s.len().is_multiple_of(2) && s.is_ascii())
+        .then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect())
+        .flatten()
 }
 
 impl Subnames {
-    /// Lines `server ID…` and `entry NAME LABEL ID`, ids as tab1…
-    /// addresses; none when the file is missing. Every zone's sequence
+    /// Lines `server ID…`, `entry NAME LABEL ID` (ids as tab1…
+    /// addresses) and `held BUNDLE` (a certificate held, in hex); none
+    /// when the file is missing. Every zone's sequence
     /// number is the file's time.
     fn load(path: &std::path::Path) -> AnyResult<Subnames> {
         let mut out = Subnames::default();
@@ -2507,6 +2528,10 @@ impl Subnames {
                     }
                     let zone = out.table.entry(name.as_bytes().to_vec()).or_default();
                     zone.entries.insert(label.as_bytes().to_vec(), id);
+                }
+                ["held", hex] => {
+                    let b = from_hex(hex).and_then(|b| tabminer::subnames::Bundle::from_bytes(&b)).ok_or(bad(n))?;
+                    out.held.certs.insert((b.cert.name.clone(), b.cert.label.clone()), b);
                 }
                 _ => return Err(bad(n).into()),
             }
@@ -2541,6 +2566,9 @@ impl Subnames {
                 ));
             }
         }
+        for b in self.held.certs.values() {
+            text.push_str(&format!("held {}\n", to_hex(&b.to_bytes())));
+        }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, path)?;
@@ -2573,15 +2601,30 @@ fn lookup_tag() -> u64 {
     tabminer::wallet::random_bytes::<8>().map(u64::from_le_bytes).unwrap_or(1) >> 1
 }
 
-/// Hands the node the sub-names it answers for, and this wallet's
+/// A name's value on this node's chain, if registered.
+fn chain_value(ctx: &Ctx, name: &[u8]) -> Option<Digest> {
+    let rtxn = ctx.chain.env().read_txn().ok()?;
+    ctx.chain.names().lookup(&rtxn, name).ok().flatten().map(|r| r.value)
+}
+
+/// Hands the node the sub-names it answers for, the certificates this
+/// wallet holds (those no longer sound dropped), and this wallet's
 /// delegation (signed afresh) or none.
 fn publish_subnames(ctx: &Ctx) {
     let Some(w) = &ctx.wallet else { return };
-    let (table, servers) = {
-        let s = ctx.subnames.lock().unwrap();
-        (s.table.clone(), s.servers.clone())
+    let (table, servers, gone, held) = {
+        let mut s = ctx.subnames.lock().unwrap();
+        let gone = s.held.prune(|name| chain_value(ctx, name), now());
+        if !gone.is_empty() {
+            let _ = s.save(&ctx.subnames_file);
+        }
+        (s.table.clone(), s.servers.clone(), gone, s.held.bytes())
     };
+    for name in gone {
+        say(ctx, &format!("sub-name {name} lapsed: its certificate expired or its name changed hands"));
+    }
     let _ = ctx.events.send(Event::Subnames(table));
+    let _ = ctx.events.send(Event::Certs(held));
     let delegation = (!servers.is_empty() && !w.address_off())
         .then(|| {
             tabminer::subnames::Delegation::make(
@@ -2779,6 +2822,7 @@ fn on_note(ctx: &Ctx, note: Note) {
     }
     match note {
         Note::Received(o) if o.kind == onion::KIND_SUBNAME_ANSWER => {}
+        Note::Received(o) if o.kind == onion::KIND_SUBNAME_CERT => on_cert(ctx, &o.inner),
         Note::Received(opened) => {
             if let Err(e) = on_message(ctx, opened) {
                 say(ctx, &format!("message: {e}"));
@@ -2824,6 +2868,38 @@ fn on_note(ctx: &Ctx, note: Note) {
                 None => say(ctx, &format!("could not answer {to}: {why}")),
             }
         }
+    }
+}
+
+/// A sub-name certificate sent to this wallet by its issuer
+/// (`docs/SUBNAME_CERT.md`): kept and published if it is sound and names
+/// this wallet, or the sub-name given up if it withdraws or moves one held.
+fn on_cert(ctx: &Ctx, bytes: &[u8]) {
+    use tabminer::subnames::Took;
+    let (Some(b), Ok(w)) = (tabminer::subnames::Bundle::from_bytes(bytes), ctx.wallet()) else { return };
+    let full = format!("{}.{}", String::from_utf8_lossy(&b.cert.label), String::from_utf8_lossy(&b.cert.name));
+    let expiry = b.cert.expiry;
+    let value = chain_value(ctx, &b.cert.name);
+    let (took, held) = {
+        let mut s = ctx.subnames.lock().unwrap();
+        let took = s.held.take(b, value, &w.id(), now());
+        if matches!(took, Took::Held | Took::Withdrawn)
+            && let Err(e) = s.save(&ctx.subnames_file)
+        {
+            say(ctx, &format!("sub-names: {e}"));
+        }
+        (took, s.held.bytes())
+    };
+    match took {
+        Took::Held => {
+            log::line(&format!("sub-name {full}: certificate held until {}", log::timestamp_of(expiry)));
+            let _ = ctx.events.send(Event::Certs(held));
+        }
+        Took::Withdrawn => {
+            say(ctx, &format!("sub-name {full} was withdrawn by its owner"));
+            let _ = ctx.events.send(Event::Certs(held));
+        }
+        Took::Ignored(why) => log::line(&format!("sub-name {full}: a certificate ignored: {why}")),
     }
 }
 

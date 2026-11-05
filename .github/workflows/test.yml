@@ -79,6 +79,7 @@ jobs:
           - test: node::tests::a_server_carries_a_delegation_to_new_points
           - test: node::tests::sub_names_resolve_through_a_delegated_server
           - test: node::tests::sub_name_certificates_are_held_at_their_points
+          - test: node::tests::a_holder_carries_its_certificate_to_new_points
           - test: node::tests::a_fresh_node_fast_syncs_when_its_first_peer_comes_late
           - test: node::tests::rendezvous_points_meet_over_circuits
           - test: node::tests::a_switch_between_modes_falls_back

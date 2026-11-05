@@ -6516,6 +6516,104 @@ mod tests {
         }
     }
 
+    /// A certificate follows its full name's points across an epoch
+    /// boundary (`docs/SUBNAME_CERT.md`): the holder publishes at epoch 0;
+    /// at an epoch whose points for the full name are none of epoch 0's,
+    /// the holder carries it there, and a resolver asking only the new
+    /// points finds it.
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn a_holder_carries_its_certificate_to_new_points() {
+        use crate::subnames::{Bundle, Cert, LIFETIME_SECS};
+        let fixtures: Vec<Fixture> = (0..8).map(|i| open(&format!("cert-carry-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 6;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats, std::thread::spawn(move || node.run())));
+        }
+        let mut listed: Vec<consensus::Relay> =
+            (0..6).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        listed.sort_by_key(|r| digest_to_bytes(&r.id));
+        let ids: Vec<Digest> = listed.iter().map(|r| r.id).collect();
+        let (holder, resolver) = (6usize, 7usize);
+        let point = Cert::point(b"example", b"cool");
+        let points = |e: u32| -> Vec<Digest> {
+            crate::onion::rendezvous_relays(&point, e, &ids).into_iter().map(|i| ids[i]).collect()
+        };
+        // An epoch whose points for the full name are none of epoch 0's,
+        // while the holder's own first point stays: its standing circuit is
+        // kept across the boundary, so only carrying its certificates on
+        // purpose gets them to the new points.
+        let first = |e: u32| crate::onion::rendezvous_relays(&id(7), e, &ids)[0];
+        let e = (1..10_000)
+            .find(|&e| points(e).iter().all(|p| !points(0).contains(p)) && first(e) == first(0))
+            .expect("such an epoch");
+        let epoch = |previous: bool, prefer: bool, n: u32| {
+            for x in &nodes {
+                let p = previous.then(|| Some(listed.clone()));
+                let _ = x.1.send(Event::TestEpoch(Some(listed.clone()), p, prefer, n));
+            }
+        };
+        // `example` is key 9's; it signed `cool` for the holder.
+        for n in &nodes {
+            n.1.send(Event::TestNames(HashMap::from([(b"example".to_vec(), id(9))]))).unwrap();
+        }
+        epoch(false, true, 0);
+        let live = |n: usize| {
+            let s = nodes[n].3.lock().unwrap().clone();
+            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+        };
+        let deadline = Instant::now() + guard(30);
+        while !(live(holder) && live(resolver)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(holder) && live(resolver));
+        let cool = Bundle {
+            cert: Cert::id(&key(9), b"example", b"cool", &id(7), 1, unix_now() + LIFETIME_SECS).unwrap(),
+            delegation: None,
+        };
+        nodes[holder].1.send(Event::Certs(vec![cool.to_bytes()])).unwrap();
+        let mut tag = 0;
+        let mut fetch = || -> Option<Bundle> {
+            tag += 1;
+            nodes[resolver].1.send(Event::GetCert(tag, point, 0)).unwrap();
+            loop {
+                if let Note::Cert { tag: t, result, .. } = nodes[resolver].2.recv_timeout(guard(40)).expect("a note")
+                    && t == tag
+                {
+                    return result.expect("asked");
+                }
+            }
+        };
+        let deadline = Instant::now() + guard(30);
+        while fetch().is_none() {
+            assert!(Instant::now() < deadline, "the certificate never appeared");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // The boundary: both sets stand, and the holder moves.
+        epoch(true, true, e);
+        std::thread::sleep(Duration::from_secs(4));
+        // The grace period over: only the new points are asked.
+        epoch(false, true, e);
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(fetch().as_ref(), Some(&cool), "the holder carried it to the new points");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for n in nodes {
+            n.4.join().unwrap();
+        }
+    }
+
     /// A switch from one relay list to another: during the grace period a
     /// participant keeps sessions at its points under both, so messages get
     /// through whichever list a sender's rendezvous point tries first; once

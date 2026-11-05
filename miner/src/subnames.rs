@@ -396,6 +396,77 @@ impl Bundle {
     }
 }
 
+/// Certificates a holder keeps at most.
+pub const MAX_HELD: usize = 256;
+
+/// What became of a bundle offered to a holder.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Took {
+    /// Kept: it names this holder, newer than any held for its full name.
+    Held,
+    /// It withdrew or moved a sub-name this holder had: dropped.
+    Withdrawn,
+    /// Not kept, and why.
+    Ignored(&'static str),
+}
+
+/// The sub-name certificates a holder keeps and publishes, by name and
+/// label: each sound against the chain and naming the holder's id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldCerts {
+    pub certs: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Bundle>,
+}
+
+impl HeldCerts {
+    /// Takes `b`, offered to the holder whose id is `me`, at time `now`;
+    /// `value` is its name's value on chain, if registered.
+    pub fn take(&mut self, b: Bundle, value: Option<Digest>, me: &Digest, now: u64) -> Took {
+        let Some(value) = value else { return Took::Ignored("no such name on chain") };
+        if !b.verify(&value, now) {
+            return Took::Ignored("not signed by the name's owner or an issuer its delegation names");
+        }
+        let key = (b.cert.name.clone(), b.cert.label.clone());
+        if let Some(old) = self.certs.get(&key) {
+            let withdrawn = b.delegation.as_ref().is_some_and(|d| {
+                old.delegation.as_ref().is_none_or(|was| d.seq > was.seq) && !old.allowed_by(&value, d)
+            });
+            if !b.cert.supersedes(&old.cert) && !withdrawn {
+                return Took::Ignored("no newer than the one held");
+            }
+        }
+        if b.cert.entry() != Entry::Id(*me) {
+            return match self.certs.remove(&key) {
+                Some(_) => Took::Withdrawn,
+                None => Took::Ignored("not for this wallet"),
+            };
+        }
+        if !self.certs.contains_key(&key) && self.certs.len() >= MAX_HELD {
+            return Took::Ignored("too many sub-names held");
+        }
+        self.certs.insert(key, b);
+        Took::Held
+    }
+
+    /// Drops the certificates no longer sound at `now` (expired, or their
+    /// name's value changed: `value_of`), returning their full names.
+    pub fn prune(&mut self, value_of: impl Fn(&[u8]) -> Option<Digest>, now: u64) -> Vec<String> {
+        let mut gone = Vec::new();
+        self.certs.retain(|(name, label), b| {
+            let keep = value_of(name).is_some_and(|v| b.verify(&v, now));
+            if !keep {
+                gone.push(format!("{}.{}", String::from_utf8_lossy(label), String::from_utf8_lossy(name)));
+            }
+            keep
+        });
+        gone
+    }
+
+    /// The bundles' bytes, as the node publishes them.
+    pub fn bytes(&self) -> Vec<Vec<u8>> {
+        self.certs.values().map(Bundle::to_bytes).collect()
+    }
+}
+
 /// A query for `label.name`: the inner bytes of a payload of kind
 /// [`crate::onion::KIND_SUBNAME_QUERY`] to the server, answered (along the
 /// payload's way back, or to its named sender) by one of kind
@@ -626,6 +697,57 @@ mod tests {
         let newer = Delegation::make(&owner, 4, life, &[id(3)]).unwrap();
         assert!(!by_issuer.allowed_by(&id(1), &newer));
         assert!(own.allowed_by(&id(1), &newer));
+    }
+
+    /// docs/SUBNAME_CERT.md step 3: a holder keeps the newest sound
+    /// certificate naming it per full name, gives one up when withdrawn
+    /// or moved, and drops those expired or whose name changed hands.
+    #[test]
+    fn a_holder_keeps_its_newest_sound_certificates() {
+        let (owner, me) = (key(1), id(5));
+        let value = Some(id(1));
+        let life = NOW + LIFETIME_SECS;
+        let mut held = HeldCerts::default();
+        let cert = |seq: u64, to: &Digest| Bundle {
+            cert: Cert::id(&owner, b"example", b"cool", to, seq, life).unwrap(),
+            delegation: None,
+        };
+        // Sound and for me: kept; again (or older): no change.
+        assert_eq!(held.take(cert(10, &me), value, &me, NOW), Took::Held);
+        assert_eq!(held.take(cert(10, &me), value, &me, NOW), Took::Ignored("no newer than the one held"));
+        assert_eq!(held.take(cert(9, &me), value, &me, NOW), Took::Ignored("no newer than the one held"));
+        // A renewal replaces it.
+        assert_eq!(held.take(cert(11, &me), value, &me, NOW), Took::Held);
+        assert_eq!(held.certs.values().next().unwrap().cert.seq, 11);
+        // Not on chain, not authorized, or for someone else.
+        assert_eq!(held.take(cert(12, &me), None, &me, NOW), Took::Ignored("no such name on chain"));
+        let rogue = Bundle { cert: Cert::id(&key(9), b"example", b"evil", &me, 1, life).unwrap(), delegation: None };
+        assert!(matches!(held.take(rogue, value, &me, NOW), Took::Ignored(_)));
+        let other = Bundle { cert: Cert::id(&owner, b"example", b"site", &id(6), 1, life).unwrap(), delegation: None };
+        assert_eq!(held.take(other, value, &me, NOW), Took::Ignored("not for this wallet"));
+        // Moved to another id, or withdrawn: given up.
+        assert_eq!(held.take(cert(12, &id(6)), value, &me, NOW), Took::Withdrawn);
+        assert!(held.certs.is_empty());
+        assert_eq!(held.take(cert(13, &me), value, &me, NOW), Took::Held);
+        let none = Bundle { cert: Cert::none(&owner, b"example", b"cool", 14, life).unwrap(), delegation: None };
+        assert_eq!(held.take(none, value, &me, NOW), Took::Withdrawn);
+        // An issuer's, then a newer delegation without that issuer: given
+        // up though the owner's certificate's seq is lower.
+        let d1 = Delegation::make(&owner, 1, life, &[id(2)]).unwrap();
+        let by_issuer =
+            Bundle { cert: Cert::id(&key(2), b"example", b"cool", &me, 20, life).unwrap(), delegation: Some(d1) };
+        assert_eq!(held.take(by_issuer, value, &me, NOW), Took::Held);
+        let d2 = Delegation::make(&owner, 2, life, &[id(3)]).unwrap();
+        let moved =
+            Bundle { cert: Cert::id(&owner, b"example", b"cool", &id(6), 3, life).unwrap(), delegation: Some(d2) };
+        assert_eq!(held.take(moved, value, &me, NOW), Took::Withdrawn);
+        // Pruned: expired, and changed hands.
+        assert_eq!(held.take(cert(30, &me), value, &me, NOW), Took::Held);
+        assert_eq!(held.bytes().len(), 1);
+        assert!(held.prune(|_| Some(id(1)), NOW).is_empty());
+        assert_eq!(held.clone().prune(|_| Some(id(1)), life), vec!["cool.example".to_string()]);
+        assert_eq!(held.prune(|_| Some(id(9)), NOW), vec!["cool.example".to_string()]);
+        assert!(held.certs.is_empty());
     }
 
     #[test]

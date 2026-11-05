@@ -269,6 +269,10 @@ pub(super) struct Participant {
     /// The epoch whose new points this node, as a sub-name server, has
     /// republished the delegations naming it at.
     republished: Option<u32>,
+    /// The epoch whose new points this node has carried its certificates
+    /// to: a standing circuit kept across the boundary (our own point
+    /// unchanged) would not publish them again by itself.
+    carried: Option<u32>,
     /// Delegations republished: the circuit, the delegation's object id
     /// and since when, until the relay answers.
     pushes: Vec<(u64, Digest, Instant)>,
@@ -303,6 +307,7 @@ impl Default for Participant {
             kept: Vec::new(),
             built: 0,
             republished: None,
+            carried: None,
             pushes: Vec::new(),
             #[cfg(test)]
             test_owners: None,
@@ -623,6 +628,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.rv.switching() && self.part.republished != Some(self.rv.epoch) && self.rv.moved(now) {
             self.part.republished = Some(self.rv.epoch);
             self.republish_delegations(id, now);
+        }
+        // A holder carries its certificates to their full names' points of
+        // the new epoch, once it has moved: up whatever standing circuits
+        // it has, new or kept.
+        if self.rv.switching() && self.part.carried != Some(self.rv.epoch) && self.rv.moved(now) {
+            self.part.carried = Some(self.rv.epoch);
+            if !self.part.certs.is_empty() {
+                for s in &mut self.part.standing {
+                    s.published = false;
+                }
+            }
         }
         let relay = self.config.relay_id();
         let all: Vec<Digest> = self.own_points_of(&id, now).into_iter().filter(|p| Some(*p) != relay).collect();

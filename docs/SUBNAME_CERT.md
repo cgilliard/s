@@ -248,6 +248,18 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
    epoch boundaries is the holder's republishing each epoch (step 3).
 3. The holder: `KIND_SUBNAME_CERT` received and kept, published at `N`'s
    points every epoch and on renewal.
+   Done (2026-11-05): `subnames::HeldCerts` (the newest sound bundle
+   naming the holder per full name; a `none` or moved certificate gives
+   one up; expired ones, and those whose name changed hands, pruned),
+   kept in `DIR/subnames` as `held` lines and shown by `subnames`; the
+   wallet takes `KIND_SUBNAME_CERT` payloads and hands its bundles to
+   the node (`Event::Certs`), again whenever they change and every
+   renewal period. The node republishes them up its standing circuits on
+   every new circuit and, once moved, at every epoch boundary, its own
+   circuit kept or not. Tested by `a_holder_keeps_its_newest_sound_certificates`
+   and, across a boundary with the holder's own point unchanged, by
+   `a_holder_carries_its_certificate_to_new_points`. The wallet's
+   receiving end is tested end to end with the issuer (step 4).
 4. The issuer: certificates signed from the wallet's table and sent on
    `subname set` and daily; `none` certificates on `subname del`;
    `subname issuer` for delegation, the delegation signed for 7 days and
