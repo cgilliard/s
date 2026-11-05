@@ -817,6 +817,11 @@ mod tests {
         ]);
         assert!(leaf.valid());
         assert_eq!(leaf.signatures(), 2);
+        // The policy decoder, fuzzed: no panic, one encoding.
+        let policy = Policy::new(vec![leaf.clone(), Leaf::new(vec![Cond::After(100)])]);
+        crate::test_util::fuzz_decoder("Policy::from_bytes", &[policy.to_bytes()], 20_000, |b| {
+            Policy::from_bytes(b).map(|p| Some(p.to_bytes()))
+        });
         let mut bytes = Vec::new();
         leaf.write(&mut bytes);
         assert_eq!(bytes.len(), leaf.size());

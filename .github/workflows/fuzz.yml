@@ -1,0 +1,42 @@
+name: fuzz
+
+# The fuzzers at length, nightly, under a fresh seed: the witnesses of the
+# block and name circuits (lenient traces), the proof verifiers (mutated
+# proof bytes), and the decoders of untrusted bytes. Every push runs them
+# short (test.yml); here each runs 50 times as long. A failure prints its
+# seed: TABMINER_FUZZ_SEED=<seed> TABMINER_FUZZ_SCALE=50 replays it.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: times the per-push iterations
+        default: "50"
+
+defaults:
+  run:
+    working-directory: miner
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C overflow-checks=on
+  TABMINER_FUZZ_SCALE: ${{ inputs.scale || '50' }}
+  TABMINER_FUZZ_SEED: ${{ github.run_id }}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+          shared-key: fuzz
+      - name: fuzzers (seed ${{ github.run_id }})
+        # The whole suite: the fuzzers sit in tests of their own and inside
+        # roundtrip tests, and the rest only add the suite's usual minute.
+        run: cargo test --release --lib

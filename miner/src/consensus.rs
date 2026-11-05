@@ -516,4 +516,26 @@ mod tests {
         assert!(!file_matches(&hash, b"mode init"));
         assert_eq!(hex(&[0xabu8; 32]).len(), 64);
     }
+
+    /// The file parser, fuzzed: no input makes it panic (a file comes
+    /// from the chain, chosen by whoever mines the votes).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_the_parser() {
+        let ids: Vec<Digest> = (1..=3u32)
+            .map(|i| {
+                let mut d = [Fp::ZERO; crate::poseidon2::DIGEST];
+                d[0] = Fp::new(i);
+                d
+            })
+            .collect();
+        let onion = format!(
+            "# relays\nmode onion\nrelay {} relay1.example.org:3737\nrelay {} 10.0.0.2:3737\nrelay {} 10.0.0.3:3737\n",
+            crate::address::encode(&ids[0]),
+            hex(&digest_to_bytes(&ids[1])),
+            crate::address::encode(&ids[2])
+        );
+        let samples = [b"mode init\n".to_vec(), onion.into_bytes()];
+        crate::test_util::fuzz_decoder("consensus File::parse", &samples, 20_000, |b| File::parse(b).ok().map(|_| None));
+    }
 }

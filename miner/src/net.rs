@@ -674,12 +674,21 @@ impl Message {
                 let kind = Kind::get(&mut r)?;
                 let id = r.digest()?;
                 let n = count(&mut r, MAX_RANGES)?;
-                let mut indexes = Vec::new();
+                let mut indexes: Vec<u16> = Vec::new();
                 for _ in 0..n {
                     let start = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
                     let len = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
                     (len > 0 && indexes.len() + len as usize <= MAX_IN_FLIGHT).then_some(())?;
-                    indexes.extend((0..len).map_while(|k| start.checked_add(k)));
+                    // Runs as the sender writes them: ascending, apart (one
+                    // that touches the last would have been part of it), and
+                    // within range. One request, one encoding, and no index
+                    // asked twice.
+                    let end = start as u32 + len as u32;
+                    (end <= 1 << 16).then_some(())?;
+                    if let Some(&last) = indexes.last() {
+                        (start as u32 > last as u32 + 1).then_some(())?;
+                    }
+                    indexes.extend((0..len).map(|k| start + k));
                 }
                 Message::GetChunks { kind, id, indexes, token }
             }
@@ -2081,11 +2090,11 @@ mod tests {
         assert_eq!(Message::decode(&bytes), Some(Message::Peers(vec![v4])));
     }
 
-    #[test]
-    fn messages_roundtrip_within_the_datagram_limit() {
+    /// One message of every kind, as the roundtrip test sends them.
+    fn sample_messages() -> Vec<Message> {
         let v4: SocketAddr = "10.1.2.3:7417".parse().unwrap();
         let v4b: SocketAddr = "203.0.113.9:65535".parse().unwrap();
-        let msgs = vec![
+        vec![
             Message::Ping(status()),
             Message::Pong(status()),
             Message::GetPeers { token: 7 },
@@ -2132,7 +2141,50 @@ mod tests {
                 sack: 6,
                 sealed: vec![7u8; crate::channel::MAX_BODY + 16],
             }),
-        ];
+        ]
+    }
+
+    /// The datagram decoder, fuzzed: no input makes it panic, and what it
+    /// decodes encodes back to the same bytes.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_message_decoder() {
+        let samples: Vec<Vec<u8>> = sample_messages().iter().map(Message::encode).collect();
+        let decoded = crate::test_util::fuzz_decoder("Message::decode", &samples, 20_000, |b| {
+            Message::decode(b).map(|m| Some(m.encode()))
+        });
+
+        // Fast sync's parts: manifest, output part, name part.
+        let d = |x: u32| {
+            let mut v = [crate::poseidon2::Fp::ZERO; crate::poseidon2::DIGEST];
+            v[0] = crate::poseidon2::Fp::new(x);
+            v
+        };
+        let manifest = Manifest {
+            next: 20_000,
+            roots: vec![d(1), d(2)],
+            name_root: d(3),
+            names: vec![NamePart { first: 0, hash: d(4) }, NamePart { first: 1 << 100, hash: d(5) }],
+        };
+        crate::test_util::fuzz_decoder("decode_manifest", &[encode_manifest(&manifest)], 20_000, |b| {
+            decode_manifest(b).map(|m| Some(encode_manifest(&m)))
+        });
+        let slot = crate::transaction::memo_slot(&[crate::poseidon2::Fp::new(7); crate::transaction::MEMO_LEN], 1000);
+        let part = encode_part(&[(5, d(1), slot, 3), (9, d(2), slot, 4)], &[(9, d(6), 4)]);
+        crate::test_util::fuzz_decoder("decode_part", &[part], 20_000, |b| {
+            decode_part(b).map(|(o, c)| Some(encode_part(&o, &c)))
+        });
+        let records =
+            [Record::new(b"alice", d(1), d(2), d(3)).unwrap(), Record::new(b"bob", d(4), d(5), d(6)).unwrap()];
+        crate::test_util::fuzz_decoder("decode_name_part", &[encode_name_part(&records)], 20_000, |b| {
+            decode_name_part(b).map(|r| Some(encode_name_part(&r)))
+        });
+        eprintln!("{decoded} mutants decoded");
+    }
+
+    #[test]
+    fn messages_roundtrip_within_the_datagram_limit() {
+        let msgs = sample_messages();
         for m in msgs {
             let bytes = m.encode();
             assert!(bytes.len() <= MAX_DATAGRAM, "{m:?}: {} bytes", bytes.len());

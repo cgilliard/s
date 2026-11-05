@@ -361,6 +361,9 @@ mod tests {
     fn delegations_verify_only_for_their_owner_and_time() {
         let (owner, s1, s2) = (key(1), id(2), id(3));
         let d = Delegation::make(&owner, 5, NOW + 3600, &[s1, s2]).unwrap();
+        crate::test_util::fuzz_decoder("Delegation::from_bytes", &[d.to_bytes()], 20_000, |b| {
+            Delegation::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         assert!(d.verify(&id(1), NOW));
         assert_eq!(Delegation::from_bytes(&d.to_bytes()), Some(d.clone()));
         // Another value, or signed by a key that is not the value's.
@@ -398,6 +401,9 @@ mod tests {
         let servers = [id(2), id(3)];
         let t = id(5);
         let a = Answer::id(&server, b"example", b"cool", &t, 9, NOW + 600).unwrap();
+        crate::test_util::fuzz_decoder("Answer::from_bytes", &[a.to_bytes()], 20_000, |b| {
+            Answer::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         assert!(a.verify(b"example", b"cool", &servers, NOW));
         assert_eq!(a.entry(), Entry::Id(t));
         assert_eq!(Answer::from_bytes(&a.to_bytes()), Some(a.clone()));

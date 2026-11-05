@@ -1361,6 +1361,9 @@ mod tests {
     fn records_round_trip() {
         let r = record("example", 4);
         assert_eq!(r.size(), 1 + 7 + 96);
+        crate::test_util::fuzz_decoder("Record::from_bytes", &[r.to_bytes()], 20_000, |b| {
+            Record::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         let bytes = r.to_bytes();
         assert_eq!(bytes.len(), r.size());
         assert_eq!(Record::from_bytes(&bytes), Some(r.clone()));
@@ -1459,6 +1462,15 @@ mod tests {
         let reveal = NameOp::Reveal { record: record("alice", 3), salt: d(4), commit: 77 };
         let mut k = owner_key(1);
         let update = NameOp::update(record("alice", 5), &mut k).unwrap();
+        // Fuzzed: a parse consumes one operation, written back the same.
+        let samples: Vec<Vec<u8>> = [&commit, &reveal, &update].iter().map(|o| o.to_bytes()).collect();
+        crate::test_util::fuzz_decoder("NameOp::parse", &samples, 20_000, |b| {
+            NameOp::parse(b).map(|(op, rest)| Some([op.to_bytes(), rest.to_vec()].concat()))
+        });
+        let public: Vec<Vec<u8>> = [&commit, &reveal, &update].iter().map(|o| o.block_op().to_bytes()).collect();
+        crate::test_util::fuzz_decoder("BlockNameOp::parse", &public, 20_000, |b| {
+            BlockNameOp::parse(b).map(|(op, rest)| Some([op.to_bytes(), rest.to_vec()].concat()))
+        });
         for op in [&commit, &reveal, &update] {
             let bytes = op.to_bytes();
             assert_eq!(bytes.len(), op.size());

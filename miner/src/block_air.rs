@@ -4555,6 +4555,12 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(verify(&config, &BlockAir, &public, &proof, &mut tr()), Ok(()));
         println!("verify: {:?}", t.elapsed());
+        // The verifier, fuzzed: mutants of the proof's bytes are refused.
+        let (iters, seed) = crate::stark::fuzz_params(200, 0xf022_b1);
+        let verifies = |p: &crate::stark::Proof| verify(&config, &BlockAir, &public, p, &mut tr()).is_ok();
+        let fuzz = crate::stark::fuzz_proof(&proof, iters, seed, verifies);
+        eprintln!("{fuzz:?}");
+        assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "seed {seed}: {fuzz:?}");
         let mut bad = public.clone();
         bad[PUB_SUM_OUT] += Fp::ONE;
         assert!(verify(&config, &BlockAir, &bad, &proof, &mut tr()).is_err());

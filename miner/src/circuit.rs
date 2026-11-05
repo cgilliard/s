@@ -508,6 +508,11 @@ mod tests {
     #[test]
     fn cells_round_trip_and_pieces_reassemble() {
         let c = handshake_cells(9, CREATE, &[7u8; 2500]);
+        // Fuzzed: no input makes the decoder panic, one encoding each.
+        let samples: Vec<Vec<u8>> = c.iter().map(|x| x.to_bytes().to_vec()).collect();
+        crate::test_util::fuzz_decoder("Cell::from_bytes", &samples, 20_000, |b| {
+            Cell::from_bytes(b).map(|x| Some(x.to_bytes().to_vec()))
+        });
         assert_eq!(c.len(), 3);
         let mut msg = Vec::new();
         for cell in &c {

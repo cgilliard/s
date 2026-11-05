@@ -633,4 +633,27 @@ mod tests {
         chain.apply_block(&Block { header: h2, body: good }, GENESIS_TIME + 1300).unwrap();
         assert_eq!(chain.tip().unwrap().unwrap().height, 2);
     }
+
+    /// The block proof container's decoder, fuzzed: no input makes it
+    /// panic, and what it decodes encodes back to the same bytes. The
+    /// proofs inside are small ones of another circuit: decoding parses,
+    /// verification is the verifier's (fuzzed with the circuits).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_the_container_decoder() {
+        use crate::poseidon2::Fp;
+        use crate::poseidon2_air::Poseidon2Air;
+        use crate::stark::{StarkConfig, prove};
+        let config = StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 0, zk: false, commit_bits: 0 };
+        let trace = Poseidon2Air::generate_trace(&[[Fp::ZERO; crate::poseidon2::WIDTH]]);
+        let proof = prove(&config, &Poseidon2Air, &trace, &[], &mut crate::challenger::Challenger::new());
+        let public = SegmentPublic::from_values(&vec![Fp::ZERO; NUM_PUBLIC]).unwrap();
+        let name_public = crate::name_air::NamePublic::from_values(&vec![Fp::ZERO; NAME_PUBLIC]).unwrap();
+        let sp = SegmentProof { public, proof: proof.clone() };
+        let np = NameProof { public: name_public, proof };
+        let samples = [encode(&[sp.clone()], &np), encode(&[sp.clone(), sp], &np)];
+        crate::test_util::fuzz_decoder("block_proof::decode", &samples, 5_000, |b| {
+            decode(b).map(|(s, n)| Some(encode(&s, &n)))
+        });
+    }
 }

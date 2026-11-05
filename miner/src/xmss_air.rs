@@ -725,6 +725,18 @@ mod tests {
         };
         let proof = prove(&config, &XmssAir, &trace, &public, &mut tr());
         assert_eq!(verify(&config, &XmssAir, &public, &proof, &mut tr()), Ok(()));
+        // The verifier, fuzzed, with and without zero knowledge.
+        let (iters, seed) = crate::stark::fuzz_params(200, 0xf022_55);
+        let verifies = |p: &crate::stark::Proof| verify(&config, &XmssAir, &public, p, &mut tr()).is_ok();
+        let fuzz = crate::stark::fuzz_proof(&proof, iters, seed, verifies);
+        eprintln!("{fuzz:?}");
+        assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "seed {seed}: {fuzz:?}");
+        let zk = StarkConfig { zk: true, log_blowup: 2, ..config };
+        let proof_zk = prove(&zk, &XmssAir, &trace, &public, &mut tr());
+        let verifies = |p: &crate::stark::Proof| verify(&zk, &XmssAir, &public, p, &mut tr()).is_ok();
+        let fuzz = crate::stark::fuzz_proof(&proof_zk, iters, seed + 1, verifies);
+        eprintln!("zk: {fuzz:?}");
+        assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "zk, seed {}: {fuzz:?}", seed + 1);
         let mut bad = public.clone();
         bad[PUB_MSG] += Fp::ONE;
         assert!(verify(&config, &XmssAir, &bad, &proof, &mut tr()).is_err());

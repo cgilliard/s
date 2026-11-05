@@ -723,6 +723,12 @@ mod tests {
         let mut sk = SecretKey::generate_with_height(&SEED, H);
         let pk = sk.public_key();
         let sig0 = sk.sign_bytes(b"first").unwrap();
+        crate::test_util::fuzz_decoder("xmss PublicKey::from_bytes", &[pk.to_bytes().to_vec()], 20_000, |b| {
+            PublicKey::from_bytes(b).map(|x| Some(x.to_bytes().to_vec()))
+        });
+        crate::test_util::fuzz_decoder("xmss Signature::from_bytes", &[sig0.to_bytes()], 20_000, |b| {
+            Signature::from_bytes(b, H).map(|x| Some(x.to_bytes()))
+        });
 
         let pk_bytes = pk.to_bytes();
         assert_eq!(pk_bytes.len(), PublicKey::SIZE);

@@ -1869,13 +1869,119 @@ pub(crate) fn freedom_report(
         .collect()
 }
 
-/// Tests: a fuzzer's iterations and seed, from `TABMINER_FUZZ_ITERS`
-/// (else `iters`) and `TABMINER_FUZZ_SEED` (else `seed`); the nightly run
-/// sets both, and prints the seed so a failure can be replayed.
+/// Tests: what the verifier fuzzer saw.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ProofFuzz {
+    /// Mutations that left the bytes as they were.
+    pub unchanged: usize,
+    /// Mutants the decoder refused.
+    pub undecodable: usize,
+    /// Mutants that decoded and failed verification.
+    pub rejected: usize,
+    /// Mutants that decoded to the very proof: another encoding of it.
+    pub same_proof: Vec<String>,
+    /// Mutants verification accepted, though another proof: failures.
+    pub accepted: Vec<String>,
+    /// Mutants the decoder or verifier panicked on: failures.
+    pub panicked: Vec<String>,
+}
+
+/// Tests: fuzzes a verifier with `iters` mutants of a valid proof's bytes
+/// (a bit flipped, bytes overwritten, truncated, extended, a slice zeroed,
+/// duplicated or moved), each decoded with [`Proof::from_bytes`] and, if
+/// it decodes, given to `verify`. Never a panic, never an acceptance of
+/// another proof.
+#[cfg(test)]
+pub(crate) fn fuzz_proof(proof: &Proof, iters: u64, seed: u64, verify: impl Fn(&Proof) -> bool) -> ProofFuzz {
+    let mut rng = crate::test_util::Rng::new(seed);
+    let bytes = proof.to_bytes();
+    assert!(verify(proof), "the proof to fuzz must verify");
+    let mut out = ProofFuzz::default();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    for _ in 0..iters {
+        let mut b = bytes.clone();
+        let mut r = |n: usize| (rng.next_u64() % n.max(1) as u64) as usize;
+        let (at, len) = (r(b.len()), 1 + r(64));
+        let what = match r(8) {
+            0 => {
+                b[at] ^= 1 << r(8);
+                format!("bit flipped at {at}")
+            }
+            1 => {
+                let v = r(256) as u8;
+                b[at] = v;
+                format!("byte {at} set to {v}")
+            }
+            2 => {
+                for i in at..(at + len).min(b.len()) {
+                    b[i] = r(256) as u8;
+                }
+                format!("{len} bytes randomized at {at}")
+            }
+            3 => {
+                b.truncate(at);
+                format!("truncated to {at}")
+            }
+            4 => {
+                b.extend((0..len).map(|_| r(256) as u8));
+                format!("{len} bytes appended")
+            }
+            5 => {
+                for i in at..(at + len).min(b.len()) {
+                    b[i] = 0;
+                }
+                format!("{len} bytes zeroed at {at}")
+            }
+            6 => {
+                let end = (at + len).min(b.len());
+                let slice = b[at..end].to_vec();
+                b.splice(at..at, slice);
+                format!("{len} bytes duplicated at {at}")
+            }
+            _ => {
+                let from = r(b.len());
+                let end = (from + len).min(b.len());
+                let slice = b[from..end].to_vec();
+                let to = at.min(b.len() - slice.len());
+                b[to..to + slice.len()].copy_from_slice(&slice);
+                format!("{} bytes moved from {from} to {to}", slice.len())
+            }
+        };
+        // A mutation that changed nothing (zeros zeroed, a byte rewritten
+        // with itself) is not a mutant.
+        if b == bytes {
+            out.unchanged += 1;
+            continue;
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Proof::from_bytes(&b).map(|p| {
+                let same = p == *proof;
+                (same, verify(&p))
+            })
+        }));
+        match r {
+            Err(_) => out.panicked.push(what),
+            Ok(None) => out.undecodable += 1,
+            Ok(Some((true, _))) => out.same_proof.push(what),
+            Ok(Some((false, false))) => out.rejected += 1,
+            Ok(Some((false, true))) => out.accepted.push(what),
+        }
+    }
+    std::panic::set_hook(hook);
+    out
+}
+
+/// Tests: a fuzzer's iterations and seed: `TABMINER_FUZZ_ITERS`, else
+/// `iters` times `TABMINER_FUZZ_SCALE` (1 by default; the nightly run,
+/// `fuzz.yml`, sets it), and `TABMINER_FUZZ_SEED`, else `seed`. Prints
+/// the seed so a failure can be replayed.
 #[cfg(test)]
 pub(crate) fn fuzz_params(iters: u64, seed: u64) -> (u64, u64) {
-    let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
-    let (iters, seed) = (var("TABMINER_FUZZ_ITERS").unwrap_or(iters), var("TABMINER_FUZZ_SEED").unwrap_or(seed));
+    let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    let scaled = iters.saturating_mul(var("TABMINER_FUZZ_SCALE").unwrap_or(1));
+    let (iters, seed) = (var("TABMINER_FUZZ_ITERS").unwrap_or(scaled), var("TABMINER_FUZZ_SEED").unwrap_or(seed));
     eprintln!("fuzz: {iters} iterations, seed {seed} (TABMINER_FUZZ_SEED={seed} to replay)");
     (iters, seed)
 }

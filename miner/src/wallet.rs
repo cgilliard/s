@@ -3739,6 +3739,9 @@ mod tests {
         let stage1 = slate.to_bytes();
         bob.receive_slate(&mut slate).unwrap();
         let stage2 = slate.to_bytes();
+        crate::test_util::fuzz_decoder("Slate::from_bytes", &[stage1.clone(), stage2.clone()], 20_000, |b| {
+            Slate::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         let mut x = 0x5eed_u64;
         let mut next = || {
             x ^= x << 13;

@@ -504,6 +504,14 @@ mod tests {
     fn announces_verify_and_round_trip() {
         let (d, k) = keys(1);
         let a = Announce::make(&d, k.public_key(), 3, 1000, 77);
+        // Fuzzed: no input makes the decoders panic, one encoding each.
+        let ob = Object::Announce(a.clone()).to_bytes();
+        crate::test_util::fuzz_decoder("Object::from_bytes", &[ob], 20_000, |b| {
+            Object::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
+        crate::test_util::fuzz_decoder("Announce::from_bytes", &[a.to_bytes()], 20_000, |b| {
+            Announce::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         assert_eq!(a.id, address::id_of(d.public_key()));
         assert!(a.verify(999));
         assert!(!a.verify(1000), "expired");

@@ -714,6 +714,27 @@ mod tests {
         assert!(!other.body_commitment_matches());
     }
 
+    /// The header, body and block decoders, fuzzed: no input makes them
+    /// panic, and what they decode encodes back to the same bytes.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_block_decoders() {
+        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 10] };
+        let mut h = header();
+        h.body_commitment = body.commitment();
+        let block = Block { header: h, body: body.clone() };
+        let empty = Body { inputs: vec![], outputs: vec![], ops: vec![], sweeps: vec![], proof: vec![] };
+        crate::test_util::fuzz_decoder("Header::from_bytes", &[h.to_bytes().to_vec()], 20_000, |b| {
+            Header::from_bytes(b).map(|h| Some(h.to_bytes().to_vec()))
+        });
+        crate::test_util::fuzz_decoder("Body::from_bytes", &[body.to_bytes(), empty.to_bytes()], 20_000, |b| {
+            Body::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
+        });
+        crate::test_util::fuzz_decoder("Block::from_bytes", &[block.to_bytes()], 20_000, |b| {
+            Block::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
+        });
+    }
+
     #[test]
     fn header_proof_of_work() {
         let params = PowParams { log_dataset_items: 8, parents: 64, accesses: 64 };

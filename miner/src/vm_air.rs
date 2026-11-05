@@ -1251,6 +1251,13 @@ mod tests {
         let proof = prove_tables(&config, &VmAir::tables(&trace, &hashes, &pre), &public, &mut tr());
         let root = pre.root();
         assert_eq!(verify_tables(&config, &VmAir::specs(&root), &public, &proof, &mut tr()), Ok(()));
+        // The verifier of several tables, fuzzed.
+        let (iters, seed) = crate::stark::fuzz_params(200, 0xf022_7a);
+        let verifies =
+            |p: &crate::stark::Proof| verify_tables(&config, &VmAir::specs(&root), &public, p, &mut tr()).is_ok();
+        let fuzz = crate::stark::fuzz_proof(&proof, iters, seed, verifies);
+        eprintln!("{fuzz:?}");
+        assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "seed {seed}: {fuzz:?}");
         let mut bad = public.clone();
         bad[PUB_OUTPUT] += Fp::ONE;
         assert!(verify_tables(&config, &VmAir::specs(&root), &bad, &proof, &mut tr()).is_err());

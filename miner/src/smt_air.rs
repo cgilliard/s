@@ -575,6 +575,12 @@ mod tests {
         };
         let proof = prove(&config, &SmtAir, &trace, &public, &mut tr());
         assert_eq!(verify(&config, &SmtAir, &public, &proof, &mut tr()), Ok(()));
+        // The verifier, fuzzed: mutants of the proof's bytes are refused.
+        let (iters, seed) = crate::stark::fuzz_params(200, 0xf022_57);
+        let verifies = |p: &crate::stark::Proof| verify(&config, &SmtAir, &public, p, &mut tr()).is_ok();
+        let fuzz = crate::stark::fuzz_proof(&proof, iters, seed, verifies);
+        eprintln!("{fuzz:?}");
+        assert!(fuzz.accepted.is_empty() && fuzz.panicked.is_empty(), "seed {seed}: {fuzz:?}");
         let mut bad = public.clone();
         bad[PUB_FINAL_ROOT + 1] += Fp::ONE;
         assert!(verify(&config, &SmtAir, &bad, &proof, &mut tr()).is_err());

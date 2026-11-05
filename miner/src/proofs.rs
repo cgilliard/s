@@ -460,6 +460,9 @@ mod tests {
         };
         let bytes = proof.to_bytes();
         assert!(!bytes.windows(32).any(|w| w == digest_to_bytes(&sender_tag(&secret))), "the tag is not sent");
+        crate::test_util::fuzz_decoder("payment Proof::from_bytes", &[bytes.clone()], 20_000, |b| {
+            Proof::from_bytes(b).map(|x| Some(x.to_bytes()))
+        });
         let back = Proof::from_bytes(&bytes).unwrap();
         assert_eq!(back, proof);
         let Claim::Payment { sender, receipt, slate_id, .. } = &back.claim else { panic!() };

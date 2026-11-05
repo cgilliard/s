@@ -218,6 +218,25 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   a cheater would naturally write, not every trace for it (the freedom
   audit covers the rest locally). A second registration of a name (the
   registry's refusal skipped too) is rejected by the constraints.
+- **Fuzzed (2026-11-04).** `fuzz_segment_witnesses` and
+  `fuzz_name_witnesses` make random changes inside block and name
+  witnesses (a block's later segments rebuilt to follow, traces written
+  leniently): none gives the same block body, or the same name
+  operations, another outcome. The proof verifiers (block segment, state
+  tree, XMSS with and without zero knowledge, the VM's tables) take
+  mutated proof bytes: refused every time, never a panic, and distinct
+  bytes never decode to the same proof. Nineteen decoders of untrusted
+  bytes (datagrams, blocks, headers, bodies, transactions, fast sync's
+  manifests and parts, onion cells, objects and announces, sub-name
+  delegations and answers, slates, payment proofs, names, policies, XMSS
+  keys and signatures, the block proof container, `consensus.txt`) never
+  panic, and what they decode encodes back to the same bytes; the
+  datagram decoder took runs of chunk indexes out of order, overlapping
+  or past the end, now refused. Every push runs them short; `fuzz.yml`
+  runs them fifty times as long nightly under a fresh seed
+  (`TABMINER_FUZZ_SCALE`, `TABMINER_FUZZ_SEED`). A trace fuzzer (random
+  cells) was not built: random values cannot meet constraints that tie
+  cells together, which the freedom audit solves for instead.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`

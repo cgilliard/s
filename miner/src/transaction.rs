@@ -901,4 +901,29 @@ mod tests {
         let input = &tx.inputs[1];
         assert_eq!(Input::from_bytes(&input.to_bytes()).as_ref(), Some(input));
     }
+
+    /// The transaction, input and output decoders, fuzzed: no input makes
+    /// them panic, and what they decode encodes back to the same bytes.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_transaction_decoders() {
+        let mut ka = key(9);
+        let kb = key(10).public_key();
+        let mut tx = UnsignedTransaction::new(
+            vec![(ka.public_key(), 7), (ka.public_key(), 8)],
+            vec![Output::new(&kb, 9), Output::new(&kb, u64::MAX)],
+        )
+        .sign_with(&mut ka)
+        .unwrap();
+        tx.set_positions(&[1 << 39, 12345]);
+        crate::test_util::fuzz_decoder("Transaction::from_bytes", &[tx.to_bytes()], 20_000, |b| {
+            Transaction::from_bytes(b).map(|t| Some(t.to_bytes()))
+        });
+        crate::test_util::fuzz_decoder("Input::from_bytes", &[tx.inputs[0].to_bytes()], 20_000, |b| {
+            Input::from_bytes(b).map(|i| Some(i.to_bytes()))
+        });
+        crate::test_util::fuzz_decoder("Output::from_bytes", &[tx.outputs[0].to_bytes().to_vec()], 20_000, |b| {
+            Output::from_bytes(b).map(|o| Some(o.to_bytes().to_vec()))
+        });
+    }
 }

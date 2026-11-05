@@ -84,4 +84,104 @@ pub(crate) mod test_util {
             Fp4([self.fp(), self.fp(), self.fp(), self.fp()])
         }
     }
+
+    /// Fuzzes a decoder of untrusted bytes: `iters` mutants of the valid
+    /// `samples` (a bit flipped, bytes overwritten, truncated, extended, a
+    /// slice set to 0xff or duplicated, two samples spliced) and random
+    /// inputs. `decode` returns `None` when it refuses the bytes, else
+    /// their encoding again (or `None` inside for a decoder with no
+    /// encoder). It must never panic, and what it decodes must encode back
+    /// to the very bytes (one object, one encoding). Returns how many
+    /// mutants decoded; panics with every failure.
+    pub fn fuzz_decoder(
+        name: &str,
+        samples: &[Vec<u8>],
+        iters: u64,
+        decode: impl Fn(&[u8]) -> Option<Option<Vec<u8>>>,
+    ) -> usize {
+        let (iters, seed) = crate::stark::fuzz_params(iters, 0xdec0de);
+        let mut rng = Rng::new(seed);
+        for s in samples {
+            match decode(s) {
+                None => panic!("{name}: a valid sample is refused"),
+                Some(Some(again)) => assert_eq!(&again, s, "{name}: a sample encodes to other bytes"),
+                Some(None) => {}
+            }
+        }
+        let (mut decoded, mut failures) = (0, Vec::new());
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        for n in 0..iters {
+            let mut r = |m: usize| (rng.next_u64() % m.max(1) as u64) as usize;
+            let si = r(samples.len());
+            let mut b = samples[si].clone();
+            let (at, len) = (r(b.len().max(1)), 1 + r(64));
+            let what = match r(9) {
+                0 if !b.is_empty() => {
+                    b[at] ^= 1 << r(8);
+                    "bit flipped"
+                }
+                1 if !b.is_empty() => {
+                    b[at] = r(256) as u8;
+                    "byte set"
+                }
+                2 => {
+                    for i in at..(at + len).min(b.len()) {
+                        b[i] = r(256) as u8;
+                    }
+                    "bytes randomized"
+                }
+                3 => {
+                    b.truncate(at);
+                    "truncated"
+                }
+                4 => {
+                    b.extend((0..len).map(|_| r(256) as u8));
+                    "extended"
+                }
+                5 => {
+                    for i in at..(at + len).min(b.len()) {
+                        b[i] = 0xff;
+                    }
+                    "bytes set to 0xff"
+                }
+                6 if !b.is_empty() => {
+                    let end = (at + len).min(b.len());
+                    let slice = b[at..end].to_vec();
+                    b.splice(at..at, slice);
+                    "bytes duplicated"
+                }
+                7 => {
+                    let other = &samples[r(samples.len())];
+                    let cut = r(other.len().max(1));
+                    b.truncate(at);
+                    b.extend_from_slice(&other[cut.min(other.len())..]);
+                    "spliced"
+                }
+                _ => {
+                    b = (0..r(256)).map(|_| r(256) as u8).collect();
+                    "random"
+                }
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&b))) {
+                Err(_) => failures.push(format!("mutant {n} ({what}): panicked")),
+                Ok(Some(Some(again))) if again != b => {
+                    let at = again.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(again.len().min(b.len()));
+                    failures.push(format!(
+                        "mutant {n} ({what}) of sample {si}: decodes, but encodes to other bytes \
+                         (from byte {at}: {:02x?} read, {:02x?} written; {} bytes read, {} written)",
+                        &b[at..(at + 8).min(b.len())],
+                        &again[at..(at + 8).min(again.len())],
+                        b.len(),
+                        again.len()
+                    ))
+                }
+                Ok(Some(_)) => decoded += 1,
+                Ok(None) => {}
+            }
+        }
+        std::panic::set_hook(hook);
+        assert!(failures.is_empty(), "{name} (seed {seed}): {} failures\n{}", failures.len(), failures.join("\n"));
+        decoded
+    }
 }
