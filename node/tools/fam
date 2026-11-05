@@ -15,8 +15,6 @@
 #                lets a Test/Bench block exercise the real disk path (find_blk/
 #                vblkinit/vreq/vpoll). Only meaningful with --test/--bench.
 #   -o OUTPUT    output binary (default: ./a.bin)
-#   --load=FILE@ADDR  load FILE's bytes at ADDR when running (forwarded to q32):
-#                test fixtures (tools/fxpack, tests/fx.fam).
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
 # `fam prog.fam --test` compiles, runs the tests, and deletes the binary (like
@@ -46,7 +44,6 @@ while [ $# -gt 0 ]; do
 		--test) TEST=1; shift ;;
 		--bench) BENCH=1; shift ;;
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
-		--load=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
 		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;

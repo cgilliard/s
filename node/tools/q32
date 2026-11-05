@@ -7,7 +7,6 @@
 #   --disk=FILE   Attach FILE as virtio-blk disk
 #   --disk-ro=FILE  the same, read only and unlocked (another QEMU may be
 #                 writing it)
-#                 (with --disk or --net, an entropy device too: src/rng.fam)
 #   --load=FILE@ADDR  Load FILE's raw bytes into memory at ADDR (repeatable):
 #                 test fixtures.  A fam program's heap and stacks span all of
 #                 RAM above its image (lib/stdlib.fam init: the data stack ends
@@ -142,12 +141,6 @@ if [ -n "$DISK" ]; then
 		ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
 	fi
 	ARGS="$ARGS -device virtio-blk-device,drive=d0"
-fi
-
-# An entropy device (src/rng.fam), with the disk or the network: last, so
-# the others keep their places.
-if [ -n "$DISK" ] || [ -n "$NETDEV" ] || [ "$NET" = "1" ]; then
-	ARGS="$ARGS -device virtio-rng-device"
 fi
 
 if [ -n "$SERPORT" ]; then
