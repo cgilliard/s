@@ -88,6 +88,14 @@ fi
 SOCKMODE=0
 case "$(uname -s)" in MINGW*|MSYS*) SOCKMODE=1 ;; esac
 [ "$FAM_SERIAL" = "socket" ] && SOCKMODE=1
+# Without --out, a program's serial port is QEMU's console (-serial stdio).
+# Windows QEMU's console loses piped input and now and then never lets QEMU
+# exit, so there, unless stdin is a terminal (interactive use), take the
+# socket path as well: output to stdout (`-`), stdin (if any) forwarded.
+if [ "$SOCKMODE" = 1 ] && [ -z "$SEROUT" ] && [ ! -t 0 ]; then
+	SEROUT=-
+	SERIN=/dev/stdin
+fi
 
 # Build QEMU arguments
 ARGS="-machine virt -cpu $CPU -nographic -bios none"

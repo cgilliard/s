@@ -163,21 +163,6 @@ jobs:
         run: sh scripts/build.sh
       - name: Checks
         run: sh scripts/check.sh
-      # Diagnostic (temporary): the store into the data stack's guard hangs
-      # here, not elsewhere. QEMU's trap log for that program, for 10 s.
-      - name: Trap log of underflow_write
-        if: failure()
-        run: |
-          CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
-          qemu-system-riscv32 -machine virt -cpu "$CPU" -nographic -bios none \
-            -device loader,file=tmp/check/underflow_write.bin,addr=0x80000000 \
-            -serial file:tmp/check/uw.serial -monitor none \
-            -d int,guest_errors,unimp -D tmp/check/uw.qemu.log &
-          sleep 10
-          taskkill //F //IM qemu-system-riscv32.exe || true
-          echo "--- serial output"; cat tmp/check/uw.serial || true
-          echo "--- QEMU log ($(wc -l < tmp/check/uw.qemu.log) lines), first 60"
-          head -60 tmp/check/uw.qemu.log || true
 
   # Every test marked slow has a job above.
   slow-listed:
