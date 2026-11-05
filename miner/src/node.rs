@@ -6292,8 +6292,9 @@ mod tests {
     /// (`docs/SUBNAME_CERT.md`): a holder publishes bundles up its own
     /// circuit; the points check each against their chain and hold the
     /// sound ones; a resolver finds them, the holder online or not. The
-    /// owner's `none` certificate takes the place of the holder's; an older
-    /// one does not come back; a newer delegation that drops an issuer
+    /// owner's `none` certificate takes the place of the holder's, though
+    /// it comes within the points' update interval (held back, not
+    /// dropped); an older one does not come back; a newer delegation that drops an issuer
     /// replaces that issuer's certificate; a name that changes hands drops
     /// its old owner's.
     #[test]
@@ -6373,8 +6374,8 @@ mod tests {
         nodes[holder].1.send(Event::Stop).unwrap();
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(fetch(b"cool").as_ref(), Some(&cool));
-        // The owner withdraws `cool` (after the points' update interval).
-        std::thread::sleep(Duration::from_secs(11));
+        // The owner withdraws `cool` at once, within the points' update
+        // interval: held back until it has passed, not dropped.
         let none = bundle(Cert::none(&key(4), b"example", b"cool", 12, life).unwrap(), None);
         nodes[owner].1.send(Event::Certs(vec![none.to_bytes()])).unwrap();
         let deadline = Instant::now() + guard(30);
@@ -6389,7 +6390,6 @@ mod tests {
         assert_eq!(got.as_ref(), Some(&none));
         assert_eq!(got.unwrap().cert.entry(), Entry::None);
         // The holder's older certificate, published again, does not come back.
-        std::thread::sleep(Duration::from_secs(11));
         nodes[resolver].1.send(Event::Certs(vec![cool.to_bytes()])).unwrap();
         std::thread::sleep(Duration::from_secs(4));
         assert_eq!(fetch(b"cool").as_ref(), Some(&none));

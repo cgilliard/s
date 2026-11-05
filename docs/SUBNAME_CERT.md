@@ -89,7 +89,10 @@ period. The point that takes it passes it to `N`'s other points
 - checks the issuer against its chain: the key hashes to `name`'s value
   (case 1), or is in the bundle's delegation, a sound one of `V` (case 2);
 - keeps the highest `seq` per `N` until its expiry, taking an update at
-  most every 10 seconds per `N`;
+  most every 10 seconds per `N`: a newer one inside that interval is held
+  back and applied when it has passed, not dropped (the newest, if
+  several), so a withdrawal and a new certificate in quick succession
+  both land;
 - checks its stored certificates again when the issuer's authority
   changes: when `name`'s value on chain changes (an update or a transfer:
   the old owner's certificates stop counting) and when it learns a newer
@@ -126,7 +129,8 @@ wallet ──circuit──▶ T's point ══session══▶ holder's node   (
 
 A certificate is cached for an hour at most (and never past its expiry),
 so a repeat send goes straight to step 4 and a withdrawal reaches senders
-within the hour. No certificate, or a `none` one, means no such sub-name.
+within the hour. No certificate, or a `none` one, means no such sub-name;
+those are not cached, so a sub-name given out again resolves at once.
 
 **Init mode** has no rendezvous points to hold certificates. There the
 resolver asks the name's owner instead: a query (`KIND_SUBNAME_QUERY`) to
@@ -305,5 +309,17 @@ and `KIND_SUBNAME_ANSWER`, the node answering queries from its table
    owner offline, through a delegated issuer, after an epoch rotation,
    after a revocation and a change), and a timed run on `--network dev`
    in onion mode.
+   Done (2026-11-05): through the prompt (`sub_names_resolve_in_both_modes`),
+   resolution in init mode from the owner and in onion mode from the
+   points with the owner offline, through a delegated issuer; a payment
+   to a withdrawn sub-name refused; the sub-name given out again within
+   the points' update interval, and paid. Across an epoch rotation by
+   `a_holder_carries_its_certificate_to_new_points` and
+   `an_issuer_carries_a_delegation_to_new_points`. Two fixes came of it:
+   a point holds back an update inside its 10-second interval instead of
+   dropping it, and a resolver no longer caches a withdrawal. Resolution
+   is logged with its time (`sub-name … resolved in …`); on one machine
+   it takes 0.01 to 0.05 s, so the network's round trip is what remains
+   to measure, on a `--network dev` run across machines.
 7. `docs/SUBNAMES.md` section 1 replaced by a pointer here; README and
    `docs/NAMES.md` updated.

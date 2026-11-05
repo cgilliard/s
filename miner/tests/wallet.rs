@@ -210,6 +210,27 @@ fn sub_names_resolve_in_both_modes() {
     c.expect_log("sub-name ex2.example was withdrawn by its owner", 180);
     c.send("subnames");
     c.expect("the list", 10, |l| l.starts_with("held     cool.example"));
+    // A payment to it is refused as withdrawn (C has no cached certificate),
+    // once the withdrawal has passed the points' update interval: B issued
+    // the certificate moments before, so the points hold the withdrawal
+    // back for up to ten seconds.
+    std::thread::sleep(Duration::from_secs(15));
+    c.send("send 1 @ex2.example");
+    let line = c.expect("the send's outcome", 90, |l| l.starts_with("error:") || l.starts_with("slate "));
+    assert!(line.contains("ex2.example was withdrawn"), "C: {line}");
+    // B gives it to itself at once, within the points' update interval:
+    // the change is held back there, not lost, and C's payment reaches B.
+    b.send(&format!("subname set ex2.example {b_address}"));
+    b.expect("the sub-name set", 90, |l| l.starts_with("ex2.example given to"));
+    c.pay("1", "@ex2.example", 180);
+    b.poll("balance", "the coin", 180, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
+    // How long resolving took (docs/SUBNAME_CERT.md: to be measured).
+    for (who, p) in [("P", &p), ("C", &c)] {
+        let log = std::fs::read_to_string(p.data.join("tabminer.log")).unwrap_or_default();
+        for line in log.lines().filter(|l| l.contains(" resolved in ")) {
+            println!("TIMING {who}: {line}");
+        }
+    }
 }
 
 /// A reorganization takes the rewards of lost blocks out of the wallet,

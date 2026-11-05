@@ -285,6 +285,11 @@ pub(super) struct Rendezvous {
     delegations: HashMap<Digest, Delegated>,
     /// Certificates held, by point id; their bundles in [`Announces`].
     certs: HashMap<Digest, Delegated>,
+    /// A newer certificate for a point that came within [`DELEGATION_EVERY`]
+    /// of its last update: applied once the interval has passed, not
+    /// dropped (a `subname del` then `subname set` in quick succession
+    /// must not lose the second). One per point, the newest.
+    cert_pending: HashMap<Digest, Vec<u8>>,
     /// Tests: names' values, instead of the chain's.
     #[cfg(test)]
     pub(super) test_names: Option<HashMap<Vec<u8>, Digest>>,
@@ -361,6 +366,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let expired: Vec<Digest> = self.rdv.certs.iter().filter(|(_, c)| c.expiry <= unix).map(|(id, _)| *id).collect();
         for id in expired {
             self.drop_cert(&id);
+        }
+        let due: Vec<Digest> = self
+            .rdv
+            .cert_pending
+            .keys()
+            .filter(|p| self.rdv.certs.get(*p).is_none_or(|c| now.duration_since(c.updated) >= DELEGATION_EVERY))
+            .copied()
+            .collect();
+        for point in due {
+            if let Some(bytes) = self.rdv.cert_pending.remove(&point) {
+                let _ = self.hold_cert(&bytes, now);
+            }
         }
         let late: Vec<usize> = (0..self.rdv.asks.len())
             .filter(|&i| self.rdv.asks[i].asked.is_some_and(|(_, t)| now.duration_since(t) >= ASK_TIMEOUT))
@@ -662,6 +679,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn drop_cert(&mut self, point: &Digest) {
         self.rdv.certs.remove(point);
+        self.rdv.cert_pending.remove(point);
         self.rdv.announces.remove_in(Table::Cert, point);
     }
 
@@ -707,11 +725,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A certificate to hold, published or passed on by another point: its
-    /// point id once held, or why not. It must be sound against the chain
-    /// and for a full name this relay is a point of; it takes the place of
-    /// the one held if its `seq` is higher (not too soon after the last
-    /// update), or if it carries a newer delegation that no longer allows
-    /// the one held.
+    /// point id once held (or set to be), or why not. It must be sound
+    /// against the chain and for a full name this relay is a point of; it
+    /// takes the place of the one held if its `seq` is higher, or if it
+    /// carries a newer delegation that no longer allows the one held. A
+    /// higher `seq` too soon after the last update waits for the interval.
     fn hold_cert(&mut self, bytes: &[u8], now: Instant) -> Result<Digest, u8> {
         let b = Bundle::from_bytes(bytes).ok_or(NOTICE_REJECTED)?;
         let point = b.point();
@@ -729,9 +747,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 (Some(new), None) => !old.allowed_by(&value, new),
                 _ => false,
             };
-            let soon = updated.is_some_and(|t| now.duration_since(t) < DELEGATION_EVERY);
-            if !withdrawn && (!b.cert.supersedes(&old.cert) || soon) {
+            if !withdrawn && !b.cert.supersedes(&old.cert) {
                 return Err(NOTICE_REFUSED);
+            }
+            if !withdrawn && updated.is_some_and(|t| now.duration_since(t) < DELEGATION_EVERY) {
+                let newer = match self.rdv.cert_pending.get(&point).and_then(|p| Bundle::from_bytes(p)) {
+                    Some(p) => b.cert.supersedes(&p.cert),
+                    None => true,
+                };
+                if newer {
+                    self.rdv.cert_pending.insert(point, bytes.to_vec());
+                }
+                return Ok(point);
             }
         } else if self.rdv.certs.len() >= self.config.max_sessions {
             return Err(NOTICE_REFUSED);

@@ -2164,6 +2164,8 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     // so a mistake shows here, not in the log.
                     let delegation = issuing_for(ctx, &name, &value)?;
                     let mut s = ctx.subnames.lock().unwrap();
+                    // Given out again: its withdrawal is no longer published.
+                    s.withdrawn.retain(|b| (b.cert.name.as_slice(), b.cert.label.as_slice()) != (&name[..], &label[..]));
                     let zone = s.table.entry(name.clone()).or_default();
                     let old = zone.entries.insert(label.clone(), id);
                     drop(s);
@@ -2694,7 +2696,18 @@ fn sign_cert(
 ) -> AnyResult<tabminer::subnames::Bundle> {
     use tabminer::subnames::{Bundle, Cert, LIFETIME_SECS};
     let key = ctx.wallet()?.identity_key();
-    let last = ctx.issued.lock().unwrap().get(&(name.to_vec(), label.to_vec())).map_or(0, |i| i.bundle.cert.seq);
+    let issued = ctx.issued.lock().unwrap().get(&(name.to_vec(), label.to_vec())).map_or(0, |i| i.bundle.cert.seq);
+    let withdrawn = ctx
+        .subnames
+        .lock()
+        .unwrap()
+        .withdrawn
+        .iter()
+        .filter(|b| b.cert.name == name && b.cert.label == label)
+        .map(|b| b.cert.seq)
+        .max()
+        .unwrap_or(0);
+    let last = issued.max(withdrawn);
     let seq = unix_millis().max(last + 1);
     let expiry = now() + LIFETIME_SECS;
     let cert = match to {
@@ -2885,6 +2898,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
     }
     let missing = || format!("{label}.{name} does not exist: {name}'s owner has issued no certificate for it");
     let onion = ctx.chain.consensus_epoch()?.current.mode == tabminer::consensus::Mode::Onion;
+    let started = std::time::Instant::now();
     let mut wait = Waiter::new(ctx);
     let tag = lookup_tag();
     wait.add(Wait::Tag(tag));
@@ -2927,11 +2941,19 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
     if b.cert.name != n || b.cert.label != l || !b.verify(&value, now()) {
         return Err(format!("{label}.{name}: its certificate is not signed by {name}'s owner or an issuer it names").into());
     }
-    let until = b.cert.expiry.min(now() + CERT_CACHE);
-    let mut r = ctx.resolved.lock().unwrap();
-    r.certs.retain(|_, (_, until)| *until > now());
-    r.certs.insert((n, l), (b.clone(), until));
-    drop(r);
+    log::line(&format!(
+        "sub-name {label}.{name} resolved in {:.2}s ({})",
+        started.elapsed().as_secs_f64(),
+        if onion { "from its points" } else { "from its owner" }
+    ));
+    // Only what resolves is cached: a withdrawal is asked again each time,
+    // so a sub-name given out again resolves at once.
+    if matches!(b.cert.entry(), Entry::Id(_)) {
+        let until = b.cert.expiry.min(now() + CERT_CACHE);
+        let mut r = ctx.resolved.lock().unwrap();
+        r.certs.retain(|_, (_, until)| *until > now());
+        r.certs.insert((n, l), (b.clone(), until));
+    }
     id_of(&b)
 }
 
