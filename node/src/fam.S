@@ -333,7 +333,7 @@ compile:
     # Two prologue slots, skipped by `j +12`:
     #   __ret (s0+8):  backpatched to the first island's return entry; the
     #                  first segment's ';'s jump here.
-    #   __ovf (s0+12): a self-loop halt (unused now: calls halt in place).
+    #   __ovf (s0+12): a self-loop halt (unused now: calls trap in place).
     addi    a0, s0, 16                  # program code begins at s0+16 (past both slots)
     CALL    emit_j                      # `j +12` at s0+4 -> s0+16
     CHECK_HEAP 4, t0
@@ -565,9 +565,10 @@ compile:
     srli    t5, t5, 2                   # t5 = return-id r = (cursor - base - 32)/4
     li      a0, 0xFFCD8D93              # addi s11, s11, -4
     CALL    emit_word
-    li      a0, 0x01ADF463             # bgeu s11, s10, +8  (skip trap-jump if no overflow)
+    li      a0, 0x01ADF463             # bgeu s11, s10, +8  (skip the ebreak if no overflow)
     CALL    emit_word
-    li      a0, 0x6F                   # j .  (RID-overflow halt, in place)
+    li      a0, 0x00100073             # ebreak  (RID overflow: stdlib init's trap handler
+                                       #   reports it and exits 1)
     CALL    emit_word
     mv      a0, t5                      # li t0, r   (lui+addi: r may exceed 2047)
     li      a1, 0x2B7                   #   lui t0, 0
@@ -626,6 +627,13 @@ compile:
     addi    sp, sp, 8
     j       .Lc_next
 .Lc_done:
+    # A definition still open at the end of the input -- a ':' or ':I' with no
+    # ';' -- would swallow the rest of the program: refuse it.
+    bnez    ra, __panic                 # unclosed ':' definition
+    li      t0, 0x1400
+    add     t0, s10, t0
+    lw      t0, 4(t0)                   # in-:I flag
+    bnez    t0, __panic                 # unclosed ':I' definition
     # Halt at the program end: a program that runs off its end -- or whose
     # final action is a call that returns to the EOT position -- lands here
     # instead of falling into the last island. (A real program exits before this.)

@@ -128,6 +128,58 @@ B7520000 ,   \ lui  t0, 0x5             ( t0 = 0x5000 = 0x1000 RID + 0x4000 vars
 B3815100 ,   \ add  gp,  gp, t0         ( gp += 0x5000 = heap base, above RID+vars )
 3701FF87 ,   \ lui  sp, 0x87FF0         ( sp = 0x87FF0000 = data-stack top: RAM top - 64 KiB )
 370C0088 ,   \ lui  s8, 0x88000         ( s8 = 0x88000000 = loop-control stack top = RAM top )
+\        Then a trap handler: any trap -- a return-stack overflow (each call
+\        checks, and executes `ebreak` on overflow), a bad address, an illegal
+\        instruction -- prints "?trap <mcause> at <mepc>" and exits with code 1,
+\        rather than leaving the machine spinning.  mcause 3 is the overflow.
+97020000 ,   \ auipc t0,0x0             ( t0 = the handler, 16 bytes on )
+93820201 ,   \ addi  t0,t0,16
+73905230 ,   \ csrrw zero,mtvec,t0
+6F00000B ,   \ jal   zero,done          ( over the handler )
+B7020010 ,   \ lui   t0,0x10000         trap: UART base
+37767261 ,   \ lui   a2,0x61727         ( a2 = "?tra" )
+1306F643 ,   \ addi  a2,a2,1087
+EF0F8004 ,   \ jal   t6,put             ( print it )
+37260000 ,   \ lui   a2,0x2             ( a2 = "p " )
+13060607 ,   \ addi  a2,a2,112
+EF0FC003 ,   \ jal   t6,put
+F3252034 ,   \ csrrs a1,mcause,zero     ( why: 3 = ebreak, a return-stack overflow )
+EF0F4005 ,   \ jal   t6,hex8            ( print it in hex )
+37667420 ,   \ lui   a2,0x20746         ( a2 = " at " )
+13060612 ,   \ addi  a2,a2,288
+EF0F8002 ,   \ jal   t6,put
+F3251034 ,   \ csrrs a1,mepc,zero       ( where )
+EF0F0004 ,   \ jal   t6,hex8
+1306A000 ,   \ addi  a2,zero,10         ( LF )
+EF0F8001 ,   \ jal   t6,put
+B7021000 ,   \ lui   t0,0x100           ( SiFive finisher 0x100000 )
+37330100 ,   \ lui   t1,0x13
+13033333 ,   \ addi  t1,t1,819          ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw    t1,0(t0)
+6F000000 ,   \ jal   zero,.             ( spin until QEMU exits )
+1375F60F ,   \ andi  a0,a2,255          put: ( low byte of a2 )
+03C35200 ,   \ lbu   t1,5(t0)           p1: ( wait THR-empty )
+13730302 ,   \ andi  t1,t1,32
+E30C03FE ,   \ beq   t1,zero,p1
+2380A200 ,   \ sb    a0,0(t0)           ( write it )
+13568600 ,   \ srli  a2,a2,0x8          ( next byte; stop at a zero )
+E31406FE ,   \ bne   a2,zero,put
+67800F00 ,   \ jalr  zero,0(t6)         ( return )
+130F8000 ,   \ addi  t5,zero,8          hex8: ( 8 digits of a1 )
+13D5C501 ,   \ srli  a0,a1,0x1c         h1: ( top nibble )
+93954500 ,   \ slli  a1,a1,0x4
+9303A000 ,   \ addi  t2,zero,10
+63447500 ,   \ blt   a0,t2,h2
+13057500 ,   \ addi  a0,a0,7            ( A-F )
+13050503 ,   \ addi  a0,a0,48           h2: ( to ASCII )
+03C35200 ,   \ lbu   t1,5(t0)           h3: ( wait THR-empty )
+13730302 ,   \ andi  t1,t1,32
+E30C03FE ,   \ beq   t1,zero,h3
+2380A200 ,   \ sb    a0,0(t0)
+130FFFFF ,   \ addi  t5,t5,-1
+E31A0FFC ,   \ bne   t5,zero,h1
+67800F00 ,   \ jalr  zero,0(t6)         ( return )
+\        done:
 ;
 
 
