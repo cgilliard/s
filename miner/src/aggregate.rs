@@ -2040,6 +2040,14 @@ mod tests {
         let mut other = st2.clone();
         other.end_output_position += 1;
         assert!(verify_chain(&SMALL, &setup, 2, &other, &c2).is_err());
+        // Every structural field of the chain proof (zero knowledge: its
+        // wrap), at its boundary values: the proof a peer sends with a block.
+        let t = std::time::Instant::now();
+        let (fields, panicked, accepted) = crate::codec::sweep_fields(&c2.to_bytes(), |b| {
+            stark::Proof::from_bytes(b).map(|p| p != c2 && verify_chain(&SMALL, &setup, 2, &st2, &p).is_ok())
+        });
+        println!("{fields} fields swept in {:?}", t.elapsed());
+        assert!(panicked.is_empty() && accepted.is_empty(), "panicked {panicked:?}, accepted {accepted:?}");
         // The schedule is enforced: with block 2 due 7, its 55 is refused.
         let strict = [(1u32, 55u64), (9, 7)];
         let bad = std::panic::catch_unwind(|| {

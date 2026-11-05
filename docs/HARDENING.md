@@ -246,6 +246,29 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   no invalid block is ever the tip, and the archive's tip is the most
   work of the complete valid branches. 1,250 blocks over five seeds,
   reorganizations up to 25 blocks deep, clean.
+  Random mutation rarely sets one field of a large proof to one chosen
+  value: the XMSS test's fuzz took many runs to set a zk proof's first
+  table height to 64 or more, which overflowed a shift in the verifier's
+  shape check (a panic with overflow checks; release wrapped, then
+  refused). So the verifiers are also swept (`codec::sweep_fields`):
+  every `u32` the decoder reads (counts, lengths, heights, indices,
+  flags, found by recording the reads, not by describing the format) set
+  in turn to 0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 2^31, `u32::MAX` and
+  one either side of its own value, on every proof `fuzz_proof` fuzzes
+  and on a real chain proof (`chain_proofs_cover_history`). The sweep
+  found absent Merkle trees' heights unchecked (another encoding of the
+  same proof verified), now required zero. A read-through of the
+  decoders and verifiers (`codec`, `stark`, `fri`, `merkle`,
+  `block_proof`, the chain proof's path in `aggregate`) for untrusted
+  values reaching arithmetic, allocation or indexing before a bound found
+  a decoder panic in release: no queries but FRI rounds claimed, an
+  exhausted iterator unwrapped (`a_proof_without_queries_is_refused`),
+  now refused; and, minor, preallocation from an untrusted query count,
+  an unchecked `u128` sum of untrusted amounts in the direct block proof,
+  an `expect` on a zero inverse at the quotient point and an unguarded
+  shift in `merkle::verify`, all fixed. The sweep changes one field at a
+  time; failures that need several fields changed together, as the
+  queries one did, are left to reading and to random mutation.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`

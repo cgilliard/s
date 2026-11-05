@@ -76,7 +76,14 @@ impl<'a> Reader<'a> {
     }
 
     pub fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let b = self.take(4)?;
+        #[cfg(test)]
+        READS.with(|r| {
+            if let Some(v) = r.borrow_mut().as_mut() {
+                v.push(b.as_ptr() as usize);
+            }
+        });
+        Some(u32::from_le_bytes(b.try_into().unwrap()))
     }
 
     pub fn u64(&mut self) -> Option<u64> {
@@ -127,6 +134,66 @@ impl<'a> Reader<'a> {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: where each `u32` read came from, while [`u32_fields`] records.
+    static READS: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the offsets in `bytes` of every `u32` that `decode` reads from
+/// them, in order. Every count, length, height, index and flag of the
+/// formats here is one, so this finds a format's structural fields without
+/// describing the format. Reads from copies of `bytes` are not seen.
+#[cfg(test)]
+pub(crate) fn u32_fields(bytes: &[u8], decode: impl FnOnce(&[u8])) -> Vec<usize> {
+    READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    decode(bytes);
+    let reads = READS.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    let base = bytes.as_ptr() as usize;
+    let mut out: Vec<usize> = reads.into_iter().filter(|&a| a >= base && a + 4 <= base + bytes.len()).map(|a| a - base).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Tests: every structural field of `bytes` (see [`u32_fields`]) set in
+/// turn to each boundary value (0, 1, 2, 31, 32, 33, 63, 64, 255, 256,
+/// 2^31, `u32::MAX`, and one either side of its own), and `check` run on
+/// the result: `None` if it does not decode, `Some(accepted)` if it does.
+/// Returns the mutants that panicked and those that were accepted; both
+/// should be empty. Deterministic, unlike random mutation, which rarely
+/// lands a chosen value on a chosen field of a large proof.
+#[cfg(test)]
+pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) -> (usize, Vec<String>, Vec<String>) {
+    let fields = u32_fields(bytes, |b| {
+        check(b);
+    });
+    let (mut panicked, mut accepted) = (Vec::new(), Vec::new());
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    for &at in &fields {
+        let own = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let values = [0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 1 << 31, u32::MAX, own.wrapping_add(1), own.wrapping_sub(1)];
+        for v in values {
+            if v == own {
+                continue;
+            }
+            let mut b = bytes.to_vec();
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&b))) {
+                Err(e) => {
+                    let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
+                    panicked.push(format!("u32 at {at} ({own}) set to {v}: {}", msg.unwrap_or_default()));
+                }
+                Ok(Some(true)) => accepted.push(format!("u32 at {at} ({own}) set to {v}")),
+                Ok(_) => {}
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    (fields.len(), panicked, accepted)
 }
 
 #[cfg(test)]

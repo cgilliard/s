@@ -884,12 +884,16 @@ impl Proof {
         let grinding = [r.fp()?, r.fp()?, r.fp()?, r.fp()?];
         let nq = r.len(4)?;
         let rounds = r.len(0)?;
-        if rounds > 32 {
+        // No queries is no proof, and the FRI trees are counted from the
+        // first query below: with none, `rounds` would claim trees that
+        // are not there.
+        if nq == 0 || rounds > 32 {
             return None;
         }
-        let mut query_indices = Vec::with_capacity(nq);
-        let mut fri_queries = Vec::with_capacity(nq);
-        let mut openings = Vec::with_capacity(nq);
+        // Capacity from the untrusted count, but not beyond any real proof's.
+        let mut query_indices = Vec::with_capacity(nq.min(128));
+        let mut fri_queries = Vec::with_capacity(nq.min(128));
+        let mut openings = Vec::with_capacity(nq.min(128));
         for _ in 0..nq {
             query_indices.push(r.u32()? as usize);
             let steps = (0..rounds)
@@ -926,6 +930,16 @@ impl Proof {
                 return None;
             }
             heights.push(h);
+        }
+        // An absent tree (no lookups, no preprocessed columns) has height
+        // zero: the verifier never opens it, so any other height would be
+        // another encoding of the same proof.
+        for (t, table) in proof.tables.iter().enumerate() {
+            if (table.aux_root.is_none() && heights[4 * t + 1] != 0)
+                || (table.pre_at_zeta.is_empty() && heights[4 * t + 2] != 0)
+            {
+                return None;
+            }
         }
         let mut all_paths: Vec<Vec<Vec<Digest>>> = Vec::with_capacity(num_trees);
         for (tree, (_, per_q)) in proof.trees().into_iter().enumerate() {
@@ -1888,6 +1902,9 @@ pub(crate) struct ProofFuzz {
     pub accepted: Vec<String>,
     /// Mutants the decoder or verifier panicked on: failures.
     pub panicked: Vec<String>,
+    /// Structural fields swept to boundary values (`codec::sweep_fields`),
+    /// whose panics and acceptances join those above.
+    pub fields: usize,
 }
 
 /// Tests: fuzzes a verifier with `iters` mutants of a valid proof's bytes
@@ -1973,6 +1990,13 @@ pub(crate) fn fuzz_proof(proof: &Proof, iters: u64, seed: u64, verify: impl Fn(&
         }
     }
     std::panic::set_hook(hook);
+    // Then every count, length, height and index at its boundary values:
+    // what random mutation rarely reaches.
+    let (fields, panicked, accepted) =
+        crate::codec::sweep_fields(&bytes, |b| Proof::from_bytes(b).map(|p| p != *proof && verify(&p)));
+    out.fields = fields;
+    out.panicked.extend(panicked);
+    out.accepted.extend(accepted);
     out
 }
 
@@ -3083,7 +3107,12 @@ pub fn verify_tables(
             let x = Fp4::from_base(x_base);
             let zeta_next = zeta.mul_base(&root_of_unity(t.log_n));
             let zeta_q = quotient_point(config, zeta, s.chunks);
-            let inv = batch_inverse(&[(x - zeta) * (x - zeta_next), x - zeta_q]);
+            // Zeta is drawn from the transcript, so a zero here is a 2^-90
+            // chance; still an error, not a panic.
+            let (Some(inv0), Some(inv1)) = (((x - zeta) * (x - zeta_next)).inv(), (x - zeta_q).inv()) else {
+                return Err(VerifyError::InvalidQuotientOpening { query: q });
+            };
+            let inv = [inv0, inv1];
             let rows = (&opening.trace_row[..], &opening.aux_row[..], &opening.pre_row[..]);
             let quotient = ext_from_row(&opening.quotient_row);
             let v = deep.value((rows.0, rows.1, rows.2, &quotient), x_base, inv[0], inv[1]);
@@ -3304,6 +3333,28 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(Proof::from_bytes(&extra).is_none());
+    }
+
+    /// A proof of no queries whose header still claims FRI rounds once
+    /// panicked the decoder (an exhausted iterator), before any check.
+    #[test]
+    fn a_proof_without_queries_is_refused() {
+        let (trace, public) = fib_trace(4);
+        let mut proof = prove(&CONFIG, &Fibonacci, &trace, &public, &mut transcript());
+        let nt = proof.tables.len();
+        proof.openings.clear();
+        proof.query_indices.clear();
+        proof.fri.queries.clear();
+        // Written with no queries: ... nq = 0, rounds = 0, 4·nt heights.
+        let bytes = proof.to_bytes();
+        let mut forged = bytes[..bytes.len() - 8 - 16 * nt].to_vec();
+        forged.extend(0u32.to_le_bytes()); // nq
+        forged.extend(1u32.to_le_bytes()); // rounds
+        for _ in 0..4 * nt + 1 {
+            forged.extend(0u32.to_le_bytes()); // heights
+        }
+        assert!(Proof::from_bytes(&forged).is_none());
+        assert!(Proof::from_bytes(&bytes).is_none());
     }
 
     #[test]

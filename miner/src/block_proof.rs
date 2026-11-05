@@ -226,9 +226,12 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof], name: &Na
     {
         return Err(AggregateError::WrongNames);
     }
-    let total_in: u128 = proofs.iter().map(|p| SegmentPublic::total(&p.public.sum_in)).sum();
-    let total_out: u128 = proofs.iter().map(|p| SegmentPublic::total(&p.public.sum_out)).sum();
-    if total_in + s.subsidy as u128 != total_out {
+    // Checked: the limbs are untrusted until the proofs are verified, and
+    // enough segments of large ones would overflow a u128.
+    let sum = |f: fn(&SegmentPublic) -> u128| proofs.iter().try_fold(0u128, |a, p| a.checked_add(f(&p.public)));
+    let total_in = sum(|p| SegmentPublic::total(&p.sum_in)).and_then(|t| t.checked_add(s.subsidy as u128));
+    let total_out = sum(|p| SegmentPublic::total(&p.sum_out));
+    if total_in.is_none() || total_in != total_out {
         return Err(AggregateError::Unbalanced);
     }
     Ok(())

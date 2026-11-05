@@ -123,7 +123,10 @@ pub fn root_from_path(index: usize, row: &[Fp], path: &[Digest]) -> Digest {
 /// Checks that `row` is leaf `index` of a tree with `height` levels and the
 /// given root.
 pub fn verify(root: &Digest, height: usize, index: usize, row: &[Fp], path: &[Digest]) -> bool {
-    path.len() == height && index < (1usize << height) && root_from_path(index, row, path) == *root
+    path.len() == height
+        && height < usize::BITS as usize
+        && index < (1usize << height)
+        && root_from_path(index, row, path) == *root
 }
 
 // ---------------------------------------------------------------------------
