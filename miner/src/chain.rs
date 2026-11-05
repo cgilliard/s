@@ -4847,4 +4847,257 @@ mod tests {
         other.init_genesis(&genesis_block(vec![Output::new(&pk(9), 1)])).unwrap();
         assert!(matches!(other.init_or_check_genesis(), Err(ChainError::WrongGenesis)));
     }
+
+    /// The chain fuzzer's parameters: room for several outputs and name
+    /// operations a block, and an emission long enough for any branch.
+    fn fuzz_chain_params() -> ChainParams {
+        ChainParams { max_block_size: 1 << 16, emission: &[(1_000_000, 50)], ..params() }
+    }
+
+    /// A fresh chain on the fuzzer's parameters fed `blocks` in order, each
+    /// of which must apply: what a node that saw only this branch holds.
+    fn replay(genesis: &Block, blocks: &[Block], window: Option<u32>) -> (TempDir, Chain<AcceptAllProofs>) {
+        let dir = TempDir::new("fuzz-replay");
+        let chain = Chain::open(&dir.0, 64 << 20, fuzz_chain_params(), seed(), AcceptAllProofs).unwrap();
+        let chain = chain.with_max_undo(window);
+        chain.init_genesis(genesis).unwrap();
+        for b in blocks {
+            chain.apply_block(b, b.header.timestamp + 1).unwrap();
+        }
+        (dir, chain)
+    }
+
+    /// Everything a node's state is: the root (outputs and names), the
+    /// output counter, unspent and registered counts, and the supply.
+    fn state_of(c: &Chain<AcceptAllProofs>) -> (Digest, u64, u64, u64, u128) {
+        let rtxn = c.env().read_txn().unwrap();
+        (
+            c.utxo().root(&rtxn).unwrap(),
+            c.utxo().next_position(&rtxn).unwrap(),
+            c.utxo().len(&rtxn).unwrap(),
+            c.names().len(&rtxn).unwrap(),
+            c.supply().unwrap(),
+        )
+    }
+
+    /// The chain under random reorganizations, against replays. A random
+    /// tree of blocks grows from genesis: each on a random block of it,
+    /// built on a chain fed that block's branch, with random spends,
+    /// outputs, name commits, reveals and updates; some made invalid (a
+    /// wrong state root, an inflated output). A chain under test (with
+    /// every undo record, and with a short window) takes them in random
+    /// order, parents often after children. After every block it takes,
+    /// its state must be a fresh replay of the branch to its tip (root,
+    /// counter, unspent, names, supply equal to what was issued), its tip
+    /// never an invalid block, and, keeping every undo record, its tip the
+    /// most work of the valid blocks whose whole branch it has.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow in debug builds; run with --release")]
+    fn fuzz_reorganizations() {
+        use crate::names::{BlockNameOp, MAX_REVEAL, MIN_REVEAL, Record};
+        use crate::poseidon2::Fp;
+        use std::collections::HashMap;
+        let (blocks_to_make, fuzz_seed) = crate::stark::fuzz_params(60, 0xc4a1_0f22);
+        let mut rng = crate::test_util::Rng::new(fuzz_seed);
+        let mut r = move |n: u64| rng.next_u64() % n.max(1);
+        let dataset = Dataset::generate(&seed());
+        let genesis = genesis_block(vec![]);
+        let digest = |r: &mut dyn FnMut(u64) -> u64| -> Digest { core::array::from_fn(|_| Fp::new(r(1 << 30) as u32)) };
+        // The tree: blocks by hash, their parents, which are invalid.
+        let gid = genesis.header.hash();
+        let mut blocks: HashMap<[u8; 32], Block> = HashMap::new();
+        let mut valid_nodes: Vec<Digest> = vec![gid];
+        let mut invalid: std::collections::HashSet<[u8; 32]> = Default::default();
+        let path = |blocks: &HashMap<[u8; 32], Block>, mut h: Digest| -> Vec<Block> {
+            let mut out = Vec::new();
+            while h != gid {
+                let b = blocks[&digest_bytes(&h)].clone();
+                h = b.header.prev_hash;
+                out.push(b);
+            }
+            out.reverse();
+            out
+        };
+        // The chains under test.
+        let (_d1, archive) = replay(&genesis, &[], None);
+        let (_d2, windowed) = replay(&genesis, &[], Some(4));
+        let mut pending: Vec<[u8; 32]> = Vec::new();
+        let mut delivered: std::collections::HashSet<[u8; 32]> = Default::default();
+        let (mut made, mut steps, mut reorgs, mut refused) = (0, 0, 0, 0);
+        let (mut reveals, mut updates, mut deepest) = (0, 0, 0);
+        // Every name a reveal made, on whichever branch.
+        let mut names_made: Vec<Vec<u8>> = Vec::new();
+        while made < blocks_to_make || !pending.is_empty() {
+            // Make a block on a random valid one, now and then.
+            if made < blocks_to_make && (pending.is_empty() || r(3) > 0) {
+                // Mostly on one of the newest blocks, so branches grow long
+                // enough for reveals; now and then anywhere, for forks.
+                let n = valid_nodes.len() as u64;
+                let parent =
+                    if r(4) > 0 { valid_nodes[(n - 1 - r(n.min(5))) as usize] } else { valid_nodes[r(n) as usize] };
+                let branch = path(&blocks, parent);
+                let (_ds, scratch) = replay(&genesis, &branch, None);
+                let tip = scratch.tip().unwrap().unwrap();
+                let height = tip.height + 1;
+                let rtxn = scratch.env().read_txn().unwrap();
+                let next = scratch.utxo().next_position(&rtxn).unwrap();
+                let commits = scratch.names().commits_in(&rtxn, 0, next).unwrap();
+                let spendable: Vec<u64> = scratch
+                    .utxo()
+                    .unspent(&rtxn)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !commits.iter().any(|(c, _)| c == p))
+                    .collect();
+                let mut inputs: Vec<u64> = Vec::new();
+                for _ in 0..if spendable.is_empty() { 0 } else { r(3) } {
+                    let p = spendable[r(spendable.len() as u64) as usize];
+                    if !inputs.contains(&p) {
+                        inputs.push(p);
+                    }
+                }
+                let spent: u64 = inputs
+                    .iter()
+                    .map(|&p| crate::transaction::slot_parts(&scratch.utxo().slot(&rtxn, p).unwrap()).unwrap().1)
+                    .sum();
+                let total = spent + scratch.params().subsidy(height);
+                let mut outputs: Vec<BlockOutput> = (0..1 + r(3)).map(|_| BlockOutput::from(digest(&mut r))).collect();
+                for (i, o) in outputs.iter_mut().enumerate() {
+                    o.amount = if i == 0 { total } else { r(2) };
+                }
+                let extra: u64 = outputs[1..].iter().map(|o| o.amount).sum();
+                outputs[0].amount -= extra.min(outputs[0].amount);
+                let mut ops = Vec::new();
+                if r(2) == 0 {
+                    ops.push(BlockNameOp::Commit {
+                        commit: digest(&mut r),
+                        memo: crate::transaction::memo5(digest(&mut r)),
+                    });
+                }
+                // A reveal of a commit in its window, or an update of a name
+                // this branch registered.
+                let ripe: Vec<u64> = commits
+                    .iter()
+                    .filter(|(_, c)| height >= c.height + MIN_REVEAL && height <= c.height + MAX_REVEAL)
+                    .map(|(p, _)| *p)
+                    .collect();
+                if !ripe.is_empty() && r(3) > 0 {
+                    let name = format!("n{:x}", r(1 << 20));
+                    let record = Record::new(name.as_bytes(), digest(&mut r), digest(&mut r), digest(&mut r)).unwrap();
+                    ops.push(BlockNameOp::Reveal { record, commit: ripe[r(ripe.len() as u64) as usize] });
+                    reveals += 1;
+                }
+                let held: Vec<Vec<u8>> = names_made
+                    .iter()
+                    .filter(|n| scratch.names().lookup(&rtxn, n).unwrap().is_some())
+                    .cloned()
+                    .collect();
+                if !held.is_empty() && r(2) == 0 {
+                    let name = &held[r(held.len() as u64) as usize];
+                    let record = Record::new(name, digest(&mut r), digest(&mut r), digest(&mut r)).unwrap();
+                    ops.push(BlockNameOp::Update(record));
+                    updates += 1;
+                }
+                drop(rtxn);
+                let mut body = Body { inputs, outputs, ops, sweeps: vec![], proof: vec![r(256) as u8; 8] };
+                let t = tip.timestamp + 300 + r(900);
+                let Ok(mut header) = scratch.template(&body, t) else { continue };
+                // Now and then a broken one.
+                let broken = r(6) == 0;
+                if broken {
+                    if r(2) == 0 {
+                        header.state_root[0] += Fp::ONE;
+                    } else {
+                        body.outputs[0].amount += 1;
+                        header.body_commitment = body.commitment();
+                    }
+                }
+                let target = scratch.expected_target(&tip).unwrap();
+                let (nonce, out) =
+                    pow::mine(&dataset, &header.pow_hash(), &target, (0..10_000_000).map(nonce_from_u64)).unwrap();
+                header.nonce = nonce;
+                header.mix = out.mix;
+                let id = header.hash();
+                for op in &body.ops {
+                    if let BlockNameOp::Reveal { record, .. } = op {
+                        names_made.push(record.name.clone());
+                    }
+                }
+                blocks.insert(digest_bytes(&id), Block { header, body });
+                if broken {
+                    invalid.insert(digest_bytes(&id));
+                } else {
+                    valid_nodes.push(id);
+                }
+                pending.push(digest_bytes(&id));
+                made += 1;
+                continue;
+            }
+            // Deliver a random pending block to both chains.
+            let k = r(pending.len() as u64) as usize;
+            let id = pending.swap_remove(k);
+            let block = blocks[&id].clone();
+            let parent_known =
+                block.header.prev_hash == gid || delivered.contains(&digest_bytes(&block.header.prev_hash));
+            if !parent_known {
+                pending.push(id);
+                if pending.iter().all(|p| {
+                    let ph = blocks[p].header.prev_hash;
+                    ph != gid && !delivered.contains(&digest_bytes(&ph))
+                }) {
+                    panic!("every pending block waits for a parent");
+                }
+                continue;
+            }
+            delivered.insert(id);
+            steps += 1;
+            let before = archive.tip().unwrap().unwrap();
+            for c in [&archive, &windowed] {
+                match c.apply_block(&block, block.header.timestamp + 1) {
+                    Ok(Applied::Reorganized { unwound, .. }) if std::ptr::eq(c, &archive) => {
+                        reorgs += 1;
+                        deepest = deepest.max(unwound);
+                    }
+                    Ok(_) => {}
+                    Err(_) => refused += 1,
+                }
+                // The state is a replay of the tip's branch.
+                let tip = c.tip().unwrap().unwrap();
+                assert!(!invalid.contains(&digest_bytes(&tip.hash())), "step {steps}: an invalid block is the tip");
+                let (_dr, fresh) = replay(&genesis, &path(&blocks, tip.hash()), None);
+                assert_eq!(state_of(c), state_of(&fresh), "step {steps}: the state is not the tip's branch replayed");
+                assert_eq!(c.supply().unwrap(), c.params().issued(tip.height), "step {steps}: supply");
+            }
+            // Keeping every undo record, the tip is the most work of the
+            // valid blocks whose whole branch was delivered.
+            let complete = |h: &[u8; 32]| {
+                let mut x = *h;
+                loop {
+                    if invalid.contains(&x) || !delivered.contains(&x) {
+                        return false;
+                    }
+                    let ph = blocks[&x].header.prev_hash;
+                    if ph == gid {
+                        return true;
+                    }
+                    x = digest_bytes(&ph);
+                }
+            };
+            let best = delivered
+                .iter()
+                .filter(|h| complete(h))
+                .map(|h| archive.entry(&digest_from_bytes(h).unwrap()).unwrap().unwrap().work)
+                .max();
+            if let Some(best) = best {
+                assert_eq!(archive.tip_work().unwrap(), best, "step {steps}: the tip is not the most work");
+            }
+            let _ = before;
+        }
+        eprintln!(
+            "{made} blocks ({} invalid), {steps} delivered, {reorgs} reorganizations (deepest {deepest}), {refused} refused, {reveals} reveals, {updates} updates made",
+            invalid.len()
+        );
+        assert!(reorgs > 0, "no reorganization happened: the fuzzer tests nothing");
+    }
 }

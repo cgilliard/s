@@ -237,6 +237,15 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   (`TABMINER_FUZZ_SCALE`, `TABMINER_FUZZ_SEED`). A trace fuzzer (random
   cells) was not built: random values cannot meet constraints that tie
   cells together, which the freedom audit solves for instead.
+  `fuzz_reorganizations` grows a random tree of blocks (spends, outputs,
+  name commits, reveals and updates; a sixth broken by a wrong state root
+  or an inflated output) and feeds it in random order, parents often
+  after children, to a chain keeping every undo record and one keeping
+  four: after every block, the state equals a fresh replay of the branch
+  to the tip (root, counter, unspent, names, supply equal to issuance),
+  no invalid block is ever the tip, and the archive's tip is the most
+  work of the complete valid branches. 1,250 blocks over five seeds,
+  reorganizations up to 25 blocks deep, clean.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`
