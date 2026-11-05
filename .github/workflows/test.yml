@@ -112,6 +112,58 @@ jobs:
           shared-key: slow
       - run: cargo test --release ${{ matrix.target || '--lib' }} --features "${{ matrix.features }}" -- --ignored --exact ${{ matrix.test }} ${{ matrix.nocapture }}
 
+  # The fam compiler (node/): rebuilt from the 168-byte seed under QEMU
+  # (scripts/build.sh checks the rebuilt fam0 against the seed), then its
+  # regression checks (scripts/check.sh).
+  compiler:
+    name: compiler ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: node
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: macos-arm64, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install QEMU (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+      - name: Install QEMU (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qemu
+      - run: qemu-system-riscv32 --version
+      - name: Build from the seed
+        run: sh scripts/build.sh
+      - name: Checks
+        run: sh scripts/check.sh
+
+  compiler-windows:
+    name: compiler windows-x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: diffutils perl vim mingw-w64-ucrt-x86_64-qemu
+      - run: qemu-system-riscv32 --version
+      - name: Build from the seed
+        run: sh scripts/build.sh
+      - name: Checks
+        run: sh scripts/check.sh
+
   # Every test marked slow has a job above.
   slow-listed:
     runs-on: ubuntu-latest
