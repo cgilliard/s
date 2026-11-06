@@ -1348,6 +1348,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store with an output of 1,000,000 for each of keys `1..=n`.
+    fn funded(dir: &std::path::Path, n: u8) -> (heed::Env, UtxoSet, NameSet) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let env = open_env(dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for tag in 1..=n {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 1_000_000).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        (env, utxo, names)
+    }
+
+    /// docs/FEES.md, step 5: a flood of better payers fills the pool. Its
+    /// minimum rises with each eviction, the protected oldest stay, a
+    /// newcomer at the floor is refused; once the flood is mined the
+    /// minimum decays back to the floor, faster in an emptier pool.
+    #[test]
+    fn a_flood_raises_the_minimum_and_it_decays_back() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-flood-{}", std::process::id()));
+        let (env, utxo, names) = funded(&dir, 40);
+        let rtxn = env.read_txn().unwrap();
+        let size = spend(1, 1_000_000, 1).size();
+        let floor = MIN_FEE_PER_BYTE;
+        // Room for 12; the oldest 4 protected.
+        let policy = Policy { protect_bytes: 4 * size, ..Policy::MAINNET };
+        let mut pool = Mempool::with_policy(12 * size, policy);
+        let now = unix_now();
+        // Six waiting at the floor, an hour old and more.
+        let waiting: Vec<Digest> = (1..=6u8)
+            .map(|t| {
+                let fee = floor * size as u64 + u64::from(t);
+                pool.insert_at(spend(t, 1_000_000, fee), &utxo, &names, &rtxn, 1, now - 7200 + u64::from(t)).unwrap()
+            })
+            .collect();
+        // The flood: 30, each paying past the minimum the last raised.
+        let mut last = pool.admission_fee(now);
+        assert_eq!(last, floor);
+        let mut flood = Vec::new();
+        for (i, t) in (7..=36u8).enumerate() {
+            let fee = (20 + 11 * i as u64) * size as u64;
+            flood.push(pool.insert(spend(t, 1_000_000, fee), &utxo, &names, &rtxn, 1).unwrap());
+            let m = pool.admission_fee(unix_now());
+            assert!(m >= last, "the minimum fell during the flood: {last} to {m}");
+            last = m;
+        }
+        assert!(pool.bytes() <= 12 * size);
+        // The protected four are still there; the other two were evicted.
+        assert!(waiting[..4].iter().all(|id| pool.contains(id)));
+        assert!(waiting[4..].iter().all(|id| !pool.contains(id)));
+        // The minimum is past what the last eviction paid.
+        let evicted = flood.iter().filter(|id| !pool.contains(id)).count();
+        assert_eq!(evicted, 30 - 8);
+        assert!(last >= 20 + 11 * (evicted as u64 - 1) + REPLACEMENT_FEE_PER_BYTE, "minimum {last}");
+        // A newcomer at the floor is refused: the protected space is full.
+        assert!(matches!(
+            pool.insert(spend(37, 1_000_000, floor * size as u64), &utxo, &names, &rtxn, 1),
+            Err(Reject::FeeTooLow { .. })
+        ));
+        // Still full: half way back to the floor in a half-life.
+        let t = unix_now();
+        let half = pool.admission_fee(t + HALF_LIFE_SECS);
+        assert!(half.abs_diff(floor + (last - floor).div_ceil(2)) <= 1, "{half} after a half-life from {last}");
+        // The flood mined: a third full, under half, the minimum halves
+        // every half of a half-life.
+        for id in &flood {
+            pool.remove(id);
+        }
+        let halved = floor + (last - floor).div_ceil(2);
+        let at = pool.admission_fee(t + HALF_LIFE_SECS / 2);
+        assert!(at.abs_diff(halved) <= 1, "{at} from {last}, a third full");
+        // Two more mined, a sixth full, under a quarter: every quarter.
+        pool.remove(&waiting[0]);
+        pool.remove(&waiting[1]);
+        let at = pool.admission_fee(t + HALF_LIFE_SECS / 4);
+        assert!(at.abs_diff(halved) <= 1, "{at} from {last}, a sixth full");
+        // Back at the floor within days.
+        assert_eq!(pool.admission_fee(t + 3 * 86400), floor);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// docs/FEES.md, step 5: blocks kept full by better payers still take
+    /// a backlog at the floor through the aged reserve, each transaction
+    /// within the bound: its bytes and those older, over the reserve.
+    #[test]
+    fn full_blocks_still_confirm_the_floor_within_the_bound() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-backlog-{}", std::process::id()));
+        let (env, utxo, names) = funded(&dir, 120);
+        let rtxn = env.read_txn().unwrap();
+        let size = spend(1, 1_000_000, 1).size();
+        let floor = MIN_FEE_PER_BYTE;
+        let mut pool = Mempool::new(1 << 24);
+        let now = unix_now();
+        // Ten waiting at the floor, oldest first.
+        let backlog: Vec<Digest> = (1..=10u8)
+            .map(|t| {
+                let fee = floor * size as u64 + u64::from(t);
+                pool.insert_at(spend(t, 1_000_000, fee), &utxo, &names, &rtxn, 1, now - 1000 + u64::from(t)).unwrap()
+            })
+            .collect();
+        // Blocks of ten transactions, two of them the reserve; each block,
+        // twelve newcomers paying ten times the floor, more than a block.
+        let (room, reserve) = (10, 2 * size);
+        let mut next = 11u8;
+        let mut confirmed_at = HashMap::new();
+        for block in 1..=6 {
+            for _ in 0..12 {
+                if next > 120 {
+                    break;
+                }
+                let fee = 10 * floor * size as u64 + u64::from(next);
+                pool.insert(spend(next, 1_000_000, fee), &utxo, &names, &rtxn, 1).unwrap();
+                next += 1;
+            }
+            let chosen = pool.select(&names, &rtxn, 1, reserve, |c| c.len() <= room);
+            assert_eq!(chosen.len(), room, "block {block} is full");
+            for tx in &chosen {
+                let id = tx.txid();
+                pool.remove(&id);
+                confirmed_at.insert(id, block);
+            }
+            // Without the reserve, none of the backlog would get in.
+            assert!(chosen.iter().filter(|t| backlog.contains(&t.txid())).count() <= 2);
+        }
+        for (i, id) in backlog.iter().enumerate() {
+            let bound = ((i + 1) * size).div_ceil(reserve);
+            let at = confirmed_at.get(id).copied();
+            assert!(at.is_some_and(|b| b <= bound), "backlog {i} confirmed at {at:?}, bound {bound}");
+        }
+        // And without a reserve, fee rate alone: the backlog waits.
+        let mut pool0 = Mempool::new(1 << 24);
+        pool0.insert_at(spend(1, 1_000_000, floor * size as u64 + 1), &utxo, &names, &rtxn, 1, now - 1000).unwrap();
+        for t in 11..=22u8 {
+            let _ = pool0.insert(spend(t, 1_000_000, 10 * floor * size as u64 + u64::from(t)), &utxo, &names, &rtxn, 1);
+        }
+        let chosen = pool0.select(&names, &rtxn, 1, 0, |c| c.len() <= room);
+        assert!(!chosen.iter().any(|t| t.txid() == backlog[0]));
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pool_validates_orders_and_revalidates() {
         let dir = std::env::temp_dir().join(format!("tabminer-mempool-{}", std::process::id()));

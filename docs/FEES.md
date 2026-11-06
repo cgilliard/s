@@ -1,7 +1,8 @@
 # Fees
 
-Written 2026-11-05 to be tracked; not built. A proposal for fees that
-adjust with time and demand, in the pool and the reference miner. All of
+Written 2026-11-05 and built the same day (see the implementation
+order): fees that adjust with time and demand, in the pool and the
+reference miner. All of
 it is policy, not consensus: no block-validity rule changes, so it can be
 tuned after launch without a fork, and a miner may always do otherwise.
 The aim is a default that serves both: users can pay the floor and wait,
@@ -229,3 +230,14 @@ Per byte for now; revisit if policy transactions become a large share.
 5. Tests: a pool under a flood (the minimum rises and decays back); full
    blocks with a backlog at the floor, each confirmed within the bound;
    restart keeping ages; expiry.
+   Done (2026-11-05): `a_flood_raises_the_minimum_and_it_decays_back`
+   (each eviction raises the minimum, so a flood must keep paying more;
+   the protected oldest stay, a newcomer at the floor is refused; the
+   minimum halves each half-life while full, each half of one under half
+   full, each quarter under a quarter, and is the floor again in days);
+   `full_blocks_still_confirm_the_floor_within_the_bound` (blocks kept
+   full by payers at ten times the floor, and every one of a backlog at
+   the floor confirmed within its bytes and those older over the reserve;
+   with no reserve, none of it). Ages across a restart and expiry, from
+   step 1: `the_pool_is_kept_across_a_restart`,
+   `transactions_expire_and_stay_refused`.
