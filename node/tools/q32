@@ -16,6 +16,8 @@
 #   --out=FILE    serial output to FILE   ┘ byte-exact on every platform (QEMU's
 #                 win32 stdio chardev loses bytes on piped stdin); used by
 #                 tools/fam for the compile step.  --out required with --in.
+#                 --out alone is a plain output file everywhere, Windows too:
+#                 for runs that need no input (scripts/check.sh).
 #
 # Examples:
 #   q32 program.bin
@@ -107,12 +109,17 @@ for spec in $LOADS; do
 done
 SERPORT=""
 if [ -n "$SEROUT" ]; then
-	if [ "$SOCKMODE" = 1 ]; then
+	# --out without --in: the file chardev, output only, which Windows QEMU
+	# has too, rather than the socket, whose close on QEMU's exit there can
+	# lose the last bytes.  To QEMU by its Windows path: MSYS does not
+	# reliably convert a path inside a comma-separated argument.
+	if [ "$SOCKMODE" = 1 ] && { [ -n "$SERIN" ] || [ "$SEROUT" = - ]; }; then
 		SERPORT=$((20000 + $$ % 20000))
-		# the chardev itself is added at the launch below, with its logfile
-		CHR="socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
+		ARGS="$ARGS -chardev socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
 	else
-		ARGS="$ARGS -chardev file,id=ser0,path=$SEROUT"
+		QOUT=$SEROUT
+		[ "$SOCKMODE" = 1 ] && command -v cygpath >/dev/null && QOUT=$(cygpath -m "$SEROUT")
+		ARGS="$ARGS -chardev file,id=ser0,path=$QOUT"
 		[ -n "$SERIN" ] && ARGS="$ARGS,input-path=$SERIN"
 	fi
 	ARGS="$ARGS -serial chardev:ser0 -monitor none"
@@ -158,29 +165,23 @@ if [ -n "$SERPORT" ]; then
 	SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
 	TOOLS=$(dirname "$SCRIPT")
 	IN="${SERIN:--}"   # "-" tells serial_pump there is no input stream
-	# QEMU's copy of the output (the chardev's logfile), from which the pump
-	# restores what the socket's close lost; QEMU's messages, shown if it
-	# fails.  To QEMU the log goes by its Windows path: MSYS does not
-	# reliably convert a path inside a comma-separated argument.
-	TMP="${TMPDIR:-/tmp}/q32.$$"
-	LOG="$TMP.log"; ERR="$TMP.err"
-	QLOG=$LOG
-	command -v cygpath >/dev/null && QLOG=$(cygpath -m "$LOG")
+	# QEMU's messages are kept, and shown if it fails.
+	ERR="${TMPDIR:-/tmp}/q32.$$.err"
 	# Stopped from outside (a time limit): say what QEMU printed.
-	trap 'echo "q32: stopped, qemu on port $SERPORT: $(head -c 300 "$ERR" 2>/dev/null | tr "\n" " ")" >&2; kill $QPID 2>/dev/null; rm -f "$LOG" "$LOG.got" "$ERR"; exit 143' TERM INT
-	qemu-system-riscv32 $ARGS -chardev "$CHR,logfile=$QLOG,logappend=off" 2>"$ERR" &
+	trap 'echo "q32: stopped, qemu on port $SERPORT: $(head -c 300 "$ERR" 2>/dev/null | tr "\n" " ")" >&2; kill $QPID 2>/dev/null; rm -f "$ERR"; exit 143' TERM INT
+	qemu-system-riscv32 $ARGS 2>"$ERR" &
 	QPID=$!
-	if ! "$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT" "$LOG"; then
+	if ! "$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT"; then
 		kill $QPID 2>/dev/null
 		echo "q32: qemu: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
-		rm -f "$LOG" "$LOG.got" "$ERR"
+		rm -f "$ERR"
 		exit 1
 	fi
 	wait $QPID
 	rc=$?
 	# 0 and 1 are the guest's verdicts; anything else is QEMU's own failure.
 	[ "$rc" -gt 1 ] && echo "q32: qemu exited $rc: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
-	rm -f "$LOG" "$LOG.got" "$ERR"
+	rm -f "$ERR"
 	exit $rc
 fi
 

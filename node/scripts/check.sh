@@ -55,7 +55,8 @@ runs() {
 	src "$1" "$2"
 	mark; lim 30 ./tools/fam -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
 	[ "$rc" = 0 ] || { fail "$1" "exit $rc after $(took), did not compile: $(head -c 200 "$T/$1.out")"; return; }
-	mark; lim 30 ./tools/q32 "$T/$1.bin" > "$T/$1.run" 2>&1; rc=$?
+	mark; lim 30 ./tools/q32 --out="$T/$1.run" "$T/$1.bin" > "$T/$1.q32" 2>&1; rc=$?
+	cat "$T/$1.q32" >> "$T/$1.run"
 	[ "$rc" = "$3" ] || { fail "$1" "exit $rc after $(took), expected $3: $(head -c 200 "$T/$1.run")"; return; }
 	grep -q -- "$4" "$T/$1.run" || fail "$1" "output $(head -c 200 "$T/$1.run"), expected /$4/"
 }
