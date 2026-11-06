@@ -1,0 +1,559 @@
+\ store.fam — the store's core (docs/OS.md, section 6), as its benchmark
+\ (step 2) uses it: virtio-blk, a cache of 4 KiB pages, and a B+ tree kept
+\ copy-on-write, committed by writing its pages, a flush, the meta page, a
+\ flush.  What the full store (step 8) adds: keys and values of any size
+\ (here 32 and 64 bytes), several trees, readers' snapshots, aborts, the
+\ free list kept on disk, recovery from the meta pages at start.
+\
+\ On the disk: pages 0 and 1 are the meta pages, written alternately (a
+\ commit's is never the one the last commit left); the tree's pages from 2.
+\ A transaction writes no page in place: a page it changes is copied to a
+\ new one (once; it is then dirty, and changed where it is), the old one
+\ freed.  A page freed in a transaction is reused two commits later, when
+\ no meta page on the disk can lead to it any more.
+\
+\ Uses src/kernel.fam's raw words (mtime@, panic, rnd); runs in machine
+\ mode, its memory from the stdlib's heap.
+
+\ ── Raw helpers ──
+
+\ mcpy ( src dst n -- )  n bytes, a multiple of 4.
+: mcpy
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+83228100 ,   \ lw t0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+638E0300 ,   \ beq t2,zero,done
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+93824200 ,   \ addi t0,t0,4
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,loop
+;
+
+\ mmove ( src dst n -- )  as mcpy, the two allowed to overlap.
+: mmove
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+83228100 ,   \ lw t0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+63820304 ,   \ beq t2,zero,done
+63E06202 ,   \ bltu t0,t1,backward
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+93824200 ,   \ addi t0,t0,4
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,forward
+6F004002 ,   \ jal zero,done
+B3827200 ,   \ add t0,t0,t2               backward:
+33037300 ,   \ add t1,t1,t2
+9382C2FF ,   \ addi t0,t0,-4
+1303C3FF ,   \ addi t1,t1,-4
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,backward
+;
+
+\ mzero ( addr n -- )
+: mzero
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+13018100 ,   \ addi sp,sp,8
+638A0300 ,   \ beq t2,zero,done
+23200300 ,   \ sw zero,0(t1)
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39A03FE ,   \ bne t2,zero,loop
+;
+
+\ kcmp ( a b -- c )  two 32-byte keys, byte by byte: -1, 0 or 1.
+: kcmp
+03230100 ,   \ lw t1,0(sp)
+83224100 ,   \ lw t0,4(sp)
+13014100 ,   \ addi sp,sp,4
+93030002 ,   \ addi t2,zero,32
+03CE0200 ,   \ lbu t3,0(t0)
+834E0300 ,   \ lbu t4,0(t1)
+631EDE01 ,   \ bne t3,t4,differ
+93821200 ,   \ addi t0,t0,1
+13031300 ,   \ addi t1,t1,1
+9383F3FF ,   \ addi t2,t2,-1
+E39403FE ,   \ bne t2,zero,loop
+130F0000 ,   \ addi t5,zero,0
+6F000001 ,   \ jal zero,out
+130F1000 ,   \ addi t5,zero,1             differ:
+6374DE01 ,   \ bgeu t3,t4,out
+130FF0FF ,   \ addi t5,zero,-1
+2320E101 ,   \ sw t5,0(sp)                out:
+;
+
+:M fence  0F00F00F , ;       \ fence iorw,iorw
+
+\ ── virtio-blk (legacy MMIO, one queue, one request at a time) ──
+
+:M QN 40 lit ;               \ 64 descriptors: a header, up to 32 pages, a status
+
+: bk     variable ;          \ the device's registers
+: bq     variable ;          \ its queue: two pages
+: bav    variable ;          \ requests made
+: bhdr   variable ;          \ a request's header (16 bytes), its status at +16
+: bflush variable ;          \ the device takes flushes
+: brn    variable ;
+: brl    variable ;
+
+\ blkfind ( -- base | 0 )  the virtio-mmio slot holding a disk.
+: blkfind
+0 lit 10001000 lit                       \ ( found slot )
+begin dup 10009000 lit u< while
+	over 0= if
+		dup @ 74726976 lit = if dup 8 lit + @ 2 lit = if nip dup then then
+	then
+	1000 lit +
+repeat
+drop ;
+
+\ dsc! ( addr len word i -- )  descriptor i; word = flags | next << 16.
+: dsc!
+4 lit lshift bq @ +
+tuck C lit + !
+tuck 8 lit + !
+0 lit over 4 lit + !
+! ;
+
+: blkinit
+blkfind dup 0= if "no virtio-blk device" panic then bk !
+0 lit bk @ 70 lit + !        \ reset
+1 lit bk @ 70 lit + !        \ acknowledged
+3 lit bk @ 70 lit + !        \ a driver
+0 lit bk @ 14 lit + !
+bk @ 10 lit + @ 200 lit and dup bflush !   \ VIRTIO_BLK_F_FLUSH, if offered
+bk @ 20 lit + !
+1000 lit bk @ 28 lit + !     \ 4 KiB pages
+0 lit bk @ 30 lit + !
+bk @ 34 lit + @ QN u< if "virtio-blk queue too small" panic then
+QN bk @ 38 lit + !
+1000 lit bk @ 3C lit + !
+3000 lit alloc FFF lit + FFFFF000 lit and dup bq ! 2000 lit mzero
+bq @ C lit rshift bk @ 40 lit + !
+20 lit alloc bhdr !
+0 lit bav !
+7 lit bk @ 70 lit + ! ;      \ running
+
+\ blkreq ( type sector list n -- )  one request, waited for: type 0 reads
+\ n pages into the buffers listed, 1 writes them, 4 flushes (n 0).
+: blkreq
+brn ! brl !
+bhdr @ 8 lit + !
+dup bhdr @ !
+0 lit bhdr @ 4 lit + !
+0 lit bhdr @ C lit + !
+FF lit bhdr @ 10 lit + c!
+bhdr @ 10 lit 10001 lit 0 lit dsc!
+brn @ if
+	brn @ 0 lit do
+		i 2 lit lshift brl @ + @ 1000 lit         \ ( type buf len )
+		2 lit pick 0= if 3 lit else 1 lit then    \ next, and written by the device on a read
+		i 2 lit + 10 lit lshift or
+		i 1 lit + dsc!
+	loop
+then
+drop
+bhdr @ 10 lit + 1 lit 2 lit brn @ 1 lit + dsc!
+bav @ QN 1 lit - and 1 lit lshift bq @ 404 lit + + 0 lit swap h!
+fence
+bav @ 1 lit + dup bav ! bq @ 402 lit + h!
+fence
+0 lit bk @ 50 lit + !
+begin bq @ 1002 lit + h@ bav @ FFFF lit and = until
+fence
+bhdr @ 10 lit + c@ if "virtio-blk request failed" panic then ;
+
+\ ── The page cache ──
+
+:M NSLOT 2000 lit ;          \ 8192 pages: 32 MiB
+:M MAXPG 40000 lit ;         \ the disk's pages: 1 GiB
+
+: cbuf   variable ;          \ the slots' buffers
+: cpg    variable ;          \ the page in each slot
+: cfl    variable ;          \ each slot's flags: 1 used, 2 dirty, 4 recently used
+: pslot  variable ;          \ each page's slot + 1 (0: not cached)
+: chand  variable ;          \ the clock's hand
+: cvs    variable ;
+: rdl    variable ;          \ a one-buffer list, for reads
+
+: sbuf   C lit lshift cbuf @ + ;              \ ( s -- buf )
+: cfl@   2 lit lshift cfl @ + @ ;             \ ( s -- flags )
+: cfl!   2 lit lshift cfl @ + ! ;             \ ( flags s -- )
+: cpg@   2 lit lshift cpg @ + @ ;
+: cpg!   2 lit lshift cpg @ + ! ;             \ ( p s -- )
+: ps@    2 lit lshift pslot @ + @ ;           \ ( p -- s+1 | 0 )
+: ps!    2 lit lshift pslot @ + ! ;           \ ( v p -- )
+
+: cinit
+NSLOT C lit lshift 1000 lit + alloc dup 0= if "no memory for the cache" panic then
+FFF lit + FFFFF000 lit and cbuf !
+NSLOT 2 lit lshift alloc cpg !
+NSLOT 2 lit lshift alloc dup cfl ! NSLOT 2 lit lshift mzero
+MAXPG 2 lit lshift alloc dup pslot ! MAXPG 2 lit lshift mzero
+0 lit chand ! ;
+
+\ cdrop  every clean page forgotten (a cold cache, for measuring reads).
+: cdrop
+NSLOT 0 lit do
+	i cfl@ dup 1 lit and swap 2 lit and 0= and if
+		0 lit i cpg@ ps!  0 lit i cfl!
+	then
+loop ;
+
+\ cevict ( -- s )  a free slot, or the clock's: a used one is passed over
+\ once (its recently-used bit cleared), a dirty one always.
+: cevict
+0 lit
+begin
+	1 lit +
+	dup NSLOT 3 lit lshift u> if "page cache full of dirty pages" panic then
+	chand @ dup cvs ! 1 lit + NSLOT 1 lit - and chand !
+	cvs @ cfl@
+	dup 1 lit and 0= if drop 1 lit else
+	dup 2 lit and if drop 0 lit else
+	dup 4 lit and if 4 lit xor cvs @ cfl! 0 lit else
+	drop 0 lit cvs @ cpg@ ps! 1 lit
+	then then then
+until
+drop cvs @ ;
+
+: blkrd  rdl ! 0 lit swap 3 lit lshift rdl 1 lit blkreq ;   \ ( p buf -- )
+
+\ pget ( p -- buf )  page p, read if it is not cached.
+: pget
+dup ps@ ?dup if
+	nip 1 lit -
+	dup cfl@ 4 lit or over cfl!
+	sbuf
+else
+	cevict
+	2dup cpg!
+	dup 1 lit + 2 lit pick ps!
+	5 lit over cfl!
+	sbuf tuck blkrd
+then ;
+
+\ ── Pages on the disk ──
+
+:M LSTMAX 10000 lit ;        \ entries in each list below
+
+: hwm    variable ;          \ the first page never used
+: frl    variable ;  : frn  variable ;    \ free now
+: fpv    variable ;  : fpvn variable ;    \ freed by the last commit
+: fpd    variable ;  : fpdn variable ;    \ freed in this transaction
+: dl     variable ;  : dln  variable ;    \ dirtied in this transaction
+
+: lpush  ( v list count -- )
+dup @ LSTMAX = if "store list full" panic then
+dup @ 1 lit + over !  @ 1 lit - 2 lit lshift swap @ + ! ;
+
+\ palloc ( -- p )  a free page, else a new one.
+: palloc
+frn @ if
+	frn @ 1 lit - dup frn ! 2 lit lshift frl @ + @
+else
+	hwm @ dup MAXPG = if "store disk full" panic then
+	dup 1 lit + hwm !
+then ;
+
+\ pnew ( -- p buf )  a page for this transaction, dirty, its header zero.
+: pnew
+palloc cevict
+2dup cpg!
+dup 1 lit + 2 lit pick ps!
+7 lit over cfl!
+over dl dln lpush
+sbuf dup 10 lit mzero ;
+
+\ pfree ( p -- )  freed by this transaction; reused two commits on.
+: pfree
+dup ps@ ?dup if 1 lit - 0 lit swap cfl! 0 lit over ps! then
+fpd fpdn lpush ;
+
+\ pdirty ( p -- p' )  page p made writable: itself if this transaction
+\ already copied it, else a copy (and p freed).
+: pdirty
+dup ps@ dup if 1 lit - cfl@ 2 lit and then
+0= if
+	dup pget
+	pnew                                   \ ( p buf p' nb )
+	rot swap 1000 lit mcpy                 \ ( p p' )
+	swap pfree
+then ;
+
+\ ── The tree ──
+\
+\ A page starts with its type (1 leaf, 2 branch) and its count.  A leaf
+\ holds up to 42 entries of a key (32 bytes) and a value (64), sorted; a
+\ branch, its first child at +12, then up to 113 of a key and the child
+\ holding the keys from it on (36 bytes).
+
+:M LMAX 2A lit ;
+:M BMAX 71 lit ;
+
+: root   variable ;
+: nent   variable ;          \ entries in the tree
+: txid   variable ;
+: mbuf   variable ;          \ the meta page
+: ppg    variable ;          \ the path down: the pages
+: pix    variable ;          \ and the child taken at each
+: pdep   variable ;
+: pkey   variable ;  : pval variable ;
+: lkey   variable ;  : lbuf variable ;
+: skeys  variable ;          \ a separator for each level
+: nwr    variable ;  : ncm  variable ;    \ pages written, commits
+: wl     variable ;          \ the buffers of a run being written
+
+: lent   dup 6 lit lshift swap 5 lit lshift + 10 lit + + ;   \ ( buf i -- entry )
+: bent   dup 5 lit lshift swap 2 lit lshift + 10 lit + + ;   \ ( buf k -- pair )
+: cnt@   4 lit + @ ;
+: cnt!   4 lit + ! ;
+: leaf?  @ 1 lit = ;
+: child@ ?dup if 1 lit - bent 20 lit + @ else C lit + @ then ;   \ ( buf i -- p )
+: child! ?dup if 1 lit - bent 20 lit + ! else C lit + ! then ;   \ ( p buf i -- )
+
+\ lfind ( key buf -- pos found )  where key is, or would go, in a leaf.
+: lfind
+lbuf ! lkey !
+0 lit lbuf @ cnt@
+begin 2dup u< while
+	2dup + 1 lit rshift
+	lbuf @ over lent lkey @ kcmp 0< if rot drop 1 lit + swap else nip then
+repeat
+drop
+dup lbuf @ cnt@ u< if lbuf @ over lent lkey @ kcmp 0= else 0 lit then ;
+
+\ bfind ( key buf -- i )  the child of a branch to follow for key.
+: bfind
+lbuf ! lkey !
+0 lit lbuf @ cnt@
+begin 2dup u< while
+	2dup + 1 lit rshift
+	lbuf @ over bent lkey @ kcmp 1 lit < if rot drop 1 lit + swap else nip then
+repeat
+drop ;
+
+\ tget ( key -- value | 0 )
+: tget
+root @ ?dup 0= if drop 0 lit else
+	begin pget dup leaf? 0= while
+		over over bfind child@
+	repeat
+	2dup lfind if lent 20 lit + nip else 2drop drop 0 lit then
+then ;
+
+\ linsert ( buf pos -- )  pkey and pval into a leaf with room.
+: linsert
+2dup lent dup 60 lit +
+3 lit pick cnt@ 3 lit pick - dup 6 lit lshift swap 5 lit lshift +
+mmove
+over dup cnt@ 1 lit + swap cnt!
+lent dup pkey @ swap 20 lit mcpy
+20 lit + pval @ swap 40 lit mcpy ;
+
+\ binsert ( sep q pb k -- )  the pair (sep, q) into a branch with room.
+: binsert
+2dup bent dup 24 lit +
+3 lit pick cnt@ 3 lit pick - dup 5 lit lshift swap 2 lit lshift +
+mmove
+over dup cnt@ 1 lit + swap cnt!
+bent
+tuck 20 lit + !
+20 lit mcpy ;
+
+: bsk  variable ;  : bspb variable ;  : bsrb variable ;
+
+\ bsplit ( sep q pb k -- sep' q' )  a full branch split at its 57th key,
+\ the pair put in the half it belongs in; the key and the right half are
+\ what the level above takes in turn.
+: bsplit
+bsk ! bspb !
+pnew bsrb !
+2 lit bsrb @ !
+bspb @ 38 lit bent
+dup skeys @ pdep @ 5 lit lshift + 20 lit mcpy
+20 lit + @ bsrb @ C lit + !
+bspb @ 39 lit bent bsrb @ 10 lit + 7E0 lit mcpy     \ pairs 57-112: 56 of 36 bytes
+38 lit bsrb @ cnt!  38 lit bspb @ cnt!
+bsk @ 38 lit u> if
+	-rot bsrb @ bsk @ 39 lit - binsert
+else
+	-rot bspb @ bsk @ binsert
+then
+skeys @ pdep @ 5 lit lshift + swap ;
+
+\ pins ( sep q -- )  a new child q, from key sep on, into the branch above
+\ the level just split, splitting it in turn when full, up to a new root.
+: pins
+begin
+	pdep @ 0= if
+		pnew
+		2 lit over !  1 lit over cnt!
+		root @ over C lit + !
+		dup 10 lit + 4 lit pick swap 20 lit mcpy
+		2 lit pick over 30 lit + !
+		drop root ! 2drop
+		1 lit
+	else
+		pdep @ 1 lit - dup pdep !
+		dup 2 lit lshift ppg @ + @ pget
+		swap 2 lit lshift pix @ + @
+		over cnt@ BMAX u< if binsert 1 lit else bsplit 0 lit then
+	then
+until ;
+
+\ lsplit ( p buf pos -- )  a full leaf split in two halves of 21, pkey
+\ and pval into the one they belong in, the right one's first key up.
+: lsplit
+pnew
+1 lit over !
+3 lit pick 7F0 lit + over 10 lit + 7E0 lit mcpy  \ entries 21-41
+15 lit over cnt!
+15 lit 4 lit pick cnt!
+2 lit pick 15 lit u> if
+	dup 3 lit pick 15 lit - linsert
+else
+	3 lit pick 3 lit pick linsert
+then
+10 lit +
+rot drop rot drop rot drop swap pins ;
+
+\ tdown  the path from the root to pkey's leaf, each page made writable:
+\ leaves ( p buf ), the leaf's.
+: tdown
+root @ pdirty root !
+0 lit pdep !
+root @
+begin dup pget dup leaf? 0= while
+	pkey @ over bfind
+	2dup child@ pdirty
+	dup 3 lit pick 3 lit pick child!
+	swap pdep @ 2 lit lshift pix @ + !
+	rot pdep @ 2 lit lshift ppg @ + !
+	nip pdep @ 1 lit + pdep !
+repeat ;
+
+\ tput ( key value -- )  set key's value, adding key if new.
+: tput
+pval ! pkey !
+root @ 0= if pnew 1 lit over ! drop root ! then
+tdown
+pkey @ over lfind
+if
+	lent 20 lit + pval @ swap 40 lit mcpy drop
+else
+	nent @ 1 lit + nent !
+	over cnt@ LMAX u< if linsert drop else lsplit then
+then ;
+
+\ tdel ( key -- found )  key removed.  A leaf left empty stays (the full
+\ store merges what runs low).
+: tdel
+pkey !
+root @ 0= if 0 lit else
+	tdown
+	pkey @ over lfind
+	if
+		2dup 1 lit + lent 2 lit pick 2 lit pick lent
+		3 lit pick cnt@ 3 lit pick - 1 lit - dup 6 lit lshift swap 5 lit lshift +
+		mmove
+		drop dup cnt@ 1 lit - swap cnt! drop
+		nent @ 1 lit - nent !
+		1 lit
+	else
+		2drop drop 0 lit
+	then
+then ;
+
+\ tvisit ( p -- n )  the entries under page p (a scan of every page).
+: tvisit
+dup pget dup leaf? if cnt@ nip else
+	cnt@ 1 lit +
+	0 lit swap 0 lit do
+		over pget i child@ tvisit +
+	loop
+	nip
+then ;
+
+: tcount  root @ ?dup if tvisit else 0 lit then ;
+
+\ frot  the free lists move on a commit: what the last commit freed is free
+\ now, what this one freed waits for the next.
+: frot
+fpvn @ ?dup if 0 lit do i 2 lit lshift fpv @ + @ frl frn lpush loop then
+fpv @ fpd @ fpv ! fpd !
+fpdn @ fpvn ! 0 lit fpdn ! ;
+
+: bflsh  bflush @ if 4 lit 0 lit 0 lit 0 lit blkreq then ;
+
+\ tcommit  the transaction made durable: its pages written (a run of
+\ consecutive pages in one request), a flush, the meta page, a flush.
+: tcommit
+0 lit
+begin dup dln @ u< while
+	dup 2 lit lshift dl @ + @
+	0 lit
+	begin
+		dup 20 lit u< if
+			2 lit pick over + dln @ u< if
+				2 lit pick over + 2 lit lshift dl @ + @
+				2 lit pick 2 lit pick + =
+			else 0 lit then
+		else 0 lit then
+	while
+		2dup + ps@ 1 lit - sbuf over 2 lit lshift wl @ + !
+		1 lit +
+	repeat
+	1 lit 2 lit pick 3 lit lshift wl @ 3 lit pick blkreq
+	dup nwr @ + nwr !
+	nip +
+repeat
+drop
+bflsh
+txid @ 1 lit + txid !
+534D4146 lit mbuf @ !
+txid @ mbuf @ 4 lit + !
+root @ mbuf @ 8 lit + !
+hwm @ mbuf @ C lit + !
+nent @ mbuf @ 10 lit + !
+534D4146 lit txid @ xor root @ xor hwm @ xor nent @ xor mbuf @ 14 lit + !
+mbuf @ rdl !
+1 lit txid @ 1 lit and 3 lit lshift rdl 1 lit blkreq
+bflsh
+dln @ ?dup if 0 lit do
+	i 2 lit lshift dl @ + @ ps@ 1 lit - dup cfl@ 2 lit invert and swap cfl!
+loop then
+0 lit dln !
+frot
+ncm @ 1 lit + ncm ! ;
+
+\ stinit  the device, the cache and the lists, once.
+: stinit
+blkinit cinit
+LSTMAX 2 lit lshift alloc frl !
+LSTMAX 2 lit lshift alloc fpv !
+LSTMAX 2 lit lshift alloc fpd !
+LSTMAX 2 lit lshift alloc dl !
+1000 lit alloc mbuf !
+mbuf @ 1000 lit mzero
+80 lit alloc wl !
+40 lit alloc ppg !  40 lit alloc pix !
+200 lit alloc skeys ! ;
+
+\ stfresh  an empty store (the disk's old contents ignored): nothing
+\ cached, nothing free, the tree empty.
+: stfresh
+NSLOT 0 lit do 0 lit i cfl! loop
+pslot @ MAXPG 2 lit lshift mzero
+0 lit chand !
+2 lit hwm !  0 lit root !  0 lit nent !  0 lit txid !
+0 lit frn !  0 lit fpvn !  0 lit fpdn !  0 lit dln !
+0 lit nwr !  0 lit ncm ! ;

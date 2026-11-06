@@ -1,0 +1,102 @@
+\ storebench.fam — the store's benchmark (docs/OS.md, step 2): how fast
+\ the store's core (src/store.fam) puts, gets, overwrites, deletes and
+\ scans, and what a commit costs, on a bare machine with virtio-blk.  Run
+\ by scripts/storebench.sh.  Keys are 32 bytes, values 64; every value got
+\ is checked, so a wrong store cannot pass for a fast one.
+
+:M BN 186A0 lit ;            \ 100,000 entries
+
+: kbuf  variable ;  : vbuf variable ;
+: t0    variable ;
+: bcnt  variable ;  : bsize variable ;
+
+\ bswap ( x -- y )  bytes reversed: a counter, big-endian, sorts as keys.
+: bswap
+dup 18 lit rshift
+over 8 lit rshift FF00 lit and or
+over 8 lit lshift FF0000 lit and or
+swap 18 lit lshift or ;
+
+\ mix ( x -- y )  two rounds of xorshift: keys scattered over the tree.
+: mix
+9E3779B9 lit xor
+dup D lit lshift xor dup 11 lit rshift xor dup 5 lit lshift xor
+dup D lit lshift xor dup 11 lit rshift xor dup 5 lit lshift xor ;
+
+: krand  8 lit 0 lit do dup 3 lit lshift i or mix kbuf @ i 2 lit lshift + ! loop drop ;  \ ( i -- )
+: kseq   kbuf @ 20 lit mzero bswap kbuf @ ! ;                                          \ ( i -- )
+: mkval  10 lit 0 lit do dup i xor vbuf @ i 2 lit lshift + ! loop drop ;               \ ( i -- )
+
+\ check ( i -- )  key i (random) holds value i.
+: check
+dup krand kbuf @ tget
+dup 0= if "a key put is missing" panic then
+@ <> if "a value got is not the one put" panic then ;
+
+: tstart  mtime@ t0 !  0 lit nwr !  0 lit ncm ! ;
+
+\ batch ( n -- )  commit every n operations.
+: batch  dup bsize ! bcnt ! ;
+: op1    bcnt @ 1 lit - dup bcnt ! 0= if tcommit bsize @ bcnt ! then ;
+
+\ report ( ops name -- )
+: report
+mtime@ t0 @ - 2710 lit /                 \ ( ops name ms )
+swap "BENCH " puts puts ": " puts
+over u. " ops in " puts dup u. " ms, " puts
+?dup if over 3E8 lit * swap / u. " ops/s" puts else ">1000000 ops/s" puts then drop
+"; " puts nwr @ u. " pages written in " puts ncm @ u. " commits" puts 0A lit putc ;
+
+stinit
+40 lit alloc kbuf !  40 lit alloc vbuf !
+"storebench: " puts BN u. " entries, 32-byte keys, 64-byte values, "
+puts NSLOT 8 lit rshift u. " MiB cache" puts
+bflush @ if ", flushed" else ", no flush (the device offers none)" then puts 0A lit putc
+
+\ Keys in order, into an empty tree.
+stfresh 2710 lit batch tstart
+BN 0 lit do i kseq i mkval kbuf @ vbuf @ tput op1 loop tcommit
+BN "seq_put (10000 a commit)" report
+
+\ Keys scattered, into an empty tree: the tree the rest works on.
+stfresh 2710 lit batch tstart
+BN 0 lit do i krand i mkval kbuf @ vbuf @ tput op1 loop tcommit
+BN "rand_put (10000 a commit)" report
+nent @ BN <> if "the tree holds the wrong number of entries" panic then
+
+tstart
+BN 0 lit do i check loop
+BN "get, cached" report
+
+cdrop tstart
+2710 lit 0 lit do i 7 lit * check loop
+2710 lit "get, from disk" report
+
+64 lit batch tstart
+2710 lit 0 lit do i 9 lit * dup krand BN + mkval kbuf @ vbuf @ tput op1 loop tcommit
+2710 lit "overwrite (100 a commit)" report
+2710 lit 0 lit do i 9 lit * dup krand kbuf @ tget @ swap BN + <> if "an overwrite was lost" panic then loop
+
+64 lit batch tstart
+2710 lit 0 lit do i 9 lit * 1 lit + krand kbuf @ tdel 0= if "a key to delete was missing" panic then op1 loop tcommit
+2710 lit "delete (100 a commit)" report
+
+tstart
+tcount
+dup BN 2710 lit - <> if "a scan counted the wrong number of entries" panic then
+"scan" report
+
+1 lit batch tstart
+3E8 lit 0 lit do i BN + dup krand mkval kbuf @ vbuf @ tput op1 loop
+3E8 lit "put (1 a commit)" report
+
+64 lit batch tstart
+2710 lit 0 lit do i BN + 3E8 lit + dup krand mkval kbuf @ vbuf @ tput op1 loop tcommit
+2710 lit "put (100 a commit)" report
+
+\ Everything put is still there.
+2710 lit 0 lit do i 9 lit * 2 lit + check loop    \ neither overwritten nor deleted
+nent @ BN 2710 lit - 3E8 lit + 2710 lit + <> if "entries miscounted at the end" panic then
+tcount nent @ <> if "the final scan disagrees" panic then
+"storebench: all checks passed" puts 0A lit putc
+bye

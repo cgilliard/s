@@ -357,9 +357,10 @@ pgins
 then
 then ;
 
-\ pgfree# ( -- pages )  free pages in all.
+\ pgfree# ( -- pages )  free pages in all.  (A `do` runs its body at least
+\ once, so an empty table is a case of its own.)
 : pgfree#
-0 lit pgn @ 0 lit do i pglen + loop ;
+0 lit pgn @ ?dup if 0 lit do i pglen + loop then ;
 
 \ pgtag ( addr pages -- )  tests: each page's first word set to addr.
 : pgtag  0 lit do dup i C lit lshift + over swap ! loop drop ;
@@ -394,6 +395,7 @@ Test {
 		41 lit pgalloc 0 lit asrt_eq
 		40 lit pgalloc over asrt_eq
 		pgn @ 0 lit asrt_eq
+		pgfree# 0 lit asrt_eq
 		1 lit pgalloc 0 lit asrt_eq
 		dup 40 lit pgfree
 		pgn @ 1 lit asrt_eq

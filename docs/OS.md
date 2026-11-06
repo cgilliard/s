@@ -379,10 +379,22 @@ kernel too much to add at the end.
    the image booting under q32 and through tabernacle from disk.
 2. **The store's benchmark.** Beside the kernel, a bare-metal program
    (as `gen_hash` is) with virtio-blk and the copy-on-write B+ tree's
-   core (pages, alternating meta pages, the commit), timed on a block's
-   worth of the miner's state-tree updates under QEMU. Done when it
-   says, with numbers, that a block is applied within the block time,
-   or what must change until it is. The store (step 8) grows from it.
+   core, timing its basic operations. The store (step 8) grows from it.
+   Done (2026-11-06): `src/store.fam` (virtio-blk with flushes and
+   multi-page requests, a 32 MiB page cache by clock, the tree of 4 KiB
+   pages: 42 entries a leaf, 113 a branch, split up to a new root;
+   alternating meta pages; freed pages reused two commits on) and
+   `src/storebench.fam`, run by `scripts/storebench.sh [--direct]`.
+   100,000 entries (32-byte keys, 64-byte values), every value read back
+   checked; under QEMU on this laptop's NVMe, with the host's cache
+   bypassed: puts 22,000-24,000 a second (10,000 a commit), cached gets
+   66,000, gets from the disk 15,000, overwrites and deletes 7,500 (100 a
+   commit), a scan 2.6 million entries a second, a commit of one put
+   0.9 ms (both flushes real). The store's own time leads, not the
+   disk's (a cached get is 15 microseconds, nearly the same either way):
+   that is where to optimize. Still to come in step 8: keys and values
+   of any size, several trees, readers' snapshots, aborts, the free list
+   on disk, recovery, and merging leaves deletes leave low.
 3. **Every hart.** Tabernacle's change (harts other than 0 mark their
    mailbox and sleep in `wfi`, released by the OS); the kernel counting
    and releasing them, a timer and a run queue per hart, software
