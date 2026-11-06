@@ -1,5 +1,6 @@
 #!/bin/sh
-# Run an RV32I binary in QEMU virt.
+# Run an RV32I binary in QEMU virt.  Linux and macOS (on Windows, WSL2):
+# Windows QEMU's serial port loses bytes, piped in or at its exit.
 #
 # Usage: q32 [options] <binary>
 #   --cpu=CPU     CPU model (default: rv32i strict)
@@ -12,12 +13,9 @@
 #                 RAM above its image (lib/stdlib.fam init: the data stack ends
 #                 at 0x88000000, the top of the virt machine's default 128 MiB),
 #                 so pick an address the program will not allocate over.
-#   --in=FILE     serial input from FILE  ┐ file-backed serial instead of stdio:
-#   --out=FILE    serial output to FILE   ┘ byte-exact on every platform (QEMU's
-#                 win32 stdio chardev loses bytes on piped stdin); used by
-#                 tools/fam for the compile step.  --out required with --in.
-#                 --out alone is a plain output file everywhere, Windows too:
-#                 for runs that need no input (scripts/check.sh).
+#   --in=FILE     serial input from FILE  ┐ file-backed serial instead of
+#   --out=FILE    serial output to FILE   ┘ stdio, byte-exact; used by tools/fam
+#                 for the compile step.  --out required with --in.
 #
 # Examples:
 #   q32 program.bin
@@ -83,22 +81,6 @@ if [ -n "$SERIN" ] && [ -z "$SEROUT" ]; then
 	exit 1
 fi
 
-# --in/--out transport: POSIX uses the file chardev (byte-exact, no deps);
-# Windows QEMU rejects input-path, so use a loopback TCP chardev + the
-# tools/serial_pump (pure bash) instead.  FAM_SERIAL=socket forces the socket
-# path (lets the Windows transport be tested on Linux).
-SOCKMODE=0
-case "$(uname -s)" in MINGW*|MSYS*) SOCKMODE=1 ;; esac
-[ "$FAM_SERIAL" = "socket" ] && SOCKMODE=1
-# Without --out, a program's serial port is QEMU's console (-serial stdio).
-# Windows QEMU's console loses piped input and now and then never lets QEMU
-# exit, so there, unless stdin is a terminal (interactive use), take the
-# socket path as well: output to stdout (`-`), stdin (if any) forwarded.
-if [ "$SOCKMODE" = 1 ] && [ -z "$SEROUT" ] && [ ! -t 0 ]; then
-	SEROUT=-
-	SERIN=/dev/stdin
-fi
-
 # Build QEMU arguments
 ARGS="-machine virt -cpu $CPU -nographic -bios none"
 ARGS="$ARGS -device loader,file=$FILE,addr=0x80000000"
@@ -107,21 +89,9 @@ for spec in $LOADS; do
 	if [ ! -f "$lfile" ]; then echo "Error: --load file not found: $lfile"; exit 1; fi
 	ARGS="$ARGS -device loader,file=$lfile,addr=$laddr,force-raw=on"
 done
-SERPORT=""
 if [ -n "$SEROUT" ]; then
-	# --out without --in: the file chardev, output only, which Windows QEMU
-	# has too, rather than the socket, whose close on QEMU's exit there can
-	# lose the last bytes.  To QEMU by its Windows path: MSYS does not
-	# reliably convert a path inside a comma-separated argument.
-	if [ "$SOCKMODE" = 1 ] && { [ -n "$SERIN" ] || [ "$SEROUT" = - ]; }; then
-		SERPORT=$((20000 + $$ % 20000))
-		ARGS="$ARGS -chardev socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
-	else
-		QOUT=$SEROUT
-		[ "$SOCKMODE" = 1 ] && command -v cygpath >/dev/null && QOUT=$(cygpath -m "$SEROUT")
-		ARGS="$ARGS -chardev file,id=ser0,path=$QOUT"
-		[ -n "$SERIN" ] && ARGS="$ARGS,input-path=$SERIN"
-	fi
+	ARGS="$ARGS -chardev file,id=ser0,path=$SEROUT"
+	[ -n "$SERIN" ] && ARGS="$ARGS,input-path=$SERIN"
 	ARGS="$ARGS -serial chardev:ser0 -monitor none"
 else
 	ARGS="$ARGS -serial stdio -monitor none"
@@ -157,32 +127,6 @@ if [ -n "$DISK" ]; then
 		ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
 	fi
 	ARGS="$ARGS -device virtio-blk-device,drive=d0"
-fi
-
-if [ -n "$SERPORT" ]; then
-	# socket serial: qemu in the background, the pump in the foreground;
-	# qemu's exit code (guest finisher) is the verdict.
-	SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
-	TOOLS=$(dirname "$SCRIPT")
-	IN="${SERIN:--}"   # "-" tells serial_pump there is no input stream
-	# QEMU's messages are kept, and shown if it fails.
-	ERR="${TMPDIR:-/tmp}/q32.$$.err"
-	# Stopped from outside (a time limit): say what QEMU printed.
-	trap 'echo "q32: stopped, qemu on port $SERPORT: $(head -c 300 "$ERR" 2>/dev/null | tr "\n" " ")" >&2; kill $QPID 2>/dev/null; rm -f "$ERR"; exit 143' TERM INT
-	qemu-system-riscv32 $ARGS 2>"$ERR" &
-	QPID=$!
-	if ! "$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT"; then
-		kill $QPID 2>/dev/null
-		echo "q32: qemu: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
-		rm -f "$ERR"
-		exit 1
-	fi
-	wait $QPID
-	rc=$?
-	# 0 and 1 are the guest's verdicts; anything else is QEMU's own failure.
-	[ "$rc" -gt 1 ] && echo "q32: qemu exited $rc: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
-	rm -f "$ERR"
-	exit $rc
 fi
 
 # exec so signals (and `timeout`) reach qemu directly and `$!` is the qemu pid

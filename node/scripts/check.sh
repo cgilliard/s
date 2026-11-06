@@ -13,18 +13,14 @@ FAILS=0; N=0
 # lim SECONDS CMD... — run CMD, killed after SECONDS with everything it started
 # (exit 124).  Perl, as macOS has no `timeout`; a watchdog that kills the
 # process group, as an alarm alone would reach only QEMU, which ignores it.
-# TERM first, so tools/q32 can say what QEMU printed; KILL 3 s later.
 # Its stdin is /dev/null: in a process group of its own, a read from a
-# terminal (MSYS2's console) would stop it until the watchdog fired.
+# terminal would stop it until the watchdog fired.
 lim() {
 	perl -e '
 		$t = shift;
 		$p = fork // die "fork: $!";
 		if (!$p) { setpgrp(0, 0); exec @ARGV or die "exec: $!" }
-		$SIG{ALRM} = sub {
-			kill "TERM", -$p; sleep 3; kill "KILL", -$p;
-			waitpid($p, 0); exit 124;
-		};
+		$SIG{ALRM} = sub { kill "KILL", -$p; waitpid($p, 0); exit 124 };
 		alarm $t;
 		waitpid($p, 0);
 		exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
@@ -55,8 +51,7 @@ runs() {
 	src "$1" "$2"
 	mark; lim 30 ./tools/fam -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
 	[ "$rc" = 0 ] || { fail "$1" "exit $rc after $(took), did not compile: $(head -c 200 "$T/$1.out")"; return; }
-	mark; lim 30 ./tools/q32 --out="$T/$1.run" "$T/$1.bin" > "$T/$1.q32" 2>&1; rc=$?
-	cat "$T/$1.q32" >> "$T/$1.run"
+	mark; lim 30 ./tools/q32 "$T/$1.bin" > "$T/$1.run" 2>&1; rc=$?
 	[ "$rc" = "$3" ] || { fail "$1" "exit $rc after $(took), expected $3: $(head -c 200 "$T/$1.run")"; return; }
 	grep -q -- "$4" "$T/$1.run" || fail "$1" "output $(head -c 200 "$T/$1.run"), expected /$4/"
 }
@@ -64,8 +59,7 @@ runs() {
 # suite NAME SOURCE MODE EXIT PATTERN — --test or --bench: exits EXIT, output matches.
 suite() {
 	src "$1" "$2"
-	mark; lim 30 ./tools/fam "$3" --run-out="$T/$1.run" -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
-	[ -f "$T/$1.run" ] && cat "$T/$1.run" >> "$T/$1.out"
+	mark; lim 30 ./tools/fam "$3" -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
 	[ "$rc" = "$4" ] || { fail "$1" "exit $rc after $(took), expected $4: $(head -c 200 "$T/$1.out")"; return; }
 	grep -q -- "$5" "$T/$1.out" || fail "$1" "output $(head -c 200 "$T/$1.out"), expected /$5/"
 }

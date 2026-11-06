@@ -5,7 +5,7 @@
 # automatically and the source is EOT-terminated, then fed to the fam compiler
 # (bin/fam) running under q32. Paths are resolved relative to this script.
 #
-# Usage: fam [--test|--bench] [--disk=FILE] [--run-out=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+# Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
 #   INPUT.fam    your program(s); multiple files are concatenated in order
 #                (lib/stdlib.fam is prepended for you)
 #   --test       build and run ONLY the Test { ... } block, then delete the binary
@@ -14,10 +14,6 @@
 #   --disk=FILE  attach FILE as a virtio-blk disk when running (forwarded to q32);
 #                lets a Test/Bench block exercise the real disk path (find_blk/
 #                vblkinit/vreq/vpoll). Only meaningful with --test/--bench.
-#   --run-out=FILE  the --test/--bench run's output to FILE instead of stdout
-#                (q32 --out): a plain file on every platform, where on Windows
-#                a run whose stdin is not a terminal goes over a socket that can
-#                lose its last bytes at QEMU's exit (scripts/check.sh uses it).
 #   -o OUTPUT    output binary (default: ./a.bin)
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
@@ -50,8 +46,7 @@ while [ $# -gt 0 ]; do
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
-		--run-out=*) QOPTS="$QOPTS --out=${1#--run-out=}"; shift ;;
-		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [--run-out=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
 		--) shift; IN="$1"; shift ;;
 		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
 		*) IN="$IN $1"; shift ;;
@@ -101,10 +96,9 @@ if [ ! -f "$HEADER" ]; then echo "fam: header not found: $HEADER" >&2; exit 1; f
 # the order given, so earlier files may define words later ones use). In --test/
 # --bench the tail closes the block chain (`_tend`) and prints the summary before
 # halting; the trailing `bye` is a safety halt.
-# The source stream goes through a FILE (q32 --in/--out, file-backed serial),
-# not a pipe: QEMU's win32 stdio chardev loses bytes on piped stdin.  The temp
-# file sits next to the output (relative path — MSYS path conversion of
-# absolute /tmp paths inside comma-separated qemu args is unreliable).
+# The source stream goes through a FILE (q32 --in/--out, file-backed serial):
+# byte-exact both ways, and the binary kept apart from QEMU's console.  The
+# temp file sits next to the output.
 if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
 _tdone
 bye'; else TAIL='bye'; fi
