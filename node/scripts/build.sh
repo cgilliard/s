@@ -3,7 +3,9 @@
 # checked against the seed, then fam and fampack), then gen_hash, the node
 # image (src/img.fam, a placeholder for now) and tabernacle, patched for that
 # image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as tools/q32.
+# Runs from anywhere: it works in the tree it belongs to.
 set -e
+cd "$(dirname "$0")/.."
 
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\

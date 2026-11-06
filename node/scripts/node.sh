@@ -5,13 +5,14 @@
 #
 # Usage: node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds]
 #                [--mac=ADDR] [--hostfwd=SPEC] [TABERNACLE]
-#   --disk=FILE       the disk (default node.img), created empty if missing
+#   --disk=FILE       the disk (default node/data/node.img, wherever this
+#                     is run from), created empty if missing
 #   --seed=HOST:PORT  another seed (repeatable): an IPv4 address or a name
 #                     with one.  10.0.2.2 is this host.
 #   --no-seeds        not the built-in seeds (SEEDS), only those given
 #   --mac=ADDR        the virtio-net MAC (give each node on a host its own)
 #   --hostfwd=SPEC    expose a guest port, e.g. udp::3737-:3737
-#   TABERNACLE        the boot program (default bin/tabernacle, as
+#   TABERNACLE        the boot program (default node/bin/tabernacle, as
 #                     scripts/build.sh leaves it)
 #
 # The seeds' names are resolved here, each to its first IPv4 address (one
@@ -23,13 +24,14 @@ CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
 SEEDS="tabernacle1.root.sx:3737 tabernacle2.root.sx:3737"
-DISK=node.img
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DISK="$ROOT/data/node.img"
 DISK_SIZE=268435456     # 256 MiB, sparse
 EXTRA=""
 NO_SEEDS=0
 MAC=""
 HOSTFWD=""
-TAB="$(dirname "$0")/../bin/tabernacle"
+TAB="$ROOT/bin/tabernacle"
 
 for arg in "$@"; do
 	case "$arg" in
@@ -38,7 +40,7 @@ for arg in "$@"; do
 		--no-seeds) NO_SEEDS=1 ;;
 		--mac=*) MAC=",mac=${arg#--mac=}" ;;
 		--hostfwd=*) HOSTFWD=",hostfwd=${arg#--hostfwd=}" ;;
-		--help|-h) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		--help|-h) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		--*) echo "node.sh: unknown option: $arg" >&2; exit 1 ;;
 		*) TAB="$arg" ;;
 	esac
@@ -48,6 +50,7 @@ done
 SEEDS="$SEEDS$EXTRA"
 
 if [ ! -e "$DISK" ]; then
+	mkdir -p "$(dirname "$DISK")"
 	dd if=/dev/zero of="$DISK" bs=1 count=0 seek=$DISK_SIZE 2>/dev/null \
 		|| { echo "node.sh: cannot create $DISK" >&2; exit 1; }
 fi

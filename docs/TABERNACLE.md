@@ -119,8 +119,9 @@ dropped.)
 
 ## The QEMU setup: `scripts/node.sh`
 
-Not q32: `node.sh` creates the disk file if missing (sparse, large
-enough for the image and the node's data after it) and starts QEMU with
+Not q32: `node.sh` creates the disk file if missing (`node/data/node.img`
+by default, `node/data` being ignored by git; sparse, large enough for
+the image and the node's data after it) and starts QEMU with
 tabernacle loaded at `0x80000000`, the disk as virtio-blk, and
 virtio-net in user mode (the guest is `10.0.2.15`, the host
 `10.0.2.2`), forwarding the node's UDP port. The seeds are built in
@@ -140,6 +141,11 @@ node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds] [--mac=ADDR]
 ```
 
 TABERNACLE defaults to `bin/tabernacle`, as `build.sh` leaves it.
+
+`scripts/makenode.sh [--disk=FILE]` writes `bin/img` at the start of the
+disk (the same default, created if missing), as the node will once it
+runs, to try the boot from disk: `makenode.sh` then `node.sh` prints
+`tabernacle: from disk`.
 
 ## A stand-in node: `tools/server.py`
 
