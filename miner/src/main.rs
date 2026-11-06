@@ -70,7 +70,7 @@ use tabminer::poseidon2::{P, digest_from_bytes, digest_to_bytes};
 use tabminer::pow::{Dataset, Digest, Nonce, PowOutput, SeedText, Target, hashimoto, nonce_from_u64};
 use tabminer::transaction::{Output, Sig, Transaction, UnsignedTransaction};
 use tabminer::utxo;
-use tabminer::wallet::{Ask, Incoming, Signed, Slate, State, Wallet};
+use tabminer::wallet::{Ask, Fee, Incoming, Signed, Slate, State, Wallet};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -170,7 +170,9 @@ const HELP: &str = "commands:
                             pay TO, a tab1… address, @NAME or @LABEL.NAME: the slate
                             goes over the message layer, where the recipient's wallet
                             answers it and this one finalizes it, if both are online
-                            (the fee defaults to the smallest the pool takes); the
+                            (FEE: coins, N/byte, or block, hour (the default), day:
+                            the rate this node's pool suggests for that wait, or
+                            economy: its minimum, waiting for the aged reserve); the
                             recipient learns nothing of the sender unless it adds
                             `named`, which puts this wallet's address in the slate
                             and so in the receipt
@@ -181,9 +183,13 @@ const HELP: &str = "commands:
   finalize FILE             sign an answered slate and pool the transaction
   cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
                             an unconfirmed payment with one paying its inputs back
-                            (FEE defaults to the smallest the network accepts)
+                            (FEE as for send, at least the smallest replacement)
   slates                    pending slates
   sent                      unconfirmed payments that can be cancelled
+  bump TXID [FEE]           pay an unconfirmed payment's recipient the same with a
+                            higher fee, from its change (FEE defaults to block)
+  fees                      the fee rates this node's pool suggests, from what it
+                            has seen confirm
   resend TXID               send an unconfirmed payment again, as signed (after a
                             restart dropped it, or a reorganization moved its inputs)
   payments                  payments and burns made, where they landed, and whether
@@ -1323,7 +1329,8 @@ fn parse_value(s: Option<&str>) -> AnyResult<tabminer::pow::Digest> {
 }
 
 /// Carries name operations in a transaction of the wallet's and pools it.
-fn carry(ctx: &Ctx, ops: Vec<NameOp>, fee: Option<u64>) -> AnyResult<()> {
+fn carry(ctx: &Ctx, ops: Vec<NameOp>, fee: Option<&str>) -> AnyResult<()> {
+    let fee = parse_fee(ctx, fee)?;
     let rtxn = ctx.chain.env().read_txn()?;
     let signed = match ctx.wallet()?.carry(ops.clone(), fee, ctx.chain.utxo(), &rtxn) {
         Ok(s) => s,
@@ -1768,7 +1775,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             };
             let (amount, fee, target) = match args {
                 [amount, target] => (*amount, None, *target),
-                [amount, fee, target] => (*amount, Some(parse_coins(fee).ok_or("bad fee")?), *target),
+                [amount, fee, target] => (*amount, Some(*fee), *target),
                 _ => return Err(usage.into()),
             };
             let amount = parse_coins(amount).ok_or("bad amount")?;
@@ -1783,7 +1790,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 await_reachable(ctx)?;
             }
             let rtxn = ctx.chain.env().read_txn()?;
-            let slate = ctx.wallet()?.send(amount, fee, named, ctx.chain.utxo(), &rtxn)?;
+            let slate = ctx.wallet()?.send(amount, parse_fee(ctx, fee)?, named, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             if let Some(to) = to {
                 ctx.outgoing.lock().unwrap().insert(slate.id, to);
@@ -1864,7 +1871,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         "cancel" => {
             let (id, fee) = match args {
                 [id] => (*id, None),
-                [id, fee] => (*id, Some(parse_coins(fee).ok_or("bad fee")?)),
+                [id, fee] => (*id, Some(*fee)),
                 _ => return Err("usage: cancel ID [FEE]".into()),
             };
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -1895,7 +1902,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
             let s = sent.into_iter().next().ok_or("no pending slate or unconfirmed payment starts with that id")?;
             let rtxn = ctx.chain.env().read_txn()?;
-            let signed = ctx.wallet()?.cancel_sent(&s.txid, fee, ctx.chain.utxo(), &rtxn)?;
+            let signed = ctx.wallet()?.cancel_sent(&s.txid, parse_fee(ctx, fee)?, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             println!(
                 "payment {} replaced; the inputs come back less a fee of {}",
@@ -1920,6 +1927,57 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     fmt_coins(Wallet::min_replacement_fee(&s) as u128)
                 );
             }
+        }
+        "bump" => {
+            let (prefix, fee) = match args {
+                [id] => (*id, None),
+                [id, fee] => (*id, Some(*fee)),
+                _ => return Err("usage: bump TXID [FEE]".into()),
+            };
+            let rtxn = ctx.chain.env().read_txn()?;
+            let sent = ctx.wallet()?.sent(ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            let found: Vec<_> = sent.iter().filter(|s| hex_digest(&s.txid).starts_with(prefix)).collect();
+            let s = match &found[..] {
+                [s] => *s,
+                [] => return Err(format!("no unconfirmed payment with a txid starting {prefix}").into()),
+                _ => {
+                    return Err(
+                        format!("{} payments have txids starting {prefix}: give more digits", found.len()).into()
+                    );
+                }
+            };
+            // Without a FEE, the rate for about a block.
+            let fee = parse_fee(ctx, Some(fee.unwrap_or("block")))?;
+            let rtxn = ctx.chain.env().read_txn()?;
+            let signed = ctx.wallet()?.bump_sent(&s.txid, fee, ctx.chain.utxo(), &rtxn)?;
+            drop(rtxn);
+            println!(
+                "payment {} replaced by {}, paying a fee of {} (was {})",
+                short(&s.txid),
+                short(&signed.tx.txid()),
+                fmt_coins(signed.tx.balance() as u128),
+                fmt_coins(s.fee as u128)
+            );
+            submit(ctx, signed);
+        }
+        "fees" => {
+            use tabminer::mempool::{TARGET_BLOCK, TARGET_DAY, TARGET_HOUR, unix_now};
+            let now = unix_now();
+            let pool = ctx.mempool.lock().unwrap();
+            let size = Wallet::payment_size(1);
+            let floor = pool.policy().min_fee_per_byte;
+            println!("floor {floor} base units a byte; the pool admits from {}", pool.admission_fee(now));
+            for (what, t) in [("block", TARGET_BLOCK), ("hour", TARGET_HOUR), ("day", TARGET_DAY)] {
+                let seen = if pool.estimate(t, now).is_some() { "" } else { " (too little seen yet: the minimum)" };
+                println!("  {what:<8} {} base units a byte{seen}", pool.suggest(t, size, now));
+            }
+            println!(
+                "  economy  {} base units a byte: at most about {} blocks, by the aged reserve",
+                pool.admission_fee(now),
+                pool.reserve_wait(size)
+            );
+            println!("a simple payment is about {size} bytes");
         }
         "resend" => {
             let [prefix] = args else {
@@ -1997,15 +2055,16 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [] => (ctx.wallet()?.id(), None),
                 [one] => match recipient(ctx, one)? {
                     Some(id) => (id, None),
-                    None => (ctx.wallet()?.id(), Some(parse_coins(one).ok_or("FOR is a tab1… address or @NAME")?)),
+                    None => (ctx.wallet()?.id(), Some(*one)),
                 },
                 [who, fee] => (
                     recipient(ctx, who)?.ok_or("FOR is a tab1… address or @NAME")?,
-                    Some(parse_coins(fee).ok_or("bad fee")?),
+                    Some(*fee),
                 ),
                 _ => unreachable!(),
             };
             let rtxn = ctx.chain.env().read_txn()?;
+            let fee = parse_fee(ctx, fee)?;
             let signed = ctx.wallet()?.burn(amount, &beneficiary, purpose.as_bytes(), fee, ctx.chain.utxo(), &rtxn)?;
             drop(rtxn);
             println!(
@@ -2049,7 +2108,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             let (name, value, fee) = match args {
                 [name] => (*name, None, None),
                 [name, value] => (*name, Some(*value), None),
-                [name, value, fee] => (*name, Some(*value), Some(parse_coins(fee).ok_or("bad fee")?)),
+                [name, value, fee] => (*name, Some(*value), Some(*fee)),
                 _ => return Err("usage: name-commit NAME [VALUE] [FEE]".into()),
             };
             // By default the name points at this wallet, so @NAME reaches it.
@@ -2066,7 +2125,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [name] => (*name, tabminer::names::MIN_REVEAL, None),
                 [name, wait] => (*name, wait.parse().map_err(|_| "bad wait")?, None),
                 [name, wait, fee] => {
-                    (*name, wait.parse().map_err(|_| "bad wait")?, Some(parse_coins(fee).ok_or("bad fee")?))
+                    (*name, wait.parse().map_err(|_| "bad wait")?, Some(*fee))
                 }
                 _ => return Err("usage: name-reveal NAME [WAIT] [FEE]".into()),
             };
@@ -2087,7 +2146,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         "name-update" => {
             let (name, value, fee) = match args {
                 [name, value] => (*name, *value, None),
-                [name, value, fee] => (*name, *value, Some(parse_coins(fee).ok_or("bad fee")?)),
+                [name, value, fee] => (*name, *value, Some(*fee)),
                 _ => return Err("usage: name-update NAME VALUE [FEE]".into()),
             };
             let (op, last) = ctx.wallet()?.name_update(name.as_bytes(), parse_value(Some(value))?)?;
@@ -2112,7 +2171,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         "name-transfer" => {
             let (file, fee) = match args {
                 [file] => (*file, None),
-                [file, fee] => (*file, Some(parse_coins(fee).ok_or("bad fee")?)),
+                [file, fee] => (*file, Some(*fee)),
                 _ => return Err("usage: name-transfer FILE [FEE]".into()),
             };
             let record = tabminer::names::Record::from_bytes(&std::fs::read(file)?).ok_or("not a name record")?;
@@ -2399,8 +2458,66 @@ fn hex_digest(d: &Digest) -> String {
 /// Pools a signed transaction here, so that a refusal reaches the prompt,
 /// then hands it to the node to announce; warns of inputs that made their
 /// last signature.
+/// A FEE argument (`docs/FEES.md`): coins in all, `N/byte`, or a wait,
+/// `block`, `hour` (the default) or `day`, for the rate this node's pool
+/// suggests, or `economy`: its admission minimum, to wait for the aged
+/// reserve.
+fn parse_fee(ctx: &Ctx, arg: Option<&str>) -> AnyResult<Fee> {
+    use tabminer::mempool::{MIN_FEE_PER_BYTE, TARGET_BLOCK, TARGET_DAY, TARGET_HOUR, unix_now};
+    let now = unix_now();
+    let pool = ctx.mempool.lock().unwrap();
+    let size = Wallet::payment_size(1);
+    let rate = |r: u64| Fee::PerByte(r.max(MIN_FEE_PER_BYTE));
+    Ok(match arg.unwrap_or("hour") {
+        "block" => rate(pool.suggest(TARGET_BLOCK, size, now)),
+        "hour" => rate(pool.suggest(TARGET_HOUR, size, now)),
+        "day" => rate(pool.suggest(TARGET_DAY, size, now)),
+        "economy" => rate(pool.admission_fee(now)),
+        s => match s.strip_suffix("/byte") {
+            Some(n) => Fee::PerByte(n.parse().map_err(|_| "bad fee rate: N/byte, N base units")?),
+            None => Fee::Total(parse_coins(s).ok_or("bad fee: coins, N/byte, block, hour, day or economy")?),
+        },
+    })
+}
+
+/// What a transaction's fee buys, from this node's pool, and a warning
+/// if it pays less than most peers' floors.
+fn fee_report(ctx: &Ctx, tx: &Transaction) {
+    use tabminer::mempool::{TARGET_BLOCK, TARGET_DAY, TARGET_HOUR, unix_now};
+    let size = tx.size();
+    let fee = tx.balance().max(0) as u64;
+    let rate = fee / size.max(1) as u64;
+    let now = unix_now();
+    let wait = {
+        let pool = ctx.mempool.lock().unwrap();
+        let within = |t| rate >= pool.suggest(t, size, now);
+        if within(TARGET_BLOCK) {
+            "about a block".to_string()
+        } else if within(TARGET_HOUR) {
+            "about an hour".to_string()
+        } else if within(TARGET_DAY) {
+            "about a day".to_string()
+        } else {
+            let blocks = pool.reserve_wait(size);
+            format!("at most about {blocks} blocks, by the aged reserve, if miners keep it")
+        }
+    };
+    println!("fee {} ({rate} base units a byte): expect it within {wait}", fmt_coins(fee as u128));
+    let floors: Vec<u64> =
+        ctx.stats.lock().unwrap().peers.iter().filter(|p| p.handshaken).filter_map(|p| p.min_fee).collect();
+    let above = floors.iter().filter(|f| **f > rate).count();
+    if above * 2 > floors.len() {
+        println!(
+            "warning: {above} of {} peers ask more than {rate} base units a byte and will not relay it; \
+             it may never reach a miner",
+            floors.len()
+        );
+    }
+}
+
 fn submit(ctx: &Ctx, signed: Signed) {
     let txid = signed.tx.txid();
+    fee_report(ctx, &signed.tx);
     if !signed.last_signatures.is_empty() {
         println!(
             "warning: this was the last signature {} can make; it cannot be cancelled again",

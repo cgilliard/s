@@ -84,9 +84,16 @@ fn a_payment_goes_through_the_prompt() {
     let id = line.split_whitespace().nth(1).unwrap().to_string();
     net.a.send(&format!("cancel {id}"));
     net.a.expect("the slate cancelled", 30, |l| l.starts_with("slate cancelled"));
+    // The pool's suggestions: on a quiet chain, the floor for every wait.
+    net.a.send("fees");
+    let line = net.a.expect("the fee rates", 30, |l| l.starts_with("  block "));
+    assert!(line.contains(" 10 base units a byte"), "A: {line}");
     let to = net.b.address();
     net.a.send(&format!("send 1 {to}"));
     net.a.expect("the slate sent", 30, |l| l.starts_with("slate ") && l.contains("sent to"));
+    // Finalized: what its fee buys.
+    let line = net.a.expect("the fee report", 60, |l| l.starts_with("fee "));
+    assert!(line.contains("expect it within about a block"), "A: {line}");
     net.b.poll("balance", "the coin", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
     net.a.poll("sent", "the payment confirmed", 60, |l| l == "no unconfirmed payments");
     assert!(net.a.exit(30).success());
@@ -305,9 +312,16 @@ fn a_reorganization_takes_a_lost_payment_out_of_the_wallet() {
 fn a_restored_wallet_finds_and_spends_beside_its_original() {
     let mut net = Net::start("restore");
     net.funded();
+    // The pool's suggestions: on a quiet chain, the floor for every wait.
+    net.a.send("fees");
+    let line = net.a.expect("the fee rates", 30, |l| l.starts_with("  block "));
+    assert!(line.contains(" 10 base units a byte"), "A: {line}");
     let to = net.b.address();
     net.a.send(&format!("send 1 {to}"));
     net.a.expect("the slate sent", 30, |l| l.starts_with("slate ") && l.contains("sent to"));
+    // Finalized: what its fee buys.
+    let line = net.a.expect("the fee report", 60, |l| l.starts_with("fee "));
+    assert!(line.contains("expect it within about a block"), "A: {line}");
     net.b.poll("balance", "the coin", 120, |l| amount(l, "confirmed").is_some_and(|c| c == 1.0));
     let dir_r = TempDir::new("restore-r");
     restore(&dir_r.0, &net.b.phrase());

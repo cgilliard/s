@@ -45,7 +45,7 @@
 //! otherwise. The miner takes operations within the block's caps, skipping
 //! what does not fit and reveals whose window has not opened.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use heed::RoTxn;
 
@@ -136,6 +136,18 @@ pub const fn reserve_bytes(max_block_size: usize, percent: usize) -> usize {
 }
 /// The oldest transactions kept from eviction, by default: about a day
 /// of the reserve (some 26 MB), so that in a flood they still age into it.
+/// Confirmations a pool remembers for its fee estimates.
+const CONFIRMED_KEPT: usize = 5000;
+/// How long a confirmation counts for estimates.
+const CONFIRMED_FOR: u64 = 7 * 86400;
+/// Transactions an estimate needs at or above its rate, else none.
+const MIN_SAMPLES: usize = 20;
+/// The share of those that must have confirmed in time.
+const SUCCESS: f64 = 0.85;
+/// The waits estimates are made for: about a block, an hour, a day.
+pub const TARGET_BLOCK: u64 = crate::difficulty::IDEAL_BLOCK_TIME as u64;
+pub const TARGET_HOUR: u64 = 3600;
+pub const TARGET_DAY: u64 = 86400;
 pub const PROTECT_BYTES: usize = RESERVE_BYTES * (86_400 / crate::difficulty::IDEAL_BLOCK_TIME as usize);
 
 /// What a pool asks of a transaction beyond validity (`docs/FEES.md`): a
@@ -315,6 +327,9 @@ pub struct Mempool {
     /// and when, in Unix seconds.
     rolling: u128,
     rolling_at: u64,
+    /// Transactions seen confirmed: their rate (base units a byte), how
+    /// long they waited here, and when, oldest first.
+    confirmed: VecDeque<(u64, u64, u64)>,
 }
 
 /// The time now, in Unix seconds.
@@ -448,6 +463,7 @@ impl Mempool {
             by_age: BTreeMap::new(),
             rolling: 0,
             rolling_at: 0,
+            confirmed: VecDeque::new(),
         }
     }
 
@@ -545,6 +561,66 @@ impl Mempool {
     /// A pooled transaction's entry.
     pub fn entry(&self, txid: &Digest) -> Option<&Entry> {
         self.txs.get(txid)
+    }
+
+    /// The lowest rate, base units a byte, at which this pool has seen
+    /// transactions confirm within `target` seconds: of those it saw at
+    /// or above that rate, confirmed lately or still waiting past the
+    /// target, [`SUCCESS`] of them in time. `None` until it has seen
+    /// enough (a new node).
+    pub fn estimate(&self, target: u64, now: u64) -> Option<u64> {
+        let mut samples: Vec<(u64, bool)> = self
+            .confirmed
+            .iter()
+            .filter(|(_, _, at)| now.saturating_sub(*at) < CONFIRMED_FOR)
+            .map(|(rate, waited, _)| (*rate, *waited <= target))
+            .collect();
+        samples.extend(
+            self.txs.values().filter(|e| now.saturating_sub(e.arrived) > target).map(|e| (per_byte(e.rate()), false)),
+        );
+        samples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let (mut total, mut ok, mut best) = (0usize, 0usize, None);
+        for (i, (rate, in_time)) in samples.iter().enumerate() {
+            total += 1;
+            ok += usize::from(*in_time);
+            // Only once every sample at this rate is counted.
+            if samples.get(i + 1).is_some_and(|next| next.0 == *rate) || total < MIN_SAMPLES {
+                continue;
+            }
+            if (ok as f64) < SUCCESS * total as f64 {
+                break;
+            }
+            best = Some(*rate);
+        }
+        best
+    }
+
+    /// The rate, base units a byte, to suggest for a transaction of `size`
+    /// to confirm within `target` seconds: the admission minimum while the
+    /// pool would fit one block with it (nothing ahead to wait for), else
+    /// the estimate, the admission minimum until there is one.
+    pub fn suggest(&self, target: u64, size: usize, now: u64) -> u64 {
+        let admission = self.admission_fee(now);
+        let space = crate::chain::ChainParams::MAINNET.max_block_size - PROOF_BYTES;
+        if self.bytes + size <= space {
+            return admission;
+        }
+        self.estimate(target, now).map_or(admission, |r| r.max(admission))
+    }
+
+    /// Blocks a transaction of `size` arriving now waits at most for the
+    /// aged reserve, if miners keep the default: everything pooled is
+    /// older and ahead of it.
+    pub fn reserve_wait(&self, size: usize) -> u64 {
+        (self.bytes + size).div_ceil(RESERVE_BYTES.max(1)) as u64
+    }
+
+    /// Notes a transaction seen confirmed, for estimates.
+    fn note_confirmed(&mut self, e: &Entry, now: u64) {
+        self.confirmed.push_back((per_byte(e.rate()), now.saturating_sub(e.arrived), now));
+        if self.confirmed.len() > CONFIRMED_KEPT {
+            self.confirmed.pop_front();
+        }
     }
 
     /// Drops the transactions that have waited [`Policy::expiry_secs`] by
@@ -774,6 +850,7 @@ impl Mempool {
         rtxn: &RoTxn,
         height: u32,
         moved: &HashMap<Commitment, Vec<u64>>,
+        created: &HashSet<Commitment>,
     ) -> utxo::Result<(usize, usize)> {
         let mut gone = Vec::new();
         for e in self.txs.values() {
@@ -787,8 +864,14 @@ impl Mempool {
                 gone.push(e.txid);
             }
         }
+        let now = unix_now();
         for id in &gone {
             if let Some(e) = self.remove(id) {
+                // Its outputs made by the new blocks: it confirmed, and its
+                // wait goes to the estimates.
+                if !e.tx.outputs.is_empty() && e.tx.outputs.iter().all(|o| created.contains(&o.commitment)) {
+                    self.note_confirmed(&e, now);
+                }
                 self.shelf.push(e);
             }
         }
@@ -1041,11 +1124,11 @@ mod tests {
         let at = utxo.add_output(&mut wtxn, &out.block_output(), 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
         // Told nothing moved, it stays shelved; told where, it comes back.
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new()).unwrap(), (0, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashSet::new()).unwrap(), (0, 0));
         let moved = HashMap::from([(out.commitment, vec![1, at])]);
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &moved).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &moved, &HashSet::new()).unwrap(), (0, 1));
         assert_eq!(pool.get(&id).unwrap().spent_positions(), vec![at]);
         // The signature still holds: positions are not signed.
         assert!(pool.get(&id).unwrap().verify_signatures());
@@ -1206,6 +1289,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// docs/FEES.md: estimates come from what this pool saw confirm, and
+    /// how long it waited; a transaction is noted confirmed when the new
+    /// blocks made its outputs, not when a conflict spent its inputs.
+    #[test]
+    fn estimates_follow_what_confirmed() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-estimate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for tag in 1u8..=2 {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 1_000_000).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        let mut pool = Mempool::new(1 << 20);
+        let now = unix_now();
+        // Nothing seen: no estimate, and the minimum suggested.
+        assert_eq!(pool.estimate(TARGET_BLOCK, now), None);
+        assert_eq!(pool.suggest(TARGET_HOUR, 3000, now), MIN_FEE_PER_BYTE);
+        assert_eq!(pool.reserve_wait(3000), 1);
+        // 30 at 50 a byte confirmed in five minutes, 30 at 20 in over an
+        // hour and a half.
+        for _ in 0..30 {
+            pool.confirmed.push_back((50, 300, now));
+            pool.confirmed.push_back((20, 5000, now));
+        }
+        assert_eq!(pool.estimate(TARGET_BLOCK, now), Some(50));
+        assert_eq!(pool.estimate(TARGET_HOUR, now), Some(50));
+        assert_eq!(pool.estimate(TARGET_DAY, now), Some(20));
+        // A week on, they no longer count.
+        assert_eq!(pool.estimate(TARGET_DAY, now + 8 * 86400), None);
+        // While the pool would fit a block, nothing is ahead: the minimum.
+        assert_eq!(pool.suggest(TARGET_BLOCK, 3000, now), MIN_FEE_PER_BYTE);
+        pool.confirmed.clear();
+
+        // Confirmed: its input spent and its output made by the new block.
+        let rtxn = env.read_txn().unwrap();
+        let t1 = spend(1, 1_000_000, 100_000);
+        let t2 = spend(2, 1_000_000, 200_000);
+        pool.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        pool.insert(t2.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        drop(rtxn);
+        let mut wtxn = env.write_txn().unwrap();
+        for tag in 1u8..=2 {
+            assert!(utxo.spend_at(&mut wtxn, &Output::new(&pk(tag), 1_000_000).commitment, u64::from(tag) - 1).unwrap());
+        }
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        // t1's output was made; t2's input went to something else.
+        let created: HashSet<Commitment> = [t1.outputs[0].commitment].into_iter().collect();
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &created).unwrap(), (2, 0));
+        assert_eq!(pool.confirmed.len(), 1);
+        assert_eq!(pool.confirmed[0].0, 100_000 / t1.size() as u64 + 1);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pool_validates_orders_and_revalidates() {
         let dir = std::env::temp_dir().join(format!("tabminer-mempool-{}", std::process::id()));
@@ -1276,14 +1418,14 @@ mod tests {
         assert!(utxo.spend_at(&mut wtxn, &c1, 0).unwrap());
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0, 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new()).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashSet::new()).unwrap(), (0, 1));
         assert!(pool.contains(&id1));
 
         // Replacement: paying the old fee plus the increment per byte
@@ -1447,14 +1589,14 @@ mod tests {
         names.apply(&utxo, &mut wtxn, 22, &[BlockNameOp::Reveal { record: alice.clone(), commit: 6 }], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23, &HashMap::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         names.apply(&utxo, &mut wtxn, 23, &[BlockNameOp::Update(bob2.clone())], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24, &HashMap::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id2));
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);

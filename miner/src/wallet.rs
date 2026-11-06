@@ -72,7 +72,7 @@ use crate::address;
 use crate::bip39;
 use crate::chacha20poly1305;
 use crate::codec::{Reader, Writer};
-use crate::mempool::{MAX_TX_SIZE, Policy};
+use crate::mempool::{MAX_TX_SIZE, MIN_FEE_PER_BYTE, Policy, REPLACEMENT_FEE_PER_BYTE};
 use crate::mldsa;
 use crate::mlkem;
 use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
@@ -609,6 +609,47 @@ impl Sent {
         let created = r.u64()?;
         let tx = Transaction::from_bytes(r.0)?;
         Some(Sent { txid, inputs, fee, size, created, tx })
+    }
+}
+
+/// The fee a transaction of this wallet's pays: a total, or a rate the
+/// total follows from once its inputs are chosen (`docs/FEES.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fee {
+    /// Base units in all.
+    Total(u64),
+    /// Base units a byte, at least the floor.
+    PerByte(u64),
+}
+
+impl Fee {
+    /// The fee of a transaction of `size` bytes.
+    pub fn for_size(self, size: usize) -> u64 {
+        match self {
+            Fee::Total(f) => f,
+            Fee::PerByte(r) => r.saturating_mul(size as u64),
+        }
+    }
+
+    /// A rate below the floor is refused before anything is chosen.
+    fn check(self, size: usize) -> Result<()> {
+        match self {
+            Fee::PerByte(r) if r < MIN_FEE_PER_BYTE => {
+                Err(WalletError::FeeTooLow { min: Policy::MAINNET.min_fee_for(size) })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn is_total(self) -> bool {
+        matches!(self, Fee::Total(_))
+    }
+}
+
+/// `None`: the floor rate; `Some`: a total.
+impl From<Option<u64>> for Fee {
+    fn from(fee: Option<u64>) -> Fee {
+        fee.map_or(Fee::PerByte(MIN_FEE_PER_BYTE), Fee::Total)
     }
 }
 
@@ -1840,7 +1881,13 @@ impl Wallet {
     /// The smallest fee a payment from `inputs` inputs may carry, with a
     /// recipient output and change: what the pool asks ([`Policy::min_fee`]).
     pub fn min_fee(inputs: usize) -> u64 {
-        Policy::MAINNET.min_fee(inputs, 2)
+        Policy::MAINNET.min_fee_for(Self::payment_size(inputs))
+    }
+
+    /// The size of a payment from `inputs` inputs, with a recipient
+    /// output and change.
+    pub fn payment_size(inputs: usize) -> usize {
+        16 + inputs * INPUT_SIZE + 2 * OUTPUT_SIZE
     }
 
     /// Starts a payment of `amount` with `fee` (or the smallest the pool
@@ -1850,7 +1897,7 @@ impl Wallet {
     /// With `named` the slate names our address, which the recipient's
     /// receipt then binds; otherwise it names the hash of a secret we keep
     /// (`docs/PRIVACY.md`, fix 4), and the recipient learns nothing of us.
-    pub fn send(&self, amount: u64, fee: Option<u64>, named: bool, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
+    pub fn send(&self, amount: u64, fee: impl Into<Fee>, named: bool, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Slate> {
         if amount == 0 {
             return Err(WalletError::BadSlate("amount is zero"));
         }
@@ -1862,9 +1909,10 @@ impl Wallet {
         // The fee depends on the inputs, which depend on the fee: with a
         // fee for the inputs chosen so far, choose again until it holds.
         let mut inputs = 1;
-        let given = fee;
+        let given: Fee = fee.into();
+        given.check(Self::payment_size(1))?;
         let fee = loop {
-            let fee = given.unwrap_or_else(|| Self::min_fee(inputs));
+            let fee = given.for_size(Self::payment_size(inputs));
             let need = amount as u128 + fee as u128;
             let mut picked = 0usize;
             let mut total = 0u128;
@@ -1879,7 +1927,7 @@ impl Wallet {
                 return Err(WalletError::Insufficient { have: total, need });
             }
             let min = Self::min_fee(picked.max(1));
-            if given.is_some() && fee < min {
+            if given.is_total() && fee < min {
                 return Err(WalletError::FeeTooLow { min });
             }
             if picked <= inputs {
@@ -2096,10 +2144,21 @@ impl Wallet {
         Ok(())
     }
 
-    /// The smallest fee a replacement of `sent` may pay: its fee plus one
-    /// base unit per byte of the replacement (see [`crate::mempool`]).
+    /// The smallest fee a cancellation of `sent` may pay: its fee plus
+    /// [`REPLACEMENT_FEE_PER_BYTE`] per byte of the replacement, its
+    /// inputs paid back to one output (see [`crate::mempool`]).
     pub fn min_replacement_fee(sent: &Sent) -> u64 {
-        sent.fee + (12 + sent.inputs.len() * INPUT_SIZE + OUTPUT_SIZE) as u64
+        sent.fee + REPLACEMENT_FEE_PER_BYTE * Self::cancel_size(sent) as u64
+    }
+
+    fn cancel_size(sent: &Sent) -> usize {
+        16 + sent.inputs.len() * INPUT_SIZE + OUTPUT_SIZE
+    }
+
+    /// The smallest fee a bump of `sent` may pay: its fee plus the
+    /// increment per byte of the bump, which is its size.
+    pub fn min_bump_fee(sent: &Sent) -> u64 {
+        sent.fee + REPLACEMENT_FEE_PER_BYTE * sent.size as u64
     }
 
     /// Cancels a finalized payment that is not yet confirmed: signs a
@@ -2107,14 +2166,19 @@ impl Wallet {
     /// wallet with `fee` (at least [`Wallet::min_replacement_fee`]), using
     /// each input's next leaf. The payment's record now points at the
     /// replacement, which can itself be cancelled while leaves remain.
-    pub fn cancel_sent(&self, txid: &Commitment, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
-        let sent = {
-            let rtxn = self.env.read_txn()?;
-            let b = self.sent.get(&rtxn, &digest_to_bytes(txid))?.ok_or(WalletError::Unknown)?;
-            Sent::from_bytes(*txid, b).ok_or(WalletError::Corrupt("sent"))?
-        };
+    pub fn cancel_sent(
+        &self,
+        txid: &Commitment,
+        fee: impl Into<Fee>,
+        utxo: &UtxoSet,
+        rtxn: &RoTxn,
+    ) -> Result<Signed> {
+        let sent = self.sent_record(txid)?;
         let min = Self::min_replacement_fee(&sent);
-        let fee = fee.unwrap_or(min);
+        let fee = match fee.into() {
+            Fee::Total(f) => f,
+            Fee::PerByte(r) => min.max(r.saturating_mul(Self::cancel_size(&sent) as u64)),
+        };
         if fee < min {
             return Err(WalletError::FeeTooLow { min });
         }
@@ -2161,6 +2225,90 @@ impl Wallet {
         for op in &sent.tx.ops {
             self.undo_name_op(op)?;
         }
+        Ok(signed)
+    }
+
+    fn sent_record(&self, txid: &Commitment) -> Result<Sent> {
+        let rtxn = self.env.read_txn()?;
+        let b = self.sent.get(&rtxn, &digest_to_bytes(txid))?.ok_or(WalletError::Unknown)?;
+        Sent::from_bytes(*txid, b).ok_or(WalletError::Corrupt("sent"))
+    }
+
+    /// Speeds up a finalized payment (or burn, or name transaction) that
+    /// is not yet confirmed: signs a replacement with the same outputs but
+    /// the change, which pays the higher `fee` (at least
+    /// [`Wallet::min_bump_fee`]; at a rate, that rate on its size), using
+    /// each input's next leaf. Change that would fall below the dust limit
+    /// goes to the fee whole. The recipient's output, and so its receipt,
+    /// stand: the payment's record moves to the replacement.
+    pub fn bump_sent(&self, txid: &Commitment, fee: impl Into<Fee>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
+        let sent = self.sent_record(txid)?;
+        let min = Self::min_bump_fee(&sent);
+        let fee = match fee.into() {
+            Fee::Total(f) => f,
+            Fee::PerByte(r) => min.max(r.saturating_mul(sent.size as u64)),
+        };
+        if fee < min {
+            return Err(WalletError::FeeTooLow { min });
+        }
+        let mut inputs = Vec::with_capacity(sent.inputs.len());
+        for c in &sent.inputs {
+            let o = self.owned(c)?.ok_or(WalletError::Corrupt("sent input"))?;
+            if !self.held(&o, utxo, rtxn)? {
+                return Err(WalletError::Landed);
+            }
+            inputs.push((self.key(&o.nonce).public_key(), o.amount));
+        }
+        // The change: the one output of the transaction this wallet holds.
+        let mut change = None;
+        for (i, o) in sent.tx.outputs.iter().enumerate() {
+            if self.owned(&o.commitment)?.is_some() {
+                change = Some(i);
+            }
+        }
+        let i = change.ok_or(WalletError::BadSlate("no change to pay a higher fee from; cancel it instead"))?;
+        let more = fee - sent.fee;
+        let have = sent.tx.outputs[i].amount;
+        let mut outputs = sent.tx.outputs.clone();
+        let (fee, fresh) = if have >= more && have - more >= Policy::MAINNET.dust {
+            let out = self.receive(have - more)?;
+            outputs[i] = out;
+            (fee, Some(out.commitment))
+        } else if have >= more {
+            outputs.remove(i);
+            (sent.fee + have, None)
+        } else {
+            return Err(WalletError::Insufficient { have: have as u128 + sent.fee as u128, need: fee as u128 });
+        };
+        let mut wtxn = self.env.write_txn()?;
+        let unsigned = UnsignedTransaction::with_ops(inputs, outputs, sent.tx.ops.clone());
+        let signed = match self.sign(&mut wtxn, unsigned, &sent.inputs) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(wtxn);
+                if let Some(c) = fresh {
+                    self.forget(&c)?;
+                }
+                return Err(e);
+            }
+        };
+        let next = Sent {
+            txid: signed.tx.txid(),
+            inputs: sent.inputs,
+            fee,
+            size: signed.tx.size(),
+            created: unix_now(),
+            tx: signed.tx.clone(),
+        };
+        self.sent.delete(&mut wtxn, &digest_to_bytes(txid))?;
+        self.sent.put(&mut wtxn, &digest_to_bytes(&next.txid), &next.to_bytes())?;
+        if let Some(b) = self.payments.get(&wtxn, &digest_to_bytes(txid))? {
+            let mut p = Payment::from_bytes(*txid, b).ok_or(WalletError::Corrupt("payment"))?;
+            p.txid = next.txid;
+            self.payments.delete(&mut wtxn, &digest_to_bytes(txid))?;
+            self.payments.put(&mut wtxn, &digest_to_bytes(&next.txid), &p.to_bytes())?;
+        }
+        wtxn.commit()?;
         Ok(signed)
     }
 
@@ -2315,7 +2463,7 @@ impl Wallet {
         amount: u64,
         beneficiary: &Digest,
         purpose: &[u8],
-        fee: Option<u64>,
+        fee: impl Into<Fee>,
         utxo: &UtxoSet,
         rtxn: &RoTxn,
     ) -> Result<Signed> {
@@ -2330,9 +2478,10 @@ impl Wallet {
         let burned = burn.output(amount);
         let coins = self.spendable(utxo, rtxn)?;
         let mut inputs = 1;
-        let given = fee;
+        let given: Fee = fee.into();
+        given.check(Self::payment_size(1))?;
         let fee = loop {
-            let fee = given.unwrap_or_else(|| Self::min_fee(inputs));
+            let fee = given.for_size(Self::payment_size(inputs));
             let need = amount as u128 + fee as u128;
             let mut picked = 0usize;
             let mut total = 0u128;
@@ -2347,7 +2496,7 @@ impl Wallet {
                 return Err(WalletError::Insufficient { have: total, need });
             }
             let min = Self::min_fee(picked.max(1));
-            if given.is_some() && fee < min {
+            if given.is_total() && fee < min {
                 return Err(WalletError::FeeTooLow { min });
             }
             if picked <= inputs {
@@ -2852,23 +3001,30 @@ impl Wallet {
     /// The smallest fee a transaction carrying `ops` from `inputs` inputs
     /// with change may pay.
     pub fn min_carry_fee(inputs: usize, ops: &[NameOp]) -> u64 {
-        let size = 16 + inputs * INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>();
-        Policy::MAINNET.min_fee_for(size)
+        Policy::MAINNET.min_fee_for(Self::carry_size(inputs, ops))
+    }
+
+    /// The size of a transaction carrying `ops` from `inputs` inputs
+    /// with change.
+    pub fn carry_size(inputs: usize, ops: &[NameOp]) -> usize {
+        16 + inputs * INPUT_SIZE + OUTPUT_SIZE + ops.iter().map(NameOp::size).sum::<usize>()
     }
 
     /// Signs a transaction of this wallet's that carries `ops` and pays
     /// `fee` (or the smallest the pool takes): confirmed inputs largest
     /// first, change to a fresh output. Recorded like a payment, so it can
     /// be cancelled while unconfirmed.
-    pub fn carry(&self, ops: Vec<NameOp>, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
+    pub fn carry(&self, ops: Vec<NameOp>, fee: impl Into<Fee>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
         if ops.is_empty() {
             return Err(WalletError::Name("nothing to carry".into()));
         }
         let dust = Policy::MAINNET.dust;
         let coins = self.spendable(utxo, rtxn)?;
         let mut inputs = 1;
+        let given: Fee = fee.into();
+        given.check(Self::carry_size(1, &ops))?;
         let fee = loop {
-            let fee = fee.unwrap_or_else(|| Self::min_carry_fee(inputs, &ops));
+            let fee = given.for_size(Self::carry_size(inputs, &ops));
             let mut picked = 0usize;
             let mut total = 0u128;
             for c in &coins {
@@ -2882,7 +3038,7 @@ impl Wallet {
                 return Err(WalletError::Insufficient { have: total, need: fee as u128 });
             }
             let min = Self::min_carry_fee(picked.max(1), &ops);
-            if fee < min {
+            if given.is_total() && fee < min {
                 return Err(WalletError::FeeTooLow { min });
             }
             if picked <= inputs {
@@ -3017,10 +3173,14 @@ impl Wallet {
         Policy::MAINNET.min_fee(inputs, outputs + 1)
     }
 
+    fn fund_size(inputs: usize, outputs: usize) -> usize {
+        16 + inputs * INPUT_SIZE + (outputs + 1) * OUTPUT_SIZE
+    }
+
     /// Pays `outputs` (a channel's funding output, say) from this wallet's
     /// confirmed outputs with `fee` (or the smallest the pool takes), change
     /// to a fresh output; the outputs are tracked by whoever owns them.
-    pub fn fund(&self, outputs: Vec<Output>, fee: Option<u64>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
+    pub fn fund(&self, outputs: Vec<Output>, fee: impl Into<Fee>, utxo: &UtxoSet, rtxn: &RoTxn) -> Result<Signed> {
         if outputs.is_empty() || outputs.iter().any(|o| o.amount == 0) {
             return Err(WalletError::BadSlate("nothing to fund"));
         }
@@ -3028,9 +3188,10 @@ impl Wallet {
         let dust = Policy::MAINNET.dust;
         let coins = self.spendable(utxo, rtxn)?;
         let mut inputs = 1;
-        let given = fee;
+        let given: Fee = fee.into();
+        given.check(Self::fund_size(1, outputs.len()))?;
         let fee = loop {
-            let fee = given.unwrap_or_else(|| Self::min_fund_fee(inputs, outputs.len()));
+            let fee = given.for_size(Self::fund_size(inputs, outputs.len()));
             let need = amount + fee as u128;
             let mut picked = 0usize;
             let mut total = 0u128;
@@ -3045,7 +3206,7 @@ impl Wallet {
                 return Err(WalletError::Insufficient { have: total, need });
             }
             let min = Self::min_fund_fee(picked.max(1), outputs.len());
-            if given.is_some() && fee < min {
+            if given.is_total() && fee < min {
                 return Err(WalletError::FeeTooLow { min });
             }
             if picked <= inputs {
@@ -3889,6 +4050,71 @@ mod tests {
         assert_eq!(alice.balance(&u, &rtxn).unwrap().reserved, 0);
         assert!(matches!(alice.cancel_slate(&s2.id), Err(WalletError::Unknown)));
         assert_eq!(digest_from_hex(&s2.id_hex()), Some(s2.id));
+    }
+
+    /// docs/FEES.md: a bump keeps the recipient's output and its receipt,
+    /// takes the higher fee from the change, and moves the payment's record;
+    /// a fee given as a rate follows from the inputs taken.
+    #[test]
+    fn bump_pays_more_from_the_change() {
+        let dir = TempDir::new("bump");
+        let (env, u) = utxo(&dir);
+        let (alice, _) = Wallet::open(&dir.0.join("alice")).unwrap();
+        let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
+        let a1 = alice.receive(60_000_000).unwrap();
+        let a2 = alice.receive(50_000_000).unwrap();
+        land(&env, &u, &alice, &[&a1, &a2]);
+        let rtxn = env.read_txn().unwrap();
+        // A rate: that rate on the size of a payment from the inputs taken.
+        assert!(matches!(
+            alice.send(70_000_000, Fee::PerByte(MIN_FEE_PER_BYTE - 1), false, &u, &rtxn),
+            Err(WalletError::FeeTooLow { .. })
+        ));
+        let mut slate = alice.send(70_000_000, Fee::PerByte(25), false, &u, &rtxn).unwrap();
+        assert_eq!(slate.fee, 25 * Wallet::payment_size(2) as u64);
+        bob.receive_slate(&mut slate).unwrap();
+        let tx = alice.finalize(&slate).unwrap().tx;
+        assert_eq!(tx.size(), Wallet::payment_size(2));
+        let sent = alice.sent(&u, &rtxn).unwrap().remove(0);
+        let min = Wallet::min_bump_fee(&sent);
+        assert_eq!(min, slate.fee + REPLACEMENT_FEE_PER_BYTE * tx.size() as u64);
+        assert!(matches!(alice.bump_sent(&tx.txid(), Some(min - 1), &u, &rtxn), Err(WalletError::FeeTooLow { .. })));
+        // At a rate below what it takes: the smallest bump.
+        let bumped = alice.bump_sent(&tx.txid(), Fee::PerByte(MIN_FEE_PER_BYTE), &u, &rtxn).unwrap().tx;
+        assert!(bumped.verify_signatures());
+        assert_eq!(bumped.balance() as u64, min);
+        assert_eq!(bumped.spent_commitments(), tx.spent_commitments());
+        assert_eq!(bumped.inputs[0].signature.index, 1);
+        // Bob's output stands; the change pays the difference.
+        assert_eq!(bumped.outputs[1], tx.outputs[1]);
+        assert_eq!(bumped.outputs[0].amount, tx.outputs[0].amount - (min - slate.fee));
+        // The payment, with its receipt, now names the bump.
+        let payments = alice.payments().unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].txid, bumped.txid());
+        assert_eq!(payments[0].output, tx.outputs[1]);
+        assert!(matches!(alice.bump_sent(&tx.txid(), None, &u, &rtxn), Err(WalletError::Unknown)));
+        // A bump the change cannot pay is refused; one taking it to dust
+        // gives it all to the fee and drops the change output.
+        let change = bumped.outputs[0].amount;
+        let fee = bumped.balance() as u64;
+        assert!(matches!(
+            alice.bump_sent(&bumped.txid(), Some(fee + change + 1), &u, &rtxn),
+            Err(WalletError::Insufficient { .. })
+        ));
+        let all = alice.bump_sent(&bumped.txid(), Some(fee + change - DUST + 1), &u, &rtxn).unwrap().tx;
+        assert_eq!(all.outputs, vec![tx.outputs[1]]);
+        assert_eq!(all.balance() as u64, fee + change);
+        // With no change left, only a cancel can pay more.
+        assert!(matches!(alice.bump_sent(&all.txid(), Some(fee + change + min), &u, &rtxn), Err(WalletError::BadSlate(_))));
+        // A cancel's smallest fee is the increment on its own size.
+        let sent = alice.sent(&u, &rtxn).unwrap().remove(0);
+        let cancel = alice.cancel_sent(&all.txid(), None, &u, &rtxn).unwrap().tx;
+        assert_eq!(cancel.balance() as u64, Wallet::min_replacement_fee(&sent));
+        assert_eq!(
+            Wallet::min_replacement_fee(&sent),
+            sent.fee + REPLACEMENT_FEE_PER_BYTE * cancel.size() as u64
+        );
     }
 
     /// A name operation no transaction could carry (no funds) is undone, so

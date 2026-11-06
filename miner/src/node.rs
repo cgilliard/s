@@ -2924,10 +2924,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn revalidate_mempool(&mut self, fork: Option<u32>) {
         let tip = self.chain.tip().ok().flatten().map_or(0, |t| t.height);
         let mut moved: HashMap<crate::transaction::Commitment, Vec<u64>> = HashMap::new();
-        if let Some(fork) = fork {
-            for h in fork + 1..=tip {
-                if let Ok(Some((_, first, outputs))) = self.chain.main_outputs(h) {
-                    for (i, o) in outputs.iter().enumerate() {
+        // What the new blocks made: a pooled transaction whose outputs are
+        // all among them confirmed (blocks carry no transactions).
+        let mut created = std::collections::HashSet::new();
+        for h in fork.map_or(tip, |f| f + 1)..=tip {
+            if let Ok(Some((_, first, outputs))) = self.chain.main_outputs(h) {
+                for (i, o) in outputs.iter().enumerate() {
+                    created.insert(o.commitment);
+                    if fork.is_some() {
                         moved.entry(o.commitment).or_default().push(first + i as u64);
                     }
                 }
@@ -2937,7 +2941,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         };
         let height = tip + 1;
-        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), self.chain.names(), &rtxn, height, &moved) {
+        match self.mempool.lock().unwrap().revalidate(self.chain.utxo(), self.chain.names(), &rtxn, height, &moved, &created) {
             Ok((gone, back)) if gone + back > 0 => {
                 self.chatter(&format!("mempool: {gone} transactions confirmed or conflicted, {back} restored"));
             }
@@ -7513,7 +7517,7 @@ mod tests {
             let (gone, back) = pool_a
                 .lock()
                 .unwrap()
-                .revalidate(a.chain.utxo(), a.chain.names(), &rtxn, height, &HashMap::new())
+                .revalidate(a.chain.utxo(), a.chain.names(), &rtxn, height, &HashMap::new(), &Default::default())
                 .unwrap();
             assert_eq!((gone, back), (1, 0), "T3 left the pool, confirmed");
         }
