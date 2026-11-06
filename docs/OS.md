@@ -366,7 +366,17 @@ kernel too much to add at the end.
 1. **The kernel's skeleton, on one hart.** It boots from tabernacle in
    place of `src/img.fam`: a trap handler, the console, the timer's
    interrupt, the page allocator. Done when it boots and its timer
-   ticks steadily.
+   ticks steadily. Done (2026-11-06): `src/kernel.fam` and
+   `src/boot.fam` are the image. One trap entry saves x1-x31 (by way of
+   `mscratch`) and calls `ktrap`, on the kernel's own stacks; the timer
+   ticks 100 times a second, each tick set a period after the last; an
+   exception in the kernel prints its cause and address and stops; the
+   pages are a sorted table of free ranges (first fit, merged when
+   freed); 126 MiB of 128 come up free. `scripts/oscheck.sh` (in CI
+   beside `check.sh`): the kernel's tests (the allocator, also over 1000
+   random takes and gives back; 20 ticks none early; a long computation
+   interrupted throughout coming out the same), a fault reported, and
+   the image booting under q32 and through tabernacle from disk.
 2. **The store's benchmark.** Beside the kernel, a bare-metal program
    (as `gen_hash` is) with virtio-blk and the copy-on-write B+ tree's
    core (pages, alternating meta pages, the commit), timed on a block's

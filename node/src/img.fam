@@ -1,6 +1,0 @@
-\ img.fam — the node image, for now a placeholder: tabernacle boots it
-\ (docs/TABERNACLE.md), and it says so.  scripts/build.sh builds it as bin/img
-\ and patches its size and hash into bin/tabernacle.
-
-"hello world\n" puts
-bye

@@ -116,8 +116,9 @@ jobs:
 
   # The fam compiler (node/): rebuilt from the 168-byte seed under QEMU
   # (scripts/build.sh checks the rebuilt fam0 against the seed), then its
-  # regression checks (scripts/check.sh).  Linux and macOS only: QEMU's
-  # serial port on Windows loses bytes (WSL2 is Linux).
+  # regression checks (scripts/check.sh) and the OS's (scripts/oscheck.sh).
+  # Linux and macOS only: QEMU's serial port on Windows loses bytes (WSL2 is
+  # Linux).
   compiler:
     name: compiler ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -145,6 +146,8 @@ jobs:
         run: sh scripts/build.sh
       - name: Checks
         run: sh scripts/check.sh
+      - name: OS checks
+        run: sh scripts/oscheck.sh
 
   # Every test marked slow has a job above.
   slow-listed:

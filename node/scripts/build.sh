@@ -1,8 +1,9 @@
 #!/bin/sh
 # build.sh — rebuild the fam compiler from the 168-byte seed under QEMU (fam0,
 # checked against the seed, then fam and fampack), then gen_hash, the node
-# image (src/img.fam, a placeholder for now) and tabernacle, patched for that
-# image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as tools/q32.
+# image (the OS: src/kernel.fam and src/boot.fam) and tabernacle, patched for
+# that image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as
+# tools/q32.
 # Runs from anywhere: it works in the tree it belongs to.
 set -e
 cd "$(dirname "$0")/.."
@@ -101,7 +102,7 @@ run bin/fam.uncompressed bin/fam0 src/fam.fam0
 run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
-run bin/img bin/fam lib/stdlib.fam src/img.fam
+run bin/img bin/fam lib/stdlib.fam lib/build.fam src/kernel.fam src/boot.fam
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"
 pack bin/tabernacle.uncompressed bin/tabernacle

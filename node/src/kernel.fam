@@ -1,0 +1,476 @@
+\ kernel.fam — the OS's kernel (docs/OS.md), step 1: its skeleton, on one
+\ hart.  The traps (every interrupt and exception comes through one entry,
+\ which saves the registers and calls ktrap), the timer (100 ticks a
+\ second), and the page allocator (RAM in 4 KiB pages, a sorted list of
+\ free ranges, first fit, neighbours merged when freed).
+\
+\ Definitions only: src/boot.fam is the kernel's main, and the Test blocks
+\ below run with `tools/fam --test src/kernel.fam` (scripts/oscheck.sh).
+\
+\ The kernel runs in machine mode on the stdlib's stacks (data stack sp,
+\ return ids s10/s11, loop frames s8).  A trap arriving in kernel code uses
+\ them too, below what the interrupted code holds: fam only ever stores to a
+\ stack after moving its pointer past the slot, so nothing there is lost.
+
+\ ── Machine registers (raw words) ──
+
+: mcause@                    \ ( -- mcause )
+F3222034 ,   \ csrrs t0,mcause,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mepc@                      \ ( -- mepc )
+F3221034 ,   \ csrrs t0,mepc,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mtval@                     \ ( -- mtval )
+F3223034 ,   \ csrrs t0,mtval,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: gp@                        \ ( -- gp )  the heap's next free byte
+93820100 ,   \ addi t0,gp,0
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mtime@                     \ ( -- t )  the CLINT's mtime, low word (10 MHz)
+B7C20002 ,   \ lui t0,0x200c
+03A382FF ,   \ lw t1,-8(t0)
+1301C1FF ,   \ addi sp,sp,-4
+23206100 ,   \ sw t1,0(sp)
+;
+
+: cmp@                       \ ( -- lo hi )  hart 0's mtimecmp
+B7420002 ,   \ lui t0,0x2004
+03A30200 ,   \ lw t1,0(t0)
+83A34200 ,   \ lw t2,4(t0)
+130181FF ,   \ addi sp,sp,-8
+23226100 ,   \ sw t1,4(sp)
+23207100 ,   \ sw t2,0(sp)
+;
+
+\ cmp! ( lo hi -- )  hart 0's mtimecmp: the high word set out of reach
+\ first, so no half-written value is ever due.
+: cmp!
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+13018100 ,   \ addi sp,sp,8
+B7420002 ,   \ lui t0,0x2004
+130EF0FF ,   \ addi t3,zero,-1
+23A2C201 ,   \ sw t3,4(t0)
+23A06200 ,   \ sw t1,0(t0)
+23A27200 ,   \ sw t2,4(t0)
+;
+
+: tmron                      \ timer interrupts on (mie.MTIE, mstatus.MIE)
+93020008 ,   \ addi t0,zero,128
+73A04230 ,   \ csrrs zero,mie,t0
+73600430 ,   \ csrrsi zero,mstatus,8
+;
+
+: tmroff                     \ timer interrupts off
+93020008 ,   \ addi t0,zero,128
+73B04230 ,   \ csrrc zero,mie,t0
+;
+
+: wfi                        \ sleep until an interrupt is pending
+73005010 ,   \ wfi
+;
+
+\ halt ( code -- )  QEMU exits with code (the SiFive test finisher).
+: halt
+03230100 ,   \ lw t1,0(sp)
+13014100 ,   \ addi sp,sp,4
+B7021000 ,   \ lui t0,0x100
+13130301 ,   \ slli t1,t1,0x10
+B7330000 ,   \ lui t2,0x3
+93833333 ,   \ addi t2,t2,819
+33637300 ,   \ or t1,t1,t2
+23A06200 ,   \ sw t1,0(t0)
+6F000000 ,   \ jal zero,.
+;
+
+\ panic ( msg -- )  a kernel bug: say so and stop.
+: panic  "kernel panic: " puts puts 0A lit putc 1 lit halt ;
+
+\ rnd ( -- n )  xorshift32 over rndseed: not for secrets; the lottery's
+\ draws (step 5) and tests.  rndseed must not be 0.
+: rndseed variable ;
+: rnd
+rndseed @
+dup D lit lshift xor
+dup 11 lit rshift xor
+dup 5 lit lshift xor
+dup rndseed ! ;
+
+\ ── The timer ──
+
+: ticks   variable ;         \ timer interrupts taken
+: period  variable ;         \ mtime between them
+
+\ ktick  the timer's interrupt: count it, and set the next one a period on
+\ from this one's (not from now: the rate does not drift).
+: ktick
+ticks @ 1 lit + ticks !
+cmp@                         \ ( lo hi )
+swap period @ +              \ ( hi lo' )
+dup period @ u< if swap 1 lit + swap then   \ the low word wrapped: carry
+swap cmp! ;
+
+\ tmrinit  100 ticks a second (10 ms slices), the first a period from now.
+: tmrinit
+186A0 lit period !           \ 100,000 at 10 MHz
+0 lit ticks !
+mtime@ period @ +            \ ( lo' )
+200BFFC lit @                \ ( lo' hi )  mtime's high word, carried
+over period @ u< if 1 lit + then
+cmp!
+tmron ;
+
+\ ── Traps ──
+
+\ kfault  an exception (or an interrupt nobody takes) in the kernel: a bug.
+: kfault
+"kernel: trap " puts mcause@ u.x
+" at " puts mepc@ u.x
+" (" puts mtval@ u.x ")" puts 0A lit putc
+1 lit halt ;
+
+\ ktrap  what the entry calls, with every register saved.
+: ktrap
+mcause@ 80000007 lit = if ktick else kfault then ;
+
+\ [skip ... skip]  compile the code between where it is but jump over it.
+:I [skip  here ,j0 ;
+:I skip]  jpat! ;
+
+\ trapinit  the trap entry: mscratch holds a 128-byte area where the entry
+\ saves x1-x31 (x5 by way of mscratch itself) before calling ktrap, and
+\ from where it restores them for mret.  mtvec points at the entry, 16
+\ bytes past the auipc (auipc, addi, csrw, and [skip's jump).
+: trapinit
+80 lit alloc
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+73900234 ,   \ csrrw zero,mscratch,t0
+97020000 ,   \ auipc t0,0x0
+93820201 ,   \ addi t0,t0,16
+73905230 ,   \ csrrw zero,mtvec,t0
+[skip
+F3920234 ,   \ csrrw t0,mscratch,t0      ( t0 = the area, mscratch = t0 )
+23A21200 ,   \ sw ra,4(t0)
+23A42200 ,   \ sw sp,8(t0)
+23A63200 ,   \ sw gp,12(t0)
+23A84200 ,   \ sw tp,16(t0)
+23AC6200 ,   \ sw t1,24(t0)
+23AE7200 ,   \ sw t2,28(t0)
+23A08202 ,   \ sw s0,32(t0)
+23A29202 ,   \ sw s1,36(t0)
+23A4A202 ,   \ sw a0,40(t0)
+23A6B202 ,   \ sw a1,44(t0)
+23A8C202 ,   \ sw a2,48(t0)
+23AAD202 ,   \ sw a3,52(t0)
+23ACE202 ,   \ sw a4,56(t0)
+23AEF202 ,   \ sw a5,60(t0)
+23A00205 ,   \ sw a6,64(t0)
+23A21205 ,   \ sw a7,68(t0)
+23A42205 ,   \ sw s2,72(t0)
+23A63205 ,   \ sw s3,76(t0)
+23A84205 ,   \ sw s4,80(t0)
+23AA5205 ,   \ sw s5,84(t0)
+23AC6205 ,   \ sw s6,88(t0)
+23AE7205 ,   \ sw s7,92(t0)
+23A08207 ,   \ sw s8,96(t0)
+23A29207 ,   \ sw s9,100(t0)
+23A4A207 ,   \ sw s10,104(t0)
+23A6B207 ,   \ sw s11,108(t0)
+23A8C207 ,   \ sw t3,112(t0)
+23AAD207 ,   \ sw t4,116(t0)
+23ACE207 ,   \ sw t5,120(t0)
+23AEF207 ,   \ sw t6,124(t0)
+73230034 ,   \ csrrs t1,mscratch,zero    ( the interrupted t0 )
+23AA6200 ,   \ sw t1,20(t0)
+73900234 ,   \ csrrw zero,mscratch,t0    ( mscratch = the area again )
+ktrap
+F3220034 ,   \ csrrs t0,mscratch,zero
+83A04200 ,   \ lw ra,4(t0)
+03A18200 ,   \ lw sp,8(t0)
+83A1C200 ,   \ lw gp,12(t0)
+03A20201 ,   \ lw tp,16(t0)
+03A38201 ,   \ lw t1,24(t0)
+83A3C201 ,   \ lw t2,28(t0)
+03A40202 ,   \ lw s0,32(t0)
+83A44202 ,   \ lw s1,36(t0)
+03A58202 ,   \ lw a0,40(t0)
+83A5C202 ,   \ lw a1,44(t0)
+03A60203 ,   \ lw a2,48(t0)
+83A64203 ,   \ lw a3,52(t0)
+03A78203 ,   \ lw a4,56(t0)
+83A7C203 ,   \ lw a5,60(t0)
+03A80204 ,   \ lw a6,64(t0)
+83A84204 ,   \ lw a7,68(t0)
+03A98204 ,   \ lw s2,72(t0)
+83A9C204 ,   \ lw s3,76(t0)
+03AA0205 ,   \ lw s4,80(t0)
+83AA4205 ,   \ lw s5,84(t0)
+03AB8205 ,   \ lw s6,88(t0)
+83ABC205 ,   \ lw s7,92(t0)
+03AC0206 ,   \ lw s8,96(t0)
+83AC4206 ,   \ lw s9,100(t0)
+03AD8206 ,   \ lw s10,104(t0)
+83ADC206 ,   \ lw s11,108(t0)
+03AE0207 ,   \ lw t3,112(t0)
+83AE4207 ,   \ lw t4,116(t0)
+03AF8207 ,   \ lw t5,120(t0)
+83AFC207 ,   \ lw t6,124(t0)
+83A24201 ,   \ lw t0,20(t0)
+73002030 ,   \ mret
+skip]
+;
+
+\ ── Pages ──
+\
+\ The free ranges, sorted by address: an entry is the range's first byte
+\ and its length in pages.  A range never touches the next (they are
+\ merged when freed), so the table holds as many entries as RAM has holes.
+
+: pgtab  variable ;          \ the table: PGMAX entries of 8 bytes
+: pgn    variable ;          \ entries in use
+: PGMAX  200 lit ;           \ 512 entries, one 4 KiB page
+
+: pgent  3 lit lshift pgtab @ + ;            \ ( i -- entry )
+: pglen  pgent 4 lit + @ ;                   \ ( i -- pages )
+: pgend  pgent dup @ swap 4 lit + @ C lit lshift + ;   \ ( i -- end )
+
+\ pginit ( base limit -- )  all of [base, limit) free, page-aligned.  The
+\ table is taken from the heap the first time.
+: pginit
+pgtab @ 0= if 1000 lit alloc pgtab ! then
+over - C lit rshift          \ ( base pages )
+pgtab @ 4 lit + !
+pgtab @ !
+1 lit pgn ! ;
+
+\ pgdel ( i -- )  remove entry i.
+: pgdel
+begin
+dup 1 lit + pgn @ u<
+while
+dup 1 lit + pgent            \ ( i src )
+over pgent                   \ ( i src dst )
+over @ over !
+swap 4 lit + @ swap 4 lit + !
+1 lit +
+repeat
+drop
+pgn @ 1 lit - pgn ! ;
+
+\ pgins ( start pages i -- )  a new entry i, those from i on moved up.
+: pgins
+pgn @ PGMAX = if "page table full" panic then
+pgn @                        \ ( start pages i j )
+begin
+2dup u<
+while
+1 lit - dup pgent            \ ( start pages i j-1 src )
+dup 8 lit +                  \ ( ... src dst )
+over @ over !
+swap 4 lit + @ swap 4 lit + !
+repeat
+drop pgent                   \ ( start pages e )
+tuck 4 lit + !
+!
+pgn @ 1 lit + pgn ! ;
+
+\ pgfit ( pages -- i )  the first range at least that long (pgn: none).
+: pgfit
+0 lit
+begin
+dup pgn @ u<
+if 2dup pglen u> else 0 lit then
+while
+1 lit +
+repeat
+nip ;
+
+\ pgalloc ( pages -- addr | 0 )  first fit, taken from the range's start.
+: pgalloc
+dup pgfit                    \ ( pages i )
+dup pgn @ u< 0= if
+2drop 0 lit
+else
+swap over pgent              \ ( i pages e )
+2dup 4 lit + @ swap -        \ ( i pages e left )
+over 4 lit + !               \ ( i pages e )
+dup @                        \ ( i pages e start )
+rot C lit lshift             \ ( i e start bytes )
+over +                       \ ( i e start start' )
+rot !                        \ ( i start )
+swap
+dup pglen 0= if pgdel else drop then
+then ;
+
+\ pgafter ( addr -- i )  the first range starting above addr.
+: pgafter
+0 lit
+begin
+dup pgn @ u<
+if 2dup pgent @ u> else 0 lit then
+while
+1 lit +
+repeat
+nip ;
+
+\ pgfree ( addr pages -- )  back into the table, merged with the range
+\ before it and the one after when they touch.
+: pgfree
+over pgafter                 \ ( addr pages i )
+dup if dup 1 lit - pgend 3 lit pick = else 0 lit then
+if
+\ it extends the range before
+dup 1 lit - pgent 4 lit +    \ ( addr pages i lenp )
+dup @ 3 lit pick + swap !    \ ( addr pages i )
+dup pgn @ u< if
+dup 1 lit - pgend over pgent @ = if
+\ and now reaches the one after: join them
+dup pglen
+over 1 lit - pgent 4 lit +
+dup @ rot + swap !
+dup pgdel
+then
+then
+drop 2drop
+else
+dup pgn @ u< if 2 lit pick 2 lit pick C lit lshift + over pgent @ = else 0 lit then
+if
+\ it reaches back to the range after
+pgent                        \ ( addr pages e )
+dup 4 lit + dup @ 3 lit pick + swap !
+nip !
+else
+pgins
+then
+then ;
+
+\ pgfree# ( -- pages )  free pages in all.
+: pgfree#
+0 lit pgn @ 0 lit do i pglen + loop ;
+
+\ pgtag ( addr pages -- )  tests: each page's first word set to addr.
+: pgtag  0 lit do dup i C lit lshift + over swap ! loop drop ;
+\ pgchk ( addr pages -- ok )  tests: each page's first word still addr.
+: pgchk  1 lit -rot 0 lit do dup i C lit lshift + @ over = rot and swap loop drop ;
+
+Test {
+	pg_one {
+		\ a range of 64 pages: three taken in a row, given back in another
+		\ order, and the table whole again
+		41000 lit alloc FFF lit + FFFFF000 lit and
+		dup dup 40000 lit + pginit           \ ( base )
+		pgfree# 40 lit asrt_eq
+		1 lit pgalloc over asrt_eq
+		2 lit pgalloc over 1000 lit + asrt_eq
+		3 lit pgalloc over 3000 lit + asrt_eq
+		pgfree# 3A lit asrt_eq
+		pgn @ 1 lit asrt_eq
+		dup 1000 lit + 2 lit pgfree          \ a hole in the middle
+		pgn @ 2 lit asrt_eq
+		dup 1 lit pgfree                     \ joins it
+		pgn @ 2 lit asrt_eq
+		dup 3000 lit + 3 lit pgfree          \ joins both sides
+		pgn @ 1 lit asrt_eq
+		pgfree# 40 lit asrt_eq
+		drop
+	}
+	pg_full {
+		\ running out, and coming back
+		41000 lit alloc FFF lit + FFFFF000 lit and
+		dup dup 40000 lit + pginit
+		41 lit pgalloc 0 lit asrt_eq
+		40 lit pgalloc over asrt_eq
+		pgn @ 0 lit asrt_eq
+		1 lit pgalloc 0 lit asrt_eq
+		dup 40 lit pgfree
+		pgn @ 1 lit asrt_eq
+		pgfree# 40 lit asrt_eq
+		drop
+	}
+	pg_holes {
+		\ every page taken one by one; every other given back (32 ranges),
+		\ then the rest (one again)
+		41000 lit alloc FFF lit + FFFFF000 lit and
+		dup dup 40000 lit + pginit
+		40 lit 0 lit do 1 lit pgalloc drop loop
+		pgn @ 0 lit asrt_eq
+		20 lit 0 lit do dup i D lit lshift + 1 lit pgfree loop
+		pgn @ 20 lit asrt_eq
+		20 lit 0 lit do dup i D lit lshift + 1000 lit + 1 lit pgfree loop
+		pgn @ 1 lit asrt_eq
+		pgfree# 40 lit asrt_eq
+		drop
+	}
+	pg_rand {
+		\ 1000 random takes and gives back over 16 slots, each block's
+		\ pages tagged with its address and checked when it is given
+		\ back (so no two blocks ever overlapped); at the end, whole
+		41000 lit alloc FFF lit + FFFFF000 lit and
+		dup 40000 lit + pginit
+		80 lit alloc                         \ ( S: 16 slots, address and pages )
+		20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+		1234567 lit rndseed !
+		3E8 lit 0 lit do
+			rnd F lit and 3 lit lshift over +        \ ( S slot )
+			dup @ if
+				dup @ over 4 lit + @ pgchk assert
+				dup @ over 4 lit + @ pgfree
+				0 lit over !
+			else
+				rnd 7 lit and 1 lit +                \ ( S slot pages )
+				dup pgalloc                          \ ( S slot pages addr )
+				dup if
+					2dup swap pgtag
+					2 lit pick !
+					over 4 lit + !
+				else
+					2drop
+				then
+			then
+			drop
+		loop
+		10 lit 0 lit do
+			dup i 3 lit lshift + dup @ if dup @ swap 4 lit + @ pgfree else drop then
+		loop
+		drop
+		pgn @ 1 lit asrt_eq
+		pgfree# 40 lit asrt_eq
+	}
+	tm_busy {
+		\ a long computation interrupted by the timer again and again comes
+		\ out as it does uninterrupted: the entry saves and restores
+		\ everything it should
+		1234567 lit rndseed !
+		100000 lit 0 lit do rnd drop loop
+		rndseed @                            \ ( undisturbed )
+		trapinit tmrinit
+		1234567 lit rndseed !
+		100000 lit 0 lit do rnd drop loop
+		tmroff
+		rndseed @ asrt_eq
+		ticks @ 2 lit u< 0= assert           \ and it was interrupted
+	}
+	timer {
+		\ 20 ticks, each a period at least after the last: none early, and
+		\ they keep coming
+		trapinit tmrinit
+		mtime@
+		begin ticks @ 14 lit u< while wfi repeat
+		tmroff
+		mtime@ swap -                        \ elapsed
+		period @ 13 lit * u< 0= assert       \ at least 19 periods
+	}
+}

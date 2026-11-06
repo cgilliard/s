@@ -1,0 +1,16 @@
+\ boot.fam — the kernel's main (docs/OS.md): what the node image does when
+\ tabernacle hands it the machine.  Built after src/kernel.fam as bin/img
+\ (scripts/build.sh), the image tabernacle is patched for.
+\
+\ Memory, from the bottom: the image; the stdlib's return-id stack and
+\ variables; the kernel's heap (64 KiB kept for what it takes before the
+\ pages are counted); the pages, up to 0x87F00000; the kernel's data stack
+\ below 0x87FF0000; the loop-frame stack above it.
+
+trapinit
+gp@ 10000 lit + FFF lit + FFFFF000 lit and
+87F00000 lit pginit
+"kernel: " puts pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
+0A lit putc
+tmrinit
+begin wfi 0 lit until

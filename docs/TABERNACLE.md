@@ -19,8 +19,8 @@ the placeholder below is one; `fam.fam0` is unchanged by it.)
 A tabernacle binary is built for exactly one version of the node image,
 and fetches only that version. At its end, `scripts/build.sh` patches in
 (`patch_config`, as the old build's did) for `bin/img`, the node image
-built from `src/img.fam` (a placeholder that prints "hello world" for
-now), at `IMAGE_VERSION`:
+(the OS: `src/kernel.fam` and `src/boot.fam`, `docs/OS.md`), at
+`IMAGE_VERSION`:
 
 ```text
 … code … ‖ version (4, LE) ‖ size (4, LE) ‖ Gimli-Hash of the image (32)
@@ -192,8 +192,8 @@ server.py [--peer=IP:PORT ...] PORT [VERSION=FILE ...]
 
 ## Implementation order
 
-1. `src/gen_hash.fam` built by `build.sh`; `patch_config` back, for
-   `src/img.fam`. Done (2026-11-06).
+1. `src/gen_hash.fam` built by `build.sh`; `patch_config` back, for the
+   node image. Done (2026-11-06).
 2. `tools/server.py`. Done (2026-11-06).
 3. `src/tabernacle.S` and its `.fam0`: the disk check; virtio-net, ARP
    and UDP; discovery and download in one loop; the seeds last; the
