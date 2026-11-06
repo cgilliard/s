@@ -244,7 +244,7 @@ const HELP: &str = "commands:
                             asked at every start
   storage                   disk use of the chain database, part by part
   quit                      stop the node
-amounts are coins with up to eight decimals, e.g. 1.5";
+amounts are coins with up to ten decimals, e.g. 1.5";
 
 /// LMDB map size: 1 TiB. It is only an upper bound, reserved as address
 /// space: the file grows as data is written (a Bitcoin-sized output set
@@ -506,20 +506,23 @@ fn secs(d: Duration) -> String {
     format!("{:.2}s", d.as_secs_f64())
 }
 
-/// Coins as whole units with eight decimals.
+/// Coins as whole units with all their decimals.
 fn fmt_coins(amount: u128) -> String {
-    format!("{}.{:08}", amount / 100_000_000, amount % 100_000_000)
+    let coin = tabminer::chain::COIN as u128;
+    format!("{}.{:0width$}", amount / coin, amount % coin, width = tabminer::chain::DECIMALS)
 }
 
-/// Parses coins with up to eight decimals into base units.
+/// Parses coins with up to [`tabminer::chain::DECIMALS`] decimals into
+/// base units.
 fn parse_coins(s: &str) -> Option<u64> {
+    let places = tabminer::chain::DECIMALS;
     let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
-    if whole.is_empty() && frac.is_empty() || frac.len() > 8 {
+    if whole.is_empty() && frac.is_empty() || frac.len() > places || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
-    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<8}").parse().ok()? };
-    whole.checked_mul(100_000_000)?.checked_add(frac)
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<places$}").parse().ok()? };
+    whole.checked_mul(tabminer::chain::COIN)?.checked_add(frac)
 }
 
 /// Expected hashes to meet `target`: `2^248 / (target + 1)`, as log2.

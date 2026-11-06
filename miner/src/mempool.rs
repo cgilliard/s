@@ -92,11 +92,13 @@ pub const MAX_TX_SIZE: usize = 128 << 10;
 pub const DEFAULT_CAPACITY: usize = 64 << 20;
 /// Shelved transactions kept, at most.
 const SHELF: usize = 1024;
-/// Base units per byte a replacement must add over what it replaces.
-pub const REPLACEMENT_FEE_PER_BYTE: u64 = 1;
+/// Base units per byte a replacement must add over what it replaces
+/// (10^-9 coins, at ten decimals).
+pub const REPLACEMENT_FEE_PER_BYTE: u64 = 10;
 /// Base units per byte a transaction must pay to be pooled at all, so
-/// that filling blocks, and the UTXO set, costs something.
-pub const MIN_FEE_PER_BYTE: u64 = 1;
+/// that filling blocks, and the UTXO set, costs something (10^-9 coins,
+/// at ten decimals; `docs/FEES.md`).
+pub const MIN_FEE_PER_BYTE: u64 = 10;
 /// The smallest output pooled: one worth the fee of spending it at that
 /// rate, so that nobody fills the UTXO set with outputs no one will spend.
 pub const DUST: u64 = (INPUT_SIZE as u64) * MIN_FEE_PER_BYTE;
@@ -780,7 +782,7 @@ mod tests {
         assert_eq!(pool.len(), 2);
         // Conflicts, unknown inputs, negative fees, bad signatures, rewards.
         let double = spend(1, 100_000, 6);
-        let min = 5 + double.size() as u64;
+        let min = 5 + REPLACEMENT_FEE_PER_BYTE * double.size() as u64;
         assert_eq!(pool.insert(double, &utxo, &names, &rtxn, 1), Err(Reject::ReplacementFee { min }));
         let unknown = spend(4, 7, 1);
         assert!(matches!(pool.insert(unknown, &utxo, &names, &rtxn, 1), Err(Reject::UnknownInput(_))));
@@ -826,10 +828,10 @@ mod tests {
         assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new()).unwrap(), (0, 1));
         assert!(pool.contains(&id1));
 
-        // Replacement: paying the old fee plus a byte's worth per byte
+        // Replacement: paying the old fee plus the increment per byte
         // takes t1's place.
         let mut k1 = key(1);
-        let bump = 5 + t1.size() as u64;
+        let bump = 5 + REPLACEMENT_FEE_PER_BYTE * t1.size() as u64;
         let mut replacement =
             UnsignedTransaction::new(vec![(k1.public_key(), 100_000)], vec![Output::new(&pk(1), 100_000 - bump)])
                 .sign_with(&mut k1)

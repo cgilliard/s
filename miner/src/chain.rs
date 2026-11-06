@@ -64,8 +64,13 @@ use crate::transaction::Commitment;
 use crate::utxo::Slot;
 use crate::utxo::{self, UtxoSet};
 
-/// Base units per coin.
-pub const COIN: u64 = 100_000_000;
+/// Base units per coin: ten decimals, the most that fits. Every coin the
+/// schedule makes, 735,840,000 of them, is 7.4 × 10^18 base units, which a
+/// `u64` (1.8 × 10^19) holds with room for 2.5 times as many; at eleven
+/// decimals it would not.
+pub const COIN: u64 = 10_000_000_000;
+/// Decimal places of [`COIN`].
+pub const DECIMALS: usize = 10;
 /// Blocks per year at the ten-minute target: 144 a day.
 pub const BLOCKS_PER_YEAR: u32 = 144 * 365;
 

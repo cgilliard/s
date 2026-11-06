@@ -3289,7 +3289,8 @@ mod tests {
                 w.locate(first, &outs).unwrap();
             }
         };
-        let coin = a.receive(10_000).unwrap();
+        // Enough for the opening's fee at the pool's minimum per byte.
+        let coin = a.receive(1_000_000).unwrap();
         land_all(&[&coin], &[&a]);
 
         // Channel keys and the state policy shape.
