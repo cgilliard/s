@@ -5,7 +5,7 @@
 # automatically and the source is EOT-terminated, then fed to the fam compiler
 # (bin/fam) running under q32. Paths are resolved relative to this script.
 #
-# Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+# Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [-o OUTPUT] INPUT.fam [MORE.fam ...]
 #   INPUT.fam    your program(s); multiple files are concatenated in order
 #                (lib/stdlib.fam is prepended for you)
 #   --test       build and run ONLY the Test { ... } block, then delete the binary
@@ -14,7 +14,9 @@
 #   --disk=FILE  attach FILE as a virtio-blk disk when running (forwarded to q32);
 #                lets a Test/Bench block exercise the real disk path (find_blk/
 #                vblkinit/vreq/vpoll). Only meaningful with --test/--bench.
-#   -o OUTPUT    output binary (default: ./a.bin)
+#   --net, --hostfwd=SPEC  virtio-net when running (forwarded to q32; see
+#                q32 --help)
+#   -o OUTPUT    output binary (default: ./a.bin; removed if the compile fails)
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
 # `fam prog.fam --test` compiles, runs the tests, and deletes the binary (like
@@ -46,7 +48,7 @@ while [ $# -gt 0 ]; do
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
-		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [-o OUTPUT] INPUT.fam [MORE.fam ...]"; exit 0 ;;
 		--) shift; IN="$1"; shift ;;
 		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
 		*) IN="$IN $1"; shift ;;
@@ -54,7 +56,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$TEST" = 1 ] && [ "$BENCH" = 1 ]; then echo "fam: --test and --bench are mutually exclusive" >&2; exit 1; fi
-if [ -z "$IN" ]; then echo "Usage: fam [--test|--bench] [-o OUTPUT] INPUT.fam [MORE.fam ...]" >&2; exit 1; fi
+if [ -z "$IN" ]; then echo "Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [-o OUTPUT] INPUT.fam [MORE.fam ...]" >&2; exit 1; fi
 for f in $IN; do
 	if [ ! -f "$f" ]; then echo "fam: input not found: $f" >&2; exit 1; fi
 done
@@ -133,7 +135,7 @@ rm -f "$STREAM"
 MAGIC=$(head -c 4 "$OUT" 2>/dev/null | xxd -p)
 if [ "$MAGIC" != "13000000" ]; then
 	echo "?"
-	[ "$DELETE" = 1 ] && rm -f "$OUT"
+	rm -f "$OUT"
 	exit 1
 fi
 

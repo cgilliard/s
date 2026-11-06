@@ -42,15 +42,15 @@ run() {
 fsize() { wc -c < "$1" | tr -d ' \t'; }
 
 pack() {
-        in=$1; out=$2
-        echo "Packing $in → $out" >&2
-        N=$(fsize "$in")
-        stream="$out.in.$$"
-        { printf "$(printf '\\%03o' $((N&255)) $(((N>>8)&255)) $(((N>>16)&255)) $(((N>>24)&255)))"
-          cat "$in"
-        } > "$stream"
-        serial_qemu "$stream" "$out" -device loader,file=bin/fampack,addr=0x80000000
-        rm -f "$stream"
+	in=$1; out=$2
+	echo "Packing $in → $out" >&2
+	N=$(fsize "$in")
+	stream="$out.in.$$"
+	{ printf "$(printf '\\%03o' $((N&255)) $(((N>>8)&255)) $(((N>>16)&255)) $(((N>>24)&255)))"
+	  cat "$in"
+	} > "$stream"
+	serial_qemu "$stream" "$out" -device loader,file=bin/fampack,addr=0x80000000
+	rm -f "$stream"
 }
 
 run bin/fam0 fam0.seed src/fam0.fam0
