@@ -2,9 +2,13 @@
 """server.py -- serves node images to tabernacle the way a node will
 (docs/TABERNACLE.md), for running on a seed until the fam node does.
 
-Usage: server.py PORT VERSION=FILE [VERSION=FILE ...]
+Usage: server.py [--peer=IP:PORT ...] PORT [VERSION=FILE ...]
 
-Each FILE is served as its VERSION on UDP PORT.  A file is re-read when its
+Each FILE is served as its VERSION on UDP PORT.  Each --peer (IPv4, at most
+32) is handed out in answer to GetPeers, as a node hands out its peers: so
+a server with no images can play a seed, pointing tabernacle at others.
+Addresses are as the asker will reach them (10.0.2.2 is the host, seen from
+a node under scripts/node.sh).  A file is re-read when its
 mtime changes, so a build can be replaced without a restart; its Gimli-Hash
 (as gen_hash and tabernacle compute it) is printed when it is loaded, to
 compare with what was patched into a tabernacle.  Nothing is checked here:
@@ -17,7 +21,8 @@ to a forged address.
   Ping (1)        status (140 bytes; the nonce first)   -> Pong
   Pong (2)        status: the nonce echoed, the token, all else zero (so a
                   tabminer node takes us for another chain, not a peer)
-  GetPeers (3)    token                                 -> Peers, empty
+  GetPeers (3)    token                                 -> Peers
+  Peers (4)       count u8, then 4 address bytes, port u16 each
   GetImages (64)  token                                 -> Images
   Images (65)     count u8, then version u32, size u32 each
   GetImage (66)   token, version u32, count u8, then start u16, len u16 each
@@ -43,19 +48,28 @@ VERBOSE = os.environ.get('VERBOSE', '') != ''
 
 
 def usage():
-    sys.exit("usage: server.py PORT VERSION=FILE [VERSION=FILE ...]")
+    sys.exit("usage: server.py [--peer=IP:PORT ...] PORT [VERSION=FILE ...]")
 
 
-args = sys.argv[1:]
-if len(args) < 2:
-    usage()
+PEERS = b''
+args = []
 try:
+    for a in sys.argv[1:]:
+        if a.startswith('--peer='):
+            ip, port = a[len('--peer='):].rsplit(':', 1)
+            PEERS += socket.inet_aton(ip) + struct.pack('<H', int(port))
+        elif a.startswith('-'):
+            usage()
+        else:
+            args.append(a)
+    if not args or len(PEERS) > 32 * 6:
+        usage()
     PORT = int(args[0])
     IMAGES = {}
     for a in args[1:]:
         v, f = a.split('=', 1)
         IMAGES[int(v)] = {'path': f, 'mtime': None, 'data': b''}
-except ValueError:
+except (ValueError, OSError):
     usage()
 KEY = os.urandom(32)
 
@@ -151,7 +165,7 @@ while True:
     if len(body) < 8 or not hmac.compare_digest(body[:8], token(addr)):
         continue
     if kind == T_GET_PEERS and len(body) == 8:
-        send(sock, addr, T_PEERS, b'\0')
+        send(sock, addr, T_PEERS, bytes([len(PEERS) // 6]) + PEERS)
     elif kind == T_GET_IMAGES and len(body) == 8:
         have = [(v, image(v)) for v in sorted(IMAGES)]
         have = [(v, d) for v, d in have if d is not None][:255]

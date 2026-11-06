@@ -140,14 +140,20 @@ The fam node will not serve its image for a while. Until it does,
 hash) brought to this protocol and to versions:
 
 ```text
-server.py PORT VERSION=FILE [VERSION=FILE ...]
+server.py [--peer=IP:PORT ...] PORT [VERSION=FILE ...]
 ```
 
 - Serves each FILE as its VERSION on UDP PORT: `Ping` answered with a
   `Pong` (all zeros but the nonce and token, so a tabminer node that
-  hears of it takes it for no peer), `GetPeers` with nothing,
+  hears of it takes it for no peer), `GetPeers` with the `--peer`
+  addresses (none by default; at most 32),
   `GetImages` with its versions and sizes, `GetImage` with the chunks
   asked for (at most 64 an ask).
+- With `--peer` and no images it plays a seed that only hands out
+  peers; with both, a seed that also has the image (used last). Tried:
+  a seed with the image listing two peers, the first serving a corrupted
+  image: tabernacle fetched from the first, dropped it, took the image
+  from the second, and never used the seed, all in about 0.05 s.
 - Tokens as a node gives them: an HMAC of the asker's address under a
   key made at start, so nothing is sent to a forged address.
 - A file is re-read when its mtime changes, so a build can be replaced
