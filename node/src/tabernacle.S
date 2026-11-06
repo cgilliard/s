@@ -129,6 +129,7 @@ _base\@:
 .equ V_NCHUNKS, 64
 .equ V_BLK, 68          # virtio-blk base (0: none)
 .equ V_BLKAV, 72        # disk requests made
+.equ V_RAND, 76         # rand_peer's state, stirred by each frame's arrival time
 .equ V_HS, 80           # the hash state (48)
 .equ V_SIZE, 128
 
@@ -204,6 +205,7 @@ net:
         jal     now
         mv      s2, a0
         mv      s3, a0
+        sw      a0, V_RAND(s0)          # QEMU's start-up jitter: the seeds' order
         li      a0, SEEDS
         li      a1, 1
         jal     add_peers
@@ -276,7 +278,9 @@ fail:
 # ===========================================================================
 # Discovery: each peer still being asked is asked again each second, three
 # times at most: a Ping until its Pong gives us its token, then GetPeers and
-# GetImages until its Images says whether it has our image.
+# GetImages until its Images says whether it has our image.  In table order,
+# which add_peers keeps shuffled: the first to answer gets the download, so
+# no peer is always asked first.
 discover:
         PUSH    ra, s5, s6
         li      s5, PEERS
@@ -361,7 +365,7 @@ download:
         ret
 
 # a1 = 0 for a non-seed, 1 for a seed: a0 = the first such peer with our
-# image, or 0.
+# image (the table is shuffled), or 0.
 find_cand:
         li      a0, PEERS
         lw      t0, V_NPEERS(s0)
@@ -376,6 +380,36 @@ find_cand:
 3:      addi    a0, a0, 32
         j       1b
 2:      li      a0, 0
+9:      ret
+
+# a0 = a peer picked at random (PEERS itself while there is none): xorshift32
+# over V_RAND, masked to a power of two and drawn again past the table, as
+# there is no division.  Not for secrets: for spreading the load.  Leaves
+# a1-a2, t3 and t6 alone.
+rand_peer:
+        lw      t2, V_NPEERS(s0)
+        li      a0, PEERS
+        beqz    t2, 9f
+        addi    t5, t2, -1
+        li      t4, 0                   # a mask covering t2 - 1
+1:      bgeu    t4, t5, 3f
+        slli    t4, t4, 1
+        addi    t4, t4, 1
+        j       1b
+3:      lw      t0, V_RAND(s0)
+        bnez    t0, 4f
+        li      t0, 0x2545F491          # xorshift never leaves 0
+4:      slli    t1, t0, 13
+        xor     t0, t0, t1
+        srli    t1, t0, 17
+        xor     t0, t0, t1
+        slli    t1, t0, 5
+        xor     t0, t0, t1
+        sw      t0, V_RAND(s0)
+        and     t1, t0, t4
+        bgeu    t1, t2, 3b              # past the table: draw again
+        slli    t1, t1, 5
+        add     a0, a0, t1
 9:      ret
 
 # a0 = 1 while some peer is still being asked.
@@ -490,6 +524,11 @@ poll_rx:
 # a0 = buffer (the virtio header first), a1 = its length.
 on_frame:
         PUSH    ra, s5, s6
+        li      t0, MTIME               # its arrival time into rand_peer's state
+        lw      t0, 0(t0)
+        lw      t1, V_RAND(s0)
+        xor     t1, t1, t0
+        sw      t1, V_RAND(s0)
         addi    s5, a0, 10              # the Ethernet frame
         addi    s6, a1, -10
         addi    a0, s5, 12
@@ -740,7 +779,10 @@ on_chunk:
 
 # ===========================================================================
 # a0 = count byte, then 6-byte entries (4 address bytes, a u16 LE port), as
-# in a Peers message; a1 = 1 if they are seeds.  Adds those not yet known.
+# in a Peers message; a1 = 1 if they are seeds.  Adds those not yet known,
+# each swapped with an entry picked at random (an inside-out Fisher-Yates
+# shuffle), so the table is always in random order and peers are asked, and
+# taken, in no fixed order.
 add_peers:
         PUSH    ra, s5, s6, s7
         lbu     s6, 0(a0)
@@ -778,6 +820,21 @@ add_peers:
         li      t1, TICK                # due at once
         sub     t1, s3, t1
         sw      t1, P_LAST(t0)
+        mv      t6, t0
+        jal     rand_peer               # where it goes
+        lw      t1, V_CUR(s0)           # the download's peer moves with its entry
+        bne     t1, a0, 2f
+        sw      t6, V_CUR(s0)
+2:      li      t3, 0                   # swap the two
+3:      add     t0, a0, t3
+        add     t1, t6, t3
+        lw      t2, 0(t0)
+        lw      t4, 0(t1)
+        sw      t4, 0(t0)
+        sw      t2, 0(t1)
+        addi    t3, t3, 4
+        li      t2, 32
+        bltu    t3, t2, 3b
         j       1b
 9:      POP     ra, s5, s6, s7
         ret

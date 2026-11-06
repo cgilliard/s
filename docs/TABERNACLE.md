@@ -2,7 +2,7 @@
 
 Written 2026-11-06; the boot program, `server.py` and `node.sh` built the
 same day (see the implementation order). `tabernacle` is the fam
-node's boot program: a few kilobytes (5,520 bytes) that run the
+node's boot program: a few kilobytes (4,241 bytes, packed) that run the
 node image from disk if it is there and correct, and otherwise fetch it
 from the peer-to-peer network, check it, and run it. The node image
 itself (the full node, written in fam) is everything else; this
@@ -49,6 +49,15 @@ values, and so is the disk.
    Discovery goes on in the same loop as the download, so the first
    candidate is used at once and later ones queue behind it: a test
    network with a peer or two is not held up waiting for more.
+   Requests go out one after another, so the peer asked first tends to
+   answer first; the peer table is kept in random order (each new peer
+   swapped with one picked at random, an inside-out Fisher-Yates
+   shuffle), so no peer is always first and the load spreads, the
+   quickest to answer (likely the least loaded) still winning. The
+   randomness is the 10 MHz timer, mixed at start and by each frame's
+   arrival time, stirred by xorshift32: not for secrets. Tried: three
+   peers listed by a seed served 17, 23 and 20 of 60 boots; two seeds
+   alone, 20 and 20 of 40.
 3. **Download, one peer at a time.** From a candidate, fetch our version
    in chunks. A peer that reports a size other than ours, whose image
    does not hash to ours, or that stops answering is dropped, and the
