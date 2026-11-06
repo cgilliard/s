@@ -62,15 +62,17 @@ they do not send what it would refuse.
 
 ### 3. An aged reserve in every block
 
-The reference miner fills a share of each block, proposed 10% of its
-size, with the longest-waiting transactions that pay at least the floor,
-oldest first (by age alone, so a user can predict the wait); the rest by
-fee rate, as now. In numbers: 10% of a full 2 MB block is 200 KB, about
-65 simple payments (3 KB each) taken by age whatever they pay. So:
+The reference miner fills a share of each block, 10% of the space for
+transactions by default and a miner setting, with the longest-waiting
+transactions that pay at least the floor, oldest first (by age alone, so
+a user can predict the wait); the rest by fee rate, as now. The space
+for transactions is the block size limit less the proof: 2,000,000
+bytes less about 205 KB, about 1,795 KB, so the reserve is about 180 KB,
+some 60 simple payments (3 KB each) taken by age whatever they pay. So:
 
 - **Users.** A transaction paying the floor confirms within a bounded
   wait even when blocks are full: about the floor-paying backlog ahead of
-  it divided by the reserve (650 ahead at 65 a block: 10 blocks, about
+  it divided by the reserve (600 ahead at 60 a block: 10 blocks, about
   1 h 40). Paying more buys speed, not admission. At a share of 0 this is
   Bitcoin's model since 2016: under congestion a floor-paying
   transaction may wait until demand falls.
@@ -131,27 +133,48 @@ Per byte for now; revisit if policy transactions become a large share.
 - Fees stay policy, not consensus.
 - The relay floor is a node setting, defaulting to 10 base units a byte
   (10^-9 coins, set with the move to ten decimals); the dust limit
-  follows it.
+  follows it. Nodes announce their floor in the handshake, and a wallet
+  warns when its fee is below most of its peers' floors (a market
+  signal, not an error).
 - The rolling minimum decays with a 12-hour half-life, as Bitcoin's; a
   node setting.
-- Pooled transactions expire after 14 days; a node setting.
+- Pooled transactions expire after 14 days; a node setting. A node
+  remembers the ids it expired for another expiry period and refuses
+  them, so an expired transaction does not come back by relay with a
+  fresh age.
 - Inclusion follows waiting time through an aged reserve in each block,
-  in the reference miner, ordered by age alone.
+  in the reference miner, ordered by age alone. The reserve is 10% of
+  the space for transactions, the block size limit less the proof: about
+  180 KB (2,000,000 bytes less a proof of about 205 KB), some 60 simple
+  payments. Fixed in bytes, so a miner whose proving time, not bytes,
+  limits its blocks gives a larger share; a miner setting, and 0 is
+  Bitcoin's model.
+- The pool protects the reserve's candidates: the oldest floor-paying
+  transactions are kept from eviction up to about a day of reserve
+  space (some 8,600 simple payments, about 26 MB of a 64 MB pool), and
+  relayed whatever the node's rolling minimum, so in a flood they still
+  reach miners and age into the reserve. Beyond that day's worth the
+  guarantee holds only while the pool is not full.
+- Fee estimates come from the node's own pool: the rates it saw confirm
+  and how long they waited. With too little seen (a new node), the
+  floor and the reserve's bound are the defaults, and estimates improve
+  as the node sees more.
+- No child-pays-for-parent: a pooled transaction's outputs have no
+  position until mined, so nothing spends them while it waits.
+  Replacement (`bump`) is how a payment is sped up, and must stay simple
+  and reliable.
 - Fees are per byte; per trace row is to be revisited if transactions
   with many policy conditions become common.
 
-## Open
-
-1. The reserve's share: 10% proposed; more shortens waits at the floor,
-   less keeps miners' revenue under congestion (0 is Bitcoin's model).
-   Likely a miner setting too, with the default the decision.
-
 ## Implementation order
 
-1. Node settings for the relay floor, the half-life and the expiry.
-   Arrival times in the pool, kept in the saved pool; expiry.
-2. The rolling admission minimum, and peers told it.
-3. The aged reserve in `Mempool::select`.
+1. Node settings for the relay floor, the half-life and the expiry; the
+   floor announced in the handshake. Arrival times in the pool, kept in
+   the saved pool; expiry, and expired ids remembered.
+2. The rolling admission minimum, and peers told it; the reserve's
+   candidates kept from eviction and relayed whatever it is.
+3. The aged reserve in `Mempool::select`: 10% of the block size limit
+   less the proof.
 4. Wallet: fee estimation, an economy option, `bump`.
 5. Tests: a pool under a flood (the minimum rises and decays back); full
    blocks with a backlog at the floor, each confirmed within the bound;
