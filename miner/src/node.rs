@@ -1169,11 +1169,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             bytes.extend_from_slice(&tx);
         }
         let expired: Vec<_> = pool.expired().map(|(id, until)| (*id, *until)).collect();
+        let confirmed: Vec<_> = pool.confirmed().copied().collect();
         drop(pool);
         bytes.extend_from_slice(&(expired.len() as u32).to_le_bytes());
         for (id, until) in expired {
             bytes.extend_from_slice(&crate::poseidon2::digest_to_bytes(&id));
             bytes.extend_from_slice(&until.to_le_bytes());
+        }
+        // The confirmations the fee estimates use: rate, wait and when.
+        bytes.extend_from_slice(&(confirmed.len() as u32).to_le_bytes());
+        for (rate, waited, at) in confirmed {
+            for v in [rate, waited, at] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
         }
         let tmp = path.with_extension("tmp");
         if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
@@ -1182,7 +1190,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Pools the transactions saved by [`Node::save_mempool`], each checked
-    /// again and keeping its arrival time, and the ids expired lately;
+    /// again and keeping its arrival time, the ids expired lately and the
+    /// confirmations the fee estimates use;
     /// returns how many transactions were taken. A file of another format
     /// is passed over.
     fn load_mempool(&mut self) -> usize {
@@ -1205,6 +1214,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for _ in 0..r.u32().unwrap_or(0) {
             let (Some(id), Some(until)) = (r.digest(), r.u64()) else { break };
             pool.remember_expired(id, until);
+        }
+        // Absent from a file saved before they were kept.
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(rate), Some(waited), Some(at)) = (r.u64(), r.u64(), r.u64()) else { break };
+            pool.remember_confirmed(rate, waited, at);
         }
         taken
     }
@@ -2924,13 +2938,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn revalidate_mempool(&mut self, fork: Option<u32>) {
         let tip = self.chain.tip().ok().flatten().map_or(0, |t| t.height);
         let mut moved: HashMap<crate::transaction::Commitment, Vec<u64>> = HashMap::new();
-        // What the new blocks made: a pooled transaction whose outputs are
-        // all among them confirmed (blocks carry no transactions).
-        let mut created = std::collections::HashSet::new();
+        // What the new blocks made, and when: a pooled transaction whose
+        // outputs are all among them confirmed (blocks carry no
+        // transactions), at its block's timestamp.
+        let mut created = HashMap::new();
         for h in fork.map_or(tip, |f| f + 1)..=tip {
+            let at = self.chain.header_at(h).ok().flatten().map_or_else(crate::mempool::unix_now, |h| h.timestamp);
             if let Ok(Some((_, first, outputs))) = self.chain.main_outputs(h) {
                 for (i, o) in outputs.iter().enumerate() {
-                    created.insert(o.commitment);
+                    created.insert(o.commitment, at);
                     if fork.is_some() {
                         moved.entry(o.commitment).or_default().push(first + i as u64);
                     }
@@ -5747,16 +5763,20 @@ mod tests {
         let arrived = mempool.lock().unwrap().entries().find(|e| e.txid == txid).unwrap().arrived;
         let gone = crate::xmss::Digest::default();
         mempool.lock().unwrap().remember_expired(gone, unix_now() + 3600);
+        let seen = (42, 600, unix_now() - 60);
+        mempool.lock().unwrap().remember_confirmed(seen.0, seen.1, seen.2);
         events.send(Event::Stop).unwrap();
         h.join().unwrap();
         // A fresh pool, the same data directory: the transaction is back,
-        // as old as it was, and the expired id still refused.
+        // as old as it was, the expired id still refused, and the
+        // confirmation the estimates use kept.
         std::thread::sleep(Duration::from_millis(1100));
         let again = pool();
         let (node, events) = Node::bind(Arc::clone(&f.chain), Arc::clone(&again), config(vec![], &f.dir)).unwrap();
         let pool = again.lock().unwrap();
         assert_eq!(pool.entries().find(|e| e.txid == txid).map(|e| e.arrived), Some(arrived));
         assert!(pool.expired().any(|(id, _)| *id == gone));
+        assert_eq!(pool.confirmed().collect::<Vec<_>>(), vec![&seen]);
         drop(pool);
         drop(node);
         drop(events);
@@ -7517,7 +7537,7 @@ mod tests {
             let (gone, back) = pool_a
                 .lock()
                 .unwrap()
-                .revalidate(a.chain.utxo(), a.chain.names(), &rtxn, height, &HashMap::new(), &Default::default())
+                .revalidate(a.chain.utxo(), a.chain.names(), &rtxn, height, &HashMap::new(), &HashMap::new())
                 .unwrap();
             assert_eq!((gone, back), (1, 0), "T3 left the pool, confirmed");
         }

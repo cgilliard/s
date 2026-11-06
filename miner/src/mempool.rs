@@ -45,7 +45,7 @@
 //! otherwise. The miner takes operations within the block's caps, skipping
 //! what does not fit and reveals whose window has not opened.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use heed::RoTxn;
 
@@ -615,9 +615,20 @@ impl Mempool {
         (self.bytes + size).div_ceil(RESERVE_BYTES.max(1)) as u64
     }
 
-    /// Notes a transaction seen confirmed, for estimates.
-    fn note_confirmed(&mut self, e: &Entry, now: u64) {
-        self.confirmed.push_back((per_byte(e.rate()), now.saturating_sub(e.arrived), now));
+    /// Notes a transaction seen confirmed at `at`, for estimates.
+    fn note_confirmed(&mut self, e: &Entry, at: u64) {
+        self.remember_confirmed(per_byte(e.rate()), at.saturating_sub(e.arrived), at);
+    }
+
+    /// The confirmations the estimates use, oldest first: rate (base
+    /// units a byte), wait and when, as the saved pool keeps them.
+    pub fn confirmed(&self) -> impl Iterator<Item = &(u64, u64, u64)> {
+        self.confirmed.iter()
+    }
+
+    /// A confirmation seen before a restart, or just now.
+    pub fn remember_confirmed(&mut self, rate: u64, waited: u64, at: u64) {
+        self.confirmed.push_back((rate, waited, at));
         if self.confirmed.len() > CONFIRMED_KEPT {
             self.confirmed.pop_front();
         }
@@ -850,7 +861,7 @@ impl Mempool {
         rtxn: &RoTxn,
         height: u32,
         moved: &HashMap<Commitment, Vec<u64>>,
-        created: &HashSet<Commitment>,
+        created: &HashMap<Commitment, u64>,
     ) -> utxo::Result<(usize, usize)> {
         let mut gone = Vec::new();
         for e in self.txs.values() {
@@ -868,9 +879,12 @@ impl Mempool {
         for id in &gone {
             if let Some(e) = self.remove(id) {
                 // Its outputs made by the new blocks: it confirmed, and its
-                // wait goes to the estimates.
-                if !e.tx.outputs.is_empty() && e.tx.outputs.iter().all(|o| created.contains(&o.commitment)) {
-                    self.note_confirmed(&e, now);
+                // wait, to its block's timestamp (blocks replayed after a
+                // restart are not timed by the clock), goes to the
+                // estimates; never later than now.
+                let at = e.tx.outputs.iter().map(|o| created.get(&o.commitment)).collect::<Option<Vec<_>>>();
+                if let Some(at) = at.and_then(|t| t.into_iter().copied().min()) {
+                    self.note_confirmed(&e, at.min(now));
                 }
                 self.shelf.push(e);
             }
@@ -1124,11 +1138,11 @@ mod tests {
         let at = utxo.add_output(&mut wtxn, &out.block_output(), 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashMap::new()).unwrap(), (1, 0));
         // Told nothing moved, it stays shelved; told where, it comes back.
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashSet::new()).unwrap(), (0, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &HashMap::new()).unwrap(), (0, 0));
         let moved = HashMap::from([(out.commitment, vec![1, at])]);
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &moved, &HashSet::new()).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &moved, &HashMap::new()).unwrap(), (0, 1));
         assert_eq!(pool.get(&id).unwrap().spent_positions(), vec![at]);
         // The signature still holds: positions are not signed.
         assert!(pool.get(&id).unwrap().verify_signatures());
@@ -1156,9 +1170,11 @@ mod tests {
         let policy = Policy { expiry_secs: 100, ..Policy::NONE };
         let mut pool = Mempool::with_policy(1 << 20, policy);
         let now = unix_now();
-        // One arrived 150 s ago (as loaded from a saved pool), one just now.
+        // One arrived 150 s ago (as loaded from a saved pool), one now:
+        // given, not read from the clock after signing, which a slow
+        // machine takes seconds over.
         let old = pool.insert_at(spend(1, 1000, 5), &utxo, &names, &rtxn, 1, now - 150).unwrap();
-        let new = pool.insert(spend(2, 1000, 5), &utxo, &names, &rtxn, 1).unwrap();
+        let new = pool.insert_at(spend(2, 1000, 5), &utxo, &names, &rtxn, 1, now).unwrap();
         assert_eq!(pool.expire(now), vec![old]);
         assert!(!pool.contains(&old) && pool.contains(&new));
         // Relayed back by a peer: refused, not taken with a fresh age.
@@ -1301,7 +1317,7 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
-        for tag in 1u8..=2 {
+        for tag in 1u8..=3 {
             utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 1_000_000).block_output(), 0).unwrap();
         }
         wtxn.commit().unwrap();
@@ -1330,7 +1346,7 @@ mod tests {
         let rtxn = env.read_txn().unwrap();
         let t1 = spend(1, 1_000_000, 100_000);
         let t2 = spend(2, 1_000_000, 200_000);
-        pool.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
+        pool.insert_at(t1.clone(), &utxo, &names, &rtxn, 1, now - 1000).unwrap();
         pool.insert(t2.clone(), &utxo, &names, &rtxn, 1).unwrap();
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
@@ -1339,11 +1355,26 @@ mod tests {
         }
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        // t1's output was made; t2's input went to something else.
-        let created: HashSet<Commitment> = [t1.outputs[0].commitment].into_iter().collect();
+        // t1's output was made, by a block 50 s after it arrived (as a
+        // block replayed after a restart: not timed by the clock); t2's
+        // input went to something else.
+        let arrived = pool.entry(&t1.txid()).unwrap().arrived;
+        let created: HashMap<Commitment, u64> = [(t1.outputs[0].commitment, arrived + 50)].into_iter().collect();
         assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &created).unwrap(), (2, 0));
-        assert_eq!(pool.confirmed.len(), 1);
-        assert_eq!(pool.confirmed[0].0, 100_000 / t1.size() as u64 + 1);
+        assert_eq!(pool.confirmed().collect::<Vec<_>>(), vec![&(100_000 / t1.size() as u64 + 1, 50, arrived + 50)]);
+        // A block timed ahead of the clock counts as now.
+        let mut ahead = Mempool::new(1 << 20);
+        let t3 = spend(3, 1_000_000, 300_000);
+        ahead.insert(t3.clone(), &utxo, &names, &rtxn, 2).unwrap();
+        drop(rtxn);
+        let mut wtxn = env.write_txn().unwrap();
+        assert!(utxo.spend_at(&mut wtxn, &Output::new(&pk(3), 1_000_000).commitment, 2).unwrap());
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let created: HashMap<Commitment, u64> = [(t3.outputs[0].commitment, unix_now() + 3600)].into_iter().collect();
+        assert_eq!(ahead.revalidate(&utxo, &names, &rtxn, 3, &HashMap::new(), &created).unwrap(), (1, 0));
+        let (_, waited, at) = *ahead.confirmed().next().unwrap();
+        assert!(at <= unix_now() && waited <= 1);
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1562,14 +1593,14 @@ mod tests {
         assert!(utxo.spend_at(&mut wtxn, &c1, 0).unwrap());
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         utxo.unspend(&mut wtxn, &c1, &crate::state_tree::EMPTY, 0, 0).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashSet::new()).unwrap(), (0, 1));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 1, &HashMap::new(), &HashMap::new()).unwrap(), (0, 1));
         assert!(pool.contains(&id1));
 
         // Replacement: paying the old fee plus the increment per byte
@@ -1733,14 +1764,14 @@ mod tests {
         names.apply(&utxo, &mut wtxn, 22, &[BlockNameOp::Reveal { record: alice.clone(), commit: 6 }], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 23, &HashMap::new(), &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id1) && pool.contains(&id2));
         drop(rtxn);
         let mut wtxn = env.write_txn().unwrap();
         names.apply(&utxo, &mut wtxn, 23, &[BlockNameOp::Update(bob2.clone())], &[]).unwrap();
         wtxn.commit().unwrap();
         let rtxn = env.read_txn().unwrap();
-        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24, &HashMap::new(), &HashSet::new()).unwrap(), (1, 0));
+        assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 24, &HashMap::new(), &HashMap::new()).unwrap(), (1, 0));
         assert!(!pool.contains(&id2));
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);

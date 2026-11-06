@@ -209,10 +209,10 @@ Per byte for now; revisit if policy transactions become a large share.
 4. Wallet: fee estimation, an economy option, `bump`.
    Done (2026-11-05): the pool notes each transaction it sees confirm
    (the new blocks made its outputs; blocks carry no transactions) with
-   its rate and wait, for a week, 5,000 at most, not kept across
-   restarts. `Mempool::estimate` gives the lowest rate at which 85% of at
-   least 20 transactions at or above it confirmed in time (those still
-   waiting past it count as late); `suggest` gives the admission minimum
+   its rate and wait, for a week, 5,000 at most. `Mempool::estimate`
+   gives the lowest rate at which 85% of at least 20 transactions at or
+   above it confirmed in time (those still waiting past it count as
+   late); `suggest` gives the admission minimum
    while the pool would fit one block, else the estimate, else the
    minimum. A FEE argument is coins, `N/byte`, `block`, `hour` (now the
    default), `day`, or `economy` (the admission minimum, waiting at most
@@ -227,6 +227,11 @@ Per byte for now; revisit if policy transactions become a large share.
    bytes, short of what the pool asks since the move to ten decimals.
    Tested by `estimates_follow_what_confirmed`,
    `bump_pays_more_from_the_change` and the prompt payment test.
+   Then: a confirmation is timed by the timestamp of the block that made
+   its outputs (never past the clock), so the blocks a node replays after
+   a restart record the waits they had, not the downtime; and the
+   confirmations are kept in the saved pool, a section a file saved
+   before it simply lacks.
 5. Tests: a pool under a flood (the minimum rises and decays back); full
    blocks with a backlog at the floor, each confirmed within the bound;
    restart keeping ages; expiry.
