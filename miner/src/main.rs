@@ -1474,13 +1474,22 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                     p.height.map_or("?".to_string(), |h| format!("h {h}")),
                     if p.live { "live" } else { "silent" },
                     if p.handshaken { "handshaken" } else { "" },
-                    p.min_fee.map_or(String::new(), |f| format!("floor {f}/byte"))
+                    match (p.min_fee, p.pool_fee) {
+                        (Some(f), Some(m)) if m > f => format!("floor {f}/byte, pool {m}/byte"),
+                        (Some(f), _) => format!("floor {f}/byte"),
+                        _ => String::new(),
+                    }
                 );
             }
         }
         "mempool" => {
             let pool = ctx.mempool.lock().unwrap();
-            println!("{} transactions, {} bytes", pool.len(), pool.bytes());
+            println!(
+                "{} transactions, {} bytes; admitting from {} base units a byte",
+                pool.len(),
+                pool.bytes(),
+                pool.admission_fee(tabminer::mempool::unix_now())
+            );
             for e in pool.entries() {
                 println!("  {}  {} bytes  fee {}", short(&e.txid), e.size, fmt_coins(e.fee as u128));
             }

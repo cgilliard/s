@@ -15,7 +15,12 @@
 //! from churning the network with free replacements.
 //!
 //! When the pool is full, a new transaction with a higher fee per byte
-//! evicts the lowest. After every change of tip the pool is revalidated
+//! evicts the lowest, and the pool's admission minimum rises to the
+//! evicted rate plus the increment, decaying back to the floor with a
+//! half-life ([`Mempool::admission_fee`]). The oldest transactions, up to
+//! [`Policy::protect_bytes`], are never evicted and are admitted whatever
+//! that minimum: they are the aged reserve's candidates (`docs/FEES.md`).
+//! After every change of tip the pool is revalidated
 //! ([`Mempool::revalidate`]): transactions whose inputs are now spent leave
 //! the pool but are shelved for a while, and return if a reorganization
 //! makes their inputs unspent again. Blocks carry no transactions, so this
@@ -39,7 +44,7 @@
 //! otherwise. The miner takes operations within the block's caps, skipping
 //! what does not fit and reveals whose window has not opened.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use heed::RoTxn;
 
@@ -114,6 +119,18 @@ pub const HALF_LIFE_SECS: u64 = 12 * 3600;
 pub const EXPIRY_SECS: u64 = 14 * 86400;
 /// Expired ids a pool remembers, at most: the oldest are forgotten first.
 const MAX_EXPIRED: usize = 100_000;
+/// About the size of a block's proof, the rest of a block being space
+/// for transactions.
+pub const PROOF_BYTES: usize = 205_000;
+/// The share of a block's space for transactions the reference miner
+/// gives to the longest-waiting ones, by default (`docs/FEES.md`).
+pub const RESERVE_PERCENT: usize = 10;
+/// The aged reserve, in bytes: about 180 KB, some 60 simple payments.
+pub const RESERVE_BYTES: usize =
+    (crate::chain::ChainParams::MAINNET.max_block_size - PROOF_BYTES) * RESERVE_PERCENT / 100;
+/// The oldest transactions kept from eviction, by default: about a day
+/// of the reserve (some 26 MB), so that in a flood they still age into it.
+pub const PROTECT_BYTES: usize = RESERVE_BYTES * (86_400 / crate::difficulty::IDEAL_BLOCK_TIME as usize);
 
 /// What a pool asks of a transaction beyond validity (`docs/FEES.md`): a
 /// node's own policy, set by its operator.
@@ -128,11 +145,20 @@ pub struct Policy {
     pub half_life_secs: u64,
     /// How long a transaction may wait in the pool.
     pub expiry_secs: u64,
+    /// The oldest transactions' bytes kept from eviction and admitted
+    /// whatever the rolling minimum; at most half the pool, so that fees
+    /// always compete for the rest.
+    pub protect_bytes: usize,
 }
 
 impl Policy {
-    pub const MAINNET: Policy =
-        Policy { min_fee_per_byte: MIN_FEE_PER_BYTE, dust: DUST, half_life_secs: HALF_LIFE_SECS, expiry_secs: EXPIRY_SECS };
+    pub const MAINNET: Policy = Policy {
+        min_fee_per_byte: MIN_FEE_PER_BYTE,
+        dust: DUST,
+        half_life_secs: HALF_LIFE_SECS,
+        expiry_secs: EXPIRY_SECS,
+        protect_bytes: PROTECT_BYTES,
+    };
     /// Anything valid, for tests.
     pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0, ..Policy::MAINNET };
 
@@ -241,8 +267,22 @@ pub struct Entry {
 impl Entry {
     /// Fee per byte, scaled by 2^16 for integer comparison.
     fn rate(&self) -> u128 {
-        ((self.fee as u128) << 16) / self.size as u128
+        rate(self.fee, self.size)
     }
+
+    fn age_key(&self) -> (u64, u64) {
+        (self.arrived, self.order)
+    }
+}
+
+/// Fee per byte, scaled by 2^16.
+fn rate(fee: u64, size: usize) -> u128 {
+    ((fee as u128) << 16) / size.max(1) as u128
+}
+
+/// A scaled rate per byte, rounded up to base units.
+fn per_byte(rate: u128) -> u64 {
+    rate.div_ceil(1 << 16).min(u64::MAX as u128) as u64
 }
 
 pub struct Mempool {
@@ -263,6 +303,12 @@ pub struct Mempool {
     expired: HashMap<Digest, u64>,
     /// The next entry's [`Entry::order`].
     next_order: u64,
+    /// Pooled transactions oldest first, by [`Entry::age_key`].
+    by_age: BTreeMap<(u64, u64), Digest>,
+    /// The rolling admission minimum (a scaled rate) when last settled,
+    /// and when, in Unix seconds.
+    rolling: u128,
+    rolling_at: u64,
 }
 
 /// The time now, in Unix seconds.
@@ -393,6 +439,9 @@ impl Mempool {
             policy,
             expired: HashMap::new(),
             next_order: 0,
+            by_age: BTreeMap::new(),
+            rolling: 0,
+            rolling_at: 0,
         }
     }
 
@@ -400,10 +449,103 @@ impl Mempool {
         &self.policy
     }
 
+    /// The rolling minimum's scaled rate at `now`, at least the floor:
+    /// what it was raised to, decayed by half each half-life (a half or a
+    /// quarter of it while the pool is under half or a quarter full, as
+    /// Bitcoin's), and back at the floor once within half the increment.
+    fn rolling_rate(&self, now: u64) -> u128 {
+        let floor = (self.policy.min_fee_per_byte as u128) << 16;
+        if self.rolling <= floor {
+            return floor;
+        }
+        let mut half_life = self.policy.half_life_secs as f64;
+        if self.bytes < self.capacity / 4 {
+            half_life /= 4.0;
+        } else if self.bytes < self.capacity / 2 {
+            half_life /= 2.0;
+        }
+        let elapsed = now.saturating_sub(self.rolling_at) as f64;
+        let excess = if half_life > 0.0 {
+            (self.rolling - floor) as f64 * 0.5f64.powf(elapsed / half_life)
+        } else {
+            0.0
+        };
+        if excess < ((REPLACEMENT_FEE_PER_BYTE as u128) << 15) as f64 {
+            return floor;
+        }
+        floor + excess as u128
+    }
+
+    /// Settles the rolling minimum's decay to `now`, so the pool's fill
+    /// from here on sets its pace.
+    fn settle(&mut self, now: u64) {
+        self.rolling = self.rolling_rate(now);
+        self.rolling_at = now;
+    }
+
+    /// The pool's admission minimum at `now`, base units a byte: the floor,
+    /// or above it while the rolling minimum is up after evictions. Peers
+    /// are told it, so they do not send what it would refuse; the aged
+    /// reserve's candidates are admitted whatever it is.
+    pub fn admission_fee(&self, now: u64) -> u64 {
+        per_byte(self.rolling_rate(now))
+    }
+
+    /// The bytes kept from eviction: [`Policy::protect_bytes`], at most
+    /// half the pool.
+    fn protect_budget(&self) -> usize {
+        self.policy.protect_bytes.min(self.capacity / 2)
+    }
+
+    /// The age key of the youngest protected transaction: the oldest are
+    /// protected while their bytes together fit the budget.
+    fn protected_until(&self) -> Option<(u64, u64)> {
+        let budget = self.protect_budget();
+        let mut used = 0;
+        let mut last = None;
+        for (key, id) in &self.by_age {
+            used += self.txs[id].size;
+            if used > budget {
+                break;
+            }
+            last = Some(*key);
+        }
+        last
+    }
+
+    /// Whether a transaction of `size` with age key `key` would be among
+    /// the protected: what is older and it fit the budget.
+    fn would_protect(&self, key: (u64, u64), size: usize) -> bool {
+        let budget = self.protect_budget();
+        let mut used = size;
+        for id in self.by_age.range(..key).map(|(_, id)| id) {
+            used += self.txs[id].size;
+            if used > budget {
+                return false;
+            }
+        }
+        used <= budget
+    }
+
+    /// Whether a pooled transaction is kept from eviction: one of the aged
+    /// reserve's candidates, relayed whatever a peer's admission minimum.
+    pub fn is_protected(&self, txid: &Digest) -> bool {
+        match (self.txs.get(txid), self.protected_until()) {
+            (Some(e), Some(until)) => e.age_key() <= until,
+            _ => false,
+        }
+    }
+
+    /// A pooled transaction's entry.
+    pub fn entry(&self, txid: &Digest) -> Option<&Entry> {
+        self.txs.get(txid)
+    }
+
     /// Drops the transactions that have waited [`Policy::expiry_secs`] by
     /// `now`, remembering their ids for as long again, and forgets the ids
     /// whose time is up; returns those dropped.
     pub fn expire(&mut self, now: u64) -> Vec<Digest> {
+        self.settle(now);
         let limit = self.policy.expiry_secs;
         let old: Vec<Digest> =
             self.txs.values().filter(|e| now.saturating_sub(e.arrived) >= limit).map(|e| e.txid).collect();
@@ -491,6 +633,14 @@ impl Mempool {
             return Err(Reject::Expired);
         }
         let fee = check_static(&tx, &self.policy)?;
+        let size = tx.size();
+        let now = unix_now();
+        self.settle(now);
+        let order = self.next_order;
+        let admission = self.rolling_rate(now);
+        if rate(fee, size) < admission && !self.would_protect((arrived, order), size) {
+            return Err(Reject::FeeTooLow { min: per_byte(admission).saturating_mul(size as u64) });
+        }
         let mut conflicts: Vec<Digest> = Vec::new();
         for (c, p) in tx.spent_commitments().into_iter().zip(tx.spent_positions()) {
             if let Some(other) = self.spends.get(&p)
@@ -515,7 +665,6 @@ impl Mempool {
         }
         tx.check_policy_inputs(height, |p| utxo.output_at(rtxn, p).ok().flatten().map(|(_, _, h)| h))
             .map_err(Reject::Policy)?;
-        let size = tx.size();
         if !conflicts.is_empty() {
             let replaced: u64 = conflicts.iter().map(|id| self.txs[id].fee).sum();
             let min = replaced.saturating_add(REPLACEMENT_FEE_PER_BYTE * size as u64);
@@ -523,7 +672,6 @@ impl Mempool {
                 return Err(Reject::ReplacementFee { min });
             }
         }
-        let order = self.next_order;
         self.next_order += 1;
         let entry = Entry { size, tx, txid, fee, arrived, order, claims };
         // Replaced transactions go first, so their room counts; they are
@@ -539,21 +687,41 @@ impl Mempool {
         Ok(txid)
     }
 
-    /// Evicts the lowest-rate transactions until `entry` fits, or refuses
-    /// if `entry` pays less than what it would evict.
+    /// Evicts the lowest-rate transactions but the protected until `entry`
+    /// fits, raising the rolling minimum past each, or refuses if `entry`
+    /// pays less than what it would evict.
     fn make_room(&mut self, entry: &Entry) -> Result<(), Reject> {
         if entry.size > self.capacity {
             return Err(Reject::Full);
         }
-        while self.bytes + entry.size > self.capacity {
-            let worst =
-                self.txs.values().min_by_key(|e| (e.rate(), std::cmp::Reverse((e.arrived, e.order)))).map(|e| e.txid);
-            match worst {
-                Some(id) if self.txs[&id].rate() < entry.rate() => {
-                    self.remove(&id);
-                }
-                _ => return Err(Reject::Full),
+        if self.bytes + entry.size <= self.capacity {
+            return Ok(());
+        }
+        // Evicting the unprotected, all younger than the protected, leaves
+        // the protected as they are.
+        let until = self.protected_until();
+        let mut victims: Vec<&Entry> = self.txs.values().filter(|e| until.is_none_or(|u| e.age_key() > u)).collect();
+        victims.sort_unstable_by_key(|e| (e.rate(), std::cmp::Reverse(e.age_key())));
+        let mut room = self.capacity - self.bytes;
+        let mut evict = Vec::new();
+        for v in victims {
+            if room >= entry.size {
+                break;
             }
+            if v.rate() >= entry.rate() {
+                return Err(Reject::Full);
+            }
+            room += v.size;
+            evict.push((v.txid, v.rate()));
+        }
+        if room < entry.size {
+            return Err(Reject::Full);
+        }
+        let now = unix_now();
+        self.settle(now);
+        for (id, r) in evict {
+            self.remove(&id);
+            self.rolling = self.rolling.max(r + ((REPLACEMENT_FEE_PER_BYTE as u128) << 16));
         }
         Ok(())
     }
@@ -566,6 +734,7 @@ impl Mempool {
             self.claims.insert(*c, entry.txid);
         }
         self.bytes += entry.size;
+        self.by_age.insert(entry.age_key(), entry.txid);
         self.txs.insert(entry.txid, entry);
     }
 
@@ -579,6 +748,7 @@ impl Mempool {
             self.claims.remove(c);
         }
         self.bytes -= entry.size;
+        self.by_age.remove(&entry.age_key());
         Some(entry)
     }
 
@@ -884,6 +1054,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// docs/FEES.md: eviction passes over the oldest, raises the pool's
+    /// minimum past what it evicted, which then decays back to the floor;
+    /// a transaction that would be among the protected is admitted below
+    /// it, and only while there is room for it.
+    #[test]
+    fn the_admission_minimum_rises_decays_and_spares_the_oldest() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-rolling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for tag in 1u8..=7 {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 100_000).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let size = spend(1, 100_000, 1).size();
+        // Room for three; the oldest one protected.
+        let policy = Policy { min_fee_per_byte: 1, protect_bytes: size, ..Policy::NONE };
+        let mut pool = Mempool::with_policy(3 * size, policy);
+        let now = unix_now();
+        let fee = |per_byte: u64| per_byte * size as u64;
+        let a = pool.insert_at(spend(1, 100_000, fee(2)), &utxo, &names, &rtxn, 1, now - 1000).unwrap();
+        let b = pool.insert(spend(2, 100_000, fee(4)), &utxo, &names, &rtxn, 1).unwrap();
+        let c = pool.insert(spend(3, 100_000, fee(6)), &utxo, &names, &rtxn, 1).unwrap();
+        assert!(pool.is_protected(&a) && !pool.is_protected(&b));
+        assert_eq!(pool.admission_fee(now), 1);
+        // A better payer evicts b, not a, which pays less but is protected.
+        let d = pool.insert(spend(4, 100_000, fee(8)), &utxo, &names, &rtxn, 1).unwrap();
+        assert!(pool.contains(&a) && !pool.contains(&b) && pool.contains(&c) && pool.contains(&d));
+        // The minimum is now b's rate plus the increment.
+        let raised = 4 + REPLACEMENT_FEE_PER_BYTE;
+        assert_eq!(pool.admission_fee(unix_now()), raised);
+        let e = spend(5, 100_000, fee(raised - 1));
+        assert_eq!(
+            pool.insert(e.clone(), &utxo, &names, &rtxn, 1),
+            Err(Reject::FeeTooLow { min: raised * size as u64 })
+        );
+        // It decays by half each half-life while the pool is full, and is
+        // back at the floor in a few days.
+        let later = unix_now() + HALF_LIFE_SECS;
+        assert_eq!(pool.admission_fee(later), 1 + (raised - 1).div_ceil(2));
+        assert_eq!(pool.admission_fee(unix_now() + 7 * 86400), 1);
+        // With the pool emptied (mined), a transaction below the minimum
+        // that would be protected is admitted; the next is not.
+        for id in [a, c, d] {
+            pool.remove(&id);
+        }
+        assert!(pool.admission_fee(unix_now()) > raised - 1);
+        let e = pool.insert(e, &utxo, &names, &rtxn, 1).unwrap();
+        assert!(pool.is_protected(&e));
+        assert!(matches!(
+            pool.insert(spend(6, 100_000, fee(raised - 1)), &utxo, &names, &rtxn, 1),
+            Err(Reject::FeeTooLow { .. })
+        ));
+        // The default protects about a day of the aged reserve.
+        assert_eq!(RESERVE_BYTES, 179_500);
+        assert_eq!(PROTECT_BYTES, 179_500 * 144);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pool_validates_orders_and_revalidates() {
         let dir = std::env::temp_dir().join(format!("tabminer-mempool-{}", std::process::id()));
@@ -987,7 +1221,8 @@ mod tests {
         small.insert(t1.clone(), &utxo, &names, &rtxn, 1).unwrap();
         assert_eq!(small.insert(t2.clone(), &utxo, &names, &rtxn, 1), Ok(id2));
         assert!(!small.contains(&id1));
-        assert_eq!(small.insert(t1.clone(), &utxo, &names, &rtxn, 1), Err(Reject::Full));
+        // The eviction raised the pool's minimum past what t1 pays.
+        assert!(matches!(small.insert(t1.clone(), &utxo, &names, &rtxn, 1), Err(Reject::FeeTooLow { .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

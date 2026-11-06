@@ -182,6 +182,19 @@ Per byte for now; revisit if policy transactions become a large share.
    `the_pool_is_kept_across_a_restart`.
 2. The rolling admission minimum, and peers told it; the reserve's
    candidates kept from eviction and relayed whatever it is.
+   Done (2026-11-05): an eviction raises the pool's minimum to the
+   evicted rate plus the increment, decaying back by Bitcoin's rule
+   (`Mempool::admission_fee`: the half-life, halved or quartered while
+   the pool is under half or a quarter full, the floor again within half
+   the increment); eviction is now all or nothing. The oldest
+   transactions, up to `PROTECT_BYTES` (a day of the reserve, 179,500
+   bytes a block for 144 blocks; at most half the pool), are never
+   evicted, and one that would be among them is admitted below the
+   minimum. Every ping and pong carries it (`Status::pool_fee`, shown by
+   `peers` when above the floor, and by `mempool`); a node announces a
+   transaction only to peers whose minimum it pays, unless it is
+   protected here. Tested by
+   `the_admission_minimum_rises_decays_and_spares_the_oldest`.
 3. The aged reserve in `Mempool::select`: 10% of the block size limit
    less the proof.
 4. Wallet: fee estimation, an economy option, `bump`.

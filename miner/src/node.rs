@@ -515,6 +515,8 @@ pub struct PeerInfo {
     pub handshaken: bool,
     /// Its relay floor, base units a byte, once it has told us.
     pub min_fee: Option<u64>,
+    /// Its pool's admission minimum, base units a byte, once it has told us.
+    pub pool_fee: Option<u64>,
 }
 
 pub struct Node<V: ProofVerifier> {
@@ -1300,6 +1302,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Our status for `to`, with the token it must put in its requests.
     fn status(&self, to: &SocketAddr, nonce: u64) -> Status {
         let tip = self.chain.tip().ok().flatten();
+        let pool = self.mempool.lock().unwrap();
         Status {
             nonce,
             version: PROTOCOL_VERSION,
@@ -1309,7 +1312,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             oldest: self.chain.oldest_body().unwrap_or_else(|_| tip.map_or(1, |h| h.height + 1)),
             tip: tip.map_or(self.genesis, |h| h.hash()),
             work: self.chain.tip_work().unwrap_or(U256::ZERO),
-            min_fee: self.mempool.lock().unwrap().policy().min_fee_per_byte,
+            min_fee: pool.policy().min_fee_per_byte,
+            pool_fee: pool.admission_fee(crate::mempool::unix_now()),
         }
     }
 
@@ -1428,6 +1432,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 addr: p.addr,
                 height: p.status.map(|s| s.height),
                 min_fee: p.status.map(|s| s.min_fee),
+                pool_fee: p.status.map(|s| s.pool_fee),
                 live: live.contains(&p.addr),
                 handshaken: p.handshaken,
             })
@@ -2840,8 +2845,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Announces a pooled transaction to every live peer but `except`;
     /// returns how many.
+    /// A peer whose admission minimum it pays less than is passed over,
+    /// unless it is one of the aged reserve's candidates here: a peer
+    /// admits those whatever its minimum, if it has room for them.
     fn announce_transaction(&self, txid: Digest, except: Option<SocketAddr>) -> usize {
-        let peers = self.peers.sample(net::MAX_PEERS, except, Instant::now());
+        let mut peers = self.peers.sample(net::MAX_PEERS, except, Instant::now());
+        {
+            let pool = self.mempool.lock().unwrap();
+            if let Some(e) = pool.entry(&txid)
+                && !pool.is_protected(&txid)
+            {
+                let (fee, size) = (e.fee as u128, e.size as u128);
+                peers.retain(|a| {
+                    self.peers.get(a).and_then(|p| p.status).is_none_or(|s| fee >= s.pool_fee as u128 * size)
+                });
+            }
+        }
         #[cfg(test)]
         self.announced.fetch_add(1, Ordering::Relaxed);
         for addr in &peers {
@@ -4099,6 +4118,7 @@ mod tests {
                 tip: genesis,
                 work: U256::ZERO,
                 min_fee: 0,
+                pool_fee: 0,
             };
             sock.send_to(&Message::Ping(st).encode(), addr_a).unwrap();
             let mut buf = [0u8; net::MAX_DATAGRAM];
@@ -4354,6 +4374,7 @@ mod tests {
             tip: genesis,
             work: U256::ZERO,
             min_fee: 0,
+            pool_fee: 0,
         };
         let real = [
             Message::Ping(st).encode(),
@@ -4725,6 +4746,7 @@ mod tests {
                         tip: genesis,
                         work: U256([u64::MAX; 4]),
                         min_fee: 0,
+                        pool_fee: 0,
                     };
                     let _ = liar.send_to(&Message::Pong(claim).encode(), from);
                 }
@@ -7129,6 +7151,7 @@ mod tests {
             tip: genesis,
             work: U256::ZERO,
             min_fee: 0,
+            pool_fee: 0,
         };
         sock.send_to(&Message::Ping(status).encode(), addr_a).unwrap();
         let Some(Message::Pong(st)) = receive(|m| matches!(m, Message::Pong(_))) else { panic!("no pong") };
