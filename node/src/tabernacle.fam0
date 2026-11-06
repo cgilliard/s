@@ -1,0 +1,2814 @@
+# MIT License
+#
+# Copyright (c) 2026 Christopher Gilliard
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+13 00 00 00	# nop  (q32 magic; prepended like scripts/build.sh)
+
+# tabernacle -- the fam node's boot program (docs/TABERNACLE.md).
+#
+# Runs the node image from the virtio-blk disk if the disk holds it, else
+# fetches it from the network, one peer at a time; either way only an image
+# of the patched-in size and Gimli-Hash is run.  The image is placed at
+# 0x80000000, where q32 would load it, so tabernacle first moves itself to
+# RELOC (its code is position-independent) and runs from there.
+#
+# Converted to src/tabernacle.fam0 by tools/s2fam0_fam.py, which prepends
+# the q32 magic (a nop): this file's first instruction runs at 0x80000004.
+#
+# Registers kept throughout:
+#   s0 = VARS   s1 = virtio-net base (0: none)   s2 = time discovery began
+#   s3 = now (read once a pass of the main loop)  s4 = the patched config
+# Functions take a0-a2, return a0, and may clobber t0-t6 and a0-a5; one that
+# uses s5-s11 saves them.  Calls are jal ra / ret; sp is a small stack.
+# ---------------------------------------------------------------------------
+
+# .option norelax
+# .altmacro
+
+# .macro LOAD_ADDRESS reg, label
+# _base\@:
+#         .equ _offset\@, (\label - _base\@)
+#         auipc   \reg, %hi(_offset\@)
+#         addi    \reg, \reg, %lo(_offset\@)
+# .endm
+
+# .macro PUSH r0, r1=zero, r2=zero, r3=zero
+#         addi    sp, sp, -16
+#         sw      \r0, 0(sp)
+#         sw      \r1, 4(sp)
+#         sw      \r2, 8(sp)
+#         sw      \r3, 12(sp)
+# .endm
+
+# .macro POP r0, r1=zero, r2=zero, r3=zero
+#         lw      \r0, 0(sp)
+#         .ifnc \r1, zero
+#         lw      \r1, 4(sp)
+#         .endif
+#         .ifnc \r2, zero
+#         lw      \r2, 8(sp)
+#         .endif
+#         .ifnc \r3, zero
+#         lw      \r3, 12(sp)
+#         .endif
+#         addi    sp, sp, 16
+# .endm
+
+# --- memory -----------------------------------------------------------------
+# .equ IMAGE,     0x80000000      # the node image, where q32 would load it
+# .equ RELOC,     0x87F00000      # tabernacle, moved
+# .equ RXQ,       0x87F10000      # virtqueues: two pages each (legacy layout)
+# .equ TXQ,       0x87F12000
+# .equ BLKQ,      0x87F14000
+# .equ RXBUF,     0x87F16000      # QN receive buffers of 2 KiB
+# .equ TXBUF,     0x87F1A000      # one transmit buffer
+# .equ BLKHDR,    0x87F1A800      # a disk request's header; its status at +16
+# .equ PEERS,     0x87F1B000      # MAXPEERS entries of 32 bytes
+# .equ VARS,      0x87F1C000
+# .equ STACK,     0x87F20000
+# .equ SEEDS,     0x87FFF000      # from scripts/node.sh: count u8, then
+                                # 4 address bytes and a port (u16 LE) each
+
+# --- devices (QEMU virt) ----------------------------------------------------
+# .equ UART,      0x10000000
+# .equ FINISHER,  0x00100000
+# .equ MTIME,     0x0200BFF8      # 10 MHz
+# .equ VIRTIO,    0x10001000      # 8 virtio-mmio slots, 0x1000 apart
+# .equ QN,        8               # entries per virtqueue
+
+# --- network ----------------------------------------------------------------
+# .equ MYIP,      0x0F02000A      # 10.0.2.15, QEMU user networking's guest
+# .equ GWIP,      0x0202000A      # 10.0.2.2, its gateway
+# .equ PORT,      3737
+# .equ MAGIC,     0x31424154      # "TAB1"
+# .equ T_PING, 1
+# .equ T_PONG, 2
+# .equ T_GET_PEERS, 3
+# .equ T_PEERS, 4
+# .equ T_GET_IMAGES, 64
+# .equ T_IMAGES, 65
+# .equ T_GET_IMAGE, 66
+# .equ T_IMAGE_CHUNK, 67
+# .equ PAYLOAD,   TXBUF + 52      # virtio header 10, Ethernet 14, IP 20, UDP 8
+# .equ MAXPEERS,  64
+# .equ BATCH,     32              # chunks asked for at once
+# .equ TICK,      10000000        # 1 s: retries, and a download's patience
+# .equ WAIT,      100000000       # 10 s before the seeds are asked for the image
+
+# --- VARS -------------------------------------------------------------------
+# .equ V_MAC, 0           # ours (6)
+# .equ V_GW, 8            # the gateway's (6)
+# .equ V_GWOK, 16         # nonzero once known
+# .equ V_RXSEEN, 20       # used receive entries handled
+# .equ V_RXAV, 24         # receive buffers handed to the device
+# .equ V_TXAV, 28         # frames sent
+# .equ V_ARPT, 32         # when ARP last asked for the gateway
+# .equ V_NPEERS, 36
+# .equ V_CUR, 40          # the peer downloading from (0: none)
+# .equ V_BASE, 44         # first chunk of the batch
+# .equ V_MASK, 48         # chunks of the batch arrived
+# .equ V_N, 52            # chunks in the batch
+# .equ V_LAST, 56         # when the batch last moved
+# .equ V_STRIKES, 60      # times it did not, in a row
+# .equ V_NCHUNKS, 64
+# .equ V_BLK, 68          # virtio-blk base (0: none)
+# .equ V_BLKAV, 72        # disk requests made
+# .equ V_HS, 80           # the hash state (48)
+# .equ V_SIZE, 128
+
+# --- a peer -----------------------------------------------------------------
+# .equ P_IP, 0            # 4 address bytes, as get32le reads them
+# .equ P_PORT, 4          # u16
+# .equ P_SEED, 6          # 1 for a seed
+# .equ P_STATE, 7         # 0 pinging, 1 asking, 2 has our image, 3 done, 4 dropped
+# .equ P_TOKEN, 8         # what its Pong gave us (8)
+# .equ P_LAST, 16         # when last asked
+# .equ P_TRIES, 20
+
+# ===========================================================================
+# Move to RELOC and go on there.
+# _start:
+#         auipc   t0, 0
+97 02 00 00	# auipc t0,0x0
+#         addi    t0, t0, -4              # where we were loaded (the magic)
+93 82 C2 FF	# addi t0,t0,-4 # fffffffc <SEEDS+0x78000ffc>
+#         LOAD_ADDRESS t4, main
+97 0E 00 00	# auipc t4,0x0
+93 8E 4E 03	# addi t4,t4,52 # 3c <main>
+#         sub     t4, t4, t0
+B3 8E 5E 40	# sub t4,t4,t0
+#         li      t2, RELOC
+B7 03 F0 87	# lui t2,0x87f00
+#         add     t4, t4, t2              # main, moved
+B3 8E 7E 00	# add t4,t4,t2
+#         LOAD_ADDRESS t1, _end
+17 13 00 00	# auipc t1,0x1
+13 03 03 57	# addi t1,t1,1392 # 158c <_end>
+# 1:      lw      t3, 0(t0)
+03 AE 02 00	# lw t3,0(t0)
+#         sw      t3, 0(t2)
+23 A0 C3 01	# sw t3,0(t2) # 87f00000 <RELOC>
+#         addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+#         addi    t2, t2, 4
+93 83 43 00	# addi t2,t2,4
+#         bltu    t0, t1, 1b
+E3 E8 62 FE	# bltu t0,t1,24 <.L1^B1>
+#         jr      t4
+67 80 0E 00	# jr t4
+
+# main:
+#         li      sp, STACK
+37 01 F2 87	# lui sp,0x87f20
+#         li      s0, VARS
+37 C4 F1 87	# lui s0,0x87f1c
+#         li      s1, 0
+93 04 00 00	# li s1,0
+#         mv      a0, s0
+13 05 04 00	# mv a0,s0
+#         li      a1, V_SIZE
+93 05 00 08	# li a1,128
+#         jal     zero_bytes
+EF 10 40 27	# jal 12c4 <zero_bytes>
+#         LOAD_ADDRESS s4, cfg_version
+17 1A 00 00	# auipc s4,0x1
+13 0A 0A 51	# addi s4,s4,1296 # 1564 <cfg_version>
+#         lw      t0, 4(s4)
+83 22 4A 00	# lw t0,4(s4)
+#         LOAD_ADDRESS a0, msg_unpatched
+17 15 00 00	# auipc a0,0x1
+13 05 05 4E	# addi a0,a0,1248 # 1540 <msg_unpatched>
+#         beqz    t0, fail                # size 0: never patched
+63 82 02 16	# beqz t0,1cc <fail>
+#         addi    t0, t0, 1023
+93 82 F2 3F	# addi t0,t0,1023
+#         srli    t0, t0, 10
+93 D2 A2 00	# srli t0,t0,0xa
+#         sw      t0, V_NCHUNKS(s0)
+23 20 54 04	# sw t0,64(s0) # 87f1c040 <VARS+0x40>
+
+# --- the disk ----------------------------------------------------------------
+#         li      a0, 2                   # virtio-blk
+13 05 20 00	# li a0,2
+#         jal     find_dev
+EF 00 50 55	# jal dd0 <find_dev>
+#         sw      a0, V_BLK(s0)
+23 22 A4 04	# sw a0,68(s0)
+#         beqz    a0, net
+63 00 05 04	# beqz a0,c4 <net>
+#         jal     dev_init
+EF 00 50 58	# jal e0c <dev_init>
+#         lw      a0, V_BLK(s0)
+03 25 44 04	# lw a0,68(s0)
+#         li      a1, 0
+93 05 00 00	# li a1,0
+#         li      a2, BLKQ
+37 46 F1 87	# lui a2,0x87f14
+#         jal     queue_init
+EF 00 50 5A	# jal e3c <queue_init>
+#         lw      a0, V_BLK(s0)
+03 25 44 04	# lw a0,68(s0)
+#         jal     dev_ok
+EF 00 10 59	# jal e30 <dev_ok>
+#         jal     disk_read
+EF 00 D0 68	# jal f30 <disk_read>
+#         bnez    a0, net
+63 1E 05 00	# bnez a0,c4 <net>
+#         jal     check_image
+EF 00 10 7D	# jal 107c <check_image>
+#         beqz    a0, net
+63 0A 05 00	# beqz a0,c4 <net>
+#         LOAD_ADDRESS a0, msg_disk
+17 15 00 00	# auipc a0,0x1
+13 05 C5 3B	# addi a0,a0,956 # 1470 <msg_disk>
+#         jal     puts
+EF 10 40 2B	# jal 1370 <puts>
+#         j       run
+6F 00 80 07	# j 138 <run>
+
+# --- the network -------------------------------------------------------------
+# net:
+#         li      a0, 1                   # virtio-net
+13 05 10 00	# li a0,1
+#         jal     find_dev
+EF 00 90 50	# jal dd0 <find_dev>
+#         mv      s1, a0
+93 04 05 00	# mv s1,a0
+#         LOAD_ADDRESS a0, msg_nonet
+17 15 00 00	# auipc a0,0x1
+13 05 05 45	# addi a0,a0,1104 # 1520 <msg_nonet>
+#         beqz    s1, fail
+63 8A 04 0E	# beqz s1,1cc <fail>
+#         jal     net_init
+EF 00 10 58	# jal e5c <net_init>
+#         jal     now
+EF 00 D0 78	# jal 106c <now>
+#         mv      s2, a0
+13 09 05 00	# mv s2,a0
+#         mv      s3, a0
+93 09 05 00	# mv s3,a0
+#         li      a0, SEEDS
+37 F5 FF 87	# lui a0,0x87fff
+#         li      a1, 1
+93 05 10 00	# li a1,1
+#         jal     add_peers
+EF 00 90 05	# jal 94c <add_peers>
+#         jal     arp_request
+EF 00 90 37	# jal c70 <arp_request>
+# loop:
+#         jal     poll_rx
+EF 00 80 3C	# jal 4c4 <poll_rx>
+#         jal     now
+EF 00 D0 76	# jal 106c <now>
+#         mv      s3, a0
+93 09 05 00	# mv s3,a0
+#         lw      t0, V_GWOK(s0)
+83 22 04 01	# lw t0,16(s0)
+#         bnez    t0, 1f
+63 90 02 02	# bnez t0,12c <.L1^B2>
+#         lw      t1, V_ARPT(s0)          # no gateway yet: ask again each second
+03 23 04 02	# lw t1,32(s0)
+#         sub     t1, s3, t1
+33 83 69 40	# sub t1,s3,t1
+#         li      t2, TICK
+B7 93 98 00	# lui t2,0x989
+93 83 03 68	# addi t2,t2,1664 # 989680 <TICK>
+#         bltu    t1, t2, loop
+E3 6E 73 FC	# bltu t1,t2,fc <loop>
+#         jal     arp_request
+EF 00 D0 34	# jal c70 <arp_request>
+#         j       loop
+6F F0 5F FD	# j fc <loop>
+# 1:      jal     discover
+EF 00 80 0B	# jal 1e4 <discover>
+#         jal     download
+EF 00 00 16	# jal 290 <download>
+#         j       loop
+6F F0 9F FC	# j fc <loop>
+
+# Hand over: devices reset (so nothing more is written to memory), the
+# registers as QEMU's reset leaves them but t0, and on to the image.
+# run:
+#         beqz    s1, 1f
+63 84 04 00	# beqz s1,140 <.L1^B3>
+#         sw      zero, 0x70(s1)
+23 A8 04 06	# sw zero,112(s1)
+# 1:      lw      t0, V_BLK(s0)
+83 22 44 04	# lw t0,68(s0)
+#         beqz    t0, 2f
+63 84 02 00	# beqz t0,14c <.L2^B1>
+#         sw      zero, 0x70(t0)
+23 A8 02 06	# sw zero,112(t0)
+# 2:      li      ra, 0
+93 00 00 00	# li ra,0
+#         li      sp, 0
+13 01 00 00	# li sp,0
+#         li      gp, 0
+93 01 00 00	# li gp,0
+#         li      tp, 0
+13 02 00 00	# li tp,0
+#         li      t1, 0
+13 03 00 00	# li t1,0
+#         li      t2, 0
+93 03 00 00	# li t2,0
+#         li      s0, 0
+13 04 00 00	# li s0,0
+#         li      s1, 0
+93 04 00 00	# li s1,0
+#         li      a0, 0
+13 05 00 00	# li a0,0
+#         li      a1, 0
+93 05 00 00	# li a1,0
+#         li      a2, 0
+13 06 00 00	# li a2,0
+#         li      a3, 0
+93 06 00 00	# li a3,0
+#         li      a4, 0
+13 07 00 00	# li a4,0
+#         li      a5, 0
+93 07 00 00	# li a5,0
+#         li      a6, 0
+13 08 00 00	# li a6,0
+#         li      a7, 0
+93 08 00 00	# li a7,0
+#         li      s2, 0
+13 09 00 00	# li s2,0
+#         li      s3, 0
+93 09 00 00	# li s3,0
+#         li      s4, 0
+13 0A 00 00	# li s4,0
+#         li      s5, 0
+93 0A 00 00	# li s5,0
+#         li      s6, 0
+13 0B 00 00	# li s6,0
+#         li      s7, 0
+93 0B 00 00	# li s7,0
+#         li      s8, 0
+13 0C 00 00	# li s8,0
+#         li      s9, 0
+93 0C 00 00	# li s9,0
+#         li      s10, 0
+13 0D 00 00	# li s10,0
+#         li      s11, 0
+93 0D 00 00	# li s11,0
+#         li      t3, 0
+13 0E 00 00	# li t3,0
+#         li      t4, 0
+93 0E 00 00	# li t4,0
+#         li      t5, 0
+13 0F 00 00	# li t5,0
+#         li      t6, 0
+93 0F 00 00	# li t6,0
+#         li      t0, IMAGE
+B7 02 00 80	# lui t0,0x80000
+#         jr      t0
+67 80 02 00	# jr t0 # 80000000 <IMAGE>
+
+# a0 = message: print it and exit 1.
+# fail:
+#         jal     puts
+EF 10 40 1A	# jal 1370 <puts>
+#         li      t0, FINISHER
+B7 02 10 00	# lui t0,0x100
+#         li      t1, 0x13333             # exit 1
+37 33 01 00	# lui t1,0x13
+13 03 33 33	# addi t1,t1,819 # 13333 <_end+0x11da7>
+#         sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0) # 100000 <FINISHER>
+#         j       .
+6F 00 00 00	# j 1e0 <fail+0x14>
+
+# ===========================================================================
+# Discovery: each peer still being asked is asked again each second, three
+# times at most: a Ping until its Pong gives us its token, then GetPeers and
+# GetImages until its Images says whether it has our image.
+# discover:
+#         PUSH    ra, s5, s6
+13 01 01 FF	# addi sp,sp,-16 # 87f1fff0 <VARS+0x3ff0>
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         li      s5, PEERS
+B7 BA F1 87	# lui s5,0x87f1b
+#         lw      s6, V_NPEERS(s0)
+03 2B 44 02	# lw s6,36(s0)
+#         slli    s6, s6, 5
+13 1B 5B 00	# slli s6,s6,0x5
+#         add     s6, s6, s5
+33 0B 5B 01	# add s6,s6,s5
+# 1:      bgeu    s5, s6, 9f
+63 FA 6A 07	# bgeu s5,s6,27c <.L9^B1>
+#         lbu     t0, P_STATE(s5)
+83 C2 7A 00	# lbu t0,7(s5) # 87f1b007 <PEERS+0x7>
+#         li      t1, 2
+13 03 20 00	# li t1,2
+#         bgeu    t0, t1, 8f              # asked enough
+63 F0 62 06	# bgeu t0,t1,274 <.L8^B1>
+#         lw      t1, P_LAST(s5)
+03 A3 0A 01	# lw t1,16(s5)
+#         sub     t1, s3, t1
+33 83 69 40	# sub t1,s3,t1
+#         li      t2, TICK
+B7 93 98 00	# lui t2,0x989
+93 83 03 68	# addi t2,t2,1664 # 989680 <TICK>
+#         bltu    t1, t2, 8f
+63 66 73 04	# bltu t1,t2,274 <.L8^B1>
+#         lw      t1, P_TRIES(s5)
+03 A3 4A 01	# lw t1,20(s5)
+#         li      t2, 3
+93 03 30 00	# li t2,3
+#         bltu    t1, t2, 2f
+63 68 73 00	# bltu t1,t2,244 <.L2^B2>
+#         li      t1, 3                   # no answer: done with it
+13 03 30 00	# li t1,3
+#         sb      t1, P_STATE(s5)
+A3 83 6A 00	# sb t1,7(s5)
+#         j       8f
+6F 00 40 03	# j 274 <.L8^B1>
+# 2:      addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+#         sw      t1, P_TRIES(s5)
+23 AA 6A 00	# sw t1,20(s5)
+#         sw      s3, P_LAST(s5)
+23 A8 3A 01	# sw s3,16(s5)
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         bnez    t0, 3f
+63 96 02 00	# bnez t0,260 <.L3^B1>
+#         jal     send_ping
+EF 00 50 03	# jal a8c <send_ping>
+#         j       8f
+6F 00 80 01	# j 274 <.L8^B1>
+# 3:      li      a1, T_GET_PEERS
+93 05 30 00	# li a1,3
+#         jal     send_token
+EF 00 90 06	# jal acc <send_token>
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         li      a1, T_GET_IMAGES
+93 05 00 04	# li a1,64
+#         jal     send_token
+EF 00 D0 05	# jal acc <send_token>
+# 8:      addi    s5, s5, 32
+93 8A 0A 02	# addi s5,s5,32
+#         j       1b
+6F F0 1F F9	# j 208 <.L1^B4>
+# 9:      POP     ra, s5, s6
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# The download: from a peer that has our image, the non-seeds first; the
+# seeds once WAIT has passed and no other has it.  Nobody left to ask, and
+# nobody still being asked: fail.
+# download:
+#         PUSH    ra
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 01 00	# sw zero,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         lw      a0, V_CUR(s0)
+03 25 84 02	# lw a0,40(s0)
+#         beqz    a0, 2f
+63 02 05 04	# beqz a0,2ec <.L2^B3>
+#         lw      t1, V_LAST(s0)          # downloading: has it stalled?
+03 23 84 03	# lw t1,56(s0)
+#         sub     t1, s3, t1
+33 83 69 40	# sub t1,s3,t1
+#         li      t2, TICK
+B7 93 98 00	# lui t2,0x989
+93 83 03 68	# addi t2,t2,1664 # 989680 <TICK>
+#         bltu    t1, t2, 9f
+63 6A 73 08	# bltu t1,t2,350 <.L9^B2>
+#         lw      t1, V_STRIKES(s0)
+03 23 C4 03	# lw t1,60(s0)
+#         addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+#         sw      t1, V_STRIKES(s0)
+23 2E 64 02	# sw t1,60(s0)
+#         li      t2, 4
+93 03 40 00	# li t2,4
+#         bltu    t1, t2, 1f
+63 6A 73 00	# bltu t1,t2,2e4 <.L1^B5>
+#         LOAD_ADDRESS a0, msg_silent
+17 15 00 00	# auipc a0,0x1
+13 05 C5 20	# addi a0,a0,524 # 14e0 <msg_silent>
+#         jal     drop
+EF 00 C0 0E	# jal 3c8 <drop>
+#         j       9f
+6F 00 00 07	# j 350 <.L9^B2>
+# 1:      jal     ask_batch               # ask again for what is missing
+EF 00 00 12	# jal 404 <ask_batch>
+#         j       9f
+6F 00 80 06	# j 350 <.L9^B2>
+# 2:      li      a1, 0
+93 05 00 00	# li a1,0
+#         jal     find_cand
+EF 00 C0 06	# jal 35c <find_cand>
+#         bnez    a0, 3f
+63 1A 05 02	# bnez a0,328 <.L3^B2>
+#         sub     t1, s3, s2
+33 83 29 41	# sub t1,s3,s2
+#         li      t2, WAIT
+B7 E3 F5 05	# lui t2,0x5f5e
+93 83 03 10	# addi t2,t2,256 # 5f5e100 <WAIT>
+#         bltu    t1, t2, 9f
+63 66 73 04	# bltu t1,t2,350 <.L9^B2>
+#         li      a1, 1
+93 05 10 00	# li a1,1
+#         jal     find_cand
+EF 00 00 05	# jal 35c <find_cand>
+#         bnez    a0, 3f
+63 1C 05 00	# bnez a0,328 <.L3^B2>
+#         jal     pending
+EF 00 00 08	# jal 394 <pending>
+#         bnez    a0, 9f
+63 1C 05 02	# bnez a0,350 <.L9^B2>
+#         LOAD_ADDRESS a0, msg_none
+17 15 00 00	# auipc a0,0x1
+13 05 05 1E	# addi a0,a0,480 # 14fc <msg_none>
+#         j       fail
+6F F0 9F EA	# j 1cc <fail>
+# 3:      sw      a0, V_CUR(s0)
+23 24 A4 02	# sw a0,40(s0)
+#         sw      zero, V_BASE(s0)
+23 26 04 02	# sw zero,44(s0)
+#         sw      zero, V_MASK(s0)
+23 28 04 02	# sw zero,48(s0)
+#         sw      zero, V_STRIKES(s0)
+23 2E 04 02	# sw zero,60(s0)
+#         LOAD_ADDRESS a0, msg_from
+17 15 00 00	# auipc a0,0x1
+13 05 05 15	# addi a0,a0,336 # 1488 <msg_from>
+#         jal     puts
+EF 10 00 03	# jal 1370 <puts>
+#         lw      a0, V_CUR(s0)
+03 25 84 02	# lw a0,40(s0)
+#         jal     put_peer
+EF 10 40 09	# jal 13dc <put_peer>
+#         jal     ask_batch
+EF 00 80 0B	# jal 404 <ask_batch>
+# 9:      POP     ra
+83 20 01 00	# lw ra,0(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a1 = 0 for a non-seed, 1 for a seed: a0 = the first such peer with our
+# image, or 0.
+# find_cand:
+#         li      a0, PEERS
+37 B5 F1 87	# lui a0,0x87f1b
+#         lw      t0, V_NPEERS(s0)
+83 22 44 02	# lw t0,36(s0)
+#         slli    t0, t0, 5
+93 92 52 00	# slli t0,t0,0x5
+#         add     t0, t0, a0
+B3 82 A2 00	# add t0,t0,a0
+# 1:      bgeu    a0, t0, 2f
+63 70 55 02	# bgeu a0,t0,38c <.L2^B4>
+#         lbu     t1, P_STATE(a0)
+03 43 75 00	# lbu t1,7(a0) # 87f1b007 <PEERS+0x7>
+#         li      t2, 2
+93 03 20 00	# li t2,2
+#         bne     t1, t2, 3f
+63 16 73 00	# bne t1,t2,384 <.L3^B3>
+#         lbu     t1, P_SEED(a0)
+03 43 65 00	# lbu t1,6(a0)
+#         beq     t1, a1, 9f
+63 08 B3 00	# beq t1,a1,390 <.L9^B3>
+# 3:      addi    a0, a0, 32
+13 05 05 02	# addi a0,a0,32
+#         j       1b
+6F F0 5F FE	# j 36c <.L1^B6>
+# 2:      li      a0, 0
+13 05 00 00	# li a0,0
+# 9:      ret
+67 80 00 00	# ret
+
+# a0 = 1 while some peer is still being asked.
+# pending:
+#         li      t3, PEERS
+37 BE F1 87	# lui t3,0x87f1b
+#         lw      t0, V_NPEERS(s0)
+83 22 44 02	# lw t0,36(s0)
+#         slli    t0, t0, 5
+93 92 52 00	# slli t0,t0,0x5
+#         add     t0, t0, t3
+B3 82 C2 01	# add t0,t0,t3
+#         li      a0, 1
+13 05 10 00	# li a0,1
+# 1:      bgeu    t3, t0, 2f
+63 7C 5E 00	# bgeu t3,t0,3c0 <.L2^B5>
+#         lbu     t1, P_STATE(t3)
+03 43 7E 00	# lbu t1,7(t3) # 87f1b007 <PEERS+0x7>
+#         li      t2, 2
+93 03 20 00	# li t2,2
+#         bltu    t1, t2, 9f
+63 68 73 00	# bltu t1,t2,3c4 <.L9^B4>
+#         addi    t3, t3, 32
+13 0E 0E 02	# addi t3,t3,32
+#         j       1b
+6F F0 DF FE	# j 3a8 <.L1^B7>
+# 2:      li      a0, 0
+13 05 00 00	# li a0,0
+# 9:      ret
+67 80 00 00	# ret
+
+# a0 = message: drop the peer downloading from, and say why.
+# drop:
+#         PUSH    ra
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 01 00	# sw zero,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         lw      t0, V_CUR(s0)
+83 22 84 02	# lw t0,40(s0)
+#         li      t1, 4
+13 03 40 00	# li t1,4
+#         sb      t1, P_STATE(t0)
+A3 83 62 00	# sb t1,7(t0)
+#         jal     puts
+EF 00 90 78	# jal 1370 <puts>
+#         lw      a0, V_CUR(s0)
+03 25 84 02	# lw a0,40(s0)
+#         sw      zero, V_CUR(s0)
+23 24 04 02	# sw zero,40(s0)
+#         jal     put_peer
+EF 00 90 7E	# jal 13dc <put_peer>
+#         POP     ra
+83 20 01 00	# lw ra,0(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# Ask the peer downloading from for the batch's chunks, from the first one
+# still missing to the batch's end.
+# ask_batch:
+#         PUSH    ra, s5
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         lw      t0, V_BASE(s0)
+83 22 C4 02	# lw t0,44(s0)
+#         lw      t1, V_NCHUNKS(s0)
+03 23 04 04	# lw t1,64(s0)
+#         sub     t1, t1, t0
+33 03 53 40	# sub t1,t1,t0
+#         li      t2, BATCH
+93 03 00 02	# li t2,32
+#         bltu    t1, t2, 1f
+63 64 73 00	# bltu t1,t2,430 <.L1^B8>
+#         mv      t1, t2
+13 83 03 00	# mv t1,t2
+# 1:      sw      t1, V_N(s0)             # n = min(BATCH, chunks left)
+23 2A 64 02	# sw t1,52(s0)
+#         lw      t2, V_MASK(s0)
+83 23 04 03	# lw t2,48(s0)
+#         li      t3, 0                   # the first missing
+13 0E 00 00	# li t3,0
+# 2:      bgeu    t3, t1, 3f
+63 7C 6E 00	# bgeu t3,t1,454 <.L3^B4>
+#         srl     t4, t2, t3
+B3 DE C3 01	# srl t4,t2,t3
+#         andi    t4, t4, 1
+93 FE 1E 00	# andi t4,t4,1
+#         beqz    t4, 3f
+63 86 0E 00	# beqz t4,454 <.L3^B4>
+#         addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+#         j       2b
+6F F0 DF FE	# j 43c <.L2^B6>
+# 3:      sub     s5, t1, t3              # how many from there
+B3 0A C3 41	# sub s5,t1,t3
+#         add     t3, t0, t3
+33 8E C2 01	# add t3,t0,t3
+#         slli    s5, s5, 16
+93 9A 0A 01	# slli s5,s5,0x10
+#         or      s5, s5, t3              # start | len << 16
+B3 EA CA 01	# or s5,s5,t3
+#         sw      s3, V_LAST(s0)
+23 2C 34 03	# sw s3,56(s0)
+#         li      a0, T_GET_IMAGE
+13 05 20 04	# li a0,66
+#         jal     put_head
+EF 00 00 5F	# jal a5c <put_head>
+#         lw      a0, V_CUR(s0)
+03 25 84 02	# lw a0,40(s0)
+#         jal     put_token
+EF 00 40 60	# jal a78 <put_token>
+#         li      a0, PAYLOAD + 13
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 15 04	# addi a0,a0,65 # 87f1a041 <PAYLOAD+0xd>
+#         lw      a1, 0(s4)               # our version
+83 25 0A 00	# lw a1,0(s4)
+#         jal     put32le
+EF 00 D0 6C	# jal 1350 <put32le>
+#         li      t0, PAYLOAD + 17
+B7 A2 F1 87	# lui t0,0x87f1a
+93 82 52 04	# addi t0,t0,69 # 87f1a045 <PAYLOAD+0x11>
+#         li      t1, 1                   # one range
+13 03 10 00	# li t1,1
+#         sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0)
+#         li      a0, PAYLOAD + 18
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 65 04	# addi a0,a0,70 # 87f1a046 <PAYLOAD+0x12>
+#         mv      a1, s5
+93 85 0A 00	# mv a1,s5
+#         jal     put32le                 # start, len (u16 LE each)
+EF 00 D0 6A	# jal 1350 <put32le>
+#         lw      a0, V_CUR(s0)
+03 25 84 02	# lw a0,40(s0)
+#         li      a1, 22
+93 05 60 01	# li a1,22
+#         jal     udp_send
+EF 00 40 65	# jal b04 <udp_send>
+#         POP     ra, s5
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# Received frames, until none is waiting.
+# poll_rx:
+#         PUSH    ra, s5, s6
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 01 00	# sw zero,12(sp)
+# 1:      li      t0, RXQ + 4096          # used ring
+B7 12 F1 87	# lui t0,0x87f11
+#         lhu     t1, 2(t0)
+03 D3 22 00	# lhu t1,2(t0) # 87f11002 <RXQ+0x1002>
+#         lw      t2, V_RXSEEN(s0)
+83 23 44 01	# lw t2,20(s0)
+#         slli    t3, t2, 16
+13 9E 03 01	# slli t3,t2,0x10
+#         srli    t3, t3, 16
+13 5E 0E 01	# srli t3,t3,0x10
+#         beq     t1, t3, 9f
+63 04 C3 07	# beq t1,t3,554 <.L9^B5>
+#         andi    t3, t2, QN - 1
+13 FE 73 00	# andi t3,t2,7
+#         slli    t3, t3, 3
+13 1E 3E 00	# slli t3,t3,0x3
+#         add     t3, t3, t0
+33 0E 5E 00	# add t3,t3,t0
+#         lw      s5, 4(t3)               # the buffer's descriptor
+83 2A 4E 00	# lw s5,4(t3)
+#         lw      a1, 8(t3)               # bytes written
+83 25 8E 00	# lw a1,8(t3)
+#         addi    t2, t2, 1
+93 83 13 00	# addi t2,t2,1
+#         sw      t2, V_RXSEEN(s0)
+23 2A 74 00	# sw t2,20(s0)
+#         slli    s6, s5, 11
+13 9B BA 00	# slli s6,s5,0xb
+#         li      t0, RXBUF
+B7 62 F1 87	# lui t0,0x87f16
+#         add     a0, s6, t0
+33 05 5B 00	# add a0,s6,t0
+#         jal     on_frame
+EF 00 00 05	# jal 568 <on_frame>
+#         li      t0, RXQ + 16 * QN       # hand the buffer back
+B7 02 F1 87	# lui t0,0x87f10
+93 82 02 08	# addi t0,t0,128 # 87f10080 <RXQ+0x80>
+#         lw      t1, V_RXAV(s0)
+03 23 84 01	# lw t1,24(s0)
+#         andi    t2, t1, QN - 1
+93 73 73 00	# andi t2,t1,7
+#         slli    t2, t2, 1
+93 93 13 00	# slli t2,t2,0x1
+#         add     t2, t2, t0
+B3 83 53 00	# add t2,t2,t0
+#         sh      s5, 4(t2)
+23 92 53 01	# sh s5,4(t2)
+#         fence
+0F 00 F0 0F	# fence
+#         addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+#         sw      t1, V_RXAV(s0)
+23 2C 64 00	# sw t1,24(s0)
+#         sh      t1, 2(t0)
+23 91 62 00	# sh t1,2(t0)
+#         fence
+0F 00 F0 0F	# fence
+#         sw      zero, 0x50(s1)          # QueueNotify: receive
+23 A8 04 04	# sw zero,80(s1)
+#         j       1b
+6F F0 9F F8	# j 4d8 <.L1^B9>
+# 9:      POP     ra, s5, s6
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = buffer (the virtio header first), a1 = its length.
+# on_frame:
+#         PUSH    ra, s5, s6
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         addi    s5, a0, 10              # the Ethernet frame
+93 0A A5 00	# addi s5,a0,10
+#         addi    s6, a1, -10
+13 8B 65 FF	# addi s6,a1,-10
+#         addi    a0, s5, 12
+13 85 CA 00	# addi a0,s5,12
+#         jal     get16be
+EF 00 50 55	# jal 12dc <get16be>
+#         li      t0, 0x0806
+B7 12 00 00	# lui t0,0x1
+93 82 62 80	# addi t0,t0,-2042 # 806 <.L1^B11+0x1a>
+#         beq     a0, t0, on_arp
+63 08 55 02	# beq a0,t0,5c4 <on_arp>
+#         li      t0, 0x0800
+B7 12 00 00	# lui t0,0x1
+93 82 02 80	# addi t0,t0,-2048 # 800 <.L1^B11+0x14>
+#         bne     a0, t0, 9f
+63 18 55 00	# bne a0,t0,5b0 <.L9^B6>
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         mv      a1, s6
+93 05 0B 00	# mv a1,s6
+#         jal     on_ip
+EF 00 00 09	# jal 63c <on_ip>
+# 9:      POP     ra, s5, s6
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# The gateway's answer gives its address; a question for ours is answered.
+# (Jumped to from on_frame, s5 = the frame, in on_frame's frame.)
+# on_arp:
+#         addi    a0, s5, 20
+13 85 4A 01	# addi a0,s5,20
+#         jal     get16be                 # op
+EF 00 50 51	# jal 12dc <get16be>
+#         mv      s6, a0
+13 0B 05 00	# mv s6,a0
+#         addi    a0, s5, 28
+13 85 CA 01	# addi a0,s5,28
+#         jal     get32le                 # sender's address
+EF 00 10 53	# jal 1304 <get32le>
+#         li      t0, 2
+93 02 20 00	# li t0,2
+#         bne     s6, t0, 1f
+63 16 5B 02	# bne s6,t0,608 <.L1^B10>
+#         li      t0, GWIP
+B7 02 02 02	# lui t0,0x2020
+93 82 A2 00	# addi t0,t0,10 # 202000a <GWIP>
+#         bne     a0, t0, 9b
+E3 14 55 FC	# bne a0,t0,5b0 <.L9^B6>
+#         addi    a0, s0, V_GW
+13 05 84 00	# addi a0,s0,8
+#         addi    a1, s5, 22
+93 85 6A 01	# addi a1,s5,22
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 D0 4A	# jal 12a4 <copy>
+#         li      t0, 1
+93 02 10 00	# li t0,1
+#         sw      t0, V_GWOK(s0)
+23 28 54 00	# sw t0,16(s0)
+#         j       9b
+6F F0 DF FA	# j 5b0 <.L9^B6>
+# 1:      li      t0, 1
+93 02 10 00	# li t0,1
+#         bne     s6, t0, 9b
+E3 12 5B FA	# bne s6,t0,5b0 <.L9^B6>
+#         mv      s6, a0
+13 0B 05 00	# mv s6,a0
+#         addi    a0, s5, 38
+13 85 6A 02	# addi a0,s5,38
+#         jal     get32le                 # the address asked about
+EF 00 D0 4E	# jal 1304 <get32le>
+#         li      t0, MYIP
+B7 02 02 0F	# lui t0,0xf020
+93 82 A2 00	# addi t0,t0,10 # f02000a <MYIP>
+#         bne     a0, t0, 9b
+E3 16 55 F8	# bne a0,t0,5b0 <.L9^B6>
+#         li      a0, 2
+13 05 20 00	# li a0,2
+#         addi    a1, s5, 22
+93 85 6A 01	# addi a1,s5,22
+#         mv      a2, s6
+13 06 0B 00	# mv a2,s6
+#         jal     arp_send
+EF 00 40 65	# jal c88 <arp_send>
+#         j       9b
+6F F0 9F F7	# j 5b0 <.L9^B6>
+
+# a0 = frame, a1 = its length: a UDP datagram to us from a peer we know.
+# on_ip:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         addi    s5, a0, 14              # IP header
+93 0A E5 00	# addi s5,a0,14
+#         add     s7, a0, a1              # the frame's end
+B3 0B B5 00	# add s7,a0,a1
+#         lbu     t0, 0(s5)
+83 C2 0A 00	# lbu t0,0(s5)
+#         srli    t1, t0, 4
+13 D3 42 00	# srli t1,t0,0x4
+#         li      t2, 4
+93 03 40 00	# li t2,4
+#         bne     t1, t2, 9f
+63 1C 73 0C	# bne t1,t2,73c <.L9^B7>
+#         andi    t0, t0, 15
+93 F2 F2 00	# andi t0,t0,15
+#         slli    t0, t0, 2               # header length
+93 92 22 00	# slli t0,t0,0x2
+#         lbu     t1, 9(s5)
+03 C3 9A 00	# lbu t1,9(s5)
+#         li      t2, 17
+93 03 10 01	# li t2,17
+#         bne     t1, t2, 9f
+63 12 73 0C	# bne t1,t2,73c <.L9^B7>
+#         add     s6, s5, t0              # UDP header
+33 8B 5A 00	# add s6,s5,t0
+#         addi    a0, s5, 16
+13 85 0A 01	# addi a0,s5,16
+#         jal     get32le
+EF 00 10 48	# jal 1304 <get32le>
+#         li      t0, MYIP
+B7 02 02 0F	# lui t0,0xf020
+93 82 A2 00	# addi t0,t0,10 # f02000a <MYIP>
+#         bne     a0, t0, 9f
+63 16 55 0A	# bne a0,t0,73c <.L9^B7>
+#         addi    a0, s6, 2
+13 05 2B 00	# addi a0,s6,2
+#         jal     get16be
+EF 00 50 44	# jal 12dc <get16be>
+#         li      t0, PORT
+B7 12 00 00	# lui t0,0x1
+93 82 92 E9	# addi t0,t0,-359 # e99 <net_init+0x3d>
+#         bne     a0, t0, 9f
+63 1C 55 08	# bne a0,t0,73c <.L9^B7>
+#         addi    a0, s6, 4
+13 05 4B 00	# addi a0,s6,4
+#         jal     get16be
+EF 00 10 43	# jal 12dc <get16be>
+#         addi    a0, a0, -8              # payload length
+13 05 85 FF	# addi a0,a0,-8
+#         li      t0, 5
+93 02 50 00	# li t0,5
+#         blt     a0, t0, 9f
+63 42 55 08	# blt a0,t0,73c <.L9^B7>
+#         addi    t1, s6, 8
+13 03 8B 00	# addi t1,s6,8
+#         add     t1, t1, a0
+33 03 A3 00	# add t1,t1,a0
+#         bltu    s7, t1, 9f              # past the frame
+63 EC 6B 06	# bltu s7,t1,73c <.L9^B7>
+#         mv      s7, a0
+93 0B 05 00	# mv s7,a0
+#         addi    a0, s5, 12
+13 85 CA 00	# addi a0,s5,12
+#         jal     get32le
+EF 00 50 43	# jal 1304 <get32le>
+#         mv      s5, a0                  # source address
+93 0A 05 00	# mv s5,a0
+#         mv      a0, s6
+13 05 0B 00	# mv a0,s6
+#         jal     get16be                 # source port
+EF 00 10 40	# jal 12dc <get16be>
+#         mv      a1, a0
+93 05 05 00	# mv a1,a0
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         jal     find_peer
+EF 00 C0 33	# jal a24 <find_peer>
+#         beqz    a0, 9f
+63 08 05 04	# beqz a0,73c <.L9^B7>
+#         mv      s5, a0                  # the peer
+93 0A 05 00	# mv s5,a0
+#         addi    s6, s6, 8               # the payload
+13 0B 8B 00	# addi s6,s6,8
+#         mv      a0, s6
+13 05 0B 00	# mv a0,s6
+#         jal     get32le
+EF 00 90 40	# jal 1304 <get32le>
+#         li      t0, MAGIC
+B7 42 42 31	# lui t0,0x31424
+93 82 42 15	# addi t0,t0,340 # 31424154 <MAGIC>
+#         bne     a0, t0, 9f
+63 1A 55 02	# bne a0,t0,73c <.L9^B7>
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         mv      a1, s6
+93 05 0B 00	# mv a1,s6
+#         mv      a2, s7
+13 86 0B 00	# mv a2,s7
+#         lbu     t0, 4(s6)
+83 42 4B 00	# lbu t0,4(s6)
+#         li      t1, T_PONG
+13 03 20 00	# li t1,2
+#         beq     t0, t1, on_pong
+63 8A 62 02	# beq t0,t1,754 <on_pong>
+#         li      t1, T_PEERS
+13 03 40 00	# li t1,4
+#         beq     t0, t1, on_peers
+63 86 62 06	# beq t0,t1,794 <on_peers>
+#         li      t1, T_IMAGES
+13 03 10 04	# li t1,65
+#         beq     t0, t1, on_images
+63 86 62 08	# beq t0,t1,7bc <on_images>
+#         li      t1, T_IMAGE_CHUNK
+13 03 30 04	# li t1,67
+#         beq     t0, t1, on_chunk
+63 86 62 0E	# beq t0,t1,824 <on_chunk>
+# 9:      POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# The message handlers: a0 = peer, a1 = payload, a2 = its length; jumped to
+# from on_ip, and back to its end.
+
+# A Pong: the peer's token for us.  Ask it at once.
+# on_pong:
+#         li      t0, 145
+93 02 10 09	# li t0,145
+#         bne     a2, t0, 9b
+E3 12 56 FE	# bne a2,t0,73c <.L9^B7>
+#         lbu     t0, P_STATE(a0)
+83 42 75 00	# lbu t0,7(a0)
+#         bnez    t0, 9b
+E3 9E 02 FC	# bnez t0,73c <.L9^B7>
+#         li      t0, 1
+93 02 10 00	# li t0,1
+#         sb      t0, P_STATE(a0)
+A3 03 55 00	# sb t0,7(a0)
+#         sw      zero, P_TRIES(a0)
+23 2A 05 00	# sw zero,20(a0)
+#         li      t0, TICK
+B7 92 98 00	# lui t0,0x989
+93 82 02 68	# addi t0,t0,1664 # 989680 <TICK>
+#         sub     t0, s3, t0
+B3 82 59 40	# sub t0,s3,t0
+#         sw      t0, P_LAST(a0)
+23 28 55 00	# sw t0,16(a0)
+#         addi    a0, a0, P_TOKEN
+13 05 85 00	# addi a0,a0,8
+#         addi    a1, a1, 17
+93 85 15 01	# addi a1,a1,17
+#         li      a2, 8
+13 06 80 00	# li a2,8
+#         jal     copy
+EF 00 90 31	# jal 12a4 <copy>
+#         j       9b
+6F F0 DF FA	# j 73c <.L9^B7>
+
+# Peers: more to ask.
+# on_peers:
+#         lbu     t0, 5(a1)
+83 C2 55 00	# lbu t0,5(a1)
+#         slli    t1, t0, 1
+13 93 12 00	# slli t1,t0,0x1
+#         add     t1, t1, t0
+33 03 53 00	# add t1,t1,t0
+#         slli    t1, t1, 1
+13 13 13 00	# slli t1,t1,0x1
+#         addi    t1, t1, 6
+13 03 63 00	# addi t1,t1,6
+#         bne     a2, t1, 9b              # 6 + 6 a peer
+E3 1A 66 F8	# bne a2,t1,73c <.L9^B7>
+#         addi    a0, a1, 5
+13 85 55 00	# addi a0,a1,5
+#         li      a1, 0
+93 05 00 00	# li a1,0
+#         jal     add_peers
+EF 00 80 19	# jal 94c <add_peers>
+#         j       9b
+6F F0 5F F8	# j 73c <.L9^B7>
+
+# Images: whether the peer has our version, at our size.
+# on_images:
+#         lbu     t0, P_STATE(a0)
+83 42 75 00	# lbu t0,7(a0)
+#         li      t1, 1
+13 03 10 00	# li t1,1
+#         bne     t0, t1, 9b
+E3 9C 62 F6	# bne t0,t1,73c <.L9^B7>
+#         lbu     t0, 5(a1)
+83 C2 55 00	# lbu t0,5(a1)
+#         slli    t1, t0, 3
+13 93 32 00	# slli t1,t0,0x3
+#         addi    t1, t1, 6
+13 03 63 00	# addi t1,t1,6
+#         bne     a2, t1, 9b              # 6 + 8 a version
+E3 14 66 F6	# bne a2,t1,73c <.L9^B7>
+#         li      t1, 3
+13 03 30 00	# li t1,3
+#         sb      t1, P_STATE(a0)         # unless we find it
+A3 03 65 00	# sb t1,7(a0)
+#         addi    s6, a1, 6
+13 8B 65 00	# addi s6,a1,6
+#         slli    t0, t0, 3
+93 92 32 00	# slli t0,t0,0x3
+#         add     s7, s6, t0
+B3 0B 5B 00	# add s7,s6,t0
+# 1:      bgeu    s6, s7, 9b
+E3 78 7B F5	# bgeu s6,s7,73c <.L9^B7>
+#         mv      a0, s6
+13 05 0B 00	# mv a0,s6
+#         jal     get32le
+EF 00 10 31	# jal 1304 <get32le>
+#         lw      t0, 0(s4)
+83 22 0A 00	# lw t0,0(s4)
+#         bne     a0, t0, 2f
+63 10 55 02	# bne a0,t0,81c <.L2^B7>
+#         addi    a0, s6, 4
+13 05 4B 00	# addi a0,s6,4
+#         jal     get32le
+EF 00 10 30	# jal 1304 <get32le>
+#         lw      t0, 4(s4)
+83 22 4A 00	# lw t0,4(s4)
+#         bne     a0, t0, 9b              # our version at another size: not ours
+E3 18 55 F2	# bne a0,t0,73c <.L9^B7>
+#         li      t1, 2
+13 03 20 00	# li t1,2
+#         sb      t1, P_STATE(s5)
+A3 83 6A 00	# sb t1,7(s5)
+#         j       9b
+6F F0 5F F2	# j 73c <.L9^B7>
+# 2:      addi    s6, s6, 8
+13 0B 8B 00	# addi s6,s6,8
+#         j       1b
+6F F0 DF FC	# j 7ec <.L1^B11>
+
+# An ImageChunk from the peer downloading from: kept if it is the size it
+# should be and in the batch.  A whole batch asks for the next; the last
+# checks the image.
+# on_chunk:
+#         lw      t0, V_CUR(s0)
+83 22 84 02	# lw t0,40(s0)
+#         bne     a0, t0, 9b
+E3 1A 55 F0	# bne a0,t0,73c <.L9^B7>
+#         li      t0, 17
+93 02 10 01	# li t0,17
+#         bltu    a2, t0, 9b
+E3 66 56 F0	# bltu a2,t0,73c <.L9^B7>
+#         mv      s6, a1
+13 8B 05 00	# mv s6,a1
+#         mv      s7, a2
+93 0B 06 00	# mv s7,a2
+#         addi    a0, s6, 5
+13 05 5B 00	# addi a0,s6,5
+#         jal     get32le
+EF 00 50 2C	# jal 1304 <get32le>
+#         lw      t0, 0(s4)
+83 22 0A 00	# lw t0,0(s4)
+#         bne     a0, t0, 9b              # another version
+E3 1A 55 EE	# bne a0,t0,73c <.L9^B7>
+#         addi    a0, s6, 9
+13 05 9B 00	# addi a0,s6,9
+#         jal     get32le
+EF 00 50 2B	# jal 1304 <get32le>
+#         lw      t0, 4(s4)
+83 22 4A 00	# lw t0,4(s4)
+#         bne     a0, t0, 5f              # another size: not our image
+63 12 55 0E	# bne a0,t0,93c <_base24>
+#         addi    a0, s6, 15
+13 05 FB 00	# addi a0,s6,15
+#         jal     get16le                 # the chunk's length
+EF 00 10 29	# jal 12f0 <get16le>
+#         addi    t0, a0, 17
+93 02 15 01	# addi t0,a0,17
+#         bne     s7, t0, 9b
+E3 9A 5B EC	# bne s7,t0,73c <.L9^B7>
+#         mv      s7, a0
+93 0B 05 00	# mv s7,a0
+#         addi    a0, s6, 13
+13 05 DB 00	# addi a0,s6,13
+#         jal     get16le                 # its index
+EF 00 D0 27	# jal 12f0 <get16le>
+#         lw      t0, V_BASE(s0)
+83 22 C4 02	# lw t0,44(s0)
+#         sub     t1, a0, t0
+33 03 55 40	# sub t1,a0,t0
+#         lw      t2, V_N(s0)
+83 23 44 03	# lw t2,52(s0)
+#         bgeu    t1, t2, 9b              # not in the batch
+E3 7C 73 EA	# bgeu t1,t2,73c <.L9^B7>
+#         mv      s5, t1
+93 0A 03 00	# mv s5,t1
+#         lw      t0, V_NCHUNKS(s0)       # the length it must have
+83 22 04 04	# lw t0,64(s0)
+#         addi    t0, t0, -1
+93 82 F2 FF	# addi t0,t0,-1
+#         li      t1, 1024
+13 03 00 40	# li t1,1024
+#         bne     a0, t0, 1f
+63 18 55 00	# bne a0,t0,8a8 <.L1^B12>
+#         slli    t2, a0, 10
+93 13 A5 00	# slli t2,a0,0xa
+#         lw      t1, 4(s4)
+03 23 4A 00	# lw t1,4(s4)
+#         sub     t1, t1, t2
+33 03 73 40	# sub t1,t1,t2
+# 1:      bne     s7, t1, 5f
+63 9A 6B 08	# bne s7,t1,93c <_base24>
+#         slli    a0, a0, 10
+13 15 A5 00	# slli a0,a0,0xa
+#         li      t0, IMAGE
+B7 02 00 80	# lui t0,0x80000
+#         add     a0, a0, t0
+33 05 55 00	# add a0,a0,t0
+#         addi    a1, s6, 17
+93 05 1B 01	# addi a1,s6,17
+#         mv      a2, s7
+13 86 0B 00	# mv a2,s7
+#         jal     copy
+EF 00 50 1E	# jal 12a4 <copy>
+#         li      t0, 1
+93 02 10 00	# li t0,1
+#         sll     t0, t0, s5
+B3 92 52 01	# sll t0,t0,s5
+#         lw      t1, V_MASK(s0)
+03 23 04 03	# lw t1,48(s0)
+#         or      t1, t1, t0
+33 63 53 00	# or t1,t1,t0
+#         sw      t1, V_MASK(s0)
+23 28 64 02	# sw t1,48(s0)
+#         sw      s3, V_LAST(s0)
+23 2C 34 03	# sw s3,56(s0)
+#         sw      zero, V_STRIKES(s0)
+23 2E 04 02	# sw zero,60(s0)
+#         lw      t2, V_N(s0)             # the batch whole?
+83 23 44 03	# lw t2,52(s0)
+#         li      t3, -1
+13 0E F0 FF	# li t3,-1
+#         li      t4, 32
+93 0E 00 02	# li t4,32
+#         beq     t2, t4, 2f
+63 88 D3 01	# beq t2,t4,8fc <.L2^B8>
+#         li      t3, 1
+13 0E 10 00	# li t3,1
+#         sll     t3, t3, t2
+33 1E 7E 00	# sll t3,t3,t2
+#         addi    t3, t3, -1
+13 0E FE FF	# addi t3,t3,-1
+# 2:      bne     t1, t3, 9b
+E3 10 C3 E5	# bne t1,t3,73c <.L9^B7>
+#         lw      t0, V_BASE(s0)
+83 22 C4 02	# lw t0,44(s0)
+#         add     t0, t0, t2
+B3 82 72 00	# add t0,t0,t2
+#         sw      t0, V_BASE(s0)
+23 26 54 02	# sw t0,44(s0)
+#         sw      zero, V_MASK(s0)
+23 28 04 02	# sw zero,48(s0)
+#         lw      t1, V_NCHUNKS(s0)
+03 23 04 04	# lw t1,64(s0)
+#         bgeu    t0, t1, 3f
+63 F6 62 00	# bgeu t0,t1,920 <.L3^B5>
+#         jal     ask_batch
+EF F0 DF AE	# jal 404 <ask_batch>
+#         j       9b
+6F F0 1F E2	# j 73c <.L9^B7>
+# 3:      jal     check_image
+EF 00 C0 75	# jal 107c <check_image>
+#         beqz    a0, 4f
+63 04 05 00	# beqz a0,92c <_base23>
+#         j       run
+6F F0 1F 81	# j 138 <run>
+# 4:      LOAD_ADDRESS a0, msg_bad
+17 15 00 00	# auipc a0,0x1
+13 05 85 B7	# addi a0,a0,-1160 # 14a4 <msg_bad>
+#         jal     drop
+EF F0 5F A9	# jal 3c8 <drop>
+#         j       9b
+6F F0 5F E0	# j 73c <.L9^B7>
+# 5:      LOAD_ADDRESS a0, msg_size
+17 15 00 00	# auipc a0,0x1
+13 05 45 B8	# addi a0,a0,-1148 # 14c0 <msg_size>
+#         jal     drop
+EF F0 5F A8	# jal 3c8 <drop>
+#         j       9b
+6F F0 5F DF	# j 73c <.L9^B7>
+
+# ===========================================================================
+# a0 = count byte, then 6-byte entries (4 address bytes, a u16 LE port), as
+# in a Peers message; a1 = 1 if they are seeds.  Adds those not yet known.
+# add_peers:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         lbu     s6, 0(a0)
+03 4B 05 00	# lbu s6,0(a0)
+#         addi    s5, a0, 1
+93 0A 15 00	# addi s5,a0,1
+#         mv      s7, a1
+93 8B 05 00	# mv s7,a1
+# 1:      beqz    s6, 9f
+63 00 0B 0A	# beqz s6,a0c <.L9^B8>
+#         addi    s6, s6, -1
+13 0B FB FF	# addi s6,s6,-1
+#         mv      a0, s5
+13 85 0A 00	# mv a0,s5
+#         jal     get32le
+EF 00 D0 18	# jal 1304 <get32le>
+#         mv      t5, a0
+13 0F 05 00	# mv t5,a0
+#         addi    a0, s5, 4
+13 85 4A 00	# addi a0,s5,4
+#         jal     get16le
+EF 00 D0 16	# jal 12f0 <get16le>
+#         mv      a1, a0
+93 05 05 00	# mv a1,a0
+#         addi    s5, s5, 6
+93 8A 6A 00	# addi s5,s5,6
+#         mv      a0, t5
+13 05 0F 00	# mv a0,t5
+#         beqz    a0, 1b
+E3 0C 05 FC	# beqz a0,96c <.L1^B13>
+#         beqz    a1, 1b
+E3 8A 05 FC	# beqz a1,96c <.L1^B13>
+#         PUSH    a0, a1
+13 01 01 FF	# addi sp,sp,-16
+23 20 A1 00	# sw a0,0(sp)
+23 22 B1 00	# sw a1,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         jal     find_peer
+EF 00 40 07	# jal a24 <find_peer>
+#         POP     t5, t6
+03 2F 01 00	# lw t5,0(sp)
+83 2F 41 00	# lw t6,4(sp)
+13 01 01 01	# addi sp,sp,16
+#         bnez    a0, 1b                  # known
+E3 16 05 FA	# bnez a0,96c <.L1^B13>
+#         lw      t0, V_NPEERS(s0)
+83 22 44 02	# lw t0,36(s0)
+#         li      t1, MAXPEERS
+13 03 00 04	# li t1,64
+#         bgeu    t0, t1, 9f              # no room
+63 F0 62 04	# bgeu t0,t1,a0c <.L9^B8>
+#         addi    t1, t0, 1
+13 83 12 00	# addi t1,t0,1 # 80000001 <IMAGE+0x1>
+#         sw      t1, V_NPEERS(s0)
+23 22 64 02	# sw t1,36(s0)
+#         slli    t0, t0, 5
+93 92 52 00	# slli t0,t0,0x5
+#         li      t1, PEERS
+37 B3 F1 87	# lui t1,0x87f1b
+#         add     t0, t0, t1
+B3 82 62 00	# add t0,t0,t1
+#         sw      t5, P_IP(t0)
+23 A0 E2 01	# sw t5,0(t0)
+#         sh      t6, P_PORT(t0)
+23 92 F2 01	# sh t6,4(t0)
+#         sb      s7, P_SEED(t0)
+23 83 72 01	# sb s7,6(t0)
+#         sb      zero, P_STATE(t0)
+A3 83 02 00	# sb zero,7(t0)
+#         sw      zero, P_TRIES(t0)
+23 AA 02 00	# sw zero,20(t0)
+#         li      t1, TICK                # due at once
+37 93 98 00	# lui t1,0x989
+13 03 03 68	# addi t1,t1,1664 # 989680 <TICK>
+#         sub     t1, s3, t1
+33 83 69 40	# sub t1,s3,t1
+#         sw      t1, P_LAST(t0)
+23 A8 62 00	# sw t1,16(t0)
+#         j       1b
+6F F0 5F F6	# j 96c <.L1^B13>
+# 9:      POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = address, a1 = port: a0 = the peer, or 0.
+# find_peer:
+#         li      t0, PEERS
+B7 B2 F1 87	# lui t0,0x87f1b
+#         lw      t1, V_NPEERS(s0)
+03 23 44 02	# lw t1,36(s0)
+#         slli    t1, t1, 5
+13 13 53 00	# slli t1,t1,0x5
+#         add     t1, t1, t0
+33 03 53 00	# add t1,t1,t0
+# 1:      bgeu    t0, t1, 2f
+63 FE 62 00	# bgeu t0,t1,a50 <.L2^B9>
+#         lw      t2, P_IP(t0)
+83 A3 02 00	# lw t2,0(t0) # 87f1b000 <PEERS>
+#         lhu     t3, P_PORT(t0)
+03 DE 42 00	# lhu t3,4(t0)
+#         bne     t2, a0, 3f
+63 94 A3 00	# bne t2,a0,a48 <.L3^B6>
+#         beq     t3, a1, 9f
+63 08 BE 00	# beq t3,a1,a54 <.L9^B9>
+# 3:      addi    t0, t0, 32
+93 82 02 02	# addi t0,t0,32
+#         j       1b
+6F F0 9F FE	# j a34 <.L1^B14>
+# 2:      li      t0, 0
+93 02 00 00	# li t0,0
+# 9:      mv      a0, t0
+13 85 02 00	# mv a0,t0
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# Sending.  A message is built at PAYLOAD; udp_send puts the headers on.
+
+# a0 = type: "TAB1" and the type at PAYLOAD.
+# put_head:
+#         li      t0, PAYLOAD
+B7 A2 F1 87	# lui t0,0x87f1a
+93 82 42 03	# addi t0,t0,52 # 87f1a034 <PAYLOAD>
+#         li      t1, MAGIC
+37 43 42 31	# lui t1,0x31424
+13 03 43 15	# addi t1,t1,340 # 31424154 <MAGIC>
+#         sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0)
+#         sb      a0, 4(t0)
+23 82 A2 00	# sb a0,4(t0)
+#         ret
+67 80 00 00	# ret
+
+# a0 = peer: its token at PAYLOAD + 5.
+# put_token:
+#         addi    a1, a0, P_TOKEN
+93 05 85 00	# addi a1,a0,8
+#         li      a0, PAYLOAD + 5
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 95 03	# addi a0,a0,57 # 87f1a039 <PAYLOAD+0x5>
+#         li      a2, 8
+13 06 80 00	# li a2,8
+#         j       copy
+6F 00 D0 01	# j 12a4 <copy>
+
+# a0 = peer: a Ping, all zeros (we are not on any chain: tabminer answers
+# with a Pong, and takes us for no peer).
+# send_ping:
+#         PUSH    ra, a0
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 A1 00	# sw a0,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         li      a0, PAYLOAD + 5
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 95 03	# addi a0,a0,57 # 87f1a039 <PAYLOAD+0x5>
+#         li      a1, 140
+93 05 C0 08	# li a1,140
+#         jal     zero_bytes
+EF 00 90 01	# jal 12c4 <zero_bytes>
+#         li      a0, T_PING
+13 05 10 00	# li a0,1
+#         jal     put_head
+EF F0 9F FA	# jal a5c <put_head>
+#         POP     ra, a0
+83 20 01 00	# lw ra,0(sp)
+03 25 41 00	# lw a0,4(sp)
+13 01 01 01	# addi sp,sp,16
+#         li      a1, 145
+93 05 10 09	# li a1,145
+#         j       udp_send
+6F 00 C0 03	# j b04 <udp_send>
+
+# a0 = peer, a1 = type: a request carrying only the token.
+# send_token:
+#         PUSH    ra, a0
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 A1 00	# sw a0,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         mv      a0, a1
+13 85 05 00	# mv a0,a1
+#         jal     put_head
+EF F0 9F F7	# jal a5c <put_head>
+#         lw      a0, 4(sp)
+03 25 41 00	# lw a0,4(sp)
+#         jal     put_token
+EF F0 DF F8	# jal a78 <put_token>
+#         POP     ra, a0
+83 20 01 00	# lw ra,0(sp)
+03 25 41 00	# lw a0,4(sp)
+13 01 01 01	# addi sp,sp,16
+#         li      a1, 13
+93 05 D0 00	# li a1,13
+#         j       udp_send
+6F 00 40 00	# j b04 <udp_send>
+
+# a0 = peer, a1 = payload length.
+# udp_send:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         mv      s5, a0
+93 0A 05 00	# mv s5,a0
+#         mv      s6, a1
+13 8B 05 00	# mv s6,a1
+#         li      s7, TXBUF + 10          # the Ethernet frame
+B7 AB F1 87	# lui s7,0x87f1a
+93 8B AB 00	# addi s7,s7,10 # 87f1a00a <TXBUF+0xa>
+#         mv      a0, s7
+13 85 0B 00	# mv a0,s7
+#         addi    a1, s0, V_GW
+93 05 84 00	# addi a1,s0,8
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 00 77	# jal 12a4 <copy>
+#         li      a0, 0x0800
+37 15 00 00	# lui a0,0x1
+13 05 05 80	# addi a0,a0,-2048 # 800 <.L1^B11+0x14>
+#         jal     put_eth_src
+EF 00 00 0F	# jal c30 <put_eth_src>
+#         addi    a0, s7, 14              # IP
+13 85 EB 00	# addi a0,s7,14
+#         li      a1, 0x45                # version 4, header 20; length below
+93 05 50 04	# li a1,69
+#         jal     put32le
+EF 00 50 00	# jal 1350 <put32le>
+#         addi    a0, s7, 16
+13 85 0B 01	# addi a0,s7,16
+#         addi    a1, s6, 28
+93 05 CB 01	# addi a1,s6,28
+#         jal     put16be
+EF 00 80 7D	# jal 1330 <put16be>
+#         addi    a0, s7, 18
+13 85 2B 01	# addi a0,s7,18
+#         li      a1, 0x00400000          # id 0; don't fragment
+B7 05 40 00	# lui a1,0x400
+#         jal     put32le
+EF 00 C0 7E	# jal 1350 <put32le>
+#         addi    a0, s7, 22
+13 85 6B 01	# addi a0,s7,22
+#         li      a1, 0x1140              # TTL 64, UDP; checksum 0 for now
+B7 15 00 00	# lui a1,0x1
+93 85 05 14	# addi a1,a1,320 # 1140 <.L5^B2+0x2c>
+#         jal     put32le
+EF 00 C0 7D	# jal 1350 <put32le>
+#         addi    a0, s7, 26
+13 85 AB 01	# addi a0,s7,26
+#         li      a1, MYIP
+B7 05 02 0F	# lui a1,0xf020
+93 85 A5 00	# addi a1,a1,10 # f02000a <MYIP>
+#         jal     put32le
+EF 00 C0 7C	# jal 1350 <put32le>
+#         addi    a0, s7, 30
+13 85 EB 01	# addi a0,s7,30
+#         lw      a1, P_IP(s5)
+83 A5 0A 00	# lw a1,0(s5)
+#         jal     put32le
+EF 00 00 7C	# jal 1350 <put32le>
+#         li      t3, 0                   # the header checksum
+13 0E 00 00	# li t3,0
+#         li      t4, 0
+93 0E 00 00	# li t4,0
+# 1:      add     a0, s7, t4
+33 85 DB 01	# add a0,s7,t4
+#         addi    a0, a0, 14
+13 05 E5 00	# addi a0,a0,14
+#         jal     get16be
+EF 00 80 73	# jal 12dc <get16be>
+#         add     t3, t3, a0
+33 0E AE 00	# add t3,t3,a0
+#         addi    t4, t4, 2
+93 8E 2E 00	# addi t4,t4,2
+#         li      t0, 20
+93 02 40 01	# li t0,20
+#         bltu    t4, t0, 1b
+E3 E4 5E FE	# bltu t4,t0,b9c <.L1^B15>
+#         srli    t0, t3, 16
+93 52 0E 01	# srli t0,t3,0x10
+#         slli    t3, t3, 16
+13 1E 0E 01	# slli t3,t3,0x10
+#         srli    t3, t3, 16
+13 5E 0E 01	# srli t3,t3,0x10
+#         add     t3, t3, t0
+33 0E 5E 00	# add t3,t3,t0
+#         srli    t0, t3, 16
+93 52 0E 01	# srli t0,t3,0x10
+#         add     t3, t3, t0
+33 0E 5E 00	# add t3,t3,t0
+#         not     a1, t3
+93 45 FE FF	# not a1,t3
+#         addi    a0, s7, 24
+13 85 8B 01	# addi a0,s7,24
+#         jal     put16be
+EF 00 80 75	# jal 1330 <put16be>
+#         addi    a0, s7, 34              # UDP
+13 85 2B 02	# addi a0,s7,34
+#         li      a1, PORT
+B7 15 00 00	# lui a1,0x1
+93 85 95 E9	# addi a1,a1,-359 # e99 <net_init+0x3d>
+#         jal     put16be
+EF 00 80 74	# jal 1330 <put16be>
+#         addi    a0, s7, 36
+13 85 4B 02	# addi a0,s7,36
+#         lhu     a1, P_PORT(s5)
+83 D5 4A 00	# lhu a1,4(s5)
+#         jal     put16be
+EF 00 C0 73	# jal 1330 <put16be>
+#         addi    a0, s7, 38
+13 85 6B 02	# addi a0,s7,38
+#         addi    a1, s6, 8
+93 05 8B 00	# addi a1,s6,8
+#         jal     put16be
+EF 00 00 73	# jal 1330 <put16be>
+#         addi    a0, s7, 40
+13 85 8B 02	# addi a0,s7,40
+#         li      a1, 0                   # no UDP checksum
+93 05 00 00	# li a1,0
+#         jal     put16be
+EF 00 40 72	# jal 1330 <put16be>
+#         addi    a0, s6, 42
+13 05 AB 02	# addi a0,s6,42
+#         jal     send_frame
+EF 00 00 15	# jal d64 <send_frame>
+#         POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = ethertype: our address as the frame's source, and the type.
+# put_eth_src:
+#         PUSH    ra, a0
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 A1 00	# sw a0,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         li      a0, TXBUF + 16
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 05 01	# addi a0,a0,16 # 87f1a010 <TXBUF+0x10>
+#         addi    a1, s0, V_MAC
+93 05 04 00	# mv a1,s0
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 00 65	# jal 12a4 <copy>
+#         POP     ra, a1
+83 20 01 00	# lw ra,0(sp)
+83 25 41 00	# lw a1,4(sp)
+13 01 01 01	# addi sp,sp,16
+#         li      a0, TXBUF + 22
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 65 01	# addi a0,a0,22 # 87f1a016 <TXBUF+0x16>
+#         j       put16be
+6F 00 40 6C	# j 1330 <put16be>
+
+# Ask for the gateway's address.
+# arp_request:
+#         sw      s3, V_ARPT(s0)
+23 20 34 03	# sw s3,32(s0)
+#         li      a0, 1
+13 05 10 00	# li a0,1
+#         LOAD_ADDRESS a1, broadcast
+97 05 00 00	# auipc a1,0x0
+93 85 05 7F	# addi a1,a1,2032 # 1468 <broadcast>
+#         li      a2, GWIP
+37 06 02 02	# lui a2,0x2020
+13 06 A6 00	# addi a2,a2,10 # 202000a <GWIP>
+        # fall through
+
+# a0 = op, a1 = the Ethernet address to send to (also the target's), a2 =
+# the target's IP address.
+# arp_send:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         mv      s5, a0
+93 0A 05 00	# mv s5,a0
+#         mv      s6, a1
+13 8B 05 00	# mv s6,a1
+#         mv      s7, a2
+93 0B 06 00	# mv s7,a2
+#         li      a0, TXBUF + 10
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 A5 00	# addi a0,a0,10 # 87f1a00a <TXBUF+0xa>
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 00 5F	# jal 12a4 <copy>
+#         li      a0, 0x0806
+37 15 00 00	# lui a0,0x1
+13 05 65 80	# addi a0,a0,-2042 # 806 <.L1^B11+0x1a>
+#         jal     put_eth_src
+EF F0 1F F7	# jal c30 <put_eth_src>
+#         li      a0, TXBUF + 24          # Ethernet, IPv4, 6, 4
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 85 01	# addi a0,a0,24 # 87f1a018 <TXBUF+0x18>
+#         li      a1, 0x00080100
+B7 05 08 00	# lui a1,0x80
+93 85 05 10	# addi a1,a1,256 # 80100 <_end+0x7eb74>
+#         jal     put32le
+EF 00 C0 67	# jal 1350 <put32le>
+#         li      a0, TXBUF + 28
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 C5 01	# addi a0,a0,28 # 87f1a01c <TXBUF+0x1c>
+#         li      a1, 0x0406
+93 05 60 40	# li a1,1030
+#         jal     put16le
+EF 00 C0 65	# jal 1340 <put16le>
+#         li      a0, TXBUF + 30
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 E5 01	# addi a0,a0,30 # 87f1a01e <TXBUF+0x1e>
+#         mv      a1, s5
+93 85 0A 00	# mv a1,s5
+#         jal     put16be
+EF 00 C0 63	# jal 1330 <put16be>
+#         li      a0, TXBUF + 32          # sender: us
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 05 02	# addi a0,a0,32 # 87f1a020 <TXBUF+0x20>
+#         addi    a1, s0, V_MAC
+93 05 04 00	# mv a1,s0
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 C0 59	# jal 12a4 <copy>
+#         li      a0, TXBUF + 38
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 65 02	# addi a0,a0,38 # 87f1a026 <TXBUF+0x26>
+#         li      a1, MYIP
+B7 05 02 0F	# lui a1,0xf020
+93 85 A5 00	# addi a1,a1,10 # f02000a <MYIP>
+#         jal     put32le
+EF 00 40 63	# jal 1350 <put32le>
+#         li      a0, TXBUF + 42          # target
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 A5 02	# addi a0,a0,42 # 87f1a02a <TXBUF+0x2a>
+#         mv      a1, s6
+93 05 0B 00	# mv a1,s6
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 40 57	# jal 12a4 <copy>
+#         li      a0, TXBUF + 48
+37 A5 F1 87	# lui a0,0x87f1a
+13 05 05 03	# addi a0,a0,48 # 87f1a030 <TXBUF+0x30>
+#         mv      a1, s7
+93 85 0B 00	# mv a1,s7
+#         jal     put32le
+EF 00 00 61	# jal 1350 <put32le>
+#         li      a0, 42
+13 05 A0 02	# li a0,42
+#         jal     send_frame
+EF 00 C0 01	# jal d64 <send_frame>
+#         POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = the frame's length: send TXBUF (the virtio header, zero, first) and
+# wait until the device has taken it.
+# send_frame:
+#         li      t0, TXQ                 # descriptor 0
+B7 22 F1 87	# lui t0,0x87f12
+#         li      t1, TXBUF
+37 A3 F1 87	# lui t1,0x87f1a
+#         sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0) # 87f12000 <TXQ>
+#         sw      zero, 4(t0)
+23 A2 02 00	# sw zero,4(t0)
+#         addi    t1, a0, 10
+13 03 A5 00	# addi t1,a0,10
+#         sw      t1, 8(t0)
+23 A4 62 00	# sw t1,8(t0)
+#         sw      zero, 12(t0)
+23 A6 02 00	# sw zero,12(t0)
+#         li      t0, TXQ + 16 * QN       # available ring
+B7 22 F1 87	# lui t0,0x87f12
+93 82 02 08	# addi t0,t0,128 # 87f12080 <TXQ+0x80>
+#         lw      t1, V_TXAV(s0)
+03 23 C4 01	# lw t1,28(s0)
+#         andi    t2, t1, QN - 1
+93 73 73 00	# andi t2,t1,7
+#         slli    t2, t2, 1
+93 93 13 00	# slli t2,t2,0x1
+#         add     t2, t2, t0
+B3 83 53 00	# add t2,t2,t0
+#         sh      zero, 4(t2)
+23 92 03 00	# sh zero,4(t2)
+#         fence
+0F 00 F0 0F	# fence
+#         addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1 # 87f1a001 <TXBUF+0x1>
+#         sw      t1, V_TXAV(s0)
+23 2E 64 00	# sw t1,28(s0)
+#         sh      t1, 2(t0)
+23 91 62 00	# sh t1,2(t0)
+#         fence
+0F 00 F0 0F	# fence
+#         li      t2, 1
+93 03 10 00	# li t2,1
+#         sw      t2, 0x50(s1)            # QueueNotify: transmit
+23 A8 74 04	# sw t2,80(s1)
+#         slli    t1, t1, 16
+13 13 03 01	# slli t1,t1,0x10
+#         srli    t1, t1, 16
+13 53 03 01	# srli t1,t1,0x10
+#         li      t0, TXQ + 4096
+B7 32 F1 87	# lui t0,0x87f13
+# 1:      lhu     t2, 2(t0)
+83 D3 22 00	# lhu t2,2(t0) # 87f13002 <TXQ+0x1002>
+#         bne     t2, t1, 1b
+E3 9E 63 FE	# bne t2,t1,dc4 <.L1^B16>
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# Devices.
+
+# a0 = device id: a0 = the virtio-mmio slot that has it, or 0.
+# find_dev:
+#         li      t0, VIRTIO
+B7 12 00 10	# lui t0,0x10001
+#         li      t1, VIRTIO + 0x8000
+37 93 00 10	# lui t1,0x10009
+#         li      t2, 0x74726976          # "virt"
+B7 73 72 74	# lui t2,0x74727
+93 83 63 97	# addi t2,t2,-1674 # 74726976 <MAGIC+0x43302822>
+# 1:      lw      t3, 0(t0)
+03 AE 02 00	# lw t3,0(t0) # 10001000 <VIRTIO>
+#         bne     t3, t2, 2f
+63 16 7E 00	# bne t3,t2,df0 <.L2^B10>
+#         lw      t3, 8(t0)
+03 AE 82 00	# lw t3,8(t0)
+#         beq     t3, a0, 9f
+63 0C AE 00	# beq t3,a0,e04 <.L9^B10>
+# 2:      addi    t0, t0, 0x7FF
+93 82 F2 7F	# addi t0,t0,2047
+#         addi    t0, t0, 0x7FF
+93 82 F2 7F	# addi t0,t0,2047
+#         addi    t0, t0, 2
+93 82 22 00	# addi t0,t0,2
+#         bltu    t0, t1, 1b
+E3 E2 62 FE	# bltu t0,t1,de0 <.L1^B17>
+#         li      t0, 0
+93 02 00 00	# li t0,0
+# 9:      mv      a0, t0
+13 85 02 00	# mv a0,t0
+#         ret
+67 80 00 00	# ret
+
+# a0 = device: reset, acknowledged, no features, 4 KiB pages (legacy).
+# dev_init:
+#         sw      zero, 0x70(a0)
+23 28 05 06	# sw zero,112(a0)
+#         li      t0, 1
+93 02 10 00	# li t0,1
+#         sw      t0, 0x70(a0)
+23 28 55 06	# sw t0,112(a0)
+#         li      t0, 3
+93 02 30 00	# li t0,3
+#         sw      t0, 0x70(a0)
+23 28 55 06	# sw t0,112(a0)
+#         sw      zero, 0x20(a0)
+23 20 05 02	# sw zero,32(a0)
+#         li      t0, 4096
+B7 12 00 00	# lui t0,0x1
+#         sw      t0, 0x28(a0)
+23 24 55 02	# sw t0,40(a0)
+#         ret
+67 80 00 00	# ret
+
+# a0 = device: running.
+# dev_ok:
+#         li      t0, 7
+93 02 70 00	# li t0,7
+#         sw      t0, 0x70(a0)
+23 28 55 06	# sw t0,112(a0)
+#         ret
+67 80 00 00	# ret
+
+# a0 = device, a1 = queue, a2 = its two pages.
+# queue_init:
+#         sw      a1, 0x30(a0)
+23 28 B5 02	# sw a1,48(a0)
+#         li      t0, QN
+93 02 80 00	# li t0,8
+#         sw      t0, 0x38(a0)
+23 2C 55 02	# sw t0,56(a0)
+#         li      t0, 4096
+B7 12 00 00	# lui t0,0x1
+#         sw      t0, 0x3C(a0)
+23 2E 55 02	# sw t0,60(a0)
+#         srli    t0, a2, 12
+93 52 C6 00	# srli t0,a2,0xc
+#         sw      t0, 0x40(a0)
+23 20 55 04	# sw t0,64(a0)
+#         ret
+67 80 00 00	# ret
+
+# net_init:
+#         PUSH    ra
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 01 00	# sw zero,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         mv      a0, s1
+13 85 04 00	# mv a0,s1
+#         jal     dev_init
+EF F0 9F F9	# jal e0c <dev_init>
+#         mv      a0, s1
+13 85 04 00	# mv a0,s1
+#         li      a1, 0
+93 05 00 00	# li a1,0
+#         li      a2, RXQ
+37 06 F1 87	# lui a2,0x87f10
+#         jal     queue_init
+EF F0 9F FB	# jal e3c <queue_init>
+#         mv      a0, s1
+13 85 04 00	# mv a0,s1
+#         li      a1, 1
+93 05 10 00	# li a1,1
+#         li      a2, TXQ
+37 26 F1 87	# lui a2,0x87f12
+#         jal     queue_init
+EF F0 9F FA	# jal e3c <queue_init>
+#         li      t0, RXQ                 # every receive buffer to the device
+B7 02 F1 87	# lui t0,0x87f10
+#         li      t1, RXBUF
+37 63 F1 87	# lui t1,0x87f16
+#         li      t3, RXQ + 16 * QN
+37 0E F1 87	# lui t3,0x87f10
+13 0E 0E 08	# addi t3,t3,128 # 87f10080 <RXQ+0x80>
+#         li      t4, 0
+93 0E 00 00	# li t4,0
+# 1:      sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0) # 87f10000 <RXQ>
+#         sw      zero, 4(t0)
+23 A2 02 00	# sw zero,4(t0)
+#         li      t2, 2048
+B7 13 00 00	# lui t2,0x1
+93 83 03 80	# addi t2,t2,-2048 # 800 <.L1^B11+0x14>
+#         sw      t2, 8(t0)
+23 A4 72 00	# sw t2,8(t0)
+#         li      t2, 2                   # device writes it
+93 03 20 00	# li t2,2
+#         sw      t2, 12(t0)
+23 A6 72 00	# sw t2,12(t0)
+#         slli    t2, t4, 1
+93 93 1E 00	# slli t2,t4,0x1
+#         add     t2, t2, t3
+B3 83 C3 01	# add t2,t2,t3
+#         sh      t4, 4(t2)
+23 92 D3 01	# sh t4,4(t2)
+#         addi    t0, t0, 16
+93 82 02 01	# addi t0,t0,16
+#         li      t2, 2048
+B7 13 00 00	# lui t2,0x1
+93 83 03 80	# addi t2,t2,-2048 # 800 <.L1^B11+0x14>
+#         add     t1, t1, t2
+33 03 73 00	# add t1,t1,t2
+#         addi    t4, t4, 1
+93 8E 1E 00	# addi t4,t4,1
+#         li      t2, QN
+93 03 80 00	# li t2,8
+#         bltu    t4, t2, 1b
+E3 E0 7E FC	# bltu t4,t2,eac <.L1^B18>
+#         sw      t4, V_RXAV(s0)
+23 2C D4 01	# sw t4,24(s0)
+#         fence
+0F 00 F0 0F	# fence
+#         sh      t4, 2(t3)
+23 11 DE 01	# sh t4,2(t3)
+#         li      a0, TXBUF               # the virtio header we send: zero
+37 A5 F1 87	# lui a0,0x87f1a
+#         li      a1, 12
+93 05 C0 00	# li a1,12
+#         jal     zero_bytes
+EF 00 00 3C	# jal 12c4 <zero_bytes>
+#         addi    a0, s0, V_MAC           # our address, from the config space
+13 05 04 00	# mv a0,s0
+#         addi    a1, s1, 0x100
+93 85 04 10	# addi a1,s1,256
+#         li      a2, 6
+13 06 60 00	# li a2,6
+#         jal     copy
+EF 00 00 39	# jal 12a4 <copy>
+#         mv      a0, s1
+13 85 04 00	# mv a0,s1
+#         jal     dev_ok
+EF F0 5F F1	# jal e30 <dev_ok>
+#         sw      zero, 0x50(s1)          # buffers to receive into
+23 A8 04 04	# sw zero,80(s1)
+#         POP     ra
+83 20 01 00	# lw ra,0(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# Read the image's size from the start of the disk to IMAGE, 64 KiB a
+# request: a0 = 0 if it all read.
+# disk_read:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         lw      s6, 4(s4)
+03 2B 4A 00	# lw s6,4(s4)
+#         addi    s6, s6, 511
+13 0B FB 1F	# addi s6,s6,511
+#         srli    s6, s6, 9               # sectors
+13 5B 9B 00	# srli s6,s6,0x9
+#         li      s5, 0
+93 0A 00 00	# li s5,0
+# 1:      bgeu    s5, s6, 8f
+63 FE 6A 0F	# bgeu s5,s6,1050 <.L8^B2>
+#         sub     s7, s6, s5
+B3 0B 5B 41	# sub s7,s6,s5
+#         li      t0, 128
+93 02 00 08	# li t0,128
+#         bltu    s7, t0, 2f
+63 E4 5B 00	# bltu s7,t0,f68 <.L2^B11>
+#         mv      s7, t0
+93 8B 02 00	# mv s7,t0
+# 2:      li      t0, BLKHDR              # read, at sector s5
+B7 B2 F1 87	# lui t0,0x87f1b
+93 82 02 80	# addi t0,t0,-2048 # 87f1a800 <BLKHDR>
+#         sw      zero, 0(t0)
+23 A0 02 00	# sw zero,0(t0)
+#         sw      zero, 4(t0)
+23 A2 02 00	# sw zero,4(t0)
+#         sw      s5, 8(t0)
+23 A4 52 01	# sw s5,8(t0)
+#         sw      zero, 12(t0)
+23 A6 02 00	# sw zero,12(t0)
+#         li      t1, 0xFF
+13 03 F0 0F	# li t1,255
+#         sb      t1, 16(t0)
+23 88 62 00	# sb t1,16(t0)
+#         li      t1, BLKQ                # header -> data -> status
+37 43 F1 87	# lui t1,0x87f14
+#         sw      t0, 0(t1)
+23 20 53 00	# sw t0,0(t1) # 87f14000 <BLKQ>
+#         sw      zero, 4(t1)
+23 22 03 00	# sw zero,4(t1)
+#         li      t2, 16
+93 03 00 01	# li t2,16
+#         sw      t2, 8(t1)
+23 24 73 00	# sw t2,8(t1)
+#         li      t2, 0x00010001          # next, then descriptor 1
+B7 03 01 00	# lui t2,0x10
+93 83 13 00	# addi t2,t2,1 # 10001 <_end+0xea75>
+#         sw      t2, 12(t1)
+23 26 73 00	# sw t2,12(t1)
+#         slli    t2, s5, 9
+93 93 9A 00	# slli t2,s5,0x9
+#         li      t3, IMAGE
+37 0E 00 80	# lui t3,0x80000
+#         add     t2, t2, t3
+B3 83 C3 01	# add t2,t2,t3
+#         sw      t2, 16(t1)
+23 28 73 00	# sw t2,16(t1)
+#         sw      zero, 20(t1)
+23 2A 03 00	# sw zero,20(t1)
+#         slli    t2, s7, 9
+93 93 9B 00	# slli t2,s7,0x9
+#         sw      t2, 24(t1)
+23 2C 73 00	# sw t2,24(t1)
+#         li      t2, 0x00020003          # next and written, then 2
+B7 03 02 00	# lui t2,0x20
+93 83 33 00	# addi t2,t2,3 # 20003 <_end+0x1ea77>
+#         sw      t2, 28(t1)
+23 2E 73 00	# sw t2,28(t1)
+#         addi    t2, t0, 16
+93 83 02 01	# addi t2,t0,16
+#         sw      t2, 32(t1)
+23 20 73 02	# sw t2,32(t1)
+#         sw      zero, 36(t1)
+23 22 03 02	# sw zero,36(t1)
+#         li      t2, 1
+93 03 10 00	# li t2,1
+#         sw      t2, 40(t1)
+23 24 73 02	# sw t2,40(t1)
+#         li      t2, 2                   # written
+93 03 20 00	# li t2,2
+#         sw      t2, 44(t1)
+23 26 73 02	# sw t2,44(t1)
+#         li      t0, BLKQ + 16 * QN
+B7 42 F1 87	# lui t0,0x87f14
+93 82 02 08	# addi t0,t0,128 # 87f14080 <BLKQ+0x80>
+#         lw      t1, V_BLKAV(s0)
+03 23 84 04	# lw t1,72(s0)
+#         andi    t2, t1, QN - 1
+93 73 73 00	# andi t2,t1,7
+#         slli    t2, t2, 1
+93 93 13 00	# slli t2,t2,0x1
+#         add     t2, t2, t0
+B3 83 53 00	# add t2,t2,t0
+#         sh      zero, 4(t2)
+23 92 03 00	# sh zero,4(t2)
+#         fence
+0F 00 F0 0F	# fence
+#         addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+#         sw      t1, V_BLKAV(s0)
+23 24 64 04	# sw t1,72(s0)
+#         sh      t1, 2(t0)
+23 91 62 00	# sh t1,2(t0)
+#         fence
+0F 00 F0 0F	# fence
+#         lw      t0, V_BLK(s0)
+83 22 44 04	# lw t0,68(s0)
+#         sw      zero, 0x50(t0)
+23 A8 02 04	# sw zero,80(t0)
+#         slli    t1, t1, 16
+13 13 03 01	# slli t1,t1,0x10
+#         srli    t1, t1, 16
+13 53 03 01	# srli t1,t1,0x10
+#         li      t0, BLKQ + 4096
+B7 52 F1 87	# lui t0,0x87f15
+# 3:      lhu     t2, 2(t0)
+83 D3 22 00	# lhu t2,2(t0) # 87f15002 <BLKQ+0x1002>
+#         bne     t2, t1, 3b
+E3 9E 63 FE	# bne t2,t1,1030 <.L3^B7>
+#         li      t0, BLKHDR
+B7 B2 F1 87	# lui t0,0x87f1b
+93 82 02 80	# addi t0,t0,-2048 # 87f1a800 <BLKHDR>
+#         lbu     a0, 16(t0)
+03 C5 02 01	# lbu a0,16(t0)
+#         bnez    a0, 9f
+63 18 05 00	# bnez a0,1054 <.L9^B11>
+#         add     s5, s5, s7
+B3 8A 7A 01	# add s5,s5,s7
+#         j       1b
+6F F0 9F F0	# j f54 <.L1^B19>
+# 8:      li      a0, 0
+13 05 00 00	# li a0,0
+# 9:      POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = time (MTIME's low word).
+# now:
+#         li      t0, MTIME
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME>
+#         lw      a0, 0(t0)
+03 A5 02 00	# lw a0,0(t0)
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# The Gimli-Hash of the image (as src/gen_hash.fam computes it): a0 = 1 if it
+# is the patched one.
+# check_image:
+#         PUSH    ra, s5, s6, s7
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 71 01	# sw s7,12(sp)
+#         addi    s7, s0, V_HS
+93 0B 04 05	# addi s7,s0,80
+#         mv      a0, s7
+13 85 0B 00	# mv a0,s7
+#         li      a1, 48
+93 05 00 03	# li a1,48
+#         jal     zero_bytes
+EF 00 80 22	# jal 12c4 <zero_bytes>
+#         li      s5, IMAGE
+B7 0A 00 80	# lui s5,0x80000
+#         lw      s6, 4(s4)
+03 2B 4A 00	# lw s6,4(s4)
+# 1:      li      t0, 16                  # whole blocks
+93 02 00 01	# li t0,16
+#         bltu    s6, t0, 2f
+63 60 5B 04	# bltu s6,t0,10ec <.L2^B12>
+#         li      t0, 0
+93 02 00 00	# li t0,0
+# 3:      add     t1, s5, t0
+33 83 5A 00	# add t1,s5,t0
+#         lw      t1, 0(t1)
+03 23 03 00	# lw t1,0(t1)
+#         add     t2, s7, t0
+B3 83 5B 00	# add t2,s7,t0
+#         lw      t3, 0(t2)
+03 AE 03 00	# lw t3,0(t2)
+#         xor     t3, t3, t1
+33 4E 6E 00	# xor t3,t3,t1
+#         sw      t3, 0(t2)
+23 A0 C3 01	# sw t3,0(t2)
+#         addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+#         li      t1, 16
+13 03 00 01	# li t1,16
+#         bltu    t0, t1, 3b
+E3 E0 62 FE	# bltu t0,t1,10b4 <.L3^B8>
+#         mv      a0, s7
+13 85 0B 00	# mv a0,s7
+#         jal     gimli
+EF 00 00 0E	# jal 11bc <gimli>
+#         addi    s5, s5, 16
+93 8A 0A 01	# addi s5,s5,16 # 80000010 <IMAGE+0x10>
+#         addi    s6, s6, -16
+13 0B 0B FF	# addi s6,s6,-16
+#         j       1b
+6F F0 1F FC	# j 10a8 <.L1^B20>
+# 2:      li      t0, 0                   # the rest, and the padding
+93 02 00 00	# li t0,0
+# 4:      bgeu    t0, s6, 5f
+63 F2 62 03	# bgeu t0,s6,1114 <.L5^B2>
+#         add     t1, s5, t0
+33 83 5A 00	# add t1,s5,t0
+#         lbu     t1, 0(t1)
+03 43 03 00	# lbu t1,0(t1)
+#         add     t2, s7, t0
+B3 83 5B 00	# add t2,s7,t0
+#         lbu     t3, 0(t2)
+03 CE 03 00	# lbu t3,0(t2)
+#         xor     t3, t3, t1
+33 4E 6E 00	# xor t3,t3,t1
+#         sb      t3, 0(t2)
+23 80 C3 01	# sb t3,0(t2)
+#         addi    t0, t0, 1
+93 82 12 00	# addi t0,t0,1
+#         j       4b
+6F F0 1F FE	# j 10f0 <.L4^B2>
+# 5:      add     t2, s7, s6
+B3 83 6B 01	# add t2,s7,s6
+#         lbu     t3, 0(t2)
+03 CE 03 00	# lbu t3,0(t2)
+#         xori    t3, t3, 1
+13 4E 1E 00	# xori t3,t3,1
+#         sb      t3, 0(t2)
+23 80 C3 01	# sb t3,0(t2)
+#         lbu     t3, 15(s7)
+03 CE FB 00	# lbu t3,15(s7)
+#         xori    t3, t3, 0x80
+13 4E 0E 08	# xori t3,t3,128
+#         sb      t3, 15(s7)
+A3 87 CB 01	# sb t3,15(s7)
+#         lbu     t3, 47(s7)
+03 CE FB 02	# lbu t3,47(s7)
+#         xori    t3, t3, 1
+13 4E 1E 00	# xori t3,t3,1
+#         sb      t3, 47(s7)
+A3 87 CB 03	# sb t3,47(s7)
+#         li      s6, 0                   # differences
+13 0B 00 00	# li s6,0
+#         addi    s5, s4, 8               # the patched hash
+93 0A 8A 00	# addi s5,s4,8
+#         jal     6f
+EF 00 40 02	# jal 1168 <.L6^B1>
+#         jal     6f
+EF 00 00 02	# jal 1168 <.L6^B1>
+#         seqz    a0, s6
+13 35 1B 00	# seqz a0,s6
+#         POP     ra, s5, s6, s7
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+83 2B C1 00	# lw s7,12(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+# 6:      PUSH    ra                      # squeeze 16 bytes, compare them
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 01 00	# sw zero,4(sp)
+23 24 01 00	# sw zero,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         mv      a0, s7
+13 85 0B 00	# mv a0,s7
+#         jal     gimli
+EF 00 C0 03	# jal 11bc <gimli>
+#         li      t0, 0
+93 02 00 00	# li t0,0
+# 7:      add     t1, s7, t0
+33 83 5B 00	# add t1,s7,t0
+#         lw      t1, 0(t1)
+03 23 03 00	# lw t1,0(t1)
+#         add     t2, s5, t0
+B3 83 5A 00	# add t2,s5,t0
+#         lw      t2, 0(t2)
+83 A3 03 00	# lw t2,0(t2)
+#         xor     t1, t1, t2
+33 43 73 00	# xor t1,t1,t2
+#         or      s6, s6, t1
+33 6B 6B 00	# or s6,s6,t1
+#         addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+#         li      t1, 16
+13 03 00 01	# li t1,16
+#         bltu    t0, t1, 7b
+E3 E0 62 FE	# bltu t0,t1,1188 <.L7^B1>
+#         addi    s5, s5, 16
+93 8A 0A 01	# addi s5,s5,16
+#         POP     ra
+83 20 01 00	# lw ra,0(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+
+# a0 = the 12-word state: the Gimli permutation.
+# gimli:
+#         li      a1, 24
+93 05 80 01	# li a1,24
+# 1:      mv      a2, a0
+13 06 05 00	# mv a2,a0
+#         addi    a3, a0, 16
+93 06 05 01	# addi a3,a0,16 # 87f1a010 <TXBUF+0x10>
+# 2:      lw      t0, 0(a2)               # x = s[c] <<< 24
+83 22 06 00	# lw t0,0(a2) # 87f12000 <TXQ>
+#         slli    t3, t0, 24
+13 9E 82 01	# slli t3,t0,0x18
+#         srli    t0, t0, 8
+93 D2 82 00	# srli t0,t0,0x8
+#         or      t0, t0, t3
+B3 E2 C2 01	# or t0,t0,t3
+#         lw      t1, 16(a2)              # y = s[4 + c] <<< 9
+03 23 06 01	# lw t1,16(a2)
+#         slli    t3, t1, 9
+13 1E 93 00	# slli t3,t1,0x9
+#         srli    t1, t1, 23
+13 53 73 01	# srli t1,t1,0x17
+#         or      t1, t1, t3
+33 63 C3 01	# or t1,t1,t3
+#         lw      t2, 32(a2)              # z = s[8 + c]
+83 23 06 02	# lw t2,32(a2)
+#         slli    t3, t2, 1               # x ^ (z << 1) ^ ((y & z) << 2)
+13 9E 13 00	# slli t3,t2,0x1
+#         and     t4, t1, t2
+B3 7E 73 00	# and t4,t1,t2
+#         slli    t4, t4, 2
+93 9E 2E 00	# slli t4,t4,0x2
+#         xor     t3, t3, t4
+33 4E DE 01	# xor t3,t3,t4
+#         xor     t3, t3, t0
+33 4E 5E 00	# xor t3,t3,t0
+#         sw      t3, 32(a2)
+23 20 C6 03	# sw t3,32(a2)
+#         or      t4, t0, t2              # y ^ x ^ ((x | z) << 1)
+B3 EE 72 00	# or t4,t0,t2
+#         slli    t4, t4, 1
+93 9E 1E 00	# slli t4,t4,0x1
+#         xor     t4, t4, t1
+B3 CE 6E 00	# xor t4,t4,t1
+#         xor     t4, t4, t0
+B3 CE 5E 00	# xor t4,t4,t0
+#         sw      t4, 16(a2)
+23 28 D6 01	# sw t4,16(a2)
+#         and     t4, t0, t1              # z ^ y ^ ((x & y) << 3)
+B3 FE 62 00	# and t4,t0,t1
+#         slli    t4, t4, 3
+93 9E 3E 00	# slli t4,t4,0x3
+#         xor     t4, t4, t2
+B3 CE 7E 00	# xor t4,t4,t2
+#         xor     t4, t4, t1
+B3 CE 6E 00	# xor t4,t4,t1
+#         sw      t4, 0(a2)
+23 20 D6 01	# sw t4,0(a2)
+#         addi    a2, a2, 4
+13 06 46 00	# addi a2,a2,4
+#         bltu    a2, a3, 2b
+E3 6C D6 F8	# bltu a2,a3,11c8 <.L2^B13>
+#         andi    t0, a1, 3
+93 F2 35 00	# andi t0,a1,3
+#         bnez    t0, 3f
+63 9C 02 02	# bnez t0,1270 <.L3^B9>
+#         lw      t1, 0(a0)               # small swap, and the round constant
+03 23 05 00	# lw t1,0(a0)
+#         lw      t2, 4(a0)
+83 23 45 00	# lw t2,4(a0)
+#         li      t3, 0x9E377900
+37 8E 37 9E	# lui t3,0x9e378
+13 0E 0E 90	# addi t3,t3,-1792 # 9e377900 <SEEDS+0x16378900>
+#         or      t3, t3, a1
+33 6E BE 00	# or t3,t3,a1
+#         xor     t2, t2, t3
+B3 C3 C3 01	# xor t2,t2,t3
+#         sw      t2, 0(a0)
+23 20 75 00	# sw t2,0(a0)
+#         sw      t1, 4(a0)
+23 22 65 00	# sw t1,4(a0)
+#         lw      t1, 8(a0)
+03 23 85 00	# lw t1,8(a0)
+#         lw      t2, 12(a0)
+83 23 C5 00	# lw t2,12(a0)
+#         sw      t2, 8(a0)
+23 24 75 00	# sw t2,8(a0)
+#         sw      t1, 12(a0)
+23 26 65 00	# sw t1,12(a0)
+#         j       4f
+6F 00 C0 02	# j 1298 <.L4^B3>
+# 3:      li      t1, 2
+13 03 20 00	# li t1,2
+#         bne     t0, t1, 4f
+63 92 62 02	# bne t0,t1,1298 <.L4^B3>
+#         lw      t1, 0(a0)               # big swap
+03 23 05 00	# lw t1,0(a0)
+#         lw      t2, 8(a0)
+83 23 85 00	# lw t2,8(a0)
+#         sw      t2, 0(a0)
+23 20 75 00	# sw t2,0(a0)
+#         sw      t1, 8(a0)
+23 24 65 00	# sw t1,8(a0)
+#         lw      t1, 4(a0)
+03 23 45 00	# lw t1,4(a0)
+#         lw      t2, 12(a0)
+83 23 C5 00	# lw t2,12(a0)
+#         sw      t2, 4(a0)
+23 22 75 00	# sw t2,4(a0)
+#         sw      t1, 12(a0)
+23 26 65 00	# sw t1,12(a0)
+# 4:      addi    a1, a1, -1
+93 85 F5 FF	# addi a1,a1,-1
+#         bnez    a1, 1b
+E3 92 05 F2	# bnez a1,11c0 <.L1^B21>
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# Bytes.  These clobber only t0-t1 (and a0).
+
+# a0 = destination, a1 = source, a2 = count.
+# copy:
+#         beqz    a2, 9f
+63 0E 06 00	# beqz a2,12c0 <.L9^B12>
+#         lbu     t0, 0(a1)
+83 C2 05 00	# lbu t0,0(a1)
+#         sb      t0, 0(a0)
+23 00 55 00	# sb t0,0(a0)
+#         addi    a0, a0, 1
+13 05 15 00	# addi a0,a0,1
+#         addi    a1, a1, 1
+93 85 15 00	# addi a1,a1,1
+#         addi    a2, a2, -1
+13 06 F6 FF	# addi a2,a2,-1
+#         j       copy
+6F F0 9F FE	# j 12a4 <copy>
+# 9:      ret
+67 80 00 00	# ret
+
+# a0 = address, a1 = count.
+# zero_bytes:
+#         beqz    a1, 9f
+63 8A 05 00	# beqz a1,12d8 <.L9^B13>
+#         sb      zero, 0(a0)
+23 00 05 00	# sb zero,0(a0)
+#         addi    a0, a0, 1
+13 05 15 00	# addi a0,a0,1
+#         addi    a1, a1, -1
+93 85 F5 FF	# addi a1,a1,-1
+#         j       zero_bytes
+6F F0 1F FF	# j 12c4 <zero_bytes>
+# 9:      ret
+67 80 00 00	# ret
+
+# get16be:
+#         lbu     t0, 0(a0)
+83 42 05 00	# lbu t0,0(a0)
+#         lbu     t1, 1(a0)
+03 43 15 00	# lbu t1,1(a0)
+#         slli    t0, t0, 8
+93 92 82 00	# slli t0,t0,0x8
+#         or      a0, t0, t1
+33 E5 62 00	# or a0,t0,t1
+#         ret
+67 80 00 00	# ret
+
+# get16le:
+#         lbu     t0, 0(a0)
+83 42 05 00	# lbu t0,0(a0)
+#         lbu     t1, 1(a0)
+03 43 15 00	# lbu t1,1(a0)
+#         slli    t1, t1, 8
+13 13 83 00	# slli t1,t1,0x8
+#         or      a0, t0, t1
+33 E5 62 00	# or a0,t0,t1
+#         ret
+67 80 00 00	# ret
+
+# get32le:
+#         lbu     t0, 3(a0)
+83 42 35 00	# lbu t0,3(a0)
+#         lbu     t1, 2(a0)
+03 43 25 00	# lbu t1,2(a0)
+#         slli    t0, t0, 8
+93 92 82 00	# slli t0,t0,0x8
+#         or      t0, t0, t1
+B3 E2 62 00	# or t0,t0,t1
+#         lbu     t1, 1(a0)
+03 43 15 00	# lbu t1,1(a0)
+#         slli    t0, t0, 8
+93 92 82 00	# slli t0,t0,0x8
+#         or      t0, t0, t1
+B3 E2 62 00	# or t0,t0,t1
+#         lbu     t1, 0(a0)
+03 43 05 00	# lbu t1,0(a0)
+#         slli    t0, t0, 8
+93 92 82 00	# slli t0,t0,0x8
+#         or      a0, t0, t1
+33 E5 62 00	# or a0,t0,t1
+#         ret
+67 80 00 00	# ret
+
+# a0 = address, a1 = value.
+# put16be:
+#         srli    t0, a1, 8
+93 D2 85 00	# srli t0,a1,0x8
+#         sb      t0, 0(a0)
+23 00 55 00	# sb t0,0(a0)
+#         sb      a1, 1(a0)
+A3 00 B5 00	# sb a1,1(a0)
+#         ret
+67 80 00 00	# ret
+
+# put16le:
+#         sb      a1, 0(a0)
+23 00 B5 00	# sb a1,0(a0)
+#         srli    t0, a1, 8
+93 D2 85 00	# srli t0,a1,0x8
+#         sb      t0, 1(a0)
+A3 00 55 00	# sb t0,1(a0)
+#         ret
+67 80 00 00	# ret
+
+# put32le:
+#         sb      a1, 0(a0)
+23 00 B5 00	# sb a1,0(a0)
+#         srli    t0, a1, 8
+93 D2 85 00	# srli t0,a1,0x8
+#         sb      t0, 1(a0)
+A3 00 55 00	# sb t0,1(a0)
+#         srli    t0, a1, 16
+93 D2 05 01	# srli t0,a1,0x10
+#         sb      t0, 2(a0)
+23 01 55 00	# sb t0,2(a0)
+#         srli    t0, a1, 24
+93 D2 85 01	# srli t0,a1,0x18
+#         sb      t0, 3(a0)
+A3 01 55 00	# sb t0,3(a0)
+#         ret
+67 80 00 00	# ret
+
+# ===========================================================================
+# The serial port.
+
+# a0 = a NUL-terminated string.
+# puts:
+#         li      t0, UART
+B7 02 00 10	# lui t0,0x10000
+# 1:      lbu     t1, 0(a0)
+03 43 05 00	# lbu t1,0(a0)
+#         beqz    t1, 9f
+63 08 03 00	# beqz t1,1388 <.L9^B14>
+#         sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0) # 10000000 <UART>
+#         addi    a0, a0, 1
+13 05 15 00	# addi a0,a0,1
+#         j       1b
+6F F0 1F FF	# j 1374 <.L1^B22>
+# 9:      ret
+67 80 00 00	# ret
+
+# a0 = a number below 100,000, in decimal.
+# put_dec:
+#         li      t0, UART
+B7 02 00 10	# lui t0,0x10000
+#         LOAD_ADDRESS t1, tens
+17 03 00 00	# auipc t1,0x0
+13 03 03 0C	# addi t1,t1,192 # 1450 <tens>
+#         li      t4, 0                   # a digit printed yet
+93 0E 00 00	# li t4,0
+# 1:      lw      t2, 0(t1)
+83 23 03 00	# lw t2,0(t1)
+#         beqz    t2, 9f
+63 8C 03 02	# beqz t2,13d8 <.L9^B15>
+#         li      t3, 0
+13 0E 00 00	# li t3,0
+# 2:      bltu    a0, t2, 3f
+63 68 75 00	# bltu a0,t2,13b8 <.L3^B10>
+#         sub     a0, a0, t2
+33 05 75 40	# sub a0,a0,t2
+#         addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+#         j       2b
+6F F0 5F FF	# j 13a8 <.L2^B14>
+# 3:      or      t4, t4, t3
+B3 EE CE 01	# or t4,t4,t3
+#         li      t5, 1
+13 0F 10 00	# li t5,1
+#         beq     t2, t5, 4f              # the last digit, even 0
+63 84 E3 01	# beq t2,t5,13c8 <.L4^B4>
+#         beqz    t4, 5f
+63 86 0E 00	# beqz t4,13d0 <.L5^B3>
+# 4:      addi    t3, t3, '0'
+13 0E 0E 03	# addi t3,t3,48
+#         sb      t3, 0(t0)
+23 80 C2 01	# sb t3,0(t0) # 10000000 <UART>
+# 5:      addi    t1, t1, 4
+13 03 43 00	# addi t1,t1,4
+#         j       1b
+6F F0 9F FC	# j 139c <.L1^B23>
+# 9:      ret
+67 80 00 00	# ret
+
+# a0 = peer: "a.b.c.d:port" and a newline.
+# put_peer:
+#         PUSH    ra, s5, s6
+13 01 01 FF	# addi sp,sp,-16
+23 20 11 00	# sw ra,0(sp)
+23 22 51 01	# sw s5,4(sp)
+23 24 61 01	# sw s6,8(sp)
+23 26 01 00	# sw zero,12(sp)
+#         mv      s5, a0
+93 0A 05 00	# mv s5,a0
+#         li      s6, 0
+13 0B 00 00	# li s6,0
+# 1:      add     t0, s5, s6
+B3 82 6A 01	# add t0,s5,s6
+#         lbu     a0, P_IP(t0)
+03 C5 02 00	# lbu a0,0(t0)
+#         jal     put_dec
+EF F0 DF F8	# jal 138c <put_dec>
+#         li      t0, UART
+B7 02 00 10	# lui t0,0x10000
+#         li      t1, '.'
+13 03 E0 02	# li t1,46
+#         li      t2, 3
+93 03 30 00	# li t2,3
+#         bne     s6, t2, 2f
+63 14 7B 00	# bne s6,t2,1418 <.L2^B15>
+#         li      t1, ':'
+13 03 A0 03	# li t1,58
+# 2:      sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0) # 10000000 <UART>
+#         addi    s6, s6, 1
+13 0B 1B 00	# addi s6,s6,1
+#         li      t2, 4
+93 03 40 00	# li t2,4
+#         bltu    s6, t2, 1b
+E3 6A 7B FC	# bltu s6,t2,13f8 <.L1^B24>
+#         lhu     a0, P_PORT(s5)
+03 D5 4A 00	# lhu a0,4(s5)
+#         jal     put_dec
+EF F0 1F F6	# jal 138c <put_dec>
+#         li      t0, UART
+B7 02 00 10	# lui t0,0x10000
+#         li      t1, '\n'
+13 03 A0 00	# li t1,10
+#         sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0) # 10000000 <UART>
+#         POP     ra, s5, s6
+83 20 01 00	# lw ra,0(sp)
+83 2A 41 00	# lw s5,4(sp)
+03 2B 81 00	# lw s6,8(sp)
+13 01 01 01	# addi sp,sp,16
+#         ret
+67 80 00 00	# ret
+10 27 00 00	# .word 0x00002710
+E8 03 00 00	# .word 0x000003e8
+64 00 00 00	# .word 0x00000064
+0A 00 00 00	# .word 0x0000000a
+01 00 00 00	# .word 0x00000001
+00 00 00 00	# .word 0x00000000
+FF FF FF FF	# .word 0xffffffff
+FF FF FF FF	# .word 0xffffffff
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+66 72 6F 6D	# .word 0x6d6f7266
+20 64 69 73	# .word 0x73696420
+6B 0A 00 00	# .word 0x00000a6b
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+66 65 74 63	# .word 0x63746566
+68 69 6E 67	# .word 0x676e6968
+20 66 72 6F	# .word 0x6f726620
+6D 20 00 00	# .word 0x0000206d
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+62 61 64 20	# .word 0x20646162
+69 6D 61 67	# .word 0x67616d69
+65 20 66 72	# .word 0x72662065
+6F 6D 20 00	# .word 0x00206d6f
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+77 72 6F 6E	# .word 0x6e6f7277
+67 20 73 69	# .word 0x69732067
+7A 65 20 66	# .word 0x6620657a
+72 6F 6D 20	# .word 0x206d6f72
+00 00 00 00	# .word 0x00000000
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+6E 6F 20 61	# .word 0x61206f6e
+6E 73 77 65	# .word 0x6577736e
+72 20 66 72	# .word 0x72662072
+6F 6D 20 00	# .word 0x00206d6f
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+6E 6F 20 70	# .word 0x70206f6e
+65 65 72 20	# .word 0x20726565
+68 61 73 20	# .word 0x20736168
+74 68 65 20	# .word 0x20656874
+69 6D 61 67	# .word 0x67616d69
+65 0A 00 00	# .word 0x00000a65
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+6E 6F 20 6E	# .word 0x6e206f6e
+65 74 77 6F	# .word 0x6f777465
+72 6B 20 64	# .word 0x64206b72
+65 76 69 63	# .word 0x63697665
+65 0A 00 00	# .word 0x00000a65
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+6E 6F 20 69	# .word 0x69206f6e
+6D 61 67 65	# .word 0x6567616d
+20 70 61 74	# .word 0x74617020
+63 68 65 64	# .word 0x64656863
+20 69 6E 0A	# .word 0x0a6e6920
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000

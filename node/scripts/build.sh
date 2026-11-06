@@ -1,6 +1,7 @@
 #!/bin/sh
 # build.sh — rebuild the fam compiler from the 168-byte seed under QEMU (fam0,
-# checked against the seed, then fam and fampack).  Linux and macOS (on
+# checked against the seed, then fam and fampack), then tabernacle (unpatched:
+# scripts/patch.sh makes one for an image) and gen_hash.  Linux and macOS (on
 # Windows, WSL2), as tools/q32.
 set -e
 
@@ -58,3 +59,5 @@ cmp ./bin/fam0 ./fam0.seed
 run bin/fam.uncompressed bin/fam0 src/fam.fam0
 run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
+run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
+run bin/tabernacle bin/fam0 src/tabernacle.fam0
