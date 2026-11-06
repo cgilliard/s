@@ -142,6 +142,8 @@ node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds] [--mac=ADDR]
 
 TABERNACLE defaults to `bin/tabernacle`, as `build.sh` leaves it.
 
+The same with QEMU alone, no script: `docs/MINIMAL_BOOT.md`.
+
 `scripts/makenode.sh [--disk=FILE]` writes `bin/img` at the start of the
 disk (the same default, created if missing), as the node will once it
 runs, to try the boot from disk: `makenode.sh` then `node.sh` prints
