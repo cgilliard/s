@@ -18,6 +18,8 @@ env:
 
 jobs:
   test:
+    # TEMPORARY: off while the Windows compiler job's serial flake is fixed.
+    if: false
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -42,6 +44,8 @@ jobs:
   # A debug build, for the debug_assert!s release builds leave out (the
   # proof tests skip themselves there; the slow ones are jobs below).
   debug:
+    # TEMPORARY: off while the Windows compiler job's serial flake is fixed.
+    if: false
     name: linux-arm64-debug
     runs-on: ubuntu-24.04-arm
     steps:
@@ -55,6 +59,8 @@ jobs:
   # The tests marked #[ignore = "slow: …"], each in its own job so they
   # run side by side. A test marked slow must be listed here.
   slow:
+    # TEMPORARY: off while the Windows compiler job's serial flake is fixed.
+    if: false
     name: slow ${{ matrix.test }}
     runs-on: ubuntu-latest
     strategy:
@@ -118,6 +124,8 @@ jobs:
   # (scripts/build.sh checks the rebuilt fam0 against the seed), then its
   # regression checks (scripts/check.sh).
   compiler:
+    # TEMPORARY: off while the Windows compiler job's serial flake is fixed.
+    if: false
     name: compiler ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -146,9 +154,15 @@ jobs:
         run: sh scripts/check.sh
 
   compiler-windows:
-    name: compiler windows-x64
+    name: compiler windows-x64 ${{ matrix.copy }}
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # TEMPORARY: four copies, the checks five times each, to catch the
+    # intermittent serial failure; back to one run when it is fixed.
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4]
     defaults:
       run:
         shell: msys2 {0}
@@ -163,11 +177,20 @@ jobs:
       - run: qemu-system-riscv32 --version
       - name: Build from the seed
         run: sh scripts/build.sh
-      - name: Checks
-        run: sh scripts/check.sh
+      - name: Checks, five times
+        run: |
+          fails=0
+          for i in 1 2 3 4 5; do
+            echo "--- round $i"
+            sh scripts/check.sh || fails=$((fails + 1))
+          done
+          echo "$fails of 5 rounds failed"
+          [ "$fails" = 0 ]
 
   # Every test marked slow has a job above.
   slow-listed:
+    # TEMPORARY: off while the Windows compiler job's serial flake is fixed.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
