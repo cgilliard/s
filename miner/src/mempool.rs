@@ -1362,8 +1362,10 @@ mod tests {
         let created: HashMap<Commitment, u64> = [(t1.outputs[0].commitment, arrived + 50)].into_iter().collect();
         assert_eq!(pool.revalidate(&utxo, &names, &rtxn, 2, &HashMap::new(), &created).unwrap(), (2, 0));
         assert_eq!(pool.confirmed().collect::<Vec<_>>(), vec![&(100_000 / t1.size() as u64 + 1, 50, arrived + 50)]);
-        // A block timed ahead of the clock counts as now.
+        // A block timed ahead of the clock counts as now (bounded by the
+        // clock around it: a slow runner can take seconds in between).
         let mut ahead = Mempool::new(1 << 20);
+        let before = unix_now();
         let t3 = spend(3, 1_000_000, 300_000);
         ahead.insert(t3.clone(), &utxo, &names, &rtxn, 2).unwrap();
         drop(rtxn);
@@ -1374,7 +1376,8 @@ mod tests {
         let created: HashMap<Commitment, u64> = [(t3.outputs[0].commitment, unix_now() + 3600)].into_iter().collect();
         assert_eq!(ahead.revalidate(&utxo, &names, &rtxn, 3, &HashMap::new(), &created).unwrap(), (1, 0));
         let (_, waited, at) = *ahead.confirmed().next().unwrap();
-        assert!(at <= unix_now() && waited <= 1);
+        let after = unix_now();
+        assert!(before <= at && at <= after && waited <= after - before);
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);
     }

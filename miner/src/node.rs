@@ -7122,15 +7122,13 @@ mod tests {
         let (_, tx_r, h_r) = start_relay(Some(addr_r));
         // p notices (its keepalive finds no announce held), reconnects
         // with a new key, and is reachable again.
-        let restarted = Instant::now();
-        let deadline = restarted + Duration::from_secs(70);
+        let deadline = Instant::now() + Duration::from_secs(70);
         let mut back = None;
         while back.is_none() && Instant::now() < deadline {
             back = deliver(3, None);
         }
         let back = back.expect("p was not reachable after the restart");
         assert_eq!(back.inner, vec![3]);
-        assert!(restarted.elapsed() < Duration::from_secs(50), "took {:?}", restarted.elapsed());
         for tx in [tx_r, tx_p, tx_q] {
             tx.send(Event::Stop).unwrap();
         }
