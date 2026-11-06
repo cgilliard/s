@@ -3,39 +3,49 @@
 # disk it boots the image from and user-mode networking for fetching it.
 # Linux and macOS (on Windows, WSL2), as tools/q32.
 #
-# Usage: node.sh [--disk=FILE] [--seed=IP:PORT ...] [--mac=ADDR]
-#                [--hostfwd=SPEC] TABERNACLE
-#   --disk=FILE     the disk (default node.img), created empty if missing
-#   --seed=IP:PORT  a seed (repeatable; IPv4).  10.0.2.2 is this host.
-#   --mac=ADDR      the virtio-net MAC (give each node on a host its own)
-#   --hostfwd=SPEC  expose a guest port, e.g. udp::3737-:3737
+# Usage: node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds]
+#                [--mac=ADDR] [--hostfwd=SPEC] [TABERNACLE]
+#   --disk=FILE       the disk (default node.img), created empty if missing
+#   --seed=HOST:PORT  another seed (repeatable): an IPv4 address or a name
+#                     with one.  10.0.2.2 is this host.
+#   --no-seeds        not the built-in seeds (SEEDS), only those given
+#   --mac=ADDR        the virtio-net MAC (give each node on a host its own)
+#   --hostfwd=SPEC    expose a guest port, e.g. udp::3737-:3737
+#   TABERNACLE        the boot program (default bin/tabernacle, as
+#                     scripts/build.sh leaves it)
 #
-# The seeds go to tabernacle as a small file loaded at 0x87FFF000: a count
-# byte, then 4 address bytes and a port (u16 LE) each.
+# The seeds' names are resolved here, each to its first IPv4 address (one
+# that does not resolve is skipped), and go to tabernacle as a small file
+# loaded at 0x87FFF000: a count byte, then 4 address bytes and a port
+# (u16 LE) each.
 
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
+SEEDS="tabernacle1.root.sx:3737 tabernacle2.root.sx:3737"
 DISK=node.img
 DISK_SIZE=268435456     # 256 MiB, sparse
-SEEDS=""
+EXTRA=""
+NO_SEEDS=0
 MAC=""
 HOSTFWD=""
-TAB=""
+TAB="$(dirname "$0")/../bin/tabernacle"
 
 for arg in "$@"; do
 	case "$arg" in
 		--disk=*) DISK="${arg#--disk=}" ;;
-		--seed=*) SEEDS="$SEEDS ${arg#--seed=}" ;;
+		--seed=*) EXTRA="$EXTRA ${arg#--seed=}" ;;
+		--no-seeds) NO_SEEDS=1 ;;
 		--mac=*) MAC=",mac=${arg#--mac=}" ;;
 		--hostfwd=*) HOSTFWD=",hostfwd=${arg#--hostfwd=}" ;;
-		--help|-h) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		--help|-h) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		--*) echo "node.sh: unknown option: $arg" >&2; exit 1 ;;
 		*) TAB="$arg" ;;
 	esac
 done
-[ -n "$TAB" ] || { echo "Usage: node.sh [--disk=FILE] [--seed=IP:PORT ...] TABERNACLE" >&2; exit 1; }
-[ -f "$TAB" ] || { echo "node.sh: $TAB not found" >&2; exit 1; }
+[ -f "$TAB" ] || { echo "node.sh: $TAB not found (run scripts/build.sh)" >&2; exit 1; }
+[ "$NO_SEEDS" = 1 ] && SEEDS=""
+SEEDS="$SEEDS$EXTRA"
 
 if [ ! -e "$DISK" ]; then
 	dd if=/dev/zero of="$DISK" bs=1 count=0 seek=$DISK_SIZE 2>/dev/null \
@@ -44,6 +54,35 @@ fi
 
 # byte N — N as one raw byte.
 byte() { printf "$(printf '\\%03o' "$1")"; }
+
+# ipv4 HOST — HOST if it is an address, else its first IPv4 address (nothing
+# if it has none): getent on Linux, dscacheutil on macOS.
+ipv4() {
+	case "$1" in
+		*[!0-9.]*) ;;
+		*) echo "$1"; return ;;
+	esac
+	if command -v getent >/dev/null 2>&1; then
+		getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+	elif command -v dscacheutil >/dev/null 2>&1; then
+		dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^ip_address:/ { print $2; exit }'
+	fi
+}
+
+RESOLVED=""
+for s in $SEEDS; do
+	host=${s%:*}; port=${s##*:}
+	case "$port" in
+		''|*[!0-9]*) echo "node.sh: not HOST:PORT: $s" >&2; exit 1 ;;
+	esac
+	ip=$(ipv4 "$host")
+	if [ -z "$ip" ]; then
+		echo "node.sh: seed $host has no IPv4 address; skipped" >&2
+		continue
+	fi
+	RESOLVED="$RESOLVED $ip:$port"
+done
+SEEDS=$RESOLVED
 
 SEEDFILE="$DISK.seeds.$$"
 trap 'rm -f "$SEEDFILE"' EXIT

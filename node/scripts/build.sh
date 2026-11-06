@@ -100,5 +100,6 @@ run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
 run bin/img bin/fam lib/stdlib.fam src/img.fam
-run bin/tabernacle bin/fam0 src/tabernacle.fam0
-patch_config bin/tabernacle bin/img "$IMAGE_VERSION"
+run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
+patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"
+pack bin/tabernacle.uncompressed bin/tabernacle

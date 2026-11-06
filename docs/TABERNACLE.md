@@ -114,15 +114,23 @@ Not q32: `node.sh` creates the disk file if missing (sparse, large
 enough for the image and the node's data after it) and starts QEMU with
 tabernacle loaded at `0x80000000`, the disk as virtio-blk, and
 virtio-net in user mode (the guest is `10.0.2.15`, the host
-`10.0.2.2`), forwarding the node's UDP port. The seeds are its
-arguments (IPv4 and port), written to a small file loaded at a fixed
-address, `0x87FFF000` (`-device loader`, as `gen_hash` takes its input):
-a count byte, then four address bytes and a port (2, LE) each, as in a
-`Peers` message. So a tabernacle is not rebuilt to point it elsewhere.
+`10.0.2.2`), forwarding the node's UDP port. The seeds are built in
+(`tabernacle1.root.sx:3737` and `tabernacle2.root.sx:3737`, as tabminer's),
+plus any given with `--seed` (`--no-seeds` leaves out the built-in ones);
+`node.sh` resolves each name to its first IPv4 address (`getent` on
+Linux, `dscacheutil` on macOS; one that does not resolve is skipped) and
+writes them to a small file loaded at a fixed address, `0x87FFF000`
+(`-device loader`, as `gen_hash` takes its input): a count byte, then
+four address bytes and a port (2, LE) each, as in a `Peers` message. So
+a tabernacle is not rebuilt to point it elsewhere, and a seed that moves
+needs only its DNS changed.
 
 ```text
-node.sh [--disk=FILE] [--seed=IP:PORT ...] [--mac=ADDR] [--hostfwd=SPEC] TABERNACLE
+node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds] [--mac=ADDR]
+        [--hostfwd=SPEC] [TABERNACLE]
 ```
+
+TABERNACLE defaults to `bin/tabernacle`, as `build.sh` leaves it.
 
 ## A stand-in node: `tools/server.py`
 
