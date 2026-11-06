@@ -13,6 +13,7 @@ FAILS=0; N=0
 # lim SECONDS CMD... — run CMD, killed after SECONDS with everything it started
 # (exit 124).  Perl, as macOS has no `timeout`; a watchdog that kills the
 # process group, as an alarm alone would reach only QEMU, which ignores it.
+# TERM first, so tools/q32 can say what QEMU printed; KILL 3 s later.
 # Its stdin is /dev/null: in a process group of its own, a read from a
 # terminal (MSYS2's console) would stop it until the watchdog fired.
 lim() {
@@ -20,7 +21,10 @@ lim() {
 		$t = shift;
 		$p = fork // die "fork: $!";
 		if (!$p) { setpgrp(0, 0); exec @ARGV or die "exec: $!" }
-		$SIG{ALRM} = sub { kill "KILL", -$p; waitpid($p, 0); exit 124 };
+		$SIG{ALRM} = sub {
+			kill "TERM", -$p; sleep 3; kill "KILL", -$p;
+			waitpid($p, 0); exit 124;
+		};
 		alarm $t;
 		waitpid($p, 0);
 		exit($? & 127 ? 128 + ($? & 127) : $? >> 8);

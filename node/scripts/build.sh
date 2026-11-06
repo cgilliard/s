@@ -18,10 +18,16 @@ serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
 		# a connection that never comes.
 		calls=$((calls + 1))
 		port=$((20000 + ($$ * 8 + calls) % 20000))
+		# QEMU's copy of the output, from which the pump restores what the
+		# socket's close lost (tools/serial_pump); to QEMU by its Windows
+		# path, as MSYS does not reliably convert one inside a
+		# comma-separated argument.
+		log="$sout.log"; qlog=$log
+		command -v cygpath >/dev/null && qlog=$(cygpath -m "$log")
 		qemu-system-riscv32 \
 			-machine virt -m "$MEM" -cpu "$CPU" \
 			-display none -bios none \
-			-chardev socket,id=ser0,host=127.0.0.1,port=$port,server=on,wait=on \
+			-chardev socket,id=ser0,host=127.0.0.1,port=$port,server=on,wait=on,logfile="$qlog",logappend=off \
 			-serial chardev:ser0 \
 			"$@" &
 		qpid=$!
@@ -38,7 +44,7 @@ serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
 			fi
 		  done ) &
 		dog=$!
-		if ! tools/serial_pump "$port" "$sin" "$sout"; then
+		if ! tools/serial_pump "$port" "$sin" "$sout" "$log"; then
 			kill $qpid 2>/dev/null
 			wait $dog 2>/dev/null
 			exit 1
@@ -47,6 +53,7 @@ serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
 		status=0
 		wait $qpid || status=$?
 		wait $dog || exit 1
+		rm -f "$log"
 		[ "$status" = 0 ] || { echo "build.sh: qemu exited $status" >&2; exit 1; }
 	else
 		qemu-system-riscv32 \

@@ -109,12 +109,13 @@ SERPORT=""
 if [ -n "$SEROUT" ]; then
 	if [ "$SOCKMODE" = 1 ]; then
 		SERPORT=$((20000 + $$ % 20000))
-		CHR="-chardev socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
+		# the chardev itself is added at the launch below, with its logfile
+		CHR="socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
 	else
-		CHR="-chardev file,id=ser0,path=$SEROUT"
-		[ -n "$SERIN" ] && CHR="$CHR,input-path=$SERIN"
+		ARGS="$ARGS -chardev file,id=ser0,path=$SEROUT"
+		[ -n "$SERIN" ] && ARGS="$ARGS,input-path=$SERIN"
 	fi
-	ARGS="$ARGS $CHR -serial chardev:ser0 -monitor none"
+	ARGS="$ARGS -serial chardev:ser0 -monitor none"
 else
 	ARGS="$ARGS -serial stdio -monitor none"
 fi
@@ -157,11 +158,30 @@ if [ -n "$SERPORT" ]; then
 	SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
 	TOOLS=$(dirname "$SCRIPT")
 	IN="${SERIN:--}"   # "-" tells serial_pump there is no input stream
-	qemu-system-riscv32 $ARGS 2>/dev/null &
+	# QEMU's copy of the output (the chardev's logfile), from which the pump
+	# restores what the socket's close lost; QEMU's messages, shown if it
+	# fails.  To QEMU the log goes by its Windows path: MSYS does not
+	# reliably convert a path inside a comma-separated argument.
+	TMP="${TMPDIR:-/tmp}/q32.$$"
+	LOG="$TMP.log"; ERR="$TMP.err"
+	QLOG=$LOG
+	command -v cygpath >/dev/null && QLOG=$(cygpath -m "$LOG")
+	# Stopped from outside (a time limit): say what QEMU printed.
+	trap 'echo "q32: stopped, qemu on port $SERPORT: $(head -c 300 "$ERR" 2>/dev/null | tr "\n" " ")" >&2; kill $QPID 2>/dev/null; rm -f "$LOG" "$LOG.got" "$ERR"; exit 143' TERM INT
+	qemu-system-riscv32 $ARGS -chardev "$CHR,logfile=$QLOG,logappend=off" 2>"$ERR" &
 	QPID=$!
-	"$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT" || { kill $QPID 2>/dev/null; exit 1; }
+	if ! "$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT" "$LOG"; then
+		kill $QPID 2>/dev/null
+		echo "q32: qemu: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
+		rm -f "$LOG" "$LOG.got" "$ERR"
+		exit 1
+	fi
 	wait $QPID
-	exit $?
+	rc=$?
+	# 0 and 1 are the guest's verdicts; anything else is QEMU's own failure.
+	[ "$rc" -gt 1 ] && echo "q32: qemu exited $rc: $(head -c 300 "$ERR" | tr '\n' ' ')" >&2
+	rm -f "$LOG" "$LOG.got" "$ERR"
+	exit $rc
 fi
 
 # exec so signals (and `timeout`) reach qemu directly and `$!` is the qemu pid
