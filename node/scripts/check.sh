@@ -64,7 +64,8 @@ runs() {
 # suite NAME SOURCE MODE EXIT PATTERN — --test or --bench: exits EXIT, output matches.
 suite() {
 	src "$1" "$2"
-	mark; lim 30 ./tools/fam "$3" -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
+	mark; lim 30 ./tools/fam "$3" --run-out="$T/$1.run" -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.out" 2>&1; rc=$?
+	[ -f "$T/$1.run" ] && cat "$T/$1.run" >> "$T/$1.out"
 	[ "$rc" = "$4" ] || { fail "$1" "exit $rc after $(took), expected $4: $(head -c 200 "$T/$1.out")"; return; }
 	grep -q -- "$5" "$T/$1.out" || fail "$1" "output $(head -c 200 "$T/$1.out"), expected /$5/"
 }

@@ -5,7 +5,7 @@
 # automatically and the source is EOT-terminated, then fed to the fam compiler
 # (bin/fam) running under q32. Paths are resolved relative to this script.
 #
-# Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+# Usage: fam [--test|--bench] [--disk=FILE] [--run-out=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
 #   INPUT.fam    your program(s); multiple files are concatenated in order
 #                (lib/stdlib.fam is prepended for you)
 #   --test       build and run ONLY the Test { ... } block, then delete the binary
@@ -14,6 +14,10 @@
 #   --disk=FILE  attach FILE as a virtio-blk disk when running (forwarded to q32);
 #                lets a Test/Bench block exercise the real disk path (find_blk/
 #                vblkinit/vreq/vpoll). Only meaningful with --test/--bench.
+#   --run-out=FILE  the --test/--bench run's output to FILE instead of stdout
+#                (q32 --out): a plain file on every platform, where on Windows
+#                a run whose stdin is not a terminal goes over a socket that can
+#                lose its last bytes at QEMU's exit (scripts/check.sh uses it).
 #   -o OUTPUT    output binary (default: ./a.bin)
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
@@ -46,7 +50,8 @@ while [ $# -gt 0 ]; do
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
-		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
+		--run-out=*) QOPTS="$QOPTS --out=${1#--run-out=}"; shift ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [--run-out=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
 		--) shift; IN="$1"; shift ;;
 		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
 		*) IN="$IN $1"; shift ;;
