@@ -60,6 +60,38 @@ pub(crate) mod test_util {
     use crate::ext::Fp4;
     use crate::poseidon2::Fp;
 
+    thread_local! {
+        static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Keeps this thread's panics unreported while it lives (a fuzzer
+    /// catching the panics it provokes), and only this thread's: the panic
+    /// hook is the process's, and tests run in parallel, so swapping it
+    /// would hide other tests' failures, and two swaps overlapping could
+    /// leave it silent for the rest of the run.
+    pub(crate) struct Quiet(bool);
+
+    impl Quiet {
+        pub(crate) fn new() -> Quiet {
+            static HOOK: std::sync::Once = std::sync::Once::new();
+            HOOK.call_once(|| {
+                let report = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    if !QUIET.with(|q| q.get()) {
+                        report(info)
+                    }
+                }));
+            });
+            Quiet(QUIET.with(|q| q.replace(true)))
+        }
+    }
+
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            QUIET.with(|q| q.set(self.0));
+        }
+    }
+
     /// SplitMix64, for deterministic test data without a dependency.
     pub struct Rng(u64);
 
@@ -109,8 +141,7 @@ pub(crate) mod test_util {
             }
         }
         let (mut decoded, mut failures) = (0, Vec::new());
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        let quiet = crate::test_util::Quiet::new();
         for n in 0..iters {
             let mut r = |m: usize| (rng.next_u64() % m.max(1) as u64) as usize;
             let si = r(samples.len());
@@ -180,7 +211,7 @@ pub(crate) mod test_util {
                 Ok(None) => {}
             }
         }
-        std::panic::set_hook(hook);
+        drop(quiet);
         assert!(failures.is_empty(), "{name} (seed {seed}): {} failures\n{}", failures.len(), failures.join("\n"));
         decoded
     }

@@ -3692,8 +3692,7 @@ mod tests {
         let (mut rejected, mut no_trace, mut other, mut bugs) = (0, 0, 0, Vec::new());
         let mut same: Vec<String> = Vec::new();
         // The lenient generator panics on witnesses it cannot write: quiet.
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        let quiet = crate::test_util::Quiet::new();
         let mut n = 0;
         while n < iters {
             let b = (rng.next_u64() % blocks.len() as u64) as usize;
@@ -3718,7 +3717,7 @@ mod tests {
                 Ok(_) => bugs.push(at),
             }
         }
-        std::panic::set_hook(hook);
+        drop(quiet);
         eprintln!(
             "{iters} mutants: {rejected} rejected, {} equivalent, {other} another body, {no_trace} without a trace, {} another outcome",
             same.len(),

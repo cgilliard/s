@@ -1918,8 +1918,7 @@ pub(crate) fn fuzz_proof(proof: &Proof, iters: u64, seed: u64, verify: impl Fn(&
     let bytes = proof.to_bytes();
     assert!(verify(proof), "the proof to fuzz must verify");
     let mut out = ProofFuzz::default();
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    let quiet = crate::test_util::Quiet::new();
     for _ in 0..iters {
         let mut b = bytes.clone();
         let mut r = |n: usize| (rng.next_u64() % n.max(1) as u64) as usize;
@@ -1989,7 +1988,7 @@ pub(crate) fn fuzz_proof(proof: &Proof, iters: u64, seed: u64, verify: impl Fn(&
             Ok(Some((false, true))) => out.accepted.push(what),
         }
     }
-    std::panic::set_hook(hook);
+    drop(quiet);
     // Then every count, length, height and index at its boundary values:
     // what random mutation rarely reaches.
     let (fields, panicked, accepted) =

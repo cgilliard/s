@@ -171,8 +171,7 @@ pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) 
         check(b);
     });
     let (mut panicked, mut accepted) = (Vec::new(), Vec::new());
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    let quiet = crate::test_util::Quiet::new();
     for &at in &fields {
         let own = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         let values = [0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 1 << 31, u32::MAX, own.wrapping_add(1), own.wrapping_sub(1)];
@@ -192,7 +191,7 @@ pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) 
             }
         }
     }
-    std::panic::set_hook(hook);
+    drop(quiet);
     (fields.len(), panicked, accepted)
 }
 

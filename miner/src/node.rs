@@ -770,6 +770,21 @@ struct Seen {
     kept_trying: AtomicU64,
     /// Snapshots abandoned for leaving the best chain.
     abandoned: AtomicU64,
+    /// What the node was doing, and when: written each tick, for a test
+    /// that fails to say where the node was stuck (a stale one: its loop
+    /// stopped).
+    state: Mutex<Option<(Instant, String)>>,
+}
+
+#[cfg(test)]
+impl Seen {
+    /// The last state written, and how long ago.
+    fn state(&self) -> String {
+        match &*self.state.lock().unwrap() {
+            Some((at, s)) => format!("as of {:.1} s ago: {s}", at.elapsed().as_secs_f64()),
+            None => "never written".to_string(),
+        }
+    }
 }
 
 impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
@@ -1264,6 +1279,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
     }
 
+    /// Tests: what the node is doing, for [`Seen::state`].
+    #[cfg(test)]
+    fn note_state(&self, now: Instant) {
+        let tip = self.chain.tip().ok().flatten().map_or("none".to_string(), |t| t.height.to_string());
+        let best = self.chain.best_header().map_or("none".to_string(), |b| b.height.to_string());
+        let mut s = format!("mode {:?}, tip {tip}, best header {best}", self.mode);
+        for d in self.downloads.values() {
+            s += &format!(
+                "; fetching {:?} {} from {}: {} of {} chunks, {} retries, last progress {:.1} s ago",
+                d.kind,
+                short(&d.id),
+                d.from,
+                d.received(),
+                d.total().map_or("?".to_string(), |n| n.to_string()),
+                d.retries,
+                now.duration_since(d.last_progress).as_secs_f64()
+            );
+        }
+        for (id, (b, from, _)) in &self.pending {
+            s += &format!("; waiting for its parent: {} at height {} from {from:?}", short(id), b.header.height);
+        }
+        for id in &self.applying {
+            s += &format!("; applying {}", short(id));
+        }
+        *self.seen.state.lock().unwrap() = Some((now, s));
+    }
+
     /// Tests: sends the datagram held back for reordering, if any.
     #[cfg(test)]
     fn release_held(&self) {
@@ -1361,6 +1403,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn tick(&mut self, now: Instant) {
         #[cfg(test)]
         self.release_held();
+        #[cfg(test)]
+        self.note_state(now);
         self.peers.prune(now);
         let (key, count) = (&self.nonce_key, &mut self.nonce_count);
         let due = self.peers.due_for_ping(now, || {
@@ -7365,7 +7409,7 @@ mod tests {
         wait_for("b ran out of attempts", 120, || seen.kept_trying.load(Ordering::Relaxed) >= 1);
         assert_eq!(b.chain.tip().unwrap().unwrap().height, 0, "b did not give up on fast sync");
         let hc = std::thread::spawn(move || node_c.run());
-        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not fast-sync once c answered");
+        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not fast-sync once c answered; b {}", seen.state());
         assert!(b.chain.floor().unwrap().is_some(), "b installed a snapshot");
         assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
         for tx in [tx_a, tx_b, tx_c] {
