@@ -17,10 +17,10 @@ the placeholder below is one; `fam.fam0` is unchanged by it.)
 ## The trusted values
 
 A tabernacle binary is built for exactly one version of the node image,
-and fetches only that version. At its end, `scripts/patch.sh TABERNACLE
-IMAGE VERSION OUT` patches in (as the old build's `patch_config` did;
-`build.sh` builds `bin/tabernacle` unpatched, there being no node image
-yet):
+and fetches only that version. At its end, `scripts/build.sh` patches in
+(`patch_config`, as the old build's did) for `bin/img`, the node image
+built from `src/img.fam` (a placeholder that prints "hello world" for
+now), at `IMAGE_VERSION`:
 
 ```text
 … code … ‖ version (4, LE) ‖ size (4, LE) ‖ Gimli-Hash of the image (32)
@@ -145,7 +145,7 @@ server.py PORT VERSION=FILE [VERSION=FILE ...]
 - A file is re-read when its mtime changes, so a build can be replaced
   without a restart.
 - Checks nothing: the stub does. It prints each file's Gimli-Hash when
-  it loads it, to compare with what `patch.sh` put in a tabernacle.
+  it loads it, to compare with what `build.sh` patched into tabernacle.
 
 ## Open questions
 
@@ -161,8 +161,8 @@ server.py PORT VERSION=FILE [VERSION=FILE ...]
 
 ## Implementation order
 
-1. `src/gen_hash.fam` built by `build.sh`; patching back, as
-   `scripts/patch.sh`. Done (2026-11-06).
+1. `src/gen_hash.fam` built by `build.sh`; `patch_config` back, for
+   `src/img.fam`. Done (2026-11-06).
 2. `tools/server.py`. Done (2026-11-06).
 3. `src/tabernacle.S` and its `.fam0`: the disk check; virtio-net, ARP
    and UDP; discovery and download in one loop; the seeds last; the
