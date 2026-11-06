@@ -312,6 +312,9 @@ pub struct Status {
     pub tip: Digest,
     /// Cumulative work of the main chain.
     pub work: U256,
+    /// The sender's relay floor, base units a byte (`docs/FEES.md`): it
+    /// pools and relays nothing paying less.
+    pub min_fee: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -452,6 +455,7 @@ fn put_status(w: &mut Writer, s: &Status) {
     w.u32(s.oldest);
     w.digest(&s.tip);
     w.0.extend_from_slice(&s.work.to_le_bytes());
+    w.u64(s.min_fee);
 }
 
 fn get_status(r: &mut Reader) -> Option<Status> {
@@ -464,6 +468,7 @@ fn get_status(r: &mut Reader) -> Option<Status> {
         oldest: r.u32()?,
         tip: r.digest()?,
         work: U256::from_le_bytes(r.take(32)?.try_into().unwrap()),
+        min_fee: r.u64()?,
     })
 }
 
@@ -1758,6 +1763,7 @@ mod tests {
             oldest: 5,
             tip: digest(2),
             work: U256([1, 2, 3, 4]),
+            min_fee: 10,
         }
     }
 

@@ -123,6 +123,13 @@ options:
                     (default 1008, a week); older blocks keep only their
                     headers. Deeper reorganizations are refused, and snapshots
                     are served only within them; 0 keeps everything (archive)
+  --min-fee N       pool and relay only transactions paying at least N base
+                    units a byte (default 10, 10^-9 coins; docs/FEES.md); the
+                    dust limit follows. Announced to peers
+  --fee-half-life H the pool's raised minimum falls halfway back to the floor
+                    in H hours (default 12)
+  --mempool-expiry D  drop a transaction waiting D days unconfirmed, and refuse
+                    it for as long again (default 14)
   --verbose         log every network message handled
   --no-prompt       no wallet prompt; log to the terminal instead of the file
   --password-file FILE  the wallet's password, the file's first line: for a
@@ -307,6 +314,11 @@ struct Args {
     verbose: bool,
     sync_point: u32,
     max_undo: u32,
+    /// The pool's policy (`docs/FEES.md`): the relay floor, the rolling
+    /// minimum's half-life and the expiry.
+    min_fee: u64,
+    fee_half_life_hours: u64,
+    mempool_expiry_days: u64,
     no_seeds: bool,
     /// Relay for others on the message layer (`docs/ONION.md`).
     relay: bool,
@@ -354,6 +366,9 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         sync_point: DEFAULT_SYNC_POINT,
         max_undo: DEFAULT_MAX_UNDO,
+        min_fee: tabminer::mempool::MIN_FEE_PER_BYTE,
+        fee_half_life_hours: tabminer::mempool::HALF_LIFE_SECS / 3600,
+        mempool_expiry_days: tabminer::mempool::EXPIRY_SECS / 86400,
         no_seeds: false,
         relay: false,
         max_sessions: tabminer::node::MAX_SESSIONS,
@@ -440,6 +455,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--verbose" => a.verbose = true,
             "--sync-point" => a.sync_point = number(value()?)? as u32,
+            "--min-fee" => a.min_fee = number(value()?)?,
+            "--fee-half-life" => a.fee_half_life_hours = number(value()?)?.max(1),
+            "--mempool-expiry" => a.mempool_expiry_days = number(value()?)?.max(1),
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
@@ -845,7 +863,12 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         }
         Some(wallet)
     };
-    let mempool = Arc::new(Mutex::new(Mempool::new(DEFAULT_CAPACITY)));
+    let policy = tabminer::mempool::Policy {
+        half_life_secs: args.fee_half_life_hours * 3600,
+        expiry_secs: args.mempool_expiry_days * 86400,
+        ..tabminer::mempool::Policy::with_floor(args.min_fee)
+    };
+    let mempool = Arc::new(Mutex::new(Mempool::with_policy(DEFAULT_CAPACITY, policy)));
     let mut config = net_config(args);
     config.relay_key = match (relay_seed, opened.as_ref()) {
         _ if !args.relay => None,
@@ -1446,11 +1469,12 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             }
             for p in &stats.peers {
                 println!(
-                    "{:<24} {:<8} {:<6} {}",
+                    "{:<24} {:<8} {:<6} {:<10} {}",
                     p.addr,
                     p.height.map_or("?".to_string(), |h| format!("h {h}")),
                     if p.live { "live" } else { "silent" },
-                    if p.handshaken { "handshaken" } else { "" }
+                    if p.handshaken { "handshaken" } else { "" },
+                    p.min_fee.map_or(String::new(), |f| format!("floor {f}/byte"))
                 );
             }
         }

@@ -40,7 +40,6 @@
 //! what does not fit and reveals whose window has not opened.
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use heed::RoTxn;
 
@@ -107,17 +106,40 @@ pub const DUST: u64 = (INPUT_SIZE as u64) * MIN_FEE_PER_BYTE;
 /// padding row. About 27 signatures of 16-level keys.
 pub const MAX_TX_ROWS: usize = (1 << crate::aggregate::AggregatorParams::MAINNET.segment_log_n) - 1;
 
-/// What a pool asks of a transaction beyond validity.
+/// How long the rolling admission minimum takes to fall halfway back to
+/// the floor (`docs/FEES.md`), by default: as Bitcoin's.
+pub const HALF_LIFE_SECS: u64 = 12 * 3600;
+/// How long a transaction may wait in the pool, by default: then it is
+/// dropped, and its id refused for as long again.
+pub const EXPIRY_SECS: u64 = 14 * 86400;
+/// Expired ids a pool remembers, at most: the oldest are forgotten first.
+const MAX_EXPIRED: usize = 100_000;
+
+/// What a pool asks of a transaction beyond validity (`docs/FEES.md`): a
+/// node's own policy, set by its operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
+    /// The relay floor: base units a byte, below which a transaction is
+    /// neither pooled nor relayed.
     pub min_fee_per_byte: u64,
+    /// The smallest output pooled: the fee of spending it at the floor.
     pub dust: u64,
+    /// The rolling minimum's half-life.
+    pub half_life_secs: u64,
+    /// How long a transaction may wait in the pool.
+    pub expiry_secs: u64,
 }
 
 impl Policy {
-    pub const MAINNET: Policy = Policy { min_fee_per_byte: MIN_FEE_PER_BYTE, dust: DUST };
+    pub const MAINNET: Policy =
+        Policy { min_fee_per_byte: MIN_FEE_PER_BYTE, dust: DUST, half_life_secs: HALF_LIFE_SECS, expiry_secs: EXPIRY_SECS };
     /// Anything valid, for tests.
-    pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0 };
+    pub const NONE: Policy = Policy { min_fee_per_byte: 0, dust: 0, ..Policy::MAINNET };
+
+    /// The mainnet policy at another floor, its dust limit following.
+    pub const fn with_floor(min_fee_per_byte: u64) -> Policy {
+        Policy { min_fee_per_byte, dust: (INPUT_SIZE as u64) * min_fee_per_byte, ..Policy::MAINNET }
+    }
 
     /// The smallest fee a transaction of `inputs` and `outputs` and no
     /// name operations may pay.
@@ -135,6 +157,8 @@ impl Policy {
 pub enum Reject {
     /// Already in the pool.
     Known,
+    /// Expired from this pool lately: refused for as long again.
+    Expired,
     /// No inputs: only a block reward looks like that.
     NoInputs,
     TooLarge(usize),
@@ -175,6 +199,7 @@ impl core::fmt::Display for Reject {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Reject::Known => f.write_str("already in the pool"),
+            Reject::Expired => f.write_str("expired from the pool lately"),
             Reject::NoInputs => f.write_str("no inputs"),
             Reject::TooLarge(n) => write!(f, "{n} bytes exceeds the transaction size limit"),
             Reject::NegativeFee => f.write_str("outputs exceed inputs"),
@@ -203,7 +228,12 @@ pub struct Entry {
     pub txid: Digest,
     pub fee: u64,
     pub size: usize,
-    pub added: Instant,
+    /// When it reached this node, in Unix seconds: its age, kept across
+    /// restarts in the saved pool (`docs/FEES.md`).
+    pub arrived: u64,
+    /// Its place in the order this pool took transactions: the last tie
+    /// breaker, arrival times being whole seconds.
+    pub order: u64,
     /// What its name operations claim.
     pub claims: Vec<Claim>,
 }
@@ -228,6 +258,16 @@ pub struct Mempool {
     /// reorganization brings their inputs back.
     shelf: Vec<Entry>,
     policy: Policy,
+    /// Ids expired here, and until when they are refused: so one a peer
+    /// still holds does not come back with a fresh age.
+    expired: HashMap<Digest, u64>,
+    /// The next entry's [`Entry::order`].
+    next_order: u64,
+}
+
+/// The time now, in Unix seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// The cheap checks of a transaction on its own: all but its signatures,
@@ -351,11 +391,48 @@ impl Mempool {
             capacity,
             shelf: Vec::new(),
             policy,
+            expired: HashMap::new(),
+            next_order: 0,
         }
     }
 
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// Drops the transactions that have waited [`Policy::expiry_secs`] by
+    /// `now`, remembering their ids for as long again, and forgets the ids
+    /// whose time is up; returns those dropped.
+    pub fn expire(&mut self, now: u64) -> Vec<Digest> {
+        let limit = self.policy.expiry_secs;
+        let old: Vec<Digest> =
+            self.txs.values().filter(|e| now.saturating_sub(e.arrived) >= limit).map(|e| e.txid).collect();
+        for id in &old {
+            self.remove(id);
+            self.expired.insert(*id, now.saturating_add(limit));
+        }
+        self.expired.retain(|_, until| *until > now);
+        if self.expired.len() > MAX_EXPIRED {
+            let mut by_time: Vec<(u64, Digest)> = self.expired.iter().map(|(id, u)| (*u, *id)).collect();
+            by_time.sort_unstable_by_key(|(u, _)| *u);
+            for (_, id) in &by_time[..self.expired.len() - MAX_EXPIRED] {
+                self.expired.remove(id);
+            }
+        }
+        old
+    }
+
+    /// The ids expired here and until when they are refused, as the saved
+    /// pool keeps them.
+    pub fn expired(&self) -> impl Iterator<Item = (&Digest, &u64)> {
+        self.expired.iter()
+    }
+
+    /// An id expired before a restart, refused until `until`.
+    pub fn remember_expired(&mut self, id: Digest, until: u64) {
+        if self.expired.len() < MAX_EXPIRED {
+            self.expired.insert(id, until);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -382,8 +459,8 @@ impl Mempool {
         self.txs.values()
     }
 
-    /// Validates and adds `tx`, for a block at `height` or later; returns
-    /// its id.
+    /// Validates and adds `tx`, arrived now, for a block at `height` or
+    /// later; returns its id.
     pub fn insert(
         &mut self,
         tx: Transaction,
@@ -392,9 +469,26 @@ impl Mempool {
         rtxn: &RoTxn,
         height: u32,
     ) -> Result<Digest, Reject> {
+        self.insert_at(tx, utxo, names, rtxn, height, unix_now())
+    }
+
+    /// [`Mempool::insert`], for a transaction that arrived at `arrived`
+    /// (Unix seconds): one loaded from the saved pool keeps its age.
+    pub fn insert_at(
+        &mut self,
+        tx: Transaction,
+        utxo: &UtxoSet,
+        names: &NameSet,
+        rtxn: &RoTxn,
+        height: u32,
+        arrived: u64,
+    ) -> Result<Digest, Reject> {
         let txid = tx.txid();
         if self.txs.contains_key(&txid) {
             return Err(Reject::Known);
+        }
+        if self.expired.get(&txid).is_some_and(|until| *until > unix_now()) {
+            return Err(Reject::Expired);
         }
         let fee = check_static(&tx, &self.policy)?;
         let mut conflicts: Vec<Digest> = Vec::new();
@@ -429,7 +523,9 @@ impl Mempool {
                 return Err(Reject::ReplacementFee { min });
             }
         }
-        let entry = Entry { size, tx, txid, fee, added: Instant::now(), claims };
+        let order = self.next_order;
+        self.next_order += 1;
+        let entry = Entry { size, tx, txid, fee, arrived, order, claims };
         // Replaced transactions go first, so their room counts; they are
         // put back if the new one still does not fit.
         let removed: Vec<Entry> = conflicts.iter().filter_map(|id| self.remove(id)).collect();
@@ -450,7 +546,8 @@ impl Mempool {
             return Err(Reject::Full);
         }
         while self.bytes + entry.size > self.capacity {
-            let worst = self.txs.values().min_by_key(|e| (e.rate(), std::cmp::Reverse(e.added))).map(|e| e.txid);
+            let worst =
+                self.txs.values().min_by_key(|e| (e.rate(), std::cmp::Reverse((e.arrived, e.order)))).map(|e| e.txid);
             match worst {
                 Some(id) if self.txs[&id].rate() < entry.rate() => {
                     self.remove(&id);
@@ -588,7 +685,7 @@ impl Mempool {
         mut fits: impl FnMut(&[&Transaction]) -> bool,
     ) -> Vec<Transaction> {
         let mut entries: Vec<&Entry> = self.txs.values().collect();
-        entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then(a.added.cmp(&b.added)));
+        entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then((a.arrived, a.order).cmp(&(b.arrived, b.order))));
         let mut chosen: Vec<&Transaction> = Vec::new();
         let mut counts = [0usize; 4];
         for e in entries {
@@ -744,6 +841,45 @@ mod tests {
         assert_eq!(pool.get(&id).unwrap().spent_positions(), vec![at]);
         // The signature still holds: positions are not signed.
         assert!(pool.get(&id).unwrap().verify_signatures());
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// docs/FEES.md: a transaction that has waited the expiry is dropped
+    /// and its id refused for as long again, then forgotten; one loaded
+    /// with its arrival time keeps its age; the floor sets the dust limit.
+    #[test]
+    fn transactions_expire_and_stay_refused() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for (tag, amount) in [(1u8, 1000u64), (2, 1000)] {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), amount).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let policy = Policy { expiry_secs: 100, ..Policy::NONE };
+        let mut pool = Mempool::with_policy(1 << 20, policy);
+        let now = unix_now();
+        // One arrived 150 s ago (as loaded from a saved pool), one just now.
+        let old = pool.insert_at(spend(1, 1000, 5), &utxo, &names, &rtxn, 1, now - 150).unwrap();
+        let new = pool.insert(spend(2, 1000, 5), &utxo, &names, &rtxn, 1).unwrap();
+        assert_eq!(pool.expire(now), vec![old]);
+        assert!(!pool.contains(&old) && pool.contains(&new));
+        // Relayed back by a peer: refused, not taken with a fresh age.
+        assert_eq!(pool.insert(spend(1, 1000, 5), &utxo, &names, &rtxn, 1), Err(Reject::Expired));
+        assert!(pool.expired().any(|(id, until)| *id == old && *until == now + 100));
+        // Forgotten once its time is up (when the other has expired too).
+        assert_eq!(pool.expire(now + 101), vec![new]);
+        assert!(!pool.expired().any(|(id, _)| *id == old));
+        assert!(pool.expired().any(|(id, _)| *id == new));
+        // The floor sets the dust limit.
+        assert_eq!(Policy::with_floor(7).dust, INPUT_SIZE as u64 * 7);
+        assert_eq!(Policy::with_floor(MIN_FEE_PER_BYTE), Policy::MAINNET);
         drop(rtxn);
         let _ = std::fs::remove_dir_all(&dir);
     }

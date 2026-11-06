@@ -138,6 +138,9 @@ const EVENT_QUEUE: usize = 8192;
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const SEED_INTERVAL: Duration = Duration::from_secs(60);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// The saved pool's format (`docs/FEES.md`: with arrival times and the
+/// ids expired lately).
+const MEMPOOL_FILE_TAG: &[u8; 4] = b"POL2";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -510,6 +513,8 @@ pub struct PeerInfo {
     pub height: Option<u32>,
     pub live: bool,
     pub handshaken: bool,
+    /// Its relay floor, base units a byte, once it has told us.
+    pub min_fee: Option<u64>,
 }
 
 pub struct Node<V: ProofVerifier> {
@@ -1147,14 +1152,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Writes the pooled transactions to the data directory, so a restart
-    /// keeps pending payments: each as its length and its bytes.
+    /// keeps pending payments and their ages (`docs/FEES.md`): after a
+    /// tag, each as its arrival time, its length and its bytes; then the
+    /// ids expired lately, each with until when it is refused.
     fn save_mempool(&self) {
         let Some(path) = self.mempool_file() else { return };
-        let mut bytes = Vec::new();
-        for e in self.mempool.lock().unwrap().entries() {
+        let pool = self.mempool.lock().unwrap();
+        let mut bytes = MEMPOOL_FILE_TAG.to_vec();
+        bytes.extend_from_slice(&(pool.len() as u32).to_le_bytes());
+        for e in pool.entries() {
             let tx = e.tx.to_bytes();
+            bytes.extend_from_slice(&e.arrived.to_le_bytes());
             bytes.extend_from_slice(&(tx.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&tx);
+        }
+        let expired: Vec<_> = pool.expired().map(|(id, until)| (*id, *until)).collect();
+        drop(pool);
+        bytes.extend_from_slice(&(expired.len() as u32).to_le_bytes());
+        for (id, until) in expired {
+            bytes.extend_from_slice(&crate::poseidon2::digest_to_bytes(&id));
+            bytes.extend_from_slice(&until.to_le_bytes());
         }
         let tmp = path.with_extension("tmp");
         if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
@@ -1163,22 +1180,29 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// Pools the transactions saved by [`Node::save_mempool`], each checked
-    /// again as if it had just arrived; returns how many were taken.
+    /// again and keeping its arrival time, and the ids expired lately;
+    /// returns how many transactions were taken. A file of another format
+    /// is passed over.
     fn load_mempool(&mut self) -> usize {
         let Some(bytes) = self.mempool_file().and_then(|p| std::fs::read(p).ok()) else { return 0 };
         let height = self.chain.tip().ok().flatten().map_or(1, |t| t.height + 1);
         let Ok(rtxn) = self.chain.env().read_txn() else { return 0 };
         let mut pool = self.mempool.lock().unwrap();
-        let (mut rest, mut taken) = (&bytes[..], 0);
-        while let Some((len, tail)) = rest.split_first_chunk::<4>() {
-            let len = u32::from_le_bytes(*len) as usize;
-            let Some((tx, tail)) = tail.split_at_checked(len) else { break };
-            rest = tail;
+        let Some(rest) = bytes.strip_prefix(MEMPOOL_FILE_TAG) else { return 0 };
+        let mut r = crate::codec::Reader(rest);
+        let mut taken = 0;
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(arrived), Some(len)) = (r.u64(), r.u32()) else { break };
+            let Some(tx) = r.take(len as usize) else { break };
             if let Some(tx) = Transaction::from_bytes(tx)
-                && pool.insert(tx, self.chain.utxo(), self.chain.names(), &rtxn, height).is_ok()
+                && pool.insert_at(tx, self.chain.utxo(), self.chain.names(), &rtxn, height, arrived).is_ok()
             {
                 taken += 1;
             }
+        }
+        for _ in 0..r.u32().unwrap_or(0) {
+            let (Some(id), Some(until)) = (r.digest(), r.u64()) else { break };
+            pool.remember_expired(id, until);
         }
         taken
     }
@@ -1285,6 +1309,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             oldest: self.chain.oldest_body().unwrap_or_else(|_| tip.map_or(1, |h| h.height + 1)),
             tip: tip.map_or(self.genesis, |h| h.hash()),
             work: self.chain.tip_work().unwrap_or(U256::ZERO),
+            min_fee: self.mempool.lock().unwrap().policy().min_fee_per_byte,
         }
     }
 
@@ -1388,6 +1413,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.syncing.store(self.mode != Mode::Normal || behind || fresh, Ordering::Release);
         if now.duration_since(self.last_save) >= SAVE_INTERVAL {
             self.last_save = now;
+            let expired = self.mempool.lock().unwrap().expire(crate::mempool::unix_now());
+            if !expired.is_empty() {
+                self.log(&format!("{} transactions expired from the pool, unconfirmed", expired.len()));
+            }
             self.save_peers();
             self.save_mempool();
         }
@@ -1398,6 +1427,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             .map(|p| PeerInfo {
                 addr: p.addr,
                 height: p.status.map(|s| s.height),
+                min_fee: p.status.map(|s| s.min_fee),
                 live: live.contains(&p.addr),
                 handshaken: p.handshaken,
             })
@@ -4068,6 +4098,7 @@ mod tests {
                 oldest: 1,
                 tip: genesis,
                 work: U256::ZERO,
+                min_fee: 0,
             };
             sock.send_to(&Message::Ping(st).encode(), addr_a).unwrap();
             let mut buf = [0u8; net::MAX_DATAGRAM];
@@ -4322,6 +4353,7 @@ mod tests {
             oldest: 1,
             tip: genesis,
             work: U256::ZERO,
+            min_fee: 0,
         };
         let real = [
             Message::Ping(st).encode(),
@@ -4692,6 +4724,7 @@ mod tests {
                         oldest: 1,
                         tip: genesis,
                         work: U256([u64::MAX; 4]),
+                        min_fee: 0,
                     };
                     let _ = liar.send_to(&Message::Pong(claim).encode(), from);
                 }
@@ -5655,7 +5688,9 @@ mod tests {
     }
 
     /// The pool outlives a restart: saved on the way out, pooled again,
-    /// checked, when the node starts.
+    /// checked, when the node starts; each transaction keeps its arrival
+    /// time (its age, `docs/FEES.md`), and the ids expired lately stay
+    /// refused.
     #[test]
     fn the_pool_is_kept_across_a_restart() {
         let f = open("pool-kept");
@@ -5683,12 +5718,20 @@ mod tests {
             assert!(Instant::now() < deadline, "not pooled");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let arrived = mempool.lock().unwrap().entries().find(|e| e.txid == txid).unwrap().arrived;
+        let gone = crate::xmss::Digest::default();
+        mempool.lock().unwrap().remember_expired(gone, unix_now() + 3600);
         events.send(Event::Stop).unwrap();
         h.join().unwrap();
-        // A fresh pool, the same data directory: the transaction is back.
+        // A fresh pool, the same data directory: the transaction is back,
+        // as old as it was, and the expired id still refused.
+        std::thread::sleep(Duration::from_millis(1100));
         let again = pool();
         let (node, events) = Node::bind(Arc::clone(&f.chain), Arc::clone(&again), config(vec![], &f.dir)).unwrap();
-        assert!(again.lock().unwrap().contains(&txid));
+        let pool = again.lock().unwrap();
+        assert_eq!(pool.entries().find(|e| e.txid == txid).map(|e| e.arrived), Some(arrived));
+        assert!(pool.expired().any(|(id, _)| *id == gone));
+        drop(pool);
         drop(node);
         drop(events);
     }
@@ -7085,6 +7128,7 @@ mod tests {
             oldest: 1,
             tip: genesis,
             work: U256::ZERO,
+            min_fee: 0,
         };
         sock.send_to(&Message::Ping(status).encode(), addr_a).unwrap();
         let Some(Message::Pong(st)) = receive(|m| matches!(m, Message::Pong(_))) else { panic!("no pong") };

@@ -171,6 +171,15 @@ Per byte for now; revisit if policy transactions become a large share.
 1. Node settings for the relay floor, the half-life and the expiry; the
    floor announced in the handshake. Arrival times in the pool, kept in
    the saved pool; expiry, and expired ids remembered.
+   Done (2026-11-05): `--min-fee`, `--fee-half-life`, `--mempool-expiry`
+   (`mempool::Policy`, the dust limit following the floor); the floor in
+   every ping and pong (`Status::min_fee`), shown by `peers`; each pooled
+   transaction's arrival time (`Entry::arrived`), kept in the saved pool
+   (a new format, `POL2`), with an insertion counter breaking ties; every
+   minute, transactions past the expiry dropped and their ids refused for
+   as long again, the ids kept across restarts too. Tested by
+   `transactions_expire_and_stay_refused` and
+   `the_pool_is_kept_across_a_restart`.
 2. The rolling admission minimum, and peers told it; the reserve's
    candidates kept from eviction and relayed whatever it is.
 3. The aged reserve in `Mempool::select`: 10% of the block size limit
