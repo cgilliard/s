@@ -356,4 +356,62 @@ exact arguments) are made as each part is built.
 
 ## Implementation order
 
-To be written once the system calls are settled.
+Each step ends in something that boots under tabernacle and is tested
+under QEMU, as `node/scripts/check.sh` tests the compiler. The kernel is
+written in fam, with raw instruction words where it must (traps, CSRs,
+PMP), as the stdlib is. Performance and every hart come early: the
+store decides whether the node keeps up, and several harts shape the
+kernel too much to add at the end.
+
+1. **The kernel's skeleton, on one hart.** It boots from tabernacle in
+   place of `src/img.fam`: a trap handler, the console, the timer's
+   interrupt, the page allocator. Done when it boots and its timer
+   ticks steadily.
+2. **The store's benchmark.** Beside the kernel, a bare-metal program
+   (as `gen_hash` is) with virtio-blk and the copy-on-write B+ tree's
+   core (pages, alternating meta pages, the commit), timed on a block's
+   worth of the miner's state-tree updates under QEMU. Done when it
+   says, with numbers, that a block is applied within the block time,
+   or what must change until it is. The store (step 8) grows from it.
+3. **Every hart.** Tabernacle's change (harts other than 0 mark their
+   mailbox and sleep in `wfi`, released by the OS); the kernel counting
+   and releasing them, a timer and a run queue per hart, software
+   interrupts between them, locks without atomics (a tournament of
+   Peterson locks) and single-writer queues. Done when `-smp 1` to
+   `-smp 64` boot, and a stress test of the locks and queues on every
+   hart finds nothing wrong.
+4. **User mode and the first program.** The program table, PMP for one
+   process, `ecall` with the fewest calls (`exit`, a console `write`),
+   and the stdlib header for programs of the OS (their output through
+   `ecall`, their stacks within their region). Done when a program
+   prints and exits, and one that touches the kernel's memory is ended
+   while the system goes on.
+5. **Processes and threads, on every hart.** `spawn`, `wait`,
+   `thread`, `join`, `yield`, `sleep`; the lottery on each hart's
+   timer; `lock`, `await`, `wake`; `/proc/<pid>/tickets`. Done when
+   programs share every hart in the proportion of their tickets.
+6. **Memory.** `map` and `unmap`; `malloc` and `free` in the stdlib.
+   Done when a long test allocating and freeing on several threads
+   holds steady.
+7. **Descriptors, the console, init and a shell.** `open`, `read`,
+   `write`, `close`, `pipe`, `poll`; `/dev/console` and `/dev/null`;
+   `/proc`'s basics; `init`, a first shell on the console, and `ps`.
+   Done when `ps` and a pipe work from the serial console.
+8. **The store.** From step 2's core: the file system's tree, files
+   through descriptors, `ls`, `pwd`, `cat`, `mkdir`, `rm`, `/etc/init`;
+   users, permissions and `login`; trees (`open(path, TREE)`) and the
+   store calls. Done when files outlive a reboot, killing QEMU in a
+   commit leaves the last one whole, and a block-sized transaction in
+   one tree runs while files are saved without either waiting.
+9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
+   in fam), then TCP. Done when a program fetches over UDP and the host
+   reads a page served from the guest.
+10. **Terminals and the window manager.** `pty`, `/dev/tty/N`, and the
+    HTTP and WebSocket server with terminals in the browser. Done when
+    a browser opens a shell and runs `ls`.
+11. **The tools.** The editor, and the fam compiler as a program (its
+    I/O through system calls, a larger heap). Done when a program is
+    written, built and run inside the OS.
+12. **The node as a daemon.** A document of its own: the chain's logic
+    in fam (verification, the state tree, sync, the protocol), its seed
+    data in the image, started by `/etc/init`.
