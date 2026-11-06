@@ -26,8 +26,9 @@
 //! makes their inputs unspent again. Blocks carry no transactions, so this
 //! shelf is the only way a reorganized-out transaction can come back.
 //!
-//! The miner takes transactions by fee rate with [`Mempool::select`], and
-//! pays itself the subsidy plus their fees.
+//! The miner takes transactions with [`Mempool::select`]: the aged
+//! reserve's share of the block to the longest-waiting, the rest by fee
+//! rate; it pays itself the subsidy plus their fees.
 //!
 //! # Name operations
 //!
@@ -126,8 +127,13 @@ pub const PROOF_BYTES: usize = 205_000;
 /// gives to the longest-waiting ones, by default (`docs/FEES.md`).
 pub const RESERVE_PERCENT: usize = 10;
 /// The aged reserve, in bytes: about 180 KB, some 60 simple payments.
-pub const RESERVE_BYTES: usize =
-    (crate::chain::ChainParams::MAINNET.max_block_size - PROOF_BYTES) * RESERVE_PERCENT / 100;
+pub const RESERVE_BYTES: usize = reserve_bytes(crate::chain::ChainParams::MAINNET.max_block_size, RESERVE_PERCENT);
+
+/// The aged reserve of a block of `max_block_size` at `percent` of its
+/// space for transactions.
+pub const fn reserve_bytes(max_block_size: usize, percent: usize) -> usize {
+    max_block_size.saturating_sub(PROOF_BYTES) * percent / 100
+}
 /// The oldest transactions kept from eviction, by default: about a day
 /// of the reserve (some 26 MB), so that in a flood they still age into it.
 pub const PROTECT_BYTES: usize = RESERVE_BYTES * (86_400 / crate::difficulty::IDEAL_BLOCK_TIME as usize);
@@ -842,33 +848,65 @@ impl Mempool {
         Ok((gone.len(), back))
     }
 
-    /// Transactions for a block at `height`, by fee rate, highest first,
-    /// while `fits` accepts the running selection (it is called with the
-    /// candidate list including the next transaction). Transactions whose
-    /// name operations would exceed the block's caps, or whose reveals are
-    /// not yet in their window, are passed over.
+    /// Transactions for a block at `height` while `fits` accepts the
+    /// running selection (it is called with the candidate list including
+    /// the next transaction): first the aged reserve, the longest-waiting
+    /// transactions, oldest first, while their bytes together fit
+    /// `reserve_bytes` (`docs/FEES.md`: stopping at the first that does not,
+    /// so the wait is by age alone; [`MAX_TX_SIZE`] fits the default
+    /// reserve whole); then the rest by fee rate, highest first.
+    /// Transactions whose name operations would exceed the block's caps,
+    /// or whose reveals are not yet in their window, are passed over.
     pub fn select(
         &self,
         names: &NameSet,
         rtxn: &RoTxn,
         height: u32,
+        reserve_bytes: usize,
         mut fits: impl FnMut(&[&Transaction]) -> bool,
     ) -> Vec<Transaction> {
-        let mut entries: Vec<&Entry> = self.txs.values().collect();
-        entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then((a.arrived, a.order).cmp(&(b.arrived, b.order))));
         let mut chosen: Vec<&Transaction> = Vec::new();
+        let mut taken: std::collections::HashSet<Digest> = std::collections::HashSet::new();
         let mut counts = [0usize; 4];
+        // Whether `e` may join, its name operations counted if so.
+        let admit = |e: &Entry, counts: &mut [usize; 4]| {
+            if e.tx.ops.is_empty() {
+                return true;
+            }
+            let mut with = *counts;
+            for op in &e.tx.ops {
+                with[op.kind() as usize] += 1;
+            }
+            let over = [OpKind::Commit, OpKind::Reveal, OpKind::Update].iter().any(|k| with[*k as usize] > k.cap());
+            if over || !reveals_open(&e.tx, names, rtxn, height) {
+                return false;
+            }
+            *counts = with;
+            true
+        };
+        let mut reserved = 0;
+        for e in self.by_age.values().map(|id| &self.txs[id]) {
+            if reserved + e.size > reserve_bytes {
+                break;
+            }
+            let before = counts;
+            if !admit(e, &mut counts) {
+                continue;
+            }
+            chosen.push(&e.tx);
+            if !fits(&chosen) {
+                chosen.pop();
+                counts = before;
+                break;
+            }
+            reserved += e.size;
+            taken.insert(e.txid);
+        }
+        let mut entries: Vec<&Entry> = self.txs.values().filter(|e| !taken.contains(&e.txid)).collect();
+        entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then(a.age_key().cmp(&b.age_key())));
         for e in entries {
-            if !e.tx.ops.is_empty() {
-                let mut with = counts;
-                for op in &e.tx.ops {
-                    with[op.kind() as usize] += 1;
-                }
-                let over = [OpKind::Commit, OpKind::Reveal, OpKind::Update].iter().any(|k| with[*k as usize] > k.cap());
-                if over || !reveals_open(&e.tx, names, rtxn, height) {
-                    continue;
-                }
-                counts = with;
+            if !admit(e, &mut counts) {
+                continue;
             }
             chosen.push(&e.tx);
             if !fits(&chosen) {
@@ -1118,6 +1156,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// docs/FEES.md: a block's aged reserve goes to the longest-waiting,
+    /// oldest first whatever they pay, while they fit it; the rest by fee
+    /// rate.
+    #[test]
+    fn the_aged_reserve_goes_to_the_longest_waiting() {
+        let dir = std::env::temp_dir().join(format!("tabminer-mempool-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = open_env(&dir, 64 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let names = NameSet::open(&env, &mut wtxn, "n").unwrap();
+        for tag in 1u8..=5 {
+            utxo.add_output(&mut wtxn, &Output::new(&pk(tag), 1_000_000).block_output(), 0).unwrap();
+        }
+        wtxn.commit().unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let size = spend(1, 1_000_000, 1).size();
+        let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+        let now = unix_now();
+        // The two oldest pay least; the youngest most.
+        let ids: Vec<Digest> = [(1u8, 1u64, 500), (2, 2, 400), (3, 30, 300), (4, 40, 200), (5, 50, 100)]
+            .into_iter()
+            .map(|(tag, per_byte, age)| {
+                pool.insert_at(spend(tag, 1_000_000, per_byte * size as u64), &utxo, &names, &rtxn, 1, now - age)
+                    .unwrap()
+            })
+            .collect();
+        let pick = |reserve: usize, room: usize| -> Vec<Digest> {
+            pool.select(&names, &rtxn, 1, reserve, |c| c.len() <= room).iter().map(|t| t.txid()).collect()
+        };
+        // Without a reserve, by fee rate alone.
+        assert_eq!(pick(0, 3), vec![ids[4], ids[3], ids[2]]);
+        // A reserve of one: the oldest first, then by rate.
+        assert_eq!(pick(size, 3), vec![ids[0], ids[4], ids[3]]);
+        // Of two: both oldest, though the second pays less than the rest.
+        assert_eq!(pick(2 * size, 3), vec![ids[0], ids[1], ids[4]]);
+        // Of one and a half: one; the next waits its turn, not passed for
+        // a smaller younger one.
+        assert_eq!(pick(size * 3 / 2, 3), vec![ids[0], ids[4], ids[3]]);
+        // A block with room for one only: the oldest.
+        assert_eq!(pick(size, 1), vec![ids[0]]);
+        // The reserve's share of the space for transactions.
+        assert_eq!(reserve_bytes(2_000_000, 10), RESERVE_BYTES);
+        assert_eq!(reserve_bytes(2_000_000, 0), 0);
+        assert!(MAX_TX_SIZE <= RESERVE_BYTES);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pool_validates_orders_and_revalidates() {
         let dir = std::env::temp_dir().join(format!("tabminer-mempool-{}", std::process::id()));
@@ -1173,10 +1261,10 @@ mod tests {
         assert_eq!(pool.insert(reward, &utxo, &names, &rtxn, 1), Err(Reject::NoInputs));
 
         // Selection: t2 pays a higher rate (same size, bigger fee).
-        let all = pool.select(&names, &rtxn, 1, |_| true);
+        let all = pool.select(&names, &rtxn, 1, 0, |_| true);
         assert_eq!(all.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![id2, id1]);
         assert_eq!(Mempool::fees(&all), 15);
-        let one = pool.select(&names, &rtxn, 1, |c| c.len() <= 1);
+        let one = pool.select(&names, &rtxn, 1, 0, |c| c.len() <= 1);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].txid(), id2);
         drop(rtxn);
@@ -1329,9 +1417,9 @@ mod tests {
         // Selection at height 15 skips the closed reveal; at 22 takes it;
         // the commit cap holds across transactions.
         let ids = |txs: Vec<Transaction>| txs.iter().map(|t| t.txid()).collect::<Vec<_>>();
-        let picked = ids(pool.select(&names, &rtxn, 15, |_| true));
+        let picked = ids(pool.select(&names, &rtxn, 15, 0, |_| true));
         assert!(!picked.contains(&id1) && picked.contains(&id2) && picked.contains(&id3));
-        assert!(ids(pool.select(&names, &rtxn, 22, |_| true)).contains(&id1));
+        assert!(ids(pool.select(&names, &rtxn, 22, 0, |_| true)).contains(&id1));
         let big: Vec<NameOp> = (0..crate::names::MAX_COMMITS as u32)
             .map(|i| NameOp::Commit { commit: d(70 + i), memo: crate::transaction::memo5(d(1)) })
             .collect();
@@ -1339,7 +1427,7 @@ mod tests {
         // t4 pays a higher rate than t3? Same fee, larger size: lower rate,
         // so t3 comes first and t4's eight commits do not fit beside it.
         let id4 = pool.insert(t4, &utxo, &names, &rtxn, 15).unwrap();
-        let picked = ids(pool.select(&names, &rtxn, 15, |_| true));
+        let picked = ids(pool.select(&names, &rtxn, 15, 0, |_| true));
         assert!(picked.contains(&id3) && !picked.contains(&id4));
         // Expiry: a reveal whose commit is too old is refused, before the
         // pool's own claims are consulted.

@@ -197,6 +197,14 @@ Per byte for now; revisit if policy transactions become a large share.
    `the_admission_minimum_rises_decays_and_spares_the_oldest`.
 3. The aged reserve in `Mempool::select`: 10% of the block size limit
    less the proof.
+   Done (2026-11-05): `select` takes the reserve in bytes and fills it
+   first with the longest-waiting transactions, oldest first whatever
+   they pay, stopping at the first that does not fit what is left of it
+   (so none is passed over for a smaller, younger one; the largest
+   transaction fits the default reserve whole), then the rest by fee
+   rate. The miner's `--reserve P` sets the share (default 10,
+   `RESERVE_BYTES` = 179,500 bytes; 0 is fee rate alone). Tested by
+   `the_aged_reserve_goes_to_the_longest_waiting`.
 4. Wallet: fee estimation, an economy option, `bump`.
 5. Tests: a pool under a flood (the minimum rises and decays back); full
    blocks with a backlog at the floor, each confirmed within the bound;

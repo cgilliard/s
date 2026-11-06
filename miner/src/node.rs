@@ -7576,7 +7576,7 @@ mod tests {
         let chosen = {
             let rtxn = a.chain.env().read_txn().unwrap();
             let height = a.chain.tip().unwrap().unwrap().height + 1;
-            pool_a.lock().unwrap().select(a.chain.names(), &rtxn, height, |_| true)
+            pool_a.lock().unwrap().select(a.chain.names(), &rtxn, height, 0, |_| true)
         };
         assert_eq!(chosen.len(), 2);
         let fees: u64 = chosen.iter().map(|t| t.balance() as u64).sum();

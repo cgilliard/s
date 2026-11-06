@@ -130,6 +130,9 @@ options:
                     in H hours (default 12)
   --mempool-expiry D  drop a transaction waiting D days unconfirmed, and refuse
                     it for as long again (default 14)
+  --reserve P       give P% of each mined block's space for transactions to
+                    the longest-waiting ones, oldest first, whatever they pay
+                    (default 10; 0 takes all by fee rate)
   --verbose         log every network message handled
   --no-prompt       no wallet prompt; log to the terminal instead of the file
   --password-file FILE  the wallet's password, the file's first line: for a
@@ -319,6 +322,7 @@ struct Args {
     min_fee: u64,
     fee_half_life_hours: u64,
     mempool_expiry_days: u64,
+    reserve_percent: usize,
     no_seeds: bool,
     /// Relay for others on the message layer (`docs/ONION.md`).
     relay: bool,
@@ -369,6 +373,7 @@ fn parse_args() -> Result<Args, String> {
         min_fee: tabminer::mempool::MIN_FEE_PER_BYTE,
         fee_half_life_hours: tabminer::mempool::HALF_LIFE_SECS / 3600,
         mempool_expiry_days: tabminer::mempool::EXPIRY_SECS / 86400,
+        reserve_percent: tabminer::mempool::RESERVE_PERCENT,
         no_seeds: false,
         relay: false,
         max_sessions: tabminer::node::MAX_SESSIONS,
@@ -458,6 +463,7 @@ fn parse_args() -> Result<Args, String> {
             "--min-fee" => a.min_fee = number(value()?)?,
             "--fee-half-life" => a.fee_half_life_hours = number(value()?)?.max(1),
             "--mempool-expiry" => a.mempool_expiry_days = number(value()?)?.max(1),
+            "--reserve" => a.reserve_percent = (number(value()?)? as usize).min(100),
             "--max-undo-blocks" => a.max_undo = number(value()?)? as u32,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option {flag}")),
@@ -695,6 +701,8 @@ struct Ctx {
     relay_address: Option<String>,
     /// Debugging: random outputs to add and earlier ones to spend per block.
     debug_fill: Option<(usize, usize)>,
+    /// Bytes of each block mined for the aged reserve (`--reserve`).
+    reserve_bytes: usize,
     /// The reward output of the block being mined, forgotten on quit.
     in_flight: Mutex<Option<tabminer::transaction::Commitment>>,
     /// Slates sent over the message layer and not yet answered: the
@@ -931,6 +939,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
         relay: args.relay,
         relay_address: relay_address.clone(),
         debug_fill: args.debug_fill,
+        reserve_bytes: tabminer::mempool::reserve_bytes(params.max_block_size, args.reserve_percent),
         in_flight: Mutex::new(None),
         outgoing: Mutex::new(std::collections::HashMap::new()),
         prompt: !args.no_prompt,
@@ -3367,8 +3376,8 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
         }
         let subsidy = params.subsidy(height);
 
-        // Transactions: the reward, then the pooled ones by fee rate while
-        // they fit the block's segment and size limits. Size: header, body
+        // Transactions: the reward, then the pooled ones, the aged reserve
+        // first and the rest by fee rate, while they fit the block's segment and size limits. Size: header, body
         // counts, input positions, outputs, the name section and room for
         // the proof. The name section also sweeps expired commits.
         let sweeps: Vec<u64> = {
@@ -3385,7 +3394,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
         };
         let pooled: Vec<Transaction> = {
             let rtxn = chain.env().read_txn()?;
-            ctx.mempool.lock().unwrap().select(chain.names(), &rtxn, height, |chosen| {
+            ctx.mempool.lock().unwrap().select(chain.names(), &rtxn, height, ctx.reserve_bytes, |chosen| {
                 let ins: usize = chosen.iter().map(|t| t.inputs.len()).sum();
                 let outs: usize = 1 + chosen.iter().map(|t| t.outputs.len()).sum::<usize>();
                 let names: usize = chosen.iter().flat_map(|t| t.ops.iter()).map(|op| op.block_op().size()).sum();
