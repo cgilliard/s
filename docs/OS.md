@@ -998,6 +998,8 @@ kernel too much to add at the end.
     - vi.fam built in the OS and byte for byte the same as the host's
       /bin/vi;
     - a word not known: the error given, no program left.
-12. **The node as a daemon.** A document of its own: the chain's logic
-    in fam (verification, the state tree, sync, the protocol), its seed
-    data in the image, started by `/etc/init`.
+12. **The node as a daemon.** A document of its own, `docs/NODE.md`
+    (2026-11-07): the chain's logic in fam (verification only, no
+    proving or mining), the state tree, sync, the protocol, and an HTTP
+    API served by the node's own process for wallets and other clients;
+    its seed data in the image, started by `/etc/init`.
