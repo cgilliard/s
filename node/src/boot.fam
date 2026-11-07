@@ -19,4 +19,5 @@ gp@ 10000 lit + FFF lit + FFFFF000 lit and
 pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 0A lit putc
 tmrinit
+"init" dup prun "kernel: " puts swap puts " ended: " puts . 0A lit putc
 begin wfi 0 lit until

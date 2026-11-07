@@ -1,11 +1,12 @@
 #!/bin/sh
 # fam — compile a .fam program and (by default) run it.
 #
-# The stdlib (lib/stdlib.fam) plus a test-harness header is prepended
+# The stdlib (lib/stdlib.fam, then lib/mach.fam or with --user lib/user.fam)
+# plus a test-harness header is prepended
 # automatically and the source is EOT-terminated, then fed to the fam compiler
 # (bin/fam) running under q32. Paths are resolved relative to this script.
 #
-# Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+# Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]
 #   INPUT.fam    your program(s); multiple files are concatenated in order
 #                (lib/stdlib.fam is prepended for you)
 #   --test       build and run ONLY the Test { ... } block, then delete the binary
@@ -17,6 +18,9 @@
 #   --net, --hostfwd=SPEC  virtio-net when running (forwarded to q32; see
 #                q32 --help)
 #   --smp=N      N harts when running (forwarded to q32)
+#   --user       a program for the OS (docs/OS.md): lib/user.fam in place of
+#                lib/mach.fam, so its I/O and exit are system calls and its
+#                stacks are in the memory the kernel gives it
 #   -o OUTPUT    output binary (default: ./a.bin; removed if the compile fails)
 #
 # cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
@@ -30,6 +34,7 @@ SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
 TOOLS=$(dirname "$SCRIPT")
 ROOT=$(dirname "$TOOLS")
 STDLIB="$ROOT/lib/stdlib.fam"
+PLAT="$ROOT/lib/mach.fam"   # the stdlib's platform part: machine mode, or (--user) under the OS
 FAMC="$ROOT/bin/fam"
 Q32="$TOOLS/q32"
 
@@ -45,12 +50,13 @@ while [ $# -gt 0 ]; do
 		-o) OUT="$2"; OUT_GIVEN=1; shift 2 ;;
 		-o*) OUT="${1#-o}"; OUT_GIVEN=1; shift ;;
 		--test) TEST=1; shift ;;
+		--user) PLAT="$ROOT/lib/user.fam"; shift ;;
 		--bench) BENCH=1; shift ;;
 		--disk=*) QOPTS="$QOPTS $1"; shift ;;
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
 		--smp=*) QOPTS="$QOPTS $1"; shift ;;
-		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]"; exit 0 ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]"; exit 0 ;;
 		--) shift; IN="$1"; shift ;;
 		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
 		*) IN="$IN $1"; shift ;;
@@ -58,7 +64,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$TEST" = 1 ] && [ "$BENCH" = 1 ]; then echo "fam: --test and --bench are mutually exclusive" >&2; exit 1; fi
-if [ -z "$IN" ]; then echo "Usage: fam [--test|--bench] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]" >&2; exit 1; fi
+if [ -z "$IN" ]; then echo "Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]" >&2; exit 1; fi
 for f in $IN; do
 	if [ ! -f "$f" ]; then echo "fam: input not found: $f" >&2; exit 1; fi
 done
@@ -113,12 +119,12 @@ STREAM="$OUT.in.$$"
 # jumps linking Test blocks (lib/test.fam) never spans more than one file:
 # a `jal` reaches 1 MiB, and a test program is more than that.
 if [ "$TEST" = 1 ]; then
-	( cat "$STDLIB" "$HEADER"; n=0; for f in $IN; do cat "$f"; n=$((n + 1)); printf '\n: _tf%d ;\nTest { }\n' $n; done; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+	( cat "$STDLIB" "$PLAT" "$HEADER"; n=0; for f in $IN; do cat "$f"; n=$((n + 1)); printf '\n: _tf%d ;\nTest { }\n' $n; done; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
 elif [ "$BENCH" = 1 ]; then
 	# --bench: the same, with `Bench { }`: Bench blocks chain as Test blocks do.
-	( cat "$STDLIB" "$HEADER"; n=0; for f in $IN; do cat "$f"; n=$((n + 1)); printf '\n: _bf%d ;\nBench { }\n' $n; done; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+	( cat "$STDLIB" "$PLAT" "$HEADER"; n=0; for f in $IN; do cat "$f"; n=$((n + 1)); printf '\n: _bf%d ;\nBench { }\n' $n; done; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
 else
-	( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+	( cat "$STDLIB" "$PLAT" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
 fi
 "$Q32" --in="$STREAM" --out="$OUT" "$FAMC"
 # A compile error: the compiler's "? src XXXXXXXX out XXXXXXXX" (src/fam.S's

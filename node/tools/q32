@@ -10,7 +10,7 @@
 #                 writing it)
 #   --load=FILE@ADDR  Load FILE's raw bytes into memory at ADDR (repeatable):
 #                 test fixtures.  A fam program's heap and stacks span all of
-#                 RAM above its image (lib/stdlib.fam init: the data stack ends
+#                 RAM above its image (lib/mach.fam's init: the data stack ends
 #                 at 0x88000000, the top of the virt machine's default 128 MiB),
 #                 so pick an address the program will not allocate over.
 #   --smp=N       N harts (default 1): all start at 0x80000000; a fam

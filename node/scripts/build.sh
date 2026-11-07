@@ -1,8 +1,9 @@
 #!/bin/sh
 # build.sh — rebuild the fam compiler from the 168-byte seed under QEMU (fam0,
 # checked against the seed, then fam and fampack), then gen_hash, the node
-# image (the OS: src/kernel.fam and src/boot.fam) and tabernacle, patched for
-# that image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as
+# image (the OS: the kernel, src/kernel.fam and src/boot.fam, and the
+# programs in src/user, put together by scripts/mkimage.sh) and tabernacle,
+# patched for that image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as
 # tools/q32.
 # Runs from anywhere: it works in the tree it belongs to.
 set -e
@@ -11,7 +12,7 @@ cd "$(dirname "$0")/.."
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
-MEM="128M"    # the virt default; lib/stdlib.fam's init lays the stacks out for exactly this
+MEM="128M"    # the virt default; lib/mach.fam's init lays the stacks out for exactly this
 IMAGE_VERSION=0   # the node image's version, patched into tabernacle
 
 serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
@@ -99,10 +100,17 @@ patch_config() {
 run bin/fam0 fam0.seed src/fam0.fam0
 cmp ./bin/fam0 ./fam0.seed
 run bin/fam.uncompressed bin/fam0 src/fam.fam0
-run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
+run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/mach.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
-run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
-run bin/img bin/fam lib/stdlib.fam lib/build.fam src/kernel.fam src/boot.fam
+run bin/gen_hash bin/fam lib/stdlib.fam lib/mach.fam lib/asm.fam src/gen_hash.fam
+run bin/kernel bin/fam lib/stdlib.fam lib/mach.fam lib/build.fam src/kernel.fam src/boot.fam
+mkdir -p bin/user
+for prog in src/user/*.fam; do
+	name=$(basename "$prog" .fam)
+	echo "Building $prog → bin/user/$name (user mode)" >&2
+	./tools/fam --user -o "bin/user/$name" "$prog"
+done
+sh scripts/mkimage.sh bin/img bin/kernel init=bin/user/init
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"
 pack bin/tabernacle.uncompressed bin/tabernacle

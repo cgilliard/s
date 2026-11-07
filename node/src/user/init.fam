@@ -1,0 +1,5 @@
+\ init.fam — the first program the kernel runs (docs/OS.md), in user mode.
+\ For now it says hello and ends; it will start what /etc/init lists.
+
+"init: hello from user mode" puts 0A lit putc
+bye

@@ -19,7 +19,8 @@ the placeholder below is one; `fam.fam0` is unchanged by it.)
 A tabernacle binary is built for exactly one version of the node image,
 and fetches only that version. At its end, `scripts/build.sh` patches in
 (`patch_config`, as the old build's did) for `bin/img`, the node image
-(the OS: `src/kernel.fam` and `src/boot.fam`, `docs/OS.md`), at
+(the OS, `docs/OS.md`: the kernel, `src/kernel.fam` and `src/boot.fam`,
+with the programs in `src/user`, by `scripts/mkimage.sh`), at
 `IMAGE_VERSION`:
 
 ```text

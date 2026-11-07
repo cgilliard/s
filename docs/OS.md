@@ -339,12 +339,10 @@ which `login` reads.
 
 - **Tabernacle**: harts other than 0 marked present and asleep in
   `wfi`, and released by the OS (section 3).
-- **Fam programs in user mode**: today a program owns the machine (the
-  stdlib writes the UART directly and lays its stacks out over all of
-  RAM). A program for the OS is built with another header: its I/O
-  through system calls, its heap (`malloc` and `free`, section 10) and
-  stacks within the memory it is given. The compiler itself does not
-  change.
+- **Fam programs in user mode**: built with `lib/user.fam` in place of
+  `lib/mach.fam` (step 4): I/O through system calls, stacks within the
+  memory given; `malloc` and `free` (section 10) still to come. The
+  compiler itself does not change.
 - **The network stack**: TCP beside UDP, for the window manager.
 - **The disk**: larger than `node.sh`'s 256 MiB once it holds a chain.
 
@@ -434,7 +432,26 @@ kernel too much to add at the end.
    and the stdlib header for programs of the OS (their output through
    `ecall`, their stacks within their region). Done when a program
    prints and exits, and one that touches the kernel's memory is ended
-   while the system goes on.
+   while the system goes on. Done (2026-11-06). The stdlib is split:
+   `lib/stdlib.fam` the language, `lib/mach.fam` what owned the machine
+   (I/O to the UART, the finisher, `init`, the harts kept waiting: put
+   after it for every program as before) and `lib/user.fam` for programs
+   of the OS (`tools/fam --user`: `putc`, `puts`, `bye`, `getc` and `sys`
+   as system calls; stacks, return ids and variables in the memory the
+   kernel gives, a0 to a1). `scripts/mkimage.sh` makes the image: the
+   kernel, the programs in `src/user`, a table (name, offset, length,
+   memory), its offset and "PROG" in the last 8 bytes of a page, and the
+   kernel's end (the gp its start loads) moved past it all. `prun` runs a
+   program to its end on the hart it is called on: its code run where it
+   lies in the image (PMP: read and execute), its memory pages zeroed
+   (read and write), nothing else reachable; the trap entry takes a trap
+   from user mode on the kernel's stacks and, when the process ends (exit,
+   or an exception: killed and reported), goes on where `prun` left off.
+   Calls 1 `exit` and 17 `write` (fds 1 and 2, the buffer checked to be
+   the process's), others -38. The kernel runs `init` at boot. Checked:
+   init's hello; a program reading kernel memory killed (load fault) and
+   one writing its own code (store fault), the system going on; writes of
+   kernel memory refused (-14), an unknown call (-38), a bad fd (-9).
 5. **Processes and threads, on every hart.** `spawn`, `wait`,
    `thread`, `join`, `yield`, `sleep`; the lottery on each hart's
    timer; `lock`, `await`, `wake`; `/proc/<pid>/tickets`. Done when

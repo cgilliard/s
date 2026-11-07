@@ -1,0 +1,271 @@
+\ ============================================================
+\ lib/mach.fam — the stdlib's machine-mode part: what a program needs when it
+\ owns the machine (QEMU's virt, in machine mode): its I/O straight to the
+\ UART, its exit through the SiFive test finisher, its stacks laid over all
+\ of RAM, its traps, and the harts it does not run kept waiting.  tools/fam
+\ and scripts/build.sh put it after lib/stdlib.fam for every program but one
+\ built for the OS (`fam --user`), which gets lib/user.fam instead.
+\ ============================================================
+
+\ bye   ( -- )   RUNTIME: clean program shutdown (process exit 0).
+\        a `:` word — called, not inlined (no perf need; saves binary).
+: bye
+8323C1FF ,   \ lw   t2, -4(sp)          ( traps if the program left sp past the data
+\                                         stack's top, in the guard: an underflow `drop`
+\                                         alone never touches memory )
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher 0x100000 )
+37530000 ,   \ lui  t1, 0x5
+13035355 ,   \ addi t1, t1, 0x555       ( 0x5555 = PASS -> exit 0 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, .               ( spin until QEMU exits )
+;
+
+
+\ init  ( -- )   RUNTIME: set up the return-id (RID) stack used by
+\        every `:`-word call, the bump allocator, and the data stack.
+\          gp  = gp rounded up to 4 KiB: the data starts on a page boundary
+\          s10 = gp             RID-stack floor / overflow bound
+\          s11 = gp + 0x1000    RID-stack top (1024 entries, grows DOWN)
+\          gp  = gp + 0x1000    heap base — first free byte ABOVE the
+\                               RID stack (bump-allocate upward from here)
+\          sp  = 0x87FF0000     data-stack top (grows DOWN toward the heap:
+\                               everything from the heap base to the top of
+\                               the machine's 128 MiB is shared between the two)
+\          s8  = 0x88000000     loop-control stack top (the last 64 KiB of RAM,
+\                               the lowest 4 KiB of it a guard: below)
+\        The RAM size is the virt machine's default (QEMU -m 128M, tools/q32
+\        and scripts/build.sh); another machine means another constant here.
+\        runtime fragment; must run before any `:`-word call.
+:M init
+B7120000 ,   \ lui  t0, 0x1             ( gp = (gp + 0xFFF) & ~0xFFF: the next page )
+9382F2FF ,   \ addi t0, t0, -1
+B3815100 ,   \ add  gp, gp, t0
+B7F2FFFF ,   \ lui  t0, 0xFFFFF
+B3F15100 ,   \ and  gp, gp, t0
+138D0100 ,   \ addi s10, gp, 0          ( s10 = gp = RID floor / region base )
+B7120000 ,   \ lui  t0, 0x1             ( t0 = 0x1000 )
+B38D5100 ,   \ add  s11, gp, t0         ( s11 = gp + 0x1000 = RID top )
+\        Variable region: 16 KiB (4096 cells) at [s10+0x1000, s10+0x5000), i.e.
+\        right after the RID stack. VARBASE = s10 + 0x1000. The `variable` word
+\        hands out fixed cells here, so they live in DATA (not code).
+B7520000 ,   \ lui  t0, 0x5             ( t0 = 0x5000 = 0x1000 RID + 0x4000 vars )
+B3815100 ,   \ add  gp,  gp, t0         ( gp += 0x5000 = heap base, above RID+vars )
+3701FF87 ,   \ lui  sp, 0x87FF0         ( sp = 0x87FF0000 = data-stack top: RAM top - 64 KiB )
+370C0088 ,   \ lui  s8, 0x88000         ( s8 = 0x88000000 = loop-control stack top = RAM top )
+\        Then a trap handler: any trap -- a return-stack overflow (each call
+\        checks, and executes `ebreak` on overflow), a bad address, an illegal
+\        instruction -- prints "?trap <mcause> at <mepc>" and exits with code 1,
+\        rather than leaving the machine spinning.  mcause 3 is the overflow.
+97020000 ,   \ auipc t0,0x0             ( t0 = the handler, 16 bytes on )
+93820201 ,   \ addi  t0,t0,16
+73905230 ,   \ csrrw zero,mtvec,t0
+6F00000B ,   \ jal   zero,done          ( over the handler )
+B7020010 ,   \ lui   t0,0x10000         trap: UART base
+37767261 ,   \ lui   a2,0x61727         ( a2 = "?tra" )
+1306F643 ,   \ addi  a2,a2,1087
+EF0F8004 ,   \ jal   t6,put             ( print it )
+37260000 ,   \ lui   a2,0x2             ( a2 = "p " )
+13060607 ,   \ addi  a2,a2,112
+EF0FC003 ,   \ jal   t6,put
+F3252034 ,   \ csrrs a1,mcause,zero     ( why: 3 = ebreak, a return-stack overflow )
+EF0F4005 ,   \ jal   t6,hex8            ( print it in hex )
+37667420 ,   \ lui   a2,0x20746         ( a2 = " at " )
+13060612 ,   \ addi  a2,a2,288
+EF0F8002 ,   \ jal   t6,put
+F3251034 ,   \ csrrs a1,mepc,zero       ( where )
+EF0F0004 ,   \ jal   t6,hex8
+1306A000 ,   \ addi  a2,zero,10         ( LF )
+EF0F8001 ,   \ jal   t6,put
+B7021000 ,   \ lui   t0,0x100           ( SiFive finisher 0x100000 )
+37330100 ,   \ lui   t1,0x13
+13033333 ,   \ addi  t1,t1,819          ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw    t1,0(t0)
+6F000000 ,   \ jal   zero,.             ( spin until QEMU exits )
+1375F60F ,   \ andi  a0,a2,255          put: ( low byte of a2 )
+03C35200 ,   \ lbu   t1,5(t0)           p1: ( wait THR-empty )
+13730302 ,   \ andi  t1,t1,32
+E30C03FE ,   \ beq   t1,zero,p1
+2380A200 ,   \ sb    a0,0(t0)           ( write it )
+13568600 ,   \ srli  a2,a2,0x8          ( next byte; stop at a zero )
+E31406FE ,   \ bne   a2,zero,put
+67800F00 ,   \ jalr  zero,0(t6)         ( return )
+130F8000 ,   \ addi  t5,zero,8          hex8: ( 8 digits of a1 )
+13D5C501 ,   \ srli  a0,a1,0x1c         h1: ( top nibble )
+93954500 ,   \ slli  a1,a1,0x4
+9303A000 ,   \ addi  t2,zero,10
+63447500 ,   \ blt   a0,t2,h2
+13057500 ,   \ addi  a0,a0,7            ( A-F )
+13050503 ,   \ addi  a0,a0,48           h2: ( to ASCII )
+03C35200 ,   \ lbu   t1,5(t0)           h3: ( wait THR-empty )
+13730302 ,   \ andi  t1,t1,32
+E30C03FE ,   \ beq   t1,zero,h3
+2380A200 ,   \ sb    a0,0(t0)
+130FFFFF ,   \ addi  t5,t5,-1
+E31A0FFC ,   \ bne   t5,zero,h1
+67800F00 ,   \ jalr  zero,0(t6)         ( return )
+\        done: a guard below the loop-control stack.  The 4 KiB just past the
+\        data stack's top, the bottom of the loop stack's 64 KiB, is made
+\        inaccessible by a locked PMP entry (locked: it binds M-mode too), so
+\        a data-stack underflow, or a loop stack over 60 KiB deep, traps
+\        (mcause 5 on a read, 7 on a write) instead of reading or overwriting
+\        the loop stack.
+B7C2FF21 ,   \ lui   t0,0x21ffc
+9382F21F ,   \ addi  t0,t0,511          ( NAPOT 0x87FF0000, 4 KiB: (base >> 2) | 0x1FF )
+7390023B ,   \ csrrw zero,pmpaddr0,t0
+93028009 ,   \ addi  t0,zero,152        ( 0x98: locked, NAPOT, no read/write/execute )
+7390023A ,   \ csrrw zero,pmpcfg0,t0
+;
+
+
+\ putc  ( c -- )   RUNTIME: pop a byte off the data stack, write to UART.
+\        a `:` word (called, not inlined).
+: putc
+B7020010 ,   \ lui  t0, 0x10000         ( UART base )
+03C35200 ,   \ lbu  t1, 5(t0)           ( LSR )
+13730302 ,   \ andi t1, t1, 0x20        ( THR-empty bit )
+E30C03FE ,   \ beqz t1, -8              ( wait until ready )
+03230100 ,   \ lw   t1, 0(sp)           ( pop the byte )
+13014100 ,   \ addi sp, sp, 4
+23806200 ,   \ sb   t1, 0(t0)           ( write to UART )
+;
+
+\ puts  ( addr -- )   RUNTIME: write a null-terminated string to the UART.
+\        a `:` word; pairs with the "..." string literal.
+: puts
+83220100 ,   \ lw   t0, 0(sp)           ( addr )
+13014100 ,   \ addi sp, sp, 4
+37030010 ,   \ lui  t1, 0x10000         ( UART base )
+83C30200 ,   \ ploop: lbu t2, 0(t0)
+638E0300 ,   \ beqz t2, pend            ( null -> done )
+034E5300 ,   \ lbu  t3, 5(t1)           ( wait THR-empty )
+137E0E02 ,   \ andi t3, t3, 0x20
+E30C0EFE ,   \ beqz t3, -8
+23007300 ,   \ sb   t2, 0(t1)           ( write byte )
+93821200 ,   \ addi t0, t0, 1
+6FF05FFE ,   \ jal  x0, ploop
+;
+
+
+\ ============================================================
+\ Number printing.
+\ ============================================================
+
+\ u.  ( u -- )   print an unsigned decimal (digits reversed via the data stack).
+: u.
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+130E0000 ,   \ li t3,0
+13030000 ,   \ li t1,0
+930EA000 ,   \ li t4,10
+63E8D201 ,   \ bltu t0,t4,24 <got>
+B382D241 ,   \ sub t0,t0,t4
+13031300 ,   \ addi t1,t1,1
+6FF01FFF ,   \ j 10 <sub10>
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+130E1E00 ,   \ addi t3,t3,1
+93020300 ,   \ mv t0,t1
+E39C02FC ,   \ bnez t0,c <extract>
+370F0010 ,   \ lui t5,0x10000
+83230100 ,   \ lw t2,0(sp)
+13014100 ,   \ addi sp,sp,4
+93830303 ,   \ addi t2,t2,48
+834F5F00 ,   \ lbu t6,5(t5)
+93FF0F02 ,   \ andi t6,t6,32
+E38C0FFE ,   \ beqz t6,48 <wait>
+23007F00 ,   \ sb t2,0(t5)
+130EFEFF ,   \ addi t3,t3,-1
+E3100EFE ,   \ bnez t3,3c <prn>
+;
+
+\ .  ( n -- )   print a signed decimal.
+: .  dup 0< if 2D lit putc 0 lit swap - then u. ;
+
+
+\ u.x  ( u -- )   print u as 8 hex digits (no prefix).
+: u.x
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+130EC001 ,   \ li t3,28
+370F0010 ,   \ lui t5,0x10000
+33D3C201 ,   \ srl t1,t0,t3
+1373F300 ,   \ andi t1,t1,15
+930EA000 ,   \ li t4,10
+6346D301 ,   \ blt t1,t4,28 <.L2^B1>
+13037303 ,   \ addi t1,t1,55
+6F008000 ,   \ j 2c <.L3^B1>
+13030303 ,   \ addi t1,t1,48
+834F5F00 ,   \ lbu t6,5(t5)
+93FF0F02 ,   \ andi t6,t6,32
+E38C0FFE ,   \ beqz t6,2c <.L3^B1>
+23006F00 ,   \ sb t1,0(t5)
+130ECEFF ,   \ addi t3,t3,-4
+E3580EFC ,   \ bgez t3,10 <.L1^B1>
+;
+
+
+\ getc  ( -- ch )   RUNTIME: read one byte from the UART (blocks). :M (inlined
+\        so it never pushes a return-id — safe inside loops that pin s11).
+:M getc
+B7020010 ,   \ lui  t0, 0x10000         ( UART base )
+03C35200 ,   \ lbu  t1, 5(t0)           ( LSR )
+13731300 ,   \ andi t1, t1, 1           ( RX data-ready bit )
+E30C03FE ,   \ beqz t1, -8              ( wait for a byte )
+03C30200 ,   \ lbu  t1, 0(t0)           ( read the byte )
+1301C1FF ,   \ addi sp, sp, -4
+23206100 ,   \ sw   t1, 0(sp)           ( push it )
+;
+
+
+\ Harts other than 0 wait (docs/OS.md, section 3).  With no firmware every
+\ hart starts at 0x80000000; tabernacle keeps all but hart 0 waiting, and so
+\ does every fam program, here, in case nothing did before it (a program run
+\ by q32 --smp=N).  The contract with the OS:
+\   0x87FF1000 + 4*hartid  the hart's mailbox word (hart ids below 960): it
+\                          writes 1 there ("present"), then sleeps in wfi with
+\                          only software interrupts enabled (mie.MSIE).
+\   0x87FF1F00             the wait loop, copied there by each such hart.
+\ The OS releases a hart by writing to its mailbox the address of a record
+\ whose first word is where to go, and raising its software interrupt (its
+\ msip word in the CLINT); the hart jumps there with a0 = the record.  Any
+\ hart id from 960 on just sleeps.  The page is above the stdlib's guard page
+\ and below the loop-frame stack's deep end, so no program's heap or stacks
+\ reach it.
+F32240F1 ,   \ csrrs t0,mhartid,zero
+63860208 ,   \ beq t0,zero,90 <end>
+17030000 ,   \ auipc t1,0x0
+13030306 ,   \ addi t1,t1,96             ( the wait loop's code, below )
+B723FF87 ,   \ lui t2,0x87ff2
+938303F0 ,   \ addi t2,t2,-256 # 87ff1f00 <end+0x87ff1e70>
+130EA000 ,   \ addi t3,zero,10
+832E0300 ,   \ lw t4,0(t1)
+23A0D301 ,   \ sw t4,0(t2)
+13034300 ,   \ addi t1,t1,4
+93834300 ,   \ addi t2,t2,4
+130EFEFF ,   \ addi t3,t3,-1
+E3160EFE ,   \ bne t3,zero,1c <.L1^B1>
+B723FF87 ,   \ lui t2,0x87ff2
+938303F0 ,   \ addi t2,t2,-256 # 87ff1f00 <end+0x87ff1e70>
+1303003C ,   \ addi t1,zero,960
+63F06202 ,   \ bgeu t0,t1,60 <toomany>
+93922200 ,   \ slli t0,t0,0x2
+3713FF87 ,   \ lui t1,0x87ff1
+B3826200 ,   \ add t0,t0,t1
+13031000 ,   \ addi t1,zero,1
+23A06200 ,   \ sw t1,0(t0)
+0F00F00F ,   \ fence iorw,iorw
+67800300 ,   \ jalr zero,0(t2)
+93830302 ,   \ addi t2,t2,32
+67800300 ,   \ jalr zero,0(t2)
+13038000 ,   \ addi t1,zero,8
+73204330 ,   \ csrrs zero,mie,t1
+73005010 ,   \ wfi
+03A50200 ,   \ lw a0,0(t0)
+13031000 ,   \ addi t1,zero,1
+E37AA3FE ,   \ bgeu t1,a0,70 <.L2^B1>
+03230500 ,   \ lw t1,0(a0)
+67000300 ,   \ jalr zero,0(t1) # 87ff1000 <end+0x87ff0f70>
+73005010 ,   \ wfi
+6FF0DFFF ,   \ jal zero,88 <dead>
+
+init
