@@ -1,0 +1,4 @@
+\ halt.fam — the machine stopped (root only): /proc/halt written.
+: f variable ;
+"/proc/halt" 1 lit open dup f ! 0< if "halt: only root may" eputs 0A lit eputc 1 lit exit then
+f @ "1" 1 lit write "halt: only root may" eputs 0A lit eputc 1 lit exit

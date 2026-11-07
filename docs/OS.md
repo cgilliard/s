@@ -817,6 +817,17 @@ kernel too much to add at the end.
     kernel can run a program stored as a file (step 11). A side fix:
     a new process record is now zeroed whole (512 bytes); since
     records grew, the 256 zeroed had left the descriptor table out.
+
+    Relative paths and halt (2026-11-07). A path to `/bin`, `/dev` or
+    `/proc` may be relative and may hold `.` and `..`: `ls bin` from
+    the root, `ls ../dev`, `cat proc/uptime`. Open makes it absolute by
+    the working directory and plain before looking, and keeps a final
+    `/` (so `/proc/self/` is still the directory and `/proc/self` the
+    file). `/proc/halt` is a new key: written only, and by root only,
+    it stops the machine (QEMU exits 0). The `halt` program writes it.
+    The store's commits are whole, so stopping loses only what was not
+    yet committed. `exit` at the console only ends the shell; init then
+    starts another.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

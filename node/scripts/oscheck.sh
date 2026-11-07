@@ -244,14 +244,15 @@ has desc '^open -2 badfd -9 ro -13 nopid -2 full 4$'; has desc '^killed -9$'
 # background (&: its pid shown, then told done), and & before a line's end;
 # ls of /proc, /dev, /bin and a process's directory (the root's, with a
 # store, in the wm test); the search path shown, a command by its path,
-# one not found with /bin left out of the path, found again with it back.
+# one not found with /bin left out of the path, found again with it back;
+# dev and proc/... found from the root as relative paths; halt stopping it.
 usrc big ': buf variable ;
 400 lit alloc buf !  400 lit 0 lit do 61 lit buf @ i + c! loop  A lit buf @ 3FF lit + c!
 64 lit 0 lit do 1 lit buf @ 400 lit write drop loop bye'
 progs=""; for p in bin/user/*; do progs="$progs $(basename "$p")=$p"; done
 sh scripts/mkimage.sh "$T/shell.img" bin/kernel $progs big="$T/big.bin" 2> "$T/shell.mk" || fail shell "mkimage: $(cat "$T/shell.mk")"
 printf '%s\n' 'echo hello world' 'ps' 'echo one two three | wc' 'big | cat | wc' 'cat /proc/self/cmd' \
-	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'cat &' 'echo after' 'echo x & echo y' 'ls /proc' 'ls /dev/' 'ls /proc/1' 'ls /bin' 'path' '/bin/echo by its path' 'path /none' 'echo x' 'path /none:/bin' 'echo found' 'exit' > "$T/shell.in"
+	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'cat &' 'echo after' 'echo x & echo y' 'ls /proc' 'ls dev' 'cat proc/../proc/self' 'ls /proc/1' 'ls /bin' 'path' '/bin/echo by its path' 'path /none' 'echo x' 'path /none:/bin' 'echo found' 'exit' 'halt' > "$T/shell.in"
 # feed SECS FILE CMD... — CMD run with FILE's lines typed into it, 0.3 s
 # apart, 3 s after one running big (typed ahead, a line is echoed among the
 # output).
@@ -266,7 +267,7 @@ for n in 1 4; do
 		'^3 2 R 1 64 [0-9]* ps$' '^1 3 14$' '^100 100 102400$' '^cat /proc/self/cmd$' '^7$' \
 		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell ended; again$' \
 		'^\(\$ \)*\[[0-9]*\]$' '\[[0-9]*\] done$' '^sh: & only ends a line$' \
-		'^uptime$' '^tty/$' '^tickets$' '^runas$' '^/bin$' '^by its path$' '^sh: echo: not found$' '^found$'; do
+		'^uptime$' '^tty/$' '^tickets$' '^runas$' '^/bin$' '^by its path$' '^sh: echo: not found$' '^found$' '^halt$' '^kernel: halted$'; do
 		grep -q -- "$pat" "$o" || { fail "shell_$n" "no /$pat/ in: $(head -c 600 "$o")"; break; }
 	done
 done
