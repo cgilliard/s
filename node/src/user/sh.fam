@@ -210,6 +210,7 @@ then then ;
 100 lit alloc dup pathv ! "/bin" scpy 0 lit swap c!  80 lit alloc pbuf !
 begin
 	reapbg
+	0 lit 1 lit 0 lit tty drop          \ its terminal in line mode (a program may have left it raw)
 	"$ " puts
 	rdline 0< if 0 lit exit then
 	parse if run else bg @ 1 lit = if "sh: & only ends a line" else "sh: a command is missing" then eputs 0A lit eputc then

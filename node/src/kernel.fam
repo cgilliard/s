@@ -892,12 +892,23 @@ then ;
 : crdy   variable ;          \ bytes ready to read
 : ctail  variable ;          \ bytes read
 : ceof   variable ;          \ ^D at a line's start: the next read gets 0
+: cmode  variable ;          \ 12 bytes, as a terminal's (a pty's at 28): its
+                             \ mode (1 raw), escape state, size (src/ksys.fam, tty)
 
-: kcinit  40 lit alloc dup kpty ! 40 lit mzero  400 lit alloc kcbuf !  0 lit chead !  0 lit crdy !  0 lit ctail !  0 lit ceof ! ;
+: kcinit  40 lit alloc dup kpty ! 40 lit mzero  C lit alloc dup cmode ! C lit mzero  400 lit alloc kcbuf !  0 lit chead !  0 lit crdy !  0 lit ctail !  0 lit ceof ! ;
 : cb  3FF lit and kcbuf @ + ;                 \ ( i -- addr )
 
 \ ckey ( c -- )  a byte typed.  Under klk.
-: ckey
+\ esc? ( c a -- drop? )  c in an escape sequence (the state at a: 0 none,
+\ 1 after ESC, 2 in ESC [ or ESC O, until a byte of 40-7E ends it).
+: esc?
+dup @ 0= if over 1B lit = if 1 lit swap ! drop 1 lit else 2drop 0 lit then else
+dup @ 1 lit = if over dup 5B lit = swap 4F lit = or if 2 lit else 0 lit then swap ! drop 1 lit else
+over 40 lit u< 0= if 0 lit swap ! else drop then drop 1 lit then then ;
+
+\ ckeyl ( c -- )  a byte typed, in line mode: echoed, backspace and delete
+\ erase, Enter ends the line, ^D the input.
+: ckeyl
 dup D lit = over A lit = or if
 	drop chead @ ctail @ - 3FF lit u< if
 		A lit chead @ cb c!  chead @ 1 lit + dup chead ! crdy !  D lit putc A lit putc  cin fwake
@@ -912,6 +923,16 @@ else
 dup 20 lit u< if drop else
 	chead @ ctail @ - 3FE lit u< if dup chead @ cb c!  chead @ 1 lit + chead !  putc else drop then
 then then then then ;
+
+\ ckey ( c -- )  a byte typed on the console: raw (cmode's mode 1), ready
+\ to read at once, not echoed; in line mode an escape sequence (an arrow's,
+\ ESC [ ... or ESC O x) dropped whole, the rest to ckeyl.
+: ckey
+cmode @ @ 1 lit and if
+	chead @ ctail @ - 3FF lit u< if dup chead @ cb c!  chead @ 1 lit + dup chead ! crdy ! then drop cin fwake
+else
+	dup cmode @ 4 lit + esc? if drop else ckeyl then
+then ;
 
 \ cpoll  what the UART has, taken.  Not from a trap of the kernel's (it
 \ might hold klk): from user mode's, or hstep's.

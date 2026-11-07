@@ -10,7 +10,7 @@
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
 \ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
 \ close, 18 seek, 20 pipe, 21 pty, 22 poll, 23-29 the store's, 30 socket, 31 net,
-\ 32 accept, 33 sendto, 34 recvfrom, 35 remove, 36 mkdir, 37 chmod, 38 chown (below).
+\ 32 accept, 33 sendto, 34 recvfrom, 35 remove, 36 mkdir, 37 chmod, 38 chown, 39 tty (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -139,6 +139,7 @@
 : mkdir   0 lit 0 lit 24 lit sys ;           \ ( path -- r )
 : chmod   0 lit 25 lit sys ;                 \ ( path mode -- r )  its owner, or root
 : chown   26 lit sys ;                       \ ( path user group -- r )  root
+: tty     27 lit sys ;                       \ ( fd op arg -- r )  0 mode, 1 set it (1 raw), 2 size (rows * 65536 + columns), 3 set it
 \ sys5 ( a0 a1 a2 a3 a4 number -- result )  a call of five arguments.
 : sys5
 83280100 ,   \ lw a7,0(sp)

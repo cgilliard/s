@@ -504,6 +504,25 @@ then then then ;
 : cuid  kthr? if cproc C4 lit + @ else 0 lit then ;
 : cgid  kthr? if cproc C8 lit + @ else 0 lit then ;
 
+\ 39 tty(fd, op, arg): a terminal's settings (the console's, or a pty's
+\ through either end): op 0 its mode (0 lines, 1 raw: each byte ready as
+\ typed, not echoed, no editing), 1 the mode set to arg; op 2 its size
+\ (rows * 65536 + columns; 0 not known, as the console's until set), 3
+\ the size set to arg (wm, from its page).  -25 not a terminal, -22 a bad
+\ op, -9 a bad descriptor.
+: ttya  dup @ 1 lit = if drop cmode @ else dup @ 9 lit = over @ A lit = or if 8 lit + @ 28 lit + else drop 0 lit then then ;   \ ( f -- a | 0 )
+: stty
+klk @ lock
+28 lit sysarg ufd ?dup 0= if FFFFFFF7 lit else
+ttya ?dup 0= if FFFFFFE7 lit else
+2C lit sysarg
+dup 0= if drop @ 1 lit and else
+dup 1 lit = if drop 30 lit sysarg 1 lit and over !  0 lit swap 4 lit + !  0 lit else
+dup 2 lit = if drop 8 lit + @ else
+3 lit = if 30 lit sysarg swap 8 lit + !  0 lit else drop FFFFFFEA lit
+then then then then then then
+klk @ unlock sret ;
+
 \ yopen ( s mode -- f | error )  /dev/tty/<N>: its slave end, for its
 \ maker or root.
 : yopen
@@ -576,7 +595,7 @@ ctail @ crdy @ = if cin 5 lit tretry BLK else
 	0 lit
 	begin
 		dup 30 lit sysarg u< ctail @ crdy @ u< and
-		over 0= if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then and
+		over 0= if 1 lit else cmode @ @ 1 lit and if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then then and
 	while
 		ctail @ cb c@  over 2C lit sysarg + c!
 		ctail @ 1 lit + ctail !  1 lit +
@@ -675,10 +694,10 @@ then then then then then ;
 : yout  dup yroom if tuck yo c!  18 lit + dup @ 1 lit + swap ! else 2drop then ;   \ ( c t -- )
 : yi    swap 3FF lit and 400 lit + + ;                         \ ( i t -- a )
 
-\ ykey ( c t -- )  a byte typed on terminal t, as the console's (ckey):
-\ echoed, backspace and delete erase, Enter ends the line, ^D the input.
-\ Under klk.
-: ykey
+\ ykeyl ( c t -- )  a byte typed on terminal t in line mode, as the
+\ console's (ckeyl): echoed, backspace and delete erase, Enter ends the
+\ line, ^D the input.  Under klk.
+: ykeyl
 over D lit = 2 lit pick A lit = or if
 	nip dup 8 lit + @ over 10 lit + @ - 3FF lit u< if
 		A lit over dup 8 lit + @ swap yi c!
@@ -703,6 +722,20 @@ over 20 lit u< if nip else
 	else nip then
 then then then then
 fwake ;
+
+\ ykey ( c t -- )  a byte typed on terminal t: raw (its mode, at 28, 1),
+\ ready at once and not echoed; in line mode an escape sequence dropped
+\ whole (its state at 2C), the rest to ykeyl.  Under klk.
+: ykey
+dup 28 lit + @ 1 lit and if
+	dup 8 lit + @ over 10 lit + @ - 3FF lit u< if
+		2dup dup 8 lit + @ swap yi c!
+		dup 8 lit + @ 1 lit + over 8 lit + !  dup 8 lit + @ over C lit + !
+	then
+	nip fwake
+else
+	2dup 2C lit + esc? if nip fwake else ykeyl then
+then ;
 
 \ ymread ( t -- r )  the master read: what the terminal shows, up to n;
 \ 0 once it is empty with no slave end.
@@ -733,7 +766,7 @@ else
 	0 lit
 	begin
 		dup 30 lit sysarg u< 2 lit pick dup 10 lit + @ swap C lit + @ u< and
-		over 0= if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then and
+		over 0= if 1 lit else 2 lit pick 28 lit + @ 1 lit and if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then then and
 	while
 		over dup 10 lit + @ swap yi c@  over 2C lit sysarg + c!
 		over 10 lit + dup @ 1 lit + swap !  1 lit +
@@ -1802,8 +1835,9 @@ dup 22 lit = if drop srecvf else
 dup 23 lit = if drop sremove else
 dup 24 lit = if drop smkdir else
 dup 25 lit = if drop schmod else
-26 lit = if schown else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
+dup 26 lit = if drop schown else
+27 lit = if stty else FFFFFFDA lit sret
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill

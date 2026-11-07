@@ -578,6 +578,41 @@ for n in 1 4; do
 	has "pty_$n" '^sh: .*hi^M^J'
 	has "pty_$n" '^ended 0 eof 0$'
 done
+# Raw mode (tty, call 39), for the editor.  The console: its size not
+# known (0), raw: each byte as typed, not echoed (an arrow's escape
+# sequence and ^D among them), then lines again with an arrow's sequence
+# dropped; a descriptor not open -9.  A pty: its size set and read through
+# the other end, raw (not echoed), then lines with an arrow dropped.
+usrc traw ': b variable ;
+20 lit alloc b !
+0 lit 2 lit 0 lit tty "size " puts . 0A lit putc
+0 lit 1 lit 1 lit tty "raw " puts . 0A lit putc
+0 lit 0 lit 0 lit tty "mode " puts . 0A lit putc
+6 lit 0 lit do 0 lit b @ 1 lit read drop b @ c@ . loop 0A lit putc
+0 lit 1 lit 0 lit tty drop
+"line: " puts 0 lit b @ 20 lit read . b @ c@ . 0A lit putc
+9 lit 0 lit 0 lit tty "notty " puts . 0A lit putc
+bye'
+usrc tpraw ': fds variable ;  : b variable ;  : m variable ;  : s variable ;
+: key  b @ c!  m @ b @ 1 lit write drop ;     \ ( c -- )  typed on the terminal
+8 lit alloc fds !  40 lit alloc b !
+fds @ pty drop  fds @ @ m !  fds @ 4 lit + @ s !
+s @ 3 lit 180050 lit tty drop  m @ 2 lit 0 lit tty "size " puts dup 10 lit rshift . FFFF lit and . 0A lit putc
+s @ 1 lit 1 lit tty drop  m @ 0 lit 0 lit tty "mode " puts . 0A lit putc
+71 lit key  s @ b @ 40 lit read "raw read " puts . b @ c@ . 0A lit putc
+s @ 1 lit 0 lit tty drop
+61 lit key  1B lit key  5B lit key  41 lit key  7A lit key  D lit key
+s @ b @ 40 lit read "line " puts dup . 1 lit b @ rot write drop
+m @ b @ 40 lit read "shown " puts . 0A lit putc
+bye'
+uimage raw bin/kernel init=traw
+uimage praw bin/kernel init=tpraw
+for n in 1 4; do
+	expect "rawcons_$n" 124 '^97982791654$' 8 sh -c '{ sleep 1; printf "ab\033[A\004"; sleep 1; printf "x\033[Dy\n"; sleep 4; } | ./tools/q32 --smp='$n' "$1"' raw "$T/raw.img"
+	has "rawcons_$n" '^size 0$'; has "rawcons_$n" '^mode 1$'; has "rawcons_$n" '^3120$'; has "rawcons_$n" '^notty -9$'
+	expect "rawpty_$n" 124 '^size 2480$' 5 ./tools/q32 --smp=$n "$T/praw.img"
+	has "rawpty_$n" '^mode 1$'; has "rawpty_$n" '^raw read 1113$'; has "rawpty_$n" '^line 3az$'; has "rawpty_$n" '^shown 4$'
+done
 
 # The window manager: wm (src/user/wm.fam) serving its page and, over a
 # WebSocket, a shell on a terminal, from the host through a forwarded
@@ -665,6 +700,8 @@ const port = process.argv[2];
   const doc = { active: null, createElement: (t) => new El(t), addEventListener() {}, removeEventListener() {},
     getElementById: (id) => byId[id] || (byId[id] = new El('div')) };
   globalThis.document = doc;
+  globalThis.window = globalThis;
+  const WSS = []; const RW = globalThis.WebSocket; globalThis.WebSocket = class extends RW { constructor(u) { super(u); WSS.push(this); } };
   globalThis.location = { protocol: 'http:', host: `127.0.0.1:${port}` };
   new Function(js)();
   const all = (e, c, out = []) => { if (e.classList && e.classList.has(c)) out.push(e); e.kids.forEach((k) => all(k, c, out)); return out; };
@@ -678,11 +715,11 @@ const port = process.argv[2];
   const wins = all(desk, 'win'), terms = all(desk, 'term');
   console.log('windows', wins.length === 2 && all(tasks, 'task').length === 2);
   const [t1, t2] = terms;
-  console.log('prompt', await wait(() => prompt.test(t1.textContent) && prompt.test(t2.textContent), 8000));
+  console.log('prompt', await wait(() => prompt.test(t1.plain) && prompt.test(t2.plain), 8000));
   console.log('focused', doc.active === t2 && wins[0].classList.has('off') && !wins[1].classList.has('off'));
-  type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.textContent), 5000);
+  type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.plain), 5000);
   type(t2, 'ls /x'); key(t2, 'Backspace'); type(t2, '\r');
-  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.textContent), 5000) && !/ls/.test(t1.textContent));
+  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.plain), 5000) && !/ls/.test(t1.plain));
   // the second minimized from its button: hidden, the first focused; restored from the taskbar
   all(wins[1], 'wb')[0].onclick({ stopPropagation() {} });
   const k2 = all(tasks, 'task')[1];
@@ -697,18 +734,30 @@ const port = process.argv[2];
   // the close button
   all(wins[1], 'wb')[2].onclick({ stopPropagation() {} });
   console.log('closed', all(desk, 'win').length === 0 && all(tasks, 'task').length === 0);
-  console.log(JSON.stringify(t2.textContent));
+  console.log(JSON.stringify(t2.plain));
+  // the emulator: escape sequences fed to the first window's terminal
+  const E = String.fromCharCode(27), feedw = (ws, s) => ws.onmessage({ data: new TextEncoder().encode(s).buffer });
+  feedw(WSS[0], E + '[2J' + E + '[H' + 'top' + E + '[3;5HX' + E + '[1;2H' + E + '[K');
+  await new Promise((r) => setTimeout(r, 100));
+  const scr = t1.plain.split(String.fromCharCode(10));
+  console.log('ansi', scr[0] === 't█' && scr[2] === '    X');
+  feedw(WSS[0], E + '[?1049h' + E + '[Halt' + E + '[31mred' + E + '[0m');
+  await new Promise((r) => setTimeout(r, 100));
+  const alt = t1.plain;
+  feedw(WSS[0], E + '[?1049l');
+  await new Promise((r) => setTimeout(r, 100));
+  console.log('altscreen', alt.startsWith('altred') && !/X/.test(alt) && t1.plain.split(String.fromCharCode(10))[2] === '    X');
   // thirteen at once: twelve terminals (wm's limit), the last told none is
   // free; all closed, the shells reaped (none left a zombie in ps)
   for (let i = 0; i < 13; i++) byId.newt.onclick();
   const ts = () => all(desk, 'term');
-  console.log('full', await wait(() => ts().filter((t) => prompt.test(t.textContent)).length === 12 && ts().filter((t) => /none free/.test(t.textContent)).length === 1, 15000));
+  console.log('full', await wait(() => ts().filter((t) => prompt.test(t.plain)).length === 12 && ts().filter((t) => /none free/.test(t.plain)).length === 1, 15000));
   all(desk, 'win').forEach((w) => all(w, 'wb')[2].onclick({ stopPropagation() {} }));
   await new Promise((r) => setTimeout(r, 1500));
   byId.newt.onclick(); const t3 = ts()[0];
-  await wait(() => prompt.test(t3.textContent), 5000); type(t3, 'ps\r');
-  console.log('reaped', await wait(() => /CMD[^]*\$ █$/.test(t3.textContent), 5000) && !/ Z /.test(t3.textContent));
-  console.log(JSON.stringify(t3.textContent));
+  await wait(() => prompt.test(t3.plain), 5000); type(t3, 'ps\r');
+  console.log('reaped', await wait(() => /CMD[^]*\$ █$/.test(t3.plain), 5000) && !/ Z /.test(t3.plain));
+  console.log(JSON.stringify(t3.plain));
   process.exit(0);
 })();
 PAGEEOF
@@ -723,7 +772,7 @@ for n in 1 4; do
 	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 60 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
-		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$' '^ansi true$' '^altscreen true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do

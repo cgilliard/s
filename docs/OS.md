@@ -879,6 +879,31 @@ kernel too much to add at the end.
     - writing over `/bin/echo` refused;
     - twenty runs leaving free memory unchanged;
     - `halt`.
+    Terminals for full-screen programs (2026-11-07):
+    - A new call, 39 `tty(fd, op, arg)`, works on the console or either
+      end of a pty. Op 0 gets the mode and op 1 sets it: 0 lines, 1 raw
+      (each byte ready as typed, not echoed, no editing). Op 2 gets the
+      size and op 3 sets it, as rows * 65536 + columns; 0 means not
+      known, as for the console.
+    - In line mode, an escape sequence (an arrow key's) is now dropped
+      whole instead of being typed into the line.
+    - The shell puts its terminal back in line mode before each prompt.
+    - wm's page is now a terminal emulator: a screen of rows and columns
+      with scrollback, and the common VT100/xterm codes. That covers
+      cursor movement and positioning, erasing the screen and the line,
+      inserting and deleting lines and characters, 16 colours with bold
+      and reverse, hiding the cursor, the alternate screen (1049) and
+      the cursor-position report (6n). Arrows, Home, End, Page Up,
+      Page Down, Insert and Delete send their sequences.
+    - The page measures each window and sends its size to wm as a
+      WebSocket text frame ("rows cols"); keystrokes stay binary
+      frames. wm passes the size to the pty with `tty`.
+    - The page's icon is `src/user/wm-icon.svg`, put in as a data URL by
+      `scripts/wmpage.py`.
+    - Checked: rawcons_1/4 and rawpty_1/4 (raw bytes unechoed, an
+      arrow's sequence dropped in line mode, the size through the pty),
+      and the page test feeding escape sequences to a window (positions,
+      erase, the alternate screen and back).
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.
