@@ -2108,7 +2108,7 @@ pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 blkfind if                    \ a disk: the store, found or made, and its interrupt
 	0 lit stmount  fsinit
 	bk @ 10001000 lit - C lit rshift 1 lit + dup birq ! kplic
-	"kernel: the store: " puts npg @ 8 lit rshift u. " MiB, " puts hwm @ u. " pages in use" puts 0A lit putc
+	"kernel: the store: " puts npg @ 8 lit rshift u. " MiB, " puts hwm @ u. " pages in use, a cache of " puts NSLOT 8 lit rshift u. " MiB" puts 0A lit putc
 then
 nfind ?dup if                 \ a network device: started, and its interrupt
 	nk !  ninit cinit

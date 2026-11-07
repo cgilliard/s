@@ -49,7 +49,8 @@
 :M CHUNK 100 lit ;           \ pages given a tree at a time: 1 MiB
 :M FLMAX 4000 lit ;          \ free pages a tree keeps in memory
 :M DLMAX 2000 lit ;          \ pages a transaction may make or free
-:M NSLOT 2000 lit ;          \ the cache: 8192 pages, 32 MiB
+: nslot variable ;           \ the cache's pages (stmount: nsize)
+: NSLOT  nslot @ ;
 :M TMAX 10 lit ;             \ trees open at once
 :M RMAX 8 lit ;              \ readers of a tree at once
 
@@ -998,6 +999,11 @@ then then ;
 
 : pvalid  dup @ 504C5453 lit = if dup 4 lit cksum swap 10 lit + @ = else drop 0 lit then ;   \ ( buf -- ok )
 
+\ nsize  the cache's size: the largest power of two of pages (the clock's
+\ hand wraps by a mask) at most a quarter of those free, 256 (1 MiB) at
+\ least: 4096, 16 MiB, on a 128 MiB machine.
+: nsize  100 lit begin dup 1 lit lshift pgfree# 2 lit rshift u> 0= while 1 lit lshift repeat nslot ! ;
+
 \ stmount ( fresh -- )  the store found on the disk (fresh: a new one made
 \ whatever is there, as when none is): the device, the cache, the pool's
 \ newer whole meta page, the file system's tree (fst).
@@ -1007,6 +1013,7 @@ lknew stlk !
 0 lit pmlk !  0 lit stopen !  0 lit chand !  0 lit stleak !
 blkinit
 bcap @ SBASE - dup 100 lit u< if "store: the disk is too small" panic then npg !
+nsize
 NSLOT pgalloc dup cbase !  0= if "store: no memory for the cache" panic then
 NSLOT 2 lit lshift FFF lit + C lit rshift
 dup pgalloc dup cpg ! over C lit lshift mzero

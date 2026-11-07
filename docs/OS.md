@@ -866,6 +866,12 @@ kernel too much to add at the end.
     say the command "cannot run"), and "not allowed" for a program
     without the x bit.
 
+    The store's cache (2026-11-07) is sized at mount, no longer a fixed
+    32 MiB: the largest power of two of pages at most a quarter of
+    those free, and 1 MiB at least. That gives 16 MiB on a 128 MiB
+    machine, and the boot line says so. With a disk, 109 MiB is free
+    after boot instead of 93.
+
     Checked by `exec_1/4` (with a disk):
     - `/bin` there, and `cd /proc`;
     - a copied echo refused without x, then run by its path, by a
