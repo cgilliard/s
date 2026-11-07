@@ -784,6 +784,16 @@ kernel too much to add at the end.
     terminals, typing, minimize and restore, maximize, `exit` and the
     close button each closing a window, then thirteen at once and no
     zombie left in `ps`.
+
+    Background commands (2026-11-07). A line ending with `&` runs in
+    the background (for example `wm &` at the console). The shell
+    prints the pid as `[pid]` and prompts again at once. Without `<`,
+    the command's input is `/dev/null`, so it cannot take the shell's
+    typing. Before each prompt, the shell reads each background
+    command's `/proc/<pid>/status`, waits for any that have ended, and
+    reports them as `[pid] done`, so none is left a zombie. An `&`
+    before the end of a line is refused. Checked in the console shell
+    test, on one hart and on four.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

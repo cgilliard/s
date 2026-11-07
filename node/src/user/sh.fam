@@ -2,8 +2,11 @@
 \ pipeline of commands (`a | b | c`), each command a program's name and its
 \ arguments, with `< path` taking its input from a file (or /dev, /proc),
 \ `> path` its output to one (made, or emptied), `>> path` added to its end.
-\ It waits for the whole pipeline.  Its own: `cd [dir]` (the root without
-\ one), and `exit`, as the end of its input.
+\ It waits for the whole pipeline, unless the line ends with `&`: then its
+\ pid is shown and the next prompt comes at once (its input /dev/null
+\ unless `<` says otherwise); before each prompt, a background command
+\ that ended is waited for and told (`[pid] done`).  Its own: `cd [dir]`
+\ (the root without one), and `exit`, as the end of its input.
 
 : line variable ;            \ the line read (256 bytes)
 : abuf variable ;            \ the commands' arguments, packed
@@ -19,6 +22,9 @@
 : pids variable ;
 : wst variable ;
 : oflg variable ;            \ the flags a > opens with
+: bg variable ;              \ the line ends with & (-1; 1: an & before its end)
+: bgp variable ;             \ the background commands' pids (16; 0 free)
+: stb variable ;             \ /proc/<pid>/status: its path, then its text
 
 : cmd  4 lit lshift cmds @ + ;      \ ( i -- entry )  args, < path, > path, appending
 
@@ -35,7 +41,7 @@ until
 dup 0< 0= if 0 lit over line @ + c! then ;
 
 : ws?  dup 20 lit = swap 9 lit = or ;                       \ ( c -- flag )
-: special?  dup 7C lit = over 3C lit = or swap 3E lit = or ; \ ( c -- flag ) | < >
+: special?  dup 7C lit = over 3C lit = or over 3E lit = or swap 26 lit = or ; \ ( c -- flag ) | < > &
 : skipws  begin lp @ c@ ws? while lp @ 1 lit + lp ! repeat ;
 
 \ token ( dst -- dst' )  the word at lp copied to dst, NUL-ended.
@@ -53,30 +59,33 @@ drop 0 lit over c! 1 lit + ;
 
 \ parse ( -- ok )  the line into cmds; not ok if a command is empty.
 : parse
-line @ lp !  abuf @ ap !  fbuf @ fq !  0 lit ncmd !  newcmd
+line @ lp !  abuf @ ap !  fbuf @ fq !  0 lit ncmd !  0 lit bg !  newcmd
 1 lit
 begin skipws lp @ c@ while
 	lp @ c@ 7C lit = if
 		lp @ 1 lit + lp !
 		ap @ ncmd @ cmd @ = if drop 0 lit then
 		endcmd newcmd
+	else lp @ c@ 26 lit = if
+		lp @ 1 lit + lp !  skipws
+		lp @ c@ if drop 0 lit  1 lit bg ! else bg @ 1 lit = 0= if FFFFFFFF lit bg ! then then
 	else lp @ c@ 3C lit = if 4 lit redir else
 	lp @ c@ 3E lit = if
 		lp @ 1 lit + c@ 3E lit = if 1 lit ncmd @ cmd C lit + !  lp @ 1 lit + lp ! then
 		8 lit redir else
 	ap @ token ap !
-	then then then
+	then then then then
 repeat
 ap @ ncmd @ cmd @ = if ncmd @ if drop 0 lit then then
 endcmd ;
 
 \ cin ( i -- fd )  command i's input: its < path, the pipe from the one
-\ before, or the shell's own.
+\ before, or the shell's own (/dev/null in the background).
 : cin
 dup cmd 4 lit + @ ?dup if
 	0 lit open swap if pin @ ?dup if close drop then then
 else
-	if pin @ else 0 lit then
+	if pin @ else bg @ if "/dev/null" 0 lit open dup 0< if drop 0 lit then else 0 lit then then
 then ;
 
 \ cout ( i -- fd )  its output: its > path (made or emptied; >> appends),
@@ -111,6 +120,33 @@ dup 0< if drop drop "sh: cd: no /proc" eputs 0A lit eputc else
 	close drop
 then ;
 
+\ zombie? ( pid -- flag )  it has ended (its status's state Z).
+: zombie?
+stb @ "/proc/" scpy swap snum "/status" scpy 0 lit swap c!
+stb @ 0 lit open dup 0< if drop 0 lit else
+	dup stb @ 40 lit + 3F lit read swap close drop
+	dup 0 lit > if
+		stb @ 40 lit + + 0 lit swap c!  stb @ 40 lit +
+		2 lit 0 lit do begin dup c@ dup 20 lit = swap 0= or 0= while 1 lit + repeat dup c@ if 1 lit + then loop
+		c@ 5A lit =
+	else drop 0 lit then
+then ;
+
+\ bgadd ( pid -- )  noted as running in the background (if a slot is free).
+: bgadd
+10 lit 0 lit do dup if i 2 lit lshift bgp @ + dup @ 0= if ! 0 lit else drop then then loop drop ;
+
+\ reapbg  the background commands that ended, waited for and told.
+: reapbg
+10 lit 0 lit do
+	i 2 lit lshift bgp @ + @ ?dup if
+		dup zombie? if
+			"[" puts dup u. "] done" puts 0A lit putc  wst wait drop
+			0 lit i 2 lit lshift bgp @ + !
+		else drop then
+	then
+loop ;
+
 : run
 ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
 0 lit cmd @ c@ if
@@ -118,14 +154,21 @@ ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
 	0 lit cmd @ "cd" streq if cd else
 	0 lit pin !
 	ncmd @ 0 lit do i launch loop
-	ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if wst wait drop then loop
+	bg @ if
+		ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if bgadd then loop
+		ncmd @ 1 lit - 2 lit lshift pids @ + @ ?dup if "[" puts u. "]" puts 0A lit putc then
+	else
+		ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if wst wait drop then loop
+	then
 	then
 then then ;
 
 100 lit alloc line !  400 lit alloc abuf !  200 lit alloc fbuf !
 800 lit alloc cmds !  8 lit alloc pfdv !  14 lit alloc fdv !  40 lit alloc pids !
+40 lit alloc dup bgp !  10 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  80 lit alloc stb !
 begin
+	reapbg
 	"$ " puts
 	rdline 0< if 0 lit exit then
-	parse if run else "sh: a command is missing" eputs 0A lit eputc then
+	parse if run else bg @ 1 lit = if "sh: & only ends a line" else "sh: a command is missing" then eputs 0A lit eputc then
 0 lit until

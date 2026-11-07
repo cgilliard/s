@@ -240,14 +240,15 @@ sh scripts/mkimage.sh "$T/desc.img" bin/kernel init="$T/tdesc.bin" cat=bin/user/
 expect desc 124 '^pipe 0 idle -110 ready 1 1 read 1 eof 0 hup 1 17$' 5 ./tools/q32 --smp=2 "$T/desc.img"
 has desc '^open -2 badfd -9 ro -13 nopid -2 full 4$'; has desc '^killed -9$'
 # The shell from the console: the image's programs and one writing 100 KiB,
-# commands typed a line at a time, on one hart and on four.
+# commands typed a line at a time, on one hart and on four; one in the
+# background (&: its pid shown, then told done), and & before a line's end.
 usrc big ': buf variable ;
 400 lit alloc buf !  400 lit 0 lit do 61 lit buf @ i + c! loop  A lit buf @ 3FF lit + c!
 64 lit 0 lit do 1 lit buf @ 400 lit write drop loop bye'
 progs=""; for p in bin/user/*; do progs="$progs $(basename "$p")=$p"; done
 sh scripts/mkimage.sh "$T/shell.img" bin/kernel $progs big="$T/big.bin" 2> "$T/shell.mk" || fail shell "mkimage: $(cat "$T/shell.mk")"
 printf '%s\n' 'echo hello world' 'ps' 'echo one two three | wc' 'big | cat | wc' 'cat /proc/self/cmd' \
-	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'exit' > "$T/shell.in"
+	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'cat &' 'echo after' 'echo x & echo y' 'exit' > "$T/shell.in"
 # feed SECS FILE CMD... — CMD run with FILE's lines typed into it, 0.3 s
 # apart, 3 s after one running big (typed ahead, a line is echoed among the
 # output).
@@ -260,7 +261,8 @@ for n in 1 4; do
 	feed 14 "$T/shell.in" ./tools/q32 --smp=$n "$T/shell.img" > "$o" 2>&1
 	for pat in '^hello world$' '^PID PPID S THR KIB TICKS CMD$' '^1 0 S 1 64 [0-9]* init$' '^2 1 S 1 64 [0-9]* sh$' \
 		'^3 2 R 1 64 [0-9]* ps$' '^1 3 14$' '^100 100 102400$' '^cat /proc/self/cmd$' '^7$' \
-		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell ended; again$'; do
+		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell ended; again$' \
+		'^\(\$ \)*\[[0-9]*\]$' '\[[0-9]*\] done$' '^sh: & only ends a line$'; do
 		grep -q -- "$pat" "$o" || { fail "shell_$n" "no /$pat/ in: $(head -c 600 "$o")"; break; }
 	done
 done
