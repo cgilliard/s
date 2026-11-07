@@ -9,8 +9,8 @@
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
 \ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
-\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 35 remove, 36 mkdir,
-\ 37 chmod, 38 chown (below).
+\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 30 socket, 31 net,
+\ 33 sendto, 34 recvfrom, 35 remove, 36 mkdir, 37 chmod, 38 chown (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -157,6 +157,12 @@
 : txput     1B lit sys5 ;                     \ ( txn key klen value vlen -- r )
 : txdel     1C lit sys ;                      \ ( txn key klen -- r )  -2 not there
 : txnext    0 lit 1D lit sys5 ;               \ ( txn key klen buf -- klen' )  -2 none after
+
+\ Sockets (UDP).  An address is a number: 10.0.2.2 is A000202.
+: socket    0 lit 0 lit 1E lit sys ;          \ ( kind -- fd )  1 UDP
+: net       0 lit 1F lit sys5 ;               \ ( fd op ip port -- r )  op 1 bind, 2 connect
+: sendto    21 lit sys5 ;                     \ ( fd buf n ip port -- n )
+: recvfrom  0 lit 22 lit sys5 ;               \ ( fd buf n from -- n )  from: address, port (or 0)
 
 \ strlen ( s -- n ), streq ( a b -- ok ), scpy ( dst src -- dst' ) (no NUL
 \ written), atoi ( s -- n ) the decimal at s, snum ( dst u -- dst' ) its

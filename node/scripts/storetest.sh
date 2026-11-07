@@ -19,7 +19,7 @@ trap 'rm -f "$DISK" tmp/storetest_*.fam tmp/storetest_*.bin' EXIT
 
 for m in 0 1 2 3; do
 	sed "s/^RUN /$m lit /" src/storetest.fam > tmp/storetest_$m.fam
-	./tools/fam -o tmp/storetest_$m.bin src/kernel.fam src/store.fam src/ksys.fam tmp/storetest_$m.fam || exit 1
+	./tools/fam -o tmp/storetest_$m.bin src/kernel.fam src/store.fam src/net.fam src/ksys.fam tmp/storetest_$m.fam || exit 1
 done
 
 # run MODE [SECONDS] — the test in that mode; killed (as a power cut would)

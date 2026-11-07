@@ -1,0 +1,272 @@
+\ net.fam — the OS's kernel (docs/OS.md), the network: the virtio-net
+\ driver, ARP and IPv4.  After src/kernel.fam and src/store.fam, before
+\ src/ksys.fam (which takes the device's interrupt and starts it in kboot).
+\
+\ Under QEMU's user networking (tools/q32 --net) we are 10.0.2.15 and
+\ everything goes by way of the gateway, 10.0.2.2, whose Ethernet address
+\ ARP learns (asked at boot and each second until it answers).
+\
+\ Receiving is hart 0's alone: the device's interrupt goes to hart 0
+\ (kext), which takes what arrived (nrx) with no lock.  Sending is any
+\ hart's: a frame is built in the one transmit buffer under nlk (ntx ...
+\ nsend) and waited for until the device has taken it.  Neither sleeps,
+\ and neither holds klk while it holds nlk.
+
+\ ── Bytes in network order ──
+
+: b16@  dup c@ 8 lit lshift swap 1 lit + c@ or ;            \ ( a -- n )
+: b16!  over 8 lit rshift over c! 1 lit + c! ;               \ ( n a -- )
+: b32@  dup b16@ 10 lit lshift swap 2 lit + b16@ or ;        \ ( a -- n )
+: b32!  over 10 lit rshift over b16! 2 lit + b16! ;          \ ( n a -- )
+
+: .h1   dup A lit u< if 30 lit else 57 lit then + putc ;     \ ( n -- ) a hex digit
+: .h2   dup 4 lit rshift .h1 F lit and .h1 ;                 \ ( b -- )
+: .mac  dup c@ .h2 6 lit 1 lit do 3A lit putc dup i + c@ .h2 loop drop ;   \ ( a -- )
+
+:M MYIP  A00020F lit ;       \ 10.0.2.15
+:M GWIP  A000202 lit ;       \ 10.0.2.2
+
+\ ── virtio-net (legacy MMIO): queue 0 receives, queue 1 sends ──
+
+:M NQN 10 lit ;              \ 16 entries a queue
+
+: nk     variable ;          \ the device's registers (0: none)
+: nirq   variable ;          \ its interrupt
+: nrq    variable ;          \ the receive queue: two pages
+: ntq    variable ;          \ the transmit queue: two pages
+: nrb    variable ;          \ NQN receive buffers of 2 KiB
+: ntb    variable ;          \ the transmit buffer: the 10-byte header (zero), the frame
+: nseen  variable ;          \ frames received, taken
+: nrav   variable ;          \ receive buffers handed to the device
+: ntav   variable ;          \ frames sent
+: nlk    variable ;          \ the transmit buffer's lock
+: nmac   variable ;          \ our Ethernet address (6 bytes)
+: ngw    variable ;          \ the gateway's
+: ngwok  variable ;          \ known
+: nbc    variable ;          \ the broadcast address
+: narpt  variable ;          \ when ARP last asked for the gateway
+: na1    variable ;          \ narp's arguments (under nlk)
+: na2    variable ;
+: na3    variable ;
+
+\ nfind ( -- base | 0 )  the virtio-mmio slot holding a network device.
+: nfind
+0 lit 10001000 lit
+begin dup 10009000 lit u< while
+	over 0= if
+		dup @ 74726976 lit = if dup 8 lit + @ 1 lit = if nip dup then then
+	then
+	1000 lit +
+repeat
+drop ;
+
+\ nqinit ( pages q -- )  queue q on its two pages.
+: nqinit
+nk @ 30 lit + !
+nk @ 34 lit + @ NQN u< if "virtio-net queue too small" panic then
+NQN nk @ 38 lit + !
+1000 lit nk @ 3C lit + !
+C lit rshift nk @ 40 lit + ! ;
+
+\ ninit  the device ready: no features (a 10-byte header, no offloads),
+\ every receive buffer handed to it, our address from its config space.
+: ninit
+0 lit nk @ 70 lit + !        \ reset
+1 lit nk @ 70 lit + !        \ acknowledged
+3 lit nk @ 70 lit + !        \ a driver
+0 lit nk @ 20 lit + !
+1000 lit nk @ 28 lit + !     \ 4 KiB pages
+4 lit pgalloc dup 0= if "no memory for the network's queues" panic then
+dup 4000 lit mzero  dup nrq !  2000 lit + ntq !
+9 lit pgalloc dup 0= if "no memory for the network's buffers" panic then
+dup 9000 lit mzero  dup nrb !  8000 lit + ntb !
+nrq @ 0 lit nqinit  ntq @ 1 lit nqinit
+NQN 0 lit do
+	i B lit lshift nrb @ +  i 4 lit lshift nrq @ + !
+	800 lit  i 4 lit lshift nrq @ + 8 lit + !
+	2 lit  i 4 lit lshift nrq @ + C lit + !     \ written by the device
+	i  i 1 lit lshift nrq @ 104 lit + + h!
+loop
+NQN nrav !  0 lit nseen !  0 lit ntav !
+fence NQN nrq @ 102 lit + h!
+ntb @ ntq @ !                \ what is sent: descriptor 0, the buffer
+1 lit ntq @ 100 lit + h!     \ and no interrupt for it
+8 lit alloc dup nmac !  nk @ 100 lit + swap 6 lit bcpy
+8 lit alloc ngw !  0 lit ngwok !
+8 lit alloc dup nbc !  FFFFFFFF lit over !  FFFFFFFF lit swap 4 lit + !
+lknew nlk !
+mtime@ 989680 lit - narpt !  \ ask for the gateway at once
+7 lit nk @ 70 lit + !        \ running
+fence 0 lit nk @ 50 lit + ! ;
+
+\ ── Sending ──
+
+: nf    ntb @ A lit + ;      \ ( -- frame ) the frame being built (nlk held)
+
+\ ntx  the transmit buffer, taken (nlk); nsend ( len -- )  the frame built
+\ there sent, and the buffer given back once the device has it.
+: ntx   nlk @ lock ;
+: nsend
+A lit + ntq @ 8 lit + !
+0 lit  ntav @ NQN 1 lit - and 1 lit lshift ntq @ 104 lit + + h!
+fence
+ntav @ 1 lit + dup ntav ! ntq @ 102 lit + h!
+fence
+1 lit nk @ 50 lit + !
+begin ntq @ 1002 lit + h@ ntav @ FFFF lit and = until
+nlk @ unlock ;
+
+\ neth ( dst type -- )  the frame's Ethernet header: to dst (6 bytes), from us.
+: neth  nf C lit + b16!  nf 6 lit bcpy  nmac @ nf 6 lit + 6 lit bcpy ;
+
+\ narp ( op mac ip -- )  an ARP packet of op (1 asks, 2 answers) for ip, sent
+\ to the Ethernet address mac (also given as the target's).
+: narp
+ntx  na3 ! na2 ! na1 !
+na2 @ 806 lit neth
+1 lit nf E lit + b16!  800 lit nf 10 lit + b16!  604 lit nf 12 lit + b16!
+na1 @ nf 14 lit + b16!
+nmac @ nf 16 lit + 6 lit bcpy  MYIP nf 1C lit + b32!
+na2 @ nf 20 lit + 6 lit bcpy  na3 @ nf 26 lit + b32!
+2A lit nsend ;
+
+\ ── Receiving (hart 0) ──
+
+\ narpin ( f len -- )  an ARP packet: the gateway's address taken from
+\ whatever it sends; a question for ours answered.
+: narpin
+drop
+dup 1C lit + b32@ GWIP = if
+	dup 16 lit + ngw @ 6 lit bcpy fence 1 lit ngwok !
+then
+dup 14 lit + b16@ 1 lit = over 26 lit + b32@ MYIP = and if
+	2 lit over 16 lit + 2 lit pick 1C lit + b32@ narp
+then
+drop ;
+
+\ nusock ( port -- f | 0 )  the open UDP socket bound to port.  Under klk.
+\
+\ A socket is an open file of kind 8 whose page (at 8) is four pages: its
+\ kind at 0 (1 UDP), its port 4, the address it is connected to 8 and that
+\ port C (0: none), datagrams in 10, taken 14 (free-running counts); then
+\ eight slots of 2 KiB from 40: a datagram's length 0, from address 4 and
+\ port 8, its bytes from C (1472 at most).
+: nusock
+0 lit MAXF 0 lit do
+	dup 0= if
+		i fln dup @ 8 lit = if
+			dup 8 lit + @ dup @ 1 lit = swap 4 lit + @ 4 lit pick = and if nip else drop then
+		else drop then
+	then
+loop nip ;
+
+\ nephem ( -- port )  a port no UDP socket has, from 49152 up.  Under klk.
+: nport  variable ;
+: nephem
+begin
+	nport @ 1 lit + dup FFFF lit u> over C000 lit u< or if drop C000 lit then dup nport !
+	nusock 0=
+until nport @ ;
+
+\ ncsum ( a n -- sum )  the Internet checksum of n bytes (n even, not 0).
+: ncsum
+0 lit -rot
+1 lit rshift 0 lit do dup i 1 lit lshift + b16@ rot + swap loop drop
+dup 10 lit rshift swap FFFF lit and + dup 10 lit rshift + invert FFFF lit and ;
+
+: na4    variable ;
+: na5    variable ;
+: nid    variable ;          \ IP's identification, counted (under nlk)
+
+\ nudpout ( sport ip port buf n -- n )  a UDP datagram of n bytes (1472 at
+\ most), by way of the gateway (known).
+: nudpout
+ntx  na5 ! na4 ! na3 ! na2 ! na1 !
+ngw @ 800 lit neth
+4500 lit nf E lit + b16!  na5 @ 1C lit + nf 10 lit + b16!
+nid @ dup 1 lit + nid ! nf 12 lit + b16!
+4000 lit nf 14 lit + b16!  4011 lit nf 16 lit + b16!  0 lit nf 18 lit + b16!
+MYIP nf 1A lit + b32!  na2 @ nf 1E lit + b32!
+nf E lit + 14 lit ncsum nf 18 lit + b16!
+na1 @ nf 22 lit + b16!  na3 @ nf 24 lit + b16!  na5 @ 8 lit + nf 26 lit + b16!
+0 lit nf 28 lit + b16!       \ no checksum (allowed, over IPv4)
+na4 @ nf 2A lit + na5 @ bcpy
+na5 @ dup 2A lit + nsend ;
+
+: nusip  variable ;          \ a datagram arriving (hart 0's): from address,
+: nusp   variable ;          \ and port, to port, its bytes and length
+: nudp   variable ;
+: nuda   variable ;
+: nun    variable ;
+
+\ nudpin ( ip u -- )  a UDP datagram (u its header, ip the packet's): queued
+\ on the socket bound to its port (if connected, only from that peer), its
+\ readers woken; dropped if there is none, or its queue is full.
+: nudpin
+dup 4 lit + b16@  2 lit pick 2 lit + b16@ 2 lit pick 4 lit pick - -  u> if 2drop else
+over C lit + b32@ nusip !  dup b16@ nusp !  dup 2 lit + b16@ nudp !
+dup 8 lit + nuda !  4 lit + b16@ 8 lit - nun !  drop
+nun @ 5C0 lit u> 0= if
+	klk @ lock
+	nudp @ nusock ?dup if
+		8 lit + @
+		dup 8 lit + @ ?dup if nusip @ = over C lit + @ nusp @ = and else 1 lit then
+		over dup 10 lit + @ swap 14 lit + @ - 8 lit u< and if
+			dup dup 10 lit + @ 7 lit and B lit lshift + 40 lit +
+			nun @ over !  nusip @ over 4 lit + !  nusp @ over 8 lit + !
+			nuda @ swap C lit + nun @ bcpy
+			dup 10 lit + dup @ 1 lit + swap !
+			fwake
+		else drop then
+	then
+	klk @ unlock
+then then ;
+
+\ nipin ( f len -- )  an IPv4 packet to us, not a fragment, whole: UDP's taken.
+: nipin
+swap E lit + swap E lit -
+over c@ F0 lit and 40 lit <> if 2drop else
+over 10 lit + b32@ MYIP <> if 2drop else
+over 6 lit + b16@ 3FFF lit and if 2drop else
+over 2 lit + b16@ over u> if 2drop else
+drop
+dup c@ F lit and 2 lit lshift over +
+over 9 lit + c@ 11 lit = if nudpin else 2drop then
+then then then then ;
+
+\ nframe ( f len -- )  a frame arrived (its Ethernet header first).
+: nframe
+over C lit + b16@
+dup 806 lit = if drop narpin else
+800 lit = if nipin else 2drop then then ;
+
+\ nrx  every frame the device has given us, taken, its buffer given back.
+: nrx
+begin nrq @ 1002 lit + h@ nseen @ FFFF lit and <> while
+	nseen @ NQN 1 lit - and 3 lit lshift nrq @ 1004 lit + +
+	dup @ swap 4 lit + @                       \ ( id len )
+	over B lit lshift nrb @ + A lit +  swap A lit -
+	nframe
+	nseen @ 1 lit + nseen !
+	nrav @ NQN 1 lit - and 1 lit lshift nrq @ 104 lit + + h!
+	fence
+	nrav @ 1 lit + dup nrav ! nrq @ 102 lit + h!
+	fence
+	0 lit nk @ 50 lit + !
+repeat ;
+
+\ narpwait  the gateway asked for, and its answer waited for (polled) for
+\ up to 100 ms: at boot, before interrupts are taken.
+: narpwait
+mtime@ narpt !  1 lit nbc @ GWIP narp
+begin nrx ngwok @ mtime@ narpt @ - F4240 lit u< 0= or until ;
+
+\ knetirq  the device's interrupt: acknowledged, what arrived taken.
+: knetirq  nk @ 60 lit + @ nk @ 64 lit + !  nrx ;
+
+\ npoll  hart 0's timed work (at its user-mode ticks, and while idle): the
+\ gateway asked for each second until it answers.
+: npoll
+nk @ if ngwok @ 0= if
+	mtime@ narpt @ - 989680 lit u< 0= if mtime@ narpt !  1 lit nbc @ GWIP narp then
+then then ;

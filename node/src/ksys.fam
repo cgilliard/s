@@ -1,6 +1,6 @@
 \ ksys.fam — the OS's kernel (docs/OS.md), its last part: the system
 \ calls, the trap handler and entry, starting the harts, and kboot; after
-\ src/kernel.fam and src/store.fam, whose words it uses.  The kernel's Test
+\ src/kernel.fam, src/store.fam and src/net.fam, whose words it uses.  The kernel's Test
 \ blocks are at the end.
 
 \ ── System calls ──
@@ -574,6 +574,43 @@ else drop
 	then
 then then then then ;
 
+\ ── Sockets (UDP; the socket's layout above nusock, src/net.fam) ──
+
+\ ufsock ( fd -- page | 0 )  the calling process's socket fd.  Under klk.
+: ufsock  ufd dup if dup @ 8 lit = if 8 lit + @ else drop 0 lit then then ;
+
+\ uslp ( page -- port )  its port, one chosen if it has none.  Under klk.
+: uslp  dup 4 lit + @ ?dup if nip else nephem dup rot 4 lit + ! then ;
+
+\ usend ( port ip to buf n -- n )  a datagram: -90 too long, -89 to no
+\ one, -113 the gateway not known yet.
+: usend
+dup 5C0 lit u> if 2drop 2drop drop FFFFFFA6 lit else
+2 lit pick 0= 3 lit pick 0= or if 2drop 2drop drop FFFFFFA7 lit else
+ngwok @ 0= if 2drop 2drop drop FFFFFF8F lit else
+nudpout
+then then then ;
+
+\ urecv ( page from -- n | BLK )  the first datagram queued, up to n bytes
+\ of it into buf (the rest dropped), from where it came (address, port) at
+\ from unless 0; waits for one.  Under klk.
+: urecv
+over dup 10 lit + @ swap 14 lit + @ = if drop 5 lit tretry BLK else
+	over dup 14 lit + @ 7 lit and B lit lshift + 40 lit +
+	over if dup 4 lit + @ 2 lit pick !  dup 8 lit + @ 2 lit pick 4 lit + ! then
+	nip
+	dup @ 30 lit sysarg 2dup u> if swap then drop
+	swap C lit + 2C lit sysarg 2 lit pick bcpy
+	swap 14 lit + dup @ 1 lit + swap !
+then ;
+
+\ uwrite ( page -- n )  write on a connected socket: the datagram to its
+\ peer (-89 not connected).  Under klk.
+: uwrite
+dup 8 lit + @ 0= if drop FFFFFFA7 lit else
+dup uslp over 8 lit + @ rot C lit + @ 2C lit sysarg 30 lit sysarg usend
+then ;
+
 \ 16 read(fd, buf, n): what there is, at least a byte (waiting for it), or
 \ 0 at the end.  -9 not a descriptor to read, -14 not its buffer.
 : sread1
@@ -585,8 +622,9 @@ dup @
 dup 1 lit = if 2drop cread else
 dup 2 lit = if 2drop 0 lit else
 dup 3 lit = if drop 8 lit + @ pread else
+dup 8 lit = if drop 8 lit + @ 0 lit urecv else
 4 lit = if ptread else drop 0 lit
-then then then then then then then
+then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 17 write(fd, buf, n): all of it (waiting for room); -9, -14, -32 a pipe
@@ -602,8 +640,9 @@ dup 1 lit = if
 else
 dup 2 lit = if 2drop 30 lit sysarg else
 dup 3 lit = if drop 8 lit + @ pwrite else
+dup 8 lit = if drop 8 lit + @ uwrite else
 drop pkwrite
-then then then then then then
+then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 19 close(fd): 0, or -9.
@@ -645,7 +684,9 @@ dup @ 3 lit = if
 		dup @ 0= if drop 14 lit else dup 8 lit + @ swap C lit + @ - 800 lit u< if 4 lit else 0 lit then then
 	then
 else
-dup @ 4 lit = if 1 lit else 4 lit then then then then
+dup @ 4 lit = if 1 lit else
+dup @ 8 lit = if dup 8 lit + @ dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else 4 lit
+then then then then then
 swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
 
 \ 22 poll(fds, n, ns): fds n entries of 8 bytes (a descriptor; the events
@@ -672,6 +713,58 @@ dup 0= if
 	drop 0 lit 6 lit tretry BLK
 then
 then then
+klk @ unlock dup BLK = if drop else sret then ;
+
+\ 30 socket(kind): a socket, kind 1 UDP: its descriptor; -22 another kind,
+\ -19 no network device, -23 no open file free, -12, -24.
+: ssocket
+klk @ lock
+28 lit sysarg 1 lit <> if FFFFFFEA lit else
+nk @ 0= if FFFFFFED lit else
+8 lit 3 lit fnew ?dup 0= if FFFFFFE9 lit else
+4 lit pgalloc ?dup 0= if 0 lit swap ! FFFFFFF4 lit else
+	dup 40 lit mzero  1 lit over !  over 8 lit + !
+	dup area@ tproc fdput dup 0< if swap fclose else nip then
+then then then then
+klk @ unlock sret ;
+
+\ 31 net(fd, op, ip, port): op 1 binds it to port (0: one chosen), op 2
+\ connects it to ip and port (read and write go there, only what comes
+\ from there arrives).  0, or -88 not a socket, -22, -98 the port taken.
+: snet
+klk @ lock
+28 lit sysarg ufsock ?dup 0= if FFFFFFA8 lit else
+2C lit sysarg 1 lit = if
+	34 lit sysarg FFFF lit u> over 4 lit + @ or if drop FFFFFFEA lit else
+	34 lit sysarg ?dup 0= if nephem then
+	dup nusock if 2drop FFFFFF9E lit else swap 4 lit + ! 0 lit then
+	then
+else 2C lit sysarg 2 lit = if
+	30 lit sysarg 0= 34 lit sysarg 0= or 34 lit sysarg FFFF lit u> or if drop FFFFFFEA lit else
+	30 lit sysarg over 8 lit + !  34 lit sysarg over C lit + !  uslp drop 0 lit
+	then
+else drop FFFFFFEA lit then then
+then
+klk @ unlock sret ;
+
+\ 33 sendto(fd, buf, n, ip, port): a datagram (the socket bound first if
+\ it is not): n, or -88, -14, and usend's.
+: ssendto
+klk @ lock
+28 lit sysarg ufsock ?dup 0= if klk @ unlock FFFFFFA8 lit else
+2C lit sysarg 30 lit sysarg urange 0= if drop klk @ unlock FFFFFFF2 lit else
+uslp klk @ unlock
+34 lit sysarg 38 lit sysarg 2C lit sysarg 30 lit sysarg usend
+then then sret ;
+
+\ 34 recvfrom(fd, buf, n, from): urecv's; -88, -14.
+: srecvf
+klk @ lock
+28 lit sysarg ufsock ?dup 0= if FFFFFFA8 lit else
+2C lit sysarg 30 lit sysarg uwrange 0= if drop FFFFFFF2 lit else
+34 lit sysarg ?dup if 8 lit uwrange else 1 lit then 0= if drop FFFFFFF2 lit else
+34 lit sysarg urecv
+then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ ── Files (docs/OS.md, sections 6 and 11) ──
@@ -1226,7 +1319,7 @@ kdfl @ if
 	until
 then ;
 
-\ ── The disk's interrupt ──
+\ ── The devices' interrupts ──
 
 \ kplic ( irq -- )  the PLIC sending irq to hart 0, machine mode (context
 \ 0), and the hart taking external interrupts.
@@ -1239,11 +1332,14 @@ B7120000 ,   \ lui t0,0x1
 1 lit over 2 lit lshift C000000 lit + !
 C002000 lit over 5 lit rshift 2 lit lshift + dup @ 1 lit 3 lit pick 1F lit and lshift or swap !
 0 lit C200000 lit !
-meie
-birq ! ;
+meie ;
 
-\ kext  an external interrupt: claimed, the disk's seen to, completed.
-: kext  C200004 lit @ dup birq @ = if kblkirq then C200004 lit ! ;
+\ kext  an external interrupt: claimed, the disk's or the network's seen
+\ to, completed.
+: kext
+C200004 lit @
+dup if dup birq @ = if kblkirq else dup nirq @ = if knetirq then then then
+C200004 lit ! ;
 
 \ read and write: files (and working directories written) without klk.
 : sread   kfile? ?dup if dup @ 7 lit = if fread else kfdone FFFFFFF7 lit then sret else sread1 then ;
@@ -1280,11 +1376,15 @@ dup 1A lit = if drop sget else
 dup 1B lit = if drop sput else
 dup 1C lit = if drop sdel else
 dup 1D lit = if drop snext else
+dup 1E lit = if drop ssocket else
+dup 1F lit = if drop snet else
+dup 21 lit = if drop ssendto else
+dup 22 lit = if drop srecvf else
 dup 23 lit = if drop sremove else
 dup 24 lit = if drop smkdir else
 dup 25 lit = if drop schmod else
 26 lit = if schown else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill
@@ -1314,7 +1414,7 @@ else 0 lit mhartid@ hstale harr ! then ;
 mcause@
 dup 80000007 lit = if drop ktick mpp@ 0= if
 	area@ C4 lit + dup @ 1 lit + swap !  cproc 50 lit + dup @ 1 lit + swap !
-	mhartid@ 0= if cpoll then
+	mhartid@ 0= if cpoll npoll then
 	tstop
 then else
 dup 80000003 lit = if drop kipi hipiok else
@@ -1450,7 +1550,7 @@ else
 		trun
 		mhartid@ hcur harr @  0 lit mhartid@ hcur harr !  tafter
 	else
-		mhartid@ 0= kready @ and if cpoll then
+		mhartid@ 0= kready @ and if cpoll npoll then
 		kei wfi kdi
 	then
 then ;
@@ -1588,8 +1688,14 @@ pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 0A lit putc
 blkfind if                    \ a disk: the store, found or made, and its interrupt
 	0 lit stmount  fsinit
-	bk @ 10001000 lit - C lit rshift 1 lit + kplic
+	bk @ 10001000 lit - C lit rshift 1 lit + dup birq ! kplic
 	"kernel: the store: " puts npg @ 8 lit rshift u. " MiB, " puts hwm @ u. " pages in use" puts 0A lit putc
+then
+nfind ?dup if                 \ a network device: started, and its interrupt
+	nk !  ninit
+	nk @ 10001000 lit - C lit rshift 1 lit + dup nirq ! kplic
+	"kernel: the network: " puts nmac @ .mac ", 10.0.2.15" puts 0A lit putc
+	narpwait ngwok @ if "kernel: the gateway: " puts ngw @ .mac 0A lit putc then
 then
 swon tmrinit                  \ hart 0 too takes software interrupts (stale PMP, a process ending)
 kdi                           \ and in machine mode only where hstep idles

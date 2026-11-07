@@ -816,7 +816,7 @@ TXMAX 4 lit lshift dup alloc dup stx ! swap mzero
 \
 \ An open file (32 bytes, in fil): its kind at 0 (0 free, 1 the console, 2
 \ null, 3 a pipe's end, 4 a /proc key's text, 5 a /proc key to write, 6 a
-\ tree of the store, its record at 8; 7 a file, src/ksys.fam), the
+\ tree of the store, its record at 8; 7 a file, src/ksys.fam; 8 a socket, src/net.fam), the
 \ descriptors on it 4, its page 8 (a pipe's, or the text's), the text's
 \ read position 12 and length 16, the process a key is of 20 and which key
 \ 24 (1 tickets, 2 kill), its mode 28 (1 read, 2 write, 3 both).  A pipe is
@@ -852,7 +852,8 @@ nip if hpoke then ;
 
 \ fclose ( f -- )  a descriptor fewer on it; with the last, it is gone (a
 \ pipe's end: its peers woken, the page freed with the last end; a tree:
-\ closed later, by kdefer, since closing it may wait).  Under klk.
+\ closed later, by kdefer, since closing it may wait; a socket: its readers
+\ woken, its pages freed).  Under klk.
 : fclose
 dup 4 lit + @ 1 lit - dup 2 lit pick 4 lit + !
 if drop else
@@ -861,6 +862,7 @@ if drop else
 		dup 8 lit + @ dup fwake  dup @ over 4 lit + @ or 0= if 1 lit pgfree else drop then
 	then
 	dup @ 4 lit = over @ 7 lit = or if dup 8 lit + @ ?dup if 1 lit pgfree then then
+	dup @ 8 lit = if dup 8 lit + @ dup fwake 4 lit pgfree then
 	dup @ 6 lit = if kdqn @ 40 lit u< if dup 8 lit + @ kdqn @ 2 lit lshift kdq @ + !  kdqn @ 1 lit + kdqn !  1 lit kdfl ! then then
 	0 lit swap !
 then ;

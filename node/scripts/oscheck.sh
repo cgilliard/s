@@ -50,17 +50,17 @@ expect() {
 [ -f bin/img ] && [ -f bin/tabernacle ] || { echo "oscheck.sh: run scripts/build.sh first" >&2; exit 1; }
 
 for n in 1 2 8 64; do
-	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/ksys.fam
+	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/net.fam src/ksys.fam
 done
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.
 N=$((N + 1))
-./tools/fam -o "$T/storebench.bin" src/kernel.fam src/store.fam src/ksys.fam src/storebench.fam > "$T/storebench.build" 2>&1 \
+./tools/fam -o "$T/storebench.bin" src/kernel.fam src/store.fam src/net.fam src/ksys.fam src/storebench.fam > "$T/storebench.build" 2>&1 \
 	|| fail storebench_build "$(head -c 300 "$T/storebench.build")"
 
 printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
-./tools/fam -o "$T/fault.bin" src/kernel.fam src/store.fam src/ksys.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
+./tools/fam -o "$T/fault.bin" src/kernel.fam src/store.fam src/net.fam src/ksys.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
 expect fault 1 'kernel: hart 0 trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
 
@@ -146,7 +146,7 @@ printf '%s\n' 'kboot
 "share: " puts over u. " to " puts dup u. 0A lit putc
 over over 1 lit lshift u< 0=  2 lit pick 1 lit lshift 2 lit pick 9 lit * u> 0= and
 nip nip if 0 lit else 1 lit then halt' > "$T/share.fam"
-./tools/fam -o "$T/sharek.bin" src/kernel.fam src/store.fam src/ksys.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
+./tools/fam -o "$T/sharek.bin" src/kernel.fam src/store.fam src/net.fam src/ksys.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
 uimage share "$T/sharek.bin" spin=spin
 expect lottery 0 'share: ' 20 ./tools/q32 "$T/share.img"
 
@@ -397,6 +397,42 @@ for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/a
 done
 [ "$(grep -c '0 0$' "$T/u2.out")" = 1 ] || fail users_boot2 "root's id not once after alice's: $(head -c 900 "$T/u2.out")"
 rm -f "$T/users.disk"
+
+# The network (step 9): UDP.  A program asks an echo server on the host
+# (10.0.2.2 under QEMU's user networking), waiting until ARP has found the
+# gateway; then connected, write, poll and read; and the errors: another
+# kind, not a socket, a port taken.
+UP=$((20000 + $$ % 20000)); UPX=$(printf %X "$UP")
+usrc tudp ': b variable ;  : from variable ;  : s variable ;  : ent variable ;  : sp  20 lit putc ;
+40 lit alloc b !  8 lit alloc from !  8 lit alloc ent !
+1 lit socket s !
+0 lit begin drop s @ "hello" 5 lit A000202 lit '"$UPX"' lit sendto dup FFFFFF8F lit = while 5F5E100 lit sleep repeat
+"sent " puts . sp
+s @ b @ 40 lit from @ recvfrom dup "got " puts . sp
+b @ + 0 lit swap c!  b @ puts sp  from @ @ u.x sp  from @ 4 lit + @ . 0A lit putc
+s @ 2 lit A000202 lit '"$UPX"' lit net "connect " puts . sp
+s @ "again" 5 lit write "write " puts . sp
+s @ ent @ !  1 lit ent @ 4 lit + !
+ent @ 1 lit 0 lit poll "poll " puts . sp
+s @ b @ 40 lit read dup "read " puts . sp b @ + 0 lit swap c! b @ puts 0A lit putc
+2 lit socket "kind " puts . sp  0 lit b @ 1 lit 0 lit recvfrom "notsock " puts . sp
+1 lit socket dup 1 lit 0 lit 1234 lit net drop  1 lit socket 1 lit 0 lit 1234 lit net "taken " puts . sp
+close drop  s @ close "close " puts . 0A lit putc bye'
+sh scripts/mkimage.sh "$T/udp.img" bin/kernel init="$T/tudp.bin" 2> "$T/udp.mk" || fail udp "mkimage: $(cat "$T/udp.mk")"
+python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    d, a = s.recvfrom(2048)
+    s.sendto(b"echo:" + d, a)
+' "$UP" & EP=$!
+for n in 1 4; do
+	expect "udp_$n" 124 '^sent 5 got 10 echo:hello 0A000202 '"$UP"'$' 6 ./tools/q32 --smp=$n --net "$T/udp.img"
+	has "udp_$n" '^connect 0 write 5 poll 1 read 10 echo:again$'
+	has "udp_$n" '^kind -22 notsock -88 taken -98 close 0$'
+done
+kill $EP
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh — rebuild the fam compiler from the 168-byte seed under QEMU (fam0,
 # checked against the seed, then fam and fampack), then gen_hash, the node
-# image (the OS: the kernel, src/kernel.fam, src/store.fam and src/ksys.fam, src/boot.fam, and the
+# image (the OS: the kernel, src/kernel.fam, src/store.fam, src/net.fam and src/ksys.fam, src/boot.fam, and the
 # programs in src/user, put together by scripts/mkimage.sh) and tabernacle,
 # patched for that image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as
 # tools/q32.
@@ -110,7 +110,7 @@ run bin/fam.uncompressed bin/fam0 src/fam.fam0
 run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/mach.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/mach.fam lib/asm.fam src/gen_hash.fam
-run bin/kernel bin/fam lib/stdlib.fam lib/mach.fam lib/build.fam src/kernel.fam src/store.fam src/ksys.fam src/boot.fam
+run bin/kernel bin/fam lib/stdlib.fam lib/mach.fam lib/build.fam src/kernel.fam src/store.fam src/net.fam src/ksys.fam src/boot.fam
 mkdir -p bin/user
 progs=""
 for prog in src/user/*.fam; do
