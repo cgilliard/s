@@ -1,0 +1,193 @@
+\ storetest.fam — the store's checks (docs/OS.md, step 8), on a bare machine
+\ with virtio-blk: the kernel (src/kernel.fam, store.fam, ksys.fam), then this.  Run by
+\ scripts/storetest.sh, twice on one disk: first as `1 lit` (a new store,
+\ and everything below), then as `0 lit` (the store found again: what the
+\ first run committed checked as it left it).
+\
+\ Then, for the crash test, `2 lit`: commits forever on the store found,
+\ each rewriting 300 keys (600-byte values stamped with the commit's
+\ number) and "last" (the number), until QEMU is killed; and `3 lit`:
+\ the store found holds one commit whole, the one "last" names.
+\
+\ Keys "k<i>" then i%50 x's (2 to 60 bytes); values of (i*37)%1000+1
+\ bytes, byte j (i+j)&255.  Every value got is checked.
+
+: fails variable ;
+: bad  "FAIL: " puts puts 0A lit putc fails @ 1 lit + fails ! ;    \ ( msg -- )
+
+\ kset ( i -- )  key i into the transaction's key.
+: kdig  dup A lit u< if 30 lit + XKEY xa XKLEN x@ + c! XKLEN x@ 1 lit + XKLEN x! else dup A lit / kdig A lit % kdig then ;
+: kset
+6B lit XKEY xa c!  1 lit XKLEN x!
+dup kdig
+32 lit % ?dup if 0 lit do 78 lit XKEY xa XKLEN x@ + c! XKLEN x@ 1 lit + XKLEN x! loop then ;
+: vlen  25 lit * 3E8 lit % 1 lit + ;                      \ ( i -- n )
+: vset  dup vlen dup XVLEN x! 0 lit do dup i + FF lit and XVAL xa i + c! loop drop ;   \ ( i -- )
+
+: gbuf variable ;
+\ vchk ( i -- ok )  key i holds its value.
+: vchk
+dup kset gbuf @ 400 lit tget
+dup 0< if 2drop 0 lit else
+	over vlen <> if drop 0 lit else
+		1 lit over vlen 0 lit do over i + FF lit and gbuf @ i + c@ = and loop nip
+	then
+then ;
+
+: T variable ;
+
+\ wput ( from to -- )  keys from to to-1 put in one transaction, committed.
+: wput
+T @ 2 lit tbegin 0= if "begin" bad then
+swap do i kset i vset tput 0= if "put" bad then tunpin loop
+tcommit if "commit" bad then ;
+
+\ wdel3 ( from to -- )  the keys of those divisible by 3 taken out.
+: wdel3
+T @ 2 lit tbegin 0= if "begin" bad then
+swap do i 3 lit % 0= if i kset tdel 0= if "del" bad then tunpin then loop
+tcommit if "commit" bad then ;
+
+\ wdelall ( from to -- )  every key there is taken out (those absent pass).
+: wdelall
+T @ 2 lit tbegin 0= if "begin" bad then
+swap do i kset tdel drop tunpin loop
+tcommit if "commit" bad then ;
+
+\ live? ( i -- flag )  key i should be there after run 1: not divisible by
+\ 3, or below 1000 and not 0.
+: live?  dup 3 lit % if drop 1 lit else dup 3E8 lit u< swap 0= 0= and then ;
+
+\ rchk ( from to -- )  in a reader: those live hold their values, the rest
+\ are not there.
+: rchk
+T @ 1 lit tbegin 0= if "begin" bad then
+swap do
+	i live? if i vchk 0= if i u. " value" bad then
+	else i kset gbuf @ 400 lit tget 0< 0= if i u. " present" bad then then
+	tunpin
+loop
+tcommit drop ;
+
+\ rnone ( from to -- )  in a reader: none of them is there.
+: rnone
+T @ 1 lit tbegin 0= if "begin" bad then
+swap do i kset gbuf @ 400 lit tget 0< 0= if i u. " present" bad then tunpin loop
+tcommit drop ;
+
+\ rall ( from to -- )  in a reader: every one holds its value.
+: rall
+T @ 1 lit tbegin 0= if "begin" bad then
+swap do i vchk 0= if i u. " value" bad then tunpin loop
+tcommit drop ;
+
+\ kcount ( -- n )  the keys, walked with tnext, each after the one before.
+: kcount
+T @ 1 lit tbegin 0= if "begin" bad then
+0 lit XKLEN x!  0 lit
+begin gbuf @ tnext dup 0< 0= while
+	over if XKEY xa XKLEN x@ gbuf @ 3 lit pick bcmp 0< 0= if "order" bad then then
+	dup XKLEN x!  gbuf @ XKEY xa rot bcpy
+	1 lit +  tunpin
+repeat
+drop tcommit drop ;
+
+: expect  over over <> if "count " puts swap u. " not " puts u. " " bad else 2drop then ;   \ ( got want -- )
+
+: m2 variable ;  : T1 variable ;  : h1 variable ;
+
+: run1
+fst @ T !
+0 lit 1F4 lit wput  0 lit 1F4 lit rall
+1F4 lit FA0 lit wput  0 lit FA0 lit rall
+kcount FA0 lit expect
+0 lit FA0 lit wdel3
+kcount A6A lit expect
+1 lit 3E8 lit wput
+kcount BB7 lit expect
+0 lit FA0 lit rchk
+\ an abort leaves nothing
+T @ 2 lit tbegin drop  FA0 lit 1388 lit do i kset i vset tput drop tunpin loop  tabort
+FA0 lit 1388 lit rnone
+kcount BB7 lit expect
+\ a second tree, its meta pages kept under "tree2"
+tcreate dup m2 ! 0= if "tcreate" bad then
+m2 @ topen dup T ! 0= if "topen" bad then
+0 lit 64 lit wput  0 lit 64 lit rall  kcount 64 lit expect
+T @ tclose
+fst @ T !
+T @ 2 lit tbegin drop
+74 lit XKEY xa c!  72 lit XKEY xa 1 lit + c!  65 lit XKEY xa 2 lit + c!  65 lit XKEY xa 3 lit + c!  32 lit XKEY xa 4 lit + c!
+5 lit XKLEN x!  m2 @ XVAL xa !  4 lit XVLEN x!  tput drop tcommit if "commit" bad then
+kcount BB8 lit expect
+"storetest: run 1, pool at " puts hwm @ u. " pages, " puts stleak @ u. " leaked" puts 0A lit putc ;
+
+: run2
+fst @ T !
+kcount BB8 lit expect
+0 lit FA0 lit rchk
+T @ 1 lit tbegin drop
+74 lit XKEY xa c!  72 lit XKEY xa 1 lit + c!  65 lit XKEY xa 2 lit + c!  65 lit XKEY xa 3 lit + c!  32 lit XKEY xa 4 lit + c!
+5 lit XKLEN x!  gbuf @ 4 lit tget 4 lit <> if "tree2's key" bad then  gbuf @ @ m2 !  tcommit drop
+m2 @ topen dup T ! 0= if "topen" bad then
+kcount 64 lit expect  0 lit 64 lit rall
+T @ tclose
+\ space comes back: everything out, in again twice; the pool stays put
+fst @ T !
+0 lit FA0 lit wdelall
+kcount 1 lit expect
+hwm @ h1 !
+0 lit FA0 lit wput  0 lit FA0 lit wdelall
+0 lit FA0 lit wput  0 lit FA0 lit wdelall
+0 lit FA0 lit wput  0 lit FA0 lit rall  kcount FA1 lit expect
+"storetest: run 2, pool at " puts h1 @ u. " pages, then " puts hwm @ u. ", " puts stleak @ u. " leaked" puts 0A lit putc
+hwm @ h1 @ - 400 lit u> if "the pool grew while what was freed was put back" bad then ;
+
+\ The crash test.
+: lastk  4C lit XKEY xa c!  1 lit XKLEN x! ;               \ the key "L"
+: stamp  258 lit XVLEN x!  dup XVAL xa !  FF lit and  254 lit 0 lit do dup XVAL xa 4 lit + i + c! loop drop ;   \ ( k -- )
+: lastv  lastk gbuf @ 4 lit tget 4 lit = if gbuf @ @ else 0 lit then ;   \ ( -- k )
+
+\ crashw  commits for ever, the next after the last found.
+: crashw
+fst @ T !
+T @ 1 lit tbegin drop lastv tcommit drop
+begin
+	1 lit +
+	T @ 2 lit tbegin drop
+	12C lit 0 lit do i kset dup stamp tput drop tunpin loop
+	lastk dup XVAL xa ! 4 lit XVLEN x! tput drop
+	tcommit drop
+	dup 3F lit and 0= if 2E lit putc then
+0 lit until ;
+
+\ crashc  the commit "last" names, whole: every key stamped with it (none
+\ there before the first).
+: crashc
+fst @ T !
+T @ 1 lit tbegin drop
+lastv dup "storetest: the last commit whole is " puts u. 0A lit putc
+12C lit 0 lit do
+	i kset gbuf @ 400 lit tget
+	over if
+		258 lit <> if "a value's length" bad else
+			gbuf @ @ over <> if "a value's stamp" bad then
+			1 lit 254 lit 0 lit do gbuf @ 4 lit + i + c@ 2 lit pick FF lit and = and loop 0= if "a value's bytes" bad then
+		then
+	else 0< 0= if "a key before the first commit" bad then then
+	tunpin
+loop
+drop tcommit drop ;
+
+\ The start: the stdlib's, then pages and a trap area for the store's
+\ context, as kboot would.
+trapinit area@ mhartid@ harea harr !
+gp@ 10000 lit + FFF lit + FFFFF000 lit and 87F00000 lit pginit
+0 lit fails !  400 lit alloc gbuf !
+RUN dup 1 lit = stmount
+T1 !
+: main
+T1 @ 1 lit = if run1 else T1 @ 0= if run2 else T1 @ 2 lit = if crashw else crashc then then then
+fails @ if "storetest: " puts fails @ u. " failed" puts 0A lit putc 1 lit halt then
+"storetest: all checks passed" puts 0A lit putc 0 lit halt ;
+main

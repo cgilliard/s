@@ -1,7 +1,7 @@
 #!/bin/sh
 # oscheck.sh — the OS's checks (docs/OS.md); run after scripts/build.sh.
 #
-# The kernel's own tests (the Test blocks in src/kernel.fam) on 1, 2, 8 and
+# The kernel's own tests (the Test blocks in src/ksys.fam) on 1, 2, 8 and
 # 64 harts; a fault in the kernel reported rather than hung on; the image
 # booting, by itself under q32 and through tabernacle from a disk holding
 # it, on one hart and on several, and running init in user mode; and
@@ -13,7 +13,8 @@
 # unmap under PMP, malloc and free on four threads; and descriptors, /proc
 # and the shell, typed into on the console.  Every run has a time
 # limit; one that should keep running (the booted kernel) passes when the
-# limit ends it.
+# limit ends it.  And the store: scripts/storetest.sh, and trees from user
+# mode on a disk.
 
 cd "$(dirname "$0")/.." || exit 1
 T=tmp/oscheck
@@ -49,17 +50,17 @@ expect() {
 [ -f bin/img ] && [ -f bin/tabernacle ] || { echo "oscheck.sh: run scripts/build.sh first" >&2; exit 1; }
 
 for n in 1 2 8 64; do
-	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam
+	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/ksys.fam
 done
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.
 N=$((N + 1))
-./tools/fam -o "$T/storebench.bin" src/kernel.fam src/store.fam src/storebench.fam > "$T/storebench.build" 2>&1 \
+./tools/fam -o "$T/storebench.bin" src/kernel.fam src/store.fam src/ksys.fam src/storebench.fam > "$T/storebench.build" 2>&1 \
 	|| fail storebench_build "$(head -c 300 "$T/storebench.build")"
 
 printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
-./tools/fam -o "$T/fault.bin" src/kernel.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
+./tools/fam -o "$T/fault.bin" src/kernel.fam src/store.fam src/ksys.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
 expect fault 1 'kernel: hart 0 trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
 
@@ -145,7 +146,7 @@ printf '%s\n' 'kboot
 "share: " puts over u. " to " puts dup u. 0A lit putc
 over over 1 lit lshift u< 0=  2 lit pick 1 lit lshift 2 lit pick 9 lit * u> 0= and
 nip nip if 0 lit else 1 lit then halt' > "$T/share.fam"
-./tools/fam -o "$T/sharek.bin" src/kernel.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
+./tools/fam -o "$T/sharek.bin" src/kernel.fam src/store.fam src/ksys.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
 uimage share "$T/sharek.bin" spin=spin
 expect lottery 0 'share: ' 20 ./tools/q32 "$T/share.img"
 
@@ -263,6 +264,66 @@ for n in 1 4; do
 		grep -q -- "$pat" "$o" || { fail "shell_$n" "no /$pat/ in: $(head -c 600 "$o")"; break; }
 	done
 done
+
+# The store (step 8): its own checks on a bare machine (a new store, the
+# same found again, QEMU killed in its commits six times and the last
+# commit found whole); then trees from user mode on a disk, on one hart
+# and then on four: a counter that outlives the reboot between, a long
+# transaction in one tree while twenty commit in another, the calls' errors.
+N=$((N + 1))
+lim 900 sh scripts/storetest.sh > "$T/storetest.out" 2>&1 || fail storetest "$(tail -c 400 "$T/storetest.out")"
+grep -q 'storetest: the last commit whole is' "$T/storetest.out" || fail storetest "no crash rounds: $(tail -c 400 "$T/storetest.out")"
+usrc tstore ': fda variable ;  : fdb variable ;  : fdc variable ;  : b variable ;  : v variable ;
+: bigdone variable ;  : smalls variable ;  : early variable ;  : stk variable ;
+: chk  dup 0< if "error " puts . 0A lit putc 1 lit exit then ;      \ ( r -- r )
+200 lit alloc b !  200 lit alloc v !  0 lit bigdone !  0 lit smalls !  0 lit early !
+\ a counter that outlives a reboot
+"/t-count" TREE CREATE or open chk fda !
+fda @ 1 lit txbegin chk
+dup "n" 1 lit b @ 4 lit txget 4 lit = if b @ @ else 0 lit then 1 lit + dup "count " puts u. 0A lit putc
+b @ !  dup "n" 1 lit b @ 4 lit txput chk drop  txcommit chk drop
+\ a long transaction on one tree while short ones commit on another
+"/t-big" TREE CREATE or open chk fdb !
+"/t-small" TREE CREATE or open chk fdc !
+tcode[
+	drop fdb @ 1 lit txbegin chk
+	BB8 lit 0 lit do
+		i v @ !  dup v @ 4 lit v @ 1F4 lit txput chk drop
+	loop
+	txcommit chk drop  1 lit bigdone !
+]tcode
+8000 lit alloc 8000 lit + 0 lit thread stk !
+2FAF080 lit sleep
+14 lit 0 lit do
+	fdc @ 1 lit txbegin chk
+	i b @ !  dup b @ 4 lit b @ 4 lit txput chk drop  txcommit chk drop
+	smalls @ 1 lit + smalls !
+	bigdone @ 0= if early @ 1 lit + early ! then
+loop
+stk @ join drop
+"small commits " puts smalls @ u. ", while the long one was open " puts early @ u. 0A lit putc
+\ the long one whole, in a reader
+fdb @ 0 lit txbegin chk stk !
+0 lit BB8 lit 0 lit do i v @ ! stk @ v @ 4 lit b @ 1F4 lit txget 1F4 lit = if b @ @ i = if 1 lit + then then loop
+"long keys whole " puts u. 0A lit putc stk @ txcommit drop
+\ errors, and a walk with next
+"errors " puts
+"/t-big" 0 lit open . 20 lit putc
+"/nope" TREE open . 20 lit putc
+1 lit 0 lit txbegin . 20 lit putc
+fdc @ 0 lit txbegin dup stk !  "k" 1 lit "v" 1 lit txput . 20 lit putc
+stk @ "absent" 6 lit b @ 10 lit txget . 20 lit putc
+0 lit 0 lit begin stk @ b @ 2 lit pick b @ txnext dup 0< 0= while nip swap 1 lit + swap repeat drop drop
+"next " puts u. 0A lit putc  stk @ txcommit drop
+bye'
+uimage store bin/kernel init=tstore
+rm -f "$T/store.disk"; dd if=/dev/zero of="$T/store.disk" bs=1 count=0 seek=268435456 2>/dev/null
+for n in 1 4; do
+	expect "store_$n" 124 '^small commits 20, while the long one was open 20$' 30 ./tools/q32 --smp=$n --disk="$T/store.disk" "$T/store.img"
+	has "store_$n" '^long keys whole 3000$'; has "store_$n" '^errors -2 -2 -9 -9 -2 next 20$'
+done
+has store_1 '^count 1$'; has store_4 '^count 2$'
+rm -f "$T/store.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

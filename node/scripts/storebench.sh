@@ -20,7 +20,7 @@ case "$1" in
 esac
 
 mkdir -p tmp
-./tools/fam -o tmp/storebench.bin src/kernel.fam src/store.fam src/storebench.fam || exit 1
+./tools/fam -o tmp/storebench.bin src/kernel.fam src/store.fam src/ksys.fam src/storebench.fam || exit 1
 DISK=tmp/storebench.img
 rm -f "$DISK"
 dd if=/dev/zero of="$DISK" bs=1 count=0 seek=1073741824 2>/dev/null || exit 1

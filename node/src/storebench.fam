@@ -6,9 +6,10 @@
 
 :M BN 186A0 lit ;            \ 100,000 entries
 
-: kbuf  variable ;  : vbuf variable ;
+: kbuf  variable ;  : vbuf variable ;  : gb variable ;
 : t0    variable ;
 : bcnt  variable ;  : bsize variable ;
+: T variable ;  : nw0 variable ;  : nc0 variable ;
 
 \ bswap ( x -- y )  bytes reversed: a counter, big-endian, sorts as keys.
 : bswap
@@ -27,76 +28,102 @@ dup D lit lshift xor dup 11 lit rshift xor dup 5 lit lshift xor ;
 : kseq   kbuf @ 20 lit mzero bswap kbuf @ ! ;                                          \ ( i -- )
 : mkval  10 lit 0 lit do dup i xor vbuf @ i 2 lit lshift + ! loop drop ;               \ ( i -- )
 
+\ The transaction's key and value from kbuf and vbuf.
+: kx  kbuf @ XKEY xa 20 lit mcpy  20 lit XKLEN x! ;
+: vx  vbuf @ XVAL xa 40 lit mcpy  40 lit XVLEN x! ;
+: put  kx vx tput 0= if "a put failed" panic then tunpin ;
+: get  kx gb @ 40 lit tget tunpin ;                  \ ( -- n | -1 )
+
 \ check ( i -- )  key i (random) holds value i.
 : check
-dup krand kbuf @ tget
-dup 0= if "a key put is missing" panic then
-@ <> if "a value got is not the one put" panic then ;
+dup krand get
+40 lit <> if "a key put is missing" panic then
+gb @ @ <> if "a value got is not the one put" panic then ;
 
-: tstart  mtime@ t0 !  0 lit nwr !  0 lit ncm ! ;
-
-\ batch ( n -- )  commit every n operations.
+\ Transactions: a writer always open; op1 commits every bsize operations.
+: wbeg  T @ 2 lit tbegin 0= if "no transaction" panic then ;
+: wend  tcommit if "a commit failed" panic then ;
 : batch  dup bsize ! bcnt ! ;
-: op1    bcnt @ 1 lit - dup bcnt ! 0= if tcommit bsize @ bcnt ! then ;
+: op1    bcnt @ 1 lit - dup bcnt ! 0= if wend wbeg bsize @ bcnt ! then ;
+: fresh  tcreate topen dup T ! 0= if "no tree" panic then ;   \ a new, empty tree
+
+: tstart  mtime@ t0 !  T @ TNW t@ nw0 !  T @ TNC t@ nc0 ! ;
+
+\ entries ( -- n )  walked with next, in a reader.
+: entries
+T @ 1 lit tbegin drop
+0 lit XKLEN x!  0 lit
+begin gb @ tnext dup 0< 0= while dup XKLEN x!  gb @ XKEY xa rot bcpy  1 lit +  tunpin repeat
+drop tcommit drop ;
+: count  T @ TCNT t@ ;
 
 \ report ( ops name -- )
 : report
-mtime@ t0 @ - 2710 lit /                 \ ( ops name ms )
+mtime@ t0 @ - 2710 lit /
 swap "BENCH " puts puts ": " puts
 over u. " ops in " puts dup u. " ms, " puts
 ?dup if over 3E8 lit * swap / u. " ops/s" puts else ">1000000 ops/s" puts then drop
-"; " puts nwr @ u. " pages written in " puts ncm @ u. " commits" puts 0A lit putc ;
+"; " puts T @ TNW t@ nw0 @ - u. " pages written in " puts T @ TNC t@ nc0 @ - u. " commits" puts 0A lit putc ;
 
-stinit
-40 lit alloc kbuf !  40 lit alloc vbuf !
+: main
+40 lit alloc kbuf !  40 lit alloc vbuf !  400 lit alloc gb !
 "storebench: " puts BN u. " entries, 32-byte keys, 64-byte values, "
 puts NSLOT 8 lit rshift u. " MiB cache" puts
 bflush @ if ", flushed" else ", no flush (the device offers none)" then puts 0A lit putc
 
 \ Keys in order, into an empty tree.
-stfresh 2710 lit batch tstart
-BN 0 lit do i kseq i mkval kbuf @ vbuf @ tput op1 loop tcommit
+fresh 2710 lit batch tstart wbeg
+BN 0 lit do i kseq i mkval put op1 loop wend
 BN "seq_put (10000 a commit)" report
 
 \ Keys scattered, into an empty tree: the tree the rest works on.
-stfresh 2710 lit batch tstart
-BN 0 lit do i krand i mkval kbuf @ vbuf @ tput op1 loop tcommit
+fresh 2710 lit batch tstart wbeg
+BN 0 lit do i krand i mkval put op1 loop wend
 BN "rand_put (10000 a commit)" report
-nent @ BN <> if "the tree holds the wrong number of entries" panic then
+count BN <> if "the tree holds the wrong number of entries" panic then
 
-tstart
+tstart T @ 1 lit tbegin drop
 BN 0 lit do i check loop
-BN "get, cached" report
+tcommit drop BN "get, cached" report
 
-cdrop tstart
+cdrop tstart T @ 1 lit tbegin drop
 2710 lit 0 lit do i 7 lit * check loop
-2710 lit "get, from disk" report
+tcommit drop 2710 lit "get, from disk" report
 
-64 lit batch tstart
-2710 lit 0 lit do i 9 lit * dup krand BN + mkval kbuf @ vbuf @ tput op1 loop tcommit
+64 lit batch tstart wbeg
+2710 lit 0 lit do i 9 lit * dup krand BN + mkval put op1 loop wend
 2710 lit "overwrite (100 a commit)" report
-2710 lit 0 lit do i 9 lit * dup krand kbuf @ tget @ swap BN + <> if "an overwrite was lost" panic then loop
+T @ 1 lit tbegin drop
+2710 lit 0 lit do i 9 lit * dup krand get drop gb @ @ swap BN + <> if "an overwrite was lost" panic then loop
+tcommit drop
 
-64 lit batch tstart
-2710 lit 0 lit do i 9 lit * 1 lit + krand kbuf @ tdel 0= if "a key to delete was missing" panic then op1 loop tcommit
+64 lit batch tstart wbeg
+2710 lit 0 lit do i 9 lit * 1 lit + krand kx tdel 0= if "a key to delete was missing" panic then tunpin op1 loop wend
 2710 lit "delete (100 a commit)" report
 
 tstart
-tcount
+entries
 dup BN 2710 lit - <> if "a scan counted the wrong number of entries" panic then
 "scan" report
 
-1 lit batch tstart
-3E8 lit 0 lit do i BN + dup krand mkval kbuf @ vbuf @ tput op1 loop
+1 lit batch tstart wbeg
+3E8 lit 0 lit do i BN + dup krand mkval put op1 loop wend
 3E8 lit "put (1 a commit)" report
 
-64 lit batch tstart
-2710 lit 0 lit do i BN + 3E8 lit + dup krand mkval kbuf @ vbuf @ tput op1 loop tcommit
+64 lit batch tstart wbeg
+2710 lit 0 lit do i BN + 3E8 lit + dup krand mkval put op1 loop wend
 2710 lit "put (100 a commit)" report
 
 \ Everything put is still there.
-2710 lit 0 lit do i 9 lit * 2 lit + check loop    \ neither overwritten nor deleted
-nent @ BN 2710 lit - 3E8 lit + 2710 lit + <> if "entries miscounted at the end" panic then
-tcount nent @ <> if "the final scan disagrees" panic then
+T @ 1 lit tbegin drop
+2710 lit 0 lit do i 9 lit * 2 lit + check loop
+tcommit drop
+count BN 2710 lit - 3E8 lit + 2710 lit + <> if "entries miscounted at the end" panic then
+entries count <> if "the final scan disagrees" panic then
 "storebench: all checks passed" puts 0A lit putc
-bye
+0 lit halt ;
+
+trapinit area@ mhartid@ harea harr !
+gp@ 10000 lit + FFF lit + FFFFF000 lit and 87F00000 lit pginit
+1 lit stmount
+main

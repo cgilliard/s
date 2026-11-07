@@ -561,6 +561,80 @@ kernel too much to add at the end.
    store calls. Done when files outlive a reboot, killing QEMU in a
    commit leaves the last one whole, and a block-sized transaction in
    one tree runs while files are saved without either waiting.
+   The plan (2026-11-06), in parts each tested before the next:
+   1. **Waiting inside the kernel.** Every thread has its own kernel
+      stacks, so a call can sleep halfway (waiting for the disk, or for
+      a lock a store writer holds) while its hart runs other threads,
+      and go on where it was when woken. The disk interrupts through
+      the PLIC when a request is done. Interrupts in machine mode are
+      taken only where a hart idles, never while it holds a lock. A
+      process ending lets a thread asleep in a call finish the call
+      first, so no store lock is left held.
+   2. **The engine.** Step 2's tree made general. Any number of trees,
+      each with its own meta pages and writer; keys of up to 255 bytes,
+      values up to 1 KiB; readers' snapshots; abort; deletes that free
+      emptied pages; recovery from the newest whole meta pages at boot.
+      Free space: each tree's freed pages are a list on the disk,
+      written with its commit, and reused once its readers are past
+      them. New pages come from the pool in 1 MiB chunks, the pool's
+      mark written before a chunk is used. A crash can leak the rest of
+      a chunk and the lost transaction's pages, about 1 MiB a tree,
+      which a sweep can take back later. The store begins 64 MiB into
+      the disk, after the room tabernacle's image may take.
+   3. **Trees and the store calls**, 23 to 29, on a tree opened as a
+      descriptor, and `/proc/store`. Checked: a value outlives a reboot,
+      QEMU killed in a commit leaves the last one whole, and a long
+      transaction in one tree does not hold up another's.
+   4. **Files.** The file system's tree: a file's header (owner, group,
+      mode, size, times, type) at its path, its bytes in 1 KiB values
+      at the path, a NUL and the chunk's number; a directory, a path
+      ending in `/`. Files through `open`, `read`, `write`, `seek` and
+      `close`; a working directory; `ls`, `pwd`, `cd`, `cat`, `mkdir`,
+      `rm`.
+   5. **Users.** `/etc/passwd` and `/etc/group`, the checks at `open`,
+      `/proc/<pid>/user`, `login`, and `init` reading `/etc/init`.
+   Parts 1 to 3 done (2026-11-06). The kernel is now three files in
+   order: `src/kernel.fam` (its base), `src/store.fam`, `src/ksys.fam`
+   (the calls, the traps, boot). Every thread has 16 KiB of kernel
+   stacks. A call begins on them empty; `ksleep` saves where it is and
+   gives the hart back to its loop, and `trun` resumes it there (its
+   `mepc` kept, `mstatus` set). Kernel mutexes (`kmlock`) sleep; `klk`
+   stays a brief spin lock. Machine mode takes interrupts only while a
+   hart idles in `hstep`. The disk interrupts hart 0 through the PLIC,
+   and a call waiting on it sleeps. The store
+   begins 64 MiB into the disk, and `kboot` mounts it when there is a
+   disk. Its trees have keys of 1 to 255 bytes and values up to 1 KiB,
+   in slotted pages. A leaf or branch that fills splits by bytes; one a
+   delete empties is freed, and a root left with one child gives way
+   to it. A meta page holds its tree's root, entries, free list and
+   chunk, checksummed. The free list is written backward, last page
+   first, so a commit rewrites only what changed. There is a shared
+   32 MiB page cache with pins, and a writer per tree. Readers are
+   snapshots whose pages are not reused while they last. `open(path,
+   TREE | CREATE)` keeps a tree's meta page in a 32-byte header at its
+   path in the file system's tree. Calls 23 to 29 are `begin`
+   (`txbegin`), `commit`, `abort`, `get`, `put`, `del` and `next`. A
+   process's open transactions are undone when it ends, and its trees
+   closed, by a hart between threads (`kdefer`).
+   Checked, by `scripts/storetest.sh` on a bare machine: 4,000 keys of
+   2 to 60 bytes with values of 1 to 1000 bytes put, read back and
+   walked in order with `next`; a third deleted and some put again; an
+   abort leaving nothing; a second tree; everything found again after
+   a reboot, the pool's size steady over three rounds of deleting and
+   putting back. Then six times, QEMU killed while commits run as fast
+   as they can, and each time the last commit is found whole. In the
+   OS, by `scripts/oscheck.sh` on one hart and on four: a counter
+   outliving a reboot; twenty commits in one tree while a 3,000-put
+   transaction is open in another, every one done before it; the
+   calls' errors. The benchmark (`scripts/storebench.sh`, 100,000
+   32-byte keys with 64-byte values) now gives about 12,500 puts a
+   second, 26,000 cached gets, 9,400 gets from the disk, 5,800
+   overwrites at 100 a commit, 690 one-put commits and 27,000 keys a
+   second walked with `next`. That is about half of step 2's
+   fixed-size core for puts, and a third for gets, with room left to
+   win back. Found on the way: the tree records outgrew their
+   64 bytes, so a field of one fell on the next's free list (they are
+   128 bytes now); and a raw word typed by hand was wrong, as before.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
    reads a page served from the guest.
