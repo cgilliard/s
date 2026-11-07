@@ -1159,4 +1159,55 @@ B3815100 ,   \ add  gp, gp, t0          ( gp += t0 )
 23200100 ,   \ sw   x0, 0(sp)           ( exhausted: return 0 )
 ;
 
+\ Harts other than 0 wait (docs/OS.md, section 3).  With no firmware every
+\ hart starts at 0x80000000; tabernacle keeps all but hart 0 waiting, and so
+\ does every fam program, here, in case nothing did before it (a program run
+\ by q32 --smp=N).  The contract with the OS:
+\   0x87FF1000 + 4*hartid  the hart's mailbox word (hart ids below 960): it
+\                          writes 1 there ("present"), then sleeps in wfi with
+\                          only software interrupts enabled (mie.MSIE).
+\   0x87FF1F00             the wait loop, copied there by each such hart.
+\ The OS releases a hart by writing to its mailbox the address of a record
+\ whose first word is where to go, and raising its software interrupt (its
+\ msip word in the CLINT); the hart jumps there with a0 = the record.  Any
+\ hart id from 960 on just sleeps.  The page is above the stdlib's guard page
+\ and below the loop-frame stack's deep end, so no program's heap or stacks
+\ reach it.
+F32240F1 ,   \ csrrs t0,mhartid,zero
+63860208 ,   \ beq t0,zero,90 <end>
+17030000 ,   \ auipc t1,0x0
+13030306 ,   \ addi t1,t1,96             ( the wait loop's code, below )
+B723FF87 ,   \ lui t2,0x87ff2
+938303F0 ,   \ addi t2,t2,-256 # 87ff1f00 <end+0x87ff1e70>
+130EA000 ,   \ addi t3,zero,10
+832E0300 ,   \ lw t4,0(t1)
+23A0D301 ,   \ sw t4,0(t2)
+13034300 ,   \ addi t1,t1,4
+93834300 ,   \ addi t2,t2,4
+130EFEFF ,   \ addi t3,t3,-1
+E3160EFE ,   \ bne t3,zero,1c <.L1^B1>
+B723FF87 ,   \ lui t2,0x87ff2
+938303F0 ,   \ addi t2,t2,-256 # 87ff1f00 <end+0x87ff1e70>
+1303003C ,   \ addi t1,zero,960
+63F06202 ,   \ bgeu t0,t1,60 <toomany>
+93922200 ,   \ slli t0,t0,0x2
+3713FF87 ,   \ lui t1,0x87ff1
+B3826200 ,   \ add t0,t0,t1
+13031000 ,   \ addi t1,zero,1
+23A06200 ,   \ sw t1,0(t0)
+0F00F00F ,   \ fence iorw,iorw
+67800300 ,   \ jalr zero,0(t2)
+93830302 ,   \ addi t2,t2,32
+67800300 ,   \ jalr zero,0(t2)
+13038000 ,   \ addi t1,zero,8
+73204330 ,   \ csrrs zero,mie,t1
+73005010 ,   \ wfi
+03A50200 ,   \ lw a0,0(t0)
+13031000 ,   \ addi t1,zero,1
+E37AA3FE ,   \ bgeu t1,a0,70 <.L2^B1>
+03230500 ,   \ lw t1,0(a0)
+67000300 ,   \ jalr zero,0(t1) # 87ff1000 <end+0x87ff0f70>
+73005010 ,   \ wfi
+6FF0DFFF ,   \ jal zero,88 <dead>
+
 init

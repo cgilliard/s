@@ -4,7 +4,7 @@
 # Linux and macOS (on Windows, WSL2), as tools/q32.
 #
 # Usage: node.sh [--disk=FILE] [--seed=HOST:PORT ...] [--no-seeds]
-#                [--mac=ADDR] [--hostfwd=SPEC] [TABERNACLE]
+#                [--mac=ADDR] [--hostfwd=SPEC] [--smp=N] [TABERNACLE]
 #   --disk=FILE       the disk (default node/data/node.img, wherever this
 #                     is run from), created empty if missing
 #   --seed=HOST:PORT  another seed (repeatable): an IPv4 address or a name
@@ -12,6 +12,7 @@
 #   --no-seeds        not the built-in seeds (SEEDS), only those given
 #   --mac=ADDR        the virtio-net MAC (give each node on a host its own)
 #   --hostfwd=SPEC    expose a guest port, e.g. udp::3737-:3737
+#   --smp=N           N harts (default 1)
 #   TABERNACLE        the boot program (default node/bin/tabernacle, as
 #                     scripts/build.sh leaves it)
 #
@@ -31,6 +32,7 @@ EXTRA=""
 NO_SEEDS=0
 MAC=""
 HOSTFWD=""
+SMP=1
 TAB="$ROOT/bin/tabernacle"
 
 for arg in "$@"; do
@@ -40,7 +42,8 @@ for arg in "$@"; do
 		--no-seeds) NO_SEEDS=1 ;;
 		--mac=*) MAC=",mac=${arg#--mac=}" ;;
 		--hostfwd=*) HOSTFWD=",hostfwd=${arg#--hostfwd=}" ;;
-		--help|-h) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		--smp=*) SMP="${arg#--smp=}" ;;
+		--help|-h) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		--*) echo "node.sh: unknown option: $arg" >&2; exit 1 ;;
 		*) TAB="$arg" ;;
 	esac
@@ -107,7 +110,7 @@ for s in $SEEDS; do n=$((n + 1)); done
 } > "$SEEDFILE" || exit 1
 
 qemu-system-riscv32 \
-	-machine virt -m 128M -cpu "$CPU" -nographic -bios none \
+	-machine virt -m 128M -cpu "$CPU" -smp "$SMP" -nographic -bios none \
 	-global virtio-mmio.force-legacy=true \
 	-device loader,file="$TAB",addr=0x80000000 \
 	-device loader,file="$SEEDFILE",addr=0x87FFF000,force-raw=on \

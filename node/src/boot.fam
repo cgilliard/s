@@ -2,15 +2,21 @@
 \ tabernacle hands it the machine.  Built after src/kernel.fam as bin/img
 \ (scripts/build.sh), the image tabernacle is patched for.
 \
+\ Every hart the machine has is started first (hstart: each other hart's
+\ stacks come from the heap, before the pages are counted).
+\
 \ Memory, from the bottom: the image; the stdlib's return-id stack and
-\ variables; the kernel's heap (64 KiB kept for what it takes before the
-\ pages are counted); the pages, up to 0x87F00000; the kernel's data stack
-\ below 0x87FF0000; the loop-frame stack above it.
+\ variables; the kernel's heap (the other harts' stacks, and 64 KiB kept for
+\ what it takes before the pages are counted); the pages, up to 0x87F00000;
+\ hart 0's data stack below 0x87FF0000; the stdlib's guard page; the harts'
+\ mailboxes (0x87FF1000); hart 0's loop-frame stack above them.
 
 trapinit
+hstart
 gp@ 10000 lit + FFF lit + FFFFF000 lit and
 87F00000 lit pginit
-"kernel: " puts pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
+"kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts
+pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 0A lit putc
 tmrinit
 begin wfi 0 lit until

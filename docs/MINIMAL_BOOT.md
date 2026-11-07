@@ -57,7 +57,8 @@ Line by line:
 - `-machine virt -cpu rv32 -nographic -bios none`: QEMU's generic RISC-V
   board, a 32-bit CPU (tabernacle and the node use only RV32I, so any
   will do), the serial port on the terminal, and no firmware: the CPU
-  starts at `0x80000000`. Its memory, 128 MiB, is the default.
+  starts at `0x80000000`. Its memory, 128 MiB, is the default. Add
+  `-smp N` for N harts: the node uses every one.
 - `force-legacy=true`: tabernacle drives the original (legacy) virtio
   interface.
 - `loader,file=tabernacle,addr=0x80000000`: the program, where the CPU

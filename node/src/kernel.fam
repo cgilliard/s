@@ -1,16 +1,23 @@
-\ kernel.fam — the OS's kernel (docs/OS.md), step 1: its skeleton, on one
-\ hart.  The traps (every interrupt and exception comes through one entry,
-\ which saves the registers and calls ktrap), the timer (100 ticks a
-\ second), and the page allocator (RAM in 4 KiB pages, a sorted list of
-\ free ranges, first fit, neighbours merged when freed).
+\ kernel.fam — the OS's kernel (docs/OS.md): steps 1 and 3.  The traps
+\ (every interrupt and exception comes through one entry, which saves the
+\ registers and calls ktrap), each hart's timer (100 ticks a second), the
+\ page allocator (RAM in 4 KiB pages, a sorted list of free ranges, first
+\ fit, neighbours merged when freed), and every hart the machine has:
+\ started from where they wait (lib/stdlib.fam, tabernacle), locks without
+\ atomic instructions, queues with one writer and one reader, and the
+\ software interrupt that wakes a hart.
 \
 \ Definitions only: src/boot.fam is the kernel's main, and the Test blocks
-\ below run with `tools/fam --test src/kernel.fam` (scripts/oscheck.sh).
+\ below run with `tools/fam --test [--smp=N] src/kernel.fam`
+\ (scripts/oscheck.sh).
 \
 \ The kernel runs in machine mode on the stdlib's stacks (data stack sp,
-\ return ids s10/s11, loop frames s8).  A trap arriving in kernel code uses
-\ them too, below what the interrupted code holds: fam only ever stores to a
-\ stack after moving its pointer past the slot, so nothing there is lost.
+\ return ids s10/s11, loop frames s8); each hart started later has its own,
+\ and shares s10, which the variables are found from.  A trap arriving in
+\ kernel code uses the stacks of the hart it arrives on, below what the
+\ interrupted code holds: fam only ever stores to a stack after moving its
+\ pointer past the slot, so nothing there is lost.  Variables are shared by
+\ every hart; what is a hart's own is in an array indexed by its id.
 
 \ ── Machine registers (raw words) ──
 
@@ -32,8 +39,26 @@ F3223034 ,   \ csrrs t0,mtval,zero
 23205100 ,   \ sw t0,0(sp)
 ;
 
+: mtvec@                     \ ( -- mtvec )
+F3225030 ,   \ csrrs t0,mtvec,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mhartid@                   \ ( -- id )  this hart's
+F32240F1 ,   \ csrrs t0,mhartid,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
 : gp@                        \ ( -- gp )  the heap's next free byte
 93820100 ,   \ addi t0,gp,0
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: s10@                       \ ( -- s10 )  where the variables are found from
+93020D00 ,   \ addi t0,s10,0
 1301C1FF ,   \ addi sp,sp,-4
 23205100 ,   \ sw t0,0(sp)
 ;
@@ -45,8 +70,11 @@ B7C20002 ,   \ lui t0,0x200c
 23206100 ,   \ sw t1,0(sp)
 ;
 
-: cmp@                       \ ( -- lo hi )  hart 0's mtimecmp
+: cmp@                       \ ( -- lo hi )  this hart's mtimecmp
+732E40F1 ,   \ csrrs t3,mhartid,zero
+131E3E00 ,   \ slli t3,t3,0x3
 B7420002 ,   \ lui t0,0x2004
+B382C201 ,   \ add t0,t0,t3
 03A30200 ,   \ lw t1,0(t0)
 83A34200 ,   \ lw t2,4(t0)
 130181FF ,   \ addi sp,sp,-8
@@ -54,17 +82,38 @@ B7420002 ,   \ lui t0,0x2004
 23207100 ,   \ sw t2,0(sp)
 ;
 
-\ cmp! ( lo hi -- )  hart 0's mtimecmp: the high word set out of reach
+\ cmp! ( lo hi -- )  this hart's mtimecmp: the high word set out of reach
 \ first, so no half-written value is ever due.
 : cmp!
 83230100 ,   \ lw t2,0(sp)
 03234100 ,   \ lw t1,4(sp)
 13018100 ,   \ addi sp,sp,8
+732E40F1 ,   \ csrrs t3,mhartid,zero
+131E3E00 ,   \ slli t3,t3,0x3
 B7420002 ,   \ lui t0,0x2004
+B382C201 ,   \ add t0,t0,t3
 130EF0FF ,   \ addi t3,zero,-1
 23A2C201 ,   \ sw t3,4(t0)
 23A06200 ,   \ sw t1,0(t0)
 23A27200 ,   \ sw t2,4(t0)
+;
+
+: ipi                        \ ( h -- )  hart h's software interrupt raised
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+93922200 ,   \ slli t0,t0,0x2
+37030002 ,   \ lui t1,0x2000
+B3826200 ,   \ add t0,t0,t1
+93031000 ,   \ addi t2,zero,1
+23A07200 ,   \ sw t2,0(t0)
+;
+
+: msipclr                    \ this hart's software interrupt cleared
+F32240F1 ,   \ csrrs t0,mhartid,zero
+93922200 ,   \ slli t0,t0,0x2
+37030002 ,   \ lui t1,0x2000
+B3826200 ,   \ add t0,t0,t1
+23A00200 ,   \ sw zero,0(t0)
 ;
 
 : tmron                      \ timer interrupts on (mie.MTIE, mstatus.MIE)
@@ -76,6 +125,10 @@ B7420002 ,   \ lui t0,0x2004
 : tmroff                     \ timer interrupts off
 93020008 ,   \ addi t0,zero,128
 73B04230 ,   \ csrrc zero,mie,t0
+;
+
+: swon                       \ software interrupts on (mie.MSIE)
+73604430 ,   \ csrrsi zero,mie,8
 ;
 
 : wfi                        \ sleep until an interrupt is pending
@@ -95,6 +148,62 @@ B7330000 ,   \ lui t2,0x3
 6F000000 ,   \ jal zero,.
 ;
 
+:M fence  0F00F00F , ;       \ fence iorw,iorw: what came before, before what follows
+
+\ ── Memory (raw words) ──
+
+\ mcpy ( src dst n -- )  n bytes, a multiple of 4.
+: mcpy
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+83228100 ,   \ lw t0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+638E0300 ,   \ beq t2,zero,done
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+93824200 ,   \ addi t0,t0,4
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,loop
+;
+
+\ mmove ( src dst n -- )  as mcpy, the two allowed to overlap.
+: mmove
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+83228100 ,   \ lw t0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+63820304 ,   \ beq t2,zero,done
+63E06202 ,   \ bltu t0,t1,backward
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+93824200 ,   \ addi t0,t0,4
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,forward
+6F004002 ,   \ jal zero,done
+B3827200 ,   \ add t0,t0,t2               backward:
+33037300 ,   \ add t1,t1,t2
+9382C2FF ,   \ addi t0,t0,-4
+1303C3FF ,   \ addi t1,t1,-4
+03AE0200 ,   \ lw t3,0(t0)
+2320C301 ,   \ sw t3,0(t1)
+9383C3FF ,   \ addi t2,t2,-4
+E39603FE ,   \ bne t2,zero,backward
+;
+
+\ mzero ( addr n -- )
+: mzero
+83230100 ,   \ lw t2,0(sp)
+03234100 ,   \ lw t1,4(sp)
+13018100 ,   \ addi sp,sp,8
+638A0300 ,   \ beq t2,zero,done
+23200300 ,   \ sw zero,0(t1)
+13034300 ,   \ addi t1,t1,4
+9383C3FF ,   \ addi t2,t2,-4
+E39A03FE ,   \ bne t2,zero,loop
+;
+
 \ panic ( msg -- )  a kernel bug: say so and stop.
 : panic  "kernel panic: " puts puts 0A lit putc 1 lit halt ;
 
@@ -108,24 +217,54 @@ dup 11 lit rshift xor
 dup 5 lit lshift xor
 dup rndseed ! ;
 
+\ ── Each hart's own ──
+\
+\ Hart ids run below 960 (the mailboxes' page, lib/stdlib.fam).  An array
+\ of a word per hart id for each of these, taken from the heap once.
+
+:M MAXH 3C0 lit ;
+: htick  variable ;          \ timer interrupts taken
+: hipi   variable ;          \ software interrupts taken
+: hup    variable ;          \ started (hart 0: always)
+: hjob   variable ;          \ the job asked of it (0: none)
+: hres   variable ;          \ what its job found (0: all well)
+: hq     variable ;          \ its queue from hart 0
+: kvok   variable ;
+
+\ harr ( h var -- addr )  hart h's word of a per-hart array.
+: harr  @ swap 2 lit lshift + ;
+
+: kvars
+kvok @ 0= if
+	MAXH 2 lit lshift dup alloc dup htick ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hipi ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hup ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hjob ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hres ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hq ! swap mzero
+	1 lit kvok !
+then ;
+
 \ ── The timer ──
 
-: ticks   variable ;         \ timer interrupts taken
-: period  variable ;         \ mtime between them
+: period  variable ;         \ mtime between ticks
 
-\ ktick  the timer's interrupt: count it, and set the next one a period on
-\ from this one's (not from now: the rate does not drift).
+: ticks@  mhartid@ htick harr @ ;            \ ( -- n )  this hart's ticks
+
+\ ktick  a timer interrupt: count it, and set this hart's next one a period
+\ on from this one's (not from now: the rate does not drift).
 : ktick
-ticks @ 1 lit + ticks !
+mhartid@ htick harr dup @ 1 lit + swap !
 cmp@                         \ ( lo hi )
 swap period @ +              \ ( hi lo' )
 dup period @ u< if swap 1 lit + swap then   \ the low word wrapped: carry
 swap cmp! ;
 
-\ tmrinit  100 ticks a second (10 ms slices), the first a period from now.
+\ tmrinit  this hart's timer: 100 ticks a second (10 ms slices), the first
+\ a period from now.
 : tmrinit
 186A0 lit period !           \ 100,000 at 10 MHz
-0 lit ticks !
+0 lit mhartid@ htick harr !
 mtime@ period @ +            \ ( lo' )
 200BFFC lit @                \ ( lo' hi )  mtime's high word, carried
 over period @ u< if 1 lit + then
@@ -136,24 +275,33 @@ tmron ;
 
 \ kfault  an exception (or an interrupt nobody takes) in the kernel: a bug.
 : kfault
-"kernel: trap " puts mcause@ u.x
+"kernel: hart " puts mhartid@ u. " trap " puts mcause@ u.x
 " at " puts mepc@ u.x
 " (" puts mtval@ u.x ")" puts 0A lit putc
 1 lit halt ;
 
+\ kipi  a software interrupt: cleared, and counted (what it asks is in the
+\ hart's job word).
+: kipi  msipclr mhartid@ hipi harr dup @ 1 lit + swap ! ;
+
 \ ktrap  what the entry calls, with every register saved.
 : ktrap
-mcause@ 80000007 lit = if ktick else kfault then ;
+mcause@
+dup 80000007 lit = if drop ktick else
+80000003 lit = if kipi else kfault then then ;
 
 \ [skip ... skip]  compile the code between where it is but jump over it.
 :I [skip  here ,j0 ;
 :I skip]  jpat! ;
+
+: trapvec variable ;         \ the entry, for the harts started later
 
 \ trapinit  the trap entry: mscratch holds a 128-byte area where the entry
 \ saves x1-x31 (x5 by way of mscratch itself) before calling ktrap, and
 \ from where it restores them for mret.  mtvec points at the entry, 16
 \ bytes past the auipc (auipc, addi, csrw, and [skip's jump).
 : trapinit
+kvars
 80 lit alloc
 83220100 ,   \ lw t0,0(sp)
 13014100 ,   \ addi sp,sp,4
@@ -231,7 +379,7 @@ F3220034 ,   \ csrrs t0,mscratch,zero
 83A24201 ,   \ lw t0,20(t0)
 73002030 ,   \ mret
 skip]
-;
+mtvec@ trapvec ! ;
 
 \ ── Pages ──
 \
@@ -367,6 +515,263 @@ then ;
 \ pgchk ( addr pages -- ok )  tests: each page's first word still addr.
 : pgchk  1 lit -rot 0 lit do dup i C lit lshift + @ over = rot and swap loop drop ;
 
+\ ── Locks, without atomic instructions ──
+\
+\ A tournament of two-hart Peterson locks: a hart takes the lock at the
+\ leaf for its id, then each node above, against the one other hart that
+\ can reach that node from the other side; about log2 of the harts steps,
+\ not one per hart as Lamport's bakery lock takes.  Peterson's lock needs
+\ a hart's write of its flag ordered before its read of the other's, which
+\ RISC-V's memory model does not give without a fence: there is one there.
+\ A lock: its leaves N (a power of two above every hart id), its levels,
+\ then a flag per side of each node (2N words), then each node's victim
+\ (N words).
+
+: lkn    variable ;          \ every lock's leaves, set before any is made
+: lkl    variable ;          \ and its levels
+
+\ lknew ( -- lock )  a lock, from the heap.
+: lknew
+lkn @ C lit * 8 lit + dup alloc tuck swap mzero
+lkl @ over 4 lit + !
+lkn @ over ! ;
+
+\ lock ( lock -- )  taken, by this hart; held until unlock.
+: lock
+03250100 ,   \ lw a0,0(sp)
+13014100 ,   \ addi sp,sp,4
+83250500 ,   \ lw a1,0(a0)                ( N )
+03264500 ,   \ lw a2,4(a0)                ( levels )
+93068500 ,   \ addi a3,a0,8               ( the flags )
+13973500 ,   \ slli a4,a1,0x3
+3387E600 ,   \ add a4,a3,a4               ( the victims )
+F32740F1 ,   \ csrrs a5,mhartid,zero
+B387B700 ,   \ add a5,a5,a1               ( this hart's leaf )
+63040606 ,   \ beq a2,zero,done
+93F21700 ,   \ andi t0,a5,1               level: ( our side )
+13D31700 ,   \ srli t1,a5,0x1             ( the node )
+93131300 ,   \ slli t2,t1,0x1
+B3E35300 ,   \ or t2,t2,t0
+93932300 ,   \ slli t2,t2,0x2
+B3837600 ,   \ add t2,a3,t2
+130E1000 ,   \ addi t3,zero,1
+23A0C301 ,   \ sw t3,0(t2)                ( our flag up )
+931E2300 ,   \ slli t4,t1,0x2
+B30ED701 ,   \ add t4,a4,t4
+23A05E00 ,   \ sw t0,0(t4)                ( and ourselves the victim )
+0F003003 ,   \ fence rw,rw                ( both seen before we look )
+13CF1200 ,   \ xori t5,t0,1
+931F1300 ,   \ slli t6,t1,0x1
+B3EFEF01 ,   \ or t6,t6,t5
+939F2F00 ,   \ slli t6,t6,0x2
+B38FF601 ,   \ add t6,a3,t6               ( the other side's flag )
+03AE0F00 ,   \ lw t3,0(t6)                wait:
+63060E00 ,   \ beq t3,zero,won
+03AE0E00 ,   \ lw t3,0(t4)
+E30A5EFE ,   \ beq t3,t0,wait             ( its flag up and we the victim )
+93070300 ,   \ addi a5,t1,0               won: ( up to the node )
+1306F6FF ,   \ addi a2,a2,-1
+E31206FA ,   \ bne a2,zero,level
+0F003003 ,   \ fence rw,rw                done: ( the lock before what it guards )
+;
+
+\ unlock ( lock -- )  given up, from the top node down.
+: unlock
+03250100 ,   \ lw a0,0(sp)
+13014100 ,   \ addi sp,sp,4
+83250500 ,   \ lw a1,0(a0)
+03264500 ,   \ lw a2,4(a0)
+93068500 ,   \ addi a3,a0,8
+F32740F1 ,   \ csrrs a5,mhartid,zero
+B387B700 ,   \ add a5,a5,a1
+0F003003 ,   \ fence rw,rw                ( what it guards, before )
+63060602 ,   \ beq a2,zero,done
+1306F6FF ,   \ addi a2,a2,-1              level:
+B3D2C700 ,   \ srl t0,a5,a2
+13F31200 ,   \ andi t1,t0,1               ( our side at that level )
+93D21200 ,   \ srli t0,t0,0x1             ( the node )
+93921200 ,   \ slli t0,t0,0x1
+B3E26200 ,   \ or t0,t0,t1
+93922200 ,   \ slli t0,t0,0x2
+B3825600 ,   \ add t0,a3,t0
+23A00200 ,   \ sw zero,0(t0)              ( our flag down )
+E31E06FC ,   \ bne a2,zero,level
+;
+
+\ ── Queues with one writer and one reader ──
+\
+\ head, tail, and 64 words: the writer alone moves head, the reader alone
+\ tail, so they need fences, not a lock.
+
+\ qnew ( -- q )
+: qnew  108 lit dup alloc tuck swap mzero ;
+
+\ qpush ( v q -- ok )  0 when full.
+: qpush
+dup @ over 4 lit + @ - 40 lit u< 0= if 2drop 0 lit else
+	dup @ 3F lit and 2 lit lshift over 8 lit + +
+	rot swap !
+	fence                                \ the word, before the head that shows it
+	dup @ 1 lit + swap !
+	1 lit
+then ;
+
+\ qpop ( q -- v 1 | 0 )
+: qpop
+dup 4 lit + @ over @ = if drop 0 lit else
+	fence                                \ the head, before the word it shows
+	dup 4 lit + @ 3F lit and 2 lit lshift over 8 lit + + @
+	fence                                \ the word read, before its slot is free
+	swap dup 4 lit + @ 1 lit + swap 4 lit + !
+	1 lit
+then ;
+
+\ ── Every hart ──
+\
+\ Hart 0 runs the kernel's main; the others wait where lib/stdlib.fam (or
+\ tabernacle) left them, each having marked its mailbox present, until
+\ hstart gives each a record: where to go, and its own stacks, trap area
+\ and trap entry.  A started hart runs hmain: its timer, then the jobs hart
+\ 0 asks of it (its job word, and a software interrupt), sleeping between.
+
+: nharts  variable ;         \ harts running (1 before hstart)
+: hmax    variable ;         \ the highest hart id + 1
+: hentrya variable ;         \ where a started hart begins
+: hstarted variable ;
+: klk     variable ;         \ the kernel's lock
+: lkk     variable ;         \ tests: each hart's turns
+: lkc     variable ;         \ tests: the count they keep
+
+: mbox  2 lit lshift 87FF1000 lit + ;       \ ( h -- addr )  its mailbox word
+
+\ lkstrs  a test job: lkk times, under the kernel's lock, add 1 to lkc
+\ (read, then written: without the lock, two harts would lose counts).
+: lkstrs  lkk @ 0 lit do klk @ lock lkc @ 1 lit + lkc ! klk @ unlock loop ;
+
+\ qstrs  a test job: from this hart's queue, lkk numbers, 1 on, in order.
+: qstrs
+mhartid@ hq harr @ 1 lit
+begin dup lkk @ u> 0= while
+	over qpop if over <> if 1 lit mhartid@ hres harr ! then 1 lit + then
+repeat
+2drop ;
+
+: hrun  dup 1 lit = if lkstrs then 2 lit = if qstrs then ;   \ ( job -- )
+
+\ hmain  where a started hart lives.
+: hmain
+swon tmrinit
+fence 1 lit mhartid@ hup harr !
+begin
+	mhartid@ hjob harr @ ?dup if
+		hrun fence 0 lit mhartid@ hjob harr !
+	else
+		wfi
+	then
+0 lit until ;
+
+\ hentry  compiles the code a started hart begins at (its address into
+\ hentrya): its stacks, its trap area and entry from the record in a0, then
+\ hmain.
+: hentry
+97020000 ,   \ auipc t0,0x0
+93824201 ,   \ addi t0,t0,20              ( the code below )
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+[skip
+03214500 ,   \ lw sp,4(a0)
+032C8500 ,   \ lw s8,8(a0)
+032DC500 ,   \ lw s10,12(a0)
+832D0501 ,   \ lw s11,16(a0)
+83214501 ,   \ lw gp,20(a0)
+83228501 ,   \ lw t0,24(a0)
+73900234 ,   \ csrrw zero,mscratch,t0
+8322C501 ,   \ lw t0,28(a0)
+73905230 ,   \ csrrw zero,mtvec,t0
+hmain
+skip]
+hentrya ! ;
+
+\ hpresent ( -- n )  harts marked present in the mailboxes.
+: hpresent  0 lit MAXH 1 lit do i mbox @ 1 lit = if 1 lit + then loop ;
+
+\ hupn ( -- n )  harts started and running.
+: hupn  0 lit hmax @ 1 lit u> if hmax @ 1 lit do i hup harr @ if 1 lit + then loop then ;
+
+\ hlate  the harts started that have not said so, and their mailboxes.
+: hlate
+"kernel: not started:" puts
+hmax @ 1 lit do
+	i hup harr @ 0= if i mbox @ 1 lit u> if
+		20 lit putc i u. "=" puts i mbox @ u.x
+	then then
+loop
+0A lit putc ;
+
+\ hstart  every hart waiting started.  The harts start at once, but
+\ reaching their mailboxes may take a moment (under QEMU, with more harts
+\ than the host has cores, a hart's thread waits its turn): hart 0 waits
+\ until 100 ms pass with no new one, and a hart it starts has 10 s to say so.  Each started hart gets 36 KiB of the heap: its record
+\ and trap area, 16 KiB of data stack, 4 KiB each of loop frames, return ids
+\ and heap.  Then the locks' size, from the highest hart id.
+: hstart
+hstarted @ 0= if
+	1 lit hstarted !
+	hentry
+	1 lit nharts !  1 lit hmax !
+	1 lit mhartid@ hup harr !
+	hpresent mtime@
+	begin mtime@ over - F4240 lit u< while
+		hpresent 2 lit pick <> if 2drop hpresent mtime@ then
+	repeat
+	2drop
+	MAXH 1 lit do
+		i mbox @ 1 lit = if
+			9000 lit alloc FFF lit + FFFFF000 lit and   \ ( blk )
+			hentrya @ over !
+			dup 5000 lit + over 4 lit + !              \ sp
+			dup 6000 lit + over 8 lit + !              \ s8
+			s10@ over C lit + !                        \ s10, shared
+			dup 7000 lit + over 10 lit + !             \ s11
+			dup 7000 lit + over 14 lit + !             \ gp
+			dup 40 lit + over 18 lit + !               \ the trap area
+			trapvec @ over 1C lit + !                  \ the trap entry
+			fence
+			i mbox !
+			fence
+			i ipi
+			nharts @ 1 lit + nharts !
+			i 1 lit + hmax !
+		then
+	loop
+	mtime@
+	begin hupn nharts @ 1 lit - u< while
+		mtime@ over - 5F5E100 lit u> if hlate "a hart did not start" panic then
+	repeat
+	drop
+	1 lit 0 lit
+	begin over hmax @ u< while swap 1 lit lshift swap 1 lit + repeat
+	lkl ! lkn !
+	lknew klk !
+then ;
+
+\ hjobs ( job -- )  asked of every started hart.
+: hjobs
+hmax @ 1 lit u> if
+	hmax @ 1 lit do
+		i hup harr @ if dup i hjob harr ! fence i ipi then
+	loop
+then
+drop ;
+
+\ hjwait  until every started hart has done its job.
+: hjwait
+begin
+	0 lit
+	hmax @ 1 lit u> if hmax @ 1 lit do i hjob harr @ or loop then
+while repeat
+fence ;
+
 Test {
 	pg_one {
 		\ a range of 64 pages: three taken in a row, given back in another
@@ -463,16 +868,45 @@ Test {
 		100000 lit 0 lit do rnd drop loop
 		tmroff
 		rndseed @ asrt_eq
-		ticks @ 2 lit u< 0= assert           \ and it was interrupted
+		ticks@ 2 lit u< 0= assert            \ and it was interrupted
 	}
 	timer {
 		\ 20 ticks, each a period at least after the last: none early, and
 		\ they keep coming
 		trapinit tmrinit
 		mtime@
-		begin ticks @ 14 lit u< while wfi repeat
+		begin ticks@ 14 lit u< while wfi repeat
 		tmroff
 		mtime@ swap -                        \ elapsed
 		period @ 13 lit * u< 0= assert       \ at least 19 periods
+	}
+	harts {
+		\ every hart there is started; 1000 counts each under the lock come
+		\ out whole; numbers sent to each hart through its queue arrive
+		\ every one, in order
+		trapinit hstart
+		hupn nharts @ 1 lit - asrt_eq
+		0 lit lkc !  3E8 lit lkk !
+		1 lit hjobs lkstrs hjwait
+		lkc @ nharts @ 3E8 lit * asrt_eq
+		hmax @ 1 lit u> if
+			hmax @ 1 lit do
+				i hup harr @ if qnew i hq harr !  0 lit i hres harr ! then
+			loop
+		then
+		2 lit hjobs
+		lkk @ 1 lit + 1 lit do
+			hmax @ 1 lit u> if
+				hmax @ 1 lit do
+					i hup harr @ if
+						begin j i hq harr @ qpush until
+					then
+				loop
+			then
+		loop
+		hjwait
+		0 lit hmax @ 1 lit u> if hmax @ 1 lit do i hres harr @ or loop then
+		0 lit asrt_eq
+		"harts: " puts nharts @ u. 0A lit putc
 	}
 }

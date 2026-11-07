@@ -13,6 +13,8 @@
 #                 RAM above its image (lib/stdlib.fam init: the data stack ends
 #                 at 0x88000000, the top of the virt machine's default 128 MiB),
 #                 so pick an address the program will not allocate over.
+#   --smp=N       N harts (default 1): all start at 0x80000000; a fam
+#                 program's stdlib keeps all but hart 0 waiting (docs/OS.md)
 #   --in=FILE     serial input from FILE  ┐ file-backed serial instead of
 #   --out=FILE    serial output to FILE   ┘ stdio, byte-exact; used by tools/fam
 #                 for the compile step.  --out required with --in.
@@ -35,6 +37,7 @@ MAC=""
 SERIN=""
 SEROUT=""
 LOADS=""
+SMP=1
 
 for arg in "$@"; do
 	case "$arg" in
@@ -46,6 +49,7 @@ for arg in "$@"; do
 		--hostfwd=*) HOSTFWD="${arg#--hostfwd=}" ;;
 		--netdev=*) NETDEV="${arg#--netdev=}" ;;
 		--mac=*) MAC="${arg#--mac=}" ;;
+		--smp=*) SMP="${arg#--smp=}" ;;
 		--in=*) SERIN="${arg#--in=}" ;;
 		--out=*) SEROUT="${arg#--out=}" ;;
 		--help|-h)
@@ -82,7 +86,7 @@ if [ -n "$SERIN" ] && [ -z "$SEROUT" ]; then
 fi
 
 # Build QEMU arguments
-ARGS="-machine virt -cpu $CPU -nographic -bios none"
+ARGS="-machine virt -cpu $CPU -smp $SMP -nographic -bios none"
 ARGS="$ARGS -device loader,file=$FILE,addr=0x80000000"
 for spec in $LOADS; do
 	lfile=${spec%@*}; laddr=${spec##*@}

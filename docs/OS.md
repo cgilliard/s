@@ -401,7 +401,34 @@ kernel too much to add at the end.
    interrupts between them, locks without atomics (a tournament of
    Peterson locks) and single-writer queues. Done when `-smp 1` to
    `-smp 64` boot, and a stress test of the locks and queues on every
-   hart finds nothing wrong.
+   hart finds nothing wrong. Done (2026-11-06), but for the run queues
+   (step 5). The contract, in `lib/stdlib.fam` and `src/tabernacle.S`,
+   the same instructions in both: every hart but 0 copies a ten-word
+   wait loop to `0x87FF1F00`, writes 1 ("present") to its mailbox word
+   `0x87FF1000 + 4*hartid` (ids below 960), and sleeps there with only
+   software interrupts enabled; the OS releases it by writing the
+   address of a record (where to go, then the hart's stacks, trap area
+   and trap entry) to its mailbox and raising its `msip`. The stdlib
+   does it too, so a fam program started by QEMU on several harts
+   (`q32 --smp=N`) behaves as one booted by tabernacle; and fampack's
+   unpacking stub keeps the other harts until hart 0 has unpacked. The
+   kernel (`hstart`) counts the marked mailboxes once 100 ms pass with no
+   new one, gives each hart 36 KiB (record, stacks, a heap it must not
+   use), and starts it; each runs `hmain`: its own timer, then the jobs
+   hart 0 asks of it. Locks: a tournament of two-hart Peterson locks,
+   log2 of the harts in steps, a `fence` between a hart's write of its
+   flag and its read of the other's. Queues: head and tail moved by one
+   side each, fences between. Found on the way: under QEMU, with 64
+   harts on six host cores, a hart could still be running its first
+   instructions at `0x80000000` when tabernacle wrote the image there;
+   tabernacle now waits for the marks to settle (100 ms) first.
+   `scripts/oscheck.sh`: the kernel's tests on 1, 2, 8 and 64 harts
+   (1000 counts each under the lock, every one kept: without the lock
+   counts are lost; numbers through each hart's queue, all in order),
+   and the image booting on 6 harts and, through tabernacle, on 64.
+   Real hardware without Zifencei must run code it copied (the wait
+   loop, tabernacle moved, an image unpacked) only where nothing was
+   cached from before: QEMU needs no such care.
 4. **User mode and the first program.** The program table, PMP for one
    process, `ecall` with the fewest calls (`exit`, a console `write`),
    and the stdlib header for programs of the OS (their output through

@@ -143,9 +143,52 @@ _base\@:
 .equ P_TRIES, 20
 
 # ===========================================================================
-# Move to RELOC and go on there.
+# Harts other than 0 wait, before anything else (docs/OS.md, section 3; the
+# same sequence, word for word, as lib/stdlib.fam's): each copies the wait
+# loop to 0x87FF1F00, marks its mailbox word (0x87FF1000 + 4*hartid) present,
+# and sleeps there until the OS writes it a record to go to.  Hart 0 boots.
 _start:
-        auipc   t0, 0
+        csrr    t0, mhartid
+        beqz    t0, park_go
+park_here:
+        auipc   t1, 0
+        addi    t1, t1, 96              # park_code (the assembler takes no
+        li      t2, 0x87FF1F00          #   forward difference here)
+        li      t3, 10                  # its words
+1:      lw      t4, 0(t1)
+        sw      t4, 0(t2)
+        addi    t1, t1, 4
+        addi    t2, t2, 4
+        addi    t3, t3, -1
+        bnez    t3, 1b
+        li      t2, 0x87FF1F00
+        li      t1, 960
+        bgeu    t0, t1, park_many
+        slli    t0, t0, 2               # its mailbox word
+        li      t1, 0x87FF1000
+        add     t0, t0, t1
+        li      t1, 1                   # present
+        sw      t1, 0(t0)
+        fence
+        jr      t2
+park_many:
+        addi    t2, t2, 32              # a hart id past the mailboxes: sleep
+        jr      t2
+park_code:                              # (copied to 0x87FF1F00)
+        li      t1, 8                   # software interrupts wake wfi
+        csrs    mie, t1
+2:      wfi
+        lw      a0, 0(t0)
+        li      t1, 1
+        bgeu    t1, a0, 2b              # 0 or 1: not released yet
+        lw      t1, 0(a0)               # the record's first word: where to go
+        jr      t1
+park_dead:
+        wfi
+        j       park_dead
+park_go:
+# Move to RELOC and go on there.
+        LOAD_ADDRESS t0, _start
         addi    t0, t0, -4              # where we were loaded (the magic)
         LOAD_ADDRESS t4, main
         sub     t4, t4, t0
@@ -166,6 +209,7 @@ main:
         mv      a0, s0
         li      a1, V_SIZE
         jal     zero_bytes
+        jal     settle
         LOAD_ADDRESS s4, cfg_version
         lw      t0, 4(s4)
         LOAD_ADDRESS a0, msg_unpatched
@@ -1216,6 +1260,33 @@ disk_read:
         j       1b
 8:      li      a0, 0
 9:      POP     ra, s5, s6, s7
+        ret
+
+# The other harts all leave 0x80000000 (where they started, and where the
+# image will be written) on their way to wait at 0x87FF1F00, each marking
+# its mailbox as it goes; under QEMU, with more harts than the host has
+# cores, one may take a while to be run at all.  So wait until 100 ms pass
+# with no new mark before anything is written there.
+settle:
+        li      t5, MTIME
+        lw      t6, 0(t5)               # since the last new mark
+        li      a2, 0                   # marks seen
+1:      li      t0, 0x87FF1000
+        li      t1, 0x87FF1F00
+        li      a3, 0
+2:      lw      t2, 0(t0)
+        addi    t2, t2, -1
+        bnez    t2, 3f
+        addi    a3, a3, 1
+3:      addi    t0, t0, 4
+        bltu    t0, t1, 2b
+        beq     a3, a2, 4f
+        mv      a2, a3
+        lw      t6, 0(t5)
+4:      lw      t4, 0(t5)
+        sub     t4, t4, t6
+        li      t3, TICK / 10
+        bltu    t4, t3, 1b
         ret
 
 # a0 = time (MTIME's low word).

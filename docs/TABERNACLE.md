@@ -2,7 +2,7 @@
 
 Written 2026-11-06; the boot program, `server.py` and `node.sh` built the
 same day (see the implementation order). `tabernacle` is the fam
-node's boot program: a few kilobytes (4,241 bytes, packed) that run the
+node's boot program: a few kilobytes (4,498 bytes, packed) that run the
 node image from disk if it is there and correct, and otherwise fetch it
 from the peer-to-peer network, check it, and run it. The node image
 itself (the full node, written in fam) is everything else; this
@@ -39,6 +39,11 @@ values, and so is the disk.
 
 ## Booting
 
+0. **Other harts.** Every hart starts at `0x80000000`. All but hart 0
+   wait (docs/OS.md, section 3: they mark their mailboxes in the page at
+   `0x87FF1000` and sleep in a loop copied to its end) until the OS
+   releases them; hart 0 waits until 100 ms pass with no new hart
+   marking, so that none is still running where the image will go.
 1. **Disk.** Read `size` bytes from the start of the virtio-blk disk
    (the image is stored there as is, no header) and hash them. If the
    hash matches, run it.

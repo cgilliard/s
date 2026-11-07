@@ -1,11 +1,11 @@
 #!/bin/sh
 # oscheck.sh — the OS's checks (docs/OS.md); run after scripts/build.sh.
 #
-# The kernel's own tests (the Test blocks in src/kernel.fam), a fault in the
-# kernel reported rather than hung on, and the image booting: by itself
-# under q32, and through tabernacle from a disk holding it.  Every run has a
-# time limit; one that should keep running (the booted kernel) passes when
-# the limit ends it.
+# The kernel's own tests (the Test blocks in src/kernel.fam) on 1, 2, 8 and
+# 64 harts, a fault in the kernel reported rather than hung on, and the
+# image booting: by itself under q32, and through tabernacle from a disk
+# holding it, on one hart and on several.  Every run has a time limit; one
+# that should keep running (the booted kernel) passes when the limit ends it.
 
 cd "$(dirname "$0")/.." || exit 1
 T=tmp/oscheck
@@ -40,19 +40,23 @@ expect() {
 
 [ -f bin/img ] && [ -f bin/tabernacle ] || { echo "oscheck.sh: run scripts/build.sh first" >&2; exit 1; }
 
-expect kernel_tests 0 'passed' 120 ./tools/fam --test src/kernel.fam
+for n in 1 2 8 64; do
+	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam
+done
 
 printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
 ./tools/fam -o "$T/fault.bin" src/kernel.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
-expect fault 1 'kernel: trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
+expect fault 1 'kernel: hart 0 trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
 
-expect boot 124 'kernel: [0-9]* pages free' 3 ./tools/q32 bin/img
+expect boot 124 'kernel: 1 hart, [0-9]* pages free' 3 ./tools/q32 bin/img
+expect boot_6 124 'kernel: 6 harts' 5 ./tools/q32 --smp=6 bin/img
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds
-grep -q 'kernel: [0-9]* pages free' "$T/boot_disk.out" \
+grep -q 'kernel: 1 hart, [0-9]* pages free' "$T/boot_disk.out" \
 	|| fail boot_disk "no kernel banner: $(head -c 300 "$T/boot_disk.out")"
+expect boot_disk_64 124 'kernel: 64 harts' 15 scripts/node.sh --disk="$T/disk.img" --no-seeds --smp=64
 rm -f "$T/disk.img"
 
 echo "$((N - FAILS)) of $N checks passed"

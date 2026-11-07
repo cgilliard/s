@@ -15,59 +15,7 @@
 \ Uses src/kernel.fam's raw words (mtime@, panic, rnd); runs in machine
 \ mode, its memory from the stdlib's heap.
 
-\ ── Raw helpers ──
-
-\ mcpy ( src dst n -- )  n bytes, a multiple of 4.
-: mcpy
-83230100 ,   \ lw t2,0(sp)
-03234100 ,   \ lw t1,4(sp)
-83228100 ,   \ lw t0,8(sp)
-1301C100 ,   \ addi sp,sp,12
-638E0300 ,   \ beq t2,zero,done
-03AE0200 ,   \ lw t3,0(t0)
-2320C301 ,   \ sw t3,0(t1)
-93824200 ,   \ addi t0,t0,4
-13034300 ,   \ addi t1,t1,4
-9383C3FF ,   \ addi t2,t2,-4
-E39603FE ,   \ bne t2,zero,loop
-;
-
-\ mmove ( src dst n -- )  as mcpy, the two allowed to overlap.
-: mmove
-83230100 ,   \ lw t2,0(sp)
-03234100 ,   \ lw t1,4(sp)
-83228100 ,   \ lw t0,8(sp)
-1301C100 ,   \ addi sp,sp,12
-63820304 ,   \ beq t2,zero,done
-63E06202 ,   \ bltu t0,t1,backward
-03AE0200 ,   \ lw t3,0(t0)
-2320C301 ,   \ sw t3,0(t1)
-93824200 ,   \ addi t0,t0,4
-13034300 ,   \ addi t1,t1,4
-9383C3FF ,   \ addi t2,t2,-4
-E39603FE ,   \ bne t2,zero,forward
-6F004002 ,   \ jal zero,done
-B3827200 ,   \ add t0,t0,t2               backward:
-33037300 ,   \ add t1,t1,t2
-9382C2FF ,   \ addi t0,t0,-4
-1303C3FF ,   \ addi t1,t1,-4
-03AE0200 ,   \ lw t3,0(t0)
-2320C301 ,   \ sw t3,0(t1)
-9383C3FF ,   \ addi t2,t2,-4
-E39603FE ,   \ bne t2,zero,backward
-;
-
-\ mzero ( addr n -- )
-: mzero
-83230100 ,   \ lw t2,0(sp)
-03234100 ,   \ lw t1,4(sp)
-13018100 ,   \ addi sp,sp,8
-638A0300 ,   \ beq t2,zero,done
-23200300 ,   \ sw zero,0(t1)
-13034300 ,   \ addi t1,t1,4
-9383C3FF ,   \ addi t2,t2,-4
-E39A03FE ,   \ bne t2,zero,loop
-;
+\ ── Raw helpers ──  (mcpy, mmove, mzero and fence are the kernel's)
 
 \ kcmp ( a b -- c )  two 32-byte keys, byte by byte: -1, 0 or 1.
 : kcmp
@@ -89,8 +37,6 @@ E39403FE ,   \ bne t2,zero,loop
 130FF0FF ,   \ addi t5,zero,-1
 2320E101 ,   \ sw t5,0(sp)                out:
 ;
-
-:M fence  0F00F00F , ;       \ fence iorw,iorw
 
 \ ── virtio-blk (legacy MMIO, one queue, one request at a time) ──
 

@@ -25,7 +25,7 @@ B7021000 ,   \ lui  t0, 0x100
 \ Wire protocol:
 \ stdin: [4 bytes LE: N] [N bytes data]
 \ stdout: [16 B header (NOP magic + jal + PAYLOAD + UNCOMP)]
-\ [200 B fixed stub body]
+\ [260 B fixed stub body]
 \ The stub copies the payload to 0x84800000, unpacks it to 0x80001000 (a page
 \ boundary, so what is packed runs page-aligned) and jumps to it.
 \ [LZ77 payload]
@@ -372,22 +372,29 @@ wr4
 \ uncomp_size = N (s7)
 s7>tos wr4
 
-\ 200-byte fixed body — 50 instructions, each as 4 LE bytes: the payload
-\ starts at 16 + 200 = 216, the unpacked image at 0x80001000, the last two
-\ words jump there.
-800002B7 lit wr4 82A303 lit wr4 D828393 lit wr4 84800E37 lit wr4
-638EB3 lit wr4 1D38C63 lit wr4 3C503 lit wr4 AE0023 lit wr4
-138393 lit wr4 1E0E13 lit wr4 FEDFF06F lit wr4 C2A303 lit wr4
-848003B7 lit wr4 80001E37 lit wr4 6E0EB3 lit wr4 F13 lit wr4
-F93 lit wr4 7DE0E63 lit wr4 F9863 lit wr4 3CF03 lit wr4
-138393 lit wr4 800F93 lit wr4 80F7513 lit wr4 1F1F13 lit wr4
-FFFF8F93 lit wr4 50C63 lit wr4 3C503 lit wr4 AE0023 lit wr4
-138393 lit wr4 1E0E13 lit wr4 FCDFF06F lit wr4 3C583 lit wr4
-13C603 lit wr4 238393 lit wr4 F67693 lit wr4 869693 lit wr4
-D5E5B3 lit wr4 158593 lit wr4 465693 lit wr4 368693 lit wr4
-40BE0733 lit wr4 FA0680E3 lit wr4 74783 lit wr4 FE0023 lit wr4
-170713 lit wr4 1E0E13 lit wr4 FFF68693 lit wr4 FE9FF06F lit wr4
-800012B7 lit wr4 28067 lit wr4
+\ 260-byte fixed body — 65 instructions, each as 4 LE bytes: the payload
+\ starts at 16 + 260 = 276, the unpacked image at 0x80001000, where the
+\ last words jump.  With several harts every one starts here: those other
+\ than hart 0 wait (the first nine words) until hart 0, its unpacking done,
+\ sets the word below the payload's copy (0x847FFFFC) to "FAM!", then go to
+\ the unpacked program too, whose own start keeps them waiting (stdlib.fam).
+F14022F3 lit wr4 2028263 lit wr4 848002B7 lit wr4 FFC2A303 lit wr4
+214D43B7 lit wr4 14638393 lit wr4 FE7318E3 lit wr4 FF0000F lit wr4
+800012B7 lit wr4 28067 lit wr4 800002B7 lit wr4 82A303 lit wr4
+11428393 lit wr4 84800E37 lit wr4 638EB3 lit wr4 1D38C63 lit wr4
+3C503 lit wr4 AE0023 lit wr4 138393 lit wr4 1E0E13 lit wr4
+FEDFF06F lit wr4 C2A303 lit wr4 848003B7 lit wr4 80001E37 lit wr4
+6E0EB3 lit wr4 F13 lit wr4 F93 lit wr4 7DE0E63 lit wr4
+F9863 lit wr4 3CF03 lit wr4 138393 lit wr4 800F93 lit wr4
+80F7513 lit wr4 1F1F13 lit wr4 FFFF8F93 lit wr4 50C63 lit wr4
+3C503 lit wr4 AE0023 lit wr4 138393 lit wr4 1E0E13 lit wr4
+FCDFF06F lit wr4 3C583 lit wr4 13C603 lit wr4 238393 lit wr4
+F67693 lit wr4 869693 lit wr4 D5E5B3 lit wr4 158593 lit wr4
+465693 lit wr4 368693 lit wr4 40BE0733 lit wr4 FA0680E3 lit wr4
+74783 lit wr4 FE0023 lit wr4 170713 lit wr4 1E0E13 lit wr4
+FFF68693 lit wr4 FE9FF06F lit wr4 FF0000F lit wr4 848002B7 lit wr4
+214D4337 lit wr4 14630313 lit wr4 FE62AE23 lit wr4 800012B7 lit wr4
+28067 lit wr4
 
 
 \ ── Phase 5: emit payload bytes ──

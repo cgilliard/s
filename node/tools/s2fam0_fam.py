@@ -35,7 +35,7 @@ def main():
 
     obj = inp + ".s2fam0.o"
     try:
-        subprocess.run([AS, "-g", "-march=rv32i", "-mabi=ilp32", "-o", obj, inp], check=True)
+        subprocess.run([AS, "-g", "-march=rv32i_zicsr", "-mabi=ilp32", "-o", obj, inp], check=True)
         dis = subprocess.run([ODUMP, "-dlz", obj], check=True, capture_output=True, text=True).stdout
     finally:
         if os.path.exists(obj): os.remove(obj)
