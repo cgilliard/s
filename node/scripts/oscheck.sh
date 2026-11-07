@@ -7,7 +7,9 @@
 # it, on one hart and on several, and running init in user mode; and
 # programs in user mode that touch the kernel's memory, write their own
 # code, or make bad system calls: each ended or refused, the system going
-# on.  Every run has a time limit; one
+# on; and processes and threads: threads counting under a lock, a child
+# spawned and waited for, sleep, await and wake, a process killed with a
+# thread running on another hart, and the lottery's shares.  Every run has a time limit; one
 # that should keep running (the booted kernel) passes when the limit ends it.
 
 cd "$(dirname "$0")/.." || exit 1
@@ -77,6 +79,66 @@ uprog usys '1 lit 80000000 lit 10 lit 11 lit sys . 2C lit putc
 bye'
 expect usys 124 '^-14,-38,-9,A1$' 4 ./tools/q32 "$T/usys.img"
 grep -q 'kernel: init ended: 0' "$T/usys.out" || fail usys "init did not end 0: $(head -c 300 "$T/usys.out")"
+
+# has NAME PATTERN — the output of check NAME matches PATTERN too.
+has() { grep -q -- "$2" "$T/$1.out" || fail "$1" "output $(head -c 300 "$T/$1.out"), expected /$2/ too"; }
+# usrc NAME SOURCE — a program in user mode: $T/NAME.bin.
+usrc() {
+	printf '%s\n' "$2" > "$T/$1.fam"
+	./tools/fam --user -o "$T/$1.bin" "$T/$1.fam" > "$T/$1.build" 2>&1 || fail "$1" "build: $(head -c 300 "$T/$1.build")"
+}
+# uimage NAME KERNEL PROG=SRC[:KiB] ... — an image of programs built by usrc.
+uimage() {
+	img=$1; k=$2; shift 2
+	specs=""
+	for a in "$@"; do specs="$specs ${a%%=*}=$T/${a#*=}"; done
+	specs=$(echo "$specs" | sed 's/=\([^ :]*\)/=\1.bin/g')
+	sh scripts/mkimage.sh "$T/$img.img" "$k" $specs 2> "$T/$img.mk" || fail "$img" "mkimage: $(cat "$T/$img.mk")"
+}
+
+# Processes and threads (step 5).
+usrc tthr ': cnt variable ;  : mtx variable ;  : tc variable ;  : tids variable ;
+0 lit cnt !  0 lit mtx !  10 lit alloc tids !
+tcode[ 3E8 lit 0 lit do mtx lock cnt @ 1 lit + cnt ! mtx unlock loop 7 lit texit ]tcode tc !
+4 lit 0 lit do tc @ 4000 lit alloc 4000 lit + i thread i 2 lit lshift tids @ + ! loop
+0 lit 4 lit 0 lit do i 2 lit lshift tids @ + @ join + loop
+"joined: " puts u. " count: " puts cnt @ u. 0A lit putc bye'
+uimage thr bin/kernel init=tthr:256
+for n in 1 4; do expect "threads_$n" 124 'joined: 28 count: 4000' 10 ./tools/q32 --smp=$n "$T/thr.img"; done
+usrc tspawn ': st variable ;
+"child" spawn dup "spawned " puts u. 0A lit putc
+st wait "waited " puts u. " status " puts st @ u. 0A lit putc
+"nosuch" spawn "nosuch: " puts . 0A lit putc
+FFFFFFFF lit st wait "no child: " puts . 0A lit putc bye'
+usrc child '7 lit exit'
+uimage spawn bin/kernel init=tspawn child=child
+expect spawn_wait 124 'waited 2 status 7' 6 ./tools/q32 --smp=2 "$T/spawn.img"
+has spawn_wait 'nosuch: -2'; has spawn_wait 'no child: -10'; has spawn_wait 'kernel: init ended: 0'
+usrc tsync ': flag variable ;  0 lit flag !
+tcode[ 2FAF080 lit sleep 1 lit flag ! flag 1 lit wake drop ]tcode
+4000 lit alloc 4000 lit + 0 lit thread drop
+flag 0 lit 0 lit await "await: " puts . " flag " puts flag @ u. 0A lit putc
+flag 1 lit 989680 lit await "timed: " puts . 0A lit putc bye'
+uimage sync bin/kernel init=tsync:128
+for n in 1 4; do expect "sleep_await_$n" 124 'await: 0 flag 1' 6 ./tools/q32 --smp=$n "$T/sync.img"; has "sleep_await_$n" 'timed: -110'; done
+usrc tkill 'tcode[ begin 0 lit until ]tcode 4000 lit alloc 4000 lit + 0 lit thread drop
+5F5E100 lit sleep 80000000 lit @ drop'
+uimage kill bin/kernel init=tkill:128
+expect kill_threads 124 'kernel: process killed: trap 00000005' 6 ./tools/q32 --smp=4 "$T/kill.img"
+has kill_threads 'kernel: init ended: -1'
+# The lottery: two programs spinning, 300 and 100 tickets, on one hart for
+# 2 s; their ticks must come out between 2:1 and 4.5:1.
+usrc spin 'begin 0 lit until'
+printf '%s\n' 'kboot
+"spin" 12C lit kspawn drop  "spin" 64 lit kspawn drop
+1312D00 lit hrunfor
+0 lit thn C4 lit + @  1 lit thn C4 lit + @
+"share: " puts over u. " to " puts dup u. 0A lit putc
+over over 1 lit lshift u< 0=  2 lit pick 1 lit lshift 2 lit pick 9 lit * u> 0= and
+nip nip if 0 lit else 1 lit then halt' > "$T/share.fam"
+./tools/fam -o "$T/sharek.bin" src/kernel.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
+uimage share "$T/sharek.bin" spin=spin
+expect lottery 0 'share: ' 20 ./tools/q32 "$T/share.img"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

@@ -456,6 +456,35 @@ kernel too much to add at the end.
    `thread`, `join`, `yield`, `sleep`; the lottery on each hart's
    timer; `lock`, `await`, `wake`; `/proc/<pid>/tickets`. Done when
    programs share every hart in the proportion of their tickets.
+   Done (2026-11-06), but for `/proc` (step 7: a process's tickets are
+   its parent's, or what the kernel gives the processes it starts). A
+   thread's control block is its trap area while it runs; every hart
+   runs `hloop`: a thread drawn by lottery among those ready (one draw
+   over all of them, under the kernel's lock, rather than a queue per
+   hart), run in user mode until it traps back to stay (its 10 ms slice
+   over, a call that waits, its end), then the next. System calls 1-12
+   and 17 as section 5 lists them, `lib/user.fam` wrapping each, and
+   `tcode[ ... ]tcode` for a thread's code (fam has no function
+   pointers: it compiles the code where it is and leaves its address).
+   A process ends with `exit`, a fault, or its last thread; its threads
+   on other harts are stopped by a software interrupt, its memory freed
+   once none is still on a hart; a parent's `wait` takes a child's
+   status, and the kernel says on the console when one it started ends.
+   Checked (`scripts/oscheck.sh`, on 1 to 8 harts): four threads adding
+   1000 each under a lock (4000), joined; a child spawned and waited for
+   (status 7), and the errors for no such program and no child; sleep,
+   await and wake, and a wait timed out; a process killed by a fault
+   while its other thread spins on another hart; two programs of 300 and
+   100 tickets on one hart getting about 3:1 of it (150:51 typically).
+   Found on the way: a thread that blocks, or ends, is still on its hart
+   while the trap unwinds, and its block holds that hart's way back, so
+   it is not run elsewhere (even woken) nor its slot reused until the
+   hart is off it; the result of a call goes where its first argument
+   came (a0), so it is set only once the arguments are read; the
+   lottery's generator is seeded at boot (xorshift never leaves 0);
+   loops over the tables stop at the slots ever used; and
+   `scripts/build.sh` now stops on a compile error rather than building
+   on the compiler's message.
 6. **Memory.** `map` and `unmap`; `malloc` and `free` in the stdlib.
    Done when a long test allocating and freeing on several threads
    holds steady.

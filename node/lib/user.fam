@@ -6,8 +6,9 @@
 \ the kernel gives it.
 \
 \ System calls: the number in a7, the arguments in a0-a2, `ecall`, the
-\ result in a0 (negative: an error).  1 exit(code), 16 read(fd, buf, n),
-\ 17 write(fd, buf, n).
+\ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
+\ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
+\ 11 await, 12 wake (below), 16 read(fd, buf, n), 17 write(fd, buf, n).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -85,6 +86,35 @@
 9302F0FF ,   \ addi t0,zero,-1
 23205100 ,   \ sw t0,0(sp)
 ;                            \ got:
+
+\ ── Processes and threads (docs/OS.md, section 5) ──
+
+: exit    0 lit 0 lit 1 lit sys drop ;       \ ( code -- )  this process ends
+: spawn   0 lit 0 lit 2 lit sys ;            \ ( name -- pid )  a child running that program
+: wait    0 lit 3 lit sys ;                  \ ( pid status-addr -- pid )  a child's end (pid -1: any)
+: thread  4 lit sys ;                        \ ( entry stack-top arg -- tid )  16 KiB below stack-top its own
+: texit   0 lit 0 lit 5 lit sys drop ;       \ ( value -- )  this thread ends
+: join    0 lit 0 lit 6 lit sys ;            \ ( tid -- value )
+: yield   0 lit 0 lit 0 lit 7 lit sys drop ;
+: sleep   0 lit 0 lit 8 lit sys drop ;       \ ( ns -- )
+: lock    0 lit 0 lit 9 lit sys drop ;       \ ( addr -- )  a mutex: the word at addr, 0 free
+: unlock  0 lit 0 lit A lit sys drop ;       \ ( addr -- )
+: await   B lit sys ;                        \ ( addr expected ns -- r )  0; -11 not expected; -110 time ran out
+: wake    0 lit C lit sys ;                  \ ( addr n -- woken )
+
+\ tcode[ ... ]tcode ( -- entry )  a thread's code, compiled where it is but
+\ jumped over; its address left for `thread`.  It runs on its own stacks
+\ (the variables and the heap are shared), and ends with texit(0) if it
+\ does not end itself.
+:I [skip  here ,j0 ;
+:I skip]  jpat! ;
+:M tcode[
+97020000 ,   \ auipc t0,0x0
+93824201 ,   \ addi t0,t0,20              ( the code past the jump )
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+[skip ;
+:M ]tcode  0 lit texit skip] ;
 
 \ The start: the stacks and the heap in the memory given (a0, a1).
 130D0500 ,   \ addi s10,a0,0              ( return ids from the start )

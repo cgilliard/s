@@ -1,11 +1,12 @@
-\ kernel.fam — the OS's kernel (docs/OS.md): steps 1 and 3.  The traps
+\ kernel.fam — the OS's kernel (docs/OS.md), steps 1 to 5.  The traps
 \ (every interrupt and exception comes through one entry, which saves the
 \ registers and calls ktrap), each hart's timer (100 ticks a second), the
 \ page allocator (RAM in 4 KiB pages, a sorted list of free ranges, first
-\ fit, neighbours merged when freed), and every hart the machine has:
-\ started from where they wait (lib/stdlib.fam, tabernacle), locks without
-\ atomic instructions, queues with one writer and one reader, and the
-\ software interrupt that wakes a hart.
+\ fit, neighbours merged when freed), every hart the machine has (started
+\ from where they wait, lib/mach.fam and tabernacle; locks without atomic
+\ instructions; queues with one writer and one reader; the software
+\ interrupt that wakes a hart), and processes and threads in user mode,
+\ scheduled on every hart by lottery, with their system calls.
 \
 \ Definitions only: src/boot.fam is the kernel's main, and the Test blocks
 \ below run with `tools/fam --test [--smp=N] src/kernel.fam`
@@ -229,6 +230,8 @@ dup rndseed ! ;
 : hjob   variable ;          \ the job asked of it (0: none)
 : hres   variable ;          \ what its job found (0: all well)
 : hq     variable ;          \ its queue from hart 0
+: hcur   variable ;          \ the thread it runs (0: none)
+: harea  variable ;          \ its own trap area (mscratch when no thread runs)
 : kvok   variable ;
 
 \ harr ( h var -- addr )  hart h's word of a per-hart array.
@@ -242,6 +245,8 @@ kvok @ 0= if
 	MAXH 2 lit lshift dup alloc dup hjob ! swap mzero
 	MAXH 2 lit lshift dup alloc dup hres ! swap mzero
 	MAXH 2 lit lshift dup alloc dup hq ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hcur ! swap mzero
+	MAXH 2 lit lshift dup alloc dup harea ! swap mzero
 	1 lit kvok !
 then ;
 
@@ -270,209 +275,6 @@ mtime@ period @ +            \ ( lo' )
 over period @ u< if 1 lit + then
 cmp!
 tmron ;
-
-\ ── Traps ──
-
-\ kfault  an exception (or an interrupt nobody takes) in the kernel: a bug.
-: kfault
-"kernel: hart " puts mhartid@ u. " trap " puts mcause@ u.x
-" at " puts mepc@ u.x
-" (" puts mtval@ u.x ")" puts 0A lit putc
-1 lit halt ;
-
-\ ── User mode: the trap side ──
-\
-\ A hart's trap area, past the registers: 128 the kernel's sp, s8, s10, s11
-\ and gp as urun left them, 148 where urun goes on, 152 set when the
-\ process has ended, 156 its exit code, 160 its code's first byte and the
-\ byte past it, 168 its memory's.
-
-: area@                      \ ( -- area )  this hart's trap area
-F3220034 ,   \ csrrs t0,mscratch,zero
-1301C1FF ,   \ addi sp,sp,-4
-23205100 ,   \ sw t0,0(sp)
-;
-
-: mpp@                       \ ( -- mode )  the mode the trap came from: 0 user, 3 machine
-F3220030 ,   \ csrrs t0,mstatus,zero
-93D2B200 ,   \ srli t0,t0,0xb
-93F23200 ,   \ andi t0,t0,3
-1301C1FF ,   \ addi sp,sp,-4
-23205100 ,   \ sw t0,0(sp)
-;
-
-: mepc!                      \ ( pc -- )  where mret goes
-83220100 ,   \ lw t0,0(sp)
-13014100 ,   \ addi sp,sp,4
-73901234 ,   \ csrrw zero,mepc,t0
-;
-
-: sysarg  area@ + @ ;        \ ( offset -- value )  a register the process trapped with
-: sysret  area@ 28 lit + ! ; \ ( value -- )  its a0 when it goes on
-: uexit   area@ 9C lit + !  1 lit area@ 98 lit + ! ;   \ ( code -- )  it ends
-
-\ inr ( a e lo hi -- ok )  [a, e) within [lo, hi).
-: inr  rot u< 0= -rot u< 0= and ;
-
-\ urange ( addr n -- ok )  n bytes from addr within the process's code or
-\ its memory.
-: urange
-over + 2dup u> if 2drop 0 lit else
-	2dup area@ A0 lit + @ area@ A4 lit + @ inr
-	-rot area@ A8 lit + @ area@ AC lit + @ inr or
-then ;
-
-\ kwrite  write(fd, buf, n): to the console, for fds 1 and 2.
-: kwrite
-28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFF7 lit sysret else      \ -9: no such fd
-2C lit sysarg 30 lit sysarg urange 0= if FFFFFFF2 lit sysret else            \ -14: not its memory
-	30 lit sysarg ?dup if 2C lit sysarg swap 0 lit do dup i + c@ putc loop drop then
-	30 lit sysarg sysret
-then then ;
-
-\ ksys  a system call (ecall from user mode): the number in a7.
-: ksys
-44 lit sysarg
-dup 1 lit = if drop 28 lit sysarg uexit else
-11 lit = if kwrite else FFFFFFDA lit sysret then                            \ -38: no such call
-mepc@ 4 lit + mepc!
-then ;
-
-\ ukill  an exception in user mode: the process ends, the system goes on.
-: ukill
-"kernel: process killed: trap " puts mcause@ u.x
-" at " puts mepc@ u.x " (" puts mtval@ u.x ")" puts 0A lit putc
-FFFFFFFF lit uexit ;
-
-\ kipi  a software interrupt: cleared, and counted (what it asks is in the
-\ hart's job word).
-: kipi  msipclr mhartid@ hipi harr dup @ 1 lit + swap ! ;
-
-\ ktrap  what the entry calls, with every register saved.  Interrupts are
-\ taken from either mode; an exception from user mode is the process's (a
-\ system call, or its end), from the kernel a bug.
-: ktrap
-mcause@
-dup 80000007 lit = if drop ktick else
-dup 80000003 lit = if drop kipi else
-mpp@ if drop kfault else
-8 lit = if ksys else ukill then
-then then then ;
-
-\ [skip ... skip]  compile the code between where it is but jump over it.
-:I [skip  here ,j0 ;
-:I skip]  jpat! ;
-
-: trapvec variable ;         \ the entry, for the harts started later
-
-\ trapinit  the trap entry: mscratch holds a hart's trap area (256 bytes:
-\ urun's words at 128 on) where the entry saves x1-x31 (x5 by way of
-\ mscratch itself) before calling ktrap, and from where it restores them
-\ for mret.  A trap from user mode runs ktrap on the kernel's stacks, as
-\ urun saved them; when ktrap ends the process (uexit), the entry goes on
-\ where urun left off rather than back to the process.  mtvec points at the
-\ entry, 16 bytes past the auipc (auipc, addi, csrw, and [skip's jump).
-: trapinit
-kvars
-100 lit alloc
-83220100 ,   \ lw t0,0(sp)
-13014100 ,   \ addi sp,sp,4
-73900234 ,   \ csrrw zero,mscratch,t0
-97020000 ,   \ auipc t0,0x0
-93820201 ,   \ addi t0,t0,16
-73905230 ,   \ csrrw zero,mtvec,t0
-[skip
-F3920234 ,   \ csrrw t0,mscratch,t0      ( t0 = the area, mscratch = t0 )
-23A21200 ,   \ sw ra,4(t0)
-23A42200 ,   \ sw sp,8(t0)
-23A63200 ,   \ sw gp,12(t0)
-23A84200 ,   \ sw tp,16(t0)
-23AC6200 ,   \ sw t1,24(t0)
-23AE7200 ,   \ sw t2,28(t0)
-23A08202 ,   \ sw s0,32(t0)
-23A29202 ,   \ sw s1,36(t0)
-23A4A202 ,   \ sw a0,40(t0)
-23A6B202 ,   \ sw a1,44(t0)
-23A8C202 ,   \ sw a2,48(t0)
-23AAD202 ,   \ sw a3,52(t0)
-23ACE202 ,   \ sw a4,56(t0)
-23AEF202 ,   \ sw a5,60(t0)
-23A00205 ,   \ sw a6,64(t0)
-23A21205 ,   \ sw a7,68(t0)
-23A42205 ,   \ sw s2,72(t0)
-23A63205 ,   \ sw s3,76(t0)
-23A84205 ,   \ sw s4,80(t0)
-23AA5205 ,   \ sw s5,84(t0)
-23AC6205 ,   \ sw s6,88(t0)
-23AE7205 ,   \ sw s7,92(t0)
-23A08207 ,   \ sw s8,96(t0)
-23A29207 ,   \ sw s9,100(t0)
-23A4A207 ,   \ sw s10,104(t0)
-23A6B207 ,   \ sw s11,108(t0)
-23A8C207 ,   \ sw t3,112(t0)
-23AAD207 ,   \ sw t4,116(t0)
-23ACE207 ,   \ sw t5,120(t0)
-23AEF207 ,   \ sw t6,124(t0)
-73230034 ,   \ csrrs t1,mscratch,zero    ( the interrupted t0 )
-23AA6200 ,   \ sw t1,20(t0)
-73900234 ,   \ csrrw zero,mscratch,t0    ( mscratch = the area again )
-73230030 ,   \ csrrs t1,mstatus,zero     ( from user mode (MPP 0): )
-1353B300 ,   \ srli t1,t1,0xb
-13733300 ,   \ andi t1,t1,3
-631C0300 ,   \ bne t1,zero,kernel
-03A10208 ,   \ lw sp,128(t0)             ( the kernel's stacks, as urun left them )
-03AC4208 ,   \ lw s8,132(t0)
-03AD8208 ,   \ lw s10,136(t0)
-83ADC208 ,   \ lw s11,140(t0)
-83A10209 ,   \ lw gp,144(t0)
-ktrap                                     \ kernel:
-F3220034 ,   \ csrrs t0,mscratch,zero
-03A38209 ,   \ lw t1,152(t0)             ( the process ended: back to urun )
-63040302 ,   \ beq t1,zero,back
-23AC0208 ,   \ sw zero,152(t0)
-03A10208 ,   \ lw sp,128(t0)
-03AC4208 ,   \ lw s8,132(t0)
-03AD8208 ,   \ lw s10,136(t0)
-83ADC208 ,   \ lw s11,140(t0)
-83A10209 ,   \ lw gp,144(t0)
-73600430 ,   \ csrrsi zero,mstatus,8
-03A34209 ,   \ lw t1,148(t0)
-67000300 ,   \ jalr zero,0(t1)
-F3220034 ,   \ csrrs t0,mscratch,zero    back: ( to where the trap came from )
-83A04200 ,   \ lw ra,4(t0)
-03A18200 ,   \ lw sp,8(t0)
-83A1C200 ,   \ lw gp,12(t0)
-03A20201 ,   \ lw tp,16(t0)
-03A38201 ,   \ lw t1,24(t0)
-83A3C201 ,   \ lw t2,28(t0)
-03A40202 ,   \ lw s0,32(t0)
-83A44202 ,   \ lw s1,36(t0)
-03A58202 ,   \ lw a0,40(t0)
-83A5C202 ,   \ lw a1,44(t0)
-03A60203 ,   \ lw a2,48(t0)
-83A64203 ,   \ lw a3,52(t0)
-03A78203 ,   \ lw a4,56(t0)
-83A7C203 ,   \ lw a5,60(t0)
-03A80204 ,   \ lw a6,64(t0)
-83A84204 ,   \ lw a7,68(t0)
-03A98204 ,   \ lw s2,72(t0)
-83A9C204 ,   \ lw s3,76(t0)
-03AA0205 ,   \ lw s4,80(t0)
-83AA4205 ,   \ lw s5,84(t0)
-03AB8205 ,   \ lw s6,88(t0)
-83ABC205 ,   \ lw s7,92(t0)
-03AC0206 ,   \ lw s8,96(t0)
-83AC4206 ,   \ lw s9,100(t0)
-03AD8206 ,   \ lw s10,104(t0)
-83ADC206 ,   \ lw s11,108(t0)
-03AE0207 ,   \ lw t3,112(t0)
-83AE4207 ,   \ lw t4,116(t0)
-03AF8207 ,   \ lw t5,120(t0)
-83AFC207 ,   \ lw t6,124(t0)
-83A24201 ,   \ lw t0,20(t0)
-73002030 ,   \ mret
-skip]
-mtvec@ trapvec ! ;
 
 \ ── Pages ──
 \
@@ -608,139 +410,6 @@ then ;
 \ pgchk ( addr pages -- ok )  tests: each page's first word still addr.
 : pgchk  1 lit -rot 0 lit do dup i C lit lshift + @ over = rot and swap loop drop ;
 
-\ ── User mode: running a program ──
-
-\ upmp  PMP for the process in the trap area: its code read and execute
-\ (entries 1-2, top of range), its memory read and write (3-4); user mode
-\ reaches nothing else.  Entry 0 is lib/mach.fam's locked guard on hart 0.
-: upmp
-F3220034 ,   \ csrrs t0,mscratch,zero
-03A3020A ,   \ lw t1,160(t0)
-13532300 ,   \ srli t1,t1,0x2
-7310133B ,   \ csrrw zero,pmpaddr1,t1
-03A3420A ,   \ lw t1,164(t0)
-13532300 ,   \ srli t1,t1,0x2
-7310233B ,   \ csrrw zero,pmpaddr2,t1
-03A3820A ,   \ lw t1,168(t0)
-13532300 ,   \ srli t1,t1,0x2
-7310333B ,   \ csrrw zero,pmpaddr3,t1
-03A3C20A ,   \ lw t1,172(t0)
-13532300 ,   \ srli t1,t1,0x2
-7310433B ,   \ csrrw zero,pmpaddr4,t1
-37030D00 ,   \ lui t1,0xd0               ( 2: top of range, read, execute )
-7310033A ,   \ csrrw zero,pmpcfg0,t1
-1303B000 ,   \ addi t1,zero,11           ( 4: top of range, read, write )
-7310133A ,   \ csrrw zero,pmpcfg1,t1
-;
-
-\ urun ( cs ce ds de -- code )  a program run in user mode, on this hart,
-\ until it ends: its code [cs, ce) (it starts at cs), its memory [ds, de)
-\ (given to it in a0 and a1).  Every other register starts zero.  The
-\ kernel's stacks are kept in the trap area for the traps it takes; when it
-\ exits or is killed, the entry goes on here, after the mret.
-: urun
-area@ AC lit + !  area@ A8 lit + !  area@ A4 lit + !  area@ A0 lit + !
-upmp
-F3220034 ,   \ csrrs t0,mscratch,zero
-23A02208 ,   \ sw sp,128(t0)
-23A28209 ,   \ sw s8,132(t0)
-23A4A209 ,   \ sw s10,136(t0)
-23A6B209 ,   \ sw s11,140(t0)
-23A83208 ,   \ sw gp,144(t0)
-17030000 ,   \ auipc t1,0x0
-1303830A ,   \ addi t1,t1,168            ( past the mret )
-23AA6208 ,   \ sw t1,148(t0)
-03A3020A ,   \ lw t1,160(t0)
-73101334 ,   \ csrrw zero,mepc,t1        ( it starts at its code's first byte )
-37230000 ,   \ lui t1,0x2
-13030380 ,   \ addi t1,t1,-2048
-73300330 ,   \ csrrc zero,mstatus,t1     ( MPP: user mode )
-13030008 ,   \ addi t1,zero,128
-73200330 ,   \ csrrs zero,mstatus,t1     ( MPIE: interrupts on in it )
-03A5820A ,   \ lw a0,168(t0)
-83A5C20A ,   \ lw a1,172(t0)
-93000000 ,   \ addi ra,zero,0
-13010000 ,   \ addi sp,zero,0
-93010000 ,   \ addi gp,zero,0
-13020000 ,   \ addi tp,zero,0
-93020000 ,   \ addi t0,zero,0
-13030000 ,   \ addi t1,zero,0
-93030000 ,   \ addi t2,zero,0
-13040000 ,   \ addi s0,zero,0
-93040000 ,   \ addi s1,zero,0
-13060000 ,   \ addi a2,zero,0
-93060000 ,   \ addi a3,zero,0
-13070000 ,   \ addi a4,zero,0
-93070000 ,   \ addi a5,zero,0
-13080000 ,   \ addi a6,zero,0
-93080000 ,   \ addi a7,zero,0
-13090000 ,   \ addi s2,zero,0
-93090000 ,   \ addi s3,zero,0
-130A0000 ,   \ addi s4,zero,0
-930A0000 ,   \ addi s5,zero,0
-130B0000 ,   \ addi s6,zero,0
-930B0000 ,   \ addi s7,zero,0
-130C0000 ,   \ addi s8,zero,0
-930C0000 ,   \ addi s9,zero,0
-130D0000 ,   \ addi s10,zero,0
-930D0000 ,   \ addi s11,zero,0
-130E0000 ,   \ addi t3,zero,0
-930E0000 ,   \ addi t4,zero,0
-130F0000 ,   \ addi t5,zero,0
-930F0000 ,   \ addi t6,zero,0
-73002030 ,   \ mret
-area@ 9C lit + @ ;
-
-\ The programs the image carries (scripts/mkimage.sh): a table past them,
-\ its offset and "PROG" in the image's last 8 bytes, where the kernel's
-\ return ids begin (s10).  An entry: the name (16 bytes), the offset, the
-\ length, the memory to start with.
-
-: ptab  s10@ 4 lit - @ 474F5250 lit = if s10@ 8 lit - @ 80000000 lit + else 0 lit then ;  \ ( -- table | 0 )
-
-\ streq ( a b -- ok )  two NUL-terminated strings the same.
-: streq
-begin
-	over c@ over c@ over <>
-	if 2drop drop 0 lit 1 lit else
-	0= if 2drop 1 lit 1 lit else
-	1 lit + swap 1 lit + swap 0 lit then then
-until ;
-
-\ pfind ( name -- entry | 0 )
-: pfind
-ptab ?dup 0= if drop 0 lit else
-	dup @ ?dup 0= if 2drop 0 lit else
-		0 lit swap 0 lit do
-			dup 0= if over 4 lit + i 1C lit * + 3 lit pick over streq if nip else drop then then
-		loop
-		nip nip
-	then
-then ;
-
-: pmem  variable ;  : pdat variable ;
-
-\ prun ( name -- code )  the program run to its end, on this hart, in its
-\ memory (pages, zeroed, given back after).  -1: none such, or no memory,
-\ or it was killed.
-: prun
-dup pfind ?dup 0= if
-	"kernel: no program " puts puts 0A lit putc FFFFFFFF lit
-else
-	nip
-	dup 18 lit + @ FFF lit + C lit rshift pmem !
-	pmem @ pgalloc dup pdat ! 0= if
-		drop "kernel: no memory for a program" puts 0A lit putc FFFFFFFF lit
-	else
-		pdat @ pmem @ C lit lshift mzero
-		dup 10 lit + @ 80000000 lit +
-		swap 14 lit + @ over +
-		pdat @ dup pmem @ C lit lshift +
-		urun
-		pdat @ pmem @ pgfree
-	then
-then ;
-
 \ ── Locks, without atomic instructions ──
 \
 \ A tournament of two-hart Peterson locks: a hart takes the lock at the
@@ -852,7 +521,7 @@ dup 4 lit + @ over @ = if drop 0 lit else
 	1 lit
 then ;
 
-\ ── Every hart ──
+\ ── Every hart: what it shares ──
 \
 \ Hart 0 runs the kernel's main; the others wait where lib/stdlib.fam (or
 \ tabernacle) left them, each having marked its mailbox present, until
@@ -884,17 +553,783 @@ repeat
 
 : hrun  dup 1 lit = if lkstrs then 2 lit = if qstrs then ;   \ ( job -- )
 
-\ hmain  where a started hart lives.
-: hmain
-swon tmrinit
-fence 1 lit mhartid@ hup harr !
+\ kfault  an exception (or an interrupt nobody takes) in the kernel: a bug.
+: kfault
+"kernel: hart " puts mhartid@ u. " trap " puts mcause@ u.x
+" at " puts mepc@ u.x
+" (" puts mtval@ u.x ")" puts 0A lit putc
+1 lit halt ;
+
+\ ── User mode ──
+\
+\ A hart's trap area, or a thread's control block (below), past the
+\ registers: 128 the kernel's sp, s8, s10, s11 and gp as trun left them,
+\ 148 where trun goes on, 152 set when the thread stops running, 160 its
+\ process's code (its first byte, the byte past it), 168 its memory.
+
+: area@                      \ ( -- area )  this hart's trap area
+F3220034 ,   \ csrrs t0,mscratch,zero
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mpp@                       \ ( -- mode )  the mode the trap came from: 0 user, 3 machine
+F3220030 ,   \ csrrs t0,mstatus,zero
+93D2B200 ,   \ srli t0,t0,0xb
+93F23200 ,   \ andi t0,t0,3
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+: mepc!                      \ ( pc -- )  where mret goes
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+73901234 ,   \ csrrw zero,mepc,t0
+;
+
+: sysarg  area@ + @ ;        \ ( offset -- value )  a register the process trapped with
+: sysret  area@ 28 lit + ! ; \ ( value -- )  its a0 when it goes on
+\ inr ( a e lo hi -- ok )  [a, e) within [lo, hi).
+: inr  rot u< 0= -rot u< 0= and ;
+
+\ urange ( addr n -- ok )  n bytes from addr within the process's code or
+\ its memory.
+: urange
+over + 2dup u> if 2drop 0 lit else
+	2dup area@ A0 lit + @ area@ A4 lit + @ inr
+	-rot area@ A8 lit + @ area@ AC lit + @ inr or
+then ;
+
+\ upmp  PMP for the process in the trap area: its code read and execute
+\ (entries 1-2, top of range), its memory read and write (3-4); user mode
+\ reaches nothing else.  Entry 0 is lib/mach.fam's locked guard on hart 0.
+: upmp
+F3220034 ,   \ csrrs t0,mscratch,zero
+03A3020A ,   \ lw t1,160(t0)
+13532300 ,   \ srli t1,t1,0x2
+7310133B ,   \ csrrw zero,pmpaddr1,t1
+03A3420A ,   \ lw t1,164(t0)
+13532300 ,   \ srli t1,t1,0x2
+7310233B ,   \ csrrw zero,pmpaddr2,t1
+03A3820A ,   \ lw t1,168(t0)
+13532300 ,   \ srli t1,t1,0x2
+7310333B ,   \ csrrw zero,pmpaddr3,t1
+03A3C20A ,   \ lw t1,172(t0)
+13532300 ,   \ srli t1,t1,0x2
+7310433B ,   \ csrrw zero,pmpaddr4,t1
+37030D00 ,   \ lui t1,0xd0               ( 2: top of range, read, execute )
+7310033A ,   \ csrrw zero,pmpcfg0,t1
+1303B000 ,   \ addi t1,zero,11           ( 4: top of range, read, write )
+7310133A ,   \ csrrw zero,pmpcfg1,t1
+;
+
+\ The programs the image carries (scripts/mkimage.sh): a table past them,
+\ its offset and "PROG" in the image's last 8 bytes, where the kernel's
+\ return ids begin (s10).  An entry: the name (16 bytes), the offset, the
+\ length, the memory to start with.
+
+: progtab  s10@ 4 lit - @ 474F5250 lit = if s10@ 8 lit - @ 80000000 lit + else 0 lit then ;  \ ( -- table | 0 )
+
+\ streq ( a b -- ok )  two NUL-terminated strings the same.
+: streq
 begin
-	mhartid@ hjob harr @ ?dup if
-		hrun fence 0 lit mhartid@ hjob harr !
+	over c@ over c@ over <>
+	if 2drop drop 0 lit 1 lit else
+	0= if 2drop 1 lit 1 lit else
+	1 lit + swap 1 lit + swap 0 lit then then
+until ;
+
+\ pfind ( name -- entry | 0 )
+: pfind
+progtab ?dup 0= if drop 0 lit else
+	dup @ ?dup 0= if 2drop 0 lit else
+		0 lit swap 0 lit do
+			dup 0= if over 4 lit + i 1C lit * + 3 lit pick over streq if nip else drop then then
+		loop
+		nip nip
+	then
+then ;
+
+\ ── Processes and threads ──
+\
+\ A thread's control block (256 bytes) is its trap area while it runs: the
+\ entry saves its registers there (its pc at 0, x1-x31 at 4-124), the
+\ kernel's stacks for its traps are kept at 128-144 (where trun left them),
+\ trun goes on at 148 when 152 is set, its process's code and memory at
+\ 160-172 (for PMP and the checks of what it passes); then its state at 176
+\ (0 free, 1 ready, 2 running, 3 asleep, 4 blocked, 6 ended, not yet
+\ joined, 7 ended, its slot freed once it is off its hart: while the
+\ thread is there, the hart's way back is in it), its process 180, its tickets 184, when to wake 188, what it
+\ waits on 192, the ticks it has run 196, what it ended with 204, where a
+\ child's status goes 208, what kind of wait 212 (1 a child, 2 a thread, 3
+\ a lock, 4 a word), whether that wait has a time limit 216, and whether
+\ a hart is on it 220: from when tpick gives it to a hart until that hart
+\ is off it again (tafter).  Until then it is not run elsewhere, even woken
+\ (the hart going back to its loop still uses its block), nor its slot
+\ reused.
+\
+\ A process (64 bytes): its state (0 free, 1 living, 2 ended, its parent
+\ not yet told), its parent's pid (0: the kernel), its exit code, its
+\ threads not ended, its memory (first byte, pages), its code (first byte,
+\ the byte past it), its tickets, its program's table entry (whose name
+\ is its first 16 bytes), whether it is ending.
+\
+\ Each hart runs hloop: a thread drawn by lottery among those ready (each
+\ holding its tickets), run until it traps back (its slice over at a timer
+\ tick, a call that blocks, its end), then the next; when none is ready,
+\ wfi.  The tables are the kernel's lock's (klk), held briefly.
+
+:M MAXT 100 lit ;            \ 256 threads
+:M MAXP 40 lit ;             \ 64 processes
+: thr  variable ;            \ the threads' table
+: prc  variable ;            \ the processes'
+
+: thn     8 lit lshift thr @ + ;           \ ( i -- t )
+: prn     6 lit lshift prc @ + ;           \ ( i -- p )
+: tid     thr @ - 8 lit rshift 1 lit + ;   \ ( t -- tid )
+: pid     prc @ - 6 lit rshift 1 lit + ;   \ ( p -- pid )
+: tproc   B4 lit + @ ;                     \ ( t -- p )
+: tstate  B0 lit + @ ;                     \ ( t -- state )
+: tstate! B0 lit + ! ;                     \ ( state t -- )
+: cproc   area@ tproc ;                    \ ( -- p )  the process trapping
+
+: mscr!                  \ ( area -- )
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+73900234 ,   \ csrrw zero,mscratch,t0
+;
+: kdi  73700430 , ;          \ interrupts off (mstatus.MIE)
+: kei  73600430 , ;          \ and on
+
+: thi  variable ;            \ the thread slots ever used: the loops over the
+: phi  variable ;            \ threads (and processes) go no further
+
+\ ptinit  the tables, from the pages.
+: ptinit
+0 lit thi !  0 lit phi !
+10 lit pgalloc dup 0= if "no memory for the threads" panic then dup thr ! 10000 lit mzero
+1 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 1000 lit mzero ;
+
+\ hpoke  every other started hart woken: a thread is ready.
+: hpoke  hmax @ 0 lit do i mhartid@ <> if i hup harr @ if i ipi then then loop ;
+
+\ max ( a b -- larger )  unsigned.
+: max  2dup u< if swap then drop ;
+
+
+\ thnew ( -- t | 0 ), prnew ( -- p | 0 )  a free slot.
+: thnew
+0 lit MAXT 0 lit do dup 0= if i thn dup tstate over DC lit + @ or 0= if nip else drop then then loop
+dup if dup tid thi @ max thi ! then ;
+: prnew
+0 lit MAXP 0 lit do dup 0= if i prn dup @ 0= if nip else drop then then loop
+dup if dup pid phi @ max phi ! then ;
+
+: spe variable ;  : spp variable ;  : spt variable ;
+
+\ pspawn ( name tickets parent -- pid | error )  a process running a
+\ program of the image, its one thread ready.  Under klk.  -2: no such
+\ program, -11: no room in the tables, -12: no memory.
+: pspawn
+rot pfind dup spe !
+0= if 2drop FFFFFFFE lit else
+prnew dup spp ! 0= if 2drop FFFFFFF5 lit else
+thnew dup spt ! 0= if 2drop FFFFFFF5 lit else
+spe @ 18 lit + @ FFF lit + C lit rshift dup pgalloc
+dup 0= if 2drop 2drop FFFFFFF4 lit else
+	dup 2 lit pick C lit lshift mzero
+	spp @ 40 lit mzero
+	spp @ 10 lit + !
+	spp @ 14 lit + !
+	spp @ 4 lit + !
+	dup spp @ 20 lit + !
+	spe @ spp @ 24 lit + !
+	spe @ 10 lit + @ 80000000 lit + spp @ 18 lit + !
+	spp @ 18 lit + @ spe @ 14 lit + @ + spp @ 1C lit + !
+	1 lit spp @ C lit + !
+	1 lit spp @ !
+	spt @ 100 lit mzero
+	spt @ B8 lit + !
+	spp @ spt @ B4 lit + !
+	spp @ 18 lit + @ dup spt @ ! spt @ A0 lit + !
+	spp @ 1C lit + @ spt @ A4 lit + !
+	spp @ 10 lit + @ dup spt @ A8 lit + ! spt @ 28 lit + !
+	spp @ 10 lit + @ spp @ 14 lit + @ C lit lshift + dup spt @ AC lit + ! spt @ 2C lit + !
+	1 lit spt @ tstate!
+	hpoke
+	spp @ pid
+then then then then ;
+
+\ thart ( t -- h+1 | 0 )  the hart running it.
+: thart  0 lit hmax @ 0 lit do i hcur harr @ 2 lit pick = if drop i 1 lit + then loop nip ;
+
+\ preap ( child t -- )  an ended child's status given to t, a thread of
+\ its parent waiting for it (t 0: nobody), and its slot freed.
+: preap
+dup if
+	over pid over 28 lit + !
+	dup D0 lit + @ ?dup if 2 lit pick 8 lit + @ swap ! then
+	0 lit over D4 lit + !
+	1 lit swap tstate!
+else drop then
+0 lit swap ! ;
+
+\ pwaiter ( child -- t | 0 )  a thread of its parent waiting for it.
+: pwaiter
+0 lit
+thi @ 0 lit do
+	dup 0= if
+		i thn dup tstate 4 lit = over D4 lit + @ 1 lit = and
+		over tproc 4 lit pick 4 lit + @ 1 lit - prn = and
+		if dup C0 lit + @ dup FFFFFFFF lit = swap 4 lit pick pid = or if nip else drop then else drop then
+	then
+loop
+nip ;
+
+\ pfinish ( p -- )  its last thread has ended: its memory back, its
+\ unjoined threads' slots free, its children given to the kernel (those
+\ ended, freed), and its parent told (the kernel says so on the console).
+: pfinish
+dup 10 lit + @ over 14 lit + @ pgfree
+thi @ 0 lit do
+	i thn dup tproc 2 lit pick = over tstate 6 lit = and if
+		dup DC lit + @ if 7 lit else 0 lit then swap tstate!
+	else drop then
+loop
+phi @ 0 lit do
+	i prn dup @ if
+		dup 4 lit + @ 2 lit pick pid = if
+			dup @ 2 lit = if 0 lit swap ! else 0 lit swap 4 lit + ! then
+		else drop then
+	else drop then
+loop
+2 lit over !
+dup 4 lit + @ 0= if
+	"kernel: " puts dup 24 lit + @ puts " ended: " puts dup 8 lit + @ . 0A lit putc
+	0 lit swap !
+else
+	dup pwaiter ?dup if preap hpoke else drop then
+then ;
+
+\ tdead ( t -- )  a thread gone; its process finished with its last.
+: tdead
+0 lit over tstate!
+tproc dup C lit + @ 1 lit - dup 2 lit pick C lit + !
+0= if pfinish else drop then ;
+
+
+\ pexit ( p code -- )  a process ends: its threads not running gone now,
+\ those running stopped at their next trap (a software interrupt brings
+\ one), then gone too.  Under klk.
+: pexit
+over 8 lit + !
+1 lit over 28 lit + !
+thi @ 0 lit do
+	i thn dup tproc 2 lit pick = if
+		dup tstate 2 lit = if
+			thart ?dup if 1 lit - ipi then
+		else
+			dup tstate dup 0= over 6 lit = or swap 7 lit = or if drop else tdead then
+		then
+	else drop then
+loop
+drop ;
+
+\ runnable ( t -- ok )  ready, or asleep or waiting with a time limit and
+\ its time come.
+: runnable
+dup DC lit + @ if drop 0 lit else
+dup tstate
+dup 1 lit = if 2drop 1 lit else
+dup 3 lit = swap 4 lit = 2 lit pick D8 lit + @ and or if
+	BC lit + @ mtime@ swap - 0< 0=
+else drop 0 lit then then then ;
+
+\ rndbelow ( n -- r )  0 to n-1, at random (a mask, drawn again past n:
+\ there is no division here worth having).
+: rndbelow
+1 lit begin 2dup u> while 1 lit lshift repeat 1 lit -
+begin rnd over and dup 3 lit pick u< 0= while drop repeat
+nip nip ;
+
+\ tgo ( t -- t )  claimed to run: a wait whose time ran out returns -110.
+: tgo
+1 lit over DC lit + !
+dup tstate 4 lit = if FFFFFF92 lit over 28 lit + ! then
+0 lit over D8 lit + !  0 lit over D4 lit + !
+2 lit over tstate! ;
+
+\ tpick ( -- t | 0 )  the lottery: a runnable thread, each with the chance
+\ of its tickets over all theirs.  Under klk.
+: tpick
+0 lit thi @ 0 lit do i thn dup runnable if B8 lit + @ + else drop then loop
+?dup 0= if 0 lit else
+	rndbelow
+	0 lit swap
+	thi @ 0 lit do
+		over 0= if
+			i thn dup runnable if
+				B8 lit + @ 2dup u< if drop nip i thn swap else - then
+			else drop then
+		then
+	loop
+	drop
+	dup if tgo then
+then ;
+
+\ trun ( t -- )  the thread run on this hart, in user mode, until it traps
+\ back to stay (the entry then goes on here, after the mret).  Interrupts
+\ are off while mscratch is the thread's: one taken in machine mode then
+\ would save the kernel's registers over the thread's.
+: trun
+kdi
+dup mhartid@ hcur harr !
+mscr!
+upmp
+F3220034 ,   \ csrrs t0,mscratch,zero
+23A02208 ,   \ sw sp,128(t0)              ( the kernel's stacks, for its traps )
+23A28209 ,   \ sw s8,132(t0)
+23A4A209 ,   \ sw s10,136(t0)
+23A6B209 ,   \ sw s11,140(t0)
+23A83208 ,   \ sw gp,144(t0)
+17030000 ,   \ auipc t1,0x0
+1303830A ,   \ addi t1,t1,168             ( past the mret: where it comes back )
+23AA6208 ,   \ sw t1,148(t0)
+03A30200 ,   \ lw t1,0(t0)
+73101334 ,   \ csrrw zero,mepc,t1         ( its pc )
+37230000 ,   \ lui t1,0x2
+13030380 ,   \ addi t1,t1,-2048
+73300330 ,   \ csrrc zero,mstatus,t1      ( MPP: user mode )
+13030008 ,   \ addi t1,zero,128
+73200330 ,   \ csrrs zero,mstatus,t1      ( MPIE: interrupts on in it )
+83A04200 ,   \ lw ra,4(t0)                ( its registers )
+03A18200 ,   \ lw sp,8(t0)
+83A1C200 ,   \ lw gp,12(t0)
+03A20201 ,   \ lw tp,16(t0)
+03A38201 ,   \ lw t1,24(t0)
+83A3C201 ,   \ lw t2,28(t0)
+03A40202 ,   \ lw s0,32(t0)
+83A44202 ,   \ lw s1,36(t0)
+03A58202 ,   \ lw a0,40(t0)
+83A5C202 ,   \ lw a1,44(t0)
+03A60203 ,   \ lw a2,48(t0)
+83A64203 ,   \ lw a3,52(t0)
+03A78203 ,   \ lw a4,56(t0)
+83A7C203 ,   \ lw a5,60(t0)
+03A80204 ,   \ lw a6,64(t0)
+83A84204 ,   \ lw a7,68(t0)
+03A98204 ,   \ lw s2,72(t0)
+83A9C204 ,   \ lw s3,76(t0)
+03AA0205 ,   \ lw s4,80(t0)
+83AA4205 ,   \ lw s5,84(t0)
+03AB8205 ,   \ lw s6,88(t0)
+83ABC205 ,   \ lw s7,92(t0)
+03AC0206 ,   \ lw s8,96(t0)
+83AC4206 ,   \ lw s9,100(t0)
+03AD8206 ,   \ lw s10,104(t0)
+83ADC206 ,   \ lw s11,108(t0)
+03AE0207 ,   \ lw t3,112(t0)
+83AE4207 ,   \ lw t4,116(t0)
+03AF8207 ,   \ lw t5,120(t0)
+83AFC207 ,   \ lw t6,124(t0)
+83A24201 ,   \ lw t0,20(t0)
+73002030 ,   \ mret
+mhartid@ harea harr @ mscr!
+kei ;
+
+\ tafter ( t -- )  a thread back from running: gone if its process is
+\ ending, ready again if its slice ran out (or it yielded).
+: tafter
+klk @ lock
+0 lit over DC lit + !
+dup tstate 7 lit = if 0 lit swap tstate! else
+dup tproc 28 lit + @ if
+	dup tstate dup 0= swap 6 lit = or if drop else tdead then
+else
+	dup tstate 2 lit = if 1 lit over tstate! then
+	tstate 1 lit = if hpoke then
+then then
+klk @ unlock ;
+
+: kready variable ;          \ the tables made: threads may be run
+
+\ hstep  one turn of a hart's loop: a test job asked of it, or (once the
+\ kernel is ready) a thread, or sleep until an interrupt.
+: hstep
+mhartid@ hjob harr @ ?dup if
+	hrun fence 0 lit mhartid@ hjob harr !
+else
+	kready @ if klk @ lock tpick klk @ unlock else 0 lit then
+	?dup if
+		trun
+		mhartid@ hcur harr @  0 lit mhartid@ hcur harr !  tafter
 	else
 		wfi
 	then
-0 lit until ;
+then ;
+
+: hloop  begin hstep 0 lit until ;                          \ for good
+: hrunfor  mtime@ + begin hstep dup mtime@ - 0< until drop ;  \ ( ticks -- ) for a while
+
+\ kspawn ( name tickets -- pid | error )  a process the kernel starts.
+: kspawn  klk @ lock 0 lit pspawn klk @ unlock ;
+
+\ ── System calls ──
+\
+\ Each runs in the trap from user mode, area@ the calling thread; it sets
+\ the result (a0) and the pc past the ecall (sret), or stops the thread
+\ (tblock: it waits; tstop: its slice or its life is over).  Pointers it is
+\ given are checked to be the process's.  The result goes in a0, where the
+\ first argument came: set it only once the arguments are read.
+
+: sret    sysret mepc@ 4 lit + mepc! ;                         \ ( v -- )
+: tblock  area@ tstate!  mepc@ 4 lit + area@ !  1 lit area@ 98 lit + ! ;   \ ( state -- )
+: tstop   mepc@ area@ !  1 lit area@ 98 lit + ! ;
+: uword   dup 3 lit and 0= swap 4 lit urange and ;          \ ( addr -- ok ) an aligned word of its
+
+\ ustr ( addr -- ok )  a NUL-terminated name of at most 15 bytes, its own.
+: ustr
+1 lit 0 lit
+10 lit 0 lit do
+	dup 0= if
+		2 lit pick i + 1 lit urange 0= if 2drop 0 lit 1 lit else
+		2 lit pick i + c@ 0= if drop 1 lit then then
+	then
+loop
+0= if drop 0 lit then
+nip ;
+
+\ 1 exit(code): the process ends.
+: sexit  klk @ lock cproc 28 lit sysarg pexit klk @ unlock tstop ;
+
+\ 2 spawn(name): a child running that program, with this one's tickets.
+: sspawn
+28 lit sysarg ustr 0= if FFFFFFF2 lit sret else
+	klk @ lock 28 lit sysarg cproc 20 lit + @ cproc pid pspawn klk @ unlock sret
+then ;
+
+\ 3 wait(pid, &status): a child's end (pid -1: any child's); its pid.
+: swait
+2C lit sysarg dup if uword 0= else drop 0 lit then if FFFFFFF2 lit sret else
+klk @ lock
+0 lit
+phi @ 0 lit do
+	dup 0= if
+		i prn dup @ 2 lit = over 4 lit + @ cproc pid = and
+		over pid 28 lit sysarg = 28 lit sysarg FFFFFFFF lit = or and
+		if nip else drop then
+	then
+loop
+?dup if
+	dup 8 lit + @ 2C lit sysarg ?dup if ! else drop then
+	dup pid swap 0 lit swap !
+	klk @ unlock sret
+else
+	0 lit phi @ 0 lit do i prn dup @ 1 lit = swap 4 lit + @ cproc pid = and or loop
+	if
+		28 lit sysarg area@ C0 lit + !
+		2C lit sysarg area@ D0 lit + !
+		1 lit area@ D4 lit + !
+		4 lit tblock klk @ unlock
+	else
+		klk @ unlock FFFFFFF6 lit sret
+	then
+then then ;
+
+\ 4 thread(entry, stack, arg): a thread of this process at entry, its stacks
+\ the 16 KiB below stack (loop frames, return ids, then its data stack), its
+\ variables and heap this thread's; its argument in a0.
+: sthread
+28 lit sysarg dup 4 lit + area@ A0 lit + @ area@ A4 lit + @ inr
+2C lit sysarg dup 4000 lit - swap area@ A8 lit + @ area@ AC lit + @ inr and
+0= if FFFFFFF2 lit sret else
+klk @ lock
+thnew ?dup 0= if klk @ unlock FFFFFFF5 lit sret else
+	dup 100 lit mzero
+	area@ A0 lit + over A0 lit + 10 lit mcpy
+	area@ tproc over B4 lit + !
+	area@ B8 lit + @ over B8 lit + !
+	28 lit sysarg over !
+	2C lit sysarg dup 2000 lit - 2 lit pick 8 lit + !
+	dup 2 lit pick 60 lit + !
+	1000 lit - over 6C lit + !
+	area@ 68 lit + @ over 68 lit + !
+	area@ C lit + @ over C lit + !
+	30 lit sysarg over 28 lit + !
+	cproc C lit + dup @ 1 lit + swap !
+	1 lit over tstate!
+	tid klk @ unlock hpoke sret
+then then ;
+
+\ 5 thread_exit(value): this thread ends; a thread joining it gets value.
+: stexit
+klk @ lock
+28 lit sysarg area@ CC lit + !
+0 lit thi @ 0 lit do
+	dup 0= if
+		i thn dup tstate 4 lit = over D4 lit + @ 2 lit = and
+		over tproc cproc = and over C0 lit + @ area@ tid = and
+		if nip else drop then
+	then
+loop
+?dup if
+	28 lit sysarg over 28 lit + !  0 lit over D4 lit + !  1 lit swap tstate!
+	7 lit area@ tstate!
+	hpoke
+else
+	6 lit area@ tstate!
+then
+cproc C lit + dup @ 1 lit - tuck swap !
+0= if cproc pfinish then
+klk @ unlock
+mepc@ area@ !  1 lit area@ 98 lit + ! ;
+
+\ 6 join(tid): a thread of this process ended: what it ended with.
+: sjoin
+28 lit sysarg dup 1 lit - MAXT u< 0= if drop FFFFFFFD lit sret else
+1 lit - thn
+klk @ lock
+dup tstate 0= over tproc cproc <> or over area@ = or if drop klk @ unlock FFFFFFFD lit sret else
+dup tstate 6 lit = if
+	dup CC lit + @ swap dup DC lit + @ if 7 lit else 0 lit then swap tstate! klk @ unlock sret
+else
+	tid area@ C0 lit + !  2 lit area@ D4 lit + !  4 lit tblock klk @ unlock
+then then then ;
+
+\ 7 yield: the rest of its slice given up.
+: syield  0 lit sysret mepc@ 4 lit + area@ !  1 lit area@ 98 lit + ! ;
+
+\ 8 sleep(ns)
+: ssleep  28 lit sysarg 64 lit / mtime@ + area@ BC lit + ! 0 lit sysret 3 lit tblock ;
+
+\ 9 lock(addr): a mutex, the word at addr (0 free); the atomic part done
+\ here.  Waits while it is held.
+: slock
+28 lit sysarg uword 0= if FFFFFFF2 lit sret else
+klk @ lock
+28 lit sysarg @ 0= if
+	1 lit 28 lit sysarg ! klk @ unlock 0 lit sret
+else
+	28 lit sysarg area@ C0 lit + ! 3 lit area@ D4 lit + ! 0 lit sysret 4 lit tblock klk @ unlock
+then then ;
+
+\ twaiter ( addr kind -- t | 0 )  a thread of the calling process waiting
+\ on addr in that kind of wait.
+: twaiter
+0 lit thi @ 0 lit do
+	dup 0= if
+		i thn dup tstate 4 lit = over D4 lit + @ 4 lit pick = and
+		over tproc cproc = and over C0 lit + @ 5 lit pick = and
+		if nip else drop then
+	then
+loop
+nip nip ;
+
+\ 10 unlock(addr): handed to a thread waiting for it, if one is.
+: sunlock
+28 lit sysarg uword 0= if FFFFFFF2 lit sret else
+klk @ lock
+28 lit sysarg 3 lit twaiter ?dup if
+	0 lit over D4 lit + !  1 lit swap tstate!  klk @ unlock hpoke
+else
+	0 lit 28 lit sysarg !  klk @ unlock
+then
+0 lit sret then ;
+
+\ 11 await(addr, expected, ns): waits while the word at addr is expected
+\ (0, or -11 if it already is not; ns 0: no limit, else -110 when it runs
+\ out).
+: sawait
+28 lit sysarg uword 0= if FFFFFFF2 lit sret else
+klk @ lock
+28 lit sysarg @ 2C lit sysarg <> if klk @ unlock FFFFFFF5 lit sret else
+	28 lit sysarg area@ C0 lit + !  4 lit area@ D4 lit + !
+	30 lit sysarg ?dup if 64 lit / mtime@ + area@ BC lit + !  1 lit area@ D8 lit + ! then
+	0 lit sysret
+	4 lit tblock klk @ unlock
+then then ;
+
+\ 12 wake(addr, n): up to n threads awaiting addr woken; how many.
+: swake
+klk @ lock
+0 lit
+begin dup 2C lit sysarg u< if 28 lit sysarg 4 lit twaiter else 0 lit then ?dup while
+	0 lit over D4 lit + !  0 lit over D8 lit + !  1 lit swap tstate!  1 lit +
+repeat
+klk @ unlock dup if hpoke then sret ;
+
+\ 17 write(fd, buf, n): to the console, for fds 1 and 2.
+: kwrite
+28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFF7 lit sret else
+2C lit sysarg 30 lit sysarg urange 0= if FFFFFFF2 lit sret else
+	30 lit sysarg ?dup if 2C lit sysarg swap 0 lit do dup i + c@ putc loop drop then
+	30 lit sysarg sret
+then then ;
+
+\ ksys  a system call (ecall from user mode): the number in a7.
+: ksys
+44 lit sysarg
+dup 1 lit = if drop sexit else
+dup 2 lit = if drop sspawn else
+dup 3 lit = if drop swait else
+dup 4 lit = if drop sthread else
+dup 5 lit = if drop stexit else
+dup 6 lit = if drop sjoin else
+dup 7 lit = if drop syield else
+dup 8 lit = if drop ssleep else
+dup 9 lit = if drop slock else
+dup A lit = if drop sunlock else
+dup B lit = if drop sawait else
+dup C lit = if drop swake else
+11 lit = if kwrite else FFFFFFDA lit sret
+then then then then then then then then then then then then then ;
+
+\ ukill  an exception in user mode: the process ends (-1), the system goes on.
+: ukill
+"kernel: process killed: trap " puts mcause@ u.x
+" at " puts mepc@ u.x " (" puts mtval@ u.x ")" puts 0A lit putc
+klk @ lock cproc FFFFFFFF lit pexit klk @ unlock tstop ;
+
+\ kipi  a software interrupt: cleared, and counted (what it asks is in the
+\ hart's job word, or the thread's process ending).
+: kipi  msipclr mhartid@ hipi harr dup @ 1 lit + swap ! ;
+
+\ ktrap  what the entry calls, with every register saved.  Interrupts are
+\ taken from either mode: a timer's ends a thread's slice (counted to it),
+\ a software interrupt stops a thread whose process is ending.  An
+\ exception from user mode is the thread's (a system call, or its end),
+\ from the kernel a bug.
+: ktrap
+mcause@
+dup 80000007 lit = if drop ktick mpp@ 0= if area@ C4 lit + dup @ 1 lit + swap ! tstop then else
+dup 80000003 lit = if drop kipi mpp@ 0= if cproc 28 lit + @ if tstop then then else
+mpp@ if drop kfault else
+8 lit = if ksys else ukill then
+then then then ;
+
+\ [skip ... skip]  compile the code between where it is but jump over it.
+:I [skip  here ,j0 ;
+:I skip]  jpat! ;
+
+: trapvec variable ;         \ the entry, for the harts started later
+
+\ trapinit  the trap entry: mscratch holds the area (a hart's, 256 bytes,
+\ or the running thread's control block) where the entry saves x1-x31 (x5
+\ by way of mscratch itself) before calling ktrap, and from where it
+\ restores them for mret.  A trap from user mode runs ktrap on the
+\ kernel's stacks, as trun saved them; when ktrap stops the thread (152
+\ set), the entry goes on where trun left off rather than back to it.  mtvec points at the
+\ entry, 16 bytes past the auipc (auipc, addi, csrw, and [skip's jump).
+: trapinit
+kvars
+100 lit alloc
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+73900234 ,   \ csrrw zero,mscratch,t0
+97020000 ,   \ auipc t0,0x0
+93820201 ,   \ addi t0,t0,16
+73905230 ,   \ csrrw zero,mtvec,t0
+[skip
+F3920234 ,   \ csrrw t0,mscratch,t0      ( t0 = the area, mscratch = t0 )
+23A21200 ,   \ sw ra,4(t0)
+23A42200 ,   \ sw sp,8(t0)
+23A63200 ,   \ sw gp,12(t0)
+23A84200 ,   \ sw tp,16(t0)
+23AC6200 ,   \ sw t1,24(t0)
+23AE7200 ,   \ sw t2,28(t0)
+23A08202 ,   \ sw s0,32(t0)
+23A29202 ,   \ sw s1,36(t0)
+23A4A202 ,   \ sw a0,40(t0)
+23A6B202 ,   \ sw a1,44(t0)
+23A8C202 ,   \ sw a2,48(t0)
+23AAD202 ,   \ sw a3,52(t0)
+23ACE202 ,   \ sw a4,56(t0)
+23AEF202 ,   \ sw a5,60(t0)
+23A00205 ,   \ sw a6,64(t0)
+23A21205 ,   \ sw a7,68(t0)
+23A42205 ,   \ sw s2,72(t0)
+23A63205 ,   \ sw s3,76(t0)
+23A84205 ,   \ sw s4,80(t0)
+23AA5205 ,   \ sw s5,84(t0)
+23AC6205 ,   \ sw s6,88(t0)
+23AE7205 ,   \ sw s7,92(t0)
+23A08207 ,   \ sw s8,96(t0)
+23A29207 ,   \ sw s9,100(t0)
+23A4A207 ,   \ sw s10,104(t0)
+23A6B207 ,   \ sw s11,108(t0)
+23A8C207 ,   \ sw t3,112(t0)
+23AAD207 ,   \ sw t4,116(t0)
+23ACE207 ,   \ sw t5,120(t0)
+23AEF207 ,   \ sw t6,124(t0)
+73230034 ,   \ csrrs t1,mscratch,zero    ( the interrupted t0 )
+23AA6200 ,   \ sw t1,20(t0)
+73900234 ,   \ csrrw zero,mscratch,t0    ( mscratch = the area again )
+73230030 ,   \ csrrs t1,mstatus,zero     ( from user mode (MPP 0): )
+1353B300 ,   \ srli t1,t1,0xb
+13733300 ,   \ andi t1,t1,3
+631C0300 ,   \ bne t1,zero,kernel
+03A10208 ,   \ lw sp,128(t0)             ( the kernel's stacks, as urun left them )
+03AC4208 ,   \ lw s8,132(t0)
+03AD8208 ,   \ lw s10,136(t0)
+83ADC208 ,   \ lw s11,140(t0)
+83A10209 ,   \ lw gp,144(t0)
+ktrap                                     \ kernel:
+F3220034 ,   \ csrrs t0,mscratch,zero
+03A38209 ,   \ lw t1,152(t0)             ( the thread stops: back to trun )
+63040302 ,   \ beq t1,zero,back
+23AC0208 ,   \ sw zero,152(t0)
+03A10208 ,   \ lw sp,128(t0)
+03AC4208 ,   \ lw s8,132(t0)
+03AD8208 ,   \ lw s10,136(t0)
+83ADC208 ,   \ lw s11,140(t0)
+83A10209 ,   \ lw gp,144(t0)
+13000000 ,   \ nop                       ( interrupts stay off: trun's after it )
+03A34209 ,   \ lw t1,148(t0)
+67000300 ,   \ jalr zero,0(t1)
+F3220034 ,   \ csrrs t0,mscratch,zero    back: ( to where the trap came from )
+83A04200 ,   \ lw ra,4(t0)
+03A18200 ,   \ lw sp,8(t0)
+83A1C200 ,   \ lw gp,12(t0)
+03A20201 ,   \ lw tp,16(t0)
+03A38201 ,   \ lw t1,24(t0)
+83A3C201 ,   \ lw t2,28(t0)
+03A40202 ,   \ lw s0,32(t0)
+83A44202 ,   \ lw s1,36(t0)
+03A58202 ,   \ lw a0,40(t0)
+83A5C202 ,   \ lw a1,44(t0)
+03A60203 ,   \ lw a2,48(t0)
+83A64203 ,   \ lw a3,52(t0)
+03A78203 ,   \ lw a4,56(t0)
+83A7C203 ,   \ lw a5,60(t0)
+03A80204 ,   \ lw a6,64(t0)
+83A84204 ,   \ lw a7,68(t0)
+03A98204 ,   \ lw s2,72(t0)
+83A9C204 ,   \ lw s3,76(t0)
+03AA0205 ,   \ lw s4,80(t0)
+83AA4205 ,   \ lw s5,84(t0)
+03AB8205 ,   \ lw s6,88(t0)
+83ABC205 ,   \ lw s7,92(t0)
+03AC0206 ,   \ lw s8,96(t0)
+83AC4206 ,   \ lw s9,100(t0)
+03AD8206 ,   \ lw s10,104(t0)
+83ADC206 ,   \ lw s11,108(t0)
+03AE0207 ,   \ lw t3,112(t0)
+83AE4207 ,   \ lw t4,116(t0)
+03AF8207 ,   \ lw t5,120(t0)
+83AFC207 ,   \ lw t6,124(t0)
+83A24201 ,   \ lw t0,20(t0)
+73002030 ,   \ mret
+skip]
+mtvec@ trapvec ! ;
+
+\ ── Every hart: starting them ──
+
+\ hmain  where a started hart lives: its timer, then its loop.
+: hmain
+swon tmrinit
+area@ mhartid@ harea harr !
+fence 1 lit mhartid@ hup harr !
+hloop ;
 
 \ hentry  compiles the code a started hart begins at (its address into
 \ hentrya): its stacks, its trap area and entry from the record in a0, then
@@ -997,6 +1432,26 @@ begin
 	hmax @ 1 lit u> if hmax @ 1 lit do i hjob harr @ or loop then
 while repeat
 fence ;
+
+\ kboot  the kernel made ready, on hart 0 at the start: its traps, every
+\ hart, the pages (from past its heap, 64 KiB of which is kept for what it
+\ takes before them, up to its stacks), the tables, its timer; then threads
+\ may run (kready).  What the image (src/boot.fam) and the tests of the
+\ whole kernel (scripts/oscheck.sh) begin with.
+: kboot
+trapinit
+area@ mhartid@ harea harr !
+hstart
+gp@ 10000 lit + FFF lit + FFFFF000 lit and
+87F00000 lit pginit
+ptinit
+mtime@ 1 lit or rndseed !     \ the lottery's draws: not from 0, which xorshift never leaves
+fence 1 lit kready !
+"kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts
+pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
+0A lit putc
+tmrinit
+;
 
 Test {
 	pg_one {

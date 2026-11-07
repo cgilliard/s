@@ -3,7 +3,8 @@
 \ (scripts/build.sh), the image tabernacle is patched for.
 \
 \ Every hart the machine has is started first (hstart: each other hart's
-\ stacks come from the heap, before the pages are counted).
+\ stacks come from the heap, before the pages are counted); then init, a
+\ process with 100 tickets, and every hart runs its loop (hloop).
 \
 \ Memory, from the bottom: the image; the stdlib's return-id stack and
 \ variables; the kernel's heap (the other harts' stacks, and 64 KiB kept for
@@ -11,13 +12,6 @@
 \ hart 0's data stack below 0x87FF0000; the stdlib's guard page; the harts'
 \ mailboxes (0x87FF1000); hart 0's loop-frame stack above them.
 
-trapinit
-hstart
-gp@ 10000 lit + FFF lit + FFFFF000 lit and
-87F00000 lit pginit
-"kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts
-pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
-0A lit putc
-tmrinit
-"init" dup prun "kernel: " puts swap puts " ended: " puts . 0A lit putc
-begin wfi 0 lit until
+kboot
+"init" 64 lit kspawn dup 0< if "kernel: init did not start: " puts . 0A lit putc else drop then
+hloop

@@ -41,6 +41,13 @@ run() {
 		-device loader,file="$asm",addr=0x80000000 \
 		$disk_args
 	rm -f "$stream"
+	# A compile error leaves the compiler's message, not a program (whose
+	# first word is the q32 magic; fam0 alone, the seed's own, has none):
+	# stop here rather than build on it.
+	if [ $# -gt 0 ] && [ "$out" != bin/fam0 ] && [ "$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')" != "13000000" ]; then
+		echo "build.sh: $out: compile error: $(head -c 80 "$out" | tr -d '\0')" >&2
+		exit 1
+	fi
 }
 
 # fsize FILE — size in bytes.  Portable: GNU stat spells it `-c %s`, BSD/macOS
