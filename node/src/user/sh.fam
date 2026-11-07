@@ -126,16 +126,20 @@ pa @ has/ if pa @ pa @ fdv @ spawnv else
 	pr @
 then ;
 
-\ launch ( i -- )  command i started (its pid noted, 0 if it did not).
+\ launch ( i -- )  command i started (its pid noted, 0 if it did not: its
+\ < or > path not opened, or the program not found or not to be run).
 : launch
 dup cin  over cout
 fdv @ 8 lit + !  fdv @ 4 lit + !  3 lit fdv @ !  2 lit fdv @ C lit + !
+fdv @ 4 lit + @ 0< if "sh: " eputs dup cmd 4 lit + @ eputs ": cannot open" eputs 0A lit eputc 0 lit else
+fdv @ 8 lit + @ 0< if "sh: " eputs dup cmd 8 lit + @ eputs ": cannot open" eputs 0A lit eputc 0 lit else
 dup cmd @ prun
 dup 0< if
 	"sh: " eputs over cmd @ eputs
-	dup FFFFFFFE lit = if ": not found" else ": cannot run" then eputs 0A lit eputc
+	dup FFFFFFFE lit = if ": not found" else dup FFFFFFF3 lit = if ": not allowed" else ": cannot run" then then eputs 0A lit eputc
 	drop 0 lit
 then
+then then
 swap 2 lit lshift pids @ + !
 fdv @ 4 lit + @ dup 0< if drop else ?dup if close drop then then
 fdv @ 8 lit + @ dup 0< if drop else dup 1 lit = if drop else close drop then then ;

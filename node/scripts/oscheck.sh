@@ -272,6 +272,30 @@ for n in 1 4; do
 	done
 done
 
+# Programs from the store, with a disk: /bin made by init (the image's
+# programs listed in it too), cd into /proc and a process's directory; an
+# image program read as /bin/echo and copied to a file, refused without an x
+# bit, then run by its path, by a relative one, and (copied into /bin) by
+# the search path; writing over /bin/echo refused; twenty runs of it
+# freeing what they took; halt.  On one hart and on four.
+sh scripts/mkimage.sh "$T/exec.img" bin/kernel $progs 2> "$T/exec.mk" || fail exec "mkimage: $(cat "$T/exec.mk")"
+{ printf '%s\n' 'ls /' 'cd /proc' 'pwd' 'cd 1' 'cat status' 'cd /' 'mkdir /home' 'cat /bin/echo > /home/e' \
+	'/home/e no x bit' 'chmod 755 /home/e' '/home/e from a file' 'cd /home' './e relative' 'cd /' \
+	'cat /bin/echo > /bin/myecho' 'chmod 755 /bin/myecho' 'myecho by the path' 'ls /bin' 'echo x > /bin/echo' 'cat /proc/mem'
+  i=0; while [ $i -lt 20 ]; do echo "/home/e run $i"; i=$((i + 1)); done
+  printf '%s\n' 'cat /proc/mem' 'halt'; } > "$T/exec.in"
+for n in 1 4; do
+	N=$((N + 1)); o="$T/exec_$n.out"
+	rm -f "$T/exec.disk"; dd if=/dev/zero of="$T/exec.disk" bs=1 count=0 seek=268435456 2>/dev/null
+	feed 40 "$T/exec.in" ./tools/q32 --smp=$n --disk="$T/exec.disk" "$T/exec.img" > "$o" 2>&1
+	for pat in '^bin/$' '^/proc$' '^1 0 S 1 64 [0-9]* init$' 'sh: /home/e: not allowed$' '^from a file$' '^relative$' \
+		'^by the path$' '^myecho$' '^sh: /bin/echo: cannot open$' '^run 19$' '^kernel: halted$'; do
+		grep -q -- "$pat" "$o" || { fail "exec_$n" "no /$pat/ in: $(tail -c 600 "$o")"; break; }
+	done
+	m=$(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | sed -n '1p;$p' | sort -u | wc -l)
+	[ "$m" = 1 ] || fail "exec_$n" "memory not given back: $(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | tr '\n' ' ')"
+done
+
 # The store (step 8): its own checks on a bare machine (a new store, the
 # same found again, QEMU killed in its commits six times and the last
 # commit found whole); then trees from user mode on a disk, on one hart
@@ -658,7 +682,7 @@ const port = process.argv[2];
   console.log('focused', doc.active === t2 && wins[0].classList.has('off') && !wins[1].classList.has('off'));
   type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.textContent), 5000);
   type(t2, 'ls /x'); key(t2, 'Backspace'); type(t2, '\r');
-  console.log('ls', await wait(() => /e\/\nbin\/\ndev\/\nproc\/\n\$ █$/.test(t2.textContent), 5000) && !/ls/.test(t1.textContent));
+  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.textContent), 5000) && !/ls/.test(t1.textContent));
   // the second minimized from its button: hidden, the first focused; restored from the taskbar
   all(wins[1], 'wb')[0].onclick({ stopPropagation() {} });
   const k2 = all(tasks, 'task')[1];

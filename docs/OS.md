@@ -828,6 +828,49 @@ kernel too much to add at the end.
     The store's commits are whole, so stopping loses only what was not
     yet committed. `exit` at the console only ends the shell; init then
     starts another.
+
+    Programs from the store (2026-11-07). This replaces the virtual
+    `/bin` above. `/bin` is now a directory of the store, made by init
+    at boot if missing (root's, mode 755: root installs there; a user
+    keeps programs in a directory of their own and adds it to their
+    `path`). Its listing also shows the image's programs.
+
+    Opening `/bin/<name>` to read, for an image program, gives the
+    program's bytes (open-file kind 11, pointing into the image). So
+    `cat /bin/echo > /home/e` copies one. Opening it to write gives
+    -13, because a stored file of that name would never run: the
+    image's comes first.
+
+    `spawn` runs an image program by its name or by `/bin/<name>`.
+    Any other name with a `/` is a file of the store, loaded by
+    `ploadf`, which:
+    - checks it is a file the caller may run, with an x bit in its
+      mode even for root;
+    - checks it is at most 1 MiB;
+    - copies it into pages of its own, after a table entry made for
+      it: the name is the path's last part, and the program starts with
+      64 KiB of memory;
+    - records the entry in the process at 0x2C. The pages are freed
+      when the process's slot is (`pslot0`: at reaping, or when an
+      ended orphan is cleared), since `ps` names an ended process from
+      its entry.
+
+    With no store (no disk), `/` still lists `bin/`, `dev/` and
+    `proc/`, and `/bin` lists the image's programs.
+
+    `cd` now also accepts `/dev`, `/dev/tty`, `/proc` and
+    `/proc/<pid>`, and opens relative to them work. The shell now says
+    "cannot open" for a `<` or `>` path it could not open (it used to
+    say the command "cannot run"), and "not allowed" for a program
+    without the x bit.
+
+    Checked by `exec_1/4` (with a disk):
+    - `/bin` there, and `cd /proc`;
+    - a copied echo refused without x, then run by its path, by a
+      relative path and through the search path;
+    - writing over `/bin/echo` refused;
+    - twenty runs leaving free memory unchanged;
+    - `halt`.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

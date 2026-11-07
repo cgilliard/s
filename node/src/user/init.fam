@@ -6,7 +6,8 @@
 \ (user a number, the group the same: a program not root's runs by way of
 \ runas), starting again those marked restart when they end (a second
 \ later).  With no /etc/init (no disk, or none written yet) it keeps a
-\ shell on the console.
+\ shell on the console.  It makes /bin first if the store has none (where
+\ programs are put to be run by name; the image's are listed there too).
 
 : buf variable ;  : st variable ;  : t variable ;  : n variable ;
 : es variable ;            \ the table: 16 programs, 4 words each
@@ -62,6 +63,7 @@ begin
 0 lit until ;
 
 1000 lit alloc buf !  100 lit alloc t !  100 lit alloc es !  0 lit n !
+"/bin" mkdir drop          \ /bin made the first time (the image's programs are listed in it too)
 "/etc/init" 0 lit open dup 0< if drop shell then
 dup buf @ FFF lit read dup 0< if drop 0 lit then buf @ + 0 lit swap c!  close drop
 buf @ q !  begin q @ c@ while line repeat
