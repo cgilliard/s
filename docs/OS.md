@@ -794,6 +794,29 @@ kernel too much to add at the end.
     reports them as `[pid] done`, so none is left a zombie. An `&`
     before the end of a line is refused. Checked in the console shell
     test, on one hart and on four.
+
+    /dev and /proc as directories (2026-11-07). These four can now be
+    opened to read, with or without a trailing `/`: `/dev`, `/dev/tty`,
+    `/proc` and `/proc/<pid>` (also `/proc/self/`). Each gives a
+    listing like a stored directory's: a name a line, a directory's
+    with a `/` after. Opening one to write gives -21. So `ls /proc`
+    shows the pids and the keys, `ls /dev` shows console, null and
+    tty/, and `ls /dev/tty` shows the terminals in use. The root's
+    listing adds `dev/` and `proc/`. `/proc/self` without a slash is
+    still the file holding the caller's pid. A side fix: `/dev/tty/`
+    with no number used to open terminal 0. `cd` into them is not
+    supported: a working directory is the store's.
+
+    /bin and the search path (2026-11-07). The image's programs are
+    `/bin`: `ls /bin` lists them, and `spawn` takes `/bin/<name>` as
+    well as the bare name (names up to 31 bytes now). The root's
+    listing adds `bin/`. The shell runs a command whose name has a `/`
+    as it is. It looks for one without a `/` in each directory of its
+    search path in turn. The path starts as `/bin`; `path` shows it,
+    and `path a:b` sets it. Only `/bin` can hold programs until the
+    kernel can run a program stored as a file (step 11). A side fix:
+    a new process record is now zeroed whole (512 bytes); since
+    records grew, the 256 zeroed had left the descriptor table out.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

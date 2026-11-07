@@ -19,10 +19,10 @@
 : tstop   mepc@ area@ !  1 lit area@ 98 lit + ! ;
 : uword   dup 3 lit and 0= swap 4 lit uwrange and ;          \ ( addr -- ok ) an aligned word of its
 
-\ ustr ( addr -- ok )  a NUL-terminated name of at most 15 bytes, its own.
+\ ustr ( addr -- ok )  a NUL-terminated name of at most 31 bytes, its own.
 : ustr
 1 lit 0 lit
-10 lit 0 lit do
+20 lit 0 lit do
 	dup 0= if
 		2 lit pick i + 1 lit urange 0= if 2drop 0 lit 1 lit else
 		2 lit pick i + c@ 0= if drop 1 lit then then
@@ -97,15 +97,22 @@ then
 \ pcwd ( p -- )  the child's working directory the caller's (a copy).
 : pcwd  cproc C0 lit + @ ?dup if 1 lit pgalloc ?dup if tuck 1000 lit mcpy swap C0 lit + ! else 2drop then else drop then ;
 
-\ 2 spawn(name, args, fds): a child running that program, with this one's
-\ tickets; its arguments args (0: its name alone), its descriptors as fds
-\ says (0: this one's 0, 1 and 2).  -14 bad arguments, -9 a bad descriptor.
+\ binp ( name -- name' )  past a leading /bin/ (the image's programs are
+\ /bin's); a byte at a time, none read past the name's end.
+: binp
+dup c@ 2F lit = if dup 1 lit + c@ 62 lit = if dup 2 lit + c@ 69 lit = if
+dup 3 lit + c@ 6E lit = if dup 4 lit + c@ 2F lit = if 5 lit + then then then then then ;
+
+\ 2 spawn(name, args, fds): a child running that program (a name of the
+\ image's, or /bin/ and one), with this one's tickets; its arguments args
+\ (0: its name alone), its descriptors as fds says (0: this one's 0, 1
+\ and 2).  -2 no such program, -14 bad arguments, -9 a bad descriptor.
 : sspawn
 28 lit sysarg ustr 0= if FFFFFFF2 lit sret else
 2C lit sysarg dup if uargl dup sal ! 0= else drop 0 lit then if FFFFFFF2 lit sret else
 klk @ lock
 sfds? 0= if klk @ unlock FFFFFFF7 lit sret else
-	28 lit sysarg cproc 20 lit + @ cproc pid pspawn
+	28 lit sysarg binp cproc 20 lit + @ cproc pid pspawn
 	dup 0< 0= if dup 1 lit - prn dup pfdset dup pargs dup pusr pcwd then
 	klk @ unlock sret
 then then then ;
@@ -480,18 +487,56 @@ cuid 0= over 24 lit + @ cuid = or 0= if 2drop FFFFFFF3 lit else
 	A lit rot fnew dup if 2dup 8 lit + !  over 4 lit + dup @ 1 lit + swap ! then nip
 then then then then ;
 
-\ 15 open(path, flags): /dev/console, /dev/null, or a /proc key; flags 0
-\ read, 1 write, 2 both.  Its descriptor; -2 no such, -13 not that way,
-\ -22 bad flags, -24 no descriptor free, -12 no room.
+\ The directories of /dev and /proc: /dev, /dev/tty, /proc and /proc/<pid>
+\ (or /proc/self/), and /bin (the image's programs), each read as a listing like the store's (a name a
+\ line, a directory's with a / after).
+\ vend? ( s -- flag )  s is empty or "/"; vdir? ( s -- flag )  open's path
+\ is s, or s and a /.
+: vend?  dup c@ 0= if drop 1 lit else dup c@ 2F lit = swap 1 lit + c@ 0= and then ;
+: vdir?  kpb @ swap kpfx ?dup if vend? else 0 lit then ;
+
+\ vdir ( -- q | 0 )  open's path one of them: 1 /dev, 2 /dev/tty, 3 /proc,
+\ 4 a process's (pp), 5 /bin (the image's programs).
+: vdir
+"/bin" vdir? if 5 lit else
+"/dev" vdir? if 1 lit else
+"/dev/tty" vdir? if 2 lit else
+"/proc" vdir? if 3 lit else
+kpb @ "/proc/self/" streq if area@ tproc pp ! 4 lit else
+kpb @ "/proc/" kpfx ?dup if
+	dup c@ 30 lit - A lit u< if
+		katoi vend? if
+			dup 1 lit - MAXP u< if 1 lit - prn dup @ if pp ! 4 lit else drop 0 lit then else drop 0 lit then
+		else drop 0 lit then
+	else drop 0 lit then
+else 0 lit then then then then then then ;
+
+\ vgen ( q -- )  directory q's listing.
+: tl  ts A lit tc ;                                          \ ( s -- )  a line
+: vgen
+dup 1 lit = if "console" tl "null" tl "tty/" tl then
+dup 2 lit = if 10 lit 0 lit do i 2 lit lshift kpty @ + @ if i tn A lit tc then loop then
+dup 3 lit = if
+	phi @ 0 lit do i prn @ if i 1 lit + tn "/" tl then loop
+	"harts" tl "mem" tl "net" tl "self" tl "uptime" tl
+then
+dup 5 lit = if progtab ?dup if dup @ ?dup if 0 lit do dup 4 lit + i 1C lit * + tl loop then drop then then
+4 lit = if "cmd" tl "cwd" tl "kill" tl "status" tl "tickets" tl "user" tl then ;
+
+\ 15 open(path, flags): /dev/console, /dev/null, /dev/tty/<N>, a /proc key,
+\ or one of the directories above (to read); flags 0 read, 1 write, 2
+\ both.  Its descriptor; -2 no such, -13 not that way, -21 a directory to
+\ write, -22 bad flags, -24 no descriptor free, -12 no room.
 : sopen1
 klk @ lock
 28 lit sysarg upath 0= if FFFFFFF2 lit else
 2C lit sysarg 3 lit and dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
+	vdir ?dup if swap 1 lit <> if drop FFFFFFEB lit else ptext dup if swap vgen tbend else nip then then else
 	kpb @ "/dev/console" streq if 1 lit swap fnew else
 	kpb @ "/dev/null" streq if 2 lit swap fnew else
 	kpb @ "/dev/tty/" kpfx ?dup if swap yopen else
 	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
-	then then then
+	then then then then
 	dup 0= if drop FFFFFFF4 lit else
 	dup kerr? 0= if
 		dup area@ tproc fdput dup 0< if swap fclose else nip then
@@ -1175,6 +1220,7 @@ then ;
 			dup XKLEN x!  XSKEY xa XKEY xa rot bcpy  0 lit
 		then then
 	until
+	XPLEN x@ 1 lit = if "bin/" 4 lit dout 0A lit dch "dev/" 4 lit dout 0A lit dch "proc/" 5 lit dout 0A lit dch then   \ the root's: /bin, /dev and /proc too
 	XOUT x@ XOUTS x@ - XOUTS x@
 	tcommit drop
 	klk @ lock 4 lit 1 lit fnew ?dup 0= if klk @ unlock 1 lit spgf drop FFFFFFF4 lit else
@@ -1452,8 +1498,12 @@ fst @ 2C lit sysarg CREATE and if 2 lit else 1 lit then tbegin 0= if FFFFFFF0 li
 	sret
 then then then ;
 
-\ vpath? ( -- flag )  open's path is under /dev/ or /proc/ (not the store's).
-: vpath?  klk @ lock 28 lit sysarg upath if kpb @ "/dev/" kpfx kpb @ "/proc/" kpfx or else 0 lit then klk @ unlock ;
+\ vpath? ( -- flag )  open's path is /dev or /proc, or under them, or /bin
+\ (not the store's).
+: vpath?
+klk @ lock
+28 lit sysarg upath if kpb @ "/dev/" kpfx kpb @ "/proc/" kpfx or "/dev" vdir? or "/proc" vdir? or "/bin" vdir? or else 0 lit then
+klk @ unlock ;
 : sopen  2C lit sysarg TREE and if sotree else vpath? if sopen1 else sofile then then ;
 
 \ 23 begin(fd, flags): a transaction on the tree open as fd: flags 0 a

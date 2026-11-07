@@ -947,7 +947,7 @@ thnew dup spt ! 0= if 2drop FFFFFFF5 lit else
 spe @ 18 lit + @ FFF lit + C lit rshift dup pgalloc
 dup 0= if 2drop 2drop FFFFFFF4 lit else
 	dup 2 lit pick C lit lshift mzero
-	spp @ 100 lit mzero
+	spp @ 200 lit mzero
 	spp @ 10 lit + !
 	spp @ 14 lit + !
 	spp @ 4 lit + !

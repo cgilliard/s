@@ -5,8 +5,11 @@
 \ It waits for the whole pipeline, unless the line ends with `&`: then its
 \ pid is shown and the next prompt comes at once (its input /dev/null
 \ unless `<` says otherwise); before each prompt, a background command
-\ that ended is waited for and told (`[pid] done`).  Its own: `cd [dir]`
-\ (the root without one), and `exit`, as the end of its input.
+\ that ended is waited for and told (`[pid] done`).  A command's name with
+\ a / in it is run as it is; one without is looked for in each directory
+\ of the search path in turn (`/bin` to begin with).  Its own: `cd [dir]`
+\ (the root without one), `path [dirs]` (the search path shown, or set:
+\ directories with : between), and `exit`, as the end of its input.
 
 : line variable ;            \ the line read (256 bytes)
 : abuf variable ;            \ the commands' arguments, packed
@@ -25,6 +28,9 @@
 : bg variable ;              \ the line ends with & (-1; 1: an & before its end)
 : bgp variable ;             \ the background commands' pids (16; 0 free)
 : stb variable ;             \ /proc/<pid>/status: its path, then its text
+: pathv variable ;           \ the search path (256 bytes): directories, : between
+: pbuf variable ;            \ a directory and a command's name, joined
+: pa variable ;  : pr variable ;  : pq variable ;
 
 : cmd  4 lit lshift cmds @ + ;      \ ( i -- entry )  args, < path, > path, appending
 
@@ -96,11 +102,35 @@ dup ncmd @ 1 lit - = if 1 lit else pfdv @ pipe drop  pfdv @ @ pin !  pfdv @ 4 li
 swap dup cmd C lit + @ if A01 lit else 601 lit then oflg !
 cmd 8 lit + @ ?dup if oflg @ open swap dup 1 lit = if drop else close drop then then ;
 
+\ has/ ( s -- flag )  a / in s.
+: has/  begin dup c@ dup 2F lit <> and while 1 lit + repeat c@ 0= 0= ;
+
+\ prun ( args -- pid | error )  the command whose arguments (its name
+\ first) are args started, with fdv's descriptors: its name as it is if it
+\ has a /, else each directory of the path in turn and the name, until one
+\ is found (-2 if none is).
+: prun
+pa !
+pa @ has/ if pa @ pa @ fdv @ spawnv else
+	FFFFFFFE lit pr !  pathv @ pq !
+	begin pr @ FFFFFFFE lit = pq @ c@ 0= 0= and while
+		pbuf @ begin pq @ c@ dup 3A lit <> and over pbuf @ - 40 lit u< and while
+			pq @ c@ over c! 1 lit +  pq @ 1 lit + pq !
+		repeat
+		begin pq @ c@ dup 3A lit <> and while pq @ 1 lit + pq ! repeat
+		pq @ c@ if pq @ 1 lit + pq ! then
+		dup pbuf @ <> if 2F lit over c! 1 lit + then
+		pa @ scpy 0 lit swap c!
+		pbuf @ pa @ fdv @ spawnv pr !
+	repeat
+	pr @
+then ;
+
 \ launch ( i -- )  command i started (its pid noted, 0 if it did not).
 : launch
 dup cin  over cout
 fdv @ 8 lit + !  fdv @ 4 lit + !  3 lit fdv @ !  2 lit fdv @ C lit + !
-dup cmd @ dup fdv @ spawnv
+dup cmd @ prun
 dup 0< if
 	"sh: " eputs over cmd @ eputs
 	dup FFFFFFFE lit = if ": not found" else ": cannot run" then eputs 0A lit eputc
@@ -147,10 +177,17 @@ then ;
 	then
 loop ;
 
+\ setpath  the path shown (no argument), or set to the argument.
+: setpath
+0 lit cmd @ snext dup c@ 0= if drop pathv @ puts 0A lit putc else
+	dup strlen FF lit u< if pathv @ swap scpy 0 lit swap c! else drop "sh: path: too long" eputs 0A lit eputc then
+then ;
+
 : run
 ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
 0 lit cmd @ c@ if
 	0 lit cmd @ "exit" streq if 0 lit exit then
+	0 lit cmd @ "path" streq if setpath else
 	0 lit cmd @ "cd" streq if cd else
 	0 lit pin !
 	ncmd @ 0 lit do i launch loop
@@ -160,12 +197,13 @@ ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
 	else
 		ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if wst wait drop then loop
 	then
-	then
+	then then
 then then ;
 
 100 lit alloc line !  400 lit alloc abuf !  200 lit alloc fbuf !
 800 lit alloc cmds !  8 lit alloc pfdv !  14 lit alloc fdv !  40 lit alloc pids !
 40 lit alloc dup bgp !  10 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  80 lit alloc stb !
+100 lit alloc dup pathv ! "/bin" scpy 0 lit swap c!  80 lit alloc pbuf !
 begin
 	reapbg
 	"$ " puts
