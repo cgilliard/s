@@ -1,0 +1,18 @@
+\ ls.fam — what each directory holds (none given: the working one), a
+\ name a line, a directory's with a / after; a file given, its name.
+: buf variable ;  : n variable ;
+: one  \ ( path -- )
+dup 1 lit open dup 0< 0= if close drop puts 0A lit putc else
+	FFFFFFEB lit <> if "ls: no such file or directory: " eputs eputs 0A lit eputc else
+		0 lit open dup 0< if drop "ls: cannot read" eputs 0A lit eputc else
+			begin dup buf @ 200 lit read dup 0< 0= over and while 1 lit buf @ rot write drop repeat 2drop
+		then
+	then
+then ;
+200 lit alloc buf !
+argn dup n ! 2 lit u< if "." one else
+	1 lit begin dup arg ?dup while
+		n @ 2 lit u> if dup puts ":" puts 0A lit putc then
+		one 1 lit +
+	repeat drop
+then bye

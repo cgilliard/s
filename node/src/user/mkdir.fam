@@ -1,0 +1,5 @@
+\ mkdir.fam — each directory named made.
+1 lit begin dup arg ?dup while
+	dup mkdir dup 0< if "mkdir: cannot make " eputs swap eputs ": " eputs . 0A lit eputc else 2drop then
+	1 lit +
+repeat drop bye

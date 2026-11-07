@@ -91,6 +91,9 @@ else
 then
 3 lit + FFFFFFFC lit and swap ! ;
 
+\ pcwd ( p -- )  the child's working directory the caller's (a copy).
+: pcwd  cproc C0 lit + @ ?dup if 1 lit pgalloc ?dup if tuck 1000 lit mcpy swap C0 lit + ! else 2drop then else drop then ;
+
 \ 2 spawn(name, args, fds): a child running that program, with this one's
 \ tickets; its arguments args (0: its name alone), its descriptors as fds
 \ says (0: this one's 0, 1 and 2).  -14 bad arguments, -9 a bad descriptor.
@@ -100,7 +103,7 @@ then
 klk @ lock
 sfds? 0= if klk @ unlock FFFFFFF7 lit sret else
 	28 lit sysarg cproc 20 lit + @ cproc pid pspawn
-	dup 0< 0= if dup 1 lit - prn dup pfdset pargs then
+	dup 0< 0= if dup 1 lit - prn dup pfdset dup pargs pcwd then
 	klk @ unlock sret
 then then then ;
 
@@ -418,6 +421,7 @@ then
 dup "status" streq if 1 lit pk ! then
 dup "cmd" streq if 2 lit pk ! then
 dup "tickets" streq if 3 lit pk ! then
+dup "cwd" streq if 5 lit pk ! then
 "kill" streq if 4 lit pk ! then ;
 
 \ pgen ( q -- )  key q's text, a newline last.
@@ -428,6 +432,7 @@ dup 3 lit = if pgfree# 2 lit lshift tn then
 dup 4 lit = if 0 lit htick harr @ dup 64 lit / tn 2E lit tc 64 lit % dup A lit u< if 30 lit tc then tn then
 dup 5 lit = if pp @ pstatus then
 dup 6 lit = if pp @ pcmd then
+dup 9 lit = if pp @ C0 lit + @ ?dup if dup 4 lit + swap @ ?dup if 0 lit do dup i + c@ tc loop then drop else 2F lit tc then then
 7 lit = if pp @ 20 lit + @ tn then
 A lit tc ;
 
@@ -446,7 +451,7 @@ pq @ if drop else
 then
 pq @ 0= if FFFFFFFE lit else
 pq @ 7 lit u< 0= pm @ 1 lit <> and if
-	5 lit 2 lit fnew dup if pp @ pid over 14 lit + !  pq @ 6 lit - over 18 lit + ! then
+	5 lit 2 lit fnew dup if pp @ pid over 14 lit + !  pq @ 9 lit = if 3 lit else pq @ 6 lit - then over 18 lit + ! then
 else
 pq @ 8 lit = pm @ 1 lit <> or if FFFFFFF3 lit else
 	ptext dup if pq @ pgen tbend then
@@ -458,7 +463,7 @@ then then then ;
 : sopen1
 klk @ lock
 28 lit sysarg upath 0= if FFFFFFF2 lit else
-2C lit sysarg dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
+2C lit sysarg 3 lit and dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
 	kpb @ "/dev/console" streq if 1 lit swap fnew else
 	kpb @ "/dev/null" streq if 2 lit swap fnew else
 	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
@@ -542,7 +547,7 @@ else 2drop drop FFFFFFFD lit then ;
 
 \ 16 read(fd, buf, n): what there is, at least a byte (waiting for it), or
 \ 0 at the end.  -9 not a descriptor to read, -14 not its buffer.
-: sread
+: sread1
 klk @ lock
 28 lit sysarg ufd dup 0= if drop FFFFFFF7 lit else
 dup 1C lit + @ 1 lit and 0= if drop FFFFFFF7 lit else
@@ -557,7 +562,7 @@ klk @ unlock dup BLK = if drop else sret then ;
 
 \ 17 write(fd, buf, n): all of it (waiting for room); -9, -14, -32 a pipe
 \ no one reads.
-: swrite
+: swrite1
 klk @ lock
 28 lit sysarg ufd dup 0= if drop FFFFFFF7 lit else
 dup 1C lit + @ 2 lit and 0= if drop FFFFFFF7 lit else
@@ -640,6 +645,353 @@ then
 then then
 klk @ unlock dup BLK = if drop else sret then ;
 
+\ ── Files (docs/OS.md, sections 6 and 11) ──
+\
+\ The file system is the store's first tree.  A path is made absolute (from
+\ the process's working directory) and plain (no "." or "..", no doubled
+\ /), the root being the empty path.  At a file's path: its header, 32
+\ bytes (its type at 0: 1 a file, 2 a directory, 3 a tree; its owner 4,
+\ group 8, mode 12, size 16, made 20, changed 24, in seconds since 1970;
+\ a tree's meta page 28); its bytes at the path, a NUL and the chunk's
+\ number (4 bytes, high first), 1 KiB a chunk.  A directory's header is at
+\ its path and a /, so what is in it follows it in the keys' order.  Names
+\ are of bytes from 32 on.  A file open (kind 7) keeps its path in a page
+\ of its own (at 8, its length at 16), its place at 12, append at 20.
+
+:M XOUT  F80 lit ;  :M XOUTS F84 lit ;  :M XPLEN F88 lit ;  :M XF   F8C lit ;
+:M XN    F90 lit ;  :M XD    F94 lit ;  :M XB    F98 lit ;  :M XSZ  F9C lit ;
+:M TREE 100 lit ;  :M CREATE 200 lit ;  :M TRUNC 400 lit ;  :M APPEND 800 lit ;   \ open's flags
+
+\ rtcsec ( -- s )  the seconds since 1970, QEMU's clock's (goldfish, at
+\ 0x101000: nanoseconds, the low word first) divided down.
+: rl variable ;  : rh variable ;  : rr variable ;  : rq variable ;
+: rtcsec
+klk @ lock
+101000 lit @ rl !  101004 lit @ rh !  0 lit rr !  0 lit rq !
+40 lit 0 lit do
+	rr @ 1 lit lshift rh @ 1F lit rshift or rr !
+	rh @ 1 lit lshift rl @ 1F lit rshift or rh !
+	rl @ 1 lit lshift rl !
+	rq @ 1 lit lshift rq !
+	rr @ 3B9ACA00 lit u< 0= if rr @ 3B9ACA00 lit - rr !  rq @ 1 lit or rq ! then
+loop
+rq @ klk @ unlock ;
+
+: bzero  ?dup if 0 lit do 0 lit over i + c! loop then drop ;   \ ( a n -- )
+
+\ ucpy ( uaddr dst max -- n | -1 )  a NUL-ended string of the caller's, at
+\ most max-1 bytes, copied (not its NUL): its length.
+: ucpy
+L2 x! L1 x! L0 x!
+FFFFFFFF lit
+L2 x@ 0 lit do
+	dup FFFFFFFF lit = if
+		L0 x@ i + 1 lit urange 0= if drop FFFFFFFE lit else
+		L0 x@ i + c@ ?dup if L1 x@ i + c! else drop i then then
+	then
+loop
+dup 0< if drop FFFFFFFF lit then ;
+
+\ rcomp ( a n -- ok )  one name of a path onto XKEY: "" and "." nothing,
+\ ".." back one, else / and the name (no byte below 32, 250 bytes in all).
+: rcomp
+dup 0= if 2drop 1 lit else
+dup 1 lit = if over c@ 2E lit = else 0 lit then if 2drop 1 lit else
+dup 2 lit = if over c@ 2E lit = 2 lit pick 1 lit + c@ 2E lit = and else 0 lit then if
+	2drop
+	XKLEN x@ begin dup if XKEY xa over 1 lit - + c@ 2F lit <> else 0 lit then while 1 lit - repeat
+	dup if 1 lit - then XKLEN x!  1 lit
+else
+	1 lit over 0 lit do 2 lit pick i + c@ 20 lit u< if drop 0 lit then loop
+	XKLEN x@ 2 lit pick + 1 lit + FA lit u> if drop 0 lit then
+	if
+		dup L3 x!  drop
+		2F lit XKEY xa XKLEN x@ + c!  XKLEN x@ 1 lit + XKLEN x!
+		XKEY xa XKLEN x@ + L3 x@ bcpy  XKLEN x@ L3 x@ + XKLEN x!  1 lit
+	else 2drop 0 lit then
+then then then ;
+
+\ rnorm ( -- ok )  the path at XSKEY (Q1 bytes), made absolute and plain,
+\ into XKEY.
+: rnorm
+0 lit XKLEN x!
+Q1 x@ if XSKEY xa c@ 2F lit = else 0 lit then 0= if
+	cproc C0 lit + @ ?dup if dup @ XKLEN x!  4 lit + XKEY xa XKLEN x@ bcpy then
+then
+1 lit Q2 x!  0 lit Q0 x!
+begin Q0 x@ Q1 x@ u< Q2 x@ and while
+	Q0 x@
+	begin Q0 x@ Q1 x@ u< if XSKEY xa Q0 x@ + c@ 2F lit <> else 0 lit then while Q0 x@ 1 lit + Q0 x! repeat
+	XSKEY xa over + Q0 x@ rot - rcomp Q2 x@ and Q2 x!
+	Q0 x@ 1 lit + Q0 x!
+repeat
+Q2 x@ ;
+
+\ rpath ( uaddr -- ok )  a path of the caller's, made absolute and plain,
+\ into XKEY (the root: XKLEN 0).
+: rpath  XSKEY xa 100 lit ucpy dup 0< if drop 0 lit else Q1 x! rnorm then ;
+
+: dkey   2F lit XKEY xa XKLEN x@ + c!  XKLEN x@ 1 lit + XKLEN x! ;   \ the path as a directory's key
+: pkey!  XPLEN x@ XKLEN x! ;                                        \ back to the path (XPLEN long)
+
+\ hget ( -- type )  the header at XKEY (to XVAL): its type, 0 if none.
+: hget  XVAL xa 20 lit tget 20 lit = if XVAL xa c@ else 0 lit then tunpin ;
+
+\ ptype ( -- type )  what is at the path: 1 a file, 2 a directory, 3 a tree,
+\ 0 nothing (its header in XVAL).
+: ptype  XKLEN x@ if hget else 0 lit then ?dup 0= if dkey hget XKLEN x@ 1 lit - XKLEN x! then ;
+
+\ hnew ( type -- )  a new header of that type in XVAL (made and changed now).
+: hnew
+XVAL xa 20 lit mzero  dup XVAL xa c!
+2 lit = if 1ED lit else 1A4 lit then XVAL xa C lit + !
+rtcsec dup XVAL xa 14 lit + !  XVAL xa 18 lit + !  20 lit XVLEN x! ;
+
+\ parent? ( -- ok )  the path's directory is there.
+: parent?
+XKLEN x@ Q3 x!
+XKLEN x@ begin dup if XKEY xa over 1 lit - + c@ 2F lit <> else 0 lit then while 1 lit - repeat
+XKLEN x!  hget 2 lit =  Q3 x@ XKLEN x! ;
+
+\ chk! ( c -- )  XKEY: the path (XPLEN long), a NUL, chunk c.
+: chk!
+XKEY xa XPLEN x@ +  0 lit over c!
+over 18 lit rshift over 1 lit + c!  over 10 lit rshift FF lit and over 2 lit + c!
+over 8 lit rshift FF lit and over 3 lit + c!  swap FF lit and swap 4 lit + c!
+XPLEN x@ 5 lit + XKLEN x! ;
+
+\ fchunks ( -- )  the file's chunks taken out (its header in XVAL).
+: fchunks  XKLEN x@ XPLEN x!  XVAL xa 10 lit + @ 3FF lit + A lit rshift ?dup if 0 lit do i chk! tdel drop tunpin loop then  pkey! ;
+
+\ ftrunc  the file emptied: its chunks out, its size 0.
+: ftrunc  fchunks  0 lit XVAL xa 10 lit + !  rtcsec XVAL xa 18 lit + !  20 lit XVLEN x!  tput drop tunpin ;
+
+\ ffd ( -- fd | error )  the transaction committed and a descriptor on the
+\ file at XKEY, open as open's flags say.
+: ffd
+1 lit spga ?dup 0= if tabort FFFFFFF4 lit else
+	XKEY xa over XKLEN x@ bcpy  XKLEN x@ swap
+	tcommit if 1 lit spgf drop FFFFFFE4 lit else
+		klk @ lock
+		7 lit 2C lit sysarg 3 lit and 1 lit + fnew ?dup 0= if klk @ unlock 1 lit spgf drop FFFFFFF4 lit else
+			tuck 8 lit + !  tuck 10 lit + !  2C lit sysarg APPEND and over 14 lit + !
+			dup cproc fdput dup 0< if swap fclose else nip then
+			klk @ unlock
+		then
+	then
+then ;
+
+\ dlist ( -- fd | error )  the directory at XKEY listed (each name a line,
+\ a directory's with a / after), the transaction ended, and a descriptor
+\ to read the listing from (4 KiB of it at most).
+: dout  XOUT x@ over + XOUTS x@ FF0 lit + u< if XOUT x@ swap dup XOUT x@ + XOUT x! bcpy else 2drop then ;   \ ( a n -- )
+: dch   XOUT x@ XOUTS x@ FF0 lit + u< if XOUT x@ c!  XOUT x@ 1 lit + XOUT x! else drop then ;            \ ( c -- )
+: dlist
+1 lit spga ?dup 0= if tabort FFFFFFF4 lit else
+	dup XOUT x!  XOUTS x!
+	dkey  XKLEN x@ XPLEN x!
+	begin
+		XSKEY xa tnext tunpin
+		dup 0< if drop 1 lit else
+		dup XPLEN x@ u> if XSKEY xa XPLEN x@ XKEY xa XPLEN x@ bcmp 0= else 0 lit then 0= if drop 1 lit else
+			XPLEN x@ begin 2dup u> if XSKEY xa over + c@ dup 0= 0= swap 2F lit <> and else 0 lit then while 1 lit + repeat
+			2dup = if
+				XSKEY xa XPLEN x@ + over XPLEN x@ - dout  0A lit dch  drop
+			else
+				XSKEY xa over + c@ 2F lit = over 1 lit + 3 lit pick = and if
+					XSKEY xa XPLEN x@ + over 1 lit + XPLEN x@ - dout  0A lit dch
+				then
+				XSKEY xa over + c@ 2F lit = if 30 lit else 1 lit then over XSKEY xa + c!
+				nip 1 lit +
+			then
+			dup XKLEN x!  XSKEY xa XKEY xa rot bcpy  0 lit
+		then then
+	until
+	XOUT x@ XOUTS x@ - XOUTS x@
+	tcommit drop
+	klk @ lock 4 lit 1 lit fnew ?dup 0= if klk @ unlock 1 lit spgf drop FFFFFFF4 lit else
+		tuck 8 lit + !  tuck 10 lit + !  0 lit over C lit + !
+		dup cproc fdput dup 0< if swap fclose else nip then
+		klk @ unlock
+	then
+then ;
+
+\ sofile  open(path, flags) of the file system: flags 0 read, 1 write, 2
+\ both; CREATE makes a file not there (its directory must be), TRUNC
+\ empties it, APPEND writes at its end.  A directory opened to read gives
+\ its listing.  -2 none there (or no store), -21 a directory to write, -22
+\ a tree (open it with TREE), -14 a bad path, -16 busy, -28 no room.
+: sofile
+fst @ 0= if FFFFFFFE lit sret else
+2C lit sysarg 3 lit and 3 lit = if FFFFFFEA lit sret else
+fst @ 2C lit sysarg 600 lit and if 2 lit else 1 lit then tbegin 0= if FFFFFFF0 lit sret else
+28 lit sysarg rpath 0= if tabort FFFFFFF2 lit sret else
+	ptype
+	dup 2 lit = if drop 2C lit sysarg 3 lit and if tabort FFFFFFEB lit else dlist then else
+	dup 3 lit = if drop tabort FFFFFFEA lit else
+	dup 1 lit = if drop
+		2C lit sysarg TRUNC and 0= 0= 2C lit sysarg 3 lit and 0= 0= and if ftrunc then
+		ffd
+	else drop
+		2C lit sysarg CREATE and 0= 0= 2C lit sysarg 3 lit and 0= 0= and 0= if tabort FFFFFFFE lit else
+		parent? 0= if tabort FFFFFFFE lit else
+			1 lit hnew tput 0= if tabort FFFFFFE4 lit else tunpin ffd then
+		then then
+	then then then
+	sret
+then then then then ;
+
+\ kfile? ( -- f | 0 )  the call's descriptor (a0), if it is a file's or a
+\ working directory to write: one descriptor more on it while the call
+\ works without klk (kfdone lets it go).
+: kfile?
+klk @ lock
+28 lit sysarg ufd dup if
+	dup @ 7 lit = over @ 5 lit = 2 lit pick 18 lit + @ 3 lit = and or if dup 4 lit + dup @ 1 lit + swap ! else drop 0 lit then
+then
+klk @ unlock ;
+: kfdone  klk @ lock fclose klk @ unlock ;          \ ( f -- )
+
+\ fpath ( f -- )  the transaction's key the file's path.
+: fpath  dup 8 lit + @ XKEY xa 2 lit pick 10 lit + @ bcpy  10 lit + @ dup XKLEN x! XPLEN x! ;
+
+\ fread ( f -- n )  read(fd, buf, n) of a file: from its place, to its end.
+: fread
+dup 1C lit + @ 1 lit and 0= if kfdone FFFFFFF7 lit else
+2C lit sysarg 30 lit sysarg uwrange 0= if kfdone FFFFFFF2 lit else
+fst @ 1 lit tbegin 0= if kfdone FFFFFFF0 lit else
+	dup XF x!  dup fpath
+	hget 1 lit = if XVAL xa 10 lit + @ else 0 lit then
+	over C lit + @ 2dup u< if 2drop 0 lit else - 30 lit sysarg 2dup u> if nip else drop then then
+	XN x!  0 lit XD x!
+	begin XD x@ XN x@ u< while
+		XF x@ C lit + @ XD x@ +  dup A lit rshift chk!  3FF lit and
+		400 lit over - XN x@ XD x@ - 2dup u> if nip else drop then
+		XVAL xa 400 lit tget tunpin dup 0< if drop 0 lit then
+		dup 400 lit u< if XVAL xa over + 400 lit 2 lit pick - bzero then drop
+		swap XVAL xa + 2C lit sysarg XD x@ + 2 lit pick bcpy
+		XD x@ + XD x!
+	repeat
+	XN x@  tcommit drop
+	over C lit + dup @ 2 lit pick + swap !
+	swap kfdone
+then then then ;
+
+\ fw1 ( f done -- f done' ok )  one transaction of a file's write: up to
+\ 16 KiB more, at its place (its end, appending), its size and its time
+\ changed.
+: fw1
+fst @ 2 lit tbegin 0= if 0 lit else
+	over fpath
+	hget 1 lit = 0= if tabort 0 lit else
+		XVAL xa 10 lit + @ XSZ x!
+		over 14 lit + @ if XSZ x@ 2 lit pick C lit + ! then
+		dup XB x!  30 lit sysarg over - 4000 lit 2dup u> if nip else drop then XN x!  0 lit XD x!
+		begin XD x@ XN x@ u< while
+			over C lit + @ XD x@ +  dup A lit rshift chk!  3FF lit and
+			400 lit over - XN x@ XD x@ - 2dup u> if nip else drop then
+			XVAL xa 400 lit tget tunpin dup 0< if drop 0 lit then
+			dup 400 lit u< if XVAL xa over + 400 lit 2 lit pick - bzero then
+			2 lit pick 2 lit pick + max XVLEN x!
+			2C lit sysarg XB x@ + XD x@ +  rot XVAL xa +  2 lit pick bcpy
+			tput 0= if 1 lit XERR x! then tunpin
+			XD x@ + XD x!
+		repeat
+		pkey! hget drop
+		over C lit + @ XN x@ + XSZ x@ max XVAL xa 10 lit + !
+		rtcsec XVAL xa 18 lit + !  20 lit XVLEN x!  tput drop tunpin
+		XN x@ tcommit if drop 0 lit else
+			2 lit pick C lit + dup @ 2 lit pick + swap !  +  1 lit
+		then
+	then
+then ;
+
+\ fwrite ( f -- n )  write(fd, buf, n) of a file: all of it, each 16 KiB a
+\ transaction; -28 if none of it could be written.
+: fwrite
+dup 1C lit + @ 2 lit and 0= if kfdone FFFFFFF7 lit else
+2C lit sysarg 30 lit sysarg urange 0= if kfdone FFFFFFF2 lit else
+	0 lit begin dup 30 lit sysarg u< if fw1 else 0 lit then while repeat
+	dup 0= 30 lit sysarg 0= 0= and if drop FFFFFFE4 lit then
+	swap kfdone
+then then ;
+
+\ fcwd ( f -- n )  a working directory written (/proc/<pid>/cwd): the path
+\ written (a newline after it no matter), which must be a directory.
+: fcwd
+30 lit sysarg 1 lit - FE lit u< 0= if kfdone FFFFFFEA lit else
+2C lit sysarg 30 lit sysarg urange 0= if kfdone FFFFFFF2 lit else
+fst @ 0= if kfdone FFFFFFED lit else
+fst @ 1 lit tbegin 0= if kfdone FFFFFFF0 lit else
+	2C lit sysarg XSKEY xa 30 lit sysarg bcpy  30 lit sysarg
+	dup if XSKEY xa over + 1 lit - c@ A lit = if 1 lit - then then Q1 x!
+	rnorm if ptype 2 lit = else 0 lit then
+	if
+		1 lit spga ?dup if
+			XKLEN x@ over !  XKEY xa over 4 lit + XKLEN x@ bcpy
+			tcommit drop
+			klk @ lock
+			over 14 lit + @ 1 lit - prn dup @ if
+				C0 lit + dup @ ?dup if 1 lit pgfree then !  30 lit sysarg
+			else drop 1 lit pgfree FFFFFFFD lit then
+			klk @ unlock
+		else tcommit drop FFFFFFF4 lit then
+	else tcommit drop FFFFFFEC lit then
+	swap kfdone
+then then then then ;
+
+\ fsize ( f -- f size )  the file's size now.
+: fsize  fst @ 1 lit tbegin if dup fpath hget 1 lit = if XVAL xa 10 lit + @ else 0 lit then tcommit drop else 0 lit then ;
+
+\ 18 seek(fd, offset, whence): a file's place set: whence 0 from its
+\ start, 1 from its place, 2 from its end.  The place; -29 not a file.
+: sseek
+kfile? ?dup 0= if FFFFFFE3 lit sret else
+dup @ 7 lit = 0= if kfdone FFFFFFE3 lit sret else
+30 lit sysarg dup 0= if drop 2C lit sysarg else
+	dup 1 lit = if drop dup C lit + @ 2C lit sysarg + else
+	2 lit = if fsize 2C lit sysarg + else FFFFFFEA lit then then then
+dup FFFFFFEA lit = if swap kfdone sret else over C lit + !  dup C lit + @ swap kfdone sret then
+then then ;
+
+\ 35 remove(path): a file, a tree (its pages are not given back yet) or an
+\ empty directory taken out.  0; -2 none there, -39 a directory not
+\ empty, -16 the root (or busy), -14 a bad path, -19 no store.
+: sremove
+fst @ 0= if FFFFFFED lit sret else
+fst @ 2 lit tbegin 0= if FFFFFFF0 lit sret else
+28 lit sysarg rpath 0= if tabort FFFFFFF2 lit sret else
+XKLEN x@ 0= if tabort FFFFFFF0 lit sret else
+	ptype
+	dup 0= if drop tabort FFFFFFFE lit else
+	dup 1 lit = if drop fchunks tdel drop tunpin tcommit else
+	3 lit = if tdel drop tunpin tcommit else
+		dkey  XKLEN x@ XPLEN x!
+		XSKEY xa tnext tunpin
+		dup 0< if drop 1 lit else
+			XPLEN x@ u> if XSKEY xa XPLEN x@ XKEY xa XPLEN x@ bcmp else 1 lit then
+		then
+		if tdel drop tunpin tcommit else tabort FFFFFFD9 lit then
+	then then then
+	sret
+then then then then ;
+
+\ 36 mkdir(path): a directory made (its own must be there).  0; -17 there
+\ already, -2 no directory to make it in, -14 a bad path, -28 no room.
+: smkdir
+fst @ 0= if FFFFFFED lit sret else
+fst @ 2 lit tbegin 0= if FFFFFFF0 lit sret else
+28 lit sysarg rpath 0= if tabort FFFFFFF2 lit sret else
+	ptype if tabort FFFFFFEF lit else
+	parent? 0= if tabort FFFFFFFE lit else
+		dkey 2 lit hnew tput 0= if tabort FFFFFFE4 lit else tunpin tcommit then
+	then then
+	sret
+then then then ;
+
+\ fsinit  the root directory, if the store has none yet.  At boot.
+: fsinit  fst @ 2 lit tbegin if 0 lit XKLEN x! dkey hget 0= if 2 lit hnew tput drop then tunpin tcommit drop then ;
+
 \ ── Trees, and the store's calls (docs/OS.md, section 6) ──
 \
 \ open(path, TREE) gives a descriptor on a tree of the store (TREE |
@@ -652,8 +1004,6 @@ klk @ unlock dup BLK = if drop else sret then ;
 \ open file (one descriptor more on it while the transaction lasts).  The
 \ calls run without klk, and may sleep (for the disk, or a tree's writer).
 
-:M TREE 100 lit ;
-:M CREATE 200 lit ;
 
 : sxe  1 lit - 4 lit lshift stx @ + ;          \ ( h -- slot )
 
@@ -672,36 +1022,23 @@ klk @ unlock ;
 : ukey0  dup FF lit u> if 2drop 0 lit else 2dup urange 0= if 2drop 0 lit else dup XKLEN x! XKEY xa swap bcpy 1 lit then then ;
 : ukey   dup 0= if 2drop 0 lit else ukey0 then ;
 
-\ uptk ( addr -- ok )  a NUL-ended path of the caller's (1 to 254 bytes,
-\ beginning with /) into the transaction's key.
-: uptk
-0 lit XKLEN x!
-1 lit 0 lit
-FF lit 0 lit do
-	dup 0= if
-		2 lit pick i + 1 lit urange 0= if 2drop 0 lit 1 lit else
-		2 lit pick i + c@ ?dup if XKEY xa i + c! i 1 lit + XKLEN x! else drop 1 lit then then
-	then
-loop
-0= if drop 0 lit then nip
-dup if XKLEN x@ 0= 0= XKEY xa c@ 2F lit = and and then ;
-
 \ sotree  open(path, TREE [| CREATE]): a descriptor on the tree.  -19 no
 \ store, -16 no transaction to be had, -14 a bad path, -2 none there, -20
 \ something else there, -28 no room, -12 no memory.
 : sotree
 fst @ 0= if FFFFFFED lit sret else
 fst @ 2C lit sysarg CREATE and if 2 lit else 1 lit then tbegin 0= if FFFFFFF0 lit sret else
-28 lit sysarg uptk 0= if tabort FFFFFFF2 lit sret else
-	XVAL xa 20 lit tget
-	dup 20 lit = XVAL xa c@ 3 lit = and if drop XVAL xa 1C lit + @  tcommit drop else
-	dup 0< 0= if drop tabort FFFFFFEC lit else
-	drop 2C lit sysarg CREATE and 0= if tabort FFFFFFFE lit else
+28 lit sysarg rpath XKLEN x@ 0= 0= and 0= if tabort FFFFFFF2 lit sret else
+	ptype
+	dup 3 lit = if drop XVAL xa 1C lit + @  tcommit drop else
+	if tabort FFFFFFEC lit else
+	2C lit sysarg CREATE and 0= if tabort FFFFFFFE lit else
+	parent? 0= if tabort FFFFFFFE lit else
 		tcreate ?dup 0= if tabort FFFFFFE4 lit else
-			XVAL xa 20 lit mzero  3 lit XVAL xa c!  dup XVAL xa 1C lit + !  20 lit XVLEN x!
+			3 lit hnew  dup XVAL xa 1C lit + !
 			tput 0= if drop tabort FFFFFFE4 lit else tcommit if drop FFFFFFE4 lit then then
 		then
-	then then then
+	then then then then
 	dup kerr? 0= if
 		topen ?dup 0= if FFFFFFF4 lit else
 			klk @ lock 6 lit 3 lit fnew ?dup 0= if klk @ unlock tclose FFFFFFF4 lit else
@@ -714,7 +1051,9 @@ fst @ 2C lit sysarg CREATE and if 2 lit else 1 lit then tbegin 0= if FFFFFFF0 li
 	sret
 then then then ;
 
-: sopen  2C lit sysarg TREE and if sotree else sopen1 then ;
+\ vpath? ( -- flag )  open's path is under /dev/ or /proc/ (not the store's).
+: vpath?  klk @ lock 28 lit sysarg upath if kpb @ "/dev/" kpfx kpb @ "/proc/" kpfx or else 0 lit then klk @ unlock ;
+: sopen  2C lit sysarg TREE and if sotree else vpath? if sopen1 else sofile then then ;
 
 \ 23 begin(fd, flags): a transaction on the tree open as fd: flags 0 a
 \ reader (the last commit's snapshot), 1 its writer (waiting for the one
@@ -829,6 +1168,10 @@ birq ! ;
 \ kext  an external interrupt: claimed, the disk's seen to, completed.
 : kext  C200004 lit @ dup birq @ = if kblkirq then C200004 lit ! ;
 
+\ read and write: files (and working directories written) without klk.
+: sread   kfile? ?dup if dup @ 7 lit = if fread else kfdone FFFFFFF7 lit then sret else sread1 then ;
+: swrite  kfile? ?dup if dup @ 7 lit = if fwrite else fcwd then sret else swrite1 then ;
+
 \ ksys  a system call (ecall from user mode): the number in a7.
 : ksys
 44 lit sysarg
@@ -849,6 +1192,7 @@ dup E lit = if drop sunmap else
 dup F lit = if drop sopen else
 dup 10 lit = if drop sread else
 dup 11 lit = if drop swrite else
+dup 12 lit = if drop sseek else
 dup 13 lit = if drop sclose else
 dup 14 lit = if drop spipe else
 dup 16 lit = if drop spoll else
@@ -858,8 +1202,10 @@ dup 19 lit = if drop sabort else
 dup 1A lit = if drop sget else
 dup 1B lit = if drop sput else
 dup 1C lit = if drop sdel else
-1D lit = if snext else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
+dup 1D lit = if drop snext else
+dup 23 lit = if drop sremove else
+24 lit = if smkdir else FFFFFFDA lit sret
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill
@@ -1162,7 +1508,7 @@ fence 1 lit kready !
 pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 0A lit putc
 blkfind if                    \ a disk: the store, found or made, and its interrupt
-	0 lit stmount
+	0 lit stmount  fsinit
 	bk @ 10001000 lit - C lit rshift 1 lit + kplic
 	"kernel: the store: " puts npg @ 8 lit rshift u. " MiB, " puts hwm @ u. " pages in use" puts 0A lit putc
 then

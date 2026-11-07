@@ -9,7 +9,8 @@
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
 \ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
-\ close, 20 pipe, 22 poll, 23-29 the store's (below).
+\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 35 remove, 36 mkdir
+\ (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -129,7 +130,12 @@
 \ The store (docs/OS.md, section 6): open(path, TREE [| CREATE]) a tree,
 \ then transactions on it.  txbegin's flags: 0 a reader, 1 the writer.
 :M TREE   100 lit ;
-:M CREATE 200 lit ;
+:M CREATE 200 lit ;                          \ open's flags: (a file) made if not there,
+:M TRUNC  400 lit ;                          \ emptied,
+:M APPEND 800 lit ;                          \ written at its end
+: seek    12 lit sys ;                       \ ( fd offset whence -- place )  0 start, 1 here, 2 end
+: remove  0 lit 0 lit 23 lit sys ;           \ ( path -- r )  a file, a tree, an empty directory
+: mkdir   0 lit 0 lit 24 lit sys ;           \ ( path -- r )
 \ sys5 ( a0 a1 a2 a3 a4 number -- result )  a call of five arguments.
 : sys5
 83280100 ,   \ lw a7,0(sp)

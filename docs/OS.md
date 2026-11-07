@@ -165,6 +165,8 @@ kernel checks every pointer against the caller's memory.
 | 32 | `accept(fd)` → fd | |
 | 33 | `sendto(fd, buf, n, ip, port)` | UDP; TCP uses `read` and `write` |
 | 34 | `recvfrom(fd, buf, n, &from)` | |
+| 35 | `remove(path)` | a file, a tree, an empty directory |
+| 36 | `mkdir(path)` | |
 
 Mutexes come both ways: the kernel's (9-12) when a thread should sleep
 while it waits, and a program's own (a bakery or Peterson lock in its
@@ -635,6 +637,28 @@ kernel too much to add at the end.
    win back. Found on the way: the tree records outgrew their
    64 bytes, so a field of one fell on the next's free list (they are
    128 bytes now); and a raw word typed by hand was wrong, as before.
+   Part 4 done (2026-11-06). A path is made absolute (from the
+   process's working directory) and plain in the kernel; the root is the
+   empty path. A file's 32-byte header is at its path, its bytes in
+   1 KiB chunks at the path, a NUL and the chunk's number. A directory's
+   header is at its path and a `/`, so what is in it follows in key
+   order, and reading a directory gives its listing (one name a line,
+   a directory's with a `/`). `open` takes `CREATE`, `TRUNC` and
+   `APPEND`. `read` and `write` on a file run without `klk`, each
+   `write` one transaction per 16 KiB; `seek` (18) works on files.
+   `remove` (35) and `mkdir` (36) are new calls, since the table had
+   none for them. The working directory is `/proc/<pid>/cwd`, written
+   to change it (it must be a directory); a child starts in its
+   parent's. Times are seconds since 1970, from QEMU's real-time clock.
+   Programs: `ls`, `pwd`, `mkdir`, `rm`; `cat` takes files; the shell
+   has `cd`, and `>` now makes or empties a file, `>>` appends.
+   Checked: 100,000 bytes written in 1,000-byte writes and read back
+   in 777-byte reads, the end found with `seek`, 3,000 bytes written in
+   the middle and read back with what is on each side, an append, and
+   the errors (a directory to write, a directory already there, no
+   directory to make one in, the root removed, a directory not empty);
+   and the shell on a disk booted twice, the file the first boot wrote
+   read back by the second, so files outlive a reboot.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
    reads a page served from the guest.

@@ -1,9 +1,9 @@
 \ sh.fam — the shell (docs/OS.md): a line at a time from its input, each a
 \ pipeline of commands (`a | b | c`), each command a program's name and its
-\ arguments, with `< path` and `> path` taking its input from, or its
-\ output to, what open finds there (/dev, /proc for now; the store's files
-\ in step 8).  It waits for the whole pipeline.  `exit` ends it; so does
-\ the end of its input.
+\ arguments, with `< path` taking its input from a file (or /dev, /proc),
+\ `> path` its output to one (made, or emptied), `>> path` added to its end.
+\ It waits for the whole pipeline.  Its own: `cd [dir]` (the root without
+\ one), and `exit`, as the end of its input.
 
 : line variable ;            \ the line read (256 bytes)
 : abuf variable ;            \ the commands' arguments, packed
@@ -18,8 +18,9 @@
 : fdv variable ;             \ spawnv's fds: 3, then the child's 0, 1, 2
 : pids variable ;
 : wst variable ;
+: oflg variable ;            \ the flags a > opens with
 
-: cmd  dup 3 lit lshift swap 2 lit lshift + cmds @ + ;      \ ( i -- entry )
+: cmd  4 lit lshift cmds @ + ;      \ ( i -- entry )  args, < path, > path, appending
 
 \ rdline ( -- n | -1 )  a line into line, NUL-ended; -1 at the end of the
 \ input.
@@ -44,7 +45,7 @@ begin lp @ c@ dup if dup ws? over special? or 0= else 0 lit then while
 repeat
 drop 0 lit over c! 1 lit + ;
 
-: newcmd  ap @ ncmd @ cmd !  0 lit ncmd @ cmd 4 lit + !  0 lit ncmd @ cmd 8 lit + ! ;
+: newcmd  ap @ ncmd @ cmd !  0 lit ncmd @ cmd 4 lit + !  0 lit ncmd @ cmd 8 lit + !  0 lit ncmd @ cmd C lit + ! ;
 : endcmd  0 lit ap @ c!  ap @ 1 lit + ap !  ncmd @ 1 lit + ncmd ! ;
 
 \ redir ( off -- )  the path after < (4) or > (8), for this command.
@@ -60,7 +61,9 @@ begin skipws lp @ c@ while
 		ap @ ncmd @ cmd @ = if drop 0 lit then
 		endcmd newcmd
 	else lp @ c@ 3C lit = if 4 lit redir else
-	lp @ c@ 3E lit = if 8 lit redir else
+	lp @ c@ 3E lit = if
+		lp @ 1 lit + c@ 3E lit = if 1 lit ncmd @ cmd C lit + !  lp @ 1 lit + lp ! then
+		8 lit redir else
 	ap @ token ap !
 	then then then
 repeat
@@ -76,12 +79,13 @@ else
 	if pin @ else 0 lit then
 then ;
 
-\ cout ( i -- fd )  its output: its > path, a pipe to the next (pin then
-\ its read end), or the shell's own.
+\ cout ( i -- fd )  its output: its > path (made or emptied; >> appends),
+\ a pipe to the next (pin then its read end), or the shell's own.
 : cout
 0 lit pin !
 dup ncmd @ 1 lit - = if 1 lit else pfdv @ pipe drop  pfdv @ @ pin !  pfdv @ 4 lit + @ then
-swap cmd 8 lit + @ ?dup if 1 lit open swap dup 1 lit = if drop else close drop then then ;
+swap dup cmd C lit + @ if A01 lit else 601 lit then oflg !
+cmd 8 lit + @ ?dup if oflg @ open swap dup 1 lit = if drop else close drop then then ;
 
 \ launch ( i -- )  command i started (its pid noted, 0 if it did not).
 : launch
@@ -97,17 +101,29 @@ swap 2 lit lshift pids @ + !
 fdv @ 4 lit + @ dup 0< if drop else ?dup if close drop then then
 fdv @ 8 lit + @ dup 0< if drop else dup 1 lit = if drop else close drop then then ;
 
+\ cd  the shell's working directory (/proc/self/cwd written): its
+\ argument, or the root.
+: cd
+0 lit cmd @ snext dup c@ 0= if drop "/" then
+"/proc/self/cwd" 1 lit open
+dup 0< if drop drop "sh: cd: no /proc" eputs 0A lit eputc else
+	2dup swap dup strlen write 0< if "sh: cd: no such directory: " eputs swap eputs 0A lit eputc else nip then
+	close drop
+then ;
+
 : run
 ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
 0 lit cmd @ c@ if
 	0 lit cmd @ "exit" streq if 0 lit exit then
+	0 lit cmd @ "cd" streq if cd else
 	0 lit pin !
 	ncmd @ 0 lit do i launch loop
 	ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if wst wait drop then loop
+	then
 then then ;
 
 100 lit alloc line !  400 lit alloc abuf !  200 lit alloc fbuf !
-600 lit alloc cmds !  8 lit alloc pfdv !  14 lit alloc fdv !  40 lit alloc pids !
+800 lit alloc cmds !  8 lit alloc pfdv !  14 lit alloc fdv !  40 lit alloc pids !
 begin
 	"$ " puts
 	rdline 0< if 0 lit exit then

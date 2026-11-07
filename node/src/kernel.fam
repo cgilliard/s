@@ -754,8 +754,9 @@ then ;
 \ (docs/OS.md, section 10), 48 on: 4 pairs (first byte, byte past), each 0
 \ when empty, which `map` and `unmap` change and `upmp` puts in PMP
 \ entries 5-12 (so a process holds code, its first region, and 4 blocks);
-\ the ticks its threads have run 80; and at 128, its 16 descriptors (each
-\ an open file of the table below, or 0).
+\ the ticks its threads have run 80; at 128, its 16 descriptors (each an
+\ open file of the table below, or 0); its working directory at 192 (a
+\ page: the path's length, then the path; 0: the root).
 \
 \ Each hart runs hloop: a thread drawn by lottery among those ready (each
 \ holding its tickets), run until it traps back (its slice over at a timer
@@ -815,7 +816,7 @@ TXMAX 4 lit lshift dup alloc dup stx ! swap mzero
 \
 \ An open file (32 bytes, in fil): its kind at 0 (0 free, 1 the console, 2
 \ null, 3 a pipe's end, 4 a /proc key's text, 5 a /proc key to write, 6 a
-\ tree of the store, its record at 8), the
+\ tree of the store, its record at 8; 7 a file, src/ksys.fam), the
 \ descriptors on it 4, its page 8 (a pipe's, or the text's), the text's
 \ read position 12 and length 16, the process a key is of 20 and which key
 \ 24 (1 tickets, 2 kill), its mode 28 (1 read, 2 write, 3 both).  A pipe is
@@ -859,7 +860,7 @@ if drop else
 		dup 8 lit + @  over 1C lit + @ 1 lit = if 0 lit else 4 lit then + dup @ 1 lit - swap !
 		dup 8 lit + @ dup fwake  dup @ over 4 lit + @ or 0= if 1 lit pgfree else drop then
 	then
-	dup @ 4 lit = if dup 8 lit + @ ?dup if 1 lit pgfree then then
+	dup @ 4 lit = over @ 7 lit = or if dup 8 lit + @ ?dup if 1 lit pgfree then then
 	dup @ 6 lit = if kdqn @ 40 lit u< if dup 8 lit + @ kdqn @ 2 lit lshift kdq @ + !  kdqn @ 1 lit + kdqn !  1 lit kdfl ! then then
 	0 lit swap !
 then ;
@@ -988,6 +989,7 @@ nip ;
 \ the console).
 : pfinish
 dup 80 lit + 10 lit 0 lit do dup @ ?dup if fclose then 0 lit over ! 4 lit + loop drop
+dup C0 lit + @ ?dup if 1 lit pgfree  0 lit over C0 lit + ! then
 TXMAX 0 lit do i 4 lit lshift stx @ + dup 4 lit + @ 2 lit pick = over 8 lit + @ 2 lit = and if 3 lit swap 8 lit + !  1 lit kdfl ! else drop then loop
 dup 10 lit + @ over 14 lit + @ pgfree
 dup 30 lit + 4 lit 0 lit do

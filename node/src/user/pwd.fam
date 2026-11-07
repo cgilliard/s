@@ -1,0 +1,5 @@
+\ pwd.fam — the working directory.
+: buf variable ;
+40 lit alloc buf !
+"/proc/self/cwd" 0 lit open dup 0< if "pwd: no /proc" eputs 0A lit eputc 1 lit exit then
+dup buf @ 3F lit read dup 0< if drop 0 lit then 1 lit buf @ rot write drop close drop bye

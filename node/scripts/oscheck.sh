@@ -320,10 +320,61 @@ uimage store bin/kernel init=tstore
 rm -f "$T/store.disk"; dd if=/dev/zero of="$T/store.disk" bs=1 count=0 seek=268435456 2>/dev/null
 for n in 1 4; do
 	expect "store_$n" 124 '^small commits 20, while the long one was open 20$' 30 ./tools/q32 --smp=$n --disk="$T/store.disk" "$T/store.img"
-	has "store_$n" '^long keys whole 3000$'; has "store_$n" '^errors -2 -2 -9 -9 -2 next 20$'
+	has "store_$n" '^long keys whole 3000$'; has "store_$n" '^errors -22 -2 -9 -9 -2 next 20$'
 done
 has store_1 '^count 1$'; has store_4 '^count 2$'
 rm -f "$T/store.disk"
+
+# Files (step 8, part 4): 100,000 bytes written and read back, seek, a
+# write in the middle, appending, the errors, on one hart and on four;
+# then the shell on a disk booted twice, a file it wrote read back after.
+usrc tfile ': buf variable ;  : fd variable ;  : ok variable ;  : tot variable ;  : base variable ;
+: sp  20 lit putc ;
+: pat   dup 5 lit rshift + FF lit and ;                                   \ ( i -- byte ) byte i of the file
+: fill  0 lit do dup i + pat buf @ i + c! loop drop ;                     \ ( base n -- )
+: vfy   -rot 0 lit do dup i + pat 2 lit pick buf @ + i + c@ <> if 0 lit ok ! then loop 2drop ;   \ ( base n off -- )
+1000 lit alloc buf !  1 lit ok !  0 lit base !
+\ 100,000 bytes written 1000 at a time, read back 777 at a time
+"/big" 601 lit open fd !
+64 lit 0 lit do base @ 3E8 lit fill fd @ buf @ 3E8 lit write drop base @ 3E8 lit + base ! loop
+fd @ close drop
+"/big" 0 lit open fd !  0 lit tot !
+begin fd @ buf @ 309 lit read dup 0< 0= over and while tot @ over 0 lit vfy tot @ + tot ! repeat drop
+"read " puts tot @ u. " whole " puts ok @ u. sp
+\ the end, by seek
+fd @ FFFFFFF6 lit 2 lit seek u. sp
+fd @ buf @ A lit read u. sp  1 lit ok !  18696 lit A lit 0 lit vfy ok @ u. 0A lit putc
+fd @ close drop
+\ 3000 bytes of AA written at 5000, read back with what is on each side
+"/big" 2 lit open fd !  fd @ 1388 lit 0 lit seek drop
+BB8 lit 0 lit do AA lit buf @ i + c! loop  "mid " puts fd @ buf @ BB8 lit write u. sp
+fd @ 0 lit 2 lit seek u. sp
+fd @ 1384 lit 0 lit seek drop  fd @ buf @ BC0 lit read u. sp
+1 lit ok !  1384 lit 4 lit 0 lit vfy  1F40 lit 4 lit BBC lit vfy
+BB8 lit 0 lit do buf @ i 4 lit + + c@ AA lit <> if 0 lit ok ! then loop
+ok @ u. 0A lit putc  fd @ close drop
+\ appending
+"/big" A01 lit open fd !  fd @ "tail" 4 lit write drop  fd @ 0 lit 1 lit seek u. sp fd @ close drop
+\ the errors
+"errors " puts
+"/" 1 lit open . sp  "/" mkdir . sp  "/x/y" mkdir . sp  "/" remove . sp  "/nope" 0 lit open . sp
+"/d" mkdir . sp  "/d/f" 601 lit open close drop  "/d" remove . sp  "/d/f" remove . sp  "/d" remove . sp
+"/big" remove . sp  "/big" 0 lit open . 0A lit putc
+bye'
+uimage files bin/kernel init=tfile
+rm -f "$T/files.disk"; dd if=/dev/zero of="$T/files.disk" bs=1 count=0 seek=268435456 2>/dev/null
+for n in 1 4; do
+	expect "files_$n" 124 '^read 100000 whole 1 99990 10 1$' 20 ./tools/q32 --smp=$n --disk="$T/files.disk" "$T/files.img"
+	has "files_$n" '^mid 3000 100000 3008 1$'; has "files_$n" '^100004 errors -21 -17 -2 -16 -2 0 -39 0 0 0 -2$'
+done
+printf '%s\n' 'mkdir /home' 'cd /home' 'echo hello files > notes' 'echo a second line >> notes' 'ls /' 'pwd' > "$T/fs1.in"
+printf '%s\n' 'cat /home/notes' 'cd /home' 'wc < notes' 'rm notes' 'ls' 'cat notes' > "$T/fs2.in"
+N=$((N + 1))
+feed 12 "$T/fs1.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs1.out" 2>&1
+feed 12 "$T/fs2.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs2.out" 2>&1
+for pat in '^home/$' '^/home$'; do grep -q -- "$pat" "$T/fs1.out" || fail fs_boot1 "no /$pat/ in: $(head -c 600 "$T/fs1.out")"; done
+for pat in '^hello files$' '^a second line$' '^2 5 26$' '^cat: cannot open notes$'; do grep -q -- "$pat" "$T/fs2.out" || fail fs_boot2 "no /$pat/ in: $(head -c 600 "$T/fs2.out")"; done
+rm -f "$T/files.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds
