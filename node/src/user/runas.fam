@@ -1,0 +1,10 @@
+\ runas.fam — `runas user group program args...`: the program run as that
+\ user and group (runas must be root), waited for; its status runas's.
+: t variable ;  : st variable ;
+100 lit alloc t !
+argn 4 lit u< if "usage: runas user group program [args...]" eputs 0A lit eputc 1 lit exit then
+t @ 1 lit arg scpy 20 lit over c! 1 lit + 2 lit arg scpy 0 lit swap c!
+"/proc/self/user" 1 lit open dup 0< if "runas: no /proc" eputs 0A lit eputc 1 lit exit then
+dup t @ dup strlen write 0< if "runas: not allowed (only root may)" eputs 0A lit eputc 1 lit exit then close drop
+3 lit arg dup 0 lit spawnv dup 0< if "runas: cannot run " eputs drop 3 lit arg eputs 0A lit eputc 1 lit exit then
+st wait drop st @ exit

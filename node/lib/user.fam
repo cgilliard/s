@@ -9,8 +9,8 @@
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
 \ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
-\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 35 remove, 36 mkdir
-\ (below).
+\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 35 remove, 36 mkdir,
+\ 37 chmod, 38 chown (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -136,6 +136,8 @@
 : seek    12 lit sys ;                       \ ( fd offset whence -- place )  0 start, 1 here, 2 end
 : remove  0 lit 0 lit 23 lit sys ;           \ ( path -- r )  a file, a tree, an empty directory
 : mkdir   0 lit 0 lit 24 lit sys ;           \ ( path -- r )
+: chmod   0 lit 25 lit sys ;                 \ ( path mode -- r )  its owner, or root
+: chown   26 lit sys ;                       \ ( path user group -- r )  root
 \ sys5 ( a0 a1 a2 a3 a4 number -- result )  a call of five arguments.
 : sys5
 83280100 ,   \ lw a7,0(sp)
@@ -157,7 +159,8 @@
 : txnext    0 lit 1D lit sys5 ;               \ ( txn key klen buf -- klen' )  -2 none after
 
 \ strlen ( s -- n ), streq ( a b -- ok ), scpy ( dst src -- dst' ) (no NUL
-\ written), snum ( dst u -- dst' ) its decimal digits.
+\ written), atoi ( s -- n ) the decimal at s, snum ( dst u -- dst' ) its
+\ decimal digits.
 : strlen  dup begin dup c@ while 1 lit + repeat swap - ;
 : streq
 begin
@@ -167,6 +170,7 @@ begin
 	1 lit + swap 1 lit + swap 0 lit then then
 until ;
 : scpy  begin dup c@ ?dup while 2 lit pick c! swap 1 lit + swap 1 lit + repeat drop ;
+: atoi  0 lit swap begin dup c@ 30 lit - A lit u< while dup c@ 30 lit - rot dup 3 lit lshift swap 1 lit lshift + + swap 1 lit + repeat drop ;   \ ( s -- n )
 : snum  dup A lit u< if 30 lit + over c! 1 lit + else tuck A lit / snum swap A lit % 30 lit + over c! 1 lit + then ;
 
 \ fputs ( s fd -- ), eputs ( s -- ) to errors, eputc ( c -- ).

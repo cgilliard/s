@@ -1,11 +1,77 @@
-\ init.fam — the first program the kernel runs (docs/OS.md), in user mode.
-\ It keeps a shell on the console: started, and started again when it ends.
-\ (Step 8: what /etc/init lists.)
+\ init.fam — the first program the kernel runs (docs/OS.md, section 8), as
+\ root.  It runs what /etc/init lists, a program a line:
+\
+\     restart|once user tickets program [args...]
+\
+\ (user a number, the group the same: a program not root's runs by way of
+\ runas), starting again those marked restart when they end (a second
+\ later).  With no /etc/init (no disk, or none written yet) it keeps a
+\ shell on the console.
 
-: st variable ;
+: buf variable ;  : st variable ;  : t variable ;  : n variable ;
+: es variable ;            \ the table: 16 programs, 4 words each
+: q variable ;  : u variable ;  : e variable ;
+: ent  4 lit lshift es @ + ;                     \ ( i -- entry )  restart, tickets, pid, args
+
+\ The line being read: q where it is.
+: skipsp  begin q @ c@ 20 lit = while q @ 1 lit + q ! repeat ;
+: eol?    q @ c@ dup A lit = swap 0= or ;          \ ( -- flag )
+\ tok ( dst -- dst' )  the word at q copied to dst, NUL-ended.
+: tok
+begin q @ c@ dup 20 lit = over A lit = or swap 0= or 0= while q @ c@ over c! 1 lit + q @ 1 lit + q ! repeat
+0 lit over c! 1 lit + ;
+: nul  0 lit over c! 1 lit + ;                   \ ( dst -- dst' )  a NUL put
+
+\ line  the line at q, if it names a program, the next entry; q then at
+\ the next line.
+: line
+skipsp eol? 0= n @ 10 lit u< and if
+	n @ ent e !
+	t @ tok drop  t @ "restart" streq e @ !
+	skipsp t @ tok drop  t @ atoi u !
+	skipsp t @ tok drop  t @ atoi e @ 4 lit + !
+	100 lit alloc dup e @ C lit + !
+	u @ if "runas" scpy nul  u @ snum nul  u @ snum nul then
+	begin skipsp eol? 0= while tok repeat
+	nul drop
+	0 lit e @ 8 lit + !
+	n @ 1 lit + n !
+then
+begin eol? 0= while q @ 1 lit + q ! repeat
+q @ c@ if q @ 1 lit + q ! then ;
+
+\ start ( e -- )  its program started, given its tickets.
+: start
+dup C lit + @ dup 0 lit spawnv
+dup 0< if "init: cannot start " puts drop C lit + @ puts 0A lit putc else
+	2dup swap 8 lit + !
+	t @ "/proc/" scpy swap snum "/tickets" scpy 0 lit swap c!
+	t @ 1 lit open dup 0< if 2drop else
+		swap 4 lit + @ t @ 80 lit + swap snum 0 lit swap c!
+		dup t @ 80 lit + dup strlen write drop close drop
+	then
+then ;
+
+\ shell  no /etc/init: a shell on the console, again when it ends.
+: shell
 "init: starting the shell" puts 0A lit putc
 begin
 	"sh" spawn dup 0< if "init: no shell: " puts . 0A lit putc 1 lit exit then
 	st wait drop
 	"init: the shell ended; again" puts 0A lit putc
+0 lit until ;
+
+1000 lit alloc buf !  100 lit alloc t !  100 lit alloc es !  0 lit n !
+"/etc/init" 0 lit open dup 0< if drop shell then
+dup buf @ FFF lit read dup 0< if drop 0 lit then buf @ + 0 lit swap c!  close drop
+buf @ q !  begin q @ c@ while line repeat
+n @ 0= if shell then
+"init: /etc/init: " puts n @ u. " programs" puts 0A lit putc
+n @ 0 lit do i ent start loop
+begin
+	FFFFFFFF lit st wait
+	dup 0< if drop 3B9ACA00 lit sleep else
+		n @ 0 lit do i ent 8 lit + @ over = if i ent dup @ if 3B9ACA00 lit sleep start else 0 lit swap 8 lit + ! then then loop
+		drop
+	then
 0 lit until

@@ -1,0 +1,5 @@
+\ id.fam — the user and group this runs as.
+: buf variable ;
+20 lit alloc buf !
+"/proc/self/user" 0 lit open dup 0< if 1 lit exit then
+dup buf @ 1F lit read dup 0< if drop 0 lit then 1 lit buf @ rot write drop close drop bye

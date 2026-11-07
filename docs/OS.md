@@ -167,6 +167,8 @@ kernel checks every pointer against the caller's memory.
 | 34 | `recvfrom(fd, buf, n, &from)` | |
 | 35 | `remove(path)` | a file, a tree, an empty directory |
 | 36 | `mkdir(path)` | |
+| 37 | `chmod(path, mode)` | its owner, or root |
+| 38 | `chown(path, user, group)` | root only |
 
 Mutexes come both ways: the kernel's (9-12) when a thread should sleep
 while it waits, and a program's own (a bakery or Peterson lock in its
@@ -659,6 +661,30 @@ kernel too much to add at the end.
    directory to make one in, the root removed, a directory not empty);
    and the shell on a disk booted twice, the file the first boot wrote
    read back by the second, so files outlive a reboot.
+   Part 5 done (2026-11-06), and with it step 8. A process has a user
+   and a group (`/proc/<pid>/user`, written only by root, inherited by
+   its children; the kernel's processes are root's). `open` checks a
+   file's mode against them: read, write, and search for a directory
+   (its owner's, its group's or others' bits; root may do anything).
+   Making or removing one needs the right to write in its directory,
+   and a new file or directory is its maker's. `chmod` (37) and
+   `chown` (38) are new calls. A tree opened only to read cannot be
+   written, and changing another's tickets or ending it needs its user
+   or root. Programs: `login` (a name and a password checked against
+   `/etc/passwd`, `name:password:user:group:home:shell`; it becomes
+   that user, goes home, and runs the shell), `runas` (a program as
+   another user, for init), `id`, `chmod`, `chown`. `init` runs what
+   `/etc/init` lists, `restart|once user tickets program args`, and
+   with no such file keeps a root shell on the console as before.
+   Checked: a disk booted twice. The first boot writes `/etc/passwd`
+   and `/etc/init` as root and gives alice a home only she can enter.
+   The second boot's `init` runs `login`, which refuses a wrong
+   password. Alice gets her user and home, writes a file of her own,
+   and is refused `/etc/passwd` and a directory at the root. Root then
+   logs in after her and may read everything. Not yet: passwords are
+   kept in plain text (`/etc/passwd` only root may read) and echoed as
+   typed; the search right is checked only on a path's last directory;
+   a removed tree's pages are not given back.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
    reads a page served from the guest.

@@ -1,0 +1,6 @@
+\ chown.fam — `chown user group path...` (root only).
+argn 4 lit u< if "usage: chown user group path..." eputs 0A lit eputc 1 lit exit then
+3 lit begin dup arg ?dup while
+	dup 1 lit arg atoi 2 lit arg atoi chown dup 0< if "chown: " eputs swap eputs ": " eputs . 0A lit putc else 2drop then
+	1 lit +
+repeat drop bye

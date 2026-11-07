@@ -278,13 +278,13 @@ usrc tstore ': fda variable ;  : fdb variable ;  : fdc variable ;  : b variable 
 : chk  dup 0< if "error " puts . 0A lit putc 1 lit exit then ;      \ ( r -- r )
 200 lit alloc b !  200 lit alloc v !  0 lit bigdone !  0 lit smalls !  0 lit early !
 \ a counter that outlives a reboot
-"/t-count" TREE CREATE or open chk fda !
+"/t-count" TREE CREATE or 2 lit or open chk fda !
 fda @ 1 lit txbegin chk
 dup "n" 1 lit b @ 4 lit txget 4 lit = if b @ @ else 0 lit then 1 lit + dup "count " puts u. 0A lit putc
 b @ !  dup "n" 1 lit b @ 4 lit txput chk drop  txcommit chk drop
 \ a long transaction on one tree while short ones commit on another
-"/t-big" TREE CREATE or open chk fdb !
-"/t-small" TREE CREATE or open chk fdc !
+"/t-big" TREE CREATE or 2 lit or open chk fdb !
+"/t-small" TREE CREATE or 2 lit or open chk fdc !
 tcode[
 	drop fdb @ 1 lit txbegin chk
 	BB8 lit 0 lit do
@@ -375,6 +375,28 @@ feed 12 "$T/fs2.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs2.out" 2>
 for pat in '^home/$' '^/home$'; do grep -q -- "$pat" "$T/fs1.out" || fail fs_boot1 "no /$pat/ in: $(head -c 600 "$T/fs1.out")"; done
 for pat in '^hello files$' '^a second line$' '^2 5 26$' '^cat: cannot open notes$'; do grep -q -- "$pat" "$T/fs2.out" || fail fs_boot2 "no /$pat/ in: $(head -c 600 "$T/fs2.out")"; done
 rm -f "$T/files.disk"
+
+# Users (step 8, part 5): a disk booted twice.  First as root (no
+# /etc/init yet): /etc/passwd and /etc/init written, a home for alice
+# hers alone.  Then init runs login: a wrong password refused; alice in,
+# her user and home, her file, root's file and the root directory closed
+# to her; root in after her, everything open to it.
+printf '%s\n' 'mkdir /etc' 'echo root:rootpw:0:0:/:sh > /etc/passwd' 'echo alice:apw:1:1:/home/alice:sh >> /etc/passwd' \
+	'chmod 600 /etc/passwd' 'mkdir /home' 'mkdir /home/alice' 'chown 1 1 /home/alice' 'chmod 700 /home/alice' \
+	'echo restart 0 100 login > /etc/init' 'id' 'ls /etc' > "$T/u1.in"
+printf '%s\n' 'alice' 'wrong' 'alice' 'apw' 'id' 'pwd' 'echo mine > f' 'cat f' 'cat /etc/passwd' 'mkdir /tmp2' 'ls /home' \
+	'exit' 'root' 'rootpw' 'id' 'cat /etc/passwd' 'ls /home/alice' > "$T/u2.in"
+rm -f "$T/users.disk"; dd if=/dev/zero of="$T/users.disk" bs=1 count=0 seek=268435456 2>/dev/null
+N=$((N + 1))
+feed 15 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
+feed 18 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
+for pat in '^0 0$' '^init$' '^passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
+for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/alice$' '^mine$' '^cat: cannot open /etc/passwd$' \
+	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^root:rootpw:0:0:/:sh$' '^f$'; do
+	grep -q -- "$pat" "$T/u2.out" || fail users_boot2 "no /$pat/ in: $(head -c 900 "$T/u2.out")"
+done
+[ "$(grep -c '0 0$' "$T/u2.out")" = 1 ] || fail users_boot2 "root's id not once after alice's: $(head -c 900 "$T/u2.out")"
+rm -f "$T/users.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

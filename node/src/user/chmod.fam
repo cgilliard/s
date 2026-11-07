@@ -1,0 +1,7 @@
+\ chmod.fam — `chmod mode path...` (the mode in octal).
+: oct  0 lit swap begin dup c@ 30 lit - 8 lit u< while dup c@ 30 lit - rot 3 lit lshift + swap 1 lit + repeat drop ;   \ ( s -- n )
+argn 3 lit u< if "usage: chmod mode path..." eputs 0A lit eputc 1 lit exit then
+2 lit begin dup arg ?dup while
+	dup 1 lit arg oct chmod dup 0< if "chmod: " eputs swap eputs ": " eputs . 0A lit putc else 2drop then
+	1 lit +
+repeat drop bye
