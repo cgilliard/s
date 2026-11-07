@@ -52,6 +52,12 @@ for n in 1 2 8 64; do
 	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam
 done
 
+# The store's benchmark (scripts/storebench.sh) builds beside the kernel:
+# its words and the kernel's share one name space.
+N=$((N + 1))
+./tools/fam -o "$T/storebench.bin" src/kernel.fam src/store.fam src/storebench.fam > "$T/storebench.build" 2>&1 \
+	|| fail storebench_build "$(head -c 300 "$T/storebench.build")"
+
 printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
 ./tools/fam -o "$T/fault.bin" src/kernel.fam "$T/fault.fam" > "$T/fault.build" 2>&1 \
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
