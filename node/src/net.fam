@@ -235,9 +235,10 @@ then then ;
 \ for the next call 3C; bytes received 40 and read 44 (a listener: the
 \ connections queued and taken); bytes written 48; the peer's segment size
 \ 4C; the listener a connection came to 50; the window last advertised 54;
-\ a listener's queue of connections (8) from 100; what is received, a ring
-\ of 4 KiB, from 1000; what is written, 8 KiB, from 2000.  The data's byte
-\ k is sequence number (ours) first + 1 + k.
+\ a listener's queue of connections from 100 (32, one per socket, so a
+\ burst never overflows it); what is received, a ring of 4 KiB, from
+\ 1000; what is written, 8 KiB, from 2000.  The data's byte k is sequence
+\ number (ours) first + 1 + k.
 \
 \ Every TCP socket is in ntcb, from socket() until it is closed both by
 \ its descriptors (fclose sets flag 1) and on the wire: hart 0's timed work
@@ -277,7 +278,7 @@ NTC 0 lit do
 loop
 dup cst @ 1 lit = if
 	dup crh @ over crtl @ - ?dup if 0 lit do
-		1 lit  over crtl @ i + 7 lit and 2 lit lshift 100 lit + 2 lit pick + @  cfl+
+		1 lit  over crtl @ i + 1F lit and 2 lit lshift 100 lit + 2 lit pick + @  cfl+
 	loop then
 then
 4 lit pgfree ;
@@ -457,8 +458,8 @@ else drop then ;
 \ it cannot be).
 : cqueue
 dup cpar @ ?dup if
-	dup crh @ over crtl @ - 8 lit u< if
-		2dup dup crh @ 7 lit and 2 lit lshift 100 lit + + !
+	dup crh @ over crtl @ - NTC u< if
+		2dup dup crh @ 1F lit and 2 lit lshift 100 lit + + !
 		dup crh @ 1 lit + over crh !  fwake drop
 	else drop 1 lit swap cfl+ then
 else 1 lit swap cfl+ then ;

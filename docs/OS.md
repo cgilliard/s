@@ -550,7 +550,7 @@ kernel too much to add at the end.
    `ps`, `echo`, `cat`, `wc`. Checked: `poll` timing out, ready, and
    hung up; a pipe read to its end; the errors (no such path, a bad
    descriptor, a key not to be written, no such process, 16 descriptors
-   at most); a child killed through `/proc`; and, typed into the console
+   at most, 32 since step 10's desktop); a child killed through `/proc`; and, typed into the console
    a line at a time on one hart and on four, `ps`, `echo … | wc`, 100 KiB
    through `big | cat | wc`, `/proc` read and written through `<` and
    `>`, an unknown program, a missing command, and `exit` with `init`
@@ -759,6 +759,31 @@ kernel too much to add at the end.
     text; arrows and colours are not handled); ^C does not end the
     foreground program; no window resizing; terminals do not survive
     the page being reloaded.
+
+    The desktop (2026-11-07). The page is now a desktop: a dock on the
+    left whose terminal button opens a window, and a taskbar along the
+    bottom with one button per window and a clock. Windows move by
+    their title bar, resize from their corner, and have minimize,
+    maximize (or a double click on the title) and close. A taskbar
+    button restores a minimized window, focuses one behind, or
+    minimizes the one in front. Each window is its own WebSocket, so
+    its own pty and shell. Closing a window ends its shell, and a shell
+    that exits closes its window. The page is kept readable in
+    `src/user/wm.html`; `scripts/wmpage.py` puts it into `wm.fam` as
+    string literals. Opening several terminals at once found three
+    bugs, now fixed. (1) A process had 16 descriptors, and `wm` uses
+    two per terminal: the record is now 512 bytes, with 32 descriptors
+    at 256. (2) `wm` took its client buffers and the reaper's stacks
+    from the 64 KiB a process starts with, past its end, so `thread`
+    failed (-14) and no shell was ever reaped. The stacks now come
+    first and the buffers from `malloc`. (3) A listener queued eight
+    connections and closed the rest of a burst with a FIN; the queue
+    now has 32 entries, one per socket, so it cannot overflow. `wm`
+    takes twelve clients and answers a thirteenth with 503, which the
+    window shows as "none free". Checked by the page test: two
+    terminals, typing, minimize and restore, maximize, `exit` and the
+    close button each closing a window, then thirteen at once and no
+    zombie left in `ps`.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

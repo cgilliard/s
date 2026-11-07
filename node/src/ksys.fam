@@ -51,12 +51,12 @@ then then ;
 
 : sal variable ;             \ the arguments' length, spawn checked
 
-\ sfds? ( -- ok )  spawn's fds: 0, or its own word count n (at most 16)
+\ sfds? ( -- ok )  spawn's fds: 0, or its own word count n (at most 32)
 \ then n descriptors of the caller's, or -1 (the child's closed).
 : sfds?
 30 lit sysarg ?dup 0= if 1 lit else
 	dup 4 lit urange 0= if drop 0 lit else
-	dup @ 10 lit u> if drop 0 lit else
+	dup @ 20 lit u> if drop 0 lit else
 	dup dup @ 1 lit + 2 lit lshift urange 0= if drop 0 lit else
 		1 lit swap
 		dup @ ?dup if 0 lit do
@@ -969,7 +969,7 @@ klk @ lock
 dup @ 2 lit <> over cst @ 1 lit <> or if drop FFFFFFEA lit else
 dup crh @ over crtl @ = if 5 lit tretry BLK else
 8 lit 3 lit fnew ?dup 0= if drop FFFFFFE9 lit else
-	over dup crtl @ 7 lit and 2 lit lshift 100 lit + + @ over 8 lit + !
+	over dup crtl @ 1F lit and 2 lit lshift 100 lit + + @ over 8 lit + !
 	dup area@ tproc fdput dup 0< if
 		swap 0 lit swap !  nip
 	else

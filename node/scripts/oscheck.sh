@@ -209,7 +209,7 @@ for n in 1 4; do
 done
 
 # Descriptors, the console, init and a shell (step 7).  Calls: poll timing
-# out, then readable, then hung up; a pipe read to its end; the errors; 16
+# out, then readable, then hung up; a pipe read to its end; the errors; 32
 # descriptors at most; a child killed through /proc/<pid>/kill.
 usrc tdesc ': pf variable ;  : ent variable ;  : b variable ;  : st variable ;  : fds variable ;  : path variable ;
 : sp  20 lit putc ;
@@ -227,8 +227,8 @@ ent @ 1 lit 0 lit poll "hup " puts . sp ent @ 6 lit + h@ u. 0A lit putc
 9 lit b @ 1 lit read "badfd " puts . sp
 "/proc/1/status" 1 lit open "ro " puts . sp
 "/proc/99/status" 0 lit open "nopid " puts . sp
-0 lit 10 lit 0 lit do "/dev/null" 0 lit open 0< if 1 lit + then loop "full " puts . 0A lit putc
-10 lit 3 lit do i close drop loop
+0 lit 20 lit 0 lit do "/dev/null" 0 lit open 0< if 1 lit + then loop "full " puts . 0A lit putc
+20 lit 3 lit do i close drop loop
 pf @ pipe drop
 2 lit fds @ !  pf @ @ fds @ 4 lit + !  FFFFFFFF lit fds @ 8 lit + !
 "cat" 0 lit fds @ spawnv
@@ -552,7 +552,10 @@ done
 # WebSocket, a shell on a terminal, from the host through a forwarded
 # port: the page, the handshake's key, the prompt, a directory made and
 # seen by ls, a ping answered, exit closing it.  With node 22 or later, the
-# page's own script too, typing ls (and a backspace).
+# desktop page's own script too, on a stub DOM: two terminals from the
+# dock, typing (a backspace among it), minimize and restore from the
+# taskbar, maximize, exit and the close button each closing a window, then
+# thirteen at once (twelve, the last told none is free) and no zombie left.
 cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
@@ -604,27 +607,81 @@ send(b"hi", 9); print("ping", pump(b"[pong:hi]"))
 send(b"exit\r"); print("exit", pump(b"[close]"))
 WSCEOF
 cat > "$T/page.js" <<'PAGEEOF'
-// Run the page wm serves: its script, with a stub DOM, keys typed as a browser would.
+// Run the page wm serves: its script, with a small stub DOM; the dock's
+// terminal button clicked, keys typed as a browser would.
 const port = process.argv[2];
 (async () => {
   const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
   const js = html.split('<script>')[1].split('</script>')[0];
-  const t = { textContent: '', focus() {} };
-  globalThis.document = { getElementById: () => t, body: { scrollHeight: 0 } };
+  const byId = {};
+  class El {
+    constructor(tag) { this.tag = tag; this.kids = []; this.parent = null; this.style = {}; this.textContent = ''; this.innerHTML = ''; this.className = '';
+      this.scrollTop = 0; this.clientHeight = 0; this.scrollHeight = 0; this.offsetLeft = 0; this.offsetTop = 0; this.ls = {};
+      const self = this;
+      this.classList = {
+        has: (c) => self.className.split(' ').includes(c),
+        add: (c) => { if (!self.classList.has(c)) self.className = (self.className + ' ' + c).trim(); },
+        remove: (c) => { self.className = self.className.split(' ').filter((x) => x && x !== c).join(' '); },
+        contains: (c) => self.classList.has(c),
+        toggle: (c) => { if (self.classList.has(c)) self.classList.remove(c); else self.classList.add(c); },
+      };
+    }
+    appendChild(e) { e.parent = this; this.kids.push(e); return e; }
+    remove() { if (this.parent) this.parent.kids = this.parent.kids.filter((k) => k !== this); this.parent = null; }
+    addEventListener(t, f) { this.ls[t] = f; }
+    focus() { if (doc.active !== this) { doc.active = this; if (this.onfocus) this.onfocus(); } }
+  }
+  const doc = { active: null, createElement: (t) => new El(t), addEventListener() {}, removeEventListener() {},
+    getElementById: (id) => byId[id] || (byId[id] = new El('div')) };
+  globalThis.document = doc;
   globalThis.location = { protocol: 'http:', host: `127.0.0.1:${port}` };
-  globalThis.window = { scrollTo() {} };
   new Function(js)();
-  const type = (s) => { for (const ch of s) t.onkeydown({ key: ch === '\r' ? 'Enter' : ch, ctrlKey: false, metaKey: false, preventDefault() {} }); };
-  const wait = (re, ms) => new Promise((ok) => { const end = Date.now() + ms; const iv = setInterval(() => { if (re.test(t.textContent) || Date.now() > end) { clearInterval(iv); ok(re.test(t.textContent)); } }, 50); });
-  console.log('prompt', await wait(/\$ █$/, 5000));
-  type('ls /x'); t.onkeydown({ key: 'Backspace', ctrlKey: false, preventDefault() {} }); type('\r');
-  console.log('ls', await wait(/d\/\n\$ █$/, 5000));
-  console.log(JSON.stringify(t.textContent));
-  type('exit\r'); console.log('closed', await wait(/\[closed\]$/, 5000));
+  const all = (e, c, out = []) => { if (e.classList && e.classList.has(c)) out.push(e); e.kids.forEach((k) => all(k, c, out)); return out; };
+  const desk = byId.desk, tasks = byId.tasks;
+  const key = (t, k, ctrl) => t.onkeydown({ key: k, ctrlKey: !!ctrl, metaKey: false, altKey: false, preventDefault() {} });
+  const type = (t, s) => { for (const ch of s) key(t, ch === '\r' ? 'Enter' : ch); };
+  const wait = (f, ms) => new Promise((ok) => { const end = Date.now() + ms; const iv = setInterval(() => { if (f() || Date.now() > end) { clearInterval(iv); ok(!!f()); } }, 50); });
+  const prompt = /\$ █$/;
+
+  byId.newt.onclick(); byId.newt.onclick();
+  const wins = all(desk, 'win'), terms = all(desk, 'term');
+  console.log('windows', wins.length === 2 && all(tasks, 'task').length === 2);
+  const [t1, t2] = terms;
+  console.log('prompt', await wait(() => prompt.test(t1.textContent) && prompt.test(t2.textContent), 8000));
+  console.log('focused', doc.active === t2 && wins[0].classList.has('off') && !wins[1].classList.has('off'));
+  type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.textContent), 5000);
+  type(t2, 'ls /x'); key(t2, 'Backspace'); type(t2, '\r');
+  console.log('ls', await wait(() => /e\/\n\$ █$/.test(t2.textContent), 5000) && !/ls/.test(t1.textContent));
+  // the second minimized from its button: hidden, the first focused; restored from the taskbar
+  all(wins[1], 'wb')[0].onclick({ stopPropagation() {} });
+  const k2 = all(tasks, 'task')[1];
+  console.log('minimize', wins[1].style.display === 'none' && k2.classList.has('min') && doc.active === t1);
+  k2.onclick();
+  console.log('restore', wins[1].style.display === 'flex' && !k2.classList.has('min') && doc.active === t2);
+  all(wins[1], 'wb')[1].onclick({ stopPropagation() {} });
+  console.log('maximize', wins[1].classList.has('max'));
+  // exit closes the shell's window and its taskbar button
+  type(t1, 'exit\r');
+  console.log('exit', await wait(() => all(desk, 'win').length === 1 && all(tasks, 'task').length === 1, 5000));
+  // the close button
+  all(wins[1], 'wb')[2].onclick({ stopPropagation() {} });
+  console.log('closed', all(desk, 'win').length === 0 && all(tasks, 'task').length === 0);
+  console.log(JSON.stringify(t2.textContent));
+  // thirteen at once: twelve terminals (wm's limit), the last told none is
+  // free; all closed, the shells reaped (none left a zombie in ps)
+  for (let i = 0; i < 13; i++) byId.newt.onclick();
+  const ts = () => all(desk, 'term');
+  console.log('full', await wait(() => ts().filter((t) => prompt.test(t.textContent)).length === 12 && ts().filter((t) => /none free/.test(t.textContent)).length === 1, 15000));
+  all(desk, 'win').forEach((w) => all(w, 'wb')[2].onclick({ stopPropagation() {} }));
+  await new Promise((r) => setTimeout(r, 1500));
+  byId.newt.onclick(); const t3 = ts()[0];
+  await wait(() => prompt.test(t3.textContent), 5000); type(t3, 'ps\r');
+  console.log('reaped', await wait(() => /CMD[^]*\$ █$/.test(t3.textContent), 5000) && !/ Z /.test(t3.textContent));
+  console.log(JSON.stringify(t3.textContent));
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))
@@ -634,8 +691,8 @@ for n in 1 4; do
 	i=0; while [ $i -lt 20 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
 	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
-		lim 30 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
-		for pat in '^prompt true$' '^ls true$' '^closed true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+		lim 60 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
+		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do

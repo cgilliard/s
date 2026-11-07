@@ -746,7 +746,7 @@ then ;
 \ at 260-272, where it goes on 276, s0-s7 at 288-316, and 280 set until
 \ trun takes it back there.
 \
-\ A process (256 bytes): its state at 0 (0 free, 1 living, 2 ended, its
+\ A process (512 bytes): its state at 0 (0 free, 1 living, 2 ended, its
 \ parent not yet told), its parent's pid at 4, exit code 8, threads not
 \ ended 12, memory (first byte 16, pages 20), code (first byte 24, the byte
 \ past it 28), tickets 32, program's table entry 36 (whose name is its
@@ -754,9 +754,10 @@ then ;
 \ (docs/OS.md, section 10), 48 on: 4 pairs (first byte, byte past), each 0
 \ when empty, which `map` and `unmap` change and `upmp` puts in PMP
 \ entries 5-12 (so a process holds code, its first region, and 4 blocks);
-\ the ticks its threads have run 80; at 128, its 16 descriptors (each an
-\ open file of the table below, or 0); its working directory at 192 (a
-\ page: the path's length, then the path; 0: the root).
+\ the ticks its threads have run 80; its working directory at 192 (a
+\ page: the path's length, then the path; 0: the root), its user and group
+\ at 196 and 200; at 256, its 32 descriptors (each an open file of the
+\ table below, or 0).
 \
 \ Each hart runs hloop: a thread drawn by lottery among those ready (each
 \ holding its tickets), run until it traps back (its slice over at a timer
@@ -769,9 +770,9 @@ then ;
 : prc  variable ;            \ the processes'
 
 : thn     9 lit lshift thr @ + ;           \ ( i -- t )
-: prn     8 lit lshift prc @ + ;           \ ( i -- p )
+: prn     9 lit lshift prc @ + ;           \ ( i -- p )
 : tid     thr @ - 9 lit rshift 1 lit + ;   \ ( t -- tid )
-: pid     prc @ - 8 lit rshift 1 lit + ;   \ ( p -- pid )
+: pid     prc @ - 9 lit rshift 1 lit + ;   \ ( p -- pid )
 : tproc   B4 lit + @ ;                     \ ( t -- p )
 : tstate  B0 lit + @ ;                     \ ( t -- state )
 : tstate! B0 lit + ! ;                     \ ( state t -- )
@@ -800,7 +801,7 @@ then ;
 : ptinit
 0 lit thi !  0 lit phi !
 20 lit pgalloc dup 0= if "no memory for the threads" panic then dup thr ! 20000 lit mzero
-4 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 4000 lit mzero
+8 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 8000 lit mzero
 2 lit pgalloc dup 0= if "no memory for the open files" panic then dup fil ! 2000 lit mzero
 TXMAX 4 lit lshift dup alloc dup stx ! swap mzero
 100 lit alloc kdq !  0 lit kdqn !  0 lit kdfl ! ;
@@ -831,7 +832,7 @@ TXMAX 4 lit lshift dup alloc dup stx ! swap mzero
 \ wakes it (fwake) need not know what it waited for.
 
 : fln  5 lit lshift fil @ + ;                \ ( i -- f )
-: pfd  swap 2 lit lshift + 80 lit + ;        \ ( fd p -- slot )
+: pfd  swap 2 lit lshift + 100 lit + ;        \ ( fd p -- slot )
 : kerr?  FFFFF000 lit u< 0= ;                \ ( x -- flag )  an error, not an address
 
 \ fnew ( kind mode -- f | 0 )  an open file, one descriptor on it.
@@ -1000,7 +1001,7 @@ nip ;
 \ kernel (those ended, freed), and its parent told (the kernel says so on
 \ the console).
 : pfinish
-dup 80 lit + 10 lit 0 lit do dup @ ?dup if fclose then 0 lit over ! 4 lit + loop drop
+dup 100 lit + 20 lit 0 lit do dup @ ?dup if fclose then 0 lit over ! 4 lit + loop drop
 dup C0 lit + @ ?dup if 1 lit pgfree  0 lit over C0 lit + ! then
 TXMAX 0 lit do i 4 lit lshift stx @ + dup 4 lit + @ 2 lit pick = over 8 lit + @ 2 lit = and if 3 lit swap 8 lit + !  1 lit kdfl ! else drop then loop
 dup 10 lit + @ over 14 lit + @ pgfree
@@ -1255,12 +1256,12 @@ klk @ unlock ;
 \ kspawn ( name tickets -- pid | error )  a process the kernel starts, its
 \ 0, 1 and 2 the console.
 \ ufd ( fd -- f | 0 )  the calling process's descriptor fd.
-: ufd  dup F lit u> if drop 0 lit else area@ tproc pfd @ then ;
+: ufd  dup 1F lit u> if drop 0 lit else area@ tproc pfd @ then ;
 
 \ fdput ( f p -- fd | -24 )  a descriptor of p on f, the lowest free.
 : fdput
 FFFFFFE8 lit
-10 lit 0 lit do
+20 lit 0 lit do
 	dup 0< if over i swap pfd @ 0= if drop i then then
 loop
 dup 0< if nip nip else rot over 3 lit pick pfd ! nip then ;

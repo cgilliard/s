@@ -1,0 +1,106 @@
+<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>tabernacle</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,sans-serif;color:#ddd}
+body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42)}
+#dock{position:fixed;left:0;top:0;bottom:44px;width:64px;background:rgba(8,8,12,.85);display:flex;flex-direction:column;align-items:center;padding-top:10px;gap:8px;z-index:100000}
+.app{width:48px;height:48px;border-radius:10px;border:0;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
+.app:hover{background:rgba(255,255,255,.14)}
+#desk{position:fixed;left:64px;top:0;right:0;bottom:44px;overflow:hidden}
+#bar{position:fixed;left:0;right:0;bottom:0;height:44px;background:rgba(8,8,12,.92);display:flex;align-items:center;gap:4px;padding:0 8px;z-index:100000}
+#tasks{flex:1;display:flex;gap:4px;overflow:hidden}
+.task{flex:0 1 180px;min-width:60px;height:32px;border:0;border-radius:6px;background:rgba(255,255,255,.07);color:#ccc;cursor:pointer;text-align:left;padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:inherit}
+.task:hover{background:rgba(255,255,255,.13)}
+.task.on{background:rgba(255,255,255,.2);color:#fff;box-shadow:inset 0 -2px #6cb6ff}
+.task.min{opacity:.55}
+#clock{color:#bbb;padding:0 8px;font-variant-numeric:tabular-nums}
+.win{position:absolute;display:flex;flex-direction:column;background:#111;border:1px solid #444;border-radius:8px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.5);resize:both;min-width:260px;min-height:140px}
+.win.max{left:0!important;top:0!important;width:100%!important;height:100%!important;border-radius:0;resize:none}
+.tb{height:32px;flex:none;display:flex;align-items:center;background:#3b3b42;color:#eee;padding-left:12px;user-select:none}
+.win.off .tb{background:#26262b;color:#999}
+.tt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wb{width:42px;height:32px;border:0;background:transparent;color:inherit;font-size:15px;cursor:pointer;padding:0}
+.wb:hover{background:rgba(255,255,255,.14)}
+.wb.x:hover{background:#c42b1c;color:#fff}
+.term{flex:1;margin:0;padding:6px 8px;overflow:auto;font:14px/1.3 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;outline:none;color:#ddd;background:#111}
+</style></head><body>
+<div id=dock><button class=app id=newt title='New terminal'>
+<svg width=34 height=34 viewBox='0 0 24 24'><rect x=2 y=4 width=20 height=16 rx=2.5 fill='#222' stroke='#bbb' stroke-width=1.2 />
+<path d='M6 9.5l3 2.5-3 2.5M11 15h6' stroke='#7ee787' stroke-width=1.8 fill=none stroke-linecap=round stroke-linejoin=round /></svg>
+</button></div>
+<div id=desk></div>
+<div id=bar><div id=tasks></div><span id=clock></span></div>
+<script>
+var desk=document.getElementById('desk'),tasks=document.getElementById('tasks'),wins=[],z=1,n=0;
+var wsurl=(location.protocol=='https:'?'wss://':'ws://')+location.host+'/tty';
+function el(g,c,p){var e=document.createElement(g);if(c)e.className=c;if(p)p.appendChild(e);return e}
+function topw(){var b=null;wins.forEach(function(o){if(!o.min&&(!b||o.z>b.z))b=o});return b}
+function focusw(w){
+wins.forEach(function(o){if(o!=w){o.d.classList.add('off');o.k.classList.remove('on')}});
+if(!w)return;
+w.min=false;w.z=++z;w.d.style.zIndex=w.z;w.d.style.display='flex';
+w.d.classList.remove('off');w.k.classList.add('on');w.k.classList.remove('min');w.t.focus();
+}
+function minw(w){w.min=true;w.d.style.display='none';w.k.classList.remove('on');w.k.classList.add('min');focusw(topw())}
+function maxw(w){w.d.classList.toggle('max');focusw(w)}
+function closew(w){
+var i=wins.indexOf(w);if(i<0)return;
+wins.splice(i,1);if(w.ws.readyState<2)w.ws.close();w.d.remove();w.k.remove();focusw(topw());
+}
+function show(w){
+var t=w.t,b=t.scrollTop+t.clientHeight>=t.scrollHeight-4;
+t.textContent=w.s+(w.done?'':String.fromCharCode(9608));if(b)t.scrollTop=t.scrollHeight;
+}
+function openw(){
+var w={s:'',min:false,z:0},i=++n,o=(wins.length%8)*28;
+w.d=el('div','win',desk);
+w.d.style.left=(24+o)+'px';w.d.style.top=(20+o)+'px';w.d.style.width='720px';w.d.style.height='440px';
+var tb=el('div','tb',w.d),tt=el('span','tt',tb);tt.textContent='Terminal '+i;
+var bm=el('button','wb',tb),bx=el('button','wb',tb),bc=el('button','wb x',tb);
+bm.innerHTML='&#8211;';bx.innerHTML='&#9633;';bc.innerHTML='&#215;';
+bm.title='Minimize';bx.title='Maximize';bc.title='Close';
+w.t=el('pre','term',w.d);w.t.tabIndex=0;
+w.k=el('button','task',tasks);w.k.textContent='Terminal '+i;w.k.title='Terminal '+i;
+bm.onclick=function(e){e.stopPropagation();minw(w)};
+bx.onclick=function(e){e.stopPropagation();maxw(w)};
+bc.onclick=function(e){e.stopPropagation();closew(w)};
+tb.ondblclick=function(e){if(e.target==tb||e.target==tt)maxw(w)};
+w.d.addEventListener('mousedown',function(){if(wins.indexOf(w)>=0&&topw()!=w)focusw(w)});
+w.t.onfocus=function(){if(topw()!=w)focusw(w)};
+w.k.onclick=function(){if(!w.min&&topw()==w)minw(w);else focusw(w)};
+tb.onmousedown=function(e){
+if(e.button!=0||(e.target!=tb&&e.target!=tt)||w.d.classList.contains('max'))return;
+var x=e.clientX-w.d.offsetLeft,y=e.clientY-w.d.offsetTop;
+function mv(e){w.d.style.left=Math.max(0,e.clientX-x)+'px';w.d.style.top=Math.max(0,e.clientY-y)+'px'}
+function up(){document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up)}
+document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);e.preventDefault();
+};
+w.ws=new WebSocket(wsurl);w.ws.binaryType='arraybuffer';
+w.ws.onopen=function(){w.up=1};
+w.ws.onmessage=function(e){
+var a=new Uint8Array(e.data);
+for(var j=0;j<a.length;j++){var c=a[j];if(c==8)w.s=w.s.slice(0,-1);else if(c==10||c>=32)w.s+=String.fromCharCode(c)}
+if(w.s.length>200000)w.s=w.s.slice(-100000);
+show(w);
+};
+w.ws.onclose=w.ws.onerror=function(){
+if(w.up){closew(w);return}
+if(w.done)return;
+w.done=1;w.s+='[no terminal: the server has none free]';show(w);
+};
+w.t.onkeydown=function(e){
+var k=e.key,c=-1;
+if(k=='Enter')c=13;else if(k=='Backspace')c=127;else if(k=='Tab')c=9;else if(k=='Escape')c=27;
+else if(e.ctrlKey&&k.length==1)c=k.toUpperCase().charCodeAt(0)-64;
+else if(k.length==1&&!e.metaKey&&!e.altKey)c=k.charCodeAt(0);
+if(c>=0&&c<128&&w.ws.readyState==1){w.ws.send(new Uint8Array([c]));e.preventDefault()}
+};
+w.t.onpaste=function(e){if(w.ws.readyState==1)w.ws.send(new TextEncoder().encode(e.clipboardData.getData('text')));e.preventDefault()};
+wins.push(w);focusw(w);show(w);
+return w;
+}
+document.getElementById('newt').onclick=function(){openw()};
+function tick(){var d=new Date();document.getElementById('clock').textContent=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}
+tick();setInterval(tick,10000);
+</script></body></html>

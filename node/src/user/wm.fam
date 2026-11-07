@@ -1,8 +1,11 @@
 \ wm.fam — the window manager (docs/OS.md, section 7): wm [port [program]]
-\ (80, sh).  An HTTP and WebSocket server: GET / is a page holding a
-\ terminal; its WebSocket (GET /tty) gets a terminal of its own (pty) with
+\ (80, sh).  An HTTP and WebSocket server: GET / is a desktop page (a dock
+\ whose terminal button opens a window, windows that move, resize,
+\ minimize, maximize and close, a taskbar with one button per window);
+\ each window's WebSocket (GET /tty) gets a terminal of its own (pty) with
 \ the program running on it, what is typed going to the terminal and what
-\ it shows coming back, until either end closes.  Eight clients at once,
+\ it shows coming back, until either end closes (the program ending closes
+\ its window).  Twelve clients at once (each two of wm's 32 descriptors),
 \ on one poll loop; a thread reaps the programs that end.
 
 \ SHA-1 (for the WebSocket handshake's accept key) and base64.
@@ -78,7 +81,7 @@ nip ;
 \ the request, 1 a WebSocket), its terminal's master end 8, bytes buffered
 \ C, its buffer 10 (4 KiB: the request, then frames arriving).
 
-:M NC 8 lit ;
+:M NC C lit ;
 : cl variable ;  : lsn variable ;  : prog variable ;  : port variable ;
 : pe variable ;              \ poll's entries: the listener, then each client's socket and terminal
 : pm variable ;              \ which client each entry is (bit 0: its terminal)
@@ -131,24 +134,78 @@ else
 then
 ?dup if cfd @ -rot write drop else drop then ;
 
-\ page  the terminal's page.
+\ page  the desktop's page (generated from a readable copy: no double
+\ quotes or backslashes inside fam strings).
 : page
 "HTTP/1.0 200 OK" wr crlf "Content-Type: text/html; charset=utf-8" wr crlf crlf
-"<!doctype html><html><head><meta charset=utf-8><title>tabernacle</title>" wr
-"<style>body{background:#111;color:#ddd;margin:0}pre{font:14px monospace;padding:8px;margin:0;" wr
-"white-space:pre-wrap;word-break:break-all;min-height:100vh;outline:none}</style></head>" wr
-"<body><pre id=t tabindex=0></pre><script>" wr
-"var t=document.getElementById('t'),s='',ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/tty');" wr
-"ws.binaryType='arraybuffer';" wr
-"function put(c){if(c==8){s=s.slice(0,-1);return}if(c==10||c>=32)s+=String.fromCharCode(c)}" wr
-"ws.onmessage=function(e){var a=new Uint8Array(e.data);for(var i=0;i<a.length;i++)put(a[i]);" wr
-"t.textContent=s+String.fromCharCode(9608);window.scrollTo(0,document.body.scrollHeight)};" wr
-"ws.onclose=function(){t.textContent=s+String.fromCharCode(10)+'[closed]'};" wr
-"t.onkeydown=function(e){var k=e.key,c=-1;if(k=='Enter')c=13;else if(k=='Backspace')c=127;" wr
-"else if(e.ctrlKey&&k.length==1)c=k.toUpperCase().charCodeAt(0)-64;else if(k.length==1&&!e.metaKey)c=k.charCodeAt(0);" wr
-"if(c>=0&&c<128){ws.send(new Uint8Array([c]));e.preventDefault()}};" wr
-"t.onpaste=function(e){ws.send(new TextEncoder().encode(e.clipboardData.getData('text')));e.preventDefault()};" wr
-"t.focus();</script></body></html>" wr ;
+"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initi" wr
+"al-scale=1'><title>tabernacle</title><style>*{box-sizing:border-box}html,body{margin:0;height:100%;o" wr
+"verflow:hidden;font:13px system-ui,sans-serif;color:#ddd}body{background:#1d2b3a linear-gradient(135" wr
+"deg,#1d3557,#2b2d42)}#dock{position:fixed;left:0;top:0;bottom:44px;width:64px;background:rgba(8,8,12" wr
+",.85);display:flex;flex-direction:column;align-items:center;padding-top:10px;gap:8px;z-index:100000}" wr
+".app{width:48px;height:48px;border-radius:10px;border:0;background:transparent;cursor:pointer;displa" wr
+"y:flex;align-items:center;justify-content:center;padding:0}.app:hover{background:rgba(255,255,255,.1" wr
+"4)}#desk{position:fixed;left:64px;top:0;right:0;bottom:44px;overflow:hidden}#bar{position:fixed;left" wr
+":0;right:0;bottom:0;height:44px;background:rgba(8,8,12,.92);display:flex;align-items:center;gap:4px;" wr
+"padding:0 8px;z-index:100000}#tasks{flex:1;display:flex;gap:4px;overflow:hidden}.task{flex:0 1 180px" wr
+";min-width:60px;height:32px;border:0;border-radius:6px;background:rgba(255,255,255,.07);color:#ccc;c" wr
+"ursor:pointer;text-align:left;padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellips" wr
+"is;font:inherit}.task:hover{background:rgba(255,255,255,.13)}.task.on{background:rgba(255,255,255,.2" wr
+");color:#fff;box-shadow:inset 0 -2px #6cb6ff}.task.min{opacity:.55}#clock{color:#bbb;padding:0 8px;f" wr
+"ont-variant-numeric:tabular-nums}.win{position:absolute;display:flex;flex-direction:column;backgroun" wr
+"d:#111;border:1px solid #444;border-radius:8px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.5)" wr
+";resize:both;min-width:260px;min-height:140px}.win.max{left:0!important;top:0!important;width:100%!i" wr
+"mportant;height:100%!important;border-radius:0;resize:none}.tb{height:32px;flex:none;display:flex;al" wr
+"ign-items:center;background:#3b3b42;color:#eee;padding-left:12px;user-select:none}.win.off .tb{backg" wr
+"round:#26262b;color:#999}.tt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.wb{wi" wr
+"dth:42px;height:32px;border:0;background:transparent;color:inherit;font-size:15px;cursor:pointer;pad" wr
+"ding:0}.wb:hover{background:rgba(255,255,255,.14)}.wb.x:hover{background:#c42b1c;color:#fff}.term{fl" wr
+"ex:1;margin:0;padding:6px 8px;overflow:auto;font:14px/1.3 ui-monospace,Menlo,Consolas,monospace;whit" wr
+"e-space:pre-wrap;word-break:break-all;outline:none;color:#ddd;background:#111}</style></head><body><" wr
+"div id=dock><button class=app id=newt title='New terminal'><svg width=34 height=34 viewBox='0 0 24 2" wr
+"4'><rect x=2 y=4 width=20 height=16 rx=2.5 fill='#222' stroke='#bbb' stroke-width=1.2 /><path d='M6 " wr
+"9.5l3 2.5-3 2.5M11 15h6' stroke='#7ee787' stroke-width=1.8 fill=none stroke-linecap=round stroke-lin" wr
+"ejoin=round /></svg></button></div><div id=desk></div><div id=bar><div id=tasks></div><span id=clock" wr
+"></span></div><script>var desk=document.getElementById('desk'),tasks=document.getElementById('tasks'" wr
+"),wins=[],z=1,n=0;var wsurl=(location.protocol=='https:'?'wss://':'ws://')+location.host+'/tty';func" wr
+"tion el(g,c,p){var e=document.createElement(g);if(c)e.className=c;if(p)p.appendChild(e);return e}fun" wr
+"ction topw(){var b=null;wins.forEach(function(o){if(!o.min&&(!b||o.z>b.z))b=o});return b}function fo" wr
+"cusw(w){wins.forEach(function(o){if(o!=w){o.d.classList.add('off');o.k.classList.remove('on')}});if(" wr
+"!w)return;w.min=false;w.z=++z;w.d.style.zIndex=w.z;w.d.style.display='flex';w.d.classList.remove('of" wr
+"f');w.k.classList.add('on');w.k.classList.remove('min');w.t.focus();}function minw(w){w.min=true;w.d" wr
+".style.display='none';w.k.classList.remove('on');w.k.classList.add('min');focusw(topw())}function ma" wr
+"xw(w){w.d.classList.toggle('max');focusw(w)}function closew(w){var i=wins.indexOf(w);if(i<0)return;w" wr
+"ins.splice(i,1);if(w.ws.readyState<2)w.ws.close();w.d.remove();w.k.remove();focusw(topw());}functio" wr
+"n show(w){var t=w.t,b=t.scrollTop+t.clientHeight>=t.scrollHeight-4;t.textContent=w.s+(w.done?'':Stri" wr
+"ng.fromCharCode(9608));if(b)t.scrollTop=t.scrollHeight;}function openw(){var w={s:'',min:false,z:0}," wr
+"i=++n,o=(wins.length%8)*28;w.d=el('div','win',desk);w.d.style.left=(24+o)+'px';w.d.style.top=(20+o)+" wr
+"'px';w.d.style.width='720px';w.d.style.height='440px';var tb=el('div','tb',w.d),tt=el('span','tt',tb" wr
+");tt.textContent='Terminal '+i;var bm=el('button','wb',tb),bx=el('button','wb',tb),bc=el('button','w" wr
+"b x',tb);bm.innerHTML='&#8211;';bx.innerHTML='&#9633;';bc.innerHTML='&#215;';bm.title='Minimize';bx." wr
+"title='Maximize';bc.title='Close';w.t=el('pre','term',w.d);w.t.tabIndex=0;w.k=el('button','task',tas" wr
+"ks);w.k.textContent='Terminal '+i;w.k.title='Terminal '+i;bm.onclick=function(e){e.stopPropagation()" wr
+";minw(w)};bx.onclick=function(e){e.stopPropagation();maxw(w)};bc.onclick=function(e){e.stopPropagati" wr
+"on();closew(w)};tb.ondblclick=function(e){if(e.target==tb||e.target==tt)maxw(w)};w.d.addEventListene" wr
+"r('mousedown',function(){if(wins.indexOf(w)>=0&&topw()!=w)focusw(w)});w.t.onfocus=function(){if(topw" wr
+"()!=w)focusw(w)};w.k.onclick=function(){if(!w.min&&topw()==w)minw(w);else focusw(w)};tb.onmousedown=" wr
+"function(e){if(e.button!=0||(e.target!=tb&&e.target!=tt)||w.d.classList.contains('max'))return;var x" wr
+"=e.clientX-w.d.offsetLeft,y=e.clientY-w.d.offsetTop;function mv(e){w.d.style.left=Math.max(0,e.clien" wr
+"tX-x)+'px';w.d.style.top=Math.max(0,e.clientY-y)+'px'}function up(){document.removeEventListener('mo" wr
+"usemove',mv);document.removeEventListener('mouseup',up)}document.addEventListener('mousemove',mv);do" wr
+"cument.addEventListener('mouseup',up);e.preventDefault();};w.ws=new WebSocket(wsurl);w.ws.binaryType" wr
+"='arraybuffer';w.ws.onopen=function(){w.up=1};w.ws.onmessage=function(e){var a=new Uint8Array(e.data" wr
+");for(var j=0;j<a.length;j++){var c=a[j];if(c==8)w.s=w.s.slice(0,-1);else if(c==10||c>=32)w.s+=Strin" wr
+"g.fromCharCode(c)}if(w.s.length>200000)w.s=w.s.slice(-100000);show(w);};w.ws.onclose=w.ws.onerror=fu" wr
+"nction(){if(w.up){closew(w);return}if(w.done)return;w.done=1;w.s+='[no terminal: the server has non" wr
+"e free]';show(w);};w.t.onkeydown=function(e){var k=e.key,c=-1;if(k=='Enter')c=13;else if(k=='Backspa" wr
+"ce')c=127;else if(k=='Tab')c=9;else if(k=='Escape')c=27;else if(e.ctrlKey&&k.length==1)c=k.toUpperCa" wr
+"se().charCodeAt(0)-64;else if(k.length==1&&!e.metaKey&&!e.altKey)c=k.charCodeAt(0);if(c>=0&&c<128&&w" wr
+".ws.readyState==1){w.ws.send(new Uint8Array([c]));e.preventDefault()}};w.t.onpaste=function(e){if(w." wr
+"ws.readyState==1)w.ws.send(new TextEncoder().encode(e.clipboardData.getData('text')));e.preventDefau" wr
+"lt()};wins.push(w);focusw(w);show(w);return w;}document.getElementById('newt').onclick=function(){op" wr
+"enw()};function tick(){var d=new Date();document.getElementById('clock').textContent=('0'+d.getHours" wr
+"()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}tick();setInterval(tick,10000);</script></body></ht" wr
+"ml>" wr ;
 
 \ upgrade ( c -- )  the WebSocket's handshake answered (its key hashed
 \ with RFC 6455's GUID), a terminal made and the program started on it.
@@ -221,11 +278,12 @@ dup 0 lit > 0= if drop cclose else over C lit + dup @ rot + swap !  frames then 
 dup 8 lit + @ io @ 1000 lit read
 dup 0 lit > if io @ swap 2 lit wsend drop else drop 0 lit 0 lit 8 lit wsend cclose then ;
 
-\ accept1  a client taken (closed at once if all eight slots are busy).
+\ accept1  a client taken (if all the slots are busy, answered 503 and
+\ closed at once: a WebSocket's handshake then fails, its window says so).
 : accept1
 lsn @ accept dup 0< if drop else
 	FFFFFFFF lit NC 0 lit do dup 0< if i crec @ 0< if drop i then then loop
-	dup 0< if drop close drop else
+	dup 0< if drop dup cfd ! "HTTP/1.0 503 Service Unavailable" wr crlf crlf close drop else
 		crec tuck !  0 lit over 4 lit + !  FFFFFFFF lit over 8 lit + !  0 lit swap C lit + !
 	then
 then ;
@@ -251,18 +309,23 @@ dup @ 0< if drop else
 dup @ cfd !  dup 4 lit + @ if wsread else request then
 then then then ;
 
-1000 lit 10 lit + alloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  10 lit alloc fdv !
+\ The reaper's stacks first: the kernel wants them in the memory it gave
+\ (64 KiB, the heap a part of it); the rest (the clients' buffers, 4 KiB
+\ each) from malloc, which maps more.
+tcode[ drop begin FFFFFFFF lit st2 wait 0< if 5F5E100 lit sleep then 0 lit until ]tcode
+4000 lit alloc 4000 lit + 0 lit thread 0< if "wm: no thread" eputs 0A lit eputc 1 lit exit then
+1010 lit malloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  10 lit alloc fdv !
 A0D0A0D lit e2 @ !  0 lit e2 @ 4 lit + c!
 NC 5 lit lshift alloc cl !
-NC 0 lit do FFFFFFFF lit i crec !  FFFFFFFF lit i crec 8 lit + !  1000 lit alloc i crec 10 lit + ! loop
+NC 0 lit do FFFFFFFF lit i crec !  FFFFFFFF lit i crec 8 lit + !  1000 lit malloc i crec 10 lit + ! loop
+NC 0 lit do i crec 10 lit + @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exit then loop
+io @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exit then
 NC 1 lit lshift 1 lit + dup 3 lit lshift alloc pe !  2 lit lshift alloc pm !
 1 lit arg ?dup if atoi else 50 lit then port !
 2 lit arg ?dup 0= if "sh" then prog !
 2 lit socket dup lsn ! 0< if "wm: no socket" eputs 0A lit eputc 1 lit exit then
 lsn @ 1 lit 0 lit port @ net ?dup if "wm: cannot bind: " eputs . 0A lit eputc 1 lit exit then
 lsn @ 3 lit 0 lit 0 lit net drop
-tcode[ drop begin FFFFFFFF lit st2 wait 0< if 5F5E100 lit sleep then 0 lit until ]tcode
-4000 lit alloc 4000 lit + 0 lit thread drop
 "wm: port " puts port @ u. ", " puts prog @ puts 0A lit putc
 begin
 	entries
