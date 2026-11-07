@@ -465,6 +465,21 @@ pq @ 8 lit = pm @ 1 lit <> or if FFFFFFF3 lit else
 	ptext dup if pq @ pgen tbend then
 then then then ;
 
+\ cuid ( -- uid ), cgid ( -- gid )  the calling process's user and group
+\ (the kernel's own work: root's).
+: cuid  kthr? if cproc C4 lit + @ else 0 lit then ;
+: cgid  kthr? if cproc C8 lit + @ else 0 lit then ;
+
+\ yopen ( s mode -- f | error )  /dev/tty/<N>: its slave end, for its
+\ maker or root.
+: yopen
+swap katoi c@ if 2drop FFFFFFFE lit else
+dup F lit u> if 2drop FFFFFFFE lit else
+2 lit lshift kpty @ + @ ?dup 0= if drop FFFFFFFE lit else
+cuid 0= over 24 lit + @ cuid = or 0= if 2drop FFFFFFF3 lit else
+	A lit rot fnew dup if 2dup 8 lit + !  over 4 lit + dup @ 1 lit + swap ! then nip
+then then then then ;
+
 \ 15 open(path, flags): /dev/console, /dev/null, or a /proc key; flags 0
 \ read, 1 write, 2 both.  Its descriptor; -2 no such, -13 not that way,
 \ -22 bad flags, -24 no descriptor free, -12 no room.
@@ -474,8 +489,9 @@ klk @ lock
 2C lit sysarg 3 lit and dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
 	kpb @ "/dev/console" streq if 1 lit swap fnew else
 	kpb @ "/dev/null" streq if 2 lit swap fnew else
+	kpb @ "/dev/tty/" kpfx ?dup if swap yopen else
 	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
-	then then
+	then then then
 	dup 0= if drop FFFFFFF4 lit else
 	dup kerr? 0= if
 		dup area@ tproc fdput dup 0< if swap fclose else nip then
@@ -536,11 +552,6 @@ begin dup 30 lit sysarg u< 2 lit pick dup C lit + @ swap 10 lit + @ u< and while
 repeat
 nip ;
 
-\ cuid ( -- uid ), cgid ( -- gid )  the calling process's user and group
-\ (the kernel's own work: root's).
-: cuid  kthr? if cproc C4 lit + @ else 0 lit then ;
-: cgid  kthr? if cproc C8 lit + @ else 0 lit then ;
-
 \ pknum  the numbers in what is written to a key: pkn1, and pkn2 (-1 if
 \ there is one only).
 : pkn1 variable ;  : pkn2 variable ;  : pkst variable ;
@@ -576,6 +587,136 @@ else drop
 		2drop 30 lit sysarg
 	then
 then then then then ;
+
+\ ── Terminals (docs/OS.md, section 7) ──
+\
+\ A terminal (pty) is a page: its master ends 0 and slave ends 4 (kinds 9
+\ and 10); what is typed (written to the master) 8, the edited lines ready
+\ C, read by the slave 10, its ^D 14; what it shows (written by the slave,
+\ and the echo) 18, read by the master 1C (free-running counts); its number
+\ 20 (/dev/tty/N), its maker's user 24; what is typed, 1 KiB from 400; what
+\ it shows, 2 KiB from 800.  The slave end has the console's line
+\ discipline, and a newline written to it shows as CR LF.
+
+: yo  dup 18 lit + @ 7FF lit and 800 lit + + ;                 \ ( t -- a ) where it shows next
+: yroom  dup 18 lit + @ swap 1C lit + @ - 800 lit swap - ;     \ ( t -- n ) room to show
+: yout  dup yroom if tuck yo c!  18 lit + dup @ 1 lit + swap ! else 2drop then ;   \ ( c t -- )
+: yi    swap 3FF lit and 400 lit + + ;                         \ ( i t -- a )
+
+\ ykey ( c t -- )  a byte typed on terminal t, as the console's (ckey):
+\ echoed, backspace and delete erase, Enter ends the line, ^D the input.
+\ Under klk.
+: ykey
+over D lit = 2 lit pick A lit = or if
+	nip dup 8 lit + @ over 10 lit + @ - 3FF lit u< if
+		A lit over dup 8 lit + @ swap yi c!
+		dup 8 lit + @ 1 lit + over 8 lit + !  dup 8 lit + @ over C lit + !
+		D lit over yout  A lit over yout
+	then
+else
+over 8 lit = 2 lit pick 7F lit = or if
+	nip dup 8 lit + @ over C lit + @ <> if
+		dup 8 lit + @ 1 lit - over 8 lit + !
+		8 lit over yout  20 lit over yout  8 lit over yout
+	then
+else
+over 4 lit = if
+	nip dup 8 lit + @ over C lit + @ = if 1 lit over 14 lit + ! else dup 8 lit + @ over C lit + ! then
+else
+over 20 lit u< if nip else
+	dup 8 lit + @ over 10 lit + @ - 3FE lit u< if
+		2dup dup 8 lit + @ swap yi c!
+		dup 8 lit + @ 1 lit + over 8 lit + !
+		tuck yout
+	else nip then
+then then then then
+fwake ;
+
+\ ymread ( t -- r )  the master read: what the terminal shows, up to n;
+\ 0 once it is empty with no slave end.
+: ymread
+dup 18 lit + @ over 1C lit + @ = if
+	dup 4 lit + @ if 5 lit tretry BLK else drop 0 lit then
+else
+	0 lit
+	begin dup 30 lit sysarg u< 2 lit pick dup 18 lit + @ swap 1C lit + @ <> and while
+		over dup 1C lit + @ 7FF lit and 800 lit + + c@  over 2C lit sysarg + c!
+		over 1C lit + dup @ 1 lit + swap !  1 lit +
+	repeat
+	swap fwake
+then ;
+
+\ ymwrite ( t -- n )  the master write: each byte typed.
+: ymwrite
+30 lit sysarg ?dup if 0 lit do 2C lit sysarg i + c@ over ykey loop then
+drop 30 lit sysarg ;
+
+\ ysread ( t -- r )  the slave read: what lines are ready, to a line's end
+\ (waiting for one); 0 after ^D at a line's start, or with no master.
+: ysread
+dup 14 lit + @ if 0 lit swap 14 lit + ! 0 lit else
+dup C lit + @ over 10 lit + @ = if
+	dup @ if 5 lit tretry BLK else drop 0 lit then
+else
+	0 lit
+	begin
+		dup 30 lit sysarg u< 2 lit pick dup 10 lit + @ swap C lit + @ u< and
+		over 0= if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then and
+	while
+		over dup 10 lit + @ swap yi c@  over 2C lit sysarg + c!
+		over 10 lit + dup @ 1 lit + swap !  1 lit +
+	repeat
+	nip
+then then ;
+
+\ yswrite ( t -- r )  the slave write: all n bytes shown (a newline as CR
+\ LF), waiting for room as it must (E8 how many before the wait); -5 with no
+\ master end.
+: yswrite
+dup @ 0= if drop FFFFFFFB lit else
+	area@ E0 lit + @ if area@ E8 lit + @ else 0 lit then
+	begin dup 30 lit sysarg u< 2 lit pick yroom 2 lit u< 0= and while
+		dup 2C lit sysarg + c@ dup A lit = if D lit 3 lit pick yout then 2 lit pick yout
+		1 lit +
+	repeat
+	over fwake
+	dup 30 lit sysarg = if nip else area@ E8 lit + !  5 lit tretry BLK then
+then ;
+
+\ yready ( f -- events )  poll's, for a terminal's end.
+: yready
+dup 8 lit + @ swap @ 9 lit = if
+	dup 18 lit + @ over 1C lit + @ <> if 5 lit else 4 lit then
+	swap 4 lit + @ 0= if 10 lit or then
+else
+	dup 14 lit + @ over C lit + @ 2 lit pick 10 lit + @ <> or if 1 lit else 0 lit then
+	over yroom 2 lit u< 0= if 4 lit or then
+	swap @ 0= if 10 lit or then
+then ;
+
+\ 21 pty(fds): a terminal, fds[0] its master end, fds[1] its slave end:
+\ its number (/dev/tty/N), or -14, -23 none free, -12, -24.
+: yp variable ;  : yf1 variable ;  : yf2 variable ;
+: spty
+klk @ lock
+28 lit sysarg 8 lit uwrange 0= if FFFFFFF2 lit else
+FFFFFFFF lit 10 lit 0 lit do dup 0< if i 2 lit lshift kpty @ + @ 0= if drop i then then loop
+dup 0< if drop FFFFFFE9 lit else
+9 lit 3 lit fnew yf1 !  A lit 3 lit fnew yf2 !
+yf1 @ 0= yf2 @ 0= or if drop yf1 @ ?dup if 0 lit swap ! then yf2 @ ?dup if 0 lit swap ! then FFFFFFE9 lit else
+1 lit pgalloc dup yp ! 0= if drop 0 lit yf1 @ !  0 lit yf2 @ !  FFFFFFF4 lit else
+	yp @ 40 lit mzero  1 lit yp @ !  1 lit yp @ 4 lit + !
+	dup yp @ 20 lit + !  cuid yp @ 24 lit + !
+	yp @ over 2 lit lshift kpty @ + !
+	yp @ yf1 @ 8 lit + !  yp @ yf2 @ 8 lit + !
+	yf1 @ area@ tproc fdput dup 0< if nip yf1 @ fclose yf2 @ fclose else
+	yf2 @ area@ tproc fdput dup 0< if
+		nip swap 0 lit swap area@ tproc pfd !  yf1 @ fclose yf2 @ fclose
+	else
+		28 lit sysarg 4 lit + !  28 lit sysarg !
+	then then
+then then then then
+klk @ unlock sret ;
 
 \ ── Sockets (UDP; the socket's layout above nusock, src/net.fam) ──
 
@@ -659,8 +800,10 @@ dup 1 lit = if 2drop cread else
 dup 2 lit = if 2drop 0 lit else
 dup 3 lit = if drop 8 lit + @ pread else
 dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if 0 lit urecv else tcrd then else
+dup 9 lit = if drop 8 lit + @ ymread else
+dup A lit = if drop 8 lit + @ ysread else
 4 lit = if ptread else drop 0 lit
-then then then then then then then then
+then then then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 17 write(fd, buf, n): all of it (waiting for room); -9, -14, -32 a pipe
@@ -677,8 +820,10 @@ else
 dup 2 lit = if 2drop 30 lit sysarg else
 dup 3 lit = if drop 8 lit + @ pwrite else
 dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if uwrite else tcwr then else
+dup 9 lit = if drop 8 lit + @ ymwrite else
+dup A lit = if drop 8 lit + @ yswrite else
 drop pkwrite
-then then then then then then then
+then then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 19 close(fd): 0, or -9.
@@ -721,8 +866,9 @@ dup @ 3 lit = if
 	then
 else
 dup @ 4 lit = if 1 lit else
+dup @ 9 lit = over @ A lit = or if dup yready else
 dup @ 8 lit = if dup 8 lit + @ dup @ 1 lit = if dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else cready then else 4 lit
-then then then then then
+then then then then then then
 swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
 
 \ 22 poll(fds, n, ns): fds n entries of 8 bytes (a descriptor; the events
@@ -1455,6 +1601,7 @@ dup 11 lit = if drop swrite else
 dup 12 lit = if drop sseek else
 dup 13 lit = if drop sclose else
 dup 14 lit = if drop spipe else
+dup 15 lit = if drop spty else
 dup 16 lit = if drop spoll else
 dup 17 lit = if drop sbegin else
 dup 18 lit = if drop scommit else
@@ -1472,7 +1619,7 @@ dup 23 lit = if drop sremove else
 dup 24 lit = if drop smkdir else
 dup 25 lit = if drop schmod else
 26 lit = if schown else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill

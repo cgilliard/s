@@ -9,7 +9,7 @@
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
 \ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
-\ close, 18 seek, 20 pipe, 22 poll, 23-29 the store's, 30 socket, 31 net,
+\ close, 18 seek, 20 pipe, 21 pty, 22 poll, 23-29 the store's, 30 socket, 31 net,
 \ 32 accept, 33 sendto, 34 recvfrom, 35 remove, 36 mkdir, 37 chmod, 38 chown (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
@@ -125,6 +125,7 @@
 : write   11 lit sys ;                       \ ( fd buf n -- n' )  all of it
 : close   0 lit 0 lit 13 lit sys ;           \ ( fd -- r )
 : pipe    0 lit 0 lit 14 lit sys ;           \ ( fds -- r )  fds[0] read, fds[1] write
+: pty     0 lit 0 lit 15 lit sys ;           \ ( fds -- n )  a terminal: fds[0] master, fds[1] slave (/dev/tty/n)
 : poll    16 lit sys ;                       \ ( fds n ns -- r )  8-byte entries: fd, events, revents
 
 \ The store (docs/OS.md, section 6): open(path, TREE [| CREATE]) a tree,

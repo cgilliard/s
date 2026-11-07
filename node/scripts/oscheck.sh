@@ -515,6 +515,135 @@ for n in 1 4; do
 done
 rm -f "$T/http.disk"
 
+# Terminals (step 10).  A pty: what is typed echoed and edited (backspace),
+# the slave reading the line, its newlines shown as CR LF; /dev/tty/0; a
+# shell on the slave end running echo, ended by ^D, the master then at its
+# end.
+usrc tpty ': b variable ;  : fds variable ;  : m variable ;  : sl variable ;  : n variable ;  : st variable ;  : cv variable ;  : path variable ;
+: sp  20 lit putc ;
+\ show ( n -- )  the bytes at b, control bytes as ^X
+: show  0 lit do b @ i + c@ dup 20 lit u< if 5E lit putc 40 lit + then putc loop ;
+100 lit alloc b !  10 lit alloc fds !  10 lit alloc cv !  20 lit alloc path !
+fds @ pty "pty " puts . sp  fds @ @ m !  fds @ 4 lit + @ sl !
+m @ "abx" 3 lit write drop  cv @ 7F lit over c! 63 lit over 1 lit + c! D lit swap 2 lit + c!  m @ cv @ 3 lit write drop
+sl @ b @ 100 lit read dup "line " puts . sp show sp
+sl @ "out" 3 lit write drop  sl @ cv @ 2 lit + 1 lit write drop  A lit cv @ c!  sl @ cv @ 1 lit write drop
+m @ b @ 100 lit read dup "shown " puts . sp show 0A lit putc
+path @ "/dev/tty/" scpy 0 lit snum 0 lit swap c!
+path @ 2 lit open dup "tty " puts . sp dup "y" 1 lit write drop  dup cv @ 1 lit write drop close drop
+m @ b @ 100 lit read dup "via " puts . sp show 0A lit putc
+3 lit fds @ !  sl @ fds @ 4 lit + !  sl @ fds @ 8 lit + !  sl @ fds @ C lit + !
+"sh" 0 lit fds @ spawnv drop  sl @ close drop
+m @ "echo hi" 7 lit write drop  m @ cv @ 2 lit + 1 lit write drop
+0 lit n !  begin m @ b @ n @ + 100 lit n @ - read dup 0 lit > if n @ + n ! else drop then n @ 11 lit u< 0= until
+"sh: " puts n @ show 0A lit putc
+4 lit cv @ c!  m @ cv @ 1 lit write drop  FFFFFFFF lit st wait drop "ended " puts st @ . sp
+m @ b @ 100 lit read drop m @ b @ 100 lit read "eof " puts . 0A lit putc
+bye'
+sh scripts/mkimage.sh "$T/pty.img" bin/kernel init="$T/tpty.bin" sh=bin/user/sh echo=bin/user/echo 2> "$T/pty.mk" || fail pty "mkimage: $(cat "$T/pty.mk")"
+for n in 1 4; do
+	expect "pty_$n" 124 '^pty 0 line 4 abc^J shown 15 abx^H ^Hc^M^Jout^M^M^J$' 6 ./tools/q32 --smp=$n "$T/pty.img"
+	has "pty_$n" '^tty 5 via 3 y^M^J$'
+	has "pty_$n" '^sh: .*hi^M^J'
+	has "pty_$n" '^ended 0 eof 0$'
+done
+
+# The window manager: wm (src/user/wm.fam) serving its page and, over a
+# WebSocket, a shell on a terminal, from the host through a forwarded
+# port: the page, the handshake's key, the prompt, a directory made and
+# seen by ls, a ping answered, exit closing it.  With node 22 or later, the
+# page's own script too, typing ls (and a backspace).
+cat > "$T/wsc.py" <<'WSCEOF'
+import socket, base64, hashlib, os, sys, time, struct
+port = int(sys.argv[1])
+G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+page = socket.create_connection(("127.0.0.1", port), timeout=5)
+page.sendall(b"GET / HTTP/1.0\r\n\r\n"); body = b""
+while True:
+    d = page.recv(65536)
+    if not d: break
+    body += d
+print("page", body.split(b"\r\n")[0].decode(), b"new WebSocket" in body)
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+key = base64.b64encode(os.urandom(16))
+s.sendall(b"GET /tty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+h = b""
+while b"\r\n\r\n" not in h: h += s.recv(1)
+want = base64.b64encode(hashlib.sha1(key + G).digest())
+print("upgrade", h.split(b"\r\n")[0].decode(), (b"Sec-WebSocket-Accept: " + want) in h)
+buf = b""; out = b""; closed = False
+def send(data, op=2):
+    m = os.urandom(4); n = len(data)
+    hdr = bytes([0x80 | op]) + (bytes([0x80 | n]) if n < 126 else bytes([0xFE]) + struct.pack(">H", n))
+    s.sendall(hdr + m + bytes(b ^ m[i & 3] for i, b in enumerate(data)))
+def pump(until, secs=5):
+    global buf, out, closed
+    end = time.time() + secs
+    while until not in out and time.time() < end and not closed:
+        try: d = s.recv(65536)
+        except socket.timeout: continue
+        if not d: closed = True; break
+        buf += d
+        while len(buf) >= 2:
+            n = buf[1] & 127; hl = 2
+            if n == 126:
+                if len(buf) < 4: break
+                n = struct.unpack(">H", buf[2:4])[0]; hl = 4
+            if len(buf) < hl + n: break
+            op = buf[0] & 15; p = buf[hl:hl + n]; buf = buf[hl + n:]
+            if op == 8: closed = True; out += b"[close]"
+            elif op == 10: out += b"[pong:" + p + b"]"
+            else: out += p
+    return until in out
+print("prompt", pump(b"$ "))
+send(b"mkdir /d\r")
+pump(b"$ mkdir"); out = b""
+send(b"ls /\r"); ok = pump(b"d/\r\n")
+print("ls", ok, repr(out[-60:]))
+send(b"hi", 9); print("ping", pump(b"[pong:hi]"))
+send(b"exit\r"); print("exit", pump(b"[close]"))
+WSCEOF
+cat > "$T/page.js" <<'PAGEEOF'
+// Run the page wm serves: its script, with a stub DOM, keys typed as a browser would.
+const port = process.argv[2];
+(async () => {
+  const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+  const js = html.split('<script>')[1].split('</script>')[0];
+  const t = { textContent: '', focus() {} };
+  globalThis.document = { getElementById: () => t, body: { scrollHeight: 0 } };
+  globalThis.location = { protocol: 'http:', host: `127.0.0.1:${port}` };
+  globalThis.window = { scrollTo() {} };
+  new Function(js)();
+  const type = (s) => { for (const ch of s) t.onkeydown({ key: ch === '\r' ? 'Enter' : ch, ctrlKey: false, metaKey: false, preventDefault() {} }); };
+  const wait = (re, ms) => new Promise((ok) => { const end = Date.now() + ms; const iv = setInterval(() => { if (re.test(t.textContent) || Date.now() > end) { clearInterval(iv); ok(re.test(t.textContent)); } }, 50); });
+  console.log('prompt', await wait(/\$ █$/, 5000));
+  type('ls /x'); t.onkeydown({ key: 'Backspace', ctrlKey: false, preventDefault() {} }); type('\r');
+  console.log('ls', await wait(/d\/\n\$ █$/, 5000));
+  console.log(JSON.stringify(t.textContent));
+  type('exit\r'); console.log('closed', await wait(/\[closed\]$/, 5000));
+  process.exit(0);
+})();
+PAGEEOF
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+for n in 1 4; do
+	N=$((N + 1))
+	WP=$((TP + 2 + n))
+	rm -f "$T/wm.disk"; dd if=/dev/zero of="$T/wm.disk" bs=1 count=0 seek=268435456 2>/dev/null
+	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < /dev/null > "$T/wm_$n.out" 2>&1 &
+	QP=$!
+	i=0; while [ $i -lt 20 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
+	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
+		lim 30 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
+		for pat in '^prompt true$' '^ls true$' '^closed true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+	fi
+	kill $QP 2>/dev/null; wait $QP 2>/dev/null
+	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do
+		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
+	done
+done
+rm -f "$T/wm.disk"
+
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds
 grep -q 'init: starting the shell' "$T/boot_disk.out" \

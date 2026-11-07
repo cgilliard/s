@@ -726,7 +726,39 @@ kernel too much to add at the end.
    are dropped, not kept; one interface, its address fixed; no DNS.
 10. **Terminals and the window manager.** `pty`, `/dev/tty/N`, and the
     HTTP and WebSocket server with terminals in the browser. Done when
-    a browser opens a shell and runs `ls`.
+    a browser opens a shell and runs `ls`. Done (2026-11-07), with the
+    browser stood in for (none could run here: see below). `pty` (21)
+    makes a terminal, a page holding two rings. What the master end
+    writes is typed through the console's line discipline (echo,
+    backspace and delete, Enter, ^D), and the slave end reads whole
+    lines. What the slave writes, and the echo, the master reads, with
+    a newline shown as CR LF. The call returns the terminal's number;
+    `/dev/tty/N` opens its slave end again, for its maker or root. 16
+    at most. An end closed is as a pipe's: the slave reads 0 with no
+    master, writes get -5, and the master reads 0 once the slave ends
+    are gone. `wm [port [program]]` (default 80 and `sh`) is the window
+    manager. It is one poll loop over the listener, eight clients and
+    their terminals. `GET /` is a page holding a terminal of its own
+    (plain JavaScript in a `<pre>`, no libraries). Its WebSocket
+    (`GET /tty`; SHA-1 and base64 for the handshake, in fam) gets a pty
+    with the program on its slave end. Key presses go to the terminal as
+    bytes, what it shows comes back as binary frames, and either end
+    closing ends the session. A thread reaps the programs that end. To
+    reach it from a browser: `restart 0 100 wm` in `/etc/init` (or
+    `wm 80 login` for a login prompt), and the node run with
+    `--hostfwd=tcp::8080-:80`, then `http://localhost:8080/`. Checked by
+    `scripts/oscheck.sh`, on one hart and on four. The pty itself:
+    editing, the line read, CR LF, `/dev/tty/0`, and a shell on the
+    slave end running `echo` and ended by ^D. Then `wm` from the host:
+    a WebSocket client checks the page, the accept key, the prompt, a
+    directory made and listed by `ls`, a ping, and `exit` closing the
+    socket. The page's own script, run under node 22 with a stand-in
+    for the DOM, connects, types `ls /x`, a backspace and Enter, and
+    shows the listing. Firefox here is only a snap stub, so no real
+    browser ran. Not yet: no escape sequences (the page shows plain
+    text; arrows and colours are not handled); ^C does not end the
+    foreground program; no window resizing; terminals do not survive
+    the page being reloaded.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

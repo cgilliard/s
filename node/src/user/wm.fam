@@ -1,0 +1,273 @@
+\ wm.fam — the window manager (docs/OS.md, section 7): wm [port [program]]
+\ (80, sh).  An HTTP and WebSocket server: GET / is a page holding a
+\ terminal; its WebSocket (GET /tty) gets a terminal of its own (pty) with
+\ the program running on it, what is typed going to the terminal and what
+\ it shows coming back, until either end closes.  Eight clients at once,
+\ on one poll loop; a thread reaps the programs that end.
+
+\ SHA-1 (for the WebSocket handshake's accept key) and base64.
+
+: sh0 variable ;  : sh1 variable ;  : sh2 variable ;  : sh3 variable ;  : sh4 variable ;
+: sa variable ;  : sb variable ;  : sc variable ;  : sd variable ;  : se variable ;
+: shw variable ;             \ the schedule: 80 words
+: shm variable ;             \ the message, padded: two blocks at most
+: shd variable ;             \ the digest: 20 bytes
+
+: rol  2dup lshift -rot 20 lit swap - rshift or ;           \ ( x n -- x' )
+: be@  dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or swap 3 lit + c@ or ;
+: be!  over 18 lit rshift over c!  over 10 lit rshift over 1 lit + c!  over 8 lit rshift over 2 lit + c!  3 lit + c! ;
+: wi   2 lit lshift shw @ + ;                                \ ( i -- a )
+
+\ shab ( blk -- )  one 64-byte block into the state.
+: shab
+10 lit 0 lit do dup i 2 lit lshift + be@ i wi ! loop drop
+50 lit 10 lit do
+	i 3 lit - wi @  i 8 lit - wi @ xor  i E lit - wi @ xor  i 10 lit - wi @ xor  1 lit rol  i wi !
+loop
+sh0 @ sa !  sh1 @ sb !  sh2 @ sc !  sh3 @ sd !  sh4 @ se !
+50 lit 0 lit do
+	i 14 lit u< if sb @ sc @ and sb @ invert sd @ and or 5A827999 lit else
+	i 28 lit u< if sb @ sc @ xor sd @ xor 6ED9EBA1 lit else
+	i 3C lit u< if sb @ sc @ and sb @ sd @ and or sc @ sd @ and or 8F1BBCDC lit else
+	sb @ sc @ xor sd @ xor CA62C1D6 lit then then then
+	+ sa @ 5 lit rol + se @ + i wi @ +
+	sd @ se !  sc @ sd !  sb @ 1E lit rol sc !  sa @ sb !  sa !
+loop
+sh0 @ sa @ + sh0 !  sh1 @ sb @ + sh1 !  sh2 @ sc @ + sh2 !  sh3 @ sd @ + sh3 !  sh4 @ se @ + sh4 ! ;
+
+\ sha1 ( src len -- )  its digest at shd (len 119 at most).
+: shl variable ;
+: sha1
+shw @ 0= if 140 lit alloc shw !  80 lit alloc shm !  14 lit alloc shd ! then
+80 lit 0 lit do 0 lit shm @ i + c! loop
+shl !  shl @ ?dup if 0 lit do dup i + c@ shm @ i + c! loop then drop
+80 lit shm @ shl @ + c!
+shl @ 9 lit + 40 lit u> if 80 lit else 40 lit then
+shl @ 3 lit lshift over 4 lit - shm @ + be!
+67452301 lit sh0 !  EFCDAB89 lit sh1 !  98BADCFE lit sh2 !  10325476 lit sh3 !  C3D2E1F0 lit sh4 !
+shm @ shab  40 lit = 0= if shm @ 40 lit + shab then
+sh0 @ shd @ be!  sh1 @ shd @ 4 lit + be!  sh2 @ shd @ 8 lit + be!  sh3 @ shd @ C lit + be!  sh4 @ shd @ 10 lit + be! ;
+
+\ b64c ( v -- c )  a base64 digit; b64 ( src n dst -- dst' )  n bytes as
+\ base64, padded.
+: b64c
+dup 1A lit u< if 41 lit + else
+dup 34 lit u< if 47 lit + else
+dup 3E lit u< if 4 lit - else
+3E lit = if 2B lit else 2F lit then then then then ;
+: bv variable ;  : bn variable ;
+: b64
+swap bn !
+begin bn @ while
+	over c@ 10 lit lshift
+	bn @ 1 lit u> if 2 lit pick 1 lit + c@ 8 lit lshift or then
+	bn @ 2 lit u> if 2 lit pick 2 lit + c@ or then
+	bv !
+	bv @ 12 lit rshift 3F lit and b64c over c!
+	bv @ C lit rshift 3F lit and b64c over 1 lit + c!
+	bn @ 1 lit u> if bv @ 6 lit rshift 3F lit and b64c else 3D lit then over 2 lit + c!
+	bn @ 2 lit u> if bv @ 3F lit and b64c else 3D lit then over 3 lit + c!
+	4 lit +  swap 3 lit + swap
+	bn @ 3 lit u> if bn @ 3 lit - else 0 lit then bn !
+repeat
+nip ;
+
+\ ── The clients ──
+\
+\ A client (32 bytes): its socket 0 (-1: a free slot), state 4 (0 reading
+\ the request, 1 a WebSocket), its terminal's master end 8, bytes buffered
+\ C, its buffer 10 (4 KiB: the request, then frames arriving).
+
+:M NC 8 lit ;
+: cl variable ;  : lsn variable ;  : prog variable ;  : port variable ;
+: pe variable ;              \ poll's entries: the listener, then each client's socket and terminal
+: pm variable ;              \ which client each entry is (bit 0: its terminal)
+: np variable ;
+: io variable ;  : kb variable ;  : ab variable ;  : e2 variable ;  : fdv variable ;
+: st variable ;  : st2 variable ;  : cfd variable ;
+: hs variable ;  : hb variable ;  : hn variable ;  : hl variable ;
+
+: crec  5 lit lshift cl @ + ;                                \ ( i -- c )
+: wr    cfd @ swap dup strlen write drop ;                   \ ( s -- )
+: crlf  cfd @ e2 @ 2 lit write drop ;
+
+\ cclose ( c -- )  a client gone: its socket and terminal closed.
+: cclose
+dup @ dup 0< if drop else close drop then
+dup 8 lit + @ dup 0< if drop else close drop then
+FFFFFFFF lit over !  FFFFFFFF lit swap 8 lit + ! ;
+
+\ hfind ( c s -- a | 0 )  where s ends in what the client sent, if there
+\ (letters of either case: header names are case-insensitive).
+: lc  dup 41 lit - 1A lit u< if 20 lit or then ;             \ ( c -- c' )
+: hfind
+hs !  dup 10 lit + @ hb !  C lit + @ hn !  hs @ strlen hl !
+0 lit
+hn @ hl @ u< 0= if
+	hn @ hl @ - 1 lit + 0 lit do
+		dup 0= if
+			1 lit hl @ 0 lit do hb @ j + i + c@ lc hs @ i + c@ lc = and loop
+			if drop hb @ i + hl @ + then
+		then
+	loop
+then ;
+
+\ pfx? ( c s -- flag )  what the client sent begins with s.
+: pfx?
+swap 10 lit + @ swap
+1 lit swap begin dup c@ while
+	dup c@ 3 lit pick c@ = rot and swap 1 lit + rot 1 lit + -rot
+repeat drop nip ;
+
+\ wsend ( buf n op -- )  a WebSocket frame to cfd: op 1 text, 2 binary, 8
+\ close, 10 pong (n under 64 KiB).
+: wsend
+80 lit or io @ 1000 lit + c!
+dup 7E lit u< if
+	dup io @ 1001 lit + c!  cfd @ io @ 1000 lit + 2 lit write drop
+else
+	7E lit io @ 1001 lit + c!  dup 8 lit rshift io @ 1002 lit + c!  dup io @ 1003 lit + c!
+	cfd @ io @ 1000 lit + 4 lit write drop
+then
+?dup if cfd @ -rot write drop else drop then ;
+
+\ page  the terminal's page.
+: page
+"HTTP/1.0 200 OK" wr crlf "Content-Type: text/html; charset=utf-8" wr crlf crlf
+"<!doctype html><html><head><meta charset=utf-8><title>tabernacle</title>" wr
+"<style>body{background:#111;color:#ddd;margin:0}pre{font:14px monospace;padding:8px;margin:0;" wr
+"white-space:pre-wrap;word-break:break-all;min-height:100vh;outline:none}</style></head>" wr
+"<body><pre id=t tabindex=0></pre><script>" wr
+"var t=document.getElementById('t'),s='',ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/tty');" wr
+"ws.binaryType='arraybuffer';" wr
+"function put(c){if(c==8){s=s.slice(0,-1);return}if(c==10||c>=32)s+=String.fromCharCode(c)}" wr
+"ws.onmessage=function(e){var a=new Uint8Array(e.data);for(var i=0;i<a.length;i++)put(a[i]);" wr
+"t.textContent=s+String.fromCharCode(9608);window.scrollTo(0,document.body.scrollHeight)};" wr
+"ws.onclose=function(){t.textContent=s+String.fromCharCode(10)+'[closed]'};" wr
+"t.onkeydown=function(e){var k=e.key,c=-1;if(k=='Enter')c=13;else if(k=='Backspace')c=127;" wr
+"else if(e.ctrlKey&&k.length==1)c=k.toUpperCase().charCodeAt(0)-64;else if(k.length==1&&!e.metaKey)c=k.charCodeAt(0);" wr
+"if(c>=0&&c<128){ws.send(new Uint8Array([c]));e.preventDefault()}};" wr
+"t.onpaste=function(e){ws.send(new TextEncoder().encode(e.clipboardData.getData('text')));e.preventDefault()};" wr
+"t.focus();</script></body></html>" wr ;
+
+\ upgrade ( c -- )  the WebSocket's handshake answered (its key hashed
+\ with RFC 6455's GUID), a terminal made and the program started on it.
+: upgrade
+dup "Sec-WebSocket-Key: " hfind ?dup 0= if "HTTP/1.0 400 Bad Request" wr crlf crlf cclose else
+	kb @ begin over c@ 20 lit u> while over c@ over c! 1 lit + swap 1 lit + swap repeat nip
+	"258EAFA5-E914-47DA-95CA-C5AB0DC85B11" scpy kb @ -  kb @ swap sha1
+	shd @ 14 lit ab @ b64 0 lit swap c!
+	fdv @ 8 lit + pty 0< if "HTTP/1.0 503 Service Unavailable" wr crlf crlf cclose else
+		fdv @ 8 lit + @ over 8 lit + !
+		"HTTP/1.1 101 Switching Protocols" wr crlf "Upgrade: websocket" wr crlf "Connection: Upgrade" wr crlf
+		"Sec-WebSocket-Accept: " wr ab @ wr crlf crlf
+		fdv @ C lit + @ dup fdv @ 4 lit + !  dup fdv @ 8 lit + !  fdv @ C lit + !  3 lit fdv @ !
+		prog @ 0 lit fdv @ spawnv drop
+		fdv @ 4 lit + @ close drop
+		1 lit over 4 lit + !  0 lit swap C lit + !
+	then
+then ;
+
+\ request ( c -- )  more of a request read; once whole: the page, the
+\ WebSocket, or 404.
+: request
+dup @ over 10 lit + @ 2 lit pick C lit + @ + FFF lit 3 lit pick C lit + @ - read
+dup 0 lit > 0= if drop cclose else
+	over C lit + dup @ rot + swap !
+	dup e2 @ hfind if
+		dup "GET /tty " pfx? if upgrade else
+		dup "GET / " pfx? if page cclose else
+		"HTTP/1.0 404 Not Found" wr crlf crlf cclose then then
+	else dup C lit + @ FFF lit = if cclose else drop then then
+then ;
+
+\ frame1 ( c -- more )  the first frame buffered, if whole, taken: typing
+\ to the terminal, a ping answered, a close returned (the client closed:
+\ 0); what follows kept.  1 when there may be another.
+: fbuf variable ;  : fn variable ;  : fh variable ;  : fl variable ;
+: frame1
+dup 10 lit + @ fbuf !  dup C lit + @ fn !
+fn @ 2 lit u< if drop 0 lit else
+fbuf @ 1 lit + c@ 7F lit and fl !  2 lit fh !
+fl @ 7F lit = if cclose 0 lit else
+fl @ 7E lit = fn @ 4 lit u< and if drop 0 lit else
+	fl @ 7E lit = if fbuf @ 2 lit + c@ 8 lit lshift fbuf @ 3 lit + c@ or fl !  4 lit fh ! then
+	fbuf @ 1 lit + c@ 80 lit and if fh @ 4 lit + fh ! then
+	fh @ fl @ + F00 lit u> if cclose 0 lit else
+	fn @ fh @ fl @ + u< if drop 0 lit else
+		fbuf @ 1 lit + c@ 80 lit and if fl @ ?dup if
+			0 lit do fbuf @ fh @ + i + dup c@ fbuf @ fh @ + 4 lit - i 3 lit and + c@ xor swap c! loop
+		then then
+		fbuf @ c@ F lit and
+		dup 1 lit = over 2 lit = or fl @ and if over 8 lit + @ fbuf @ fh @ + fl @ write drop then
+		dup 9 lit = if fbuf @ fh @ + fl @ A lit wsend then
+		8 lit = if 0 lit 0 lit 8 lit wsend cclose 0 lit else
+			fn @ fh @ fl @ + - ?dup if 0 lit do fbuf @ fh @ + fl @ + i + c@ fbuf @ i + c! loop then
+			fn @ fh @ fl @ + - swap C lit + !  1 lit
+		then
+	then then
+then then then ;
+
+: frames  begin dup frame1 0= until drop ;                   \ ( c -- )
+
+\ wsread ( c -- )  frames arriving on a WebSocket.
+: wsread
+dup @ over 10 lit + @ 2 lit pick C lit + @ + 1000 lit 3 lit pick C lit + @ - read
+dup 0 lit > 0= if drop cclose else over C lit + dup @ rot + swap !  frames then ;
+
+\ ttyread ( c -- )  what its terminal shows, sent as a binary frame; when
+\ the program and its terminal are done, a close, and the client gone.
+: ttyread
+dup 8 lit + @ io @ 1000 lit read
+dup 0 lit > if io @ swap 2 lit wsend drop else drop 0 lit 0 lit 8 lit wsend cclose then ;
+
+\ accept1  a client taken (closed at once if all eight slots are busy).
+: accept1
+lsn @ accept dup 0< if drop else
+	FFFFFFFF lit NC 0 lit do dup 0< if i crec @ 0< if drop i then then loop
+	dup 0< if drop close drop else
+		crec tuck !  0 lit over 4 lit + !  FFFFFFFF lit over 8 lit + !  0 lit swap C lit + !
+	then
+then ;
+
+\ entries  poll's entries made: the listener; each client's socket, and
+\ its terminal once it has one.
+: pent  np @ 3 lit lshift pe @ + tuck !  1 lit swap 4 lit + !  np @ 2 lit lshift pm @ + !  np @ 1 lit + np ! ;   \ ( tag fd -- )
+: entries
+0 lit np !
+0 lit lsn @ pent
+NC 0 lit do
+	i crec @ 0< 0= if
+		i crec dup @ pent
+		i crec 4 lit + @ if i crec 1 lit or i crec 8 lit + @ pent then
+	then
+loop ;
+
+\ handle ( tag -- )  an entry with something to do.
+: handle
+?dup 0= if accept1 else
+dup 1 lit and if 1 lit - dup @ 0< 0= over 8 lit + @ 0< 0= and if dup @ cfd ! ttyread else drop then else
+dup @ 0< if drop else
+dup @ cfd !  dup 4 lit + @ if wsread else request then
+then then then ;
+
+1000 lit 10 lit + alloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  10 lit alloc fdv !
+A0D0A0D lit e2 @ !  0 lit e2 @ 4 lit + c!
+NC 5 lit lshift alloc cl !
+NC 0 lit do FFFFFFFF lit i crec !  FFFFFFFF lit i crec 8 lit + !  1000 lit alloc i crec 10 lit + ! loop
+NC 1 lit lshift 1 lit + dup 3 lit lshift alloc pe !  2 lit lshift alloc pm !
+1 lit arg ?dup if atoi else 50 lit then port !
+2 lit arg ?dup 0= if "sh" then prog !
+2 lit socket dup lsn ! 0< if "wm: no socket" eputs 0A lit eputc 1 lit exit then
+lsn @ 1 lit 0 lit port @ net ?dup if "wm: cannot bind: " eputs . 0A lit eputc 1 lit exit then
+lsn @ 3 lit 0 lit 0 lit net drop
+tcode[ drop begin FFFFFFFF lit st2 wait 0< if 5F5E100 lit sleep then 0 lit until ]tcode
+4000 lit alloc 4000 lit + 0 lit thread drop
+"wm: port " puts port @ u. ", " puts prog @ puts 0A lit putc
+begin
+	entries
+	pe @ np @ 0 lit poll drop
+	np @ 0 lit do
+		i 3 lit lshift pe @ + 6 lit + h@ if i 2 lit lshift pm @ + @ handle then
+	loop
+0 lit until
