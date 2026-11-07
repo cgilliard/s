@@ -330,6 +330,31 @@ print("|".join(["e37" if "E37: No write since last change" in t else "no-e37"] +
 	[ "$r" = "e37|hello world/second line|second line/hello world|second line/hello world" ] || fail "vi_$n" "$r"
 done
 
+# Programs built inside the OS (step 11), with a disk: hello.fam written in
+# vi, built with fam (famc: bin/fam unchanged, a machine program whose UART
+# and test finisher the kernel stands in for) and run; vi.fam (a data file
+# here, /lib/vi.fam) built and the same, byte for byte, as /bin/vi, built
+# on the host; a file with a word not known: the error said, no program
+# left.
+sh scripts/mkimage.sh "$T/build.img" bin/kernel $progs famc=bin/fam.uncompressed:8192:m stdlib.fam=lib/stdlib.fam:0 \
+	user.fam=lib/user.fam:0 build.fam=lib/build.fam:0 vi.fam=src/user/vi.fam:0 2> "$T/build.mk" || fail build "mkimage: $(cat "$T/build.mk")"
+cat > "$T/build.feed" <<'BUILDEOF'
+sleep 3; printf 'vi /h.fam\n'; sleep 1.5
+printf 'i: greet  "hello, " puts puts 0A lit putc ;\r"world" greet\rbye\033:wq\r'; sleep 1.5
+printf 'fam /h.fam\n'; sleep 4; printf '/h\n'; sleep 1.5
+printf 'fam -o /vi2 /lib/vi.fam\n'; sleep 10; printf 'cmp /vi2 /bin/vi\n'; sleep 1.5
+printf 'echo 1 lit nosuchword bye > /bad.fam\n'; sleep 1; printf 'fam /bad.fam\n'; sleep 4; printf 'ls /\n'; sleep 1; printf 'halt\n'; sleep 1
+BUILDEOF
+for n in 1 4; do
+	N=$((N + 1)); o="$T/build_$n.out"
+	rm -f "$T/build.disk"; dd if=/dev/zero of="$T/build.disk" bs=1 count=0 seek=268435456 2>/dev/null
+	lim 60 sh -c 'sh "$1" | ./tools/q32 --smp='$n' --disk="$2" "$3"' build "$T/build.feed" "$T/build.disk" "$T/build.img" > "$o" 2>&1
+	for pat in '^hello, world' '^same' 'fam: compile error (a word not known' '^vi2' '^kernel: halted'; do
+		tr -d '\r' < "$o" | grep -q -- "$pat" || { fail "build_$n" "no /$pat/ in: $(tr -d '\r' < "$o" | tail -c 500)"; break; }
+	done
+	tr -d '\r' < "$o" | grep -qx 'bad' && fail "build_$n" "a program left after a compile error"
+done
+
 # The store (step 8): its own checks on a bare machine (a new store, the
 # same found again, QEMU killed in its commits six times and the last
 # commit found whole); then trees from user mode on a disk, on one hart

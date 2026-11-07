@@ -953,6 +953,51 @@ kernel too much to add at the end.
       and the shell's screen back after.
     - `mapexit_1/4`: memory still mapped at a process's end is given
       back whole.
+
+    Part 2, the compiler (2026-11-07). Step 11 is done: a program is
+    written (in vi), built (with `fam`) and run inside the OS.
+
+    The compiler is `bin/fam`, unchanged byte for byte (`src/fam.S` and
+    `src/fam.fam0` are untouched). It is in the image as `famc`, a
+    machine program (mkimage's `:m`, bit 31 of the memory word):
+    - `pspawne` runs it from a copy at its memory's start, so its code
+      and data sit together as on bare metal: immediate words run from
+      the data, and the trampoline is patched.
+    - That memory (8 MiB) is runnable as well as readable and writable:
+      process field 84 adds X to its PMP entry.
+    - Its UART and test-finisher accesses fault, and the kernel stands
+      in for them (`kemu`, in `src/ksys.fam`):
+      - the line status reads ready once input is buffered (read(0)
+        into the last 32 KiB of its memory);
+      - the data register gives the next byte, or EOT at the input's
+        end;
+      - written bytes are buffered and go out by write(1);
+      - the finisher writes the output, then exits 0 (pass) or 1.
+      A read or write that waits leaves the instruction to fault again
+      when woken, its a0-a2 kept in the process meanwhile.
+    - About 3.7 s builds vi.fam (124 KB out); an empty program takes
+      1.25 s, mostly reading the libraries.
+
+    The libraries are data files in the image (KiB 0): `/lib/stdlib.fam`,
+    `user.fam` and `build.fam`, read like `/bin`'s programs and listed in
+    `/lib` (a store directory init makes, so more can be added). `pfind`
+    finds only programs; `dfind` finds data files.
+
+    `fam [-o out] file.fam ...` (`src/user/fam.fam`) is the wrapper, as
+    `tools/fam --user` is on the host:
+    - it feeds famc, through a pipe, the libraries, the files and `bye`,
+      with the output file as famc's standard output;
+    - a program (its nop header) is made runnable, 755;
+    - otherwise it reports the compiler's line (taken back to a file
+      and line when it has the `? src ... out ...` form, else "a word
+      not known") and removes the file.
+    `cmp a b` compares two files.
+
+    Checked by `build_1/4`:
+    - hello.fam written in vi, built and run;
+    - vi.fam built in the OS and byte for byte the same as the host's
+      /bin/vi;
+    - a word not known: the error given, no program left.
 12. **The node as a daemon.** A document of its own: the chain's logic
     in fam (verification, the state tree, sync, the protocol), its seed
     data in the image, started by `/etc/init`.

@@ -70,6 +70,7 @@ begin
 
 1000 lit alloc buf !  100 lit alloc t !  100 lit alloc es !  0 lit n !
 "/bin" mkdir drop          \ /bin made the first time (the image's programs are listed in it too)
+"/lib" mkdir drop          \ and /lib (its data files: the compiler's libraries)
 "/etc/init" 0 lit open dup 0< if drop shell then
 dup buf @ FFF lit read dup 0< if drop 0 lit then buf @ + 0 lit swap c!  close drop
 buf @ q !  begin q @ c@ while line repeat

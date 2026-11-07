@@ -2,10 +2,16 @@
 # mkimage.sh — the node image (docs/OS.md, section 1): the kernel followed by
 # the programs it carries, all one file under tabernacle's hash.
 #
-# Usage: scripts/mkimage.sh OUT KERNEL NAME=FILE[:KiB] ...
+# Usage: scripts/mkimage.sh OUT KERNEL NAME=FILE[:KiB[:m]] ...
 #   KERNEL   the kernel, as fam built it (bin/kernel)
 #   NAME     a program's name (at most 15 bytes), FILE its binary (built with
-#            `tools/fam --user`), KiB the memory it starts with (default 64)
+#            `tools/fam --user`), KiB the memory it starts with (default 64),
+#            m a machine program (bit 31 of the memory word: the compiler,
+#            bin/fam, unchanged, which talks to the UART and QEMU's test
+#            finisher; the kernel runs it from a copy in its memory, which it
+#            may run code in, and stands in for those devices: src/ksys.fam,
+#            kemu); KiB 0: not a program but a data file, read as /lib/NAME
+#            (the compiler's libraries)
 #
 # The layout: the kernel; each program, from a page boundary and padded with
 # zeros to the next (its code's PMP range then covers whole pages: QEMU
@@ -21,7 +27,7 @@
 # programs.
 set -e
 
-[ $# -ge 2 ] || { echo "Usage: mkimage.sh OUT KERNEL NAME=FILE[:KiB] ..." >&2; exit 1; }
+[ $# -ge 2 ] || { echo "Usage: mkimage.sh OUT KERNEL NAME=FILE[:KiB[:m]] ..." >&2; exit 1; }
 out=$1; kernel=$2; shift 2
 
 fsize() { wc -c < "$1" | tr -d ' \t'; }
@@ -41,8 +47,8 @@ pad4 "$tmp"
 n=0
 for spec in "$@"; do
 	name=${spec%%=*}; rest=${spec#*=}
-	file=${rest%%:*}; kib=64
-	case "$rest" in *:*) kib=${rest##*:} ;; esac
+	file=${rest%%:*}; kib=64; x=0
+	case "$rest" in *:*:m) x=1; kib=${rest#*:}; kib=${kib%:m} ;; *:*) kib=${rest##*:} ;; esac
 	[ -f "$file" ] || { echo "mkimage.sh: $file not found" >&2; exit 1; }
 	len=$(printf '%s' "$name" | wc -c | tr -d ' \t')
 	[ "$len" -ge 1 ] && [ "$len" -le 15 ] || { echo "mkimage.sh: name $name: 1 to 15 bytes" >&2; exit 1; }
@@ -50,7 +56,7 @@ for spec in "$@"; do
 	off=$(fsize "$tmp")
 	cat "$file" >> "$tmp"
 	padpg "$tmp"
-	{ printf '%s' "$name"; zeros $((16 - len)); le32 "$off"; le32 "$(fsize "$file")"; le32 $((kib * 1024)); } >> "$tmp.table"
+	{ printf '%s' "$name"; zeros $((16 - len)); le32 "$off"; le32 "$(fsize "$file")"; le32 $((kib * 1024 + x * 2147483648)); } >> "$tmp.table"
 	n=$((n + 1))
 done
 toff=$(fsize "$tmp")

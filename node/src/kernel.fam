@@ -672,6 +672,8 @@ F3220034 ,   \ csrrs t0,mscratch,zero
 370E0B00 ,   \ lui t3,0xb0
 337E6E00 ,   \ and t3,t3,t1
 130EBE00 ,   \ addi t3,t3,11
+83AE4305 ,   \ lw t4,84(t2)              ( and X, 4, for a machine program )
+330EDE01 ,   \ add t3,t3,t4
 73101E3A ,   \ csrw pmpcfg1,t3
 03A38303 ,   \ lw t1,56(t2)              ( entries 8, 10: blocks 2, 3 )
 33336000 ,   \ snez t1,t1
@@ -698,7 +700,10 @@ B3FE6E00 ,   \ and t4,t4,t1
 \ The programs the image carries (scripts/mkimage.sh): a table past them,
 \ its offset and "PROG" in the image's last 8 bytes, where the kernel's
 \ return ids begin (s10).  An entry: the name (16 bytes), the offset, the
-\ length, the memory to start with.
+\ length, the memory to start with (bit 31: a machine program, mkimage's
+\ :m, the compiler: run from a copy at its memory's start, that memory
+\ runnable as well as read and written, its UART and test finisher stood
+\ in for: src/ksys.fam, kemu; 0: not a program but a data file, /lib's).
 
 : progtab  s10@ 4 lit - @ 474F5250 lit = if s10@ 8 lit - @ 80000000 lit + else 0 lit then ;  \ ( -- table | 0 )
 
@@ -711,16 +716,24 @@ begin
 	1 lit + swap 1 lit + swap 0 lit then then
 until ;
 
-\ pfind ( name -- entry | 0 )
-: pfind
-progtab ?dup 0= if drop 0 lit else
-	dup @ ?dup 0= if 2drop 0 lit else
+\ tfind ( name d -- entry | 0 )  an entry of the image's by its name: d 0
+\ a program's (memory not 0), -1 a data file's (memory 0).  pfind ( name
+\ -- entry | 0 ) and dfind the same.
+: tfind
+progtab ?dup 0= if 2drop 0 lit else
+	dup @ ?dup 0= if drop 2drop 0 lit else
 		0 lit swap 0 lit do
-			dup 0= if over 4 lit + i 1C lit * + 3 lit pick over streq if nip else drop then then
+			dup 0= if
+				over 4 lit + i 1C lit * +
+				dup 18 lit + @ 0= 4 lit pick =
+				5 lit pick 2 lit pick streq and if nip else drop then
+			then
 		loop
-		nip nip
+		nip nip nip
 	then
 then ;
+: pfind  0 lit tfind ;
+: dfind  FFFFFFFF lit tfind ;
 
 \ ── Processes and threads ──
 \
@@ -756,7 +769,9 @@ then ;
 \ (docs/OS.md, section 10), 48 on: 4 pairs (first byte, byte past), each 0
 \ when empty, which `map` and `unmap` change and `upmp` puts in PMP
 \ entries 5-12 (so a process holds code, its first region, and 4 blocks);
-\ the ticks its threads have run 80; its working directory at 192 (a
+\ the ticks its threads have run 80, 4 at 84 for a machine program (its
+\ memory runnable: added to its PMP entry), its devices' state at 128-168
+\ (src/ksys.fam, kemu); its working directory at 192 (a
 \ page: the path's length, then the path; 0: the root), its user and group
 \ at 196 and 200; at 256, its 32 descriptors (each an open file of the
 \ table below, or 0).
@@ -970,10 +985,11 @@ rot dup spe !
 0= if 2drop FFFFFFFE lit else
 prnew dup spp ! 0= if 2drop FFFFFFF5 lit else
 thnew dup spt ! 0= if 2drop FFFFFFF5 lit else
-spe @ 18 lit + @ FFF lit + C lit rshift dup pgalloc
+spe @ 18 lit + @ 7FFFFFFF lit and FFF lit + C lit rshift dup pgalloc
 dup 0= if 2drop 2drop FFFFFFF4 lit else
 	dup 2 lit pick C lit lshift mzero
 	spp @ 200 lit mzero
+	spe @ 18 lit + @ 0< if 4 lit spp @ 54 lit + ! then        \ a machine program: its memory runnable (upmp)
 	spp @ 10 lit + !
 	spp @ 14 lit + !
 	spp @ 4 lit + !
@@ -990,6 +1006,10 @@ dup 0= if 2drop 2drop FFFFFFF4 lit else
 	spp @ 1C lit + @ spt @ A4 lit + !
 	spp @ 10 lit + @ dup spt @ A8 lit + ! spt @ 28 lit + !
 	spp @ 10 lit + @ spp @ 14 lit + @ C lit lshift + dup spt @ AC lit + ! spt @ 2C lit + !
+	spe @ 18 lit + @ 0< if                                    \ a machine program: run from a copy
+		spe @ 10 lit + @ 80000000 lit +  spp @ 10 lit + @  spe @ 14 lit + @ 3 lit + FFFFFFFC lit and mcpy
+		spp @ 10 lit + @ spt @ !
+	then
 	1 lit spt @ tstate!
 	hpoke
 	spp @ pid

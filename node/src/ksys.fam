@@ -1318,9 +1318,10 @@ sfds? 0= if klk @ unlock sfree FFFFFFF7 lit sret else
 	then
 then then then then ;
 
-\ binl? ( -- flag )  the directory listed is /bin; dname ( a -- )  an
-\ image program's name (16 bytes at most) a line of the listing.
-: binl?  XPLEN x@ 5 lit = if XKEY xa dup c@ 2F lit = over 1 lit + c@ 62 lit = and over 2 lit + c@ 69 lit = and over 3 lit + c@ 6E lit = and swap 4 lit + c@ 2F lit = and else 0 lit then ;
+\ dirl? ( s -- flag )  the directory listed is s (5 bytes: /bin/, /lib/);
+\ dname ( a -- )  an image entry's name (16 bytes at most) a line of the
+\ listing.
+: dirl?  XPLEN x@ 5 lit = if 1 lit 5 lit 0 lit do over i + c@ XKEY xa i + c@ <> if drop 0 lit then loop nip else drop 0 lit then ;
 
 \ dlist ( -- fd | error )  the directory at XKEY listed (each name a line,
 \ a directory's with a / after), the transaction ended, and a descriptor
@@ -1328,6 +1329,15 @@ then then then then ;
 : dout  XOUT x@ over + XOUTS x@ FF0 lit + u< if XOUT x@ swap dup XOUT x@ + XOUT x! bcpy else 2drop then ;   \ ( a n -- )
 : dch   XOUT x@ XOUTS x@ FF0 lit + u< if XOUT x@ c!  XOUT x@ 1 lit + XOUT x! else drop then ;            \ ( c -- )
 : dname  0 lit begin 2dup + c@ over 10 lit u< and while 1 lit + repeat dout 0A lit dch ;
+\ tnames ( d out -- )  the image's names of one kind (d 0 its programs, -1
+\ its data files), a line each: of a listing (out 0: dname) or of a text
+\ (out 1: tl).
+: tnkd variable ;  : tnout variable ;
+: tnames
+tnout ! tnkd !
+progtab ?dup if dup @ ?dup if 0 lit do
+	dup 4 lit + i 1C lit * + dup 18 lit + @ 0= tnkd @ = if tnout @ if tl else dname then else drop then
+loop then drop then ;
 : dlist
 1 lit spga ?dup 0= if tabort FFFFFFF4 lit else
 	dup XOUT x!  XOUTS x!
@@ -1350,7 +1360,8 @@ then then then then ;
 		then then
 	until
 	XPLEN x@ 1 lit = if "dev/" 4 lit dout 0A lit dch "proc/" 5 lit dout 0A lit dch then   \ the root's: /dev and /proc too
-	binl? if progtab ?dup if dup @ ?dup if 0 lit do dup 4 lit + i 1C lit * + dname loop then drop then then   \ /bin's: the image's programs too
+	"/bin/" dirl? if 0 lit 0 lit tnames then   \ /bin's: the image's programs too
+	"/lib/" dirl? if FFFFFFFF lit 0 lit tnames then   \ /lib's: its data files
 	XOUT x@ XOUTS x@ - XOUTS x@
 	tcommit drop
 	klk @ lock 4 lit 1 lit fnew ?dup 0= if klk @ unlock 1 lit spgf drop FFFFFFF4 lit else
@@ -1360,17 +1371,17 @@ then then then then ;
 	then
 then ;
 
-\ nostore ( -- fd | error )  open with no store: the root and /bin still
-\ listed (bin/, dev/ and proc/; the image's programs), to read only (-21
-\ to write); -2 any other path.
+\ nostore ( -- fd | error )  open with no store: the root, /bin and /lib
+\ still listed (bin/, dev/, lib/, proc/; the image's programs; its data
+\ files), to read only (-21 to write); -2 any other path.
 : nostore
 klk @ lock
-kvpath if kpb @ "/" streq if 1 lit else "/bin" vdir? if 2 lit else 0 lit then then else 0 lit then
+kvpath if kpb @ "/" streq if 1 lit else "/bin" vdir? if 2 lit else "/lib" vdir? if 3 lit else 0 lit then then then else 0 lit then
 ?dup 0= if FFFFFFFE lit else
 2C lit sysarg 3 lit and if drop FFFFFFEB lit else
 ptext ?dup 0= if drop FFFFFFF4 lit else
-	swap 1 lit = if "bin/" tl "dev/" tl "proc/" tl else
-		progtab ?dup if dup @ ?dup if 0 lit do dup 4 lit + i 1C lit * + tl loop then drop then
+	swap dup 1 lit = if drop "bin/" tl "dev/" tl "lib/" tl "proc/" tl else
+		2 lit = if 0 lit 1 lit tnames else FFFFFFFF lit 1 lit tnames then
 	then
 	tbend dup cproc fdput dup 0< if swap fclose else nip then
 then then then
@@ -1651,11 +1662,13 @@ fst @ 2C lit sysarg CREATE and if 2 lit else 1 lit then tbegin 0= if FFFFFFF0 li
 	sret
 then then then ;
 
-\ binf? ( -- entry | 0 )  open's path is /bin/ and an image program's name.
-: binf?  klk @ lock kvpath if kpb @ "/bin/" kpfx ?dup if pfind else 0 lit then else 0 lit then klk @ unlock ;
+\ binf? ( -- entry | 0 )  open's path is /bin/ and an image program's name,
+\ or /lib/ and one of its data files'.
+: binf?  klk @ lock kvpath if kpb @ "/bin/" kpfx ?dup if pfind else kpb @ "/lib/" kpfx ?dup if dfind else 0 lit then then else 0 lit then klk @ unlock ;
 
-\ sobin ( entry -- )  open of an image program as /bin/<name>: to read
-\ only (its bytes, kind 11); -13 to write (its name the image's).
+\ sobin ( entry -- )  open of an image program as /bin/<name> (or a data
+\ file as /lib/<name>): to read only (its bytes, kind 11); -13 to write
+\ (its name the image's).
 : sobin
 2C lit sysarg 3 lit and if drop FFFFFFF3 lit sret else
 klk @ lock
@@ -1861,8 +1874,72 @@ else 0 lit mhartid@ hstale harr ! then ;
 \ the thread rather than go back to it.  Interrupts are
 \ taken from either mode: a timer's ends a thread's slice (counted to it),
 \ a software interrupt stops a thread whose process is ending.  An
-\ exception from user mode is the thread's (a system call, or its end),
-\ from the kernel a bug.
+\ ── A machine program's devices (docs/OS.md, step 11) ──
+\
+\ A machine program (the image's :m: the compiler, bin/fam, unchanged) runs
+\ as on bare metal: it polls the UART (its line status at 10000005, its
+\ data at 10000000) and stops QEMU through the test finisher (100000).  In
+\ user mode those accesses fault; kemu does each one instead, the faulting
+\ load or store decoded at mepc, its address mtval:
+\   line status read: data ready (and the transmitter empty) once input is
+\     buffered, or its end reached; the buffer refilled first (read(0)).
+\   data read: the next byte of the input, or EOT at its end.
+\   data written: the byte buffered, the buffer written (write(1)) full.
+\   the finisher written: the output written, then exit, 0 for 5555 (pass),
+\     else the code in its upper half (13333: 1).
+\ The buffers: the last 64 KiB of its memory (32 KiB in, 32 KiB out), past
+\ what bin/fam uses.  A read or write that waits leaves the instruction to
+\ fault again when woken (as a call is run again), the program's a0-a2
+\ kept meanwhile.  The state, in the process: input taken 128 and held 132,
+\ its end seen 136, output held 140, a0-a2 kept 144 (148, 152, 156), the
+\ faulting pc 160, the value 164, whether to go on 168.
+
+: kpr     cproc + ;                                          \ ( off -- a )  a field of the process
+: kemub    cproc dup 10 lit + @ swap 14 lit + @ C lit lshift + 10000 lit - ;   \ ( -- in )  the output's 32 KiB after it
+: kstash  90 lit kpr @ 0= if 28 lit sysarg 94 lit kpr !  2C lit sysarg 98 lit kpr !  30 lit sysarg 9C lit kpr !  1 lit 90 lit kpr ! then ;
+: kunst   90 lit kpr @ if 94 lit kpr @ area@ 28 lit + !  98 lit kpr @ area@ 2C lit + !  9C lit kpr @ area@ 30 lit + !  0 lit 90 lit kpr ! then ;
+: kavail?  80 lit kpr @ 84 lit kpr @ u< 88 lit kpr @ or ;
+\ kfill, kflush ( -- ok )  the input buffer refilled, the output written:
+\ 0 if the call waits.
+: kfill
+kstash  0 lit area@ 28 lit + !  kemub area@ 2C lit + !  8000 lit area@ 30 lit + !
+sread
+area@ E0 lit + @ if 0 lit else
+	area@ 28 lit + @ dup 0 lit > if 84 lit kpr !  0 lit 80 lit kpr ! else drop 1 lit 88 lit kpr ! then
+	kunst 1 lit
+then ;
+: kflush
+8C lit kpr @ 0= if 1 lit else
+	kstash  1 lit area@ 28 lit + !  kemub 8000 lit + area@ 2C lit + !  8C lit kpr @ area@ 30 lit + !
+	swrite
+	area@ E0 lit + @ if 0 lit else 0 lit 8C lit kpr !  kunst 1 lit then
+then ;
+: kemu
+mepc@ A0 lit kpr !  kunst  1 lit A8 lit kpr !  0 lit A4 lit kpr !
+mepc@ @ dup 7F lit and 3 lit = if
+	mtval@ dup 10000005 lit = if drop
+		kavail? 0= if kfill A8 lit kpr ! then  61 lit A4 lit kpr !
+	else 10000000 lit = if
+		80 lit kpr @ 84 lit kpr @ u< if
+			80 lit kpr @ kemub + c@ A4 lit kpr !  80 lit kpr dup @ 1 lit + swap !
+		else 4 lit A4 lit kpr ! then
+	then then
+	A8 lit kpr @ if 7 lit rshift 1F lit and ?dup if 2 lit lshift area@ + A4 lit kpr @ swap ! then else drop then
+else dup 7F lit and 23 lit = if
+	14 lit rshift 1F lit and ?dup if 2 lit lshift area@ + @ else 0 lit then
+	mtval@ dup 10000000 lit = if drop
+		8C lit kpr @ 8000 lit = if kflush A8 lit kpr ! then
+		A8 lit kpr @ if FF lit and kemub 8000 lit + 8C lit kpr @ + c!  8C lit kpr dup @ 1 lit + swap ! else drop then
+	else 100000 lit = if
+		kflush if
+			dup 5555 lit = if drop 0 lit else 10 lit rshift then area@ 28 lit + !  sexit  0 lit A8 lit kpr !
+		else drop 0 lit A8 lit kpr ! then
+	else drop then then
+else drop then then
+A8 lit kpr @ if A0 lit kpr @ 4 lit + mepc!  0 lit area@ E0 lit + ! then ;
+
+\ exception from user mode is the thread's (a system call, or its end; a
+\ machine program's device access, kemu), from the kernel a bug.
 : ktrap
 mcause@
 dup 80000007 lit = if drop ktick mpp@ 0= if
@@ -1873,7 +1950,8 @@ then else
 dup 80000003 lit = if drop kipi hipiok else
 dup 8000000B lit = if drop kext else
 mpp@ if drop kfault else
-8 lit = if ksys mpp@ 0= cproc 28 lit + @ and if tstop then else ukill then
+dup 8 lit = if drop ksys mpp@ 0= cproc 28 lit + @ and if tstop then else
+dup 5 lit = swap 7 lit = or 54 lit kpr @ and if kemu else ukill then then
 then then then then ;
 
 \ [skip ... skip]  compile the code between where it is but jump over it.

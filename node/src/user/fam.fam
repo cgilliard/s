@@ -1,0 +1,95 @@
+\ fam.fam — the compiler's wrapper (docs/OS.md, step 11), as tools/fam
+\ --user is on the host: fam [-o out] file.fam ...  famc (bin/fam, a
+\ machine program) compiles what it reads, the libraries first
+\ (/lib/stdlib.fam, user.fam, build.fam: as for a program of the OS), then
+\ the files, then bye; what it writes is the program, made runnable (mode
+\ 755).  Its name: -o's, else the first file's without .fam.  A compile
+\ error: the compiler's line ("? src ... out ...") taken back to a file
+\ and line, and no program left.
+
+: buf variable ;  : out variable ;  : pfd variable ;  : fdv variable ;  : st variable ;
+: nin variable ;  : ins variable ;  : sts variable ;  : pos variable ;  : ofd variable ;
+: nlx variable ;  : pid variable ;
+: err  "fam: " eputs eputs 0A lit eputc ;          \ ( s -- )
+
+\ feed ( path -- ok )  a file's bytes down the pipe (pos counting them).
+: feed
+0 lit open dup 0< if drop 0 lit else
+	begin dup buf @ 1000 lit read dup 0 lit > while
+		pfd @ 4 lit + @ buf @ 2 lit pick write drop  pos @ + pos !
+	repeat drop
+	close drop 1 lit
+then ;
+
+\ hex ( s -- n )  8 hex digits.
+: hex  0 lit swap 8 lit 0 lit do dup i + c@ dup 41 lit u< if 30 lit - else 37 lit - then rot 4 lit lshift + swap loop drop ;
+
+: mn  2dup u> if swap then drop ;                 \ ( a b -- min )
+\ where ( off -- )  the compiler's place in what it read: which file, which
+\ line (a library's, or one of the files).
+: where
+nin @ 3 lit + 0 lit do
+	dup i 2 lit lshift sts @ + @ - dup 0< 0= i 1 lit + 2 lit lshift sts @ + @ 3 lit pick - 0 lit > and if
+		i 3 lit u< if
+			i 0= if "/lib/stdlib.fam" else i 1 lit = if "/lib/user.fam" else "/lib/build.fam" then then
+		else i 3 lit - 2 lit lshift ins @ + @ then
+		dup eputs ":" eputs
+		0 lit open dup 0< 0= if
+			1 lit nlx !  swap
+			begin dup 0 lit > if over buf @ 2 lit pick 1000 lit mn read else 0 lit then dup 0 lit > while
+				dup 0 lit do buf @ i + c@ A lit = if nlx @ 1 lit + nlx ! then loop -
+			repeat drop drop close drop
+			nlx @ u.
+		else drop drop "?" eputs then
+		": " eputs
+	else drop then
+loop drop ;
+
+4000 lit alloc buf !  8 lit alloc pfd !  10 lit alloc fdv !  4 lit alloc st !
+100 lit alloc out !  0 lit out @ c!
+40 lit alloc ins !  50 lit alloc sts !  0 lit nin !
+\ the arguments: -o name, the files
+1 lit begin dup arg ?dup while
+	dup "-o" streq if drop 1 lit + dup arg ?dup if out @ swap scpy 0 lit swap c! else "-o: no name" err 1 lit exit then
+	else nin @ 10 lit u< if nin @ 2 lit lshift ins @ + ! nin @ 1 lit + nin ! else drop then then
+	1 lit +
+repeat drop
+nin @ 0= if "usage: fam [-o out] file.fam ..." err 1 lit exit then
+out @ c@ 0= if
+	out @ ins @ @ scpy 0 lit swap c!
+	out @ strlen dup 4 lit u> if out @ + 4 lit - dup ".fam" streq if 0 lit swap c! else drop ".out" out @ dup strlen + swap scpy 0 lit swap c! then
+	else drop ".out" out @ dup strlen + swap scpy 0 lit swap c! then
+then
+\ famc: reading the pipe, writing the program
+out @ 601 lit open dup ofd ! 0< if "cannot write " err 1 lit exit then
+pfd @ pipe drop
+3 lit fdv @ !  pfd @ @ fdv @ 4 lit + !  ofd @ fdv @ 8 lit + !  2 lit fdv @ C lit + !
+"famc" 0 lit fdv @ spawnv dup pid ! 0< if "no compiler (famc)" err 1 lit exit then
+pfd @ @ close drop  ofd @ close drop
+0 lit pos !
+0 lit sts @ !  "/lib/stdlib.fam" feed 0= if "no /lib/stdlib.fam" err 1 lit exit then
+pos @ sts @ 4 lit + !  "/lib/user.fam" feed 0= if "no /lib/user.fam" err 1 lit exit then
+pos @ sts @ 8 lit + !  "/lib/build.fam" feed 0= if "no /lib/build.fam" err 1 lit exit then
+nin @ 0 lit do
+	pos @ sts @ i 3 lit + 2 lit lshift + !
+	i 2 lit lshift ins @ + @ dup feed 0= if "fam: cannot read " eputs eputs 0A lit eputc pfd @ 4 lit + @ close drop pid @ st wait drop out @ remove drop 1 lit exit then drop
+loop
+pos @ sts @ nin @ 3 lit + 2 lit lshift + !
+A lit buf @ c!  pfd @ 4 lit + @ buf @ 1 lit write drop  pfd @ 4 lit + @ "bye" 3 lit write drop  pfd @ 4 lit + @ buf @ 1 lit write drop
+pfd @ 4 lit + @ close drop
+pid @ st wait drop
+\ a program (its first word the nop header q32 and the kernel know), or
+\ the compiler's error line
+out @ 0 lit open dup 0< if drop "no output" err 1 lit exit then
+dup buf @ 40 lit read swap close drop
+dup 4 lit u< 0= buf @ @ 13 lit = and if
+	drop out @ 1ED lit chmod drop 0 lit exit
+then
+dup 0 lit > buf @ c@ 3F lit = and if
+	"fam: " eputs
+	dup E lit u< 0= buf @ 2 lit + c@ 73 lit = and if
+		buf @ 6 lit + hex where "compile error (" eputs 2 lit buf @ rot 1 lit - write drop ")" eputs
+	else drop "compile error (a word not known, or not used rightly)" eputs then
+	0A lit eputc
+else drop "fam: the compiler wrote nothing" eputs 0A lit eputc then
+out @ remove drop 1 lit exit

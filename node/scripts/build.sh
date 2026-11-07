@@ -124,6 +124,11 @@ for prog in src/user/*.fam; do
 	./tools/fam --user -o "bin/user/$name" "$prog" || { echo "build.sh: $prog did not build" >&2; exit 1; }
 	progs="$progs $name=bin/user/$name"
 done
+# The compiler too (famc: bin/fam, unpacked and unchanged, as a machine
+# program with 8 MiB: the kernel stands in for its UART and test finisher),
+# and the libraries it compiles a program with (data files, read as
+# /lib/<name>: docs/OS.md, step 11).
+progs="$progs famc=bin/fam.uncompressed:8192:m stdlib.fam=lib/stdlib.fam:0 user.fam=lib/user.fam:0 build.fam=lib/build.fam:0"
 sh scripts/mkimage.sh bin/img bin/kernel $progs
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"

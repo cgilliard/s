@@ -1,0 +1,23 @@
+\ cmp.fam — cmp a b: whether two files hold the same bytes; if not, where
+\ the first difference is (a byte's number, from 0), or that one is shorter.
+: ba variable ;  : bb variable ;  : fa variable ;  : fb2 variable ;  : at variable ;
+: na variable ;  : nb variable ;
+\ fill ( fd buf -- n )  up to 1000 bytes, as many as the file has (reads
+\ until the buffer is full or the file ends).
+: fill
+0 lit begin
+	dup 1000 lit u< if 2 lit pick 2 lit pick 2 lit pick + 1000 lit 3 lit pick - read dup 0 lit > if + 0 lit else drop 1 lit then else 1 lit then
+until nip nip ;
+argn 3 lit u< if "usage: cmp a b" eputs 0A lit eputc 2 lit exit then
+1000 lit alloc ba !  1000 lit alloc bb !  0 lit at !
+1 lit arg 0 lit open dup fa ! 0< if "cmp: cannot open " eputs 1 lit arg eputs 0A lit eputc 2 lit exit then
+2 lit arg 0 lit open dup fb2 ! 0< if "cmp: cannot open " eputs 2 lit arg eputs 0A lit eputc 2 lit exit then
+begin
+	fa @ ba @ fill na !  fb2 @ bb @ fill nb !
+	na @ nb @ 2dup u> if swap then drop ?dup if 0 lit do
+		ba @ i + c@ bb @ i + c@ <> if "differ: byte " puts at @ i + u. 0A lit putc 1 lit exit then
+	loop then
+	na @ nb @ <> if "differ: " puts na @ nb @ u< if 1 lit arg else 2 lit arg then puts " is shorter" puts 0A lit putc 1 lit exit then
+	at @ na @ + at !
+na @ 0= until
+"same" puts 0A lit putc bye
