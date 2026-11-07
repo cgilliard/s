@@ -1,0 +1,115 @@
+\ sh.fam — the shell (docs/OS.md): a line at a time from its input, each a
+\ pipeline of commands (`a | b | c`), each command a program's name and its
+\ arguments, with `< path` and `> path` taking its input from, or its
+\ output to, what open finds there (/dev, /proc for now; the store's files
+\ in step 8).  It waits for the whole pipeline.  `exit` ends it; so does
+\ the end of its input.
+
+: line variable ;            \ the line read (256 bytes)
+: abuf variable ;            \ the commands' arguments, packed
+: fbuf variable ;            \ the paths of < and >
+: cmds variable ;            \ per command: its arguments, < path, > path
+: ncmd variable ;
+: lp variable ;              \ where in the line
+: ap variable ;              \ where in abuf
+: fq variable ;              \ where in fbuf
+: pin variable ;             \ the read end of the pipe into the next command
+: pfdv variable ;            \ pipe's two descriptors
+: fdv variable ;             \ spawnv's fds: 3, then the child's 0, 1, 2
+: pids variable ;
+: wst variable ;
+
+: cmd  dup 3 lit lshift swap 2 lit lshift + cmds @ + ;      \ ( i -- entry )
+
+\ rdline ( -- n | -1 )  a line into line, NUL-ended; -1 at the end of the
+\ input.
+: rdline
+0 lit
+begin
+	getc dup 0< if drop dup 0= if drop FFFFFFFF lit then 1 lit else
+	dup A lit = if drop 1 lit else
+	over FE lit u< if over line @ + c! 1 lit + else drop then 0 lit
+	then then
+until
+dup 0< 0= if 0 lit over line @ + c! then ;
+
+: ws?  dup 20 lit = swap 9 lit = or ;                       \ ( c -- flag )
+: special?  dup 7C lit = over 3C lit = or swap 3E lit = or ; \ ( c -- flag ) | < >
+: skipws  begin lp @ c@ ws? while lp @ 1 lit + lp ! repeat ;
+
+\ token ( dst -- dst' )  the word at lp copied to dst, NUL-ended.
+: token
+begin lp @ c@ dup if dup ws? over special? or 0= else 0 lit then while
+	over c! 1 lit +  lp @ 1 lit + lp !
+repeat
+drop 0 lit over c! 1 lit + ;
+
+: newcmd  ap @ ncmd @ cmd !  0 lit ncmd @ cmd 4 lit + !  0 lit ncmd @ cmd 8 lit + ! ;
+: endcmd  0 lit ap @ c!  ap @ 1 lit + ap !  ncmd @ 1 lit + ncmd ! ;
+
+\ redir ( off -- )  the path after < (4) or > (8), for this command.
+: redir  lp @ 1 lit + lp !  skipws  fq @ swap ncmd @ cmd + !  fq @ token fq ! ;
+
+\ parse ( -- ok )  the line into cmds; not ok if a command is empty.
+: parse
+line @ lp !  abuf @ ap !  fbuf @ fq !  0 lit ncmd !  newcmd
+1 lit
+begin skipws lp @ c@ while
+	lp @ c@ 7C lit = if
+		lp @ 1 lit + lp !
+		ap @ ncmd @ cmd @ = if drop 0 lit then
+		endcmd newcmd
+	else lp @ c@ 3C lit = if 4 lit redir else
+	lp @ c@ 3E lit = if 8 lit redir else
+	ap @ token ap !
+	then then then
+repeat
+ap @ ncmd @ cmd @ = if ncmd @ if drop 0 lit then then
+endcmd ;
+
+\ cin ( i -- fd )  command i's input: its < path, the pipe from the one
+\ before, or the shell's own.
+: cin
+dup cmd 4 lit + @ ?dup if
+	0 lit open swap if pin @ ?dup if close drop then then
+else
+	if pin @ else 0 lit then
+then ;
+
+\ cout ( i -- fd )  its output: its > path, a pipe to the next (pin then
+\ its read end), or the shell's own.
+: cout
+0 lit pin !
+dup ncmd @ 1 lit - = if 1 lit else pfdv @ pipe drop  pfdv @ @ pin !  pfdv @ 4 lit + @ then
+swap cmd 8 lit + @ ?dup if 1 lit open swap dup 1 lit = if drop else close drop then then ;
+
+\ launch ( i -- )  command i started (its pid noted, 0 if it did not).
+: launch
+dup cin  over cout
+fdv @ 8 lit + !  fdv @ 4 lit + !  3 lit fdv @ !  2 lit fdv @ C lit + !
+dup cmd @ dup fdv @ spawnv
+dup 0< if
+	"sh: " eputs over cmd @ eputs
+	dup FFFFFFFE lit = if ": not found" else ": cannot run" then eputs 0A lit eputc
+	drop 0 lit
+then
+swap 2 lit lshift pids @ + !
+fdv @ 4 lit + @ dup 0< if drop else ?dup if close drop then then
+fdv @ 8 lit + @ dup 0< if drop else dup 1 lit = if drop else close drop then then ;
+
+: run
+ncmd @ 8 lit u> if "sh: too many commands" eputs 0A lit eputc else
+0 lit cmd @ c@ if
+	0 lit cmd @ "exit" streq if 0 lit exit then
+	0 lit pin !
+	ncmd @ 0 lit do i launch loop
+	ncmd @ 0 lit do i 2 lit lshift pids @ + @ ?dup if wst wait drop then loop
+then then ;
+
+100 lit alloc line !  400 lit alloc abuf !  200 lit alloc fbuf !
+600 lit alloc cmds !  8 lit alloc pfdv !  14 lit alloc fdv !  40 lit alloc pids !
+begin
+	"$ " puts
+	rdline 0< if 0 lit exit then
+	parse if run else "sh: a command is missing" eputs 0A lit eputc then
+0 lit until

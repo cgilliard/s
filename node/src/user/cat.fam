@@ -1,0 +1,12 @@
+\ cat.fam — each path's contents to the output (none: the input's).
+: buf variable ;
+: copy  begin dup buf @ 200 lit read dup 0< 0= over and while 1 lit buf @ rot write drop repeat 2drop ;
+200 lit alloc buf !
+1 lit arg 0= if 0 lit copy else
+	1 lit begin dup arg ?dup while
+		0 lit open dup 0< if
+			drop "cat: cannot open " eputs dup arg eputs 0A lit eputc
+		else dup copy close drop then
+		1 lit +
+	repeat drop
+then bye

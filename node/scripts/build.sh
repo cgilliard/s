@@ -112,12 +112,14 @@ pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/mach.fam lib/asm.fam src/gen_hash.fam
 run bin/kernel bin/fam lib/stdlib.fam lib/mach.fam lib/build.fam src/kernel.fam src/boot.fam
 mkdir -p bin/user
+progs=""
 for prog in src/user/*.fam; do
 	name=$(basename "$prog" .fam)
 	echo "Building $prog → bin/user/$name (user mode)" >&2
-	./tools/fam --user -o "bin/user/$name" "$prog"
+	./tools/fam --user -o "bin/user/$name" "$prog" || { echo "build.sh: $prog did not build" >&2; exit 1; }
+	progs="$progs $name=bin/user/$name"
 done
-sh scripts/mkimage.sh bin/img bin/kernel init=bin/user/init
+sh scripts/mkimage.sh bin/img bin/kernel $progs
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"
 pack bin/tabernacle.uncompressed bin/tabernacle

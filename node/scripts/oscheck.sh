@@ -9,8 +9,9 @@
 # code, or make bad system calls: each ended or refused, the system going
 # on; and processes and threads: threads counting under a lock, a child
 # spawned and waited for, sleep, await and wake, a process killed with a
-# thread running on another hart, and the lottery's shares; and memory: map
-# and unmap under PMP, malloc and free on four threads.  Every run has a time
+# thread running on another hart, and the lottery's shares; memory: map and
+# unmap under PMP, malloc and free on four threads; and descriptors, /proc
+# and the shell, typed into on the console.  Every run has a time
 # limit; one that should keep running (the booted kernel) passes when the
 # limit ends it.
 
@@ -56,8 +57,8 @@ printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
 expect fault 1 'kernel: hart 0 trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
 
-expect boot 124 'kernel: init ended: 0' 3 ./tools/q32 bin/img
-grep -q 'kernel: 1 hart, [0-9]* pages free' "$T/boot.out" && grep -q 'init: hello from user mode' "$T/boot.out" \
+expect boot 124 'init: starting the shell' 3 ./tools/q32 bin/img
+grep -q 'kernel: 1 hart, [0-9]* pages free' "$T/boot.out" && grep -q '^\$ $' "$T/boot.out" \
 	|| fail boot "no banner or no init: $(head -c 300 "$T/boot.out")"
 expect boot_6 124 'kernel: 6 harts' 5 ./tools/q32 --smp=6 bin/img
 
@@ -200,9 +201,66 @@ for n in 1 4; do
 	has "malloc_$n" '^big: blocks 2 '
 done
 
+# Descriptors, the console, init and a shell (step 7).  Calls: poll timing
+# out, then readable, then hung up; a pipe read to its end; the errors; 16
+# descriptors at most; a child killed through /proc/<pid>/kill.
+usrc tdesc ': pf variable ;  : ent variable ;  : b variable ;  : st variable ;  : fds variable ;  : path variable ;
+: sp  20 lit putc ;
+8 lit alloc pf !  8 lit alloc ent !  10 lit alloc b !  10 lit alloc fds !  20 lit alloc path !
+pf @ pipe "pipe " puts . sp
+pf @ @ ent @ !  1 lit ent @ 4 lit + !
+ent @ 1 lit 2FAF080 lit poll "idle " puts . sp
+pf @ 4 lit + @ "x" 1 lit write drop
+ent @ 1 lit 0 lit poll "ready " puts . sp ent @ 6 lit + h@ u. sp
+pf @ 4 lit + @ close drop
+pf @ @ b @ 10 lit read "read " puts . sp
+pf @ @ b @ 10 lit read "eof " puts . sp
+ent @ 1 lit 0 lit poll "hup " puts . sp ent @ 6 lit + h@ u. 0A lit putc
+"/nosuch" 0 lit open "open " puts . sp
+9 lit b @ 1 lit read "badfd " puts . sp
+"/proc/1/status" 1 lit open "ro " puts . sp
+"/proc/99/status" 0 lit open "nopid " puts . sp
+0 lit 10 lit 0 lit do "/dev/null" 0 lit open 0< if 1 lit + then loop "full " puts . 0A lit putc
+10 lit 3 lit do i close drop loop
+pf @ pipe drop
+2 lit fds @ !  pf @ @ fds @ 4 lit + !  FFFFFFFF lit fds @ 8 lit + !
+"cat" 0 lit fds @ spawnv
+pf @ @ close drop
+path @ "/proc/" scpy over snum "/kill" scpy 0 lit swap c!
+path @ 1 lit open dup "1" 1 lit write drop close drop
+st wait drop "killed " puts st @ . 0A lit putc bye'
+sh scripts/mkimage.sh "$T/desc.img" bin/kernel init="$T/tdesc.bin" cat=bin/user/cat 2> "$T/desc.mk" || fail desc "mkimage: $(cat "$T/desc.mk")"
+expect desc 124 '^pipe 0 idle -110 ready 1 1 read 1 eof 0 hup 1 17$' 5 ./tools/q32 --smp=2 "$T/desc.img"
+has desc '^open -2 badfd -9 ro -13 nopid -2 full 4$'; has desc '^killed -9$'
+# The shell from the console: the image's programs and one writing 100 KiB,
+# commands typed a line at a time, on one hart and on four.
+usrc big ': buf variable ;
+400 lit alloc buf !  400 lit 0 lit do 61 lit buf @ i + c! loop  A lit buf @ 3FF lit + c!
+64 lit 0 lit do 1 lit buf @ 400 lit write drop loop bye'
+progs=""; for p in bin/user/*; do progs="$progs $(basename "$p")=$p"; done
+sh scripts/mkimage.sh "$T/shell.img" bin/kernel $progs big="$T/big.bin" 2> "$T/shell.mk" || fail shell "mkimage: $(cat "$T/shell.mk")"
+printf '%s\n' 'echo hello world' 'ps' 'echo one two three | wc' 'big | cat | wc' 'cat /proc/self/cmd' \
+	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'exit' > "$T/shell.in"
+# feed SECS FILE CMD... — CMD run with FILE's lines typed into it, 0.3 s
+# apart, 3 s after one running big (typed ahead, a line is echoed among the
+# output).
+feed() {
+	secs=$1; in=$2; shift 2
+	lim "$secs" sh -c 'in=$1; shift; { sleep 1; while IFS= read -r l; do printf "%s\n" "$l"; sleep 0.3; case $l in big*) sleep 3 ;; esac; done < "$in"; sleep 3; } | "$@"' feed "$in" "$@"
+}
+for n in 1 4; do
+	N=$((N + 1)); o="$T/shell_$n.out"
+	feed 14 "$T/shell.in" ./tools/q32 --smp=$n "$T/shell.img" > "$o" 2>&1
+	for pat in '^hello world$' '^PID PPID S THR KIB TICKS CMD$' '^1 0 S 1 64 [0-9]* init$' '^2 1 S 1 64 [0-9]* sh$' \
+		'^3 2 R 1 64 [0-9]* ps$' '^1 3 14$' '^100 100 102400$' '^cat /proc/self/cmd$' '^7$' \
+		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell ended; again$'; do
+		grep -q -- "$pat" "$o" || { fail "shell_$n" "no /$pat/ in: $(head -c 600 "$o")"; break; }
+	done
+done
+
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds
-grep -q 'init: hello from user mode' "$T/boot_disk.out" \
+grep -q 'init: starting the shell' "$T/boot_disk.out" \
 	|| fail boot_disk "no init: $(head -c 300 "$T/boot_disk.out")"
 expect boot_disk_64 124 'kernel: 64 harts' 15 scripts/node.sh --disk="$T/disk.img" --no-seeds --smp=64
 rm -f "$T/disk.img"

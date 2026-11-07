@@ -594,12 +594,30 @@ F3220030 ,   \ csrrs t0,mstatus,zero
 \ inr ( a e lo hi -- ok )  [a, e) within [lo, hi).
 : inr  rot u< 0= -rot u< 0= and ;
 
-\ urange ( addr n -- ok )  n bytes from addr within the process's code or
-\ its memory.
+\ umap? ( addr end -- ok )  within one of the process's mapped blocks.
+: umap?
+0 lit 4 lit 0 lit do
+	2 lit pick 2 lit pick
+	i 3 lit lshift area@ B4 lit + @ 30 lit + +  dup @ swap 4 lit + @  inr
+	i 3 lit lshift area@ B4 lit + @ 30 lit + + @ 0= 0= and or
+loop
+nip nip ;
+
+\ urange ( addr n -- ok )  n bytes from addr within the process's code, its
+\ memory, or a block it mapped: what it may give the kernel to read.
 : urange
 over + 2dup u> if 2drop 0 lit else
 	2dup area@ A0 lit + @ area@ A4 lit + @ inr
-	-rot area@ A8 lit + @ area@ AC lit + @ inr or
+	2 lit pick 2 lit pick area@ A8 lit + @ area@ AC lit + @ inr or
+	-rot umap? or
+then ;
+
+\ uwrange ( addr n -- ok )  the same but for its code: what the kernel may
+\ write for it.
+: uwrange
+over + 2dup u> if 2drop 0 lit else
+	2dup area@ A8 lit + @ area@ AC lit + @ inr
+	-rot umap? or
 then ;
 
 \ upmp  PMP for the thread's process: its code read and execute (entries
@@ -724,14 +742,16 @@ then ;
 \ (the hart going back to its loop still uses its block), nor its slot
 \ reused.
 \
-\ A process (128 bytes): its state at 0 (0 free, 1 living, 2 ended, its
+\ A process (256 bytes): its state at 0 (0 free, 1 living, 2 ended, its
 \ parent not yet told), its parent's pid at 4, exit code 8, threads not
 \ ended 12, memory (first byte 16, pages 20), code (first byte 24, the byte
 \ past it 28), tickets 32, program's table entry 36 (whose name is its
 \ first 16 bytes), whether it is ending 40; then its mapped blocks
 \ (docs/OS.md, section 10), 48 on: 4 pairs (first byte, byte past), each 0
 \ when empty, which `map` and `unmap` change and `upmp` puts in PMP
-\ entries 5-12 (so a process holds code, its first region, and 4 blocks).
+\ entries 5-12 (so a process holds code, its first region, and 4 blocks);
+\ the ticks its threads have run 80; and at 128, its 16 descriptors (each
+\ an open file of the table below, or 0).
 \
 \ Each hart runs hloop: a thread drawn by lottery among those ready (each
 \ holding its tickets), run until it traps back (its slice over at a timer
@@ -744,9 +764,9 @@ then ;
 : prc  variable ;            \ the processes'
 
 : thn     8 lit lshift thr @ + ;           \ ( i -- t )
-: prn     7 lit lshift prc @ + ;           \ ( i -- p )
+: prn     8 lit lshift prc @ + ;           \ ( i -- p )
 : tid     thr @ - 8 lit rshift 1 lit + ;   \ ( t -- tid )
-: pid     prc @ - 7 lit rshift 1 lit + ;   \ ( p -- pid )
+: pid     prc @ - 8 lit rshift 1 lit + ;   \ ( p -- pid )
 : tproc   B4 lit + @ ;                     \ ( t -- p )
 : tstate  B0 lit + @ ;                     \ ( t -- state )
 : tstate! B0 lit + ! ;                     \ ( state t -- )
@@ -764,10 +784,14 @@ then ;
 : phi  variable ;            \ threads (and processes) go no further
 
 \ ptinit  the tables, from the pages.
+:M MAXF 100 lit ;            \ 256 open files
+: fil  variable ;            \ their table
+
 : ptinit
 0 lit thi !  0 lit phi !
 10 lit pgalloc dup 0= if "no memory for the threads" panic then dup thr ! 10000 lit mzero
-2 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 2000 lit mzero ;
+4 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 4000 lit mzero
+2 lit pgalloc dup 0= if "no memory for the open files" panic then dup fil ! 2000 lit mzero ;
 
 \ hpoke  every other started hart woken: a thread is ready.
 : hpoke  hmax @ 0 lit do i mhartid@ <> if i hup harr @ if i ipi then then loop ;
@@ -775,6 +799,91 @@ then ;
 \ max ( a b -- larger )  unsigned.
 : max  2dup u< if swap then drop ;
 
+
+\ ── Open files (docs/OS.md, section 5) ──
+\
+\ An open file (32 bytes, in fil): its kind at 0 (0 free, 1 the console, 2
+\ null, 3 a pipe's end, 4 a /proc key's text, 5 a /proc key to write), the
+\ descriptors on it 4, its page 8 (a pipe's, or the text's), the text's
+\ read position 12 and length 16, the process a key is of 20 and which key
+\ 24 (1 tickets, 2 kill), its mode 28 (1 read, 2 write, 3 both).  A pipe is
+\ a page: its read ends 0, its write ends 4, bytes written 8 and read 12
+\ (counting on, so their difference is what it holds), its 2 KiB of data
+\ from 2048.
+\
+\ A call that cannot go on (nothing to read, no room to write) waits on a
+\ token (the pipe's page, or cin for the console) with its pc on the ecall
+\ itself, so it runs again from the start when woken (tretry): whatever
+\ wakes it (fwake) need not know what it waited for.
+
+: fln  5 lit lshift fil @ + ;                \ ( i -- f )
+: pfd  swap 2 lit lshift + 80 lit + ;        \ ( fd p -- slot )
+: kerr?  FFFFF000 lit u< 0= ;                \ ( x -- flag )  an error, not an address
+
+\ fnew ( kind mode -- f | 0 )  an open file, one descriptor on it.
+: fnew
+0 lit MAXF 0 lit do dup 0= if i fln dup @ 0= if nip else drop then then loop
+dup if dup 20 lit mzero  tuck 1C lit + !  tuck !  1 lit over 4 lit + ! else nip nip then ;
+
+\ fwake ( token -- )  the threads waiting on it ready, and those polling.
+: fwake
+0 lit
+thi @ 0 lit do
+	i thn dup tstate 4 lit = if
+		dup D4 lit + @ dup 5 lit = if drop dup C0 lit + @ 3 lit pick = else 6 lit = then
+		if 0 lit over D4 lit + !  0 lit over D8 lit + !  1 lit swap tstate!  1 lit or else drop then
+	else drop then
+loop
+nip if hpoke then ;
+
+\ fclose ( f -- )  a descriptor fewer on it; with the last, it is gone (a
+\ pipe's end: its peers woken, the page freed with the last end).
+: fclose
+dup 4 lit + @ 1 lit - dup 2 lit pick 4 lit + !
+if drop else
+	dup @ 3 lit = if
+		dup 8 lit + @  over 1C lit + @ 1 lit = if 0 lit else 4 lit then + dup @ 1 lit - swap !
+		dup 8 lit + @ dup fwake  dup @ over 4 lit + @ or 0= if 1 lit pgfree else drop then
+	then
+	dup @ 4 lit = if dup 8 lit + @ ?dup if 1 lit pgfree then then
+	0 lit swap !
+then ;
+
+\ The console: input from the UART, polled by hart 0 at its ticks (and
+\ while idle), kept in a 1 KiB ring as lines are edited: typed bytes echoed,
+\ backspace and delete erase, Enter ends the line (read gets whole lines
+\ only), ^D ends the input (a read at a line's start gets 0).
+
+: cin    variable ;          \ the token console readers wait on
+: cbuf   variable ;          \ the ring
+: chead  variable ;          \ bytes in (the line being edited after crdy)
+: crdy   variable ;          \ bytes ready to read
+: ctail  variable ;          \ bytes read
+: ceof   variable ;          \ ^D at a line's start: the next read gets 0
+
+: cinit  400 lit alloc cbuf !  0 lit chead !  0 lit crdy !  0 lit ctail !  0 lit ceof ! ;
+: cb  3FF lit and cbuf @ + ;                 \ ( i -- addr )
+
+\ ckey ( c -- )  a byte typed.  Under klk.
+: ckey
+dup D lit = over A lit = or if
+	drop chead @ ctail @ - 3FF lit u< if
+		A lit chead @ cb c!  chead @ 1 lit + dup chead ! crdy !  D lit putc A lit putc  cin fwake
+	then
+else
+dup 8 lit = over 7F lit = or if
+	drop chead @ crdy @ <> if chead @ 1 lit - chead !  8 lit putc 20 lit putc 8 lit putc then
+else
+dup 4 lit = if
+	drop chead @ crdy @ = if 1 lit ceof ! else chead @ crdy ! then cin fwake
+else
+dup 20 lit u< if drop else
+	chead @ ctail @ - 3FE lit u< if dup chead @ cb c!  chead @ 1 lit + chead !  putc else drop then
+then then then then ;
+
+\ cpoll  what the UART has, taken.  Not from a trap of the kernel's (it
+\ might hold klk): from user mode's, or hstep's.
+: cpoll  klk @ lock begin 10000005 lit c@ 1 lit and while 10000000 lit c@ ckey repeat klk @ unlock ;
 
 \ thnew ( -- t | 0 ), prnew ( -- p | 0 )  a free slot.
 : thnew
@@ -797,7 +906,7 @@ thnew dup spt ! 0= if 2drop FFFFFFF5 lit else
 spe @ 18 lit + @ FFF lit + C lit rshift dup pgalloc
 dup 0= if 2drop 2drop FFFFFFF4 lit else
 	dup 2 lit pick C lit lshift mzero
-	spp @ 80 lit mzero
+	spp @ 100 lit mzero
 	spp @ 10 lit + !
 	spp @ 14 lit + !
 	spp @ 4 lit + !
@@ -845,11 +954,12 @@ thi @ 0 lit do
 loop
 nip ;
 
-\ pfinish ( p -- )  its last thread has ended: its memory and mapped
+\ pfinish ( p -- )  its last thread has ended: its descriptors closed, its memory and mapped
 \ blocks back, its unjoined threads' slots free, its children given to the
 \ kernel (those ended, freed), and its parent told (the kernel says so on
 \ the console).
 : pfinish
+dup 80 lit + 10 lit 0 lit do dup @ ?dup if fclose then 0 lit over ! 4 lit + loop drop
 dup 10 lit + @ over 14 lit + @ pgfree
 dup 30 lit + 4 lit 0 lit do
 	dup @ ?dup if over 4 lit + @ swap - C lit rshift 2 lit pick @ swap pgfree then
@@ -919,7 +1029,10 @@ nip nip ;
 \ tgo ( t -- t )  claimed to run: a wait whose time ran out returns -110.
 : tgo
 1 lit over DC lit + !
-dup tstate 4 lit = if FFFFFF92 lit over 28 lit + ! then
+dup tstate 4 lit = if
+	FFFFFF92 lit over 28 lit + !
+	dup E0 lit + @ if dup @ 4 lit + over !  0 lit over E0 lit + ! then
+then
 0 lit over D8 lit + !  0 lit over D4 lit + !
 2 lit over tstate! ;
 
@@ -1028,6 +1141,7 @@ else
 		trun
 		mhartid@ hcur harr @  0 lit mhartid@ hcur harr !  tafter
 	else
+		mhartid@ 0= kready @ and if cpoll then
 		wfi
 	then
 then ;
@@ -1035,8 +1149,41 @@ then ;
 : hloop  begin hstep 0 lit until ;                          \ for good
 : hrunfor  mtime@ + begin hstep dup mtime@ - 0< until drop ;  \ ( ticks -- ) for a while
 
-\ kspawn ( name tickets -- pid | error )  a process the kernel starts.
-: kspawn  klk @ lock 0 lit pspawn klk @ unlock ;
+\ kspawn ( name tickets -- pid | error )  a process the kernel starts, its
+\ 0, 1 and 2 the console.
+\ ufd ( fd -- f | 0 )  the calling process's descriptor fd.
+: ufd  dup F lit u> if drop 0 lit else area@ tproc pfd @ then ;
+
+\ fdput ( f p -- fd | -24 )  a descriptor of p on f, the lowest free.
+: fdput
+FFFFFFE8 lit
+10 lit 0 lit do
+	dup 0< if over i swap pfd @ 0= if drop i then then
+loop
+dup 0< if nip nip else rot over 3 lit pick pfd ! nip then ;
+
+\ pcons ( p -- )  its 0, 1 and 2 on a new console file.
+: pcons
+1 lit 3 lit fnew ?dup if
+	3 lit over 4 lit + !
+	3 lit 0 lit do dup 2 lit pick i swap pfd ! loop drop
+then drop ;
+
+\ A process's arguments are at 20 KiB into its memory (where its heap would
+\ begin): their length, then the strings, each NUL-ended, an empty one
+\ last; the first is the program's name.  lib/user.fam's start puts the
+\ heap past them.
+
+\ kargs ( name p -- )  the arguments of a process the kernel starts.
+: kargs
+10 lit + @ 5000 lit +
+0 lit begin 2 lit pick over + c@ ?dup while 2 lit pick 4 lit + 2 lit pick + c! 1 lit + repeat
+2 lit + 3 lit + FFFFFFFC lit and swap ! drop ;
+
+: kspawn
+klk @ lock over swap 0 lit pspawn
+dup 0< 0= if dup 1 lit - prn dup pcons 2 lit pick swap kargs then nip
+klk @ unlock ;
 
 \ ── System calls ──
 \
@@ -1046,10 +1193,13 @@ then ;
 \ given are checked to be the process's.  The result goes in a0, where the
 \ first argument came: set it only once the arguments are read.
 
-: sret    sysret mepc@ 4 lit + mepc! ;                         \ ( v -- )
+: sret    sysret mepc@ 4 lit + mepc!  0 lit area@ E0 lit + ! ;   \ ( v -- )
+\ tretry ( token kind -- )  the call waits (kind 5 on token, 6 a poll) and
+\ runs again when woken: its pc stays on the ecall, its arguments in place.
+: tretry  area@ D4 lit + !  area@ C0 lit + !  1 lit area@ E0 lit + !  4 lit area@ tstate!  mepc@ area@ !  1 lit area@ 98 lit + ! ;
 : tblock  area@ tstate!  mepc@ 4 lit + area@ !  1 lit area@ 98 lit + ! ;   \ ( state -- )
 : tstop   mepc@ area@ !  1 lit area@ 98 lit + ! ;
-: uword   dup 3 lit and 0= swap 4 lit urange and ;          \ ( addr -- ok ) an aligned word of its
+: uword   dup 3 lit and 0= swap 4 lit uwrange and ;          \ ( addr -- ok ) an aligned word of its
 
 \ ustr ( addr -- ok )  a NUL-terminated name of at most 15 bytes, its own.
 : ustr
@@ -1066,11 +1216,75 @@ nip ;
 \ 1 exit(code): the process ends.
 : sexit  klk @ lock cproc 28 lit sysarg pexit klk @ unlock tstop ;
 
-\ 2 spawn(name): a child running that program, with this one's tickets.
+\ uargl ( src -- len | 0 )  arguments a program gave (strings NUL-ended, an
+\ empty one last, at most 1 KiB, the first not empty): their length, the
+\ empty one's NUL included; 0 if they are not such, or not its.
+: uargl
+dup 1 lit urange 0= if drop 0 lit else dup c@ 0= if drop 0 lit else
+0 lit swap
+400 lit 1 lit do
+	over 0= if
+		dup i + 1 lit urange 0= if nip FFFFFFFF lit swap else
+		dup i + c@ 0= over i + 1 lit - c@ 0= and if nip i 1 lit + swap then then
+	then
+loop
+drop dup FFFFFFFF lit = if drop 0 lit then
+then then ;
+
+: sal variable ;             \ the arguments' length, spawn checked
+
+\ sfds? ( -- ok )  spawn's fds: 0, or its own word count n (at most 16)
+\ then n descriptors of the caller's, or -1 (the child's closed).
+: sfds?
+30 lit sysarg ?dup 0= if 1 lit else
+	dup 4 lit urange 0= if drop 0 lit else
+	dup @ 10 lit u> if drop 0 lit else
+	dup dup @ 1 lit + 2 lit lshift urange 0= if drop 0 lit else
+		1 lit swap
+		dup @ ?dup if 0 lit do
+			dup i 1 lit + 2 lit lshift + @ dup FFFFFFFF lit = if drop else ufd 0= if nip 0 lit swap then then
+		loop then
+		drop
+	then then then then ;
+
+\ pfdset ( p -- )  the child's descriptors: spawn's fds, or the caller's
+\ 0, 1 and 2.
+: pfdset
+30 lit sysarg ?dup 0= if
+	3 lit 0 lit do i ufd ?dup if dup 4 lit + dup @ 1 lit + swap !  over i swap pfd ! then loop drop
+else
+	dup @ ?dup if 0 lit do
+		dup i 1 lit + 2 lit lshift + @ dup FFFFFFFF lit = if drop else
+			ufd dup 4 lit + dup @ 1 lit + swap !  2 lit pick i swap pfd !
+		then
+	loop then
+	2drop
+then ;
+
+\ pargs ( p -- )  the child's arguments: spawn's, or its name alone.
+: pargs
+10 lit + @ 5000 lit +
+2C lit sysarg if
+	sal @ ?dup if 0 lit do 2C lit sysarg i + c@ over 4 lit + i + c! loop then
+	sal @
+else
+	0 lit begin 28 lit sysarg over + c@ ?dup while 2 lit pick 4 lit + 2 lit pick + c! 1 lit + repeat
+	2 lit +
+then
+3 lit + FFFFFFFC lit and swap ! ;
+
+\ 2 spawn(name, args, fds): a child running that program, with this one's
+\ tickets; its arguments args (0: its name alone), its descriptors as fds
+\ says (0: this one's 0, 1 and 2).  -14 bad arguments, -9 a bad descriptor.
 : sspawn
 28 lit sysarg ustr 0= if FFFFFFF2 lit sret else
-	klk @ lock 28 lit sysarg cproc 20 lit + @ cproc pid pspawn klk @ unlock sret
-then ;
+2C lit sysarg dup if uargl dup sal ! 0= else drop 0 lit then if FFFFFFF2 lit sret else
+klk @ lock
+sfds? 0= if klk @ unlock FFFFFFF7 lit sret else
+	28 lit sysarg cproc 20 lit + @ cproc pid pspawn
+	dup 0< 0= if dup 1 lit - prn dup pfdset pargs then
+	klk @ unlock sret
+then then then ;
 
 \ 3 wait(pid, &status): a child's end (pid -1: any child's); its pid.
 : swait
@@ -1292,13 +1506,321 @@ mslot dup 0= if drop klk @ unlock FFFFFFEA lit sret else
 	0 lit sret
 then ;
 
-\ 17 write(fd, buf, n): to the console, for fds 1 and 2.
-: kwrite
-28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFF7 lit sret else
-2C lit sysarg 30 lit sysarg urange 0= if FFFFFFF2 lit sret else
-	30 lit sysarg ?dup if 2C lit sysarg swap 0 lit do dup i + c@ putc loop drop then
-	30 lit sysarg sret
+\ ── Descriptors: open, read, write, close, pipe, poll (docs/OS.md, 5) ──
+\
+\ Under klk throughout.  A handler gives a result, or BLK when it waited
+\ (tretry), for the call to run again when woken.
+
+:M BLK 7FFFFFFF lit ;
+
+: kpb variable ;             \ a path, copied in (64 bytes)
+
+\ upath ( addr -- ok )  a NUL-ended path of the process's, at most 63
+\ bytes, copied to kpb.
+: upath
+1 lit 0 lit
+40 lit 0 lit do
+	dup 0= if
+		2 lit pick i + 1 lit urange 0= if 2drop 0 lit 1 lit else
+		2 lit pick i + c@ dup i kpb @ + c! 0= if drop 1 lit then then
+	then
+loop
+0= if drop 0 lit then
+nip ;
+
+\ kpfx ( s prefix -- rest | 0 )  s begins with prefix: what follows it.
+: kpfx
+begin dup c@ if over c@ over c@ = else 0 lit then while 1 lit + swap 1 lit + swap repeat
+dup c@ if 2drop 0 lit else drop then ;
+
+\ katoi ( s -- n rest )  a decimal number at s (0 if none).
+: katoi
+0 lit swap
+begin dup c@ 30 lit - A lit u< while
+	dup c@ 30 lit - rot dup 3 lit lshift swap 1 lit lshift + + swap 1 lit +
+repeat ;
+
+\ A /proc key's text, made when it is opened (a page, freed at its close).
+: tb variable ;              \ where the text goes on
+: tc  tb @ c!  tb @ 1 lit + tb ! ;                         \ ( c -- )
+: ts  begin dup c@ ?dup while tc 1 lit + repeat drop ;      \ ( s -- )
+: tn  dup A lit u< if 30 lit + tc else dup A lit / tn A lit % 30 lit + tc then ;   \ ( u -- )
+
+\ ptext ( -- f | 0 )  an open file for a key's text, tb at its page.
+: ptext
+4 lit 1 lit fnew dup if
+	1 lit pgalloc ?dup if over 8 lit + !  dup 8 lit + @ tb ! else 0 lit swap ! 0 lit then
+then ;
+: tend  tb @ over 8 lit + @ - over 10 lit + ! ;            \ ( f -- f )  its length
+
+\ pbusy ( p -- ok )  a thread of p ready or running.
+: pbusy
+0 lit thi @ 0 lit do
+	i thn dup tproc 3 lit pick = swap tstate dup 1 lit = swap 2 lit = or and or
+loop nip ;
+
+\ pkib ( p -- KiB )  its memory and mapped blocks.
+: pkib
+dup 14 lit + @ swap 30 lit +
+4 lit 0 lit do dup @ ?dup if over 4 lit + @ swap - C lit rshift rot + swap then 8 lit + loop
+drop 2 lit lshift ;
+
+\ pcmd ( p -- )  its arguments, spaced (an ended one's: its program's name).
+: pcmd
+dup @ 1 lit = if
+	10 lit + @ 5000 lit +  dup @ dup 400 lit u> if drop 400 lit then
+	0 lit swap ?dup if 0 lit do
+		over 4 lit + i + c@ ?dup if swap if 20 lit tc then tc 0 lit else drop 1 lit then
+	loop then
+	2drop
+else 24 lit + @ ts then ;
+
+\ pstatus ( p -- )  one line: pid, parent, state (R running or ready, S
+\ waiting, Z ended), threads, KiB, ticks run, arguments.
+: pstatus
+dup pid tn 20 lit tc
+dup 4 lit + @ tn 20 lit tc
+dup @ 2 lit = if 5A lit else dup pbusy if 52 lit else 53 lit then then tc 20 lit tc
+dup C lit + @ tn 20 lit tc
+dup @ 1 lit = if dup pkib else 0 lit then tn 20 lit tc
+dup 50 lit + @ tn 20 lit tc
+pcmd ;
+
+: pp variable ;  : pk variable ;  : pq variable ;  : pm variable ;
+
+\ ppath ( s -- )  "<pid>/<key>" or "self/<key>": pp the process (0: none
+\ such), pk the key (1 status, 2 cmd, 3 tickets, 4 kill; 0 none).
+: ppath
+0 lit pp !  0 lit pk !
+dup "self/" kpfx ?dup if nip area@ tproc pp ! else
+	katoi swap
+	dup 1 lit - MAXP u< if 1 lit - prn dup @ if pp ! else drop then else drop then
+	dup c@ 2F lit = if 1 lit + else 0 lit pp ! then
+then
+dup "status" streq if 1 lit pk ! then
+dup "cmd" streq if 2 lit pk ! then
+dup "tickets" streq if 3 lit pk ! then
+"kill" streq if 4 lit pk ! then ;
+
+\ pgen ( q -- )  key q's text, a newline last.
+: pgen
+dup 1 lit = if area@ tproc pid tn then
+dup 2 lit = if nharts @ tn then
+dup 3 lit = if pgfree# 2 lit lshift tn then
+dup 4 lit = if 0 lit htick harr @ dup 64 lit / tn 2E lit tc 64 lit % dup A lit u< if 30 lit tc then tn then
+dup 5 lit = if pp @ pstatus then
+dup 6 lit = if pp @ pcmd then
+7 lit = if pp @ 20 lit + @ tn then
+A lit tc ;
+
+\ popen ( s mode -- f | 0 | error )  a key under /proc: self, harts, mem
+\ (KiB free), uptime (seconds), and <pid>/ status, cmd, tickets (also
+\ written: the process's tickets), kill (written only: it ends, -9).
+: popen
+pm !  0 lit pq !
+dup "self" streq if 1 lit pq ! then
+dup "harts" streq if 2 lit pq ! then
+dup "mem" streq if 3 lit pq ! then
+dup "uptime" streq if 4 lit pq ! then
+pq @ if drop else
+	ppath
+	pp @ if pk @ ?dup if 4 lit + pq ! then then
+then
+pq @ 0= if FFFFFFFE lit else
+pq @ 7 lit u< 0= pm @ 1 lit <> and if
+	5 lit 2 lit fnew dup if pp @ pid over 14 lit + !  pq @ 6 lit - over 18 lit + ! then
+else
+pq @ 8 lit = pm @ 1 lit <> or if FFFFFFF3 lit else
+	ptext dup if pq @ pgen tend then
+then then then ;
+
+\ 15 open(path, flags): /dev/console, /dev/null, or a /proc key; flags 0
+\ read, 1 write, 2 both.  Its descriptor; -2 no such, -13 not that way,
+\ -22 bad flags, -24 no descriptor free, -12 no room.
+: sopen
+klk @ lock
+28 lit sysarg upath 0= if FFFFFFF2 lit else
+2C lit sysarg dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
+	kpb @ "/dev/console" streq if 1 lit swap fnew else
+	kpb @ "/dev/null" streq if 2 lit swap fnew else
+	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
+	then then
+	dup 0= if drop FFFFFFF4 lit else
+	dup kerr? 0= if
+		dup area@ tproc fdput dup 0< if swap fclose else nip then
+	then then
+then then
+klk @ unlock sret ;
+
+\ cread ( -- r )  from the console: what is ready, to the end of a line.
+: cread
+ceof @ if 0 lit ceof ! 0 lit else
+ctail @ crdy @ = if cin 5 lit tretry BLK else
+	0 lit
+	begin
+		dup 30 lit sysarg u< ctail @ crdy @ u< and
+		over 0= if 1 lit else over 2C lit sysarg + 1 lit - c@ A lit <> then and
+	while
+		ctail @ cb c@  over 2C lit sysarg + c!
+		ctail @ 1 lit + ctail !  1 lit +
+	repeat
 then then ;
+
+\ pread ( pipe -- r )  what it holds, up to n; 0 when empty with no writer.
+: pread
+dup 8 lit + @ over C lit + @ = if
+	dup 4 lit + @ if 5 lit tretry BLK else drop 0 lit then
+else
+	0 lit
+	begin dup 30 lit sysarg u< 2 lit pick dup 8 lit + @ swap C lit + @ <> and while
+		over dup C lit + @ 7FF lit and 800 lit + + c@  over 2C lit sysarg + c!
+		over C lit + dup @ 1 lit + swap !
+		1 lit +
+	repeat
+	swap fwake
+then ;
+
+\ pwrite ( pipe -- r )  all n bytes, waiting for room as it must (E8: how
+\ many were written before the wait); -32 with no reader.
+: pwrite
+dup @ 0= if
+	drop area@ E0 lit + @ if area@ E8 lit + @ else 0 lit then ?dup 0= if FFFFFFE0 lit then
+else
+	area@ E0 lit + @ if area@ E8 lit + @ else 0 lit then
+	begin dup 30 lit sysarg u< 2 lit pick dup 8 lit + @ swap C lit + @ - 800 lit u< and while
+		dup 2C lit sysarg + c@  2 lit pick dup 8 lit + @ 7FF lit and 800 lit + + c!
+		over 8 lit + dup @ 1 lit + swap !
+		1 lit +
+	repeat
+	over fwake
+	dup 30 lit sysarg = if nip else area@ E8 lit + !  5 lit tretry BLK then
+then ;
+
+\ ptread ( f -- r )  a key's text, from where reading is.
+: ptread
+0 lit
+begin dup 30 lit sysarg u< 2 lit pick dup C lit + @ swap 10 lit + @ u< and while
+	over dup 8 lit + @ swap C lit + @ + c@  over 2C lit sysarg + c!
+	over C lit + dup @ 1 lit + swap !  1 lit +
+repeat
+nip ;
+
+\ pkwrite ( f -- r )  a key written: the number in what is written.
+: pkwrite
+0 lit 30 lit sysarg ?dup if 0 lit do
+	2C lit sysarg i + c@ dup 30 lit - A lit u< if 30 lit - swap dup 3 lit lshift swap 1 lit lshift + + else drop then
+loop then
+over 14 lit + @ 1 lit - prn dup @ 1 lit = if
+	2 lit pick 18 lit + @ 1 lit = if
+		over 0= if 2drop drop FFFFFFEA lit else
+			2dup 20 lit + !
+			thi @ 0 lit do i thn dup tproc 2 lit pick = if 2 lit pick swap B8 lit + ! else drop then loop
+			2drop drop 30 lit sysarg
+		then
+	else
+		FFFFFFF7 lit pexit 2drop 30 lit sysarg
+	then
+else 2drop drop FFFFFFFD lit then ;
+
+\ 16 read(fd, buf, n): what there is, at least a byte (waiting for it), or
+\ 0 at the end.  -9 not a descriptor to read, -14 not its buffer.
+: sread
+klk @ lock
+28 lit sysarg ufd dup 0= if drop FFFFFFF7 lit else
+dup 1C lit + @ 1 lit and 0= if drop FFFFFFF7 lit else
+2C lit sysarg 30 lit sysarg uwrange 0= if drop FFFFFFF2 lit else
+dup @
+dup 1 lit = if 2drop cread else
+dup 2 lit = if 2drop 0 lit else
+dup 3 lit = if drop 8 lit + @ pread else
+4 lit = if ptread else drop 0 lit
+then then then then then then then
+klk @ unlock dup BLK = if drop else sret then ;
+
+\ 17 write(fd, buf, n): all of it (waiting for room); -9, -14, -32 a pipe
+\ no one reads.
+: swrite
+klk @ lock
+28 lit sysarg ufd dup 0= if drop FFFFFFF7 lit else
+dup 1C lit + @ 2 lit and 0= if drop FFFFFFF7 lit else
+2C lit sysarg 30 lit sysarg urange 0= if drop FFFFFFF2 lit else
+dup @
+dup 1 lit = if
+	2drop 30 lit sysarg ?dup if 2C lit sysarg swap 0 lit do dup i + c@ putc loop drop then 30 lit sysarg
+else
+dup 2 lit = if 2drop 30 lit sysarg else
+dup 3 lit = if drop 8 lit + @ pwrite else
+drop pkwrite
+then then then then then then
+klk @ unlock dup BLK = if drop else sret then ;
+
+\ 19 close(fd): 0, or -9.
+: sclose
+klk @ lock
+28 lit sysarg ufd ?dup if fclose  0 lit 28 lit sysarg area@ tproc pfd !  0 lit else FFFFFFF7 lit then
+klk @ unlock sret ;
+
+: sp1 variable ;  : sf1 variable ;  : sf2 variable ;
+
+\ 20 pipe(fds): fds[0] its read end, fds[1] its write end; 0, or -14,
+\ -23 no open file free, -12 no memory, -24 no descriptor free.
+: spipe
+klk @ lock
+28 lit sysarg 8 lit uwrange 0= if FFFFFFF2 lit else
+3 lit 1 lit fnew sf1 !  3 lit 2 lit fnew sf2 !
+sf1 @ 0= sf2 @ 0= or if sf1 @ ?dup if 0 lit swap ! then sf2 @ ?dup if 0 lit swap ! then FFFFFFE9 lit else
+1 lit pgalloc dup sp1 ! 0= if 0 lit sf1 @ !  0 lit sf2 @ !  FFFFFFF4 lit else
+	sp1 @ 10 lit mzero  1 lit sp1 @ !  1 lit sp1 @ 4 lit + !
+	sp1 @ sf1 @ 8 lit + !  sp1 @ sf2 @ 8 lit + !
+	sf1 @ area@ tproc fdput dup 0< if drop sf1 @ fclose sf2 @ fclose FFFFFFE8 lit else
+	sf2 @ area@ tproc fdput dup 0< if
+		drop 0 lit swap area@ tproc pfd !  sf1 @ fclose sf2 @ fclose FFFFFFE8 lit
+	else
+		28 lit sysarg 4 lit + !  28 lit sysarg !  0 lit
+	then then
+then then then
+klk @ unlock sret ;
+
+\ fready ( f -- events )  1 readable (or at its end), 4 writable, 16 the
+\ other end gone; only those its mode allows (and 16).
+: fready
+dup @ 1 lit = if ceof @ ctail @ crdy @ <> or if 5 lit else 4 lit then else
+dup @ 2 lit = if 5 lit else
+dup @ 3 lit = if
+	dup 8 lit + @ over 1C lit + @ 1 lit = if
+		dup 4 lit + @ 0= if drop 11 lit else dup 8 lit + @ swap C lit + @ <> if 1 lit else 0 lit then then
+	else
+		dup @ 0= if drop 14 lit else dup 8 lit + @ swap C lit + @ - 800 lit u< if 4 lit else 0 lit then then
+	then
+else
+dup @ 4 lit = if 1 lit else 4 lit then then then then
+swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
+
+\ 22 poll(fds, n, ns): fds n entries of 8 bytes (a descriptor; the events
+\ wanted, 16 bits; those found, 16 bits: 1 in, 4 out, 16 hung up, 32 not a
+\ descriptor; a negative descriptor is passed over); waits until one has
+\ any (ns 0: no limit): how many, or -110 when the time ran out.
+: spoll
+klk @ lock
+2C lit sysarg dup 40 lit u> if drop FFFFFFEA lit else
+3 lit lshift 28 lit sysarg swap uwrange 0= if FFFFFFF2 lit else
+0 lit
+2C lit sysarg ?dup if 0 lit do
+	28 lit sysarg i 3 lit lshift +
+	dup @ 0< if 0 lit else
+		dup @ ufd ?dup if fready over 4 lit + @ FFFF lit and 30 lit or and else 20 lit then
+	then
+	dup rot 6 lit + h!  if 1 lit + then
+loop then
+dup 0= if
+	30 lit sysarg if
+		area@ E0 lit + @ 0= if 30 lit sysarg 64 lit / mtime@ + area@ E4 lit + ! then
+		area@ E4 lit + @ area@ BC lit + !  1 lit area@ D8 lit + !
+	then
+	drop 0 lit 6 lit tretry BLK
+then
+then then
+klk @ unlock dup BLK = if drop else sret then ;
 
 \ ksys  a system call (ecall from user mode): the number in a7.
 : ksys
@@ -1317,8 +1839,13 @@ dup B lit = if drop sawait else
 dup C lit = if drop swake else
 dup D lit = if drop smap else
 dup E lit = if drop sunmap else
-11 lit = if kwrite else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then ;
+dup F lit = if drop sopen else
+dup 10 lit = if drop sread else
+dup 11 lit = if drop swrite else
+dup 13 lit = if drop sclose else
+dup 14 lit = if drop spipe else
+16 lit = if spoll else FFFFFFDA lit sret
+then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill
@@ -1344,7 +1871,11 @@ else 0 lit mhartid@ hstale harr ! then ;
 \ from the kernel a bug.
 : ktrap
 mcause@
-dup 80000007 lit = if drop ktick mpp@ 0= if area@ C4 lit + dup @ 1 lit + swap ! tstop then else
+dup 80000007 lit = if drop ktick mpp@ 0= if
+	area@ C4 lit + dup @ 1 lit + swap !  cproc 50 lit + dup @ 1 lit + swap !
+	mhartid@ 0= if cpoll then
+	tstop
+then else
 dup 80000003 lit = if drop kipi hipiok else
 mpp@ if drop kfault else
 8 lit = if ksys else ukill then
@@ -1587,7 +2118,7 @@ area@ mhartid@ harea harr !
 hstart
 gp@ 10000 lit + FFF lit + FFFFF000 lit and
 87F00000 lit pginit
-ptinit
+ptinit cinit 40 lit alloc kpb !
 mtime@ 1 lit or rndseed !     \ the lottery's draws: not from 0, which xorshift never leaves
 fence 1 lit kready !
 "kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts

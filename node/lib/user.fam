@@ -8,14 +8,16 @@
 \ System calls: the number in a7, the arguments in a0-a2, `ecall`, the
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
-\ 11 await, 12 wake, 13 map, 14 unmap (below), 16 read(fd, buf, n), 17
-\ write(fd, buf, n).
+\ 11 await, 12 wake, 13 map, 14 unmap, 15 open, 16 read, 17 write, 19
+\ close, 20 pipe, 22 poll (below).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
-\ lib/mach.fam's over RAM: return ids (4 KiB), variables (16 KiB), the heap
-\ upward from there, the data stack down from 4 KiB below the end, the loop
-\ frames' stack in that last 4 KiB.
+\ lib/mach.fam's over RAM: return ids (4 KiB), variables (16 KiB), the
+\ program's arguments (their length in bytes, then the strings, each
+\ NUL-ended, an empty one last: see arg), the heap upward from there, the
+\ data stack down from 4 KiB below the end, the loop frames' stack in that
+\ last 4 KiB.
 \ ============================================================
 
 \ sys ( a0 a1 a2 number -- result )  any system call of up to three
@@ -92,6 +94,7 @@
 
 : exit    0 lit 0 lit 1 lit sys drop ;       \ ( code -- )  this process ends
 : spawn   0 lit 0 lit 2 lit sys ;            \ ( name -- pid )  a child running that program
+: spawnv  2 lit sys ;                        \ ( name args fds -- pid )  its arguments, its descriptors
 : wait    0 lit 3 lit sys ;                  \ ( pid status-addr -- pid )  a child's end (pid -1: any)
 : thread  4 lit sys ;                        \ ( entry stack-top arg -- tid )  16 KiB below stack-top its own
 : texit   0 lit 0 lit 5 lit sys drop ;       \ ( value -- )  this thread ends
@@ -108,6 +111,56 @@
 : map   0 lit 0 lit D lit sys ;
 \ unmap ( addr -- )  a block from map given back.
 : unmap  0 lit 0 lit E lit sys drop ;
+
+\ ── Descriptors (docs/OS.md, section 5) ──
+\
+\ 0, 1 and 2 are a program's input, output and errors; spawnv gives a
+\ child others: fds is a count n, then n of the caller's descriptors (or
+\ -1) to be the child's 0 to n-1.  args are the child's arguments, packed
+\ (each NUL-ended, an empty one last, the first the program's name).
+
+: open    0 lit F lit sys ;                  \ ( path flags -- fd )  flags 0 read, 1 write, 2 both
+: read    10 lit sys ;                       \ ( fd buf n -- n' )  0 at the end
+: write   11 lit sys ;                       \ ( fd buf n -- n' )  all of it
+: close   0 lit 0 lit 13 lit sys ;           \ ( fd -- r )
+: pipe    0 lit 0 lit 14 lit sys ;           \ ( fds -- r )  fds[0] read, fds[1] write
+: poll    16 lit sys ;                       \ ( fds n ns -- r )  8-byte entries: fd, events, revents
+
+\ strlen ( s -- n ), streq ( a b -- ok ), scpy ( dst src -- dst' ) (no NUL
+\ written), snum ( dst u -- dst' ) its decimal digits.
+: strlen  dup begin dup c@ while 1 lit + repeat swap - ;
+: streq
+begin
+	over c@ over c@ over <>
+	if 2drop drop 0 lit 1 lit else
+	0= if 2drop 1 lit 1 lit else
+	1 lit + swap 1 lit + swap 0 lit then then
+until ;
+: scpy  begin dup c@ ?dup while 2 lit pick c! swap 1 lit + swap 1 lit + repeat drop ;
+: snum  dup A lit u< if 30 lit + over c! 1 lit + else tuck A lit / snum swap A lit % 30 lit + over c! 1 lit + then ;
+
+\ fputs ( s fd -- ), eputs ( s -- ) to errors, eputc ( c -- ).
+: fputs  swap dup strlen write drop ;
+: eputs  2 lit fputs ;
+: eputc
+93050100 ,   \ addi a1,sp,0
+13052000 ,   \ addi a0,zero,2
+13061000 ,   \ addi a2,zero,1
+93081001 ,   \ addi a7,zero,17
+73000000 ,   \ ecall
+13014100 ,   \ addi sp,sp,4
+;
+
+\ args ( -- addr )  the arguments; arg ( i -- s | 0 ) the ith (0: the
+\ program's name); argn ( -- n ) how many.
+:M s10@
+1301C1FF ,   \ addi sp,sp,-4
+2320A101 ,   \ sw s10,0(sp)
+;
+: args  s10@ 5004 lit + ;
+: snext  begin dup c@ while 1 lit + repeat 1 lit + ;
+: arg  args swap ?dup if 0 lit do dup c@ if snext then loop then dup c@ 0= if drop 0 lit then ;
+: argn  0 lit args begin dup c@ while snext swap 1 lit + swap repeat drop ;
 
 \ ── malloc and free (docs/OS.md, section 10) ──
 \
@@ -256,7 +309,10 @@ mlk unlock ;
 B7120000 ,   \ lui t0,0x1
 B30D5500 ,   \ add s11,a0,t0              ( growing down from 4 KiB on )
 B7520000 ,   \ lui t0,0x5
-B3015500 ,   \ add gp,a0,t0               ( the heap, past the variables )
+B3025500 ,   \ add t0,a0,t0               ( the arguments, past the variables: )
+03A30200 ,   \ lw t1,0(t0)                ( their length, )
+B3816200 ,   \ add gp,t0,t1               ( and the heap past them )
+93814100 ,   \ addi gp,gp,4
 138C0500 ,   \ addi s8,a1,0               ( loop frames, down from the end )
 B7120000 ,   \ lui t0,0x1
 33815540 ,   \ sub sp,a1,t0               ( the data stack, down from 4 KiB below it )

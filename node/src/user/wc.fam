@@ -1,0 +1,11 @@
+\ wc.fam — the input's lines, words and bytes.
+: buf variable ;  : nl variable ;  : nw variable ;  : nb variable ;  : inw variable ;
+: count  \ ( c -- )
+nb @ 1 lit + nb !
+dup A lit = if nl @ 1 lit + nl ! then
+dup 20 lit = over 9 lit = or swap A lit = or if 0 lit inw ! else inw @ 0= if nw @ 1 lit + nw ! 1 lit inw ! then then ;
+200 lit alloc buf !  0 lit nl !  0 lit nw !  0 lit nb !  0 lit inw !
+begin 0 lit buf @ 200 lit read dup 0< 0= over and while
+	0 lit do buf @ i + c@ count loop
+repeat drop
+nl @ u. 20 lit putc nw @ u. 20 lit putc nb @ u. 0A lit putc bye

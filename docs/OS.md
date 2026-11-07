@@ -523,6 +523,38 @@ kernel too much to add at the end.
    `write`, `close`, `pipe`, `poll`; `/dev/console` and `/dev/null`;
    `/proc`'s basics; `init`, a first shell on the console, and `ps`.
    Done when `ps` and a pipe work from the serial console.
+   Done (2026-11-06). The kernel keeps a table of open files (the
+   console, null, a pipe's end, a `/proc` key), and each process has 16
+   descriptors on them. A process the kernel starts has the console as
+   0, 1 and 2. `spawn(name, args, fds)` gives the child its arguments
+   (packed strings, kept at 20 KiB into its memory, where
+   `lib/user.fam`'s `arg` finds them) and its descriptors (a count, then
+   which of the caller's are its 0 to n-1, or none: the caller's 0, 1
+   and 2). A pipe is a page holding 2 KiB; `write` writes all it is
+   given, waiting for room; `read` gets what is there, or 0 once no
+   writer is left. A call that must wait goes back onto its own `ecall`
+   and runs again from the start when woken, so whatever wakes it only
+   has to name what changed; `poll` keeps its deadline across those
+   runs. The console is polled by hart 0 at each tick (and while idle):
+   typed bytes echoed into a 1 KiB line buffer, backspace, Enter ending
+   the line (`read` gets whole lines), ^D ending the input. `/proc`:
+   `self`, `harts`, `mem`, `uptime`, and per process `status` (one line:
+   pid, parent, state, threads, KiB, ticks, its arguments), `cmd`,
+   `tickets` (written to set them) and `kill` (written to end it, -9);
+   its text is made when opened. Programs in `src/user`: `init` keeps a
+   shell running; `sh` runs pipelines with `<` and `>`, and `exit`;
+   `ps`, `echo`, `cat`, `wc`. Checked: `poll` timing out, ready, and
+   hung up; a pipe read to its end; the errors (no such path, a bad
+   descriptor, a key not to be written, no such process, 16 descriptors
+   at most); a child killed through `/proc`; and, typed into the console
+   a line at a time on one hart and on four, `ps`, `echo … | wc`, 100 KiB
+   through `big | cat | wc`, `/proc` read and written through `<` and
+   `>`, an unknown program, a missing command, and `exit` with `init`
+   starting the shell again. Not yet: ^C (QEMU's `-serial stdio` takes
+   it itself), `seek` and files (step 8), `/proc`'s other keys, `rdtime`
+   from user mode. Found on the way: the kernel's range check missed
+   mapped blocks (a `malloc`ed buffer could not be written out), and a
+   `lock` could be taken on a word of the program's own code.
 8. **The store.** From step 2's core: the file system's tree, files
    through descriptors, `ls`, `pwd`, `cat`, `mkdir`, `rm`, `/etc/init`;
    users, permissions and `login`; trees (`open(path, TREE)`) and the

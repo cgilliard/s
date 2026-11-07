@@ -1,0 +1,3 @@
+\ echo.fam — its arguments, spaced, then a newline.
+1 lit begin dup arg ?dup while over 1 lit u> if 20 lit putc then puts 1 lit + repeat drop
+0A lit putc bye

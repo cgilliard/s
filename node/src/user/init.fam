@@ -1,5 +1,11 @@
 \ init.fam — the first program the kernel runs (docs/OS.md), in user mode.
-\ For now it says hello and ends; it will start what /etc/init lists.
+\ It keeps a shell on the console: started, and started again when it ends.
+\ (Step 8: what /etc/init lists.)
 
-"init: hello from user mode" puts 0A lit putc
-bye
+: st variable ;
+"init: starting the shell" puts 0A lit putc
+begin
+	"sh" spawn dup 0< if "init: no shell: " puts . 0A lit putc 1 lit exit then
+	st wait drop
+	"init: the shell ended; again" puts 0A lit putc
+0 lit until

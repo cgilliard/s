@@ -1,0 +1,12 @@
+\ ps.fam — the processes, from /proc/<pid>/status: pid, parent, state (R
+\ running or ready, S waiting, Z ended), threads, KiB, ticks run, command.
+: path variable ;  : buf variable ;
+40 lit alloc path !  100 lit alloc buf !
+"PID PPID S THR KIB TICKS CMD" puts 0A lit putc
+41 lit 1 lit do
+	path @ "/proc/" scpy i snum "/status" scpy 0 lit swap c!
+	path @ 0 lit open dup 0< if drop else
+		dup buf @ 100 lit read dup 0< 0= over and if 1 lit buf @ rot write drop else drop then
+		close drop
+	then
+loop bye
