@@ -487,7 +487,38 @@ kernel too much to add at the end.
    on the compiler's message.
 6. **Memory.** `map` and `unmap`; `malloc` and `free` in the stdlib.
    Done when a long test allocating and freeing on several threads
-   holds steady.
+   holds steady. Done (2026-11-06). Call 13 `map(bytes)` gives a block
+   of zeroed pages in one of a process's 4 slots (PMP entries 5-12):
+   its first byte, or 0, since an address has its high bit set and an
+   error cannot be told by sign. Call 14 `unmap(addr)` gives one back
+   (-22 if it is not one). The other harts running the process's
+   threads reload their PMP by a software interrupt, and an unmapped
+   block's pages go back only once every one has, so none can reach
+   them once they are another's. `malloc` and `free` (`lib/user.fam`):
+   one free list sorted by address, first fit, split, neighbours merged
+   but never across an arena's start; arenas mapped as needed (at least
+   64 KiB, and at least what is mapped already, so 4 slots go far) and
+   unmapped when wholly free unless the last; the kernel's mutex guards
+   it, since threads share the heap (a thread allocates with `malloc`,
+   never `alloc`, whose `gp` is its own). Not yet the size classes and
+   large-block path of section 10: one list served the tests, and they
+   come when a program's profile asks. Checked: four blocks mapped,
+   written and read, a fifth refused, one unmapped and mapped again, a
+   bad unmap refused, a read of an unmapped block killed; four threads
+   of 5,000 steps, twice, each holding up to 16 blocks of 4 to 8192
+   bytes filled with its own pattern and checked when freed, all
+   intact, and the heap whole after each round (one block, one arena);
+   a 200 KiB block given an arena of its own, and back. On 4 harts the
+   contended allocator is no faster than on one. Found on the way:
+   QEMU runs code an instruction at a time in a page that a PMP range
+   covers only in part (it cannot cache the translation), hundreds of
+   times slower, and what looked like threads deadlocking was this.
+   Programs now begin on a page of the image and are padded to the
+   next, and their code's range is whole pages. QEMU also takes a TOR
+   range's end as the bound less one, so an empty slot's `[0, 0)`
+   opened all of memory to user mode; an empty slot's entry is now off.
+   And hart 0 never enabled software interrupts, so a thread there was
+   neither stopped when its process ended nor told to reload its PMP.
 7. **Descriptors, the console, init and a shell.** `open`, `read`,
    `write`, `close`, `pipe`, `poll`; `/dev/console` and `/dev/null`;
    `/proc`'s basics; `init`, a first shell on the console, and `ps`.

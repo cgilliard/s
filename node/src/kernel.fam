@@ -232,6 +232,7 @@ dup rndseed ! ;
 : hq     variable ;          \ its queue from hart 0
 : hcur   variable ;          \ the thread it runs (0: none)
 : harea  variable ;          \ its own trap area (mscratch when no thread runs)
+: hstale variable ;          \ its PMP is to be reloaded (a block was unmapped)
 : kvok   variable ;
 
 \ harr ( h var -- addr )  hart h's word of a per-hart array.
@@ -247,6 +248,7 @@ kvok @ 0= if
 	MAXH 2 lit lshift dup alloc dup hq ! swap mzero
 	MAXH 2 lit lshift dup alloc dup hcur ! swap mzero
 	MAXH 2 lit lshift dup alloc dup harea ! swap mzero
+	MAXH 2 lit lshift dup alloc dup hstale ! swap mzero
 	1 lit kvok !
 then ;
 
@@ -600,28 +602,82 @@ over + 2dup u> if 2drop 0 lit else
 	-rot area@ A8 lit + @ area@ AC lit + @ inr or
 then ;
 
-\ upmp  PMP for the process in the trap area: its code read and execute
-\ (entries 1-2, top of range), its memory read and write (3-4); user mode
-\ reaches nothing else.  Entry 0 is lib/mach.fam's locked guard on hart 0.
+\ upmp  PMP for the thread's process: its code read and execute (entries
+\ 1-2, top of range, from the thread block, mscratch), its memory read and
+\ write (3-4), its mapped blocks read and write (5-12, from the process);
+\ user mode reaches nothing else, since an access matching no entry is
+\ denied in user mode (allowed in machine mode).  An empty block's entry is
+\ off: a zero-length range is not enough, since QEMU takes a TOR range's end
+\ as the bound less one, and [0, 0) as all of memory.
 : upmp
 F3220034 ,   \ csrrs t0,mscratch,zero
-03A3020A ,   \ lw t1,160(t0)
+03A3020A ,   \ lw t1,160(t0)              ( code start )
 13532300 ,   \ srli t1,t1,0x2
-7310133B ,   \ csrrw zero,pmpaddr1,t1
-03A3420A ,   \ lw t1,164(t0)
+7310133B ,   \ csrw pmpaddr1,t1
+03A3420A ,   \ lw t1,164(t0)              ( code end )
 13532300 ,   \ srli t1,t1,0x2
-7310233B ,   \ csrrw zero,pmpaddr2,t1
-03A3820A ,   \ lw t1,168(t0)
+7310233B ,   \ csrw pmpaddr2,t1
+03A3820A ,   \ lw t1,168(t0)              ( memory start )
 13532300 ,   \ srli t1,t1,0x2
-7310333B ,   \ csrrw zero,pmpaddr3,t1
-03A3C20A ,   \ lw t1,172(t0)
+7310333B ,   \ csrw pmpaddr3,t1
+03A3C20A ,   \ lw t1,172(t0)              ( memory end )
 13532300 ,   \ srli t1,t1,0x2
-7310433B ,   \ csrrw zero,pmpaddr4,t1
-37030D00 ,   \ lui t1,0xd0               ( 2: top of range, read, execute )
-7310033A ,   \ csrrw zero,pmpcfg0,t1
-1303B000 ,   \ addi t1,zero,11           ( 4: top of range, read, write )
-7310133A ,   \ csrrw zero,pmpcfg1,t1
+7310433B ,   \ csrw pmpaddr4,t1
+83A3420B ,   \ lw t2,180(t0)              ( the process, for its mapped blocks )
+03A30303 ,   \ lw t1,48(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310533B ,   \ csrw pmpaddr5,t1
+03A34303 ,   \ lw t1,52(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310633B ,   \ csrw pmpaddr6,t1
+03A38303 ,   \ lw t1,56(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310733B ,   \ csrw pmpaddr7,t1
+03A3C303 ,   \ lw t1,60(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310833B ,   \ csrw pmpaddr8,t1
+03A30304 ,   \ lw t1,64(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310933B ,   \ csrw pmpaddr9,t1
+03A34304 ,   \ lw t1,68(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310A33B ,   \ csrw pmpaddr10,t1
+03A38304 ,   \ lw t1,72(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310B33B ,   \ csrw pmpaddr11,t1
+03A3C304 ,   \ lw t1,76(t2)
+13532300 ,   \ srli t1,t1,0x2
+7310C33B ,   \ csrw pmpaddr12,t1
+37030D00 ,   \ lui t1,0xd0               ( entry 2: code, R+X, TOR )
+7310033A ,   \ csrw pmpcfg0,t1
+03A30303 ,   \ lw t1,48(t2)              ( entries 4, 6: memory, block 1, R+W; )
+33336000 ,   \ snez t1,t1                ( a block's entry off when it is empty )
+33036040 ,   \ neg t1,t1
+370E0B00 ,   \ lui t3,0xb0
+337E6E00 ,   \ and t3,t3,t1
+130EBE00 ,   \ addi t3,t3,11
+73101E3A ,   \ csrw pmpcfg1,t3
+03A38303 ,   \ lw t1,56(t2)              ( entries 8, 10: blocks 2, 3 )
+33336000 ,   \ snez t1,t1
+33036040 ,   \ neg t1,t1
+137EB300 ,   \ andi t3,t1,11
+03A30304 ,   \ lw t1,64(t2)
+33336000 ,   \ snez t1,t1
+33036040 ,   \ neg t1,t1
+B70E0B00 ,   \ lui t4,0xb0
+B3FE6E00 ,   \ and t4,t4,t1
+336EDE01 ,   \ or t3,t3,t4
+73102E3A ,   \ csrw pmpcfg2,t3
+03A38304 ,   \ lw t1,72(t2)              ( entry 12: block 4 )
+33336000 ,   \ snez t1,t1
+33036040 ,   \ neg t1,t1
+137EB300 ,   \ andi t3,t1,11
+73103E3A ,   \ csrw pmpcfg3,t3
 ;
+
+\ hfresh  upmp, this hart's stale mark cleared first: an unmap that marks
+\ it after this sees it cleared only by a later upmp (sunmap).
+: hfresh  0 lit mhartid@ hstale harr ! fence upmp ;
 
 \ The programs the image carries (scripts/mkimage.sh): a table past them,
 \ its offset and "PROG" in the image's last 8 bytes, where the kernel's
@@ -668,11 +724,14 @@ then ;
 \ (the hart going back to its loop still uses its block), nor its slot
 \ reused.
 \
-\ A process (64 bytes): its state (0 free, 1 living, 2 ended, its parent
-\ not yet told), its parent's pid (0: the kernel), its exit code, its
-\ threads not ended, its memory (first byte, pages), its code (first byte,
-\ the byte past it), its tickets, its program's table entry (whose name
-\ is its first 16 bytes), whether it is ending.
+\ A process (128 bytes): its state at 0 (0 free, 1 living, 2 ended, its
+\ parent not yet told), its parent's pid at 4, exit code 8, threads not
+\ ended 12, memory (first byte 16, pages 20), code (first byte 24, the byte
+\ past it 28), tickets 32, program's table entry 36 (whose name is its
+\ first 16 bytes), whether it is ending 40; then its mapped blocks
+\ (docs/OS.md, section 10), 48 on: 4 pairs (first byte, byte past), each 0
+\ when empty, which `map` and `unmap` change and `upmp` puts in PMP
+\ entries 5-12 (so a process holds code, its first region, and 4 blocks).
 \
 \ Each hart runs hloop: a thread drawn by lottery among those ready (each
 \ holding its tickets), run until it traps back (its slice over at a timer
@@ -685,9 +744,9 @@ then ;
 : prc  variable ;            \ the processes'
 
 : thn     8 lit lshift thr @ + ;           \ ( i -- t )
-: prn     6 lit lshift prc @ + ;           \ ( i -- p )
+: prn     7 lit lshift prc @ + ;           \ ( i -- p )
 : tid     thr @ - 8 lit rshift 1 lit + ;   \ ( t -- tid )
-: pid     prc @ - 6 lit rshift 1 lit + ;   \ ( p -- pid )
+: pid     prc @ - 7 lit rshift 1 lit + ;   \ ( p -- pid )
 : tproc   B4 lit + @ ;                     \ ( t -- p )
 : tstate  B0 lit + @ ;                     \ ( t -- state )
 : tstate! B0 lit + ! ;                     \ ( state t -- )
@@ -708,7 +767,7 @@ then ;
 : ptinit
 0 lit thi !  0 lit phi !
 10 lit pgalloc dup 0= if "no memory for the threads" panic then dup thr ! 10000 lit mzero
-1 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 1000 lit mzero ;
+2 lit pgalloc dup 0= if "no memory for the processes" panic then dup prc ! 2000 lit mzero ;
 
 \ hpoke  every other started hart woken: a thread is ready.
 : hpoke  hmax @ 0 lit do i mhartid@ <> if i hup harr @ if i ipi then then loop ;
@@ -738,14 +797,14 @@ thnew dup spt ! 0= if 2drop FFFFFFF5 lit else
 spe @ 18 lit + @ FFF lit + C lit rshift dup pgalloc
 dup 0= if 2drop 2drop FFFFFFF4 lit else
 	dup 2 lit pick C lit lshift mzero
-	spp @ 40 lit mzero
+	spp @ 80 lit mzero
 	spp @ 10 lit + !
 	spp @ 14 lit + !
 	spp @ 4 lit + !
 	dup spp @ 20 lit + !
 	spe @ spp @ 24 lit + !
 	spe @ 10 lit + @ 80000000 lit + spp @ 18 lit + !
-	spp @ 18 lit + @ spe @ 14 lit + @ + spp @ 1C lit + !
+	spp @ 18 lit + @ spe @ 14 lit + @ + FFF lit + FFFFF000 lit and spp @ 1C lit + !   \ code to a page's end (mkimage pads it)
 	1 lit spp @ C lit + !
 	1 lit spp @ !
 	spt @ 100 lit mzero
@@ -786,11 +845,16 @@ thi @ 0 lit do
 loop
 nip ;
 
-\ pfinish ( p -- )  its last thread has ended: its memory back, its
-\ unjoined threads' slots free, its children given to the kernel (those
-\ ended, freed), and its parent told (the kernel says so on the console).
+\ pfinish ( p -- )  its last thread has ended: its memory and mapped
+\ blocks back, its unjoined threads' slots free, its children given to the
+\ kernel (those ended, freed), and its parent told (the kernel says so on
+\ the console).
 : pfinish
 dup 10 lit + @ over 14 lit + @ pgfree
+dup 30 lit + 4 lit 0 lit do
+	dup @ ?dup if over 4 lit + @ swap - C lit rshift 2 lit pick @ swap pgfree then
+	8 lit +
+loop drop
 thi @ 0 lit do
 	i thn dup tproc 2 lit pick = over tstate 6 lit = and if
 		dup DC lit + @ if 7 lit else 0 lit then swap tstate!
@@ -885,7 +949,7 @@ then ;
 kdi
 dup mhartid@ hcur harr !
 mscr!
-upmp
+hfresh
 F3220034 ,   \ csrrs t0,mscratch,zero
 23A02208 ,   \ sw sp,128(t0)              ( the kernel's stacks, for its traps )
 23A28209 ,   \ sw s8,132(t0)
@@ -1158,6 +1222,76 @@ begin dup 2C lit sysarg u< if 28 lit sysarg 4 lit twaiter else 0 lit then ?dup w
 repeat
 klk @ unlock dup if hpoke then sret ;
 
+\ prefresh  the other harts running a thread of this process told to
+\ reload their PMP (a block was mapped or unmapped), by a software
+\ interrupt, each marked stale until it has; this hart does it itself
+\ (the caller).
+: prefresh
+hmax @ 0 lit do
+	i mhartid@ <> if
+		i hcur harr @ ?dup if tproc cproc = if 1 lit i hstale harr ! fence i ipi then then
+	then
+loop ;
+
+\ pwait  until no other hart is marked stale: none can reach a block just
+\ unmapped, so its pages may go back.  Without klk (a hart marked may be
+\ waiting for it, interrupts off); this hart's own mark, from another's
+\ unmap, it clears itself, so two waiting on each other both go on.
+: pwait
+begin
+	fence
+	mhartid@ hstale harr @ if hfresh then
+	1 lit hmax @ 0 lit do i mhartid@ <> if i hstale harr @ if drop 0 lit then then loop
+until ;
+
+\ mslot ( addr -- slot | 0 )  the process's map slot whose first byte is
+\ addr, or 0.  An empty slot's is 0, so addr 0 finds the first empty one.
+: mslot
+0 lit swap
+4 lit 0 lit do
+	over 0= if
+		i 3 lit lshift cproc 30 lit + +
+		dup @ 2 lit pick = if rot drop swap else drop then
+	then
+loop
+drop ;
+
+: mpages variable ;  : msl variable ;
+
+\ 13 map(bytes): a block of that many bytes (rounded up to pages), zeroed,
+\ in one of the process's 4 slots; its first byte, or 0 (bytes 0, no free
+\ slot, or no memory): 0 is never a mapped address, and a RAM address has
+\ its high bit set, so the caller cannot tell map's errors by sign.
+: smap
+28 lit sysarg dup 0= if drop 0 lit sret else
+FFF lit + C lit rshift mpages !
+klk @ lock
+0 lit mslot dup msl ! 0= if klk @ unlock 0 lit sret else
+	mpages @ pgalloc dup 0= if drop klk @ unlock 0 lit sret else
+		dup mpages @ C lit lshift mzero
+		dup msl @ !
+		dup mpages @ C lit lshift + msl @ 4 lit + !
+		upmp prefresh
+		klk @ unlock sret
+	then
+then then ;
+
+\ 14 unmap(addr): the block at addr given back; 0, or -22.  Its pages go
+\ back only once every hart running a thread of the process has reloaded
+\ its PMP, so none can touch them once they are another's.
+: sunmap
+28 lit sysarg
+klk @ lock
+mslot dup 0= if drop klk @ unlock FFFFFFEA lit sret else
+	dup @ swap dup 4 lit + @ 2 lit pick - C lit rshift swap   \ ( first pages slot )
+	0 lit over !  0 lit swap 4 lit + !
+	upmp prefresh
+	klk @ unlock
+	pwait
+	klk @ lock pgfree klk @ unlock
+	0 lit sret
+then ;
+
 \ 17 write(fd, buf, n): to the console, for fds 1 and 2.
 : kwrite
 28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFF7 lit sret else
@@ -1181,8 +1315,10 @@ dup 9 lit = if drop slock else
 dup A lit = if drop sunlock else
 dup B lit = if drop sawait else
 dup C lit = if drop swake else
+dup D lit = if drop smap else
+dup E lit = if drop sunmap else
 11 lit = if kwrite else FFFFFFDA lit sret
-then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill
@@ -1194,6 +1330,13 @@ klk @ lock cproc FFFFFFFF lit pexit klk @ unlock tstop ;
 \ hart's job word, or the thread's process ending).
 : kipi  msipclr mhartid@ hipi harr dup @ 1 lit + swap ! ;
 
+\ hipiok  a software interrupt's part: the hart's stale mark cleared (its
+\ PMP reloaded if a thread runs, which is stopped if its process is
+\ ending; from the kernel, no thread runs and the next trun reloads it).
+: hipiok
+mpp@ 0= if cproc 28 lit + @ if 0 lit mhartid@ hstale harr ! tstop else hfresh then
+else 0 lit mhartid@ hstale harr ! then ;
+
 \ ktrap  what the entry calls, with every register saved.  Interrupts are
 \ taken from either mode: a timer's ends a thread's slice (counted to it),
 \ a software interrupt stops a thread whose process is ending.  An
@@ -1202,7 +1345,7 @@ klk @ lock cproc FFFFFFFF lit pexit klk @ unlock tstop ;
 : ktrap
 mcause@
 dup 80000007 lit = if drop ktick mpp@ 0= if area@ C4 lit + dup @ 1 lit + swap ! tstop then else
-dup 80000003 lit = if drop kipi mpp@ 0= if cproc 28 lit + @ if tstop then then else
+dup 80000003 lit = if drop kipi hipiok else
 mpp@ if drop kfault else
 8 lit = if ksys else ukill then
 then then then ;
@@ -1450,7 +1593,7 @@ fence 1 lit kready !
 "kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts
 pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
 0A lit putc
-tmrinit
+swon tmrinit                  \ hart 0 too takes software interrupts (stale PMP, a process ending)
 ;
 
 Test {

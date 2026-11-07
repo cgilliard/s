@@ -9,8 +9,10 @@
 # code, or make bad system calls: each ended or refused, the system going
 # on; and processes and threads: threads counting under a lock, a child
 # spawned and waited for, sleep, await and wake, a process killed with a
-# thread running on another hart, and the lottery's shares.  Every run has a time limit; one
-# that should keep running (the booted kernel) passes when the limit ends it.
+# thread running on another hart, and the lottery's shares; and memory: map
+# and unmap under PMP, malloc and free on four threads.  Every run has a time
+# limit; one that should keep running (the booted kernel) passes when the
+# limit ends it.
 
 cd "$(dirname "$0")/.." || exit 1
 T=tmp/oscheck
@@ -139,6 +141,64 @@ nip nip if 0 lit else 1 lit then halt' > "$T/share.fam"
 ./tools/fam -o "$T/sharek.bin" src/kernel.fam "$T/share.fam" > "$T/share.build" 2>&1 || fail lottery "build: $(head -c 300 "$T/share.build")"
 uimage share "$T/sharek.bin" spin=spin
 expect lottery 0 'share: ' 20 ./tools/q32 "$T/share.img"
+
+# Memory (step 6): map and unmap under PMP; malloc and free on threads.
+usrc tmap ': a variable ;  : b variable ;  : c variable ;  : d variable ;
+1000 lit map a !  3000 lit map b !  10000 lit map c !  1 lit map d !
+"maps: " puts a @ 0= b @ 0= or c @ 0= or d @ 0= or if "missing" else "four" then puts
+" fifth " puts 1 lit map u.
+7 lit a @ !  9 lit c @ FFFC lit + !  a @ @ c @ FFFC lit + @ + " sum " puts u.
+b @ unmap " again " puts 1 lit map if "yes" else "no" then puts
+" bad " puts 12345000 lit 0 lit 0 lit E lit sys . 0A lit putc
+c @ unmap  c @ @ drop "not reached" puts bye'
+uimage map bin/kernel init=tmap
+expect map 124 'maps: four fifth 0 sum 16 again yes bad -22' 4 ./tools/q32 --smp=2 "$T/map.img"
+has map 'kernel: process killed: trap 00000005'; has map 'kernel: init ended: -1'
+# Four threads, 5,000 steps each, twice: each holds up to 16 blocks of 4
+# to 8192 bytes, each filled with its own pattern and checked when freed;
+# after each round the heap is whole again (one block, one arena), and a
+# block larger than an arena gets one of its own, given back when freed.
+usrc tmalloc ': st variable ;  : tc variable ;  : stk variable ;  : bad variable ;
+: xs  dup @ dup D lit lshift xor dup 11 lit rshift xor dup 5 lit lshift xor tuck swap ! ;
+: tslot  2 lit lshift + 4 lit + ;
+: tsize  2 lit lshift + 44 lit + ;
+: fill  -rot 2 lit rshift 0 lit do 2dup i 2 lit lshift + ! loop 2drop ;
+: chk  -rot 2 lit rshift 1 lit swap 0 lit do over i 2 lit lshift + @ 3 lit pick = and loop nip nip ;
+: tfree
+2dup tslot @  2 lit pick 2 lit pick tsize @  3 lit pick 3 lit pick + chk 0= if 1 lit bad ! then
+2dup tslot @ free
+tslot 0 lit swap ! ;
+: tnew
+dup malloc dup 0= if "null" puts 0A lit putc 1 lit exit then
+2dup swap 5 lit pick 5 lit pick + fill
+3 lit pick 3 lit pick tslot !
+-rot tsize ! ;
+: step
+dup xs dup F lit and
+2 lit pick over tslot @ if nip tfree else swap 8 lit rshift 1FFC lit and 4 lit + tnew then ;
+: heap
+0 lit 0 lit freelist @ begin ?dup while dup @ rot + swap rot 1 lit + -rot 4 lit + @ repeat
+swap "blocks " puts u. " free " puts u. " mapped " puts mbytes @ u. ;
+tcode[
+	8 lit lshift st @ + dup 9E3779B9 lit xor over !
+	1388 lit 0 lit do dup step loop
+	10 lit 0 lit do dup i tslot @ if dup i tfree then loop
+	drop 0 lit texit
+]tcode tc !
+400 lit alloc st !  20000 lit alloc stk !  0 lit bad !
+2 lit 0 lit do
+	4 lit 0 lit do tc @ stk @ i 1 lit + F lit lshift + i thread loop
+	4 lit 0 lit do join drop loop
+	"round " puts i u. ": " puts heap 0A lit putc
+loop
+32000 lit malloc "big: " puts heap 0A lit putc free "after: " puts heap 0A lit putc
+bad @ if "corrupt" else "intact" then puts 0A lit putc bye'
+uimage malloc bin/kernel init=tmalloc:512
+for n in 1 4; do
+	expect "malloc_$n" 124 '^intact$' 10 ./tools/q32 --smp=$n "$T/malloc.img"
+	for r in 'round 0' 'round 1' 'after'; do has "malloc_$n" "^$r: blocks 1 free \([0-9]*\) mapped \1\$"; done
+	has "malloc_$n" '^big: blocks 2 '
+done
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

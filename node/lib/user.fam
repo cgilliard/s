@@ -8,7 +8,8 @@
 \ System calls: the number in a7, the arguments in a0-a2, `ecall`, the
 \ result in a0 (negative: an error).  1 exit(code), 2 spawn, 3 wait,
 \ 4 thread, 5 thread_exit, 6 join, 7 yield, 8 sleep, 9 lock, 10 unlock,
-\ 11 await, 12 wake (below), 16 read(fd, buf, n), 17 write(fd, buf, n).
+\ 11 await, 12 wake, 13 map, 14 unmap (below), 16 read(fd, buf, n), 17
+\ write(fd, buf, n).
 \
 \ At the start the kernel gives the program, in a0 and a1, the first byte of
 \ its memory and the byte past it (page-aligned).  The layout there, as
@@ -102,18 +103,152 @@
 : await   B lit sys ;                        \ ( addr expected ns -- r )  0; -11 not expected; -110 time ran out
 : wake    0 lit C lit sys ;                  \ ( addr n -- woken )
 
+\ map ( bytes -- addr | 0 )  a new block of pages (docs/OS.md, section 10);
+\ 0 if no slot is free (4 a process) or memory ran out.
+: map   0 lit 0 lit D lit sys ;
+\ unmap ( addr -- )  a block from map given back.
+: unmap  0 lit 0 lit E lit sys drop ;
+
+\ ── malloc and free (docs/OS.md, section 10) ──
+\
+\ A free list sorted by address, so neighbours merge.  A block: its size
+\ (bytes, header included) at 0, the next free block at 4 (0 at the end);
+\ malloc returns the 8 bytes past the header.  First fit, split when the
+\ remainder holds a header; when none fits, a fresh arena is mapped (the
+\ request rounded up to pages, at least 64 KiB and at least what is mapped
+\ already, so the 4 map slots go a long way) and added.  Blocks never merge
+\ across an arena's start, so an arena wholly free is one block, and free
+\ unmaps it unless it is the last.  Threads share the heap, so a lock (mlk,
+\ the kernel's mutex) guards it all.
+
+: max  2dup u< if swap then drop ;
+
+: freelist variable ;        \ the first free block (0: empty)
+: mlk variable ;             \ its lock: threads share the heap
+: fb variable ;  : fp variable ;  : mcur variable ;  : mneed variable ;
+: mbytes variable ;          \ the bytes mapped in arenas
+\ The arenas, (first byte, byte past) in 4 pairs: variables are handed out
+\ in order, so these 8 cells are one table (arena).  0: an empty pair.
+: mar0 variable ;  : mar1 variable ;  : mar2 variable ;  : mar3 variable ;
+: mar4 variable ;  : mar5 variable ;  : mar6 variable ;  : mar7 variable ;
+: arena  3 lit lshift mar0 + ;               \ ( i -- pair )
+
+\ astart? ( a -- flag )  a is an arena's first byte.
+: astart?  0 lit swap 4 lit 0 lit do dup i arena @ = rot or swap loop drop ;
+\ marenas ( -- n )  the arenas mapped.
+: marenas  0 lit 4 lit 0 lit do i arena @ if 1 lit + then loop ;
+\ marec ( bytes first -- )  a new arena noted, in an empty pair.
+: marec
+over mbytes @ + mbytes !
+1 lit 4 lit 0 lit do
+	dup if i arena @ 0= if drop dup i arena ! 2dup + i arena 4 lit + ! 0 lit then then
+loop
+drop 2drop ;
+
+\ fwalk  fp := the block before the first free block of mneed bytes or more,
+\ mcur := that block (0: none); the free list is sorted by address.
+: fwalk
+0 lit fp !  freelist @ mcur !
+begin mcur @ if mcur @ @ mneed @ u< else 0 lit then while
+	mcur @ fp !  mcur @ 4 lit + @ mcur !
+repeat ;
+
+\ mtake ( -- ptr )  mcur taken (it fits): split off the remainder if it
+\ would hold a header, else unlink the whole block.
+: mtake
+mcur @ @ mneed @ - 10 lit u< if
+	fp @ 0= if mcur @ 4 lit + @ freelist ! else mcur @ 4 lit + @ fp @ 4 lit + ! then
+else
+	mcur @ mneed @ +                   \ ( new )
+	mcur @ @ mneed @ - over !          \ [new] = remainder
+	mcur @ 4 lit + @ over 4 lit + !    \ [new+4] = old next
+	fp @ 0= if dup freelist ! else dup fp @ 4 lit + ! then
+	drop
+	mneed @ mcur @ !
+then
+mcur @ 8 lit + ;
+
+\ finsert ( block -- )  into the list in address order, merged with the
+\ block before it and the one after when they touch (and are one arena's).
+: finsert
+fb !
+0 lit fp !  freelist @ mcur !
+begin mcur @ if mcur @ fb @ u< else 0 lit then while
+	mcur @ fp !  mcur @ 4 lit + @ mcur !
+repeat
+mcur @ fb @ 4 lit + !
+fp @ 0= if fb @ freelist ! else fb @ fp @ 4 lit + ! then
+mcur @ ?dup if
+	fb @ fb @ @ + over = over astart? 0= and if
+		dup @ fb @ @ + fb @ !
+		4 lit + @ fb @ 4 lit + !
+	else drop then
+then
+fp @ ?dup if
+	dup dup @ + fb @ = fb @ astart? 0= and if
+		dup @ fb @ @ + over !
+		fb @ 4 lit + @ over 4 lit + !
+	then
+	drop
+then ;
+
+\ mrel  an arena wholly free (one block, its size the arena's) unlinked and
+\ unmapped, unless it is the last.
+: mrel
+4 lit 0 lit do
+	i arena @ ?dup if
+		0 lit fp !  freelist @ mcur !
+		begin mcur @ if mcur @ over u< else 0 lit then while
+			mcur @ fp !  mcur @ 4 lit + @ mcur !
+		repeat
+		mcur @ = if
+			mcur @ @  i arena 4 lit + @ mcur @ - =  marenas 1 lit u> and if
+				mcur @ 4 lit + @  fp @ ?dup if 4 lit + ! else freelist ! then
+				mbytes @ i arena 4 lit + @ i arena @ - - mbytes !
+				mcur @ unmap  0 lit i arena !  0 lit i arena 4 lit + !
+			then
+		then
+	then
+loop ;
+
+\ malloc ( n -- ptr | 0 )
+: malloc
+mlk lock
+8 lit + 7 lit + FFFFFFF8 lit and 10 lit max mneed !
+fwalk
+mcur @ if mtake else
+	mneed @ 10000 lit max mbytes @ max FFF lit + FFFFF000 lit and
+	dup map dup 0= if 2drop 0 lit else
+		2dup marec
+		swap over !
+		0 lit over 4 lit + !
+		finsert
+		fwalk
+		mcur @ if mtake else 0 lit then
+	then
+then
+mlk unlock ;
+
+\ free ( ptr -- )
+: free  mlk lock 8 lit - finsert mrel mlk unlock ;
+
 \ tcode[ ... ]tcode ( -- entry )  a thread's code, compiled where it is but
 \ jumped over; its address left for `thread`.  It runs on its own stacks
-\ (the variables and the heap are shared), and ends with texit(0) if it
-\ does not end itself.
+\ (the variables and malloc's heap are shared), begins with the thread's
+\ argument on the data stack, and ends with texit(0) if it does not end
+\ itself.  A thread allocates with malloc, never alloc: alloc moves gp, and
+\ each thread's gp is its own copy of its parent's.
 :I [skip  here ,j0 ;
 :I skip]  jpat! ;
 :M tcode[
 97020000 ,   \ auipc t0,0x0
-93824201 ,   \ addi t0,t0,20              ( the code past the jump )
+93824201 ,   \ addi t0,t0,20              ( the entry, past the jump )
 1301C1FF ,   \ addi sp,sp,-4
 23205100 ,   \ sw t0,0(sp)
-[skip ;
+[skip
+1301C1FF ,   \ addi sp,sp,-4              ( the body's first act: a0, the )
+2320A100 ,   \ sw a0,0(sp)                ( thread.s argument, onto the data stack )
+;
 :M ]tcode  0 lit texit skip] ;
 
 \ The start: the stacks and the heap in the memory given (a0, a1).

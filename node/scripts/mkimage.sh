@@ -7,7 +7,10 @@
 #   NAME     a program's name (at most 15 bytes), FILE its binary (built with
 #            `tools/fam --user`), KiB the memory it starts with (default 64)
 #
-# The layout: the kernel; each program (4-byte aligned); the table (a count,
+# The layout: the kernel; each program, from a page boundary and padded with
+# zeros to the next (its code's PMP range then covers whole pages: QEMU
+# cannot cache translations for a page a PMP range only partly covers, and
+# runs code there an instruction at a time, hundreds of times slower); the table (a count,
 # then for each program its name in 16 bytes, its offset in the image, its
 # length and its memory, little-endian); zeros to the end of a page but 8
 # bytes; then the table's offset and "PROG".  The image ends on a page
@@ -27,6 +30,7 @@ le32() {
 }
 zeros() { [ "$1" -gt 0 ] && head -c "$1" /dev/zero; return 0; }
 pad4() { zeros $(( (4 - $(fsize "$1") % 4) % 4 )) >> "$1"; }
+padpg() { zeros $(( (4096 - $(fsize "$1") % 4096) % 4096 )) >> "$1"; }
 
 tmp="$out.mk.$$"
 trap 'rm -f "$tmp" "$tmp.table"' EXIT
@@ -41,9 +45,10 @@ for spec in "$@"; do
 	[ -f "$file" ] || { echo "mkimage.sh: $file not found" >&2; exit 1; }
 	len=$(printf '%s' "$name" | wc -c | tr -d ' \t')
 	[ "$len" -ge 1 ] && [ "$len" -le 15 ] || { echo "mkimage.sh: name $name: 1 to 15 bytes" >&2; exit 1; }
+	padpg "$tmp"
 	off=$(fsize "$tmp")
 	cat "$file" >> "$tmp"
-	pad4 "$tmp"
+	padpg "$tmp"
 	{ printf '%s' "$name"; zeros $((16 - len)); le32 "$off"; le32 "$(fsize "$file")"; le32 $((kib * 1024)); } >> "$tmp.table"
 	n=$((n + 1))
 done
