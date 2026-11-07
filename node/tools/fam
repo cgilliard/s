@@ -113,6 +113,8 @@ if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
 _tdone
 bye'; else TAIL='bye'; fi
 STREAM="$OUT.in.$$"
+trap 'rm -f "$STREAM"' EXIT                    # however it ends (Ctrl-C too)
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 # --test (and --bench, with `Bench { }`): after each file, an empty word and an empty `Test { }` -- so the
 # compiler has a `:` at which to put an island (src/fam.S: it does only at
 # definitions, and test files are mostly top-level code), and the chain of

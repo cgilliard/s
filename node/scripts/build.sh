@@ -8,6 +8,11 @@
 # Runs from anywhere: it works in the tree it belongs to.
 set -e
 cd "$(dirname "$0")/.."
+# The temporary files (a compile's input, <out>.in.$$; gen_hash's and the
+# patch's, <tab>.gh*.$$ and .new.$$) sit next to their outputs in bin/, and
+# go however the build ends: Ctrl-C, a closed terminal and kill included.
+trap 'rm -f bin/*.$$' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\

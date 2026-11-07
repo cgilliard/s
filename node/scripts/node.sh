@@ -91,7 +91,8 @@ done
 SEEDS=$RESOLVED
 
 SEEDFILE="$DISK.seeds.$$"
-trap 'rm -f "$SEEDFILE"' EXIT
+trap 'rm -f "$SEEDFILE"' EXIT                 # however it ends (Ctrl-C too)
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 n=0
 for s in $SEEDS; do n=$((n + 1)); done
 [ "$n" -le 255 ] || { echo "node.sh: too many seeds" >&2; exit 1; }

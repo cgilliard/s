@@ -33,7 +33,8 @@ pad4() { zeros $(( (4 - $(fsize "$1") % 4) % 4 )) >> "$1"; }
 padpg() { zeros $(( (4096 - $(fsize "$1") % 4096) % 4096 )) >> "$1"; }
 
 tmp="$out.mk.$$"
-trap 'rm -f "$tmp" "$tmp.table"' EXIT
+trap 'rm -f "$tmp" "$tmp.table"' EXIT         # however it ends (Ctrl-C too)
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 cp "$kernel" "$tmp"
 pad4 "$tmp"
 : > "$tmp.table"

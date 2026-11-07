@@ -16,6 +16,7 @@ DISK=tmp/storetest.img
 rm -f "$DISK"
 dd if=/dev/zero of="$DISK" bs=1 count=0 seek=268435456 2>/dev/null || exit 1
 trap 'rm -f "$DISK" tmp/storetest_*.fam tmp/storetest_*.bin' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
 for m in 0 1 2 3; do
 	sed "s/^RUN /$m lit /" src/storetest.fam > tmp/storetest_$m.fam
