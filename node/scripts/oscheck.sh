@@ -208,6 +208,19 @@ for n in 1 4; do
 	has "malloc_$n" '^big: blocks 2 '
 done
 
+# A process that ends with memory still mapped (malloc's arenas, never
+# freed): its blocks given back whole, five times over, /proc/mem the same
+# after (after a first run, which takes the kernel's one-time 16 KiB;
+# pfinish once freed from the process's state word instead).
+usrc tleak '20000 lit malloc 0= if "null" puts 0A lit putc then bye'
+usrc tleakp ': st variable ;  : b variable ;
+: mem  "/proc/mem" 0 lit open dup b @ 20 lit read drop close drop b @ atoi ;
+40 lit alloc b !
+"leak" spawn st wait drop  mem  5 lit 0 lit do "leak" spawn st wait drop loop  mem
+= if "mapped freed" else "mapped leaked" then puts 0A lit putc bye'
+uimage leak bin/kernel init=tleakp leak=tleak
+for n in 1 4; do expect "mapexit_$n" 124 '^mapped freed$' 6 ./tools/q32 --smp=$n "$T/leak.img"; done
+
 # Descriptors, the console, init and a shell (step 7).  Calls: poll timing
 # out, then readable, then hung up; a pipe read to its end; the errors; 32
 # descriptors at most; a child killed through /proc/<pid>/kill.
@@ -294,6 +307,27 @@ for n in 1 4; do
 	done
 	m=$(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | sed -n '1p;$p' | sort -u | wc -l)
 	[ "$m" = 1 ] || fail "exec_$n" "memory not given back: $(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | tr '\n' ' ')"
+done
+
+# vi (step 11), on the console with a disk: a new file typed (Esc then o
+# straight after), written and quit; opened again, its lines swapped (dd
+# p), written; opened again, a byte taken out, :q refused (E37), :q!; the
+# file seen with cat after each (its escape sequences stripped).
+cat > "$T/vi.feed" <<'VIEOF'
+sleep 3; printf 'vi /t.txt\n'; sleep 1.5; printf 'ihello world\033osecond line\033:wq\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1
+printf 'vi /t.txt\n'; sleep 1.5; printf 'ddp:wq\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1
+printf 'vi /t.txt\n'; sleep 1.5; printf 'x:q\r'; sleep 1; printf ':q!\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1; printf 'halt\n'; sleep 1
+VIEOF
+for n in 1 4; do
+	N=$((N + 1)); o="$T/vi_$n.out"
+	rm -f "$T/vi.disk"; dd if=/dev/zero of="$T/vi.disk" bs=1 count=0 seek=268435456 2>/dev/null
+	lim 40 sh -c 'sh "$1" | ./tools/q32 --smp='$n' --disk="$2" "$3"' vi "$T/vi.feed" "$T/vi.disk" "$T/exec.img" > "$o" 2>&1
+	r=$(python3 -c '
+import re, sys
+t = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "\n", open(sys.argv[1], errors="replace").read()).replace("\r", "")
+cats = ["/".join(b.split("\n")[1:3]) for b in t.split("$ cat /t.txt")[1:]]
+print("|".join(["e37" if "E37: No write since last change" in t else "no-e37"] + cats))' "$o")
+	[ "$r" = "e37|hello world/second line|second line/hello world|second line/hello world" ] || fail "vi_$n" "$r"
 done
 
 # The store (step 8): its own checks on a bare machine (a new store, the
@@ -621,7 +655,9 @@ done
 # desktop page's own script too, on a stub DOM: two terminals from the
 # dock, typing (a backspace among it), minimize and restore from the
 # taskbar, maximize, exit and the close button each closing a window, then
-# thirteen at once (twelve, the last told none is free) and no zombie left.
+# thirteen at once (twelve, the last told none is free) and no zombie left;
+# escape sequences fed to a window; vi in one (typed, written, the shell's
+# screen back after).
 cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
@@ -757,11 +793,17 @@ const port = process.argv[2];
   byId.newt.onclick(); const t3 = ts()[0];
   await wait(() => prompt.test(t3.plain), 5000); type(t3, 'ps\r');
   console.log('reaped', await wait(() => /CMD[^]*\$ █$/.test(t3.plain), 5000) && !/ Z /.test(t3.plain));
+  // vi in a window: its screen (the alternate one), typed and written, the
+  // shell's screen back as it was when it quits, the file as typed
+  type(t3, 'vi /v.txt\r'); console.log('vi', await wait(() => /\[New\]/.test(t3.plain), 5000));
+  type(t3, 'ihi there'); key(t3, 'Escape'); type(t3, ':wq\r');
+  console.log('vi back', await wait(() => /\$ vi \/v\.txt\n\$ █$/.test(t3.plain), 5000));
+  type(t3, 'cat /v.txt\r'); console.log('vi wrote', await wait(() => /\nhi there\n\$ █$/.test(t3.plain), 5000));
   console.log(JSON.stringify(t3.plain));
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))
@@ -772,7 +814,7 @@ for n in 1 4; do
 	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 60 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
-		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$' '^ansi true$' '^altscreen true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do

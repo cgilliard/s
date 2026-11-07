@@ -1,0 +1,608 @@
+\ vi.fam — a full-screen editor, like vim for those who know it (docs/OS.md,
+\ step 11): vi [file].  Its terminal raw (tty) and on the alternate screen
+\ while it runs, drawn whole on each key; the screen's size from tty (the
+\ browser's terminal tells wm), else asked of the terminal (ESC [6n), else
+\ 24 by 80.
+\
+\ Normal mode: h j k l and the arrows, w b e, 0 ^ $, gg G, H M L, ^F ^B ^D
+\ ^U (a count before most: 3j, 2dd); x X r~ J, dd D dw d$ cw cc C, yy yw
+\ p P, i a I A o O, u and ^R, / ? n N, . nothing yet, ZZ and ZQ; : for
+\ :w [file], :q, :q!, :wq, :x, :N (a line), :$.  Insert mode: typing,
+\ Backspace (joining lines at a line's start), Enter, the arrows, Esc.
+\ Lines are kept apart, each a block from malloc: its length, its room,
+\ its bytes.  Undo keeps a copy of the buffer from before each change (50).
+
+\ ── Bytes, lines and the buffer ──
+
+: ms variable ;  : md variable ;  : mvn variable ;
+\ mv ( src dst n -- )  n bytes, the two may overlap.
+: mv
+mvn ! md ! ms !
+md @ ms @ u> if
+	mvn @ ?dup if 0 lit do ms @ mvn @ + i - 1 lit - c@ md @ mvn @ + i - 1 lit - c! loop then
+else
+	mvn @ ?dup if 0 lit do ms @ i + c@ md @ i + c! loop then
+then ;
+: mn  2dup > if swap then drop ;                   \ ( a b -- min ) signed
+: mx  2dup < if swap then drop ;                   \ ( a b -- max ) signed
+
+\ A line: its length 0, its room 4, its bytes from 8.
+: llen  @ ;
+: ltxt  8 lit + ;
+: lmk   dup 8 lit + malloc tuck 4 lit + !  0 lit over ! ;     \ ( room -- l )
+: lcopy  dup llen dup 10 lit + lmk tuck !  over ltxt over ltxt 3 lit pick llen mv  nip ;   \ ( l -- l' )
+
+: lns variable ;  : nl variable ;  : lcap variable ;
+: lof   2 lit lshift lns @ + @ ;                   \ ( i -- l )
+: lof!  2 lit lshift lns @ + ! ;                   \ ( l i -- )
+
+\ lgrow ( i need -- )  line i given room for need bytes.
+: lgrow
+over lof 4 lit + @ over u< if
+	1 lit lshift 10 lit + lmk  over lof  2dup llen swap !
+	dup ltxt 2 lit pick ltxt 2 lit pick llen mv  free  swap lof!
+else 2drop then ;
+
+\ ains ( l i -- )  a line put in at i; adel ( i -- )  line i taken out
+\ (not freed).
+: ains
+nl @ lcap @ = if
+	lcap @ 1 lit lshift 10 lit + dup 2 lit lshift malloc  lns @ over nl @ 2 lit lshift mv
+	lns @ free  lns !  lcap !
+then
+dup 2 lit lshift lns @ +  dup 4 lit +  nl @ 3 lit pick - 2 lit lshift mv
+lof!  nl @ 1 lit + nl ! ;
+: adel
+dup 1 lit + 2 lit lshift lns @ +  over 2 lit lshift lns @ +  nl @ 3 lit pick - 1 lit - 2 lit lshift mv
+drop nl @ 1 lit - nl ! ;
+
+\ empty  the buffer one empty line (its old lines freed).
+: freeall  nl @ ?dup if 0 lit do i lof free loop then  0 lit nl ! ;
+: empty  freeall  10 lit lmk 0 lit ains ;
+
+\ ── The screen's output ──
+
+: obuf variable ;  : op variable ;
+: oc    op @ obuf @ + c!  op @ 1 lit + op ! ;      \ ( c -- )
+: os    begin dup c@ ?dup while oc 1 lit + repeat drop ;   \ ( s -- )
+: on    op @ obuf @ + swap snum obuf @ - op ! ;   \ ( u -- )  in decimal
+: oesc  1B lit oc 5B lit oc ;
+: ogo   oesc swap 1 lit + on 3B lit oc 1 lit + on 48 lit oc ;   \ ( row col -- )  0 first
+: oflush  1 lit obuf @ op @ write drop  0 lit op ! ;
+
+\ ── The file ──
+
+: fname variable ;  : dirty variable ;  : msg variable ;  : nlb variable ;   \ nlb: a newline, to write
+: msg!  msg @ swap scpy 0 lit swap c! ;          \ ( s -- )  the message shown
+: rb variable ;  : rn variable ;  : rcap variable ;
+
+\ load  fname's lines (none there: an empty buffer, said to be new).
+: lbeg variable ;
+: load
+freeall
+fname @ c@ 0= if empty else
+fname @ 0 lit open dup 0< if drop empty "[New]" msg! else
+	1000 lit rcap !  rcap @ malloc rb !  0 lit rn !
+	begin
+		rn @ 1000 lit + rcap @ u> if
+			rcap @ 1 lit lshift dup malloc  rb @ over rn @ mv  rb @ free  rb !  rcap !
+		then
+		dup rb @ rn @ + 1000 lit read dup 0 lit > if rn @ + rn ! 0 lit else drop 1 lit then
+	until
+	close drop
+	0 lit lbeg !
+	rn @ ?dup if 0 lit do
+		rb @ i + c@ A lit = if
+			i lbeg @ - dup lmk  2dup ! nip  rb @ lbeg @ + over ltxt 2 lit pick llen mv  nl @ ains
+			i 1 lit + lbeg !
+		then
+	loop then
+	lbeg @ rn @ u< if rn @ lbeg @ - dup lmk 2dup ! nip  rb @ lbeg @ + over ltxt 2 lit pick llen mv  nl @ ains then
+	rb @ free
+	nl @ 0= if empty then
+	msg @ 22 lit over c! 1 lit + fname @ scpy 22 lit over c! 1 lit + 20 lit over c! 1 lit + nl @ snum " lines" scpy 0 lit swap c!
+then then
+0 lit dirty ! ;
+
+\ savef ( path -- ok )  the buffer written to path; save ( -- ok )  to
+\ fname, the buffer then unchanged.
+: savef
+dup c@ 0= if drop "E32: No file name" msg! 0 lit else
+dup 601 lit open dup 0< if 2drop "E212: Can't open file for writing" msg! 0 lit else
+	nl @ 0 lit do dup i lof ltxt i lof llen write drop  dup nlb @ 1 lit write drop loop
+	close drop
+	msg @ 22 lit over c! 1 lit + swap scpy 22 lit over c! 1 lit + 20 lit over c! 1 lit + nl @ snum " lines written" scpy 0 lit swap c!
+	1 lit
+then then ;
+: save  fname @ savef dup if 0 lit dirty ! then ;
+
+\ ── The terminal ──
+
+: rows variable ;  : cols variable ;  : asked variable ;
+: pe variable ;                    \ poll's entry for fd 0
+: kb variable ;                    \ a byte read
+\ ready? ( ns -- flag )  a byte to read within ns.
+: ready?  0 lit pe @ !  1 lit pe @ 4 lit + h!  0 lit pe @ 6 lit + h!  pe @ 1 lit rot poll 0 lit > ;
+\ byte ( -- c | -1 )  a byte typed (-1 at the input's end), those put back
+\ first; unread ( c -- )  one put back (two at most, the last first out).
+: pb variable ;  : pbn variable ;
+: byte  pbn @ if pbn @ 1 lit - dup pbn ! pb @ + c@ else 0 lit kb @ 1 lit read 1 lit = if kb @ c@ else FFFFFFFF lit then then ;
+: unread  pb @ pbn @ + c!  pbn @ 1 lit + pbn ! ;
+
+\ ask  the size asked of the terminal itself (the cursor sent far right
+\ and down, then its place asked: ESC [ rows ; cols R), when tty does not
+\ know it; 24 by 80 when no answer comes (keys typed meanwhile put back).
+: ask
+18 lit rows !  50 lit cols !
+oesc "999;999H" os oesc "6n" os oflush
+1DCD6500 lit ready? if
+	byte dup 1B lit = if drop byte dup 5B lit = if drop
+		0 lit begin byte dup 30 lit - A lit u< while 30 lit - swap dup 3 lit lshift swap 1 lit lshift + + repeat
+		3B lit = if
+			0 lit begin byte dup 30 lit - A lit u< while 30 lit - swap dup 3 lit lshift swap 1 lit lshift + + repeat
+			drop  ?dup if cols ! then  ?dup if rows ! then
+		else drop then
+	else unread 1B lit unread then else unread then
+then ;
+
+\ tsize ( -- changed )  rows and cols from tty, else as asked once.
+: tsize
+rows @ cols @
+0 lit 2 lit 0 lit tty dup 0 lit > if dup 10 lit rshift rows !  FFFF lit and cols ! else drop asked @ 0= if 1 lit asked ! ask then then
+rows @ 3 lit mx rows !  cols @ A lit mx cols !
+cols @ <> swap rows @ <> or ;
+
+\ Keys: a byte, or one of these for an escape sequence.
+:M K_UP 100 lit ;  :M K_DOWN 101 lit ;  :M K_RIGHT 102 lit ;  :M K_LEFT 103 lit ;
+:M K_HOME 104 lit ;  :M K_END 105 lit ;  :M K_PGUP 106 lit ;  :M K_PGDN 107 lit ;  :M K_DEL 108 lit ;
+\ arrow ( c -- k | 0 )  an escape sequence's last byte, as a key.
+: arrow
+dup 41 lit = if drop K_UP else  dup 42 lit = if drop K_DOWN else
+dup 43 lit = if drop K_RIGHT else  dup 44 lit = if drop K_LEFT else
+dup 48 lit = if drop K_HOME else  46 lit = if K_END else 0 lit
+then then then then then then ;
+\ csi ( -- k )  the rest of ESC [ ...: an arrow, or a number and ~ (Home,
+\ End, Delete, Page Up and Down); anything else Esc.
+: csi
+byte dup arrow ?dup if nip else
+dup 30 lit - A lit u< if
+	begin byte dup 40 lit - 3F lit u< over 0< or 0= while drop repeat drop
+	dup 31 lit = over 37 lit = or if drop K_HOME else
+	dup 34 lit = over 38 lit = or if drop K_END else
+	dup 33 lit = if drop K_DEL else  dup 35 lit = if drop K_PGUP else
+	36 lit = if K_PGDN else 1B lit then then then then then
+else drop 1B lit then then ;
+\ key ( -- k )  a key.  Esc with nothing after it within 30 ms, or with
+\ what is not a sequence after it, is 27 (what followed put back: Esc
+\ then o typed fast is Esc, then o); ESC O is a sequence only with its
+\ letter straight after.
+: key
+byte dup 1B lit = if
+	1C9C380 lit ready? if
+		drop byte
+		dup 5B lit = if drop csi else
+		dup 4F lit = if
+			1C9C380 lit ready? if byte dup arrow ?dup if nip nip else unread unread 1B lit then else unread 1B lit then
+		else unread 1B lit then then
+	then
+then ;
+
+\ ── Where the cursor is, and the screen ──
+
+: cy variable ;  : cx variable ;  : top variable ;  : lft variable ;
+: mode variable ;                  \ 0 normal, 1 insert, 2 a command line
+: cmd variable ;  : cn variable ;  : ctype variable ;   \ the command line: its text, length, first key (: / ?)
+: cl    cy @ lof ;                 \ ( -- l )  the cursor's line
+: maxx  cl llen mode @ 1 lit = if else 1 lit - 0 lit mx then ;   \ ( -- n )  the last place for the cursor
+: clamp  cy @ nl @ 1 lit - mn 0 lit mx cy !  cx @ maxx mn 0 lit mx cx ! ;
+
+\ dcol ( l n -- col )  where byte n of line l is shown (a tab to the next
+\ multiple of 8).
+: dcol
+0 lit swap ?dup if 0 lit do over ltxt i + c@ 9 lit = if 8 lit + FFFFFFF8 lit and else 1 lit + then loop then nip ;
+
+: dc variable ;
+: vis?  dc @ lft @ - dup 0< 0= swap cols @ < and ;   \ ( -- flag )  column dc on the screen
+\ drow ( l -- )  a line as shown, from column lft, cols wide (a control
+\ byte as ?).
+: drow
+0 lit dc !
+dup llen ?dup if 0 lit do
+	dup ltxt i + c@
+	dup 9 lit = if
+		drop dc @ 8 lit + FFFFFFF8 lit and
+		begin dc @ over < while vis? if 20 lit oc then dc @ 1 lit + dc ! repeat drop
+	else
+		vis? if dup 20 lit u< if drop 3F lit then oc else drop then dc @ 1 lit + dc !
+	then
+loop then drop ;
+
+\ status  the last row: the command line being typed, or the message, or
+\ -- INSERT --; the cursor's line and column at the right.
+: status
+rows @ 1 lit - 0 lit ogo
+mode @ 2 lit = if
+	ctype @ oc  cn @ ?dup if 0 lit do cmd @ i + c@ oc loop then
+else
+	msg @ c@ if msg @ os else mode @ 1 lit = if "-- INSERT --" os then then
+then
+oesc 4B lit oc
+mode @ 2 lit = 0= if
+	rows @ 1 lit - cols @ 12 lit - 0 lit mx ogo  cy @ 1 lit + on 2C lit oc cx @ 1 lit + on
+	dirty @ if "  [+]" os then
+then ;
+
+\ draw  the screen whole: the lines from top (a ~ past the end), the
+\ status row, the cursor; top and lft moved first to keep it in sight.
+: draw
+tsize drop clamp
+cy @ top @ < if cy @ top ! then
+cy @ top @ - rows @ 1 lit - < 0= if cy @ rows @ 2 lit - - top ! then
+cl cx @ dcol
+dup lft @ < if dup lft ! then
+dup lft @ - cols @ < 0= if dup cols @ - 1 lit + lft ! then
+oesc "?25l" os
+rows @ 1 lit - 0 lit do
+	i 0 lit ogo
+	top @ i + dup nl @ < if lof drow else drop 7E lit oc then
+	oesc 4B lit oc
+loop
+status
+mode @ 2 lit = if rows @ 1 lit - cn @ 1 lit + else cy @ top @ - over lft @ - then ogo
+drop
+oesc "?25h" os oflush ;
+
+\ ── Undo ──
+\
+\ A snapshot (16 bytes): its lines (an array), how many, the cursor's
+\ line and column.  Two stacks of 50: undo's, and redo's (emptied by a new
+\ change).
+
+: us variable ;  : ua variable ;  : rs variable ;  : ra variable ;
+: snap
+10 lit malloc  nl @ 1 lit mx 2 lit lshift malloc over !
+nl @ over 4 lit + !  cy @ over 8 lit + !  cx @ over C lit + !
+nl @ 0 lit do i lof lcopy over @ i 2 lit lshift + ! loop ;   \ ( -- s )
+: sfree  dup 4 lit + @ ?dup if 0 lit do dup @ i 2 lit lshift + @ free loop then  dup @ free free ;   \ ( s -- )
+: cur>s  10 lit malloc  lns @ over !  nl @ over 4 lit + !  cy @ over 8 lit + !  cx @ over C lit + ! ;   \ ( -- s )  its lines taken
+: s>cur  dup @ lns !  dup 4 lit + @ dup nl !  1 lit mx lcap !  dup 8 lit + @ cy !  dup C lit + @ cx !  free ;   \ ( s -- )
+\ spush ( s stack count -- ), spop ( stack count -- s | 0 )  count's
+\ address; the oldest dropped from a full stack.
+: spush
+dup @ 32 lit = if
+	over @ sfree  over 4 lit + 2 lit pick C4 lit mv  dup @ 1 lit - over !
+then
+dup @ 2 lit lshift rot + rot swap !  dup @ 1 lit + swap ! ;
+: spop  dup @ 0= if 2drop 0 lit else dup @ 1 lit - dup rot ! 2 lit lshift + @ then ;
+\ chg  a change about to be made: the buffer kept for undo.
+: chg  snap us @ ua spush  begin rs @ ra spop ?dup while sfree repeat  1 lit dirty ! ;
+: undo  us @ ua spop ?dup if cur>s rs @ ra spush s>cur 1 lit dirty ! else "Already at oldest change" msg! then ;
+: redo  rs @ ra spop ?dup if cur>s us @ ua spush s>cur 1 lit dirty ! else "Already at newest change" msg! then ;
+
+\ ── Yanked text: lines (ylw 1: an array of yn copies) or bytes (a line) ──
+
+: ya variable ;  : yn variable ;  : ylw variable ;  : yc variable ;
+: yfree
+ylw @ if yn @ ?dup if 0 lit do ya @ i 2 lit lshift + @ free loop then ya @ free 0 lit ya ! else yc @ ?dup if free 0 lit yc ! then then ;
+: ylines   \ ( i n -- )
+yfree  dup yn !  1 lit ylw !  dup 1 lit mx 2 lit lshift malloc ya !
+?dup if 0 lit do dup i + lof lcopy ya @ i 2 lit lshift + ! loop then drop ;
+: ychars   \ ( a n -- )
+yfree  0 lit ylw !  dup 10 lit + lmk tuck !  dup yc !  ltxt yc @ llen mv ;
+
+\ ── Editing ──
+
+\ insc ( c -- )  a byte put in at the cursor, the cursor after it.
+: insc
+cy @ cl llen 1 lit + lgrow
+cl ltxt cx @ + dup 1 lit + cl llen cx @ - mv
+cl ltxt cx @ + c!  cl dup llen 1 lit + swap !  cx @ 1 lit + cx ! ;
+\ dchars ( from n -- )  n bytes of the cursor's line taken out (yanked).
+: dchars
+?dup if
+	over cl ltxt + over ychars
+	over cl ltxt + over + 2 lit pick cl ltxt + cl llen 4 lit pick - 3 lit pick - mv
+	cl dup llen rot - swap !  drop
+else drop then ;
+\ splitl  the cursor's line cut at the cursor, the rest a new line below.
+: splitl
+cl llen cx @ - dup 10 lit + lmk tuck !
+cl ltxt cx @ + over ltxt 2 lit pick llen mv
+cx @ cl !  cy @ 1 lit + ains  cy @ 1 lit + cy !  0 lit cx ! ;
+\ joinl ( i -- )  line i+1 put at the end of line i.
+: jl variable ;
+: joinl
+dup 1 lit + nl @ < if
+	dup dup lof llen over 1 lit + lof llen + lgrow
+	dup 1 lit + lof jl !
+	jl @ ltxt over lof dup ltxt swap llen + jl @ llen mv
+	dup lof dup llen jl @ llen + swap !
+	jl @ free  1 lit + adel
+else drop then ;
+\ dlines ( n -- )  n lines from the cursor's taken out (yanked).
+: dlines
+nl @ cy @ - mn  cy @ over ylines
+0 lit do cy @ lof free cy @ adel loop
+nl @ 0= if 10 lit lmk 0 lit ains then clamp ;
+
+\ ── Motions ──
+
+\ chr ( -- c | -1 )  the byte under the cursor (-1: none, an empty line).
+: chr  cx @ cl llen < if cl ltxt cx @ + c@ else FFFFFFFF lit then ;
+: wch?  dup 30 lit - A lit u< over 41 lit - 1A lit u< or over 61 lit - 1A lit u< or over 5F lit = or swap 7F lit u> or ;
+\ cls ( c -- k )  0 a space (or none), 1 a word's byte, 2 punctuation.
+: cls  dup 0< if drop 0 lit else dup 20 lit u> 0= if drop 0 lit else wch? if 1 lit else 2 lit then then then ;
+\ nextc, prevc ( -- moved )  one place on or back, across lines.
+: nextc  cx @ 1 lit + cl llen < if cx @ 1 lit + cx ! 1 lit else cy @ nl @ 1 lit - < if cy @ 1 lit + cy ! 0 lit cx ! 1 lit else 0 lit then then ;
+: prevc  cx @ if cx @ 1 lit - cx ! 1 lit else cy @ if cy @ 1 lit - cy ! cl llen 1 lit - 0 lit mx cx ! 1 lit else 0 lit then then ;
+: wk variable ;  : wy variable ;
+\ wfwd  w: to the next word's start (an empty line is one).
+: wfwd
+cy @ wy !  chr cls wk !
+begin nextc dup if drop cy @ wy @ = chr cls wk @ = and wk @ 0= 0= and then 0= until
+begin chr cls 0= cl llen 0= 0= and if nextc else 0 lit then 0= until ;
+\ wback  b: to this word's start, or the one before.
+: wback
+prevc drop
+begin chr cls 0= cl llen 0= 0= and if prevc else 0 lit then 0= until
+chr cls wk !
+begin cx @ if cl ltxt cx @ 1 lit - + c@ cls wk @ = else 0 lit then while cx @ 1 lit - cx ! repeat ;
+\ wend  e: to this word's end, or the next one's.
+: wend
+nextc drop
+begin chr cls 0= if nextc else 0 lit then 0= until
+chr cls wk !
+begin cx @ 1 lit + cl llen < if cl ltxt cx @ 1 lit + + c@ cls wk @ = else 0 lit then while cx @ 1 lit + cx ! repeat ;
+\ first  ^: the line's first byte not a space.
+: first  0 lit cx !  begin chr dup 20 lit = swap 9 lit = or while cx @ 1 lit + cx ! repeat ;
+
+\ ── Search ──
+
+: pat variable ;  : pn variable ;  : sdir variable ;
+: ml variable ;  : mc variable ;  : sy variable ;  : sc variable ;  : fnd variable ;  : scnt variable ;
+\ mat? ( l c -- flag )  the pattern at byte c of line l.
+: mat?
+mc ! ml !
+ml @ llen mc @ - pn @ < if 0 lit else
+	1 lit pn @ 0 lit do ml @ ltxt mc @ + i + c@ pat @ i + c@ <> if drop 0 lit then loop
+then ;
+\ sfwd, sbck  the pattern's next place after the cursor, or before it
+\ (round the end).
+: sfwd
+cy @ sy !  cx @ 1 lit + sc !  0 lit fnd !  nl @ 1 lit + scnt !
+begin fnd @ 0= scnt @ and while
+	sc @ sy @ lof llen < if
+		sy @ lof sc @ mat? if 1 lit fnd ! else sc @ 1 lit + sc ! then
+	else
+		sy @ 1 lit + dup nl @ = if drop 0 lit "search hit BOTTOM, continuing at TOP" msg! then sy !
+		0 lit sc !  scnt @ 1 lit - scnt !
+	then
+repeat
+fnd @ if sy @ cy ! sc @ cx ! else "E486: Pattern not found" msg! then ;
+: sbck
+cy @ sy !  cx @ 1 lit - sc !  0 lit fnd !  nl @ 1 lit + scnt !
+begin fnd @ 0= scnt @ and while
+	sc @ 0< 0= if
+		sy @ lof sc @ mat? if 1 lit fnd ! else sc @ 1 lit - sc ! then
+	else
+		sy @ dup 0= if drop nl @ "search hit TOP, continuing at BOTTOM" msg! then 1 lit - sy !
+		sy @ lof llen 1 lit - sc !  scnt @ 1 lit - scnt !
+	then
+repeat
+fnd @ if sy @ cy ! sc @ cx ! else "E486: Pattern not found" msg! then ;
+: srch  pn @ 0= if "E35: No previous regular expression" msg! else sdir @ if sfwd else sbck then then ;   \ ( -- )
+
+\ ── Leaving ──
+
+: quit  oesc "?1049l" os oflush  0 lit 1 lit 0 lit tty drop  0 lit exit ;
+
+\ ── Normal mode ──
+
+: cnt variable ;
+: c1  cnt @ 1 lit mx ;                             \ ( -- n )  the count, 1 if none
+: oy variable ;  : ox variable ;
+: here!  cy @ oy !  cx @ ox ! ;                    \ the cursor kept
+: back!  oy @ cy !  ox @ cx ! ;                    \ and put back
+\ wto, eto ( -- n )  bytes from the cursor to where count w's (e's, and
+\ the byte there) lead, on this line (to its end if they leave it).
+: wto  here!  c1 0 lit do wfwd loop  cy @ oy @ = if cx @ else oy @ lof llen then ox @ -  back! ;
+: eto  here!  c1 0 lit do wend loop  cy @ oy @ = if cx @ 1 lit + else oy @ lof llen then ox @ -  back! ;
+\ del1  the byte at the cursor taken out (not yanked: insert mode's).
+: del1  cx @ cl llen < if cl ltxt cx @ + dup 1 lit + swap cl llen cx @ - 1 lit - mv  cl dup llen 1 lit - swap ! then ;
+
+\ dop, cop, yop  d, c, y and what follows them.
+: dop
+key
+dup 64 lit = if chg c1 dlines then
+dup 77 lit = if chg cx @ wto dchars then
+dup 65 lit = if chg cx @ eto dchars then
+dup 24 lit = over K_END = or if chg cx @ cl llen cx @ - dchars then
+dup 30 lit = if chg cx @ 0 lit cx ! 0 lit swap dchars then
+dup 62 lit = if here! wback cy @ oy @ = if chg cx @ ox @ cx @ - dchars else back! then then
+dup 6A lit = over K_DOWN = or if chg c1 1 lit + dlines then
+dup 6B lit = over K_UP = or if chg cy @ c1 - 0 lit mx dup cy @ swap - 1 lit + swap cy ! dlines then
+dup 47 lit = if chg nl @ cy @ - dlines then
+drop ;
+: cop
+key
+dup 63 lit = if chg cy @ 1 lit ylines  0 lit cl !  0 lit cx !  1 lit mode ! then
+dup 77 lit = over 65 lit = or if chg cx @ eto dchars 1 lit mode ! then
+dup 24 lit = if chg cx @ cl llen cx @ - dchars 1 lit mode ! then
+dup 30 lit = if chg cx @ 0 lit cx ! 0 lit swap dchars 1 lit mode ! then
+drop ;
+: yop
+key
+dup 79 lit = if cy @ c1 nl @ cy @ - mn ylines then
+dup 77 lit = if cl ltxt cx @ + wto ychars then
+dup 65 lit = if cl ltxt cx @ + eto ychars then
+dup 24 lit = if cl ltxt cx @ + cl llen cx @ - ychars then
+drop ;
+
+\ put ( after -- )  p and P: the yanked lines below or above the cursor's,
+\ or its bytes after or at the cursor (count times).
+: pp0 variable ;
+: put
+ylw @ if
+	yn @ 0= if drop else
+		chg  if cy @ 1 lit + else cy @ then dup pp0 !
+		c1 0 lit do yn @ 0 lit do ya @ i 2 lit lshift + @ lcopy over ains 1 lit + loop loop drop
+		pp0 @ cy !  first
+	then
+else
+	yc @ 0= if drop else
+		chg  if cl llen if cx @ 1 lit + cx ! then then
+		c1 0 lit do yc @ llen ?dup if 0 lit do yc @ ltxt i + c@ insc loop then loop
+		cx @ 1 lit - 0 lit mx cx !
+	then
+then ;
+
+\ jsp  J: the next line put at the end of this one, its leading spaces
+\ dropped, one space between.
+: jn variable ;
+: jsp
+cy @ 1 lit + nl @ < if
+	cy @ 1 lit + lof jl !  0 lit jn !
+	begin jn @ jl @ llen < if jl @ ltxt jn @ + c@ dup 20 lit = swap 9 lit = or else 0 lit then while jn @ 1 lit + jn ! repeat
+	jl @ ltxt jn @ + jl @ ltxt jl @ llen jn @ - mv  jl @ dup llen jn @ - swap !
+	cl llen cx !
+	cl llen jl @ llen 0= 0= and if cy @ cl llen 1 lit + lgrow  20 lit cl ltxt cl llen + c!  cl dup llen 1 lit + swap ! then
+	cy @ joinl
+then ;
+\ tilde  ~: the byte's case changed, the cursor on.
+: tilde
+chr dup 61 lit - 1A lit u< if 20 lit - else dup 41 lit - 1A lit u< if 20 lit + then then
+chr 0< if drop else chg cl ltxt cx @ + c! cx @ 1 lit + cx ! then ;
+
+: normal   \ ( k -- )
+dup 68 lit = over K_LEFT = or over 8 lit = or over 7F lit = or if c1 0 lit do cx @ 1 lit - 0 lit mx cx ! loop then
+dup 6C lit = over K_RIGHT = or over 20 lit = or if cx @ c1 + cx ! then
+dup 6A lit = over K_DOWN = or over E lit = or if cy @ c1 + cy ! then
+dup 6B lit = over K_UP = or over 10 lit = or if cy @ c1 - cy ! then
+dup 30 lit = over K_HOME = or if 0 lit cx ! then
+dup 5E lit = if first then
+dup 24 lit = over K_END = or if cl llen cx ! then
+dup 77 lit = if c1 0 lit do wfwd loop then
+dup 62 lit = if c1 0 lit do wback loop then
+dup 65 lit = if c1 0 lit do wend loop then
+dup 47 lit = if cnt @ if cnt @ 1 lit - else nl @ 1 lit - then cy ! first then
+dup 67 lit = if key 67 lit = if cnt @ 1 lit - 0 lit mx cy ! first then then
+dup 48 lit = if top @ cy ! first then
+dup 4C lit = if top @ rows @ 2 lit - + cy ! first then
+dup 4D lit = if top @ rows @ 1 lit - nl @ top @ - mn 1 lit rshift + cy ! first then
+dup 6 lit = over K_PGDN = or if top @ rows @ 2 lit - c1 * + dup top ! cy ! then
+dup 2 lit = over K_PGUP = or if top @ rows @ 2 lit - c1 * - 0 lit mx dup top ! rows @ 2 lit - + cy ! then
+dup 4 lit = if rows @ 1 lit rshift dup cy @ + cy !  top @ + top ! then
+dup 15 lit = if rows @ 1 lit rshift dup cy @ swap - cy !  top @ swap - 0 lit mx top ! then
+dup 78 lit = over K_DEL = or if cl llen cx @ - c1 mn dup 0 lit > if chg cx @ swap dchars else drop then then
+dup 58 lit = if cx @ c1 mn dup 0 lit > if chg cx @ over - cx ! cx @ swap dchars else drop then then
+dup 44 lit = if chg cx @ cl llen cx @ - dchars then
+dup 43 lit = if chg cx @ cl llen cx @ - dchars 1 lit mode ! then
+dup 53 lit = if chg cy @ 1 lit ylines 0 lit cl ! 0 lit cx ! 1 lit mode ! then
+dup 64 lit = if dop then
+dup 63 lit = if cop then
+dup 79 lit = if yop then
+dup 59 lit = if cy @ c1 nl @ cy @ - mn ylines then
+dup 70 lit = if 1 lit put then
+dup 50 lit = if 0 lit put then
+dup 4A lit = if chg cnt @ 1 lit - 1 lit mx 0 lit do jsp loop then
+dup 72 lit = if key dup 20 lit u< over 7E lit u> or if drop else cx @ cl llen < if chg cl ltxt cx @ + c! else drop then then then
+dup 7E lit = if tilde then
+dup 69 lit = if chg 1 lit mode ! then
+dup 61 lit = if chg 1 lit mode ! cl llen if cx @ 1 lit + cx ! then then
+dup 49 lit = if chg first 1 lit mode ! then
+dup 41 lit = if chg 1 lit mode ! cl llen cx ! then
+dup 6F lit = if chg 10 lit lmk cy @ 1 lit + ains cy @ 1 lit + cy ! 0 lit cx ! 1 lit mode ! then
+dup 4F lit = if chg 10 lit lmk cy @ ains 0 lit cx ! 1 lit mode ! then
+dup 75 lit = if undo then
+dup 12 lit = if redo then
+dup 3A lit = over 2F lit = or over 3F lit = or if dup ctype ! 0 lit cn ! 2 lit mode ! then
+dup 6E lit = if srch then
+dup 4E lit = if sdir @ 0= sdir ! srch sdir @ 0= sdir ! then
+dup 5A lit = if key dup 5A lit = if drop dirty @ if save if quit then else quit then else 51 lit = if quit then then then
+drop clamp ;
+
+\ ── Insert mode ──
+
+\ bksp  Backspace: the byte before the cursor taken out, or (at a line's
+\ start) this line joined to the one above.
+: bksp
+cx @ if cx @ 1 lit - cx ! del1 else
+	cy @ if cy @ 1 lit - lof llen  cy @ 1 lit - joinl  cy @ 1 lit - cy !  cx ! then
+then ;
+: imode   \ ( k -- )
+dup 1B lit = if drop 0 lit mode ! cx @ 1 lit - 0 lit mx cx ! else
+dup D lit = over A lit = or if drop splitl else
+dup 7F lit = over 8 lit = or if drop bksp else
+dup K_LEFT = if drop cx @ 1 lit - 0 lit mx cx ! else
+dup K_RIGHT = if drop cx @ 1 lit + cl llen mn cx ! else
+dup K_UP = if drop cy @ 1 lit - 0 lit mx cy ! clamp else
+dup K_DOWN = if drop cy @ 1 lit + cy ! clamp else
+dup K_HOME = if drop 0 lit cx ! else
+dup K_END = if drop cl llen cx ! else
+dup K_DEL = if drop cx @ cl llen < if del1 else cy @ joinl then else
+dup 9 lit = over 20 lit u< 0= over 7F lit <> and over 100 lit u< and or if insc else drop
+then then then then then then then then then then then ;
+
+\ ── The command line (: / ?) ──
+
+\ excmd  a : command: w [file] (another file: written, the buffer's name
+\ kept, unless it has none), q, q!, wq, x, a line's number, $.
+: excmd
+cmd @ "w" streq cmd @ "w!" streq or if save drop else
+cmd @ "q" streq if dirty @ if "E37: No write since last change (add ! to override)" msg! else quit then else
+cmd @ "q!" streq if quit else
+cmd @ "wq" streq cmd @ "x" streq or cmd @ "wq!" streq or if save if quit then else
+cmd @ "$" streq if nl @ 1 lit - cy ! first else
+cmd @ c@ 77 lit = cmd @ 1 lit + c@ 20 lit = and if
+	cmd @ 2 lit + begin dup c@ 20 lit = while 1 lit + repeat
+	fname @ c@ if savef drop else fname @ swap scpy 0 lit swap c!  save drop then
+else
+cmd @ c@ 30 lit - A lit u< if cmd @ atoi 1 lit - 0 lit mx cy ! first else
+cn @ if "E492: Not an editor command: " msg!  msg @ dup strlen + cmd @ scpy 0 lit swap c! then
+then then then then then then then ;
+\ cexec  the command line run: a : command, or a search (/ on, ? back;
+\ empty: the last pattern again).
+: cexec
+0 lit cmd @ cn @ + c!
+ctype @ 3A lit = if excmd else
+	cn @ if cmd @ pat @ cn @ 1 lit + mv  cn @ pn ! then
+	ctype @ 2F lit = sdir !  srch
+then ;
+: cmode   \ ( k -- )
+dup 1B lit = if drop 0 lit mode ! else
+dup D lit = over A lit = or if drop 0 lit mode ! cexec else
+dup 7F lit = over 8 lit = or if drop cn @ if cn @ 1 lit - cn ! else 0 lit mode ! then else
+dup 20 lit u< 0= over 7F lit u< and cn @ C8 lit u< and if cmd @ cn @ + c!  cn @ 1 lit + cn ! else drop then
+then then then ;
+
+\ ── The loop ──
+
+\ waitk ( -- k )  the next key, the screen drawn again if its size
+\ changes while waiting.
+: waitk  begin pbn @ if 0 lit else 11E1A300 lit ready? 0= then while tsize if draw then repeat key ;
+: main
+begin
+	draw  waitk
+	dup 0< if quit then
+	0 lit msg @ c!
+	mode @ 1 lit = if imode else
+	mode @ 2 lit = if cmode else
+	dup 31 lit - 9 lit u< over 30 lit = cnt @ 0= 0= and or if
+		30 lit - cnt @ dup 3 lit lshift swap 1 lit lshift + + cnt !
+	else normal 0 lit cnt ! then
+	then then
+0 lit until ;
+
+100 lit alloc fname !  100 lit alloc msg !  100 lit alloc cmd !  100 lit alloc pat !
+8 lit alloc pe !  4 lit alloc kb !  4 lit alloc pb !  0 lit pbn !  4 lit alloc dup nlb ! A lit swap c!
+0 lit msg @ c!  0 lit fname @ c!
+A000 lit malloc obuf !  0 lit op !
+A lit lcap !  28 lit malloc lns !  0 lit nl !
+C8 lit malloc us !  C8 lit malloc rs !  0 lit ua !  0 lit ra !
+0 lit ya !  0 lit yn !  0 lit ylw !  0 lit yc !
+0 lit rows !  0 lit cols !  0 lit asked !
+1 lit arg ?dup if fname @ swap scpy 0 lit swap c! then
+0 lit 1 lit 1 lit tty 0< if "vi: not a terminal" eputs 0A lit eputc 1 lit exit then
+oesc "?1049h" os oflush
+load  0 lit cy !  0 lit cx !  0 lit top !  0 lit lft !  0 lit mode !  0 lit cnt !  FFFFFFFF lit sdir !  0 lit pn !
+main

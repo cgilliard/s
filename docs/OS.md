@@ -907,6 +907,52 @@ kernel too much to add at the end.
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.
+
+    Part 1, the editor (2026-11-07): `vi [file]`, a full-screen editor
+    like vim, in `src/user/vi.fam`.
+
+    How it works:
+    - Its terminal is raw (`tty`) and on the alternate screen while it
+      runs, and the whole screen is drawn again after each key.
+    - The size comes from `tty`, which the browser's terminal sets
+      through wm and which vi checks while it waits for a key. Failing
+      that, vi asks the terminal itself (`ESC [6n`, keys typed meanwhile
+      put back), and failing that it uses 24 by 80.
+    - Esc is told from an arrow's escape sequence by a 30 ms wait, and
+      what follows Esc is put back. So Esc then `o` typed fast still
+      opens a line.
+
+    Commands:
+    - Movement: h j k l and the arrows, w b e, 0 ^ $, gg G, H M L, and
+      ^F ^B ^D ^U. A count goes before most (3j, 2dd).
+    - Changes: x X r ~ J, dd D dw de d$ d0 db dj dk dG, cw ce cc c$ C
+      S, and yy yw ye y$ Y with p and P (lines or bytes).
+    - Insert: i a I A o O. In insert mode: typing, Backspace (which
+      joins lines at a line's start), Enter, the arrows, Home, End and
+      Delete.
+    - Undo and redo (u, ^R), 50 deep. Each is a copy of the buffer
+      taken before a change.
+    - Search: / ? n N, by plain text, wrapping round the file.
+    - Leaving and writing: ZZ, ZQ, :w [file], :q (refused, E37, with
+      changes unwritten), :q!, :wq, :x, :N and :$. `:w other` writes
+      there and keeps the buffer's own name, as vim does.
+
+    Not yet: `.`, visual mode, :s, marks, registers and autoindent.
+
+    A kernel bug found on the way: `pfinish` freed a process's mapped
+    blocks from its state word instead of each block's first address.
+    So a process that ended with memory still mapped (vi, through
+    malloc) corrupted the page allocator, and the next allocation
+    faulted.
+
+    Checked:
+    - `vi_1/4` on the console: a file typed and written; its lines
+      swapped and written; a change refused by :q and dropped by :q!;
+      `cat` after each.
+    - The page test, in a browser window: vi's screen, a file written,
+      and the shell's screen back after.
+    - `mapexit_1/4`: memory still mapped at a process's end is given
+      back whole.
 12. **The node as a daemon.** A document of its own: the chain's logic
     in fam (verification, the state tree, sync, the protocol), its seed
     data in the image, started by `/etc/init`.

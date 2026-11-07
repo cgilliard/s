@@ -1040,7 +1040,7 @@ dup C0 lit + @ ?dup if 1 lit pgfree  0 lit over C0 lit + ! then
 TXMAX 0 lit do i 4 lit lshift stx @ + dup 4 lit + @ 2 lit pick = over 8 lit + @ 2 lit = and if 3 lit swap 8 lit + !  1 lit kdfl ! else drop then loop
 dup 10 lit + @ over 14 lit + @ pgfree
 dup 30 lit + 4 lit 0 lit do
-	dup @ ?dup if over 4 lit + @ swap - C lit rshift 2 lit pick @ swap pgfree then
+	dup @ ?dup if over 4 lit + @ swap - C lit rshift over @ swap pgfree then
 	8 lit +
 loop drop
 thi @ 0 lit do
