@@ -6,7 +6,7 @@
 \ (user a number, the group the same: a program not root's runs by way of
 \ runas), starting again those marked restart when they end (a second
 \ later).  With no /etc/init (no disk, or none written yet) it keeps a
-\ shell on the console.  It makes /bin first if the store has none (where
+\ shell on the console, and its exit stops the machine.  It makes /bin first if the store has none (where
 \ programs are put to be run by name; the image's are listed there too).
 
 : buf variable ;  : st variable ;  : t variable ;  : n variable ;
@@ -53,12 +53,18 @@ dup 0< if "init: cannot start " puts drop C lit + @ puts 0A lit putc else
 	then
 then ;
 
-\ shell  no /etc/init: a shell on the console, again when it ends.
+\ shell  no /etc/init: a shell on the console.  Its exit (exit, or ^D:
+\ code 0) stops the machine (/proc/halt); ended otherwise (killed, a
+\ fault), another is started.
 : shell
 "init: starting the shell" puts 0A lit putc
 begin
 	"sh" spawn dup 0< if "init: no shell: " puts . 0A lit putc 1 lit exit then
 	st wait drop
+	st @ 0= if
+		"init: the shell exited; halting" puts 0A lit putc
+		"/proc/halt" 1 lit open dup 0< 0= if dup "1" 1 lit write drop then drop
+	then
 	"init: the shell ended; again" puts 0A lit putc
 0 lit until ;
 

@@ -265,7 +265,7 @@ for n in 1 4; do
 	feed 20 "$T/shell.in" ./tools/q32 --smp=$n "$T/shell.img" > "$o" 2>&1
 	for pat in '^hello world$' '^PID PPID S THR KIB TICKS CMD$' '^1 0 S 1 64 [0-9]* init$' '^2 1 S 1 64 [0-9]* sh$' \
 		'^3 2 R 1 64 [0-9]* ps$' '^1 3 14$' '^100 100 102400$' '^cat /proc/self/cmd$' '^7$' \
-		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell ended; again$' \
+		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell exited; halting$' \
 		'^\(\$ \)*\[[0-9]*\]$' '\[[0-9]*\] done$' '^sh: & only ends a line$' \
 		'^uptime$' '^tty/$' '^tickets$' '^runas$' '^/bin$' '^by its path$' '^sh: echo: not found$' '^found$' '^halt$' '^kernel: halted$'; do
 		grep -q -- "$pat" "$o" || { fail "shell_$n" "no /$pat/ in: $(head -c 600 "$o")"; break; }

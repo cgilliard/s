@@ -826,8 +826,10 @@ kernel too much to add at the end.
     file). `/proc/halt` is a new key: written only, and by root only,
     it stops the machine (QEMU exits 0). The `halt` program writes it.
     The store's commits are whole, so stopping loses only what was not
-    yet committed. `exit` at the console only ends the shell; init then
-    starts another.
+    yet committed. Later the same day: when init keeps the console
+    shell (no `/etc/init`), the shell exiting normally (`exit` or ^D)
+    stops the machine the same way. A shell that is killed or faults is
+    started again, as before.
 
     Programs from the store (2026-11-07). This replaces the virtual
     `/bin` above. `/bin` is now a directory of the store, made by init
