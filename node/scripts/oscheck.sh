@@ -390,7 +390,7 @@ rm -f "$T/users.disk"; dd if=/dev/zero of="$T/users.disk" bs=1 count=0 seek=2684
 N=$((N + 1))
 feed 15 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
 feed 18 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
-for pat in '^0 0$' '^init$' '^passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
+for pat in '^\([$] \)*0 0$' '^\([$] \)*init$' '^\([$] \)*passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
 for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/alice$' '^mine$' '^cat: cannot open /etc/passwd$' \
 	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^root:rootpw:0:0:/:sh$' '^f$'; do
 	grep -q -- "$pat" "$T/u2.out" || fail users_boot2 "no /$pat/ in: $(head -c 900 "$T/u2.out")"
@@ -415,7 +415,7 @@ s @ "again" 5 lit write "write " puts . sp
 s @ ent @ !  1 lit ent @ 4 lit + !
 ent @ 1 lit 0 lit poll "poll " puts . sp
 s @ b @ 40 lit read dup "read " puts . sp b @ + 0 lit swap c! b @ puts 0A lit putc
-2 lit socket "kind " puts . sp  0 lit b @ 1 lit 0 lit recvfrom "notsock " puts . sp
+3 lit socket "kind " puts . sp  0 lit b @ 1 lit 0 lit recvfrom "notsock " puts . sp
 1 lit socket dup 1 lit 0 lit 1234 lit net drop  1 lit socket 1 lit 0 lit 1234 lit net "taken " puts . sp
 close drop  s @ close "close " puts . 0A lit putc bye'
 sh scripts/mkimage.sh "$T/udp.img" bin/kernel init="$T/tudp.bin" 2> "$T/udp.mk" || fail udp "mkimage: $(cat "$T/udp.mk")"
@@ -433,6 +433,87 @@ for n in 1 4; do
 	has "udp_$n" '^kind -22 notsock -88 taken -98 close 0$'
 done
 kill $EP
+
+# TCP (step 9).  A client: connected to an echo server on the host,
+# written, read, closed; a port no one listens on refused.  Then 400 KiB
+# sent to a host server that checks them, on a kernel losing 16 frames in
+# a row (ndrop: the acknowledgments of what is in flight), so what was sent
+# goes again (/proc/net counts it) and the socket is freed after.
+TP=$((UP + 1)); TPX=$(printf %X "$TP")
+usrc ttcp ': b variable ;  : s variable ;  : sp  20 lit putc ;
+100 lit alloc b !
+2 lit socket s !
+s @ 2 lit A000202 lit '"$TPX"' lit net "connect " puts . sp
+s @ "hello tcp" 9 lit write "write " puts . sp
+s @ b @ 100 lit read dup "read " puts . sp b @ + 0 lit swap c! b @ puts 0A lit putc
+s @ close "close " puts . sp
+2 lit socket dup 2 lit A000202 lit 3 lit net "refused " puts . sp close drop 0A lit putc bye'
+usrc tup ': b variable ;  : s variable ;  : sp  20 lit putc ;
+400 lit alloc b !  400 lit 0 lit do i 3F lit and 30 lit + b @ i + c! loop
+2 lit socket s !
+s @ 2 lit A000202 lit '"$TPX"' lit net "connect " puts . sp
+0 lit 190 lit 0 lit do s @ b @ 400 lit write + loop "wrote " puts . sp
+s @ b @ 100 lit read dup "read " puts . sp b @ + 0 lit swap c! b @ puts 0A lit putc
+s @ close drop 3B9ACA00 lit sleep
+"/proc/net" 0 lit open dup b @ 100 lit read b @ + 0 lit swap c! close drop b @ puts bye'
+printf '%s\n' kboot '28 lit ndrop !' '"init" 64 lit kspawn drop' hloop > "$T/lossy.fam"
+./tools/fam -o "$T/lossyk.bin" src/kernel.fam src/store.fam src/net.fam src/ksys.fam "$T/lossy.fam" > "$T/lossy.build" 2>&1 \
+	|| fail tcp_lossy "build: $(head -c 300 "$T/lossy.build")"
+sh scripts/mkimage.sh "$T/tcp.img" bin/kernel init="$T/ttcp.bin" 2> "$T/tcp.mk" || fail tcp "mkimage: $(cat "$T/tcp.mk")"
+sh scripts/mkimage.sh "$T/up.img" "$T/lossyk.bin" init="$T/tup.bin" 2> "$T/up.mk" || fail tcp_lossy "mkimage: $(cat "$T/up.mk")"
+python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(5)
+pat = bytes(48 + (i & 63) for i in range(1024)) * 400
+while True:
+    c, a = s.accept(); got = b""
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        got += d
+        if got == b"hello tcp": c.sendall(b"echo:" + got); got = b""
+        if len(got) >= len(pat): break
+    if got: c.sendall(b"got %d %s" % (len(got), b"intact" if got == pat else b"BAD"))
+    c.close()
+' "$TP" & EP=$!
+for n in 1 4; do
+	expect "tcp_$n" 124 '^connect 0 write 9 read 14 echo:hello tcp$' 6 ./tools/q32 --smp=$n --net "$T/tcp.img"
+	has "tcp_$n" '^close 0 refused -111 $'
+done
+expect tcp_lossy 124 '^connect 0 wrote 409600 read 17 got 409600 intact$' 20 ./tools/q32 --net "$T/up.img"
+has tcp_lossy '^tcp 0 retransmits [1-9]'
+kill $EP
+
+# A web server: httpd (src/user/httpd.fam) serving files from the store,
+# fetched by the host through a forwarded port: a page, 100 KiB (whole),
+# a 404, and 40 fetches one after another (more than TCP's 32 sockets).
+usrc thttp ': b variable ;  : st variable ;
+400 lit alloc b !
+"/index.html" 201 lit open dup "<h1>hello from the guest</h1>" dup strlen write drop close drop
+400 lit 0 lit do i 3F lit and 30 lit + b @ i + c! loop
+"/big" 201 lit open 64 lit 0 lit do dup b @ 400 lit write drop loop close drop
+"httpd" spawn drop  st wait drop bye'
+sh scripts/mkimage.sh "$T/http.img" bin/kernel init="$T/thttp.bin" httpd=bin/user/httpd 2> "$T/http.mk" || fail httpd "mkimage: $(cat "$T/http.mk")"
+python3 -c 'import sys; sys.stdout.buffer.write(bytes(48 + (i & 63) for i in range(1024)) * 100)' > "$T/big.want"
+for n in 1 4; do
+	N=$((N + 1))
+	HP=$((TP + n))
+	rm -f "$T/http.disk"; dd if=/dev/zero of="$T/http.disk" bs=1 count=0 seek=268435456 2>/dev/null
+	./tools/q32 --smp=$n --net --hostfwd=tcp::$HP-:80 --disk="$T/http.disk" "$T/http.img" < /dev/null > "$T/httpd_$n.out" 2>&1 &
+	QP=$!                          # q32 execs QEMU: this is QEMU
+	i=0; while [ $i -lt 20 ] && ! grep -q 'httpd: port 80' "$T/httpd_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	page=$(curl -s -m 5 "http://127.0.0.1:$HP/")
+	curl -s -m 10 -o "$T/big_$n.got" "http://127.0.0.1:$HP/big"
+	nf=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/nosuch")
+	ok=0; for j in $(seq 40); do [ "$(curl -s -m 3 "http://127.0.0.1:$HP/index.html")" = "<h1>hello from the guest</h1>" ] && ok=$((ok + 1)); done
+	kill $QP 2>/dev/null; wait $QP 2>/dev/null
+	[ "$page" = "<h1>hello from the guest</h1>" ] || fail "httpd_$n" "page: $page; $(head -c 300 "$T/httpd_$n.out")"
+	cmp -s "$T/big.want" "$T/big_$n.got" || fail "httpd_$n" "100 KiB not whole: $(wc -c < "$T/big_$n.got") bytes"
+	[ "$nf" = 404 ] || fail "httpd_$n" "no 404: $nf"
+	[ "$ok" = 40 ] || fail "httpd_$n" "$ok of 40 fetches"
+done
+rm -f "$T/http.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
 expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds

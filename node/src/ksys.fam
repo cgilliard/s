@@ -438,11 +438,13 @@ dup 5 lit = if pp @ pstatus then
 dup 6 lit = if pp @ pcmd then
 dup A lit = if pp @ C4 lit + @ tn 20 lit tc pp @ C8 lit + @ tn then
 dup 9 lit = if pp @ C0 lit + @ ?dup if dup 4 lit + swap @ ?dup if 0 lit do dup i + c@ tc loop then drop else 2F lit tc then then
-7 lit = if pp @ 20 lit + @ tn then
+dup 7 lit = if pp @ 20 lit + @ tn then
+10 lit = if nk @ if "tcp " ts ctcpn tn " retransmits " ts nretx @ tn else "none" ts then then
 A lit tc ;
 
 \ popen ( s mode -- f | 0 | error )  a key under /proc: self, harts, mem
-\ (KiB free), uptime (seconds), and <pid>/ status, cmd, tickets (also
+\ (KiB free), uptime (seconds), net (TCP's sockets in use, its
+\ retransmissions), and <pid>/ status, cmd, tickets (also
 \ written: the process's tickets), kill (written only: it ends, -9).
 : popen
 pm !  0 lit pq !
@@ -450,12 +452,13 @@ dup "self" streq if 1 lit pq ! then
 dup "harts" streq if 2 lit pq ! then
 dup "mem" streq if 3 lit pq ! then
 dup "uptime" streq if 4 lit pq ! then
+dup "net" streq if 10 lit pq ! then
 pq @ if drop else
 	ppath
 	pp @ if pk @ ?dup if 4 lit + pq ! then then
 then
 pq @ 0= if FFFFFFFE lit else
-pq @ 7 lit u< 0= pm @ 1 lit <> and if
+pq @ 7 lit u< 0= pq @ 10 lit u< and pm @ 1 lit <> and if
 	5 lit 2 lit fnew dup if pp @ pid over 14 lit + !  pq @ 9 lit = if 3 lit else pq @ A lit = if 4 lit else pq @ 6 lit - then then over 18 lit + ! then
 else
 pq @ 8 lit = pm @ 1 lit <> or if FFFFFFF3 lit else
@@ -604,6 +607,39 @@ over dup 10 lit + @ swap 14 lit + @ = if drop 5 lit tretry BLK else
 	swap 14 lit + dup @ 1 lit + swap !
 then ;
 
+\ tcrd ( p -- n | BLK )  read on a TCP socket: what has arrived, up to n
+\ bytes (waiting for some); 0 at its end (or its error).  A window grown by
+\ a segment's worth told to the peer.  Under klk.
+: tcrd
+dup crh @ over crtl @ = if
+	dup cflg @ 8 lit and over cst @ 4 lit u< or if cerr @ else 5 lit tretry BLK then
+else
+	2C lit sysarg  over crh @ 2 lit pick crtl @ - 30 lit sysarg cmin
+	swap over 3 lit pick 1000 lit + 1000 lit 5 lit pick crtl @ rget
+	over crtl @ over + 2 lit pick crtl !
+	over cfree# 2 lit pick cadv @ - 5B4 lit u< 0= 2 lit pick cst @ 4 lit u< 0= and if over 10 lit 0 lit ntcpout then
+	nip
+then ;
+
+\ tcwr ( p -- n | BLK )  write on a TCP socket: all n bytes, into what is
+\ written as there is room (waiting for more; E8 how many before the wait),
+\ sent as the window allows; -32 once it cannot send (or its error).  Under
+\ klk.
+: cwm variable ;
+: tcwr
+dup cst @ dup 4 lit = swap 7 lit = or 0= if dup cerr @ ?dup if nip else drop FFFFFFE0 lit then else
+	area@ E0 lit + @ if area@ E8 lit + @ else 0 lit then
+	2C lit sysarg over +
+	30 lit sysarg 2 lit pick -
+	3 lit pick dup csw @ swap cackd - 2000 lit swap - cmin
+	?dup if
+		dup cwm !  3 lit pick 2000 lit + 2000 lit 5 lit pick csw @ rput
+		over csw @ cwm @ + 2 lit pick csw !
+		cwm @ +  over tout
+	else drop then
+	dup 30 lit sysarg = if nip else area@ E8 lit + !  5 lit tretry BLK then
+then ;
+
 \ uwrite ( page -- n )  write on a connected socket: the datagram to its
 \ peer (-89 not connected).  Under klk.
 : uwrite
@@ -622,7 +658,7 @@ dup @
 dup 1 lit = if 2drop cread else
 dup 2 lit = if 2drop 0 lit else
 dup 3 lit = if drop 8 lit + @ pread else
-dup 8 lit = if drop 8 lit + @ 0 lit urecv else
+dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if 0 lit urecv else tcrd then else
 4 lit = if ptread else drop 0 lit
 then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
@@ -640,7 +676,7 @@ dup 1 lit = if
 else
 dup 2 lit = if 2drop 30 lit sysarg else
 dup 3 lit = if drop 8 lit + @ pwrite else
-dup 8 lit = if drop 8 lit + @ uwrite else
+dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if uwrite else tcwr then else
 drop pkwrite
 then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
@@ -685,7 +721,7 @@ dup @ 3 lit = if
 	then
 else
 dup @ 4 lit = if 1 lit else
-dup @ 8 lit = if dup 8 lit + @ dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else 4 lit
+dup @ 8 lit = if dup 8 lit + @ dup @ 1 lit = if dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else cready then else 4 lit
 then then then then then
 swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
 
@@ -715,25 +751,57 @@ then
 then then
 klk @ unlock dup BLK = if drop else sret then ;
 
-\ 30 socket(kind): a socket, kind 1 UDP: its descriptor; -22 another kind,
-\ -19 no network device, -23 no open file free, -12, -24.
+\ 30 socket(kind): a socket, kind 1 UDP, 2 TCP: its descriptor; -22
+\ another kind, -19 no network device, -23 no open file free, -12 no
+\ memory (or TCP's 32 sockets taken), -24.
 : ssocket
 klk @ lock
-28 lit sysarg 1 lit <> if FFFFFFEA lit else
+28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFEA lit else
 nk @ 0= if FFFFFFED lit else
 8 lit 3 lit fnew ?dup 0= if FFFFFFE9 lit else
-4 lit pgalloc ?dup 0= if 0 lit swap ! FFFFFFF4 lit else
-	dup 40 lit mzero  1 lit over !  over 8 lit + !
+28 lit sysarg 1 lit = if 4 lit pgalloc dup if dup 40 lit mzero  1 lit over ! then else cnew then
+?dup 0= if 0 lit swap ! FFFFFFF4 lit else
+	over 8 lit + !
 	dup area@ tproc fdput dup 0< if swap fclose else nip then
 then then then then
 klk @ unlock sret ;
 
+\ tnet ( p -- r | BLK )  net() on a TCP socket: 1 bind, 3 listen (bound),
+\ 2 connect (waiting until it is, or is refused: -111, or times out:
+\ -110; -113 no gateway yet).
+: tnet
+2C lit sysarg 1 lit = if
+	34 lit sysarg FFFF lit u> over 4 lit + @ or if drop FFFFFFEA lit else
+	34 lit sysarg ?dup 0= if cephem then
+	dup ctaken if 2drop FFFFFF9E lit else swap 4 lit + ! 0 lit then
+	then
+else 2C lit sysarg 3 lit = if
+	dup 4 lit + @ 0= over cst @ or if drop FFFFFFEA lit else 1 lit swap cst ! 0 lit then
+else 2C lit sysarg 2 lit = if
+	dup cerr @ ?dup if nip else
+	dup cst @ 2 lit = if 5 lit tretry BLK else
+	dup cst @ 3 lit u> if drop 0 lit else
+	dup cst @ if drop FFFFFFEA lit else
+	30 lit sysarg 0= 34 lit sysarg 0= or 34 lit sysarg FFFF lit u> or if drop FFFFFFEA lit else
+	ngwok @ 0= if drop FFFFFF8F lit else
+		30 lit sysarg over 8 lit + !  34 lit sysarg over C lit + !
+		dup 4 lit + @ 0= if cephem over 4 lit + ! then
+		mtime@ over ciss !  dup ciss @ over cuna !  dup ciss @ over cnxt !
+		dup 2 lit 0 lit ntcpout
+		dup cnxt @ 1 lit + over cnxt !  2 lit over cst !
+		mtime@ over crto @ + 1 lit or over cdl !
+		5 lit tretry BLK
+	then then then then then then
+else drop FFFFFFEA lit then then then ;
+
 \ 31 net(fd, op, ip, port): op 1 binds it to port (0: one chosen), op 2
-\ connects it to ip and port (read and write go there, only what comes
-\ from there arrives).  0, or -88 not a socket, -22, -98 the port taken.
+\ connects it to ip and port (read and write go there; for UDP only what
+\ comes from there arrives), op 3 (TCP) listens.  0, or -88 not a socket,
+\ -22, -98 the port taken; tnet's.
 : snet
 klk @ lock
 28 lit sysarg ufsock ?dup 0= if FFFFFFA8 lit else
+dup @ 2 lit = if tnet else
 2C lit sysarg 1 lit = if
 	34 lit sysarg FFFF lit u> over 4 lit + @ or if drop FFFFFFEA lit else
 	34 lit sysarg ?dup 0= if nephem then
@@ -744,27 +812,46 @@ else 2C lit sysarg 2 lit = if
 	30 lit sysarg over 8 lit + !  34 lit sysarg over C lit + !  uslp drop 0 lit
 	then
 else drop FFFFFFEA lit then then
-then
-klk @ unlock sret ;
+then then
+klk @ unlock dup BLK = if drop else sret then ;
+
+\ 32 accept(fd): a connection to the listening TCP socket fd, as a new
+\ descriptor (waiting for one): -88, -22 not listening, -23, -24.
+: saccept
+klk @ lock
+28 lit sysarg ufsock ?dup 0= if FFFFFFA8 lit else
+dup @ 2 lit <> over cst @ 1 lit <> or if drop FFFFFFEA lit else
+dup crh @ over crtl @ = if 5 lit tretry BLK else
+8 lit 3 lit fnew ?dup 0= if drop FFFFFFE9 lit else
+	over dup crtl @ 7 lit and 2 lit lshift 100 lit + + @ over 8 lit + !
+	dup area@ tproc fdput dup 0< if
+		swap 0 lit swap !  nip
+	else
+		nip swap dup crtl @ 1 lit + swap crtl !
+	then
+then then then then
+klk @ unlock dup BLK = if drop else sret then ;
 
 \ 33 sendto(fd, buf, n, ip, port): a datagram (the socket bound first if
 \ it is not): n, or -88, -14, and usend's.
 : ssendto
 klk @ lock
 28 lit sysarg ufsock ?dup 0= if klk @ unlock FFFFFFA8 lit else
+dup @ 1 lit <> if drop klk @ unlock FFFFFFEA lit else
 2C lit sysarg 30 lit sysarg urange 0= if drop klk @ unlock FFFFFFF2 lit else
 uslp klk @ unlock
 34 lit sysarg 38 lit sysarg 2C lit sysarg 30 lit sysarg usend
-then then sret ;
+then then then sret ;
 
 \ 34 recvfrom(fd, buf, n, from): urecv's; -88, -14.
 : srecvf
 klk @ lock
 28 lit sysarg ufsock ?dup 0= if FFFFFFA8 lit else
+dup @ 1 lit <> if drop FFFFFFEA lit else
 2C lit sysarg 30 lit sysarg uwrange 0= if drop FFFFFFF2 lit else
 34 lit sysarg ?dup if 8 lit uwrange else 1 lit then 0= if drop FFFFFFF2 lit else
 34 lit sysarg urecv
-then then then
+then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ ── Files (docs/OS.md, sections 6 and 11) ──
@@ -1378,13 +1465,14 @@ dup 1C lit = if drop sdel else
 dup 1D lit = if drop snext else
 dup 1E lit = if drop ssocket else
 dup 1F lit = if drop snet else
+dup 20 lit = if drop saccept else
 dup 21 lit = if drop ssendto else
 dup 22 lit = if drop srecvf else
 dup 23 lit = if drop sremove else
 dup 24 lit = if drop smkdir else
 dup 25 lit = if drop schmod else
 26 lit = if schown else FFFFFFDA lit sret
-then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ ukill  an exception in user mode: the process ends (-1), the system goes on.
 : ukill
@@ -1692,7 +1780,7 @@ blkfind if                    \ a disk: the store, found or made, and its interr
 	"kernel: the store: " puts npg @ 8 lit rshift u. " MiB, " puts hwm @ u. " pages in use" puts 0A lit putc
 then
 nfind ?dup if                 \ a network device: started, and its interrupt
-	nk !  ninit
+	nk !  ninit cinit
 	nk @ 10001000 lit - C lit rshift 1 lit + dup nirq ! kplic
 	"kernel: the network: " puts nmac @ .mac ", 10.0.2.15" puts 0A lit putc
 	narpwait ngwok @ if "kernel: the gateway: " puts ngw @ .mac 0A lit putc then

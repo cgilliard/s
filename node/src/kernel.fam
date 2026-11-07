@@ -853,7 +853,8 @@ nip if hpoke then ;
 \ fclose ( f -- )  a descriptor fewer on it; with the last, it is gone (a
 \ pipe's end: its peers woken, the page freed with the last end; a tree:
 \ closed later, by kdefer, since closing it may wait; a socket: its readers
-\ woken, its pages freed).  Under klk.
+\ woken, a UDP one's pages freed, a TCP one marked for closing on the wire
+\ and freeing, by src/net.fam's csweep).  Under klk.
 : fclose
 dup 4 lit + @ 1 lit - dup 2 lit pick 4 lit + !
 if drop else
@@ -862,7 +863,7 @@ if drop else
 		dup 8 lit + @ dup fwake  dup @ over 4 lit + @ or 0= if 1 lit pgfree else drop then
 	then
 	dup @ 4 lit = over @ 7 lit = or if dup 8 lit + @ ?dup if 1 lit pgfree then then
-	dup @ 8 lit = if dup 8 lit + @ dup fwake 4 lit pgfree then
+	dup @ 8 lit = if dup 8 lit + @ dup fwake dup @ 1 lit = if 4 lit pgfree else 38 lit + dup @ 1 lit or swap ! then then
 	dup @ 6 lit = if kdqn @ 40 lit u< if dup 8 lit + @ kdqn @ 2 lit lshift kdq @ + !  kdqn @ 1 lit + kdqn !  1 lit kdfl ! then then
 	0 lit swap !
 then ;

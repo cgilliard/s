@@ -1,0 +1,66 @@
+\ httpd.fam — a small web server (docs/OS.md, step 9): httpd [port]
+\ (default 80) answers each GET with the file at its path in the store (a
+\ path ending in / gets its index.html), or 404; HTTP/1.0, one request a
+\ connection, one connection at a time.
+
+: buf variable ;  : crb variable ;  : path variable ;  : s variable ;  : c variable ;  : n variable ;
+
+\ wr ( s -- )  a string to the connection; crlf  a line's end.
+: wr  c @ swap dup strlen write drop ;
+: crlf  c @ crb @ 2 lit write drop ;
+
+\ hend? ( -- flag )  the request's header whole (an empty line read).
+: hend?
+0 lit n @ 3 lit u> if
+	n @ 3 lit - 0 lit do
+		buf @ i + dup c@ D lit = over 1 lit + c@ A lit = and
+		over 2 lit + c@ D lit = and swap 3 lit + c@ A lit = and or
+	loop
+then ;
+
+\ request ( -- ok )  the header read (4 KiB at most).
+: request
+0 lit n !
+begin
+	c @ buf @ n @ + FFF lit n @ - read
+	dup 0 lit > if n @ + n ! hend? n @ FFF lit = or else drop 1 lit then
+until
+n @ 0 lit > hend? and ;
+
+\ getpath ( -- ok )  "GET /path" into path, index.html after a final /.
+: getpath
+buf @ c@ 47 lit = buf @ 1 lit + c@ 45 lit = and buf @ 2 lit + c@ 54 lit = and
+buf @ 3 lit + c@ 20 lit = and buf @ 4 lit + c@ 2F lit = and if
+	path @ buf @ 4 lit +
+	begin dup c@ dup 20 lit = over D lit = or swap 0= or 0= over buf @ - E0 lit u< and while
+		dup c@ 2 lit pick c! 1 lit + swap 1 lit + swap
+	repeat drop
+	dup 1 lit - c@ 2F lit = if "index.html" scpy then
+	0 lit swap c! 1 lit
+else 0 lit then ;
+
+\ serve  one connection: answered, closed.
+: serve
+request if getpath else 0 lit then
+if
+	path @ 0 lit open dup 0< if
+		drop "HTTP/1.0 404 Not Found" wr crlf crlf "not found" wr crlf
+	else
+		"HTTP/1.0 200 OK" wr crlf crlf
+		begin dup buf @ 1000 lit read dup 0 lit > while c @ buf @ rot write drop repeat drop
+		close drop
+	then
+else
+	"HTTP/1.0 400 Bad Request" wr crlf crlf
+then
+c @ close drop ;
+
+1000 lit alloc buf !  100 lit alloc path !  4 lit alloc crb !  A0D lit crb @ !
+1 lit arg ?dup if atoi else 50 lit then
+2 lit socket dup s ! 0< if "httpd: no socket" eputs 0A lit eputc 1 lit exit then
+s @ 1 lit 0 lit 3 lit pick net dup if "httpd: cannot bind: " eputs . 0A lit eputc 1 lit exit then drop
+s @ 3 lit 0 lit 0 lit net drop
+"httpd: port " puts u. 0A lit putc
+begin
+	s @ accept dup c ! 0< 0= if serve then
+0 lit until

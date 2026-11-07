@@ -687,7 +687,43 @@ kernel too much to add at the end.
    a removed tree's pages are not given back.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
-   reads a page served from the guest.
+   reads a page served from the guest. Done (2026-11-07):
+   `src/net.fam`, between the store and the calls. The virtio-net
+   driver takes what arrives in its interrupt, on hart 0 and without a
+   lock; anything sent is built in one transmit buffer under a lock of
+   its own (`nlk`, always taken after `klk`, never before it). ARP asks
+   for the gateway at boot, waiting up to 100 ms for the answer, then
+   each second until it answers. Everything goes by way of the gateway
+   (QEMU's user networking: we are 10.0.2.15, it is 10.0.2.2). IPv4
+   takes no fragments; UDP is sent without a checksum. A socket is an
+   open file of kind 8 over four pages. A UDP socket queues up to eight
+   datagrams of up to 1,472 bytes. A TCP socket has a 4 KiB receive
+   ring (the window it offers) and an 8 KiB send ring. TCP's sockets
+   are also in a table of 32, since one outlives its descriptors until
+   it is closed on the wire. Calls: `socket` (30, kind 1 UDP or 2 TCP),
+   `net` (31: bind, connect, listen), `accept` (32), `sendto` (33) and
+   `recvfrom` (34) for UDP; `read`, `write` and `poll` on either (a
+   connected UDP socket's peer, or the TCP stream). TCP is plain RFC 793
+   without the refinements: our segment size offered as 1,460, in-order
+   bytes kept and anything else answered with our ACK again, go-back-N
+   retransmission from 200 ms doubling (given up after 8 tries, -110), a
+   connect refused by a reset (-111), FIN both ways. A socket's close is
+   finished by hart 0's timed work (`csweep`, at its ticks, where no
+   lock is held), which also retransmits, and TIME-WAIT is skipped.
+   `/proc/net` counts TCP's sockets and retransmissions. `httpd` (a
+   program) serves the store's files over HTTP/1.0. Checked by
+   `scripts/oscheck.sh`, on one hart and on four. A program asks a UDP
+   echo server on the host, then connected, with `write`, `poll` and
+   `read`. A TCP client talks to an echo server on the host, and a
+   connect to a closed port is refused. 400 KiB go to a host server
+   that checks every byte, on a kernel that loses 16 frames in a row on
+   purpose (`ndrop`), so the retransmission timer has to resend what
+   was in flight. The host fetches pages from `httpd` through a
+   forwarded port: a page, 100 KiB whole, a 404, and 40 fetches one
+   after another (more than the 32 sockets). Five 100 KiB fetches at
+   once take 30-160 ms each. Not yet: no window scaling, persist
+   timer, congestion control or delayed ACKs; out-of-order segments
+   are dropped, not kept; one interface, its address fixed; no DNS.
 10. **Terminals and the window manager.** `pty`, `/dev/tty/N`, and the
     HTTP and WebSocket server with terminals in the browser. Done when
     a browser opens a shell and runs `ls`.

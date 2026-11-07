@@ -222,7 +222,367 @@ nun @ 5C0 lit u> 0= if
 	klk @ unlock
 then then ;
 
-\ nipin ( f len -- )  an IPv4 packet to us, not a fragment, whole: UDP's taken.
+\ ── TCP ──
+\
+\ A TCP socket's four pages (kind 2 at 0): its port 4, its peer's address 8
+\ and port C; its state 18 (0 closed, 1 listening, 2 SYN sent, 3 SYN
+\ received, 4 established, 5 FIN sent, 6 FIN sent and acknowledged, 7 FIN
+\ received, 8 FIN received then sent, 9 both sent, ours not acknowledged);
+\ sequence numbers: the first unacknowledged 1C, the next to send 20, the
+\ next expected 24, our first 28; the peer's window 2C; the retransmission
+\ deadline 30 (0: none), tries 34, timeout 58; flags 38 (1 its descriptors
+\ all closed, 2 a FIN to send, 4 the FIN sent, 8 a FIN received); an error
+\ for the next call 3C; bytes received 40 and read 44 (a listener: the
+\ connections queued and taken); bytes written 48; the peer's segment size
+\ 4C; the listener a connection came to 50; the window last advertised 54;
+\ a listener's queue of connections (8) from 100; what is received, a ring
+\ of 4 KiB, from 1000; what is written, 8 KiB, from 2000.  The data's byte
+\ k is sequence number (ours) first + 1 + k.
+\
+\ Every TCP socket is in ntcb, from socket() until it is closed both by
+\ its descriptors (fclose sets flag 1) and on the wire: hart 0's timed work
+\ (csweep) closes the one, frees the other, retransmits.  All of it under
+\ klk; a segment is sent holding klk and then nlk.
+
+:M NTC 20 lit ;               \ 32 sockets at most
+:M RTO0 1E8480 lit ;          \ the first retransmission after 200 ms
+: ntcb   variable ;           \ their pages (0: a free slot)
+
+: cst   18 lit + ;  : cuna  1C lit + ;  : cnxt  20 lit + ;  : crcv  24 lit + ;
+: ciss  28 lit + ;  : cwnd  2C lit + ;  : cdl   30 lit + ;  : ctry  34 lit + ;
+: cflg  38 lit + ;  : cerr  3C lit + ;  : crh   40 lit + ;  : crtl  44 lit + ;
+: csw   48 lit + ;  : cmss  4C lit + ;  : cpar  50 lit + ;  : cadv  54 lit + ;
+: crto  58 lit + ;
+: cslot  2 lit lshift ntcb @ + ;                             \ ( i -- a )
+: cfl+   dup cflg @ rot or swap cflg ! ;                     \ ( bits p -- )
+
+\ cnew ( -- p | 0 )  a TCP socket's pages, closed, in ntcb.
+: cnew
+0 lit NTC 0 lit do dup 0= if i cslot @ 0= if drop i cslot then then loop
+dup if
+	4 lit pgalloc ?dup if
+		dup 100 lit mzero  2 lit over !  RTO0 over crto !  218 lit over cmss !
+		tuck swap !
+	else drop 0 lit then
+then ;
+
+\ cfree ( p -- )  gone from ntcb, its pages freed: a listener's queued
+\ connections closed, those still arriving told it is gone.
+: cfree
+NTC 0 lit do
+	i cslot @ ?dup if
+		dup cpar @ 2 lit pick = if 0 lit over cpar ! then drop
+		i cslot @ over = if 0 lit i cslot ! then
+	then
+loop
+dup cst @ 1 lit = if
+	dup crh @ over crtl @ - ?dup if 0 lit do
+		1 lit  over crtl @ i + 7 lit and 2 lit lshift 100 lit + 2 lit pick + @  cfl+
+	loop then
+then
+4 lit pgfree ;
+
+\ csum+ ( a n -- )  n bytes added into nca, a checksum's sum (n odd: the
+\ last byte padded); csumf ( -- sum )  the checksum.  Under nlk.
+: nca  variable ;
+: csum+
+dup 1 lit and if 2dup + 1 lit - c@ 8 lit lshift nca @ + nca ! then
+1 lit rshift ?dup if 0 lit do dup i 1 lit lshift + b16@ nca @ + nca ! loop then drop ;
+: csumf  nca @ dup 10 lit rshift swap FFFF lit and + dup 10 lit rshift + invert FFFF lit and ;
+
+\ rput ( src n ring size off -- )  n bytes into a ring (size a power of
+\ two) at off, wrapping; rget ( dst n ring size off -- )  out of it.
+: rgx variable ;  : rgn variable ;  : rgr variable ;  : rgs variable ;  : rgo variable ;
+: rgset  over 1 lit - and rgo ! rgs ! rgr ! rgn ! rgx !  rgs @ rgo @ - rgn @ 2dup u> if swap then drop ;
+: rput
+rgset dup rgx @ rgr @ rgo @ + rot bcpy
+rgn @ over - ?dup if swap rgx @ + rgr @ rot bcpy else drop then ;
+: rget
+rgset dup rgr @ rgo @ + rgx @ rot bcpy
+rgn @ over - ?dup if swap rgx @ + rgr @ swap rot bcpy else drop then ;
+
+: so1 variable ;  : so2 variable ;  : so3 variable ;  : so4 variable ;
+
+\ cfree# ( p -- n )  the room in its receive ring (the window).
+: cfree#  dup crh @ swap crtl @ - 1000 lit swap - ;
+
+\ ntcpout ( p flags n -- )  a segment of p's: flags (1 FIN, 2 SYN, 4 RST, 8
+\ PSH, 10 ACK), sequence number cnxt, n bytes of what is written from there
+\ (a SYN carries our segment size).
+: ntcpout
+ntx so3 ! so2 ! so1 !
+so2 @ 2 lit and if 18 lit else 14 lit then so4 !
+ngw @ 800 lit neth
+4500 lit nf E lit + b16!  so4 @ so3 @ + 14 lit + nf 10 lit + b16!
+nid @ dup 1 lit + nid ! nf 12 lit + b16!
+4000 lit nf 14 lit + b16!  4006 lit nf 16 lit + b16!  0 lit nf 18 lit + b16!
+MYIP nf 1A lit + b32!  so1 @ 8 lit + @ nf 1E lit + b32!
+nf E lit + 14 lit ncsum nf 18 lit + b16!
+so1 @ 4 lit + @ nf 22 lit + b16!  so1 @ C lit + @ nf 24 lit + b16!
+so1 @ cnxt @ nf 26 lit + b32!  so1 @ crcv @ nf 2A lit + b32!
+so4 @ A lit lshift so2 @ or nf 2E lit + b16!
+so1 @ cfree# dup so1 @ cadv ! nf 30 lit + b16!
+0 lit nf 32 lit + b16!  0 lit nf 34 lit + b16!
+so2 @ 2 lit and if 20405B4 lit nf 36 lit + b32! then
+so3 @ if
+	nf 22 lit + so4 @ +  so3 @  so1 @ 2000 lit +  2000 lit
+	so1 @ cnxt @ so1 @ ciss @ - 1 lit -  rget
+then
+MYIP 10 lit rshift MYIP FFFF lit and +
+so1 @ 8 lit + @ dup 10 lit rshift swap FFFF lit and + +
+6 lit + so4 @ + so3 @ + nca !
+nf 22 lit + so4 @ so3 @ + csum+  csumf nf 32 lit + b16!
+so4 @ so3 @ + 22 lit + nsend ;
+
+\ csent ( p -- n ), cackd ( p -- n )  bytes of what is written sent, and
+\ acknowledged (while the FIN is not).
+: csent  dup cnxt @ over ciss @ - 1 lit -  swap cflg @ 4 lit and if 1 lit - then ;
+: cackd  dup cuna @ swap ciss @ - 1 lit - ;
+: cmin   2dup u> if swap then drop ;                         \ ( a b -- min )
+
+\ tout ( p -- )  what may be sent, sent: what is written, as the peer's
+\ window allows, then the FIN if one is to be; the retransmission timer set
+\ if anything is unacknowledged.
+: tout
+dup cst @ dup 4 lit = over 5 lit = or over 7 lit = or over 8 lit = or swap 9 lit = or if
+	begin
+		dup csw @ over csent -
+		over cwnd @ 2 lit pick csent 3 lit pick cackd - - dup 0< if drop 0 lit then
+		cmin over cmss @ cmin
+		?dup
+	while
+		over 18 lit 2 lit pick ntcpout
+		over cnxt @ + over cnxt !
+	repeat
+	dup cflg @ 6 lit and 2 lit = over csw @ 2 lit pick csent = and if
+		dup 11 lit 0 lit ntcpout
+		dup cnxt @ 1 lit + over cnxt !  4 lit over cfl+
+		dup cst @ 4 lit = if 5 lit over cst ! then
+		dup cst @ 7 lit = if 8 lit over cst ! then
+	then
+	dup cuna @ over cnxt @ <> over cdl @ 0= and if mtime@ over crto @ + 1 lit or over cdl ! then
+then drop ;
+
+\ cdead ( p err -- )  the connection over: err for its next call, its
+\ waiters woken.
+: cdead  over cerr !  0 lit over cst !  0 lit over cdl !  fwake ;
+
+\ nretx  retransmissions, counted (/proc/net).
+: nretx variable ;
+
+\ cretx ( p -- )  its retransmission time come: what is unacknowledged sent
+\ again (the SYN, or from the first unacknowledged byte), the timeout
+\ doubled; after 8 tries, the connection is given up (-110).
+: cretx
+0 lit over cdl !  nretx @ 1 lit + nretx !
+dup ctry @ 8 lit u< 0= if FFFFFF92 lit cdead else
+	dup ctry @ 1 lit + over ctry !
+	dup crto @ 1 lit lshift over crto !
+	dup cst @ dup 2 lit = swap 3 lit = or if
+		dup ciss @ over cnxt !
+		dup dup cst @ 2 lit = if 2 lit else 12 lit then 0 lit ntcpout
+		dup cnxt @ 1 lit + over cnxt !
+		mtime@ over crto @ + 1 lit or swap cdl !
+	else
+		dup cuna @ over cnxt !
+		dup cflg @ 4 lit invert and over cflg !
+		tout
+	then
+then ;
+
+\ The segment arriving (hart 0's, under klk).
+: tssip variable ;  : tssp variable ;  : tsdp variable ;  : tsseq variable ;
+: tsack variable ;  : tsfl variable ;  : tswin variable ;  : tsd variable ;
+: tsn variable ;  : tsmss variable ;
+: nrstp variable ;            \ a socket's first 60 bytes, to answer with a reset
+
+\ cfind ( -- p | 0 )  the socket the segment is for: its connection, else
+\ the listener on its port.
+: cfind
+0 lit NTC 0 lit do
+	dup 0= if i cslot @ ?dup if
+		dup 4 lit + @ tsdp @ = over 8 lit + @ tssip @ = and over C lit + @ tssp @ = and
+		over cst @ 1 lit u> and if nip else drop then
+	then then
+loop
+?dup 0= if
+	0 lit NTC 0 lit do
+		dup 0= if i cslot @ ?dup if
+			dup 4 lit + @ tsdp @ = over cst @ 1 lit = and if nip else drop then
+		then then
+	loop
+then ;
+
+\ creset  a reset for the segment, which no socket takes (unless it is one).
+: creset
+tsfl @ 4 lit and 0= if
+	nrstp @ 60 lit mzero
+	tsdp @ nrstp @ 4 lit + !  tssip @ nrstp @ 8 lit + !  tssp @ nrstp @ C lit + !
+	1000 lit nrstp @ crh !        \ a window of 0
+	tsfl @ 10 lit and if
+		tsack @ nrstp @ cnxt !  nrstp @ 4 lit 0 lit ntcpout
+	else
+		tsseq @ tsn @ + tsfl @ 2 lit and if 1 lit + then tsfl @ 1 lit and if 1 lit + then nrstp @ crcv !
+		nrstp @ 14 lit 0 lit ntcpout
+	then
+then ;
+
+\ clisten ( p -- )  a SYN to a listener: a connection, SYN received, our
+\ SYN and ACK sent (it is queued for accept once established).
+: clisten
+tsfl @ 16 lit and 2 lit = if
+	cnew ?dup if
+		tsdp @ over 4 lit + !  tssip @ over 8 lit + !  tssp @ over C lit + !
+		tsseq @ 1 lit + over crcv !
+		mtime@ over ciss !  dup ciss @ over cuna !  dup ciss @ over cnxt !
+		tswin @ over cwnd !  tsmss @ over cmss !  3 lit over cst !
+		tuck cpar !
+		dup 12 lit 0 lit ntcpout
+		dup cnxt @ 1 lit + over cnxt !
+		mtime@ over crto @ + 1 lit or swap cdl !
+	else drop then
+else drop creset then ;
+
+\ csynsent ( p -- )  the answer to our SYN: established.
+: csynsent
+tsfl @ 12 lit and 12 lit = tsack @ 2 lit pick ciss @ 1 lit + = and if
+	tsseq @ 1 lit + over crcv !  tsack @ over cuna !
+	tswin @ over cwnd !  tsmss @ over cmss !
+	4 lit over cst !  0 lit over cdl !  0 lit over ctry !  RTO0 over crto !
+	dup 10 lit 0 lit ntcpout
+	dup fwake tout
+else drop then ;
+
+\ cqueue ( p -- )  established: queued on its listener for accept (closed if
+\ it cannot be).
+: cqueue
+dup cpar @ ?dup if
+	dup crh @ over crtl @ - 8 lit u< if
+		2dup dup crh @ 7 lit and 2 lit lshift 100 lit + + !
+		dup crh @ 1 lit + over crh !  fwake drop
+	else drop 1 lit swap cfl+ then
+else 1 lit swap cfl+ then ;
+
+\ cack ( p -- )  an acknowledgment: what it acknowledges done with, the
+\ timer reset; SYN received becomes established, a FIN acknowledged moves
+\ the state on.
+: cack
+tsack @ over cuna @ - 0 lit > tsack @ 2 lit pick cnxt @ - 0 lit > 0= and if
+	tsack @ over cuna !  0 lit over ctry !  RTO0 over crto !
+	dup cuna @ over cnxt @ = if 0 lit else mtime@ over crto @ + 1 lit or then over cdl !
+	dup cst @ 3 lit = if 4 lit over cst !  dup cqueue then
+	dup cflg @ 4 lit and over cuna @ 2 lit pick cnxt @ = and if
+		dup cst @ 5 lit = if 6 lit over cst ! else
+		dup cst @ 8 lit = over cst @ 9 lit = or if 0 lit over cst ! then then
+	then
+	dup fwake
+then
+tsack @ over cuna @ - 0< 0= if tswin @ over cwnd ! then
+drop ;
+
+\ cdata ( p -- )  in-order bytes: as many as there is room for kept (a FIN
+\ after bytes not kept is not taken), readers woken.
+: cdata
+tsn @ over cfree# cmin
+dup if
+	tsd @ over 3 lit pick 1000 lit + 1000 lit 5 lit pick crh @ rput
+	over crh @ over + 2 lit pick crh !
+	over crcv @ over + 2 lit pick crcv !
+	dup tsn @ <> if tsfl @ 1 lit invert and tsfl ! then
+	over fwake
+then 2drop ;
+
+\ cfin ( p -- )  the peer's FIN: no more to read.
+: cfin
+dup crcv @ 1 lit + over crcv !  8 lit over cfl+
+dup cst @ 4 lit = if 7 lit over cst ! else
+dup cst @ 5 lit = if 9 lit over cst ! else
+dup cst @ 6 lit = if 0 lit over cst ! then then then
+fwake ;
+
+\ cother ( p -- )  a segment for a connection, SYN received or after.
+: cother
+tsfl @ 2 lit and if
+	dup cst @ 3 lit = if dup ciss @ over cnxt !  dup 12 lit 0 lit ntcpout  dup cnxt @ 1 lit + over cnxt ! then
+	drop
+else
+	tsfl @ 10 lit and if dup cack then
+	dup crcv @ tsseq @ -  dup tsn @ u> 0= if
+		dup tsd @ + tsd !  tsn @ swap - tsn !
+		tsn @ if dup cdata then
+		tsfl @ 1 lit and if dup cfin then
+	else drop then
+	tsn @ tsfl @ 1 lit and or if dup 10 lit 0 lit ntcpout then
+	tout
+then ;
+
+\ ntcpin ( ip t -- )  a TCP segment (t its header) to us.
+: ntcpin
+over C lit + b32@ tssip !  dup b16@ tssp !  dup 2 lit + b16@ tsdp !
+dup 4 lit + b32@ tsseq !  dup 8 lit + b32@ tsack !  dup E lit + b16@ tswin !
+dup C lit + b16@ dup 3F lit and tsfl !  C lit rshift 2 lit lshift
+218 lit tsmss !
+dup 18 lit u< 0= if over 14 lit + c@ 2 lit = if over 16 lit + b16@ tsmss ! then then
+2dup + tsd !
+rot dup 2 lit + b16@ swap c@ F lit and 2 lit lshift - swap - tsn !
+drop
+tsn @ 5DC lit u> 0= if
+	klk @ lock
+	cfind ?dup if
+		tsfl @ 4 lit and if
+			dup cst @ dup 1 lit <> swap 0 lit <> and if
+				dup cst @ 2 lit = if FFFFFF91 lit else FFFFFF98 lit then cdead
+			else drop then
+		else
+			dup cst @
+			dup 1 lit = if drop clisten else
+			dup 2 lit = if drop csynsent else
+			dup 2 lit u> if drop cother else
+			2drop creset
+			then then then
+		then
+	else creset then
+	klk @ unlock
+then ;
+
+\ csweep  hart 0's timed work for TCP: a socket its descriptors closed
+\ either freed (closed, listening, connecting) or closed on the wire (its
+\ FIN, after what is written); retransmissions due, done.
+: csweep
+klk @ lock
+NTC 0 lit do
+	i cslot @ ?dup if
+		dup cflg @ 1 lit and if
+			dup cst @ 3 lit u< if cfree 0 lit else
+			dup cst @ 3 lit = if dup 14 lit 0 lit ntcpout FFFFFF98 lit cdead 0 lit else
+			dup cflg @ 2 lit and 0= if 2 lit over cfl+ dup tout then
+			then then
+		then
+		?dup if
+			dup cdl @ ?dup if mtime@ swap - 0< 0= if dup cretx then then
+			drop
+		then
+	then
+loop
+klk @ unlock ;
+
+\ cinit  TCP's table, at boot; ctcpn ( -- n )  its sockets in use.
+: cinit  NTC 2 lit lshift dup alloc dup ntcb ! swap mzero  60 lit alloc nrstp !  0 lit nretx ! ;
+: ctcpn  0 lit NTC 0 lit do i cslot @ if 1 lit + then loop ;
+
+\ ctaken ( port -- f )  a TCP socket has port; cephem ( -- port )  a port
+\ neither a UDP socket nor a TCP one has.  Under klk.
+: ctaken  0 lit NTC 0 lit do i cslot @ ?dup if 4 lit + @ 2 lit pick = or then loop nip ;
+: cephem  begin nephem dup ctaken while drop repeat ;
+
+\ cready ( p -- events )  poll's for a TCP socket: 1 something to read (or
+\ its end, or a connection to accept), 4 room to write.
+: cready
+dup crh @ over crtl @ <> over cflg @ 8 lit and or over cst @ 0= or if 1 lit else 0 lit then
+over cst @ dup 4 lit = swap 7 lit = or 2 lit pick dup csw @ swap cackd - 2000 lit u< and if 4 lit or then
+nip ;
+
+\ nipin ( f len -- )  an IPv4 packet to us, not a fragment, whole: UDP's and TCP's taken.
 : nipin
 swap E lit + swap E lit -
 over c@ F0 lit and 40 lit <> if 2drop else
@@ -231,7 +591,7 @@ over 6 lit + b16@ 3FFF lit and if 2drop else
 over 2 lit + b16@ over u> if 2drop else
 drop
 dup c@ F lit and 2 lit lshift over +
-over 9 lit + c@ 11 lit = if nudpin else 2drop then
+over 9 lit + c@ dup 11 lit = if drop nudpin else 6 lit = if ntcpin else 2drop then then
 then then then then ;
 
 \ nframe ( f len -- )  a frame arrived (its Ethernet header first).
@@ -240,13 +600,20 @@ over C lit + b16@
 dup 806 lit = if drop narpin else
 800 lit = if nipin else 2drop then then ;
 
+\ nlose ( -- flag )  this frame lost on purpose, for the tests of
+\ retransmission: 16 in a row after the ndrop-th (a kernel of their own
+\ sets ndrop; 0: none lost).
+: ndrop  variable ;
+: ndc    variable ;
+: nlose  ndrop @ dup if ndc @ 1 lit + dup ndc ! swap - 10 lit u< then ;
+
 \ nrx  every frame the device has given us, taken, its buffer given back.
 : nrx
 begin nrq @ 1002 lit + h@ nseen @ FFFF lit and <> while
 	nseen @ NQN 1 lit - and 3 lit lshift nrq @ 1004 lit + +
 	dup @ swap 4 lit + @                       \ ( id len )
 	over B lit lshift nrb @ + A lit +  swap A lit -
-	nframe
+	nlose if 2drop else nframe then
 	nseen @ 1 lit + nseen !
 	nrav @ NQN 1 lit - and 1 lit lshift nrq @ 104 lit + + h!
 	fence
@@ -264,9 +631,14 @@ begin nrx ngwok @ mtime@ narpt @ - F4240 lit u< 0= or until ;
 \ knetirq  the device's interrupt: acknowledged, what arrived taken.
 : knetirq  nk @ 60 lit + @ nk @ 64 lit + !  nrx ;
 
+
+
 \ npoll  hart 0's timed work (at its user-mode ticks, and while idle): the
-\ gateway asked for each second until it answers.
+\ gateway asked for each second until it answers; TCP's (csweep).
 : npoll
-nk @ if ngwok @ 0= if
-	mtime@ narpt @ - 989680 lit u< 0= if mtime@ narpt !  1 lit nbc @ GWIP narp then
-then then ;
+nk @ if
+	ngwok @ 0= if
+		mtime@ narpt @ - 989680 lit u< 0= if mtime@ narpt !  1 lit nbc @ GWIP narp then
+	then
+	csweep
+then ;
