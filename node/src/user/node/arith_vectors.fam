@@ -1,0 +1,829 @@
+\ arith_vectors.fam — tabminer's values for arith.fam (docs/NODE.md, step 1).
+\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_arith_vectors
+\ -- --ignored`); not to be edited.  Run: tools/fam --test
+\ src/user/node/arith.fam src/user/node/arith_vectors.fam
+
+: vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;
+: vinit  arinit vx @ 0= if 40 lit alloc vx !  40 lit alloc vy !  40 lit alloc vz !  40 lit alloc vw ! then ;
+\ v! ( x0 .. xn-1 a n -- )  the n values at a, x0 first.
+: v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;
+\ canonical values in and out of the Montgomery words.
+: cadd  tom swap tom f+ fromm ;
+: csub  swap tom swap tom f- fromm ;
+: cmul  tom swap tom fmul fromm ;
+: cneg  tom fneg fromm ;
+: cinv  tom finv fromm ;
+: e4tom   4 lit 0 lit do dup i e4@ tom over i e4! loop drop ;
+: e4from  4 lit 0 lit do dup i e4@ fromm over i e4! loop drop ;
+
+Test {
+	um_star {
+		vinit
+		0 lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit 1 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit FFFF lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit 10000 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit 7FFFFFFF lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit 80000000 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		0 lit FFFFFFFF lit um* 0 lit asrt_eq 0 lit asrt_eq
+		1 lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		1 lit 1 lit um* 0 lit asrt_eq 1 lit asrt_eq
+		1 lit FFFF lit um* 0 lit asrt_eq FFFF lit asrt_eq
+		1 lit 10000 lit um* 0 lit asrt_eq 10000 lit asrt_eq
+		1 lit 7FFFFFFF lit um* 0 lit asrt_eq 7FFFFFFF lit asrt_eq
+		1 lit 80000000 lit um* 0 lit asrt_eq 80000000 lit asrt_eq
+		1 lit FFFFFFFF lit um* 0 lit asrt_eq FFFFFFFF lit asrt_eq
+		FFFF lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		FFFF lit 1 lit um* 0 lit asrt_eq FFFF lit asrt_eq
+		FFFF lit FFFF lit um* 0 lit asrt_eq FFFE0001 lit asrt_eq
+		FFFF lit 10000 lit um* 0 lit asrt_eq FFFF0000 lit asrt_eq
+		FFFF lit 7FFFFFFF lit um* 7FFF lit asrt_eq 7FFF0001 lit asrt_eq
+		FFFF lit 80000000 lit um* 7FFF lit asrt_eq 80000000 lit asrt_eq
+		FFFF lit FFFFFFFF lit um* FFFE lit asrt_eq FFFF0001 lit asrt_eq
+		10000 lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		10000 lit 1 lit um* 0 lit asrt_eq 10000 lit asrt_eq
+		10000 lit FFFF lit um* 0 lit asrt_eq FFFF0000 lit asrt_eq
+		10000 lit 10000 lit um* 1 lit asrt_eq 0 lit asrt_eq
+		10000 lit 7FFFFFFF lit um* 7FFF lit asrt_eq FFFF0000 lit asrt_eq
+		10000 lit 80000000 lit um* 8000 lit asrt_eq 0 lit asrt_eq
+		10000 lit FFFFFFFF lit um* FFFF lit asrt_eq FFFF0000 lit asrt_eq
+		7FFFFFFF lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		7FFFFFFF lit 1 lit um* 0 lit asrt_eq 7FFFFFFF lit asrt_eq
+		7FFFFFFF lit FFFF lit um* 7FFF lit asrt_eq 7FFF0001 lit asrt_eq
+		7FFFFFFF lit 10000 lit um* 7FFF lit asrt_eq FFFF0000 lit asrt_eq
+		7FFFFFFF lit 7FFFFFFF lit um* 3FFFFFFF lit asrt_eq 1 lit asrt_eq
+		7FFFFFFF lit 80000000 lit um* 3FFFFFFF lit asrt_eq 80000000 lit asrt_eq
+		7FFFFFFF lit FFFFFFFF lit um* 7FFFFFFE lit asrt_eq 80000001 lit asrt_eq
+		80000000 lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		80000000 lit 1 lit um* 0 lit asrt_eq 80000000 lit asrt_eq
+		80000000 lit FFFF lit um* 7FFF lit asrt_eq 80000000 lit asrt_eq
+		80000000 lit 10000 lit um* 8000 lit asrt_eq 0 lit asrt_eq
+		80000000 lit 7FFFFFFF lit um* 3FFFFFFF lit asrt_eq 80000000 lit asrt_eq
+		80000000 lit 80000000 lit um* 40000000 lit asrt_eq 0 lit asrt_eq
+		80000000 lit FFFFFFFF lit um* 7FFFFFFF lit asrt_eq 80000000 lit asrt_eq
+		FFFFFFFF lit 0 lit um* 0 lit asrt_eq 0 lit asrt_eq
+		FFFFFFFF lit 1 lit um* 0 lit asrt_eq FFFFFFFF lit asrt_eq
+		FFFFFFFF lit FFFF lit um* FFFE lit asrt_eq FFFF0001 lit asrt_eq
+		FFFFFFFF lit 10000 lit um* FFFF lit asrt_eq FFFF0000 lit asrt_eq
+		FFFFFFFF lit 7FFFFFFF lit um* 7FFFFFFE lit asrt_eq 80000001 lit asrt_eq
+		FFFFFFFF lit 80000000 lit um* 7FFFFFFF lit asrt_eq 80000000 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit um* FFFFFFFE lit asrt_eq 1 lit asrt_eq
+		575D008C lit 9277361F lit um* 31FBB903 lit asrt_eq 4B7498F4 lit asrt_eq
+		355F0 lit EBC02AEA lit um* 31264 lit asrt_eq 5325ED60 lit asrt_eq
+		F61E354A lit 6B81B7D9 lit um* 675B563E lit asrt_eq FFFD11BA lit asrt_eq
+		7971B649 lit 537183A9 lit um* 2795B7C0 lit asrt_eq 7D91B131 lit asrt_eq
+		65191BEC lit 1CC32A18 lit um* B5BD1CD lit asrt_eq ADB35620 lit asrt_eq
+		527CB3B0 lit AFC1E928 lit um* 38A1B9F9 lit asrt_eq 2AB74380 lit asrt_eq
+		7E865639 lit 325EC463 lit um* 18E5133A lit asrt_eq 92E4FC0B lit asrt_eq
+		66C5DD6A lit ADA0A6DD lit um* 45B43548 lit asrt_eq AA2E082 lit asrt_eq
+		834CB423 lit 90414762 lit um* 49FCA069 lit asrt_eq F635AA66 lit asrt_eq
+		9D64E804 lit 6A80C9A7 lit um* 417AF680 lit asrt_eq 90FE7E9C lit asrt_eq
+		F28976BF lit 6BAC5392 lit um* 6602B82A lit asrt_eq 8139A5EE lit asrt_eq
+		B583717E lit 9A01DB4A lit um* 6D326345 lit asrt_eq 2793986C lit asrt_eq
+		F7A6624C lit BE25A799 lit um* B7F1EA22 lit asrt_eq 298C536C lit asrt_eq
+		1D9FAB38 lit 1F92DC7B lit um* 3A7544E lit asrt_eq E0CB63E8 lit asrt_eq
+		44312692 lit 1BB29665 lit um* 760C14D lit asrt_eq EB81C39A lit asrt_eq
+		78465C7A lit 2CC8DCB5 lit um* 150A768E lit asrt_eq B8883A42 lit asrt_eq
+		9404D609 lit 33CAC750 lit um* 1DF235B2 lit asrt_eq B1FDE1D0 lit asrt_eq
+		C5304AF9 lit DB1395E lit um* A8BF662 lit asrt_eq A395F86E lit asrt_eq
+		D76A377D lit 28A9765C lit um* 22373162 lit asrt_eq 89448EEC lit asrt_eq
+		C0EC8B0A lit 29278D2F lit um* 1F03B0B3 lit asrt_eq 7C8808D6 lit asrt_eq
+		FFDD01CA lit 966C932 lit um* 9658035 lit asrt_eq 500DF374 lit asrt_eq
+		28FB2BEB lit 1F49D780 lit um* 5023C70 lit asrt_eq 6A7B5280 lit asrt_eq
+		F15BE4DE lit A203D96F lit um* 98BFC7E7 lit asrt_eq B6726A42 lit asrt_eq
+		A22D7F42 lit 60D8213F lit um* 3D59FB2B lit asrt_eq E649D33E lit asrt_eq
+		A66A29B2 lit 85B3216A lit um* 56E9999D lit asrt_eq 38CB35B4 lit asrt_eq
+		AD9BB140 lit FC56E24A lit um* AB202E3E lit asrt_eq 2CFBBC80 lit asrt_eq
+		7D781F6E lit 9B5740E3 lit um* 4C227EA7 lit asrt_eq 91C15E8A lit asrt_eq
+		89414BA4 lit A132EC4D lit um* 566D5E04 lit asrt_eq 6466F054 lit asrt_eq
+		338A19F1 lit 81103B7A lit um* 19FBDBAD lit asrt_eq 73DAE7DA lit asrt_eq
+		C0859B5A lit DD8CF75 lit um* A69D5A2 lit asrt_eq AB9DC622 lit asrt_eq
+		C2185547 lit 5EC09919 lit um* 47D6F5A3 lit asrt_eq 8697C2EF lit asrt_eq
+		EB97A95D lit A96939B3 lit um* 9BE7F51C lit asrt_eq 5BE62107 lit asrt_eq
+		23A9656D lit 201B4487 lit um* 478F917 lit asrt_eq 1FC4707B lit asrt_eq
+		F08501FF lit 4C36C4FC lit um* 479AF1B8 lit asrt_eq B83F3304 lit asrt_eq
+		120F2FA4 lit 3602A358 lit um* 3CF63B0 lit asrt_eq D7D5CC60 lit asrt_eq
+		BD25CD5A lit EBF7377E lit um* AE585BFA lit asrt_eq F78F684C lit asrt_eq
+		4C8A08E1 lit 1434C969 lit um* 60A90F3 lit asrt_eq 274A4D49 lit asrt_eq
+		E6B86931 lit 71C54AE9 lit um* 668935DA lit asrt_eq DFF4E799 lit asrt_eq
+		45CB2EE6 lit C7C0753E lit um* 367569CE lit asrt_eq BA2479B4 lit asrt_eq
+		FD9490DE lit 571AF246 lit um* 56482E4D lit asrt_eq F01D78B4 lit asrt_eq
+	}
+	babybear {
+		vinit
+		0 lit 0 lit cadd 0 lit asrt_eq
+		0 lit 0 lit csub 0 lit asrt_eq
+		0 lit 0 lit cmul 0 lit asrt_eq
+		0 lit cneg 0 lit asrt_eq
+		1 lit 7214D1D4 lit cadd 7214D1D5 lit asrt_eq
+		1 lit 7214D1D4 lit csub 5EB2E2E lit asrt_eq
+		1 lit 7214D1D4 lit cmul 7214D1D4 lit asrt_eq
+		1 lit cneg 78000000 lit asrt_eq
+		1 lit cinv 1 lit asrt_eq
+		2 lit 28E16EC6 lit cadd 28E16EC8 lit asrt_eq
+		2 lit 28E16EC6 lit csub 4F1E913D lit asrt_eq
+		2 lit 28E16EC6 lit cmul 51C2DD8C lit asrt_eq
+		2 lit cneg 77FFFFFF lit asrt_eq
+		2 lit cinv 3C000001 lit asrt_eq
+		78000000 lit 6CC8709D lit cadd 6CC8709C lit asrt_eq
+		78000000 lit 6CC8709D lit csub B378F63 lit asrt_eq
+		78000000 lit 6CC8709D lit cmul B378F64 lit asrt_eq
+		78000000 lit cneg 1 lit asrt_eq
+		78000000 lit cinv 78000000 lit asrt_eq
+		77FFFFFF lit 5E8C28F8 lit cadd 5E8C28F6 lit asrt_eq
+		77FFFFFF lit 5E8C28F8 lit csub 1973D707 lit asrt_eq
+		77FFFFFF lit 5E8C28F8 lit cmul 32E7AE12 lit asrt_eq
+		77FFFFFF lit cneg 2 lit asrt_eq
+		77FFFFFF lit cinv 3C000000 lit asrt_eq
+		40000000 lit 6F6B78AB lit cadd 376B78AA lit asrt_eq
+		40000000 lit 6F6B78AB lit csub 48948756 lit asrt_eq
+		40000000 lit 6F6B78AB lit cmul 74937B62 lit asrt_eq
+		40000000 lit cneg 38000001 lit asrt_eq
+		40000000 lit cinv 68FFFFFF lit asrt_eq
+		9B26EEE lit 1 lit cadd 9B26EEF lit asrt_eq
+		9B26EEE lit 1 lit csub 9B26EED lit asrt_eq
+		9B26EEE lit 1 lit cmul 9B26EEE lit asrt_eq
+		9B26EEE lit cneg 6E4D9113 lit asrt_eq
+		9B26EEE lit cinv 3D842926 lit asrt_eq
+		FA28096 lit 752D3ED9 lit cadd CCFBF6E lit asrt_eq
+		FA28096 lit 752D3ED9 lit csub 127541BE lit asrt_eq
+		FA28096 lit 752D3ED9 lit cmul 44FCFD74 lit asrt_eq
+		FA28096 lit cneg 685D7F6B lit asrt_eq
+		FA28096 lit cinv 5208B97B lit asrt_eq
+		2F8F9689 lit 3D53DF22 lit cadd 6CE375AB lit asrt_eq
+		2F8F9689 lit 3D53DF22 lit csub 6A3BB768 lit asrt_eq
+		2F8F9689 lit 3D53DF22 lit cmul 284FD575 lit asrt_eq
+		2F8F9689 lit cneg 48706978 lit asrt_eq
+		2F8F9689 lit cinv 33A2F9AA lit asrt_eq
+		1FCFAC43 lit F640292 lit cadd 2F33AED5 lit asrt_eq
+		1FCFAC43 lit F640292 lit csub 106BA9B1 lit asrt_eq
+		1FCFAC43 lit F640292 lit cmul 4EE04B9B lit asrt_eq
+		1FCFAC43 lit cneg 583053BE lit asrt_eq
+		1FCFAC43 lit cinv 215F5B31 lit asrt_eq
+		673478DB lit A517CB2 lit cadd 7185F58D lit asrt_eq
+		673478DB lit A517CB2 lit csub 5CE2FC29 lit asrt_eq
+		673478DB lit A517CB2 lit cmul 4F71527A lit asrt_eq
+		673478DB lit cneg 10CB8726 lit asrt_eq
+		673478DB lit cinv 58151263 lit asrt_eq
+		701E2C9B lit 8FBC72 lit cadd 70ADE90D lit asrt_eq
+		701E2C9B lit 8FBC72 lit csub 6F8E7029 lit asrt_eq
+		701E2C9B lit 8FBC72 lit cmul 68406589 lit asrt_eq
+		701E2C9B lit cneg 7E1D366 lit asrt_eq
+		701E2C9B lit cinv 45C7AFB4 lit asrt_eq
+		117D6368 lit 2 lit cadd 117D636A lit asrt_eq
+		117D6368 lit 2 lit csub 117D6366 lit asrt_eq
+		117D6368 lit 2 lit cmul 22FAC6D0 lit asrt_eq
+		117D6368 lit cneg 66829C99 lit asrt_eq
+		117D6368 lit cinv 781AE56 lit asrt_eq
+		388D060B lit 1E2359D8 lit cadd 56B05FE3 lit asrt_eq
+		388D060B lit 1E2359D8 lit csub 1A69AC33 lit asrt_eq
+		388D060B lit 1E2359D8 lit cmul 4D6401F8 lit asrt_eq
+		388D060B lit cneg 3F72F9F6 lit asrt_eq
+		388D060B lit cinv 29BC3DE5 lit asrt_eq
+		6E0673EC lit 6583913 lit cadd 745EACFF lit asrt_eq
+		6E0673EC lit 6583913 lit csub 67AE3AD9 lit asrt_eq
+		6E0673EC lit 6583913 lit cmul D98F031 lit asrt_eq
+		6E0673EC lit cneg 9F98C15 lit asrt_eq
+		6E0673EC lit cinv 2B0539EF lit asrt_eq
+		689B16B lit 6528201E lit cadd 6BB1D189 lit asrt_eq
+		689B16B lit 6528201E lit csub 1961914E lit asrt_eq
+		689B16B lit 6528201E lit cmul C8549D5 lit asrt_eq
+		689B16B lit cneg 71764E96 lit asrt_eq
+		689B16B lit cinv 19094469 lit asrt_eq
+		6359159 lit 124E1CE5 lit cadd 1883AE3E lit asrt_eq
+		6359159 lit 124E1CE5 lit csub 6BE77475 lit asrt_eq
+		6359159 lit 124E1CE5 lit cmul 5BFC4680 lit asrt_eq
+		6359159 lit cneg 71CA6EA8 lit asrt_eq
+		6359159 lit cinv 73320716 lit asrt_eq
+		5A01B945 lit 20D435E6 lit cadd 2D5EF2A lit asrt_eq
+		5A01B945 lit 20D435E6 lit csub 392D835F lit asrt_eq
+		5A01B945 lit 20D435E6 lit cmul 4D6C1BDA lit asrt_eq
+		5A01B945 lit cneg 1DFE46BC lit asrt_eq
+		5A01B945 lit cinv EC0A0E2 lit asrt_eq
+		6DB320F5 lit 78000000 lit cadd 6DB320F4 lit asrt_eq
+		6DB320F5 lit 78000000 lit csub 6DB320F6 lit asrt_eq
+		6DB320F5 lit 78000000 lit cmul A4CDF0C lit asrt_eq
+		6DB320F5 lit cneg A4CDF0C lit asrt_eq
+		6DB320F5 lit cinv 68A1F768 lit asrt_eq
+		527B1C9B lit 76E7FF88 lit cadd 51631C22 lit asrt_eq
+		527B1C9B lit 76E7FF88 lit csub 53931D14 lit asrt_eq
+		527B1C9B lit 76E7FF88 lit cmul 5B07EFA9 lit asrt_eq
+		527B1C9B lit cneg 2584E366 lit asrt_eq
+		527B1C9B lit cinv 516962D5 lit asrt_eq
+		645FFDD2 lit 1B065E3E lit cadd 7665C0F lit asrt_eq
+		645FFDD2 lit 1B065E3E lit csub 49599F94 lit asrt_eq
+		645FFDD2 lit 1B065E3E lit cmul 70C3A820 lit asrt_eq
+		645FFDD2 lit cneg 13A0022F lit asrt_eq
+		645FFDD2 lit cinv EA8063C lit asrt_eq
+		3AE2C35 lit 763F5A19 lit cadd 1ED864D lit asrt_eq
+		3AE2C35 lit 763F5A19 lit csub 56ED21D lit asrt_eq
+		3AE2C35 lit 763F5A19 lit cmul 42F78981 lit asrt_eq
+		3AE2C35 lit cneg 7451D3CC lit asrt_eq
+		3AE2C35 lit cinv 3BA34661 lit asrt_eq
+		303A2794 lit 3D37B950 lit cadd 6D71E0E4 lit asrt_eq
+		303A2794 lit 3D37B950 lit csub 6B026E45 lit asrt_eq
+		303A2794 lit 3D37B950 lit cmul 4CF7F6DF lit asrt_eq
+		303A2794 lit cneg 47C5D86D lit asrt_eq
+		303A2794 lit cinv 439DA707 lit asrt_eq
+		20F8D9EF lit 887B62E lit cadd 2980901D lit asrt_eq
+		20F8D9EF lit 887B62E lit csub 187123C1 lit asrt_eq
+		20F8D9EF lit 887B62E lit cmul 62580FBD lit asrt_eq
+		20F8D9EF lit cneg 57072612 lit asrt_eq
+		20F8D9EF lit cinv 19D22795 lit asrt_eq
+		1BB577E6 lit 77FFFFFF lit cadd 1BB577E4 lit asrt_eq
+		1BB577E6 lit 77FFFFFF lit csub 1BB577E8 lit asrt_eq
+		1BB577E6 lit 77FFFFFF lit cmul 40951035 lit asrt_eq
+		1BB577E6 lit cneg 5C4A881B lit asrt_eq
+		1BB577E6 lit cinv 5C86D1F7 lit asrt_eq
+		101DF583 lit 2C8C39B lit cadd 12E6B91E lit asrt_eq
+		101DF583 lit 2C8C39B lit csub D5531E8 lit asrt_eq
+		101DF583 lit 2C8C39B lit cmul 181EB45B lit asrt_eq
+		101DF583 lit cneg 67E20A7E lit asrt_eq
+		101DF583 lit cinv 310BE514 lit asrt_eq
+		6370A5C7 lit 672E9ED5 lit cadd 529F449B lit asrt_eq
+		6370A5C7 lit 672E9ED5 lit csub 744206F3 lit asrt_eq
+		6370A5C7 lit 672E9ED5 lit cmul 704BD48E lit asrt_eq
+		6370A5C7 lit cneg 148F5A3A lit asrt_eq
+		6370A5C7 lit cinv FEBAE0B lit asrt_eq
+		6EE6367A lit 51D720F3 lit cadd 48BD576C lit asrt_eq
+		6EE6367A lit 51D720F3 lit csub 1D0F1587 lit asrt_eq
+		6EE6367A lit 51D720F3 lit cmul 3A28C0CA lit asrt_eq
+		6EE6367A lit cneg 919C987 lit asrt_eq
+		6EE6367A lit cinv 5781FC2A lit asrt_eq
+		173C7FD lit 1DDD9E57 lit cadd 1F516654 lit asrt_eq
+		173C7FD lit 1DDD9E57 lit csub 5B9629A7 lit asrt_eq
+		173C7FD lit 1DDD9E57 lit cmul 11D39581 lit asrt_eq
+		173C7FD lit cneg 768C3804 lit asrt_eq
+		173C7FD lit cinv 1ABD0053 lit asrt_eq
+		2E649AE5 lit EAEA5CA lit cadd 3D1340AF lit asrt_eq
+		2E649AE5 lit EAEA5CA lit csub 1FB5F51B lit asrt_eq
+		2E649AE5 lit EAEA5CA lit cmul 6B30B1EC lit asrt_eq
+		2E649AE5 lit cneg 499B651C lit asrt_eq
+		2E649AE5 lit cinv 731CA351 lit asrt_eq
+		3C7DDC6A lit 40000000 lit cadd 47DDC69 lit asrt_eq
+		3C7DDC6A lit 40000000 lit csub 747DDC6B lit asrt_eq
+		3C7DDC6A lit 40000000 lit cmul 1FBCDFC8 lit asrt_eq
+		3C7DDC6A lit cneg 3B822397 lit asrt_eq
+		3C7DDC6A lit cinv 6512F714 lit asrt_eq
+		2DA294D4 lit 2FCD7366 lit cadd 5D70083A lit asrt_eq
+		2DA294D4 lit 2FCD7366 lit csub 75D5216F lit asrt_eq
+		2DA294D4 lit 2FCD7366 lit cmul 2F38B95A lit asrt_eq
+		2DA294D4 lit cneg 4A5D6B2D lit asrt_eq
+		2DA294D4 lit cinv 14EFE1AC lit asrt_eq
+		3E04B1FB lit 69AB5E21 lit cadd 2FB0101B lit asrt_eq
+		3E04B1FB lit 69AB5E21 lit csub 4C5953DB lit asrt_eq
+		3E04B1FB lit 69AB5E21 lit cmul 2F016EB0 lit asrt_eq
+		3E04B1FB lit cneg 39FB4E06 lit asrt_eq
+		3E04B1FB lit cinv 6AE30FB1 lit asrt_eq
+		614016BF lit 3300DC01 lit cadd 1C40F2BF lit asrt_eq
+		614016BF lit 3300DC01 lit csub 2E3F3ABE lit asrt_eq
+		614016BF lit 3300DC01 lit cmul 6876B1FD lit asrt_eq
+		614016BF lit cneg 16BFE942 lit asrt_eq
+		614016BF lit cinv 305F0C11 lit asrt_eq
+		353AC583 lit 980D59F lit cadd 3EBB9B22 lit asrt_eq
+		353AC583 lit 980D59F lit csub 2BB9EFE4 lit asrt_eq
+		353AC583 lit 980D59F lit cmul 3E1F835F lit asrt_eq
+		353AC583 lit cneg 42C53A7E lit asrt_eq
+		353AC583 lit cinv 35406D3C lit asrt_eq
+		388582C3 lit 1349C1F lit cadd 39BA1EE2 lit asrt_eq
+		388582C3 lit 1349C1F lit csub 3750E6A4 lit asrt_eq
+		388582C3 lit 1349C1F lit cmul 15E44DAB lit asrt_eq
+		388582C3 lit cneg 3F7A7D3E lit asrt_eq
+		388582C3 lit cinv 4E70C1A5 lit asrt_eq
+		368DFC lit 5484B59F lit cadd 54BB439B lit asrt_eq
+		368DFC lit 5484B59F lit csub 23B1D85E lit asrt_eq
+		368DFC lit 5484B59F lit cmul 420EEEFF lit asrt_eq
+		368DFC lit cneg 77C97205 lit asrt_eq
+		368DFC lit cinv 5ED6DB13 lit asrt_eq
+		23580DC1 lit 39E929CE lit cadd 5D41378F lit asrt_eq
+		23580DC1 lit 39E929CE lit csub 616EE3F4 lit asrt_eq
+		23580DC1 lit 39E929CE lit cmul FA97A5B lit asrt_eq
+		23580DC1 lit cneg 54A7F240 lit asrt_eq
+		23580DC1 lit cinv 4FB2185D lit asrt_eq
+		4607C7CA lit 52A823A7 lit cadd 20AFEB70 lit asrt_eq
+		4607C7CA lit 52A823A7 lit csub 6B5FA424 lit asrt_eq
+		4607C7CA lit 52A823A7 lit cmul FB72CB0 lit asrt_eq
+		4607C7CA lit cneg 31F83837 lit asrt_eq
+		4607C7CA lit cinv BD58564 lit asrt_eq
+		3E6039C5 lit D1C7DA6 lit cadd 4B7CB76B lit asrt_eq
+		3E6039C5 lit D1C7DA6 lit csub 3143BC1F lit asrt_eq
+		3E6039C5 lit D1C7DA6 lit cmul 1255F363 lit asrt_eq
+		3E6039C5 lit cneg 399FC63C lit asrt_eq
+		3E6039C5 lit cinv 5ACDB68E lit asrt_eq
+	}
+	babybear4 {
+		vinit
+		0 lit 1 lit 2 lit 78000000 lit vx @ 4 lit v!  40000000 lit 77FFFFFF lit 78000000 lit 2 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  16 lit 40000037 lit 7FFFFE7 lit 37FFFFFC lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  40000000 lit 78000000 lit 1 lit 1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  38000001 lit 3 lit 3 lit 77FFFFFE lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  4A492493 lit 30924925 lit 6124924A lit 703531E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  16 lit 40000037 lit 7FFFFE7 lit 37FFFFFC lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		1 lit 2 lit 78000000 lit 77FFFFFF lit vx @ 4 lit v!  6AB25093 lit 40000000 lit 77FFFFFF lit 78000000 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  12B2509E lit 2564A15B lit 154DAF81 lit 529B5ED8 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  6AB25094 lit 40000002 lit 77FFFFFE lit 77FFFFFE lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  D4DAF6F lit 38000003 lit 1 lit 78000000 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  6E0EA0EB lit 13E2BE2C lit 5C3A83A9 lit 378AF8B0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  12B2509E lit 2564A15B lit 154DAF81 lit 529B5ED8 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		2 lit 78000000 lit 77FFFFFF lit 40000000 lit vx @ 4 lit v!  5407957 lit 549139AE lit 40000000 lit 77FFFFFF lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  6A6028FA lit 546A82BC lit 40EDD3B0 lit 5C107F1F lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  5407959 lit 549139AD lit 3FFFFFFE lit 3FFFFFFE lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  72BF86AC lit 236EC652 lit 37FFFFFF lit 40000002 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  237A60FA lit 2EBCBC42 lit F831FBE lit 2FF443DB lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  6A6028FA lit 546A82BC lit 40EDD3B0 lit 5C107F1F lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		78000000 lit 77FFFFFF lit 40000000 lit 382E41B0 lit vx @ 4 lit v!  3324016F lit 87883F lit 6913A805 lit 40000000 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  18B304D0 lit 216527A5 lit 40FEF893 lit 14AF41C1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  3324016E lit 87883D lit 3113A804 lit 2E41AF lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  44DBFE91 lit 777877C0 lit 4EEC57FC lit 702E41B1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  7220B46C lit 4635DE14 lit 6AFBFFD3 lit 2EDAF208 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  18B304D0 lit 216527A5 lit 40FEF893 lit 14AF41C1 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		77FFFFFF lit 40000000 lit 74BD18E6 lit 6A66EC44 lit vx @ 4 lit v!  C0D36F3 lit F30E234 lit 7215CB9F lit 57DDCEF lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  20E69A48 lit 33BF7C56 lit 6A852885 lit 3735C391 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  C0D36F1 lit 4F30E234 lit 6ED2E484 lit 6FE4C933 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  6BF2C90C lit 30CF1DCC lit 2A74D47 lit 64E90F55 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  1DFE4D18 lit 1D88665B lit 6C56C306 lit 16338942 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  20E69A48 lit 33BF7C56 lit 6A852885 lit 3735C391 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		40000000 lit 6C52F9D4 lit 4EF235A5 lit 68B9EF60 lit vx @ 4 lit v!  5BCB1999 lit 4DD06E7E lit 2EB1486C lit 48093668 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  640A8DD lit 5D630953 lit 36A5B4CC lit 26EDBFCD lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  23CB1998 lit 42236851 lit 5A37E10 lit 38C325C7 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  5C34E668 lit 1E828B56 lit 2040ED39 lit 20B0B8F8 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  604E5F4A lit 2EA360FA lit 165DFBD1 lit 36F9B3BD lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  640A8DD lit 5D630953 lit 36A5B4CC lit 26EDBFCD lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		5E1B8300 lit 3C202C83 lit 74EE322 lit 2C58CE8B lit vx @ 4 lit v!  726A79AF lit 4EBAAB8C lit 40804F6B lit 2E3F0928 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  2F717471 lit 42F350EE lit 395BBF1 lit F5F6406 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  5885FCAE lit 12DAD80E lit 47CF328D lit 5A97D7B3 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  63B10952 lit 656580F8 lit 3ECE93B8 lit 7619C564 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  5D02E8DB lit 3AEC4C59 lit 5B0D9C69 lit 1BD44C1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  2F717471 lit 42F350EE lit 395BBF1 lit F5F6406 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		13B75017 lit 45A9057 lit 2A4870E2 lit D7646EA lit vx @ 4 lit v!  15696836 lit 5CCF72A1 lit 315938E4 lit 6095D822 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  6A415865 lit 38659E07 lit 1A19AE01 lit 3453B41D lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  2920B84D lit 612A02F8 lit 5BA1A9C6 lit 6E0C1F0C lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  764DE7E2 lit 1F8B1DB7 lit 70EF37FF lit 24E06EC9 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  6F3BE404 lit 5B796487 lit 5304772E lit 62DAAE5B lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  6A415865 lit 38659E07 lit 1A19AE01 lit 3453B41D lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		4C91DDCD lit 44636655 lit 38DF12D9 lit 60B54B32 lit vx @ 4 lit v!  1CED71D4 lit A5AE2F lit CA0EDE0 lit 495C0B5 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  8EF1897 lit 6E455349 lit 644FF8C6 lit 61231CD1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  697F4FA1 lit 45091484 lit 458000B9 lit 654B0BE7 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  2FA46BF9 lit 43BDB826 lit 2C3E24F9 lit 5C1F8A7D lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  3B1DDFB8 lit 6B3B525B lit 316EDBC7 lit 14D53D29 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  8EF1897 lit 6E455349 lit 644FF8C6 lit 61231CD1 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		E6D8B69 lit 74C2E568 lit 4DFCE705 lit 11199B07 lit vx @ 4 lit v!  8B7847 lit 30769CB9 lit 73F7826D lit 3EA127A2 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  602189D1 lit 380FE4DF lit 234C4C72 lit 4BE413CB lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  EF903B0 lit 2D398220 lit 49F46971 lit 4FBAC2A9 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  DE21322 lit 444C48AF lit 52056499 lit 4A787366 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  3479CC50 lit 4AD96FB1 lit 35D6D6E7 lit 113F2D1B lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  602189D1 lit 380FE4DF lit 234C4C72 lit 4BE413CB lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		638CD745 lit 2B386FB2 lit B914FFE lit 2F7F1389 lit vx @ 4 lit v!  4F409111 lit 674912BA lit 46D18A4 lit 312E3BEC lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  66E68EB lit 19B1850C lit 482BC75C lit 5FEE942E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  3ACD6855 lit 1A81826B lit FFE68A2 lit 60AD4F75 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  144C4634 lit 3BEF5CF9 lit 724375A lit 7650D79E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  5EB20155 lit 58747529 lit 544DDFF0 lit 18408030 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  66E68EB lit 19B1850C lit 482BC75C lit 5FEE942E lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		5A57B1BC lit 41162C73 lit 3EFCEC5D lit 36BE19BA lit vx @ 4 lit v!  2BE27A75 lit 50640027 lit 70E5E723 lit 4EAEBACA lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  21DDECD3 lit 469CDFEA lit 54F9043F lit 48A40272 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  E3A2C30 lit 197A2C99 lit 37E2D37F lit D6CD483 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  2E753747 lit 68B22C4D lit 4617053B lit 600F5EF1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  22524F76 lit 7192CD33 lit 43956688 lit 1D53596C lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  21DDECD3 lit 469CDFEA lit 54F9043F lit 48A40272 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		23BFF4BC lit 13432FE5 lit 74274990 lit 295F2AE2 lit vx @ 4 lit v!  38DF237D lit 1E2D2FD6 lit 103B454C lit 320B2D47 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  285AB37A lit 3ACB073A lit 6ABA2BF8 lit 267EF243 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  5C9F1839 lit 31705FBB lit C628EDB lit 5B6A5829 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  62E0D140 lit 6D160010 lit 63EC0444 lit 6F53FD9C lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  4F44895D lit 2DDD3415 lit 309DEE0E lit 5D40B2BA lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  285AB37A lit 3ACB073A lit 6ABA2BF8 lit 267EF243 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		F7C529B lit 21C4FADF lit 3F665040 lit 881B30A lit vx @ 4 lit v!  324E7DB5 lit 53BEE6B lit 3FB27B2D lit 77937885 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  2F758A77 lit 5E065CE1 lit 73545CCE lit 69224D67 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  41CAD050 lit 2700E94A lit 718CB6C lit 8152B8E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  552DD4E7 lit 1C890C74 lit 77B3D514 lit 8EE3A86 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  35F57C89 lit 47BED7AE lit 384EB9EC lit 20DBFF48 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  2F758A77 lit 5E065CE1 lit 73545CCE lit 69224D67 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		4B9AFDCD lit 30744E7B lit 6C346046 lit 1DFF787B lit vx @ 4 lit v!  6B425983 lit 2DDE21C4 lit 74EFD3F9 lit 71D08936 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  27432318 lit 5B4F656 lit 5FE97870 lit A2A0B55 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  3EDD574F lit 5E52703F lit 6924343E lit 17D001B0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  5858A44B lit 2962CB7 lit 6F448C4E lit 242EEF46 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  4949463 lit E5C89EB lit 225D22B7 lit 66C06D62 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  27432318 lit 5B4F656 lit 5FE97870 lit A2A0B55 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		68ADA5AD lit 502291B1 lit 4F56F048 lit 511F78DA lit vx @ 4 lit v!  61388E63 lit 724FCAD7 lit 524C9C57 lit 5A1CEF3A lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  4C4DA633 lit A592C74 lit 58E3A89A lit 1DE57C7 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  51E6340F lit 4A725C87 lit 29A38C9E lit 333C6813 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  775174A lit 55D2C6DB lit 750A53F2 lit 6F0289A1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  294B4B8 lit 37ABCADD lit 459F4429 lit BFF18EF lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  4C4DA633 lit A592C74 lit 58E3A89A lit 1DE57C7 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		93E199C lit 6A078D14 lit 4E431637 lit 24E8B0FD lit vx @ 4 lit v!  4E68EB96 lit 7716804B lit 33D939E3 lit F556084 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  573AE368 lit 39C3EE81 lit 25332846 lit 4C934C8 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  57A70532 lit 691E0D5E lit A1C5019 lit 343E1181 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  32D52E07 lit 6AF10CCA lit 1A69DC54 lit 15935079 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  39654046 lit 401AB409 lit 313E62AD lit 6DD59218 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  573AE368 lit 39C3EE81 lit 25332846 lit 4C934C8 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		35401CDE lit 2395B913 lit 5BCE23FA lit 14706107 lit vx @ 4 lit v!  32BD33F lit 414883B lit 409A41BA lit 637D62BA lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  6D38832 lit 763E143F lit 8C46F82 lit 6B39382D lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  386BF01D lit 27AA414E lit 246865B3 lit 77EDC3C1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  3214499F lit 1F8130D8 lit 1B33E240 lit 28F2FE4E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  63FE06C9 lit 6EB83BB6 lit 4BBAF851 lit 2596267C lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  6D38832 lit 763E143F lit 8C46F82 lit 6B39382D lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		51CD9974 lit 11D215E3 lit 851C392 lit 28379C36 lit vx @ 4 lit v!  3BC4B7A6 lit 1DE2E05B lit 538D2EE7 lit 2555550C lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  F981492 lit 27489D7C lit 714FDC8 lit 49D27ACA lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  15925119 lit 2FB4F63E lit 5BDEF279 lit 4D8CF142 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  1608E1CE lit 6BEF3589 lit 2CC494AC lit 2E2472A lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  5334BE05 lit 57D91AD6 lit 6E8FCD3B lit F5B6279 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  F981492 lit 27489D7C lit 714FDC8 lit 49D27ACA lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		30CD4ABA lit 5A2B1256 lit 20B545F1 lit 6CF64E89 lit vx @ 4 lit v!  7408788F lit 2C86D7E8 lit 76F81273 lit 77312AAC lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  51EB1D39 lit 52AB91D5 lit 4F3F2AA6 lit 4139CE7F lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  2CD5C348 lit EB1EA3D lit 1FAD5863 lit 6C277934 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  34C4D22C lit 2DA43A6E lit 21BD337F lit 6DC523DE lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  2771C250 lit 5A87078E lit 6DCBC0FD lit 3B9674B9 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  51EB1D39 lit 52AB91D5 lit 4F3F2AA6 lit 4139CE7F lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		125F549 lit 550511D0 lit 25BE532D lit 6556945C lit vx @ 4 lit v!  2DC88498 lit A490F50 lit 56BE27AA lit 1AE7C5F lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  646AC3BC lit 2648F518 lit 1E58C48E lit 348EEF92 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  2EEE79E1 lit 5F4E2120 lit 47C7AD6 lit 670510BB lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  4B5D70B2 lit 4ABC0280 lit 47002B84 lit 63A817FD lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  7AC8C80 lit 24925EFB lit 4D2BE458 lit 30899BCA lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  646AC3BC lit 2648F518 lit 1E58C48E lit 348EEF92 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		200A6D12 lit 3755334D lit 3020773B lit 47DA1B5F lit vx @ 4 lit v!  6E85BB55 lit 32633150 lit 181E2D4C lit 162847C4 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  19D3AD4F lit 740FA9A2 lit 3D7697C lit 188229C7 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  16902866 lit 69B8649D lit 483EA487 lit 5E026323 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  2984B1BE lit 4F201FD lit 180249EF lit 31B1D39B lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  3956FB8E lit 392CB10C lit 3B6AD1B5 lit 4B574DF6 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  19D3AD4F lit 740FA9A2 lit 3D7697C lit 188229C7 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		1484F15F lit 2376492C lit 4E21D36E lit 42A6AA16 lit vx @ 4 lit v!  3423445A lit 2BEA4A85 lit 4E27413B lit 5BFC2077 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  2ED408E1 lit 68B356F9 lit 950AC3C lit AB089D lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  48A835B9 lit 4F6093B1 lit 244914A8 lit 26A2CA8C lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  5861AD06 lit 6F8BFEA8 lit 77FA9234 lit 5EAA89A0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  174CFDCF lit 2B2CDEF8 lit 1E91B628 lit 51B30910 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  2ED408E1 lit 68B356F9 lit 950AC3C lit AB089D lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+		3C270487 lit 6F0FE29B lit 68104E2E lit 3BBED153 lit vx @ 4 lit v!  292C8579 lit 13F60F51 lit F43732A lit 65AC1797 lit vy @ 4 lit v!  vx @ e4tom vy @ e4tom
+		vx @ vy @ vz @ e4mul vz @ e4from  2F77BF21 lit 46566B71 lit 3DF65789 lit 43574126 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4+ vz @ e4from  65538A00 lit B05F1EB lit 7753C158 lit 296AE8E9 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ e4- vz @ e4from  12FA7F0E lit 5B19D34A lit 58CCDB04 lit 4E12B9BD lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vz @ e4inv vz @ e4from  6A061E4E lit 141CFDD5 lit 6D40003C lit 768683B0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vx @ e4mul vx @ e4from  2F77BF21 lit 46566B71 lit 3DF65789 lit 43574126 lit vw @ 4 lit v!  vx @ vw @ 4 lit wcmp 0 lit asrt_eq
+	}
+	wide {
+		vinit
+		9663161D lit C8870B39 lit ACF48DF6 lit 46AC077 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  4EE1FF0C lit 5A1F926D lit 98905171 lit FD9B4849 lit 2B07B848 lit E lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  E5451529 lit 22A69DA6 lit 4584DF68 lit 20608C1 lit 2B07B849 lit E lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  47811711 lit 6E6778CC lit 14643C85 lit 6CF782E lit D4F847B7 lit FFFFFFF1 lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 7B lit asrt_eq
+		vx @ vz @ 8 lit 43 lit wshl  0 lit 0 lit B318B0E8 lit 443859CC lit 67A46FB6 lit 235603BD lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 43 lit wshr  F59E91BE lit 8D580E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		B58182D1 lit B1B6540B lit D6867180 lit 751BB799 lit B9CF418C lit 9A843BEA lit 8CAFAA51 lit C51 lit vx @ 8 lit v!  23CE88C lit F6CE67D6 lit DB1570F0 lit 86FDEAA6 lit 29B93 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  B7BE6B5D lit A884BBE1 lit B19BE271 lit FC19A240 lit B9D1DD1F lit 9A843BEA lit 8CAFAA51 lit C51 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  B3449A45 lit BAE7EC35 lit FB71008F lit EE1DCCF2 lit B9CCA5F8 lit 9A843BEA lit 8CAFAA51 lit C51 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits EC lit asrt_eq
+		vx @ vz @ 8 lit D7 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 68800000 lit 5DAC0C1 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit D7 lit wshr  18A319 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		B8B16A30 lit 6457994F lit CB1A lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  E3B lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  B8B1786B lit 6457994F lit CB1A lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  B8B15BF5 lit 6457994F lit CB1A lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 50 lit asrt_eq
+		vx @ vz @ 8 lit C7 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 58B51800 lit 2BCCA7DC lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit C7 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		266A4A8F lit 653 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  F0A65DA9 lit 782544 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  1710A838 lit 782B98 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  35C3ECE6 lit FF87E10E lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 2B lit asrt_eq
+		vx @ vz @ 8 lit A5 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit CD4951E0 lit CA64 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit A5 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		43734FC9 lit 28B4E53D lit 5756F56 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  CDDAD0AF lit CA2180CB lit 8DE lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  114E2078 lit F2D66609 lit 5757834 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  75987F1A lit 5E936471 lit 5756677 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 5B lit asrt_eq
+		vx @ vz @ 8 lit 31 lit wshl  0 lit 9F920000 lit CA7A86E6 lit DEAC5169 lit AEA lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 31 lit wshr  B7AB145A lit 2BA lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		DD9EADD0 lit 47F2C068 lit A08BE5BE lit 27BE3A64 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  0 lit 0 lit FFFFFFFF lit FFFFFFFF lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  DD9EADD0 lit 47F2C068 lit A08BE5BD lit 27BE3A64 lit 1 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  DD9EADD0 lit 47F2C068 lit A08BE5BF lit 27BE3A64 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 7E lit asrt_eq
+		vx @ vz @ 8 lit F4 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit DD000000 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit F4 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		4E9518C4 lit A3F86699 lit FFFFFFFF lit FFFFFFFF lit C12 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  24AB57EE lit B1AE0B17 lit 7970BBD8 lit D8C961B2 lit 4 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  734070B2 lit 55A671B0 lit 7970BBD8 lit D8C961B2 lit C17 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  29E9C0D6 lit F24A5B82 lit 868F4426 lit 27369E4D lit C0E lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 8C lit asrt_eq
+		vx @ vz @ 8 lit 34 lit wshl  0 lit 8C400000 lit 6994E951 lit FFFA3F86 lit FFFFFFFF lit C12FFFFF lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 34 lit wshr  FFFFFA3F lit FFFFFFFF lit C12FFF lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		CB6BD5C5 lit 69FDBD0C lit E1FF460F lit F9D92029 lit 39970F10 lit D582864F lit E5CBA7DE lit 7DD286 lit vx @ 8 lit v!  ECEF6235 lit 93134826 lit 34AC1 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  B85B37FA lit FD110533 lit E20290D0 lit F9D92029 lit 39970F10 lit D582864F lit E5CBA7DE lit 7DD286 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  DE7C7390 lit D6EA74E5 lit E1FBFB4D lit F9D92029 lit 39970F10 lit D582864F lit E5CBA7DE lit 7DD286 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits F7 lit asrt_eq
+		vx @ vz @ 8 lit 62 lit wshl  0 lit 0 lit 0 lit 2DAF5714 lit A7F6F433 lit 87FD183D lit E76480A7 lit E65C3C43 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 62 lit wshr  3E76480A lit CE65C3C4 lit B560A193 lit B972E9F7 lit 1F74A1 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		3D9461F7 lit 38752F22 lit A18F9C4C lit A81F6F58 lit 1130D645 lit E8F5FD76 lit 3877E818 lit 4AF7 lit vx @ 8 lit v!  71EF2 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  3D9B80E9 lit 38752F22 lit A18F9C4C lit A81F6F58 lit 1130D645 lit E8F5FD76 lit 3877E818 lit 4AF7 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  3D8D4305 lit 38752F22 lit A18F9C4C lit A81F6F58 lit 1130D645 lit E8F5FD76 lit 3877E818 lit 4AF7 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits EF lit asrt_eq
+		vx @ vz @ 8 lit F6 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 7DC00000 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit F6 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		CFA8066C lit 89CD342A lit BA6AE11B lit 2739997 lit 8DE15F8E lit B84 lit FFFFFFFF lit FFFFFFFF lit vx @ 8 lit v!  B6D6DCE0 lit AD48BF11 lit FFA0454E lit 1405C45E lit 2377B91B lit 1D5845 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  867EE34C lit 3715F33C lit BA0B266A lit 16795DF6 lit B15918A9 lit 1D63C9 lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  18D1298C lit DC847519 lit BACA9BCC lit EE6DD538 lit 6A69A672 lit FFE2B33F lit FFFFFFFE lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 100 lit asrt_eq
+		vx @ vz @ 8 lit EE lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 19B0000 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit EE lit wshr  3FFFF lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E182F8DB lit 94A1B89B lit B571A7F3 lit 15BD8D7D lit 623E561E lit 550049BA lit 178F6B6 lit 0 lit vx @ 8 lit v!  E26FB5A6 lit 2B4797F8 lit F3FF9AF0 lit 20D5EAB lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  C3F2AE81 lit BFE95094 lit A97142E3 lit 17CAEC29 lit 623E561E lit 550049BA lit 178F6B6 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  FF134335 lit 695A20A2 lit C1720D03 lit 13B02ED1 lit 623E561E lit 550049BA lit 178F6B6 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits D9 lit asrt_eq
+		vx @ vz @ 8 lit 9F lit wshl  0 lit 0 lit 0 lit 0 lit 80000000 lit F0C17C6D lit CA50DC4D lit DAB8D3F9 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 9F lit wshr  AA009374 lit 2F1ED6C lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		C4C99380 lit 7F9BB187 lit 2 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  F8D6AB06 lit 84B7C859 lit 124E63B0 lit 2E0E3862 lit EFB76D16 lit FF630F3D lit 1F016BB4 lit 2B8A lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  BDA03E86 lit 45379E1 lit 124E63B3 lit 2E0E3862 lit EFB76D16 lit FF630F3D lit 1F016BB4 lit 2B8A lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  CBF2E87A lit FAE3E92D lit EDB19C51 lit D1F1C79D lit 104892E9 lit 9CF0C2 lit E0FE944B lit FFFFD475 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 42 lit asrt_eq
+		vx @ vz @ 8 lit 85 lit wshl  0 lit 0 lit 0 lit 0 lit 99327000 lit F37630F8 lit 4F lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 85 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		EE5F88A5 lit B33E6FF7 lit 6 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  8B3379D8 lit 8C52B72A lit 64A46E07 lit D0E795AF lit 64 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  7993027D lit 3F912722 lit 64A46E0E lit D0E795AF lit 64 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  632C0ECD lit 26EBB8CD lit 9B5B91FF lit 2F186A50 lit FFFFFF9B lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 43 lit asrt_eq
+		vx @ vz @ 8 lit 29 lit wshl  0 lit BF114A00 lit 7CDFEFDC lit D66 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 29 lit wshr  3599F37 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		82589ACE lit 73C2DE92 lit 94538A29 lit 22A341BE lit 552AFE35 lit 68129E0 lit 2695E95C lit 5F0 lit vx @ 8 lit v!  63CABFC2 lit 6469E464 lit 31CD68B lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  E6235A90 lit D82CC2F6 lit 977060B4 lit 22A341BE lit 552AFE35 lit 68129E0 lit 2695E95C lit 5F0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  1E8DDB0C lit F58FA2E lit 9136B39E lit 22A341BE lit 552AFE35 lit 68129E0 lit 2695E95C lit 5F0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits EB lit asrt_eq
+		vx @ vz @ 8 lit 14 lit wshl  ACE00000 lit E9282589 lit A2973C2D lit 1BE94538 lit E3522A34 lit 9E0552AF lit 95C06812 lit 5F02695E lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 14 lit wshr  2DE92825 lit 38A2973C lit 341BE945 lit AFE3522A lit 129E0552 lit 5E95C068 lit 5F0269 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		BD0D36B lit 97B17538 lit 7968E7D1 lit C216AA5 lit 56 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  A74546CA lit 2AA lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  B3161A35 lit 97B177E2 lit 7968E7D1 lit C216AA5 lit 56 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  648B8CA1 lit 97B1728D lit 7968E7D1 lit C216AA5 lit 56 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 87 lit asrt_eq
+		vx @ vz @ 8 lit 8A lit wshl  0 lit 0 lit 0 lit 0 lit 434DAC00 lit C5D4E02F lit A39F465E lit 85AA95E5 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 8A lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		7726FCE7 lit C0301EA3 lit 5864F5E lit 2A4E83EF lit 109F6AFE lit 1972DA56 lit 177 lit 0 lit vx @ 8 lit v!  61F9347D lit 1D8A5809 lit 6FD1D1D2 lit 5EFEE143 lit D255F065 lit 5D6AA154 lit 3B453774 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  D9203164 lit DDBA76AC lit 75582130 lit 894D6532 lit E2F55B63 lit 76DD7BAA lit 3B4538EB lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  152DC86A lit A2A5C69A lit 95B47D8C lit CB4FA2AB lit 3E497A98 lit BC083901 lit C4BACA02 lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits C9 lit asrt_eq
+		vx @ vz @ 8 lit AB lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 37E73800 lit 80F51BB9 lit 327AF601 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit AB lit wshr  2EE32E5B lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		2702BDA7 lit 8D6B15A7 lit 74 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  691D1D4E lit 3768E38B lit ADE35001 lit 2B0D2E2E lit 2B00E1AE lit 79D41 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  901FDAF5 lit C4D3F932 lit ADE35075 lit 2B0D2E2E lit 2B00E1AE lit 79D41 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  BDE5A059 lit 5602321B lit 521CB073 lit D4F2D1D1 lit D4FF1E51 lit FFF862BE lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 47 lit asrt_eq
+		vx @ vz @ 8 lit C3 lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 3815ED38 lit 6B58AD39 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit C3 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E03BB128 lit 8BB768C8 lit 9060C52C lit 2D2D7435 lit 1FAE9ACF lit F1639DD1 lit BE6B51E9 lit 1A0 lit vx @ 8 lit v!  57486E20 lit 67EBAE6F lit D0EF1F18 lit 64B33 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  37841F48 lit F3A31738 lit 614FE444 lit 2D33BF69 lit 1FAE9ACF lit F1639DD1 lit BE6B51E9 lit 1A0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  88F34308 lit 23CBBA59 lit BF71A614 lit 2D272901 lit 1FAE9ACF lit F1639DD1 lit BE6B51E9 lit 1A0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits E9 lit asrt_eq
+		vx @ vz @ 8 lit CA lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit EEC4A000 lit DDA32380 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit CA lit wshr  682F9AD4 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		B1561A9C lit 0 lit FFFFFFFF lit FFFFFFFF lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  31A09FBC lit A4BFB47F lit 61D4E31A lit 10436C48 lit AB6188AD lit 119FD lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  E2F6BA58 lit A4BFB47F lit 61D4E319 lit 10436C48 lit AB6188AE lit 119FD lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  7FB57AE0 lit 5B404B81 lit 9E2B1CE4 lit EFBC93B7 lit 549E7753 lit FFFEE602 lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 80 lit asrt_eq
+		vx @ vz @ 8 lit D lit wshl  C3538000 lit 162A lit FFFFE000 lit FFFFFFFF lit 1FFF lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit D lit wshr  58AB0 lit FFF80000 lit FFFFFFFF lit 7FFFF lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		2C1F4918 lit 4C0E03DB lit 4EB66473 lit AF995F10 lit 43C90F lit 0 lit 0 lit 0 lit vx @ 8 lit v!  7B51BB8 lit 5 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  33D464D0 lit 4C0E03E0 lit 4EB66473 lit AF995F10 lit 43C90F lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  246A2D60 lit 4C0E03D6 lit 4EB66473 lit AF995F10 lit 43C90F lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 97 lit asrt_eq
+		vx @ vz @ 8 lit 3 lit wshl  60FA48C0 lit 60701ED9 lit 75B3239A lit 7CCAF882 lit 21E487D lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 3 lit wshr  6583E923 lit 6981C07B lit 9D6CC8E lit F5F32BE2 lit 87921 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E659AE90 lit 980 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  2FC2599 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  E955D429 lit 980 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  E35D88F7 lit 980 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 2C lit asrt_eq
+		vx @ vz @ 8 lit 53 lit wshl  0 lit 0 lit 74800000 lit 4C0732CD lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 53 lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		2C lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  13DFA7E0 lit 35DFEC9C lit 570D286C lit 47DCF8F3 lit 719BB600 lit 0 lit FFFFFFFF lit FFFFFFFF lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  13DFA80C lit 35DFEC9C lit 570D286C lit 47DCF8F3 lit 719BB600 lit 0 lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 1 lit asrt_eq  EC20584C lit CA201363 lit A8F2D793 lit B823070C lit 8E6449FF lit FFFFFFFF lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp FFFFFFFF lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 6 lit asrt_eq
+		vx @ vz @ 8 lit 7B lit wshl  0 lit 0 lit 0 lit 60000000 lit 1 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 7B lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		69E5A3AB lit 8FEA434 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  69E5A3AB lit 8FEA434 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  69E5A3AB lit 8FEA434 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 3C lit asrt_eq
+		vx @ vz @ 8 lit 2B lit wshl  0 lit 2D1D5800 lit F521A34F lit 47 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 2B lit wshr  11FD4 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		197A444 lit 43653EA3 lit F08D0D94 lit 8458471 lit 1AEC78B0 lit C84C414E lit FFFFFFFF lit FFFFFFFF lit vx @ 8 lit v!  B9F80D9C lit 3EBA3985 lit 410F6600 lit 174D4125 lit F5B896D3 lit 1A99DE lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ 8 lit wadd 0 lit asrt_eq  BB8FB1E0 lit 821F7828 lit 319C7394 lit 1F92C597 lit 10A50F83 lit C866DB2D lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ vz @ 8 lit wsub 0 lit asrt_eq  479F96A8 lit 4AB051D lit AF7DA794 lit F0F8434C lit 2533E1DC lit C831A76F lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vy @ 8 lit wcmp 1 lit asrt_eq  vx @ vx @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8 lit wbits 100 lit asrt_eq
+		vx @ vz @ 8 lit 52 lit wshl  0 lit 0 lit 91100000 lit FA8C065E lit 36510D94 lit 11C7C234 lit E2C02116 lit 5386BB1 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ vz @ 8 lit 52 lit wshr  611C7C23 lit 1E2C0211 lit 105386BB lit FFFFF213 lit FFFFFFFF lit 3FFF lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 0 lit wshl  67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 0 lit wshr  67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 1 lit wshl  CF75D03C lit 9E350D1C lit 1 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 1 lit wshr  33DD740F lit 678D4347 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 1F lit wshl  0 lit 33DD740F lit 678D4347 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 1F lit wshr  9E350D1C lit 1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 20 lit wshl  0 lit 67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 20 lit wshr  CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 21 lit wshl  0 lit CF75D03C lit 9E350D1C lit 1 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit 21 lit wshr  678D4347 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit FF lit wshl  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+		67BAE81E lit CF1A868E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vx @ 8 lit FF lit wshr  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vx @ vw @ 8 lit wcmp 0 lit asrt_eq
+	}
+	wide_mul {
+		vinit
+		51FB3763 lit 758737E7 lit 42C405C7 lit 29D92B1E lit 30 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  C2CD00A2 lit A56CB13 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  41400CA6 lit 33C103DF lit CB1C2C99 lit 11FBA81B lit A15D7C53 lit F1F6BF8A lit 1 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		38777A92 lit 6FA9BE71 lit vx @ 2 lit v!  BD9071E4 lit C4778536 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  C3A39C08 lit D45D4441 lit 464B0A5B lit 55B217D1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		741C474E lit 198D559A lit B53DE103 lit 96EEF52F lit 1F553EC3 lit 5C97AAFE lit 3 lit 0 lit vx @ 8 lit v!  5246750 lit 8F6C3AE0 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  367EAA60 lit 8F66D69A lit 1E29802 lit FC46D3DF lit 75992D7 lit 6E2D2357 lit 89725E73 lit E2248E6B lit 1 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		304C2596 lit 1BFDEF70 lit vx @ 2 lit v!  F8BAD41A lit 4AE63458 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  95D8093C lit FAF378B0 lit DBE0ED4C lit 8309314 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		126FD4F6 lit 77EDF541 lit 8ACB5742 lit D52B0F9C lit 9CEB7400 lit 3F967D lit 0 lit 0 lit vx @ 8 lit v!  EBE429BB lit 227FE4FB lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  DDE3F5B2 lit E0558BC5 lit 83450DCF lit 83C59A62 lit 4E35D6FE lit EB5DE42E lit 37C322F2 lit 891C1 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		15E9297F lit A9E64007 lit vx @ 2 lit v!  21217A7 lit BC8AB1CA lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  26C27AD9 lit 35C15185 lit FB3C444A lit 7D212321 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		E54D7820 lit 7B6FB2CA lit 2FD14EC lit B92C2059 lit 46AB32D2 lit D410323D lit 1D7E2D7 lit 0 lit vx @ 8 lit v!  46C9DE lit 0 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  853F4BC0 lit A1B90D2B lit 58F9288 lit 1200C1BD lit 98FC2831 lit 5A3F006F lit 21562918 lit 827C lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		30450BB lit E1B7B66D lit vx @ 2 lit v!  885D3F5B lit 226C182F lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  CE55B779 lit 7BA76A47 lit 92745F5A lit 1E59B50E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		D836C69F lit 81A877B6 lit 4E5BA996 lit D207E103 lit BF28831D lit CCC99E3B lit 24C666 lit 0 lit vx @ 8 lit v!  2484B53B lit F312214B lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  550A31A5 lit BAFBBDC4 lit 27BEE1E2 lit 6009A90 lit 1E09291 lit 7D437A34 lit 9DAC4F25 lit 4FFC66DA lit 22EAEE lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		B37079E6 lit 31D52997 lit vx @ 2 lit v!  FEA8E9B0 lit 5971557C lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  EF362420 lit 1C796EC6 lit 34FA33BB lit 11692B31 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		DD0434CE lit A113776F lit D4BBA05A lit BFD687BA lit 4B9A07 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  AC333C52 lit CF04375E lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  B4C331FC lit 901DFA96 lit 993A843A lit 81AF5095 lit 6D9E8646 lit 64A8AC8 lit 3D22CB lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		170BC897 lit B84B9068 lit vx @ 2 lit v!  DCECB54A lit 5F855D37 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  AD6EBEA6 lit C18EA911 lit 515E8790 lit 44C40CF4 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		5EB38B6B lit CA50202A lit 3164522E lit 2680017B lit 37C464AC lit 158A27 lit 0 lit 0 lit vx @ 8 lit v!  EEFD0222 lit 12769F46 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  3DAE5A36 lit DED0B1AE lit F45F19D9 lit 17F2A8F0 lit DAF9826E lit E8D48C6B lit D6C5C1B0 lit 18DB1 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		80A11EBD lit C415234E lit vx @ 2 lit v!  E75267D4 lit A6B78266 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  BC557F84 lit A0D5A269 lit B20E8CDC lit 7FB243E2 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		FC722C44 lit B33E61A3 lit C33ABAC0 lit F2FFBA5A lit 5365BB49 lit 1C5FE8CD lit 5D870C6D lit 25D59157 lit vx @ 8 lit v!  A4A97D12 lit 7ABCE18C lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  488850C8 lit E452B4B6 lit D805D74C lit 7C26C861 lit 4F6C9068 lit D9BE97EC lit 3F5CD387 lit D3005FE9 lit DC9A2DA8 lit 1223B16F lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		624F0BFD lit CBDF62E8 lit vx @ 2 lit v!  9AC601E2 lit FB862446 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  9082925A lit 7A32AB10 lit 4246C145 lit C84ED9CB lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		6D717B3F lit 86704412 lit 871BDACA lit F60BA992 lit ECC0FB87 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  855A7F lit 12A9AE7E lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  385B4A41 lit 51699695 lit 3256D819 lit 5E18D09E lit 40079DBB lit 4E7BC9BA lit 11427E75 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		C5698DE8 lit CCBBE3E7 lit vx @ 2 lit v!  BF890439 lit EA1A2E9C lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  A3E038A8 lit 2619ED6D lit 1E9CD21B lit BB38AEAE lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		13A7C18D lit 1E2C1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  507FD15F lit C4B23A5C lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  5537F053 lit F8ED7413 lit EB59EE78 lit 172EB lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		5F8AAE65 lit 50AD17CF lit vx @ 2 lit v!  6F33407E lit 6C8FBE77 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  3AFA15B6 lit 133C125 lit E4520E7A lit 223652C1 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  F192C2 lit 0 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  FF0E6D3E lit FFFFFFFF lit F192C1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		E0A09C36 lit 343F2679 lit vx @ 2 lit v!  8448E442 lit AE6BCCDD lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  BBB85DEC lit 465A57D0 lit 73CAD3B4 lit 2398EC5B lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		AC745D70 lit 4CE55B35 lit BF77A13E lit DB77041C lit 721CBCD6 lit DDB29C62 lit 7E06B68C lit 5 lit vx @ 8 lit v!  EAFFC5D9 lit 8D40D764 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  2D1A63F0 lit BBA15346 lit F16DC62B lit E0C688BF lit E1E35011 lit 6385E1C2 lit 83B35B5A lit 21F15430 lit 7CDD33B lit 3 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		5D2F661F lit 911277EA lit vx @ 2 lit v!  854887B2 lit D1E34BEE lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  9D875A8E lit 79E0D34D lit 3EB92AFA lit 76F0E24E lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit 3B093E94 lit F4BB7590 lit 190C0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  776976 lit 0 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  FF88968A lit FFFFFFFF lit 1830F5AD lit 57ABC9FE lit EEC9A075 lit BA lit 0 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		2A480863 lit 29CB738C lit vx @ 2 lit v!  1818E834 lit EA2A53C5 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  EF836C1C lit 9989C382 lit 379A47DE lit 263AE0AC lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  A8B3D460 lit 79F079A9 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		8B92ADC7 lit 25492C27 lit vx @ 2 lit v!  EA19F237 lit 289F074F lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  833873C1 lit BF83A403 lit 3E40FA0E lit 5EA9869 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		CB8078E0 lit 258A2EBC lit EE238383 lit 644680C2 lit F1240B8 lit CA6A965F lit 140056A lit 0 lit vx @ 8 lit v!  B7BBCCF9 lit 34C82579 lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  BBE811E0 lit 6A38E6EC lit 51E01564 lit 30AE6D2E lit 114BD3D0 lit 641DF7F3 lit 64BAB709 lit C57C772F lit 41FB4C lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		C975DA20 lit F8A20AF0 lit vx @ 2 lit v!  31B1E208 lit F2A856F1 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  465F1100 lit 1DFCDABC lit 7CF2958D lit EBACAD1F lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+		8F648E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  F7C60733 lit D12B2F4B lit vy @ 2 lit v!
+		vx @ 8 lit vy @ 2 lit vz @ wmul  D024EA4A lit 4FDD508A lit 752948 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ A lit v!  vz @ vw @ A lit wcmp 0 lit asrt_eq
+		F0D08C2 lit 1E2E67C lit vx @ 2 lit v!  BA9D5638 lit FD6BA3F1 lit vy @ 2 lit v!
+		vx @ 2 lit vy @ 2 lit vz @ wmul  FEC51670 lit FB03902E lit 317628B9 lit 1DE08D4 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq
+	}
+	wide_div {
+		vinit
+		3D796364 lit 75202F36 lit 47A5A84A lit 37F76 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  3D796364 lit 75202F36 lit 47A5A84A lit 37F76 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		EE4CA090 lit C3CAF623 lit 7A0BAE88 lit 166 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  7AE5 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  BFC1E256 lit 1D9DF25E lit 2EABCFD lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		3356B562 lit A1672F4 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  7741E498 lit 1513 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  7A87 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E471CAF2 lit 6AFC58F3 lit 9B8A57C8 lit 3BF686BC lit 5786D419 lit C0F6FA03 lit 269FC02A lit 207706 lit vx @ 8 lit v!  A05061BB lit 471A lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  34033F28 lit DE12E12 lit 81868864 lit 42174D1A lit 11792DD8 lit E2ACD3A5 lit 74 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		4448DBFB lit F1F2D5CE lit 11096A80 lit 9FA89C3A lit 5 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  FFFFFFFF lit FFFFFFFF lit 540F1F3A lit CD280AEA lit D74BDBE5 lit CEB9E09 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E34E3904 lit 6CF59438 lit 2727E5FC lit EC98AA48 lit E593DF1A lit 57FBD7D lit BEDC lit 0 lit vx @ 8 lit v!  74 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  1F5A3CD lit 7C8687E6 lit 92A4665 lit 5EBAB205 lit FB5BC1EC lit 35034EDF lit 1A5 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		881698AA lit 7C181E0F lit 6DBE9FA8 lit 5EE42F5E lit 390 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  881698AA lit 7C181E0F lit 6DBE9FA8 lit 5EE42F5E lit 390 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		E233DC12 lit 14F410 lit E74740AD lit BC24AAE6 lit 6 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  4F98 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  3696979E lit DD15CFD1 lit 2E38940A lit 15A96B lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		2242E07D lit 84D5AC18 lit 8F8A350C lit F6BDA0B3 lit A934420 lit 79EB23CB lit 0 lit 0 lit vx @ 8 lit v!  BC0ECBDE lit CB82CA1E lit 85819F85 lit 91C672A2 lit E3E6B9A9 lit 1B18 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  47FD2 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		911F22F1 lit AA37431B lit 228F69E4 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  911F22F1 lit AA37431B lit 228F69E4 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		1D19A789 lit 39C834B lit BC16BE46 lit 1E851 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  1868603D lit 8AD2B8DA lit BA56F530 lit 58A3EDA4 lit 55E2084D lit 984AF9FC lit 4D lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		5269B744 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  C22BC669 lit 1DA016D1 lit 8FCCE452 lit 9C55F34B lit 3D6A lit 0 lit 0 lit 0 lit vy @ 8 lit v!
+		vx @ vy @ vz @ vw @ 8 lit wdivmod  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		B3B7E1 lit E10B06B1 lit 6F030533 lit 3C2D8A08 lit vx @ 4 lit v!  F49F17C9 lit 10EFC46B lit 0 lit 0 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		FA9515B8 lit 8D99D7E7 lit 3 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  FF6A2269 lit 536FAD5 lit 0 lit 0 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		A241CB5C lit 64A5CC75 lit A3FABFDA lit BDE09DF lit vx @ 4 lit v!  6AD7A54F lit 6098F604 lit 5FF9966E lit 8CBB3210 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  A241CB5C lit 64A5CC75 lit A3FABFDA lit BDE09DF lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		25BD3688 lit DE23B574 lit 3EC71B84 lit 1A461BE3 lit vx @ 4 lit v!  1BC14717 lit F9B19F2D lit FFFFFFFF lit FFFFFFFF lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  25BD3688 lit DE23B574 lit 3EC71B84 lit 1A461BE3 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		C6800CD0 lit 475E660C lit B336FAC2 lit A3A61926 lit vx @ 4 lit v!  1F1F0991 lit FC4825EB lit 0 lit 0 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		6888EDDC lit A60F8A58 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  4EF09734 lit 1638BF6 lit 0 lit 0 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		303C1C3D lit B0D87900 lit C58E6728 lit 74748A9F lit vx @ 4 lit v!  BD281EEF lit 2D5DF746 lit CCA159FA lit 6D4FFF45 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		1 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  7313FD4E lit 837A81B9 lit F8ED0D2E lit 7248B59 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		86ACE402 lit 34542703 lit 598764AE lit 4B89647A lit vx @ 4 lit v!  C59DA758 lit 2921C9A7 lit FFFFFFFF lit FFFFFFFF lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  86ACE402 lit 34542703 lit 598764AE lit 4B89647A lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		7670BE29 lit C869E4AA lit DF0B1DA6 lit 49E3D443 lit vx @ 4 lit v!  CB6103C5 lit CA744AD6 lit 0 lit 0 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		DD18BF3E lit 5D6EBF12 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  67A9D973 lit AC6B72B4 lit 0 lit 0 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		D88C67F3 lit A6B0206D lit 41F5BD48 lit 5477C88 lit vx @ 4 lit v!  B808486B lit C29BFBF lit C544E6E6 lit E32C6D1E lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  D88C67F3 lit A6B0206D lit 41F5BD48 lit 5477C88 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		D4C452F8 lit A31742EE lit 2959C43F lit C30E2766 lit vx @ 4 lit v!  89577402 lit 38255D1 lit FFFFFFFF lit FFFFFFFF lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  D4C452F8 lit A31742EE lit 2959C43F lit C30E2766 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		76B2294E lit EE53E5C6 lit 8F4E358F lit 639A3AF8 lit vx @ 4 lit v!  201C1225 lit CE21FB0D lit 0 lit 0 lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		3DCBE544 lit 7BB2B775 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  9EAB3E7A lit 71249412 lit 0 lit 0 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		9C090471 lit E5226061 lit BD4DB799 lit C4935934 lit vx @ 4 lit v!  1C52B8F3 lit 48040C lit 2646BAC5 lit 1E1107BC lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		6 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  F218AEBF lit E3724818 lit D7A556FB lit 102D2ACB lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		60A20FDB lit 86D02B8E lit C13CBDEF lit 96D28341 lit vx @ 4 lit v!  ACC3CACE lit C02B19A8 lit FFFFFFFF lit FFFFFFFF lit vy @ 4 lit v!
+		vx @ vy @ vz @ vw @ 4 lit wdivmod  vw @ vy @ 4 lit wcopy
+		0 lit 0 lit 0 lit 0 lit vw @ 4 lit v!  vz @ vw @ 4 lit wcmp 0 lit asrt_eq  60A20FDB lit 86D02B8E lit C13CBDEF lit 96D28341 lit vw @ 4 lit v!  vy @ vw @ 4 lit wcmp 0 lit asrt_eq
+		2C0EBB2B lit 6595087 lit DCCEA027 lit ud% 4A589ECB lit asrt_eq
+		969FC51A lit 1DDD5B3 lit D223 lit ud% 50A6 lit asrt_eq
+		86BA161E lit AE355B2B lit FF04301 lit ud% 6D6E30E lit asrt_eq
+		1EC5CFAE lit 6FE0CA2 lit D223 lit ud% 3EF5 lit asrt_eq
+		4062F12 lit BE7C7D62 lit D223 lit ud% 7E60 lit asrt_eq
+		36600D36 lit 1D0D942E lit D223 lit ud% AB66 lit asrt_eq
+		B495FA9A lit 10B444E8 lit 94D11DB7 lit ud% 927543B3 lit asrt_eq
+		5003A3F1 lit 3144606 lit D223 lit ud% 127B lit asrt_eq
+		409EF5EC lit 3CFEF35 lit D223 lit ud% D165 lit asrt_eq
+		F5ACC9D4 lit 1F6F6669 lit D223 lit ud% 16C lit asrt_eq
+		7F7D80D5 lit 58C5E665 lit D223 lit ud% 1C56 lit asrt_eq
+		C7038FAB lit C403C5F6 lit D223 lit ud% 2AA6 lit asrt_eq
+		6236C73 lit BDDF6058 lit E43C92E1 lit ud% 37E1EB03 lit asrt_eq
+		2671609D lit FE68AF6 lit D223 lit ud% C529 lit asrt_eq
+		C83CCD47 lit 3F0A3863 lit 2C288 lit ud% 131E7 lit asrt_eq
+		F844945C lit 3E038D50 lit D223 lit ud% 6376 lit asrt_eq
+		8751B7D7 lit 1EC062B lit D223 lit ud% 71DE lit asrt_eq
+		477F3A62 lit 8018180 lit D223 lit ud% 3412 lit asrt_eq
+		281F3476 lit 41A61565 lit D223 lit ud% 309C lit asrt_eq
+		39C0C201 lit 3ECDFABB lit D223 lit ud% B845 lit asrt_eq
+		3A0EBED5 lit 3B23C5EE lit D223 lit ud% 1FC1 lit asrt_eq
+		440D1B68 lit 3968D10C lit B370236D lit ud% 5A4157F7 lit asrt_eq
+		2AA60018 lit AFFDE25E lit D223 lit ud% C1B6 lit asrt_eq
+		E1C33F lit 13D07CF3 lit 3E8A0AE3 lit ud% 143C2FC1 lit asrt_eq
+	}
+	log2_x256 {
+		vinit
+		1 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 1 lit asrt_eq
+		2 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 101 lit asrt_eq
+		3 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 196 lit asrt_eq
+		4 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 201 lit asrt_eq
+		5 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 253 lit asrt_eq
+		FF lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 7FF lit asrt_eq
+		100 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 801 lit asrt_eq
+		0 lit 40000000 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 3E01 lit asrt_eq
+		FFFFFFFF lit 7FFFFFFF lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 3F00 lit asrt_eq
+		0 lit 80000000 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 3F01 lit asrt_eq
+		0 lit 0 lit 1 lit 0 lit vx @ 4 lit v!  vx @ log2x256 4001 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vx @ 4 lit v!  vx @ log2x256 8000 lit asrt_eq
+		D5DA28C2 lit E1D1BAC5 lit 39C4 lit 0 lit vx @ 4 lit v!  vx @ log2x256 4DDB lit asrt_eq
+		BA7633A3 lit 5EF3DE40 lit 23AE6BF0 lit 5766D4 lit vx @ 4 lit v!  vx @ log2x256 7674 lit asrt_eq
+		46705D25 lit 60E9EA91 lit 68CD5171 lit 6B lit vx @ 4 lit v!  vx @ log2x256 66C0 lit asrt_eq
+		488D5E31 lit 699B89A2 lit 44ED lit 0 lit vx @ 4 lit v!  vx @ log2x256 4E1C lit asrt_eq
+		2B lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 56E lit asrt_eq
+		44 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 617 lit asrt_eq
+		3A9 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 9E0 lit asrt_eq
+		F23A984C lit 6DC51EB0 lit D6B5DE02 lit 6AF4B lit vx @ 4 lit v!  vx @ log2x256 72BE lit asrt_eq
+		8B00 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 F1F lit asrt_eq
+		D lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 3B4 lit asrt_eq
+		188A253F lit E6C lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 2BDA lit asrt_eq
+		D5E42AE lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 1BBE lit asrt_eq
+		E56F1BC9 lit 88EC756E lit 75FEF2C6 lit 95F6A1 lit vx @ 4 lit v!  vx @ log2x256 773B lit asrt_eq
+		AF6A20BF lit 8D3843F0 lit 61EF1201 lit 3A6A lit vx @ 4 lit v!  vx @ log2x256 6DDF lit asrt_eq
+		37 lit 0 lit 0 lit 0 lit vx @ 4 lit v!  vx @ log2x256 5C9 lit asrt_eq
+		702375A5 lit A2B2BCF lit 7 lit 0 lit vx @ 4 lit v!  vx @ log2x256 42D1 lit asrt_eq
+	}
+}

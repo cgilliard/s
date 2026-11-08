@@ -1,0 +1,18 @@
+\ arith_bench.fam — the cost of arith.fam's words.  Run with --icount, so
+\ that ns/op is instructions per operation (docs/NODE.md, step 1):
+\   tools/fam --bench --icount src/user/node/arith.fam src/user/node/arith_bench.fam
+\ Each loop's own cost is the empty loop's: take it off the others.
+
+: bx variable ;  : by variable ;  : bz variable ;
+: binit  arinit bx @ 0= if 10 lit alloc bx !  10 lit alloc by !  10 lit alloc bz ! then
+	4 lit 0 lit do i 7 lit + tom bx @ i e4! i 3 lit + tom by @ i e4! loop ;
+
+Bench {
+	loop_alone { binit bgo 0 lit 186A0 lit 0 lit do i xor loop drop 186A0 lit bops }
+	um_star { binit bgo 0 lit 186A0 lit 0 lit do i dup um* xor xor loop drop 186A0 lit bops }
+	fmul { binit bgo ONE 186A0 lit 0 lit do i fmul loop drop 186A0 lit bops }
+	f_add { binit bgo 0 lit 186A0 lit 0 lit do i f+ loop drop 186A0 lit bops }
+	e4mul { binit bgo 2710 lit 0 lit do bx @ by @ bz @ e4mul loop 2710 lit bops }
+	finv { binit bgo 3E8 lit 0 lit do i 1 lit + finv drop loop 3E8 lit bops }
+	ud_mod { binit bgo 2710 lit 0 lit do i FFFFFFFF lit D223 lit ud% drop loop 2710 lit bops }
+}

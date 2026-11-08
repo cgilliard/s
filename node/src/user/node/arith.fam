@@ -1,0 +1,845 @@
+\ arith.fam — the node's arithmetic (docs/NODE.md, step 1): the 32×32→64
+\ product, BabyBear and its degree-4 extension, and wide integers.  RV32I
+\ has no multiply, so the product is in software: by quarter squares over
+\ 16-bit halves, uv = S[u+v] - S[|u-v|] with S[n] = floor(n^2/4) from a
+\ table of 2^17 words (512 KiB) built once by arinit.
+\
+\ BabyBear: p = 2^31 - 2^27 + 1 = 0x78000001, elements in Montgomery form
+\ (R = 2^32: a held as aR mod p, in [0, p)).  The reduction needs no
+\ general product: -1/p mod 2^32 = 2^31 - 2^27 - 1, and m p = m 2^31 -
+\ m 2^27 + m, both shifts and adds.  tom and fromm convert; f+ f- fneg
+\ fmul fpow finv work on Montgomery values.
+\
+\ The extension: x^4 = 11, an element four words in memory (Montgomery,
+\ lowest degree first): e4+ e4- e4mul e4inv, given addresses (the result
+\ may be either operand).
+\
+\ Wide integers: n words of 32 bits in memory, least significant first:
+\ wzero wcopy wadd wsub wcmp wshl wshr wbits wmul wdivmod, and ud% (a
+\ 64-bit value's remainder by a word).  On them, log2x256: tabminer's
+\ log2_x256_ceil (miner/src/fri.rs).
+\
+\ The raw words come from tools/genarith.py through tools/asm2fam.py.
+\
+\ Not reentrant: e4inv, the shifts, wmul, wdivmod and log2x256 keep state
+\ in variables.  um* fmul f+ f- fneg are macros, inlined: a call costs
+\ about 40 instructions in fam, a variable's fetch about 60.  So code that
+\ makes many products is a raw word that fetches sqt once and keeps it in
+\ a7, as e4mul does: there a product and its reduction are 92
+\ instructions, straight through.  tabminer's vectors: arith_vectors.fam (made by
+\ miner/src/fam_vectors.rs).
+
+:M P 78000001 lit ;
+:M ONE FFFFFFE lit ;           \ 1 in Montgomery form: 2^32 mod p
+:M R2 45DDDDE3 lit ;           \ 2^64 mod p, to convert in
+
+: sqt variable ;               \ the quarter squares: S[n], n < 2^17
+: et1 variable ;  : et2 variable ;  : et3 variable ;   \ e4inv's elements
+: lgt variable ;  : lgp variable ;                     \ log2x256's 4 words each
+
+\ ── The product ──
+
+\ sqinit  S[n] = S[n-1] + floor(n/2), from S[0] = 0.
+: sqinit
+80000 lit alloc sqt !
+0 lit dup sqt @ !
+20000 lit 1 lit do i 1 lit rshift + dup sqt @ i 2 lit lshift + ! loop drop ;
+
+\ um* ( a b -- lo hi )  a b, 64 bits.  Inline, as the field's words.
+:M um* sqt @
+83280100 ,   \ lw a7,0(sp)   ( the table )
+83254100 ,   \ lw a1,4(sp)   ( b )
+03258100 ,   \ lw a0,8(sp)   ( a )
+13014100 ,   \ addi sp,sp,4
+13560501 ,   \ srli a2,a0,16   ( a's high half )
+93160501 ,   \ slli a3,a0,16
+93D60601 ,   \ srli a3,a3,16   ( a's low half )
+13D70501 ,   \ srli a4,a1,16   ( b's high half )
+93970501 ,   \ slli a5,a1,16
+93D70701 ,   \ srli a5,a5,16   ( b's low half )
+B382F600 ,   \ add t0,a3,a5   ( u+v )
+3383F640 ,   \ sub t1,a3,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338E6240 ,   \ sub t3,t0,t1
+B382E600 ,   \ add t0,a3,a4   ( u+v )
+3383E640 ,   \ sub t1,a3,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38E6240 ,   \ sub t4,t0,t1
+B302F600 ,   \ add t0,a2,a5   ( u+v )
+3303F640 ,   \ sub t1,a2,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338F6240 ,   \ sub t5,t0,t1
+B302E600 ,   \ add t0,a2,a4   ( u+v )
+3303E640 ,   \ sub t1,a2,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38F6240 ,   \ sub t6,t0,t1
+B38EEE01 ,   \ add t4,t4,t5   ( the middle )
+33BFEE01 ,   \ sltu t5,t4,t5   ( its carry (2^48) )
+93920E01 ,   \ slli t0,t4,16
+33085E00 ,   \ add a6,t3,t0
+3333C801 ,   \ sltu t1,a6,t3
+93D20E01 ,   \ srli t0,t4,16
+B3855F00 ,   \ add a1,t6,t0
+131F0F01 ,   \ slli t5,t5,16
+B385E501 ,   \ add a1,a1,t5
+B3856500 ,   \ add a1,a1,t1
+23220101 ,   \ sw a6,4(sp)   ( lo )
+2320B100 ,   \ sw a1,0(sp)   ( hi )
+;
+
+\ ── BabyBear ──
+
+\ fmul ( a b -- c )  a b / R mod p: Montgomery values' product.
+:M fmul sqt @
+83280100 ,   \ lw a7,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+13018100 ,   \ addi sp,sp,8
+13560501 ,   \ srli a2,a0,16   ( a's high half )
+93160501 ,   \ slli a3,a0,16
+93D60601 ,   \ srli a3,a3,16   ( a's low half )
+13D70501 ,   \ srli a4,a1,16   ( b's high half )
+93970501 ,   \ slli a5,a1,16
+93D70701 ,   \ srli a5,a5,16   ( b's low half )
+B382F600 ,   \ add t0,a3,a5   ( u+v )
+3383F640 ,   \ sub t1,a3,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338E6240 ,   \ sub t3,t0,t1
+B382E600 ,   \ add t0,a3,a4   ( u+v )
+3383E640 ,   \ sub t1,a3,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38E6240 ,   \ sub t4,t0,t1
+B302F600 ,   \ add t0,a2,a5   ( u+v )
+3303F640 ,   \ sub t1,a2,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338F6240 ,   \ sub t5,t0,t1
+B302E600 ,   \ add t0,a2,a4   ( u+v )
+3303E640 ,   \ sub t1,a2,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38F6240 ,   \ sub t6,t0,t1
+B38EEE01 ,   \ add t4,t4,t5   ( the middle )
+33BFEE01 ,   \ sltu t5,t4,t5   ( its carry (2^48) )
+93920E01 ,   \ slli t0,t4,16
+33085E00 ,   \ add a6,t3,t0
+3333C801 ,   \ sltu t1,a6,t3
+93D20E01 ,   \ srli t0,t4,16
+B3855F00 ,   \ add a1,t6,t0
+131F0F01 ,   \ slli t5,t5,16
+B385E501 ,   \ add a1,a1,t5
+B3856500 ,   \ add a1,a1,t1
+9312F801 ,   \ slli t0,a6,31   ( m = lo * -1/p mod 2^32 = lo(2^31 - 2^27 - 1) )
+1313B801 ,   \ slli t1,a6,27
+B3826240 ,   \ sub t0,t0,t1
+B3820241 ,   \ sub t0,t0,a6   ( m )
+1393F201 ,   \ slli t1,t0,31   ( m p = m 2^31 - m 2^27 + m: its high word )
+9393B201 ,   \ slli t2,t0,27
+333E7300 ,   \ sltu t3,t1,t2
+33037340 ,   \ sub t1,t1,t2
+93DE1200 ,   \ srli t4,t0,1
+13DF5200 ,   \ srli t5,t0,5
+B38EEE41 ,   \ sub t4,t4,t5
+B38ECE41 ,   \ sub t4,t4,t3
+33035300 ,   \ add t1,t1,t0
+B33F5300 ,   \ sltu t6,t1,t0
+B38EFE01 ,   \ add t4,t4,t6   ( (m p) >> 32 )
+B3320001 ,   \ sltu t0,zero,a6   ( the low words' carry: lo + (m p mod 2^32) = 2^32 unless lo is 0 )
+3385D501 ,   \ add a0,a1,t4
+33055500 ,   \ add a0,a0,t0
+37030078 ,   \ lui t1,0x78000
+13031300 ,   \ addi t1,t1,1   ( p )
+63646500 ,   \ bltu a0,t1,redc_done
+33056540 ,   \ sub a0,a0,t1
+\ redc_done:
+2320A100 ,   \ sw a0,0(sp)
+;
+
+\ f+ ( a b -- c ), f- ( a b -- a-b ), fneg ( a -- -a ), mod p.
+:M f+
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+13014100 ,   \ addi sp,sp,4
+B3025300 ,   \ add t0,t1,t0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F201 ,   \ bltu t0,t6,fa_t0_t1_t0_0
+B382F241 ,   \ sub t0,t0,t6
+\ fa_t0_t1_t0_0:
+23205100 ,   \ sw t0,0(sp)
+;
+:M f-
+83220100 ,   \ lw t0,0(sp)   ( b )
+03234100 ,   \ lw t1,4(sp)   ( a )
+13014100 ,   \ addi sp,sp,4
+B3035340 ,   \ sub t2,t1,t0
+63785300 ,   \ bgeu t1,t0,fs_done
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+B383F301 ,   \ add t2,t2,t6
+\ fs_done:
+23207100 ,   \ sw t2,0(sp)
+;
+:M fneg
+83220100 ,   \ lw t0,0(sp)
+63880200 ,   \ beq t0,zero,fn_done
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+B3825F40 ,   \ sub t0,t6,t0
+\ fn_done:
+23205100 ,   \ sw t0,0(sp)
+;
+:M fsq  dup fmul ;
+\ tom ( a -- aR ), fromm ( aR -- a )  into and out of Montgomery form.
+: tom   R2 fmul ;
+: fromm 1 lit fmul ;
+\ fpow ( a e -- a^e )  by squaring; finv ( a -- 1/a ) as a^(p-2) (0 for 0).
+: fpow
+ONE -rot
+begin dup while
+	dup 1 lit and if rot 2 lit pick fmul -rot then
+	1 lit rshift swap fsq swap
+repeat
+2drop ;
+: finv  P 2 lit - fpow ;
+
+\ ── The extension: x^4 = 11 ──
+
+: e4@  2 lit lshift + @ ;                  \ ( a i -- x )
+: e4!  2 lit lshift + ! ;                  \ ( x a i -- )
+: w*   dup dup f+ dup dup f+ dup f+ f+ f+ ;   \ ( x -- 11x )
+
+\ e4+ e4- ( a b c -- )  c = a + b, a - b.
+: e4+  4 lit 0 lit do 2 lit pick i e4@ 2 lit pick i e4@ f+ over i e4! loop 2drop drop ;
+: e4-  4 lit 0 lit do 2 lit pick i e4@ 2 lit pick i e4@ f- over i e4! loop 2drop drop ;
+
+\ e4mul ( a b c -- )  c = a b: the sixteen products (a subroutine of the
+\ word's own, through ra, which fam's calls leave alone), kept below the
+\ data stack, then summed, the wrapped ones times 11.
+: e4mul sqt @
+83280100 ,   \ lw a7,0(sp)   ( the table )
+83224100 ,   \ lw t0,4(sp)   ( c )
+03238100 ,   \ lw t1,8(sp)   ( b )
+8323C100 ,   \ lw t2,12(sp)   ( a )
+13010101 ,   \ addi sp,sp,16
+232E71FE ,   \ sw t2,-4(sp)
+232C61FE ,   \ sw t1,-8(sp)
+232A51FE ,   \ sw t0,-12(sp)
+8322C1FF ,   \ lw t0,-4(sp)
+03A50200 ,   \ lw a0,0(t0)   ( a0 )
+832281FF ,   \ lw t0,-8(sp)
+83A50200 ,   \ lw a1,0(t0)   ( b0 )
+EF008040 ,   \ jal ra,e4m_mm
+2328A1FE ,   \ sw a0,-16(sp)   ( P00 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A50200 ,   \ lw a0,0(t0)   ( a0 )
+832281FF ,   \ lw t0,-8(sp)
+83A54200 ,   \ lw a1,4(t0)   ( b1 )
+EF00003F ,   \ jal ra,e4m_mm
+2326A1FE ,   \ sw a0,-20(sp)   ( P01 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A50200 ,   \ lw a0,0(t0)   ( a0 )
+832281FF ,   \ lw t0,-8(sp)
+83A58200 ,   \ lw a1,8(t0)   ( b2 )
+EF00803D ,   \ jal ra,e4m_mm
+2324A1FE ,   \ sw a0,-24(sp)   ( P02 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A50200 ,   \ lw a0,0(t0)   ( a0 )
+832281FF ,   \ lw t0,-8(sp)
+83A5C200 ,   \ lw a1,12(t0)   ( b3 )
+EF00003C ,   \ jal ra,e4m_mm
+2322A1FE ,   \ sw a0,-28(sp)   ( P03 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A54200 ,   \ lw a0,4(t0)   ( a1 )
+832281FF ,   \ lw t0,-8(sp)
+83A50200 ,   \ lw a1,0(t0)   ( b0 )
+EF00803A ,   \ jal ra,e4m_mm
+2320A1FE ,   \ sw a0,-32(sp)   ( P10 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A54200 ,   \ lw a0,4(t0)   ( a1 )
+832281FF ,   \ lw t0,-8(sp)
+83A54200 ,   \ lw a1,4(t0)   ( b1 )
+EF000039 ,   \ jal ra,e4m_mm
+232EA1FC ,   \ sw a0,-36(sp)   ( P11 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A54200 ,   \ lw a0,4(t0)   ( a1 )
+832281FF ,   \ lw t0,-8(sp)
+83A58200 ,   \ lw a1,8(t0)   ( b2 )
+EF008037 ,   \ jal ra,e4m_mm
+232CA1FC ,   \ sw a0,-40(sp)   ( P12 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A54200 ,   \ lw a0,4(t0)   ( a1 )
+832281FF ,   \ lw t0,-8(sp)
+83A5C200 ,   \ lw a1,12(t0)   ( b3 )
+EF000036 ,   \ jal ra,e4m_mm
+232AA1FC ,   \ sw a0,-44(sp)   ( P13 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A58200 ,   \ lw a0,8(t0)   ( a2 )
+832281FF ,   \ lw t0,-8(sp)
+83A50200 ,   \ lw a1,0(t0)   ( b0 )
+EF008034 ,   \ jal ra,e4m_mm
+2328A1FC ,   \ sw a0,-48(sp)   ( P20 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A58200 ,   \ lw a0,8(t0)   ( a2 )
+832281FF ,   \ lw t0,-8(sp)
+83A54200 ,   \ lw a1,4(t0)   ( b1 )
+EF000033 ,   \ jal ra,e4m_mm
+2326A1FC ,   \ sw a0,-52(sp)   ( P21 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A58200 ,   \ lw a0,8(t0)   ( a2 )
+832281FF ,   \ lw t0,-8(sp)
+83A58200 ,   \ lw a1,8(t0)   ( b2 )
+EF008031 ,   \ jal ra,e4m_mm
+2324A1FC ,   \ sw a0,-56(sp)   ( P22 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A58200 ,   \ lw a0,8(t0)   ( a2 )
+832281FF ,   \ lw t0,-8(sp)
+83A5C200 ,   \ lw a1,12(t0)   ( b3 )
+EF000030 ,   \ jal ra,e4m_mm
+2322A1FC ,   \ sw a0,-60(sp)   ( P23 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A5C200 ,   \ lw a0,12(t0)   ( a3 )
+832281FF ,   \ lw t0,-8(sp)
+83A50200 ,   \ lw a1,0(t0)   ( b0 )
+EF00802E ,   \ jal ra,e4m_mm
+2320A1FC ,   \ sw a0,-64(sp)   ( P30 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A5C200 ,   \ lw a0,12(t0)   ( a3 )
+832281FF ,   \ lw t0,-8(sp)
+83A54200 ,   \ lw a1,4(t0)   ( b1 )
+EF00002D ,   \ jal ra,e4m_mm
+232EA1FA ,   \ sw a0,-68(sp)   ( P31 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A5C200 ,   \ lw a0,12(t0)   ( a3 )
+832281FF ,   \ lw t0,-8(sp)
+83A58200 ,   \ lw a1,8(t0)   ( b2 )
+EF00802B ,   \ jal ra,e4m_mm
+232CA1FA ,   \ sw a0,-72(sp)   ( P32 )
+8322C1FF ,   \ lw t0,-4(sp)
+03A5C200 ,   \ lw a0,12(t0)   ( a3 )
+832281FF ,   \ lw t0,-8(sp)
+83A5C200 ,   \ lw a1,12(t0)   ( b3 )
+EF00002A ,   \ jal ra,e4m_mm
+232AA1FA ,   \ sw a0,-76(sp)   ( P33 )
+032641FD ,   \ lw a2,-44(sp)
+832681FC ,   \ lw a3,-56(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_1
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_1:
+8326C1FB ,   \ lw a3,-68(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_2
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_2:
+3305C600 ,   \ add a0,a2,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F501 ,   \ bltu a0,t6,fa_a0_a2_a2_3
+3305F541 ,   \ sub a0,a0,t6
+\ fa_a0_a2_a2_3:
+B305A500 ,   \ add a1,a0,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a0_a0_4
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a0_a0_4:
+B385B500 ,   \ add a1,a1,a1
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a1_5
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a1_5:
+B385A500 ,   \ add a1,a1,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a0_6
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a0_6:
+3386C500 ,   \ add a2,a1,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a1_a2_7
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a1_a2_7:
+832601FF ,   \ lw a3,-16(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_8
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_8:
+832241FF ,   \ lw t0,-12(sp)
+23A0C200 ,   \ sw a2,0(t0)   ( c0 )
+032641FC ,   \ lw a2,-60(sp)
+832681FB ,   \ lw a3,-72(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_9
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_9:
+3305C600 ,   \ add a0,a2,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F501 ,   \ bltu a0,t6,fa_a0_a2_a2_10
+3305F541 ,   \ sub a0,a0,t6
+\ fa_a0_a2_a2_10:
+B305A500 ,   \ add a1,a0,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a0_a0_11
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a0_a0_11:
+B385B500 ,   \ add a1,a1,a1
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a1_12
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a1_12:
+B385A500 ,   \ add a1,a1,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a0_13
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a0_13:
+3386C500 ,   \ add a2,a1,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a1_a2_14
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a1_a2_14:
+8326C1FE ,   \ lw a3,-20(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_15
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_15:
+832601FE ,   \ lw a3,-32(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_16
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_16:
+832241FF ,   \ lw t0,-12(sp)
+23A2C200 ,   \ sw a2,4(t0)   ( c1 )
+032641FB ,   \ lw a2,-76(sp)
+3305C600 ,   \ add a0,a2,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F501 ,   \ bltu a0,t6,fa_a0_a2_a2_17
+3305F541 ,   \ sub a0,a0,t6
+\ fa_a0_a2_a2_17:
+B305A500 ,   \ add a1,a0,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a0_a0_18
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a0_a0_18:
+B385B500 ,   \ add a1,a1,a1
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a1_19
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a1_19:
+B385A500 ,   \ add a1,a1,a0
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+63E4F501 ,   \ bltu a1,t6,fa_a1_a1_a0_20
+B385F541 ,   \ sub a1,a1,t6
+\ fa_a1_a1_a0_20:
+3386C500 ,   \ add a2,a1,a2
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a1_a2_21
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a1_a2_21:
+832681FE ,   \ lw a3,-24(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_22
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_22:
+8326C1FD ,   \ lw a3,-36(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_23
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_23:
+832601FD ,   \ lw a3,-48(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_24
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_24:
+832241FF ,   \ lw t0,-12(sp)
+23A4C200 ,   \ sw a2,8(t0)   ( c2 )
+13060000 ,   \ li a2,0
+832641FE ,   \ lw a3,-28(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_25
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_25:
+832681FD ,   \ lw a3,-40(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_26
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_26:
+8326C1FC ,   \ lw a3,-52(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_27
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_27:
+832601FC ,   \ lw a3,-64(sp)
+3306D600 ,   \ add a2,a2,a3
+B70F0078 ,   \ lui t6,0x78000
+938F1F00 ,   \ addi t6,t6,1
+6364F601 ,   \ bltu a2,t6,fa_a2_a2_a3_28
+3306F641 ,   \ sub a2,a2,t6
+\ fa_a2_a2_a3_28:
+832241FF ,   \ lw t0,-12(sp)
+23A6C200 ,   \ sw a2,12(t0)   ( c3 )
+6F000016 ,   \ jal zero,e4m_done
+\ e4m_mm:
+13560501 ,   \ srli a2,a0,16   ( a's high half )
+93160501 ,   \ slli a3,a0,16
+93D60601 ,   \ srli a3,a3,16   ( a's low half )
+13D70501 ,   \ srli a4,a1,16   ( b's high half )
+93970501 ,   \ slli a5,a1,16
+93D70701 ,   \ srli a5,a5,16   ( b's low half )
+B382F600 ,   \ add t0,a3,a5   ( u+v )
+3383F640 ,   \ sub t1,a3,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338E6240 ,   \ sub t3,t0,t1
+B382E600 ,   \ add t0,a3,a4   ( u+v )
+3383E640 ,   \ sub t1,a3,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38E6240 ,   \ sub t4,t0,t1
+B302F600 ,   \ add t0,a2,a5   ( u+v )
+3303F640 ,   \ sub t1,a2,a5   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338F6240 ,   \ sub t5,t0,t1
+B302E600 ,   \ add t0,a2,a4   ( u+v )
+3303E640 ,   \ sub t1,a2,a4   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38F6240 ,   \ sub t6,t0,t1
+B38EEE01 ,   \ add t4,t4,t5   ( the middle )
+33BFEE01 ,   \ sltu t5,t4,t5   ( its carry (2^48) )
+93920E01 ,   \ slli t0,t4,16
+33085E00 ,   \ add a6,t3,t0
+3333C801 ,   \ sltu t1,a6,t3
+93D20E01 ,   \ srli t0,t4,16
+B3855F00 ,   \ add a1,t6,t0
+131F0F01 ,   \ slli t5,t5,16
+B385E501 ,   \ add a1,a1,t5
+B3856500 ,   \ add a1,a1,t1
+9312F801 ,   \ slli t0,a6,31   ( m = lo * -1/p mod 2^32 = lo(2^31 - 2^27 - 1) )
+1313B801 ,   \ slli t1,a6,27
+B3826240 ,   \ sub t0,t0,t1
+B3820241 ,   \ sub t0,t0,a6   ( m )
+1393F201 ,   \ slli t1,t0,31   ( m p = m 2^31 - m 2^27 + m: its high word )
+9393B201 ,   \ slli t2,t0,27
+333E7300 ,   \ sltu t3,t1,t2
+33037340 ,   \ sub t1,t1,t2
+93DE1200 ,   \ srli t4,t0,1
+13DF5200 ,   \ srli t5,t0,5
+B38EEE41 ,   \ sub t4,t4,t5
+B38ECE41 ,   \ sub t4,t4,t3
+33035300 ,   \ add t1,t1,t0
+B33F5300 ,   \ sltu t6,t1,t0
+B38EFE01 ,   \ add t4,t4,t6   ( (m p) >> 32 )
+B3320001 ,   \ sltu t0,zero,a6   ( the low words' carry: lo + (m p mod 2^32) = 2^32 unless lo is 0 )
+3385D501 ,   \ add a0,a1,t4
+33055500 ,   \ add a0,a0,t0
+37030078 ,   \ lui t1,0x78000
+13031300 ,   \ addi t1,t1,1   ( p )
+63646500 ,   \ bltu a0,t1,e4m_rd
+33056540 ,   \ sub a0,a0,t1
+\ e4m_rd:
+67800000 ,   \ jalr zero,0(ra)
+\ e4m_done:
+;
+
+\ e4inv ( a c -- )  c = 1/a (0 for 0): with a' = a(-x), a a' = b0 + b2 x^2,
+\ whose norm n = b0^2 - 11 b2^2 is in the base field; 1/a = a' (b0 - b2 x^2)/n.
+: e4inv
+swap
+dup 0 lit e4@ et1 @ 0 lit e4!
+dup 1 lit e4@ fneg et1 @ 1 lit e4!
+dup 2 lit e4@ et1 @ 2 lit e4!
+dup 3 lit e4@ fneg et1 @ 3 lit e4!
+et1 @ et2 @ e4mul
+et2 @ 0 lit e4@ fsq  et2 @ 2 lit e4@ fsq w* f-  finv
+et2 @ 0 lit e4@ over fmul et3 @ 0 lit e4!
+et2 @ 2 lit e4@ fmul fneg et3 @ 2 lit e4!
+0 lit et3 @ 1 lit e4!  0 lit et3 @ 3 lit e4!
+et1 @ et3 @ rot e4mul ;
+
+\ ── Wide integers ──
+
+: w@  2 lit lshift + @ ;                   \ ( a i -- x )
+: w!  2 lit lshift + ! ;                   \ ( x a i -- )
+
+\ wzero ( a n -- ), wcopy ( a c n -- )
+: wzero  0 lit do 0 lit over i w! loop drop ;
+: wcopy  0 lit do over i w@ over i w! loop 2drop ;
+
+\ wadd ( a b c n -- carry ), wsub ( a b c n -- borrow )  c = a + b, a - b.
+: wadd
+0 lit swap 0 lit do
+	3 lit pick i w@  3 lit pick i w@  over +  tuck u>  -rot  tuck +  tuck u>  rot or 1 lit and
+	swap 2 lit pick i w!
+loop
+nip nip nip ;
+: wsub
+0 lit swap 0 lit do
+	3 lit pick i w@  3 lit pick i w@  2dup u< -rot -  rot 2dup u< -rot -  -rot or 1 lit and
+	swap 2 lit pick i w!
+loop
+nip nip nip ;
+
+\ wcmp ( a b n -- c )  -1, 0 or 1 as a is below, equal to or above b.
+: wcmp
+0 lit swap
+begin dup while
+	1 lit -
+	over 0= if
+		3 lit pick over w@  3 lit pick 2 lit pick w@
+		2dup u< if 2drop FFFFFFFF lit else u> if 1 lit else 0 lit then then
+		rot drop swap
+	then
+repeat
+drop nip nip ;
+
+: wq variable ;  : wb variable ;  : wn variable ;
+: w@0  dup 0< if 2drop 0 lit else w@ then ;          \ ( a i -- x )  0 below 0
+: w@n  dup wn @ u< if w@ else 2drop 0 lit then ;     \ ( a i -- x )  0 from n on
+
+\ wshl ( a c n s -- ), wshr ( a c n s -- )  c = a shifted s bits (c may be a).
+: wshl
+dup 5 lit rshift wq ! 1F lit and wb !
+begin dup while
+	1 lit -
+	2 lit pick over wq @ - w@0  wb @ lshift
+	wb @ if 3 lit pick 2 lit pick wq @ - 1 lit - w@0 20 lit wb @ - rshift or then
+	2 lit pick 2 lit pick w!
+repeat
+2drop drop ;
+: wshr
+dup 5 lit rshift wq ! 1F lit and wb !  dup wn !
+0 lit do
+	over i wq @ + w@n wb @ rshift
+	wb @ if 2 lit pick i wq @ + 1 lit + w@n 20 lit wb @ - lshift or then
+	over i w!
+loop
+2drop ;
+
+\ wbits ( a n -- bits )  the bits a needs: 0 for 0.
+: nbits  0 lit swap begin dup while 1 lit rshift swap 1 lit + swap repeat drop ;   \ ( x -- bits )
+: wbits
+0 lit swap
+begin dup while
+	1 lit -
+	over 0= if 2 lit pick over w@ ?dup if nbits over 5 lit lshift + rot drop swap then then
+repeat
+drop nip ;
+
+: wa variable ;  : wbv variable ;  : wm variable ;  : wc variable ;
+
+\ wmul ( a n b m c -- )  c (n + m words) = a b.  c is neither a nor b.
+: wmul
+wc ! wm ! wbv ! swap wa !
+dup wm @ + wc @ swap wzero
+0 lit do
+	0 lit
+	wm @ 0 lit do
+		wa @ j w@  wbv @ i w@  um*
+		-rot  tuck +  tuck u> 1 lit and  rot + swap
+		wc @ i j + w@  over +  tuck u> 1 lit and  rot + swap
+		wc @ i j + w!
+	loop
+	wc @ i wm @ + w!
+loop ;
+
+\ wdivmod ( a b q r n -- )  q = a / b, r = a mod b (b not 0): a bit at a
+\ time, the remainder shifted in and b taken off when it fits (or the
+\ shift carried out of it).  q and r are neither a nor b.
+: wdivmod
+wn ! wc ! wm ! wbv ! wa !
+wm @ wn @ wzero  wc @ wn @ wzero
+wn @ 5 lit lshift
+begin dup while
+	1 lit -
+	wc @ wn @ 1 lit - w@ 0<
+	wc @ wc @ wn @ 1 lit wshl
+	wa @ 2 lit pick 5 lit rshift w@ 2 lit pick 1F lit and rshift 1 lit and  wc @ @ or wc @ !
+	wc @ wbv @ wn @ wcmp 0< 0= or if
+		wc @ wbv @ wc @ wn @ wsub drop
+		wm @ over 5 lit rshift 2 lit lshift +  dup @  2 lit pick 1F lit and 1 lit swap lshift or  swap !
+	then
+repeat
+drop ;
+
+\ ud% ( lo hi d -- r )  the 64-bit hi:lo mod d (d not 0), 64 steps.
+: ud%
+83220100 ,   \ lw t0,0(sp)   ( d )
+03234100 ,   \ lw t1,4(sp)   ( hi )
+83238100 ,   \ lw t2,8(sp)   ( lo )
+13018100 ,   \ addi sp,sp,8
+130E0000 ,   \ li t3,0   ( the remainder )
+930E0004 ,   \ li t4,64   ( bits )
+\ udm_loop:
+135FF301 ,   \ srli t5,t1,31   ( hi:lo's top bit, into the remainder )
+13131300 ,   \ slli t1,t1,1
+93DFF301 ,   \ srli t6,t2,31
+3363F301 ,   \ or t1,t1,t6
+93931300 ,   \ slli t2,t2,1
+1355FE01 ,   \ srli a0,t3,31   ( the bit the remainder shifts out )
+131E1E00 ,   \ slli t3,t3,1
+336EEE01 ,   \ or t3,t3,t5
+63140500 ,   \ bne a0,zero,udm_sub
+63645E00 ,   \ bltu t3,t0,udm_next
+\ udm_sub:
+330E5E40 ,   \ sub t3,t3,t0
+\ udm_next:
+938EFEFF ,   \ addi t4,t4,-1
+E3980EFC ,   \ bne t4,zero,udm_loop
+2320C101 ,   \ sw t3,0(sp)
+;
+
+\ log2x256 ( a -- n )  log2 of the 128-bit a (4 words, not 0) in 1/256
+\ bits, rounded up, exactly as tabminer's log2_x256_ceil: the mantissa
+\ with 62 fractional bits, squared eight times.
+: log2x256
+dup 4 lit wbits 1 lit -
+dup 3E lit u< if
+	over lgt @ 4 lit 3E lit 4 lit pick - wshl
+else
+	over lgt @ 4 lit 3 lit pick 3E lit - wshr
+then
+nip 0 lit
+8 lit 0 lit do
+	lgt @ 2 lit lgt @ 2 lit lgp @ wmul
+	lgp @ lgt @ 4 lit 3E lit wshr
+	1 lit lshift
+	lgt @ 1 lit w@ 0< if lgt @ lgt @ 2 lit 1 lit wshr 1 lit or then
+loop
+swap 8 lit lshift + 1 lit + ;
+
+\ arinit  the table and the scratch: before any of the above (again, a
+\ no-op).
+: arinit
+sqt @ 0= if
+	sqinit
+	10 lit alloc et1 !  10 lit alloc et2 !  10 lit alloc et3 !
+	10 lit alloc lgt !  10 lit alloc lgp !
+then ;

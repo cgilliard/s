@@ -15,6 +15,9 @@
 #                 so pick an address the program will not allocate over.
 #   --smp=N       N harts (default 1): all start at 0x80000000; a fam
 #                 program's stdlib keeps all but hart 0 waiting (docs/OS.md)
+#   --icount      one instruction a nanosecond of the machine's time (QEMU's
+#                 -icount shift=0): the timer then counts instructions, as
+#                 benches measuring cost in instructions want
 #   --in=FILE     serial input from FILE  ┐ file-backed serial instead of
 #   --out=FILE    serial output to FILE   ┘ stdio, byte-exact; used by tools/fam
 #                 for the compile step.  --out required with --in.
@@ -38,6 +41,7 @@ SERIN=""
 SEROUT=""
 LOADS=""
 SMP=1
+ICOUNT=""
 
 for arg in "$@"; do
 	case "$arg" in
@@ -50,6 +54,7 @@ for arg in "$@"; do
 		--netdev=*) NETDEV="${arg#--netdev=}" ;;
 		--mac=*) MAC="${arg#--mac=}" ;;
 		--smp=*) SMP="${arg#--smp=}" ;;
+		--icount) ICOUNT=1 ;;
 		--in=*) SERIN="${arg#--in=}" ;;
 		--out=*) SEROUT="${arg#--out=}" ;;
 		--help|-h)
@@ -116,6 +121,8 @@ if [ -n "$NETDEV" ] || [ "$NET" = "1" ]; then
 	fi
 	ARGS="$ARGS $NETDEV_DEV"
 fi
+
+[ -n "$ICOUNT" ] && ARGS="$ARGS -icount shift=0"
 
 # randomness: /dev/random (virtio-rng, from the host's)
 ARGS="$ARGS -global virtio-mmio.force-legacy=true -device virtio-rng-device"

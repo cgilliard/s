@@ -6,7 +6,7 @@
 # automatically and the source is EOT-terminated, then fed to the fam compiler
 # (bin/fam) running under q32. Paths are resolved relative to this script.
 #
-# Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+# Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [--icount] [-o OUTPUT] INPUT.fam [MORE.fam ...]
 #   INPUT.fam    your program(s); multiple files are concatenated in order
 #                (lib/stdlib.fam is prepended for you)
 #   --test       build and run ONLY the Test { ... } block, then delete the binary
@@ -18,6 +18,8 @@
 #   --net, --hostfwd=SPEC  virtio-net when running (forwarded to q32; see
 #                q32 --help)
 #   --smp=N      N harts when running (forwarded to q32)
+#   --icount     instructions as the machine's time (forwarded to q32): a
+#                bench's ns/op is then its instructions per operation
 #   --user       a program for the OS (docs/OS.md): lib/user.fam in place of
 #                lib/mach.fam, so its I/O and exit are system calls and its
 #                stacks are in the memory the kernel gives it
@@ -56,7 +58,8 @@ while [ $# -gt 0 ]; do
 		--net) QOPTS="$QOPTS $1"; shift ;;
 		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
 		--smp=*) QOPTS="$QOPTS $1"; shift ;;
-		-h|--help) echo "Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [-o OUTPUT] INPUT.fam [MORE.fam ...]"; exit 0 ;;
+		--icount) QOPTS="$QOPTS $1"; shift ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--user] [--disk=FILE] [--net] [--hostfwd=SPEC] [--smp=N] [--icount] [-o OUTPUT] INPUT.fam [MORE.fam ...]"; exit 0 ;;
 		--) shift; IN="$1"; shift ;;
 		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
 		*) IN="$IN $1"; shift ;;

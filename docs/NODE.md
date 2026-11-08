@@ -685,7 +685,34 @@ Each step done when its test passes.
      (`docs/OS.md`; oscheck's `rnd`).
 1. **Arithmetic.** The 32×32→64 product, BabyBear, its extension, and
    the wide integers. Done when they match tabminer's vectors, and the
-   cost of a product is measured.
+   cost of a product is measured. Done (2026-11-08):
+   `node/src/user/node/arith.fam`.
+   - The product: quarter squares over 16-bit halves, uv = S[u+v] −
+     S[|u−v|] with S[n] = ⌊n²/4⌋, a table of 2^17 words (512 KiB) built
+     once with additions. Four lookups' worth: about 70 instructions for
+     32×32→64, straight through.
+   - BabyBear in Montgomery form (R = 2^32). The reduction is shifts and
+     adds, since −1/p mod 2^32 = 2^31 − 2^27 − 1 and m·p = m·2^31 −
+     m·2^27 + m: 22 instructions. A product and its reduction: 92.
+   - The extension (x⁴ = 11): addition, subtraction, a product of 16 base
+     products as one raw word (1,900 instructions), and the inverse by
+     the norm.
+   - Wide integers on n words: add, subtract, compare, shifts, bits,
+     product, long division, and the 64-by-32 remainder (860
+     instructions) for the windows' indices; tabminer's
+     `log2_x256_ceil` on them.
+   - Vectors: `miner/src/fam_vectors.rs` writes
+     `arith_vectors.fam` from tabminer's own code (and checks it is
+     current); all pass, in oscheck as `arith`.
+   - Costs, in instructions (`arith_bench.fam`, run with `--icount`:
+     QEMU's clock then counts instructions): `f+` 7, `fmul` as a fam word
+     134, `e4mul` 1,900, `finv` 10,700. A fam call costs about 40
+     instructions and a variable's fetch about 60, so code making many
+     products is a raw word keeping the table's address in a register,
+     as `e4mul` does.
+   - So a Poseidon2 permutation's 800 or so products are about 75,000
+     instructions, plus its additions: NODE.md's 100,000 holds, to be
+     measured in step 2.
 2. **Poseidon2 and Merkle paths.** Done when they match the vectors,
    and a permutation's cost is measured. Then this document's
    estimates are revised, with the cost of the full proof of work at
