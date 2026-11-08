@@ -22,6 +22,12 @@ transactions it does.
   its parent's proof of work, and the proof of work reads aligned
   windows of the seed text (The work in the chain proof, below): a
   change to tabminer, made first, so the node never checks old work.
+- **Full validation, as tabminer.** The node checks the full proof of
+  work of every block it accepts that no verified chain proof covers:
+  the fast-sync block and those after it, then each new block, before
+  accepting it (decided 2026-11-08). It does not defer a block's work
+  to its child's proof, which would leave the tip unchecked: at every
+  moment it accepts exactly what tabminer accepts.
 - **No M extension.** RV32I as everywhere else: products in software,
   and the verification loop optimised until it is fast enough.
   Verification without M has been done before.
@@ -123,23 +129,30 @@ measured in the first step, and the plan adjusted to what is found.
   Verifying it means Merkle paths, the FRI checks and the AIR
   constraints at the out-of-domain point. Rough estimate: on the
   order of 10^4 permutations, so seconds per block.
-- **Proof-of-work.** An Ethash-like hashimoto over Poseidon2 (`pow.rs`).
+- **Proof-of-work.** An Ethash-like hashimoto over Poseidon2 (`pow.rs`),
+  checked in full only for the fast-sync block and the headers after it
+  (about 145, once) and then for each new block (one every 600 s); every
+  header before the sync block is attested by its chain proof.
   The node takes the light path: each item it needs is computed from
   the seed text instead of a 64 MB dataset:
-  - 64 accesses × 2 items × 255 permutations ≈ 32,640 permutations a
-    header, so several seconds each by the estimate above;
+  - 64 accesses × 2 items × (254 parents + 1) ≈ 32,643 permutations
+    a header, so several seconds each by the estimate above;
   - it needs the seed (the King James text, 1.29 MB gzipped,
     4.34 MB inflated) with random access: inflated once at start,
     held in memory;
   - `quick_pow_check` (2 permutations) runs first, to throw out junk
-    cheaply.
+    cheaply, and is all that headers below the sync block get;
+  - genesis's true `mix`, which block 1's statement carries (its
+    header's is empty), computed once from the text.
 - **Wide integers.** U256 for targets and work; 64-bit amounts and
   supply; u64 `%` for seed offsets; a u128 logarithm for the grinding
   check. They are small routines over words.
 
 A block every 600 s leaves room: a header, its proof and its state
-change should take well under a minute. Catching up is the hard case
-(below).
+change should take well under a minute. Catching up costs the full
+proof of work of about 145 headers once, spread over the harts, and
+then a chain proof and the full work per block after the sync block
+(below); no work before it is checked.
 
 ## Syncing
 
@@ -596,10 +609,11 @@ Each step done when its test passes.
 
 - **The sync depth:** today 144 blocks. The full proof of work is
   checked natively for every header after `S`, so a deeper `S` costs a
-  node more, and the fam node most.
-- **The first block:** at height 1 the parent is genesis, which has no
-  proof of work (its `mix` is empty and not checked). So there is nothing
-  to prove for it, and its header is a constant in the circuit.
+  node more, and the fam node most: about 145 headers at several seconds
+  each by the estimates, before the harts share them.
+- **The first block:** settled in step 4. Genesis's `mix` is empty, so
+  its true mix is computed once from the seed text, and the base program
+  (height 1) fixes genesis's hash and that work as constants.
 
 ## Implementation order
 
@@ -617,7 +631,8 @@ Each step done when its test passes.
    cost of a product is measured.
 2. **Poseidon2 and Merkle paths.** Done when they match the vectors,
    and a permutation's cost is measured. Then this document's
-   estimates are revised, and the proof-of-work question settled.
+   estimates are revised, with the cost of the full proof of work at
+   sync (about 145 headers) and per block.
 3. **The chain proof's verifier**: the challenger, FRI, the STARK
    check, and the two tables' constraints. Done when it accepts a real
    proof from tabminer and rejects it with any byte changed.
