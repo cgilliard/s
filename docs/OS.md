@@ -872,6 +872,24 @@ kernel too much to add at the end.
     machine, and the boot line says so. With a disk, 109 MiB is free
     after boot instead of 93.
 
+    The store at 25 GB (2026-11-08, `docs/NODE.md` step 0): nothing in
+    it grows with the disk any more. Which slot caches a page was a
+    word for every page of the disk (25 MB at 25 GB); it is a hash
+    table with a bucket a slot, chained through the slots (32 KiB for
+    the 16 MiB cache). Which pages a writer made was a bit for every
+    page, allocated and zeroed for each transaction (800 KiB); it is a
+    flag on the page's cache slot, since such a page stays cached and
+    dirty until written or dropped. `storetest.sh --size=26843545600`
+    passes on a 25 GB disk with 112,840 KiB free after mounting, as on
+    256 MiB (the old store: 87,340). `node.sh` and `makenode.sh` make
+    25 GB disks, sparse.
+
+    `/dev/random` (2026-11-08): the host's randomness through
+    virtio-rng (file kind C), each byte handed out once; a read takes
+    what is ready, up to the device's 256 bytes, and with none waits for
+    the device's interrupt; `poll` sees it readable when bytes are
+    ready. `q32` and `node.sh` give QEMU the device. Checked by `rnd`.
+
     Checked by `exec_1/4` (with a disk):
     - `/bin` there, and `cd /proc`;
     - a copied echo refused without x, then run by its path, by a

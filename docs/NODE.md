@@ -211,16 +211,17 @@ half-applied one.
   make it. Outside the window a block costs about 500 bytes (26 MB a
   year) and an unspent output about 85, so the disk holds essentially
   the whole chain for a long time, even at Bitcoin's scale.
-- **The store at that size.** Two of its structures grow with the disk
-  today, and must not (step 0):
-  - the map from a disk page to its cache slot (`pslot`) is 4 bytes for
-    every page: about 24 MB of RAM for 25 GB. It becomes a hash table
-    sized to the cache (16 MiB: 4,096 slots);
-  - a writer transaction's bitmap of pages (`XBMAP`) is a bit for every
-    page, zeroed for each transaction: about 750 KB for 25 GB. It
-    becomes a record of the pages the transaction touches, sized to the
-    transaction (which `DLMAX` already bounds).
-  `node.sh`'s default disk stays 256 MiB until then.
+- **The store at that size.** Two of its structures grew with the disk,
+  and no longer do (step 0, done):
+  - the map from a disk page to its cache slot (`pslot`) was 4 bytes for
+    every page: about 25 MB of RAM for 25 GB. It is a hash table sized
+    to the cache: a bucket a slot, chained through the slots (32 KiB for
+    4,096 slots);
+  - a writer transaction's bitmap of pages (`XBMAP`) was a bit for every
+    page, zeroed for each transaction: about 800 KB for 25 GB. It is a
+    flag on the page's cache slot: a page a writer made stays cached and
+    dirty until written or dropped, so needs no other record.
+  `node.sh` and `makenode.sh` make 25 GB disks.
 - **Memory:** the node's own region and its `malloc`, the seed file
   (1.29 MB), a proof being verified (205 KB and its working state),
   the pool (bounded far below tabminer's 64 MiB), and buffers for
@@ -673,7 +674,15 @@ Each step done when its test passes.
    - `node.sh` and `makenode.sh` making 25 GB disks;
    - virtio-rng and `/dev/random`.
    Done when storetest passes on a 25 GB disk, and RAM in use is the
-   same as on 256 MiB.
+   same as on 256 MiB. Done (2026-11-08):
+   - the page-to-slot map and the writer's page record as above
+     (Its state); `storetest.sh --size=26843545600` passes, crash rounds
+     included, with 112,840 KiB free after mounting on 25 GB and on
+     256 MiB alike (the old store on 25 GB: 87,340);
+   - `node.sh` and `makenode.sh` make 25 GB disks, sparse;
+   - `/dev/random`: virtio-rng in the kernel, each byte handed out once,
+     a read waiting for the device's interrupt when none are ready
+     (`docs/OS.md`; oscheck's `rnd`).
 1. **Arithmetic.** The 32×32→64 product, BabyBear, its extension, and
    the wide integers. Done when they match tabminer's vectors, and the
    cost of a product is measured.

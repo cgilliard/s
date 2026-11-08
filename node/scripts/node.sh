@@ -27,7 +27,7 @@ zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
 SEEDS="tabernacle1.root.sx:3737 tabernacle2.root.sx:3737"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DISK="$ROOT/data/node.img"
-DISK_SIZE=268435456     # 256 MiB, sparse
+DISK_SIZE=26843545600   # 25 GB, sparse (docs/NODE.md)
 EXTRA=""
 NO_SEEDS=0
 MAC=""
@@ -117,6 +117,7 @@ qemu-system-riscv32 \
 	-device loader,file="$SEEDFILE",addr=0x87FFF000,force-raw=on \
 	-drive file="$DISK",format=raw,if=none,id=d0 \
 	-device virtio-blk-device,drive=d0 \
+	-device virtio-rng-device \
 	-netdev user,id=n0$HOSTFWD \
 	-device virtio-net-device,netdev=n0$MAC \
 	-serial stdio -monitor none 2>/dev/null

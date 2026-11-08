@@ -316,6 +316,22 @@ st wait drop "killed " puts st @ . 0A lit putc bye'
 sh scripts/mkimage.sh "$T/desc.img" bin/kernel init="$T/tdesc.bin" cat=bin/user/cat 2> "$T/desc.mk" || fail desc "mkimage: $(cat "$T/desc.mk")"
 expect desc 124 '^pipe 0 idle -110 ready 1 1 read 1 eof 0 hup 1 17$' 5 ./tools/q32 --smp=2 "$T/desc.img"
 has desc '^open -2 badfd -9 ro -13 nopid -2 full 4$'; has desc '^killed -9$'
+# Randomness: /dev/random from virtio-rng (node step 0).  Two reads of 32
+# bytes that differ, the rest of the device's 256, the next 256 (a new
+# request, waited for), a write refused (opened to read).
+usrc trnd ': b variable ;  : c variable ;  : f variable ;
+: sp  20 lit putc ;
+100 lit alloc b !  100 lit alloc c !
+"/dev/random" 0 lit open dup f ! 0< if "random bad" else "random ok" then puts sp
+f @ b @ 20 lit read "read " puts . sp
+f @ c @ 20 lit read . sp
+0 lit 20 lit 0 lit do b @ i + c@ c @ i + c@ <> if 1 lit + then loop 8 lit u> if "differ yes" else "differ no" then puts sp
+f @ c @ 100 lit read "rest " puts . sp
+f @ c @ 100 lit read "next " puts . sp
+f @ "x" 1 lit write "write " puts . 0A lit putc
+f @ close drop bye'
+sh scripts/mkimage.sh "$T/rnd.img" bin/kernel init="$T/trnd.bin" 2> "$T/rnd.mk" || fail rnd "mkimage: $(cat "$T/rnd.mk")"
+expect rnd 124 '^random ok read 32 32 differ yes rest 192 next 256 write -9$' 5 ./tools/q32 --smp=2 "$T/rnd.img"
 # The shell from the console: the image's programs and one writing 100 KiB,
 # commands typed a line at a time, on one hart and on four; one in the
 # background (&: its pid shown, then told done), and & before a line's end;

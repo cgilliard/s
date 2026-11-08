@@ -523,6 +523,91 @@ dup 2 lit = if drop 8 lit + @ else
 then then then then then then
 klk @ unlock sret ;
 
+\ ── Randomness: virtio-rng (legacy MMIO, one queue, one request at a time) ──
+\
+\ /dev/random (file kind C): the host's randomness, as the device gives it,
+\ each byte handed out once.  A read takes what is ready (up to 256
+\ bytes); with none, it asks the device and waits for its interrupt.
+\ Writes are taken and dropped.
+
+:M RNGQN 4 lit ;               \ descriptors (one is used)
+: rngk    variable ;           \ the device's registers (0: none)
+: rngq    variable ;           \ its queue: two pages
+: rngav   variable ;           \ requests made
+: rngbuf  variable ;           \ what it gave: 256 bytes
+: rnglen  variable ;           \ bytes in rngbuf
+: rngpos  variable ;           \ bytes of them handed out
+: rngbusy variable ;           \ a request is out
+: rngirq  variable ;           \ its interrupt (0: polled)
+
+\ rngfind ( -- base | 0 )  the virtio-mmio slot holding an entropy device.
+: rngfind
+0 lit 10001000 lit
+begin dup 10009000 lit u< while
+	over 0= if
+		dup @ 74726976 lit = if dup 8 lit + @ 4 lit = if nip dup then then
+	then
+	1000 lit +
+repeat
+drop ;
+
+\ rnginit ( base -- )  the device started, no request out.
+: rnginit
+dup rngk !
+0 lit over 70 lit + !        \ reset
+1 lit over 70 lit + !        \ acknowledged
+3 lit over 70 lit + !        \ a driver
+0 lit over 20 lit + !        \ no features
+1000 lit over 28 lit + !     \ 4 KiB pages
+0 lit over 30 lit + !
+dup 34 lit + @ RNGQN u< if "virtio-rng queue too small" panic then
+RNGQN over 38 lit + !
+1000 lit over 3C lit + !
+2 lit pgalloc dup 0= if "no memory for virtio-rng's queue" panic then dup rngq ! 2000 lit mzero
+rngq @ C lit rshift over 40 lit + !
+100 lit alloc rngbuf !  0 lit rngav !  0 lit rnglen !  0 lit rngpos !  0 lit rngbusy !  0 lit rngirq !
+7 lit swap 70 lit + ! ;      \ running
+
+\ rngreq  a request for 256 bytes into rngbuf (all of it handed out): its one
+\ descriptor, device-written.  Under klk.
+: rngreq
+rngbuf @ rngq @ !  0 lit rngq @ 4 lit + !  100 lit rngq @ 8 lit + !  2 lit rngq @ C lit + !
+rngav @ RNGQN 1 lit - and 1 lit lshift rngq @ 44 lit + + 0 lit swap h!
+fence
+rngav @ 1 lit + dup rngav ! rngq @ 42 lit + h!
+fence
+1 lit rngbusy !
+0 lit rngk @ 50 lit + ! ;
+
+\ rngdone? ( -- flag )  the request out answered; rngtake  its bytes ready.
+: rngdone?  rngq @ 1002 lit + h@ rngav @ FFFF lit and = ;
+: rngtake
+fence
+rngav @ 1 lit - RNGQN 1 lit - and 3 lit lshift rngq @ 1008 lit + + @
+dup 100 lit u> if drop 100 lit then rnglen !  0 lit rngpos !  0 lit rngbusy ! ;
+
+\ krngirq  the device's interrupt: acknowledged, its bytes taken, readers
+\ woken.
+: krngirq
+rngk @ 60 lit + @ rngk @ 64 lit + !
+klk @ lock rngbusy @ if rngdone? if rngtake then then rngbuf @ fwake klk @ unlock ;
+
+\ rngread ( -- n )  read on /dev/random, under klk: the bytes ready, up to
+\ what was asked; none, and the call waits for the device.  The next
+\ request goes out as soon as the last byte is handed out.
+: rngread
+rngbusy @ if rngdone? if rngtake then then
+rnglen @ rngpos @ = if
+	rngbusy @ 0= if rngreq then
+	rngirq @ 0= if begin rngdone? until rngtake then
+then
+rnglen @ rngpos @ - ?dup 0= if rngbuf @ 5 lit tretry BLK else
+	30 lit sysarg 2dup u> if swap then drop
+	dup ?dup if 0 lit do rngbuf @ rngpos @ + i + c@  2C lit sysarg i + c! loop then
+	dup rngpos @ + rngpos !
+	rnglen @ rngpos @ = rngbusy @ 0= and if rngreq then
+then ;
+
 \ yopen ( s mode -- f | error )  /dev/tty/<N>: its slave end, for its
 \ maker or root.
 : yopen
@@ -559,7 +644,7 @@ else 0 lit then then then then then ;
 \ vgen ( q -- )  directory q's listing.
 : tl  ts A lit tc ;                                          \ ( s -- )  a line
 : vgen
-dup 1 lit = if "console" tl "null" tl "tty/" tl then
+dup 1 lit = if "console" tl "null" tl rngk @ if "random" tl then "tty/" tl then
 dup 2 lit = if 10 lit 0 lit do i 2 lit lshift kpty @ + @ if i tn A lit tc then loop then
 dup 3 lit = if
 	phi @ 0 lit do i prn @ if i 1 lit + tn "/" tl then loop
@@ -567,7 +652,7 @@ dup 3 lit = if
 then
 4 lit = if "cmd" tl "cwd" tl "kill" tl "status" tl "tickets" tl "user" tl then ;
 
-\ 15 open(path, flags): /dev/console, /dev/null, /dev/tty/<N>, a /proc key,
+\ 15 open(path, flags): /dev/console, /dev/null, /dev/random, /dev/tty/<N>, a /proc key,
 \ or one of the directories above (to read); flags 0 read, 1 write, 2
 \ both.  Its descriptor; -2 no such, -13 not that way, -21 a directory to
 \ write, -22 bad flags, -24 no descriptor free, -12 no room.
@@ -578,9 +663,10 @@ kvpath 0= if FFFFFFF2 lit else
 	vdir ?dup if swap 1 lit <> if drop FFFFFFEB lit else ptext dup if swap vgen tbend else nip then then else
 	kpb @ "/dev/console" streq if 1 lit swap fnew else
 	kpb @ "/dev/null" streq if 2 lit swap fnew else
+	kpb @ "/dev/random" streq if rngk @ if C lit swap fnew else drop FFFFFFFE lit then else
 	kpb @ "/dev/tty/" kpfx ?dup if swap yopen else
 	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
-	then then then then
+	then then then then then
 	dup 0= if drop FFFFFFF4 lit else
 	dup kerr? 0= if
 		dup area@ tproc fdput dup 0< if swap fclose else nip then
@@ -908,8 +994,9 @@ dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if 0 lit urecv else tcrd then else
 dup 9 lit = if drop 8 lit + @ ymread else
 dup A lit = if drop 8 lit + @ ysread else
 dup B lit = if drop ptread else
+dup C lit = if 2drop rngread else
 4 lit = if ptread else drop 0 lit
-then then then then then then then then then then then
+then then then then then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 17 write(fd, buf, n): all of it (waiting for room); -9, -14, -32 a pipe
@@ -928,8 +1015,9 @@ dup 3 lit = if drop 8 lit + @ pwrite else
 dup 8 lit = if drop 8 lit + @ dup @ 1 lit = if uwrite else tcwr then else
 dup 9 lit = if drop 8 lit + @ ymwrite else
 dup A lit = if drop 8 lit + @ yswrite else
+dup C lit = if 2drop 30 lit sysarg else
 drop pkwrite
-then then then then then then then then then
+then then then then then then then then then then
 klk @ unlock dup BLK = if drop else sret then ;
 
 \ 19 close(fd): 0, or -9.
@@ -973,8 +1061,9 @@ dup @ 3 lit = if
 else
 dup @ 4 lit = over @ B lit = or if 1 lit else
 dup @ 9 lit = over @ A lit = or if dup yready else
-dup @ 8 lit = if dup 8 lit + @ dup @ 1 lit = if dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else cready then else 4 lit
-then then then then then then
+dup @ 8 lit = if dup 8 lit + @ dup @ 1 lit = if dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else cready then else
+dup @ C lit = if rngbusy @ if rngdone? if rngtake then then rnglen @ rngpos @ <> if 5 lit else rngbusy @ 0= if rngreq then 4 lit then else 4 lit
+then then then then then then then
 swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
 
 \ 22 poll(fds, n, ns): fds n entries of 8 bytes (a descriptor; the events
@@ -1797,11 +1886,11 @@ C002000 lit over 5 lit rshift 2 lit lshift + dup @ 1 lit 3 lit pick 1F lit and l
 0 lit C200000 lit !
 meie ;
 
-\ kext  an external interrupt: claimed, the disk's or the network's seen
-\ to, completed.
+\ kext  an external interrupt: claimed, the disk's, the network's or
+\ randomness's seen to, completed.
 : kext
 C200004 lit @
-dup if dup birq @ = if kblkirq else dup nirq @ = if knetirq then then then
+dup if dup birq @ = if kblkirq else dup nirq @ = if knetirq else dup rngirq @ = if krngirq then then then then
 C200004 lit ! ;
 
 \ read and write: files (and working directories written) without klk.
@@ -2254,6 +2343,11 @@ nfind ?dup if                 \ a network device: started, and its interrupt
 	nk @ 10001000 lit - C lit rshift 1 lit + dup nirq ! kplic
 	"kernel: the network: " puts nmac @ .mac ", 10.0.2.15" puts 0A lit putc
 	narpwait ngwok @ if "kernel: the gateway: " puts ngw @ .mac 0A lit putc then
+then
+rngfind ?dup if               \ randomness: /dev/random, and its interrupt
+	rnginit
+	rngk @ 10001000 lit - C lit rshift 1 lit + dup rngirq ! kplic
+	"kernel: randomness: virtio-rng" puts 0A lit putc
 then
 swon tmrinit                  \ hart 0 too takes software interrupts (stale PMP, a process ending)
 kdi                           \ and in machine mode only where hstep idles

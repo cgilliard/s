@@ -117,6 +117,9 @@ if [ -n "$NETDEV" ] || [ "$NET" = "1" ]; then
 	ARGS="$ARGS $NETDEV_DEV"
 fi
 
+# randomness: /dev/random (virtio-rng, from the host's)
+ARGS="$ARGS -global virtio-mmio.force-legacy=true -device virtio-rng-device"
+
 if [ -n "$DISK" ]; then
 	if [ ! -e "$DISK" ]; then
 		echo "Error: disk image $DISK not found"
