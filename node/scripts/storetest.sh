@@ -6,15 +6,25 @@
 # QEMU killed while the store commits as fast as it can, and the store
 # found holding the last commit whole.  Exits 0 when every run passes.
 # Linux and macOS.
+#
+# Usage: storetest.sh [--size=BYTES]  the disk's size (default 256 MiB;
+# sparse, so 26843545600, the node's 25 GB, costs no more).
 
 cd "$(dirname "$0")/.." || exit 1
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
+SIZE=268435456
+for arg in "$@"; do
+	case "$arg" in
+		--size=*) SIZE="${arg#--size=}" ;;
+		*) echo "storetest.sh: unknown argument: $arg" >&2; exit 1 ;;
+	esac
+done
 mkdir -p tmp
 DISK=tmp/storetest.img
 rm -f "$DISK"
-dd if=/dev/zero of="$DISK" bs=1 count=0 seek=268435456 2>/dev/null || exit 1
+dd if=/dev/zero of="$DISK" bs=1 count=0 seek="$SIZE" 2>/dev/null || exit 1
 trap 'rm -f "$DISK" tmp/storetest_*.fam tmp/storetest_*.bin' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 

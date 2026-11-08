@@ -186,6 +186,8 @@ gp@ 10000 lit + FFF lit + FFFFF000 lit and 87F00000 lit pginit
 0 lit fails !  400 lit alloc gbuf !
 RUN dup 1 lit = stmount
 T1 !
+\ What mounting cost: the same whatever the disk's size.
+"storetest: disk of " puts npg @ u. " pages, " puts pgfree# 2 lit lshift u. " KiB of memory free" puts 0A lit putc
 : main
 T1 @ 1 lit = if run1 else T1 @ 0= if run2 else T1 @ 2 lit = if crashw else crashc then then then
 fails @ if "storetest: " puts fails @ u. " failed" puts 0A lit putc 1 lit halt then

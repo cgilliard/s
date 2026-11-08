@@ -6,12 +6,12 @@
 #
 # Usage: makenode.sh [--disk=FILE]
 #   --disk=FILE  the disk (default node/data/node.img); created if missing
-#                (256 MiB, sparse, as node.sh makes it), else its start is
+#                (25 GB, sparse, as node.sh makes it), else its start is
 #                overwritten and the rest kept
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DISK="$ROOT/data/node.img"
-DISK_SIZE=268435456     # as scripts/node.sh
+DISK_SIZE=26843545600   # as scripts/node.sh
 IMG="$ROOT/bin/img"
 
 for arg in "$@"; do

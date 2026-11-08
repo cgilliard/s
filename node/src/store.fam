@@ -257,7 +257,7 @@ B3826200 ,   \ add t0,t0,t1
 
 :M XTREE   0 lit ;  :M XKIND   4 lit ;  :M XTXID   8 lit ;  :M XROOT   C lit ;
 :M XCNT   10 lit ;  :M XRSLOT 14 lit ;  :M XNDIRTY 18 lit ; :M XNFREED 1C lit ;
-:M XNPIN  20 lit ;  :M XDEPTH 24 lit ;  :M XBMAP  28 lit ;  :M XDIRTY 2C lit ;
+:M XNPIN  20 lit ;  :M XDEPTH 24 lit ;  ( 28 unused )     :M XDIRTY 2C lit ;
 :M XFREED 30 lit ;  :M XTMP   34 lit ;  :M XTMP2  38 lit ;  :M XKLEN  3C lit ;
 :M XVLEN  40 lit ;  :M XSKLEN 44 lit ;  :M XERR   48 lit ;  :M XCHG   4C lit ;
 :M S0 50 lit ;  :M S1 54 lit ;  :M S2 58 lit ;  :M S3 5C lit ;     \ the searches' locals
@@ -302,9 +302,11 @@ B3826200 ,   \ add t0,t0,t1
 
 : cbase  variable ;          \ the slots' buffers
 : cpg    variable ;          \ each slot's page
-: cfl    variable ;          \ its flags: 1 used, 2 dirty, 4 recently used, 8 being read
+: cfl    variable ;          \ its flags: 1 used, 2 dirty, 4 recently used, 8 being read,
+                             \ 10 made by its tree's writer (own?)
 : cpn    variable ;          \ its pins: calls using it now
-: pslot  variable ;          \ each page's slot + 1 (0: not cached)
+: cbkt  variable ;          \ the pages cached, by hash: each bucket's first slot + 1 (0: none)
+: clink  variable ;          \ each slot's next in its bucket, + 1 (0: the last)
 : chand  variable ;          \ the clock's hand
 : npg    variable ;          \ the store's pages
 
@@ -317,8 +319,24 @@ B3826200 ,   \ add t0,t0,t1
 : cpn+   2 lit lshift cpn @ + dup @ 1 lit + swap ! ;   \ ( s -- )
 : cpn-   2 lit lshift cpn @ + dup @ 1 lit - swap ! ;
 : cpn@   2 lit lshift cpn @ + @ ;
-: ps@    2 lit lshift pslot @ + @ ;            \ ( p -- s+1 | 0 )
-: ps!    2 lit lshift pslot @ + ! ;            \ ( v p -- )
+
+\ Which slot holds a page: a hash table of NSLOT buckets, each a chain of
+\ the slots holding its pages (linked by clink, matched by cpg), so its
+\ size follows the cache, not the disk.  Under stlk.
+: hb     dup C lit rshift xor NSLOT 1 lit - and 2 lit lshift cbkt @ + ;   \ ( p -- addr ) its bucket
+: cnx    1 lit - 2 lit lshift clink @ + ;      \ ( s+1 -- addr ) its link
+\ ps@ ( p -- s+1 | 0 )  the slot holding page p, + 1.
+: ps@
+dup hb @
+begin dup if dup 1 lit - cpg@ 2 lit pick = 0= else 0 lit then while cnx @ repeat
+nip ;
+\ psdel ( p -- )  page p no longer in its slot.
+: psdel
+dup hb
+begin dup @ dup if 1 lit - cpg@ 2 lit pick = 0= else drop 0 lit then while @ cnx repeat
+dup @ ?dup if cnx @ swap ! else drop then drop ;
+\ ps! ( v p -- )  page p in slot v - 1 (its cpg already p), or none (v 0).
+: ps!    over if hb 2dup @ swap cnx ! ! else nip psdel then ;
 
 \ cevict ( -- s )  a slot to use, under stlk: a free one, or the clock's
 \ (passing over one recently used once, and always one dirty, pinned or
@@ -540,23 +558,24 @@ stopen kmunlock ;
 
 \ ── Transactions ──
 
-\ own? ( p -- flag ), own! own0 ( p -- )  a page this transaction made.
-: obit  dup 5 lit rshift 2 lit lshift XBMAP x@ +  1 lit rot 1F lit and lshift ;   \ ( p -- addr bit )
-: own?  obit swap @ and ;
-: own!  obit over @ or swap ! ;
-: own0  obit invert over @ and swap ! ;
+\ own? ( p -- flag ), own! own0 ( p -- )  a page this transaction made: its
+\ slot's flag 10.  Such a page stays cached, dirty, until it is written or
+\ dropped (a page of a tree's is made only by its writer, one at a time),
+\ so the flag needs no record the disk's size.  own?u own0u: stlk held.
+: own?u  ps@ ?dup if 1 lit - cfl@ 10 lit and else 0 lit then ;
+: own0u  ps@ ?dup if 1 lit - dup cfl@ 10 lit invert and swap cfl! then ;
+: own?   stl own?u stu ;
+: own0   stl own0u stu ;
+: own!   stl ps@ ?dup if 1 lit - dup cfl@ 10 lit or swap cfl! then stu ;
 
 \ dpush ( p -- ), fpush ( p -- )  a page this transaction made, or freed
 \ (one a commit had: free once it commits); too many, and it fails.
 : dpush  XNDIRTY x@ DLMAX = if drop 1 lit XERR x! else XNDIRTY x@ 2 lit lshift XDIRTY x@ + !  XNDIRTY x@ 1 lit + XNDIRTY x! then ;
 : fpush  XNFREED x@ DLMAX = if drop 1 lit XERR x! else XNFREED x@ 2 lit lshift XFREED x@ + !  XNFREED x@ 1 lit + XNFREED x! then ;
 
-: bmpages  npg @ 7FFF lit + F lit rshift ;         \ ( -- n )  the bitmap's pages
-
 \ tfree  a transaction's memory given back (tx 0 after).
 : tfree
 XKIND x@ 2 lit = if
-	XBMAP x@ ?dup if bmpages spgf then
 	XDIRTY x@ ?dup if 8 lit spgf then
 	XFREED x@ ?dup if 8 lit spgf then
 	XTMP x@ ?dup if 1 lit spgf then
@@ -581,11 +600,9 @@ tx 1 lit spgf  0 lit tx! ;
 	else
 		XTREE x@ TWLK + kmlock
 		stl XTREE x@ TTX t@ 1 lit + XTXID x!  XTREE x@ TROOT t@ XROOT x!  XTREE x@ TCNT t@ XCNT x! stu
-		bmpages spga dup XBMAP x!  8 lit spga dup XDIRTY x!  8 lit spga dup XFREED x!
+		8 lit spga dup XDIRTY x!  8 lit spga dup XFREED x!
 		1 lit spga dup XTMP x!  1 lit spga dup XTMP2 x!
-		and and and and if
-			XBMAP x@ bmpages C lit lshift mzero
-		else XTREE x@ TWLK + kmunlock tfree then
+		and and and 0= if XTREE x@ TWLK + kmunlock tfree then
 	then
 then
 tx ;
@@ -604,7 +621,7 @@ then ;
 \ its header zero; 0 0 if there is none to be had (XERR then set).
 : pnew
 palloc ?dup 0= if 1 lit XERR x! 0 lit 0 lit else
-	dup own! dup dpush dup pslot! dup 10 lit mzero
+	dup dpush dup pslot! over own! dup 10 lit mzero
 then ;
 
 \ pwr ( p -- p' buf | 0 0 )  page p to change: itself if this transaction
@@ -919,8 +936,8 @@ tunpin
 XKIND x@ 2 lit = if
 	stl
 	XNDIRTY x@ ?dup if 0 lit do
-		i 2 lit lshift XDIRTY x@ + @ dup own? if
-			dup own0
+		i 2 lit lshift XDIRTY x@ + @ dup own?u if
+			dup own0u
 			dup ps@ ?dup if 1 lit - 0 lit swap cfl!  0 lit over ps! then
 			0 lit XTREE x@ flpush
 		else drop then
@@ -933,7 +950,7 @@ tend ;
 \ written in one request and then clean.
 : wrun
 ?dup if
-	2dup 0 lit do dup i + ps@ 1 lit - sbuf i 2 lit lshift XWL + x! loop drop
+	stl 2dup 0 lit do dup i + ps@ 1 lit - sbuf i 2 lit lshift XWL + x! loop drop stu
 	2dup 1 lit -rot XWL xa swap blkreq
 	XTREE x@ TNW t@ over + XTREE x@ TNW t!
 	stl 0 lit do dup i + ps@ 1 lit - dup cfl@ 2 lit invert and swap cfl! loop stu
@@ -962,10 +979,10 @@ XKIND x@ 1 lit = XCHG x@ 0= XNFREED x@ 0= and or if tend 0 lit else
 	L2 x@ L3 x@ u> if L2 x@ L3 x@ do
 		L0 x@ TCH t@ L0 x@ TCE t@ u< 0= if L0 x@ chunk 0= if "store: the disk is full" panic then then
 		stl L0 x@ TCH t@ dup 1 lit + L0 x@ TCH t! stu
-		dup own! dup dpush  L0 x@ TFP t@ i 2 lit lshift + !
+		dup dpush  L0 x@ TFP t@ i 2 lit lshift + !
 	loop
 	L2 x@ L3 x@ do
-		L0 x@ TFP t@ i 2 lit lshift + @ pslot!  dup 1000 lit mzero
+		L0 x@ TFP t@ i 2 lit lshift + @ dup pslot!  swap own!  dup 1000 lit mzero
 		i if L0 x@ TFP t@ i 1 lit - 2 lit lshift + @ else 0 lit then over !
 		i 3FD lit * over 8 lit + !
 		L1 x@ i 3FD lit * - dup 3FD lit u> if drop 3FD lit then  2dup swap 4 lit + !
@@ -1018,10 +1035,10 @@ NSLOT pgalloc dup cbase !  0= if "store: no memory for the cache" panic then
 NSLOT 2 lit lshift FFF lit + C lit rshift
 dup pgalloc dup cpg ! over C lit lshift mzero
 dup pgalloc dup cfl ! over C lit lshift mzero
-dup pgalloc dup cpn ! swap C lit lshift mzero
-cpg @ cfl @ cpn @ and and 0= if "store: no memory for the cache" panic then
-npg @ 2 lit lshift FFF lit + C lit rshift dup pgalloc dup pslot ! dup 0= if "store: no memory for the cache" panic then
-swap C lit lshift mzero
+dup pgalloc dup cpn ! over C lit lshift mzero
+dup pgalloc dup cbkt ! over C lit lshift mzero
+dup pgalloc dup clink ! swap C lit lshift mzero
+cpg @ cfl @ cpn @ cbkt @ clink @ and and and and 0= if "store: no memory for the cache" panic then
 TMAX 7 lit lshift dup alloc dup trees ! swap mzero
 80 lit alloc dup gtr ! 80 lit mzero
 1 lit pgalloc pmbuf !  2 lit pgalloc tmp2 !
