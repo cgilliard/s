@@ -5,7 +5,16 @@
 //!   BabyBear and its extension, the wide integers, the remainder of 64
 //!   bits by 32, and `fri::log2_x256_ceil`;
 //! - `poseidon2_vectors.fam` (step 2): the permutation, `compress`, `hash`,
-//!   and Merkle roots from paths, verified and refused.
+//!   and Merkle roots from paths, verified and refused;
+//! - `difficulty_vectors.fam` (step 4): ASERT's next target, a block's
+//!   work, and a proof-of-work result against a target;
+//! - `pow_vectors.fam` (step 4): the seed file's windows, dataset items,
+//!   hashimoto, a header's hashes and its proof of work, checked and
+//!   refused; plain code for a program under the OS, which has the file;
+//! - `headers_vectors.fam` (step 4): a dev network's header chain fed to
+//!   tabminer's own `Chain::accept_headers` one at a time, each verdict as
+//!   it gave it, a heavier branch of fewer blocks taking over, and headers
+//!   breaking each rule; plain code for a program under the OS.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -19,6 +28,9 @@ mod tests {
 
     const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/arith_vectors.fam");
     const P2_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/poseidon2_vectors.fam");
+    const POW_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pow_vectors.fam");
+    const HDR_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/headers_vectors.fam");
+    const DIFF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/difficulty_vectors.fam");
 
     /// splitmix64: the same values every run.
     struct Rng(u64);
@@ -343,18 +355,414 @@ mod tests {
         o
     }
 
+
+    fn generate_difficulty() -> String {
+        use crate::chain::ChainParams;
+        use crate::difficulty::{Asert, Schedule};
+        use crate::pow::{Target, digest_to_u248_le};
+        let mut r = Rng(0x5eed_d1ff);
+        let mut o = String::new();
+        o.push_str(
+            "\\ difficulty_vectors.fam — tabminer's values for difficulty.fam (docs/NODE.md,\n\
+             \\ step 4).  Written by miner/src/fam_vectors.rs (`cargo test --lib\n\
+             \\ write_fam_vectors -- --ignored`); not to be edited.  Run: tools/fam --test\n\
+             \\ src/user/node/arith.fam src/user/node/difficulty.fam src/user/node/difficulty_vectors.fam\n\n\
+             : vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;\n\
+             : vinit  arinit dvinit vx @ 0= if 60 lit alloc vx !  60 lit alloc vy !  60 lit alloc vz !  60 lit alloc vw ! then ;\n\
+             : v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;\n\n\
+             Test {\n",
+        );
+        // Results against targets: around the result's own value.
+        o.push_str("\tmeets {\n\t\tvinit\n");
+        for i in 0..24 {
+            let d: [u32; 8] = core::array::from_fn(|k| if i % 4 == 0 && k < i / 4 { 0 } else { r.u32() % P });
+            let df = d.map(Fp::new);
+            let v = U256::from_le_bytes(&digest_to_u248_le(&df));
+            let t = match i % 3 {
+                0 => v,
+                1 => v.checked_sub(U256::ONE).unwrap_or(U256::ZERO),
+                _ => r.u256(),
+            };
+            let met = Target::from(t).is_met_by(&df);
+            writeln!(o, "\t\t{}  {}  vx @ vy @ meets {} asrt_eq", store("vx", &d), store("vy", &w256(t)), if met { "FFFFFFFF lit" } else { "0 lit" }).unwrap();
+        }
+        o.push_str("\t}\n");
+        // A block's work.
+        o.push_str("\tblock_work {\n\t\tvinit\n");
+        let mut targets = vec![U256::ZERO, U256::ONE, U256::MAX, U256::MAX.shift_right(8), U256(crate::genesis::TARGET)];
+        targets.extend((0..12).map(|_| r.u256()));
+        for t in targets {
+            let w = ChainParams::block_work(t);
+            writeln!(o, "\t\t{}  vx @ vz @ bwork  {}", store("vx", &w256(t)), expect("vz", &w256(w))).unwrap();
+        }
+        o.push_str("\t}\n");
+        // ASERT: mainnet's anchored at genesis, the dev networks' at block
+        // 1, and others; blocks on schedule, ahead, behind, and far off.
+        o.push_str("\tasert {\n\t\tvinit\n");
+        let max = ChainParams::MAINNET.max_target;
+        let mut scheds: Vec<Asert> = vec![
+            Asert::anchored(0, crate::genesis::TIMESTAMP as i64, U256(crate::genesis::TARGET), max, Schedule::MAINNET),
+            Asert::anchored(1, 1_767_300_000, ChainParams::DEV.genesis_target, max, ChainParams::DEV.schedule),
+            Asert::anchored(1, 1_767_300_000, ChainParams::DEV_RECURSIVE.genesis_target, max, ChainParams::DEV_RECURSIVE.schedule),
+        ];
+        for _ in 0..4 {
+            let sch = Schedule { block_time: 1 + (r.next() % 900) as i64, half_life: 1 + (r.next() % 300_000) as i64, from_first_block: false };
+            scheds.push(Asert::anchored(r.next() % 1000, (r.next() % (1u64 << 40)) as i64, r.u256().shift_right(8), max, sch));
+        }
+        for a in &scheds {
+            let at = a.anchor_parent_time as u64;
+            let mut sw = vec![a.anchor_height as u32, at as u32, (at >> 32) as u32, a.half_life as u32, a.ideal_block_time as u32];
+            sw.extend(w256(a.anchor_target));
+            sw.extend(w256(a.max_target));
+            writeln!(o, "\t\t{}", store("vx", &sw)).unwrap();
+            for k in 0..14u64 {
+                let dh = match k { 0 => 0, 1..=5 => r.next() % 1000, 6..=9 => r.next() % 1_000_000, _ => r.next() % (1 << 31) };
+                let eh = a.anchor_height + dh;
+                let ideal = a.anchor_parent_time + a.ideal_block_time * (dh as i64 + 1);
+                let et: i64 = match k % 7 {
+                    0 => ideal,
+                    1 => ideal + (r.next() % 100_000) as i64,
+                    2 => ideal - (r.next() % 100_000) as i64,
+                    3 => ideal + (r.next() % (1 << 40)) as i64,
+                    4 => ideal - (r.next() % (1 << 40)) as i64,
+                    5 => r.next() as i64,
+                    _ => ideal + (r.next() % 2000) as i64 - 1000,
+                };
+                let t = a.next_target(eh, et);
+                writeln!(
+                    o,
+                    "\t\tvx @ {} {} {} vz @ asert  {}",
+                    lit(eh as u32), lit(et as u32), lit((et as u64 >> 32) as u32), expect("vz", &w256(t))
+                ).unwrap();
+            }
+        }
+        o.push_str("\t}\n}\n");
+        o
+    }
+
+
+    fn generate_pow() -> String {
+        use crate::block::Header;
+        use crate::pow::{PowParams, SeedText, Target, hashimoto};
+        let mut r = Rng(0x5eed_9077);
+        let mut o = String::new();
+        o.push_str(
+            "\\ pow_vectors.fam — tabminer's values for pow.fam (docs/NODE.md, step 4).\n\
+             \\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_fam_vectors\n\
+             \\ -- --ignored`); not to be edited.  Plain code, for pow_test.fam (a\n\
+             \\ program under the OS, after powinit): it counts the checks in vpass\n\
+             \\ and vfail.\n\n\
+             : vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;  : vpass variable ;  : vfail variable ;\n\
+             : vinit  vx @ 0= if 100 lit alloc vx !  100 lit alloc vy !  100 lit alloc vz !  100 lit alloc vw ! then ;\n\
+             : v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;\n\
+             : wfrom  0 lit do dup i w@ fromm over i w! loop drop ;\n\
+             : vok  if vpass @ 1 lit + vpass ! else vfail @ 1 lit + vfail !  \"pow_vectors: check \" puts vpass @ vfail @ + u. \" failed\" puts 0A lit putc then ;\n\
+             \\ vsame ( n -- )  vz holds the n words vw does.\n\
+             : vsame  vz @ vw @ rot wcmp 0= vok ;\n\
+             : vexp  vw @ swap v! ;\n\n\
+             vinit\n",
+        );
+        let mainnet = SeedText::new(PowParams::MAINNET);
+        let dev = SeedText::new(PowParams::DEV);
+        let n = mainnet.windows();
+        let vexp = |v: &[u32]| format!("{} {} vexp", lits(v), lit(v.len() as u32));
+        // Windows: the first, the last two (overlapping), and others.
+        let mut ws = vec![0, 1, 2, n - 2, n - 1];
+        ws.extend((0..4).map(|_| (r.next() % n as u64) as usize));
+        for w in ws {
+            writeln!(o, "{} vz @ window  vz @ 8 lit wfrom  {}  8 lit vsame", lit(w as u32), vexp(&canon(&mainnet.window(w)))).unwrap();
+        }
+        // Items, the dataset's first and last among them.
+        let mut items = vec![0usize, 1, 2, 1023, 1 << 19, (1 << 20) - 1];
+        items.extend((0..3).map(|_| (r.next() % (1 << 20)) as usize));
+        for i in items {
+            writeln!(o, "{} vz @ item  vz @ 10 lit wfrom  {}  10 lit vsame", lit(i as u32), vexp(&canon(&mainnet.calc_dataset_item(i)))).unwrap();
+        }
+        // Headers: their hashes, a height past p, the largest timestamp.
+        let header = |r: &mut Rng, height: u32, timestamp: u64| Header {
+            prev_hash: core::array::from_fn(|_| Fp::new(r.u32() % P)),
+            height,
+            timestamp,
+            body_commitment: core::array::from_fn(|_| Fp::new(r.u32() % P)),
+            state_root: core::array::from_fn(|_| Fp::new(r.u32() % P)),
+            aux: core::array::from_fn(|_| r.u32() as u8),
+            mix: core::array::from_fn(|_| Fp::new(r.u32() % P)),
+            nonce: core::array::from_fn(|_| r.u32() as u8),
+        };
+        let words = |h: &Header| -> Vec<u32> {
+            h.to_bytes().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+        };
+        let put = |h: &Header| format!("{} vx @ {} v!", lits(&words(h)), lit(51));
+        let hs = [header(&mut r, 1, 1_793_322_871), header(&mut r, u32::MAX, u64::MAX), header(&mut r, P, 1 << 60), { let t = r.next(); header(&mut r, 77, t) }];
+        for h in &hs {
+            writeln!(o, "{}  vx @ hdr-ok vok", put(h)).unwrap();
+            writeln!(o, "vx @ vz @ powhash  vz @ 8 lit wfrom  {}  8 lit vsame", vexp(&canon(&h.pow_hash()))).unwrap();
+            writeln!(o, "vx @ vz @ blockid  vz @ 8 lit wfrom  {}  8 lit vsame", vexp(&canon(&h.hash()))).unwrap();
+        }
+        // A digest not canonical.
+        let mut w = words(&hs[0]);
+        w[36] = P;
+        writeln!(o, "{} vx @ {} v!  vx @ hdr-ok 0= vok", lits(&w), lit(51)).unwrap();
+        // hashimoto, at the dev networks' items and at mainnet's.
+        for (src, items) in [(&dev, 0x400u32), (&dev, 0x400), (&mainnet, 0x100000)] {
+            let h = header(&mut r, 5, 1_800_000_000);
+            let out = hashimoto(src, &h.pow_hash(), &h.nonce);
+            writeln!(o, "{} pwitems !  {}  vx @ vy @ powhash", lit(items), put(&h)).unwrap();
+            writeln!(o, "vy @ vx @ AC lit + vz @ vw @ hashmix  vz @ 8 lit wfrom  vw @ 8 lit wfrom  vw @ vy @ 8 lit wcopy").unwrap();
+            writeln!(o, "{}  8 lit vsame  vy @ vz @ 8 lit wcopy  {}  8 lit vsame", vexp(&canon(&out.mix)), vexp(&canon(&out.result))).unwrap();
+        }
+        // A header's proof of work at the dev items: a nonce found for a
+        // target one in sixteen meet, its true mix; then refused with
+        // another mix, and against a harder target.
+        let target = Target::from(U256::MAX.shift_right(12));
+        let mut h = header(&mut r, 9, 1_800_000_600);
+        let out = loop {
+            let out = h.pow_output(&dev);
+            if target.is_met_by(&out.result) {
+                break out;
+            }
+            h.nonce[0] = h.nonce[0].wrapping_add(1);
+            h.nonce[1] = h.nonce[1].wrapping_add((h.nonce[0] == 0) as u8);
+        };
+        h.mix = out.mix;
+        assert!(h.verify_pow(&dev, &target));
+        let tw = w256(target.value());
+        writeln!(o, "400 lit pwitems !  {}  {} vy @ 8 lit v!", put(&h), lits(&tw)).unwrap();
+        writeln!(o, "vx @ vy @ quickpow vok  vx @ vy @ fullpow vok").unwrap();
+        let mut forged = h;
+        forged.mix[3] = Fp::new((forged.mix[3].to_canonical() + 1) % P);
+        assert!(!forged.verify_pow(&dev, &Target::MAX));
+        writeln!(o, "{}  {} vy @ 8 lit v!  vx @ vy @ quickpow vok  vx @ vy @ fullpow 0= vok", put(&forged), lits(&w256(Target::MAX.value()))).unwrap();
+        let hard = Target::from(U256::MAX.shift_right(200));
+        assert!(!h.quick_pow_check(&hard));
+        writeln!(o, "{}  {} vy @ 8 lit v!  vx @ vy @ quickpow 0= vok  vx @ vy @ fullpow 0= vok", put(&h), lits(&w256(hard.value()))).unwrap();
+        o.push_str("100000 lit pwitems !\n");
+        o
+    }
+
+
+    /// The nonces of [`dev_headers`]: each the least meeting its target,
+    /// found once by [`nonce_for`]'s search (which prints the table when
+    /// one no longer holds, after a change to the proof of work).
+    const DEV_NONCES: [u64; 13] = [457442, 46356, 0, 0, 0, 0, 0, 0, 0, 0, 647779, 58059, 0];
+
+    /// The least nonce from 0 at which `h` meets `target`, its mix set:
+    /// `hint` if it is that, else searched (slowly) and reported.
+    fn nonce_for(h: &mut crate::block::Header, target: &crate::pow::Target, data: &crate::pow::Dataset, hint: u64, found: &mut Vec<u64>) {
+        let meets = |h: &crate::block::Header, n: u64| {
+            let mut c = *h;
+            c.nonce = crate::pow::nonce_from_u64(n);
+            target.is_met_by(&c.pow_output(data).result)
+        };
+        let least = |h: &crate::block::Header| (0..).find(|&n| meets(h, n)).unwrap();
+        let ok = meets(h, hint);
+        let n = if ok { hint } else { least(h) };
+        found.push(n);
+        h.nonce = crate::pow::nonce_from_u64(n);
+        h.mix = h.pow_output(data).mix;
+    }
+
+    fn dev_dataset() -> &'static crate::pow::Dataset {
+        use crate::pow::{Dataset, PowParams, SeedText};
+        static D: std::sync::OnceLock<Dataset> = std::sync::OnceLock::new();
+        D.get_or_init(|| Dataset::generate(&SeedText::new(PowParams::DEV)))
+    }
+
+    /// The dev header chain: genesis, blocks 1 and 2 at genesis's target,
+    /// eight blocks 3,000 s behind schedule (at the easiest target), a
+    /// branch from block 1 of two blocks on schedule (each at genesis's
+    /// target: more work in fewer blocks), and a block 11 on the first
+    /// branch.
+    fn dev_headers() -> (Vec<crate::block::Header>, Vec<crate::block::Header>, crate::block::Header) {
+        use crate::block::Header;
+        use crate::chain::ChainParams;
+        let p = ChainParams::DEV;
+        let data = dev_dataset();
+        let g = p.genesis().header;
+        let gt: crate::pow::Target = p.genesis_target.into();
+        let easy: crate::pow::Target = p.max_target.into();
+        let child = |parent: &Header, ts: u64, tag: u8| Header {
+            prev_hash: parent.hash(),
+            height: parent.height + 1,
+            timestamp: ts,
+            body_commitment: g.body_commitment,
+            state_root: g.state_root,
+            aux: [tag; 32],
+            mix: [Fp::ZERO; 8],
+            nonce: [0; 32],
+        };
+        let mut found = Vec::new();
+        let mut hint = DEV_NONCES.iter().copied();
+        let mut main = vec![g];
+        let mut h1 = child(&g, g.timestamp + 5, 1);
+        nonce_for(&mut h1, &gt, data, hint.next().unwrap(), &mut found);
+        main.push(h1);
+        let mut h2 = child(&h1, h1.timestamp + 3000, 2);
+        nonce_for(&mut h2, &gt, data, hint.next().unwrap(), &mut found);
+        main.push(h2);
+        for k in 0..8 {
+            let prev = *main.last().unwrap();
+            let mut h = child(&prev, prev.timestamp + 1, 3 + k);
+            nonce_for(&mut h, &easy, data, hint.next().unwrap(), &mut found);
+            main.push(h);
+        }
+        let mut b2 = child(&h1, h1.timestamp + 1, 0x42);
+        nonce_for(&mut b2, &gt, data, hint.next().unwrap(), &mut found);
+        let mut b3 = child(&b2, b2.timestamp + 1, 0x43);
+        nonce_for(&mut b3, &gt, data, hint.next().unwrap(), &mut found);
+        let tip = main[10];
+        let mut times: Vec<u64> = main[main.len() - 11..].iter().map(|h| h.timestamp).collect();
+        times.sort();
+        let mut h11 = child(&tip, times[5] + 1, 0x77);
+        nonce_for(&mut h11, &easy, data, hint.next().unwrap(), &mut found);
+        assert!(found == DEV_NONCES, "fam_vectors: DEV_NONCES no longer hold; set them to {found:?}");
+        (main, vec![b2, b3], h11)
+    }
+
+    fn generate_headers() -> String {
+        use crate::block::Header;
+        use crate::chain::{AcceptAllProofs, Chain, ChainError, ChainParams};
+        use crate::pow::{PowParams, SeedText};
+        let p = ChainParams::DEV;
+        let (main, branch, h11) = dev_headers();
+        let dir = std::env::temp_dir().join(format!("tabminer-famhdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chain = Chain::open(&dir, 64 << 20, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        chain.init_genesis(&p.genesis()).unwrap();
+        let tip = main.last().unwrap();
+        let now = branch[1].timestamp.max(tip.timestamp) + 60;
+        let mut o = String::new();
+        o.push_str(
+            "\\ headers_vectors.fam — a dev network's header chain for headers.fam\n\
+             \\ (docs/NODE.md, step 4), each verdict tabminer's own Chain::accept_headers\n\
+             \\ gave it.  Written by miner/src/fam_vectors.rs (`cargo test --lib\n\
+             \\ write_fam_vectors -- --ignored`); not to be edited.  Plain code, for\n\
+             \\ headers_test.fam (a program under the OS, after powinit): it counts the\n\
+             \\ checks in vpass and vfail.\n\n\
+             : vx variable ;  : vy variable ;  : vpass variable ;  : vfail variable ;  : vn variable ;\n\
+             : vinit  vx @ 0= if 100 lit alloc vx !  100 lit alloc vy ! then ;\n\
+             : v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;\n\
+             : vok  vn @ 1 lit + vn !  if vpass @ 1 lit + vpass ! else vfail @ 1 lit + vfail !  \"headers_vectors: check \" puts vn @ u. \" failed\" puts 0A lit putc then ;\n\
+             : vnow variable ;  : vnow2 variable ;\n\
+             \\ vh ( code -- )  the header at vx, offered now, gets code.\n\
+             : vh  vx @ vnow @ vnow2 @ hacc  dup rot = dup 0= if \"  got \" puts over . 0A lit putc then vok drop ;\n\n\
+             vinit\n",
+        );
+        // The network: ChainParams::DEV.
+        let mut pw: Vec<u32> = vec![p.pow.log_dataset_items, p.pow.parents as u32, p.pow.accesses as u32];
+        pw.extend(w256(p.genesis_target));
+        pw.extend(w256(p.max_target));
+        pw.extend([p.max_future_drift as u32, p.median_time_window as u32, p.final_height()]);
+        pw.extend([p.schedule.block_time as u32, p.schedule.half_life as u32, p.schedule.from_first_block as u32]);
+        assert_eq!(pw.len(), 25);
+        let words = |h: &Header| -> Vec<u32> {
+            h.to_bytes().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+        };
+        writeln!(o, "{} vy @ {} v!", lits(&pw), lit(pw.len() as u32)).unwrap();
+        writeln!(o, "{} vx @ {} v!  vy @ vx @ 100 lit hinit", lits(&words(&main[0])), lit(51)).unwrap();
+        writeln!(o, "{} vnow !  {} vnow2 !", lit(now as u32), lit((now >> 32) as u32)).unwrap();
+        let code = |r: (usize, Option<ChainError>)| -> i32 {
+            match r {
+                (1, None) => 0,
+                (0, None) => 1,
+                (_, Some(ChainError::UnknownParent(_))) => -2,
+                (_, Some(ChainError::BadHeight { .. })) => -3,
+                (_, Some(ChainError::ChainEnded)) => -4,
+                (_, Some(ChainError::TimestampTooOld { .. })) => -5,
+                (_, Some(ChainError::TimestampTooNew { .. })) => -6,
+                (_, Some(ChainError::BadProofOfWork)) => -7,
+                other => panic!("unexpected verdict {other:?}"),
+            }
+        };
+        let feed = |o: &mut String, h: &Header, what: &str| -> i32 {
+            let c = code(chain.accept_headers(&[*h], now));
+            writeln!(o, "\\ {what}\n{} vx @ {} v!  {} vh", lits(&words(h)), lit(51), lit(c as u32)).unwrap();
+            c
+        };
+        let best = |o: &mut String, chain: &Chain<AcceptAllProofs>, what: &str| {
+            let b = chain.best_header().unwrap();
+            writeln!(o, "\\ the best header: {what}\n{} vy @ 8 lit v!  hbest hid vy @ 8 lit wcmp 0= vok", lits(&canon(&b.hash()))).unwrap();
+            let _ = b;
+        };
+        for (k, h) in main[1..].iter().enumerate() {
+            assert_eq!(feed(&mut o, h, &format!("block {}", k + 1)), 0);
+        }
+        best(&mut o, &chain, "block 10");
+        assert_eq!(feed(&mut o, &main[2], "block 2 again: known"), 1);
+        assert_eq!(feed(&mut o, &branch[1], "the branch's second before its first: its parent unknown"), -2);
+        assert_eq!(feed(&mut o, &branch[0], "the branch's first"), 0);
+        best(&mut o, &chain, "still block 10");
+        assert_eq!(feed(&mut o, &branch[1], "the branch's second: more work in fewer blocks"), 0);
+        best(&mut o, &chain, "the branch");
+        // Headers breaking one rule each, on block 10 (no mining needed:
+        // the rules before the proof of work fail first).
+        let base = Header {
+            prev_hash: tip.hash(),
+            height: tip.height + 1,
+            timestamp: tip.timestamp + 1,
+            body_commitment: tip.body_commitment,
+            state_root: tip.state_root,
+            aux: [0x77; 32],
+            mix: tip.mix,
+            nonce: tip.nonce,
+        };
+        let mut bad = base;
+        bad.height += 1;
+        assert_eq!(feed(&mut o, &bad, "a wrong height"), -3);
+        let median = {
+            let mut t: Vec<u64> = main[main.len() - 11..].iter().map(|h| h.timestamp).collect();
+            t.sort();
+            t[5]
+        };
+        let mut bad = base;
+        bad.timestamp = median;
+        assert_eq!(feed(&mut o, &bad, "a timestamp at the median of the last eleven"), -5);
+        let mut bad = base;
+        bad.timestamp = now + p.max_future_drift + 1;
+        assert_eq!(feed(&mut o, &bad, "a timestamp past the clock and its drift"), -6);
+        let mut bad = base;
+        bad.timestamp = median + 1;
+        assert_eq!(feed(&mut o, &bad, "the median plus one, but a mix not the true one (the quick check passes at the easiest target)"), -7);
+        let mut hard = base;
+        hard.prev_hash = branch[1].hash();
+        hard.height = branch[1].height + 1;
+        hard.timestamp = branch[1].timestamp + 1;
+        assert_eq!(feed(&mut o, &hard, "after the branch, at genesis's target, a nonce not mined"), -7);
+        // And a good one, mined: stored, but less work than the branch.
+        let good = h11;
+        assert_eq!(good.prev_hash, base.prev_hash);
+        assert_eq!(feed(&mut o, &good, "block 11, mined"), 0);
+        best(&mut o, &chain, "still the branch");
+        // A digest not canonical: refused as malformed before any rule.
+        let mut w = words(&good);
+        w[11] = P;
+        writeln!(o, "\\ a digest not canonical\n{} vx @ {} v!  {} vh", lits(&w), lit(51), lit(-1i32 as u32)).unwrap();
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&dir);
+        o
+    }
+
     #[test]
     fn fam_vectors_are_current() {
         let file = std::fs::read_to_string(PATH).expect("node/src/user/node/arith_vectors.fam");
         assert!(file == generate(), "the fam node's arithmetic vectors are stale: run write_fam_vectors");
         let file = std::fs::read_to_string(P2_PATH).expect("node/src/user/node/poseidon2_vectors.fam");
         assert!(file == generate_poseidon2(), "the fam node's Poseidon2 vectors are stale: run write_fam_vectors");
+        let file = std::fs::read_to_string(DIFF_PATH).expect("node/src/user/node/difficulty_vectors.fam");
+        assert!(file == generate_difficulty(), "the fam node's difficulty vectors are stale: run write_fam_vectors");
+        let file = std::fs::read_to_string(POW_PATH).expect("node/src/user/node/pow_vectors.fam");
+        assert!(file == generate_pow(), "the fam node's proof-of-work vectors are stale: run write_fam_vectors");
+        let file = std::fs::read_to_string(HDR_PATH).expect("node/src/user/node/headers_vectors.fam");
+        assert!(file == generate_headers(), "the fam node's header vectors are stale: run write_fam_vectors");
     }
 
     #[test]
-    #[ignore = "writes node/src/user/node/arith_vectors.fam and poseidon2_vectors.fam"]
+    #[ignore = "writes the node's vectors: node/src/user/node/*_vectors.fam"]
     fn write_fam_vectors() {
         std::fs::write(PATH, generate()).unwrap();
         std::fs::write(P2_PATH, generate_poseidon2()).unwrap();
+        std::fs::write(DIFF_PATH, generate_difficulty()).unwrap();
+        std::fs::write(POW_PATH, generate_pow()).unwrap();
+        std::fs::write(HDR_PATH, generate_headers()).unwrap();
     }
 }

@@ -1,0 +1,166 @@
+\ difficulty_vectors.fam — tabminer's values for difficulty.fam (docs/NODE.md,
+\ step 4).  Written by miner/src/fam_vectors.rs (`cargo test --lib
+\ write_fam_vectors -- --ignored`); not to be edited.  Run: tools/fam --test
+\ src/user/node/arith.fam src/user/node/difficulty.fam src/user/node/difficulty_vectors.fam
+
+: vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;
+: vinit  arinit dvinit vx @ 0= if 60 lit alloc vx !  60 lit alloc vy !  60 lit alloc vz !  60 lit alloc vw ! then ;
+: v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;
+
+Test {
+	meets {
+		vinit
+		66E3692E lit 63783DAF lit 16864C42 lit 5E886E76 lit CA1D5EF lit 1E9C353D lit 2000220D lit 3B7007B9 lit vx @ 8 lit v!  BB7007B9 lit 50001106 lit E7A70D4F lit 61943ABD lit 15E886E7 lit BCB43262 lit 5D8DE0F6 lit CDC6D2 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		15F8A1A3 lit 6286DEA7 lit 9BAB78F lit 4F93984 lit 4B8DA3E4 lit 2CAFBE92 lit 4A46BA08 lit 2D6759 lit vx @ 8 lit v!  2D6758 lit A5235D04 lit 8B2BEFA4 lit 4971B47C lit 784F9398 lit 9C4DD5BC lit 478A1B7A lit 2BF143 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		38FE5909 lit 392CA173 lit 634D5377 lit 76F36B8B lit 5456BC47 lit 759C663A lit 5AAA82DF lit 1325A78B lit vx @ 8 lit v!  3609348D lit 4DB0BF27 lit CAF6D95F lit 7724938 lit FFFFFFFF lit FFFFFFFF lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		23FFF703 lit 39390A9 lit C9B6F16 lit 6485553C lit 3B1E2FFD lit 6E254269 lit 14E2741A lit 3C86D1B7 lit vx @ 8 lit v!  3C86D1B7 lit 4A713A0D lit BB89509A lit C763C5FF lit B6485553 lit A464DB78 lit 60E4E42 lit 47FFEE lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		0 lit 19A947EB lit 68505AEA lit 13B69A57 lit 70321B08 lit 2E86F060 lit 660103CE lit 23EBDE65 lit vx @ 8 lit v!  23EBDE64 lit 330081E7 lit BA1BC18 lit 7E064361 lit 513B69A5 lit AF4282D7 lit 66A51F lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		518399A5 lit 1B0BD965 lit 2BCD2C8E lit 1CB654F6 lit C37934A lit 394B69D5 lit 54DF29FA lit 5320B7D6 lit vx @ 8 lit v!  F3C3425 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		1840F6AF lit 25DF360 lit 6EA172CE lit 19FCF451 lit 17EBE5D8 lit 509B6002 lit 13EAA800 lit 728BC0B lit vx @ 8 lit v!  728BC0B lit 89F55400 lit 1426D800 lit 12FD7CBB lit 719FCF45 lit 83750B96 lit 5E0977CD lit 3081ED lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		D9A1FDB lit 155CAC44 lit 1CF9516D lit 5D7606FF lit 34965F58 lit 64645C07 lit B985DDF lit 514824DF lit vx @ 8 lit v!  D14824DE lit C5CC2EEF lit 19191701 lit F692CBEB lit 6DD7606F lit 10E7CA8B lit B65572B1 lit 1B343F lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		0 lit 0 lit 27009474 lit 5C42F347 lit 179550D lit 123BC165 lit 4E980065 lit 60D446B lit vx @ 8 lit v!  34DD9D80 lit 3EA5 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		661A98B5 lit 184B3E2 lit 5449458F lit 143CBFBB lit 6496F6A2 lit 18AEE2E8 lit 24A7568B lit 3D987CCA lit vx @ 8 lit v!  BD987CCA lit 1253AB45 lit 462BB8BA lit BC92DED4 lit 7943CBFB lit 8AA24A2C lit 6A0612CF lit CC3531 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		784C848 lit 6427F24 lit 3B40AA2 lit 1D5638CA lit 665B7780 lit 378AC174 lit 3C2338AA lit 2224FB50 lit vx @ 8 lit v!  2224FB4F lit 1E119C55 lit DE2B05D lit ACCB6EF0 lit 11D5638C lit 901DA055 lit 901909FC lit F0990 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		58D48F47 lit 4FFA91BA lit 32B25C71 lit FC69DE0 lit 610D6246 lit 3D4855EB lit 1BBCE82A lit 756FA175 lit vx @ 8 lit v!  2978D72C lit 51EC9C lit 0 lit 0 lit 0 lit 0 lit FFFFFFFF lit FFFFFFFF lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		0 lit 0 lit 0 lit 63D78714 lit 1D7E56FB lit 3CE22921 lit 678B42D lit 6C53D078 lit vx @ 8 lit v!  EC53D078 lit 433C5A16 lit 6F388A48 lit 43AFCADF lit 63D7871 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		14E115AA lit 5F5B7732 lit 5CDF7AF7 lit 2D3AB595 lit 1B937642 lit 5A02D3B3 lit E382B86 lit 5A7DA5E2 lit vx @ 8 lit v!  5A7DA5E1 lit C71C15C3 lit 5680B4EC lit 53726EC8 lit BAD3AB59 lit CAE6FBD7 lit 557D6DDC lit 29C22B lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		6B1C8505 lit 4760349A lit 6C242C06 lit 46C1FE24 lit 170C190D lit 1959BD94 lit 1A7665D1 lit 29B4468C lit vx @ 8 lit v!  77B3E22C lit D539E5EA lit EFC17440 lit AC2BFD1B lit F4719510 lit 359 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		2B6C394E lit 5828ADC6 lit 4A74C832 lit 82B8190 lit 1479FC1E lit 6EEF861F lit 6D7666D2 lit 6620FEA5 lit vx @ 8 lit v!  6620FEA5 lit F6BB3369 lit DBBBE187 lit 28F3F83 lit 9082B819 lit 1A53A641 lit 9D60A2B7 lit 56D872 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		0 lit 0 lit 0 lit 0 lit 2C5413FF lit 56D24EBF lit 576C64CC lit 47D57001 lit vx @ 8 lit v!  47D57000 lit EBB63266 lit F5B493AF lit 58A827F lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		4E59CE1D lit 296E1082 lit 5A8C83E7 lit 17CD6426 lit 3AF09423 lit 48989450 lit 4FD218D5 lit 1C29DB0E lit vx @ 8 lit v!  56E37245 lit ED8CA3DB lit 77D lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		5A5F9389 lit BEA9807 lit 10DAD229 lit 4CA440FD lit 21CD95A0 lit 38634E68 lit 4021C429 lit 67D5D7BC lit vx @ 8 lit v!  E7D5D7BC lit 2010E214 lit E18D39A lit D439B2B4 lit 4CCA440F lit 1C86D691 lit 122FAA60 lit B4BF27 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		5E7F1CE6 lit 4CC819D0 lit 2175F17F lit 1678486E lit 28772761 lit 42B2CA2C lit 6D6AEA52 lit 535B2584 lit vx @ 8 lit v!  535B2583 lit 36B57529 lit 30ACB28B lit E50EE4EC lit F9678486 lit 410BAF8B lit CD332067 lit BCFE39 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		0 lit 0 lit 0 lit 0 lit 0 lit 3AC59CE3 lit 67E9F29F lit 67010CD5 lit vx @ 8 lit v!  A360163E lit AF7177AF lit 840EFA15 lit 60364F0A lit C8240512 lit D3E5F4E8 lit 18198552 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		319A618 lit 3C65F3E0 lit 5AD6B05C lit 33322438 lit 28002CDF lit 3DC11452 lit 6DCABC13 lit 5074FED0 lit vx @ 8 lit v!  D074FED0 lit B6E55E09 lit EF704514 lit 8500059B lit E3332243 lit 82D6B582 lit 30F197CF lit 6334C lit vy @ 8 lit v!  vx @ vy @ meets FFFFFFFF lit asrt_eq
+		EE4C107 lit 42A300EF lit 5EEA0AB5 lit 21361993 lit 510A9469 lit 2979058 lit 1907A5A0 lit 2340798C lit vx @ 8 lit v!  2340798B lit C83D2D0 lit 20A5E416 lit 3A21528D lit AA136199 lit BEF75055 lit F0A8C03 lit 1DC982 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+		5D0BE231 lit 51B21061 lit 26B6BBA0 lit F8670D2 lit 36474991 lit 3D72BFAB lit 72DA06A4 lit 191A512 lit vx @ 8 lit v!  C16C9C9B lit 1A4E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vy @ 8 lit v!  vx @ vy @ meets 0 lit asrt_eq
+	}
+	block_work {
+		vinit
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 80000000 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit vx @ 8 lit v!  vx @ vz @ bwork  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 8 lit v!  vx @ vz @ bwork  100 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 100 lit vx @ 8 lit v!  vx @ vz @ bwork  FFFFFF lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		40A2D46A lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  A9BFCAA7 lit 232E16DA lit D57AD94A lit 7B268DA7 lit 2DFB5043 lit D72FBDFD lit F5EC5C77 lit 3 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		23E11155 lit D0802DAC lit CEB459D9 lit 53A7B275 lit E470F277 lit A3769454 lit BDD4D4E7 lit 3C lit vx @ 8 lit v!  vx @ vz @ bwork  436EEAE lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		126E8BB0 lit 489B45C9 lit 7AD4D8F lit 718E1D93 lit 40A lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  6A901E07 lit DBFD0BB3 lit FC7B162E lit 3F5A96 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		CE3F9C97 lit F65BF909 lit 95A9EC0F lit A39455AF lit 2C31821E lit 11FA7D lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  62B5FF7E lit 3F9E3E12 lit E3D lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		18E159B3 lit F4234995 lit 632A187E lit 2EE28F4F lit 9DD4ED9D lit 6 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  24E81F07 lit CD59FC25 lit 26B0E3A9 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		60069DD0 lit 5EBE947F lit F7E71CA4 lit F1A3377B lit C9CA79FF lit A6A058F1 lit D6B3B908 lit 7FADF lit vx @ 8 lit v!  vx @ vz @ bwork  2014 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		8B78D330 lit C2303C96 lit 15BCD48D lit 10D806D8 lit 4FED7308 lit 3DBE205B lit 32B lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  27445284 lit 50C8EC lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		8C5E22C9 lit 82690742 lit 48EAC5A lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  C2CA4816 lit F0FCC20A lit 21F77BC1 lit DD34920E lit 2C63BF2D lit 38 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		C26EF9C8 lit 2373982E lit 4167CBF0 lit 7AE37A3B lit FC38 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  22266200 lit 501AF8A3 lit 4863A8F lit 103D6 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		5C7 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  2C47F4EE lit C47F4EE0 lit 47F4EE02 lit 7F4EE02C lit F4EE02C4 lit 4EE02C47 lit EE02C47F lit 2C47F4 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		FFFFFFFF lit FFFFFFFF lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vx @ 8 lit v!  vx @ vz @ bwork  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		22B23468 lit 44F9C57C lit FC13FCC1 lit EA3F8322 lit 981035C5 lit EF66F052 lit 2A787D72 lit 8B5595 lit vx @ 8 lit v!  vx @ vz @ bwork  1D6 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+	}
+	asert {
+		vinit
+		0 lit 6AE3ED1F lit 0 lit 2A300 lit 258 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 100 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 0 lit 6AE3EF77 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 100 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 20F lit 6AEA1688 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit E8000000 lit 16A lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2F2 lit 6AEA1EB5 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit F3000000 lit D3 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1C2 lit CFC3F9F3 lit 44 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1B6 lit D160A1A5 lit FFFFFF6E lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 34E lit 4C53AEB6 lit A0BECE25 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 36F21 lit 72F06145 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 13800000 lit FF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ CD128 lit 88EE2537 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 100 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ CFC52 lit 8953D4F8 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 94000000 lit 125 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ A72C3 lit 8360757D lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 82000000 lit E3 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1FA5F7AD lit 1DB9733E lit A5 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2442AC34 lit D768A10F lit FFFFFF75 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1D1A74CC lit 861AE339 lit 95FB6DE1 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 48ECC2E lit 19927B0E lit B lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit F1800000 lit FF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		1 lit 6956DB9F lit 0 lit 3C lit 1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 1 lit 6956DBA0 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ E0 lit 6957443E lit 0 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 26B lit 69568CEE lit 0 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1F0 lit AB6486B9 lit 8A lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ E0 lit DC2AC1C8 lit FFFFFFC1 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 320 lit 998C82AA lit 1C722B5D lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 60EED lit 695CE6B4 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit C2010 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 88B33 lit 695F66D2 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 3818C lit 695B3EAF lit 0 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ B38B5 lit 6961710A lit 0 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 1A546E1A lit 79A42C83 lit 2 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 9452A3D lit B986172D lit FFFFFFDA lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 5D277715 lit 8034176C lit A4478823 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2A906A9E lit 93E74498 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1FA23000 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		1 lit 6956DB96 lit 0 lit 12C lit A lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 1 lit 6956DBA0 lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 37C lit 6957AA40 lit 0 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 396 lit 69566DE0 lit 0 lit vz @ asert  0 lit 0 lit D0800000 lit DB lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 299 lit E4372BA4 lit FB lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ FC lit DF5E8D57 lit FFFFFF49 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 134 lit 67E8FE46 lit 5EB9497F lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ C767 lit 695EA48B lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 84180000 lit 8 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ E105F lit 69E37F4C lit 0 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 10 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 52585 lit 698B9A8B lit 0 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 24EE7 lit 696C8BDF lit 0 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 40C53E6E lit 403D0541 lit 10 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 44191433 lit EF27A60D lit FFFFFF4A lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 4B940C85 lit 4990D2C8 lit C464FAF8 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 39687C0C lit A76BB4A7 lit 2 lit vz @ asert  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit C8700000 lit 16 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		111 lit 3E521DED lit 26 lit 19511 lit 107 lit 68238726 lit 311B7400 lit 3CB67A83 lit AD21D295 lit FD9B32B lit 3F96 lit 0 lit 0 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 111 lit 3E521EF4 lit 26 lit vz @ asert  68238726 lit 311B7400 lit 3CB67A83 lit AD21D295 lit FD9B32B lit 3F96 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 333 lit 3E559130 lit 26 lit vz @ asert  A47B72BD lit 561F802E lit BC54909B lit F5F1DA21 lit 66405F50 lit 6E33 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 3C3 lit 3E5440A4 lit 26 lit vz @ asert  14C3AB06 lit 3CC2CB0F lit 36C0E60E lit F3CDE55 lit BFF20037 lit 3017 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 44A lit 9C60DCBB lit 9A lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 242 lit 48B3C498 lit FFFFFFBC lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 4E5 lit 273B5E26 lit 4080B989 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 7360E lit 45B98DC4 lit 26 lit vz @ asert  ABF17E14 lit 5412DBCF lit F024ED6 lit 9725A355 lit 82C01592 lit 3F77 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 9CBD7 lit 4861705E lit 26 lit vz @ asert  68238726 lit 311B7400 lit 3CB67A83 lit AD21D295 lit FD9B32B lit 3F96 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ E76F7 lit 4D2D6C2B lit 26 lit vz @ asert  E8AA5FD8 lit 2B02C971 lit 40DD136F lit 42A0D589 lit E349F05D lit 44CA lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ B982C lit 4A39BB8C lit 26 lit vz @ asert  B72CD2E6 lit F23BE147 lit 5A72B450 lit 7AD730FC lit F4F9018A lit 3057 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 67903983 lit D43DCD7F lit 121 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 6A7A18B7 lit 757CFA06 lit 35 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 29CBD631 lit E63EF83C lit D1491EDD lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2CF8690B lit 7184ED81 lit 54 lit vz @ asert  8F8EA45A lit 98B3EC0 lit 2B59ADA0 lit 84B04C3A lit 274F09ED lit 3F3B lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		C6 lit F9192261 lit 42 lit 251B0 lit 28A lit 8427EB32 lit 2E6 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ C6 lit F91924EB lit 42 lit vz @ asert  8427EB32 lit 2E6 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 26A lit F91DBC7C lit 42 lit vz @ asert  7FE71D05 lit 34B lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ E9 lit F917FC17 lit 42 lit vz @ asert  473763B1 lit 1D9 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 457 lit 21794EBC lit 6D lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 321 lit F66CD05E lit FFFFFFB6 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 3AD lit C68B9E39 lit 24B31B3C lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 3E298 lit 2F48356 lit 43 lit vz @ asert  D79433EA lit 2E5 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 4ACA7 lit 4F58E35 lit 43 lit vz @ asert  8427EB32 lit 2E6 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 8102 lit FA5F7B04 lit 42 lit vz @ asert  A088B919 lit 39E lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 867FF lit E6DC4E8 lit 43 lit vz @ asert  5E35DD81 lit 1DF lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 6EE1CC70 lit C5B150A2 lit 21B lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 73B45485 lit D0F65785 lit 138 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2491B2FC lit B04FDF11 lit D439EB6C lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 390D8BC2 lit D57C085D lit D3 lit vz @ asert  2E97B098 lit 2E6 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		30C lit DBEA19D4 lit A6 lit 6EFF lit 8E lit 170DCE40 lit F2236DC0 lit 443E9550 lit DC1AA7B5 lit 293A5F lit 0 lit 0 lit 0 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 30C lit DBEA1A62 lit A6 lit vz @ asert  170DCE40 lit F2236DC0 lit 443E9550 lit DC1AA7B5 lit 293A5F lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 5A7 lit DBECD29F lit A6 lit vz @ asert  66DBC107 lit 2111AAB lit EE91BBAB lit F39FDC22 lit 13C47F9 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 4FE lit DBE9FB30 lit A6 lit vz @ asert  5A996F22 lit 34BC43A lit EF8A7DD9 lit 79C87C1E lit 60BAE lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 452 lit 1741A5A7 lit C6 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 492 lit C03D2607 lit FFFFFFC5 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 69E lit A504E61F lit 24F94BC9 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 17648 lit DCB8031F lit A6 lit vz @ asert  3B11183B lit 791DAC46 lit D4C8A3A3 lit 9B9B0283 lit 289493 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 3BA2 lit DC097D96 lit A6 lit vz @ asert  170DCE40 lit F2236DC0 lit 443E9550 lit DC1AA7B5 lit 293A5F lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 452A5 lit DE4E5E88 lit A6 lit vz @ asert  A82E0568 lit E619659F lit F5661C0A lit 6426C8E7 lit 318024 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 126F0 lit DC8B16EA lit A6 lit vz @ asert  1DB08F98 lit 8BEC1F55 lit 166EBD39 lit 2BCA0257 lit 972D3 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 6E6C9749 lit ECDD89E lit F1 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 55661538 lit FA029E59 lit 38 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2BC3EBF lit 605E5CD lit E47FC2ED lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 6DD632A6 lit C8B87FEC lit E3 lit vz @ asert  44A90C93 lit 9F394516 lit 17218CAA lit 4335B636 lit 28BF6A lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		326 lit D6B4DC8D lit 3A lit 2152C lit 192 lit EA04589D lit E6211645 lit 336CA9FF lit 176744C3 lit B6E06CA lit 38AF5 lit 0 lit 0 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vx @ 15 lit v!
+		vx @ 326 lit D6B4DE1F lit 3A lit vz @ asert  EA04589D lit E6211645 lit 336CA9FF lit 176744C3 lit B6E06CA lit 38AF5 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 598 lit D6B8C8AF lit 3A lit vz @ asert  9D52352 lit D37632D4 lit 68D158C6 lit F04FDBE6 lit EC108690 lit 3A25B lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 33D lit D6B4FF79 lit 3A lit vz @ asert  8E1C70A4 lit 8238BC07 lit 58FFA8AC lit E2ADE05E lit 7719437 lit 387B8 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 64A lit BB6A598F lit 59 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 328 lit 4E940C78 lit 30 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 359 lit B06753B6 lit D5F68CB2 lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 601C4 lit E01EB26C lit 3A lit vz @ asert  4E62F8E2 lit 861F7857 lit 7F9FE0CA lit 8408BB37 lit BABEBDAA lit 38B2D lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 61531 lit E03D3365 lit 3A lit vz @ asert  EA04589D lit E6211645 lit 336CA9FF lit 176744C3 lit B6E06CA lit 38AF5 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 246BC lit DA439129 lit 3A lit vz @ asert  2CC48C48 lit ACBE0DF7 lit 908BD44D lit FFD2C776 lit 1D7549B7 lit 447CE lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ D6E0 lit D80006F4 lit 3A lit vz @ asert  4D6F18A6 lit DA50246D lit C629DD70 lit 16F37086 lit 8984D26A lit 248FF lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 647B7796 lit 2070B2DC lit 197 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2DD04FC9 lit 2C184D1B lit FFFFFFCF lit vz @ asert  1 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 10A76C1F lit C70AF7C9 lit 34F75840 lit vz @ asert  FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFF lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+		vx @ 2691026A lit 6665B995 lit 77 lit vz @ asert  D68EAE80 lit F809F1DE lit B609AA33 lit 2A2E3423 lit 58A14036 lit 38E20 lit 0 lit 0 lit vw @ 8 lit v!  vz @ vw @ 8 lit wcmp 0 lit asrt_eq
+	}
+}
