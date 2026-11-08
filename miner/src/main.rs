@@ -3484,9 +3484,26 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
             log::line(&format!("wallet: {e}"));
         }
         let started = Instant::now();
-        let generation = ctx.tip_changes.load(Ordering::Acquire);
-        let cancel = || ctx.stop.load(Ordering::Acquire) || ctx.tip_changes.load(Ordering::Acquire) != generation;
+        // The node bumps the counter after its applier reports, so the bump
+        // for our last block may come after we read the tip: a change counts
+        // only if the tip is another.
+        let generation = AtomicU64::new(ctx.tip_changes.load(Ordering::Acquire));
         let tip = chain.tip()?.unwrap();
+        let tip_id = tip.hash();
+        let cancel = || {
+            if ctx.stop.load(Ordering::Acquire) {
+                return true;
+            }
+            let now = ctx.tip_changes.load(Ordering::Acquire);
+            if now == generation.load(Ordering::Acquire) {
+                return false;
+            }
+            if chain.tip().ok().flatten().is_some_and(|t| t.hash() == tip_id) {
+                generation.store(now, Ordering::Release);
+                return false;
+            }
+            true
+        };
         let height = tip.height + 1;
         if height > params.final_height() {
             log::line("the chain has reached its final block; nothing left to mine");
