@@ -1,10 +1,14 @@
-//! tabminer's values for the fam node's arithmetic
-//! (`node/src/user/node/arith.fam`, docs/NODE.md step 1), written as fam
-//! tests to `node/src/user/node/arith_vectors.fam`: the 32×32→64 product,
-//! BabyBear and its extension, the wide integers, the remainder of 64 bits
-//! by 32, and `fri::log2_x256_ceil`. Each value comes from tabminer's own
-//! code (or Rust's integers where tabminer uses them). `write_arith_vectors`
-//! writes the file; `arith_vectors_are_current` checks it.
+//! tabminer's values for the fam node (`node/src/user/node/`), written as
+//! fam tests, each value from tabminer's own code (or Rust's integers where
+//! tabminer uses them):
+//! - `arith_vectors.fam` (docs/NODE.md step 1): the 32×32→64 product,
+//!   BabyBear and its extension, the wide integers, the remainder of 64
+//!   bits by 32, and `fri::log2_x256_ceil`;
+//! - `poseidon2_vectors.fam` (step 2): the permutation, `compress`, `hash`,
+//!   and Merkle roots from paths, verified and refused.
+//!
+//! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
+//! them.
 
 #[cfg(test)]
 mod tests {
@@ -14,6 +18,7 @@ mod tests {
     use std::fmt::Write;
 
     const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/arith_vectors.fam");
+    const P2_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/poseidon2_vectors.fam");
 
     /// splitmix64: the same values every run.
     struct Rng(u64);
@@ -83,7 +88,7 @@ mod tests {
         let mut o = String::new();
         o.push_str(
             "\\ arith_vectors.fam — tabminer's values for arith.fam (docs/NODE.md, step 1).\n\
-             \\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_arith_vectors\n\
+             \\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_fam_vectors\n\
              \\ -- --ignored`); not to be edited.  Run: tools/fam --test\n\
              \\ src/user/node/arith.fam src/user/node/arith_vectors.fam\n\n\
              : vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;\n\
@@ -253,15 +258,103 @@ mod tests {
         o
     }
 
-    #[test]
-    fn arith_vectors_are_current() {
-        let file = std::fs::read_to_string(PATH).expect("node/src/user/node/arith_vectors.fam");
-        assert!(file == generate(), "the fam node's vectors are stale: run write_arith_vectors");
+    /// `words` (canonical) at buffer `buf`, then into Montgomery form.
+    fn store_mont(buf: &str, words: &[u32]) -> String {
+        format!("{}  {buf} @ {} wtom", store(buf, words), lit(words.len() as u32))
+    }
+
+    fn canon(v: &[Fp]) -> Vec<u32> {
+        v.iter().map(|x| x.to_canonical()).collect()
+    }
+
+    fn generate_poseidon2() -> String {
+        use crate::merkle::{MerkleTree, root_from_path};
+        use crate::poseidon2::{compress, hash, permute};
+        let mut r = Rng(0x5eed_9052);
+        let mut o = String::new();
+        o.push_str(
+            "\\ poseidon2_vectors.fam — tabminer's values for poseidon2.fam (docs/NODE.md,\n\
+             \\ step 2).  Written by miner/src/fam_vectors.rs (`cargo test --lib\n\
+             \\ write_fam_vectors -- --ignored`); not to be edited.  Run: tools/fam --test\n\
+             \\ src/user/node/arith.fam src/user/node/poseidon2.fam src/user/node/poseidon2_vectors.fam\n\n\
+             : vx variable ;  : vy variable ;  : vz variable ;  : vw variable ;  : vr variable ;\n\
+             : vinit  p2init vx @ 0= if 400 lit alloc vx !  400 lit alloc vy !  400 lit alloc vz !  40 lit alloc vw !  40 lit alloc vr ! then ;\n\
+             : v!  begin dup while 1 lit - rot 2 lit pick 2 lit pick w! repeat 2drop ;\n\
+             : wtom   0 lit do dup i w@ tom over i w! loop drop ;\n\
+             : wfrom  0 lit do dup i w@ fromm over i w! loop drop ;\n\n\
+             Test {\n",
+        );
+        // The permutation.
+        o.push_str("\tpermutation {\n\t\tvinit\n");
+        let mut states: Vec<[u32; 16]> = vec![[0; 16], core::array::from_fn(|i| i as u32), [P - 1; 16]];
+        states.extend((0..8).map(|_| core::array::from_fn(|_| r.u32() % P)));
+        for st in states {
+            let out = permute(st.map(Fp::new));
+            writeln!(o, "\t\t{}  vx @ perm16  vx @ 10 lit wfrom  {}", store_mont("vx", &st), expect("vx", &canon(&out))).unwrap();
+        }
+        o.push_str("\t}\n");
+        // compress and hash.
+        o.push_str("\tsponge {\n\t\tvinit\n");
+        for _ in 0..6 {
+            let a: [u32; 8] = core::array::from_fn(|_| r.u32() % P);
+            let b: [u32; 8] = core::array::from_fn(|_| r.u32() % P);
+            let c = compress(&a.map(Fp::new), &b.map(Fp::new));
+            writeln!(o, "\t\t{}  {}", store_mont("vx", &a), store_mont("vy", &b)).unwrap();
+            writeln!(o, "\t\tvx @ vy @ vz @ compress  vz @ 8 lit wfrom  {}", expect("vz", &canon(&c))).unwrap();
+            writeln!(o, "\t\tvx @ vy @ vx @ compress  vx @ 8 lit wfrom  {}", expect("vx", &canon(&c))).unwrap();
+        }
+        for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 23, 24, 25, 40] {
+            let x: Vec<u32> = (0..n).map(|_| r.u32() % P).collect();
+            let h = hash(&x.iter().map(|v| Fp::new(*v)).collect::<Vec<_>>());
+            let put = if n == 0 { String::new() } else { store_mont("vx", &x) };
+            writeln!(o, "\t\t{put}  vx @ {} vz @ hash  vz @ 8 lit wfrom  {}", lit(n as u32), expect("vz", &canon(&h))).unwrap();
+        }
+        o.push_str("\t}\n");
+        // Merkle paths: trees of 1, 8 and 32 leaves, rows of 1 to 11.
+        o.push_str("\tmerkle {\n\t\tvinit\n");
+        for (leaves, width) in [(1usize, 3usize), (8, 5), (32, 1), (16, 11)] {
+            let rows: Vec<Vec<Fp>> = (0..leaves).map(|_| (0..width).map(|_| Fp::new(r.u32() % P)).collect()).collect();
+            let tree = MerkleTree::new(&rows);
+            let root = tree.root();
+            let h = tree.height();
+            for index in [0, leaves / 2, leaves - 1] {
+                let path = tree.open(index);
+                assert_eq!(root_from_path(index, &rows[index], &path), root);
+                let flat: Vec<u32> = path.iter().flat_map(|d| canon(d)).collect();
+                let pathset = if flat.is_empty() { String::new() } else { store_mont("vy", &flat) };
+                writeln!(o, "\t\t{}  {pathset}  {}", store_mont("vx", &canon(&rows[index])), store_mont("vr", &canon(&root))).unwrap();
+                writeln!(
+                    o,
+                    "\t\tvx @ {} {} vy @ {} vz @ mroot  vz @ 8 lit wfrom  {}",
+                    lit(width as u32), lit(index as u32), lit(h as u32), expect("vz", &canon(&root))
+                ).unwrap();
+                writeln!(o, "\t\tvr @ vx @ {} {} vy @ {} mverify assert", lit(width as u32), lit(index as u32), lit(h as u32)).unwrap();
+                // Refused: another index (same path), a changed element, a
+                // height one less, an index past the tree.
+                if leaves > 1 {
+                    writeln!(o, "\t\tvr @ vx @ {} {} vy @ {} mverify 0= assert", lit(width as u32), lit((index ^ 1) as u32), lit(h as u32)).unwrap();
+                    writeln!(o, "\t\tvr @ vx @ {} {} vy @ {} mverify 0= assert", lit(width as u32), lit(index as u32), lit(h as u32 - 1)).unwrap();
+                }
+                writeln!(o, "\t\tvr @ vx @ {} {} vy @ {} mverify 0= assert", lit(width as u32), lit((leaves + index) as u32), lit(h as u32)).unwrap();
+                writeln!(o, "\t\tvx @ 0 lit w@ ONE f+ vx @ 0 lit w!  vr @ vx @ {} {} vy @ {} mverify 0= assert", lit(width as u32), lit(index as u32), lit(h as u32)).unwrap();
+            }
+        }
+        o.push_str("\t}\n}\n");
+        o
     }
 
     #[test]
-    #[ignore = "writes node/src/user/node/arith_vectors.fam"]
-    fn write_arith_vectors() {
+    fn fam_vectors_are_current() {
+        let file = std::fs::read_to_string(PATH).expect("node/src/user/node/arith_vectors.fam");
+        assert!(file == generate(), "the fam node's arithmetic vectors are stale: run write_fam_vectors");
+        let file = std::fs::read_to_string(P2_PATH).expect("node/src/user/node/poseidon2_vectors.fam");
+        assert!(file == generate_poseidon2(), "the fam node's Poseidon2 vectors are stale: run write_fam_vectors");
+    }
+
+    #[test]
+    #[ignore = "writes node/src/user/node/arith_vectors.fam and poseidon2_vectors.fam"]
+    fn write_fam_vectors() {
         std::fs::write(PATH, generate()).unwrap();
+        std::fs::write(P2_PATH, generate_poseidon2()).unwrap();
     }
 }

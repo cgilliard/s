@@ -1,5 +1,5 @@
 \ arith_vectors.fam — tabminer's values for arith.fam (docs/NODE.md, step 1).
-\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_arith_vectors
+\ Written by miner/src/fam_vectors.rs (`cargo test --lib write_fam_vectors
 \ -- --ignored`); not to be edited.  Run: tools/fam --test
 \ src/user/node/arith.fam src/user/node/arith_vectors.fam
 
