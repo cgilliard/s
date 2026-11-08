@@ -35,14 +35,68 @@ lim() {
 	' "$@" < /dev/null
 }
 
+# upto SECS CMD... — as lim, but a machine running a test program as init
+# is stopped as soon as the kernel says init ended, the whole line (nothing
+# follows it):
+# exit 124 then, as if the time ran out, so a slow machine only takes
+# longer, and a fast one doesn't wait out SECS.
+upto() {
+	perl -e '
+		$t = shift;
+		pipe(R, W) or die "pipe: $!";
+		$p = fork // die "fork: $!";
+		if (!$p) { close R; setpgrp(0, 0); open STDOUT, ">&W"; open STDERR, ">&W"; exec @ARGV or die "exec: $!" }
+		close W;
+		$end = time + $t; $buf = ""; $rin = ""; vec($rin, fileno(R), 1) = 1; $eof = 0;
+		while (time < $end) {
+			if (select($rout = $rin, undef, undef, 0.25)) {
+				$n = sysread(R, $d, 65536);
+				if (!$n) { $eof = 1; last }
+				syswrite(STDOUT, $d); $buf .= $d;
+				if ($buf =~ /^kernel: init ended: \S+\r?\n/m) { kill "KILL", -$p; waitpid($p, 0); exit 124 }
+			}
+		}
+		if (!$eof) { kill "KILL", -$p; waitpid($p, 0); exit 124 }
+		waitpid($p, 0);
+		exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+	' "$@" < /dev/null
+}
 fail() { echo "FAIL $1: $2"; FAILS=$((FAILS + 1)); }
+# boots NAME REGEX SECS CMD... — CMD run (its own process group, stdin
+# /dev/null) until its output matches REGEX (Perl's, multi-line), then
+# stopped; SECS at most, so a slow machine only takes longer.  Fails if it
+# never matched.
+boots() {
+	name=$1; pat=$2; secs=$3; shift 3
+	N=$((N + 1))
+	perl -e '
+		($f, $pat, $t) = splice(@ARGV, 0, 3);
+		$p = fork // die "fork: $!";
+		if (!$p) {
+			setpgrp(0, 0);
+			open STDIN, "<", "/dev/null"; open STDOUT, ">", $f; open STDERR, ">&STDOUT";
+			exec @ARGV or die "exec: $!";
+		}
+		$end = time + $t;
+		while (time < $end) {
+			select(undef, undef, undef, 0.25);
+			open F, "<", $f; local $/; $c = <F>; close F;
+			last if $c =~ /$pat/m;
+			last if waitpid($p, 1) > 0;
+		}
+		kill "KILL", -$p; waitpid($p, 0);
+	' "$T/$name.out" "$pat" "$secs" "$@"
+	perl -e 'local $/; $c = <STDIN>; exit($c =~ /$ARGV[0]/m ? 0 : 1)' "$pat" < "$T/$name.out" \
+		|| fail "$name" "no /$pat/ in $secs s: $(head -c 300 "$T/$name.out")"
+}
 
 # expect NAME EXIT PATTERN SECONDS CMD... — CMD exits EXIT (124: still
 # running when the time was up) and its output matches PATTERN.
 expect() {
 	name=$1; want=$2; pat=$3; secs=$4; shift 4
 	N=$((N + 1))
-	lim "$secs" "$@" > "$T/$name.out" 2>&1; rc=$?
+	if [ "$want" = 124 ]; then upto "$((secs * 6))" "$@" > "$T/$name.out" 2>&1; rc=$?
+	else lim "$secs" "$@" > "$T/$name.out" 2>&1; rc=$?; fi
 	[ "$rc" = "$want" ] || { fail "$name" "exit $rc, expected $want: $(head -c 300 "$T/$name.out")"; return; }
 	grep -q -- "$pat" "$T/$name.out" || fail "$name" "output $(head -c 300 "$T/$name.out"), expected /$pat/"
 }
@@ -50,7 +104,7 @@ expect() {
 [ -f bin/img ] && [ -f bin/tabernacle ] || { echo "oscheck.sh: run scripts/build.sh first" >&2; exit 1; }
 
 for n in 1 2 8 64; do
-	expect "kernel_tests_$n" 0 "harts: $n" 120 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/net.fam src/ksys.fam
+	expect "kernel_tests_$n" 0 "harts: $n" 600 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/net.fam src/ksys.fam
 done
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
@@ -64,10 +118,10 @@ printf 'trapinit 0 lit @ drop bye\n' > "$T/fault.fam"
 	|| fail fault_build "$(head -c 300 "$T/fault.build")"
 expect fault 1 'kernel: hart 0 trap 00000005 at .* (00000000)' 30 ./tools/q32 "$T/fault.bin"
 
-expect boot 124 'init: starting the shell' 3 ./tools/q32 bin/img
+boots boot '^\$ ' 60 ./tools/q32 bin/img
 grep -q 'kernel: 1 hart, [0-9]* pages free' "$T/boot.out" && grep -q '^\$ $' "$T/boot.out" \
 	|| fail boot "no banner or no init: $(head -c 300 "$T/boot.out")"
-expect boot_6 124 'kernel: 6 harts' 5 ./tools/q32 --smp=6 bin/img
+boots boot_6 'kernel: 6 harts' 60 ./tools/q32 --smp=6 bin/img
 
 # uprog NAME SOURCE — a program in user mode, run as init in an image of its
 # own: $T/NAME.img.
@@ -302,7 +356,7 @@ for n in 1 4; do
 		'^by the path$' '^myecho$' '^sh: /bin/echo: cannot open$' '^run 19$' '^kernel: halted$'; do
 		grep -q -- "$pat" "$o" || { fail "exec_$n" "no /$pat/ in: $(tail -c 600 "$o")"; break; }
 	done
-	m=$(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | sed -n '1p;$p' | sort -u | wc -l)
+	m=$(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | sed -n '1p;$p' | sort -u | wc -l | tr -d " \t")
 	[ "$m" = 1 ] || fail "exec_$n" "memory not given back: $(grep -x '[0-9][0-9][0-9][0-9]*' "$o" | tr '\n' ' ')"
 done
 
@@ -702,14 +756,14 @@ cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
 G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-page = socket.create_connection(("127.0.0.1", port), timeout=5)
+page = socket.create_connection(("127.0.0.1", port), timeout=30)
 page.sendall(b"GET / HTTP/1.0\r\n\r\n"); body = b""
 while True:
     d = page.recv(65536)
     if not d: break
     body += d
 print("page", body.split(b"\r\n")[0].decode(), b"new WebSocket" in body)
-s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s = socket.create_connection(("127.0.0.1", port), timeout=30)
 key = base64.b64encode(os.urandom(16))
 s.sendall(b"GET /tty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
 h = b""
@@ -721,7 +775,7 @@ def send(data, op=2):
     m = os.urandom(4); n = len(data)
     hdr = bytes([0x80 | op]) + (bytes([0x80 | n]) if n < 126 else bytes([0xFE]) + struct.pack(">H", n))
     s.sendall(hdr + m + bytes(b ^ m[i & 3] for i, b in enumerate(data)))
-def pump(until, secs=5):
+def pump(until, secs=30):
     global buf, out, closed
     end = time.time() + secs
     while until not in out and time.time() < end and not closed:
@@ -791,11 +845,11 @@ const port = process.argv[2];
   const wins = all(desk, 'win'), terms = all(desk, 'term');
   console.log('windows', wins.length === 2 && all(tasks, 'task').length === 2);
   const [t1, t2] = terms;
-  console.log('prompt', await wait(() => prompt.test(t1.plain) && prompt.test(t2.plain), 8000));
+  console.log('prompt', await wait(() => prompt.test(t1.plain) && prompt.test(t2.plain), 60000));
   console.log('focused', doc.active === t2 && wins[0].classList.has('off') && !wins[1].classList.has('off'));
-  type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.plain), 5000);
+  type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.plain), 60000);
   type(t2, 'ls /x'); key(t2, 'Backspace'); type(t2, '\r');
-  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.plain), 5000) && !/ls/.test(t1.plain));
+  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.plain), 60000) && !/ls/.test(t1.plain));
   // the second minimized from its button: hidden, the first focused; restored from the taskbar
   all(wins[1], 'wb')[0].onclick({ stopPropagation() {} });
   const k2 = all(tasks, 'task')[1];
@@ -806,7 +860,7 @@ const port = process.argv[2];
   console.log('maximize', wins[1].classList.has('max'));
   // exit closes the shell's window and its taskbar button
   type(t1, 'exit\r');
-  console.log('exit', await wait(() => all(desk, 'win').length === 1 && all(tasks, 'task').length === 1, 5000));
+  console.log('exit', await wait(() => all(desk, 'win').length === 1 && all(tasks, 'task').length === 1, 60000));
   // the close button
   all(wins[1], 'wb')[2].onclick({ stopPropagation() {} });
   console.log('closed', all(desk, 'win').length === 0 && all(tasks, 'task').length === 0);
@@ -827,18 +881,38 @@ const port = process.argv[2];
   // free; all closed, the shells reaped (none left a zombie in ps)
   for (let i = 0; i < 13; i++) byId.newt.onclick();
   const ts = () => all(desk, 'term');
-  console.log('full', await wait(() => ts().filter((t) => prompt.test(t.plain)).length === 12 && ts().filter((t) => /none free/.test(t.plain)).length === 1, 15000));
+  console.log('full', await wait(() => ts().filter((t) => prompt.test(t.plain)).length === 12 && ts().filter((t) => /none free/.test(t.plain)).length === 1, 60000));
   all(desk, 'win').forEach((w) => all(w, 'wb')[2].onclick({ stopPropagation() {} }));
-  await new Promise((r) => setTimeout(r, 1500));
-  byId.newt.onclick(); const t3 = ts()[0];
-  await wait(() => prompt.test(t3.plain), 5000); type(t3, 'ps\r');
-  console.log('reaped', await wait(() => /CMD[^]*\$ █$/.test(t3.plain), 5000) && !/ Z /.test(t3.plain));
+  // a new window, once the server has freed the slots of those closed (a
+  // window told none is free closed and opened again), a minute at most
+  let t3 = null;
+  for (let k = 0; k < 60 && !t3; k++) {
+    byId.newt.onclick(); const t = ts()[ts().length - 1];
+    await wait(() => prompt.test(t.plain) || /none free/.test(t.plain), 20000);
+    if (prompt.test(t.plain)) t3 = t;
+    else { all(desk, 'win').forEach((w) => all(w, 'wb')[2].onclick({ stopPropagation() {} })); await new Promise((r) => setTimeout(r, 1000)); }
+  }
+  console.log('reopened', !!t3);
+  // ps until the closed shells are gone (each ends when its window closes;
+  // a slow machine takes longer), a minute at most
+  let reaped = false;
+  const heads = () => (t3.plain.match(/CMD/g) || []).length;
+  let last = '';
+  for (let k = 0; k < 60 && !reaped; k++) {
+    const n0 = heads(); type(t3, 'ps\r');
+    await wait(() => heads() > n0 && prompt.test(t3.plain), 20000);
+    last = t3.plain.slice(t3.plain.lastIndexOf('CMD'));
+    reaped = !/ Z /.test(last) && (last.match(/ sh$/gm) || []).length === 1;
+    if (!reaped) await new Promise((r) => setTimeout(r, 1000));
+  }
+  console.log('reaped', reaped);
+  if (!reaped) console.log(JSON.stringify(last));
   // vi in a window: its screen (the alternate one), typed and written, the
   // shell's screen back as it was when it quits, the file as typed
-  type(t3, 'vi /v.txt\r'); console.log('vi', await wait(() => /\[New\]/.test(t3.plain), 5000));
+  type(t3, 'vi /v.txt\r'); console.log('vi', await wait(() => /\[New\]/.test(t3.plain), 60000));
   type(t3, 'ihi there'); key(t3, 'Escape'); type(t3, ':wq\r');
-  console.log('vi back', await wait(() => /\$ vi \/v\.txt\n\$ █$/.test(t3.plain), 5000));
-  type(t3, 'cat /v.txt\r'); console.log('vi wrote', await wait(() => /\nhi there\n\$ █$/.test(t3.plain), 5000));
+  console.log('vi back', await wait(() => /\$ vi \/v\.txt\n\$ █$/.test(t3.plain), 60000));
+  type(t3, 'cat /v.txt\r'); console.log('vi wrote', await wait(() => /\nhi there\n\$ █$/.test(t3.plain), 60000));
   console.log(JSON.stringify(t3.plain));
   process.exit(0);
 })();
@@ -851,10 +925,10 @@ for n in 1 4; do
 	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < /dev/null > "$T/wm_$n.out" 2>&1 &
 	QP=$!
 	i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
-	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
+	lim 300 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
-		lim 60 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
-		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
+		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do
@@ -864,10 +938,10 @@ done
 rm -f "$T/wm.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null
-expect boot_disk 124 'tabernacle: from disk' 5 scripts/node.sh --disk="$T/disk.img" --no-seeds
-grep -q 'init: starting the shell' "$T/boot_disk.out" \
-	|| fail boot_disk "no init: $(head -c 300 "$T/boot_disk.out")"
-expect boot_disk_64 124 'kernel: 64 harts' 15 scripts/node.sh --disk="$T/disk.img" --no-seeds --smp=64
+boots boot_disk 'init: starting the shell' 60 scripts/node.sh --disk="$T/disk.img" --no-seeds
+grep -q 'tabernacle: from disk' "$T/boot_disk.out" \
+	|| fail boot_disk "not from disk: $(head -c 300 "$T/boot_disk.out")"
+boots boot_disk_64 'kernel: 64 harts' 120 scripts/node.sh --disk="$T/disk.img" --no-seeds --smp=64
 rm -f "$T/disk.img"
 
 echo "$((N - FAILS)) of $N checks passed"

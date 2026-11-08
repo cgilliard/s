@@ -2136,10 +2136,31 @@ hmax @ 1 lit do
 loop
 0A lit putc ;
 
+\ fdtharts ( -- n | 0 )  the harts the machine has, from the device tree
+\ QEMU puts at the end of RAM (2 MiB aligned: 87E00000 with 128 MiB, which
+\ nothing has used by the time hstart reads it): its nodes named cpu@...;
+\ 0 if there is none there.  fbe@ ( a -- u )  a big-endian word.
+: fbe@  dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or swap 3 lit + c@ or ;
+: fdtharts
+87E00000 lit dup fbe@ D00DFEED lit <> if drop 0 lit else
+	dup 8 lit + fbe@ +  0 lit swap
+	begin dup fbe@ dup 9 lit <> while
+		dup 1 lit = if
+			drop 4 lit +
+			dup c@ 63 lit = over 1 lit + c@ 70 lit = and over 2 lit + c@ 75 lit = and over 3 lit + c@ 40 lit = and if swap 1 lit + swap then
+			begin dup c@ while 1 lit + repeat 4 lit + FFFFFFFC lit and
+		else dup 3 lit = if drop dup 4 lit + fbe@ 3 lit + FFFFFFFC lit and C lit + +
+		else drop 4 lit + then then
+	repeat
+	2drop
+then ;
+
 \ hstart  every hart waiting started.  The harts start at once, but
 \ reaching their mailboxes may take a moment (under QEMU, with more harts
 \ than the host has cores, a hart's thread waits its turn): hart 0 waits
-\ until 100 ms pass with no new one, and a hart it starts has 10 s to say so.  Each started hart gets 36 KiB of the heap: its record
+\ for as many as the device tree has (fdtharts), however long they take
+\ (60 s at most, against a hang); with no device tree, until 100 ms pass
+\ with no new one.  A hart it starts has 60 s to say so.  Each started hart gets 36 KiB of the heap: its record
 \ and trap area, 16 KiB of data stack, 4 KiB each of loop frames, return ids
 \ and heap.  Then the locks' size, from the highest hart id.
 : hstart
@@ -2148,11 +2169,17 @@ hstarted @ 0= if
 	hentry
 	1 lit nharts !  1 lit hmax !
 	1 lit mhartid@ hup harr !
-	hpresent mtime@
-	begin mtime@ over - F4240 lit u< while
-		hpresent 2 lit pick <> if 2drop hpresent mtime@ then
-	repeat
-	2drop
+	fdtharts ?dup if
+		1 lit - mtime@
+		begin hpresent 2 lit pick u< mtime@ 2 lit pick - 23C34600 lit u< and while repeat
+		2drop
+	else
+		hpresent mtime@
+		begin mtime@ over - F4240 lit u< while
+			hpresent 2 lit pick <> if 2drop hpresent mtime@ then
+		repeat
+		2drop
+	then
 	MAXH 1 lit do
 		i mbox @ 1 lit = if
 			9000 lit alloc FFF lit + FFFFF000 lit and   \ ( blk )
@@ -2174,7 +2201,7 @@ hstarted @ 0= if
 	loop
 	mtime@
 	begin hupn nharts @ 1 lit - u< while
-		mtime@ over - 5F5E100 lit u> if hlate "a hart did not start" panic then
+		mtime@ over - 23C34600 lit u> if hlate "a hart did not start" panic then
 	repeat
 	drop
 	1 lit 0 lit
