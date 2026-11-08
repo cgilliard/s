@@ -514,6 +514,12 @@ const STATUS_HEADER_ONLY: u8 = 3;
 /// branch forks below the fast-sync snapshot or the undo records kept.
 /// Treated as invalid, but no peer is at fault for it.
 const STATUS_ASIDE: u8 = 4;
+/// [`STATUS_HEADER_ONLY`] with only the quick proof-of-work check: the
+/// `mix` meets the target, not that it is the true one. A fast sync stores
+/// headers so; those below the snapshot block keep it, their work attested
+/// by its chain proof, and the rest have their full proof of work checked
+/// ([`Chain::confirm_work`], or when their block is applied).
+const STATUS_HEADER_LIGHT: u8 = 5;
 
 /// The synthetic output at `position` of [`Chain::debug_fill_outputs`]:
 /// commitment and memo drawn from the position (splitmix64), amount zero.
@@ -532,6 +538,28 @@ fn debug_output(position: u64) -> (u64, Commitment, Slot, u32) {
     (position, commitment, crate::transaction::memo_slot(&memo, 0), 0)
 }
 
+/// [`Chain::full_pow`].
+struct FullPow<'a> {
+    seed: &'a SeedText,
+    dataset: Option<&'a crate::pow::Dataset>,
+    #[cfg(test)]
+    heights: &'a Mutex<Vec<u32>>,
+}
+
+impl FullPow<'_> {
+    fn check(&self, header: &Header, target: &Target) -> bool {
+        if !header.quick_pow_check(target) {
+            return false;
+        }
+        #[cfg(test)]
+        self.heights.lock().unwrap().push(header.height);
+        match self.dataset {
+            Some(d) => header.verify_pow(d, target),
+            None => header.verify_pow(self.seed, target),
+        }
+    }
+}
+
 /// A stored header with its index record.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
@@ -546,6 +574,8 @@ pub struct Entry {
     pub aside: bool,
     /// Stored as a header alone (fast sync), its body not yet seen.
     pub header_only: bool,
+    /// Its proof of work checked only quickly (see `STATUS_HEADER_LIGHT`).
+    pub light: bool,
 }
 
 /// What disconnecting a block needs besides its body and the outputs it
@@ -764,6 +794,9 @@ pub struct Chain<V: ProofVerifier> {
     dataset: std::sync::RwLock<Option<std::sync::Arc<crate::pow::Dataset>>>,
     /// Genesis's work, computed ([`Chain::parent_work`]).
     genesis_work: std::sync::OnceLock<crate::pow_air::Work>,
+    /// Heights whose full proof of work was checked, for the tests.
+    #[cfg(test)]
+    pub(crate) full_pow_heights: Mutex<Vec<u32>>,
     /// Headers' block 1, by header hash, for a schedule anchored there
     /// ([`Schedule::from_first_block`]).
     first_blocks: Mutex<std::collections::HashMap<Digest, Header>>,
@@ -834,6 +867,8 @@ impl<V: ProofVerifier> Chain<V> {
             timings: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
             genesis_work: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            full_pow_heights: Mutex::new(Vec::new()),
             first_blocks: Mutex::new(std::collections::HashMap::new()),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
@@ -1022,7 +1057,8 @@ impl<V: ProofVerifier> Chain<V> {
             validated: status == STATUS_VALID,
             invalid: status == STATUS_INVALID || status == STATUS_ASIDE,
             aside: status == STATUS_ASIDE,
-            header_only: status == STATUS_HEADER_ONLY,
+            header_only: status == STATUS_HEADER_ONLY || status == STATUS_HEADER_LIGHT,
+            light: status == STATUS_HEADER_LIGHT,
         }))
     }
 
@@ -1409,12 +1445,18 @@ impl<V: ProofVerifier> Chain<V> {
     /// Whether `header`'s proof of work meets `target`, from the dataset if
     /// loaded, else from the seed text.
     fn pow_ok(&self, header: &Header, target: &Target) -> bool {
-        if !header.quick_pow_check(target) {
-            return false;
-        }
-        match self.dataset.read().unwrap().as_deref() {
-            Some(d) => header.verify_pow(d, target),
-            None => header.verify_pow(&self.seed, target),
+        let dataset = self.dataset.read().unwrap().clone();
+        self.full_pow(dataset.as_deref()).check(header, target)
+    }
+
+    /// The full proof-of-work check, from `dataset` if given, else from the
+    /// seed text; shareable between threads.
+    fn full_pow<'a>(&'a self, dataset: Option<&'a crate::pow::Dataset>) -> FullPow<'a> {
+        FullPow {
+            seed: &self.seed,
+            dataset,
+            #[cfg(test)]
+            heights: &self.full_pow_heights,
         }
     }
 
@@ -1515,8 +1557,9 @@ impl<V: ProofVerifier> Chain<V> {
             };
         }
         let parent = self.entry_in(&wtxn, &header.prev_hash)?.ok_or(ChainError::UnknownParent(header.prev_hash))?;
-        // A header stored alone had its proof of work checked then.
-        let pow = known.map(|_| true);
+        // A header stored alone had its proof of work checked then, unless
+        // only quickly.
+        let pow = known.filter(|e| !e.light).map(|_| true);
         let work = self.check_header(&wtxn, block, &parent, now, pow)?;
         self.lap("checks", &mut t);
 
@@ -1824,13 +1867,23 @@ impl<V: ProofVerifier> Chain<V> {
     /// Returns how many were new and the error that stopped the run, if
     /// any; the headers before it are kept.
     pub fn accept_headers(&self, headers: &[Header], now: u64) -> (usize, Option<ChainError>) {
-        match self.accept_headers_inner(headers, now) {
+        self.accept_headers_with(headers, now, false)
+    }
+
+    /// [`Chain::accept_headers`], checking only the quick proof of work
+    /// with `light`: that the claimed `mix` meets the target. A fast sync
+    /// does so; the work below its snapshot block is attested by that
+    /// block's chain proof, and [`Chain::confirm_work`] checks the rest.
+    /// Applying a block checks its full proof of work if its header was
+    /// stored so.
+    pub fn accept_headers_with(&self, headers: &[Header], now: u64, light: bool) -> (usize, Option<ChainError>) {
+        match self.accept_headers_inner(headers, now, light) {
             Ok(r) => r,
             Err(e) => (0, Some(e)),
         }
     }
 
-    fn accept_headers_inner(&self, headers: &[Header], now: u64) -> Result<(usize, Option<ChainError>)> {
+    fn accept_headers_inner(&self, headers: &[Header], now: u64, light: bool) -> Result<(usize, Option<ChainError>)> {
         // The target of each, from its parent: the previous header of the
         // run or a stored one. Proofs of work are then checked at once.
         let (targets, known): (Vec<Option<Target>>, Vec<bool>) = {
@@ -1855,16 +1908,12 @@ impl<V: ProofVerifier> Chain<V> {
             (out, known)
         };
         let dataset = self.dataset.read().unwrap().clone();
-        let seed = &self.seed;
+        let full = self.full_pow(dataset.as_deref());
         let pow: Vec<bool> = crate::parallel::par_map_min(headers.len(), 1, |i| {
             let (h, Some(t)) = (&headers[i], targets[i]) else { return false };
-            known[i]
-                || (h.quick_pow_check(&t)
-                    && match dataset.as_deref() {
-                        Some(d) => h.verify_pow(d, &t),
-                        None => h.verify_pow(seed, &t),
-                    })
+            known[i] || if light { h.quick_pow_check(&t) } else { full.check(h, &t) }
         });
+        let status = if light { STATUS_HEADER_LIGHT } else { STATUS_HEADER_ONLY };
         let mut wtxn = self.env.write_txn()?;
         let mut new = 0;
         let mut stop = None;
@@ -1884,7 +1933,7 @@ impl<V: ProofVerifier> Chain<V> {
                     match self.check_header_rules(&wtxn, h, &parent, now, Some(*ok)) {
                         Ok(w) => {
                             self.headers.put(&mut wtxn, &id, &h.to_bytes())?;
-                            self.put_index(&mut wtxn, &id, w, STATUS_HEADER_ONLY)?;
+                            self.put_index(&mut wtxn, &id, w, status)?;
                             new += 1;
                             w
                         }
@@ -1912,6 +1961,67 @@ impl<V: ProofVerifier> Chain<V> {
         let best = self.header_by_hash_in(rtxn, id)?.ok_or(ChainError::Corrupt("best header"))?;
         let w = |h: &Header| -> Result<U256> { Ok(self.entry_in(rtxn, &h.hash())?.map_or(U256::ZERO, |e| e.work)) };
         Ok(if w(&best)? > w(&tip)? { best } else { tip })
+    }
+
+    /// Checks the full proof of work of the headers from height `from` to
+    /// `best` on `best`'s branch that were stored with only the quick check
+    /// ([`Chain::accept_headers_with`]), in parallel, and marks them
+    /// checked. A fast sync calls it for its snapshot block and the headers
+    /// after it, whose work no chain proof it verifies attests. On the
+    /// first header that fails, it and every header after it on the branch
+    /// are marked invalid, the best header falls back to the tip, and that
+    /// header's height and id are returned. Otherwise, how many were checked.
+    pub fn confirm_work(&self, best: &Header, from: u32) -> Result<std::result::Result<usize, (u32, Digest)>> {
+        let (light, targets) = {
+            let rtxn = self.env.read_txn()?;
+            let mut light = Vec::new();
+            let mut targets = Vec::new();
+            let mut h = *best;
+            while h.height >= from && h.height > 0 {
+                let e = self.entry_in(&rtxn, &h.hash())?.ok_or(ChainError::Corrupt("best branch header"))?;
+                if e.invalid {
+                    return Err(if e.aside { ChainError::SetAside } else { ChainError::KnownInvalid });
+                }
+                let parent = self
+                    .header_by_hash_in(&rtxn, &digest_bytes(&h.prev_hash))?
+                    .ok_or(ChainError::Corrupt("best branch parent"))?;
+                if e.light {
+                    targets.push(self.target_after(&rtxn, &parent)?);
+                    light.push(h);
+                }
+                h = parent;
+            }
+            light.reverse();
+            targets.reverse();
+            (light, targets)
+        };
+        let dataset = self.dataset.read().unwrap().clone();
+        let full = self.full_pow(dataset.as_deref());
+        let ok: Vec<bool> = crate::parallel::par_map_min(light.len(), 1, |i| full.check(&light[i], &targets[i]));
+        let mut wtxn = self.env.write_txn()?;
+        let bad = ok.iter().position(|ok| !ok);
+        for (i, h) in light.iter().enumerate() {
+            let id = digest_bytes(&h.hash());
+            let e = self.entry_in(&wtxn, &h.hash())?.ok_or(ChainError::Corrupt("best branch header"))?;
+            let status = if bad.is_some_and(|b| i >= b) { STATUS_INVALID } else { STATUS_HEADER_ONLY };
+            self.put_index(&mut wtxn, &id, if status == STATUS_INVALID { U256::ZERO } else { e.work }, status)?;
+        }
+        if let Some(b) = bad {
+            // The headers after the last light one, checked in full already,
+            // still descend from the failure.
+            let mut h = *best;
+            while h.height > light[b].height {
+                self.put_index(&mut wtxn, &digest_bytes(&h.hash()), U256::ZERO, STATUS_INVALID)?;
+                match self.header_by_hash_in(&wtxn, &digest_bytes(&h.prev_hash))? {
+                    Some(p) => h = p,
+                    None => break,
+                }
+            }
+            self.meta.delete(&mut wtxn, META_BEST_HEADER)?;
+            self.branch.lock().unwrap().clear();
+        }
+        wtxn.commit()?;
+        Ok(bad.map_or(Ok(light.len()), |b| Err((light[b].height, light[b].hash()))))
     }
 
     /// The most-work header known: the tip, or a header stored ahead of it.
@@ -2032,10 +2142,16 @@ impl<V: ProofVerifier> Chain<V> {
     /// its proof, which covers every block before it. The statement's
     /// previous state root comes from the stored parent header.
     pub fn verify_snapshot_block(&self, block: &Block, next_position: u64) -> Result<()> {
-        let rtxn = self.env.read_txn()?;
         if block.header.height == 0 {
             return Err(ChainError::BadSnapshot);
         }
+        // Its own work is the one its proof does not attest.
+        if self.entry(&block.header.hash())?.is_some_and(|e| e.light)
+            && self.confirm_work(&block.header, block.header.height)?.is_err()
+        {
+            return Err(ChainError::BadProofOfWork);
+        }
+        let rtxn = self.env.read_txn()?;
         self.entry_in(&rtxn, &block.header.hash())?.ok_or(ChainError::UnknownParent(block.header.hash()))?;
         let parent = self
             .header_by_hash_in(&rtxn, &digest_bytes(&block.header.prev_hash))?
@@ -2375,6 +2491,11 @@ impl<V: ProofVerifier> Chain<V> {
         }
         let header = block.header;
         let entry = self.entry_in(&wtxn, &header.hash())?.ok_or(ChainError::UnknownParent(header.hash()))?;
+        // Its own work, which its proof does not attest, checked in full
+        // (`verify_snapshot_block`).
+        if entry.light {
+            return Err(ChainError::BadSnapshot);
+        }
         self.check_body(&header, &block.body)?;
         self.utxo
             .finish_staged(&mut wtxn, SNAPSHOT_PART_LOG, roots, next_position)
@@ -3456,6 +3577,80 @@ mod tests {
         assert_eq!(m.subsidy(m.final_height()), 7 * COIN);
         assert_eq!(m.subsidy(m.final_height() + 1), 0);
         assert_eq!(m.total_supply(), 735_840_000 * COIN as u128);
+    }
+
+    /// `header` with a `mix` that is not the true one but passes the quick
+    /// check against `target`: what a forger grinds for at two
+    /// permutations a try.
+    fn forge(mut header: Header, target: &Target) -> Header {
+        loop {
+            header.mix[0] += crate::poseidon2::Fp::ONE;
+            if header.quick_pow_check(target) && !header.verify_pow(&seed(), target) {
+                return header;
+            }
+        }
+    }
+
+    /// A fast sync's headers: checked quickly when stored, those from the
+    /// snapshot block on in full by `confirm_work`, a forged one refused
+    /// with what follows it, and a light header's full work checked when
+    /// its block is applied.
+    #[test]
+    fn light_headers_have_their_work_checked_from_the_sync_point() {
+        let f = open("light-a");
+        f.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let mut blocks = Vec::new();
+        for i in 1..=6u64 {
+            let b = mine(&f, Body::default(), GENESIS_TIME + 600 * i);
+            f.chain.apply_block(&b, GENESIS_TIME + 600 * i).unwrap();
+            blocks.push(b);
+        }
+        let now = GENESIS_TIME + 600 * 8;
+        let headers: Vec<Header> = blocks.iter().map(|b| b.header).collect();
+        let target = f.chain.expected_target(&headers[5]).unwrap();
+        let next = Body::default();
+        let mut forged = f.chain.template(&next, now).unwrap();
+        forged = forge(forged, &target);
+
+        let g = open("light-b");
+        g.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let (n, stop) = g.chain.accept_headers_with(&headers, now, true);
+        assert!(stop.is_none(), "{stop:?}");
+        assert_eq!(n, 6);
+        let (n, stop) = g.chain.accept_headers_with(&[forged], now, true);
+        assert!(stop.is_none() && n == 1, "a light header takes only the quick check: {stop:?}");
+        assert!(g.chain.full_pow_heights.lock().unwrap().is_empty());
+        assert!(g.chain.entry(&headers[2].hash()).unwrap().unwrap().light);
+        assert_eq!(g.chain.best_header().unwrap(), forged);
+
+        // Sync point 4: the forged header and everything from 4 on checked.
+        assert_eq!(g.chain.confirm_work(&forged, 4).unwrap(), Err((7, forged.hash())));
+        let mut checked = g.chain.full_pow_heights.lock().unwrap().clone();
+        checked.sort();
+        assert_eq!(checked, vec![4, 5, 6, 7]);
+        assert!(g.chain.entry(&forged.hash()).unwrap().unwrap().invalid);
+        assert!(!g.chain.entry(&headers[5].hash()).unwrap().unwrap().light);
+        assert!(g.chain.entry(&headers[2].hash()).unwrap().unwrap().light);
+        assert_ne!(g.chain.best_header().unwrap(), forged);
+        // The honest headers again: the best once more, nothing to check.
+        g.chain.accept_headers_with(&headers, now, true);
+        assert_eq!(g.chain.best_header().unwrap(), headers[5]);
+        assert_eq!(g.chain.confirm_work(&headers[5], 4).unwrap(), Ok(0));
+        assert_eq!(g.chain.full_pow_heights.lock().unwrap().len(), 4);
+        // Its children are refused.
+        let (_, stop) = g.chain.accept_headers_with(&[forged], now, true);
+        assert!(matches!(stop, Some(ChainError::KnownInvalid)), "{stop:?}");
+
+        // Applying a block stored light checks its full work.
+        g.chain.full_pow_heights.lock().unwrap().clear();
+        g.chain.apply_block(&blocks[0], now).unwrap();
+        assert_eq!(*g.chain.full_pow_heights.lock().unwrap(), vec![1]);
+        let h = open("light-c");
+        h.chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let bad = Block { header: forge(headers[0], &h.chain.expected_target(&h.chain.tip().unwrap().unwrap()).unwrap()), body: blocks[0].body.clone() };
+        let (n, _) = h.chain.accept_headers_with(&[bad.header], now, true);
+        assert_eq!(n, 1);
+        assert!(matches!(h.chain.apply_block(&bad, now), Err(ChainError::BadProofOfWork)));
     }
 
     #[test]

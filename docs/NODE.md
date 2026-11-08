@@ -146,7 +146,8 @@ change should take well under a minute. Catching up is the hard case
 As tabminer (`node.rs:10-56`), within the machine's limits:
 
 1. **Headers first**, `GetHeadersFrom` in batches of 60 from several
-   peers, each header's rules and proof-of-work checked.
+   peers, each header's rules and quick proof of work checked; the full
+   proof of work for the sync block and those after it (below).
 2. **Fast sync**, the default:
    - pick a block about 144 deep;
    - fetch its snapshot (a manifest and its parts) and check them
@@ -562,7 +563,32 @@ Each step done when its test passes.
      the chain step proves in 2.0–2.2 s, as before.
 5. **Sync**: the node checks headers natively as in section 4 and full
    work only after `S`. Done when a node fast-syncs a dev-recursive
-   chain checking no full proof of work before `S`.
+   chain checking no full proof of work before `S`. Done (2026-11-08),
+   in tabminer's node:
+   - During a fast sync, headers are stored after the quick check alone
+     (`Chain::accept_headers_with`, status "light"): link, height,
+     timestamps, target, and the claimed `mix` meeting it.
+   - Once `S` is picked, `Chain::confirm_work` checks the full proof of
+     work of `S` and every header after it on the best branch, in
+     parallel. It runs again before `S`'s proof is verified, since the
+     target may have moved and headers come in. A header that fails is
+     marked invalid with every header after it, the best header falls
+     back, and the peer that sent it is struck.
+   - `S`'s own work is checked before its proof is verified and its
+     snapshot installed (`verify_snapshot_block`, `finish_snapshot`):
+     its proof attests its parent's work, not its own.
+   - A block whose header was stored light has its full work checked when
+     it is applied, so a sync that falls back to replaying blocks checks
+     every one.
+   - Tests: `light_headers_have_their_work_checked_from_the_sync_point`
+     (a forged header that passes the quick check is refused at
+     `confirm_work` with what follows it, and on applying its block);
+     `a_fresh_node_fast_syncs` checks the full work of blocks 8 to 12
+     alone, the snapshot block 8 and after.
+   - Dev-recursive, ten blocks mined, a fresh node with `--sync-point 4`:
+     full proof of work for headers 6 to 10, block 6's proof verified,
+     its state installed, blocks 7 to 10 applied; headers 1 to 5 never
+     checked in full.
 6. **Measure and document**: `miner/SECURITY.md`'s cost table with the
    work segment, and `README.md`'s fast-sync section.
 

@@ -15,7 +15,8 @@
 //! best header, headers are fetched in batches by height
 //! (`GetHeadersFrom`, [`MAX_HEADERS`] each), up to `HEADER_BATCHES` at
 //! once, each from a different such peer; complete batches are checked
-//! (proof of work, in parallel, difficulty, timestamps) and stored in
+//! (proof of work, in parallel, difficulty, timestamps; during a fast sync
+//! only the quick proof of work, below) and stored in
 //! order, so a slow peer delays only its share, and a batch late by
 //! `BATCH_TIMEOUT` goes to another peer. A batch that does not follow
 //! our best header means a fork: a locator (`GetHeaders`) finds where. A
@@ -43,14 +44,19 @@
 //!
 //! A node starting from genesis with a sync point (by default 144 blocks)
 //! first downloads every header from the peer claiming the most work,
-//! checking proof of work, difficulty and timestamps, without bodies.
-//! It then takes the block `sync_point` below the best header (every node
-//! keeps a snapshot manifest for each block in its undo window), and
-//! fetches it with a manifest of the state after it: the output counter and the
-//! root of each part's subtree (16,384 positions), which must compose to the
-//! block's state root. The block's proof, a chain proof, is checked
-//! against the counter: it shows that block and every one before it valid,
-//! so nothing about the past is trusted. The parts come from every peer
+//! checking difficulty, timestamps and the quick proof of work (the claimed
+//! `mix` meets the target: two permutations), without bodies. It then takes
+//! the block `sync_point` below the best header (every node keeps a
+//! snapshot manifest for each block in its undo window), checks the full
+//! proof of work of that header and every one after it
+//! ([`Chain::confirm_work`]), and fetches the block with a manifest of the
+//! state after it: the output counter and the root of each part's subtree
+//! (16,384 positions), which must compose to the block's state root. The
+//! block's proof, a chain proof, is checked against the counter: it shows
+//! that block and every one before it valid, and every header before it
+//! with its true `mix` (docs/NODE.md, the work in the chain proof), so
+//! nothing about the past is trusted and no work before it is checked
+//! again. The parts come from every peer
 //! that can serve them, `MAX_PART_DOWNLOADS` at once, and are checked
 //! against their roots and stored on the applier thread; the snapshot is
 //! installed and ordinary sync fetches the blocks after it.
@@ -1671,7 +1677,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             let b = self.header_batches.remove(&start).unwrap();
             let headers: Vec<Header> = b.headers.into_values().filter(|h| h.height > best.height).collect();
             let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
-            let (new, stop) = self.chain.accept_headers(&headers, unix_now());
+            let (new, stop) = self.chain.accept_headers_with(&headers, unix_now(), self.mode != Mode::Normal);
             for h in headers.iter().take(new) {
                 self.note_source(h.hash(), b.peer);
             }
@@ -2408,7 +2414,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
         } else {
             let before = self.chain.best_header_work().unwrap_or(U256::ZERO);
-            let (new, stop) = self.chain.accept_headers(&headers, unix_now());
+            let (new, stop) = self.chain.accept_headers_with(&headers, unix_now(), self.mode != Mode::Normal);
             for h in headers.iter().take(new) {
                 self.note_source(h.hash(), from);
             }
@@ -3065,6 +3071,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Ok(Some(t)) => t,
             _ => return self.log("fast sync: snapshot block's header is missing"),
         };
+        if !self.confirm_work(&best, height) {
+            return;
+        }
         self.log(&format!(
             "fast sync: {} headers checked; fetching the state after block {} ({})",
             best.height,
@@ -3094,6 +3103,36 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         });
         self.mode = Mode::Snapshot;
         self.snapshot_sync(now);
+    }
+
+    /// Checks the full proof of work of the headers from `from` to `best`
+    /// stored with only the quick check: the snapshot block's chain proof
+    /// attests the work before it, not its own or what follows. A header
+    /// that fails is refused with every header after it, and its source
+    /// struck. Whether all passed.
+    fn confirm_work(&mut self, best: &Header, from: u32) -> bool {
+        match self.chain.confirm_work(best, from) {
+            Ok(Ok(0)) => true,
+            Ok(Ok(n)) => {
+                self.log(&format!(
+                    "fast sync: full proof of work checked for {n} headers from {from} to {}; the chain proof covers the rest",
+                    best.height
+                ));
+                true
+            }
+            Ok(Err((height, id))) => {
+                self.log(&format!("fast sync: header {height} ({}) fails its proof of work", short(&id)));
+                if let Some(&from) = self.sources.get(&id) {
+                    self.peers.strike(from);
+                }
+                self.header_batches.clear();
+                false
+            }
+            Err(e) => {
+                self.log(&format!("fast sync: checking the work after the snapshot block: {e}"));
+                false
+            }
+        }
     }
 
     /// Peers that may serve the snapshot: trusted, past its block and
@@ -3411,6 +3450,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.start_snapshot_download(Kind::Manifest, now);
         }
         if has_block && has_manifest && !self.snap.as_ref().unwrap().verified {
+            // The target may have moved, and headers come in, since the
+            // header sync checked the work after it.
+            let target = self.snap.as_ref().unwrap().target;
+            let best = self.chain.best_header();
+            if let Ok(best) = best
+                && !self.confirm_work(&best, target.height)
+            {
+                return self.abandon_snapshot("a header after the snapshot block fails its proof of work");
+            }
             let snap = self.snap.as_ref().unwrap();
             let next = snap.manifest.as_ref().unwrap().next;
             match self.chain.verify_snapshot_block(snap.block.as_ref().unwrap(), next) {
@@ -4315,6 +4363,12 @@ mod tests {
         // b has no bodies below its snapshot, but every header.
         assert!(b.chain.block_by_hash(&b.chain.header_at(3).unwrap().unwrap().hash()).unwrap().is_none());
         assert_eq!(b.chain.header_at(3).unwrap(), a.chain.header_at(3).unwrap());
+        // No full proof of work checked below the snapshot block, whose
+        // chain proof attests it; its own and every one after it checked.
+        let mut checked = b.chain.full_pow_heights.lock().unwrap().clone();
+        checked.sort();
+        checked.dedup();
+        assert_eq!(checked, (8..=12).collect::<Vec<u32>>());
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!syncing.load(Ordering::Acquire));
         tx_a.send(Event::Stop).unwrap();
