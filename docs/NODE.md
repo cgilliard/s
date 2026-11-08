@@ -18,6 +18,10 @@ transactions it does.
 - **A 25 GB disk.** It holds essentially the whole chain, even at
   Bitcoin's scale, with tabminer's full undo window. The store must be
   made to scale to it first (step 0).
+- **The work in the chain proof.** Each block's chain proof attests to
+  its parent's proof of work, and the proof of work reads aligned
+  windows of the seed text (The work in the chain proof, below): a
+  change to tabminer, made first, so the node never checks old work.
 - **No M extension.** RV32I as everywhere else: products in software,
   and the verification loop optimised until it is fast enough.
   Verification without M has been done before.
@@ -153,15 +157,14 @@ As tabminer (`node.rs:10-56`), within the machine's limits:
 3. **Bodies after that**, each block applied as above, then follow
    the tip.
 
-The open question is proof-of-work over a long header chain: at
-several seconds a header, 50,000 headers is days. The chain proof
-attests to every block's validity, but not to its work. Options, to
-choose once Poseidon2's real cost is measured:
-- check every header's work, and accept a slow first sync;
-- check the work of the last N headers in full, and the rest by
-  sampling;
-- start from a checkpoint carried in the image. The image is already
-  trusted, through tabernacle's hash.
+Proof-of-work over a long header chain is settled by
+the work in the chain proof (below): each block's chain proof attests to its parent's
+work, so a node:
+- checks every header's cheap rules natively: link, timestamps, ASERT
+  target, and `quick_pow_check` (two permutations a header);
+- trusts the work before the sync block to its chain proof;
+- checks the full proof of work only for the headers after it.
+No checkpoints, so no one has to keep shipping trusted values.
 
 ## Its state
 
@@ -315,6 +318,198 @@ Against tabminer, which is the reference:
   a short dev chain, answering the API, surviving a kill and restart
   with its state whole.
 
+## The work in the chain proof
+
+Decided 2026-11-07 (pre-launch, so the proof of work and the proof may
+change): the chain proof will attest to the proof of work of every block
+before it, so that no node has to check the work of a long header
+history. This is a change to tabminer. It lands step by step (the order
+below), and the README, `miner/src/pow.rs`'s documentation and
+`miner/SECURITY.md` are updated as each part does.
+
+### What changes, in short
+
+1. **The proof of work reads aligned windows.** A dataset item's 256
+   steps each read 24 bytes of the seed text at a position the state
+   picks. Today that position is any byte. It becomes a multiple of 24.
+   That makes proving the reads about 20 times cheaper (below).
+2. **A block's chain proof attests to its parent's work.** Block `N`'s
+   chain proof shows, besides what it shows today, that the `mix` in
+   block `N-1`'s header is the true hashimoto mix. Recursively, that
+   covers every block before it. It is the parent's work, not the
+   block's own, because a block's work exists only once its nonce is
+   found, and proving it then would delay publishing by a minute
+   (below).
+3. **The chain proof binds the headers.** Its statement gains the hash of
+   the parent header. Each step checks the parent's `prev_hash` against
+   what the previous step bound, so a chain proof stands for one header
+   chain back to genesis. Today "the proof binds transitions, not
+   headers" (`README.md`).
+
+What stays native, on every header, because it is cheap: the timestamp
+rules, the ASERT target from the parent, and `quick_pow_check`: the
+result from the claimed `mix` meets the target, two permutations. The
+proof supplies the one expensive fact, that the `mix` is the true one.
+
+### 1. Aligned windows
+
+`SeedText::calc_dataset_item` (`miner/src/pow.rs`): each of the
+`parents` steps picks `offset = r mod (len - 24 + 1)` and absorbs
+`text[offset..offset + 24]`. With aligned windows it picks
+`w = r mod floor(len / 24)` and absorbs `text[24w..24w + 24]`: one of
+180,871 windows instead of 4,340,894.
+
+- **The same:** the dataset (2^20 items of 64 bytes, 64 MB), hashimoto's
+  64 accesses, the cost of mining and of building the dataset, the light
+  path's cost, and the need to hold the whole text to verify.
+- **Different:** every item's value, so the dataset itself. Also the
+  dev dataset built into the binary, and any genesis or test block mined
+  with the old one.
+- **The module's claim changes.** It says arbitrary offsets mean no
+  table smaller than the text reproduces the derivation, since hashing
+  every window would take thirty times more space. With aligned
+  windows, the smallest table is the windows themselves as field
+  elements: 180,871 × 32 bytes, 5.8 MB, more than the 4.34 MB text. So
+  holding something at least text-sized is still required, and the
+  claim is restated that way.
+- **Why:** the proof shows each window came from the text by looking it
+  up in a committed table of every possible window. That table has
+  4.34 M rows (2^23) today, and 180,871 (2^18) aligned. It is the whole
+  difference between 81–89 s and 3–4.5 s to prove (Measured, below).
+- **Optionally 254 parents instead of 256.** A header's work is then
+  32,643 permutations instead of 32,899, which fits a 2^15-row table
+  instead of 2^16: 3.2 s instead of 4.5 s. It is a change to the
+  parameter, nothing else.
+
+### 2. The parent's work
+
+A miner proves a block's transactions before mining it (`README.md`:
+"proves them, mines them"). So the block goes out the moment a nonce is
+found. The work of block `N` cannot be proven before its nonce exists.
+Putting it in block `N`'s own proof would put the work proof, its fold
+into the block's tree, the wrap (about 22 s) and the chain step
+(about 25 s) between finding the nonce and publishing: about a minute,
+which favours large miners and raises orphan rates.
+
+Block `N`'s proof attests instead to the work of block `N-1`, which is
+known once `N-1` is. A miner proves it as soon as it starts on a new
+tip, once per tip (not per template), beside the block's segments.
+Publishing waits for nothing new.
+
+What a node checks for a block it receives at the tip: the chain proof,
+as now, and the block's own header natively (the full proof of work,
+one header). The work before it comes with the chain proof.
+
+### 3. What the proof carries
+
+- **A work segment:** one more child in the block's tree, at the segment
+  configuration. Its public values are the parent header's
+  `pow_hash` (8 elements), its nonce (11 elements) and its `mix`
+  (8 elements). It proves `hashimoto(pow_hash, nonce)` on the light path
+  gives that `mix`. `miner/src/pow_air.rs` is its prototype: the hash
+  machine with the seed and the 128 items, the window indices proven in
+  10-bit limbs, the windows looked up in a preprocessed table of the
+  text, the 64 accesses folded in a mix table, and a range table. Still
+  to add: the final fold to the 8-element `mix`, checked against the
+  public value.
+- **The statement** (`aggregate::Statement`) gains the parent header's
+  hash and its `pow_hash`, nonce and `mix`. The parent's other fields
+  are needed to recompute its hash in the circuit: about 204 bytes, a
+  few permutations.
+- **The chain step** checks, besides what it checks today:
+  - the parent header's hash is what the previous chain proof bound as
+    *its* block's header, and its `prev_hash` is what that proof bound
+    as its parent's;
+  - the work segment's public values are this parent header's.
+  - At height 1, the parent is genesis, whose header is a constant.
+- **The plan** (`plan_leaves`, `MAINNET_PLAN`, `MAINNET_CHAIN`): each
+  block's tree has one more child. The plan constants are regenerated.
+
+### 4. Syncing with it
+
+A node starting from scratch:
+
+1. Downloads every header and checks, natively, its link, height,
+   timestamps, ASERT target and `quick_pow_check`: two permutations a
+   header, cheap even for the fam node.
+2. Picks the sync block `S`, as now a set depth below the best header.
+3. Verifies `S`'s chain proof, bound to `S`'s header chain. That covers
+   every state transition before `S` (as now) and now the true `mix` of
+   every header before `S`.
+4. Checks the full proof of work natively for the headers from `S` to
+   the tip, and fetches the snapshot and the blocks after `S` as now.
+
+No header before `S` has its dataset items computed by anyone but the
+miners who proved them. The sync section above is this.
+
+### Measured
+
+`miner/src/pow_air.rs`, `pow_air::tests::cost`: one header's proof of
+work, proven and verified at the mainnet segment configuration (rate 1/4,
+54 queries, 16 bits of grinding, commit grinding to 121), on the
+development laptop (12 threads).
+
+| windows | parents | text table | perm table | prove | proof | verify |
+|---|---|---|---|---|---|---|
+| aligned | 256 | 2^18 | 2^16 | 4.5 s | 462 KB | 19 ms |
+| aligned | 254 | 2^18 | 2^15 | 3.2 s | 469 KB | 20 ms |
+| any byte (today) | 256 | 2^23 | 2^16 | 88.7 s | 572 KB | 29 ms |
+| any byte (today) | 254 | 2^23 | 2^15 | 81.2 s | 561 KB | 48 ms |
+
+The text table's commitment is made once per miner: 0.3 s aligned, 15 s
+at any byte. The byte-offset variant's mix equals `pow::hashimoto`'s
+(`mix_matches_hashimoto`).
+
+What it means for a block, with aligned windows:
+
+- **Proving:** the work segment's 3–4.5 s, run with the block's other
+  segments, plus its fold into the tree: one more child of the root for a
+  one-segment block, perhaps one more node for a sixteen-segment one.
+  Estimated at about +5–15 s a block, against 29 s and 170 s today
+  (`miner/SECURITY.md`). The fold is the part still to measure.
+- **The published proof:** unchanged, about 205 KB, since the wrap and
+  the chain step keep their shape. The work segment's 462 KB never
+  leaves the miner.
+- **Verifying it:** unchanged, about 13 ms. The work segment verifies
+  natively in 19–20 ms, the range of children the nodes already fold
+  (the name segment's 27 ms). No node checks old work again.
+
+### Its order
+
+Each step done when its test passes.
+
+1. **Aligned windows** in `pow.rs` (and 254 parents if chosen).
+   Regenerate the dev dataset, the genesis block and every test vector
+   built on the old dataset. Done when the suite passes on the new proof
+   of work.
+2. **The work segment, complete**: the prototype's tables, the final
+   fold to the `mix` checked against its public value, the attack tests
+   (each constraint broken alone is refused, as the other circuits'
+   tests do). Done when it proves a real header's work and refuses a
+   wrong `mix`.
+3. **Into the block's tree**: the work segment as one more child, the
+   plan regenerated. Done when a block proves with its parent's work,
+   and the fold's cost is measured against the estimate above.
+4. **The statement and the chain step**: the parent header bound, its
+   hash recomputed and linked, genesis at height 1, the constants
+   regenerated. Done when a chain proof verifies only against the header
+   chain it was made for.
+5. **Sync**: the node checks headers natively as in section 4 and full
+   work only after `S`. Done when a node fast-syncs a dev-recursive
+   chain checking no full proof of work before `S`.
+6. **Measure and document**: `miner/SECURITY.md`'s cost table with the
+   work segment, and `README.md`'s fast-sync section.
+
+### Its open questions
+
+- **254 parents:** take the second saved, or leave the parameter alone.
+- **The sync depth:** today 144 blocks. The full proof of work is
+  checked natively for every header after `S`, so a deeper `S` costs a
+  node more, and the fam node most.
+- **The first block:** at height 1 the parent is genesis. Genesis can
+  either be proven like any other block's work (a work segment for it)
+  or taken as a constant in the circuit.
+
 ## Implementation order
 
 Each step done when its test passes.
@@ -359,8 +554,6 @@ Each step done when its test passes.
 
 ## Open questions
 
-- **Proof-of-work over a long header chain**: all of it, sampled, or
-  from a checkpoint in the image (Syncing, above).
 - **How fast verification gets without M**: step 1 and step 2 measure
   it, and say how much optimising the loop needs.
 - **The API's reach**: local only by default; how a user opens it
