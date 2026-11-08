@@ -117,8 +117,10 @@ for n in 1 2 8 64; do
 	expect "kernel_tests_$n" 0 "harts: $n" 600 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/net.fam src/ksys.fam
 done
 
-# The node's arithmetic (docs/NODE.md, step 1) against tabminer's values.
+# The node's arithmetic and Poseidon2 (docs/NODE.md, steps 1 and 2) against
+# tabminer's values.
 expect arith 0 '7 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/arith_vectors.fam
+expect poseidon2 0 '3 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/poseidon2.fam src/user/node/poseidon2_vectors.fam
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

@@ -1,0 +1,15 @@
+\ poseidon2_bench.fam — the cost of poseidon2.fam's words, in instructions
+\ (docs/NODE.md, step 2):
+\   tools/fam --bench --icount src/user/node/arith.fam src/user/node/poseidon2.fam src/user/node/poseidon2_bench.fam
+
+: pbs variable ;  : pbt variable ;
+: binit  p2init pbs @ 0= if 400 lit alloc pbs !  40 lit alloc pbt ! then
+	100 lit 0 lit do i tom pbs @ i w! loop ;
+
+Bench {
+	perm16 { binit bgo 3E8 lit 0 lit do pbs @ perm16 loop 3E8 lit bops }
+	compress { binit bgo 3E8 lit 0 lit do pbs @ pbs @ 20 lit + pbt @ compress loop 3E8 lit bops }
+	hash_8 { binit bgo 3E8 lit 0 lit do pbs @ 8 lit pbt @ hash loop 3E8 lit bops }
+	hash_100 { binit bgo 64 lit 0 lit do pbs @ 64 lit pbt @ hash loop 64 lit bops }
+	merkle_20 { binit bgo 64 lit 0 lit do pbs @ 5 lit 12345 lit pbs @ 40 lit + 14 lit pbt @ mroot loop 64 lit bops }
+}

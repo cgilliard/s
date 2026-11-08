@@ -1,0 +1,2551 @@
+\ poseidon2.fam — the node's Poseidon2 and Merkle paths (docs/NODE.md, step
+\ 2), after arith.fam.  As tabminer's miner/src/poseidon2.rs and merkle.rs:
+\ width 16 over BabyBear, x^7, 8 full rounds and 13 partial, bit-compatible
+\ with Plonky3's default_babybear_poseidon2_16; values in Montgomery form
+\ (arith.fam).
+\
+\ perm16 is one raw word (from tools/genposeidon.py, which reads tabminer's
+\ round constants): the S-box's four products (x^2, x^3, x^6, x^7) are its
+\ only ones, since the internal layer's diagonal is small multiples and
+\ powers of 1/2 (1/2^27 = -15).
+\
+\ compress: the first 8 words of perm(a || b), the Merkle node.  hash: the
+\ sponge with rate 8, the length in the first capacity word, a short last
+\ block zero padded (none empty: one permutation).  mroot and mverify: a
+\ leaf row's root from its path, siblings from the leaf up.  Not
+\ reentrant: they share p2s and the variables below.
+
+: p2s variable ;               \ the state: 16 words
+: mvt variable ;               \ mverify's root: 8 words
+: p2init  arinit p2s @ 0= if 40 lit alloc p2s !  20 lit alloc mvt ! then ;
+
+\ perm16 ( s -- )  the 16 words at s permuted in place.
+: perm16 sqt @
+83280100 ,   \ lw a7,0(sp)   ( the table )
+03274100 ,   \ lw a4,4(sp)   ( the state )
+13018100 ,   \ addi sp,sp,8
+EF10007E ,   \ jal ra,p2_ext   ( the first external layer )
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7754D5E ,   \ lui a1,0x5e4d7
+93858593 ,   \ addi a1,a1,-1736
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa1
+3305F540 ,   \ sub a0,a0,a5
+\ fa1:
+EF100079 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B7653871 ,   \ lui a1,0x71386
+9385F5DE ,   \ addi a1,a1,-529
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa2
+3305F540 ,   \ sub a0,a0,a5
+\ fa2:
+EF108076 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B7C5DD61 ,   \ lui a1,0x61ddc
+9385A5D3 ,   \ addi a1,a1,-710
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa3
+3305F540 ,   \ sub a0,a0,a5
+\ fa3:
+EF100074 ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B715941B ,   \ lui a1,0x1b941
+93850518 ,   \ addi a1,a1,384
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa4
+3305F540 ,   \ sub a0,a0,a5
+\ fa4:
+EF108071 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7D5204D ,   \ lui a1,0x4d20d
+9385D577 ,   \ addi a1,a1,1917
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa5
+3305F540 ,   \ sub a0,a0,a5
+\ fa5:
+EF10006F ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7854752 ,   \ lui a1,0x52478
+93857502 ,   \ addi a1,a1,39
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa6
+3305F540 ,   \ sub a0,a0,a5
+\ fa6:
+EF10806C ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7552E73 ,   \ lui a1,0x732e5
+9385357C ,   \ addi a1,a1,1987
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa7
+3305F540 ,   \ sub a0,a0,a5
+\ fa7:
+EF10006A ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B735E610 ,   \ lui a1,0x10e63
+93852511 ,   \ addi a1,a1,274
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa8
+3305F540 ,   \ sub a0,a0,a5
+\ fa8:
+EF108067 ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B7C5993C ,   \ lui a1,0x3c99c
+938575E2 ,   \ addi a1,a1,-473
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa9
+3305F540 ,   \ sub a0,a0,a5
+\ fa9:
+EF100065 ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7852102 ,   \ lui a1,0x2218
+9385A557 ,   \ addi a1,a1,1402
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa10
+3305F540 ,   \ sub a0,a0,a5
+\ fa10:
+EF108062 ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7A5BE4B ,   \ lui a1,0x4bbea
+938575AB ,   \ addi a1,a1,-1353
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa11
+3305F540 ,   \ sub a0,a0,a5
+\ fa11:
+EF100060 ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B765C432 ,   \ lui a1,0x32c46
+93853513 ,   \ addi a1,a1,307
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa12
+3305F540 ,   \ sub a0,a0,a5
+\ fa12:
+EF10805D ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7D5622F ,   \ lui a1,0x2f62d
+938565C7 ,   \ addi a1,a1,-906
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa13
+3305F540 ,   \ sub a0,a0,a5
+\ fa13:
+EF10005B ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7256837 ,   \ lui a1,0x37682
+93856526 ,   \ addi a1,a1,614
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa14
+3305F540 ,   \ sub a0,a0,a5
+\ fa14:
+EF108058 ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B715371F ,   \ lui a1,0x1f371
+9385354E ,   \ addi a1,a1,1251
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa15
+3305F540 ,   \ sub a0,a0,a5
+\ fa15:
+EF100056 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7E5015F ,   \ lui a1,0x5f01e
+9385D5D7 ,   \ addi a1,a1,-643
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa16
+3305F540 ,   \ sub a0,a0,a5
+\ fa16:
+EF108053 ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF10C055 ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7856735 ,   \ lui a1,0x35678
+93856550 ,   \ addi a1,a1,1286
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa17
+3305F540 ,   \ sub a0,a0,a5
+\ fa17:
+EF10C050 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B715DA67 ,   \ lui a1,0x67da1
+938545D2 ,   \ addi a1,a1,-732
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa18
+3305F540 ,   \ sub a0,a0,a5
+\ fa18:
+EF10404E ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B705B336 ,   \ lui a1,0x36b30
+9385A508 ,   \ addi a1,a1,138
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa19
+3305F540 ,   \ sub a0,a0,a5
+\ fa19:
+EF10C04B ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B765675A ,   \ lui a1,0x5a676
+9385C55C ,   \ addi a1,a1,1484
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa20
+3305F540 ,   \ sub a0,a0,a5
+\ fa20:
+EF104049 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B775C045 ,   \ lui a1,0x45c07
+9385D58B ,   \ addi a1,a1,-1859
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa21
+3305F540 ,   \ sub a0,a0,a5
+\ fa21:
+EF10C046 ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7C5D42E ,   \ lui a1,0x2ed4c
+9385C59E ,   \ addi a1,a1,-1556
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa22
+3305F540 ,   \ sub a0,a0,a5
+\ fa22:
+EF104044 ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7959324 ,   \ lui a1,0x24939
+9385352D ,   \ addi a1,a1,723
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa23
+3305F540 ,   \ sub a0,a0,a5
+\ fa23:
+EF10C041 ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B7550A15 ,   \ lui a1,0x150a5
+9385C571 ,   \ addi a1,a1,1820
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa24
+3305F540 ,   \ sub a0,a0,a5
+\ fa24:
+EF10403F ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B7557528 ,   \ lui a1,0x28755
+9385A59E ,   \ addi a1,a1,-1558
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa25
+3305F540 ,   \ sub a0,a0,a5
+\ fa25:
+EF10C03C ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7B5ED3B ,   \ lui a1,0x3bedb
+9385851B ,   \ addi a1,a1,440
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa26
+3305F540 ,   \ sub a0,a0,a5
+\ fa26:
+EF10403A ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7059E65 ,   \ lui a1,0x659e0
+9385E548 ,   \ addi a1,a1,1166
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa27
+3305F540 ,   \ sub a0,a0,a5
+\ fa27:
+EF10C037 ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B7450246 ,   \ lui a1,0x46024
+938505D7 ,   \ addi a1,a1,-656
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa28
+3305F540 ,   \ sub a0,a0,a5
+\ fa28:
+EF104035 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7B5551E ,   \ lui a1,0x1e55b
+9385D592 ,   \ addi a1,a1,-1747
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa29
+3305F540 ,   \ sub a0,a0,a5
+\ fa29:
+EF10C032 ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7559C1F ,   \ lui a1,0x1f9c5
+9385F528 ,   \ addi a1,a1,655
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa30
+3305F540 ,   \ sub a0,a0,a5
+\ fa30:
+EF104030 ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B7D51A4F ,   \ lui a1,0x4f1ad
+93850562 ,   \ addi a1,a1,1568
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa31
+3305F540 ,   \ sub a0,a0,a5
+\ fa31:
+EF10C02D ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7B57F54 ,   \ lui a1,0x547fb
+93850588 ,   \ addi a1,a1,-1920
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa32
+3305F540 ,   \ sub a0,a0,a5
+\ fa32:
+EF10402B ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF10802D ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7A5C144 ,   \ lui a1,0x44c1a
+938565B3 ,   \ addi a1,a1,-1226
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa33
+3305F540 ,   \ sub a0,a0,a5
+\ fa33:
+EF108028 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B7F5C222 ,   \ lui a1,0x22c2f
+9385A511 ,   \ addi a1,a1,282
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa34
+3305F540 ,   \ sub a0,a0,a5
+\ fa34:
+EF100026 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B775B617 ,   \ lui a1,0x17b67
+93851567 ,   \ addi a1,a1,1649
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa35
+3305F540 ,   \ sub a0,a0,a5
+\ fa35:
+EF108023 ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B7E5DD55 ,   \ lui a1,0x55dde
+938545EB ,   \ addi a1,a1,-332
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa36
+3305F540 ,   \ sub a0,a0,a5
+\ fa36:
+EF100021 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7A5181B ,   \ lui a1,0x1b18a
+9385D57E ,   \ addi a1,a1,2029
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa37
+3305F540 ,   \ sub a0,a0,a5
+\ fa37:
+EF10801E ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B785660A ,   \ lui a1,0xa668
+9385E540 ,   \ addi a1,a1,1038
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa38
+3305F540 ,   \ sub a0,a0,a5
+\ fa38:
+EF10001C ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7D53C0A ,   \ lui a1,0xa3cd
+93859540 ,   \ addi a1,a1,1033
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa39
+3305F540 ,   \ sub a0,a0,a5
+\ fa39:
+EF108019 ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B7551E77 ,   \ lui a1,0x771e5
+93858554 ,   \ addi a1,a1,1352
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa40
+3305F540 ,   \ sub a0,a0,a5
+\ fa40:
+EF100017 ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B7C5AA53 ,   \ lui a1,0x53aac
+938525A9 ,   \ addi a1,a1,-1390
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa41
+3305F540 ,   \ sub a0,a0,a5
+\ fa41:
+EF108014 ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7E5BF6B ,   \ lui a1,0x6bbfe
+93850507 ,   \ addi a1,a1,112
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa42
+3305F540 ,   \ sub a0,a0,a5
+\ fa42:
+EF100012 ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7C5D71A ,   \ lui a1,0x1ad7c
+93852551 ,   \ addi a1,a1,1298
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa43
+3305F540 ,   \ sub a0,a0,a5
+\ fa43:
+EF10800F ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B705F556 ,   \ lui a1,0x56f50
+938595BF ,   \ addi a1,a1,-1031
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa44
+3305F540 ,   \ sub a0,a0,a5
+\ fa44:
+EF10000D ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B745E92E ,   \ lui a1,0x2ee94
+9385C5EA ,   \ addi a1,a1,-340
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa45
+3305F540 ,   \ sub a0,a0,a5
+\ fa45:
+EF10800A ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7C5673F ,   \ lui a1,0x3f67c
+938545C1 ,   \ addi a1,a1,-1004
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa46
+3305F540 ,   \ sub a0,a0,a5
+\ fa46:
+EF100008 ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B7456F76 ,   \ lui a1,0x766f4
+938565F6 ,   \ addi a1,a1,-154
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa47
+3305F540 ,   \ sub a0,a0,a5
+\ fa47:
+EF108005 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B755B51C ,   \ lui a1,0x1cb55
+9385C555 ,   \ addi a1,a1,1372
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa48
+3305F540 ,   \ sub a0,a0,a5
+\ fa48:
+EF100003 ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF104005 ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7556B49 ,   \ lui a1,0x496b5
+93856585 ,   \ addi a1,a1,-1962
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa49
+3305F540 ,   \ sub a0,a0,a5
+\ fa49:
+EF104000 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B725E54E ,   \ lui a1,0x4ee52
+93859528 ,   \ addi a1,a1,649
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa50
+3305F540 ,   \ sub a0,a0,a5
+\ fa50:
+EF00D07D ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B715350E ,   \ lui a1,0xe351
+93857562 ,   \ addi a1,a1,1575
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa51
+3305F540 ,   \ sub a0,a0,a5
+\ fa51:
+EF00507B ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B705F377 ,   \ lui a1,0x77f30
+9385B5A2 ,   \ addi a1,a1,-1493
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa52
+3305F540 ,   \ sub a0,a0,a5
+\ fa52:
+EF00D078 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B775173D ,   \ lui a1,0x3d177
+9385C5CC ,   \ addi a1,a1,-820
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa53
+3305F540 ,   \ sub a0,a0,a5
+\ fa53:
+EF005076 ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7451042 ,   \ lui a1,0x42104
+938575AD ,   \ addi a1,a1,-1321
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa54
+3305F540 ,   \ sub a0,a0,a5
+\ fa54:
+EF00D073 ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7658A4C ,   \ lui a1,0x4c8a6
+938595BA ,   \ addi a1,a1,-1111
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa55
+3305F540 ,   \ sub a0,a0,a5
+\ fa55:
+EF005071 ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B7052D24 ,   \ lui a1,0x242d0
+938565E1 ,   \ addi a1,a1,-490
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa56
+3305F540 ,   \ sub a0,a0,a5
+\ fa56:
+EF00D06E ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B735E23C ,   \ lui a1,0x3ce23
+938525E5 ,   \ addi a1,a1,-430
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa57
+3305F540 ,   \ sub a0,a0,a5
+\ fa57:
+EF00506C ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B765E02A ,   \ lui a1,0x2ae06
+9385A510 ,   \ addi a1,a1,266
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa58
+3305F540 ,   \ sub a0,a0,a5
+\ fa58:
+EF00D069 ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7D55127 ,   \ lui a1,0x2751d
+9385B580 ,   \ addi a1,a1,-2037
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa59
+3305F540 ,   \ sub a0,a0,a5
+\ fa59:
+EF005067 ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B705DF2D ,   \ lui a1,0x2ddf0
+938575DB ,   \ addi a1,a1,-585
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa60
+3305F540 ,   \ sub a0,a0,a5
+\ fa60:
+EF00D064 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7850330 ,   \ lui a1,0x30038
+9385E596 ,   \ addi a1,a1,-1682
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa61
+3305F540 ,   \ sub a0,a0,a5
+\ fa61:
+EF005062 ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7754C23 ,   \ lui a1,0x234c7
+9385B57E ,   \ addi a1,a1,2027
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa62
+3305F540 ,   \ sub a0,a0,a5
+\ fa62:
+EF00D05F ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B7857868 ,   \ lui a1,0x68788
+9385751F ,   \ addi a1,a1,503
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa63
+3305F540 ,   \ sub a0,a0,a5
+\ fa63:
+EF00505D ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7E58A27 ,   \ lui a1,0x278ae
+93853590 ,   \ addi a1,a1,-1789
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa64
+3305F540 ,   \ sub a0,a0,a5
+\ fa64:
+EF00D05A ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF00105D ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B745EE0E ,   \ lui a1,0xeee4
+938565C4 ,   \ addi a1,a1,-954
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa65
+3305F540 ,   \ sub a0,a0,a5
+\ fa65:
+EF001058 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF100021 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B735801F ,   \ lui a1,0x1f803
+93850570 ,   \ addi a1,a1,1792
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa66
+3305F540 ,   \ sub a0,a0,a5
+\ fa66:
+EF005055 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10401E ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7B5CB57 ,   \ lui a1,0x57cbb
+938565DE ,   \ addi a1,a1,-538
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa67
+3305F540 ,   \ sub a0,a0,a5
+\ fa67:
+EF009052 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10801B ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7353D3A ,   \ lui a1,0x3a3d3
+93852547 ,   \ addi a1,a1,1138
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa68
+3305F540 ,   \ sub a0,a0,a5
+\ fa68:
+EF00D04F ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10C018 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7656870 ,   \ lui a1,0x70686
+9385D56B ,   \ addi a1,a1,1725
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa69
+3305F540 ,   \ sub a0,a0,a5
+\ fa69:
+EF00104D ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF100016 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7A53D41 ,   \ lui a1,0x413da
+93853507 ,   \ addi a1,a1,115
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa70
+3305F540 ,   \ sub a0,a0,a5
+\ fa70:
+EF00504A ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF104013 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B795CA08 ,   \ lui a1,0x8ca9
+938555F3 ,   \ addi a1,a1,-203
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa71
+3305F540 ,   \ sub a0,a0,a5
+\ fa71:
+EF009047 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF108010 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7559627 ,   \ lui a1,0x27965
+9385B52B ,   \ addi a1,a1,699
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa72
+3305F540 ,   \ sub a0,a0,a5
+\ fa72:
+EF00D044 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10C00D ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B705C617 ,   \ lui a1,0x17c60
+9385A51D ,   \ addi a1,a1,474
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa73
+3305F540 ,   \ sub a0,a0,a5
+\ fa73:
+EF001042 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10000B ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7850A14 ,   \ lui a1,0x140a8
+9385154A ,   \ addi a1,a1,1185
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa74
+3305F540 ,   \ sub a0,a0,a5
+\ fa74:
+EF00503F ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF104008 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7351361 ,   \ lui a1,0x61133
+9385B537 ,   \ addi a1,a1,891
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa75
+3305F540 ,   \ sub a0,a0,a5
+\ fa75:
+EF00903C ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF108005 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7E5F634 ,   \ lui a1,0x34f6e
+93856521 ,   \ addi a1,a1,534
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa76
+3305F540 ,   \ sub a0,a0,a5
+\ fa76:
+EF00D039 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF10C002 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7C5F922 ,   \ lui a1,0x22f9c
+9385258B ,   \ addi a1,a1,-1870
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa77
+3305F540 ,   \ sub a0,a0,a5
+\ fa77:
+EF001037 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+EF100000 ,   \ jal ra,p2_int
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B735983B ,   \ lui a1,0x3b983
+9385A531 ,   \ addi a1,a1,794
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa78
+3305F540 ,   \ sub a0,a0,a5
+\ fa78:
+EF005034 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B7B52512 ,   \ lui a1,0x1225b
+93850550 ,   \ addi a1,a1,1280
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa79
+3305F540 ,   \ sub a0,a0,a5
+\ fa79:
+EF00D031 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B785F120 ,   \ lui a1,0x20f18
+93854572 ,   \ addi a1,a1,1828
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa80
+3305F540 ,   \ sub a0,a0,a5
+\ fa80:
+EF00502F ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B725DD1A ,   \ lui a1,0x1add2
+9385D5EA ,   \ addi a1,a1,-339
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa81
+3305F540 ,   \ sub a0,a0,a5
+\ fa81:
+EF00D02C ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7C5C827 ,   \ lui a1,0x27c8c
+938505AE ,   \ addi a1,a1,-1312
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa82
+3305F540 ,   \ sub a0,a0,a5
+\ fa82:
+EF00502A ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7158167 ,   \ lui a1,0x67811
+93858593 ,   \ addi a1,a1,-1736
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa83
+3305F540 ,   \ sub a0,a0,a5
+\ fa83:
+EF00D027 ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B705244F ,   \ lui a1,0x4f240
+9385155E ,   \ addi a1,a1,1505
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa84
+3305F540 ,   \ sub a0,a0,a5
+\ fa84:
+EF005025 ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B715BD44 ,   \ lui a1,0x44bd1
+9385F503 ,   \ addi a1,a1,63
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa85
+3305F540 ,   \ sub a0,a0,a5
+\ fa85:
+EF00D022 ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B785AD30 ,   \ lui a1,0x30ad8
+938575B4 ,   \ addi a1,a1,-1209
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa86
+3305F540 ,   \ sub a0,a0,a5
+\ fa86:
+EF005020 ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7252540 ,   \ lui a1,0x40252
+9385A583 ,   \ addi a1,a1,-1990
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa87
+3305F540 ,   \ sub a0,a0,a5
+\ fa87:
+EF00D01D ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7052272 ,   \ lui a1,0x72220
+9385F568 ,   \ addi a1,a1,1679
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa88
+3305F540 ,   \ sub a0,a0,a5
+\ fa88:
+EF00501B ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B7B57663 ,   \ lui a1,0x6376b
+9385552E ,   \ addi a1,a1,741
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa89
+3305F540 ,   \ sub a0,a0,a5
+\ fa89:
+EF00D018 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7256551 ,   \ lui a1,0x51652
+9385A584 ,   \ addi a1,a1,-1974
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa90
+3305F540 ,   \ sub a0,a0,a5
+\ fa90:
+EF005016 ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B715283A ,   \ lui a1,0x3a281
+9385051D ,   \ addi a1,a1,464
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa91
+3305F540 ,   \ sub a0,a0,a5
+\ fa91:
+EF00D013 ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B7657D3D ,   \ lui a1,0x3d7d6
+9385C5B9 ,   \ addi a1,a1,-1124
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa92
+3305F540 ,   \ sub a0,a0,a5
+\ fa92:
+EF005011 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7550C53 ,   \ lui a1,0x530c5
+9385D569 ,   \ addi a1,a1,1693
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa93
+3305F540 ,   \ sub a0,a0,a5
+\ fa93:
+EF00D00E ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF001011 ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7E5AA5C ,   \ lui a1,0x5caae
+9385C5A1 ,   \ addi a1,a1,-1508
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa94
+3305F540 ,   \ sub a0,a0,a5
+\ fa94:
+EF00100C ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B765063D ,   \ lui a1,0x3d066
+9385D527 ,   \ addi a1,a1,637
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa95
+3305F540 ,   \ sub a0,a0,a5
+\ fa95:
+EF009009 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B775FC5F ,   \ lui a1,0x5ffc7
+9385C5E6 ,   \ addi a1,a1,-404
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa96
+3305F540 ,   \ sub a0,a0,a5
+\ fa96:
+EF001007 ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B735BA14 ,   \ lui a1,0x14ba3
+9385859F ,   \ addi a1,a1,-1544
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa97
+3305F540 ,   \ sub a0,a0,a5
+\ fa97:
+EF009004 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7C5D171 ,   \ lui a1,0x71d1c
+9385951E ,   \ addi a1,a1,489
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa98
+3305F540 ,   \ sub a0,a0,a5
+\ fa98:
+EF001002 ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7C50F2C ,   \ lui a1,0x2c0fc
+9385758F ,   \ addi a1,a1,-1801
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa99
+3305F540 ,   \ sub a0,a0,a5
+\ fa99:
+EF00807F ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7658B19 ,   \ lui a1,0x198b6
+9385155E ,   \ addi a1,a1,1505
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa100
+3305F540 ,   \ sub a0,a0,a5
+\ fa100:
+EF00007D ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B705BD25 ,   \ lui a1,0x25bd0
+938565F0 ,   \ addi a1,a1,-250
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa101
+3305F540 ,   \ sub a0,a0,a5
+\ fa101:
+EF00807A ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B7854207 ,   \ lui a1,0x7428
+938555C3 ,   \ addi a1,a1,-971
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa102
+3305F540 ,   \ sub a0,a0,a5
+\ fa102:
+EF000078 ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7159B05 ,   \ lui a1,0x59b1
+93852512 ,   \ addi a1,a1,290
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa103
+3305F540 ,   \ sub a0,a0,a5
+\ fa103:
+EF008075 ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7A59E51 ,   \ lui a1,0x519ea
+93851506 ,   \ addi a1,a1,97
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa104
+3305F540 ,   \ sub a0,a0,a5
+\ fa104:
+EF000073 ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B7A5814A ,   \ lui a1,0x4a81a
+93856553 ,   \ addi a1,a1,1334
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa105
+3305F540 ,   \ sub a0,a0,a5
+\ fa105:
+EF008070 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7A5CF06 ,   \ lui a1,0x6cfa
+938595AA ,   \ addi a1,a1,-1367
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa106
+3305F540 ,   \ sub a0,a0,a5
+\ fa106:
+EF00006E ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7D5B21E ,   \ lui a1,0x1eb2d
+938545A0 ,   \ addi a1,a1,-1532
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa107
+3305F540 ,   \ sub a0,a0,a5
+\ fa107:
+EF00806B ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B785EC02 ,   \ lui a1,0x2ec8
+9385C5CA ,   \ addi a1,a1,-852
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa108
+3305F540 ,   \ sub a0,a0,a5
+\ fa108:
+EF000069 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7C5F674 ,   \ lui a1,0x74f6c
+93853573 ,   \ addi a1,a1,1843
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa109
+3305F540 ,   \ sub a0,a0,a5
+\ fa109:
+EF008066 ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF00C068 ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7C54E52 ,   \ lui a1,0x524ec
+9385E5FD ,   \ addi a1,a1,-34
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa110
+3305F540 ,   \ sub a0,a0,a5
+\ fa110:
+EF00C063 ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B7A5DD6E ,   \ lui a1,0x6edda
+938595D0 ,   \ addi a1,a1,-759
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa111
+3305F540 ,   \ sub a0,a0,a5
+\ fa111:
+EF004061 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B775DB03 ,   \ lui a1,0x3db7
+938515B2 ,   \ addi a1,a1,-1247
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa112
+3305F540 ,   \ sub a0,a0,a5
+\ fa112:
+EF00C05E ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B7E59400 ,   \ lui a1,0x94e
+9385C56F ,   \ addi a1,a1,1788
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa113
+3305F540 ,   \ sub a0,a0,a5
+\ fa113:
+EF00405C ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7D53E64 ,   \ lui a1,0x643ed
+9385B513 ,   \ addi a1,a1,315
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa114
+3305F540 ,   \ sub a0,a0,a5
+\ fa114:
+EF00C059 ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7C55E2A ,   \ lui a1,0x2a5ec
+93859582 ,   \ addi a1,a1,-2007
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa115
+3305F540 ,   \ sub a0,a0,a5
+\ fa115:
+EF004057 ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B775CF3C ,   \ lui a1,0x3ccf7
+93855558 ,   \ addi a1,a1,1413
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa116
+3305F540 ,   \ sub a0,a0,a5
+\ fa116:
+EF00C054 ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B7754A54 ,   \ lui a1,0x544a7
+93856513 ,   \ addi a1,a1,310
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa117
+3305F540 ,   \ sub a0,a0,a5
+\ fa117:
+EF004052 ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B715495B ,   \ lui a1,0x5b491
+9385F528 ,   \ addi a1,a1,655
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa118
+3305F540 ,   \ sub a0,a0,a5
+\ fa118:
+EF00C04F ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B7C52702 ,   \ lui a1,0x227c
+938555D5 ,   \ addi a1,a1,-683
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa119
+3305F540 ,   \ sub a0,a0,a5
+\ fa119:
+EF00404D ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7C5882A ,   \ lui a1,0x2a88c
+9385D5DA ,   \ addi a1,a1,-595
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa120
+3305F540 ,   \ sub a0,a0,a5
+\ fa120:
+EF00C04A ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B7555C05 ,   \ lui a1,0x55c5
+938575D1 ,   \ addi a1,a1,-745
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa121
+3305F540 ,   \ sub a0,a0,a5
+\ fa121:
+EF004048 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B735826F ,   \ lui a1,0x6f823
+9385A5C4 ,   \ addi a1,a1,-950
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa122
+3305F540 ,   \ sub a0,a0,a5
+\ fa122:
+EF00C045 ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B7459A17 ,   \ lui a1,0x179a4
+9385253F ,   \ addi a1,a1,1010
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa123
+3305F540 ,   \ sub a0,a0,a5
+\ fa123:
+EF004043 ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B725EC42 ,   \ lui a1,0x42ec2
+93855589 ,   \ addi a1,a1,-1899
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa124
+3305F540 ,   \ sub a0,a0,a5
+\ fa124:
+EF00C040 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B7E5F368 ,   \ lui a1,0x68f3e
+9385F582 ,   \ addi a1,a1,-2001
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa125
+3305F540 ,   \ sub a0,a0,a5
+\ fa125:
+EF00403E ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF008040 ,   \ jal ra,p2_ext
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+B7F5DC30 ,   \ lui a1,0x30dcf
+93852552 ,   \ addi a1,a1,1314
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa126
+3305F540 ,   \ sub a0,a0,a5
+\ fa126:
+EF00803B ,   \ jal ra,p2_sbox
+2320A700 ,   \ sw a0,0(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254700 ,   \ lw a0,4(a4)
+B7B50608 ,   \ lui a1,0x806b
+938525B7 ,   \ addi a1,a1,-1166
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa127
+3305F540 ,   \ sub a0,a0,a5
+\ fa127:
+EF000039 ,   \ jal ra,p2_sbox
+2322A700 ,   \ sw a0,4(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258700 ,   \ lw a0,8(a4)
+B7659D68 ,   \ lui a1,0x689d6
+9385B53D ,   \ addi a1,a1,987
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa128
+3305F540 ,   \ sub a0,a0,a5
+\ fa128:
+EF008036 ,   \ jal ra,p2_sbox
+2324A700 ,   \ sw a0,8(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C700 ,   \ lw a0,12(a4)
+B7451901 ,   \ lui a1,0x1194
+9385853F ,   \ addi a1,a1,1016
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa129
+3305F540 ,   \ sub a0,a0,a5
+\ fa129:
+EF000034 ,   \ jal ra,p2_sbox
+2326A700 ,   \ sw a0,12(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250701 ,   \ lw a0,16(a4)
+B7A57065 ,   \ lui a1,0x6570a
+9385D5CC ,   \ addi a1,a1,-819
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa130
+3305F540 ,   \ sub a0,a0,a5
+\ fa130:
+EF008031 ,   \ jal ra,p2_sbox
+2328A700 ,   \ sw a0,16(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254701 ,   \ lw a0,20(a4)
+B7553C6A ,   \ lui a1,0x6a3c5
+9385156E ,   \ addi a1,a1,1761
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa131
+3305F540 ,   \ sub a0,a0,a5
+\ fa131:
+EF00002F ,   \ jal ra,p2_sbox
+232AA700 ,   \ sw a0,20(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258701 ,   \ lw a0,24(a4)
+B7F57158 ,   \ lui a1,0x5871f
+938545D9 ,   \ addi a1,a1,-620
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa132
+3305F540 ,   \ sub a0,a0,a5
+\ fa132:
+EF00802C ,   \ jal ra,p2_sbox
+232CA700 ,   \ sw a0,24(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C701 ,   \ lw a0,28(a4)
+B7455E39 ,   \ lui a1,0x395e4
+9385D57B ,   \ addi a1,a1,1981
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa133
+3305F540 ,   \ sub a0,a0,a5
+\ fa133:
+EF00002A ,   \ jal ra,p2_sbox
+232EA700 ,   \ sw a0,28(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250702 ,   \ lw a0,32(a4)
+B795B86E ,   \ lui a1,0x6eb89
+9385455C ,   \ addi a1,a1,1476
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa134
+3305F540 ,   \ sub a0,a0,a5
+\ fa134:
+EF008027 ,   \ jal ra,p2_sbox
+2320A702 ,   \ sw a0,32(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254702 ,   \ lw a0,36(a4)
+B735420D ,   \ lui a1,0xd423
+938595BD ,   \ addi a1,a1,-1063
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa135
+3305F540 ,   \ sub a0,a0,a5
+\ fa135:
+EF000025 ,   \ jal ra,p2_sbox
+2322A702 ,   \ sw a0,36(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258702 ,   \ lw a0,40(a4)
+B7B5C403 ,   \ lui a1,0x3c4b
+93859567 ,   \ addi a1,a1,1657
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa136
+3305F540 ,   \ sub a0,a0,a5
+\ fa136:
+EF008022 ,   \ jal ra,p2_sbox
+2324A702 ,   \ sw a0,40(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C702 ,   \ lw a0,44(a4)
+B775B51E ,   \ lui a1,0x1eb57
+9385E5DD ,   \ addi a1,a1,-546
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa137
+3305F540 ,   \ sub a0,a0,a5
+\ fa137:
+EF000020 ,   \ jal ra,p2_sbox
+2326A702 ,   \ sw a0,44(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250703 ,   \ lw a0,48(a4)
+B7655E50 ,   \ lui a1,0x505e6
+9385557B ,   \ addi a1,a1,1973
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa138
+3305F540 ,   \ sub a0,a0,a5
+\ fa138:
+EF00801D ,   \ jal ra,p2_sbox
+2328A702 ,   \ sw a0,48(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03254703 ,   \ lw a0,52(a4)
+B725053A ,   \ lui a1,0x3a052
+9385E511 ,   \ addi a1,a1,286
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa139
+3305F540 ,   \ sub a0,a0,a5
+\ fa139:
+EF00001B ,   \ jal ra,p2_sbox
+232AA702 ,   \ sw a0,52(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03258703 ,   \ lw a0,56(a4)
+B7C5D55E ,   \ lui a1,0x5ed5c
+93854510 ,   \ addi a1,a1,260
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa140
+3305F540 ,   \ sub a0,a0,a5
+\ fa140:
+EF008018 ,   \ jal ra,p2_sbox
+232CA702 ,   \ sw a0,56(a4)
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+0325C703 ,   \ lw a0,60(a4)
+B775122A ,   \ lui a1,0x2a127
+9385155F ,   \ addi a1,a1,1521
+3305B500 ,   \ add a0,a0,a1
+6364F500 ,   \ bltu a0,a5,fa141
+3305F540 ,   \ sub a0,a0,a5
+\ fa141:
+EF000016 ,   \ jal ra,p2_sbox
+232EA702 ,   \ sw a0,60(a4)
+EF004018 ,   \ jal ra,p2_ext
+6F00D039 ,   \ jal zero,p2_done
+\ p2_mm:
+13560501 ,   \ srli a2,a0,16   ( a's high half )
+13150501 ,   \ slli a0,a0,16
+13550501 ,   \ srli a0,a0,16   ( a's low half )
+93D60501 ,   \ srli a3,a1,16   ( b's high half )
+93950501 ,   \ slli a1,a1,16
+93D50501 ,   \ srli a1,a1,16   ( b's low half )
+B302B500 ,   \ add t0,a0,a1   ( u+v )
+3303B540 ,   \ sub t1,a0,a1   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338E6240 ,   \ sub t3,t0,t1
+B302D500 ,   \ add t0,a0,a3   ( u+v )
+3303D540 ,   \ sub t1,a0,a3   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38E6240 ,   \ sub t4,t0,t1
+B302B600 ,   \ add t0,a2,a1   ( u+v )
+3303B640 ,   \ sub t1,a2,a1   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+338F6240 ,   \ sub t5,t0,t1
+B302D600 ,   \ add t0,a2,a3   ( u+v )
+3303D640 ,   \ sub t1,a2,a3   ( u-v )
+9353F341 ,   \ srai t2,t1,31
+33437300 ,   \ xor t1,t1,t2
+33037340 ,   \ sub t1,t1,t2   ( |u-v| )
+93922200 ,   \ slli t0,t0,2
+13132300 ,   \ slli t1,t1,2
+B3821201 ,   \ add t0,t0,a7
+33031301 ,   \ add t1,t1,a7
+83A20200 ,   \ lw t0,0(t0)   ( S[u+v] )
+03230300 ,   \ lw t1,0(t1)   ( S[|u-v|] )
+B38F6240 ,   \ sub t6,t0,t1
+B38EEE01 ,   \ add t4,t4,t5   ( the middle (no carry: halves of values below p) )
+93920E01 ,   \ slli t0,t4,16
+33055E00 ,   \ add a0,t3,t0   ( lo )
+3333C501 ,   \ sltu t1,a0,t3
+93D20E01 ,   \ srli t0,t4,16
+B3855F00 ,   \ add a1,t6,t0
+B3856500 ,   \ add a1,a1,t1   ( hi )
+9312F501 ,   \ slli t0,a0,31   ( m = lo * -1/p mod 2^32 = lo(2^31 - 2^27 - 1) )
+1313B501 ,   \ slli t1,a0,27
+B3826240 ,   \ sub t0,t0,t1
+B382A240 ,   \ sub t0,t0,a0   ( m )
+1393F201 ,   \ slli t1,t0,31   ( m p = m 2^31 - m 2^27 + m: its high word )
+9393B201 ,   \ slli t2,t0,27
+333E7300 ,   \ sltu t3,t1,t2
+33037340 ,   \ sub t1,t1,t2
+93DE1200 ,   \ srli t4,t0,1
+13DF5200 ,   \ srli t5,t0,5
+B38EEE41 ,   \ sub t4,t4,t5
+B38ECE41 ,   \ sub t4,t4,t3
+33035300 ,   \ add t1,t1,t0
+B33F5300 ,   \ sltu t6,t1,t0
+B38EFE01 ,   \ add t4,t4,t6   ( (m p) >> 32 )
+B332A000 ,   \ sltu t0,zero,a0   ( the low words' carry: lo + (m p mod 2^32) = 2^32 unless lo is 0 )
+3385D501 ,   \ add a0,a1,t4
+33055500 ,   \ add a0,a0,t0
+37030078 ,   \ lui t1,0x78000
+13031300 ,   \ addi t1,t1,1   ( p )
+63646500 ,   \ bltu a0,t1,mm_rd
+33056540 ,   \ sub a0,a0,t1
+\ mm_rd:
+67800000 ,   \ jalr zero,0(ra)
+\ p2_sbox:
+13880000 ,   \ addi a6,ra,0   ( the link )
+93070500 ,   \ addi a5,a0,0   ( x )
+93050500 ,   \ addi a1,a0,0
+EFF05FEA ,   \ jal ra,p2_mm   ( x^2 )
+93850700 ,   \ addi a1,a5,0
+EFF0DFE9 ,   \ jal ra,p2_mm   ( x^3 )
+93050500 ,   \ addi a1,a0,0
+EFF05FE9 ,   \ jal ra,p2_mm   ( x^6 )
+93850700 ,   \ addi a1,a5,0
+EFF0DFE8 ,   \ jal ra,p2_mm   ( x^7 )
+67000800 ,   \ jalr zero,0(a6)
+\ p2_ext:
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+03250700 ,   \ lw a0,0(a4)
+83254700 ,   \ lw a1,4(a4)
+03268700 ,   \ lw a2,8(a4)
+8326C700 ,   \ lw a3,12(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa142
+B382F240 ,   \ sub t0,t0,a5
+\ fa142:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa143
+3303F340 ,   \ sub t1,t1,a5
+\ fa143:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa144
+B383F340 ,   \ sub t2,t2,a5
+\ fa144:
+338EB300 ,   \ add t3,t2,a1
+6364FE00 ,   \ bltu t3,a5,fa145
+330EFE40 ,   \ sub t3,t3,a5
+\ fa145:
+B38ED300 ,   \ add t4,t2,a3
+63E4FE00 ,   \ bltu t4,a5,fa146
+B38EFE40 ,   \ sub t4,t4,a5
+\ fa146:
+330FA500 ,   \ add t5,a0,a0
+6364FF00 ,   \ bltu t5,a5,fa147
+330FFF40 ,   \ sub t5,t5,a5
+\ fa147:
+338FEE01 ,   \ add t5,t4,t5
+6364FF00 ,   \ bltu t5,a5,fa148
+330FFF40 ,   \ sub t5,t5,a5
+\ fa148:
+2326E701 ,   \ sw t5,12(a4)
+B30FC600 ,   \ add t6,a2,a2
+63E4FF00 ,   \ bltu t6,a5,fa149
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa149:
+B30FFE01 ,   \ add t6,t3,t6
+63E4FF00 ,   \ bltu t6,a5,fa150
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa150:
+2322F701 ,   \ sw t6,4(a4)
+330F5E00 ,   \ add t5,t3,t0
+6364FF00 ,   \ bltu t5,a5,fa151
+330FFF40 ,   \ sub t5,t5,a5
+\ fa151:
+2320E701 ,   \ sw t5,0(a4)
+B38F6E00 ,   \ add t6,t4,t1
+63E4FF00 ,   \ bltu t6,a5,fa152
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa152:
+2324F701 ,   \ sw t6,8(a4)
+03250701 ,   \ lw a0,16(a4)
+83254701 ,   \ lw a1,20(a4)
+03268701 ,   \ lw a2,24(a4)
+8326C701 ,   \ lw a3,28(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa153
+B382F240 ,   \ sub t0,t0,a5
+\ fa153:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa154
+3303F340 ,   \ sub t1,t1,a5
+\ fa154:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa155
+B383F340 ,   \ sub t2,t2,a5
+\ fa155:
+338EB300 ,   \ add t3,t2,a1
+6364FE00 ,   \ bltu t3,a5,fa156
+330EFE40 ,   \ sub t3,t3,a5
+\ fa156:
+B38ED300 ,   \ add t4,t2,a3
+63E4FE00 ,   \ bltu t4,a5,fa157
+B38EFE40 ,   \ sub t4,t4,a5
+\ fa157:
+330FA500 ,   \ add t5,a0,a0
+6364FF00 ,   \ bltu t5,a5,fa158
+330FFF40 ,   \ sub t5,t5,a5
+\ fa158:
+338FEE01 ,   \ add t5,t4,t5
+6364FF00 ,   \ bltu t5,a5,fa159
+330FFF40 ,   \ sub t5,t5,a5
+\ fa159:
+232EE701 ,   \ sw t5,28(a4)
+B30FC600 ,   \ add t6,a2,a2
+63E4FF00 ,   \ bltu t6,a5,fa160
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa160:
+B30FFE01 ,   \ add t6,t3,t6
+63E4FF00 ,   \ bltu t6,a5,fa161
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa161:
+232AF701 ,   \ sw t6,20(a4)
+330F5E00 ,   \ add t5,t3,t0
+6364FF00 ,   \ bltu t5,a5,fa162
+330FFF40 ,   \ sub t5,t5,a5
+\ fa162:
+2328E701 ,   \ sw t5,16(a4)
+B38F6E00 ,   \ add t6,t4,t1
+63E4FF00 ,   \ bltu t6,a5,fa163
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa163:
+232CF701 ,   \ sw t6,24(a4)
+03250702 ,   \ lw a0,32(a4)
+83254702 ,   \ lw a1,36(a4)
+03268702 ,   \ lw a2,40(a4)
+8326C702 ,   \ lw a3,44(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa164
+B382F240 ,   \ sub t0,t0,a5
+\ fa164:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa165
+3303F340 ,   \ sub t1,t1,a5
+\ fa165:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa166
+B383F340 ,   \ sub t2,t2,a5
+\ fa166:
+338EB300 ,   \ add t3,t2,a1
+6364FE00 ,   \ bltu t3,a5,fa167
+330EFE40 ,   \ sub t3,t3,a5
+\ fa167:
+B38ED300 ,   \ add t4,t2,a3
+63E4FE00 ,   \ bltu t4,a5,fa168
+B38EFE40 ,   \ sub t4,t4,a5
+\ fa168:
+330FA500 ,   \ add t5,a0,a0
+6364FF00 ,   \ bltu t5,a5,fa169
+330FFF40 ,   \ sub t5,t5,a5
+\ fa169:
+338FEE01 ,   \ add t5,t4,t5
+6364FF00 ,   \ bltu t5,a5,fa170
+330FFF40 ,   \ sub t5,t5,a5
+\ fa170:
+2326E703 ,   \ sw t5,44(a4)
+B30FC600 ,   \ add t6,a2,a2
+63E4FF00 ,   \ bltu t6,a5,fa171
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa171:
+B30FFE01 ,   \ add t6,t3,t6
+63E4FF00 ,   \ bltu t6,a5,fa172
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa172:
+2322F703 ,   \ sw t6,36(a4)
+330F5E00 ,   \ add t5,t3,t0
+6364FF00 ,   \ bltu t5,a5,fa173
+330FFF40 ,   \ sub t5,t5,a5
+\ fa173:
+2320E703 ,   \ sw t5,32(a4)
+B38F6E00 ,   \ add t6,t4,t1
+63E4FF00 ,   \ bltu t6,a5,fa174
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa174:
+2324F703 ,   \ sw t6,40(a4)
+03250703 ,   \ lw a0,48(a4)
+83254703 ,   \ lw a1,52(a4)
+03268703 ,   \ lw a2,56(a4)
+8326C703 ,   \ lw a3,60(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa175
+B382F240 ,   \ sub t0,t0,a5
+\ fa175:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa176
+3303F340 ,   \ sub t1,t1,a5
+\ fa176:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa177
+B383F340 ,   \ sub t2,t2,a5
+\ fa177:
+338EB300 ,   \ add t3,t2,a1
+6364FE00 ,   \ bltu t3,a5,fa178
+330EFE40 ,   \ sub t3,t3,a5
+\ fa178:
+B38ED300 ,   \ add t4,t2,a3
+63E4FE00 ,   \ bltu t4,a5,fa179
+B38EFE40 ,   \ sub t4,t4,a5
+\ fa179:
+330FA500 ,   \ add t5,a0,a0
+6364FF00 ,   \ bltu t5,a5,fa180
+330FFF40 ,   \ sub t5,t5,a5
+\ fa180:
+338FEE01 ,   \ add t5,t4,t5
+6364FF00 ,   \ bltu t5,a5,fa181
+330FFF40 ,   \ sub t5,t5,a5
+\ fa181:
+232EE703 ,   \ sw t5,60(a4)
+B30FC600 ,   \ add t6,a2,a2
+63E4FF00 ,   \ bltu t6,a5,fa182
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa182:
+B30FFE01 ,   \ add t6,t3,t6
+63E4FF00 ,   \ bltu t6,a5,fa183
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa183:
+232AF703 ,   \ sw t6,52(a4)
+330F5E00 ,   \ add t5,t3,t0
+6364FF00 ,   \ bltu t5,a5,fa184
+330FFF40 ,   \ sub t5,t5,a5
+\ fa184:
+2328E703 ,   \ sw t5,48(a4)
+B38F6E00 ,   \ add t6,t4,t1
+63E4FF00 ,   \ bltu t6,a5,fa185
+B38FFF40 ,   \ sub t6,t6,a5
+\ fa185:
+232CF703 ,   \ sw t6,56(a4)
+03250700 ,   \ lw a0,0(a4)
+83250701 ,   \ lw a1,16(a4)
+03260702 ,   \ lw a2,32(a4)
+83260703 ,   \ lw a3,48(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa186
+B382F240 ,   \ sub t0,t0,a5
+\ fa186:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa187
+3303F340 ,   \ sub t1,t1,a5
+\ fa187:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa188
+B383F340 ,   \ sub t2,t2,a5
+\ fa188:
+33057500 ,   \ add a0,a0,t2
+6364F500 ,   \ bltu a0,a5,fa189
+3305F540 ,   \ sub a0,a0,a5
+\ fa189:
+2320A700 ,   \ sw a0,0(a4)
+B3857500 ,   \ add a1,a1,t2
+63E4F500 ,   \ bltu a1,a5,fa190
+B385F540 ,   \ sub a1,a1,a5
+\ fa190:
+2328B700 ,   \ sw a1,16(a4)
+33067600 ,   \ add a2,a2,t2
+6364F600 ,   \ bltu a2,a5,fa191
+3306F640 ,   \ sub a2,a2,a5
+\ fa191:
+2320C702 ,   \ sw a2,32(a4)
+B3867600 ,   \ add a3,a3,t2
+63E4F600 ,   \ bltu a3,a5,fa192
+B386F640 ,   \ sub a3,a3,a5
+\ fa192:
+2328D702 ,   \ sw a3,48(a4)
+03254700 ,   \ lw a0,4(a4)
+83254701 ,   \ lw a1,20(a4)
+03264702 ,   \ lw a2,36(a4)
+83264703 ,   \ lw a3,52(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa193
+B382F240 ,   \ sub t0,t0,a5
+\ fa193:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa194
+3303F340 ,   \ sub t1,t1,a5
+\ fa194:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa195
+B383F340 ,   \ sub t2,t2,a5
+\ fa195:
+33057500 ,   \ add a0,a0,t2
+6364F500 ,   \ bltu a0,a5,fa196
+3305F540 ,   \ sub a0,a0,a5
+\ fa196:
+2322A700 ,   \ sw a0,4(a4)
+B3857500 ,   \ add a1,a1,t2
+63E4F500 ,   \ bltu a1,a5,fa197
+B385F540 ,   \ sub a1,a1,a5
+\ fa197:
+232AB700 ,   \ sw a1,20(a4)
+33067600 ,   \ add a2,a2,t2
+6364F600 ,   \ bltu a2,a5,fa198
+3306F640 ,   \ sub a2,a2,a5
+\ fa198:
+2322C702 ,   \ sw a2,36(a4)
+B3867600 ,   \ add a3,a3,t2
+63E4F600 ,   \ bltu a3,a5,fa199
+B386F640 ,   \ sub a3,a3,a5
+\ fa199:
+232AD702 ,   \ sw a3,52(a4)
+03258700 ,   \ lw a0,8(a4)
+83258701 ,   \ lw a1,24(a4)
+03268702 ,   \ lw a2,40(a4)
+83268703 ,   \ lw a3,56(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa200
+B382F240 ,   \ sub t0,t0,a5
+\ fa200:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa201
+3303F340 ,   \ sub t1,t1,a5
+\ fa201:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa202
+B383F340 ,   \ sub t2,t2,a5
+\ fa202:
+33057500 ,   \ add a0,a0,t2
+6364F500 ,   \ bltu a0,a5,fa203
+3305F540 ,   \ sub a0,a0,a5
+\ fa203:
+2324A700 ,   \ sw a0,8(a4)
+B3857500 ,   \ add a1,a1,t2
+63E4F500 ,   \ bltu a1,a5,fa204
+B385F540 ,   \ sub a1,a1,a5
+\ fa204:
+232CB700 ,   \ sw a1,24(a4)
+33067600 ,   \ add a2,a2,t2
+6364F600 ,   \ bltu a2,a5,fa205
+3306F640 ,   \ sub a2,a2,a5
+\ fa205:
+2324C702 ,   \ sw a2,40(a4)
+B3867600 ,   \ add a3,a3,t2
+63E4F600 ,   \ bltu a3,a5,fa206
+B386F640 ,   \ sub a3,a3,a5
+\ fa206:
+232CD702 ,   \ sw a3,56(a4)
+0325C700 ,   \ lw a0,12(a4)
+8325C701 ,   \ lw a1,28(a4)
+0326C702 ,   \ lw a2,44(a4)
+8326C703 ,   \ lw a3,60(a4)
+B302B500 ,   \ add t0,a0,a1
+63E4F200 ,   \ bltu t0,a5,fa207
+B382F240 ,   \ sub t0,t0,a5
+\ fa207:
+3303D600 ,   \ add t1,a2,a3
+6364F300 ,   \ bltu t1,a5,fa208
+3303F340 ,   \ sub t1,t1,a5
+\ fa208:
+B3836200 ,   \ add t2,t0,t1
+63E4F300 ,   \ bltu t2,a5,fa209
+B383F340 ,   \ sub t2,t2,a5
+\ fa209:
+33057500 ,   \ add a0,a0,t2
+6364F500 ,   \ bltu a0,a5,fa210
+3305F540 ,   \ sub a0,a0,a5
+\ fa210:
+2326A700 ,   \ sw a0,12(a4)
+B3857500 ,   \ add a1,a1,t2
+63E4F500 ,   \ bltu a1,a5,fa211
+B385F540 ,   \ sub a1,a1,a5
+\ fa211:
+232EB700 ,   \ sw a1,28(a4)
+33067600 ,   \ add a2,a2,t2
+6364F600 ,   \ bltu a2,a5,fa212
+3306F640 ,   \ sub a2,a2,a5
+\ fa212:
+2326C702 ,   \ sw a2,44(a4)
+B3867600 ,   \ add a3,a3,t2
+63E4F600 ,   \ bltu a3,a5,fa213
+B386F640 ,   \ sub a3,a3,a5
+\ fa213:
+232ED702 ,   \ sw a3,60(a4)
+67800000 ,   \ jalr zero,0(ra)
+\ p2_int:
+B7070078 ,   \ lui a5,0x78000
+93871700 ,   \ addi a5,a5,1
+83260700 ,   \ lw a3,0(a4)
+03254700 ,   \ lw a0,4(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa214
+B386F640 ,   \ sub a3,a3,a5
+\ fa214:
+03258700 ,   \ lw a0,8(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa215
+B386F640 ,   \ sub a3,a3,a5
+\ fa215:
+0325C700 ,   \ lw a0,12(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa216
+B386F640 ,   \ sub a3,a3,a5
+\ fa216:
+03250701 ,   \ lw a0,16(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa217
+B386F640 ,   \ sub a3,a3,a5
+\ fa217:
+03254701 ,   \ lw a0,20(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa218
+B386F640 ,   \ sub a3,a3,a5
+\ fa218:
+03258701 ,   \ lw a0,24(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa219
+B386F640 ,   \ sub a3,a3,a5
+\ fa219:
+0325C701 ,   \ lw a0,28(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa220
+B386F640 ,   \ sub a3,a3,a5
+\ fa220:
+03250702 ,   \ lw a0,32(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa221
+B386F640 ,   \ sub a3,a3,a5
+\ fa221:
+03254702 ,   \ lw a0,36(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa222
+B386F640 ,   \ sub a3,a3,a5
+\ fa222:
+03258702 ,   \ lw a0,40(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa223
+B386F640 ,   \ sub a3,a3,a5
+\ fa223:
+0325C702 ,   \ lw a0,44(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa224
+B386F640 ,   \ sub a3,a3,a5
+\ fa224:
+03250703 ,   \ lw a0,48(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa225
+B386F640 ,   \ sub a3,a3,a5
+\ fa225:
+03254703 ,   \ lw a0,52(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa226
+B386F640 ,   \ sub a3,a3,a5
+\ fa226:
+03258703 ,   \ lw a0,56(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa227
+B386F640 ,   \ sub a3,a3,a5
+\ fa227:
+0325C703 ,   \ lw a0,60(a4)
+B386A600 ,   \ add a3,a3,a0
+63E4F600 ,   \ bltu a3,a5,fa228
+B386F640 ,   \ sub a3,a3,a5
+\ fa228:
+03250700 ,   \ lw a0,0(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa229
+3303F340 ,   \ sub t1,t1,a5
+\ fa229:
+93030300 ,   \ addi t2,t1,0
+13850300 ,   \ addi a0,t2,0
+63040500 ,   \ beq a0,zero,ng230
+3385A740 ,   \ sub a0,a5,a0
+\ ng230:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa231
+3305F540 ,   \ sub a0,a0,a5
+\ fa231:
+2320A700 ,   \ sw a0,0(a4)
+03254700 ,   \ lw a0,4(a4)
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa232
+3305F540 ,   \ sub a0,a0,a5
+\ fa232:
+2322A700 ,   \ sw a0,4(a4)
+03258700 ,   \ lw a0,8(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa233
+3303F340 ,   \ sub t1,t1,a5
+\ fa233:
+93030300 ,   \ addi t2,t1,0
+13850300 ,   \ addi a0,t2,0
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa234
+3305F540 ,   \ sub a0,a0,a5
+\ fa234:
+2324A700 ,   \ sw a0,8(a4)
+0325C700 ,   \ lw a0,12(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h235
+3305F500 ,   \ add a0,a0,a5
+\ h235:
+13551500 ,   \ srli a0,a0,1
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa236
+3305F540 ,   \ sub a0,a0,a5
+\ fa236:
+2326A700 ,   \ sw a0,12(a4)
+03250701 ,   \ lw a0,16(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+93030300 ,   \ addi t2,t1,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa237
+3303F340 ,   \ sub t1,t1,a5
+\ fa237:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa238
+B383F340 ,   \ sub t2,t2,a5
+\ fa238:
+13850300 ,   \ addi a0,t2,0
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa239
+3305F540 ,   \ sub a0,a0,a5
+\ fa239:
+2328A700 ,   \ sw a0,16(a4)
+03254701 ,   \ lw a0,20(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa240
+3303F340 ,   \ sub t1,t1,a5
+\ fa240:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa241
+3303F340 ,   \ sub t1,t1,a5
+\ fa241:
+93030300 ,   \ addi t2,t1,0
+13850300 ,   \ addi a0,t2,0
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa242
+3305F540 ,   \ sub a0,a0,a5
+\ fa242:
+232AA700 ,   \ sw a0,20(a4)
+03258701 ,   \ lw a0,24(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h243
+3305F500 ,   \ add a0,a0,a5
+\ h243:
+13551500 ,   \ srli a0,a0,1
+63040500 ,   \ beq a0,zero,ng244
+3385A740 ,   \ sub a0,a5,a0
+\ ng244:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa245
+3305F540 ,   \ sub a0,a0,a5
+\ fa245:
+232CA700 ,   \ sw a0,24(a4)
+0325C701 ,   \ lw a0,28(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+93030300 ,   \ addi t2,t1,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa246
+3303F340 ,   \ sub t1,t1,a5
+\ fa246:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa247
+B383F340 ,   \ sub t2,t2,a5
+\ fa247:
+13850300 ,   \ addi a0,t2,0
+63040500 ,   \ beq a0,zero,ng248
+3385A740 ,   \ sub a0,a5,a0
+\ ng248:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa249
+3305F540 ,   \ sub a0,a0,a5
+\ fa249:
+232EA700 ,   \ sw a0,28(a4)
+03250702 ,   \ lw a0,32(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa250
+3303F340 ,   \ sub t1,t1,a5
+\ fa250:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa251
+3303F340 ,   \ sub t1,t1,a5
+\ fa251:
+93030300 ,   \ addi t2,t1,0
+13850300 ,   \ addi a0,t2,0
+63040500 ,   \ beq a0,zero,ng252
+3385A740 ,   \ sub a0,a5,a0
+\ ng252:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa253
+3305F540 ,   \ sub a0,a0,a5
+\ fa253:
+2320A702 ,   \ sw a0,32(a4)
+03254702 ,   \ lw a0,36(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h254
+3305F500 ,   \ add a0,a0,a5
+\ h254:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h255
+3305F500 ,   \ add a0,a0,a5
+\ h255:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h256
+3305F500 ,   \ add a0,a0,a5
+\ h256:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h257
+3305F500 ,   \ add a0,a0,a5
+\ h257:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h258
+3305F500 ,   \ add a0,a0,a5
+\ h258:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h259
+3305F500 ,   \ add a0,a0,a5
+\ h259:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h260
+3305F500 ,   \ add a0,a0,a5
+\ h260:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h261
+3305F500 ,   \ add a0,a0,a5
+\ h261:
+13551500 ,   \ srli a0,a0,1
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa262
+3305F540 ,   \ sub a0,a0,a5
+\ fa262:
+2322A702 ,   \ sw a0,36(a4)
+03258702 ,   \ lw a0,40(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h263
+3305F500 ,   \ add a0,a0,a5
+\ h263:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h264
+3305F500 ,   \ add a0,a0,a5
+\ h264:
+13551500 ,   \ srli a0,a0,1
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa265
+3305F540 ,   \ sub a0,a0,a5
+\ fa265:
+2324A702 ,   \ sw a0,40(a4)
+0325C702 ,   \ lw a0,44(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h266
+3305F500 ,   \ add a0,a0,a5
+\ h266:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h267
+3305F500 ,   \ add a0,a0,a5
+\ h267:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h268
+3305F500 ,   \ add a0,a0,a5
+\ h268:
+13551500 ,   \ srli a0,a0,1
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa269
+3305F540 ,   \ sub a0,a0,a5
+\ fa269:
+2326A702 ,   \ sw a0,44(a4)
+03250703 ,   \ lw a0,48(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+93030300 ,   \ addi t2,t1,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa270
+3303F340 ,   \ sub t1,t1,a5
+\ fa270:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa271
+B383F340 ,   \ sub t2,t2,a5
+\ fa271:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa272
+3303F340 ,   \ sub t1,t1,a5
+\ fa272:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa273
+B383F340 ,   \ sub t2,t2,a5
+\ fa273:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa274
+3303F340 ,   \ sub t1,t1,a5
+\ fa274:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa275
+B383F340 ,   \ sub t2,t2,a5
+\ fa275:
+13850300 ,   \ addi a0,t2,0
+63040500 ,   \ beq a0,zero,ng276
+3385A740 ,   \ sub a0,a5,a0
+\ ng276:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa277
+3305F540 ,   \ sub a0,a0,a5
+\ fa277:
+2328A702 ,   \ sw a0,48(a4)
+03254703 ,   \ lw a0,52(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h278
+3305F500 ,   \ add a0,a0,a5
+\ h278:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h279
+3305F500 ,   \ add a0,a0,a5
+\ h279:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h280
+3305F500 ,   \ add a0,a0,a5
+\ h280:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h281
+3305F500 ,   \ add a0,a0,a5
+\ h281:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h282
+3305F500 ,   \ add a0,a0,a5
+\ h282:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h283
+3305F500 ,   \ add a0,a0,a5
+\ h283:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h284
+3305F500 ,   \ add a0,a0,a5
+\ h284:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h285
+3305F500 ,   \ add a0,a0,a5
+\ h285:
+13551500 ,   \ srli a0,a0,1
+63040500 ,   \ beq a0,zero,ng286
+3385A740 ,   \ sub a0,a5,a0
+\ ng286:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa287
+3305F540 ,   \ sub a0,a0,a5
+\ fa287:
+232AA702 ,   \ sw a0,52(a4)
+03258703 ,   \ lw a0,56(a4)
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h288
+3305F500 ,   \ add a0,a0,a5
+\ h288:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h289
+3305F500 ,   \ add a0,a0,a5
+\ h289:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h290
+3305F500 ,   \ add a0,a0,a5
+\ h290:
+13551500 ,   \ srli a0,a0,1
+93721500 ,   \ andi t0,a0,1
+63840200 ,   \ beq t0,zero,h291
+3305F500 ,   \ add a0,a0,a5
+\ h291:
+13551500 ,   \ srli a0,a0,1
+63040500 ,   \ beq a0,zero,ng292
+3385A740 ,   \ sub a0,a5,a0
+\ ng292:
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa293
+3305F540 ,   \ sub a0,a0,a5
+\ fa293:
+232CA702 ,   \ sw a0,56(a4)
+0325C703 ,   \ lw a0,60(a4)
+13030500 ,   \ addi t1,a0,0
+93030000 ,   \ li t2,0
+93030300 ,   \ addi t2,t1,0
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa294
+3303F340 ,   \ sub t1,t1,a5
+\ fa294:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa295
+B383F340 ,   \ sub t2,t2,a5
+\ fa295:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa296
+3303F340 ,   \ sub t1,t1,a5
+\ fa296:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa297
+B383F340 ,   \ sub t2,t2,a5
+\ fa297:
+33036300 ,   \ add t1,t1,t1
+6364F300 ,   \ bltu t1,a5,fa298
+3303F340 ,   \ sub t1,t1,a5
+\ fa298:
+B3836300 ,   \ add t2,t2,t1
+63E4F300 ,   \ bltu t2,a5,fa299
+B383F340 ,   \ sub t2,t2,a5
+\ fa299:
+13850300 ,   \ addi a0,t2,0
+3305D500 ,   \ add a0,a0,a3
+6364F500 ,   \ bltu a0,a5,fa300
+3305F540 ,   \ sub a0,a0,a5
+\ fa300:
+232EA702 ,   \ sw a0,60(a4)
+67800000 ,   \ jalr zero,0(ra)
+\ p2_done:
+;
+
+\ compress ( a b c -- )  c (8 words) = perm(a || b)'s first 8; c may be a or b.
+: compress
+rot p2s @ 8 lit wcopy  swap p2s @ 20 lit + 8 lit wcopy
+p2s @ perm16  p2s @ swap 8 lit wcopy ;
+
+\ hash ( x n c -- )  c (8 words) = the sponge of the n words at x.
+: hash
+p2s @ 10 lit wzero
+over tom p2s @ 8 lit w!
+over 0= if p2s @ perm16 then
+-rot
+begin dup while
+	dup 8 lit u< if dup else 8 lit then
+	dup 0 lit do 2 lit pick i w@ p2s @ i w@ f+ p2s @ i w! loop
+	p2s @ perm16
+	tuck - -rot 2 lit lshift + swap
+repeat
+2drop p2s @ swap 8 lit wcopy ;
+
+: mi variable ;  : mp variable ;  : mh variable ;  : mc variable ;
+
+\ mroot ( row n index path h c -- )  c (8 words) = the root above the leaf
+\ row of n words at index, from its path: h siblings of 8 words, the leaf's
+\ first.
+: mroot
+mc ! mh ! mp ! mi !
+mc @ hash
+mh @ begin dup while
+	mi @ 1 lit and if mp @ mc @ mc @ compress else mc @ mp @ mc @ compress then
+	mp @ 20 lit + mp !  mi @ 1 lit rshift mi !
+	1 lit -
+repeat
+drop ;
+
+\ mverify ( root row n index path h -- flag )  the row is leaf index of the
+\ tree of h levels (at most 31) whose root is root.
+: mverify
+dup 1F lit u>  over 1 lit swap lshift 4 lit pick u> 0= or if
+	2drop 2drop 2drop 0 lit
+else
+	mvt @ mroot  mvt @ 8 lit wcmp 0=
+then ;
