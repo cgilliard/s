@@ -113,7 +113,7 @@ asked of up to 16 peers at once and checked in order, so one slow peer
 delays only its own share. Proofs of work are checked against the 64 MB
 dataset, which every node builds once (about 30 s on 12 cores) and keeps
 in its data directory: 19 microseconds a header, against 30 ms from the
-seed text, which is used, across all cores, until it is ready. Only then
+seed file, which is used, across all cores, until it is ready. Only then
 does it fetch blocks, from several peers at once (up to 24 blocks, 8 from any one peer,
 and no more than 32 past the first one missing), applying them in order.
 Each peer's status says the lowest height from which it holds every block,

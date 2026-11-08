@@ -28,6 +28,13 @@ transactions it does.
   accepting it (decided 2026-11-08). It does not defer a block's work
   to its child's proof, which would leave the tip unchecked: at every
   moment it accepts exactly what tabminer accepts.
+- **The seed file, whole and as shipped.** The proof of work reads the
+  King James text as the 1,291,059-byte gzip file embedded in the
+  binaries, never decompressed, and each of hashimoto's accesses reads a
+  window of it directly besides its two items (decided 2026-11-08). So
+  validating a block requires the entire file: neither the 64 MB dataset
+  nor any hash of the file substitutes, and every validating node, this
+  one and tabminer, stores it. The node needs no inflate.
 - **No M extension.** RV32I as everywhere else: products in software,
   and the verification loop optimised until it is fast enough.
   Verification without M has been done before.
@@ -133,17 +140,17 @@ measured in the first step, and the plan adjusted to what is found.
   checked in full only for the fast-sync block and the headers after it
   (about 145, once) and then for each new block (one every 600 s); every
   header before the sync block is attested by its chain proof.
-  The node takes the light path: each item it needs is computed from
-  the seed text instead of a 64 MB dataset:
+  The node computes each item it needs from the seed file instead of
+  holding the 64 MB dataset:
   - 64 accesses × 2 items × (254 parents + 1) ≈ 32,643 permutations
-    a header, so several seconds each by the estimate above;
-  - it needs the seed (the King James text, 1.29 MB gzipped,
-    4.34 MB inflated) with random access: inflated once at start,
-    held in memory;
+    a header, so several seconds each by the estimate above, and 64
+    windows read directly;
+  - it needs the seed file (1.29 MB, the text gzipped, used as it is)
+    with random access, held in memory: nothing to inflate;
   - `quick_pow_check` (2 permutations) runs first, to throw out junk
     cheaply, and is all that headers below the sync block get;
   - genesis's true `mix`, which block 1's statement carries (its
-    header's is empty), computed once from the text.
+    header's is empty), computed once from the file.
 - **Wide integers.** U256 for targets and work; 64-bit amounts and
   supply; u64 `%` for seed offsets; a u128 logarithm for the grinding
   check. They are small routines over words.
@@ -214,8 +221,8 @@ half-applied one.
     becomes a record of the pages the transaction touches, sized to the
     transaction (which `DLMAX` already bounds).
   `node.sh`'s default disk stays 256 MiB until then.
-- **Memory:** the node's own region and its `malloc`, the seed text
-  (4.34 MB), a proof being verified (205 KB and its working state),
+- **Memory:** the node's own region and its `malloc`, the seed file
+  (1.29 MB), a proof being verified (205 KB and its working state),
   the pool (bounded far below tabminer's 64 MiB), and buffers for
   peers. The store's page cache is shared with everything else, as
   OS.md's memory section says. The target is the whole system in
@@ -394,7 +401,47 @@ instead of 4,340,894.
   between 81–89 s and 3–4.5 s to prove (Measured, below).
 - **254 parents instead of 256:** a header's work is 32,643 permutations
   instead of 32,899, which fits a 2^15-row table instead of 2^16: 3.2 s
-  instead of 4.5 s to prove. The light path's cost falls by the same 1%.
+  instead of 4.5 s to prove. Computing items from the text costs 1% less
+  with it.
+
+Revised (2026-11-08): **the gzip file, read directly.** The windows are
+now those of the seed file as shipped, `resources/akjv.txt.gz`
+(1,291,059 bytes, never decompressed): 53,795 windows, the last 3 bytes
+short of a whole one, so it overlaps the one before. And each of
+hashimoto's 64 accesses reads one window directly besides its two items:
+a second selector, `fnv(i + seed[1], mix[(i + 16) % 32])`, gives the
+window (its low 16 bits, less 53,795 once if they are that or more:
+`pow::direct_window`), whose eight packed elements are added to the mix
+words as the items fold in.
+
+- **Why:** validating a block must require the entire text, which the
+  chain exists to preserve. The dataset is a hash of the windows, so
+  before, a node holding it verified without the text. Now every check of
+  a header's work reads 64 windows of the file directly, and computing
+  its items from the file reads about 32,500: a node missing any window
+  soon meets a block it cannot validate (`validation_needs_the_entire_file`).
+  And the file as shipped is 1.29 MB in memory where the inflated text
+  was 4.34 MB, against a node budget of 128 MiB, with no inflate to write
+  in fam.
+- **What it costs:** mining stays memory-bound: one more read, of a
+  window in a 1.29 MB file, an access, and no permutation. Computing a
+  header's items from the file is unchanged. The work segment's mix table
+  proves the second selector canonical in bits, the subtraction and
+  `w < N` in two 10-bit limbs each, and looks the window up in the text
+  table: 189 columns instead of 142. The text table is 2^16 rows instead
+  of 2^18. Proving is about the same (3.4–3.6 s; the perm table
+  dominates), the table's commitment 0.07 s instead of 0.3 s, the proof
+  450 KB (Measured, below).
+- **Different:** every item and every mix, so the dev dataset and the
+  plan and chain constants were regenerated; genesis's work too (its id
+  is unchanged). The file is pinned by its bytes: recompressing the text
+  gives other bytes. `seed_file_is_the_king_james_text` inflates it, in
+  the tests only, and checks it is the text.
+- **The module's claim, restated** (`miner/src/pow.rs`): validating a
+  block requires the entire seed file, and every validating node stores
+  it. The smallest table reproducing the items is still the windows
+  themselves as field elements: 53,795 × 32 bytes, 1.7 MB, more than the
+  file.
 
 ### 2. The parent's work
 
@@ -420,7 +467,7 @@ one header). The work before it comes with the chain proof.
 - **A work segment:** one more child in the block's tree, at the segment
   configuration. Its public values are the parent header's
   `pow_hash` (8 elements), its nonce (11 elements) and its `mix`
-  (8 elements). It proves `hashimoto(pow_hash, nonce)` on the light path
+  (8 elements). It proves `hashimoto(pow_hash, nonce)`, items computed from the seed file,
   gives that `mix`. `miner/src/pow_air.rs` is its prototype: the hash
   machine with the seed and the 128 items, the window indices proven in
   10-bit limbs, the windows looked up in a preprocessed table of the
@@ -468,6 +515,7 @@ development laptop (12 threads).
 |---|---|---|---|---|---|---|
 | aligned | 256 | 2^18 | 2^16 | 4.5 s | 462 KB | 19 ms |
 | aligned | 254 | 2^18 | 2^15 | 3.2 s | 469 KB | 20 ms |
+| gzip file, direct reads (now) | 254 | 2^16 | 2^15 | 3.4–3.6 s | 450 KB | 19–20 ms |
 | any byte (before) | 256 | 2^23 | 2^16 | 88.7 s | 572 KB | 29 ms |
 | any byte (before) | 254 | 2^23 | 2^15 | 81.2 s | 561 KB | 48 ms |
 
@@ -578,8 +626,8 @@ Each step done when its test passes.
    work only after `S`. Done when a node fast-syncs a dev-recursive
    chain checking no full proof of work before `S`. Done (2026-11-08),
    in tabminer's node:
-   - During a fast sync, headers are stored after the quick check alone
-     (`Chain::accept_headers_with`, status "light"): link, height,
+   - During a fast sync, headers are stored with their work pending
+     (`Chain::accept_headers_with`): checked so far for link, height,
      timestamps, target, and the claimed `mix` meeting it.
    - Once `S` is picked, `Chain::confirm_work` checks the full proof of
      work of `S` and every header after it on the best branch, in
@@ -590,10 +638,10 @@ Each step done when its test passes.
    - `S`'s own work is checked before its proof is verified and its
      snapshot installed (`verify_snapshot_block`, `finish_snapshot`):
      its proof attests its parent's work, not its own.
-   - A block whose header was stored light has its full work checked when
+   - A block whose header's work is pending has its full work checked when
      it is applied, so a sync that falls back to replaying blocks checks
      every one.
-   - Tests: `light_headers_have_their_work_checked_from_the_sync_point`
+   - Tests: `pending_work_is_checked_from_the_sync_point`
      (a forged header that passes the quick check is refused at
      `confirm_work` with what follows it, and on applying its block);
      `a_fresh_node_fast_syncs` checks the full work of blocks 8 to 12
@@ -636,7 +684,8 @@ Each step done when its test passes.
 3. **The chain proof's verifier**: the challenger, FRI, the STARK
    check, and the two tables' constraints. Done when it accepts a real
    proof from tabminer and rejects it with any byte changed.
-4. **Proof-of-work and headers**: inflate, the light path, ASERT,
+4. **Proof-of-work and headers**: items and the direct reads from the
+   seed file, ASERT,
    median time, fork choice by work. Done when a header chain from a
    dev network is accepted as tabminer accepts it.
 5. **The state**: the state tree and the names trie in the store, a

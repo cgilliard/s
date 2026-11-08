@@ -1,30 +1,36 @@
 //! Memory-hard proof of work in the style of Ethash, seeded by a text that
 //! the chain exists to preserve.
 //!
-//! The American King James Bible in `resources/akjv.txt.gz` is embedded in
-//! the binary and decompressed at startup ([`SeedText`], 4.3 MB). Every
-//! dataset item is derived directly from it: starting from a state seeded
-//! with the item index, each of [`PowParams::parents`] sequential steps uses
-//! the current state to pick one of the text's [`WINDOW`]-byte windows,
-//! absorbs it and applies the Poseidon2 permutation. The windows lie on
-//! 24-byte boundaries, the last one ending at the text's end (it overlaps
-//! the one before), so every byte is in one: 180,872 of them. Aligned
-//! windows keep small the table a proof of the work looks them up in (a
-//! row a window: `docs/NODE.md`, the work in the chain proof). The smallest
-//! table that reproduces the derivation is the windows themselves as field
-//! elements, 5.8 MB, more than the text. A single verification touches
-//! tens of thousands of windows, so a node missing any part of the text
-//! fails almost every block. Holding the complete text is therefore a
-//! precondition for verifying the chain.
+//! The seed is the American King James Bible as the gzip file
+//! `resources/akjv.txt.gz` ([`SEED_TEXT_LEN`] bytes), embedded in the
+//! binary and used as it is: nothing is decompressed. Its bytes are read in
+//! [`WINDOW`]-byte windows on 24-byte boundaries, the last ending at the
+//! file's end (it overlaps the one before), so every byte is in one: 53,795
+//! of them. Aligned windows keep small the table a proof of the work looks
+//! them up in (a row a window: `docs/NODE.md`, the work in the chain proof).
 //!
-//! Miners expand the text once into a 64 MB [`Dataset`] of 64-byte items.
-//! The proof ([`hashimoto`]) seeds a 32-element mix from the header hash and
-//! nonce, performs [`PowParams::accesses`] random reads of two adjacent items,
-//! folds the mix to 8 elements and hashes it with the seed. Verifiers
-//! recompute only the items a proof touches from the text (the light path).
-//! A hash costs two permutations with the dataset and about
+//! Every dataset item is derived from the windows: starting from a state
+//! seeded with the item index, each of [`PowParams::parents`] sequential
+//! steps uses the state to pick a window, absorbs it and applies the
+//! Poseidon2 permutation. Miners expand the file once into a 64 MB
+//! [`Dataset`] of 64-byte items. The proof ([`hashimoto`]) seeds a
+//! 32-element mix from the header hash and nonce and makes
+//! [`PowParams::accesses`] reads, each folding in two adjacent items and one
+//! window of the file itself, picked by a second selector; it then folds the
+//! mix to 8 elements and hashes it with the seed.
+//!
+//! **Validating a block requires the entire seed file.** Checking a
+//! header's work reads windows spread over the whole file: computing its 128
+//! items from the file reads about 32,500 of them, and the direct reads take
+//! 64 more however the items are had. So neither the dataset nor any hash of
+//! the file substitutes for it, and a node missing any window soon meets a
+//! block it cannot validate. Every validating node stores it.
+//!
+//! Verifiers compute only the items a proof touches, from the file. A hash
+//! costs a few permutations with the dataset and about
 //! `2 * accesses * parents` without it, a gap no cheaper arithmetic closes,
-//! so keeping the table is the economical choice even for custom silicon.
+//! so keeping the table is the economical choice for miners, even with
+//! custom silicon.
 //!
 //! All arithmetic is in BabyBear: the Ethash FNV step used in the mixing
 //! loop becomes `a * FNV_PRIME + b` in the field, and the hashes are the
@@ -39,7 +45,8 @@ pub type Item = [Fp; WIDTH];
 /// Proof-of-work nonce: 32 arbitrary bytes.
 pub type Nonce = [u8; 32];
 
-/// Compressed seed text, embedded at build time.
+/// The seed file: the text gzipped, embedded at build time and used as it
+/// is.
 pub const SEED_TEXT_GZ: &[u8] = include_bytes!("../../resources/akjv.txt.gz");
 
 /// The dev dataset ([`PowParams::DEV`]), generated once from the seed text
@@ -49,8 +56,8 @@ pub const SEED_TEXT_GZ: &[u8] = include_bytes!("../../resources/akjv.txt.gz");
 #[cfg(feature = "dev")]
 pub const DEV_DATASET: &[u8] = include_bytes!("../../resources/dev_dataset.bin");
 
-/// Size of the decompressed seed text, checked when loading.
-pub const SEED_TEXT_LEN: usize = 4_340_917;
+/// Size of the seed file, checked when loading.
+pub const SEED_TEXT_LEN: usize = 1_291_059;
 
 /// Bytes of text absorbed per derivation step: one sponge block.
 pub const WINDOW: usize = 3 * RATE;
@@ -94,11 +101,20 @@ fn fnv(a: Fp, b: Fp) -> Fp {
     a.mul(&FNV_PRIME).add(&b)
 }
 
-/// Decompresses the embedded seed text.
+/// The seed file's bytes, as they are.
 pub fn seed_text() -> Vec<u8> {
-    let out = crate::inflate::gunzip(SEED_TEXT_GZ).expect("embedded seed text is valid gzip");
-    assert_eq!(out.len(), SEED_TEXT_LEN, "embedded seed text has unexpected length");
-    out
+    assert_eq!(SEED_TEXT_GZ.len(), SEED_TEXT_LEN, "embedded seed file has unexpected length");
+    SEED_TEXT_GZ.to_vec()
+}
+
+/// The window a direct read takes for a canonical selector value `v`, with
+/// `n` windows: the low `L` bits of `v`, where `2^L` is the least power of
+/// two at least `n`, less `n` once if that is `n` or more. Every window can
+/// be taken; those below `2^L - n` twice as often.
+pub fn direct_window(v: u32, n: usize) -> usize {
+    let bits = (n as u32).next_power_of_two() - 1;
+    let low = (v & bits) as usize;
+    if low >= n { low - n } else { low }
 }
 
 /// Packs bytes three per element, little-endian, zero padding the last.
@@ -136,14 +152,17 @@ pub fn nonce_from_u64(n: u64) -> Nonce {
     out
 }
 
-/// Anything that can supply dataset items: the full [`Dataset`] or the
-/// [`SeedText`] computing them on demand.
+/// Anything that can supply dataset items, and the seed file's windows: the
+/// full [`Dataset`] beside the file, or the [`SeedText`] computing items on
+/// demand.
 pub trait ItemSource {
     fn params(&self) -> &PowParams;
     fn item(&self, index: usize) -> Item;
+    /// The seed file, which [`hashimoto`] reads directly.
+    fn seed(&self) -> &SeedText;
 }
 
-/// The seed text, from which every dataset item is derived.
+/// The seed file, from which every dataset item is derived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedText {
     params: PowParams,
@@ -151,7 +170,7 @@ pub struct SeedText {
 }
 
 impl SeedText {
-    /// Loads the embedded text.
+    /// The embedded seed file.
     pub fn new(params: PowParams) -> SeedText {
         Self::from_bytes(params, seed_text())
     }
@@ -177,6 +196,12 @@ impl SeedText {
     /// length before the text's end.
     pub fn window_offset(&self, w: usize) -> usize {
         (w * WINDOW).min(self.text.len() - WINDOW)
+    }
+
+    /// Window `w`, packed into one sponge block.
+    pub fn window(&self, w: usize) -> [Fp; RATE] {
+        let at = self.window_offset(w);
+        pack_window(&self.text[at..at + WINDOW])
     }
 
     /// Computes dataset item `index`: `parents` sequential permutations, each
@@ -209,13 +234,19 @@ impl ItemSource for SeedText {
     fn item(&self, index: usize) -> Item {
         self.calc_dataset_item(index)
     }
+
+    fn seed(&self) -> &SeedText {
+        self
+    }
 }
 
-/// The full dataset, held in memory by miners.
+/// The full dataset, held in memory by miners, with the seed file it was
+/// made from (hashimoto reads both).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dataset {
     params: PowParams,
     items: Vec<Item>,
+    seed: SeedText,
 }
 
 impl Dataset {
@@ -235,7 +266,7 @@ impl Dataset {
                 });
             }
         });
-        Dataset { params, items }
+        Dataset { params, items, seed: seed.clone() }
     }
 
     /// Loads a saved dataset, or generates and saves it. A loaded file is
@@ -243,15 +274,14 @@ impl Dataset {
     /// item would make honest blocks look invalid) and a few items spread
     /// through it match the text.
     pub fn load_or_generate(seed: &SeedText, path: &std::path::Path) -> std::io::Result<Dataset> {
-        let params = *seed.params();
-        if let Some(d) = Self::built_in(params) {
+        if let Some(d) = Self::built_in(seed) {
             return Ok(d);
         }
         if let Ok(bytes) = std::fs::read(path)
             && bytes.len() > CHECKSUM_BYTES
             && let (body, sum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES)
             && sum == checksum(body)
-            && let Some(d) = Self::from_bytes(params, body)
+            && let Some(d) = Self::from_bytes(seed, body)
         {
             let n = d.items.len();
             if (0..8).map(|k| k * (n - 1) / 7).all(|i| d.items[i] == seed.calc_dataset_item(i)) {
@@ -267,14 +297,14 @@ impl Dataset {
         Ok(d)
     }
 
-    /// The dataset built into the binary for `params`, if any: the dev
-    /// networks', in a build with the `dev` feature.
-    pub fn built_in(params: PowParams) -> Option<Dataset> {
+    /// The dataset built into the binary for `seed`, if any: the dev
+    /// networks', from the embedded file, in a build with the `dev` feature.
+    pub fn built_in(seed: &SeedText) -> Option<Dataset> {
         #[cfg(feature = "dev")]
-        if params == PowParams::DEV {
-            return Self::from_bytes(params, DEV_DATASET);
+        if seed.params == PowParams::DEV && seed.text == SEED_TEXT_GZ {
+            return Self::from_bytes(seed, DEV_DATASET);
         }
-        let _ = params;
+        let _ = seed;
         None
     }
 
@@ -288,7 +318,8 @@ impl Dataset {
         out
     }
 
-    fn from_bytes(params: PowParams, bytes: &[u8]) -> Option<Dataset> {
+    fn from_bytes(seed: &SeedText, bytes: &[u8]) -> Option<Dataset> {
+        let params = seed.params;
         if bytes.len() != params.dataset_items() * WIDTH * 4 {
             return None;
         }
@@ -300,7 +331,7 @@ impl Dataset {
             }
             items.push(item);
         }
-        Some(Dataset { params, items })
+        Some(Dataset { params, items, seed: seed.clone() })
     }
 
     pub fn len(&self) -> usize {
@@ -331,6 +362,10 @@ impl ItemSource for Dataset {
     #[inline]
     fn item(&self, index: usize) -> Item {
         self.items[index]
+    }
+
+    fn seed(&self) -> &SeedText {
+        &self.seed
     }
 }
 
@@ -367,9 +402,15 @@ pub struct PowOutput {
     pub result: Digest,
 }
 
-/// The memory-hard hash of `(header_hash, nonce)` using `source` for items.
+/// The memory-hard hash of `(header_hash, nonce)` using `source` for items
+/// and the seed file. Each access folds in two adjacent items, picked by
+/// `fnv(i + seed[0], mix[i % 32])`, and one window of the file, picked by
+/// `fnv(i + seed[1], mix[(i + 16) % 32])` ([`direct_window`]): window
+/// element `k % 8` is added to mix word `k` after its item's fold.
 pub fn hashimoto<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce) -> PowOutput {
     let params = source.params();
+    let text = source.seed();
+    let windows = text.windows();
     let seed = seed(header_hash, nonce);
     let mut mix = [Fp::ZERO; MIX_WORDS];
     mix[..WIDTH].copy_from_slice(&seed);
@@ -377,11 +418,13 @@ pub fn hashimoto<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce)
     let pairs = params.dataset_items() / 2;
     for i in 0..params.accesses {
         let sel = fnv(Fp::from_u32(i as u32).add(&seed[0]), mix[i % MIX_WORDS]);
+        let sel2 = fnv(Fp::from_u32(i as u32).add(&seed[1]), mix[(i + WIDTH) % MIX_WORDS]);
         let idx = (sel.to_canonical() as usize % pairs) * 2;
+        let x = text.window(direct_window(sel2.to_canonical(), windows));
         let a = source.item(idx);
         let b = source.item(idx + 1);
-        for (m, d) in mix.iter_mut().zip(a.iter().chain(&b)) {
-            *m = fnv(*m, *d);
+        for (k, (m, d)) in mix.iter_mut().zip(a.iter().chain(&b)).enumerate() {
+            *m = fnv(*m, *d).add(&x[k % RATE]);
         }
     }
     let mut cmix = [Fp::ZERO; DIGEST];
@@ -467,10 +510,9 @@ impl Ord for Target {
     }
 }
 
-/// Checks a proof of work using only the text: the mix must match and the
-/// result must meet the target.
-/// Checks a proof of work from `source`: the full [`Dataset`] (microseconds)
-/// or the [`SeedText`] alone (tens of milliseconds).
+/// Checks a proof of work from `source`: the full [`Dataset`] with the seed
+/// file (microseconds), or the file alone (tens of milliseconds). The mix
+/// must be the true one and the result must meet the target.
 pub fn verify<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce, mix: &Digest, target: &Target) -> bool {
     let out = hashimoto(source, header_hash, nonce);
     out.mix == *mix && target.is_met_by(&out.result)
@@ -496,9 +538,9 @@ mod tests {
     #[test]
     #[cfg(feature = "dev")]
     fn dev_dataset_is_built_in() {
-        let built = Dataset::built_in(PowParams::DEV).expect("the dev dataset decodes");
+        let built = Dataset::built_in(&SeedText::new(PowParams::DEV)).expect("the dev dataset decodes");
         assert_eq!(built, Dataset::generate(&SeedText::new(PowParams::DEV)), "regenerate it: write_dev_dataset");
-        assert!(Dataset::built_in(PowParams::MAINNET).is_none());
+        assert!(Dataset::built_in(&SeedText::new(PowParams::MAINNET)).is_none());
     }
 
     /// Writes `resources/dev_dataset.bin` from the seed text.
@@ -526,24 +568,75 @@ mod tests {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
     }
 
+    /// The seed is the gzip file as shipped, and it is the King James text.
     #[test]
-    fn seed_text_is_the_expected_file() {
-        let text = seed_text();
-        assert_eq!(text.len(), SEED_TEXT_LEN);
+    fn seed_file_is_the_king_james_text() {
+        let file = seed_text();
+        assert_eq!(file.len(), SEED_TEXT_LEN);
+        assert_eq!(fnv1a64(&file), SEED_FILE_FNV);
+        assert_eq!(small_seed().text(), &file[..]);
+        let text = crate::inflate::gunzip(&file).expect("the seed file is gzip");
+        assert_eq!(text.len(), 4_340_917);
         assert_eq!(fnv1a64(&text), 0xb128_7e0a_c9ad_c1c6);
         assert!(text.starts_with(b"### Genesis"));
-        assert_eq!(small_seed().text().len(), SEED_TEXT_LEN);
     }
+
+    const SEED_FILE_FNV: u64 = 0x9810_ea1c_2d2d_6c21;
 
     #[test]
     fn mainnet_sizes() {
         assert_eq!(PowParams::MAINNET.dataset_bytes(), 64 << 20);
         assert_eq!(WINDOW, 24);
-        // Every byte of the text is in a window: the last one ends at its end.
+        // Every byte of the file is in a window: the last one ends at its end.
         let seed = small_seed();
-        assert_eq!(seed.windows(), 180_872);
-        assert_eq!(seed.window_offset(180_870), 180_870 * WINDOW);
-        assert_eq!(seed.window_offset(180_871) + WINDOW, SEED_TEXT_LEN);
+        assert_eq!(seed.windows(), 53_795);
+        assert_eq!(seed.window_offset(53_793), 53_793 * WINDOW);
+        assert_eq!(seed.window_offset(53_794) + WINDOW, SEED_TEXT_LEN);
+        assert!(seed.window_offset(53_794) < 53_794 * WINDOW, "the last window overlaps the one before");
+    }
+
+    /// The direct reads' windows: every one reachable, the lowest twice.
+    #[test]
+    fn direct_windows_cover_the_file() {
+        let n = 53_795;
+        let mut hit = vec![0u8; n];
+        for v in 0..1u32 << 16 {
+            hit[direct_window(v, n)] += 1;
+        }
+        assert!(hit.iter().all(|&h| h >= 1));
+        assert_eq!(hit.iter().filter(|&&h| h == 2).count(), (1 << 16) - n);
+        assert_eq!(direct_window(0xffff, n), 0xffff - n);
+        assert_eq!(direct_window(0x7000_0000 | 0x1234, n), 0x1234);
+        assert_eq!(direct_window(12345, 1), 0);
+        assert_eq!(direct_window(5, 8), 5);
+    }
+
+    /// Validating needs the entire file: the full dataset with any part of
+    /// the file missing (zeroed) checks almost no proof of work, and
+    /// computing items from a file with a single window changed fails some
+    /// of sixteen headers (13 of 64 with this small dataset; about 45% of
+    /// headers on mainnet, whose 2^20 items repeat less).
+    #[test]
+    fn validation_needs_the_entire_file() {
+        let dataset = small_dataset();
+        let h: Digest = core::array::from_fn(|i| Fp::new(31 + i as u32));
+        let nonces: Vec<Nonce> = (0..64u64).map(nonce_from_u64).collect();
+        let honest: Vec<PowOutput> = nonces.iter().map(|n| hashimoto(dataset, &h, n)).collect();
+        let with_file = |file: Vec<u8>| Dataset { seed: SeedText::from_bytes(SMALL, file), ..dataset.clone() };
+        let agree = |d: &Dataset| nonces.iter().zip(&honest).filter(|(n, o)| hashimoto(d, &h, n) == **o).count();
+        // The dataset without the file.
+        assert_eq!(agree(&with_file(vec![0u8; SEED_TEXT_LEN])), 0);
+        // A tenth of it missing.
+        let mut tenth = seed_text();
+        tenth[SEED_TEXT_LEN / 2..SEED_TEXT_LEN / 2 + SEED_TEXT_LEN / 10].fill(0);
+        assert!(agree(&with_file(tenth)) <= 1);
+        // One window changed, items computed from the file.
+        let mut one = seed_text();
+        one[24 * 20_000] ^= 1;
+        let damaged = SeedText::from_bytes(SMALL, one);
+        let failed = nonces[..16].iter().zip(&honest).filter(|(n, o)| hashimoto(&damaged, &h, n) != **o).count();
+        eprintln!("one window changed: {failed} of 16 fail");
+        assert!(failed >= 1, "one window changed, and every header still checks");
     }
 
     #[test]
@@ -587,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn light_and_full_evaluation_agree() {
+    fn dataset_and_file_evaluation_agree() {
         let seed = small_seed();
         let dataset = small_dataset();
         let h: Digest = core::array::from_fn(|i| Fp::new(100 + i as u32));
@@ -595,8 +688,8 @@ mod tests {
         for nonce in [0u64, 1, 2, u64::MAX, 1 << 40] {
             let nonce = nonce_from_u64(nonce);
             let full = hashimoto(dataset, &h, &nonce);
-            let light = hashimoto(seed, &h, &nonce);
-            assert_eq!(full, light, "nonce {nonce:?}");
+            let from_file = hashimoto(seed, &h, &nonce);
+            assert_eq!(full, from_file, "nonce {nonce:?}");
             assert_ne!(Some(full.result), prev);
             prev = Some(full.result);
             assert_eq!(result_from_mix(&h, &nonce, &full.mix), full.result);
@@ -659,7 +752,7 @@ mod tests {
         use std::time::Instant;
         let t = Instant::now();
         let seed = SeedText::new(PowParams::MAINNET);
-        println!("seed text ({} KB): {:?}", seed.text().len() / 1024, t.elapsed());
+        println!("seed file ({} KB): {:?}", seed.text().len() / 1024, t.elapsed());
         let t = Instant::now();
         let dataset = Dataset::generate(&seed);
         println!("dataset ({} MB): {:?}", PowParams::MAINNET.dataset_bytes() >> 20, t.elapsed());
@@ -673,7 +766,7 @@ mod tests {
         for n in 0..5u64 {
             let _ = hashimoto(&seed, &h, &nonce_from_u64(n));
         }
-        println!("light hashimoto: {:?} per hash", t.elapsed() / 5);
+        println!("hashimoto from the file: {:?} per hash", t.elapsed() / 5);
         let five = nonce_from_u64(5);
         assert_eq!(hashimoto(&dataset, &h, &five), hashimoto(&seed, &h, &five));
     }

@@ -4,28 +4,29 @@
 //! `parent_work`.
 //!
 //! One proof of four tables shows that `hashimoto` (see [`crate::pow`]),
-//! computed on the light path from the seed text, gives the mix it gives:
+//! its items computed from the seed file, gives the mix it gives:
 //!
 //! - **perm**: the hash machine ([`crate::hash_machine`]), one permutation a
 //!   row. Three seed rows (a start with the header hash and `DOM_SEED`,
 //!   then the nonce's two blocks absorbed), then for each dataset item a
-//!   start `[index, DOM_ITEM]` and exactly `parents` absorbs of text
-//!   windows (a counter). On each absorb, the window's index
+//!   start `[index, DOM_ITEM]` and exactly `parents` absorbs of windows (a
+//!   counter). On each absorb, the window's index
 //!   `w = (out0 + out1 * 2^31) mod N`, from the previous permutation's
 //!   output, is proven in 10-bit limbs (both outputs shown canonical, the
 //!   quotient and remainder decomposed, the carries ranged, `w < N`), and
 //!   the window it absorbs is looked up in the text table. An item's final
 //!   output is offered under its index.
-//! - **text**: the windows, a preprocessed table `[w, eight packed
-//!   elements]` committed once, and how often each is read.
+//! - **text**: the windows of the seed file at 24-byte boundaries
+//!   (`N` = 53,795, a table of 2^16 rows), a preprocessed table
+//!   `[w, eight packed elements]` committed once, and how often each is
+//!   read.
 //! - **mix**: hashimoto's accesses: each row derives a pair's index from
 //!   the mix (the low 19 bits of a canonical value), takes its two items
-//!   from perm and folds them in (`fnv`).
+//!   from perm and folds them in (`fnv`), and reads one window directly: its
+//!   index from a second canonical value ([`crate::pow::direct_window`]: the
+//!   low `L` bits, less `N` once if they are `N` or more, `w < N` in limbs),
+//!   looked up in the text table and added to the mix.
 //! - **range**: 0 to 1023, for the limbs.
-//!
-//! Two variants of the windows, to compare: at 24-byte boundaries, the proof
-//! of work's (`N` = 180,872, a table of 2^18 rows), or at any byte offset,
-//! as it was before (`N` = 4,340,894, 2^23 rows).
 //!
 //! The public values are the header's `pow_hash` (8 elements), its nonce
 //! (11) and its `mix` (8): the mix after the 64 accesses, folded to eight
@@ -74,12 +75,6 @@ pub struct Windows {
 }
 
 impl Windows {
-    /// At any byte offset: the proof of work as it was before aligned
-    /// windows, kept to compare.
-    pub fn bytes(text_len: usize) -> Windows {
-        Windows { stride: 1, n: text_len - WINDOW + 1 }
-    }
-
     /// At 24-byte boundaries, the last ending at the text's end: the proof
     /// of work ([`crate::pow::SeedText::windows`]).
     pub fn aligned(text_len: usize) -> Windows {
@@ -347,13 +342,35 @@ const M_T: usize = M_SB + 31; // 3 helpers
 const M_A: usize = M_T + 3; // 16
 const M_BB: usize = M_A + WIDTH; // 16
 const M_FIN: usize = M_BB + WIDTH; // the row after the last access
-pub const MIX_COLS: usize = M_FIN + 1;
+const M_SEED1: usize = M_FIN + 1;
+const M_SB2: usize = M_SEED1 + 1; // 31 bits of the direct read's selector
+const M_T2: usize = M_SB2 + 31; // 3 helpers
+const M_WF: usize = M_T2 + 3; // the low bits were N or more
+const M_WL: usize = M_WF + 1; // 2 limbs of its window
+const M_WD: usize = M_WL + 2; // 2 limbs of N - 1 - w
+const M_X: usize = M_WD + 2; // the window, 8 packed elements
+pub const MIX_COLS: usize = M_X + RATE;
 const MIX_ROWS: usize = 128;
 
 /// hashimoto's accesses, one a row (64 active rows of 128).
 pub struct MixAir {
     /// The dataset's pairs of items: `2^log_pairs` (`2^19` on mainnet).
     pub log_pairs: u32,
+    /// The seed file's windows, `N`: at most 2^20.
+    pub windows: usize,
+}
+
+/// A canonical value's 31 bits, from `bits`: binary, summing to `v`, and
+/// with bits 30 to 27 all set the rest zero (`t`, three helpers).
+fn canonical_bits<F: Field>(b: &mut Builder<'_, F>, v: F, bits: &[F], t: &[F]) {
+    for x in bits {
+        b.assert_zero(*x * *x - *x);
+    }
+    b.assert_eq(v, (0..31).fold(F::ZERO, |acc, k| acc + bits[k].scale(Fp::from_u32(1 << k))));
+    b.assert_eq(t[0], bits[30] * bits[29]);
+    b.assert_eq(t[1], bits[28] * bits[27]);
+    b.assert_eq(t[2], t[0] * t[1]);
+    b.assert_zero(t[2] * (0..27).fold(F::ZERO, |acc, k| acc + bits[k]));
 }
 
 impl Air for MixAir {
@@ -401,20 +418,30 @@ impl Air for MixAir {
         let picked = (0..MIX_WORDS).fold(F::ZERO, |acc, k| acc + l[M_OH + k] * l[M_MIX + k]);
         let sel = (l[M_I] + l[M_SEED0]).scale(Fp::new(FNV_PRIME)) + picked;
         // sel in bits, canonical: bits 30..27 all set leave the rest zero.
-        for k in 0..31 {
-            let x = l[M_SB + k];
-            b.assert_zero(x * x - x);
-        }
-        b.assert_eq(sel, (0..31).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::from_u32(1 << k))));
-        b.assert_eq(l[M_T], l[M_SB + 30] * l[M_SB + 29]);
-        b.assert_eq(l[M_T + 1], l[M_SB + 28] * l[M_SB + 27]);
-        b.assert_eq(l[M_T + 2], l[M_T] * l[M_T + 1]);
-        b.assert_zero(l[M_T + 2] * (0..27).fold(F::ZERO, |acc, k| acc + l[M_SB + k]));
+        canonical_bits(b, sel, &l[M_SB..M_SB + 31], &l[M_T..M_T + 3]);
         let idx = (0..self.log_pairs as usize).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::new(2 << k)));
-        // The two items, folded in.
+        // The direct read: sel2 = fnv(i + seed1, mix[(i + 16) % 32]) in bits,
+        // canonical; its low L bits, less N once if they are N or more, are
+        // the window: 0 <= w < N in limbs.
+        b.when_first_row(l[M_SEED1] - l[M_MIX + 1]);
+        b.when_transition(n[M_SEED1] - l[M_SEED1]);
+        let picked2 = (0..MIX_WORDS).fold(F::ZERO, |acc, k| acc + l[M_OH + k] * l[M_MIX + (k + WIDTH) % MIX_WORDS]);
+        let sel2 = (l[M_I] + l[M_SEED1]).scale(Fp::new(FNV_PRIME)) + picked2;
+        canonical_bits(b, sel2, &l[M_SB2..M_SB2 + 31], &l[M_T2..M_T2 + 3]);
+        let bits = (self.windows as u32).next_power_of_two().trailing_zeros() as usize;
+        let low = (0..bits).fold(F::ZERO, |acc, k| acc + l[M_SB2 + k].scale(Fp::new(1 << k)));
+        let wf = l[M_WF];
+        b.assert_zero(wf * wf - wf);
+        let w = l[M_WL] + l[M_WL + 1].scale(Fp::new(LIMB));
+        b.assert_eq(w, low - wf.scale(Fp::new(self.windows as u32)));
+        b.assert_eq(l[M_WD] + l[M_WD + 1].scale(Fp::new(LIMB)), c(self.windows as u32 - 1) - w);
+        // The two items folded in, and the window added.
         for k in 0..MIX_WORDS {
             let d = if k < WIDTH { l[M_A + k] } else { l[M_BB + k - WIDTH] };
-            b.when_transition(n[M_MIX + k] - l[M_MIX + k] - act * (l[M_MIX + k].scale(Fp::new(FNV_PRIME - 1)) + d));
+            let x = l[M_X + k % RATE];
+            b.when_transition(
+                n[M_MIX + k] - l[M_MIX + k] - act * (l[M_MIX + k].scale(Fp::new(FNV_PRIME - 1)) + d + x),
+            );
         }
         // The row after the 64th access holds the final mix: folded to eight
         // elements (fnv is linear), the header's.
@@ -436,6 +463,19 @@ impl Air for MixAir {
         let mut bb = vec![c(TAG_ITEM), idx + one];
         bb.extend((0..WIDTH).map(|k| l[M_BB + k]));
         b.lookup(false, act, &bb);
+        let mut text = vec![c(TAG_TEXT), w];
+        text.extend((0..RATE).map(|k| l[M_X + k]));
+        b.lookup(true, act, &text);
+        for x in Self::range_cols() {
+            b.lookup(true, act, &[c(TAG_RANGE), l[x]]);
+        }
+    }
+}
+
+impl MixAir {
+    /// The limbs an active row ranges.
+    fn range_cols() -> [usize; 4] {
+        [M_WL, M_WL + 1, M_WD, M_WD + 1]
     }
 }
 
@@ -481,7 +521,8 @@ impl WorkShape {
     }
 
     pub fn mix_air(&self) -> MixAir {
-        MixAir { log_pairs: self.log_pairs }
+        assert!(self.windows.n <= 1 << 20, "the direct read's window is ranged in two limbs");
+        MixAir { log_pairs: self.log_pairs, windows: self.windows.n }
     }
 }
 
@@ -512,10 +553,16 @@ pub enum Cheat {
     /// Another mix claimed, or another header hash.
     WrongMix,
     WrongHash,
+    /// The first access adds the next window while showing the true index.
+    OtherDirect,
+    /// A direct read whose low bits are N or more taken unreduced, the
+    /// table's padding row (zeros) read.
+    DirectUnreduced,
 }
 
-/// hashimoto's mix on the light path, with `parents` absorbs an item and
-/// windows laid out as `windows`, and the traces that prove it.
+/// hashimoto's mix, its items computed from the seed file, with `parents`
+/// absorbs an item and windows laid out as `windows`, and the traces that
+/// prove it.
 pub fn witness(text: &[u8], shape: WorkShape, header_hash: &[Fp; DIGEST], nonce: &[u8; 32]) -> PowWitness {
     witness_cheating(text, shape, header_hash, nonce, Cheat::None)
 }
@@ -683,6 +730,8 @@ pub fn witness_cheating(
 
     // The accesses, and the mix table beside them.
     let pairs = 1u32 << shape.log_pairs;
+    let low_mask = (windows.n as u32).next_power_of_two() - 1;
+    let mut unreduced = false;
     let mut mixv = [Fp::ZERO; MIX_WORDS];
     mixv[..WIDTH].copy_from_slice(&seed);
     mixv[WIDTH..].copy_from_slice(&seed);
@@ -708,14 +757,54 @@ pub fn witness_cheating(
         row[M_T + 1] = Fp::new(bit(28) * bit(27));
         row[M_T + 2] = Fp::new(bit(30) * bit(29) * bit(28) * bit(27));
         row[M_FIN] = if i == 64 { Fp::ONE } else { Fp::ZERO };
+        // The direct read.
+        row[M_SEED1] = seed[1];
+        let sel2 = fnv(Fp::from_u32(i as u32).add(&seed[1]), mixv[(i + WIDTH) % MIX_WORDS]);
+        let s2 = sel2.to_canonical();
+        for k in 0..31 {
+            row[M_SB2 + k] = Fp::new((s2 >> k) & 1);
+        }
+        let bit2 = |k: usize| (s2 >> k) & 1;
+        row[M_T2] = Fp::new(bit2(30) * bit2(29));
+        row[M_T2 + 1] = Fp::new(bit2(28) * bit2(27));
+        row[M_T2 + 2] = Fp::new(bit2(30) * bit2(29) * bit2(28) * bit2(27));
+        let low = s2 & low_mask;
+        let mut wrapped = low >= windows.n as u32;
+        let mut wd = crate::pow::direct_window(s2, windows.n) as u32;
+        let mut x = window(wd as usize);
         if i < 64 {
+            if i == 0 && cheat == Cheat::OtherDirect {
+                x = window((wd as usize + 1) % windows.n);
+            }
+            if wrapped && !unreduced && cheat == Cheat::DirectUnreduced {
+                unreduced = true;
+                wrapped = false;
+                wd = low;
+                x = [Fp::ZERO; RATE];
+            }
+        }
+        row[M_WF] = Fp::new(wrapped as u32);
+        let d = (windows.n as u32 - 1).wrapping_sub(wd) & ((1 << 20) - 1);
+        for (at, v) in [(M_WL, wd), (M_WD, d)] {
+            row[at] = Fp::new(v % LIMB);
+            row[at + 1] = Fp::new(v / LIMB);
+        }
+        row[M_X..M_X + RATE].copy_from_slice(&x);
+        if i < 64 {
+            refuse((wd as usize) < windows.n, "the direct read is in the file");
+            reads[wd as usize] += 1;
+            for col in MixAir::range_cols() {
+                if let Some(c) = ranged.get_mut(row[col].to_canonical() as usize) {
+                    *c += 1;
+                }
+            }
             let idx = (sv % pairs) * 2;
             let a = item(idx, i == 0, &mut perm, &mut reads);
             let bv = item(idx + 1, false, &mut perm, &mut reads);
             row[M_A..M_A + WIDTH].copy_from_slice(&a);
             row[M_BB..M_BB + WIDTH].copy_from_slice(&bv);
-            for (m, d) in mixv.iter_mut().zip(a.iter().chain(&bv)) {
-                *m = fnv(*m, *d);
+            for (k, (m, d)) in mixv.iter_mut().zip(a.iter().chain(&bv)).enumerate() {
+                *m = fnv(*m, *d).add(&x[k % RATE]);
             }
         }
     }
@@ -859,7 +948,7 @@ impl Work {
     }
 
     /// A header's, its mix computed (genesis, whose `mix` field is empty):
-    /// on the light path, a few tens of milliseconds.
+    /// from the seed file, a few tens of milliseconds.
     pub fn computed(seed: &crate::pow::SeedText, h: &crate::block::Header) -> Work {
         let pow_hash = h.pow_hash();
         Work { pow_hash, nonce: h.nonce, mix: crate::pow::hashimoto(seed, &pow_hash, &h.nonce).mix }
@@ -950,8 +1039,8 @@ fn work_transcript() -> crate::challenger::Challenger {
     c
 }
 
-/// Proves a header's work: that `hashimoto(pow_hash, nonce)` on the light
-/// path gives the `mix` returned.
+/// Proves a header's work: that `hashimoto(pow_hash, nonce)`, its items
+/// computed from the seed file, gives the `mix` returned.
 pub fn prove_work(
     setup: &WorkSetup,
     config: &crate::stark::StarkConfig,
@@ -998,7 +1087,6 @@ mod tests {
     use crate::pow::{self, PowParams, SeedText};
     use crate::stark::{self, DynAir, Preprocessed, StarkConfig, TableInput, TableSpec};
 
-    const MIX: MixAir = MixAir { log_pairs: 19 };
     const SEGMENT: StarkConfig =
         StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 };
 
@@ -1012,40 +1100,40 @@ mod tests {
         c
     }
 
-    /// The aligned variant's mix is hashimoto's: the prototype computes the
-    /// proof of work as it is.
+    /// The witness's mix is hashimoto's.
     #[test]
     #[ignore = "slow: the seed text and 128 items"]
     fn mix_matches_hashimoto() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let w = witness(seed.text(), WorkShape { windows: Windows::aligned(seed.text().len()), parents: PowParams::MAINNET.parents, log_pairs: 19 }, &hh, &nonce);
+        let w = witness(seed.text(), WorkShape::of(&seed), &hh, &nonce);
         let want = pow::hashimoto(&seed, &hh, &nonce);
         assert_eq!(fold_mix(&w.mix_out), want.mix);
         assert_eq!(w.public, public_values(&hh, &nonce, &want.mix));
     }
 
-    fn tables<'a>(w: &'a PowWitness, perm: &'a PermAir) -> Vec<(&'a dyn DynAir, &'a Trace, Option<&'a Trace>)> {
+    fn tables<'a>(
+        w: &'a PowWitness,
+        perm: &'a PermAir,
+        mix: &'a MixAir,
+    ) -> Vec<(&'a dyn DynAir, &'a Trace, Option<&'a Trace>)> {
         vec![
             (&TextAir, &w.text, Some(&w.text_pre)),
             (perm, &w.perm, None),
             (&RangeAir, &w.range, None),
-            (&MIX, &w.mix, None),
+            (mix, &w.mix, None),
         ]
     }
 
-    /// Every constraint holds and the buses balance (aligned windows, the
-    /// smaller table).
+    /// Every constraint holds and the buses balance.
     #[test]
-    #[ignore = "slow: the seed text and 128 items"]
+    #[ignore = "slow: the seed file and 128 items"]
     fn constraints_hold() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let windows = Windows::aligned(seed.text().len());
-        let parents = PowParams::MAINNET.parents;
-        let w = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
-        let perm = PermAir { windows, parents };
-        assert_eq!(stark::check_tables(&tables(&w, &perm), &w.public), Ok(()));
+        let shape = WorkShape::of(&seed);
+        let w = witness(seed.text(), shape, &hh, &nonce);
+        assert_eq!(stark::check_tables(&tables(&w, &shape.perm_air(), &shape.mix_air()), &w.public), Ok(()));
     }
 
     /// Each way of cheating, written as a cheating prover would (the
@@ -1056,11 +1144,10 @@ mod tests {
     fn attacks() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let windows = Windows::aligned(seed.text().len());
-        let parents = PowParams::MAINNET.parents;
-        let perm = PermAir { windows, parents };
-        let honest = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
-        assert_eq!(stark::check_tables(&tables(&honest, &perm), &honest.public), Ok(()));
+        let shape = WorkShape::of(&seed);
+        let (perm, mix) = (shape.perm_air(), shape.mix_air());
+        let honest = witness(seed.text(), shape, &hh, &nonce);
+        assert_eq!(stark::check_tables(&tables(&honest, &perm, &mix), &honest.public), Ok(()));
         for cheat in [
             Cheat::OtherWindow,
             Cheat::OtherIndex,
@@ -1073,11 +1160,13 @@ mod tests {
             Cheat::BeyondN,
             Cheat::WrongMix,
             Cheat::WrongHash,
+            Cheat::OtherDirect,
+            Cheat::DirectUnreduced,
         ] {
             crate::stark::LENIENT.with(|l| l.set(true));
-            let w = witness_cheating(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce, cheat);
+            let w = witness_cheating(seed.text(), shape, &hh, &nonce, cheat);
             crate::stark::LENIENT.with(|l| l.set(false));
-            assert!(stark::check_tables(&tables(&w, &perm), &w.public).is_err(), "{cheat:?} accepted");
+            assert!(stark::check_tables(&tables(&w, &perm, &mix), &w.public).is_err(), "{cheat:?} accepted");
         }
     }
 
@@ -1139,63 +1228,57 @@ mod tests {
         for (i, v) in setup.root().iter().enumerate() {
             c.assert_scalar(root + i as u32, *v);
         }
-        let perm = setup.shape.perm_air();
-        let tables: [(&dyn DynAir, Option<u32>); 4] = [(&TextAir, Some(root)), (&perm, None), (&RangeAir, None), (&MIX, None)];
+        let (perm, mix_air) = (setup.shape.perm_air(), setup.shape.mix_air());
+        let tables: [(&dyn DynAir, Option<u32>); 4] = [(&TextAir, Some(root)), (&perm, None), (&RangeAir, None), (&mix_air, None)];
         c.verify_stark(&tables, &SEGMENT, &[Fp::new(DOM_WORK_PROOF)], pubv, NUM_PUBLIC, &proof);
         eprintln!("compiled in {:.2?}: {} rows (2^{}), hash rows 2^{}", t.elapsed(), c.prog.instrs.len(), c.prog.height().trailing_zeros(), VmAir::hash_height(&c.prog).trailing_zeros());
         VmAir::execute(&c.prog, &c.inputs).expect("the verifier program accepts");
     }
 
     /// Proving and verifying one header's proof of work at the mainnet
-    /// segment configuration: both window layouts, 256 and 254 parents.
+    /// segment configuration.
     /// `cargo test --release --lib pow_air::tests::cost -- --ignored --nocapture`
     #[test]
     #[ignore = "slow: measures proving"]
     fn cost() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let len = seed.text().len();
-        for (name, windows) in [("aligned", Windows::aligned(len)), ("bytes", Windows::bytes(len))] {
-            for parents in [256, 254] {
-                let t = std::time::Instant::now();
-                let w = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
-                let built = t.elapsed();
-                let perm = PermAir { windows, parents };
-                let t = std::time::Instant::now();
-                let pre = Preprocessed::new(
-                    &w.text_pre,
-                    SEGMENT.log_blowup,
-                    SEGMENT.quotient_stride(TextAir.max_constraint_degree()),
-                );
-                let commit = t.elapsed();
-                let inputs = [
-                    TableInput { air: &TextAir, trace: &w.text, pre: Some(&pre) },
-                    TableInput { air: &perm, trace: &w.perm, pre: None },
-                    TableInput { air: &RangeAir, trace: &w.range, pre: None },
-                    TableInput { air: &MIX, trace: &w.mix, pre: None },
-                ];
-                let t = std::time::Instant::now();
-                let proof = stark::prove_tables(&SEGMENT, &inputs, &w.public, &mut transcript());
-                let proved = t.elapsed();
-                let root = pre.root();
-                let specs = [
-                    TableSpec { air: &TextAir, pre_root: Some(&root) },
-                    TableSpec { air: &perm, pre_root: None },
-                    TableSpec { air: &RangeAir, pre_root: None },
-                    TableSpec { air: &MIX, pre_root: None },
-                ];
-                let t = std::time::Instant::now();
-                let ok = stark::verify_tables(&SEGMENT, &specs, &w.public, &proof, &mut transcript());
-                let verified = t.elapsed();
-                assert_eq!(ok, Ok(()));
-                println!(
-                    "{name:7} parents {parents}: text 2^{} perm 2^{} ({} cols) | witness {built:.2?}, text commit (once) {commit:.2?}, prove {proved:.2?}, {} KB, verify {verified:.2?}",
-                    w.text.height().trailing_zeros(),
-                    w.perm.height().trailing_zeros(),
-                    PERM_COLS,
-                    proof.to_bytes().len() / 1024,
-                );
-            }
-        }
+        let shape = WorkShape::of(&seed);
+        let (perm, mix) = (shape.perm_air(), shape.mix_air());
+        let t = std::time::Instant::now();
+        let w = witness(seed.text(), shape, &hh, &nonce);
+        let built = t.elapsed();
+        let t = std::time::Instant::now();
+        let pre = Preprocessed::new(&w.text_pre, SEGMENT.log_blowup, SEGMENT.quotient_stride(TextAir.max_constraint_degree()));
+        let commit = t.elapsed();
+        let inputs = [
+            TableInput { air: &TextAir, trace: &w.text, pre: Some(&pre) },
+            TableInput { air: &perm, trace: &w.perm, pre: None },
+            TableInput { air: &RangeAir, trace: &w.range, pre: None },
+            TableInput { air: &mix, trace: &w.mix, pre: None },
+        ];
+        let t = std::time::Instant::now();
+        let proof = stark::prove_tables(&SEGMENT, &inputs, &w.public, &mut transcript());
+        let proved = t.elapsed();
+        let root = pre.root();
+        let specs = [
+            TableSpec { air: &TextAir, pre_root: Some(&root) },
+            TableSpec { air: &perm, pre_root: None },
+            TableSpec { air: &RangeAir, pre_root: None },
+            TableSpec { air: &mix, pre_root: None },
+        ];
+        let t = std::time::Instant::now();
+        let ok = stark::verify_tables(&SEGMENT, &specs, &w.public, &proof, &mut transcript());
+        let verified = t.elapsed();
+        assert_eq!(ok, Ok(()));
+        println!(
+            "parents {}: text 2^{} perm 2^{} ({} cols) mix {} cols | witness {built:.2?}, text commit (once) {commit:.2?}, prove {proved:.2?}, {} KB, verify {verified:.2?}",
+            shape.parents,
+            w.text.height().trailing_zeros(),
+            w.perm.height().trailing_zeros(),
+            PERM_COLS,
+            MIX_COLS,
+            proof.to_bytes().len() / 1024,
+        );
     }
 }

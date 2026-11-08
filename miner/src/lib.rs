@@ -19,6 +19,7 @@ pub mod genesis;
 pub mod fri;
 pub mod hash_machine;
 pub mod hash_table;
+#[cfg(test)]
 pub mod inflate;
 pub mod keccak;
 pub mod log;
