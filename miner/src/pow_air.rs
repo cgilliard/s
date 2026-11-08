@@ -1,0 +1,733 @@
+//! Prototype: a header's proof of work, proven (docs/NODE.md: the
+//! evaluation of putting the work into the chain proof).
+//!
+//! One proof of four tables shows that `hashimoto` (see [`crate::pow`]),
+//! computed on the light path from the seed text, gives the mix it gives:
+//!
+//! - **perm**: the hash machine ([`crate::hash_machine`]), one permutation a
+//!   row. Three seed rows (a start with the header hash and `DOM_SEED`,
+//!   then the nonce's two blocks absorbed), then for each dataset item a
+//!   start `[index, DOM_ITEM]` and exactly `parents` absorbs of text
+//!   windows (a counter). On each absorb, the window's index
+//!   `w = (out0 + out1 * 2^31) mod N`, from the previous permutation's
+//!   output, is proven in 10-bit limbs (both outputs shown canonical, the
+//!   quotient and remainder decomposed, the carries ranged, `w < N`), and
+//!   the window it absorbs is looked up in the text table. An item's final
+//!   output is offered under its index.
+//! - **text**: the windows, a preprocessed table `[w, eight packed
+//!   elements]` committed once, and how often each is read.
+//! - **mix**: hashimoto's accesses: each row derives a pair's index from
+//!   the mix (the low 19 bits of a canonical value), takes its two items
+//!   from perm and folds them in (`fnv`).
+//! - **range**: 0 to 1023, for the limbs.
+//!
+//! Two variants of the windows, to compare: at any byte offset (the proof
+//! of work as it is: `N` = 4,340,894, a table of 2^23 rows), or at 24-byte
+//! boundaries (`N` = 180,871, 2^18 rows). Not yet constrained, being a few
+//! rows of thousands and no part of the cost: the mix's final fold, the
+//! result's compression and its comparison with the target.
+
+use crate::field::Field;
+use crate::hash_machine::{
+    COL_ABSORB, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_LOAD, COL_START, HashTraceBuilder, NUM_COLS as HM_COLS,
+    eval_hash_machine,
+};
+use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute_in_place};
+use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
+use crate::stark::{Air, Builder, Trace};
+
+const LIMB: u32 = 1 << 10;
+const TAG_ITEM: u32 = 1;
+const TAG_SEED: u32 = 2;
+const TAG_RANGE: u32 = 3;
+const TAG_TEXT: u32 = 4;
+const DOM_ITEM: u32 = 0x5041;
+const DOM_SEED: u32 = 0x5042;
+const FNV_PRIME: u32 = 0x0100_0193;
+const WINDOW: usize = 3 * RATE;
+/// `p - 2^30 - 1`: the largest low 30 bits of a canonical element whose
+/// bit 30 is set.
+const CANON_LOW: u32 = 0x3800_0000;
+/// Dataset items are pairs of this many (`2^19` pairs, a 64 MB dataset).
+const LOG_PAIRS: u32 = 19;
+const MIX_WORDS: usize = 2 * WIDTH;
+
+/// How the windows are laid out: window `w` is the 24 bytes from
+/// `w * stride`, for `w < n`.
+#[derive(Clone, Copy, Debug)]
+pub struct Windows {
+    pub stride: usize,
+    pub n: usize,
+}
+
+impl Windows {
+    /// At any byte offset: the proof of work as it is.
+    pub fn bytes(text_len: usize) -> Windows {
+        Windows { stride: 1, n: text_len - WINDOW + 1 }
+    }
+
+    /// At 24-byte boundaries.
+    pub fn aligned(text_len: usize) -> Windows {
+        Windows { stride: WINDOW, n: text_len / WINDOW }
+    }
+
+    fn limbs(v: u32) -> [u32; 3] {
+        [v % LIMB, (v / LIMB) % LIMB, v / (LIMB * LIMB)]
+    }
+}
+
+/// Packs 24 bytes three to an element, little-endian.
+fn pack_window(window: &[u8]) -> [Fp; RATE] {
+    core::array::from_fn(|k| {
+        let c = &window[3 * k..3 * k + 3];
+        Fp::new(c[0] as u32 | (c[1] as u32) << 8 | (c[2] as u32) << 16)
+    })
+}
+
+fn fnv(a: Fp, b: Fp) -> Fp {
+    a.mul(&Fp::new(FNV_PRIME)).add(&b)
+}
+
+// ---------------------------------------------------------------------------
+// perm: the permutations
+// ---------------------------------------------------------------------------
+
+const P_S0: usize = HM_COLS;
+const P_S1: usize = P_S0 + 1;
+const P_S2: usize = P_S0 + 2;
+const P_IS: usize = P_S0 + 3;
+const P_IA: usize = P_S0 + 4;
+const P_LAST: usize = P_S0 + 5;
+const P_K: usize = P_S0 + 6;
+const P_CUR: usize = P_S0 + 7;
+const P_PA0: usize = P_S0 + 8;
+const P_PA1: usize = P_S0 + 9;
+const P_A: usize = P_S0 + 10; // a0..a3
+const P_B: usize = P_A + 4; // b0..b3
+const P_DA: usize = P_B + 4; // 3
+const P_DB: usize = P_DA + 3; // 3
+const P_Q: usize = P_DB + 3; // 5
+const P_W: usize = P_Q + 5; // 3
+const P_D: usize = P_W + 3; // 3
+const P_E: usize = P_D + 3; // 2
+const P_C: usize = P_E + 2; // 6 low limbs of the carries
+const P_CH: usize = P_C + 6; // 6 x 4 high bits
+pub const PERM_COLS: usize = P_CH + 24;
+const CARRY_BIAS: i64 = 1 << 13;
+
+/// The perm table's AIR for windows numbered below `n` and `parents`
+/// absorbs an item (the proof of work has 256; 254 fits 2^15 rows).
+pub struct PermAir {
+    pub windows: Windows,
+    pub parents: usize,
+}
+
+impl PermAir {
+    /// The limbs every row ranges.
+    fn range_cols() -> impl Iterator<Item = usize> {
+        (P_A..P_A + 3)
+            .chain(P_B..P_B + 3)
+            .chain(P_DA..P_DA + 3)
+            .chain(P_DB..P_DB + 3)
+            .chain(P_Q..P_Q + 5)
+            .chain(P_W..P_W + 3)
+            .chain(P_D..P_D + 3)
+            .chain(P_C..P_C + 6)
+    }
+}
+
+fn lin<F: Field>(l: &[F], at: usize, n: usize) -> F {
+    (0..n).rev().fold(F::ZERO, |acc, i| acc.scale(Fp::new(LIMB)) + l[at + i])
+}
+
+impl Air for PermAir {
+    fn width(&self) -> usize {
+        PERM_COLS
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        3
+    }
+
+    fn lookup_group(&self) -> usize {
+        2
+    }
+
+    fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+        eval_hash_machine(b);
+        let l = b.local();
+        let n = b.next();
+        let p = b.public();
+        let one = F::ONE;
+        let c = |v: u32| F::from_u32(v);
+        b.mark("pow flags");
+        let (s0, s1, s2, is, ia, last) = (l[P_S0], l[P_S1], l[P_S2], l[P_IS], l[P_IA], l[P_LAST]);
+        for f in [s0, s1, s2, is, ia, last] {
+            b.assert_zero(f * f - f);
+        }
+        b.assert_zero(l[COL_CHAIN]);
+        b.assert_zero(l[COL_COMPRESS]);
+        b.assert_zero(l[COL_LOAD]);
+        b.assert_eq(l[COL_START], s0 + is);
+        b.assert_eq(l[COL_ABSORB], s1 + s2 + ia);
+        // The seed: rows 0, 1, 2.
+        b.when_first_row(s0 - one);
+        b.when_transition(n[P_S0]);
+        b.when_transition(n[P_S1] - s0);
+        b.when_transition(n[P_S2] - s1);
+        b.mark("pow seed");
+        for k in 0..DIGEST {
+            b.assert_zero(s0 * (l[COL_INPUT + k] - p[k]));
+        }
+        b.assert_zero(s0 * (l[COL_INPUT + DIGEST] - c(DOM_SEED)));
+        for k in DIGEST + 1..WIDTH {
+            b.assert_zero(s0 * l[COL_INPUT + k]);
+        }
+        for k in 0..RATE {
+            b.assert_zero(s1 * (l[COL_DATA + k] - p[DIGEST + k]));
+            let block2 = if k < 3 { p[DIGEST + RATE + k] } else { F::ZERO };
+            b.assert_zero(s2 * (l[COL_DATA + k] - block2));
+        }
+        // An item: a start, then exactly 256 absorbs.
+        b.mark("pow items");
+        b.assert_zero(is * (l[COL_INPUT] - l[P_CUR]));
+        b.assert_zero(is * (l[COL_INPUT + 1] - c(DOM_ITEM)));
+        for k in 2..WIDTH {
+            b.assert_zero(is * l[COL_INPUT + k]);
+        }
+        b.assert_zero(is * l[P_K]);
+        let it = is + ia;
+        b.when_transition(n[P_IA] * (one - it));
+        b.when_transition(n[P_IA] * (n[P_K] - l[P_K] - one));
+        b.when_transition(n[P_IA] * (n[P_CUR] - l[P_CUR]));
+        b.when_transition(n[P_IA] * last);
+        b.assert_zero(last * (l[P_K] - c(self.parents as u32)));
+        b.assert_zero(last * (one - ia));
+        b.when_transition(it * (one - last) * (one - n[P_IA]));
+        b.when_last_row(it - last);
+        b.when_transition(n[P_IA] * (n[P_PA0] - l[COL_OUTPUT]));
+        b.when_transition(n[P_IA] * (n[P_PA1] - l[COL_OUTPUT + 1]));
+        // The window: w = (pa0 + pa1 * 2^31) mod N, in 10-bit limbs.
+        b.mark("pow window");
+        for x in [P_A + 3, P_B + 3, P_E, P_E + 1] {
+            b.assert_zero(l[x] * l[x] - l[x]);
+        }
+        for k in 0..24 {
+            let h = l[P_CH + k];
+            b.assert_zero(h * h - h);
+        }
+        b.assert_zero(ia * (l[P_PA0] - lin(l, P_A, 4)));
+        b.assert_zero(ia * (l[P_PA1] - lin(l, P_B, 4)));
+        // Canonical: with bit 30 set, the low 30 bits at most CANON_LOW.
+        b.assert_zero(ia * (lin(l, P_DA, 3) - l[P_A + 3] * (c(CANON_LOW) - lin(l, P_A, 3))));
+        b.assert_zero(ia * (lin(l, P_DB, 3) - l[P_B + 3] * (c(CANON_LOW) - lin(l, P_B, 3))));
+        let nl = Windows::limbs(self.windows.n as u32);
+        let r = [
+            l[P_A],
+            l[P_A + 1],
+            l[P_A + 2],
+            l[P_A + 3] + l[P_B].scale(Fp::new(2)),
+            l[P_B + 1].scale(Fp::new(2)),
+            l[P_B + 2].scale(Fp::new(2)),
+            l[P_B + 3].scale(Fp::new(2)),
+        ];
+        let carry = |k: usize| -> F {
+            let hi = (0..4).fold(F::ZERO, |acc, j| acc + l[P_CH + 4 * k + j].scale(Fp::new(1 << j)));
+            l[P_C + k] + hi.scale(Fp::new(LIMB)) - c(CARRY_BIAS as u32)
+        };
+        let mut prev = F::ZERO;
+        for k in 0..7 {
+            let mut ck = if k < 3 { l[P_W + k] } else { F::ZERO };
+            for (j, nj) in nl.iter().enumerate() {
+                if k >= j && k - j < 5 {
+                    ck += l[P_Q + k - j].scale(Fp::new(*nj));
+                }
+            }
+            let out = if k < 6 { carry(k).scale(Fp::new(LIMB)) } else { F::ZERO };
+            b.assert_zero(ia * (ck - r[k] + prev - out));
+            if k < 6 {
+                prev = carry(k);
+            }
+        }
+        // w < N: w + d = N - 1.
+        let m = Windows::limbs(self.windows.n as u32 - 1);
+        b.assert_zero(ia * (l[P_W] + l[P_D] - c(m[0]) - l[P_E].scale(Fp::new(LIMB))));
+        b.assert_zero(ia * (l[P_W + 1] + l[P_D + 1] + l[P_E] - c(m[1]) - l[P_E + 1].scale(Fp::new(LIMB))));
+        b.assert_zero(ia * (l[P_W + 2] + l[P_D + 2] + l[P_E + 1] - c(m[2])));
+        // The buses.
+        let w = lin(l, P_W, 3);
+        let mut text = vec![c(TAG_TEXT), w];
+        text.extend((0..RATE).map(|k| l[COL_DATA + k]));
+        b.lookup(true, ia, &text);
+        let mut item = vec![c(TAG_ITEM), l[P_CUR]];
+        item.extend((0..WIDTH).map(|k| l[COL_OUTPUT + k]));
+        b.lookup(true, last, &item);
+        let mut seed = vec![c(TAG_SEED)];
+        seed.extend((0..WIDTH).map(|k| l[COL_OUTPUT + k]));
+        b.lookup(true, s2, &seed);
+        for x in Self::range_cols() {
+            b.lookup(true, one, &[c(TAG_RANGE), l[x]]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// text, range, mix
+// ---------------------------------------------------------------------------
+
+/// The windows: preprocessed `[w, packed[8]]`, and the reads of each.
+pub struct TextAir;
+
+impl Air for TextAir {
+    fn width(&self) -> usize {
+        1
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        3
+    }
+
+    fn preprocessed_width(&self) -> usize {
+        1 + RATE
+    }
+
+    fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+        let pre = b.preprocessed();
+        let m = b.local()[0];
+        let mut v = vec![F::from_u32(TAG_TEXT)];
+        v.extend_from_slice(&pre[..1 + RATE]);
+        b.lookup(false, m, &v);
+    }
+}
+
+/// 0 to 1023, and how often each is ranged.
+pub struct RangeAir;
+
+impl Air for RangeAir {
+    fn width(&self) -> usize {
+        2
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        3
+    }
+
+    fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+        let l = b.local();
+        let n = b.next();
+        b.when_first_row(l[0]);
+        b.when_transition(n[0] - l[0] - F::ONE);
+        b.lookup(false, l[1], &[F::from_u32(TAG_RANGE), l[0]]);
+    }
+}
+
+const M_FIRST: usize = 0;
+const M_I: usize = 1;
+const M_IB: usize = 2; // 7 bits of I
+const M_SEED0: usize = M_IB + 7;
+const M_MIX: usize = M_SEED0 + 1; // 32
+const M_OH: usize = M_MIX + MIX_WORDS; // 32
+const M_SB: usize = M_OH + MIX_WORDS; // 31 bits of sel
+const M_T: usize = M_SB + 31; // 3 helpers
+const M_A: usize = M_T + 3; // 16
+const M_BB: usize = M_A + WIDTH; // 16
+pub const MIX_COLS: usize = M_BB + WIDTH;
+const MIX_ROWS: usize = 128;
+
+/// hashimoto's accesses, one a row (64 active rows of 128).
+pub struct MixAir;
+
+impl Air for MixAir {
+    fn width(&self) -> usize {
+        MIX_COLS
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        3
+    }
+
+    fn lookup_group(&self) -> usize {
+        2
+    }
+
+    fn eval<F: Field>(&self, b: &mut Builder<'_, F>) {
+        let l = b.local();
+        let n = b.next();
+        let one = F::ONE;
+        let c = |v: u32| F::from_u32(v);
+        b.when_first_row(l[M_FIRST] - one);
+        b.when_transition(n[M_FIRST]);
+        b.when_first_row(l[M_I]);
+        b.when_transition(n[M_I] - l[M_I] - one);
+        for k in 0..7 {
+            let x = l[M_IB + k];
+            b.assert_zero(x * x - x);
+        }
+        b.assert_eq(l[M_I], (0..7).fold(F::ZERO, |acc, k| acc + l[M_IB + k].scale(Fp::new(1 << k))));
+        let act = one - l[M_IB + 6];
+        // The seed fills both halves of the first mix; seed0 is kept.
+        for k in 0..WIDTH {
+            b.when_first_row(l[M_MIX + WIDTH + k] - l[M_MIX + k]);
+        }
+        b.when_first_row(l[M_SEED0] - l[M_MIX]);
+        b.when_transition(n[M_SEED0] - l[M_SEED0]);
+        // mix[i % 32] by a rotating one-hot.
+        b.when_first_row(l[M_OH] - one);
+        for k in 1..MIX_WORDS {
+            b.when_first_row(l[M_OH + k]);
+        }
+        for k in 0..MIX_WORDS {
+            b.when_transition(n[M_OH + (k + 1) % MIX_WORDS] - l[M_OH + k]);
+        }
+        let picked = (0..MIX_WORDS).fold(F::ZERO, |acc, k| acc + l[M_OH + k] * l[M_MIX + k]);
+        let sel = (l[M_I] + l[M_SEED0]).scale(Fp::new(FNV_PRIME)) + picked;
+        // sel in bits, canonical: bits 30..27 all set leave the rest zero.
+        for k in 0..31 {
+            let x = l[M_SB + k];
+            b.assert_zero(x * x - x);
+        }
+        b.assert_eq(sel, (0..31).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::from_u32(1 << k))));
+        b.assert_eq(l[M_T], l[M_SB + 30] * l[M_SB + 29]);
+        b.assert_eq(l[M_T + 1], l[M_SB + 28] * l[M_SB + 27]);
+        b.assert_eq(l[M_T + 2], l[M_T] * l[M_T + 1]);
+        b.assert_zero(l[M_T + 2] * (0..27).fold(F::ZERO, |acc, k| acc + l[M_SB + k]));
+        let idx = (0..LOG_PAIRS as usize).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::new(2 << k)));
+        // The two items, folded in.
+        for k in 0..MIX_WORDS {
+            let d = if k < WIDTH { l[M_A + k] } else { l[M_BB + k - WIDTH] };
+            b.when_transition(n[M_MIX + k] - l[M_MIX + k] - act * (l[M_MIX + k].scale(Fp::new(FNV_PRIME - 1)) + d));
+        }
+        let mut seed = vec![c(TAG_SEED)];
+        seed.extend((0..WIDTH).map(|k| l[M_MIX + k]));
+        b.lookup(false, l[M_FIRST], &seed);
+        let mut a = vec![c(TAG_ITEM), idx];
+        a.extend((0..WIDTH).map(|k| l[M_A + k]));
+        b.lookup(false, act, &a);
+        let mut bb = vec![c(TAG_ITEM), idx + one];
+        bb.extend((0..WIDTH).map(|k| l[M_BB + k]));
+        b.lookup(false, act, &bb);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The witness
+// ---------------------------------------------------------------------------
+
+/// The four traces of one header's proof of work, the text's preprocessed
+/// table, the public values and the folded mix.
+pub struct PowWitness {
+    pub text_pre: Trace,
+    pub text: Trace,
+    pub perm: Trace,
+    pub range: Trace,
+    pub mix: Trace,
+    pub public: Vec<Fp>,
+    pub mix_out: [Fp; MIX_WORDS],
+}
+
+/// hashimoto's mix on the light path, with `parents` absorbs an item and
+/// windows laid out as `windows`, and the traces that prove it.
+pub fn witness(
+    text: &[u8],
+    windows: Windows,
+    parents: usize,
+    header_hash: &[Fp; DIGEST],
+    nonce: &[u8; 32],
+) -> PowWitness {
+    let n_text = windows.n.next_power_of_two();
+    let window = |w: usize| pack_window(&text[w * windows.stride..w * windows.stride + WINDOW]);
+    let mut reads = vec![0u32; n_text];
+    let mut ranged = vec![0u32; LIMB as usize];
+    let mut perm = HashTraceBuilder::new(PERM_COLS);
+
+    // The seed.
+    let packed: Vec<Fp> = nonce
+        .chunks(3)
+        .map(|ch| Fp::new(ch.iter().enumerate().fold(0u32, |a, (i, x)| a | (*x as u32) << (8 * i))))
+        .collect();
+    let mut input = [Fp::ZERO; WIDTH];
+    input[..DIGEST].copy_from_slice(header_hash);
+    input[DIGEST] = Fp::new(DOM_SEED);
+    perm.start(input);
+    perm.last_row_mut()[P_S0] = Fp::ONE;
+    for (j, block) in packed.chunks(RATE).enumerate() {
+        let mut data = [Fp::ZERO; RATE];
+        data[..block.len()].copy_from_slice(block);
+        perm.absorb(data);
+        perm.last_row_mut()[if j == 0 { P_S1 } else { P_S2 }] = Fp::ONE;
+    }
+    let seed = perm.state();
+
+    // An item, its rows appended.
+    let item = |index: u32, perm: &mut HashTraceBuilder, reads: &mut Vec<u32>| -> [Fp; WIDTH] {
+        let mut input = [Fp::ZERO; WIDTH];
+        input[0] = Fp::from_u32(index);
+        input[1] = Fp::new(DOM_ITEM);
+        perm.start(input);
+        {
+            let row = perm.last_row_mut();
+            row[P_IS] = Fp::ONE;
+            row[P_CUR] = Fp::from_u32(index);
+        }
+        for k in 1..=parents {
+            let st = perm.state();
+            let (a, bv) = (st[0].to_canonical(), st[1].to_canonical());
+            let r = a as u64 | (bv as u64) << 31;
+            let w = (r % windows.n as u64) as u32;
+            let q = r / windows.n as u64;
+            perm.absorb(window(w as usize));
+            reads[w as usize] += 1;
+            let row = perm.last_row_mut();
+            row[P_IA] = Fp::ONE;
+            row[P_K] = Fp::from_u32(k as u32);
+            row[P_CUR] = Fp::from_u32(index);
+            row[P_PA0] = st[0];
+            row[P_PA1] = st[1];
+            let limbs4 = |v: u32| [v % LIMB, (v >> 10) % LIMB, (v >> 20) % LIMB, v >> 30];
+            let (al, bl) = (limbs4(a), limbs4(bv));
+            for j in 0..4 {
+                row[P_A + j] = Fp::new(al[j]);
+                row[P_B + j] = Fp::new(bl[j]);
+            }
+            let diff = |l: [u32; 4]| if l[3] == 1 { CANON_LOW - (l[0] + l[1] * LIMB + l[2] * LIMB * LIMB) } else { 0 };
+            for (at, d) in [(P_DA, diff(al)), (P_DB, diff(bl))] {
+                for (j, x) in Windows::limbs(d).iter().enumerate() {
+                    row[at + j] = Fp::new(*x);
+                }
+            }
+            for j in 0..5 {
+                row[P_Q + j] = Fp::new(((q >> (10 * j)) % LIMB as u64) as u32);
+            }
+            let wl = Windows::limbs(w);
+            let m = Windows::limbs(windows.n as u32 - 1);
+            let dl = Windows::limbs(windows.n as u32 - 1 - w);
+            for j in 0..3 {
+                row[P_W + j] = Fp::new(wl[j]);
+                row[P_D + j] = Fp::new(dl[j]);
+            }
+            let e0 = (wl[0] + dl[0] - m[0]) / LIMB;
+            let e1 = (wl[1] + dl[1] + e0 - m[1]) / LIMB;
+            row[P_E] = Fp::new(e0);
+            row[P_E + 1] = Fp::new(e1);
+            let nl = Windows::limbs(windows.n as u32);
+            let ql: Vec<i64> = (0..5).map(|j| ((q >> (10 * j)) % LIMB as u64) as i64).collect();
+            let rl = [al[0], al[1], al[2], al[3] + 2 * bl[0], 2 * bl[1], 2 * bl[2], 2 * bl[3]];
+            let mut prev = 0i64;
+            for kk in 0..7 {
+                let mut ck = if kk < 3 { wl[kk] as i64 } else { 0 };
+                for (j, nj) in nl.iter().enumerate() {
+                    if kk >= j && kk - j < 5 {
+                        ck += ql[kk - j] * *nj as i64;
+                    }
+                }
+                let v = ck - rl[kk] as i64 + prev;
+                if kk < 6 {
+                    assert_eq!(v % LIMB as i64, 0, "carry");
+                    let carry = v / LIMB as i64;
+                    let biased = (carry + CARRY_BIAS) as u32;
+                    row[P_C + kk] = Fp::new(biased % LIMB);
+                    for j in 0..4 {
+                        row[P_CH + 4 * kk + j] = Fp::new((biased >> (10 + j)) & 1);
+                    }
+                    prev = carry;
+                } else {
+                    assert_eq!(v, 0, "the last limb balances");
+                }
+            }
+            if k == parents {
+                row[P_LAST] = Fp::ONE;
+            }
+        }
+        perm.state()
+    };
+
+    // The accesses, and the mix table beside them.
+    let pairs = 1u32 << LOG_PAIRS;
+    let mut mixv = [Fp::ZERO; MIX_WORDS];
+    mixv[..WIDTH].copy_from_slice(&seed);
+    mixv[WIDTH..].copy_from_slice(&seed);
+    let mut mix_rows = vec![Fp::ZERO; MIX_ROWS * MIX_COLS];
+    for i in 0..MIX_ROWS {
+        let row = &mut mix_rows[i * MIX_COLS..(i + 1) * MIX_COLS];
+        row[M_FIRST] = if i == 0 { Fp::ONE } else { Fp::ZERO };
+        row[M_I] = Fp::from_u32(i as u32);
+        for k in 0..7 {
+            row[M_IB + k] = Fp::new((i as u32 >> k) & 1);
+        }
+        row[M_SEED0] = seed[0];
+        row[M_MIX..M_MIX + MIX_WORDS].copy_from_slice(&mixv);
+        row[M_OH + i % MIX_WORDS] = Fp::ONE;
+        let sel = fnv(Fp::from_u32(i as u32).add(&seed[0]), mixv[i % MIX_WORDS]);
+        let sv = sel.to_canonical();
+        for k in 0..31 {
+            row[M_SB + k] = Fp::new((sv >> k) & 1);
+        }
+        let bit = |k: usize| (sv >> k) & 1;
+        row[M_T] = Fp::new(bit(30) * bit(29));
+        row[M_T + 1] = Fp::new(bit(28) * bit(27));
+        row[M_T + 2] = Fp::new(bit(30) * bit(29) * bit(28) * bit(27));
+        if i < 64 {
+            let idx = (sv % pairs) * 2;
+            let a = item(idx, &mut perm, &mut reads);
+            let bv = item(idx + 1, &mut perm, &mut reads);
+            row[M_A..M_A + WIDTH].copy_from_slice(&a);
+            row[M_BB..M_BB + WIDTH].copy_from_slice(&bv);
+            for (m, d) in mixv.iter_mut().zip(a.iter().chain(&bv)) {
+                *m = fnv(*m, *d);
+            }
+        }
+    }
+
+    // Pass rows to a power of two; every row's limbs ranged.
+    let perm_trace = perm.finish();
+    for i in 0..perm_trace.height() {
+        let row = perm_trace.row(i);
+        for x in PermAir::range_cols() {
+            ranged[row[x].to_canonical() as usize] += 1;
+        }
+    }
+
+    let mut pre = vec![Fp::ZERO; n_text * (1 + RATE)];
+    let mut text_main = vec![Fp::ZERO; n_text];
+    for w in 0..n_text {
+        pre[w * (1 + RATE)] = Fp::from_u32(w as u32);
+        if w < windows.n {
+            pre[w * (1 + RATE) + 1..(w + 1) * (1 + RATE)].copy_from_slice(&window(w));
+        }
+        text_main[w] = Fp::new(reads[w]);
+    }
+    let mut range = vec![Fp::ZERO; 2 * LIMB as usize];
+    for v in 0..LIMB as usize {
+        range[2 * v] = Fp::new(v as u32);
+        range[2 * v + 1] = Fp::new(ranged[v]);
+    }
+    let mut public = header_hash.to_vec();
+    public.extend_from_slice(&packed);
+    PowWitness {
+        text_pre: Trace::new(pre, 1 + RATE),
+        text: Trace::new(text_main, 1),
+        perm: perm_trace,
+        range: Trace::new(range, 2),
+        mix: Trace::new(mix_rows, MIX_COLS),
+        public,
+        mix_out: mixv,
+    }
+}
+
+/// A permutation, for tests.
+pub fn permute(mut s: [Fp; WIDTH]) -> [Fp; WIDTH] {
+    permute_in_place(&mut s);
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pow::{self, PowParams, SeedText};
+    use crate::stark::{self, DynAir, Preprocessed, StarkConfig, TableInput, TableSpec};
+
+    const SEGMENT: StarkConfig =
+        StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 };
+
+    fn header() -> ([Fp; DIGEST], [u8; 32]) {
+        (core::array::from_fn(|k| Fp::new(1000 + k as u32 * 7)), core::array::from_fn(|k| (k * 13) as u8))
+    }
+
+    fn transcript() -> crate::challenger::Challenger {
+        let mut c = crate::challenger::Challenger::new();
+        c.observe(Fp::new(0x7077));
+        c
+    }
+
+    /// The byte-offset variant's mix is hashimoto's: the prototype computes
+    /// the proof of work as it is.
+    #[test]
+    #[ignore = "slow: the seed text and 128 items"]
+    fn mix_matches_hashimoto() {
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let w = witness(seed.text(), Windows::bytes(seed.text().len()), 256, &hh, &nonce);
+        let want = pow::hashimoto(&seed, &hh, &nonce);
+        let mut cmix = [Fp::ZERO; DIGEST];
+        for (k, c) in cmix.iter_mut().enumerate() {
+            let x = &w.mix_out[4 * k..4 * k + 4];
+            *c = fnv(fnv(fnv(x[0], x[1]), x[2]), x[3]);
+        }
+        assert_eq!(cmix, want.mix);
+    }
+
+    fn tables<'a>(w: &'a PowWitness, perm: &'a PermAir) -> Vec<(&'a dyn DynAir, &'a Trace, Option<&'a Trace>)> {
+        vec![
+            (&TextAir, &w.text, Some(&w.text_pre)),
+            (perm, &w.perm, None),
+            (&RangeAir, &w.range, None),
+            (&MixAir, &w.mix, None),
+        ]
+    }
+
+    /// Every constraint holds and the buses balance (aligned windows, the
+    /// smaller table).
+    #[test]
+    #[ignore = "slow: the seed text and 128 items"]
+    fn constraints_hold() {
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let windows = Windows::aligned(seed.text().len());
+        let w = witness(seed.text(), windows, 256, &hh, &nonce);
+        let perm = PermAir { windows, parents: 256 };
+        assert_eq!(stark::check_tables(&tables(&w, &perm), &w.public), Ok(()));
+    }
+
+    /// Proving and verifying one header's proof of work at the mainnet
+    /// segment configuration: both window layouts, 256 and 254 parents.
+    /// `cargo test --release --lib pow_air::tests::cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "slow: measures proving"]
+    fn cost() {
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let len = seed.text().len();
+        for (name, windows) in [("aligned", Windows::aligned(len)), ("bytes", Windows::bytes(len))] {
+            for parents in [256, 254] {
+                let t = std::time::Instant::now();
+                let w = witness(seed.text(), windows, parents, &hh, &nonce);
+                let built = t.elapsed();
+                let perm = PermAir { windows, parents };
+                let t = std::time::Instant::now();
+                let pre = Preprocessed::new(
+                    &w.text_pre,
+                    SEGMENT.log_blowup,
+                    SEGMENT.quotient_stride(TextAir.max_constraint_degree()),
+                );
+                let commit = t.elapsed();
+                let inputs = [
+                    TableInput { air: &TextAir, trace: &w.text, pre: Some(&pre) },
+                    TableInput { air: &perm, trace: &w.perm, pre: None },
+                    TableInput { air: &RangeAir, trace: &w.range, pre: None },
+                    TableInput { air: &MixAir, trace: &w.mix, pre: None },
+                ];
+                let t = std::time::Instant::now();
+                let proof = stark::prove_tables(&SEGMENT, &inputs, &w.public, &mut transcript());
+                let proved = t.elapsed();
+                let root = pre.root();
+                let specs = [
+                    TableSpec { air: &TextAir, pre_root: Some(&root) },
+                    TableSpec { air: &perm, pre_root: None },
+                    TableSpec { air: &RangeAir, pre_root: None },
+                    TableSpec { air: &MixAir, pre_root: None },
+                ];
+                let t = std::time::Instant::now();
+                let ok = stark::verify_tables(&SEGMENT, &specs, &w.public, &proof, &mut transcript());
+                let verified = t.elapsed();
+                assert_eq!(ok, Ok(()));
+                println!(
+                    "{name:7} parents {parents}: text 2^{} perm 2^{} ({} cols) | witness {built:.2?}, text commit (once) {commit:.2?}, prove {proved:.2?}, {} KB, verify {verified:.2?}",
+                    w.text.height().trailing_zeros(),
+                    w.perm.height().trailing_zeros(),
+                    PERM_COLS,
+                    proof.to_bytes().len() / 1024,
+                );
+            }
+        }
+    }
+}
