@@ -21,9 +21,9 @@
 //!   from perm and folds them in (`fnv`).
 //! - **range**: 0 to 1023, for the limbs.
 //!
-//! Two variants of the windows, to compare: at any byte offset (the proof
-//! of work as it is: `N` = 4,340,894, a table of 2^23 rows), or at 24-byte
-//! boundaries (`N` = 180,871, 2^18 rows). Not yet constrained, being a few
+//! Two variants of the windows, to compare: at 24-byte boundaries, the proof
+//! of work's (`N` = 180,872, a table of 2^18 rows), or at any byte offset,
+//! as it was before (`N` = 4,340,894, 2^23 rows). Not yet constrained, being a few
 //! rows of thousands and no part of the cost: the mix's final fold, the
 //! result's compression and its comparison with the target.
 
@@ -53,7 +53,8 @@ const LOG_PAIRS: u32 = 19;
 const MIX_WORDS: usize = 2 * WIDTH;
 
 /// How the windows are laid out: window `w` is the 24 bytes from
-/// `w * stride`, for `w < n`.
+/// `w * stride` (the last no later than a window's length before the
+/// text's end), for `w < n`.
 #[derive(Clone, Copy, Debug)]
 pub struct Windows {
     pub stride: usize,
@@ -61,14 +62,16 @@ pub struct Windows {
 }
 
 impl Windows {
-    /// At any byte offset: the proof of work as it is.
+    /// At any byte offset: the proof of work as it was before aligned
+    /// windows, kept to compare.
     pub fn bytes(text_len: usize) -> Windows {
         Windows { stride: 1, n: text_len - WINDOW + 1 }
     }
 
-    /// At 24-byte boundaries.
+    /// At 24-byte boundaries, the last ending at the text's end: the proof
+    /// of work ([`crate::pow::SeedText::windows`]).
     pub fn aligned(text_len: usize) -> Windows {
-        Windows { stride: WINDOW, n: text_len / WINDOW }
+        Windows { stride: WINDOW, n: text_len.div_ceil(WINDOW) }
     }
 
     fn limbs(v: u32) -> [u32; 3] {
@@ -435,7 +438,10 @@ pub fn witness(
     nonce: &[u8; 32],
 ) -> PowWitness {
     let n_text = windows.n.next_power_of_two();
-    let window = |w: usize| pack_window(&text[w * windows.stride..w * windows.stride + WINDOW]);
+    let window = |w: usize| {
+        let at = (w * windows.stride).min(text.len() - WINDOW);
+        pack_window(&text[at..at + WINDOW])
+    };
     let mut reads = vec![0u32; n_text];
     let mut ranged = vec![0u32; LIMB as usize];
     let mut perm = HashTraceBuilder::new(PERM_COLS);
@@ -639,14 +645,14 @@ mod tests {
         c
     }
 
-    /// The byte-offset variant's mix is hashimoto's: the prototype computes
-    /// the proof of work as it is.
+    /// The aligned variant's mix is hashimoto's: the prototype computes the
+    /// proof of work as it is.
     #[test]
     #[ignore = "slow: the seed text and 128 items"]
     fn mix_matches_hashimoto() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let w = witness(seed.text(), Windows::bytes(seed.text().len()), 256, &hh, &nonce);
+        let w = witness(seed.text(), Windows::aligned(seed.text().len()), PowParams::MAINNET.parents, &hh, &nonce);
         let want = pow::hashimoto(&seed, &hh, &nonce);
         let mut cmix = [Fp::ZERO; DIGEST];
         for (k, c) in cmix.iter_mut().enumerate() {
@@ -673,8 +679,9 @@ mod tests {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
         let windows = Windows::aligned(seed.text().len());
-        let w = witness(seed.text(), windows, 256, &hh, &nonce);
-        let perm = PermAir { windows, parents: 256 };
+        let parents = PowParams::MAINNET.parents;
+        let w = witness(seed.text(), windows, parents, &hh, &nonce);
+        let perm = PermAir { windows, parents };
         assert_eq!(stark::check_tables(&tables(&w, &perm), &w.public), Ok(()));
     }
 

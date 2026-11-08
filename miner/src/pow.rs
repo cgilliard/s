@@ -5,13 +5,16 @@
 //! the binary and decompressed at startup ([`SeedText`], 4.3 MB). Every
 //! dataset item is derived directly from it: starting from a state seeded
 //! with the item index, each of [`PowParams::parents`] sequential steps uses
-//! the current state to pick a byte offset anywhere in the text, absorbs the
-//! [`WINDOW`]-byte slice at that offset and applies the Poseidon2
-//! permutation. Because windows start at arbitrary byte offsets, no table
-//! smaller than the text reproduces the derivation (hashing every window
-//! would take about thirty times more space), and a single verification
-//! touches tens of thousands of windows, so a node missing any part of the
-//! text fails almost every block. Holding the complete text is therefore a
+//! the current state to pick one of the text's [`WINDOW`]-byte windows,
+//! absorbs it and applies the Poseidon2 permutation. The windows lie on
+//! 24-byte boundaries, the last one ending at the text's end (it overlaps
+//! the one before), so every byte is in one: 180,872 of them. Aligned
+//! windows keep small the table a proof of the work looks them up in (a
+//! row a window: `docs/NODE.md`, the work in the chain proof). The smallest
+//! table that reproduces the derivation is the windows themselves as field
+//! elements, 5.8 MB, more than the text. A single verification touches
+//! tens of thousands of windows, so a node missing any part of the text
+//! fails almost every block. Holding the complete text is therefore a
 //! precondition for verifying the chain.
 //!
 //! Miners expand the text once into a 64 MB [`Dataset`] of 64-byte items.
@@ -70,11 +73,11 @@ pub struct PowParams {
 
 impl PowParams {
     /// 64 MB dataset.
-    pub const MAINNET: PowParams = PowParams { log_dataset_items: 20, parents: 256, accesses: 64 };
+    pub const MAINNET: PowParams = PowParams { log_dataset_items: 20, parents: 254, accesses: 64 };
 
     /// The dev networks' (`--network dev`): a 64 KB dataset, built into
     /// the binary ([`DEV_DATASET`]).
-    pub const DEV: PowParams = PowParams { log_dataset_items: 10, parents: 256, accesses: 64 };
+    pub const DEV: PowParams = PowParams { log_dataset_items: 10, parents: 254, accesses: 64 };
 
     pub const fn dataset_items(&self) -> usize {
         1 << self.log_dataset_items
@@ -164,18 +167,30 @@ impl SeedText {
         &self.text
     }
 
+    /// The text's windows: one every [`WINDOW`] bytes, the last one ending
+    /// at the text's end.
+    pub fn windows(&self) -> usize {
+        self.text.len().div_ceil(WINDOW)
+    }
+
+    /// Where window `w` starts: `w * WINDOW`, but the last one a window's
+    /// length before the text's end.
+    pub fn window_offset(&self, w: usize) -> usize {
+        (w * WINDOW).min(self.text.len() - WINDOW)
+    }
+
     /// Computes dataset item `index`: `parents` sequential permutations, each
     /// preceded by absorbing the text window selected by the current state.
     pub fn calc_dataset_item(&self, index: usize) -> Item {
         assert!(index < self.params.dataset_items());
-        let offsets = (self.text.len() - WINDOW + 1) as u64;
+        let windows = self.windows() as u64;
         let mut mix = [Fp::ZERO; WIDTH];
         mix[0] = Fp::from_u32(index as u32);
         mix[1] = Fp::new(DOM_ITEM);
         permute_in_place(&mut mix);
         for _ in 0..self.params.parents {
             let r = mix[0].to_canonical() as u64 | (mix[1].to_canonical() as u64) << 31;
-            let offset = (r % offsets) as usize;
+            let offset = self.window_offset((r % windows) as usize);
             let block = pack_window(&self.text[offset..offset + WINDOW]);
             for (m, b) in mix.iter_mut().zip(&block) {
                 *m = m.add(b);
@@ -495,7 +510,7 @@ mod tests {
     }
     use std::sync::OnceLock;
 
-    const SMALL: PowParams = PowParams { log_dataset_items: 10, parents: 256, accesses: 64 };
+    const SMALL: PowParams = PowParams { log_dataset_items: 10, parents: 254, accesses: 64 };
 
     fn small_seed() -> &'static SeedText {
         static SEED: OnceLock<SeedText> = OnceLock::new();
@@ -524,14 +539,19 @@ mod tests {
     fn mainnet_sizes() {
         assert_eq!(PowParams::MAINNET.dataset_bytes(), 64 << 20);
         assert_eq!(WINDOW, 24);
+        // Every byte of the text is in a window: the last one ends at its end.
+        let seed = small_seed();
+        assert_eq!(seed.windows(), 180_872);
+        assert_eq!(seed.window_offset(180_870), 180_870 * WINDOW);
+        assert_eq!(seed.window_offset(180_871) + WINDOW, SEED_TEXT_LEN);
     }
 
     #[test]
     fn items_depend_on_every_part_of_the_text() {
-        // A short synthetic text is covered densely by 256 windows per item:
-        // an interior byte lies in 24 window offsets, so flipping it changes
-        // nearly every item; an edge byte lies in a single offset and still
-        // changes a good fraction of them.
+        // A short synthetic text of 42 windows (the last overlapping the one
+        // before) is covered densely by 254 windows per item: every byte
+        // lies in a window, so flipping any byte, the last ones included,
+        // changes nearly every item.
         let base: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
         let a = SeedText::from_bytes(SMALL, base.clone());
         let items: Vec<Item> = (0..64).map(|i| a.calc_dataset_item(i)).collect();
@@ -542,13 +562,11 @@ mod tests {
             let b = SeedText::from_bytes(SMALL, t);
             (0..count).filter(|&i| b.calc_dataset_item(i) != items[i]).count()
         };
-        for pos in [30usize, 499, 969] {
+        assert_eq!(a.windows(), 42);
+        assert_eq!(a.window_offset(41), 1000 - WINDOW);
+        for pos in [0usize, 30, 499, 969, 999] {
             let c = changed(pos, 8);
             assert!(c >= 7, "byte {pos}: only {c} of 8 items changed");
-        }
-        for pos in [0usize, 999] {
-            let c = changed(pos, 64);
-            assert!(c >= 8, "byte {pos}: only {c} of 64 items changed");
         }
         // A text shorter than one window is rejected.
         assert!(std::panic::catch_unwind(|| SeedText::from_bytes(SMALL, vec![0u8; WINDOW - 1])).is_err());

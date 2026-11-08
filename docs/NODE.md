@@ -126,7 +126,7 @@ measured in the first step, and the plan adjusted to what is found.
 - **Proof-of-work.** An Ethash-like hashimoto over Poseidon2 (`pow.rs`).
   The node takes the light path: each item it needs is computed from
   the seed text instead of a 64 MB dataset:
-  - 64 accesses × 2 items × 257 permutations ≈ 33,000 permutations a
+  - 64 accesses × 2 items × 255 permutations ≈ 32,640 permutations a
     header, so several seconds each by the estimate above;
   - it needs the seed (the King James text, 1.29 MB gzipped,
     4.34 MB inflated) with random access: inflated once at start,
@@ -353,33 +353,34 @@ proof supplies the one expensive fact, that the `mix` is the true one.
 
 ### 1. Aligned windows
 
-`SeedText::calc_dataset_item` (`miner/src/pow.rs`): each of the
-`parents` steps picks `offset = r mod (len - 24 + 1)` and absorbs
-`text[offset..offset + 24]`. With aligned windows it picks
-`w = r mod floor(len / 24)` and absorbs `text[24w..24w + 24]`: one of
-180,871 windows instead of 4,340,894.
+Done (2026-11-07), with 254 parents. `SeedText::calc_dataset_item`
+(`miner/src/pow.rs`) picked `offset = r mod (len - 24 + 1)`, any byte,
+and absorbed `text[offset..offset + 24]`. It now picks
+`w = r mod ceil(len / 24)` and absorbs window `w`: 24 bytes from `24w`,
+except that the last window ends at the text's end, overlapping the one
+before. So every byte is in a window, the text's last words included
+(`len` is 13 more than a multiple of 24). That is 180,872 windows
+instead of 4,340,894.
 
 - **The same:** the dataset (2^20 items of 64 bytes, 64 MB), hashimoto's
-  64 accesses, the cost of mining and of building the dataset, the light
-  path's cost, and the need to hold the whole text to verify.
-- **Different:** every item's value, so the dataset itself. Also the
-  dev dataset built into the binary, and any genesis or test block mined
-  with the old one.
-- **The module's claim changes.** It says arbitrary offsets mean no
+  64 accesses, the cost of mining and of building the dataset, and the
+  need to hold the whole text to verify. Genesis, whose proof of work is
+  not checked (its `mix` is empty), and its id.
+- **Different:** every item's value, so the dataset itself; the dev
+  dataset built into the binary was regenerated. A node's saved mainnet
+  dataset fails its sampled check and is rebuilt.
+- **The module's claim, restated.** It said arbitrary offsets meant no
   table smaller than the text reproduces the derivation, since hashing
   every window would take thirty times more space. With aligned
   windows, the smallest table is the windows themselves as field
-  elements: 180,871 × 32 bytes, 5.8 MB, more than the 4.34 MB text. So
-  holding something at least text-sized is still required, and the
-  claim is restated that way.
+  elements: 180,872 × 32 bytes, 5.8 MB, more than the 4.34 MB text.
 - **Why:** the proof shows each window came from the text by looking it
-  up in a committed table of every possible window. That table has
-  4.34 M rows (2^23) today, and 180,871 (2^18) aligned. It is the whole
-  difference between 81–89 s and 3–4.5 s to prove (Measured, below).
-- **Optionally 254 parents instead of 256.** A header's work is then
-  32,643 permutations instead of 32,899, which fits a 2^15-row table
-  instead of 2^16: 3.2 s instead of 4.5 s. It is a change to the
-  parameter, nothing else.
+  up in a committed table of every possible window: 4.34 M rows (2^23)
+  at any byte, 180,872 (2^18) aligned. That is the whole difference
+  between 81–89 s and 3–4.5 s to prove (Measured, below).
+- **254 parents instead of 256:** a header's work is 32,643 permutations
+  instead of 32,899, which fits a 2^15-row table instead of 2^16: 3.2 s
+  instead of 4.5 s to prove. The light path's cost falls by the same 1%.
 
 ### 2. The parent's work
 
@@ -453,12 +454,13 @@ development laptop (12 threads).
 |---|---|---|---|---|---|---|
 | aligned | 256 | 2^18 | 2^16 | 4.5 s | 462 KB | 19 ms |
 | aligned | 254 | 2^18 | 2^15 | 3.2 s | 469 KB | 20 ms |
-| any byte (today) | 256 | 2^23 | 2^16 | 88.7 s | 572 KB | 29 ms |
-| any byte (today) | 254 | 2^23 | 2^15 | 81.2 s | 561 KB | 48 ms |
+| any byte (before) | 256 | 2^23 | 2^16 | 88.7 s | 572 KB | 29 ms |
+| any byte (before) | 254 | 2^23 | 2^15 | 81.2 s | 561 KB | 48 ms |
 
 The text table's commitment is made once per miner: 0.3 s aligned, 15 s
-at any byte. The byte-offset variant's mix equals `pow::hashimoto`'s
-(`mix_matches_hashimoto`).
+at any byte. Measured before the change, with the aligned variant's
+table one window shorter; the aligned variant now computes exactly
+`pow::hashimoto`'s mix (`mix_matches_hashimoto`).
 
 What it means for a block, with aligned windows:
 
@@ -478,10 +480,8 @@ What it means for a block, with aligned windows:
 
 Each step done when its test passes.
 
-1. **Aligned windows** in `pow.rs` (and 254 parents if chosen).
-   Regenerate the dev dataset, the genesis block and every test vector
-   built on the old dataset. Done when the suite passes on the new proof
-   of work.
+1. **Aligned windows** in `pow.rs`, and 254 parents; the dev dataset
+   regenerated. Done (2026-11-07): section 1.
 2. **The work segment, complete**: the prototype's tables, the final
    fold to the `mix` checked against its public value, the attack tests
    (each constraint broken alone is refused, as the other circuits'
@@ -502,13 +502,12 @@ Each step done when its test passes.
 
 ### Its open questions
 
-- **254 parents:** take the second saved, or leave the parameter alone.
 - **The sync depth:** today 144 blocks. The full proof of work is
   checked natively for every header after `S`, so a deeper `S` costs a
   node more, and the fam node most.
-- **The first block:** at height 1 the parent is genesis. Genesis can
-  either be proven like any other block's work (a work segment for it)
-  or taken as a constant in the circuit.
+- **The first block:** at height 1 the parent is genesis, which has no
+  proof of work (its `mix` is empty and not checked). So there is nothing
+  to prove for it, and its header is a constant in the circuit.
 
 ## Implementation order
 
