@@ -1,0 +1,37 @@
+\ chainver_test.fam — the chain proof's verifier on a real proof (docs/NODE.md,
+\ step 3), a program for the OS after arith.fam, poseidon2.fam and
+\ chainver.fam.  /lib/chainver is the program (chainver.bin), /lib/chainproof
+\ a mainnet chain proof from tabminer (chainproof.bin: its 16 public values,
+\ then its bytes; miner/src/aggregate.rs's write_fam_chain_proof).  The
+\ proof is accepted, then refused with a byte changed, at 24 places spread
+\ over it, and with its output changed.
+
+: cta variable ;  : ctn variable ;  : ctk variable ;  : ctp variable ;
+
+\ rdfile ( path -- addr n )  a whole file of at most 1 MiB, in memory (the
+\ image's data files cannot seek, so it is read to its end).
+: rdfile
+0 lit open  dup 0< if "chainver_test: no file" puts 0A lit putc then
+100000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  100000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: ctverify  cta @  cta @ 40 lit +  ctn @ 40 lit -  cvverify ;   \ ( -- flag )
+
+"/lib/chainver" rdfile drop cvinit
+"/lib/chainproof" rdfile ctn ! cta !
+ctverify if "accepted" else "refused" then puts 0A lit putc
+0 lit ctk !
+18 lit 0 lit do
+	ctn @ 41 lit - i * 17 lit / 40 lit + cta @ + ctp !
+	ctp @ c@ i 7 lit and 1 lit swap lshift xor ctp @ c!
+	ctverify 0= if ctk @ 1 lit + ctk ! then
+	ctp @ c@ i 7 lit and 1 lit swap lshift xor ctp @ c!
+loop
+"refused " puts ctk @ u. " of 24 changed" puts 0A lit putc
+cta @ 20 lit + dup @ 1 lit xor swap !
+ctverify if "accepted" else "refused" then puts " with another output" puts 0A lit putc
+bye

@@ -35,6 +35,15 @@ transactions it does.
   validating a block requires the entire file: neither the 64 MB dataset
   nor any hash of the file substitutes, and every validating node, this
   one and tabminer, stores it. The node needs no inflate.
+- **One verifier for chain proofs, run by both.** A chain proof is
+  checked by running the verifier a chain step already runs on its
+  predecessor: tabminer's `Compiler::verify_stark`, compiled once for
+  the chain setup's table heights into a fixed program (41,374
+  operations), interpreted. Tabminer verifies chain proofs this way too
+  (`miner/src/chain_verifier.rs`, decided 2026-11-08), so the two accept
+  exactly the same proofs, and a chain proof must have the setup's
+  heights. The node ships the program as data (`/lib/chainver`) rather
+  than porting the STARK verifier and the two tables' constraints.
 - **No M extension.** RV32I as everywhere else: products in software,
   and the verification loop optimised until it is fast enough.
   Verification without M has been done before.
@@ -134,10 +143,10 @@ measured in the first step, and the plan adjusted to what is found.
   - rate 1/32, 22 queries, 16 bits of grinding, zero-knowledge;
   - FRI folding by 4;
   - two tables: the VM (92 columns) and the hash table (about 314).
-  Verifying it means Merkle paths, the FRI checks and the AIR
-  constraints at the out-of-domain point. Rough estimate: on the
-  order of 10^4 permutations, about 0.4 s of them, plus the field work
-  (measured in step 3).
+  Verifying it means decoding it (its Merkle paths rebuilt, which
+  hashes its opened rows), then running the verifier program: about
+  8,500 permutations and 24,000 extension products. Measured (step 3):
+  about 1.2 to 1.5 s on one hart under QEMU.
 - **Proof-of-work.** An Ethash-like hashimoto over Poseidon2 (`pow.rs`),
   checked in full only for the fast-sync block and the headers after it
   (about 145, once) and then for each new block (one every 600 s); every
@@ -228,7 +237,8 @@ half-applied one.
     dirty until written or dropped, so needs no other record.
   `node.sh` and `makenode.sh` make 25 GB disks.
 - **Memory:** the node's own region and its `malloc`, the seed file
-  (1.29 MB), a proof being verified (205 KB and its working state),
+  (1.29 MB), a proof being verified (205 KB, and about 4 MB to verify
+  it: the verifier program, its memory and its input stream),
   the pool (bounded far below tabminer's 64 MiB), and buffers for
   peers. The store's page cache is shared with everything else, as
   OS.md's memory section says. The target is the whole system in
@@ -744,7 +754,34 @@ Each step done when its test passes.
      hart.
 3. **The chain proof's verifier**: the challenger, FRI, the STARK
    check, and the two tables' constraints. Done when it accepts a real
-   proof from tabminer and rejects it with any byte changed.
+   proof from tabminer and rejects it with any byte changed. Done
+   (2026-11-08), as one program both implementations run (One verifier
+   for chain proofs, above):
+   - Tabminer (`miner/src/chain_verifier.rs`): `ChainVerifier` compiles
+     `verify_stark` for the setup's heights from a zero proof of their
+     shape. The program's inputs are the proof's values, except the
+     inverses it asks the prover for, which the interpreter computes
+     (`Op::Inv`): a wrong one fails the assertion after it, so nothing
+     changes. A proof is accepted when it decodes to the program's
+     shape, the program accepts its values, and its query indices are
+     those the program sampled. `verify_chain` uses it, so a proof of
+     other heights is refused. Tests: the stream equals the compiled
+     verifier's witness without its hints; fuzzed proofs are refused, and
+     byte-changed ones as the native `verify_tables` refuses them; the
+     node's copy of the program is current (`fam_verifier_is_current`).
+   - The program as data: `node/src/user/node/chainver.bin` (695 KB:
+     its header gives the proof's shape and where each query's sampled
+     bits are; then 41,374 operations over 53,590 words, reading 65,905
+     values), written by `write_fam_verifier`. A real mainnet chain
+     proof, block 2's, with its public values: `chainproof.bin`,
+     written by `aggregate`'s `write_fam_chain_proof`.
+   - The node (`node/src/user/node/chainver.fam`): the decoder (every
+     count as the header gives it, every element canonical, the paths
+     rebuilt as `merkle::expand_paths` does, the bytes used up), the
+     stream in the program's order, and the interpreter. oscheck's
+     `chainver` runs it under the OS: the proof is accepted, and refused
+     with a byte changed at 24 places and with another output. About
+     1.2 to 1.5 s a proof on one hart.
 4. **Proof-of-work and headers**: items and the direct reads from the
    seed file, ASERT,
    median time, fork choice by work. Done when a header chain from a
@@ -770,8 +807,10 @@ Each step done when its test passes.
 
 ## Open questions
 
-- **How fast verification gets without M**: step 1 and step 2 measure
-  it, and say how much optimising the loop needs.
+- **How fast verification gets without M**: a chain proof takes about
+  1.2 to 1.5 s and a header's full proof of work about 1.4 s on one
+  hart (steps 2 and 3), well within a block time of 600 s; the fast
+  sync's 145 headers about 3.4 minutes. Optimising further can wait.
 - **The API's reach**: local only by default; how a user opens it
   wider. The token is needed either way.
 - **Messages and onion routing**: protocol messages 16 to 22, in a

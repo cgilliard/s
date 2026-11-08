@@ -121,6 +121,15 @@ done
 # tabminer's values.
 expect arith 0 '7 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/arith_vectors.fam
 expect poseidon2 0 '3 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/poseidon2.fam src/user/node/poseidon2_vectors.fam
+# The chain proof's verifier (step 3), a program for the OS: tabminer's
+# compiled verifier (/lib/chainver) on a real mainnet chain proof
+# (/lib/chainproof), accepted, then refused with a byte changed at 24 places
+# and with another output.
+ND=src/user/node
+./tools/fam --user -o "$T/tcv.bin" $ND/arith.fam $ND/poseidon2.fam $ND/chainver.fam $ND/chainver_test.fam > "$T/tcv.build" 2>&1 || fail chainver "build: $(head -c 300 "$T/tcv.build")"
+sh scripts/mkimage.sh "$T/cv.img" bin/kernel init="$T/tcv.bin":8192 chainver=$ND/chainver.bin:0 chainproof=$ND/chainproof.bin:0 2> "$T/cv.mk" || fail chainver "mkimage: $(cat "$T/cv.mk")"
+expect chainver 124 'refused with another output' 60 ./tools/q32 "$T/cv.img"
+has chainver '^accepted'; has chainver '^refused 24 of 24 changed'
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

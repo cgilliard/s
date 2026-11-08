@@ -1,0 +1,361 @@
+\ chainver.fam — the chain proof's verifier (docs/NODE.md, step 3), after
+\ arith.fam and poseidon2.fam.  As tabminer's miner/src/chain_verifier.rs,
+\ whose program it runs: the STARK verifier a chain step runs on its
+\ predecessor, compiled by tabminer for the chain setup's heights
+\ (chainver.bin, /lib/chainver in the image).  Tabminer verifies chain
+\ proofs with the same program, so the two accept the same proofs.
+\
+\ A proof is accepted when its bytes decode to a proof of the program's
+\ shape (cvdecode: every count as the program's header gives it, every
+\ field element canonical, the Merkle paths rebuilt as tabminer's
+\ merkle::expand_paths rebuilds them, the bytes used up), the program
+\ accepts its values (cvstream lays them out, cvrun runs it: every
+\ assertion holds), and each query index the proof gives is the one the
+\ program sampled.
+\
+\ The program's memory is words of the extension, 16 bytes each in
+\ Montgomery form; its stream the proof's values in the order it reads
+\ them, as words.  The proof is decoded in a copy whose field elements are
+\ turned to Montgomery form in place.  Not reentrant.
+\
+\ cvinit ( prog -- )  the program (chainver.bin's bytes, in memory),
+\ checked for its magic; buffers allocated.
+\ cvverify ( pub proof n -- flag )  the 16 public values (the program
+\ digest and the output digest, canonical words) and a proof of n bytes:
+\ -1 accepted, 0 refused.
+
+: cvp variable ;    \ the program file
+: cvm variable ;    \ the program's memory
+: cvs variable ;    \ its stream
+: cvb variable ;    \ the proof being decoded
+: cverr variable ;  \ nonzero: refused
+: cvT variable ;  : cvR variable ;  : cvH variable ;  : cvG variable ;  : cvO variable ;   \ header sections (word indices)
+
+\ The proof's largest size: more than any proof of the program's shape can
+\ be (one whose paths share no sibling is about 300 KB), so a longer one,
+\ which tabminer refuses for its bytes left over, is refused unread.
+:M CVMAX 100000 lit ;
+
+: hw  2 lit lshift cvp @ + @ ;               \ ( i -- x )  header word i
+: cvslen 2 lit hw ;  : cvnops 3 lit hw ;  : cvL 5 lit hw ;  : cvnq 6 lit hw ;
+: cvnt  cvT @ hw ;
+: cvnr  cvR @ hw ;
+: tw  swap D lit * + cvT @ 1 lit + + hw ;     \ ( t k -- x )  table t's word k: log_n aux lens*7 rows*4
+: tgl  2 lit + tw ;                           \ ( t g -- n )  opening group g's length (words)
+: trow  9 lit + tw ;                          \ ( t k -- n )  row k's length (scalars)
+: rvals  2 lit * cvR @ 1 lit + + hw ;         \ ( r -- n )  values a query opens in round r
+: rbits  2 lit * cvR @ 2 lit + + hw ;         \ ( r -- bits )  its fold grinding
+: theight  cvH @ + hw ;                       \ ( k -- h )  tree k's height
+: grind  cvG @ + hw ;                         \ ( k -- bits )
+: ntrees  cvnt 4 lit * cvnr + ;
+
+\ ── Decoding ──
+
+: rp variable ;  : re variable ;
+: rbad  1 lit cverr ! ;
+: r32  rp @ 4 lit + re @ u> if rbad 0 lit else rp @ @ rp @ 4 lit + rp ! then ;   \ ( -- u )
+: rexp  r32 <> if rbad then ;                 \ ( v -- )  the next word must be v
+\ rfps ( n -- )  n field elements, each canonical, turned to Montgomery form in place.
+: rfps
+?dup if 0 lit do
+	rp @ 4 lit + re @ u> if rbad else
+		rp @ @ dup P u< if tom rp @ ! else drop rbad then
+		rp @ 4 lit + rp !
+	then
+loop then ;
+
+\ What decoding records (byte addresses in the proof).
+: tofa variable ;   \ per table 16 words: trace root, aux root, lookup sum, quotient root, the 7 groups
+: tof  swap 4 lit lshift + 2 lit lshift tofa @ + ;            \ ( t k -- addr )
+: cmt variable ;  : fin variable ;  : pwit variable ;  : fwit variable ;  : gwit variable ;
+: qidx variable ;  : qva variable ;  : qra variable ;
+: qi  2 lit lshift qidx @ + ;                                 \ ( q -- addr )
+: qv  swap cvnr * + 2 lit lshift qva @ + ;                    \ ( q r -- addr )
+: qr  rot cvnt * rot + 2 lit lshift + 2 lit lshift qra @ + ;  \ ( q t k -- addr )
+
+: rtable  ( t -- )
+dup 0 lit tw rexp
+rp @ over 0 lit tof !  8 lit rfps
+dup 1 lit tw dup rexp if
+	rp @ over 1 lit tof !  8 lit rfps
+	rp @ over 2 lit tof !  4 lit rfps
+then
+rp @ over 3 lit tof !  8 lit rfps
+7 lit 0 lit do
+	dup i tgl dup rexp
+	rp @ 2 lit pick i 4 lit + tof !
+	2 lit lshift rfps
+loop
+drop ;
+
+: rquery  ( q -- )
+r32 over qi !
+cvnr 0 lit do
+	i rvals dup rexp
+	rp @ 2 lit pick i qv !
+	2 lit lshift rfps
+loop
+cvnt 0 lit do
+	4 lit 0 lit do
+		j i trow dup rexp
+		rp @ 2 lit pick j i qr !
+		rfps
+	loop
+loop
+drop ;
+
+
+\ ── The paths: tabminer's merkle::walk_paths ──
+\
+\ A tree's walk, level by level from the leaves: a query's sibling is a
+\ node already known (the first leaf or node at its position), one sent
+\ before at this level, or the next digest sent.  The next level's nodes
+\ are the parents, a shared parent the first query's.
+
+: pba variable ;                              \ per tree, its paths: per query h digests
+: pos variable ;  : npos variable ;  : ndig variable ;  : ncnt variable ;
+: xpos variable ;  : xdig variable ;  : xcnt variable ;
+: spos variable ;  : sptr variable ;  : scnt variable ;
+: wt variable ;  : wh variable ;  : zdig variable ;
+: posa  2 lit lshift pos @ + ;                \ ( q -- addr )
+: wpath  swap wh @ * + 5 lit lshift  wt @ 2 lit lshift pba @ + @ + ;   \ ( q l -- addr )
+: ndg  5 lit lshift ndig @ + ;                \ ( i -- addr )
+: xdg  5 lit lshift xdig @ + ;
+\ dfind ( p a n -- i|-1 )  the first of the n words at a that is p.
+: dfind
+FFFFFFFF lit swap ?dup if 0 lit do dup 0< if 2 lit pick 2 lit pick i w@ = if drop i then then loop then
+nip nip ;
+
+\ leaf ( q c -- )  c (8 words) = query q's leaf in tree wt: its row's hash
+\ (zeros for an empty row).
+: leaf
+wt @ cvnt 4 lit * u< if
+	over wt @ 2 lit rshift wt @ 3 lit and qr @
+	wt @ 2 lit rshift wt @ 3 lit and trow
+	dup if rot hash drop else 2drop 8 lit wzero drop then
+else
+	swap wt @ cvnt 4 lit * - qv @
+	wt @ cvnt 4 lit * - rvals 2 lit lshift
+	rot hash
+then ;
+
+\ rdig ( -- addr )  the next digest sent (zeros if there is none).
+: rdig  rp @ 20 lit + re @ u> if rbad zdig @ else rp @ 8 lit rfps then ;
+
+: walk  ( tree -- )
+dup wt ! theight wh !
+wh @ if
+	0 lit ncnt !
+	cvnq 0 lit do
+		i qi @  1 lit wh @ lshift 1 lit -  and  i posa !
+		i posa @ npos @ ncnt @ dfind 0< if
+			i posa @ npos @ ncnt @ w!
+			i ncnt @ ndg leaf
+			ncnt @ 1 lit + ncnt !
+		then
+	loop
+	wh @ 0 lit do
+		0 lit scnt !
+		cvnq 0 lit do
+			i posa @ 1 lit xor
+			dup npos @ ncnt @ dfind
+			dup 0< if
+				drop
+				dup spos @ scnt @ dfind
+				dup 0< if
+					drop spos @ scnt @ w!
+					rdig dup sptr @ scnt @ w!
+					scnt @ 1 lit + scnt !
+				else
+					nip sptr @ swap w@
+				then
+			else
+				nip ndg
+			then
+			i j wpath 8 lit wcopy
+		loop
+		0 lit xcnt !
+		cvnq 0 lit do
+			i posa @
+			dup 1 lit rshift xpos @ xcnt @ dfind 0< if
+				dup 1 lit rshift xpos @ xcnt @ w!
+				dup npos @ ncnt @ dfind ndg  i j wpath
+				rot 1 lit and if swap then
+				xcnt @ xdg compress
+				xcnt @ 1 lit + xcnt !
+			else drop then
+		loop
+		cvnq 0 lit do i posa dup @ 1 lit rshift swap ! loop
+		npos @ xpos @ npos ! xpos !  ndig @ xdig @ ndig ! xdig !  xcnt @ ncnt !
+	loop
+then ;
+
+\ cvdecode ( proof n -- )  decodes into cvb; cverr set if refused.
+: cvdecode
+0 lit cverr !
+dup CVMAX u> if 2drop rbad else
+	cvb @ swap dup cvb @ + re !  0 lit do over i + c@ over i + c! loop 2drop
+	cvb @ rp !
+	cvnt rexp
+	cvnt 0 lit do i rtable loop
+	cvnr rexp  rp @ cmt !  cvnr 3 lit lshift rfps
+	rp @ fin !  4 lit rfps
+	rp @ pwit !  1 lit rfps
+	cvnr rexp  rp @ fwit !  cvnr rfps
+	rp @ gwit !  4 lit rfps
+	cvnq rexp  cvnr rexp
+	cvnq 0 lit do i rquery loop
+	ntrees 0 lit do i theight rexp loop
+	cverr @ 0= if ntrees 0 lit do i walk loop then
+	rp @ re @ <> if rbad then
+	\ No witness where nothing is ground.
+	4 lit 0 lit do i grind 0= gwit @ i w@ and if rbad then loop
+	4 lit grind 0= pwit @ @ and if rbad then
+	cvnr 0 lit do i rbits 0= fwit @ i w@ and if rbad then loop
+then ;
+
+\ ── The stream ──
+
+: sw variable ;                               \ where the next value goes
+: sn variable ;                               \ scalars since the last padding
+: s1  sw @ !  0 lit sw @ 4 lit + !  0 lit sw @ 8 lit + !  0 lit sw @ C lit + !  sw @ 10 lit + sw !  sn @ 1 lit + sn ! ;   \ ( x -- )
+: sraw  ?dup if 0 lit do dup i w@ s1 loop then drop ;   \ ( a n -- )  n scalars from a
+: spad  sn @ 0= if 1 lit sn ! 0 lit s1 then  begin sn @ 7 lit and while 0 lit s1 repeat  0 lit sn ! ;
+: sblk  sraw spad ;                           \ ( a n -- )  as scalars in blocks of eight
+: s4  4 lit 0 lit do dup i w@ sw @ i w! loop drop  sw @ 10 lit + sw ! ;   \ ( a -- )  one word
+: swit  if @ s1 0 lit sn ! else drop then ;   \ ( a bits -- )  a witness, where something is ground
+\ spath ( tree q -- )  a query's path in a tree, its digests as scalars.
+: spath  over wt ! over theight wh !  nip 0 lit wpath  wh @ 3 lit lshift sraw  0 lit sn ! ;
+\ srow ( q t k -- )  a query's row of a table, and its path.
+: srow
+2 lit pick 2 lit pick 2 lit pick qr @  2 lit pick 2 lit pick trow sblk
+swap 2 lit lshift + swap spath ;
+
+: cvstream  ( pub -- )
+cvs @ sw !  0 lit sn !
+10 lit 0 lit do dup i w@ tom s1 loop drop spad
+cvnt 0 lit do i 0 lit tof @ 8 lit sblk loop
+cvnt 0 lit do i 1 lit tw if i 1 lit tof @ 8 lit sblk  i 2 lit tof @ s4 then loop
+cvnt 0 lit do i 3 lit tof @ 8 lit sblk loop
+0 lit cvnt 0 lit do i 1 lit tw or loop if gwit @ 0 lit grind swit then
+gwit @ 4 lit + 1 lit grind swit
+gwit @ 8 lit + 2 lit grind swit
+\ The out-of-domain openings: every group of every table, as scalars.
+cvnt 0 lit do 7 lit 0 lit do j i 4 lit + tof @  j i tgl 2 lit lshift sraw loop loop spad
+gwit @ C lit + 3 lit grind swit
+cvnr 0 lit do  i 5 lit lshift cmt @ + 8 lit sblk  i 2 lit lshift fwit @ +  i rbits swit  loop
+fin @ s4
+pwit @ 4 lit grind swit
+cvnq 0 lit do
+	cvnt 0 lit do
+		j i 0 lit srow
+		i 1 lit trow if j i 1 lit srow then
+		i 2 lit trow if j i 2 lit srow then
+		j i 3 lit srow
+	loop
+	cvnr 0 lit do
+		j i qv @  i rvals 2 lit lshift sblk
+		i cvnt 4 lit * + j spath
+	loop
+loop ;
+
+\ ── The interpreter: tabminer's chain_verifier::ChainVerifier::run ──
+
+: ip variable ;  : sr variable ;
+: tmp variable ;  : tmpd variable ;  : tsib variable ;
+: f  ip @ @  ip @ 4 lit + ip ! ;              \ ( -- x )  the program's next word
+: ma  4 lit lshift cvm @ + ;                  \ ( a -- addr )  a word of memory
+: scal?  dup 4 lit + @ over 8 lit + @ or swap C lit + @ or 0= ;   \ ( addr -- flag )  a scalar
+\ blk ( addr -- )  tsib = the 8 scalars at addr (refused if one is not).
+: blk  8 lit 0 lit do dup i 4 lit lshift + dup scal? 0= if rbad then @ tsib @ i w! loop drop ;
+
+: oconst  4 lit 0 lit do f tom tsib @ i w! loop  tsib @ f ma 4 lit wcopy ;
+: oin  sr @ f ma 4 lit wcopy  sr @ 10 lit + sr ! ;
+: oin8  sr @ f ma 20 lit wcopy  sr @ 80 lit + sr ! ;
+: odot
+f ma f ma f ma f ma
+swap tmpd @ 4 lit wcopy
+8 lit 0 lit do
+	sr @ 3 lit pick i 4 lit lshift + 4 lit wcopy
+	sr @ 2 lit pick i 4 lit lshift + tmp @ e4mul
+	tmpd @ tmp @ tmpd @ e4+
+	sr @ 10 lit + sr !
+loop
+tmpd @ swap 4 lit wcopy 2drop ;
+: omuladd  f ma f ma tmp @ e4mul  tmp @ f ma f ma e4+ ;
+: oassert  f ma f ma 4 lit wcmp if rbad then ;
+: odec
+f ma f ma swap dup scal? 0= if rbad then @ fromm
+20 lit 0 lit do dup i rshift 1 lit and if ONE else 0 lit then 2 lit pick i w! loop 2drop ;
+: osel  f ma f 2 lit lshift + @  f ma dup 4 lit wzero ! ;
+: osst  f ma blk  tsib @ p2s @ 8 lit wcopy  f tom p2s @ 8 lit w!  p2s @ 24 lit + 7 lit wzero  p2s @ perm16 ;
+: oabs  f ma blk  8 lit 0 lit do p2s @ i w@ tsib @ i w@ f+ p2s @ i w! loop  p2s @ perm16 ;
+\ ocmp: a Merkle step, the sibling the stream's next 8 values (scalars: the
+\ stream is the decoder's), the digest the sponge's first 8 words.
+: ocmp
+8 lit 0 lit do sr @ @ tsib @ i w!  sr @ 10 lit + sr ! loop
+p2s @ tmpd @ 8 lit wcopy
+f ma f 2 lit lshift + @ ONE = if tsib @ tmpd @ else tmpd @ tsib @ then tmpd @ compress ;
+: osq  f ma 8 lit 0 lit do p2s @ i w@ over i 4 lit lshift + dup 4 lit wzero ! loop drop ;
+: oinv  f ma f ma e4inv ;
+
+\ op: one operation, by its code (the commonest first).
+: op
+f
+dup 4 lit = if drop omuladd else
+dup A lit = if drop ocmp else
+dup 5 lit = if drop oassert else
+dup 9 lit = if drop oabs else
+dup 3 lit = if drop odot else
+dup 7 lit = if drop osel else
+dup 2 lit = if drop oin8 else
+dup B lit = if drop osq else
+dup 8 lit = if drop osst else
+dup 0 lit = if drop oconst else
+dup 1 lit = if drop oin else
+dup C lit = if drop oinv else
+dup 6 lit = if drop odec else
+drop rbad
+then then then then then then then then then then then then then ;
+
+: cvrun
+cvO @ 2 lit lshift cvp @ + ip !  cvs @ sr !
+cvnops 0 lit do cverr @ 0= if op then loop ;
+
+\ cvidx ( q -- index )  the index the program sampled for query q.
+: cvidx  7 lit + hw ma  0 lit  cvL 0 lit do over i w@ ONE = if 1 lit i lshift or then loop nip ;
+
+: cvverify  ( pub proof n -- flag )
+cvdecode
+cverr @ if drop else
+	cvstream
+	sw @ cvs @ - 4 lit rshift cvslen <> if rbad then
+	cverr @ 0= if cvrun then
+	cverr @ 0= if cvnq 0 lit do i cvidx i qi @ <> if rbad then loop then
+then
+cverr @ 0= ;
+
+: cvinit  ( prog -- )
+cvp !
+p2init
+0 lit hw 31564843 lit <> if "chainver: not a chain verifier" puts 0A lit putc then
+cvnq 7 lit + cvT !
+cvT @ 1 lit + cvnt D lit * + cvR !
+cvR @ 1 lit + cvnr 2 lit * + cvH !
+cvH @ ntrees + cvG !
+cvG @ 5 lit + cvO !
+1 lit hw 4 lit lshift alloc cvm !
+cvslen 4 lit lshift alloc cvs !
+CVMAX alloc cvb !
+cvnt 6 lit lshift alloc tofa !
+cvnq 2 lit lshift alloc qidx !
+cvnq cvnr * 2 lit lshift alloc qva !
+cvnq cvnt * 4 lit lshift alloc qra !
+ntrees 2 lit lshift alloc pba !
+ntrees 0 lit do cvnq i theight * 5 lit lshift alloc pba @ i w! loop
+cvnq 2 lit lshift alloc pos !
+cvnq 2 lit lshift alloc npos !  cvnq 2 lit lshift alloc xpos !
+cvnq 2 lit lshift alloc spos !  cvnq 2 lit lshift alloc sptr !
+cvnq 5 lit lshift alloc ndig !  cvnq 5 lit lshift alloc xdig !
+20 lit alloc dup zdig ! 8 lit wzero
+10 lit alloc tmp !  20 lit alloc tmpd !  20 lit alloc tsib ! ;
