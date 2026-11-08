@@ -893,30 +893,55 @@ pub fn work_setup(config: &crate::stark::StarkConfig, pow: crate::pow::PowParams
     s
 }
 
-/// A parent's work for test blocks: real, its mix hashimoto's under `pow`
-/// (computed once per proof of work).
+/// The seed text of `pow`, for tests (decompressed once).
+#[cfg(test)]
+pub(crate) fn test_seed(pow: crate::pow::PowParams) -> &'static crate::pow::SeedText {
+    static SEEDS: std::sync::Mutex<Vec<(crate::pow::PowParams, &'static crate::pow::SeedText)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut seeds = SEEDS.lock().unwrap();
+    if let Some((_, s)) = seeds.iter().find(|(p, _)| *p == pow) {
+        return s;
+    }
+    let s: &'static crate::pow::SeedText = Box::leak(Box::new(crate::pow::SeedText::new(pow)));
+    seeds.push((pow, s));
+    s
+}
+
+/// A header for tests on `prev_hash` at `height` with `state_root`, its mix
+/// hashimoto's under `pow` (its target not met: the chain proof checks the
+/// mix, not the target), and its work.
+#[cfg(test)]
+pub(crate) fn test_header(
+    prev_hash: [Fp; DIGEST],
+    height: u32,
+    state_root: [Fp; DIGEST],
+    pow: crate::pow::PowParams,
+) -> (crate::block::Header, Work) {
+    let mut header = crate::block::Header {
+        prev_hash,
+        height,
+        timestamp: 1_793_000_000 + 600 * height as u64,
+        body_commitment: core::array::from_fn(|k| Fp::new(100 * height + k as u32)),
+        state_root,
+        aux: [height as u8; 32],
+        mix: [Fp::ZERO; DIGEST],
+        nonce: [7u8.wrapping_add(height as u8); 32],
+    };
+    let work = Work::computed(test_seed(pow), &header);
+    header.mix = work.mix;
+    (header, work)
+}
+
+/// The test chains' genesis: a header at height 0, its `mix` empty.
+#[cfg(test)]
+pub(crate) fn test_genesis_header() -> crate::block::Header {
+    crate::block::Header { mix: [Fp::ZERO; DIGEST], ..test_header([Fp::ZERO; DIGEST], 0, [Fp::ZERO; DIGEST], crate::pow::PowParams::DEV).0 }
+}
+
+/// The test genesis's work under `pow`: its true mix.
 #[cfg(test)]
 pub(crate) fn test_work(pow: crate::pow::PowParams) -> Work {
-    static WORKS: std::sync::Mutex<Vec<(crate::pow::PowParams, Work)>> = std::sync::Mutex::new(Vec::new());
-    let mut works = WORKS.lock().unwrap();
-    if let Some((_, w)) = works.iter().find(|(p, _)| *p == pow) {
-        return *w;
-    }
-    let w = {
-        let header = crate::block::Header {
-            prev_hash: [Fp::ZERO; DIGEST],
-            height: 0,
-            timestamp: 1_793_000_000,
-            body_commitment: [Fp::ZERO; DIGEST],
-            state_root: [Fp::ZERO; DIGEST],
-            aux: [0; 32],
-            mix: [Fp::ZERO; DIGEST],
-            nonce: [7; 32],
-        };
-        Work::computed(&crate::pow::SeedText::new(pow), &header)
-    };
-    works.push((pow, w));
-    w
+    Work::computed(test_seed(pow), &test_genesis_header())
 }
 
 fn work_transcript() -> crate::challenger::Challenger {

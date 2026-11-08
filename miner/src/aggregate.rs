@@ -47,6 +47,7 @@ use crate::block_air::{
 use crate::block_proof::{
     DOM_NAME_PROOF, DOM_SEGMENT_PROOF, NameProof, SegmentProof, prove_name_padded, prove_segment_padded,
 };
+use crate::block::Header;
 use crate::chain::{BlockStatement, ProofVerifier};
 use crate::challenger::Challenger;
 use crate::codec::{Reader, Writer};
@@ -219,10 +220,14 @@ pub struct Statement {
     pub sweeps_state: [Fp; WIDTH],
     /// The parent header's work, which the root's work segment proves.
     pub parent_work: Work,
+    /// The parent header's hash (the block's `prev_hash`), which the chain
+    /// step recomputes from the parent's fields and links to the previous
+    /// block's.
+    pub parent_hash: Digest,
 }
 
 /// Scalars in the statement encoding.
-pub const STATEMENT_LEN: usize = 2 * DIGEST + 4 * WIDTH + 4 + LIMBS + 1 + WORK_PUBLIC;
+pub const STATEMENT_LEN: usize = 3 * DIGEST + 4 * WIDTH + 4 + LIMBS + 1 + WORK_PUBLIC;
 const ST_PREV: usize = 0;
 const ST_NEW: usize = DIGEST;
 const ST_ISP: usize = 2 * DIGEST;
@@ -234,6 +239,7 @@ const ST_HEIGHT: usize = ST_SUBSIDY + LIMBS;
 const ST_NSP: usize = ST_HEIGHT + 1;
 const ST_SSP: usize = ST_NSP + WIDTH;
 const ST_WORK: usize = ST_SSP + WIDTH;
+const ST_PARENT: usize = ST_WORK + WORK_PUBLIC;
 
 impl Statement {
     pub fn from_block(s: &BlockStatement<'_>) -> Statement {
@@ -250,6 +256,7 @@ impl Statement {
             names_state: names_state(&s.body.op_digests()),
             sweeps_state: sweeps_state(&s.body.sweeps),
             parent_work: s.parent_work,
+            parent_hash: s.parent_hash,
         }
     }
 
@@ -266,6 +273,7 @@ impl Statement {
             names_state: [Fp::ZERO; WIDTH],
             sweeps_state: [Fp::ZERO; WIDTH],
             parent_work: Work::ZERO,
+            parent_hash: [Fp::ZERO; DIGEST],
         }
     }
 
@@ -284,6 +292,7 @@ impl Statement {
         v.extend_from_slice(&self.names_state);
         v.extend_from_slice(&self.sweeps_state);
         v.extend(self.parent_work.to_values());
+        v.extend_from_slice(&self.parent_hash);
         debug_assert_eq!(v.len(), STATEMENT_LEN);
         v
     }
@@ -1327,11 +1336,28 @@ pub fn chain_output(height: u32, statement: &Statement, step: &Digest, plan_root
     crate::poseidon2::hash(&v)
 }
 
-/// The previous block's chain proof, for a step.
+/// The previous block's chain proof, for a step, and its header: the
+/// block's parent, whose hash the step recomputes.
 pub struct PrevChain<'a> {
     pub height: u32,
     pub statement: &'a Statement,
     pub proof: &'a stark::Proof,
+    pub header: &'a Header,
+}
+
+/// What the base chain program (height 1) fixes of genesis, the parent of
+/// block 1: its hash, and its work as the work segment proves it (its
+/// header's `mix` is empty, so the true mix computed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Genesis {
+    pub hash: Digest,
+    pub work: Work,
+}
+
+impl Genesis {
+    pub fn of(header: &Header, seed: &crate::pow::SeedText) -> Genesis {
+        Genesis { hash: header.hash(), work: Work::computed(seed, header) }
+    }
 }
 
 /// Everything a chain program needs about one block.
@@ -1350,6 +1376,7 @@ pub struct ChainWitness<'a> {
 /// The fixed context of the chain programs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainSetup {
+    pub genesis: Genesis,
     pub plan_root: Digest,
     /// Height of the plan tree.
     pub plan_depth: usize,
@@ -1367,6 +1394,7 @@ pub struct ChainSetup {
 fn compile_chain(
     params: &AggregatorParams,
     emission: &[(u32, u64)],
+    genesis: &Genesis,
     plan_root: &Digest,
     base_digest: &Digest,
     self_step: &Digest,
@@ -1459,6 +1487,13 @@ fn compile_chain(
             }
             c.assert_eq(at(st, ST_POS_IN), 0);
             c.assert_eq(at(st, ST_POS_IN + 1), 0);
+            // Its parent is genesis.
+            for (i, v) in genesis.hash.iter().enumerate() {
+                c.assert_scalar(at(st, ST_PARENT + i), *v);
+            }
+            for (i, v) in genesis.work.to_values().iter().enumerate() {
+                c.assert_scalar(at(st, ST_WORK + i), *v);
+            }
         }
         Some(prev) => {
             let pst = c.scalar_inputs(&prev.statement.to_values());
@@ -1467,6 +1502,36 @@ fn compile_chain(
             c.assert_eq(next, h);
             c.assert_block(at(pst, ST_NEW), at(st, ST_PREV), DIGEST);
             c.assert_block(at(pst, ST_POS_OUT), at(st, ST_POS_IN), 2);
+            // The parent header, the previous block's: its hash recomputed
+            // from its fields. Its prev_hash is the parent hash the
+            // previous proof bound, its height that proof's, its state
+            // root this block's previous one, and its pow_hash, nonce and
+            // mix the work this block's root proved.
+            let hd = prev.header;
+            let ts = c.scalar_inputs(&hd.timestamp_limbs());
+            let body = c.scalar_inputs(&hd.body_commitment);
+            let aux = c.scalar_inputs(&crate::pow::pack_bytes(&hd.aux));
+            let dom = c.scalar(Fp::new(crate::block::DOM_POW_HASH));
+            let mut words: Vec<Addr> = vec![dom];
+            words.extend((0..DIGEST).map(|i| at(pst, ST_PARENT + i)));
+            words.push(ph);
+            words.extend((0..3).map(|i| at(ts, i)));
+            words.extend((0..DIGEST).map(|i| at(body, i)));
+            words.extend((0..DIGEST).map(|i| at(st, ST_PREV + i)));
+            words.extend((0..11).map(|i| at(aux, i)));
+            let block = concat(&mut c, &words);
+            c.hash_scalars(block, words.len());
+            let pow_hash = c.squeeze_digest();
+            c.assert_block(pow_hash, at(st, ST_WORK + crate::pow_air::PUB_HASH), DIGEST);
+            let dom = c.scalar(Fp::new(crate::block::DOM_BLOCK_ID));
+            let mut words: Vec<Addr> = vec![dom];
+            words.extend((0..DIGEST).map(|i| pow_hash + i as Addr));
+            words.extend((0..DIGEST).map(|i| at(st, ST_WORK + crate::pow_air::PUB_MIX + i)));
+            words.extend((0..11).map(|i| at(st, ST_WORK + crate::pow_air::PUB_NONCE + i)));
+            let block = concat(&mut c, &words);
+            c.hash_scalars(block, words.len());
+            let id = c.squeeze_digest();
+            c.assert_block(id, at(st, ST_PARENT), DIGEST);
             // The predecessor's program: the base at height 2, else the
             // step this proof itself claims.
             let two = c.scalar(Fp::new(2));
@@ -1550,6 +1615,7 @@ fn wrap_heights(params: &AggregatorParams, cache: &mut PlanCache) -> (usize, usi
 pub fn chain_setup(
     params: &AggregatorParams,
     emission: &[(u32, u64)],
+    genesis: &Genesis,
     plan_root: &Digest,
     plan_depth: usize,
     cache: &mut PlanCache,
@@ -1560,6 +1626,16 @@ pub fn chain_setup(
     let wrap = Wrap { digest: [Fp::ZERO; DIGEST], log_n: wn, hash_log_n: wh, tree: [Fp::ZERO; DIGEST] };
     let path = vec![[Fp::ZERO; DIGEST]; plan_depth];
     let zd = [Fp::ZERO; DIGEST];
+    let dummy_header = Header {
+        prev_hash: zd,
+        height: 0,
+        timestamp: 0,
+        body_commitment: zd,
+        state_root: zd,
+        aux: [0; 32],
+        mix: zd,
+        nonce: [0; 32],
+    };
     fn witness<'a>(
         height: u32,
         statement: &'a Statement,
@@ -1574,7 +1650,7 @@ pub fn chain_setup(
         (c.prog.height().trailing_zeros() as usize, VmAir::hash_height(&c.prog).trailing_zeros() as usize)
     };
     let base =
-        compile_chain(params, emission, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), None);
+        compile_chain(params, emission, genesis, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), None);
     // The step verifies a proof of its own heights: find the fixed point,
     // with room for the padding's bookkeeping.
     let (bn, bh) = heights(&base);
@@ -1582,8 +1658,8 @@ pub fn chain_setup(
     loop {
         let prev = dummy_proof(&[(&VmAir, guess.0), (&HashTableAir, guess.1)], &params.wrap, VM_PUBLIC);
         let w =
-            witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev }));
-        let step = compile_chain(params, emission, plan_root, &zd, &zd, &w, None);
+            witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev, header: &dummy_header }));
+        let step = compile_chain(params, emission, genesis, plan_root, &zd, &zd, &w, None);
         let (sn, sh) = heights(&step);
         let room = step.prog.num_rows() + 64 < 1 << guess.0;
         if sn <= guess.0 && sh <= guess.1 && room {
@@ -1593,12 +1669,13 @@ pub fn chain_setup(
     }
     let pad = Some(guess);
     let base =
-        compile_chain(params, emission, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), pad);
+        compile_chain(params, emission, genesis, plan_root, &zd, &zd, &witness(1, &zero, wrap, &wrap_dummy, &path, None), pad);
     let base_digest = base.prog.digest(params.wrap.log_blowup);
     let prev = dummy_proof(&[(&VmAir, guess.0), (&HashTableAir, guess.1)], &params.wrap, VM_PUBLIC);
-    let w = witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev }));
-    let step = compile_chain(params, emission, plan_root, &base_digest, &zd, &w, pad);
+    let w = witness(3, &zero, wrap, &wrap_dummy, &path, Some(PrevChain { height: 2, statement: &zero, proof: &prev, header: &dummy_header }));
+    let step = compile_chain(params, emission, genesis, plan_root, &base_digest, &zd, &w, pad);
     ChainSetup {
+        genesis: *genesis,
         plan_root: *plan_root,
         plan_depth,
         base: base_digest,
@@ -1617,7 +1694,7 @@ pub fn prove_chain(
     cancel: stark::Cancel<'_>,
 ) -> Option<stark::Proof> {
     let pad = Some((setup.log_n, setup.hash_log_n));
-    let c = compile_chain(params, emission, &setup.plan_root, &setup.base, &setup.step, w, pad);
+    let c = compile_chain(params, emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, w, pad);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("chain program rejects its own witness");
     let digest = if w.prev.is_none() { setup.base } else { setup.step };
     let pre = committed_program(&c.prog, &params.wrap, &digest);
@@ -1669,10 +1746,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1558421478, 639258978, 1210089184, 734761604, 1252940729, 1123716956, 477110432, 1624258239],
+    plan_root: [1977317276, 1950768581, 409573744, 1307303923, 1500070553, 990566250, 1094698060, 961179610],
     plan_depth: 14,
-    base: [1491144615, 1692776848, 772580570, 294055779, 716752362, 810463816, 1359458729, 1161990189],
-    step: [1647388461, 781050296, 1807516799, 134302249, 1164459272, 414941, 698349428, 519382518],
+    base: [1412193361, 37963895, 1159522647, 443025466, 831494734, 170586005, 1937956224, 1286328838],
+    step: [1949176317, 793805489, 1359033049, 1659543498, 762181156, 831987721, 84728180, 706085056],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -1687,10 +1764,10 @@ const MAINNET_PLAN: &[u8] = include_bytes!("mainnet_plan.bin");
 /// with mainnet's emission), as [`MAINNET_CHAIN`]; regenerated by
 /// `dev_recursive_chain_constants`.
 pub const DEV_RECURSIVE_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1549752479, 19086199, 1379039922, 759295459, 11406880, 1825510286, 515605751, 185298678],
+    plan_root: [1722219090, 1570428304, 1253474085, 1703071864, 57058542, 1738280548, 105795904, 1174917193],
     plan_depth: 6,
-    base: [62598863, 563252730, 1132886052, 44908415, 1473767265, 1410167255, 1697246142, 1319129120],
-    step: [1206078060, 724266973, 738166853, 1493055513, 1110185805, 1130545222, 148587520, 1313344762],
+    base: [144919556, 930826116, 1424469370, 1726619051, 323314135, 381694245, 1097735, 230993008],
+    step: [1226290079, 1997129506, 839302165, 1670202426, 223081338, 1942849482, 1495844827, 559676838],
     log_n: 16,
     hash_log_n: 12,
 });
@@ -1712,9 +1789,10 @@ pub struct ChainSetupConst {
 }
 
 impl ChainSetupConst {
-    fn setup(&self) -> ChainSetup {
+    fn setup(&self, genesis: Genesis) -> ChainSetup {
         let d = |x: &[u32; DIGEST]| x.map(Fp::new);
         ChainSetup {
+            genesis,
             plan_root: d(&self.plan_root),
             plan_depth: self.plan_depth,
             base: d(&self.base),
@@ -1730,6 +1808,8 @@ impl ChainSetupConst {
 pub struct AggregateVerifier {
     pub params: AggregatorParams,
     pub emission: &'static [(u32, u64)],
+    /// The chain's genesis, block 1's parent.
+    pub genesis: Genesis,
     /// Compiled program types, and the planned wrap by segment count.
     plans: Mutex<(PlanCache, HashMap<usize, Wrap>)>,
     setup: std::sync::OnceLock<ChainSetup>,
@@ -1739,10 +1819,11 @@ pub struct AggregateVerifier {
 }
 
 impl AggregateVerifier {
-    pub fn new(params: AggregatorParams, emission: &'static [(u32, u64)]) -> AggregateVerifier {
+    pub fn new(params: AggregatorParams, emission: &'static [(u32, u64)], genesis: Genesis) -> AggregateVerifier {
         AggregateVerifier {
             params,
             emission,
+            genesis,
             plans: Mutex::new((PlanCache::new(), HashMap::new())),
             setup: std::sync::OnceLock::new(),
             tree: std::sync::OnceLock::new(),
@@ -1784,14 +1865,17 @@ impl AggregateVerifier {
     /// parameters, if any: mainnet's and the recursive dev network's.
     /// Otherwise the setup is computed, which plans every segment count.
     fn built_in(&self) -> Option<(ChainSetupConst, &'static [u8])> {
+        use crate::chain::ChainParams;
         if self.emission != crate::chain::MAINNET_EMISSION {
             return None;
         }
-        if self.params == AggregatorParams::MAINNET {
+        if self.params == AggregatorParams::MAINNET && self.genesis.hash == ChainParams::MAINNET.genesis().header.hash() {
             return MAINNET_CHAIN.map(|c| (c, MAINNET_PLAN));
         }
         #[cfg(feature = "dev")]
-        if self.params == AggregatorParams::DEV_RECURSIVE {
+        if self.params == AggregatorParams::DEV_RECURSIVE
+            && self.genesis.hash == ChainParams::DEV_RECURSIVE.genesis().header.hash()
+        {
             return DEV_RECURSIVE_CHAIN.map(|c| (c, DEV_RECURSIVE_PLAN));
         }
         None
@@ -1824,7 +1908,7 @@ impl AggregateVerifier {
 
     fn embedded_plan(&self) -> Option<crate::merkle::MerkleTree> {
         let (c, plan) = self.built_in()?;
-        let root = c.setup().plan_root;
+        let root = c.setup(self.genesis).plan_root;
         let leaves = plan
             .chunks_exact(32)
             .map(crate::poseidon2::digest_from_bytes)
@@ -1838,12 +1922,12 @@ impl AggregateVerifier {
     pub fn setup(&self) -> &ChainSetup {
         self.setup.get_or_init(|| {
             if let Some((c, _)) = self.built_in() {
-                return c.setup();
+                return c.setup(self.genesis);
             }
             let tree = self.plan_tree();
             let (root, depth) = (tree.root(), tree.height());
             let mut plans = self.plans.lock().unwrap();
-            chain_setup(&self.params, self.emission, &root, depth, &mut plans.0)
+            chain_setup(&self.params, self.emission, &self.genesis, &root, depth, &mut plans.0)
         })
     }
 
@@ -1861,8 +1945,8 @@ impl AggregateVerifier {
 
     /// Proves the block at `height`: its segments and name segment, tree
     /// and wrap, then the chain step on `prev` (the previous block's
-    /// height, statement and proof; `None` at height 1). Returns the block
-    /// proof.
+    /// height, statement, proof and header; `None` at height 1). Returns
+    /// the block proof.
     #[allow(clippy::too_many_arguments)]
     pub fn prove_block(
         &self,
@@ -1870,7 +1954,7 @@ impl AggregateVerifier {
         statement: &Statement,
         segments: &[SegmentWitness],
         names: &NameWitness,
-        prev: Option<(u32, &Statement, &[u8])>,
+        prev: Option<(u32, &Statement, &[u8], &Header)>,
         jobs: usize,
         progress: &(dyn Fn(Progress) + Sync),
         cancel: stark::Cancel<'_>,
@@ -1884,7 +1968,7 @@ impl AggregateVerifier {
         let shape = self.shape(segments.len());
         let wrap_proof = prove_wrap(&self.params, &shape, statement, segments, names, jobs, progress, cancel)?;
         let prev_proof = match prev {
-            Some((_, _, bytes)) => Some(stark::Proof::from_bytes(bytes).expect("the previous block's proof decodes")),
+            Some((_, _, bytes, _)) => Some(stark::Proof::from_bytes(bytes).expect("the previous block's proof decodes")),
             None => None,
         };
         let setup = *self.setup();
@@ -1897,10 +1981,11 @@ impl AggregateVerifier {
             wrap_proof: &wrap_proof,
             path: tree.open(index),
             index,
-            prev: prev.zip(prev_proof.as_ref()).map(|((h, st, _), proof)| PrevChain {
+            prev: prev.zip(prev_proof.as_ref()).map(|((h, st, _, header), proof)| PrevChain {
                 height: h,
                 statement: st,
                 proof,
+                header,
             }),
         };
         let t = std::time::Instant::now();
@@ -1987,6 +2072,18 @@ mod tests {
         work_proof: WorkProof,
     }
 
+    /// The genesis of the network whose aggregator `params` are.
+    fn network_genesis(params: AggregatorParams) -> Genesis {
+        use crate::chain::ChainParams;
+        let net = [ChainParams::MAINNET, ChainParams::DEV_RECURSIVE].into_iter().find(|n| n.aggregator == params).unwrap();
+        Genesis::of(&net.genesis().header, crate::pow_air::test_seed(net.pow))
+    }
+
+    /// The test chains' genesis under `pow`.
+    fn genesis_for(pow: PowParams) -> Genesis {
+        Genesis { hash: crate::pow_air::test_genesis_header().hash(), work: crate::pow_air::test_work(pow) }
+    }
+
     /// The test blocks' parent work, proven at SMALL (once).
     fn small_work_proof() -> WorkProof {
         static PROOF: std::sync::OnceLock<WorkProof> = std::sync::OnceLock::new();
@@ -2030,6 +2127,7 @@ mod tests {
             subsidy,
             body: &body,
             parent_work: crate::pow_air::test_work(SMALL.pow),
+            parent_hash: crate::pow_air::test_genesis_header().hash(),
         });
         let proofs: Vec<SegmentProof> =
             segments.iter().map(|w| prove_segment_padded(&SMALL.segment, w, SMALL.segment_log_n)).collect();
@@ -2106,7 +2204,7 @@ mod tests {
         // Never: a proof as from `prove_block_with`.
         let proof =
             prove_block_cancellable(&SMALL, &shape, &s.statement, &s.segments, &s.names, 2, &quiet, &|| false).unwrap();
-        assert_eq!(AggregateVerifier::new(SMALL, &[(10, 55)]).verify_statement(&s.statement, &proof), Ok(()));
+        assert_eq!(AggregateVerifier::new(SMALL, &[(10, 55)], genesis_for(SMALL.pow)).verify_statement(&s.statement, &proof), Ok(()));
     }
 
     #[test]
@@ -2117,8 +2215,9 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let miner = key(9).public_key();
-        // Two consecutive blocks on one UTXO set, 55 each.
-        let mut block = |txs: Vec<Transaction>, height: u32| {
+        // Two consecutive blocks on one UTXO set, 55 each, each on its
+        // parent's hash and work.
+        let mut block = |txs: Vec<Transaction>, height: u32, parent: (Digest, Work)| {
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
             let segments =
@@ -2136,20 +2235,24 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
-                parent_work: crate::pow_air::test_work(SMALL.pow),
+                parent_work: parent.1,
+                parent_hash: parent.0,
             });
             let names = empty_names(&segments, height);
             (segments, statement, names)
         };
-        let (seg1, st1, nm1) = block(vec![reward(&miner, 30), reward(&miner, 25)], 1);
-        let (seg2, st2, nm2) = block(vec![reward(&miner, 55)], 2);
+        let genesis = genesis_for(SMALL.pow);
+        let (seg1, st1, nm1) = block(vec![reward(&miner, 30), reward(&miner, 25)], 1, (genesis.hash, genesis.work));
+        // Block 1's header, the parent of block 2.
+        let (h1, work1) = crate::pow_air::test_header(genesis.hash, 1, st1.new_state_root, SMALL.pow);
+        let (seg2, st2, nm2) = block(vec![reward(&miner, 55)], 2, (h1.hash(), work1));
         wtxn.abort();
 
         let mut cache = PlanCache::new();
         let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&SMALL, &mut cache));
         let emission = [(10u32, 55u64)];
         let t = std::time::Instant::now();
-        let setup = chain_setup(&SMALL, &emission, &tree.root(), tree.height(), &mut cache);
+        let setup = chain_setup(&SMALL, &emission, &genesis_for(SMALL.pow), &tree.root(), tree.height(), &mut cache);
         println!("chain setup in {:?}: 2^{}/2^{}", t.elapsed(), setup.log_n, setup.hash_log_n);
         let wrap_of = |segs: &[SegmentWitness], st: &Statement, nm: &NameWitness| {
             let shape = plan_with(&SMALL, segs.len(), &mut PlanCache::new());
@@ -2171,7 +2274,7 @@ mod tests {
         let c1 = prove_chain(&SMALL, &emission, &setup, &witness(1, &st1, w1, &p1, i1, None), &|| false).unwrap();
         println!("base proof in {:?}", t.elapsed());
         assert_eq!(verify_chain(&SMALL, &setup, 1, &st1, &c1), Ok(()));
-        let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+        let prev = PrevChain { height: 1, statement: &st1, proof: &c1, header: &h1 };
         let t = std::time::Instant::now();
         let c2 = prove_chain(&SMALL, &emission, &setup, &witness(2, &st2, w2, &p2, i2, Some(prev)), &|| false).unwrap();
         println!("step proof in {:?}, {} bytes", t.elapsed(), c2.to_bytes().len());
@@ -2194,9 +2297,9 @@ mod tests {
         // The schedule is enforced: with block 2 due 7, its 55 is refused.
         let strict = [(1u32, 55u64), (9, 7)];
         let bad = std::panic::catch_unwind(|| {
-            let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+            let prev = PrevChain { height: 1, statement: &st1, proof: &c1, header: &h1 };
             let w = witness(2, &st2, w2, &p2, i2, Some(prev));
-            compile_chain(&SMALL, &strict, &setup.plan_root, &setup.base, &setup.step, &w, None)
+            compile_chain(&SMALL, &strict, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, &w, None)
         });
         if let Ok(c) = bad {
             assert!(VmAir::execute(&c.prog, &c.inputs).is_err());
@@ -2204,10 +2307,42 @@ mod tests {
         // A wrap that is not in the plan is refused.
         let mut fake = w2;
         fake.tree[0] += Fp::ONE;
-        let prev = PrevChain { height: 1, statement: &st1, proof: &c1 };
+        let prev = PrevChain { height: 1, statement: &st1, proof: &c1, header: &h1 };
         let w = witness(2, &st2, fake, &p2, i2, Some(prev));
-        let c = compile_chain(&SMALL, &emission, &setup.plan_root, &setup.base, &setup.step, &w, None);
+        let c = compile_chain(&SMALL, &emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, &w, None);
         assert!(VmAir::execute(&c.prog, &c.inputs).is_err());
+        // The step stands for one header chain: block 2's proof verifies
+        // only with block 1's hash as its parent, and is made only on a
+        // parent header with that hash, linked to genesis, at height 1, on
+        // block 1's state.
+        let mut other = st2.clone();
+        other.parent_hash[0] += Fp::ONE;
+        assert!(verify_chain(&SMALL, &setup, 2, &other, &c2).is_err());
+        let parents = [
+            ("block 1's header", h1),
+            ("another timestamp", Header { timestamp: h1.timestamp + 1, ..h1 }),
+            ("another body", Header { body_commitment: [Fp::ONE; DIGEST], ..h1 }),
+            ("another aux", Header { aux: [9; 32], ..h1 }),
+        ];
+        for (i, (what, h)) in parents.iter().enumerate() {
+            let prev = PrevChain { height: 1, statement: &st1, proof: &c1, header: h };
+            let w = witness(2, &st2, w2, &p2, i2, Some(prev));
+            let c = compile_chain(&SMALL, &emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, &w, None);
+            assert_eq!(VmAir::execute(&c.prog, &c.inputs).is_err(), i > 0, "{what}");
+        }
+        // A parent on another chain: its own hash and work, so the root
+        // proved its work, but its prev_hash is not genesis's.
+        let (stray, stray_work) = crate::pow_air::test_header([Fp::ONE; DIGEST], 1, st1.new_state_root, SMALL.pow);
+        let st_stray = Statement { parent_hash: stray.hash(), parent_work: stray_work, ..st2.clone() };
+        let prev = PrevChain { height: 1, statement: &st1, proof: &c1, header: &stray };
+        let w = ChainWitness { statement: &st_stray, ..witness(2, &st2, w2, &p2, i2, Some(prev)) };
+        let c = compile_chain(&SMALL, &emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, &w, None);
+        assert!(VmAir::execute(&c.prog, &c.inputs).is_err(), "a parent not on genesis");
+        // Block 1 must be on genesis: its statement with another parent.
+        let st_orphan = Statement { parent_hash: [Fp::ONE; DIGEST], ..st1.clone() };
+        let w = ChainWitness { statement: &st_orphan, ..witness(1, &st1, w1, &p1, i1, None) };
+        let c = compile_chain(&SMALL, &emission, &setup.genesis, &setup.plan_root, &setup.base, &setup.step, &w, None);
+        assert!(VmAir::execute(&c.prog, &c.inputs).is_err(), "block 1 not on genesis");
     }
 
     /// How long the recursive dev parameters take: chain setup, then
@@ -2217,7 +2352,7 @@ mod tests {
     fn dev_block_timing() {
         let p = AggregatorParams::DEV_RECURSIVE;
         const EMISSION: &[(u32, u64)] = &[(1000, 55)];
-        let v = AggregateVerifier::new(p, EMISSION);
+        let v = AggregateVerifier::new(p, EMISSION, genesis_for(p.pow));
         let t = std::time::Instant::now();
         v.plan_tree();
         let _ = v.setup();
@@ -2227,8 +2362,12 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let miner = key(9).public_key();
-        let mut prev: Option<(u32, Statement, Vec<u8>)> = None;
+        let mut prev: Option<(u32, Statement, Vec<u8>, Header)> = None;
         for (height, n) in [(1u32, 1usize), (2, 2), (3, 5)] {
+            let (parent_hash, parent_work) = match &prev {
+                Some((_, _, _, h)) => (h.hash(), Work::of_header(h)),
+                None => (v.genesis.hash, v.genesis.work),
+            };
             let amounts: Vec<u64> = (0..n as u64).map(|i| if i == 0 { 55 - (n as u64 - 1) } else { 1 }).collect();
             let txs: Vec<Transaction> = amounts.iter().map(|a| reward(&miner, *a)).collect();
             let prev_root = utxo.root(&wtxn).unwrap();
@@ -2247,7 +2386,8 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
-                parent_work: crate::pow_air::test_work(SMALL.pow),
+                parent_work,
+                parent_hash,
             });
             let names = empty_names(&segments, height);
             let t = std::time::Instant::now();
@@ -2257,7 +2397,7 @@ mod tests {
                     &statement,
                     &segments,
                     &names,
-                    prev.as_ref().map(|(h, s, p)| (*h, s, &p[..])),
+                    prev.as_ref().map(|(h, s, p, hd)| (*h, s, &p[..], hd)),
                     2,
                     &|p| println!("  {p:?}"),
                     &|| false,
@@ -2272,7 +2412,8 @@ mod tests {
                 proof.len() / 1000,
                 t.elapsed()
             );
-            prev = Some((height, statement, proof));
+            let (header, _) = crate::pow_air::test_header(parent_hash, height, statement.new_state_root, p.pow);
+            prev = Some((height, statement, proof, header));
         }
     }
 
@@ -2320,14 +2461,16 @@ mod tests {
         let seed = SeedText::new(pow_params);
         let dataset = Dataset::generate(&seed);
         let dir = TempDir::new("connect");
-        let chain = Chain::open(&dir.0, 64 << 20, params, seed, AggregateVerifier::new(SMALL, EMISSION)).unwrap();
+        let genesis = Genesis::of(&params.genesis().header, &seed);
+        let chain = Chain::open(&dir.0, 64 << 20, params, seed, AggregateVerifier::new(SMALL, EMISSION, genesis)).unwrap();
         chain.init_genesis(&params.genesis()).unwrap();
         let miner = key(9).public_key();
         let t0 = params.genesis_timestamp;
         // The body of the block on the tip paying `amount`, its statement,
         // and its proof on `prev`.
         let build = |amount: u64, prev: Option<(u32, &Statement, &[u8])>| {
-            let height = chain.tip().unwrap().unwrap().height + 1;
+            let tip = chain.tip().unwrap().unwrap();
+            let height = tip.height + 1;
             let mut wtxn = chain.env().write_txn().unwrap();
             let prev_root = chain.utxo().root(&wtxn).unwrap();
             let first = chain.utxo().next_position(&wtxn).unwrap();
@@ -2350,8 +2493,10 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
-                parent_work: chain.parent_work(&chain.tip().unwrap().unwrap()),
+                parent_work: chain.parent_work(&tip),
+                parent_hash: tip.hash(),
             });
+            let prev = prev.map(|(h, st, proof)| (h, st, proof, &tip));
             body.proof = chain
                 .verifier()
                 .prove_block(height, &statement, &segments, &names, prev, 2, &|_| {}, &|| false)
@@ -2407,7 +2552,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("9 segments, 4 levels: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)], genesis_for(SMALL.pow));
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         let mut poor = s.statement.clone();
         poor.subsidy -= 1;
@@ -2419,7 +2564,7 @@ mod tests {
     fn spanning_transaction_roundtrip() {
         let s = spanning_setup("span-roundtrip");
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
-        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)], genesis_for(SMALL.pow));
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
     }
 
@@ -2445,7 +2590,7 @@ mod tests {
         let alice = Record::new(b"alice", o1, [Fp::new(5); DIGEST], [Fp::new(6); DIGEST]).unwrap();
         let salt = [Fp::new(77); DIGEST];
         let c = commit_hash(&name_hash(&alice.elements().unwrap()), &salt, &o1);
-        let v = AggregateVerifier::new(SMALL, &[(1000, 55)]);
+        let v = AggregateVerifier::new(SMALL, &[(1000, 55)], genesis_for(SMALL.pow));
 
         // A block of one reward transaction carrying `ops`, applied and proven.
         let block = |height: u32, ops: Vec<NameOp>| {
@@ -2476,6 +2621,7 @@ mod tests {
                 subsidy: 55,
                 body: &body,
                 parent_work: crate::pow_air::test_work(SMALL.pow),
+                parent_hash: crate::pow_air::test_genesis_header().hash(),
             });
             let t = std::time::Instant::now();
             let proof = prove_block(&SMALL, &statement, &segments, &nm);
@@ -2712,7 +2858,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("aggregate of 2 segments: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)], genesis_for(SMALL.pow));
         let t = std::time::Instant::now();
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         println!("verify: {:?}", t.elapsed());
@@ -2741,7 +2887,7 @@ mod tests {
         let t = std::time::Instant::now();
         let proof = prove_block(&SMALL, &s.statement, &s.segments, &s.names);
         println!("tree aggregate of 3 segments: {} bytes in {:?}", proof.len(), t.elapsed());
-        let v = AggregateVerifier::new(SMALL, &[(10, 55)]);
+        let v = AggregateVerifier::new(SMALL, &[(10, 55)], genesis_for(SMALL.pow));
         assert_eq!(v.verify_statement(&s.statement, &proof), Ok(()));
         let mut poor = s.statement.clone();
         poor.subsidy = 64;
@@ -2808,6 +2954,7 @@ mod tests {
             subsidy,
             body: &body,
             parent_work: crate::pow_air::test_work(params.pow),
+            parent_hash: crate::pow_air::test_genesis_header().hash(),
         });
         let names = NameWitness { root_in: new_root, pos_in: statement.end_output_position, height: 1, ops: vec![] };
         (w, statement, names)
@@ -2824,9 +2971,9 @@ mod tests {
         }
         for (params, c, name) in built {
             let c = c.unwrap_or_else(|| panic!("no constants: run {name}"));
-            let v = AggregateVerifier::new(params, crate::chain::MAINNET_EMISSION);
+            let v = AggregateVerifier::new(params, crate::chain::MAINNET_EMISSION, network_genesis(params));
             assert!(v.plan_is_built_in(), "the built-in plan is stale: run {name}");
-            assert_eq!(v.plan_tree().root(), c.setup().plan_root);
+            assert_eq!(v.plan_tree().root(), c.setup(v.genesis).plan_root);
             assert_eq!(v.plan_tree().height(), c.plan_depth);
         }
     }
@@ -2843,7 +2990,14 @@ mod tests {
     ) {
         let mut cache = PlanCache::new();
         let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&params, &mut cache));
-        let s = chain_setup(&params, crate::chain::MAINNET_EMISSION, &tree.root(), tree.height(), &mut cache);
+        let s = chain_setup(
+            &params,
+            crate::chain::MAINNET_EMISSION,
+            &network_genesis(params),
+            &tree.root(),
+            tree.height(),
+            &mut cache,
+        );
         let u = |d: &Digest| d.map(|x| x.to_canonical());
         let c = ChainSetupConst {
             plan_root: u(&s.plan_root),
@@ -2911,7 +3065,7 @@ mod tests {
         let mut wtxn = env.write_txn().unwrap();
         let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
         let subsidy: u64 = (1..=per as u64).sum();
-        let mut block = |height: u32| {
+        let mut block = |height: u32, parent: (Digest, Work)| {
             let txs: Vec<Transaction> = (0..per).map(|i| reward(&miner, 1 + i as u64)).collect();
             let prev_root = utxo.root(&wtxn).unwrap();
             let first = utxo.next_position(&wtxn).unwrap();
@@ -2929,19 +3083,22 @@ mod tests {
                 first_output_position: first,
                 subsidy,
                 body: &body,
-                parent_work: crate::pow_air::test_work(params.pow),
+                parent_work: parent.1,
+                parent_hash: parent.0,
             });
             let nm = NameWitness { root_in: st.new_state_root, pos_in: st.end_output_position, height, ops: vec![] };
             (w, st, nm)
         };
-        let (seg1, st1, nm1) = block(1);
-        let (seg2, st2, nm2) = block(2);
+        let genesis = genesis_for(params.pow);
+        let (seg1, st1, nm1) = block(1, (genesis.hash, genesis.work));
+        let (h1, work1) = crate::pow_air::test_header(genesis.hash, 1, st1.new_state_root, params.pow);
+        let (seg2, st2, nm2) = block(2, (h1.hash(), work1));
         wtxn.abort();
         let mut cache = PlanCache::new();
         let t = std::time::Instant::now();
         let tree = crate::merkle::MerkleTree::from_leaf_hashes(plan_leaves(&params, &mut cache));
         let emission = [(10u32, subsidy)];
-        let setup = chain_setup(&params, &emission, &tree.root(), tree.height(), &mut cache);
+        let setup = chain_setup(&params, &emission, &genesis_for(params.pow), &tree.root(), tree.height(), &mut cache);
         println!(
             "plan and chain setup in {:?}: chain proofs 2^{} + 2^{} rows",
             t.elapsed(),
@@ -2977,7 +3134,7 @@ mod tests {
             wrap_proof: &p2,
             path: tree.open(0),
             index: 0,
-            prev: Some(PrevChain { height: 1, statement: &st1, proof: &c1 }),
+            prev: Some(PrevChain { height: 1, statement: &st1, proof: &c1, header: &h1 }),
         };
         let c2 = prove_chain(&params, &emission, &setup, &step, &|| false).unwrap();
         println!("step chain proof in {:?}, {} bytes", t.elapsed(), c2.to_bytes().len());

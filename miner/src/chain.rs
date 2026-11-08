@@ -246,6 +246,8 @@ pub struct BlockStatement<'a> {
     /// The parent header's work ([`ChainParams::parent_work`]), which the
     /// block's proof proves.
     pub parent_work: crate::pow_air::Work,
+    /// The parent header's hash (the block's `prev_hash`).
+    pub parent_hash: Digest,
 }
 
 /// Verifies a block's validity proof. The real implementation is the STARK
@@ -1606,6 +1608,7 @@ impl<V: ProofVerifier> Chain<V> {
             subsidy: self.params.subsidy(header.height),
             body,
             parent_work: self.parent_work(&parent),
+            parent_hash: header.prev_hash,
         };
         self.lap("supply", &mut t);
         if !self.verifier.verify(&statement, &body.proof) {
@@ -2048,6 +2051,7 @@ impl<V: ProofVerifier> Chain<V> {
             subsidy: self.params.subsidy(block.header.height),
             body: &block.body,
             parent_work: self.parent_work(&parent),
+            parent_hash: block.header.prev_hash,
         };
         if !self.verifier.verify(&statement, &block.body.proof) {
             return Err(ChainError::BadProof);
@@ -2722,6 +2726,7 @@ impl<V: ProofVerifier> Chain<V> {
             subsidy: self.params.subsidy(height),
             body: &body,
             parent_work: self.parent_work(&parent),
+            parent_hash: header.prev_hash,
         });
         Ok(Some((statement, body.proof)))
     }

@@ -563,7 +563,8 @@ fn work_bits(target: &Target) -> f64 {
 
 fn open_chain(args: &Args, params: ChainParams, seed: SeedText) -> AnyResult<Arc<Chain<AggregateVerifier>>> {
     std::fs::create_dir_all(args.data.join("chain"))?;
-    let mut verifier = AggregateVerifier::new(params.aggregator, params.emission);
+    let genesis = tabminer::aggregate::Genesis::of(&params.genesis().header, &seed);
+    let mut verifier = AggregateVerifier::new(params.aggregator, params.emission, genesis);
     if args.debug_unchecked {
         verifier = verifier.unchecked();
     }
@@ -3599,6 +3600,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
                 subsidy,
                 body: &body,
                 parent_work: chain.parent_work(&tip),
+                parent_hash: tip.hash(),
             });
             (segments, names, statement, inputs, outputs)
         };
@@ -3643,7 +3645,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
             }
             Progress::Chain { elapsed } => log::line(&format!("  chain step proven in {}", secs(elapsed))),
         };
-        let prev_ref = prev.as_ref().map(|(st, proof)| (height - 1, st, proof.as_slice()));
+        let prev_ref = prev.as_ref().map(|(st, proof)| (height - 1, st, proof.as_slice(), &tip));
         let proof = if unchecked {
             // Debugging: a stand-in the size of a real proof.
             Some(vec![0u8; DEBUG_PROOF_SIZE])

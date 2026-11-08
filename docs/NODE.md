@@ -537,7 +537,29 @@ Each step done when its test passes.
 4. **The statement and the chain step**: the parent header bound, its
    hash recomputed and linked, genesis at height 1, the constants
    regenerated. Done when a chain proof verifies only against the header
-   chain it was made for.
+   chain it was made for. Done (2026-11-08):
+   - The header hashes (`Header::pow_hash`, `Header::hash`) are the
+     plain sponge with the domain tag as the first element, so that the
+     chain program's machine, whose sponge sets only the length in the
+     capacity, can recompute them. Every block id changed with them,
+     mainnet's genesis included (`src/genesis.rs`'s `ID`; its inputs are
+     the same).
+   - The statement gains `parent_hash`, the block's `prev_hash`.
+   - The base program (height 1) requires the parent to be genesis: its
+     hash, and its work with the true mix (`aggregate::Genesis`, which
+     the verifier is made with and the chain setup's programs fix).
+   - Each step takes the parent header (the previous block's) and
+     recomputes its `pow_hash` and hash: its `prev_hash` is the parent
+     hash the previous proof bound, its height that proof's, its state
+     root this block's previous one, and its `pow_hash`, nonce and mix
+     the work this block's root proved. The hash must be the statement's
+     `parent_hash`.
+   - `chain_proofs_cover_history`: a proof does not verify with another
+     parent hash, and a step is refused on a parent header with another
+     timestamp, body or aux, on a parent not linked to genesis, and for
+     a block 1 that names another parent.
+   - Dev-recursive, four blocks mined on a fresh chain, each accepted:
+     the chain step proves in 2.0–2.2 s, as before.
 5. **Sync**: the node checks headers natively as in section 4 and full
    work only after `S`. Done when a node fast-syncs a dev-recursive
    chain checking no full proof of work before `S`.

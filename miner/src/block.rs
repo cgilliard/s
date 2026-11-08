@@ -81,8 +81,11 @@ impl From<Commitment> for BlockOutput {
     }
 }
 
-const DOM_POW_HASH: u32 = 0x10;
-const DOM_BLOCK_ID: u32 = 0x11;
+/// The header hashes' domains: the first element hashed, in the plain
+/// sponge (`poseidon2::hash`, the input length in the capacity), so that
+/// the chain proof's machine can recompute them.
+pub(crate) const DOM_POW_HASH: u32 = 0x10;
+pub(crate) const DOM_BLOCK_ID: u32 = 0x11;
 const DOM_BODY: u32 = 0x12;
 const DOM_PROOF: u32 = 0x13;
 const MASK30: u64 = (1 << 30) - 1;
@@ -133,27 +136,39 @@ impl Header {
         })
     }
 
+    /// The timestamp in three elements of 30, 30 and 4 bits.
+    pub fn timestamp_limbs(&self) -> [Fp; 3] {
+        [
+            Fp::new((self.timestamp & MASK30) as u32),
+            Fp::new(((self.timestamp >> 30) & MASK30) as u32),
+            Fp::new((self.timestamp >> 60) as u32),
+        ]
+    }
+
     /// Hash of the fields under proof of work: everything but mix and nonce.
+    /// `H(DOM_POW_HASH, prev_hash, height, timestamp limbs, body_commitment,
+    /// state_root, aux packed)`: 40 elements.
     pub fn pow_hash(&self) -> Digest {
-        let mut v = Vec::with_capacity(3 * DIGEST + 15);
+        let mut v = Vec::with_capacity(3 * DIGEST + 16);
+        v.push(Fp::new(DOM_POW_HASH));
         v.extend_from_slice(&self.prev_hash);
         v.push(Fp::from_u32(self.height));
-        v.push(Fp::new((self.timestamp & MASK30) as u32));
-        v.push(Fp::new(((self.timestamp >> 30) & MASK30) as u32));
-        v.push(Fp::new((self.timestamp >> 60) as u32));
+        v.extend_from_slice(&self.timestamp_limbs());
         v.extend_from_slice(&self.body_commitment);
         v.extend_from_slice(&self.state_root);
         v.extend(pack_bytes(&self.aux));
-        hash_domain(DOM_POW_HASH, &v)
+        crate::poseidon2::hash(&v)
     }
 
     /// Block id: hash of the whole header including the proof of work.
+    /// `H(DOM_BLOCK_ID, pow_hash, mix, nonce packed)`: 28 elements.
     pub fn hash(&self) -> Digest {
-        let mut v = Vec::with_capacity(2 * DIGEST + 11);
+        let mut v = Vec::with_capacity(2 * DIGEST + 12);
+        v.push(Fp::new(DOM_BLOCK_ID));
         v.extend_from_slice(&self.pow_hash());
         v.extend_from_slice(&self.mix);
         v.extend(pack_bytes(&self.nonce));
-        hash_domain(DOM_BLOCK_ID, &v)
+        crate::poseidon2::hash(&v)
     }
 
     /// Evaluates the proof of work for this header's nonce.
