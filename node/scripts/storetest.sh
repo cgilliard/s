@@ -23,10 +23,24 @@ for m in 0 1 2 3; do
 	./tools/fam -o tmp/storetest_$m.bin src/kernel.fam src/store.fam src/net.fam src/ksys.fam tmp/storetest_$m.fam || exit 1
 done
 
+# killafter SECS CMD... — CMD, killed (SIGKILL, exit 137) after SECS, which
+# may have a fraction.  Perl, as macOS has no `timeout`.
+killafter() {
+	perl -MTime::HiRes=alarm -e '
+		$t = shift;
+		$p = fork // die "fork: $!";
+		if (!$p) { exec @ARGV or die "exec: $!" }
+		$SIG{ALRM} = sub { kill "KILL", $p; waitpid($p, 0); exit 137 };
+		alarm $t;
+		waitpid($p, 0);
+		exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+	' "$@"
+}
+
 # run MODE [SECONDS] — the test in that mode; killed (as a power cut would)
 # after SECONDS if given.
 run() {
-	timeout -s KILL "${2:-300}" qemu-system-riscv32 -machine virt -m 128M -cpu "$CPU" -nographic -bios none \
+	killafter "${2:-300}" qemu-system-riscv32 -machine virt -m 128M -cpu "$CPU" -nographic -bios none \
 		-global virtio-mmio.force-legacy=true \
 		-device loader,file=tmp/storetest_$1.bin,addr=0x80000000 \
 		-drive file="$DISK",format=raw,if=none,id=d0 \

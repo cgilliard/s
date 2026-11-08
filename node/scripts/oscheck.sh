@@ -266,16 +266,13 @@ progs=""; for p in bin/user/*; do progs="$progs $(basename "$p")=$p"; done
 sh scripts/mkimage.sh "$T/shell.img" bin/kernel $progs big="$T/big.bin" 2> "$T/shell.mk" || fail shell "mkimage: $(cat "$T/shell.mk")"
 printf '%s\n' 'echo hello world' 'ps' 'echo one two three | wc' 'big | cat | wc' 'cat /proc/self/cmd' \
 	'echo 7 > /proc/2/tickets' 'cat < /proc/2/tickets' 'nosuch' 'a |' 'cat &' 'echo after' 'echo x & echo y' 'ls /proc' 'ls dev' 'cat proc/../proc/self' 'ls /proc/1' 'ls /bin' 'path' '/bin/echo by its path' 'path /none' 'echo x' 'path /none:/bin' 'echo found' 'exit' 'halt' > "$T/shell.in"
-# feed SECS FILE CMD... — CMD run with FILE's lines typed into it, 0.3 s
-# apart, 3 s after one running big (typed ahead, a line is echoed among the
-# output).
-feed() {
-	secs=$1; in=$2; shift 2
-	lim "$secs" sh -c 'in=$1; shift; { sleep 1; while IFS= read -r l; do printf "%s\n" "$l"; sleep 0.3; case $l in big*) sleep 3 ;; esac; done < "$in"; sleep 3; } | "$@"' feed "$in" "$@"
-}
+# feed SECS FILE CMD... — CMD run with FILE's lines typed into it, each once
+# the program prompts for it (scripts/feed.py: so a slow machine doesn't get
+# a line typed ahead, echoed among the output), SECS at most.
+feed() { python3 scripts/feed.py "$@"; }
 for n in 1 4; do
 	N=$((N + 1)); o="$T/shell_$n.out"
-	feed 20 "$T/shell.in" ./tools/q32 --smp=$n "$T/shell.img" > "$o" 2>&1
+	feed 120 "$T/shell.in" ./tools/q32 --smp=$n "$T/shell.img" > "$o" 2>&1
 	for pat in '^hello world$' '^PID PPID S THR KIB TICKS CMD$' '^1 0 S 1 64 [0-9]* init$' '^2 1 S 1 64 [0-9]* sh$' \
 		'^3 2 R 1 64 [0-9]* ps$' '^1 3 14$' '^100 100 102400$' '^cat /proc/self/cmd$' '^7$' \
 		'^sh: nosuch: not found$' '^sh: a command is missing$' '^init: the shell exited; halting$' \
@@ -300,7 +297,7 @@ sh scripts/mkimage.sh "$T/exec.img" bin/kernel $progs 2> "$T/exec.mk" || fail ex
 for n in 1 4; do
 	N=$((N + 1)); o="$T/exec_$n.out"
 	rm -f "$T/exec.disk"; dd if=/dev/zero of="$T/exec.disk" bs=1 count=0 seek=268435456 2>/dev/null
-	feed 40 "$T/exec.in" ./tools/q32 --smp=$n --disk="$T/exec.disk" "$T/exec.img" > "$o" 2>&1
+	feed 180 "$T/exec.in" ./tools/q32 --smp=$n --disk="$T/exec.disk" "$T/exec.img" > "$o" 2>&1
 	for pat in '^bin/$' '^/proc$' '^1 0 S 1 64 [0-9]* init$' 'sh: /home/e: not allowed$' '^from a file$' '^relative$' \
 		'^by the path$' '^myecho$' '^sh: /bin/echo: cannot open$' '^run 19$' '^kernel: halted$'; do
 		grep -q -- "$pat" "$o" || { fail "exec_$n" "no /$pat/ in: $(tail -c 600 "$o")"; break; }
@@ -314,14 +311,26 @@ done
 # p), written; opened again, a byte taken out, :q refused (E37), :q!; the
 # file seen with cat after each (its escape sequences stripped).
 cat > "$T/vi.feed" <<'VIEOF'
-sleep 3; printf 'vi /t.txt\n'; sleep 1.5; printf 'ihello world\033osecond line\033:wq\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1
-printf 'vi /t.txt\n'; sleep 1.5; printf 'ddp:wq\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1
-printf 'vi /t.txt\n'; sleep 1.5; printf 'x:q\r'; sleep 1; printf ':q!\r'; sleep 1.5; printf 'cat /t.txt\n'; sleep 1; printf 'halt\n'; sleep 1
+vi /t.txt
+#wait [New]
+#raw ihello world\x1bosecond line\x1b:wq\r
+cat /t.txt
+vi /t.txt
+#wait 2 lines
+#raw ddp:wq\r
+cat /t.txt
+vi /t.txt
+#wait 2 lines
+#raw x:q\r
+#wait E37
+#raw :q!\r
+cat /t.txt
+halt
 VIEOF
 for n in 1 4; do
 	N=$((N + 1)); o="$T/vi_$n.out"
 	rm -f "$T/vi.disk"; dd if=/dev/zero of="$T/vi.disk" bs=1 count=0 seek=268435456 2>/dev/null
-	lim 40 sh -c 'sh "$1" | ./tools/q32 --smp='$n' --disk="$2" "$3"' vi "$T/vi.feed" "$T/vi.disk" "$T/exec.img" > "$o" 2>&1
+	feed 120 "$T/vi.feed" ./tools/q32 --smp=$n --disk="$T/vi.disk" "$T/exec.img" > "$o" 2>&1
 	r=$(python3 -c '
 import re, sys
 t = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "\n", open(sys.argv[1], errors="replace").read()).replace("\r", "")
@@ -339,16 +348,22 @@ done
 sh scripts/mkimage.sh "$T/build.img" bin/kernel $progs famc=bin/fam.uncompressed:8192:m stdlib.fam=lib/stdlib.fam:0 \
 	user.fam=lib/user.fam:0 build.fam=lib/build.fam:0 vi.fam=src/user/vi.fam:0 2> "$T/build.mk" || fail build "mkimage: $(cat "$T/build.mk")"
 cat > "$T/build.feed" <<'BUILDEOF'
-sleep 3; printf 'vi /h.fam\n'; sleep 1.5
-printf 'i: greet  "hello, " puts puts 0A lit putc ;\r"world" greet\rbye\033:wq\r'; sleep 1.5
-printf 'fam /h.fam\n'; sleep 4; printf '/h\n'; sleep 1.5
-printf 'fam -o /vi2 /lib/vi.fam\n'; sleep 10; printf 'cmp /vi2 /bin/vi\n'; sleep 1.5
-printf 'echo 1 lit nosuchword bye > /bad.fam\n'; sleep 1; printf 'fam /bad.fam\n'; sleep 4; printf 'ls /\n'; sleep 1; printf 'halt\n'; sleep 1
+vi /h.fam
+#wait [New]
+#raw i: greet  "hello, " puts puts 0A lit putc ;\r"world" greet\rbye\x1b:wq\r
+fam /h.fam
+/h
+fam -o /vi2 /lib/vi.fam
+cmp /vi2 /bin/vi
+echo 1 lit nosuchword bye > /bad.fam
+fam /bad.fam
+ls /
+halt
 BUILDEOF
 for n in 1 4; do
 	N=$((N + 1)); o="$T/build_$n.out"
 	rm -f "$T/build.disk"; dd if=/dev/zero of="$T/build.disk" bs=1 count=0 seek=268435456 2>/dev/null
-	lim 60 sh -c 'sh "$1" | ./tools/q32 --smp='$n' --disk="$2" "$3"' build "$T/build.feed" "$T/build.disk" "$T/build.img" > "$o" 2>&1
+	feed 240 "$T/build.feed" ./tools/q32 --smp=$n --disk="$T/build.disk" "$T/build.img" > "$o" 2>&1
 	for pat in '^hello, world' '^same' 'fam: compile error (a word not known' '^vi2' '^kernel: halted'; do
 		tr -d '\r' < "$o" | grep -q -- "$pat" || { fail "build_$n" "no /$pat/ in: $(tr -d '\r' < "$o" | tail -c 500)"; break; }
 	done
@@ -460,8 +475,8 @@ done
 printf '%s\n' 'mkdir /home' 'cd /home' 'echo hello files > notes' 'echo a second line >> notes' 'ls /' 'pwd' > "$T/fs1.in"
 printf '%s\n' 'cat /home/notes' 'cd /home' 'wc < notes' 'rm notes' 'ls' 'cat notes' > "$T/fs2.in"
 N=$((N + 1))
-feed 12 "$T/fs1.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs1.out" 2>&1
-feed 12 "$T/fs2.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs2.out" 2>&1
+feed 60 "$T/fs1.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs1.out" 2>&1
+feed 60 "$T/fs2.in" ./tools/q32 --disk="$T/files.disk" bin/img > "$T/fs2.out" 2>&1
 for pat in '^home/$' '^/home$'; do grep -q -- "$pat" "$T/fs1.out" || fail fs_boot1 "no /$pat/ in: $(head -c 600 "$T/fs1.out")"; done
 for pat in '^hello files$' '^a second line$' '^2 5 26$' '^cat: cannot open notes$'; do grep -q -- "$pat" "$T/fs2.out" || fail fs_boot2 "no /$pat/ in: $(head -c 600 "$T/fs2.out")"; done
 rm -f "$T/files.disk"
@@ -478,8 +493,8 @@ printf '%s\n' 'alice' 'wrong' 'alice' 'apw' 'id' 'pwd' 'echo mine > f' 'cat f' '
 	'exit' 'root' 'rootpw' 'id' 'cat /etc/passwd' 'ls /home/alice' > "$T/u2.in"
 rm -f "$T/users.disk"; dd if=/dev/zero of="$T/users.disk" bs=1 count=0 seek=268435456 2>/dev/null
 N=$((N + 1))
-feed 15 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
-feed 18 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
+feed 60 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
+feed 60 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
 for pat in '^\([$] \)*0 0$' '^\([$] \)*init$' '^\([$] \)*passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
 for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/alice$' '^mine$' '^cat: cannot open /etc/passwd$' \
 	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^root:rootpw:0:0:/:sh$' '^f$'; do
@@ -592,11 +607,11 @@ for n in 1 4; do
 	rm -f "$T/http.disk"; dd if=/dev/zero of="$T/http.disk" bs=1 count=0 seek=268435456 2>/dev/null
 	./tools/q32 --smp=$n --net --hostfwd=tcp::$HP-:80 --disk="$T/http.disk" "$T/http.img" < /dev/null > "$T/httpd_$n.out" 2>&1 &
 	QP=$!                          # q32 execs QEMU: this is QEMU
-	i=0; while [ $i -lt 20 ] && ! grep -q 'httpd: port 80' "$T/httpd_$n.out"; do sleep 0.5; i=$((i + 1)); done
-	page=$(curl -s -m 5 "http://127.0.0.1:$HP/")
-	curl -s -m 10 -o "$T/big_$n.got" "http://127.0.0.1:$HP/big"
-	nf=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/nosuch")
-	ok=0; for j in $(seq 40); do [ "$(curl -s -m 3 "http://127.0.0.1:$HP/index.html")" = "<h1>hello from the guest</h1>" ] && ok=$((ok + 1)); done
+	i=0; while [ $i -lt 120 ] && ! grep -q 'httpd: port 80' "$T/httpd_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	page=$(curl -s -m 30 "http://127.0.0.1:$HP/")
+	curl -s -m 60 -o "$T/big_$n.got" "http://127.0.0.1:$HP/big"
+	nf=$(curl -s -m 30 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/nosuch")
+	ok=0; for j in $(seq 40); do [ "$(curl -s -m 20 "http://127.0.0.1:$HP/index.html")" = "<h1>hello from the guest</h1>" ] && ok=$((ok + 1)); done
 	kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	[ "$page" = "<h1>hello from the guest</h1>" ] || fail "httpd_$n" "page: $page; $(head -c 300 "$T/httpd_$n.out")"
 	cmp -s "$T/big.want" "$T/big_$n.got" || fail "httpd_$n" "100 KiB not whole: $(wc -c < "$T/big_$n.got") bytes"
@@ -835,7 +850,7 @@ for n in 1 4; do
 	rm -f "$T/wm.disk"; dd if=/dev/zero of="$T/wm.disk" bs=1 count=0 seek=268435456 2>/dev/null
 	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < /dev/null > "$T/wm_$n.out" 2>&1 &
 	QP=$!
-	i=0; while [ $i -lt 20 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
 	lim 30 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 60 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
