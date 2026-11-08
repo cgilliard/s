@@ -1,5 +1,6 @@
-//! Prototype: a header's proof of work, proven (docs/NODE.md: the
-//! evaluation of putting the work into the chain proof).
+//! The work segment: a header's proof of work, proven (docs/NODE.md, the
+//! work in the chain proof). A block's chain proof is to carry its
+//! parent's; not yet part of the block's tree (step 3).
 //!
 //! One proof of four tables shows that `hashimoto` (see [`crate::pow`]),
 //! computed on the light path from the seed text, gives the mix it gives:
@@ -23,16 +24,21 @@
 //!
 //! Two variants of the windows, to compare: at 24-byte boundaries, the proof
 //! of work's (`N` = 180,872, a table of 2^18 rows), or at any byte offset,
-//! as it was before (`N` = 4,340,894, 2^23 rows). Not yet constrained, being a few
-//! rows of thousands and no part of the cost: the mix's final fold, the
-//! result's compression and its comparison with the target.
+//! as it was before (`N` = 4,340,894, 2^23 rows).
+//!
+//! The public values are the header's `pow_hash` (8 elements), its nonce
+//! (11) and its `mix` (8): the mix after the 64 accesses, folded to eight
+//! elements, must be the header's. That the result from the mix meets the
+//! target is left to the native check (`Header::quick_pow_check`, two
+//! permutations): the proof supplies the expensive fact, that the `mix` is
+//! the true one.
 
 use crate::field::Field;
 use crate::hash_machine::{
     COL_ABSORB, COL_CHAIN, COL_COMPRESS, COL_DATA, COL_LOAD, COL_START, HashTraceBuilder, NUM_COLS as HM_COLS,
     eval_hash_machine,
 };
-use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH, permute_in_place};
+use crate::poseidon2::{DIGEST, Fp, RATE, WIDTH};
 use crate::poseidon2_air::{COL_INPUT, COL_OUTPUT};
 use crate::stark::{Air, Builder, Trace};
 
@@ -51,6 +57,13 @@ const CANON_LOW: u32 = 0x3800_0000;
 /// Dataset items are pairs of this many (`2^19` pairs, a 64 MB dataset).
 const LOG_PAIRS: u32 = 19;
 const MIX_WORDS: usize = 2 * WIDTH;
+/// The public values: `pow_hash`, the nonce's 11 elements, the `mix`.
+pub const PUB_HASH: usize = 0;
+pub const PUB_NONCE: usize = DIGEST;
+pub const PUB_MIX: usize = PUB_NONCE + 11;
+pub const NUM_PUBLIC: usize = PUB_MIX + DIGEST;
+/// The work segment's transcript domain (the other proofs': 0x30 to 0x34).
+pub const DOM_WORK_PROOF: u32 = 0x35;
 
 /// How the windows are laid out: window `w` is the 24 bytes from
 /// `w * stride` (the last no later than a window's length before the
@@ -334,7 +347,8 @@ const M_SB: usize = M_OH + MIX_WORDS; // 31 bits of sel
 const M_T: usize = M_SB + 31; // 3 helpers
 const M_A: usize = M_T + 3; // 16
 const M_BB: usize = M_A + WIDTH; // 16
-pub const MIX_COLS: usize = M_BB + WIDTH;
+const M_FIN: usize = M_BB + WIDTH; // the row after the last access
+pub const MIX_COLS: usize = M_FIN + 1;
 const MIX_ROWS: usize = 128;
 
 /// hashimoto's accesses, one a row (64 active rows of 128).
@@ -400,6 +414,17 @@ impl Air for MixAir {
             let d = if k < WIDTH { l[M_A + k] } else { l[M_BB + k - WIDTH] };
             b.when_transition(n[M_MIX + k] - l[M_MIX + k] - act * (l[M_MIX + k].scale(Fp::new(FNV_PRIME - 1)) + d));
         }
+        // The row after the 64th access holds the final mix: folded to eight
+        // elements (fnv is linear), the header's.
+        b.when_first_row(l[M_FIN]);
+        b.when_transition(n[M_FIN] - (n[M_IB + 6] - l[M_IB + 6]));
+        let p = b.public();
+        let f = Fp::new(FNV_PRIME);
+        for k in 0..DIGEST {
+            let w = &l[M_MIX + 4 * k..M_MIX + 4 * k + 4];
+            let folded = ((w[0].scale(f) + w[1]).scale(f) + w[2]).scale(f) + w[3];
+            b.assert_zero(l[M_FIN] * (folded - p[PUB_MIX + k]));
+        }
         let mut seed = vec![c(TAG_SEED)];
         seed.extend((0..WIDTH).map(|k| l[M_MIX + k]));
         b.lookup(false, l[M_FIRST], &seed);
@@ -428,6 +453,35 @@ pub struct PowWitness {
     pub mix_out: [Fp; MIX_WORDS],
 }
 
+/// A way to cheat, for the attack tests: the witness generator, made
+/// lenient, writes the trace as a cheating prover would, everything after
+/// the cheat computed from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cheat {
+    None,
+    /// Absorbs the next window while showing the true index.
+    OtherWindow,
+    /// Shows the next index (and absorbs its window) with the true quotient.
+    OtherIndex,
+    /// Absorbs the true window with an element changed.
+    OtherText,
+    /// An item of one parent too few, or too many.
+    FewerParents,
+    MoreParents,
+    /// The first access's first item computed for another index.
+    OtherItem,
+    /// The first access picks another pair than its selector's bits.
+    OtherPair,
+    /// An output decomposed as itself plus p, where that fits 31 bits.
+    NonCanonical,
+    /// A window index past N (and so a padding row's zeros), the quotient one
+    /// less.
+    BeyondN,
+    /// Another mix claimed, or another header hash.
+    WrongMix,
+    WrongHash,
+}
+
 /// hashimoto's mix on the light path, with `parents` absorbs an item and
 /// windows laid out as `windows`, and the traces that prove it.
 pub fn witness(
@@ -437,6 +491,19 @@ pub fn witness(
     header_hash: &[Fp; DIGEST],
     nonce: &[u8; 32],
 ) -> PowWitness {
+    witness_cheating(text, windows, parents, header_hash, nonce, Cheat::None)
+}
+
+/// [`witness`], cheating as `cheat` says (tests, with the generator lenient).
+pub fn witness_cheating(
+    text: &[u8],
+    windows: Windows,
+    parents: usize,
+    header_hash: &[Fp; DIGEST],
+    nonce: &[u8; 32],
+    cheat: Cheat,
+) -> PowWitness {
+    use crate::stark::refuse;
     let n_text = windows.n.next_power_of_two();
     let window = |w: usize| {
         let at = (w * windows.stride).min(text.len() - WINDOW);
@@ -464,8 +531,16 @@ pub fn witness(
     }
     let seed = perm.state();
 
-    // An item, its rows appended.
-    let item = |index: u32, perm: &mut HashTraceBuilder, reads: &mut Vec<u32>| -> [Fp; WIDTH] {
+    // An item, its rows appended; `first` for the first access's first item,
+    // where the cheats happen.
+    let mut cheated = false;
+    let mut item = |index: u32, first: bool, perm: &mut HashTraceBuilder, reads: &mut Vec<u32>| -> [Fp; WIDTH] {
+        let index = if first && cheat == Cheat::OtherItem { index + 2 } else { index };
+        let parents = match (first, cheat) {
+            (true, Cheat::FewerParents) => parents - 1,
+            (true, Cheat::MoreParents) => parents + 1,
+            _ => parents,
+        };
         let mut input = [Fp::ZERO; WIDTH];
         input[0] = Fp::from_u32(index);
         input[1] = Fp::new(DOM_ITEM);
@@ -477,11 +552,44 @@ pub fn witness(
         }
         for k in 1..=parents {
             let st = perm.state();
-            let (a, bv) = (st[0].to_canonical(), st[1].to_canonical());
+            let (mut a, bv) = (st[0].to_canonical(), st[1].to_canonical());
+            let here = first && !cheated && k >= 10;
+            if here && cheat == Cheat::NonCanonical && (a as u64) + (crate::poseidon2::P as u64) < 1 << 31 {
+                a += crate::poseidon2::P;
+                cheated = true;
+            }
             let r = a as u64 | (bv as u64) << 31;
-            let w = (r % windows.n as u64) as u32;
-            let q = r / windows.n as u64;
-            perm.absorb(window(w as usize));
+            let mut w = (r % windows.n as u64) as u32;
+            let mut q = r / windows.n as u64;
+            let mut data = window(w as usize);
+            let n_text = windows.n.next_power_of_two() as u32;
+            if here {
+                match cheat {
+                    Cheat::OtherWindow => {
+                        data = window((w as usize + 1) % windows.n);
+                        cheated = true;
+                    }
+                    Cheat::OtherIndex => {
+                        w = (w + 1) % windows.n as u32;
+                        data = window(w as usize);
+                        cheated = true;
+                    }
+                    Cheat::OtherText => {
+                        data[0] = data[0].add(&Fp::ONE);
+                        cheated = true;
+                    }
+                    Cheat::BeyondN if w + (windows.n as u32) < n_text && q > 0 => {
+                        w += windows.n as u32;
+                        q -= 1;
+                        data = [Fp::ZERO; RATE];
+                        cheated = true;
+                    }
+                    _ => {}
+                }
+            }
+            refuse(a < crate::poseidon2::P, "the output is canonical");
+            refuse((w as usize) < windows.n, "the window is in the text");
+            perm.absorb(data);
             reads[w as usize] += 1;
             let row = perm.last_row_mut();
             row[P_IA] = Fp::ONE;
@@ -506,15 +614,15 @@ pub fn witness(
             }
             let wl = Windows::limbs(w);
             let m = Windows::limbs(windows.n as u32 - 1);
-            let dl = Windows::limbs(windows.n as u32 - 1 - w);
+            let dl = Windows::limbs((windows.n as u32 - 1).wrapping_sub(w) & ((1 << 30) - 1));
             for j in 0..3 {
                 row[P_W + j] = Fp::new(wl[j]);
                 row[P_D + j] = Fp::new(dl[j]);
             }
-            let e0 = (wl[0] + dl[0] - m[0]) / LIMB;
-            let e1 = (wl[1] + dl[1] + e0 - m[1]) / LIMB;
-            row[P_E] = Fp::new(e0);
-            row[P_E + 1] = Fp::new(e1);
+            let e0 = (wl[0] as i64 + dl[0] as i64 - m[0] as i64).div_euclid(LIMB as i64);
+            let e1 = (wl[1] as i64 + dl[1] as i64 + e0 - m[1] as i64).div_euclid(LIMB as i64);
+            row[P_E] = Fp::from_u32(e0 as u32 & 1);
+            row[P_E + 1] = Fp::from_u32(e1 as u32 & 1);
             let nl = Windows::limbs(windows.n as u32);
             let ql: Vec<i64> = (0..5).map(|j| ((q >> (10 * j)) % LIMB as u64) as i64).collect();
             let rl = [al[0], al[1], al[2], al[3] + 2 * bl[0], 2 * bl[1], 2 * bl[2], 2 * bl[3]];
@@ -528,16 +636,16 @@ pub fn witness(
                 }
                 let v = ck - rl[kk] as i64 + prev;
                 if kk < 6 {
-                    assert_eq!(v % LIMB as i64, 0, "carry");
-                    let carry = v / LIMB as i64;
-                    let biased = (carry + CARRY_BIAS) as u32;
+                    refuse(v % LIMB as i64 == 0, "the limbs carry whole");
+                    let carry = v.div_euclid(LIMB as i64);
+                    let biased = ((carry + CARRY_BIAS) as u32) & ((1 << 14) - 1);
                     row[P_C + kk] = Fp::new(biased % LIMB);
                     for j in 0..4 {
                         row[P_CH + 4 * kk + j] = Fp::new((biased >> (10 + j)) & 1);
                     }
                     prev = carry;
                 } else {
-                    assert_eq!(v, 0, "the last limb balances");
+                    refuse(v == 0, "the last limb balances");
                 }
             }
             if k == parents {
@@ -568,14 +676,16 @@ pub fn witness(
         for k in 0..31 {
             row[M_SB + k] = Fp::new((sv >> k) & 1);
         }
+        let sv = if i == 0 && cheat == Cheat::OtherPair { sv ^ 2 } else { sv };
         let bit = |k: usize| (sv >> k) & 1;
         row[M_T] = Fp::new(bit(30) * bit(29));
         row[M_T + 1] = Fp::new(bit(28) * bit(27));
         row[M_T + 2] = Fp::new(bit(30) * bit(29) * bit(28) * bit(27));
+        row[M_FIN] = if i == 64 { Fp::ONE } else { Fp::ZERO };
         if i < 64 {
             let idx = (sv % pairs) * 2;
-            let a = item(idx, &mut perm, &mut reads);
-            let bv = item(idx + 1, &mut perm, &mut reads);
+            let a = item(idx, i == 0, &mut perm, &mut reads);
+            let bv = item(idx + 1, false, &mut perm, &mut reads);
             row[M_A..M_A + WIDTH].copy_from_slice(&a);
             row[M_BB..M_BB + WIDTH].copy_from_slice(&bv);
             for (m, d) in mixv.iter_mut().zip(a.iter().chain(&bv)) {
@@ -589,7 +699,11 @@ pub fn witness(
     for i in 0..perm_trace.height() {
         let row = perm_trace.row(i);
         for x in PermAir::range_cols() {
-            ranged[row[x].to_canonical() as usize] += 1;
+            // A limb out of range (only a cheat's) has no row to count on:
+            // its lookup goes unanswered.
+            if let Some(c) = ranged.get_mut(row[x].to_canonical() as usize) {
+                *c += 1;
+            }
         }
     }
 
@@ -608,7 +722,15 @@ pub fn witness(
         range[2 * v + 1] = Fp::new(ranged[v]);
     }
     let mut public = header_hash.to_vec();
+    if cheat == Cheat::WrongHash {
+        public[0] = public[0].add(&Fp::ONE);
+    }
     public.extend_from_slice(&packed);
+    let mut folded = fold_mix(&mixv);
+    if cheat == Cheat::WrongMix {
+        folded[0] = folded[0].add(&Fp::ONE);
+    }
+    public.extend_from_slice(&folded);
     PowWitness {
         text_pre: Trace::new(pre, 1 + RATE),
         text: Trace::new(text_main, 1),
@@ -620,10 +742,124 @@ pub fn witness(
     }
 }
 
-/// A permutation, for tests.
-pub fn permute(mut s: [Fp; WIDTH]) -> [Fp; WIDTH] {
-    permute_in_place(&mut s);
-    s
+/// hashimoto's fold of the 32-element mix to the header's eight.
+pub fn fold_mix(mix: &[Fp; MIX_WORDS]) -> [Fp; DIGEST] {
+    core::array::from_fn(|k| {
+        let w = &mix[4 * k..4 * k + 4];
+        fnv(fnv(fnv(w[0], w[1]), w[2]), w[3])
+    })
+}
+
+/// The public values of a header's work: its `pow_hash`, nonce and `mix`.
+pub fn public_values(pow_hash: &[Fp; DIGEST], nonce: &[u8; 32], mix: &[Fp; DIGEST]) -> Vec<Fp> {
+    let mut v = pow_hash.to_vec();
+    v.extend(nonce.chunks(3).map(|ch| Fp::new(ch.iter().enumerate().fold(0u32, |a, (i, x)| a | (*x as u32) << (8 * i)))));
+    v.extend_from_slice(mix);
+    v
+}
+
+// ---------------------------------------------------------------------------
+// The work segment
+// ---------------------------------------------------------------------------
+
+/// The text's window table, committed once, and the shape of the proof of
+/// work it serves.
+pub struct WorkSetup {
+    pub windows: Windows,
+    pub parents: usize,
+    pre: crate::stark::Preprocessed,
+}
+
+impl WorkSetup {
+    /// Commits the windows of `seed`'s text at `config` (0.3 s on the
+    /// development laptop).
+    pub fn new(seed: &crate::pow::SeedText, config: &crate::stark::StarkConfig) -> WorkSetup {
+        let windows = Windows::aligned(seed.text().len());
+        let n_text = windows.n.next_power_of_two();
+        let mut pre = vec![Fp::ZERO; n_text * (1 + RATE)];
+        for w in 0..n_text {
+            pre[w * (1 + RATE)] = Fp::from_u32(w as u32);
+            if w < windows.n {
+                let at = seed.window_offset(w);
+                pre[w * (1 + RATE) + 1..(w + 1) * (1 + RATE)].copy_from_slice(&pack_window(&seed.text()[at..at + WINDOW]));
+            }
+        }
+        let table = Trace::new(pre, 1 + RATE);
+        let pre = crate::stark::Preprocessed::new(&table, config.log_blowup, config.quotient_stride(TextAir.max_constraint_degree()));
+        WorkSetup { windows, parents: crate::pow::ItemSource::params(seed).parents, pre }
+    }
+
+    /// The root of the committed window table, which a verifier needs.
+    pub fn root(&self) -> crate::merkle::Digest {
+        self.pre.root()
+    }
+
+    fn perm_air(&self) -> PermAir {
+        PermAir { windows: self.windows, parents: self.parents }
+    }
+
+    /// What a verifier needs of it.
+    pub fn verifier(&self) -> WorkVerifier {
+        WorkVerifier { root: self.root(), windows: self.windows, parents: self.parents }
+    }
+}
+
+/// What verifying a header's work needs: the window table's root and the
+/// proof of work's shape.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkVerifier {
+    pub root: crate::merkle::Digest,
+    pub windows: Windows,
+    pub parents: usize,
+}
+
+fn work_transcript() -> crate::challenger::Challenger {
+    let mut c = crate::challenger::Challenger::new();
+    c.observe(Fp::new(DOM_WORK_PROOF));
+    c
+}
+
+/// Proves a header's work: that `hashimoto(pow_hash, nonce)` on the light
+/// path gives the `mix` returned.
+pub fn prove_work(
+    setup: &WorkSetup,
+    seed: &crate::pow::SeedText,
+    config: &crate::stark::StarkConfig,
+    pow_hash: &[Fp; DIGEST],
+    nonce: &[u8; 32],
+) -> (crate::stark::Proof, [Fp; DIGEST]) {
+    use crate::stark::TableInput;
+    let w = witness(seed.text(), setup.windows, setup.parents, pow_hash, nonce);
+    let perm = setup.perm_air();
+    let inputs = [
+        TableInput { air: &TextAir, trace: &w.text, pre: Some(&setup.pre) },
+        TableInput { air: &perm, trace: &w.perm, pre: None },
+        TableInput { air: &RangeAir, trace: &w.range, pre: None },
+        TableInput { air: &MixAir, trace: &w.mix, pre: None },
+    ];
+    let proof = crate::stark::prove_tables(config, &inputs, &w.public, &mut work_transcript());
+    (proof, fold_mix(&w.mix_out))
+}
+
+/// Verifies a proof of [`prove_work`] for a header's `pow_hash`, nonce and
+/// `mix`, against the window table's root.
+pub fn verify_work(
+    verifier: &WorkVerifier,
+    config: &crate::stark::StarkConfig,
+    pow_hash: &[Fp; DIGEST],
+    nonce: &[u8; 32],
+    mix: &[Fp; DIGEST],
+    proof: &crate::stark::Proof,
+) -> Result<(), crate::stark::VerifyError> {
+    use crate::stark::TableSpec;
+    let perm = PermAir { windows: verifier.windows, parents: verifier.parents };
+    let specs = [
+        TableSpec { air: &TextAir, pre_root: Some(&verifier.root) },
+        TableSpec { air: &perm, pre_root: None },
+        TableSpec { air: &RangeAir, pre_root: None },
+        TableSpec { air: &MixAir, pre_root: None },
+    ];
+    crate::stark::verify_tables(config, &specs, &public_values(pow_hash, nonce, mix), proof, &mut work_transcript())
 }
 
 #[cfg(test)]
@@ -654,12 +890,8 @@ mod tests {
         let (hh, nonce) = header();
         let w = witness(seed.text(), Windows::aligned(seed.text().len()), PowParams::MAINNET.parents, &hh, &nonce);
         let want = pow::hashimoto(&seed, &hh, &nonce);
-        let mut cmix = [Fp::ZERO; DIGEST];
-        for (k, c) in cmix.iter_mut().enumerate() {
-            let x = &w.mix_out[4 * k..4 * k + 4];
-            *c = fnv(fnv(fnv(x[0], x[1]), x[2]), x[3]);
-        }
-        assert_eq!(cmix, want.mix);
+        assert_eq!(fold_mix(&w.mix_out), want.mix);
+        assert_eq!(w.public, public_values(&hh, &nonce, &want.mix));
     }
 
     fn tables<'a>(w: &'a PowWitness, perm: &'a PermAir) -> Vec<(&'a dyn DynAir, &'a Trace, Option<&'a Trace>)> {
@@ -683,6 +915,78 @@ mod tests {
         let w = witness(seed.text(), windows, parents, &hh, &nonce);
         let perm = PermAir { windows, parents };
         assert_eq!(stark::check_tables(&tables(&w, &perm), &w.public), Ok(()));
+    }
+
+    /// Each way of cheating, written as a cheating prover would (the
+    /// generator lenient, all after the cheat computed from it), is refused
+    /// by the constraints or the buses.
+    #[test]
+    #[ignore = "slow: the seed text and 128 items, for each cheat"]
+    fn attacks() {
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let windows = Windows::aligned(seed.text().len());
+        let parents = PowParams::MAINNET.parents;
+        let perm = PermAir { windows, parents };
+        let honest = witness(seed.text(), windows, parents, &hh, &nonce);
+        assert_eq!(stark::check_tables(&tables(&honest, &perm), &honest.public), Ok(()));
+        for cheat in [
+            Cheat::OtherWindow,
+            Cheat::OtherIndex,
+            Cheat::OtherText,
+            Cheat::FewerParents,
+            Cheat::MoreParents,
+            Cheat::OtherItem,
+            Cheat::OtherPair,
+            Cheat::NonCanonical,
+            Cheat::BeyondN,
+            Cheat::WrongMix,
+            Cheat::WrongHash,
+        ] {
+            crate::stark::LENIENT.with(|l| l.set(true));
+            let w = witness_cheating(seed.text(), windows, parents, &hh, &nonce, cheat);
+            crate::stark::LENIENT.with(|l| l.set(false));
+            assert!(stark::check_tables(&tables(&w, &perm), &w.public).is_err(), "{cheat:?} accepted");
+        }
+    }
+
+    /// A real header's work: proven, and verified only against its own
+    /// `pow_hash`, nonce and `mix`, and the window table's root.
+    #[test]
+    #[ignore = "slow: proves a header's work"]
+    fn proves_a_real_header() {
+        use crate::block::Header;
+        let seed = SeedText::new(PowParams::MAINNET);
+        let mut header = Header {
+            prev_hash: core::array::from_fn(|k| Fp::new(11 + k as u32)),
+            height: 7,
+            timestamp: 1_793_400_000,
+            body_commitment: core::array::from_fn(|k| Fp::new(500 + k as u32)),
+            state_root: core::array::from_fn(|k| Fp::new(900 + k as u32)),
+            aux: [0; 32],
+            mix: [Fp::ZERO; DIGEST],
+            nonce: crate::pow::nonce_from_u64(42),
+        };
+        let pow_hash = header.pow_hash();
+        header.mix = pow::hashimoto(&seed, &pow_hash, &header.nonce).mix;
+        let setup = WorkSetup::new(&seed, &SEGMENT);
+        let (proof, mix) = prove_work(&setup, &seed, &SEGMENT, &pow_hash, &header.nonce);
+        assert_eq!(mix, header.mix);
+        let check = |root: &crate::merkle::Digest, h: &[Fp; DIGEST], n: &[u8; 32], m: &[Fp; DIGEST]| {
+            let v = WorkVerifier { root: *root, ..setup.verifier() };
+            verify_work(&v, &SEGMENT, h, n, m, &proof).is_ok()
+        };
+        assert!(check(&setup.root(), &pow_hash, &header.nonce, &header.mix));
+        let mut wrong_mix = header.mix;
+        wrong_mix[3] = wrong_mix[3].add(&Fp::ONE);
+        assert!(!check(&setup.root(), &pow_hash, &header.nonce, &wrong_mix), "another mix");
+        assert!(!check(&setup.root(), &pow_hash, &crate::pow::nonce_from_u64(43), &header.mix), "another nonce");
+        let mut other = header;
+        other.timestamp += 1;
+        assert!(!check(&setup.root(), &other.pow_hash(), &header.nonce, &header.mix), "another header");
+        let mut root = setup.root();
+        root[0] = root[0].add(&Fp::ONE);
+        assert!(!check(&root, &pow_hash, &header.nonce, &header.mix), "another text");
     }
 
     /// Proving and verifying one header's proof of work at the mainnet

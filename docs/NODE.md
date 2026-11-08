@@ -410,9 +410,9 @@ one header). The work before it comes with the chain proof.
   gives that `mix`. `miner/src/pow_air.rs` is its prototype: the hash
   machine with the seed and the 128 items, the window indices proven in
   10-bit limbs, the windows looked up in a preprocessed table of the
-  text, the 64 accesses folded in a mix table, and a range table. Still
-  to add: the final fold to the 8-element `mix`, checked against the
-  public value.
+  text, the 64 accesses folded in a mix table, and a range table. The
+  final fold to the 8-element `mix` is checked against the public value
+  (step 2, done).
 - **The statement** (`aggregate::Statement`) gains the parent header's
   hash and its `pow_hash`, nonce and `mix`. The parent's other fields
   are needed to recompute its hash in the circuit: about 204 bytes, a
@@ -485,8 +485,22 @@ Each step done when its test passes.
 2. **The work segment, complete**: the prototype's tables, the final
    fold to the `mix` checked against its public value, the attack tests
    (each constraint broken alone is refused, as the other circuits'
-   tests do). Done when it proves a real header's work and refuses a
-   wrong `mix`.
+   tests do). Done (2026-11-07). `miner/src/pow_air.rs`:
+   - Public values: `pow_hash`, the nonce's 11 elements, the `mix`.
+   - The mix table's row after the 64th access folds the mix to eight
+     elements and checks it against them.
+   - `WorkSetup` commits the window table once; `prove_work` and
+     `verify_work` (with a `WorkVerifier`: root, layout, parents) make
+     and check the proof, under transcript domain 0x35.
+   - `attacks`: eleven cheats, each generated leniently as a cheating
+     prover would, are refused. They are: another window absorbed;
+     another index shown; changed text; a parent too few or too many;
+     an item for another index; another pair picked; a non-canonical
+     decomposition; an index past N into the table's padding; another
+     mix; another header hash.
+   - `proves_a_real_header`: a `block::Header`'s work proven, and
+     verified only against its own `pow_hash`, nonce, `mix` and window
+     table.
 3. **Into the block's tree**: the work segment as one more child, the
    plan regenerated. Done when a block proves with its parent's work,
    and the fold's cost is measured against the estimate above.
