@@ -243,6 +243,9 @@ pub struct BlockStatement<'a> {
     /// Subsidy the block may create.
     pub subsidy: u64,
     pub body: &'a Body,
+    /// The parent header's work ([`ChainParams::parent_work`]), which the
+    /// block's proof proves.
+    pub parent_work: crate::pow_air::Work,
 }
 
 /// Verifies a block's validity proof. The real implementation is the STARK
@@ -757,6 +760,8 @@ pub struct Chain<V: ProofVerifier> {
     /// header in microseconds instead of tens of milliseconds from the
     /// seed text.
     dataset: std::sync::RwLock<Option<std::sync::Arc<crate::pow::Dataset>>>,
+    /// Genesis's work, computed ([`Chain::parent_work`]).
+    genesis_work: std::sync::OnceLock<crate::pow_air::Work>,
     /// Headers' block 1, by header hash, for a schedule anchored there
     /// ([`Schedule::from_first_block`]).
     first_blocks: Mutex<std::collections::HashMap<Digest, Header>>,
@@ -826,6 +831,7 @@ impl<V: ProofVerifier> Chain<V> {
             branch: Mutex::new(Vec::new()),
             timings: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
+            genesis_work: std::sync::OnceLock::new(),
             first_blocks: Mutex::new(std::collections::HashMap::new()),
         };
         // A snapshot install interrupted by a stop: start over cleanly.
@@ -1383,6 +1389,17 @@ impl<V: ProofVerifier> Chain<V> {
     }
 
     /// Uses the full proof-of-work dataset for header checks from now on.
+    /// The work a block's proof proves of its parent `parent`: the
+    /// header's `pow_hash`, nonce and `mix`, its mix checked by the proof of
+    /// work. Genesis's `mix` is empty (its proof of work is not checked), so
+    /// for it the true mix is computed from the seed text, once.
+    pub fn parent_work(&self, parent: &Header) -> crate::pow_air::Work {
+        if parent.height != 0 {
+            return crate::pow_air::Work::of_header(parent);
+        }
+        *self.genesis_work.get_or_init(|| crate::pow_air::Work::computed(&self.seed, parent))
+    }
+
     pub fn set_dataset(&self, dataset: std::sync::Arc<crate::pow::Dataset>) {
         *self.dataset.write().unwrap() = Some(dataset);
     }
@@ -1578,6 +1595,9 @@ impl<V: ProofVerifier> Chain<V> {
             return Err(ChainError::Corrupt("supply"));
         }
         self.meta.put(wtxn, META_SUPPLY, &supply.to_le_bytes())?;
+        let parent = self
+            .header_by_hash_in(wtxn, &digest_bytes(&header.prev_hash))?
+            .ok_or(ChainError::Corrupt("connected block's parent"))?;
         let statement = BlockStatement {
             height: header.height,
             prev_state_root,
@@ -1585,6 +1605,7 @@ impl<V: ProofVerifier> Chain<V> {
             first_output_position,
             subsidy: self.params.subsidy(header.height),
             body,
+            parent_work: self.parent_work(&parent),
         };
         self.lap("supply", &mut t);
         if !self.verifier.verify(&statement, &body.proof) {
@@ -2026,6 +2047,7 @@ impl<V: ProofVerifier> Chain<V> {
             first_output_position: first,
             subsidy: self.params.subsidy(block.header.height),
             body: &block.body,
+            parent_work: self.parent_work(&parent),
         };
         if !self.verifier.verify(&statement, &block.body.proof) {
             return Err(ChainError::BadProof);
@@ -2699,6 +2721,7 @@ impl<V: ProofVerifier> Chain<V> {
             first_output_position,
             subsidy: self.params.subsidy(height),
             body: &body,
+            parent_work: self.parent_work(&parent),
         });
         Ok(Some((statement, body.proof)))
     }
@@ -3173,6 +3196,15 @@ mod tests {
             emission: &[(10, 50), (10, 25), (5, 12)],
             aggregator: AggregatorParams::MAINNET,
             schedule: crate::difficulty::Schedule::MAINNET,
+        }
+    }
+
+    /// Each network's block proofs prove parents' work under its own proof
+    /// of work.
+    #[test]
+    fn networks_prove_their_own_work() {
+        for p in [ChainParams::MAINNET, ChainParams::DEV, ChainParams::DEV_RECURSIVE] {
+            assert_eq!(p.pow, p.aggregator.pow);
         }
     }
 

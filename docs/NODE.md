@@ -468,7 +468,9 @@ What it means for a block, with aligned windows:
   segments, plus its fold into the tree: one more child of the root for a
   one-segment block, perhaps one more node for a sixteen-segment one.
   Estimated at about +5–15 s a block, against 29 s and 170 s today
-  (`miner/SECURITY.md`). The fold is the part still to measure.
+  (`miner/SECURITY.md`). The fold's sizes are measured (step 3): a
+  one-segment root goes from 2^18 to 2^19 rows, larger roots and the
+  wrap keep their heights.
 - **The published proof:** unchanged, about 205 KB, since the wrap and
   the chain step keep their shape. The work segment's 462 KB never
   leaves the miner.
@@ -503,7 +505,35 @@ Each step done when its test passes.
      table.
 3. **Into the block's tree**: the work segment as one more child, the
    plan regenerated. Done when a block proves with its parent's work,
-   and the fold's cost is measured against the estimate above.
+   and the fold's cost is measured against the estimate above. Done
+   (2026-11-07):
+   - The root verifies the work segment after the name segment, with the
+     window table's root a constant of its program, and requires its
+     public values to be the statement's new `parent_work` (the parent's
+     `pow_hash`, nonce and `mix`, 27 elements). The root's tree digest
+     ends with a `WORK_TAG` (0x43) descriptor.
+   - `AggregatorParams` gains `pow`, the proof of work the parent's is
+     proven under. It must be the chain's (`networks_prove_their_own_work`).
+   - `prove_wrap` proves the parent's work as one more job, first, beside
+     the segments. The last work proof is kept, so a template rebuilt on
+     the same parent reuses it.
+   - Genesis's `mix` is empty, so for block 1 the parent's true mix is
+     computed from the seed text (`Chain::parent_work`, once).
+   - Every wrap is padded to one set of heights (`wrap_pad`): the tallest
+     of the roots over 1 to `fan_in` segments and over `max_segments`.
+     The chain program verifies every wrap at one set of heights, and
+     with the work segment the roots' heights spread further.
+   - Measured on a dev-recursive chain of three blocks: the parent's work
+     proves in 1.6 s beside the segment and name segment, and the root
+     over one segment (2^17 rows) in 2.2 s; 7.5–7.8 s to prove a block.
+     Each block verifies in 3 ms, and its proof is 35 KB.
+   - Mainnet, planned: the root of a one-segment block passes 2^19 rows
+     (it was 2^18); the roots of 2 to 16384 segments stay at 2^19 rows
+     and a 2^17-row hash table, and the wrap at 2^17. So a one-segment
+     block's root costs about twice as much to prove, a larger block's
+     about the same, plus the work segment's 3.2 s alongside its
+     segments: within the estimate. The mainnet timings in
+     `miner/SECURITY.md` are redone in step 6.
 4. **The statement and the chain step**: the parent header bound, its
    hash recomputed and linked, genesis at height 1, the constants
    regenerated. Done when a chain proof verifies only against the header

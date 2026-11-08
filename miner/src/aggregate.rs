@@ -60,6 +60,8 @@ use crate::name_air::{
 };
 use crate::names::OpKind;
 use crate::poseidon2::{DIGEST, Fp, P, WIDTH};
+use crate::pow::PowParams;
+use crate::pow_air::{DOM_WORK_PROOF, NUM_PUBLIC as WORK_PUBLIC, RangeAir, TextAir, Work, WorkProof};
 use crate::recursion::{Compiler, dummy_proof};
 use crate::stark::{self, Preprocessed, StarkConfig};
 use crate::vm_air::{Addr, NUM_PUBLIC as VM_PUBLIC, PUB_OUTPUT, Program, VmAir};
@@ -105,6 +107,9 @@ pub struct AggregatorParams {
     /// plan either (`--network dev`, for rapid blocks). A proof then says
     /// nothing of the blocks before.
     pub direct: bool,
+    /// The proof of work, whose parent's the root's work segment proves
+    /// (at the segment configuration).
+    pub pow: PowParams,
 }
 
 impl AggregatorParams {
@@ -144,6 +149,7 @@ impl AggregatorParams {
         outer: StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 },
         wrap: StarkConfig { log_blowup: 5, num_queries: 22, pow_bits: 16, zk: true, commit_bits: 121 },
         direct: false,
+        pow: PowParams::MAINNET,
     };
 
     /// The recursive dev network's (`--network dev-recursive`): the
@@ -162,6 +168,7 @@ impl AggregatorParams {
         outer: StarkConfig { log_blowup: 2, num_queries: 2, pow_bits: 0, zk: false, commit_bits: 0 },
         wrap: StarkConfig { log_blowup: 3, num_queries: 2, pow_bits: 0, zk: true, commit_bits: 0 },
         direct: false,
+        pow: PowParams::DEV,
     };
 
     /// The dev network's (`--network dev`): the same segments, proven and
@@ -176,6 +183,19 @@ impl AggregatorParams {
     /// Rows available to transactions in one segment.
     pub fn segment_rows(&self) -> usize {
         1 << self.segment_log_n
+    }
+
+    /// The work segment's setup: its window table committed (once per
+    /// process).
+    pub fn work_setup(&self) -> &'static crate::pow_air::WorkSetup {
+        crate::pow_air::work_setup(&self.segment, self.pow)
+    }
+
+    /// Proves `work`'s mix (the parent's, for a block).
+    pub fn prove_work(&self, work: &Work) -> WorkProof {
+        let (proof, mix) = crate::pow_air::prove_work(self.work_setup(), &self.segment, &work.pow_hash, &work.nonce);
+        assert_eq!(mix, work.mix, "the work's mix is not hashimoto's");
+        WorkProof { work: *work, proof }
     }
 }
 
@@ -197,10 +217,12 @@ pub struct Statement {
     pub names_state: [Fp; WIDTH],
     /// Sweeps sponge state after the block's swept positions.
     pub sweeps_state: [Fp; WIDTH],
+    /// The parent header's work, which the root's work segment proves.
+    pub parent_work: Work,
 }
 
 /// Scalars in the statement encoding.
-pub const STATEMENT_LEN: usize = 2 * DIGEST + 4 * WIDTH + 4 + LIMBS + 1;
+pub const STATEMENT_LEN: usize = 2 * DIGEST + 4 * WIDTH + 4 + LIMBS + 1 + WORK_PUBLIC;
 const ST_PREV: usize = 0;
 const ST_NEW: usize = DIGEST;
 const ST_ISP: usize = 2 * DIGEST;
@@ -211,6 +233,7 @@ const ST_SUBSIDY: usize = ST_POS_OUT + 2;
 const ST_HEIGHT: usize = ST_SUBSIDY + LIMBS;
 const ST_NSP: usize = ST_HEIGHT + 1;
 const ST_SSP: usize = ST_NSP + WIDTH;
+const ST_WORK: usize = ST_SSP + WIDTH;
 
 impl Statement {
     pub fn from_block(s: &BlockStatement<'_>) -> Statement {
@@ -226,6 +249,7 @@ impl Statement {
             height: s.height,
             names_state: names_state(&s.body.op_digests()),
             sweeps_state: sweeps_state(&s.body.sweeps),
+            parent_work: s.parent_work,
         }
     }
 
@@ -241,6 +265,7 @@ impl Statement {
             height: 0,
             names_state: [Fp::ZERO; WIDTH],
             sweeps_state: [Fp::ZERO; WIDTH],
+            parent_work: Work::ZERO,
         }
     }
 
@@ -258,6 +283,7 @@ impl Statement {
         v.push(Fp::new(self.height));
         v.extend_from_slice(&self.names_state);
         v.extend_from_slice(&self.sweeps_state);
+        v.extend(self.parent_work.to_values());
         debug_assert_eq!(v.len(), STATEMENT_LEN);
         v
     }
@@ -276,6 +302,8 @@ impl Statement {
 const SEGMENT_TAG: u32 = 0x41;
 /// Descriptor tag of the root's name segment child.
 const NAME_TAG: u32 = 0x42;
+/// Descriptor tag of the root's work segment child.
+const WORK_TAG: u32 = 0x43;
 /// Scalars per child descriptor.
 const DESCRIPTOR: usize = 2 * DIGEST;
 
@@ -301,7 +329,7 @@ pub fn tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
 }
 
 /// Tree digest of the root: its children's descriptors, then the name
-/// segment's `[NAME_TAG, 0, ..]`.
+/// segment's `[NAME_TAG, 0, ..]` and the work segment's `[WORK_TAG, 0, ..]`.
 pub fn root_tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
     let mut v = Vec::with_capacity(DESCRIPTOR * (children.len() + 1));
     for ch in children {
@@ -316,8 +344,10 @@ pub fn root_tree_digest(children: &[Option<(Digest, Digest)>]) -> Digest {
             }
         }
     }
-    v.push(Fp::new(NAME_TAG));
-    v.extend_from_slice(&[Fp::ZERO; DESCRIPTOR - 1]);
+    for tag in [NAME_TAG, WORK_TAG] {
+        v.push(Fp::new(tag));
+        v.extend_from_slice(&[Fp::ZERO; DESCRIPTOR - 1]);
+    }
     crate::poseidon2::hash(&v)
 }
 
@@ -445,9 +475,9 @@ impl Child<'_> {
 pub enum Output<'a> {
     /// The combined span record (inner nodes).
     Record,
-    /// The block statement, after binding the span and the name segment
-    /// to it (the root).
-    Statement(&'a Statement, &'a NameProof),
+    /// The block statement, after binding the span, the name segment and
+    /// the parent's work segment to it (the root).
+    Statement(&'a Statement, &'a NameProof, &'a WorkProof),
 }
 
 /// Copies `words` into a fresh block, zero padded to a multiple of eight,
@@ -568,7 +598,7 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.hash_scalars(out, SEGMENT_PUBLIC + DIGEST);
             c.assert_public();
         }
-        Output::Statement(statement, name) => {
+        Output::Statement(statement, name, work) => {
             // The name segment: its record as inputs, then its proof, and
             // its descriptor last in the tree digest.
             let nm = c.scalar_inputs(&name.public.to_values());
@@ -576,6 +606,24 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             let name_prefix = [Fp::new(DOM_NAME_PROOF)];
             c.verify_stark(&[(&NameAir, None)], &params.segment, &name_prefix, nm, NAME_PUBLIC, &name.proof);
             let tag = c.scalar(Fp::new(NAME_TAG));
+            descriptors.push(tag);
+            descriptors.extend([0; DESCRIPTOR - 1]);
+            // The work segment: the parent's work as inputs, then its proof
+            // against the window table, a constant of the program; its
+            // descriptor after the name segment's.
+            let wk = c.scalar_inputs(&work.work.to_values());
+            let setup = params.work_setup();
+            let heights: Vec<usize> = work.proof.tables.iter().map(|t| t.log_n).collect();
+            assert_eq!(heights, setup.log_heights, "work segment proof has the wrong heights");
+            let text_root = c.scalar_inputs(&setup.root());
+            for (i, v) in setup.root().iter().enumerate() {
+                c.assert_scalar(text_root + i as Addr, *v);
+            }
+            let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
+            let tables: [(&dyn stark::DynAir, Option<Addr>); 4] =
+                [(&TextAir, Some(text_root)), (&perm, None), (&RangeAir, None), (&mix, None)];
+            c.verify_stark(&tables, &params.segment, &[Fp::new(DOM_WORK_PROOF)], wk, WORK_PUBLIC, &work.proof);
+            let tag = c.scalar(Fp::new(WORK_TAG));
             descriptors.push(tag);
             descriptors.extend([0; DESCRIPTOR - 1]);
             let block = concat(&mut c, &descriptors);
@@ -609,6 +657,8 @@ pub fn compile_node(params: &AggregatorParams, children: &[Child<'_>], output: O
             c.assert_block(at(nm, NM_NSP), at(st, ST_NSP), WIDTH);
             c.assert_block(at(nm, NM_SSP), at(st, ST_SSP), WIDTH);
             c.assert_eq(at(nm, NM_HEIGHT), at(st, ST_HEIGHT));
+            // The work proven is the statement's parent work.
+            c.assert_block(wk, at(st, ST_WORK), WORK_PUBLIC);
             // Every transaction segment created its outputs at the block's
             // height.
             c.assert_eq(at(first, PUB_HEIGHT), at(st, ST_HEIGHT));
@@ -674,8 +724,15 @@ fn verify_node_child(
 /// `params.outer`) and outputs the statement with the wrap's tree digest
 /// ([`wrap_tree`]), so the block's proof can be a single proof at the
 /// lower rate of `params.wrap`. Like every node, it depends only on the
-/// root's table heights.
-pub fn compile_wrap(params: &AggregatorParams, root: &NodeProof, statement: &Statement) -> Compiler {
+/// root's table heights. `pad`, the heights every wrap is padded to (the
+/// chain program verifies all of them at one set of heights), is `None`
+/// only when finding those heights.
+pub fn compile_wrap(
+    params: &AggregatorParams,
+    root: &NodeProof,
+    statement: &Statement,
+    pad: Option<(usize, usize)>,
+) -> Compiler {
     let mut c = Compiler::new();
     let (st, pubv) = verify_node_child(&mut c, params, root, |c, root| {
         let mut v = statement.to_values();
@@ -693,6 +750,9 @@ pub fn compile_wrap(params: &AggregatorParams, root: &NodeProof, statement: &Sta
     c.hash_scalars(block, words.len());
     c.assert_public();
     c.prog.reserve(params.wrap.blind_rows());
+    if let Some((log_n, hash_log_n)) = pad {
+        c.prog.pad_to(log_n, hash_log_n);
+    }
     c
 }
 
@@ -781,6 +841,8 @@ impl Compiled {
 pub struct PlanCache {
     nodes: HashMap<NodeType, Compiled>,
     wraps: HashMap<(usize, usize), Compiled>,
+    /// The heights every wrap is padded to ([`wrap_pad`]).
+    wrap_pad: Option<(usize, usize)>,
 }
 
 impl PlanCache {
@@ -807,15 +869,11 @@ pub fn plan(params: &AggregatorParams, k: usize) -> Shape {
 /// As [`plan`], compiling only the program types `cache` lacks.
 pub fn plan_with(params: &AggregatorParams, k: usize, cache: &mut PlanCache) -> Shape {
     assert!(k >= 1 && k <= params.max_segments, "segment count {k} out of range");
+    let pad = wrap_pad(params, cache);
     let mut root = plan_node(params, k, true, cache);
     let wrap = *cache.wraps.entry((root.log_n, root.hash_log_n)).or_insert_with(|| {
-        let dummy = NodeProof {
-            record: dummy_record(),
-            digest: [Fp::ZERO; DIGEST],
-            tree: [Fp::ZERO; DIGEST],
-            proof: dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC),
-        };
-        Compiled::of(&compile_wrap(params, &dummy, &Statement::zero()).prog, params.wrap.log_blowup)
+        let dummy = dummy_root(params, &root);
+        Compiled::of(&compile_wrap(params, &dummy, &Statement::zero(), Some(pad)).prog, params.wrap.log_blowup)
     });
     root.wrap = Some(Wrap {
         digest: wrap.digest,
@@ -826,8 +884,49 @@ pub fn plan_with(params: &AggregatorParams, k: usize, cache: &mut PlanCache) -> 
     root
 }
 
+/// A root proof of `root`'s heights with zero values, for planning.
+fn dummy_root(params: &AggregatorParams, root: &Shape) -> NodeProof {
+    NodeProof {
+        record: dummy_record(),
+        digest: [Fp::ZERO; DIGEST],
+        tree: [Fp::ZERO; DIGEST],
+        proof: dummy_proof(&[(&VmAir, root.log_n), (&HashTableAir, root.hash_log_n)], &params.outer, VM_PUBLIC),
+    }
+}
+
+/// The heights every wrap is padded to: those of the wrap over a root as
+/// tall as the tallest of the roots over 1 to `fan_in` segments (segment
+/// children only) and over `max_segments` (the largest subtrees), table by
+/// table. A wrap depends only on its root's heights, and every other root
+/// mixes such children; a count whose wrap needs more rows all the same is
+/// caught by [`plan_leaves`].
+fn wrap_pad(params: &AggregatorParams, cache: &mut PlanCache) -> (usize, usize) {
+    if let Some(pad) = cache.wrap_pad {
+        return pad;
+    }
+    let mut root = plan_node(params, params.max_segments, true, cache);
+    for k in 1..=params.fan_in.min(params.max_segments) {
+        let r = plan_node(params, k, true, cache);
+        root.log_n = root.log_n.max(r.log_n);
+        root.hash_log_n = root.hash_log_n.max(r.hash_log_n);
+    }
+    let p = compile_wrap(params, &dummy_root(params, &root), &Statement::zero(), None).prog;
+    let pad = (p.height().trailing_zeros() as usize, VmAir::hash_height(&p).trailing_zeros() as usize);
+    cache.wrap_pad = Some(pad);
+    pad
+}
+
 fn dummy_record() -> SegmentPublic {
     SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap()
+}
+
+/// A work segment proof of the right shape with zero values, for planning.
+fn dummy_work(params: &AggregatorParams) -> WorkProof {
+    let setup = params.work_setup();
+    let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
+    let h = setup.log_heights;
+    let tables: [(&dyn stark::DynAir, usize); 4] = [(&TextAir, h[0]), (&perm, h[1]), (&RangeAir, h[2]), (&mix, h[3])];
+    WorkProof { work: Work::ZERO, proof: dummy_proof(&tables, &params.segment, WORK_PUBLIC) }
 }
 
 /// A name segment proof of the right shape with zero values, for planning.
@@ -884,7 +983,11 @@ fn plan_node(params: &AggregatorParams, k: usize, root: bool, cache: &mut PlanCa
             .collect();
         let zero = Statement::zero();
         let name_dummy = dummy_name(params);
-        let output = if root { Output::Statement(&zero, &name_dummy) } else { Output::Record };
+        let work_dummy = if root { Some(dummy_work(params)) } else { None };
+        let output = match &work_dummy {
+            Some(w) => Output::Statement(&zero, &name_dummy, w),
+            None => Output::Record,
+        };
         Compiled::of(&compile_node(params, &child_refs, output).prog, params.outer.log_blowup)
     });
     let descriptors: Vec<Option<(Digest, Digest)>> =
@@ -921,6 +1024,8 @@ pub enum Progress {
     Segment { index: usize, count: usize, elapsed: std::time::Duration },
     /// The name segment is proven.
     Name { elapsed: std::time::Duration },
+    /// The parent's work is proven.
+    Work { elapsed: std::time::Duration },
     /// A node over `segments` segments is proven; `root` for the last one.
     Node { segments: usize, log_n: usize, hash_log_n: usize, root: bool, elapsed: std::time::Duration },
     /// The wrap over the root is proven.
@@ -1002,7 +1107,7 @@ fn prove_node(
     let record = combine_records(&records);
     let out_digest = match &output {
         Output::Record => node_output(&record, &shape.tree),
-        Output::Statement(s, _) => s.output(&shape.tree),
+        Output::Statement(s, _, _) => s.output(&shape.tree),
     };
     let c = compile_node(params, &children, output);
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("node program rejects its own witness");
@@ -1071,7 +1176,23 @@ pub fn prove_block_cancellable(
     Some(w.finish())
 }
 
-/// The wrap proof of a block: segments and the name segment, the tree,
+/// The last work proof made, by segment configuration: a block template
+/// rebuilt on the same parent reuses it.
+static LAST_WORK: Mutex<Option<(StarkConfig, WorkProof)>> = Mutex::new(None);
+
+fn cached_work(params: &AggregatorParams, work: &Work) -> Option<WorkProof> {
+    match &*LAST_WORK.lock().unwrap() {
+        Some((config, p)) if *config == params.segment && p.work == *work => Some(p.clone()),
+        _ => None,
+    }
+}
+
+fn remember_work(params: &AggregatorParams, proof: &WorkProof) {
+    *LAST_WORK.lock().unwrap() = Some((params.segment, proof.clone()));
+}
+
+/// The wrap proof of a block: segments, the name segment and the parent's
+/// work, the tree,
 /// then the wrap, as [`prove_block_cancellable`] encodes it.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_wrap(
@@ -1086,20 +1207,29 @@ pub fn prove_wrap(
 ) -> Option<stark::Proof> {
     assert_eq!(shape.segments, segments.len(), "shape planned for a different segment count");
     let count = segments.len();
-    // Job `count` is the name segment.
+    // Job `count` is the name segment, job `count + 1` the parent's work
+    // (unless proven for an earlier template on the same parent).
+    let work_done: Mutex<Option<WorkProof>> = Mutex::new(cached_work(params, &statement.parent_work));
+    let jobs_total = if work_done.lock().unwrap().is_some() { count + 1 } else { count + 2 };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done: Vec<Mutex<Option<SegmentProof>>> = (0..count).map(|_| Mutex::new(None)).collect();
     let name_done: Mutex<Option<NameProof>> = Mutex::new(None);
     std::thread::scope(|s| {
-        for _ in 0..jobs.clamp(1, count + 1) {
+        for _ in 0..jobs.clamp(1, jobs_total) {
             s.spawn(|| {
                 loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if index > count || cancel() {
+                    let taken = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if taken >= jobs_total || cancel() {
                         break;
                     }
+                    // The work first, if it is a job: the longest one.
+                    let index = if jobs_total == count + 2 { (taken + count + 1) % jobs_total } else { taken };
                     let t = std::time::Instant::now();
-                    if index == count {
+                    if index == count + 1 {
+                        let p = params.prove_work(&statement.parent_work);
+                        progress(Progress::Work { elapsed: t.elapsed() });
+                        *work_done.lock().unwrap() = Some(p);
+                    } else if index == count {
                         let p = prove_name_padded(&params.segment, names, params.name_log_n);
                         progress(Progress::Name { elapsed: t.elapsed() });
                         *name_done.lock().unwrap() = Some(p);
@@ -1117,10 +1247,13 @@ pub fn prove_wrap(
     }
     let proofs: Vec<SegmentProof> = done.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let name_proof = name_done.into_inner().unwrap().unwrap();
-    let root = prove_node(params, shape, &proofs, Output::Statement(statement, &name_proof), progress, cancel)?;
+    let work_proof = work_done.into_inner().unwrap().unwrap();
+    remember_work(params, &work_proof);
+    let root =
+        prove_node(params, shape, &proofs, Output::Statement(statement, &name_proof, &work_proof), progress, cancel)?;
     let wrap = shape.wrap.expect("shape is a planned root");
     let t = std::time::Instant::now();
-    let c = compile_wrap(params, &root, statement);
+    let c = compile_wrap(params, &root, statement, Some((wrap.log_n, wrap.hash_log_n)));
     let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).expect("wrap program rejects its own witness");
     let pre = committed_program(&c.prog, &params.wrap, &wrap.digest);
     let public = VmAir::public_values(&pre.root(), &statement.output(&wrap.tree));
@@ -1536,10 +1669,10 @@ pub fn verify_block(
 /// chain programs, fixed by the circuits. Regenerate with the ignored test
 /// `aggregate::tests::mainnet_chain_constants` after any circuit change.
 pub const MAINNET_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [136321940, 1870844914, 307673264, 958462441, 704931512, 1659856536, 578368572, 901526559],
+    plan_root: [1558421478, 639258978, 1210089184, 734761604, 1252940729, 1123716956, 477110432, 1624258239],
     plan_depth: 14,
-    base: [1155005832, 717413951, 1743677040, 59236118, 1038206205, 948534588, 26439164, 1716982270],
-    step: [1447693859, 698176439, 1480644851, 1556547979, 945260240, 584146007, 387136665, 1640845301],
+    base: [1491144615, 1692776848, 772580570, 294055779, 716752362, 810463816, 1359458729, 1161990189],
+    step: [1647388461, 781050296, 1807516799, 134302249, 1164459272, 414941, 698349428, 519382518],
     log_n: 17,
     hash_log_n: 15,
 });
@@ -1554,10 +1687,10 @@ const MAINNET_PLAN: &[u8] = include_bytes!("mainnet_plan.bin");
 /// with mainnet's emission), as [`MAINNET_CHAIN`]; regenerated by
 /// `dev_recursive_chain_constants`.
 pub const DEV_RECURSIVE_CHAIN: Option<ChainSetupConst> = Some(ChainSetupConst {
-    plan_root: [1803680089, 1872001427, 1755976133, 623752496, 38593653, 916717061, 1264299743, 1895501514],
+    plan_root: [1549752479, 19086199, 1379039922, 759295459, 11406880, 1825510286, 515605751, 185298678],
     plan_depth: 6,
-    base: [943910577, 1791688754, 653025762, 45963403, 1036268654, 136172128, 893529519, 1314608608],
-    step: [1125792227, 482735339, 1979008605, 182102957, 1469784205, 1086891503, 327619006, 516778218],
+    base: [62598863, 563252730, 1132886052, 44908415, 1473767265, 1410167255, 1697246142, 1319129120],
+    step: [1206078060, 724266973, 738166853, 1493055513, 1110185805, 1130545222, 148587520, 1313344762],
     log_n: 16,
     hash_log_n: 12,
 });
@@ -1841,6 +1974,7 @@ mod tests {
         outer: StarkConfig { log_blowup: 2, num_queries: 4, pow_bits: 5, zk: false, commit_bits: 112 },
         wrap: StarkConfig { log_blowup: 3, num_queries: 4, pow_bits: 4, zk: true, commit_bits: 112 },
         direct: false,
+        pow: PowParams::DEV,
     };
 
     struct Setup {
@@ -1850,6 +1984,13 @@ mod tests {
         statement: Statement,
         proofs: Vec<SegmentProof>,
         name_proof: NameProof,
+        work_proof: WorkProof,
+    }
+
+    /// The test blocks' parent work, proven at SMALL (once).
+    fn small_work_proof() -> WorkProof {
+        static PROOF: std::sync::OnceLock<WorkProof> = std::sync::OnceLock::new();
+        PROOF.get_or_init(|| SMALL.prove_work(&crate::pow_air::test_work(SMALL.pow))).clone()
     }
 
     /// An empty name segment witness after `segments`, at `height`.
@@ -1888,12 +2029,13 @@ mod tests {
             first_output_position: 0,
             subsidy,
             body: &body,
+            parent_work: crate::pow_air::test_work(SMALL.pow),
         });
         let proofs: Vec<SegmentProof> =
             segments.iter().map(|w| prove_segment_padded(&SMALL.segment, w, SMALL.segment_log_n)).collect();
         let names = empty_names(&segments, 1);
         let name_proof = prove_name_padded(&SMALL.segment, &names, SMALL.name_log_n);
-        Setup { _dir: dir, segments, names, statement, proofs, name_proof }
+        Setup { _dir: dir, segments, names, statement, proofs, name_proof, work_proof: small_work_proof() }
     }
 
     fn seg_children(proofs: &[SegmentProof]) -> Vec<Child<'_>> {
@@ -1935,7 +2077,7 @@ mod tests {
             subsidy: 30,
             ..s.statement.clone()
         };
-        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short, &s.name_proof));
+        let c = compile_node(&SMALL, &seg_children(&s.proofs[..2]), Output::Statement(&short, &s.name_proof, &s.work_proof));
         assert!(matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_))));
     }
 
@@ -1994,6 +2136,7 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
+                parent_work: crate::pow_air::test_work(SMALL.pow),
             });
             let names = empty_names(&segments, height);
             (segments, statement, names)
@@ -2104,6 +2247,7 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
+                parent_work: crate::pow_air::test_work(SMALL.pow),
             });
             let names = empty_names(&segments, height);
             let t = std::time::Instant::now();
@@ -2155,9 +2299,11 @@ mod tests {
         use crate::block::Block;
         use crate::chain::{Chain, ChainError, ChainParams};
         use crate::difficulty::U256;
-        use crate::pow::{self, Dataset, PowParams, SeedText, nonce_from_u64};
+        use crate::pow::{self, Dataset, SeedText, nonce_from_u64};
         const EMISSION: &[(u32, u64)] = &[(10, 55)];
-        let pow_params = PowParams { log_dataset_items: 8, parents: 32, accesses: 64 };
+        // The aggregator's proof of work (the work segment proves parents'
+        // under it), with the built-in text.
+        let pow_params = SMALL.pow;
         let params = ChainParams {
             pow: pow_params,
             genesis_timestamp: 1_700_000_000,
@@ -2171,7 +2317,7 @@ mod tests {
             aggregator: SMALL,
             schedule: crate::difficulty::Schedule::MAINNET,
         };
-        let seed = SeedText::from_bytes(pow_params, (0..20_000u32).map(|i| (i * 31 % 253) as u8).collect());
+        let seed = SeedText::new(pow_params);
         let dataset = Dataset::generate(&seed);
         let dir = TempDir::new("connect");
         let chain = Chain::open(&dir.0, 64 << 20, params, seed, AggregateVerifier::new(SMALL, EMISSION)).unwrap();
@@ -2204,6 +2350,7 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
+                parent_work: chain.parent_work(&chain.tip().unwrap().unwrap()),
             });
             body.proof = chain
                 .verifier()
@@ -2328,6 +2475,7 @@ mod tests {
                 first_output_position: first,
                 subsidy: 55,
                 body: &body,
+                parent_work: crate::pow_air::test_work(SMALL.pow),
             });
             let t = std::time::Instant::now();
             let proof = prove_block(&SMALL, &statement, &segments, &nm);
@@ -2362,7 +2510,7 @@ mod tests {
             stark::verify(&SMALL.segment, &NameAir, &s.name_proof.public.to_values(), &s.name_proof.proof, tr),
             Ok(())
         );
-        let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Statement(&s.statement, &s.name_proof));
+        let c = compile_node(&SMALL, &seg_children(&s.proofs), Output::Statement(&s.statement, &s.name_proof, &s.work_proof));
         let exec = match VmAir::execute(&c.prog, &c.inputs) {
             Ok(e) => e,
             Err(ExecError::AssertionFailed(i)) => panic!("root rejected at {i}: {:?}", c.prog.instrs[i]),
@@ -2381,7 +2529,7 @@ mod tests {
         assert_ne!(plan(&SMALL, 1).digest, shape.digest);
 
         let rejects_with = |st: &Statement, proofs: &[SegmentProof], name: &NameProof| {
-            let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st, name));
+            let c = compile_node(&SMALL, &seg_children(proofs), Output::Statement(st, name, &s.work_proof));
             matches!(VmAir::execute(&c.prog, &c.inputs), Err(ExecError::AssertionFailed(_)))
         };
         let rejects = |st: &Statement, proofs: &[SegmentProof]| rejects_with(st, proofs, &s.name_proof);
@@ -2501,8 +2649,8 @@ mod tests {
             let public = SegmentPublic::from_values(&vec![Fp::ZERO; SEGMENT_PUBLIC]).unwrap();
             let seg = SegmentProof { public, proof: dummy };
             let zero = Statement::zero();
-            let nm = dummy_name(&params);
-            let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm));
+            let (nm, wk) = (dummy_name(&params), dummy_work(&params));
+            let c = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk));
             let mut hist = std::collections::BTreeMap::new();
             for ins in &c.prog.instrs {
                 let name = format!("{ins:?}");
@@ -2531,8 +2679,8 @@ mod tests {
                 proof: dummy_proof(&[(&BlockAir, params.segment_log_n)], &params.segment, SEGMENT_PUBLIC),
             };
             let zero = Statement::zero();
-            let nm = dummy_name(&params);
-            let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm)).prog;
+            let (nm, wk) = (dummy_name(&params), dummy_work(&params));
+            let leaf = compile_node(&params, &[Child::Segment(&seg)], Output::Statement(&zero, &nm, &wk)).prog;
             let np = NodeProof {
                 record: seg.public,
                 digest: [Fp::ZERO; DIGEST],
@@ -2659,6 +2807,7 @@ mod tests {
             first_output_position: 0,
             subsidy,
             body: &body,
+            parent_work: crate::pow_air::test_work(params.pow),
         });
         let names = NameWitness { root_in: new_root, pos_in: statement.end_output_position, height: 1, ops: vec![] };
         (w, statement, names)
@@ -2780,6 +2929,7 @@ mod tests {
                 first_output_position: first,
                 subsidy,
                 body: &body,
+                parent_work: crate::pow_air::test_work(params.pow),
             });
             let nm = NameWitness { root_in: st.new_state_root, pos_in: st.end_output_position, height, ops: vec![] };
             (w, st, nm)
@@ -2967,11 +3117,11 @@ mod tests {
         let s = setup("wrap", &[30, 25], 55);
         let shape = plan(&SMALL, 2);
         let root =
-            prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement, &s.name_proof), &|_| {}, &|| false)
+            prove_node(&SMALL, &shape, &s.proofs, Output::Statement(&s.statement, &s.name_proof, &s.work_proof), &|_| {}, &|| false)
                 .unwrap();
-        let c = compile_wrap(&SMALL, &root, &s.statement);
-        let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
         let wrap = shape.wrap.unwrap();
+        let c = compile_wrap(&SMALL, &root, &s.statement, Some((wrap.log_n, wrap.hash_log_n)));
+        let exec = VmAir::execute(&c.prog, &c.inputs).expect("wrap accepts the root proof");
         assert_eq!(wrap.tree, wrap_tree(&shape.digest, &root_tree_digest(&[None, None])));
         assert_eq!(exec.output_digest, Some(s.statement.output(&wrap.tree)));
         assert_eq!(c.prog.digest(SMALL.wrap.log_blowup), wrap.digest);
@@ -2980,16 +3130,16 @@ mod tests {
         // corrupted proof.
         let mut poor = s.statement.clone();
         poor.subsidy = 54;
-        assert!(rejects(compile_wrap(&SMALL, &root, &poor)));
+        assert!(rejects(compile_wrap(&SMALL, &root, &poor, None)));
         let mut other = root.clone();
         other.digest[0] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement, None)));
         let mut other = root.clone();
         other.tree[0] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &other, &s.statement, None)));
         let mut bad = root.clone();
         bad.proof.openings[1][0].trace_row[3] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement, None)));
         // Proof-of-work witnesses before the batching challenge and the
         // first fold are checked too.
         let hash = crate::hash_table::HashTableAir;
@@ -3001,10 +3151,10 @@ mod tests {
         assert!(g.beta > 0, "{g:?}");
         let mut bad = root.clone();
         bad.proof.grinding[3] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement, None)));
         let mut bad = root.clone();
         bad.proof.fri.fold_witnesses[0] += Fp::ONE;
-        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement)));
+        assert!(rejects(compile_wrap(&SMALL, &bad, &s.statement, None)));
     }
 
     #[test]
@@ -3016,7 +3166,7 @@ mod tests {
         let name = prove_name_padded(&params.segment, &s.names, params.name_log_n);
         let shape = plan(&params, 1);
         let root =
-            prove_node(&params, &shape, &[seg], Output::Statement(&s.statement, &name), &|_| {}, &|| false).unwrap();
+            prove_node(&params, &shape, &[seg], Output::Statement(&s.statement, &name, &params.prove_work(&s.statement.parent_work)), &|_| {}, &|| false).unwrap();
         let configs: Vec<StarkConfig> = match std::env::var("WRAP") {
             Ok(v) => {
                 let n: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
@@ -3035,7 +3185,7 @@ mod tests {
             ],
         };
         for wrap in configs {
-            let mut c = compile_wrap(&params, &root, &s.statement);
+            let mut c = compile_wrap(&params, &root, &s.statement, None);
             c.prog.reserve(wrap.blind_rows());
             let t = std::time::Instant::now();
             let (trace, hashes) = VmAir::generate_trace(&c.prog, &c.inputs).unwrap();

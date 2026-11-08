@@ -440,6 +440,18 @@ impl Program {
         self.reserved = rows;
     }
 
+    /// Reserves rows so that the machine table has exactly `2^log_n` rows
+    /// and the hash table `2^hash_log_n`, keeping the rows already
+    /// reserved. Panics if that cannot be done (a table already taller, or
+    /// the padding pushing the other over).
+    pub fn pad_to(&mut self, log_n: usize, hash_log_n: usize) {
+        let hashes = VmAir::hash_rows(self);
+        let fill = |rows: usize, log: usize| ((1usize << log) / 2 + 1).saturating_sub(rows);
+        self.reserved = self.reserved.max(fill(self.instrs.len(), log_n)).max(fill(hashes, hash_log_n));
+        assert_eq!(self.height(), 1 << log_n, "program does not fit its padding");
+        assert_eq!(VmAir::hash_height(self), 1 << hash_log_n, "program does not fit its hash padding");
+    }
+
     /// Trace height: the instruction count and reserved rows rounded up
     /// to a power of two.
     pub fn height(&self) -> usize {
@@ -984,7 +996,12 @@ impl VmAir {
 
     /// Height of the hash table for `program`.
     pub fn hash_height(program: &Program) -> usize {
-        let hashes = program
+        (Self::hash_rows(program) + program.reserved).max(2).next_power_of_two()
+    }
+
+    /// Rows of the hash table for `program`'s hashing instructions.
+    pub fn hash_rows(program: &Program) -> usize {
+        program
             .instrs
             .iter()
             .filter(|i| {
@@ -996,8 +1013,7 @@ impl VmAir {
                         | Instr::CompressIn { .. }
                 )
             })
-            .count();
-        (hashes + program.reserved).max(2).next_power_of_two()
+            .count()
     }
 
     /// The two tables of a machine proof, from [`VmAir::generate_trace`].

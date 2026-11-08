@@ -340,6 +340,7 @@ mod tests {
             first_output_position: 0,
             subsidy: 50,
             body: &body,
+            parent_work: crate::pow_air::test_work(crate::pow::PowParams::DEV),
         };
         assert!(!v.verify(&st, &[]));
         assert!(!v.verify(&st, &[1, 2, 3]));
@@ -588,6 +589,7 @@ mod tests {
             first_output_position: 3,
             subsidy: 50,
             body: &body1,
+            parent_work: crate::pow_air::test_work(crate::pow::PowParams::DEV),
         };
         assert_eq!(check_chaining(&st, &proofs, &name), Ok(()));
         let swapped = vec![proofs[1].clone(), proofs[0].clone()];

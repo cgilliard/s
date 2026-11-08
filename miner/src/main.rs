@@ -3598,6 +3598,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
                 first_output_position,
                 subsidy,
                 body: &body,
+                parent_work: chain.parent_work(&tip),
             });
             (segments, names, statement, inputs, outputs)
         };
@@ -3630,6 +3631,7 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
                 log::line(&format!("  segment {}/{count} proven in {}", index + 1, secs(elapsed)))
             }
             Progress::Name { elapsed } => log::line(&format!("  name segment proven in {}", secs(elapsed))),
+            Progress::Work { elapsed } => log::line(&format!("  parent's work proven in {}", secs(elapsed))),
             Progress::Node { segments, log_n, hash_log_n, root, elapsed } => log::line(&format!(
                 "  {} over {segments} segment{} (2^{log_n} + 2^{hash_log_n} rows) proven in {}",
                 if root { "root node" } else { "node" },

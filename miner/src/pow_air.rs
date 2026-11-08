@@ -1,6 +1,7 @@
 //! The work segment: a header's proof of work, proven (docs/NODE.md, the
-//! work in the chain proof). A block's chain proof is to carry its
-//! parent's; not yet part of the block's tree (step 3).
+//! work in the chain proof). Each block's root verifies its parent's
+//! (`aggregate::Output::Statement`), against the block statement's
+//! `parent_work`.
 //!
 //! One proof of four tables shows that `hashimoto` (see [`crate::pow`]),
 //! computed on the light path from the seed text, gives the mix it gives:
@@ -54,8 +55,6 @@ const WINDOW: usize = 3 * RATE;
 /// `p - 2^30 - 1`: the largest low 30 bits of a canonical element whose
 /// bit 30 is set.
 const CANON_LOW: u32 = 0x3800_0000;
-/// Dataset items are pairs of this many (`2^19` pairs, a 64 MB dataset).
-const LOG_PAIRS: u32 = 19;
 const MIX_WORDS: usize = 2 * WIDTH;
 /// The public values: `pow_hash`, the nonce's 11 elements, the `mix`.
 pub const PUB_HASH: usize = 0;
@@ -68,7 +67,7 @@ pub const DOM_WORK_PROOF: u32 = 0x35;
 /// How the windows are laid out: window `w` is the 24 bytes from
 /// `w * stride` (the last no later than a window's length before the
 /// text's end), for `w < n`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Windows {
     pub stride: usize,
     pub n: usize,
@@ -352,7 +351,10 @@ pub const MIX_COLS: usize = M_FIN + 1;
 const MIX_ROWS: usize = 128;
 
 /// hashimoto's accesses, one a row (64 active rows of 128).
-pub struct MixAir;
+pub struct MixAir {
+    /// The dataset's pairs of items: `2^log_pairs` (`2^19` on mainnet).
+    pub log_pairs: u32,
+}
 
 impl Air for MixAir {
     fn width(&self) -> usize {
@@ -408,7 +410,7 @@ impl Air for MixAir {
         b.assert_eq(l[M_T + 1], l[M_SB + 28] * l[M_SB + 27]);
         b.assert_eq(l[M_T + 2], l[M_T] * l[M_T + 1]);
         b.assert_zero(l[M_T + 2] * (0..27).fold(F::ZERO, |acc, k| acc + l[M_SB + k]));
-        let idx = (0..LOG_PAIRS as usize).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::new(2 << k)));
+        let idx = (0..self.log_pairs as usize).fold(F::ZERO, |acc, k| acc + l[M_SB + k].scale(Fp::new(2 << k)));
         // The two items, folded in.
         for k in 0..MIX_WORDS {
             let d = if k < WIDTH { l[M_A + k] } else { l[M_BB + k - WIDTH] };
@@ -453,6 +455,36 @@ pub struct PowWitness {
     pub mix_out: [Fp; MIX_WORDS],
 }
 
+/// What a proof of work's circuit depends on: the text's window layout, the
+/// absorbs an item and the dataset's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkShape {
+    pub windows: Windows,
+    pub parents: usize,
+    /// `2^log_pairs` pairs of items.
+    pub log_pairs: u32,
+}
+
+impl WorkShape {
+    /// The proof of work's, for `seed` (aligned windows).
+    pub fn of(seed: &crate::pow::SeedText) -> WorkShape {
+        let params = crate::pow::ItemSource::params(seed);
+        WorkShape {
+            windows: Windows::aligned(seed.text().len()),
+            parents: params.parents,
+            log_pairs: params.log_dataset_items - 1,
+        }
+    }
+
+    pub fn perm_air(&self) -> PermAir {
+        PermAir { windows: self.windows, parents: self.parents }
+    }
+
+    pub fn mix_air(&self) -> MixAir {
+        MixAir { log_pairs: self.log_pairs }
+    }
+}
+
 /// A way to cheat, for the attack tests: the witness generator, made
 /// lenient, writes the trace as a cheating prover would, everything after
 /// the cheat computed from it.
@@ -484,26 +516,20 @@ pub enum Cheat {
 
 /// hashimoto's mix on the light path, with `parents` absorbs an item and
 /// windows laid out as `windows`, and the traces that prove it.
-pub fn witness(
-    text: &[u8],
-    windows: Windows,
-    parents: usize,
-    header_hash: &[Fp; DIGEST],
-    nonce: &[u8; 32],
-) -> PowWitness {
-    witness_cheating(text, windows, parents, header_hash, nonce, Cheat::None)
+pub fn witness(text: &[u8], shape: WorkShape, header_hash: &[Fp; DIGEST], nonce: &[u8; 32]) -> PowWitness {
+    witness_cheating(text, shape, header_hash, nonce, Cheat::None)
 }
 
 /// [`witness`], cheating as `cheat` says (tests, with the generator lenient).
 pub fn witness_cheating(
     text: &[u8],
-    windows: Windows,
-    parents: usize,
+    shape: WorkShape,
     header_hash: &[Fp; DIGEST],
     nonce: &[u8; 32],
     cheat: Cheat,
 ) -> PowWitness {
     use crate::stark::refuse;
+    let (windows, parents) = (shape.windows, shape.parents);
     let n_text = windows.n.next_power_of_two();
     let window = |w: usize| {
         let at = (w * windows.stride).min(text.len() - WINDOW);
@@ -656,7 +682,7 @@ pub fn witness_cheating(
     };
 
     // The accesses, and the mix table beside them.
-    let pairs = 1u32 << LOG_PAIRS;
+    let pairs = 1u32 << shape.log_pairs;
     let mut mixv = [Fp::ZERO; MIX_WORDS];
     mixv[..WIDTH].copy_from_slice(&seed);
     mixv[WIDTH..].copy_from_slice(&seed);
@@ -765,8 +791,11 @@ pub fn public_values(pow_hash: &[Fp; DIGEST], nonce: &[u8; 32], mix: &[Fp; DIGES
 /// The text's window table, committed once, and the shape of the proof of
 /// work it serves.
 pub struct WorkSetup {
-    pub windows: Windows,
-    pub parents: usize,
+    pub shape: WorkShape,
+    /// Log heights of the four tables, which a recursive verifier's
+    /// program depends on: the same for every header.
+    pub log_heights: [usize; 4],
+    seed: crate::pow::SeedText,
     pre: crate::stark::Preprocessed,
 }
 
@@ -774,7 +803,8 @@ impl WorkSetup {
     /// Commits the windows of `seed`'s text at `config` (0.3 s on the
     /// development laptop).
     pub fn new(seed: &crate::pow::SeedText, config: &crate::stark::StarkConfig) -> WorkSetup {
-        let windows = Windows::aligned(seed.text().len());
+        let shape = WorkShape::of(seed);
+        let windows = shape.windows;
         let n_text = windows.n.next_power_of_two();
         let mut pre = vec![Fp::ZERO; n_text * (1 + RATE)];
         for w in 0..n_text {
@@ -786,7 +816,9 @@ impl WorkSetup {
         }
         let table = Trace::new(pre, 1 + RATE);
         let pre = crate::stark::Preprocessed::new(&table, config.log_blowup, config.quotient_stride(TextAir.max_constraint_degree()));
-        WorkSetup { windows, parents: crate::pow::ItemSource::params(seed).parents, pre }
+        let w = witness(seed.text(), shape, &[Fp::ZERO; DIGEST], &[0; 32]);
+        let log_heights = [&w.text, &w.perm, &w.range, &w.mix].map(|t| t.height().trailing_zeros() as usize);
+        WorkSetup { shape, log_heights, seed: seed.clone(), pre }
     }
 
     /// The root of the committed window table, which a verifier needs.
@@ -794,13 +826,9 @@ impl WorkSetup {
         self.pre.root()
     }
 
-    fn perm_air(&self) -> PermAir {
-        PermAir { windows: self.windows, parents: self.parents }
-    }
-
     /// What a verifier needs of it.
     pub fn verifier(&self) -> WorkVerifier {
-        WorkVerifier { root: self.root(), windows: self.windows, parents: self.parents }
+        WorkVerifier { root: self.root(), shape: self.shape }
     }
 }
 
@@ -809,8 +837,86 @@ impl WorkSetup {
 #[derive(Clone, Copy, Debug)]
 pub struct WorkVerifier {
     pub root: crate::merkle::Digest,
-    pub windows: Windows,
-    pub parents: usize,
+    pub shape: WorkShape,
+}
+
+/// A header's work, as the work segment proves it: its `pow_hash`, nonce
+/// and the true hashimoto `mix` of the two. A block's statement carries its
+/// parent's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Work {
+    pub pow_hash: [Fp; DIGEST],
+    pub nonce: [u8; 32],
+    pub mix: [Fp; DIGEST],
+}
+
+impl Work {
+    pub const ZERO: Work = Work { pow_hash: [Fp::ZERO; DIGEST], nonce: [0; 32], mix: [Fp::ZERO; DIGEST] };
+
+    /// A header's, as it claims it (its `mix` checked by the proof of work).
+    pub fn of_header(h: &crate::block::Header) -> Work {
+        Work { pow_hash: h.pow_hash(), nonce: h.nonce, mix: h.mix }
+    }
+
+    /// A header's, its mix computed (genesis, whose `mix` field is empty):
+    /// on the light path, a few tens of milliseconds.
+    pub fn computed(seed: &crate::pow::SeedText, h: &crate::block::Header) -> Work {
+        let pow_hash = h.pow_hash();
+        Work { pow_hash, nonce: h.nonce, mix: crate::pow::hashimoto(seed, &pow_hash, &h.nonce).mix }
+    }
+
+    /// The work segment's public values.
+    pub fn to_values(&self) -> Vec<Fp> {
+        public_values(&self.pow_hash, &self.nonce, &self.mix)
+    }
+}
+
+/// A proven [`Work`].
+#[derive(Clone, Debug)]
+pub struct WorkProof {
+    pub work: Work,
+    pub proof: crate::stark::Proof,
+}
+
+/// The work setup for proofs at `config` of the proof of work `pow`:
+/// committed once per process (0.3 s and about 50 MB on mainnet), then
+/// shared.
+pub fn work_setup(config: &crate::stark::StarkConfig, pow: crate::pow::PowParams) -> &'static WorkSetup {
+    type Setups = std::sync::Mutex<Vec<(crate::stark::StarkConfig, crate::pow::PowParams, &'static WorkSetup)>>;
+    static SETUPS: Setups = std::sync::Mutex::new(Vec::new());
+    let mut setups = SETUPS.lock().unwrap();
+    if let Some((_, _, s)) = setups.iter().find(|(c, p, _)| c == config && *p == pow) {
+        return s;
+    }
+    let s: &'static WorkSetup = Box::leak(Box::new(WorkSetup::new(&crate::pow::SeedText::new(pow), config)));
+    setups.push((*config, pow, s));
+    s
+}
+
+/// A parent's work for test blocks: real, its mix hashimoto's under `pow`
+/// (computed once per proof of work).
+#[cfg(test)]
+pub(crate) fn test_work(pow: crate::pow::PowParams) -> Work {
+    static WORKS: std::sync::Mutex<Vec<(crate::pow::PowParams, Work)>> = std::sync::Mutex::new(Vec::new());
+    let mut works = WORKS.lock().unwrap();
+    if let Some((_, w)) = works.iter().find(|(p, _)| *p == pow) {
+        return *w;
+    }
+    let w = {
+        let header = crate::block::Header {
+            prev_hash: [Fp::ZERO; DIGEST],
+            height: 0,
+            timestamp: 1_793_000_000,
+            body_commitment: [Fp::ZERO; DIGEST],
+            state_root: [Fp::ZERO; DIGEST],
+            aux: [0; 32],
+            mix: [Fp::ZERO; DIGEST],
+            nonce: [7; 32],
+        };
+        Work::computed(&crate::pow::SeedText::new(pow), &header)
+    };
+    works.push((pow, w));
+    w
 }
 
 fn work_transcript() -> crate::challenger::Challenger {
@@ -823,19 +929,18 @@ fn work_transcript() -> crate::challenger::Challenger {
 /// path gives the `mix` returned.
 pub fn prove_work(
     setup: &WorkSetup,
-    seed: &crate::pow::SeedText,
     config: &crate::stark::StarkConfig,
     pow_hash: &[Fp; DIGEST],
     nonce: &[u8; 32],
 ) -> (crate::stark::Proof, [Fp; DIGEST]) {
     use crate::stark::TableInput;
-    let w = witness(seed.text(), setup.windows, setup.parents, pow_hash, nonce);
-    let perm = setup.perm_air();
+    let w = witness(setup.seed.text(), setup.shape, pow_hash, nonce);
+    let (perm, mix) = (setup.shape.perm_air(), setup.shape.mix_air());
     let inputs = [
         TableInput { air: &TextAir, trace: &w.text, pre: Some(&setup.pre) },
         TableInput { air: &perm, trace: &w.perm, pre: None },
         TableInput { air: &RangeAir, trace: &w.range, pre: None },
-        TableInput { air: &MixAir, trace: &w.mix, pre: None },
+        TableInput { air: &mix, trace: &w.mix, pre: None },
     ];
     let proof = crate::stark::prove_tables(config, &inputs, &w.public, &mut work_transcript());
     (proof, fold_mix(&w.mix_out))
@@ -852,12 +957,12 @@ pub fn verify_work(
     proof: &crate::stark::Proof,
 ) -> Result<(), crate::stark::VerifyError> {
     use crate::stark::TableSpec;
-    let perm = PermAir { windows: verifier.windows, parents: verifier.parents };
+    let (perm, mix_air) = (verifier.shape.perm_air(), verifier.shape.mix_air());
     let specs = [
         TableSpec { air: &TextAir, pre_root: Some(&verifier.root) },
         TableSpec { air: &perm, pre_root: None },
         TableSpec { air: &RangeAir, pre_root: None },
-        TableSpec { air: &MixAir, pre_root: None },
+        TableSpec { air: &mix_air, pre_root: None },
     ];
     crate::stark::verify_tables(config, &specs, &public_values(pow_hash, nonce, mix), proof, &mut work_transcript())
 }
@@ -868,6 +973,7 @@ mod tests {
     use crate::pow::{self, PowParams, SeedText};
     use crate::stark::{self, DynAir, Preprocessed, StarkConfig, TableInput, TableSpec};
 
+    const MIX: MixAir = MixAir { log_pairs: 19 };
     const SEGMENT: StarkConfig =
         StarkConfig { log_blowup: 2, num_queries: 54, pow_bits: 16, zk: false, commit_bits: 121 };
 
@@ -888,7 +994,7 @@ mod tests {
     fn mix_matches_hashimoto() {
         let seed = SeedText::new(PowParams::MAINNET);
         let (hh, nonce) = header();
-        let w = witness(seed.text(), Windows::aligned(seed.text().len()), PowParams::MAINNET.parents, &hh, &nonce);
+        let w = witness(seed.text(), WorkShape { windows: Windows::aligned(seed.text().len()), parents: PowParams::MAINNET.parents, log_pairs: 19 }, &hh, &nonce);
         let want = pow::hashimoto(&seed, &hh, &nonce);
         assert_eq!(fold_mix(&w.mix_out), want.mix);
         assert_eq!(w.public, public_values(&hh, &nonce, &want.mix));
@@ -899,7 +1005,7 @@ mod tests {
             (&TextAir, &w.text, Some(&w.text_pre)),
             (perm, &w.perm, None),
             (&RangeAir, &w.range, None),
-            (&MixAir, &w.mix, None),
+            (&MIX, &w.mix, None),
         ]
     }
 
@@ -912,7 +1018,7 @@ mod tests {
         let (hh, nonce) = header();
         let windows = Windows::aligned(seed.text().len());
         let parents = PowParams::MAINNET.parents;
-        let w = witness(seed.text(), windows, parents, &hh, &nonce);
+        let w = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
         let perm = PermAir { windows, parents };
         assert_eq!(stark::check_tables(&tables(&w, &perm), &w.public), Ok(()));
     }
@@ -928,7 +1034,7 @@ mod tests {
         let windows = Windows::aligned(seed.text().len());
         let parents = PowParams::MAINNET.parents;
         let perm = PermAir { windows, parents };
-        let honest = witness(seed.text(), windows, parents, &hh, &nonce);
+        let honest = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
         assert_eq!(stark::check_tables(&tables(&honest, &perm), &honest.public), Ok(()));
         for cheat in [
             Cheat::OtherWindow,
@@ -944,7 +1050,7 @@ mod tests {
             Cheat::WrongHash,
         ] {
             crate::stark::LENIENT.with(|l| l.set(true));
-            let w = witness_cheating(seed.text(), windows, parents, &hh, &nonce, cheat);
+            let w = witness_cheating(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce, cheat);
             crate::stark::LENIENT.with(|l| l.set(false));
             assert!(stark::check_tables(&tables(&w, &perm), &w.public).is_err(), "{cheat:?} accepted");
         }
@@ -970,7 +1076,7 @@ mod tests {
         let pow_hash = header.pow_hash();
         header.mix = pow::hashimoto(&seed, &pow_hash, &header.nonce).mix;
         let setup = WorkSetup::new(&seed, &SEGMENT);
-        let (proof, mix) = prove_work(&setup, &seed, &SEGMENT, &pow_hash, &header.nonce);
+        let (proof, mix) = prove_work(&setup, &SEGMENT, &pow_hash, &header.nonce);
         assert_eq!(mix, header.mix);
         let check = |root: &crate::merkle::Digest, h: &[Fp; DIGEST], n: &[u8; 32], m: &[Fp; DIGEST]| {
             let v = WorkVerifier { root: *root, ..setup.verifier() };
@@ -989,6 +1095,32 @@ mod tests {
         assert!(!check(&root, &pow_hash, &header.nonce, &header.mix), "another text");
     }
 
+    /// The work segment verified inside a machine program, as a block's
+    /// root would: the program's height, and that it accepts.
+    #[test]
+    #[ignore = "slow: proves a header's work and compiles its verifier"]
+    fn folds() {
+        use crate::recursion::Compiler;
+        use crate::vm_air::VmAir;
+        let seed = SeedText::new(PowParams::MAINNET);
+        let (hh, nonce) = header();
+        let setup = WorkSetup::new(&seed, &SEGMENT);
+        let (proof, mix) = prove_work(&setup, &SEGMENT, &hh, &nonce);
+        let t = std::time::Instant::now();
+        let mut c = Compiler::new();
+        let public = public_values(&hh, &nonce, &mix);
+        let pubv = c.scalar_inputs(&public);
+        let root = c.scalar_inputs(&setup.root());
+        for (i, v) in setup.root().iter().enumerate() {
+            c.assert_scalar(root + i as u32, *v);
+        }
+        let perm = setup.shape.perm_air();
+        let tables: [(&dyn DynAir, Option<u32>); 4] = [(&TextAir, Some(root)), (&perm, None), (&RangeAir, None), (&MIX, None)];
+        c.verify_stark(&tables, &SEGMENT, &[Fp::new(DOM_WORK_PROOF)], pubv, NUM_PUBLIC, &proof);
+        eprintln!("compiled in {:.2?}: {} rows (2^{}), hash rows 2^{}", t.elapsed(), c.prog.instrs.len(), c.prog.height().trailing_zeros(), VmAir::hash_height(&c.prog).trailing_zeros());
+        VmAir::execute(&c.prog, &c.inputs).expect("the verifier program accepts");
+    }
+
     /// Proving and verifying one header's proof of work at the mainnet
     /// segment configuration: both window layouts, 256 and 254 parents.
     /// `cargo test --release --lib pow_air::tests::cost -- --ignored --nocapture`
@@ -1001,7 +1133,7 @@ mod tests {
         for (name, windows) in [("aligned", Windows::aligned(len)), ("bytes", Windows::bytes(len))] {
             for parents in [256, 254] {
                 let t = std::time::Instant::now();
-                let w = witness(seed.text(), windows, parents, &hh, &nonce);
+                let w = witness(seed.text(), WorkShape { windows, parents, log_pairs: 19 }, &hh, &nonce);
                 let built = t.elapsed();
                 let perm = PermAir { windows, parents };
                 let t = std::time::Instant::now();
@@ -1015,7 +1147,7 @@ mod tests {
                     TableInput { air: &TextAir, trace: &w.text, pre: Some(&pre) },
                     TableInput { air: &perm, trace: &w.perm, pre: None },
                     TableInput { air: &RangeAir, trace: &w.range, pre: None },
-                    TableInput { air: &MixAir, trace: &w.mix, pre: None },
+                    TableInput { air: &MIX, trace: &w.mix, pre: None },
                 ];
                 let t = std::time::Instant::now();
                 let proof = stark::prove_tables(&SEGMENT, &inputs, &w.public, &mut transcript());
@@ -1025,7 +1157,7 @@ mod tests {
                     TableSpec { air: &TextAir, pre_root: Some(&root) },
                     TableSpec { air: &perm, pre_root: None },
                     TableSpec { air: &RangeAir, pre_root: None },
-                    TableSpec { air: &MixAir, pre_root: None },
+                    TableSpec { air: &MIX, pre_root: None },
                 ];
                 let t = std::time::Instant::now();
                 let ok = stark::verify_tables(&SEGMENT, &specs, &w.public, &proof, &mut transcript());
