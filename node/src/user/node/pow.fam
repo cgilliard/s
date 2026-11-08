@@ -1,0 +1,163 @@
+\ pow.fam — the proof of work and the header's hashes (docs/NODE.md, step 4),
+\ after arith.fam, poseidon2.fam and difficulty.fam.  As tabminer's
+\ miner/src/pow.rs and block.rs.
+\
+\ The seed file is the King James text gzipped, 1,291,059 bytes, used as it
+\ is (/lib/akjv.txt.gz): read in 24-byte windows on 24-byte boundaries, the
+\ last ending at the file's end, each packed three bytes to an element.  A
+\ dataset item is 16 elements: a state from its index, then `parents` steps
+\ each absorbing the window the state picks and permuting.  hashimoto mixes
+\ 32 words from the header's hash and nonce through `accesses` reads, each
+\ of two adjacent items and one window picked by a second selector, folds
+\ them to 8 and compresses them with the seed.  The node computes each item
+\ it needs from the file: validating a header needs the whole file.
+\
+\ Field values in memory are Montgomery words (arith.fam); digests given or
+\ returned as canonical words say so.  Not reentrant.
+\
+\ powinit ( text n -- )  the seed file in memory.
+\ window ( w c -- )  c (8 words) = window w.
+\ item ( index c -- )  c (16 words) = dataset item index (parents: pwpar).
+\ hashmix ( hh nonce mix res -- )  tabminer's hashimoto (a name fam's dictionary
+\ cannot take: it clashes): the 8-word mix and result for the
+\ header hash hh (8 words) and the 32-byte nonce, from pwitems items and
+\ pwacc accesses.
+\ hdr-ok ( h -- flag )  the 204-byte header's digests are canonical.
+\ powhash ( h c -- ), blockid ( h c -- )  its hashes (8 words).
+\ quickpow ( h t -- flag )  the result from its claimed mix meets t.
+\ fullpow ( h t -- flag )  that, its mix the true one, and the result meets t.
+
+: pwtext variable ;  : pwlen variable ;  : pwwin variable ;
+: pwpar variable ;  : pwitems variable ;  : pwacc variable ;   \ the parameters (mainnet's by default)
+: pwfnv variable ;                            \ the FNV prime, Montgomery
+: pws variable ;  : pwmix variable ;  : pwa variable ;  : pwb variable ;  : pwx variable ;  : pwy variable ;
+: pwv variable ;  : pwid variable ;  : pwhh variable ;  : pwm variable ;  : pwo variable ;
+: pwh variable ;  : pwr variable ;  : pwi variable ;  : pwt variable ;
+: pka variable ;  : pkn variable ;  : pkc variable ;
+
+:M DOM_ITEM 5041 lit ;  :M DOM_SEED 5042 lit ;  :M DOM_POW 10 lit ;  :M DOM_ID 11 lit ;
+
+: powinit  ( text n -- )
+p2init dvinit
+dup pwlen !  17 lit + 18 lit / pwwin !  pwtext !
+1000193 lit tom pwfnv !
+FE lit pwpar !  100000 lit pwitems !  40 lit pwacc !
+pws @ 0= if
+	40 lit alloc pws !  80 lit alloc pwmix !  40 lit alloc pwa !  40 lit alloc pwb !
+	20 lit alloc pwx !  20 lit alloc pwy !  A0 lit alloc pwv !  70 lit alloc pwid !
+	20 lit alloc pwhh !  20 lit alloc pwm !  20 lit alloc pwo !  20 lit alloc pwh !  20 lit alloc pwr !
+then ;
+
+: fnv  swap pwfnv @ fmul f+ ;               \ ( a b -- a*prime+b )
+
+\ pack3 ( a n c -- )  c = the n bytes at a (n at least 1) three to an
+\ element, little-endian, the last zero padded; Montgomery.
+: pack3
+pkc ! pkn ! pka !
+pkn @ 2 lit + 3 lit / 0 lit do
+	0 lit
+	3 lit 0 lit do
+		j 3 lit * i +  dup pkn @ u< if pka @ + c@ i 3 lit lshift lshift or else drop then
+	loop
+	tom pkc @ i w!
+loop ;
+
+: window  ( w c -- )
+swap 18 lit *  pwlen @ 18 lit -  2dup u> if swap then drop
+pwtext @ + 18 lit rot pack3 ;
+
+\ wsel ( v -- w )  tabminer's direct_window: the bits of v below the least
+\ power of two at least the windows, less the windows once if that many.
+: wsel
+1 lit begin dup pwwin @ u< while 1 lit lshift repeat 1 lit -  and
+dup pwwin @ u< 0= if pwwin @ - then ;
+
+: item  ( index c -- )
+dup pwt !  10 lit wzero
+P 2dup u< 0= if - else drop then tom pwt @ 0 lit w!
+DOM_ITEM tom pwt @ 1 lit w!
+pwt @ perm16
+pwpar @ 0 lit do
+	pwt @ 0 lit w@ fromm  pwt @ 1 lit w@ fromm
+	dup 1F lit lshift rot or  swap 1 lit rshift      \ the 62-bit c0 + c1 2^31
+	pwwin @ ud%  pwy @ window
+	8 lit 0 lit do pwt @ i w@ pwy @ i w@ f+ pwt @ i w! loop
+	pwt @ perm16
+loop ;
+
+\ pwseed ( hh nonce -- )  pws (16 words) = the seed state.
+: pwseed
+20 lit pwv @ pack3
+pws @ 8 lit wcopy  pws @ 20 lit + 8 lit wzero  DOM_SEED tom pws @ 8 lit w!
+pws @ perm16
+8 lit 0 lit do pws @ i w@ pwv @ i w@ f+ pws @ i w! loop  pws @ perm16
+3 lit 0 lit do pws @ i w@ pwv @ 8 lit i + w@ f+ pws @ i w! loop  pws @ perm16 ;
+
+: hashmix  ( hh nonce mix res -- )
+pwr ! pwh ! pwseed
+pws @ pwmix @ 10 lit wcopy  pws @ pwmix @ 40 lit + 10 lit wcopy
+pwacc @ 0 lit do
+	i tom pws @ 0 lit w@ f+  pwmix @ i 1F lit and w@ fnv fromm
+	pwitems @ 1 lit rshift 1 lit - and 1 lit lshift pwi !
+	i tom pws @ 1 lit w@ f+  pwmix @ i 10 lit + 1F lit and w@ fnv fromm
+	wsel pwx @ window
+	pwi @ pwa @ item  pwi @ 1 lit + pwb @ item
+	20 lit 0 lit do
+		pwmix @ i w@  i 10 lit u< if pwa @ i w@ else pwb @ i 10 lit - w@ then  fnv
+		pwx @ i 7 lit and w@ f+  pwmix @ i w!
+	loop
+loop
+8 lit 0 lit do
+	pwmix @ i 2 lit lshift w@  pwmix @ i 2 lit lshift 1 lit + w@ fnv
+	pwmix @ i 2 lit lshift 2 lit + w@ fnv  pwmix @ i 2 lit lshift 3 lit + w@ fnv
+	pwh @ i w!
+loop
+pwh @ pws @ pwr @ compress ;
+
+\ ── Headers: prev_hash 0, height 32, timestamp 36, body 44, state 76,
+\ aux 108, mix 140, nonce 172 ──
+
+: dig-ok  -1 lit 8 lit 0 lit do over i w@ P u< and loop nip ;   \ ( a -- flag )  8 canonical words
+: hdr-ok  dup dig-ok over 2C lit + dig-ok and over 4C lit + dig-ok and swap 8C lit + dig-ok and ;
+: dtom  8 lit 0 lit do over i w@ tom over i w! loop 2drop ;     \ ( a c -- )  8 canonical words in
+: dfrom  8 lit 0 lit do dup i w@ fromm over i w! loop drop ;    \ ( a -- )  8 words out, in place
+
+: powhash  ( h c -- )
+swap
+DOM_POW tom pwv @ 0 lit w!
+dup pwv @ 4 lit + dtom
+dup 20 lit + @ P 2dup u< 0= if - else drop then tom pwv @ 9 lit w!
+dup 24 lit + @ 3FFFFFFF lit and tom pwv @ A lit w!
+dup 24 lit + @ 1E lit rshift over 28 lit + @ 2 lit lshift or 3FFFFFFF lit and tom pwv @ B lit w!
+dup 28 lit + @ 1C lit rshift tom pwv @ C lit w!
+dup 2C lit + pwv @ 34 lit + dtom
+dup 4C lit + pwv @ 54 lit + dtom
+6C lit + 20 lit pwv @ 74 lit + pack3
+pwv @ 28 lit rot hash ;
+
+: blockid  ( h c -- )
+swap
+DOM_ID tom pwid @ 0 lit w!
+dup pwid @ 4 lit + powhash
+dup 8C lit + pwid @ 24 lit + dtom
+AC lit + 20 lit pwid @ 44 lit + pack3
+pwid @ 1C lit rot hash ;
+
+\ quickpow ( h t -- flag )  the result from the header's claimed mix meets t.
+: quickpow
+over pwhh @ powhash
+over 8C lit + pwm @ dtom
+pwhh @ rot AC lit + pwseed
+pwm @ pws @ pwo @ compress  pwo @ dfrom
+pwo @ swap meets ;
+
+\ fullpow ( h t -- flag )  quickpow, and the true mix the claimed one and its
+\ result meeting t.
+: fullpow
+2dup quickpow if
+	over pwhh @ powhash
+	pwhh @ 2 lit pick AC lit + pwo @ pwr @ hashmix
+	pwo @ dfrom  pwr @ dfrom
+	pwo @ rot 8C lit + 8 lit wcmp 0=
+	pwr @ rot meets and
+else 2drop 0 lit then ;

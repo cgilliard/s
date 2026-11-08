@@ -117,10 +117,11 @@ for n in 1 2 8 64; do
 	expect "kernel_tests_$n" 0 "harts: $n" 600 ./tools/fam --test --smp=$n src/kernel.fam src/store.fam src/net.fam src/ksys.fam
 done
 
-# The node's arithmetic and Poseidon2 (docs/NODE.md, steps 1 and 2) against
-# tabminer's values.
+# The node's arithmetic and Poseidon2 (docs/NODE.md, steps 1 and 2), and
+# targets, ASERT and work (step 4), against tabminer's values.
 expect arith 0 '7 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/arith_vectors.fam
 expect poseidon2 0 '3 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/poseidon2.fam src/user/node/poseidon2_vectors.fam
+expect difficulty 0 '3 passed' 120 ./tools/fam --test src/user/node/arith.fam src/user/node/difficulty.fam src/user/node/difficulty_vectors.fam
 # The chain proof's verifier (step 3), a program for the OS: tabminer's
 # compiled verifier (/lib/chainver) on a real mainnet chain proof
 # (/lib/chainproof), accepted, then refused with a byte changed at 24 places
@@ -130,6 +131,19 @@ ND=src/user/node
 sh scripts/mkimage.sh "$T/cv.img" bin/kernel init="$T/tcv.bin":8192 chainver=$ND/chainver.bin:0 chainproof=$ND/chainproof.bin:0 2> "$T/cv.mk" || fail chainver "mkimage: $(cat "$T/cv.mk")"
 expect chainver 124 'refused with another output' 60 ./tools/q32 "$T/cv.img"
 has chainver '^accepted'; has chainver '^refused 24 of 24 changed'
+# The proof of work (step 4), a program for the OS with the seed file
+# (/lib/akjv.txt.gz): windows, items, hashimoto, a header's hashes and its
+# proof of work, against tabminer's values.
+printf '"pow: " puts vpass @ u. " passed, " puts vfail @ u. " failed" puts 0A lit putc\nbye\n' > "$T/pow_tail.fam"
+./tools/fam --user -o "$T/tpow.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/pow_test.fam $ND/pow_vectors.fam "$T/pow_tail.fam" > "$T/tpow.build" 2>&1 || fail pow "build: $(head -c 300 "$T/tpow.build")"
+sh scripts/mkimage.sh "$T/pow.img" bin/kernel init="$T/tpow.bin":4096 akjv.txt.gz=../resources/akjv.txt.gz:0 2> "$T/pow.mk" || fail pow "mkimage: $(cat "$T/pow.mk")"
+expect pow 124 '^pow: 43 passed, 0 failed' 60 ./tools/q32 "$T/pow.img"
+# Headers (step 4): a dev network's header chain, each verdict tabminer's
+# Chain::accept_headers gave, fork choice by work, every rule refused.
+printf '"headers: " puts vpass @ u. " passed, " puts vfail @ u. " failed" puts 0A lit putc\nbye\n' > "$T/hdr_tail.fam"
+./tools/fam --user -o "$T/thdr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/headers_test.fam $ND/headers_vectors.fam "$T/hdr_tail.fam" > "$T/thdr.build" 2>&1 || fail headers "build: $(head -c 300 "$T/thdr.build")"
+sh scripts/mkimage.sh "$T/hdr.img" bin/kernel init="$T/thdr.bin":4096 akjv.txt.gz=../resources/akjv.txt.gz:0 2> "$T/hdr.mk" || fail headers "mkimage: $(cat "$T/hdr.mk")"
+expect headers 124 '^headers: 25 passed, 0 failed' 120 ./tools/q32 "$T/hdr.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

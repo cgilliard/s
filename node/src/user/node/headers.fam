@@ -1,0 +1,156 @@
+\ headers.fam — the header chain and fork choice (docs/NODE.md, step 4),
+\ after arith.fam, poseidon2.fam, difficulty.fam and pow.fam.  As tabminer's
+\ Chain::accept_headers (miner/src/chain.rs): a header is stored when its
+\ parent is stored, its height is the parent's plus one and not past the
+\ chain's end, its timestamp is after the median of the last eleven on its
+\ branch and at most the drift past the clock, and its proof of work meets
+\ the ASERT target from its parent, in full.  The best header is the one of
+\ most work, each block counting 2^256 / (target + 1); a tie keeps the
+\ first.  A header that breaks a rule is not stored.
+\
+\ Headers are held in memory for now (an entry each, found by its id
+\ through a table), until the store takes them (step 6).  Not reentrant.
+\
+\ A network is 25 words: the dataset's log2 items, parents and accesses;
+\ the genesis target (8 words); the easiest target (8 words); the drift; the
+\ median's window; the final height; the block time; the half-life; and
+\ whether the schedule starts at block 1.
+\
+\ hinit ( net genesis cap -- )  the network, its genesis header (204 bytes,
+\ not checked), room for cap headers.
+\ hacc ( h nowlo nowhi -- code )  offers the header h at the clock now: 0
+\ stored, 1 already stored, -1 malformed (a digest not canonical), -2 its
+\ parent unknown, -3 a wrong height, -4 past the chain's end, -5 a timestamp
+\ not after the median, -6 one past the clock and its drift, -7 its proof
+\ of work refused.  As tabminer's verdicts: known, UnknownParent, BadHeight,
+\ ChainEnded, TimestampTooOld, TimestampTooNew, BadProofOfWork.
+\ hbest ( -- e ), hid ( e -- id ), hwork ( e -- work ), hhdr ( e -- h )
+\ the best entry; an entry's id and cumulative work (8 canonical words) and
+\ header.
+
+: hnet variable ;  : hent variable ;  : hcap variable ;  : hcnt variable ;
+: htab variable ;  : hbst variable ;
+: htg variable ;  : hsch variable ;  : hts variable ;  : hidb variable ;  : hwk variable ;
+: hpar variable ;  : hnew variable ;  : hfid variable ;  : hfr variable ;
+: hc variable ;  : hh variable ;  : hnl variable ;  : hnh variable ;
+
+:M HENT 120 lit ;                             \ an entry's bytes
+:M HTABN 1000 lit ;                           \ the table's slots
+
+: nw  2 lit lshift hnet @ + @ ;               \ ( k -- x )  network word k
+: he  HENT * hent @ + ;                       \ ( i -- e )
+: hhdr ;                                      \ ( e -- h )  the header comes first
+: hid  CC lit + ;
+: hwork  EC lit + ;
+: hparent  10C lit + ;                        \ ( e -- addr )  the parent's index
+: hfirst  110 lit + ;                         \ ( e -- addr )  block 1 of its branch (-1: none)
+: hheight  20 lit + @ ;
+: htslo  24 lit + @ ;  : htshi  28 lit + @ ;
+: hbest  hbst @ he ;
+: 0<>  0= 0= ;
+
+\ hfind ( id -- i | -1 )  the entry with that id (8 canonical words).
+: hfind
+hfid !  FFFFFFFF lit hfr !
+hfid @ @ HTABN 1 lit - and
+begin dup 2 lit lshift htab @ + @ ?dup while
+	1 lit - dup he hid hfid @ 8 lit wcmp 0= if hfr ! else drop then
+	1 lit + HTABN 1 lit - and
+repeat drop hfr @ ;
+\ hindex ( i -- )  the table finds entry i.
+: hindex
+dup he hid @ HTABN 1 lit - and
+begin dup 2 lit lshift htab @ + @ while 1 lit + HTABN 1 lit - and repeat
+2 lit lshift htab @ + swap 1 lit + swap ! ;
+
+: hinit  ( net genesis cap -- )
+dup hcap !  HENT * alloc hent !
+HTABN 2 lit lshift alloc dup htab ! HTABN wzero
+swap 64 lit alloc dup hnet ! 19 lit wcopy
+1 lit 0 lit nw lshift pwitems !  1 lit nw pwpar !  2 lit nw pwacc !
+20 lit alloc htg !  54 lit alloc hsch !  14 lit nw 3 lit lshift alloc hts !  20 lit alloc hidb !  20 lit alloc hwk !
+0 lit he 33 lit wcopy
+0 lit he dup hid blockid  0 lit he hid dfrom
+0 lit he hwork 8 lit wzero
+FFFFFFFF lit 0 lit he hparent !  FFFFFFFF lit 0 lit he hfirst !
+1 lit hcnt !  0 lit hbst !  0 lit hindex ;
+
+\ u64> ( alo ahi blo bhi -- flag )  a above b, unsigned.
+: u64>  rot 2dup = if 2drop u> else u< nip nip then ;
+
+\ The median's pairs: p@ ( k -- lo hi ), pgt ( k -- flag ) pair k-1 above
+\ pair k, pswap ( k -- ) exchanges them.
+: p@  3 lit lshift hts @ + dup @ swap 4 lit + @ ;
+: pgt  dup 1 lit - p@ rot p@ u64> ;
+: pswap
+3 lit lshift hts @ + dup 8 lit -
+over @ over @ 3 lit pick ! over !
+4 lit + swap 4 lit + swap
+over @ over @ 3 lit pick ! over ! 2drop ;
+
+\ hmedian ( e -- lo hi )  the median timestamp of the window of entries
+\ ending at e on its branch (fewer from genesis).
+: hmedian
+0 lit swap
+begin
+	dup htslo 2 lit pick 3 lit lshift hts @ + !
+	dup htshi 2 lit pick 3 lit lshift hts @ + 4 lit + !
+	swap 1 lit + swap
+	over 14 lit nw u<  over hheight 0<> and
+while
+	hparent @ he
+repeat
+drop
+dup 1 lit u> if
+	dup 1 lit do
+		i begin dup if dup pgt else 0 lit then while dup pswap 1 lit - repeat drop
+	loop
+then
+1 lit rshift p@ ;
+
+\ htarget ( pe -- )  htg = the target after the entry pe: ASERT anchored at
+\ block 1 of its branch if the schedule starts there (and pe is not
+\ genesis), else at genesis; the anchor's parent a block time before it.
+: htarget
+dup hheight 0<> 18 lit nw 0<> and if
+	1 lit hsch @ 0 lit w!  dup hfirst @ he
+else
+	0 lit hsch @ 0 lit w!  0 lit he
+then
+dup htslo swap htshi
+swap dup 16 lit nw - swap 16 lit nw u< rot swap -
+hsch @ 2 lit w!  hsch @ 1 lit w!
+17 lit nw hsch @ 3 lit w!  16 lit nw hsch @ 4 lit w!
+hnet @ C lit + hsch @ 14 lit + 8 lit wcopy
+hnet @ 2C lit + hsch @ 34 lit + 8 lit wcopy
+hsch @ over hheight 2 lit pick htslo 3 lit pick htshi htg @ asert drop ;
+
+: hstore
+hcnt @ hcap @ u< 0= if -8 lit hc ! else
+	hcnt @ he hnew !
+	hh @ hnew @ 33 lit wcopy
+	hidb @ hnew @ hid 8 lit wcopy
+	htg @ hwk @ bwork  hpar @ he hwork hwk @ hnew @ hwork wsat+
+	hpar @ hnew @ hparent !
+	hh @ hheight 1 lit = if hcnt @ else hpar @ he hfirst @ then hnew @ hfirst !
+	hcnt @ hindex
+	hnew @ hwork hbest hwork 8 lit wcmp 0 lit > if hcnt @ hbst ! then
+	hcnt @ 1 lit + hcnt !
+then ;
+
+: hacc  ( h nowlo nowhi -- code )
+hnh ! hnl ! hh !  0 lit hc !
+hh @ hdr-ok 0= if -1 lit hc ! then
+hc @ 0= if hh @ hidb @ blockid  hidb @ dfrom  hidb @ hfind 0< 0= if 1 lit hc ! then then
+hc @ 0= if hh @ hfind dup hpar ! 0< if -2 lit hc ! then then
+hc @ 0= if hpar @ he hheight 1 lit + dup 0= swap hh @ hheight <> or if -3 lit hc ! then then
+hc @ 0= if hh @ hheight 15 lit nw u> if -4 lit hc ! then then
+hc @ 0= if hh @ htslo hh @ htshi hpar @ he hmedian u64> 0= if -5 lit hc ! then then
+hc @ 0= if
+	hnl @ 13 lit nw + dup hnl @ u<
+	hnh @ swap if dup FFFFFFFF lit = if 2drop FFFFFFFF lit FFFFFFFF lit else 1 lit + then then
+	hh @ htslo -rot hh @ htshi -rot u64> if -6 lit hc ! then
+then
+hc @ 0= if hpar @ he htarget  hh @ htg @ fullpow 0= if -7 lit hc ! then then
+hc @ 0= if hstore then
+hc @ ;

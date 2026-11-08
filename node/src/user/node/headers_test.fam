@@ -1,0 +1,17 @@
+\ headers_test.fam — a dev network's header chain (docs/NODE.md, step 4),
+\ a program for the OS after arith.fam, poseidon2.fam, difficulty.fam,
+\ pow.fam and headers.fam, then headers_vectors.fam: the seed file is
+\ /lib/akjv.txt.gz, read whole.
+
+\ rdfile ( path -- addr n )  a whole file of at most 1.25 MiB, in memory
+\ (the image's data files cannot seek, so it is read to its end).
+: rdfile
+0 lit open  dup 0< if "headers_test: no file" puts 0A lit putc then
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+"/lib/akjv.txt.gz" rdfile powinit

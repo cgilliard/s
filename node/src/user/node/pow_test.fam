@@ -1,0 +1,18 @@
+\ pow_test.fam — the proof of work against tabminer's values (docs/NODE.md,
+\ step 4), a program for the OS after arith.fam, poseidon2.fam,
+\ difficulty.fam and pow.fam, then pow_vectors.fam: the seed file is
+\ /lib/akjv.txt.gz, read whole.
+
+\ rdfile ( path -- addr n )  a whole file of at most 1.25 MiB, in memory
+\ (the image's data files cannot seek, so it is read to its end).
+: rdfile
+0 lit open  dup 0< if "pow_test: no file" puts 0A lit putc then
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+"/lib/akjv.txt.gz" rdfile dup 13B333 lit <> if "pow_test: the seed file is not 1291059 bytes" puts 0A lit putc then
+powinit

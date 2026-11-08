@@ -156,8 +156,10 @@ measured in the first step, and the plan adjusted to what is found.
   - 64 accesses × 2 items × (254 parents + 1) ≈ 32,643 permutations
     a header: 1.35 s at 41 µs each, and about 0.05 s for the 32,576
     window indices (the 64-by-32 remainder); 64 windows read directly;
-  - so about 3.4 minutes for the fast sync's 145 headers on one hart
-    (each header is separate, so the harts share them), and 1.4 s per
+  - measured (step 4): about 2.2 s a header on one hart, the
+    items' bookkeeping in fam adding about half to the permutations;
+    so about 5.3 minutes for the fast sync's 145 headers on one hart
+    (each header is separate, so the harts share them), and 2.2 s per
     new block;
   - it needs the seed file (1.29 MB, the text gzipped, used as it is)
     with random access, held in memory: nothing to inflate;
@@ -673,8 +675,9 @@ Each step done when its test passes.
 
 - **The sync depth:** today 144 blocks. The full proof of work is
   checked natively for every header after `S`, so a deeper `S` costs a
-  node more, and the fam node most: about 145 headers at 1.4 s each,
-  3.4 minutes on one hart, before the harts share them.
+  node more, and the fam node most: about 145 headers at 2.2 s each
+  (measured in step 4), 5.3 minutes on one hart, before the harts share
+  them.
 - **The first block:** settled in step 4. Genesis's `mix` is empty, so
   its true mix is computed once from the seed text, and the base program
   (height 1) fixes genesis's hash and that work as constants.
@@ -785,7 +788,37 @@ Each step done when its test passes.
 4. **Proof-of-work and headers**: items and the direct reads from the
    seed file, ASERT,
    median time, fork choice by work. Done when a header chain from a
-   dev network is accepted as tabminer accepts it.
+   dev network is accepted as tabminer accepts it. Done (2026-11-08):
+   - `difficulty.fam`: ASERT (aserti3-2d) bit for bit, its exponent in
+     4-word two's complement; a block's work, `2^256 / (target + 1)`;
+     whether a result meets a target. Against tabminer's vectors
+     (`difficulty_vectors.fam`): 98 targets under mainnet's schedule,
+     the dev networks' and others, on schedule, ahead, behind and far
+     off; oscheck's `difficulty`.
+   - `pow.fam`: the seed file's windows, items computed from the file,
+     hashimoto, the header's two hashes, the quick check and the full
+     one (`hashmix`: fam's dictionary cannot take the name
+     `hashimoto`). Against tabminer's vectors under the OS, with the
+     file as `/lib/akjv.txt.gz` (`pow_vectors.fam`, 43 checks: the
+     first and last windows, items to the dataset's last, hashes of a
+     height past p and the largest timestamp, hashimoto at the dev
+     networks' and mainnet's items, a proof of work accepted, a forged
+     mix and a harder target refused); oscheck's `pow`. About 2.2 s a
+     header.
+   - `headers.fam`: the header chain in memory (until the store takes
+     it, step 6) and `hacc`, tabminer's `accept_headers` for one
+     header: parent, height, the chain's end, the median of eleven,
+     the clock's drift, the ASERT target from the parent (anchored at
+     block 1 when the schedule starts there), the full proof of work;
+     the best header of most work. A dev network's chain
+     (`headers_vectors.fam`), fed to tabminer's own `Chain` one header at
+     a time, each verdict recorded: ten blocks, then a branch of two
+     blocks from block 1 with more work taking over; a known header, an
+     unknown parent, a wrong height, a timestamp at the median, one
+     past the drift, a forged mix, an unmined nonce, and a digest not
+     canonical. All 25 checks as tabminer (oscheck's `headers`). The
+     nonces are fixed in `fam_vectors.rs` (`DEV_NONCES`), so the vectors
+     regenerate without mining.
 5. **The state**: the state tree and the names trie in the store, a
    block applied and undone. Done when the state roots of a dev chain
    match, block by block.
@@ -808,9 +841,11 @@ Each step done when its test passes.
 ## Open questions
 
 - **How fast verification gets without M**: a chain proof takes about
-  1.2 to 1.5 s and a header's full proof of work about 1.4 s on one
-  hart (steps 2 and 3), well within a block time of 600 s; the fast
-  sync's 145 headers about 3.4 minutes. Optimising further can wait.
+  1.2 to 1.5 s and a header's full proof of work about 2.2 s on one
+  hart (steps 3 and 4), well within a block time of 600 s; the fast
+  sync's 145 headers about 5.3 minutes. Optimising further can wait:
+  the items' loop (a fam word around each permutation) is the first
+  place to look.
 - **The API's reach**: local only by default; how a user opens it
   wider. The token is needed either way.
 - **Messages and onion routing**: protocol messages 16 to 22, in a

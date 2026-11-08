@@ -1,0 +1,125 @@
+\ difficulty.fam — targets, ASERT and work (docs/NODE.md, step 4), after
+\ arith.fam.  As tabminer's miner/src/difficulty.rs and pow.rs: 256-bit
+\ integers as 8 words (least significant first, arith.fam's wide integers),
+\ the ASERT retarget (aserti3-2d) bit for bit, a block's work, and whether a
+\ proof-of-work result meets a target.
+\
+\ ASERT's exponent needs more than 64 bits: it is worked in 4-word
+\ two's-complement integers.  Not reentrant: scratch in variables.
+\
+\ A schedule is 21 words: the anchor's height, its parent's time (2 words,
+\ signed), the half-life, the block time, the anchor's target (8 words),
+\ the easiest target (8 words).
+\
+\ asert ( sched eh etlo ethi out -- )  out (8 words) = the target of the
+\ block after the one at height eh, time etlo:ethi (signed); eh not below
+\ the anchor's height.
+\ bwork ( t out -- )  out = 2^256 / (t + 1), as (~t / (t + 1)) + 1, saturating.
+\ meets ( digest t -- flag )  the digest (8 canonical words), read as a
+\ 248-bit integer (element 0 the most significant 31 bits), is at most t.
+\ wsat+ ( a b c -- )  c = a + b, 8 words, saturating.
+
+: dva variable ;  : dvb variable ;  : dvc variable ;  : dvd variable ;  : dve variable ;
+: dvs variable ;  : dvo variable ;  : dvh variable ;  : dvn variable ;  : dvf variable ;
+: dvg variable ;  : dvt variable ;  : dvu variable ;
+\ dvinit  the scratch (12 words each), once.
+: dvinit  dva @ 0= if 30 lit alloc dva !  30 lit alloc dvb !  30 lit alloc dvc !  30 lit alloc dvd !  30 lit alloc dve ! then ;
+
+\ ineg ( a n -- )  a = -a, n words, two's complement.
+: ineg
+2dup 0 lit do dup i w@ invert over i w! loop drop
+1 lit swap 0 lit do
+	over i w@ over +  dup 3 lit pick i w!  0= and
+loop 2drop ;
+: neg?  3 lit w@ 0< ;                          \ ( a -- flag )  a 4-word value is negative
+\ i64! ( lo hi a -- )  a = the signed 64-bit hi:lo, sign-extended to 4 words.
+: i64!
+dup dvu ! 1 lit w!  dvu @ 0 lit w!
+dvu @ 1 lit w@ 0< if FFFFFFFF lit else 0 lit then
+dup dvu @ 2 lit w!  dvu @ 3 lit w! ;
+
+\ factor ( f -- k )  the exponent's fractional power of two: ((195766423245049 f
+\ + 971821376 f^2 + 5127 f^3 + 2^47) >> 48) + 65536, f below 2^16.
+: factor
+dvf !
+dvb @ 4 lit wzero  6C1DD0F9 lit dvb @ 0 lit w!  B20C lit dvb @ 1 lit w!
+dvf @ dvd @ 0 lit w!
+dvb @ 2 lit dvd @ 1 lit dvc @ wmul           \ A f: 3 words
+dva @ 4 lit wzero  dvc @ dva @ 3 lit wcopy
+dvf @ dvf @ um*  dvb @ 1 lit w!  dvb @ 0 lit w!   \ f^2: 2 words
+39ECD140 lit dvd @ 0 lit w!
+dvb @ 2 lit dvd @ 1 lit dvc @ wmul  0 lit dvc @ 3 lit w!
+dva @ dvc @ dva @ 4 lit wadd drop
+dvf @ dvd @ 0 lit w!
+dvb @ 2 lit dvd @ 1 lit dvc @ wmul           \ f^3: 3 words
+1407 lit dvd @ 0 lit w!
+dvc @ 3 lit dvd @ 1 lit dve @ wmul           \ 5127 f^3: 4 words
+dva @ dve @ dva @ 4 lit wadd drop
+dvb @ 4 lit wzero  8000 lit dvb @ 1 lit w!   \ 2^47
+dva @ dvb @ dva @ 4 lit wadd drop
+dva @ dva @ 4 lit 30 lit wshr
+dva @ 0 lit w@ 10000 lit + ;
+
+\ nshift ( a -- n )  the 4-word signed a as a word, or +-2^20 if it does not
+\ fit: past any shift that matters (a target moves at most 512 bits).
+: nshift
+dup 0 lit w@ 0< if FFFFFFFF lit else 0 lit then
+over 1 lit w@ over =  2 lit pick 2 lit w@ 2 lit pick = and  2 lit pick 3 lit w@ 2 lit pick = and
+nip if 0 lit w@ else 3 lit w@ 0< if FFF00000 lit else 100000 lit then then ;
+
+: asert  ( sched eh etlo ethi out -- )
+dvinit dvo !  dva @ i64!  dvh !  dvs !
+dvs @ 1 lit w@ dvs @ 2 lit w@ dvb @ i64!
+dva @ dvb @ dva @ 4 lit wsub drop             \ the time since the anchor's parent
+dvb @ 4 lit wzero
+dvh @ dvs @ 0 lit w@ - 1 lit + dup dvb @ 0 lit w!  0= if 1 lit dvb @ 1 lit w! then   \ heights since, plus one
+dvs @ 4 lit w@ dvd @ 0 lit w!
+dvb @ 2 lit dvd @ 1 lit dvc @ wmul  0 lit dvc @ 3 lit w!
+dva @ dvc @ dva @ 4 lit wsub drop             \ ahead of schedule (negative) or behind
+dva @ dva @ 4 lit 10 lit wshl
+dva @ neg? dvg !  dvg @ if dva @ 4 lit ineg then
+dvb @ 4 lit wzero  dvs @ 3 lit w@ dvb @ 0 lit w!
+dva @ dvb @ dvc @ dvd @ 4 lit wdivmod         \ truncated toward zero
+dvg @ if dvc @ 4 lit ineg then                \ dvc: the exponent
+dvc @ 0 lit w@ FFFF lit and dvf !            \ its fraction (factor's scratch is these buffers: after)
+dvc @ dvd @ 4 lit 10 lit wshr
+dvc @ neg? if dvd @ 3 lit w@ FFFF0000 lit or dvd @ 3 lit w! then
+dvd @ nshift 10 lit - dvn !                   \ the shift: num_shifts - 16
+dvf @ factor dvf !
+dve @ A lit wzero  dvf @ dvd @ 0 lit w!
+dvs @ 14 lit + 8 lit dvd @ 1 lit dve @ wmul   \ the anchor's target times the factor
+dvn @ 1 lit < if
+	0 lit dvn @ -  dup 140 lit u> if drop 140 lit then
+	dve @ swap dvb @ swap A lit swap wshr
+	dvb @ 8 lit w@ dvb @ 9 lit w@ or 0=
+else
+	dvn @ dup 200 lit u> if drop 200 lit then
+	dve @ A lit wbits 0= if
+		drop dvb @ 8 lit wzero -1 lit
+	else
+		dve @ A lit wbits over + 100 lit u> if drop 0 lit else dve @ swap dvb @ swap 8 lit swap wshl -1 lit then
+	then
+then
+if
+	dvb @ 8 lit wbits 0= if 1 lit dvb @ 0 lit w! then
+	dvb @ dvs @ 34 lit + 8 lit wcmp 0 lit > if dvs @ 34 lit + dvb @ 8 lit wcopy then
+else
+	dvs @ 34 lit + dvb @ 8 lit wcopy
+then
+dvb @ dvo @ 8 lit wcopy ;
+
+: wsat+  dup dvu ! 8 lit wadd if dvu @ 8 lit 0 lit do FFFFFFFF lit over i w! loop drop then ;   \ ( a b c -- )
+
+: bwork  ( t out -- )
+dvinit dvo !
+dup dva @ 8 lit wcopy  dvb @ 8 lit wzero  1 lit dvb @ 0 lit w!
+dva @ dvb @ dva @ wsat+                       \ t + 1
+dvc @ 8 lit wcopy  8 lit 0 lit do dvc @ i w@ invert dvc @ i w! loop   \ ~t
+dvc @ dva @ dvd @ dve @ 8 lit wdivmod
+dvd @ dvb @ dvo @ wsat+ ;
+
+: meets  ( digest t -- flag )
+dvinit dvt !
+dva @ 8 lit wzero
+8 lit 0 lit do dva @ dva @ 8 lit 1F lit wshl  dup i w@ dva @ 0 lit w@ or dva @ 0 lit w! loop
+drop dva @ dvt @ 8 lit wcmp 1 lit < ;
