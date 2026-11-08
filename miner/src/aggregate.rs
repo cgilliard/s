@@ -1293,7 +1293,7 @@ pub fn prove_wrap(
 // root it expects, which pins every program involved.
 
 /// Transcript domain separator for chain proofs.
-const DOM_CHAIN_PROOF: u32 = 0x33;
+pub(crate) const DOM_CHAIN_PROOF: u32 = 0x33;
 
 fn chain_transcript() -> Challenger {
     let mut c = Challenger::new();
@@ -1704,7 +1704,11 @@ pub fn prove_chain(
 }
 
 /// Verifies that `proof` shows the block at `height` with `statement`, and
-/// every block before it, valid.
+/// every block before it, valid. The check is the compiled verifier a
+/// chain step runs on its predecessor, compiled for the setup's heights
+/// and interpreted ([`crate::chain_verifier`]): the fam node runs the same
+/// program, so both accept the same proofs, and a proof of other heights
+/// is refused.
 pub fn verify_chain(
     params: &AggregatorParams,
     setup: &ChainSetup,
@@ -1717,8 +1721,8 @@ pub fn verify_chain(
     }
     let digest = if height == 1 { setup.base } else { setup.step };
     let public = VmAir::public_values(&digest, &chain_output(height, statement, &setup.step, &setup.plan_root));
-    stark::verify_tables(&params.wrap, &VmAir::specs(&digest), &public, proof, &mut chain_transcript())
-        .map_err(|_| AggregateError::Rejected)
+    let verifier = crate::chain_verifier::chain_verifier(&params.wrap, setup.log_n, setup.hash_log_n);
+    if verifier.verify(&public, proof) { Ok(()) } else { Err(AggregateError::Rejected) }
 }
 
 /// Verifies an encoded block proof against a statement. `wrap` gives the
@@ -3141,6 +3145,79 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(verify_chain(&params, &setup, 2, &st2, &c2), Ok(()));
         println!("verified in {:?}; wrap proof was {} bytes", t.elapsed(), p2.to_bytes().len());
+    }
+
+    /// Writes a real mainnet chain proof for the fam node's verifier
+    /// (`node/src/user/node/chainproof.bin`): block 2's, under mainnet's
+    /// built-in setup, as its 16 public values (little-endian words) and
+    /// then its bytes.
+    #[test]
+    #[ignore = "proves two mainnet blocks; run with --release"]
+    fn write_fam_chain_proof() {
+        use crate::chain::{ChainParams, MAINNET_EMISSION};
+        let params = AggregatorParams::MAINNET;
+        let genesis = network_genesis(params);
+        let verifier = AggregateVerifier::new(params, MAINNET_EMISSION, genesis);
+        let setup = *verifier.setup();
+        let tree = verifier.plan_tree();
+        let miner = key(9).public_key();
+        let dir = TempDir::new("fam-chain-proof");
+        let env = open_env(&dir.0, 256 << 20).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let utxo = UtxoSet::open(&env, &mut wtxn, "u").unwrap();
+        let mut block = |height: u32, parent: (Digest, Work)| {
+            let subsidy = ChainParams::MAINNET.subsidy(height);
+            let txs = vec![reward(&miner, subsidy)];
+            let prev_root = utxo.root(&wtxn).unwrap();
+            let first = utxo.next_position(&wtxn).unwrap();
+            let w = SegmentWitness::collect_by_rows(&utxo, &mut wtxn, &txs, params.segment_rows(), height).unwrap();
+            let body = Body {
+                inputs: vec![],
+                outputs: w.iter().flat_map(|s| s.block_outputs()).collect(),
+                proof: vec![],
+                ..Default::default()
+            };
+            let st = Statement::from_block(&BlockStatement {
+                height,
+                prev_state_root: prev_root,
+                new_state_root: utxo.root(&wtxn).unwrap(),
+                first_output_position: first,
+                subsidy,
+                body: &body,
+                parent_work: parent.1,
+                parent_hash: parent.0,
+            });
+            let nm = NameWitness { root_in: st.new_state_root, pos_in: st.end_output_position, height, ops: vec![] };
+            (w, st, nm)
+        };
+        let (seg1, st1, nm1) = block(1, (genesis.hash, genesis.work));
+        let (h1, work1) = crate::pow_air::test_header(genesis.hash, 1, st1.new_state_root, params.pow);
+        let (seg2, st2, nm2) = block(2, (h1.hash(), work1));
+        wtxn.abort();
+        let mut cache = PlanCache::new();
+        let wrap_of = |segs: &[SegmentWitness], st: &Statement, nm: &NameWitness, cache: &mut PlanCache| {
+            let shape = plan_with(&params, segs.len(), cache);
+            let proof = prove_wrap(&params, &shape, st, segs, nm, 2, &|_| {}, &|| false).unwrap();
+            (shape.wrap.unwrap(), proof)
+        };
+        let (w1, p1) = wrap_of(&seg1, &st1, &nm1, &mut cache);
+        let (w2, p2) = wrap_of(&seg2, &st2, &nm2, &mut cache);
+        let emission = MAINNET_EMISSION;
+        let base = ChainWitness { height: 1, statement: &st1, wrap: w1, wrap_proof: &p1, path: tree.open(0), index: 0, prev: None };
+        let c1 = prove_chain(&params, emission, &setup, &base, &|| false).unwrap();
+        let prev = Some(PrevChain { height: 1, statement: &st1, proof: &c1, header: &h1 });
+        let step = ChainWitness { height: 2, statement: &st2, wrap: w2, wrap_proof: &p2, path: tree.open(0), index: 0, prev };
+        let c2 = prove_chain(&params, emission, &setup, &step, &|| false).unwrap();
+        assert_eq!(verify_chain(&params, &setup, 1, &st1, &c1), Ok(()));
+        assert_eq!(verify_chain(&params, &setup, 2, &st2, &c2), Ok(()));
+        let bytes = c2.to_bytes();
+        assert_eq!(verifier.verify_chain_proof(2, &st2, &bytes), Ok(()));
+        let public = VmAir::public_values(&setup.step, &chain_output(2, &st2, &setup.step, &setup.plan_root));
+        let mut out: Vec<u8> = public.iter().flat_map(|x| x.to_canonical().to_le_bytes()).collect();
+        out.extend_from_slice(&bytes);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/chainproof.bin");
+        std::fs::write(path, &out).unwrap();
+        println!("wrote {} bytes: a proof of {} bytes", out.len(), bytes.len());
     }
 
     /// Candidate security levels: table heights over the segment counts,

@@ -121,6 +121,12 @@ pub struct Compiler {
     consts: HashMap<[u32; DEGREE], Addr>,
     sponge: Option<[Fp; WIDTH]>,
     digest: [Fp; DIGEST],
+    /// Each inverse hint: the index of its `Input` instruction and the
+    /// address of the word it inverts (see [`crate::chain_verifier`]).
+    pub hints: Vec<(usize, Addr)>,
+    /// The bits of each FRI query's sampled index, from the last
+    /// [`Compiler::verify_stark`].
+    pub query_bits: Vec<Addr>,
 }
 
 impl Default for Compiler {
@@ -138,6 +144,8 @@ impl Compiler {
             consts: HashMap::new(),
             sponge: None,
             digest: [Fp::ZERO; DIGEST],
+            hints: Vec::new(),
+            query_bits: Vec::new(),
         };
         assert_eq!(c.constant(Fp4::ZERO), A_ZERO);
         assert_eq!(c.constant(Fp4::ONE), A_ONE);
@@ -238,6 +246,7 @@ impl Compiler {
     /// `a * hint == 1`.
     pub fn inverse(&mut self, a: Addr) -> Addr {
         let hint = self.val(a).inverse().unwrap_or(Fp4::ZERO);
+        self.hints.push((self.prog.instrs.len(), a));
         let h = self.input(hint);
         let prod = self.mul(a, h);
         self.prog.assert_eq(prod, A_ONE);
@@ -293,6 +302,8 @@ impl Compiler {
             consts: HashMap::new(),
             sponge: None,
             digest: [Fp::ZERO; DIGEST],
+            hints: Vec::new(),
+            query_bits: Vec::new(),
         }
     }
 
@@ -874,6 +885,7 @@ impl Compiler {
         // verifier observes nothing between queries, and the machine's sponge
         // register is shared with the Merkle work below.
         let query_bits: Vec<Addr> = (0..config.num_queries).map(|_| c.sample_bits(&mut t)).collect();
+        c.query_bits = query_bits.clone();
 
         // ---- per-proof constants ----
         // `omega_pows[k] = omega^(2^k)` and likewise for the inverse.
