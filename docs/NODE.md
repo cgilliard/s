@@ -9,6 +9,19 @@ Paths in `miner/src` are to the Rust node, tabminer. It is the
 reference: the fam node must accept and reject exactly the blocks and
 transactions it does.
 
+## Decided
+
+- **Verification only.** The node does not prove or mine.
+- **A daemon with an API.** It has no interface of its own; wallets and
+  other clients use its HTTP API, served by its own process.
+- **An API token.** Every request carries it (The API, below).
+- **A 25 GB disk.** It holds essentially the whole chain, even at
+  Bitcoin's scale, with tabminer's full undo window. The store must be
+  made to scale to it first (step 0).
+- **No M extension.** RV32I as everywhere else: products in software,
+  and the verification loop optimised until it is fast enough.
+  Verification without M has been done before.
+
 ## What it is
 
 - **A verifying node.** It checks every block and transaction it
@@ -89,9 +102,11 @@ measured in the first step, and the plan adjusted to what is found.
 
 - **Field arithmetic.** BabyBear (p = 0x78000001, Montgomery form) and
   its degree-4 extension (W = 11). A product needs a 32×32→64 multiply
-  done in software, from 16-bit halves. This is the inner loop of
-  everything else, so it is written first, with care, perhaps as
-  machine code words as the kernel's are.
+  done in software, from 16-bit halves, since there is no M extension
+  (decided). This is the inner loop of everything else, so it is
+  written first and then optimised: machine code words as the kernel's
+  are, Poseidon2's rounds unrolled, constants laid out for the loop,
+  reductions deferred where the bounds allow.
 - **Poseidon2.** Width 16, x^7, 8 full and 13 partial rounds,
   bit-compatible with Plonky3's `default_babybear_poseidon2_16`. A
   permutation is roughly 800 field products. Estimate: around
@@ -164,14 +179,24 @@ half-applied one.
   hash (`name_trie.rs`).
 - **Blocks and headers:** headers all kept; bodies within the undo
   window, and proofs only for the tip.
-- **Undo records** for reorganisations, within the undo window. Its
-  depth and the disk's size go together:
-  - tabminer keeps 1,008 blocks, with a snapshot manifest each (about
-    150 KB, 3.2 GB with full blocks);
-  - a fam node on a 256 MiB disk can't. It keeps a shorter window by
-    default, enough for any likely reorganisation, and serves no
-    snapshots, or serves only recent ones.
-  The disk `node.sh` makes may need to grow.
+- **Undo records** for reorganisations, within the undo window: as
+  tabminer, 1,008 blocks, with a snapshot manifest each (about 150 KB;
+  3.2 GB with full blocks). So the node can serve fast sync to others
+  as tabminer does.
+- **The disk: 25 GB** (decided), sparse, as `node.sh` and `makenode.sh`
+  make it. Outside the window a block costs about 500 bytes (26 MB a
+  year) and an unspent output about 85, so the disk holds essentially
+  the whole chain for a long time, even at Bitcoin's scale.
+- **The store at that size.** Two of its structures grow with the disk
+  today, and must not (step 0):
+  - the map from a disk page to its cache slot (`pslot`) is 4 bytes for
+    every page: about 24 MB of RAM for 25 GB. It becomes a hash table
+    sized to the cache (16 MiB: 4,096 slots);
+  - a writer transaction's bitmap of pages (`XBMAP`) is a bit for every
+    page, zeroed for each transaction: about 750 KB for 25 GB. It
+    becomes a record of the pages the transaction touches, sized to the
+    transaction (which `DLMAX` already bounds).
+  `node.sh`'s default disk stays 256 MiB until then.
 - **Memory:** the node's own region and its `malloc`, the seed text
   (4.34 MB), a proof being verified (205 KB and its working state),
   the pool (bounded far below tabminer's 64 MiB), and buffers for
@@ -208,6 +233,22 @@ half-applied one.
 JSON over HTTP, one request a connection to begin with. Paths are
 versioned (`/v1/...`) so they can change without breaking wallets.
 
+**The token** (decided). Every request carries it, as `Authorization:
+Bearer <token>`. A request without it, or with another, gets 401 and
+nothing else.
+- The node makes the token at its first start: 32 random bytes, in hex.
+  It writes it to `/etc/node/token`, owned by the node's user, mode 600
+  (`docs/OS.md`, section 11). A wallet run by that user (or root)
+  reads it from there. One on the host is given it by the user, as for
+  bitcoind's cookie.
+- `POST /v1/token` with the current token makes a new one; the old one
+  stops working.
+- Randomness for it: the OS has no source yet. QEMU's virtio-rng device
+  (`-device virtio-rng-device`) gives one: a small driver, and
+  `/dev/random`.
+- Configuration may open the read-only endpoints without the token
+  (for a public explorer). Writing always needs it.
+
 - **Reading:**
   - `GET /v1/status`: height, tip, work, sync progress, peers, version.
   - `GET /v1/header/<height|id>`, `GET /v1/block/<height|id>`: a block,
@@ -231,8 +272,9 @@ versioned (`/v1/...`) so they can change without breaking wallets.
   (long polling), so a GUI can update without asking again and again.
   A WebSocket for events can come later; the framing is wm's.
 
-The API holds nothing secret. A wallet's keys never reach the node.
-Whether to answer only local programs, or anyone, is configuration.
+The API holds nothing secret but the token. A wallet's keys never
+reach the node. Whether to answer only local programs, or anyone, is
+configuration; the token is needed either way.
 
 ## In the OS
 
@@ -246,7 +288,8 @@ Whether to answer only local programs, or anyone, is configuration.
   ```text
   restart 2 300 node
   ```
-- **Its data in the store:** one tree, its own.
+- **Its data in the store:** one tree, its own, on a 25 GB disk.
+- **Its token:** `/etc/node/token` (The API, above).
 - **Its threads:** one poll loop for the network and the API, as
   `wm` has; verification on another thread, so a slow proof never
   stalls peers or API clients; a second hart if there is one.
@@ -276,6 +319,13 @@ Against tabminer, which is the reference:
 
 Each step done when its test passes.
 
+0. **The store at 25 GB, and randomness**:
+   - the page-to-slot map sized to the cache, and transactions' page
+     records sized to them (Its state, above);
+   - `node.sh` and `makenode.sh` making 25 GB disks;
+   - virtio-rng and `/dev/random`.
+   Done when storetest passes on a 25 GB disk, and RAM in use is the
+   same as on 256 MiB.
 1. **Arithmetic.** The 32×32→64 product, BabyBear, its extension, and
    the wide integers. Done when they match tabminer's vectors, and the
    cost of a product is measured.
@@ -297,9 +347,10 @@ Each step done when its test passes.
 7. **The pool**: XMSS verification, admission, replacement, relay.
    Done when transactions from tabminer's wallet are accepted, relayed
    and mined by a tabminer peer.
-8. **The API**: the HTTP server and the endpoints above. Done when a
-   program in the OS and a client on the host read the chain and send
-   a transaction through it.
+8. **The API**: the HTTP server, the token, and the endpoints above.
+   Done when a program in the OS and a client on the host read the
+   chain and send a transaction through it with the token, and are
+   refused without it.
 9. **Images**: serving tabernacles. Done when a tabernacle boots from
    a fam node with `tools/server.py` gone.
 10. **The daemon**: in the image, started by init, its `/proc` keys,
@@ -310,14 +361,9 @@ Each step done when its test passes.
 
 - **Proof-of-work over a long header chain**: all of it, sampled, or
   from a checkpoint in the image (Syncing, above).
-- **The undo window and the disk**: how deep a reorganisation the node
-  survives on the disk it is given; whether it serves snapshots.
-- **Multiplication's cost**: step 1 decides whether the field
-  arithmetic stays in fam words or becomes machine code, and whether
-  to ask for the M extension (QEMU has it; the design so far avoids
-  it).
+- **How fast verification gets without M**: step 1 and step 2 measure
+  it, and say how much optimising the loop needs.
 - **The API's reach**: local only by default; how a user opens it
-  wider, and whether writing (`POST /v1/tx`) needs a token when it
-  does.
+  wider. The token is needed either way.
 - **Messages and onion routing**: protocol messages 16 to 22, in a
   later step.
