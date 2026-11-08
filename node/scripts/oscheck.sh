@@ -62,6 +62,16 @@ upto() {
 	' "$@" < /dev/null
 }
 fail() { echo "FAIL $1: $2"; FAILS=$((FAILS + 1)); }
+# served FILE NAME — waits until a host server started in the background
+# has written "ready" to FILE (bound, and listening): a guest's first
+# packet to it is otherwise lost to the race.  30 s at most.
+served() {
+	i=0
+	until grep -q ready "$1" 2>/dev/null; do
+		i=$((i + 1)); [ "$i" -gt 300 ] && { fail "$2" "the host's echo server did not start"; return; }
+		sleep 0.1
+	done
+}
 # boots NAME REGEX SECS CMD... — CMD run (its own process group, stdin
 # /dev/null) until its output matches REGEX (Perl's, multi-line), then
 # stopped; SECS at most, so a slow machine only takes longer.  Fails if it
@@ -582,10 +592,12 @@ python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", int(sys.argv[1])))
+print("ready", flush=True)
 while True:
     d, a = s.recvfrom(2048)
     s.sendto(b"echo:" + d, a)
-' "$UP" & EP=$!
+' "$UP" > "$T/udpecho.ready" & EP=$!
+served "$T/udpecho.ready" udp
 for n in 1 4; do
 	expect "udp_$n" 124 '^sent 5 got 10 echo:hello 0A000202 '"$UP"'$' 6 ./tools/q32 --smp=$n --net "$T/udp.img"
 	has "udp_$n" '^connect 0 write 5 poll 1 read 10 echo:again$'
@@ -624,6 +636,7 @@ python3 -c '
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(5)
+print("ready", flush=True)
 pat = bytes(48 + (i & 63) for i in range(1024)) * 400
 while True:
     c, a = s.accept(); got = b""
@@ -635,7 +648,8 @@ while True:
         if len(got) >= len(pat): break
     if got: c.sendall(b"got %d %s" % (len(got), b"intact" if got == pat else b"BAD"))
     c.close()
-' "$TP" & EP=$!
+' "$TP" > "$T/tcpecho.ready" & EP=$!
+served "$T/tcpecho.ready" tcp
 for n in 1 4; do
 	expect "tcp_$n" 124 '^connect 0 write 9 read 14 echo:hello tcp$' 6 ./tools/q32 --smp=$n --net "$T/tcp.img"
 	has "tcp_$n" '^close 0 refused -111 $'
