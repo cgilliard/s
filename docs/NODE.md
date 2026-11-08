@@ -304,9 +304,9 @@ configuration; the token is needed either way.
 
 - **Its program:** `node` in the image, its memory given in the table
   (tens of MiB; its `malloc` maps more).
-- **Its data:** the seed text, as a data file in the image
-  (`/lib/akjv.txt.gz`, as the compiler's libraries are). Inflated at
-  start.
+- **Its data:** the seed file, as a data file in the image
+  (`/lib/akjv.txt.gz`, 1.29 MB, as the compiler's libraries are), read
+  as it is: nothing is inflated.
 - **Starting it:** started by init from `/etc/init`, as its own user
   with its own tickets, and restarted if it ends:
   ```text
