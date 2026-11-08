@@ -67,7 +67,7 @@ const LOG_K_X256: i64 = 31_648;
 
 /// `log2(x)` in 1/256 bits, rounded up (computed with integers only, so
 /// every verifier derives the same grinding).
-fn log2_x256_ceil(x: u128) -> i64 {
+pub(crate) fn log2_x256_ceil(x: u128) -> i64 {
     assert!(x > 0);
     let k = 127 - x.leading_zeros() as i64;
     // The mantissa x / 2^k in [1, 2) with 62 fractional bits, rounded down.

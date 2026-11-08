@@ -13,6 +13,7 @@ pub mod codec;
 pub mod consensus;
 pub mod difficulty;
 pub mod ext;
+pub mod fam_vectors;
 pub mod field;
 #[rustfmt::skip]
 pub mod genesis;

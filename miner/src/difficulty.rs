@@ -152,7 +152,7 @@ impl U256 {
     }
 
     /// `self * m` as five limbs (no overflow possible).
-    fn mul_u64_wide(self, m: u64) -> [u64; 5] {
+    pub(crate) fn mul_u64_wide(self, m: u64) -> [u64; 5] {
         let mut out = [0u64; 5];
         let mut carry = 0u128;
         for (o, limb) in out.iter_mut().zip(self.0) {
