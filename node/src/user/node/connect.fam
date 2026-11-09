@@ -22,6 +22,20 @@
 \ length at chunk FFFF.
 
 : sprchk variable ;  : bbody variable ;  : bbn variable ;
+\ swk: if set, the block's header entry (headers.fam's: its id at CC, its
+\ cumulative work at EC): its work kept with its header ('w', the height)
+\ for a start to resume from the middle of the chain (sync.fam's nload),
+\ and its height under its id ('i', the id's first 8 bytes), for old
+\ headers found by id (query.fam's yfind; a stale one, of a block undone,
+\ found not to match).
+: swk variable ;
+: kwork  kb @ 1 lit + 4 lit be!  77 lit kb @ c!  5 lit ;   \ ( height -- klen )
+: kid  kb @ 1 lit + 8 lit bcopy  69 lit kb @ c!  9 lit ;   \ ( id -- klen )
+\ shidx ( e -- )  entry e's work and id kept for its height (in the
+\ transaction open).
+: shidx
+dup 20 lit + @ kwork  over EC lit + 20 lit sput
+dup 20 lit + @ sbuf @ !  CC lit + kid sbuf @ 4 lit sput ;
 
 \ The undo record's keys: 'u', the height, the chunk; the body's, 'b'.
 : kundo  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  75 lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
@@ -110,6 +124,7 @@ stxo @ if
 		repeat
 		sh @ 3F0 lit u> if sh @ 3F0 lit - bdrop then
 		sctr @ 70 lit mput  sh @ 68 lit mput  sh @ khdr bh @ CC lit sput
+		swk @ ?dup if shidx then
 		serr @ if FFFFFFF6 lit bfail then
 	then
 	bcode @ if stx @ txabort drop 0 lit ndirty ! else stx @ txcommit drop then
@@ -165,7 +180,7 @@ begin dup ub @ ub @ @ 2 lit lshift + u< while
 	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
 repeat drop
 nev @ ?dup if 0 lit do ev @ nev @ 1 lit - i - w@ uevent loop then
-sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput  sh @ khdr sdel  sh @ bdrop
+sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput  sh @ khdr sdel  sh @ kwork sdel  sh @ bdrop
 ub @ @ 2 lit lshift 3FF lit + A lit rshift 0 lit do sh @ i kundo sdel loop
 sprop
 stx @ txcommit drop

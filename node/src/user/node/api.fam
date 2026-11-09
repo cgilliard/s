@@ -186,14 +186,13 @@ drop ahh @ ;
 : aid
 dup strlen 40 lit = if
 	ab32 @ 20 lit ahexb if
-		0 lit hbest
-		begin
-			dup hid ab32 @ 20 lit d8= if nip dup then
-			dup hheight 0= 2 lit pick 0= 0= or if -1 lit else hparent @ he 0 lit then
-		until drop
+		\ held or the store's, and on our best branch
+		ab32 @ yfind dup if
+			dup hheight phget dup if hid ab32 @ 20 lit d8= 0= if drop 0 lit then else nip then
+		then
 	else 0 lit then
 else
-	dup c@ 30 lit - A lit u< if atoi dup hbest hheight u> if drop 0 lit else hat then else drop 0 lit then
+	dup c@ 30 lit - A lit u< if atoi dup hbest hheight u> if drop 0 lit else phget then else drop 0 lit then
 then ;
 
 \ ── The answers ──

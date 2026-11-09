@@ -1096,7 +1096,7 @@ Each step done when its test passes.
       (quick-checked again: each was checked in full, or covered by a
       proof, before it was stored), takes its tip from the store, and
       catches up from the peer; only a store with no tip is made afresh
-      and synced. Room for 65,536 headers (a year of mainnet; 19 MB,
+      and synced. Room then for 65,536 headers (19 MB; now a window, below,
       `malloc`'d), the lookup table at least twice that (it was exactly
       the room, so a full table would have looped).
     - Reorganizing: headers asked for from lower (2, 4, 8... below the
@@ -1183,8 +1183,31 @@ Each step done when its test passes.
       (Python) claims a height far ahead and answers with malformed
       headers: struck once a minute, banned at the fifth, while the node
       follows A throughout.
+    - A window of the headers (2026-11-09): room for 16,384 in memory
+      (4.7 MB); when it nears full, the main chain's below the newest
+      half go to the store alone (`ncompact`: saved with their
+      cumulative work, then `hprune`: genesis and block 1, ASERT's
+      anchor, kept; those whose parent went become roots), never above
+      our tip less 8 (where a fork is found) or, before any block is
+      connected, the best less 160 (a fast sync's S and on). Each
+      connected block's work is kept with its header ('w'), so a start
+      loads only the last 2,048 (`nload`: block 1, then a root with the
+      store's work, the rest on it, trusted: checked only for how they
+      join). Older headers are answered from the store, by height and by
+      id (its index, 'i' and the id's first 8 bytes, the header read
+      back and its id compared): GetHeadersFrom, a GetHeaders locator,
+      `/v1/header`. A store with a chain that cannot be taken up is
+      said and left (never made afresh: `rm /var/node` does that); the
+      headers to S are saved before S's snapshot sets the tip. The
+      chain's length is bounded only by the disk (about 240 bytes a
+      header: 12 MB a year of mainnet); a reorganization below the
+      headers held is not followed (said).
+      `node -w N` holds N, for tests: `scripts/windowtest.sh` runs
+      `-w 16` to 26 blocks (headers moved to the store several times),
+      asks the API for header 3 (the store's, its id A's) by height and
+      by id, and resumes from 8 headers, following on.
     - Not yet: started by init (held back while it is tried by hand),
-      configuration (network, port), more than 65,536 headers (the store holding them, a window in memory),
+      configuration (network, port),
       a log and a way to read its state from the shell, serving
       snapshots.
 

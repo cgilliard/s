@@ -117,46 +117,84 @@ begin dup hheight 2 lit pick u< 0= over hheight and while
 	dup hparent @ he htarget  dup vpow 0= if rot drop 0 lit -rot then
 	hparent @ he
 repeat 2drop ;
-\ nconnect ( h body n -- code )  sconnect, the proof checked by nodev.
-: nconnect  sconn1  spend @ if vproof else -1 lit then  sconn2 ;
+\ nconnect ( e body n -- code )  sconnect, the proof checked by nodev,
+\ for header entry e (its work and id kept with it: swk).
+: nconnect  2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk ! ;
 
-\ nsave ( n -- )  the main chain's headers 1 to n into the store (a
-\ transaction a 1,024): after a fast sync's snapshot, so that the store
-\ holds every header from genesis to its tip (sconnect stores each block's
-\ after), for a start to load (nload).
+\ nsave ( n -- )  the main chain's headers 1 to n held into the store,
+\ with their work (a transaction a 1,024): after a fast sync's snapshot,
+\ so that the store holds every header from genesis to its tip (sconnect
+\ stores each block's after; ncompact those dropped before), for a start
+\ to load (nload) and for peers asking for old headers.
+\ ncompact  when the headers held near their room (hcap), the main
+\ chain's below a height saved in the store and dropped (hprune): the
+\ newest half kept, and never above our tip less 8 (where a fork is
+\ found from) or, before any block is connected, the best less 160 (a
+\ fast sync's S and the blocks after it).  nkeep, if set, how many to
+\ keep (main.fam's -w), else half the room.
 : nsv variable ;
 : nsave
 nsv !  1 lit
 begin dup nsv @ u> 0= while
 	stfd @ 1 lit txbegin stx !
-	dup 400 lit + nsv @ 1 lit + umin  over do  i khdr i hat hhdr CC lit sput  loop
+	dup 400 lit + nsv @ 1 lit + umin  over do
+		i hat ?dup if  i khdr over hhdr CC lit sput  shidx  then
+	loop
 	stx @ txcommit drop
 	400 lit +
 repeat drop ;
 
-\ nload ( -- flag )  the store's chain taken up, if it has one: its
-\ headers, genesis to its tip, offered again (the quick check: each was
-\ checked in full, or covered by a proof, before it was stored), and our
-\ status from its tip.  0 if the store has no tip, or a header is missing
-\ or refused.
-: nlh variable ;  : nlok variable ;
+\ ncompact
+: nkeep variable ;  : ncf variable ;
+: ncompact
+hcnt @  hcap @ 80 lit hcap @ 2 lit rshift umin -  u< 0= if
+	hbest hheight  nkeep @ ?dup 0= if hcap @ 1 lit rshift then  -
+	myh @ if myh @ 8 lit - else hbest hheight A0 lit - then  2dup u> if swap then drop   \ the lesser
+	dup 0< over 2 lit u< or over hbase @ u> 0= or if drop else
+		ncf !
+		hbase @ 2 lit max
+		begin dup ncf @ u< while
+			stfd @ 1 lit txbegin stx !
+			dup 400 lit + ncf @ umin  over do
+				i hat ?dup if  i khdr over hhdr CC lit sput  shidx  then
+			loop
+			stx @ txcommit drop
+			400 lit +
+		repeat drop
+		ncf @ hprune
+		vrb @ if nhead "headers below " puts ncf @ u. " now only in the store (" puts hcnt @ u. " held)" puts 0A lit putc then
+	then
+then ;
+
+\ nload ( -- flag )  the store's chain taken up, if it has one: its last
+\ nldn headers (2,048 if not set) to its tip, trusted (each was checked in
+\ full, or covered by a proof, before it was stored: htrust, only how
+\ each joins checked), the first a root (hroot, its work the store's)
+\ after block 1 (ASERT's anchor), or all from block 1 if fewer; and our
+\ status from its tip.  0 if the store has no tip, or a header is
+\ missing or does not join.
+: nlh variable ;  : nlok variable ;  : nlb variable ;  : nldn variable ;
+: nlone  ntime 0 lit hacc 1 lit u> if 0 lit nlok ! then ;   \ ( h -- )  a header taken up
 : nload
-stfd @ 0 lit txbegin stx !  68 lit mget nlh !  -1 lit nlok !
-nlh @ 0= if 0 lit nlok ! then
+stfd @ 0 lit txbegin stx !  68 lit mget nlh !  stx @ txcommit drop
+nlh @ 0= 0= nlok !
 nlok @ if
-	"loading " nsay vrb @ if nlh @ u. " headers from the store" puts 0A lit putc then
-	ticks nt0 !  -1 lit hquick !
-	nlh @ 1 lit + 1 lit do
-		nlok @ if
-			i khdr sbuf @ CC lit sget CC lit = if
-				sbuf @ ntime 0 lit hacc 1 lit u> if 0 lit nlok ! then
-			else 0 lit nlok ! then
-		then
-	loop
-	0 lit hquick !
+	nldn @ ?dup 0= if 800 lit then  nlh @ over u> if nlh @ swap - 1 lit + else drop 1 lit then  nlb !
+	vrb @ if nhead "loading " puts nlh @ nlb @ - 1 lit + u. " headers from the store" puts 0A lit putc then
+	ticks nt0 !  -1 lit htrust !
+	nlb @ 1 lit u> if
+		1 lit yentry ?dup if nlone  hcnt @ 1 lit - hb1 ! else 0 lit nlok ! then
+		nlok @ if nlb @ yentry ?dup if dup hwork hroot  nlb @ hbase ! else 0 lit nlok ! then then
+	then
+	stfd @ 0 lit txbegin stx !
+	nlh @ 1 lit +  nlb @ 1 lit u> if nlb @ 1 lit + else 1 lit then
+	2dup u> if do
+		nlok @ if i khdr sbuf @ CC lit sget CC lit = if sbuf @ nlone else 0 lit nlok ! then then
+	loop else 2drop then
+	stx @ txcommit drop
+	0 lit htrust !
 	nlok @ hbest hheight nlh @ = and nlok !
 then
-stx @ txcommit drop
 nlok @ if nstat  -1 lit sprchk !  vrb @ if nhead "resumed at height " puts myh @ u. ", the headers loaded in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
 nlok @ ;
 
@@ -168,7 +206,7 @@ ncode @ 0= if pst @ 14 lit + mygen @ 20 lit d8= 0= if FFFFFFFE lit nfail then th
 ncode @ 0= if
 	-1 lit hquick !  1 lit
 	begin dup pst-h u> 0= ncode @ 0= and while
-		dup phdrs ?dup if
+		ncompact  dup phdrs ?dup if
 			0 lit do phb @ i CC lit * +  ntime 0 lit hacc  1 lit u> if FFFFFFFD lit nfail then loop
 			hbest hheight 1 lit + max
 			"headers to " nsay hbest hheight nsayn
@@ -209,7 +247,9 @@ ncode @ 0= if
 		then
 	loop then
 then
-ncode @ 0= if nS @ hat hhdr snfin if FFFFFFF8 lit nfail else "the snapshot's state checked against S" nsay vrb @ if 0A lit putc then  nS @ nsave then then
+\ (the headers to S saved first: once snfin sets the tip, a start finds
+\ them all)
+ncode @ 0= if nS @ nsave  nS @ hat hhdr snfin if FFFFFFF8 lit nfail else "the snapshot's state checked against S" nsay vrb @ if 0A lit putc then then then
 nblk @ ?dup if free 0 lit nblk ! then
 \ the blocks after S, each with its proof
 ncode @ 0= if
@@ -261,7 +301,7 @@ hbst @ nb0 !  0 lit ncn !  -1 lit hquick !
 begin hbest hheight pst-h u< nfl @ 0= and while
 	hbest hheight 1 lit +  nstp @ 1 lit -  over 1 lit - umin  -
 	0 lit nbk !
-	dup phdrs ?dup if
+	ncompact  dup phdrs ?dup if
 		0 lit do nfl @ 0= nbk @ 0= and if
 			phb @ i CC lit * + ntime 0 lit hacc
 			dup FFFFFFFE lit = i 0= and if
@@ -293,7 +333,12 @@ then
 0 lit nfl !
 \ our tip off the best branch: undone down to where it joins
 myh @ if mytip @ hfind dup 0< if drop else
-	he begin dup dup hheight hat <> while hparent @ he repeat hheight nfk !
+	he begin dup dup hheight hat <> over hparent @ 0< 0= and while hparent @ he repeat
+	dup dup hheight hat = if hheight nfk ! else
+		\ the fork below the headers held (a root reached): not followed
+		drop  myh @ nfk !  1 lit nfl !
+		vrb @ if nhead "the best branch forks below the headers held: not followed" puts 0A lit putc then
+	then
 	myh @ nfk @ u> if
 		vrb @ if nhead "reorganizing: our " puts myh @ nfk @ - u. " blocks above " puts nfk @ u. " leave for the best branch" puts 0A lit putc then
 		begin myh @ nfk @ u> nfl @ 0= and while

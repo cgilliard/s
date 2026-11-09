@@ -267,15 +267,20 @@ prx @ 5 lit + c@  dup 6 lit * 6 lit + prn @ u> if drop else
 	loop then
 then ;
 
+\ phget ( h -- e | 0 )  our chain's header h: held, or the store's.
+: phget  dup hat ?dup if nip else yentry then ;
 \ phsend ( from -- )  Headers: our chain's (to our tip) from height
 \ from, 60 at most, 6 a datagram, as tabminer's headers_from.
-: phs variable ;  : phe variable ;
+: phs variable ;  : phe variable ;  : phc variable ;  : phk variable ;
 : phsend
 dup phs !  3C lit +  myh @ 1 lit +  umin phe !
 begin phs @ phe @ u< while
-	6 lit wbeg  phe @ phs @ - 6 lit umin dup w8
-	0 lit do phs @ i + hat hhdr CC lit wbs loop
-	prply  phs @ 6 lit + phs !
+	6 lit wbeg  ptp @ phc !  0 lit w8  0 lit phk !
+	phe @ phs @ - 6 lit umin 0 lit do
+		phs @ i + phget ?dup if hhdr CC lit wbs  phk @ 1 lit + phk ! else phs @ i + phe ! then
+	loop
+	phk @ phc @ c!  phk @ if prply then
+	phs @ 6 lit + phs !
 repeat ;
 \ phfrom  the GetHeadersFrom in prx: its height's headers on.
 : phfrom  prn @ 11 lit u< 0= if prx @ D lit + le@ phsend then ;
@@ -290,8 +295,11 @@ prn @ 11 lit u< 0= if
 		?dup if 0 lit do
 			phat @ 0= if
 				prx @ 11 lit + i 5 lit lshift + pidm @ 20 lit bcopy
-				pidm @ hfind dup 0< if drop else
-					he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if hheight phat ! else drop then
+				\ held or the store's, and our chain's (to our tip)
+				pidm @ yfind ?dup if
+					hheight dup myh @ u> 0= if
+						dup phget ?dup if hid pidm @ 20 lit d8= if phat ! else drop then else drop then
+					else drop then
 				then
 			then
 		loop then

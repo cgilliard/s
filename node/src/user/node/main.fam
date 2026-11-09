@@ -15,8 +15,10 @@
 \ caught up to, by nstep, once the peer answers); if not, the tree is
 \ made afresh and the node syncs (a removed tree's pages are not given
 \ back yet, so that costs its size on the disk).  The fast sync's block S
-\ is 144 below the best header, as tabminer's.  Room for 65,536 headers
-\ in memory (19 MB): a year of mainnet.
+\ is 144 below the best header, as tabminer's.  Room for 16,384 headers
+\ in memory (4.7 MB): when it fills, those below the newest half go to
+\ the store alone (sync.fam's ncompact), and a start loads the last
+\ 2,048 (nload).  `node -w N ...` (for tests) holds N instead.
 
 : mdc variable ;  : mnet variable ;  : mpt variable ;  : mip variable ;  : mport variable ;
 
@@ -56,14 +58,19 @@ dup 3 lit 2 lit lshift + 8 lit wzero  10 lit over A lit w!
 1C20 lit over 13 lit w!  B lit over 14 lit w!  3279DB0 lit over 15 lit w!
 A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
 
-\ the peers given: their addresses in mpa (8 of 2 words), mpn of them
-: mpa variable ;  : mpn variable ;
+\ the headers held (-w N), and the peers given: their addresses in mpa
+\ (8 of 2 words), mpn of them, from argument mpf on
+: mpa variable ;  : mpn variable ;  : mpf variable ;  : mhc variable ;
+4000 lit mhc !  1 lit mpf !
+argn 2 lit u> if 1 lit arg "-w" streq if
+	2 lit arg dup c@ 30 lit - A lit u< if atoi 10 lit max mhc ! else drop then  3 lit mpf !
+then then
 40 lit alloc mpa !  A000202 lit mpa @ !  EA3 lit mpa @ 4 lit + !  1 lit mpn !
-argn 9 lit > if "usage: node [IP:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit then
-argn 1 lit u> if
-	argn 1 lit - mpn !
+argn mpf @ - 8 lit u> if "usage: node [-w N] [IP:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit then
+argn mpf @ u> if
+	argn mpf @ - mpn !
 	mpn @ 0 lit do
-		i 1 lit + arg maddr 0= if nhead "not IP:PORT: " puts i 1 lit + arg puts 0A lit putc 1 lit exit then
+		i mpf @ + arg maddr 0= if nhead "not IP:PORT: " puts i mpf @ + arg puts 0A lit putc 1 lit exit then
 		mip @ mpa @ i 3 lit lshift + !  mport @ mpa @ i 3 lit lshift + 4 lit + !
 	loop
 then
@@ -83,7 +90,8 @@ mip @ 8 lit rshift FF lit and u. 2E lit putc  mip @ FF lit and u. 3A lit putc  m
 "/var" mkdir drop
 mtree stinit  sninit  ninit  xinit tinit qinit yinit
 "/lib/devchain" mfile drop 4 lit + mdc !
-mparams  mnet @ mdc @ 60 lit + 10000 lit hinit
+mparams  mnet @ mdc @ 60 lit + mhc @ hinit
+mhc @ 1 lit rshift nkeep !  mhc @ 1 lit rshift 800 lit umin nldn !
 mdc @ dup 60 lit + prinit
 \ our status: genesis, no work
 20 lit alloc dup mygen !  0 lit he hid swap 8 lit wcopy
@@ -101,7 +109,13 @@ nload if
 		pst-h myh @ u> if ncatch then
 	else nhead "no answer from " puts mpeer " yet; asking it again as we serve" puts 0A lit putc then
 else
-	\ afresh: the tree made again (whatever a sync cut short left in it gone)
+	\ a chain in the store not taken up: said, and left as it is
+	nlh @ if
+		nhead "the store's chain (to height " puts nlh @ u. ") could not be taken up; to sync afresh, remove /var/node (rm /var/node)" puts 0A lit putc
+		1 lit exit
+	then
+	\ afresh: the tree made again (whatever a sync cut short, before its
+	\ first block, left in it gone)
 	stfd @ close drop  "/var/node" remove drop  mtree stfd !
 	mip @ mport @ E99 lit pinit  mrest
 	\ from each given in turn while none answers

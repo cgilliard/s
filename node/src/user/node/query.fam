@@ -12,6 +12,13 @@
 \ empty slot).
 \ ykey ( name len k -- )  k (4 words) = a name's key.
 \ ybody ( h -- a n | 0 0 )  block h's body, if kept (malloc'd).
+\ yfind ( id -- e | 0 )  the header with that id (8 canonical words):
+\ held (hfind), or the store's by its index ('i'), if the header at that
+\ height has that id; in a transaction of its own, as yentry.
+\ yentry ( h -- e | 0 )  main-chain header h from the store, as a header
+\ entry (the header, its id at CC, its work at EC: headers.fam's), in a
+\ buffer of its own, for heights below those held (hbase); in a
+\ transaction of its own (stx kept for whatever the caller holds).
 
 : yc variable ;  : ylo variable ;  : yhi variable ;  : yix variable ;  : ylv variable ;  : ytmp variable ;
 : yk variable ;  : ykp variable ;  : ydep variable ;  : ytag variable ;  : yterm variable ;  : yhb variable ;
@@ -63,3 +70,25 @@ dup FFFF lit kbody sbuf @ 4 lit sget 4 lit = if
 else drop 0 lit 0 lit then ;
 
 : yinit  2000 lit alloc ylv !  20 lit alloc ytmp !  10 lit alloc ykp !  54 lit alloc yterm !  20 lit alloc yhb ! ;
+
+: yent variable ;  : ystx variable ;
+: yentry
+yent @ 0= if 120 lit alloc yent ! then
+stx @ ystx !  stfd @ 0 lit txbegin stx !
+dup khdr yent @ CC lit sget CC lit = if
+	yent @ EC lit + 8 lit wzero  kwork yent @ EC lit + 20 lit sget drop
+	yent @ yent @ CC lit + blockid  yent @ CC lit + dfrom  yent @
+else drop 0 lit then
+stx @ txcommit drop  ystx @ stx ! ;
+
+: yfid variable ;
+: yfind
+dup hfind dup 0< 0= if nip he else drop
+	yfid !
+	stx @ ystx !  stfd @ 0 lit txbegin stx !
+	yfid @ kid sbuf @ 4 lit sget 4 lit = if sbuf @ @ else FFFFFFFF lit then
+	stx @ txcommit drop  ystx @ stx !
+	dup 0< if drop 0 lit else
+		yentry dup if dup CC lit + yfid @ 8 lit wcmp if drop 0 lit then then
+	then
+then ;

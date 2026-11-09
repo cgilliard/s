@@ -9,9 +9,13 @@
 \ first.  A header that breaks a rule is not stored.
 \
 \ Headers are held in memory (an entry each, 288 bytes, found by its id
-\ through a table of at least twice as many slots); the node keeps the
-\ main chain's in its store too, and loads them at a start (main.fam).
-\ Not reentrant.
+\ through a table of at least twice as many slots), a window of them: the
+\ node keeps the main chain's in its store (with their work), and before
+\ the room runs out drops all below a height (hprune: genesis and the
+\ main chain's block 1, ASERT's anchor, kept), the oldest kept becoming
+\ roots (no parent); and at a start loads the last ones from the store,
+\ the first a root (hroot).  hat finds only what is held (hbase the
+\ lowest height held but the two kept).  Not reentrant.
 \
 \ A network is 25 words: the dataset's log2 items, parents and accesses;
 \ the genesis target (8 words); the easiest target (8 words); the drift; the
@@ -29,6 +33,12 @@
 \ -9 its parent set aside (hmark: a block of its branch refused).
 \ hmark ( e -- )  entry e set aside, its block refused, and every entry
 \ above it: none is the best again, nor takes a child.
+\ hprune ( from -- )  every entry below height from dropped but genesis
+\ and the main chain's block 1; those left whose parent went, roots.
+\ hroot ( h work -- )  header h (204 bytes) taken as a root, its
+\ cumulative work given (8 canonical words), unchecked: one the store
+\ kept.  htrust set: hacc checks only how a header joins (its id, parent,
+\ height), as for the store's.
 \ hbest ( -- e ), hid ( e -- id ), hwork ( e -- work ), hhdr ( e -- h )
 \ the best entry; an entry's id and cumulative work (8 canonical words) and
 \ header.
@@ -39,6 +49,7 @@
 : htg variable ;  : hsch variable ;  : hts variable ;  : hidb variable ;  : hwk variable ;
 : hpar variable ;  : hnew variable ;  : hfid variable ;  : hfr variable ;
 : hc variable ;  : hh variable ;  : hnl variable ;  : hnh variable ;
+: htrust variable ;  : hrw variable ;  : hbase variable ;  : hb1 variable ;  : hmap variable ;  : hpf variable ;  : hpn variable ;
 
 :M HENT 120 lit ;                             \ an entry's bytes
 : htn variable ;
@@ -50,7 +61,7 @@
 : hid  CC lit + ;
 : hwork  EC lit + ;
 : hparent  10C lit + ;                        \ ( e -- addr )  the parent's index
-: hfirst  110 lit + ;                         \ ( e -- addr )  block 1 of its branch (-1: none)
+: hfirst  110 lit + ;                         \ ( e -- addr )  block 1 of its branch (-1: none, or dropped: hb1's)
 : hout  114 lit + ;                           \ ( e -- addr )  set aside (hmark): not 0
 : hidx  hent @ - HENT / ;                     \ ( e -- i )
 : hheight  20 lit + @ ;
@@ -76,6 +87,7 @@ begin dup 2 lit lshift htab @ + @ while 1 lit + HTABN 1 lit - and repeat
 dup hcap !  HENT * malloc hent !               \ (malloc's: mapped as needed, not the program's fixed memory)
 1 lit begin dup hcap @ 1 lit lshift u< while 1 lit lshift repeat htn !
 HTABN 2 lit lshift malloc dup htab ! HTABN wzero
+hcap @ 2 lit lshift malloc hmap !  FFFFFFFF lit hb1 !  0 lit hbase !
 swap 64 lit alloc dup hnet ! 19 lit wcopy
 1 lit 0 lit nw lshift pwitems !  1 lit nw pwpar !  2 lit nw pwacc !
 20 lit alloc htg !  54 lit alloc hsch !  14 lit nw 3 lit lshift alloc hts !  20 lit alloc hidb !  20 lit alloc hwk !
@@ -106,7 +118,7 @@ begin
 	dup htslo 2 lit pick 3 lit lshift hts @ + !
 	dup htshi 2 lit pick 3 lit lshift hts @ + 4 lit + !
 	swap 1 lit + swap
-	over 14 lit nw u<  over hheight 0<> and
+	over 14 lit nw u<  over hheight 0<> and  over hparent @ 0< 0= and
 while
 	hparent @ he
 repeat
@@ -123,7 +135,7 @@ then
 \ genesis), else at genesis; the anchor's parent a block time before it.
 : htarget
 dup hheight 0<> 18 lit nw 0<> and if
-	1 lit hsch @ 0 lit w!  dup hfirst @ he
+	1 lit hsch @ 0 lit w!  dup hfirst @ dup 0< if drop hb1 @ then he
 else
 	0 lit hsch @ 0 lit w!  0 lit he
 then
@@ -156,13 +168,18 @@ hc @ 0= if hh @ hfind dup hpar ! 0< if -2 lit hc ! then then
 hc @ 0= if hpar @ he hout @ if -9 lit hc ! then then
 hc @ 0= if hpar @ he hheight 1 lit + dup 0= swap hh @ hheight <> or if -3 lit hc ! then then
 hc @ 0= if hh @ hheight 15 lit nw u> if -4 lit hc ! then then
-hc @ 0= if hh @ htslo hh @ htshi hpar @ he hmedian u64> 0= if -5 lit hc ! then then
-hc @ 0= if
+hc @ 0= htrust @ 0= and if hh @ htslo hh @ htshi hpar @ he hmedian u64> 0= if -5 lit hc ! then then
+hc @ 0= htrust @ 0= and if
 	hnl @ 13 lit nw + dup hnl @ u<
 	hnh @ swap if dup FFFFFFFF lit = if 2drop FFFFFFFF lit FFFFFFFF lit else 1 lit + then then
 	hh @ htslo -rot hh @ htshi -rot u64> if -6 lit hc ! then
 then
-hc @ 0= if hpar @ he htarget  hh @ htg @ hquick @ if quickpow else fullpow then 0= if -7 lit hc ! then then
+\ the target always (the entry's work is counted from it), the work not
+\ if trusted
+hc @ 0= if
+	hpar @ he htarget
+	htrust @ 0= if hh @ htg @ hquick @ if quickpow else fullpow then 0= if -7 lit hc ! then then
+then
 hc @ 0= if hstore then
 hc @ ;
 
@@ -198,8 +215,14 @@ cfr @ cdl @ +  dup 989680 lit u< 0= if 989680 lit - csec @ 1 lit + csec ! then  
 cdate @ csec @ + 15180 lit %  dup E10 lit / n2d 3A lit putc  dup E10 lit % 3C lit / n2d 3A lit putc
 3C lit % n2d 2E lit putc  cfr @ 186A0 lit / n2d 20 lit putc ;
 
-\ hat ( h -- e | 0 )  the best branch's entry at height h.
-: hat  hbest begin dup hheight 2 lit pick u> while hparent @ he repeat  nip ;
+\ hat ( h -- e | 0 )  the best branch's entry at height h, if held
+\ (genesis and block 1 always are).
+: hat
+dup 0= if drop 0 lit he else
+dup 1 lit = hb1 @ 0< 0= and hbase @ 1 lit u> and if drop hb1 @ he else
+	hbest begin dup hheight 2 lit pick u> over hparent @ 0< 0= and while hparent @ he repeat
+	dup hheight rot = 0= if drop 0 lit then
+then then ;
 \ hconf ( from -- flag )  the full proof of work of the best branch's
 \ headers from height `from` up (tabminer's confirm_work).
 : hconf
@@ -213,8 +236,40 @@ repeat 2drop ;
 \ hmark ( e -- )
 : hmark
 hidx  hcnt @ over do
-	i over = if 1 lit i he hout ! else i he hparent @ he hout @ if 1 lit i he hout ! then then
+	i over = if 1 lit i he hout ! else i he hparent @ dup 0< if drop else he hout @ if 1 lit i he hout ! then then then
 loop drop
 0 lit  hcnt @ 1 lit do
 	i he hout @ 0= if i he hwork over he hwork 8 lit wcmp 0 lit > if drop i then then
 loop hbst ! ;
+
+\ hprune ( from -- )
+: hprune
+hpf !  hb1 @ 0< if 1 lit hat ?dup if hidx hb1 ! then then
+0 lit hpn !
+hcnt @ 0 lit do
+	i 0= i hb1 @ = or i he hheight hpf @ u< 0= or if
+		i hpn @ <> if i he hpn @ he 48 lit wcopy then
+		hpn @ hmap @ i w!  hpn @ 1 lit + hpn !
+	else FFFFFFFF lit hmap @ i w! then
+loop
+hpn @ 0 lit do
+	i he hparent @ dup 0< 0= if hmap @ swap w@ then i he hparent !
+	i he hfirst @ dup 0< 0= if hmap @ swap w@ then i he hfirst !
+loop
+hb1 @ 0< 0= if hmap @ hb1 @ w@ hb1 ! then
+hmap @ hbst @ w@ hbst !
+hpn @ hcnt !  hpf @ hbase !
+htab @ HTABN wzero  hcnt @ 0 lit do i hindex loop ;
+
+\ hroot ( h work -- )
+: hroot
+hrw !  hh !  hcnt @ hcap @ u< if
+	hcnt @ he hnew !
+	hh @ hnew @ 33 lit wcopy
+	hh @ hidb @ blockid  hidb @ dfrom  hidb @ hnew @ hid 8 lit wcopy
+	hrw @ hnew @ hwork 8 lit wcopy
+	FFFFFFFF lit hnew @ hparent !  0 lit hnew @ hout !  hb1 @ hnew @ hfirst !
+	hcnt @ hindex
+	hnew @ hwork hbest hwork 8 lit wcmp 0 lit > if hcnt @ hbst ! then
+	hcnt @ 1 lit + hcnt !
+then ;
