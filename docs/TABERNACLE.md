@@ -155,10 +155,23 @@ disk (the same default, created if missing), as the node will once it
 runs, to try the boot from disk: `makenode.sh` then `node.sh` prints
 `tabernacle: from disk`.
 
+## The node serving its image
+
+The fam node serves its image (`docs/NODE.md`, step 9, done
+2026-11-09): `src/user/node/p2p.fam` answers anyone's `Ping` (a `Pong`
+with a token for the asker's address, a keyed hash of it, as tabminer
+gives tokens), and, with that token, `GetPeers` (the peers that answered
+it), `GetImages` (its version and size) and `GetImage` (64 chunks an ask
+at most, as `server.py`). The image is the one the machine booted, read
+from `/dev/image` (`docs/OS.md`), so it is exactly what this tabernacle
+checked; its version is the image's own `/lib/version`, which
+`build.sh` writes from `IMAGE_VERSION`. `scripts/imagetest.sh` boots a
+tabernacle from a node with no `server.py` anywhere.
+
 ## A stand-in node: `tools/server.py`
 
-The fam node will not serve its image for a while. Until it does,
-`server.py` plays one, on the seeds for testing. It is the old one
+Before the fam node served its image, `server.py` played one, on the
+seeds for testing. It is the old one
 (`GET_HOSTS`/`GET_BIN` on its own `TBRN` magic, one image named by its
 hash) brought to this protocol and to versions:
 
@@ -211,3 +224,5 @@ server.py [--peer=IP:PORT ...] PORT [VERSION=FILE ...]
    though a seed had the image too; a 200 KiB image (several batches, a
    short last chunk).
 5. A test in `check.sh` (or beside it) doing the same, for CI.
+   `node/scripts/imagetest.sh` boots a tabernacle from a fam node
+   (2026-11-09); the cases above with a corrupt peer are still by hand.

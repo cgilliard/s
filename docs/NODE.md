@@ -263,8 +263,9 @@ half-applied one.
   `Peers`. Messages 16 to 22, the onion and message layer
   (`docs/ONION.md`), are not in the first node.
 - **Images:** the node serves its own image to tabernacles: GetImages,
-  Images, GetImage and ImageChunk (64 to 67, `docs/TABERNACLE.md`). It
-  takes over from `tools/server.py`, which plays that part today.
+  Images, GetImage and ImageChunk (64 to 67, `docs/TABERNACLE.md`), and
+  answers anyone's Ping and GetPeers, as tabminer does. It takes over
+  from `tools/server.py` (step 9).
 - **The API:** HTTP on its own TCP port (3738 unless configured), in
   its own process. By default it listens for the machine only: wm's
   terminals, programs in the OS, and the host through a forwarded port
@@ -999,7 +1000,45 @@ Each step done when its test passes.
      configured (the daemon's, step 10), fee estimates, verification on
      a thread of its own (a proof's second or so stalls the API).
 9. **Images**: serving tabernacles. Done when a tabernacle boots from
-   a fam node with `tools/server.py` gone.
+   a fam node with `tools/server.py` gone. Done (2026-11-09):
+   - The kernel gained `/dev/image` (`docs/OS.md`): the image the
+     machine booted, read only, from `0x80000000` to its end, so exactly
+     what tabernacle checked against its hash; `seek` works on it.
+     oscheck's `image`.
+   - The image carries its version as `/lib/version` (decimal), which
+     `build.sh` writes from `IMAGE_VERSION`; its helpers (`serial_qemu`,
+     `pack`, `patch_config`) moved to `scripts/buildlib.sh`, so a test
+     can patch a tabernacle for an image of its own.
+   - `p2p.fam`: anyone's Ping answered with a Pong; our token for an
+     address is now a keyed hash of it (the first 8 bytes of Poseidon2's
+     compress of a random key and the address), as tabminer's
+     `token_for`, rather than one token for everyone. With that token:
+     GetPeers (the peers that answered us), GetImages (our version and
+     size, or none) and GetImage (chunks of `/dev/image`, 64 an ask at
+     most, nothing for another version). Served wherever the node waits
+     on the network: syncing, catching up and serving alike.
+   - A bug from step 6 found on the way: `pinit` never bound the node's
+     UDP port (its `net` arguments were out of order), so it sent from
+     an ephemeral port. Peers answered there, so syncing and relay
+     worked, but nothing could reach the node unasked. Fixed: it listens
+     on 3737.
+   - `scripts/imagetest.sh`: a tabminer mines the recursive dev network;
+     the node, in an image of its own, syncs from it; the miner is
+     stopped (so the node verifies nothing while it serves). A client
+     on the host pings the node, asks GetImages and GetPeers, and
+     GetImage: chunks byte for byte the image's, 64 of 100 asked,
+     nothing past the end, for another version or another token. Then a
+     second machine runs a tabernacle patched for that image, with an
+     empty disk and the node as its only seed: it fetches the image
+     (2.8 MB) from the node, checks it and runs it; the miner is
+     started again and the node it booted syncs. No `server.py`.
+   - Not yet: the node writing its image to the disk, so the next boot
+     is from disk (`docs/TABERNACLE.md`, Booting); serving older
+     versions; image requests are answered only between blocks, since a
+     block's verification holds the loop a few seconds and tabernacle
+     drops a peer after 4 s with no chunks (verification on its own
+     thread, step 8's not yet). `tools/server.py` remains for the
+     seeds until the node runs on them as a daemon (step 10).
 10. **The daemon**: in the image, started by init, its `/proc` keys,
     restart after a kill. Done when a booted OS runs the node on its
     own, synced, and answers the API.

@@ -3,7 +3,13 @@
 \ is "TAB1", a type byte and a little-endian payload, at most 1,232 bytes.
 \ A request carries the token the peer gave us in its last Ping or Pong; a
 \ peer serves requests only from an address that answered its Ping with
-\ the nonce echoed, so every Ping is answered.  Up to PPEERS peers, one
+\ the nonce echoed, so every Ping is answered, whoever sends it.  Our
+\ token for an address is a keyed hash of it (ptokn), as tabminer's
+\ token_for, so a request with it shows it came from there.  Anyone with
+\ their token is answered GetPeers (the peers that answered us) and, as
+\ docs/TABERNACLE.md has it, GetImages and GetImage: the image this
+\ machine booted (/dev/image), as the version in its /lib/version, in
+\ 1,024-byte chunks, 64 an ask at most.  Up to PPEERS peers, one
 \ the current (puse): requests go to it and only its replies are taken;
 \ meanwhile any peer's Pings are answered, its requests for pooled
 \ transactions served (GetChunks, kind 1, with our token), and its
@@ -15,7 +21,7 @@
 \ from a height; those lost are asked for again from the first gap.
 \
 \ pinit ( ip port lport -- )  the socket (bound to lport) and peer 0,
-\ the current; padd ( ip port -- k ) another; puse ( k -- ) the current.
+\ the current; the image to serve, if any; padd ( ip port -- k ) another; puse ( k -- ) the current.
 \ pping ( -- flag )  a Ping to the current peer until its Pong (a few
 \ seconds): its status in pst.
 \ pann ( id k -- )  TxInv (id: 32 canonical bytes) to every peer that
@@ -40,6 +46,7 @@
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
+: pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
 
 :M PWIN 4 lit ;                               \ chunks in flight
 :M PMAX 400000 lit ;                          \ the largest object taken: 4 MiB
@@ -56,7 +63,14 @@
 : wsend  pip @ ppt @ wsendto ;
 : wtok  ptok @ 8 lit wbs ;                     \ the peer's token for us
 
-\ wstatus ( nonce -- )  our status, with the nonce at its address.
+\ ptokn ( ip port -- )  mtok = our token for that address: the first 8
+\ bytes of compress(key, address), the key random at start.
+: ptokn
+pkd @ 8 lit wzero  pkd @ 2 lit w!  dup FFFF lit and pkd @ 0 lit w!  10 lit rshift pkd @ 1 lit w!
+pkey @ pkd @ pko @ compress  pko @ mtok @ 8 lit bcopy ;
+
+\ wstatus ( nonce -- )  our status, with the nonce at its address and
+\ mtok's token (ptokn for whom it goes to).
 : wstatus
 8 lit wbs  A lit w32  mtok @ 8 lit wbs  mygen @ 20 lit wbs
 myh @ w32  myh @ 1 lit + w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
@@ -73,14 +87,25 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 2drop pfk @ ;
 
 : pinit  ( ip port lport -- )
-1 lit socket pfd !  pfd @ 1 lit 0 lit rot net drop
+1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
 600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
 padd puse
-\ our token and nonce: random
-"/dev/random" 0 lit open dup mtok @ 8 lit read drop dup mnon @ 8 lit read drop close drop ;
+\ our tokens' key and our nonce: random
+p2init  20 lit alloc pkey !  20 lit alloc pkd !  20 lit alloc pko !
+"/dev/random" 0 lit open dup pkey @ 20 lit read drop dup mnon @ 8 lit read drop close drop
+8 lit 0 lit do pkey @ i 2 lit lshift + dup @ 7FFFFFF lit and swap ! loop
+\ the image: its size, and the version it says it is
+0 lit pisz !
+"/dev/image" 0 lit open dup 0< if drop else
+	dup pifd !
+	"/lib/version" 0 lit open dup 0< if drop else
+		dup pko @ 1F lit read dup 0< if drop 0 lit then pko @ + 0 lit swap c!  close drop
+		pko @ c@ 30 lit - A lit u< if pko @ atoi pver !  pifd @ 0 lit 2 lit seek pisz ! then
+	then
+then ;
 
 \ d8= ( a b n -- flag )  n bytes equal.
 : d8=  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
@@ -125,14 +150,55 @@ pint @ 10 lit u< prn @ 25 lit u< 0= and if
 then ;
 : pdeq  pint @ if pinh @ 24 lit * pinq @ +  pinh @ 1 lit + F lit and pinh !  pint @ 1 lit - pint ! else 0 lit then ;
 
+\ prply  the datagram at ptx to whoever sent the one in prx.
+: prply  pfrom @ @ pfrom @ 4 lit + @ wsendto ;
+\ ppeers  Peers: those that answered us, as they are reached from here.
+: ppeers
+4 lit wbeg  ptp @ 0 lit w8  0 lit
+pnp @ ?dup if 0 lit do
+	i prec 8 lit + @ if
+		i prec @  dup 18 lit rshift w8  dup 10 lit rshift w8  dup 8 lit rshift w8  w8  i prec 4 lit + @ w16  1 lit +
+	then
+loop then
+swap c!  prply ;
+\ pimgs  Images: our version and its size, or none.
+: pimgs  41 lit wbeg  pisz @ if 1 lit w8 pver @ w32 pisz @ w32 else 0 lit w8 then prply ;
+\ pichunk ( index -- )  ImageChunk index, if the image has it and fewer
+\ than 64 went for this ask.
+: pichunk
+dup A lit lshift dup pisz @ u<  pisent @ 40 lit u< and if
+	43 lit wbeg  pver @ w32  pisz @ w32  over w16
+	pisz @ over - dup 400 lit u> if drop 400 lit then  dup w16
+	swap pifd @ swap 0 lit seek drop
+	pifd @ ptp @ rot read  dup 0< if drop 0 lit then  ptp @ + ptp !
+	drop prply  pisent @ 1 lit + pisent !
+else 2drop then ;
+\ pimage  the GetImage in prx: token, version, count, then start and
+\ length (u16 each) for each range.
+: pimage
+prx @ D lit + le@ pver @ =  pisz @ 0= 0= and
+prx @ 11 lit + c@  dup 2 lit lshift 12 lit + prn @ =  rot and if
+	0 lit pisent !
+	?dup if 0 lit do
+		prx @ 12 lit + i 2 lit lshift +  dup u16@ swap 2 lit + u16@
+		dup if over + swap do i pichunk loop else 2drop then
+	loop then
+else drop then ;
+
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
 	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
-	pfrom @ @ pfrom @ 4 lit + @ pwho drop
-	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfk @ 0< or if 0 lit else
+	pfrom @ @ pfrom @ 4 lit + @ 2dup pwho drop ptokn
+	prn @ 5 lit u< prx @ @ 31424154 lit <> or if 0 lit else
 		prx @ 4 lit + c@
-		dup 1 lit = if  2 lit wbeg  prx @ 5 lit + wstatus  pfk @ psend  then
+		dup 1 lit =  prn @ 91 lit u< 0= and if  2 lit wbeg  prx @ 5 lit + wstatus  prply  then
+		prn @ D lit u< 0=  prx @ 5 lit + mtok @ 8 lit d8= and if
+			dup 3 lit = prn @ D lit = and if ppeers then
+			dup 40 lit = prn @ D lit = and if pimgs then
+			dup 42 lit = if pimage then
+		then
+		pfk @ 0< if drop 0 lit else
 		dup 2 lit = if
 			prx @ 5 lit + mnon @ 8 lit d8= if
 				prx @ 5 lit + pfk @ prec 18 lit + 8C lit bcopy  prx @ 11 lit + pfk @ prec 10 lit + 8 lit bcopy
@@ -142,6 +208,7 @@ prdy if
 		dup 8 lit = if pgive then
 		dup A lit = if pqinv then
 		pfk @ pcur @ = 0= if drop 0 lit then
+		then
 	then
 else 0 lit then ;
 
@@ -155,7 +222,7 @@ loop then 2drop ;
 0 lit pok !
 8 lit 0 lit do
 	pok @ 0= if
-		1 lit wbeg  mnon @ wstatus  wsend
+		pip @ ppt @ ptokn  1 lit wbeg  mnon @ wstatus  wsend
 		A lit 0 lit do pok @ 0= if 5F5E100 lit pwait drop then loop
 	then
 loop pok @ ;
