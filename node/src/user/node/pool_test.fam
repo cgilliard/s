@@ -1,0 +1,71 @@
+\ pool_test.fam — the pool (docs/NODE.md, step 7), a program for the OS
+\ after arith, poseidon2, difficulty, pow, chainver, state, proofs,
+\ connect, xmss, tx and pool, with a disk.  /lib/pool is
+\ miner/src/fam_vectors.rs's pool.bin: a dev chain whose outputs pay known
+\ keys, transactions offered to tabminer's pool with its verdicts, blocks
+\ mining some and the pool after each, and XMSS signatures of other
+\ heights.  Each is given tabminer's answer.
+
+: tpas variable ;  : tfai variable ;  : ep variable ;  : ctn variable ;  : tbuf variable ;  : tk variable ;
+
+\ rdfile ( path -- addr n )  a whole file of at most 1 MiB, in memory.
+: rdfile
+0 lit open  dup 0< if "pool_test: no file" puts 0A lit putc then
+100000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  100000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: vok  if tpas @ 1 lit + tpas ! else tfai @ 1 lit + tfai ! then ;
+: epad  3 lit + FFFFFFFC lit and ep ! ;       \ ( end -- )  the next entry, word aligned
+: tsay  "entry " puts tk @ u. ;
+
+\ A block: connected, then the pool checked against it.
+: tblock
+ep @ 4 lit + ep @ D4 lit + ep @ D0 lit + @ sconnect
+dup 0= dup vok 0= if tsay "block refused: " puts dup . 0A lit putc then drop
+qcheck
+ep @ D4 lit + ep @ D0 lit + @ + epad ;
+
+\ A transaction: tabminer's verdict, and its id when pooled.
+: ttx
+ep @ 2C lit + ep @ 28 lit + @ qadmit
+dup ep @ 4 lit + @ = if
+	ep @ 4 lit + @ 0= if ep @ 8 lit + tbuf @ dle  qid @ tbuf @ 8 lit wcmp 0= else -1 lit then
+	dup 0= if tsay "the id differs" puts 0A lit putc then
+else tsay "got " puts dup . " not " puts ep @ 4 lit + @ . 0A lit putc 0 lit then
+vok drop
+ep @ 2C lit + ep @ 28 lit + @ + epad ;
+
+\ The pool: as many, and each id in it.
+: tids
+ep @ 4 lit + @  dup qnum @ =
+over ?dup if 0 lit do ep @ 8 lit + i 5 lit lshift + tbuf @ dle  tbuf @ qfind 0< 0= and loop then
+dup 0= if tsay "the pool differs: " puts qnum @ u. " held, " puts over u. " in tabminer's" puts 0A lit putc then
+vok
+5 lit lshift ep @ + 8 lit + ep ! ;
+
+\ An XMSS signature.
+: txmss
+ep @ 8 lit + tbuf @ dle
+ep @ 28 lit + ep @ 5D lit + tbuf @ xverify 0= 0=  ep @ 4 lit + @ 0= 0= =
+dup 0= if tsay "signature verdict differs" puts 0A lit putc then
+vok
+ep @ 5D lit + ep @ 59 lit + le@ + epad ;
+
+"/t-pool" TREE CREATE or 2 lit or open stinit
+xinit tinit qinit  20 lit alloc tbuf !
+"/lib/pool" rdfile drop dup @ ctn ! 4 lit + ep !
+0 lit tpas !  0 lit tfai !
+ctn @ 0 lit do
+	i tk !
+	ep @ @
+	dup 0= if drop tblock else
+	dup 1 lit = if drop ttx else
+	dup 2 lit = if drop tids else
+	3 lit = if txmss else tsay "unknown entry" puts 0A lit putc then then then then
+loop
+"pool: " puts tpas @ u. " as tabminer, " puts tfai @ u. " not" puts 0A lit putc
+bye

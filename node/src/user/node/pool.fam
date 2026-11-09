@@ -1,0 +1,263 @@
+\ pool.fam — the transaction pool (docs/NODE.md, step 7), after tx.fam.
+\ As tabminer's Mempool::insert (miner/src/mempool.rs), checked against the
+\ state in the store for the block after the tip: the id not pooled; the
+\ static checks; each input's output unspent (its commitment the one at
+\ its position) and the pooled transactions spending the same positions
+\ noted; the name operations against the registry (a reveal's commit
+\ there, its, not past its window, the name free; an update's name
+\ registered, signed by its owner's key, for another owner); what they
+\ claim (names, commits) distinct and not held by a pooled transaction
+\ but those replaced; the signatures; a replacement paying what it
+\ replaces and 10 a byte more; room, the lowest-paying evicted for it.
+\
+\ The pool's policy is the node's own (docs/FEES.md): tabminer's floor,
+\ dust and replacement rules; not yet its rolling minimum, aged reserve,
+\ expiry or shelf.  Up to QSLOTS transactions, QBYTES bytes.
+\
+\ qadmit ( a n -- code )  the transaction offered: 0, or why not: -1 it
+\ does not decode, tstatic's codes, -8 a signature, -9 an input not
+\ unspent, -10 pooled already, -11 a name or commit claimed, -12 a
+\ replacement short of its fee, -13 no room, -14 no commit (or not the
+\ reveal's), -15 the commit expired, -16 the name registered, -17 the name
+\ not registered, -18 not the owner's update.  Its id in qid.
+\ qcheck  after the tip moved: the transactions whose inputs are spent or
+\ whose operations fail now dropped.
+\ qfind ( id -- k | -1 )  the slot holding a pooled id.
+\ A slot (64 bytes): the bytes (0 if free), their length, the fee (2
+\ words), the id (8 Montgomery words), the positions spent (a count, then
+\ lo and hi), the claims (a count, then 5 words each: the kind, 4 words),
+\ the order it came in, and a word for the relay.
+
+:M QSLOTS 200 lit ;
+:M QBYTES 400000 lit ;
+
+: qbase variable ;  : qbytes variable ;  : qnum variable ;  : qord variable ;  : qcode variable ;  : qht variable ;
+: qid variable ;  : qtmp variable ;  : qkc variable ;  : qlv variable ;  : qcb variable ;  : qch variable ;  : qown variable ;
+: qum variable ;  : qcf variable ;  : qncf variable ;  : qcl variable ;  : qncl variable ;  : qvic variable ;  : qnvic variable ;
+: qlo variable ;  : qhi variable ;  : qplo variable ;  : qphi variable ;  : qsk variable ;  : qhc variable ;  : qhf variable ;
+: qm1 variable ;  : qm2 variable ;  : qw1 variable ;  : qw2 variable ;  : qfa variable ;  : qfb variable ;  : qbad variable ;
+: qka variable ;  : qkb variable ;  : qbest variable ;  : qgo variable ;  : qsav variable ;
+
+: qfl  qcode @ 0= if qcode ! else drop then ;   \ ( code -- )  the first refusal stands
+: qok  qcode @ 0= ;
+: qslot  6 lit lshift qbase @ + ;               \ ( k -- a )
+: qused  qslot @ 0= 0= ;                        \ ( k -- flag )
+
+: qfind  ( id -- k | -1 )
+qhc !  FFFFFFFF lit qsk !
+QSLOTS 0 lit do
+	i qused if qhc @ i qslot 10 lit + 8 lit wcmp 0= if i qsk ! then then
+loop qsk @ ;
+
+\ qspender ( lo hi -- k | -1 )  the pooled transaction spending a position.
+: qspender
+qphi ! qplo !  FFFFFFFF lit qsk !
+QSLOTS 0 lit do
+	i qused if
+		i qslot 30 lit + @  dup @ ?dup if 0 lit do
+			dup i 3 lit lshift + 4 lit +  dup @ qplo @ =  swap 4 lit + @ qphi @ = and if j qsk ! then
+		loop then drop
+	then
+loop qsk @ ;
+
+\ qincf ( k -- flag )  slot k among the conflicts; qaddcf ( k -- ).
+: qincf  0 lit qncf @ ?dup if 0 lit do over qcf @ i w@ = or loop then nip ;
+: qaddcf  dup qincf if drop else qcf @ qncf @ w!  qncf @ 1 lit + qncf ! then ;
+
+\ qholds ( i -- flag )  input i's output unspent: at its position, below
+\ 2^40, the commitment it spends.
+: qholds
+dup tpos dup 100 lit u< if
+	oget if sbuf @ qtmp @ dle  qkc @ tikh  qkc @ qtmp @ 8 lit wcmp 0= else drop 0 lit then
+else 2drop drop 0 lit then ;
+
+: qinputs
+0 lit qncf !
+tnin @ ?dup if 0 lit do
+	qok if
+		i tpos qspender dup 0< if drop else qaddcf then
+		i qholds 0= if FFFFFFF7 lit qfl then
+	then
+loop then ;
+
+\ Claims, 5 words: 1 and a name's key, or 2 and a commit's position (lo,
+\ hi, 0, 0).  qclaim ( kind a -- ) appends one; qcleq ( a b -- flag ).
+: qclaim  qcl @ qncl @ 14 lit * + tuck 4 lit + 4 lit wcopy !  qncl @ 1 lit + qncl ! ;
+: qcleq  5 lit wcmp 0= ;
+
+\ qreveal ( op -- )
+: qreveal
+dup 4 lit + @ qlv @ rvalue
+dup rpos pos@ qhi ! qlo !
+qlo @ qhi @ cget 0= if drop FFFFFFF2 lit qfl else
+	nin @ qcb @ 8 lit wcopy  8 lit + @ qcb @ 20 lit + dle  nin @ 20 lit + qcb @ 40 lit + 8 lit wcopy
+	qcb @ 18 lit 7 lit qch @ hdom
+	sbuf @ qtmp @ dle
+	qch @ qtmp @ 8 lit wcmp if FFFFFFF2 lit qfl else
+		sbuf @ 20 lit + @ 120 lit + qht @ u< if FFFFFFF1 lit qfl else
+			nkey @ krec sbuf @ 100 lit sget 0< 0= if FFFFFFF0 lit qfl else
+				1 lit nkey @ qclaim
+				qtmp @ 4 lit wzero  qlo @ qtmp @ !  qhi @ qtmp @ 1 lit w!  2 lit qtmp @ qclaim
+			then
+		then
+	then
+then ;
+
+\ qupdate ( op -- )
+: qupdate
+dup 4 lit + @ qlv @ rvalue
+nkey @ krec sbuf @ 100 lit sget 0< if drop FFFFFFEF lit qfl else
+	sbuf @ dup c@ 1 lit + + qown @ dle
+	nin @ 20 lit + qown @ 8 lit wcmp 0=  qbad !
+	8 lit + @  dup qtmp @ tpkh  qtmp @ qown @ 8 lit wcmp 0= 0= qbad @ or qbad !
+	qlv @ 8 lit A lit qum @ hdom
+	qbad @ if drop else dup 31 lit + qum @ xverify 0= qbad ! then
+	qbad @ if FFFFFFEE lit qfl else 1 lit nkey @ qclaim then
+then ;
+
+\ qops  the name operations against the registry; their claims in qcl,
+\ distinct.
+: qops
+0 lit qncl !
+tnops @ ?dup if 0 lit do
+	qok if
+		tops @ i C lit * +  dup @
+		dup 2 lit = if drop qreveal else 3 lit = if qupdate else drop then then
+	then
+loop then
+qok qncl @ 1 lit u> and if
+	0 lit
+	qncl @ 1 lit do i 0 lit do
+		qcl @ j 14 lit * +  qcl @ i 14 lit * +  qcleq or
+	loop loop
+	if FFFFFFFD lit qfl then
+then ;
+
+\ qheld ( c -- flag )  claim c held by a pooled transaction not replaced.
+: qheld
+qhc !  0 lit qhf !
+QSLOTS 0 lit do
+	i qused i qincf 0= and if
+		i qslot 34 lit + @  dup @ ?dup if 0 lit do
+			dup 4 lit + i 14 lit * +  qhc @ qcleq if -1 lit qhf ! then
+		loop then drop
+	then
+loop qhf @ ;
+
+\ qrlt ( fa sa fb sb -- flag )  the rate fa/sa below fb/sb: fa sb < fb sa
+\ (fees 2 words at fa and fb, sizes on the stack).
+: qrlt
+qw2 @ !  qfb !  qw1 @ !  qfa !
+qfa @ 2 lit qw2 @ 1 lit qm1 @ wmul
+qfb @ 2 lit qw1 @ 1 lit qm2 @ wmul
+qm1 @ qm2 @ 3 lit wcmp 0< ;
+: qrk  qslot dup 8 lit + swap 4 lit + @ ;      \ ( k -- fa sa )  slot k's fee and size
+\ qnewlt ( k -- flag )  slot k's rate below the new transaction's.
+: qnewlt  qrk tfee @ tsz @ qrlt ;
+\ qlower ( k b -- flag )  slot k the better victim: a lower rate, or the
+\ same and younger.
+: qlower
+qkb ! qka !
+qka @ qrk qkb @ qrk qrlt if -1 lit else
+	qkb @ qrk qka @ qrk qrlt if 0 lit else
+		qka @ qslot 38 lit + @  qkb @ qslot 38 lit + @ u>
+	then
+then ;
+
+\ qroom ( -- flag )  room for the new transaction once the conflicts and
+\ the victims are gone.
+: qroom
+qbytes @ tsz @ +  qnum @ 1 lit +
+qncf @ ?dup if 0 lit do qcf @ i w@ qslot 4 lit + @ rot swap - swap 1 lit - loop then
+qnvic @ ?dup if 0 lit do qvic @ i w@ qslot 4 lit + @ rot swap - swap 1 lit - loop then
+QSLOTS u> 0=  swap QBYTES u> 0= and ;
+
+: qinvic  0 lit qnvic @ ?dup if 0 lit do over qvic @ i w@ = or loop then nip ;   \ ( k -- flag )
+
+\ qevict ( -- flag )  victims chosen until there is room, each the best
+\ (qlower) not replaced, if below the new one's rate.
+: qevict
+0 lit qnvic !  -1 lit qgo !
+begin qroom 0= qgo @ and while
+	FFFFFFFF lit qbest !
+	QSLOTS 0 lit do
+		i qused i qincf 0= and i qinvic 0= and if
+			qbest @ 0< if i qbest ! else i qbest @ qlower if i qbest ! then then
+		then
+	loop
+	qbest @ 0< if 0 lit qgo ! else
+		qbest @ qnewlt if qbest @ qvic @ qnvic @ w!  qnvic @ 1 lit + qnvic ! else 0 lit qgo ! then
+	then
+repeat
+qroom ;
+
+\ qdrop ( k -- )  slot k emptied.
+: qdrop
+qslot dup @ ?dup if
+	free  dup 30 lit + @ free  dup 34 lit + @ free
+	qbytes @ over 4 lit + @ - qbytes !  qnum @ 1 lit - qnum !
+	0 lit swap !
+else drop then ;
+
+\ qadd ( a n -- )  the transaction parsed (its id in qid, fee in tfee,
+\ claims in qcl) pooled in a free slot.
+: qadd
+0 lit begin dup qused while 1 lit + repeat qslot qsav !
+dup malloc  dup qsav @ !  swap  dup qsav @ 4 lit + !  bcopy
+tfee @ qsav @ 8 lit + 2 lit wcopy  qid @ qsav @ 10 lit + 8 lit wcopy
+tnin @ 3 lit lshift 4 lit + malloc  dup qsav @ 30 lit + !  tnin @ over !
+tnin @ ?dup if 0 lit do i tpos 2 lit pick i 3 lit lshift + 8 lit + !  over i 3 lit lshift + 4 lit + ! loop then drop
+qncl @ 14 lit * 4 lit + malloc  dup qsav @ 34 lit + !  qncl @ over !  qcl @ swap 4 lit + qncl @ 5 lit * wcopy
+qord @ qsav @ 38 lit + !  qord @ 1 lit + qord !  0 lit qsav @ 3C lit + !
+qbytes @ qsav @ 4 lit + @ + qbytes !  qnum @ 1 lit + qnum ! ;
+
+: qadmit  ( a n -- code )
+0 lit qcode !  2dup tparse 0= if FFFFFFFF lit qfl then
+qok if qid @ tbody  qid @ qfind 0< 0= if FFFFFFF6 lit qfl then then
+qok if tstatic ?dup if qfl then then
+qok if
+	stfd @ 0 lit txbegin stx !
+	68 lit mget 1 lit + qht !
+	qinputs
+	qok if qops then
+	qok if qncl @ ?dup if 0 lit do qcl @ i 14 lit * + qheld if FFFFFFF5 lit qfl then loop then then
+	qok if tnin @ ?dup if 0 lit do qok if tin @ i w@ dup 41 lit + qid @ xverify 0= if FFFFFFF8 lit qfl then then loop then then
+	stx @ txcommit drop
+then
+\ a replacement pays what it replaces and 10 a byte more
+qok qncf @ and if
+	tacc @ 4 lit wzero
+	qncf @ 0 lit do qcf @ i w@ qslot 8 lit + dup @ swap 4 lit + @ tacc @ amount+ loop
+	tsz @ A lit um* tacc @ amount+
+	tacc @ 2 lit w@ tacc @ 3 lit w@ or if FFFFFFFF lit tacc @ ! FFFFFFFF lit tacc @ 1 lit w! then
+	tfee @ tacc @ 2 lit wcmp 0< if FFFFFFF4 lit qfl then
+then
+qok if qevict 0= if FFFFFFF3 lit qfl then then
+qok if
+	qncf @ ?dup if 0 lit do qcf @ i w@ qdrop loop then
+	qnvic @ ?dup if 0 lit do qvic @ i w@ qdrop loop then
+	2dup qadd
+then
+2drop qcode @ ;
+
+\ qcheck  after the tip moved (Mempool::revalidate, without its shelf).
+: qcheck
+stfd @ 0 lit txbegin stx !  68 lit mget 1 lit + qht !
+QSLOTS 0 lit do
+	i qused if
+		i qka !
+		i qslot dup @ swap 4 lit + @ tparse drop
+		0 lit qcode !  0 lit qncf !
+		tnin @ ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
+		qok tnops @ 0= 0= and if qops then
+		qok 0= if qka @ qdrop then
+	then
+loop
+stx @ txcommit drop ;
+
+: qinit
+QSLOTS 6 lit lshift alloc dup qbase !  QSLOTS 4 lit lshift wzero
+0 lit qbytes !  0 lit qnum !  0 lit qord !
+20 lit alloc qid !  40 lit alloc qtmp !  20 lit alloc qkc !  20 lit alloc qlv !  60 lit alloc qcb !
+20 lit alloc qch !  20 lit alloc qown !  20 lit alloc qum !  400 lit alloc qcf !  200 lit alloc qcl !
+QSLOTS 2 lit lshift alloc qvic !  10 lit alloc qm1 !  10 lit alloc qm2 !  4 lit alloc qw1 !  4 lit alloc qw2 ! ;

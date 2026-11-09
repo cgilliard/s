@@ -899,7 +899,30 @@ Each step done when its test passes.
      in memory, 4,096 here).
 7. **The pool**: XMSS verification, admission, replacement, relay.
    Done when transactions from tabminer's wallet are accepted, relayed
-   and mined by a tabminer peer.
+   and mined by a tabminer peer. In parts:
+   - (a) Done (2026-11-08): XMSS (`xmss.fam`: the tweakable sponge,
+     WOTS+'s 67 chains, the path), transactions (`tx.fam`: decoding as
+     `Transaction::from_bytes`, the id, `check_static`), and the pool
+     (`pool.fam`), as `Mempool::insert` against the state in the store:
+     inputs unspent, name operations against the registry, claims,
+     signatures, replacement (what it replaces and 10 a byte more), room
+     (the lowest rate evicted, if below the new one's). After a block,
+     those whose inputs are spent or whose operations fail are dropped
+     (`Mempool::revalidate`). oscheck's `pool`: a dev chain whose outputs
+     pay known keys (`pool.bin`, from `fam_vectors.rs`), 30 transactions
+     offered with tabminer's verdict on each, one for each rule, and the
+     ids of those pooled; two blocks mining some and the pool after each;
+     18 XMSS signatures of heights 1, 3 and 6, verified and refused. All
+     as tabminer, about 2.5 s with the boot (a signature about 25 ms).
+     The pool's policy is the node's own (`docs/FEES.md`): tabminer's
+     floor, dust and replacement rules; not yet its rolling minimum, aged
+     reserve, expiry or shelf. Not yet: policy inputs (channels,
+     `policy.rs`), refused as not decoding.
+   - (b) Relay: several peers, `TxInv` taken and the transaction fetched
+     (`GetChunks`, kind 1), pooled transactions served and announced.
+   - (c) The test: a tabminer wallet whose only peer is the fam node
+     sends a transaction; the node pools it and relays it to a mining
+     tabminer, which mines it.
 8. **The API**: the HTTP server, the token, and the endpoints above.
    Done when a program in the OS and a client on the host read the
    chain and send a transaction through it with the token, and are

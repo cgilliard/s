@@ -1,0 +1,150 @@
+\ tx.fam — transactions (docs/NODE.md, step 7), after xmss.fam.  As
+\ tabminer's miner/src/transaction.rs and names.rs's NameOp, and
+\ mempool.rs's check_static:
+\
+\   transaction := u32 n_in, n_in * input, u32 n_policy, n_policy * policy
+\                  input, u32 n_out, n_out * output, u32 n_ops, n_ops * op
+\   input       := pubkey (49) | amount u64 | position u64 | signature
+\   output      := key hash (32) | amount u64 | memo (20)
+\   op          := commit: 1 | commit (32) | memo (20)
+\                | reveal: 2 | record | position (5) | salt (32)
+\                | update: 3 | record | pubkey (49) | signature
+\
+\ Parsed with state.fam's cursor (bp, bq, bcode): tnin inputs at the
+\ addresses in tin, tnout outputs from tout (their commitments in tcom),
+\ tnops operations in tops (tag, its public part as a block lists it, the
+\ salt or the key), tnpol policy inputs (none yet).
+\
+\ tparse ( a n -- flag )  the bytes decode (Transaction::from_bytes).
+\ tbody ( c -- )  c (8 Montgomery words) = the id: the body's hash.
+\ tstatic ( -- code )  check_static: 0, or -2 no inputs, -3 malformed,
+\ -4 too large, -5 dust, -6 a negative fee, -7 a fee below the floor
+\ (10 a byte); the fee in tfee (2 words), the size in tsz.
+\ tikh ( i c -- )  c = the commitment input i spends; tpkh ( pk c -- )
+\ c = a key's hash.
+
+: tin variable ;  : tnin variable ;  : tout variable ;  : tnout variable ;  : tops variable ;  : tnops variable ;
+: tnpol variable ;  : tcom variable ;  : tfee variable ;  : tsz variable ;  : tkb variable ;
+: tacc variable ;  : tacc2 variable ;  : tcap variable ;
+
+\ tkey ( -- a )  a key (49 bytes): its root and seed canonical, its height
+\ 1 to 20; then tsig its signature, of that height.
+: tkey  bp @  31 lit btake drop  bcode @ 0= if dup C lit bcanon  dup 30 lit + c@ 1 lit - 14 lit u< 0= if bbad then then ;
+: tsig  ( key -- )
+bcode @ if drop else
+	30 lit + c@ 44 lit + dup 5 lit lshift 8 lit + btake  bcode @ if 2drop else 8 lit + swap 3 lit lshift bcanon then
+then ;
+\ tcnt ( size -- n )  a count, at most what the bytes left could hold.
+: tcnt  bu32 swap bleft swap / over u< if drop 0 lit bbad then ;
+
+: tparse  ( a n -- flag )
+dup tsz !  over + bq ! bp !  0 lit bcode !
+tin @ ?dup if free then  tops @ ?dup if free then  tcom @ ?dup if free then
+8E9 lit tcnt tnin !  tnin @ 2 lit lshift 4 lit + malloc tin !
+tnin @ ?dup if 0 lit do bcode @ 0= if
+	tkey  dup tin @ i w!  10 lit btake drop  tsig
+then loop then
+bu32 tnpol !  tnpol @ if bbad then
+3C lit tcnt tnout !  bp @ tout !  tnout @ 3C lit * btake drop
+bcode @ 0= if tnout @ ?dup if 0 lit do tout @ i 3C lit * + dup 8 lit bcanon 28 lit + 5 lit bcanon loop then then
+35 lit tcnt tnops !  tnops @ C lit * 4 lit + malloc tops !
+tnops @ ?dup if 0 lit do bcode @ 0= if
+	bp @ c@  1 lit btake drop
+	tops @ i C lit * +  2dup !  bp @ over 4 lit + !  swap
+	dup 1 lit = if 2drop 34 lit btake D lit bcanon else
+	dup 2 lit = if drop brec drop 5 lit btake drop  bp @ swap 8 lit + !  20 lit btake 8 lit bcanon else
+	3 lit = if brec drop  tkey dup rot 8 lit + !  tsig else drop bbad then then then
+then loop then
+bcode @ 0= bp @ bq @ <> and if bbad then
+\ the outputs' commitments: hash_domain 2 of the key hash and the amount
+tnout @ 5 lit lshift 4 lit + malloc tcom !
+bcode @ 0= if tnout @ ?dup if 0 lit do
+	tkb @ vp !  tout @ i 3C lit * +  dup vd,  20 lit + vamount
+	tkb @ B lit 2 lit tcom @ i 5 lit lshift + hdom
+loop then then
+bcode @ 0= ;
+
+\ tpkh ( pk c -- )  c = H(pubkey): hash_domain 1 of the root, the seed
+\ and the height.
+: tpkh
+tkb @ vp !  swap dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  30 lit + c@ v,
+tkb @ D lit 1 lit 3 lit pick hdom drop ;
+
+\ tikh ( i c -- )  c = H(H(pubkey) || amount) of input i.
+: tikh
+swap tin @ swap w@  2dup swap tpkh
+tkb @ vp !  over vp @ 8 lit wcopy  vp @ 20 lit + vp !  31 lit + vamount
+tkb @ B lit 2 lit 3 lit pick hdom drop ;
+
+: tbody  ( c -- )
+tnin @ 4 lit lshift tnout @ 18 lit * + tnops @ 3 lit lshift + 8 lit + 2 lit lshift malloc dup vb ! vp !
+tnin @ v, tnout @ v, tnops @ v, tnpol @ v,  4 lit 0 lit do 0 lit v, loop
+tnin @ ?dup if 0 lit do
+	tin @ i w@  dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  31 lit + vamount  0 lit v,
+loop then
+tnout @ ?dup if 0 lit do
+	tcom @ i 5 lit lshift + vp @ 8 lit wcopy  vp @ 20 lit + vp !
+	tout @ i 3C lit * +  dup 20 lit + vamount  5 lit 0 lit do 0 lit v, loop
+	dup 28 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  20 lit + vamount
+loop then
+tnops @ ?dup if 0 lit do tops @ i C lit * + vp @ opdigest  vp @ 20 lit + vp ! loop then
+vb @ vp @ vb @ - 2 lit rshift 3 lit 3 lit pick hdom drop
+vb @ free ;
+
+\ tamt ( a -- lo hi )  an 8-byte amount.
+: tamt  dup le@ swap 4 lit + le@ ;
+\ tpos ( i -- lo hi )  input i's position.
+: tpos  tin @ swap w@ 39 lit + tamt ;
+
+: tcd variable ;
+: tfl  tcd @ 0= if tcd ! else drop then ;    \ ( code -- )  the first refusal stands
+: tok  tcd @ 0= ;
+: tstatic  ( -- code )
+0 lit tcd !
+tnin @ tnpol @ or 0= if FFFFFFFE lit tfl then
+tnpol @ 1 lit u> if FFFFFFFD lit tfl then
+tsz @ 20000 lit u> if FFFFFFFC lit tfl then
+tok if
+	0 lit tnout @ ?dup if 0 lit do tout @ i 3C lit * + 20 lit + tamt or 0= or loop then
+	if FFFFFFFD lit tfl then
+then
+\ the caps: a commit, two reveals, eight updates
+tok if
+	0 lit 0 lit 0 lit
+	tnops @ ?dup if 0 lit do
+		tops @ i C lit * + @  dup 1 lit = if drop rot 1 lit + -rot else 2 lit = if swap 1 lit + swap else 1 lit + then then
+	loop then
+	8 lit u>  swap 2 lit u> or  swap 1 lit u> or if FFFFFFFD lit tfl then
+then
+tok if
+	0 lit tnout @ ?dup if 0 lit do tout @ i 3C lit * + 20 lit + tamt 0= swap 5CDA lit u< and or loop then
+	if FFFFFFFB lit tfl then
+then
+\ an input twice
+tok tnin @ 1 lit u> and if
+	0 lit
+	tnin @ 1 lit do i 0 lit do
+		j tpos i tpos  rot = -rot = and or
+	loop loop
+	if FFFFFFFD lit tfl then
+then
+\ the fee: the inputs' amounts less the outputs'
+tok if
+	tacc @ 4 lit wzero  tacc2 @ 4 lit wzero
+	tnin @ ?dup if 0 lit do tin @ i w@ 31 lit + tamt tacc @ amount+ loop then
+	tnout @ ?dup if 0 lit do tout @ i 3C lit * + 20 lit + tamt tacc2 @ amount+ loop then
+	tacc @ tacc2 @ tacc @ 4 lit wsub if FFFFFFFA lit tfl then
+then
+tok if
+	tacc @ 2 lit w@ tacc @ 3 lit w@ or if FFFFFFFF lit dup else tacc @ @ tacc @ 1 lit w@ then  tfee @ 1 lit w! tfee @ !
+	\ the floor: 10 a byte
+	tsz @ A lit um*  tfee @ 1 lit w@
+	2dup u> if 2drop drop FFFFFFF9 lit tfl else
+		= if tfee @ @ u> if FFFFFFF9 lit tfl then else drop then
+	then
+then
+tcd @ ;
+
+: tinit
+0 lit tin !  0 lit tops !  0 lit tcom !
+40 lit alloc tkb !  10 lit alloc tacc !  10 lit alloc tacc2 !  8 lit alloc tfee ! ;

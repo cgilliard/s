@@ -1,0 +1,88 @@
+\ xmss.fam — XMSS signatures (docs/NODE.md, step 7), after arith.fam,
+\ poseidon2.fam and state.fam.  As tabminer's miner/src/xmss.rs: WOTS+
+\ with w = 16 (64 message chains, seven 4-bit digits and a 3-bit one an
+\ element, and 3 checksum chains), a Merkle tree of the key's height, all
+\ hashed by one tweakable sponge whose capacity holds the public seed, a
+\ domain, a 60-bit index (two 30-bit limbs) and an extra word.
+\
+\ xverify ( pk sig msg -- flag )  pk the key's 49 bytes (root, public
+\ seed: canonical words; its height, 1 to 20), sig the signature's bytes
+\ (8 + (68 + height) 32: the leaf index, the randomizer, a value a chain,
+\ the path; canonical, as the caller parsed them), msg 8 Montgomery words.
+\ About 580 permutations at height 4.
+
+: xpk variable ;  : xsig variable ;  : xmsg variable ;  : xh variable ;  : xix variable ;
+: xsd variable ;  : xmd variable ;  : xd variable ;  : xends variable ;  : xnode variable ;  : xtmp variable ;
+: xa variable ;  : xn variable ;  : xc variable ;  : xe variable ;
+
+\ thcap ( dom lo hi extra -- )  the state zeroed, its capacity the tweak.
+: thcap
+p2s @ 10 lit wzero
+tom p2s @ F lit w!  tom p2s @ E lit w!  tom p2s @ D lit w!  tom p2s @ C lit w!
+xsd @ p2s @ 20 lit + 4 lit wcopy ;
+
+\ thabs ( a n c -- )  the n words at a absorbed eight at a time (one
+\ permutation if none); c (8 words) = the first eight.
+: thabs
+xc ! xn ! xa !
+xn @ 0= if p2s @ perm16 then
+begin xn @ while
+	xn @ 8 lit u< if xn @ else 8 lit then
+	dup 0 lit do p2s @ i w@ xa @ i w@ f+ p2s @ i w! loop
+	p2s @ perm16
+	dup 2 lit lshift xa @ + xa !  xn @ swap - xn !
+repeat
+p2s @ xc @ 8 lit wcopy ;
+
+\ xstep ( a extra -- )  one step of a chain of leaf xix, in place.
+: xstep  xe !  2 lit xix @ 0 lit xe @ thcap  dup 8 lit swap thabs ;
+
+\ xdigits  xd (67 bytes) = the digest's digits, then the checksum's.
+: xdigits
+0 lit
+8 lit 0 lit do
+	xmd @ i w@ fromm
+	8 lit 0 lit do
+		dup F lit and  dup xd @ j 3 lit lshift i + + c!
+		F lit swap - rot + swap  4 lit rshift
+	loop drop
+loop
+3 lit 0 lit do dup F lit and xd @ 40 lit i + + c! 4 lit rshift loop drop ;
+
+\ xchains  xends (67 digests) = each chain run from its digit to the end.
+: xchains
+43 lit 0 lit do
+	xsig @ 28 lit + i 5 lit lshift +  xends @ i 5 lit lshift +  dle
+	xd @ i + c@  dup F lit u< if
+		F lit swap do  xends @ j 5 lit lshift +  j i 10 lit lshift or  xstep  loop
+	else drop then
+loop ;
+
+: xverify  ( pk sig msg -- flag )
+xmsg ! xsig ! xpk !
+xpk @ 30 lit + c@ xh !
+4 lit 0 lit do xpk @ 20 lit + i 2 lit lshift + le@ tom xsd @ i w! loop
+xsig @ le@ xix !
+xsig @ 4 lit + le@ 0=  xix @ 1 lit xh @ lshift u< and if
+	\ the message's digest: the randomizer, the length (8), the message
+	xsig @ 8 lit + xtmp @ dle  8 lit tom xtmp @ 8 lit w!  xmsg @ xtmp @ 24 lit + 8 lit wcopy
+	5 lit xix @ 0 lit 0 lit thcap  xtmp @ 11 lit xmd @ thabs
+	xdigits xchains
+	3 lit xix @ 0 lit 0 lit thcap  xends @ 218 lit xnode @ thabs
+	\ the path
+	xh @ 0 lit do
+		xsig @ 888 lit + i 5 lit lshift +
+		xix @ 1 lit and if
+			xtmp @ dle  xnode @ xtmp @ 20 lit + 8 lit wcopy
+		else
+			xtmp @ 20 lit + dle  xnode @ xtmp @ 8 lit wcopy
+		then
+		xix @ 1 lit rshift xix !
+		4 lit xix @ xh @ i 1 lit + thcap  xtmp @ 10 lit xnode @ thabs
+	loop
+	xpk @ xtmp @ dle  xnode @ xtmp @ 8 lit wcmp 0=
+else 0 lit then ;
+
+: xinit
+10 lit alloc xsd !  20 lit alloc xmd !  44 lit alloc xd !  860 lit alloc xends !
+20 lit alloc xnode !  60 lit alloc xtmp ! ;
