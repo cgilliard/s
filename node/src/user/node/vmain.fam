@@ -1,0 +1,50 @@
+\ vmain.fam — nodev, the node's verifier (docs/NODE.md, step 10): a
+\ process of its own, so the node goes on serving while a block's heavy
+\ checks run, on another hart when there is one.  After arith, poseidon2,
+\ difficulty, pow and chainver (it shares nothing with the node: its own
+\ copy of every buffer).  The node starts it with a pipe on its 0 (jobs)
+\ and another on its 1 (verdicts).  A job is a word, its kind, then:
+\   0  the proof of work's parameters: items, parents, accesses (3 words)
+\   1  a header's full proof of work: the header (204 bytes) and its
+\      target (8 words, as headers.fam's htarget leaves it): fullpow
+\   2  a chain proof: its 16 public values (words), its length n (a word)
+\   	and its n bytes: cvverify
+\ each answered (but 0) by a word: the verdict, -1 or 0.  The pipe closed
+\ (the node gone), it ends.
+
+: vbuf variable ;  : vcap variable ;  : vwd variable ;  : vh variable ;  : vtg variable ;  : vpub variable ;
+
+\ vfile ( path -- addr n )  a whole data file of at most 1.25 MiB, in memory.
+: vfile
+dup 0 lit open  dup 0< if drop "nodev: no " puts puts 0A lit putc 1 lit exit then  nip
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+\ vread ( a n -- )  n bytes from the jobs' pipe; it closed, the end.
+: vread
+begin dup while
+	0 lit 2 lit pick 2 lit pick read  dup 0 lit > 0= if 0 lit exit then
+	rot over + -rot -
+repeat 2drop ;
+: vword  vwd @ 4 lit vread  vwd @ @ ;             \ ( -- x )
+: vsay  vwd @ !  1 lit vwd @ 4 lit write drop ;  \ ( x -- )  a verdict
+
+"/lib/akjv.txt.gz" vfile powinit
+"/lib/chainver" vfile drop cvinit
+10 lit alloc vwd !  CC lit alloc vh !  20 lit alloc vtg !  40 lit alloc vpub !
+10000 lit dup vcap ! malloc vbuf !
+begin
+	vword
+	dup 0= if drop  vword pwitems !  vword pwpar !  vword pwacc ! else
+	dup 1 lit = if drop  vh @ CC lit vread  vtg @ 20 lit vread  vh @ vtg @ fullpow vsay else
+	2 lit = if
+		vpub @ 40 lit vread  vword
+		dup vcap @ u> if vbuf @ free  dup malloc vbuf !  dup vcap ! then
+		vbuf @ over vread
+		vpub @ vbuf @ rot cvverify vsay
+	else 0 lit exit then then then
+0 lit until

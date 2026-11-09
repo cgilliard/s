@@ -41,7 +41,13 @@ stfd @ 1 lit txbegin stx !  dup 0 lit khdr swap CC lit sput  stx @ txcommit drop
 dup pgw @ powhash
 pgw @ swap AC lit + pgw @ 20 lit + pwr @ hashmix ;
 
-: sproof  ( -- flag )
+\ sstmt ( -- flag )  sproof's public values in ppub (16 words: the
+\ program's, then the statement's hash), from the parent's header in the
+\ store (in the transaction open), the block's parsed fields and the
+\ state's counters; 0 if the parent's header is missing.  sproof is it
+\ and the verifier run on them; sync.fam runs the verifier in another
+\ process (nodev) instead, the node serving meanwhile.
+: sstmt  ( -- flag )
 sh @ 1 lit - khdr ppar @ CC lit sget CC lit = if
 	pin @ pvp !
 	sh @ pv,
@@ -79,5 +85,6 @@ sh @ 1 lit - khdr ppar @ CC lit sget CC lit = if
 	pin @ pvp @ pin @ - 2 lit rshift ptmp @ hash  ptmp @ dfrom
 	sh @ 1 lit = if prk @ else prk @ 20 lit + then ppub @ 8 lit wcopy
 	ptmp @ ppub @ 20 lit + 8 lit wcopy
-	ppub @ bpr @ bnpr @ cvverify
+	-1 lit
 else 0 lit then ;
+: sproof  ( -- flag )  sstmt if ppub @ bpr @ bnpr @ cvverify else 0 lit then ;

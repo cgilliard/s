@@ -1145,12 +1145,28 @@ Each step done when its test passes.
       served (GetChunks kind 0: the header and the stored body).
       `scripts/blocktest.sh`: tabminer C, its only peer the node, takes
       A's blocks from it.
+    - Verification in a process of its own (2026-11-09): `nodev`
+      (`src/user/node/vmain.fam`, in the image with 8 MiB), started by
+      the node on two pipes, runs a header's full proof of work and a
+      block's chain proof (the two heavy checks: about 2 s and 0.5 s)
+      while the node serves, on another hart when there is one. A
+      process rather than a thread: the node's modules share buffers
+      (Poseidon2's sponge, arith's scratch, the store's transaction), and
+      a process has its own copy of each. `sconnect` is split around the
+      proof (`sconn1` to its public values, `sconn2` the rest), `hconf`
+      run as `nconf`; while waiting, the node answers Pings, peers,
+      images and pooled transactions, not the API or blocks' chunks
+      (they read the store a block's connection holds open), so those
+      wait as before. Measured, two harts: 1,160 Pings over two minutes
+      of syncing and following, none lost, the slowest 0.52 s (each
+      block stalled them 2 to 3 s before). Without `nodev` the node
+      checks inline, as before.
     - Not yet: started by init (held back while it is tried by hand),
       configuration (network, port), serving headers, manifests and parts
       to peers syncing from the node, striking peers that misbehave, more
       than 65,536 headers (the store holding them, a window in memory),
-      a log and a way to read its state from the shell, verification on
-      a thread of its own.
+      a log and a way to read its state from the shell, the API answered
+      while a block is verified.
 
 ## Open questions
 

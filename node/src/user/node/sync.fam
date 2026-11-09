@@ -63,6 +63,62 @@ ticks nft @ - btf ! ;
 : nt0 variable ;  : nh0 variable ;
 : nsayn  vrb @ if u. 0A lit putc else drop then ;   \ ( n -- )  a number ending the line
 
+\ The verifier, nodev (vmain.fam): a process of its own running a
+\ header's full proof of work and a block's chain proof while the node
+\ serves.  vinit starts it (its 0 reading the jobs' pipe, its 1 writing
+\ the verdicts'); vjw is 0 if it could not be, or once it is gone: the
+\ checks then run here, as before.  vwait serves the network while it
+\ works (Pings, peers, images, pooled transactions; not blocks, which
+\ read the store a block's connection may hold open: pnest), the API
+\ waiting.
+: vjw variable ;  : vjr variable ;  : vwk variable ;  : vp1 variable ;  : vp2 variable ;  : vfds variable ;  : vsav variable ;
+\ vput ( a n -- )  bytes to nodev; a write that fails, it gone (vjw 0).
+: vput
+begin dup vjw @ 0= 0= and while
+	vjw @ 2 lit pick 2 lit pick write
+	dup 0 lit > if rot over + -rot - else drop 0 lit vjw ! then
+repeat 2drop ;
+: vw  vwk @ !  vwk @ 4 lit vput ;                 \ ( x -- )  a word to nodev
+: vinit
+0 lit vjw !  10 lit alloc vwk !  10 lit alloc vp1 !  10 lit alloc vp2 !  10 lit alloc vfds !
+vp1 @ pipe 0< 0=  vp2 @ pipe 0< 0= and if
+	2 lit vfds @ !  vp1 @ @ vfds @ 4 lit + !  vp2 @ 4 lit + @ vfds @ 8 lit + !
+	"nodev" 0 lit vfds @ spawnv 0< if
+		vp1 @ @ close drop  vp1 @ 4 lit + @ close drop  vp2 @ @ close drop  vp2 @ 4 lit + @ close drop
+	else
+		vp1 @ 4 lit + @ vjw !  vp2 @ @ vjr !
+		vp1 @ @ close drop  vp2 @ 4 lit + @ close drop
+		0 lit vw  pwitems @ vw  pwpar @ vw  pwacc @ vw
+	then
+then ;
+\ vwait ( -- flag | -2 )  nodev's verdict, the network served meanwhile;
+\ -2 if it is gone (the caller checks here).
+: vwait
+pxfd @ vsav !  vjr @ pxfd !  0 lit pxrdy !  1 lit pnest !
+begin vjw @ if pxrdy @ 0= else 0 lit then while 3B9ACA00 lit pwait drop repeat
+vsav @ pxfd !  0 lit pxrdy !  0 lit pnest !
+vjw @ if
+	vjr @ vwk @ 4 lit read 4 lit = if vwk @ @ else 0 lit vjw ! FFFFFFFE lit then
+else FFFFFFFE lit then ;
+\ vpow ( e -- flag )  entry e's full proof of work against htg (its target).
+: vpow
+vjw @ if 1 lit vw  dup CC lit vput  htg @ 20 lit vput  vwait else FFFFFFFE lit then
+dup FFFFFFFE lit = if drop htg @ fullpow else nip then ;
+\ vproof ( -- flag )  the chain proof of the block sconn1 left (ppub, bpr).
+: vproof
+vjw @ if 2 lit vw  ppub @ 40 lit vput  bnpr @ vw  bpr @ bnpr @ vput  vwait else FFFFFFFE lit then
+dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
+\ nconf ( from -- flag )  hconf, the work checked by nodev.
+: nconf
+-1 lit swap  hbest
+begin dup hheight 2 lit pick u< 0= over hheight and while
+	vrb @ if nhead "the proof of work of header " puts dup hheight u. 0A lit putc then
+	dup hparent @ he htarget  dup vpow 0= if rot drop 0 lit -rot then
+	hparent @ he
+repeat 2drop ;
+\ nconnect ( h body n -- code )  sconnect, the proof checked by nodev.
+: nconnect  sconn1  spend @ if vproof else -1 lit then  sconn2 ;
+
 \ nsave ( n -- )  the main chain's headers 1 to n into the store (a
 \ transaction a 1,024): after a fast sync's snapshot, so that the store
 \ holds every header from genesis to its tip (sconnect stores each block's
@@ -124,7 +180,7 @@ ncode @ 0= if
 	hbest hheight dup nH !  nS @ - dup 1 lit < if drop 1 lit then nS !
 	"fast sync from block S = " nsay nS @ nsayn
 	ticks nt0 !
-	nH @ hconf 0= if FFFFFFFC lit nfail else vrb @ if nhead "its work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
+	nH @ nconf 0= if FFFFFFFC lit nfail else vrb @ if nhead "its work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
 then
 \ S's block and manifest, its parent's header, its proof
 ncode @ 0= if
@@ -161,7 +217,7 @@ ncode @ 0= if
 		nH @ 1 lit + nS @ 1 lit + do
 			ncode @ 0= if
 				i hat dup nblock if
-					hhdr nblk @ CC lit + nbn @ CC lit - sconnect if FFFFFFF7 lit nfail else vrb @ if nhead "block " puts i u. " of " puts nH @ u. " connected" puts nbrk 0A lit putc then then
+					hhdr nblk @ CC lit + nbn @ CC lit - nconnect if FFFFFFF7 lit nfail else vrb @ if nhead "block " puts i u. " of " puts nH @ u. " connected" puts nbrk 0A lit putc then then
 					nblk @ free 0 lit nblk !
 				else drop FFFFFFFB lit nfail then
 			then
@@ -218,7 +274,7 @@ repeat
 0 lit hquick !
 \ the best's work in full; one that fails set aside, until one passes
 hbst @ nb0 @ <> if
-	begin hbst @ nb0 @ <> if hbest hheight hconf 0= else 0 lit then while
+	begin hbst @ nb0 @ <> if hbest hheight nconf 0= else 0 lit then while
 		vrb @ if nhead "header " puts hbest hheight u. "'s proof of work refused; its branch set aside" puts 0A lit putc then
 		hbest hmark
 	repeat
@@ -245,7 +301,7 @@ myh @ hbest hheight u< nfl @ 0= and if
 	hbest hheight 1 lit + myh @ 1 lit + do
 		nfl @ 0= if
 			i hat dup nblock if
-				hhdr nblk @ CC lit + nbn @ CC lit - sconnect ?dup if
+				hhdr nblk @ CC lit + nbn @ CC lit - nconnect ?dup if
 					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
 					i hat hmark  1 lit nfl !
 				else

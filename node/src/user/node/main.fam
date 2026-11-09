@@ -90,6 +90,8 @@ mdc @ dup 60 lit + prinit
 20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
 20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
 1 lit vrb !
+\ the verifier, a process of its own, so the node serves while it checks
+vinit  vjw @ if nhead "verifying in nodev (a process of its own)" puts else nhead "nodev not started: verifying here" puts then 0A lit putc
 nload if
 	\ resumed: the peer asked, and caught up to if ahead; if it does not
 	\ answer yet, nstep goes on asking

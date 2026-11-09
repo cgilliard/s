@@ -11,6 +11,11 @@
 \ state root, -16 the supply, -17 the proof; -20 to -26 the name rules;
 \ -30 to -35 the body's own).  A block refused changes nothing.  Its chain
 \ proof is checked when sprchk is set (prinit first).
+\ sconn1 ( h body n -- ) and sconn2 ( ok -- code )  sconnect in two:
+\ everything to the chain proof's public values (ppub; spend set if the
+\ proof is to be checked), then, given the verifier's verdict, the rest
+\ (the store written, or the block refused); between them the store's
+\ transaction is open, so nothing else may use the state.
 \ sundo ( -- )  undoes the last block connected.
 \ A block's body is kept for the last 1,008 blocks (tabminer's default
 \ --max-undo-blocks): 'b', the height, the chunk (1 KiB each); its
@@ -37,15 +42,17 @@ else drop then ;
 : bt0 variable ;  : btb variable ;  : bts variable ;  : btp variable ;  : btc variable ;
 : btick  ticks dup bt0 @ - rot ! bt0 ! ;          \ ( var -- )  the time since the last, into var
 
-: sconnect  ( h body n -- code )
+: spend variable ;  : stxo variable ;
+: sconn1  ( h body n -- )
 ticks bt0 !
 rot bh !  2dup bbn ! bbody !  0 lit bcode !  0 lit ndirty !
 2dup bparse nip
 bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
 bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
 btb btick
+0 lit stxo !  0 lit spend !
 bcode @ 0= if
-	stfd @ 1 lit txbegin stx !
+	stfd @ 1 lit txbegin stx !  1 lit stxo !
 	bh @ 20 lit + @ sh !
 	70 lit mget dup sctr ! sfirst !
 	bnin @ 3 lit lshift 400 lit + malloc dup ub ! ux !
@@ -76,8 +83,14 @@ bcode @ 0= if
 	\ the supply: what the outputs make, what the inputs held and the subsidy
 	bcode @ 0= if sh @ subsidy spent @ amount+  made @ spent @ 4 lit wcmp if FFFFFFF0 lit bfail then then
 	bts btick
-	\ the proof, last (tabminer's order)
-	bcode @ 0= sprchk @ and if sproof 0= if FFFFFFEF lit bfail then then
+	\ the proof, last (tabminer's order): its public values here, the
+	\ verifier's verdict given to sconn2
+	bcode @ 0= sprchk @ and if sstmt if 1 lit spend ! else FFFFFFEF lit bfail then then
+then ;
+
+: sconn2  ( ok -- code )
+spend @ if 0= if FFFFFFEF lit bfail then else drop then
+stxo @ if
 	btp btick
 	bcode @ 0= if
 		ux @ ub @ - 2 lit rshift ub @ !
@@ -105,6 +118,8 @@ bcode @ 0= if
 then
 bops @ free
 bcode @ ;
+
+: sconnect  ( h body n -- code )  sconn1  spend @ if ppub @ bpr @ bnpr @ cvverify else -1 lit then  sconn2 ;
 
 \ uevent ( p -- )  undoes one event of the names section.
 : uevent
