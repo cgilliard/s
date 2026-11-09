@@ -1,0 +1,81 @@
+\ main.fam — the node (docs/NODE.md), the program /bin/node in the image
+\ (scripts/build.sh): the node's modules in order, then this.
+\
+\     node [IP:PORT]
+\
+\ Syncs from the peer at IP:PORT (default 10.0.2.2:3747: the host, seen
+\ from QEMU's user-mode network), then serves for good: its peers, the API
+\ (TCP 3738, the token in /etc/node/token) and its image to tabernacles
+\ (UDP 3737).  For now only the recursive dev network (tabminer's
+\ --network dev-recursive): there is no mainnet chain yet.  Its state is
+\ the tree /var/node, made afresh at each start (resuming from it is not
+\ done yet; the old tree's pages are not given back yet either, so each
+\ start costs its size on the disk).  The fast sync's block S is 144
+\ below the best header, as tabminer's.
+
+: mdc variable ;  : mnet variable ;  : mpt variable ;  : mip variable ;  : mport variable ;
+
+\ mfile ( path -- addr n )  a whole data file of at most 1.25 MiB, in memory.
+: mfile
+dup 0 lit open  dup 0< if drop "node: no " puts puts 0A lit putc 1 lit exit then  nip
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+\ mnum ( -- n )  the decimal number at mpt, mpt past it.
+: mnum  0 lit begin mpt @ c@ 30 lit - dup A lit u< while swap A lit * + mpt @ 1 lit + mpt ! repeat drop ;
+\ maddr ( s -- flag )  IP:PORT at s into mip and mport.
+: maddr
+mpt !  0 lit mip !  -1 lit
+4 lit 0 lit do
+	mpt @ c@ 30 lit - A lit u< and
+	mnum  dup FF lit u> if 2drop 0 lit 0 lit then  mip @ 8 lit lshift or mip !
+	i 3 lit < if mpt @ c@ 2E lit = and  mpt @ 1 lit + mpt ! then
+loop
+mpt @ c@ 3A lit = and  mpt @ 1 lit + mpt !
+mpt @ c@ 30 lit - A lit u< and  mnum dup mport !  dup 0= 0= swap 10000 lit u< and and
+mpt @ c@ 0= and ;
+
+\ The recursive dev network (tabminer's ChainParams::DEV_RECURSIVE), as
+\ headers.fam takes it: 2^10 items, 254 parents, 64 accesses; genesis's
+\ target 2^228; the easiest 2^248 - 1; the drift 7,200 s; the median of
+\ 11; the final height; 10 s blocks, a half-life of 300 s, from block 1.
+: mparams
+64 lit alloc dup mnet !
+A lit over 0 lit w!  FE lit over 1 lit w!  40 lit over 2 lit w!
+dup 3 lit 2 lit lshift + 8 lit wzero  10 lit over A lit w!
+8 lit 0 lit do FFFFFFFF lit over i B lit + w! loop  FFFFFF lit over 12 lit w!
+1C20 lit over 13 lit w!  B lit over 14 lit w!  3279DB0 lit over 15 lit w!
+A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
+
+A000202 lit mip !  EA3 lit mport !
+argn 2 lit > if "usage: node [IP:PORT]" puts 0A lit putc 1 lit exit then
+argn 2 lit = if 1 lit arg maddr 0= if "node: not IP:PORT: " puts 1 lit arg puts 0A lit putc 1 lit exit then then
+
+"/lib/akjv.txt.gz" mfile powinit
+"/lib/chainver" mfile drop cvinit
+"/var" mkdir drop  "/var/node" remove drop
+"/var/node" TREE CREATE or 2 lit or open  dup 0< if "node: no store (a disk is needed): " puts . 0A lit putc 1 lit exit then
+stinit  sninit  ninit  xinit tinit qinit yinit
+"/lib/devchain" mfile drop 4 lit + mdc !
+mparams  mnet @ mdc @ 60 lit + 1000 lit hinit
+mdc @ dup 60 lit + prinit
+\ our status: genesis, no work
+20 lit alloc dup mygen !  0 lit he hid swap 8 lit wcopy
+20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
+20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
+mip @ mport @ E99 lit pinit
+"node: syncing from " puts  mip @ 18 lit rshift u. 2E lit putc  mip @ 10 lit rshift FF lit and u. 2E lit putc
+mip @ 8 lit rshift FF lit and u. 2E lit putc  mip @ FF lit and u. 3A lit putc  mport @ u. 0A lit putc
+90 lit nsync ?dup if
+	"node: the sync stopped: " puts .
+	"  (-1 no answer, -2 another chain, -3 headers, -4 a proof of work, -5 a block not fetched, -6 a chain proof, -7 a part, -8 the state, -9 a block after S)" puts 0A lit putc
+	1 lit exit
+then
+"node: synced, height " puts myh @ u. 0A lit putc
+E9A lit ainit
+"node: the API on port 3738, token " puts atk @ puts 0A lit putc
+begin E10 lit aserve 0 lit until

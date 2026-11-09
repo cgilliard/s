@@ -1043,7 +1043,24 @@ Each step done when its test passes.
      backup after.
 10. **The daemon**: in the image, started by init, its `/proc` keys,
     restart after a kill. Done when a booted OS runs the node on its
-    own, synced, and answers the API.
+    own, synced, and answers the API. Begun (2026-11-09):
+    - In the image: `build.sh` compiles `src/user/node/` (its modules,
+      then `main.fam`) into `bin/user/node`, with 24 MiB, and adds its
+      data files (`/lib/akjv.txt.gz`, `/lib/chainver`, `/lib/devchain`);
+      `bin/img` is now 3.6 MB. From the OS's shell, with a disk,
+      `node [IP:PORT]` (default `10.0.2.2:3747`, the host) syncs (S 144
+      below the best header, as tabminer), then serves for good: peers,
+      the API on 3738, its image on 3737. Tried: `node &` at the shell of
+      `bin/img` under q32, a dev-recursive tabminer on the host: synced,
+      the API's token in `/etc/node/token`.
+    - The recursive dev network only, for now (no mainnet chain yet):
+      its parameters in `main.fam`, its genesis in `/lib/devchain`.
+    - Its tree, `/var/node`, is made afresh at each start: resuming from
+      it is not done yet, and a removed tree's pages are not given back
+      yet, so each start costs its size on the disk.
+    - Not yet: started by init, restart after a kill, configuration
+      (network, peers, port), more than 4,096 headers (`hinit`'s room),
+      a log and a way to read its state from the shell.
 
 ## Open questions
 

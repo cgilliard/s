@@ -2,7 +2,7 @@
 # build.sh — rebuild the fam compiler from the 168-byte seed under QEMU (fam0,
 # checked against the seed, then fam and fampack), then gen_hash, the node
 # image (the OS: the kernel, src/kernel.fam, src/store.fam, src/net.fam and src/ksys.fam, src/boot.fam, and the
-# programs in src/user, put together by scripts/mkimage.sh) and tabernacle,
+# programs in src/user and the node, src/user/node, put together by scripts/mkimage.sh) and tabernacle,
 # patched for that image (docs/TABERNACLE.md).  Linux and macOS (on Windows, WSL2), as
 # tools/q32.
 # Runs from anywhere: it works in the tree it belongs to.
@@ -58,6 +58,17 @@ for prog in src/user/*.fam; do
 	./tools/fam --user -o "bin/user/$name" "$prog" || { echo "build.sh: $prog did not build" >&2; exit 1; }
 	progs="$progs $name=bin/user/$name"
 done
+# The node (docs/NODE.md): its modules in order, then its main, as one
+# program with 24 MiB to start; and the data files it reads: the seed text
+# as shipped (the proof of work reads it whole), the chain verifier and
+# the network's constants and genesis.  The recursive dev network's for
+# now: there is no mainnet chain yet.
+N=src/user/node
+echo "Building $N → bin/user/node (user mode)" >&2
+./tools/fam --user -o bin/user/node $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
+	$N/chainver.fam $N/state.fam $N/proofs.fam $N/connect.fam $N/query.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
+	$N/pool.fam $N/p2p.fam $N/sync.fam $N/api.fam $N/main.fam || { echo "build.sh: the node did not build" >&2; exit 1; }
+progs="$progs node=bin/user/node:24576 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$N/chainver_dev.bin:0 devchain=$N/devchain.bin:0"
 # The compiler too (famc: bin/fam, unpacked and unchanged, as a machine
 # program with 8 MiB: the kernel stands in for its UART and test finisher),
 # and the libraries it compiles a program with (data files, read as
