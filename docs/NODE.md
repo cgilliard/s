@@ -916,13 +916,34 @@ Each step done when its test passes.
      as tabminer, about 2.5 s with the boot (a signature about 25 ms).
      The pool's policy is the node's own (`docs/FEES.md`): tabminer's
      floor, dust and replacement rules; not yet its rolling minimum, aged
-     reserve, expiry or shelf. Not yet: policy inputs (channels,
-     `policy.rs`), refused as not decoding.
-   - (b) Relay: several peers, `TxInv` taken and the transaction fetched
-     (`GetChunks`, kind 1), pooled transactions served and announced.
-   - (c) The test: a tabminer wallet whose only peer is the fam node
-     sends a transaction; the node pools it and relays it to a mining
-     tabminer, which mines it.
+     reserve, expiry or shelf.
+   - (b) Done (2026-11-08): relay (`p2p.fam`, `sync.fam`). Up to four
+     peers, one the current, whose replies requests take; meanwhile every
+     peer's Pings are answered, its `GetChunks` for a pooled transaction
+     (kind 1, with our token) served, and its `TxInv`s queued. `nrelay`
+     fetches each queued transaction not pooled from the peer that
+     announced it, offers it to the pool, and announces it to the other
+     peers if pooled; after blocks are connected the pool is rechecked.
+   - (c) Done (2026-11-08): `scripts/pooltest.sh`. A tabminer mines the
+     recursive dev network to 12 blocks; its directory is copied for a
+     second tabminer that does not mine and keeps the wallet; the two
+     never meet, each having only the node for a peer. The node syncs
+     from the miner and pings the wallet's node; the wallet burns a coin;
+     its node announces the transaction to the node, which fetches it,
+     pools it and announces it to the miner; the miner fetches it from
+     the node (its log: "transaction from 127.0.0.1:… pooled") and mines
+     it in its next block, and the node sees it leave its pool. Relayed
+     within the second it was announced.
+   - (d) Done (2026-11-08): policy inputs (`tx.fam`, `pool.fam`, as
+     `policy.rs`): decoded, the policy's root from the leaf's hash and
+     its path, in the id, the positions, the commitments and the fee;
+     `block_air::tx_rows` against a segment; the leaf checked (thresholds
+     in body and rebindable mode, hash locks, `After`, `Older`, `State`,
+     covenants over the covered outputs). `pool.bin` gains a policy of
+     five leaves: 13 transactions spending its outputs through each kind
+     of leaf, satisfied and not, two policy inputs, too many rows, and
+     the covenant admitted once old enough; oscheck's `pool`: 89 entries,
+     all as tabminer.
 8. **The API**: the HTTP server, the token, and the endpoints above.
    Done when a program in the OS and a client on the host read the
    chain and send a transaction through it with the token, and are

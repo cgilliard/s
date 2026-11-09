@@ -7,7 +7,8 @@
 \ there, its, not past its window, the name free; an update's name
 \ registered, signed by its owner's key, for another owner); what they
 \ claim (names, commits) distinct and not held by a pooled transaction
-\ but those replaced; the signatures; a replacement paying what it
+\ but those replaced; the signatures; the policy input's leaf satisfied
+\ (policy.rs's PolicyInput::check); a replacement paying what it
 \ replaces and 10 a byte more; room, the lowest-paying evicted for it.
 \
 \ The pool's policy is the node's own (docs/FEES.md): tabminer's floor,
@@ -19,7 +20,8 @@
 \ unspent, -10 pooled already, -11 a name or commit claimed, -12 a
 \ replacement short of its fee, -13 no room, -14 no commit (or not the
 \ reveal's), -15 the commit expired, -16 the name registered, -17 the name
-\ not registered, -18 not the owner's update.  Its id in qid.
+\ not registered, -18 not the owner's update, -19 a policy input's leaf
+\ not satisfied.  Its id in qid.
 \ qcheck  after the tip moved: the transactions whose inputs are spent or
 \ whose operations fail now dropped.
 \ qfind ( id -- k | -1 )  the slot holding a pooled id.
@@ -37,6 +39,8 @@
 : qlo variable ;  : qhi variable ;  : qplo variable ;  : qphi variable ;  : qsk variable ;  : qhc variable ;  : qhf variable ;
 : qm1 variable ;  : qm2 variable ;  : qw1 variable ;  : qw2 variable ;  : qfa variable ;  : qfb variable ;  : qbad variable ;
 : qka variable ;  : qkb variable ;  : qbest variable ;  : qgo variable ;  : qsav variable ;
+: qpcr variable ;  : qpok variable ;  : qseen variable ;  : qgood variable ;  : qmsg variable ;  : qcov variable ;  : qrb variable ;
+: qsg variable ;
 
 : qfl  qcode @ 0= if qcode ! else drop then ;   \ ( code -- )  the first refusal stands
 : qok  qcode @ 0= ;
@@ -73,7 +77,7 @@ else 2drop drop 0 lit then ;
 
 : qinputs
 0 lit qncf !
-tnin @ ?dup if 0 lit do
+tnall ?dup if 0 lit do
 	qok if
 		i tpos qspender dup 0< if drop else qaddcf then
 		i qholds 0= if FFFFFFF7 lit qfl then
@@ -205,11 +209,54 @@ else drop then ;
 0 lit begin dup qused while 1 lit + repeat qslot qsav !
 dup malloc  dup qsav @ !  swap  dup qsav @ 4 lit + !  bcopy
 tfee @ qsav @ 8 lit + 2 lit wcopy  qid @ qsav @ 10 lit + 8 lit wcopy
-tnin @ 3 lit lshift 4 lit + malloc  dup qsav @ 30 lit + !  tnin @ over !
-tnin @ ?dup if 0 lit do i tpos 2 lit pick i 3 lit lshift + 8 lit + !  over i 3 lit lshift + 4 lit + ! loop then drop
+tnall 3 lit lshift 4 lit + malloc  dup qsav @ 30 lit + !  tnall over !
+tnall ?dup if 0 lit do i tpos 2 lit pick i 3 lit lshift + 8 lit + !  over i 3 lit lshift + 4 lit + ! loop then drop
 qncl @ 14 lit * 4 lit + malloc  dup qsav @ 34 lit + !  qncl @ over !  qcl @ swap 4 lit + qncl @ 5 lit * wcopy
 qord @ qsav @ 38 lit + !  qord @ 1 lit + qord !  0 lit qsav @ 3C lit + !
 qbytes @ qsav @ 4 lit + @ + qbytes !  qnum @ 1 lit + qnum ! ;
+
+\ qthr ( i -- )  threshold condition i (tthr's fields set): m of its n
+\ keys sign, each listed once, over the body, or in rebindable mode over
+\ hash_domain 15 of the channel, the state and the covered outputs'
+\ digest, with the state's leaf.
+: qthr
+tm @ 0=  tm @ tn @ u> or if drop 0 lit qpok ! else
+	tmode @ if
+		tchan @ qrb @ dle  tpol @ 91 lit + le@ tom qrb @ 8 lit w!  qcov @ qrb @ 24 lit + 8 lit wcopy
+		qrb @ 11 lit F lit qmsg @ hdom
+	else qid @ qmsg @ 8 lit wcopy then
+	0 lit qseen !  0 lit qgood !
+	twit @ swap w@  dup c@ swap 1 lit + qsg !
+	?dup if 0 lit do qpok @ if
+		qsg @ c@  dup tn @ u<  over 1 lit swap lshift qseen @ and 0= and if
+			qsg @ 1 lit + qkc @ tpkh  tkeys @ over 5 lit lshift + qtmp @ dle  qkc @ qtmp @ 8 lit wcmp 0=
+			tmode @ if qsg @ 32 lit + dup le@ tpol @ 91 lit + le@ =  swap 4 lit + le@ 0= and and then
+			dup if drop qsg @ 1 lit + qsg @ 32 lit + qmsg @ xverify then
+			if 1 lit swap lshift qseen @ or qseen !  qgood @ 1 lit + qgood ! else drop 0 lit qpok ! then
+		else drop 0 lit qpok ! then
+		qsg @ 31 lit + c@ 5 lit lshift 8BA lit + qsg @ + qsg !
+	then loop then
+	qgood @ tm @ u< if 0 lit qpok ! then
+then ;
+
+\ qpchk  the policy input's leaf satisfied, for the block after the tip
+\ (qht), its output made at qpcr: qpok.
+: qpchk
+-1 lit qpok !
+tnin @ tpos oget if sbuf @ 40 lit + @ qpcr ! else 0 lit qpok ! then
+tpol @ 95 lit + c@ tpol @ 96 lit + c@ + tnout @ u> if 0 lit qpok ! then
+qpok @ if tpol @ 95 lit + c@ tpol @ 96 lit + c@ qcov @ tcovo then
+tpc @ 0 lit do qpok @ if
+	tcnd @ i w@ dup c@ swap 1 lit + swap
+	dup 0= if drop tthr i qthr else
+	dup 1 lit = if drop
+		twit @ i w@ qtmp @ dle  qtmp @ 8 lit E lit qch @ hdom  qtmp @ dle  qch @ qtmp @ 8 lit wcmp if 0 lit qpok ! then
+	else dup 2 lit = if drop le@ qht @ u> if 0 lit qpok ! then else
+	dup 3 lit = if drop le@ qpcr @ +  dup qpcr @ u<  swap qht @ u> or if 0 lit qpok ! then else
+	4 lit = if le@ dup 3FFFFFFF lit u>  swap tpol @ 91 lit + le@ u< 0= or if 0 lit qpok ! then else
+		dup c@ 0= if drop 0 lit qpok ! else dup 1 lit + swap c@ qch @ tcovd  qch @ qcov @ 8 lit wcmp if 0 lit qpok ! then then
+	then then then then then
+then loop ;
 
 : qadmit  ( a n -- code )
 0 lit qcode !  2dup tparse 0= if FFFFFFFF lit qfl then
@@ -222,6 +269,7 @@ qok if
 	qok if qops then
 	qok if qncl @ ?dup if 0 lit do qcl @ i 14 lit * + qheld if FFFFFFF5 lit qfl then loop then then
 	qok if tnin @ ?dup if 0 lit do qok if tin @ i w@ dup 41 lit + qid @ xverify 0= if FFFFFFF8 lit qfl then then loop then then
+	qok tnpol @ and if qpchk qpok @ 0= if FFFFFFED lit qfl then then
 	stx @ txcommit drop
 then
 \ a replacement pays what it replaces and 10 a byte more
@@ -248,7 +296,7 @@ QSLOTS 0 lit do
 		i qka !
 		i qslot dup @ swap 4 lit + @ tparse drop
 		0 lit qcode !  0 lit qncf !
-		tnin @ ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
+		tnall ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
 		qok tnops @ 0= 0= and if qops then
 		qok 0= if qka @ qdrop then
 	then
@@ -260,4 +308,4 @@ QSLOTS 6 lit lshift alloc dup qbase !  QSLOTS 4 lit lshift wzero
 0 lit qbytes !  0 lit qnum !  0 lit qord !
 20 lit alloc qid !  40 lit alloc qtmp !  20 lit alloc qkc !  20 lit alloc qlv !  60 lit alloc qcb !
 20 lit alloc qch !  20 lit alloc qown !  20 lit alloc qum !  400 lit alloc qcf !  200 lit alloc qcl !
-QSLOTS 2 lit lshift alloc qvic !  10 lit alloc qm1 !  10 lit alloc qm2 !  4 lit alloc qw1 !  4 lit alloc qw2 ! ;
+QSLOTS 2 lit lshift alloc qvic !  20 lit alloc qmsg !  20 lit alloc qcov !  50 lit alloc qrb !  10 lit alloc qm1 !  10 lit alloc qm2 !  4 lit alloc qw1 !  4 lit alloc qw2 ! ;

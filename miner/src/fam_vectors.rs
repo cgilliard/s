@@ -22,8 +22,9 @@
 //!   tabminer serves it: its manifest, output parts and name parts;
 //! - `pool.bin` (step 7): transactions offered to tabminer's own
 //!   `Mempool` on a dev chain whose outputs pay known keys, each verdict as
-//!   it gave it, blocks mining some, the pool after each, and XMSS
-//!   signatures of other heights, verified and refused.
+//!   it gave it, policy inputs spent through each kind of leaf, blocks
+//!   mining some, the pool after each, and XMSS signatures of other
+//!   heights, verified and refused.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -1309,6 +1310,180 @@ mod tests {
         }
         ids(&mut out, &pool);
         entries += 2;
+        // Policy inputs (docs/ELTOO.md): five outputs of one policy made by
+        // block 19, spent through each kind of leaf, satisfied and not.
+        {
+            use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer, hash_lock, rebind_message};
+            let pk: Vec<Key> = (110..113).map(|t| key(t, crate::transaction::TREE_HEIGHT)).collect();
+            let ph: Vec<Digest> = pk.iter().map(|k| pubkey_hash(&k.public_key())).collect();
+            let pre = digest(&mut r);
+            let channel = digest(&mut r);
+            let settle_outs = vec![
+                Output::with_memo(&ph[0], 4 * coin, memo(&mut r)),
+                Output::with_memo(&ph[1], 5 * coin, memo(&mut r)),
+            ];
+            let settle: Vec<_> = settle_outs.iter().map(|o| (o.commitment, o.slot())).collect();
+            let policy = Policy::new(vec![
+                Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys: ph.clone() }]),
+                Leaf::new(vec![Cond::Hash(hash_lock(&pre)), Cond::Thresh { mode: Mode::Body, m: 1, keys: ph[1..2].to_vec() }]),
+                Leaf::new(vec![Cond::After(100), Cond::Thresh { mode: Mode::Body, m: 1, keys: ph[..1].to_vec() }]),
+                Leaf::new(vec![Cond::Thresh { mode: Mode::Rebindable { channel }, m: 2, keys: ph[..2].to_vec() }, Cond::State(3)]),
+                Leaf::new(vec![Cond::Older(2), Cond::Outputs(settle.clone())]),
+            ]);
+            let a = 10 * coin;
+            // The funding transaction: keys[0]'s reward of block 8.
+            let fund = {
+                let mut outputs: Vec<Output> = (0..5).map(|_| policy.output(a, memo(&mut r))).collect();
+                outputs.push(Output::with_memo(&h0, s - 5 * a - 300_000, memo(&mut r)));
+                let mut t = UnsignedTransaction::new(vec![(keys[0].public_key(), s)], outputs)
+                    .sign::<()>(|_, _, msg| Ok(keys[0].sign(msg).unwrap()))
+                    .unwrap();
+                t.set_positions(&[reward[8]]);
+                t
+            };
+            offer(&mut out, &mut pool, &fund.to_bytes(), 0);
+            ts += 10;
+            reward.push(next(&chain));
+            block(&mut out, ts, &k, &[&fund], vec![], &mut r);
+            let at = |i: u64| reward[19] + 1 + i;
+            {
+                let rtxn = chain.env().read_txn().unwrap();
+                let height = chain.tip().unwrap().unwrap().height + 1;
+                let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+                pool.revalidate(chain.utxo(), chain.names(), &rtxn, height, &moved, &created).unwrap();
+            }
+            ids(&mut out, &pool);
+            entries += 3;
+            // A policy spend paying `outs` (key hash, amount), witnessed by
+            // `witness`, given the body hash; a plain input of keys[0]'s
+            // reward of block 16 too if `plain`.
+            let pay = |keys: &mut [Key], p: crate::policy::PolicyInput, outs: Vec<Output>, plain: bool, witness: &mut dyn FnMut(&mut crate::policy::PolicyInput, &Digest)| -> Transaction {
+                let mut p = p;
+                let inputs = if plain { vec![(keys[0].public_key(), s)] } else { vec![] };
+                let mut outs = outs;
+                if plain {
+                    outs.push(Output::with_memo(&h1, s - 200_000, memo(&mut Rng(7))));
+                }
+                let body = UnsignedTransaction::new(inputs.clone(), outs.clone()).with_policy_inputs(vec![p.clone()]).body_hash();
+                witness(&mut p, &body);
+                let mut t = UnsignedTransaction::new(inputs, outs)
+                    .with_policy_inputs(vec![p.clone()])
+                    .sign::<()>(|_, _, msg| Ok(keys[0].sign(msg).unwrap()))
+                    .unwrap();
+                let mut pos = if plain { vec![reward[16]] } else { vec![] };
+                pos.push(p.position);
+                t.set_positions(&pos);
+                t
+            };
+            let signer = |k: &mut Key, key: u8, msg: &Digest| Signer { key, pubkey: k.public_key(), signature: k.sign(msg).unwrap() };
+            let k5 = pubkey_hash(&keys[5].public_key());
+            let to5 = |amount: u64, r: &mut Rng| vec![Output::with_memo(&k5, amount, memo(r))];
+            let mut pk = pk;
+            // 2 of 3 in body mode; one signature short.
+            let (p0, p1) = (pk[0].clone(), pk[2].clone());
+            let mut sk = [p0, p1];
+            let ta = pay(&mut keys, policy.spend(0, a, at(0)), to5(a - 100_000, &mut r), false, &mut |p, body| {
+                let (x, y) = sk.split_at_mut(1);
+                p.witness[0] = CondWitness::Signatures(vec![signer(&mut x[0], 0, body), signer(&mut y[0], 2, body)]);
+            });
+            offer(&mut out, &mut pool, &ta.to_bytes(), 0);
+            let t = pay(&mut keys, policy.spend(0, a, at(1)), to5(a - 100_000, &mut r), false, &mut |p, body| {
+                p.witness[0] = CondWitness::Signatures(vec![signer(&mut pk[0], 0, body)]);
+            });
+            offer(&mut out, &mut pool, &t.to_bytes(), -19);
+            // The hash lock with a plain input beside it; a wrong preimage;
+            // a time lock not yet open.
+            let tc = pay(&mut keys, policy.spend(1, a, at(1)), to5(a - 200_000, &mut r), true, &mut |p, body| {
+                p.witness[0] = CondWitness::Preimage(pre);
+                p.witness[1] = CondWitness::Signatures(vec![signer(&mut pk[1], 0, body)]);
+            });
+            offer(&mut out, &mut pool, &tc.to_bytes(), 0);
+            let wrong = digest(&mut r);
+            let t = pay(&mut keys, policy.spend(1, a, at(2)), to5(a - 200_000, &mut r), false, &mut |p, body| {
+                p.witness[0] = CondWitness::Preimage(wrong);
+                p.witness[1] = CondWitness::Signatures(vec![signer(&mut pk[1], 0, body)]);
+            });
+            offer(&mut out, &mut pool, &t.to_bytes(), -19);
+            let t = pay(&mut keys, policy.spend(2, a, at(2)), to5(a - 200_000, &mut r), false, &mut |p, body| {
+                p.witness[1] = CondWitness::Signatures(vec![signer(&mut pk[0], 0, body)]);
+            });
+            offer(&mut out, &mut pool, &t.to_bytes(), -19);
+            entries += 5;
+            // The channel's update: rebindable signatures at the state's
+            // leaf over the two outputs covered; then a state not above 3.
+            let rebind = |pk: &mut [Key], state: u32, p: &mut crate::policy::PolicyInput, outs: &[Output]| {
+                p.state = state;
+                p.covered = (0, 2);
+                let covered: Vec<_> = outs.iter().map(|o| (o.commitment, o.slot())).collect();
+                let msg = rebind_message(&channel, state, &covered);
+                let mut x = pk[0].clone();
+                x.set_next_index(state as u64);
+                let mut y = pk[1].clone();
+                y.set_next_index(state as u64);
+                p.witness[0] = CondWitness::Signatures(vec![signer(&mut x, 0, &msg), signer(&mut y, 1, &msg)]);
+            };
+            let two = |r: &mut Rng| {
+                vec![Output::with_memo(&k5, 3 * coin, memo(r)), Output::with_memo(&k5, a - 3 * coin - 200_000, memo(r))]
+            };
+            let outs = two(&mut r);
+            let mut sp = policy.spend(3, a, at(3));
+            rebind(&mut pk, 4, &mut sp, &outs);
+            let tf = pay(&mut keys, sp, outs, false, &mut |_, _| {});
+            offer(&mut out, &mut pool, &tf.to_bytes(), 0);
+            let outs = two(&mut r);
+            let mut sp = policy.spend(3, a, at(2));
+            rebind(&mut pk, 3, &mut sp, &outs);
+            let t = pay(&mut keys, sp, outs, false, &mut |_, _| {});
+            offer(&mut out, &mut pool, &t.to_bytes(), -19);
+            // The settlement covenant, before its outputs are old enough;
+            // covering outputs that are not there.
+            let mut sp = policy.spend(4, a, at(4));
+            sp.covered = (0, 2);
+            let th = pay(&mut keys, sp, settle_outs.clone(), false, &mut |_, _| {});
+            offer(&mut out, &mut pool, &th.to_bytes(), -19);
+            let mut sp = policy.spend(4, a, at(2));
+            sp.covered = (1, 2);
+            let t = pay(&mut keys, sp, settle_outs.clone(), false, &mut |_, _| {});
+            offer(&mut out, &mut pool, &t.to_bytes(), -19);
+            entries += 4;
+            // Two policy inputs; more rows than a segment holds (29
+            // signatures, the same one, never checked).
+            let mut t = th.clone();
+            t.policy_inputs.push(policy.spend(4, a, at(2)));
+            offer(&mut out, &mut pool, &t.to_bytes(), -3);
+            let many: Vec<Digest> = (0..29).map(|_| digest(&mut r)).collect();
+            let big = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 29, keys: many }])]);
+            let mut sp = big.spend(0, a, at(2));
+            let one = signer(&mut pk[2], 0, &digest(&mut r));
+            sp.witness[0] = CondWitness::Signatures(vec![one; 29]);
+            let t = pay(&mut keys, sp, to5(a - 2_000_000, &mut r), false, &mut |_, _| {});
+            offer(&mut out, &mut pool, &t.to_bytes(), -20);
+            entries += 2;
+            // Block 20 mines the three pooled; the covenant then admitted
+            // at 21 and mined.
+            ts += 10;
+            reward.push(next(&chain));
+            block(&mut out, ts, &k, &[&ta, &tc, &tf], vec![], &mut r);
+            {
+                let rtxn = chain.env().read_txn().unwrap();
+                let height = chain.tip().unwrap().unwrap().height + 1;
+                let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+                pool.revalidate(chain.utxo(), chain.names(), &rtxn, height, &moved, &created).unwrap();
+            }
+            ids(&mut out, &pool);
+            offer(&mut out, &mut pool, &th.to_bytes(), 0);
+            ts += 10;
+            reward.push(next(&chain));
+            block(&mut out, ts, &k, &[&th], vec![], &mut r);
+            {
+                let rtxn = chain.env().read_txn().unwrap();
+                let height = chain.tip().unwrap().unwrap().height + 1;
+                let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+                pool.revalidate(chain.utxo(), chain.names(), &rtxn, height, &moved, &created).unwrap();
+            }
+            ids(&mut out, &pool);
+            entries += 5;
+        }
         // XMSS on its own: keys of heights 1, 3 and 6, signed, a message,
         // the randomizer and the index changed.
         for (tag, height) in [(200u8, 1usize), (201, 3), (202, 6)] {

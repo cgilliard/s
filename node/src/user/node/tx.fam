@@ -5,6 +5,9 @@
 \   transaction := u32 n_in, n_in * input, u32 n_policy, n_policy * policy
 \                  input, u32 n_out, n_out * output, u32 n_ops, n_ops * op
 \   input       := pubkey (49) | amount u64 | position u64 | signature
+\   policy input := amount u64 | position u64 | leaf index u8 | 4 siblings
+\                  (32) | state u32 | covered start u8, count u8 | leaf |
+\                  a witness a condition (policy.rs)
 \   output      := key hash (32) | amount u64 | memo (20)
 \   op          := commit: 1 | commit (32) | memo (20)
 \                | reveal: 2 | record | position (5) | salt (32)
@@ -13,19 +16,28 @@
 \ Parsed with state.fam's cursor (bp, bq, bcode): tnin inputs at the
 \ addresses in tin, tnout outputs from tout (their commitments in tcom),
 \ tnops operations in tops (tag, its public part as a block lists it, the
-\ salt or the key), tnpol policy inputs (none yet).
+\ salt or the key), tnpol policy inputs (the first at tpol: its leaf's
+\ tpc conditions at the addresses in tcnd, their witnesses in twit, its
+\ policy's root in tprt).  tnall counts the inputs, the policy input last.
 \
 \ tparse ( a n -- flag )  the bytes decode (Transaction::from_bytes).
 \ tbody ( c -- )  c (8 Montgomery words) = the id: the body's hash.
 \ tstatic ( -- code )  check_static: 0, or -2 no inputs, -3 malformed,
 \ -4 too large, -5 dust, -6 a negative fee, -7 a fee below the floor
-\ (10 a byte); the fee in tfee (2 words), the size in tsz.
+\ (10 a byte), -20 more trace rows than a segment (block_air.rs's
+\ tx_rows); the fee in tfee (2 words), the size in tsz.
+\ tcovd ( a k c -- )  c = covered_digest of k (commitment, slot) pairs of
+\ canonical bytes at a; tcovo ( start count c -- ) of outputs.
 \ tikh ( i c -- )  c = the commitment input i spends; tpkh ( pk c -- )
 \ c = a key's hash.
 
 : tin variable ;  : tnin variable ;  : tout variable ;  : tnout variable ;  : tops variable ;  : tnops variable ;
 : tnpol variable ;  : tcom variable ;  : tfee variable ;  : tsz variable ;  : tkb variable ;
 : tacc variable ;  : tacc2 variable ;  : tcap variable ;
+: tpol variable ;  : tpc variable ;  : tpc2 variable ;  : tcnd variable ;  : twit variable ;  : ttag variable ;  : tpk variable ;
+: tprt variable ;  : tsbl variable ;  : tlb variable ;  : tcvb variable ;  : tcva variable ;  : tcvk variable ;  : tcvc variable ;
+: tmode variable ;  : tchan variable ;  : tm variable ;  : tn variable ;  : tkeys variable ;
+: tnall  tnin @ tnpol @ 0= 0= 1 lit and + ;     \ ( -- n )  the inputs, the policy input counted
 
 \ tkey ( -- a )  a key (49 bytes): its root and seed canonical, its height
 \ 1 to 20; then tsig its signature, of that height.
@@ -37,6 +49,98 @@ then ;
 \ tcnt ( size -- n )  a count, at most what the bytes left could hold.
 : tcnt  bu32 swap bleft swap / over u< if drop 0 lit bbad then ;
 
+\ tdigs ( n -- )  n digests, canonical.
+: tdigs  ?dup if dup 5 lit lshift btake swap 3 lit lshift bcanon then ;
+
+\ tcond ( i -- )  condition i of a leaf (policy.rs's Cond::read).
+: tcond
+tpk @ 0= if bp @ tcnd @ 2 lit pick w! then
+bp @ c@ swap ttag @ + c!
+bp @ c@ 1 lit btake drop
+bcode @ if drop else
+	dup 0= if drop
+		bp @ c@ 1 lit btake drop
+		dup 1 lit = if drop 1 lit tdigs else if bbad then then
+		2 lit btake bcode @ if drop else 1 lit + c@ dup 20 lit u> if drop bbad else tdigs then then
+	else dup 1 lit = if drop 1 lit tdigs else
+	dup 5 lit u< if drop 4 lit btake drop else
+	5 lit = if
+		bp @ c@ 1 lit btake drop  dup 80 lit u> if drop bbad else 1 lit lshift tdigs then
+	else bbad then then then then
+then ;
+
+\ twitn ( i -- )  the witness of condition i: signers (a key's number, its
+\ key, its signature), a preimage, or nothing.
+: twitn
+tpk @ 0= if bp @ twit @ 2 lit pick w! then
+ttag @ + c@
+dup 0= if drop
+	bp @ c@ 1 lit btake drop  dup 20 lit u> if drop bbad else
+		?dup if 0 lit do bcode @ 0= if 1 lit btake drop tkey tsig then loop then
+	then
+else 1 lit = if 1 lit tdigs then then ;
+
+\ tpin  a policy input (PolicyInput::read).
+: tpin
+tpk @ 0= if bp @ tpol ! then
+11 lit btake bcode @ 0= if 10 lit + c@ F lit u> if bbad then else drop then
+4 lit tdigs
+4 lit btake bcode @ 0= if le@ 3FFFFFFF lit u> if bbad then else drop then
+2 lit btake drop
+bp @ c@ 1 lit btake drop  dup tpc2 !
+bcode @ if drop else
+	dup 1 lit - 4 lit u< 0= if drop bbad else
+		0 lit do bcode @ 0= if i tcond then loop
+		tpc2 @ 0 lit do bcode @ 0= if i twitn then loop
+	then
+then
+tpk @ 0= if tpc2 @ tpc ! then
+tpk @ 1 lit + tpk ! ;
+
+\ tthr ( p -- )  the threshold after its tag at p: tmode, tchan, tm, tn,
+\ tkeys.
+: tthr  dup c@ dup tmode ! if dup 1 lit + tchan ! 21 lit + else 1 lit + then  dup c@ tm !  dup 1 lit + c@ tn !  2 lit + tkeys ! ;
+
+: tcovd  ( a k c -- )
+tcvc ! tcvk ! tcva !
+tcvk @ tom tcvb @ !  tcvb @ 4 lit + 7 lit wzero
+tcvk @ ?dup if 0 lit do
+	tcva @ i 6 lit lshift +  tcvb @ 20 lit + i 6 lit lshift +  2dup dle  swap 20 lit + swap 20 lit + dle
+loop then
+tcvb @ tcvk @ 4 lit lshift 8 lit + 10 lit tcvc @ hdom ;
+: tcovo  ( start count c -- )
+tcvc ! tcvk ! tcva !
+tcvk @ tom tcvb @ !  tcvb @ 4 lit + 7 lit wzero
+tcvk @ ?dup if 0 lit do
+	tcom @ tcva @ i + 5 lit lshift +  tcvb @ 20 lit + i 6 lit lshift + 8 lit wcopy
+	tout @ tcva @ i + 3C lit * +  tcvb @ 40 lit + i 6 lit lshift + vp !
+	dup 28 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  20 lit + vamount
+loop then
+tcvb @ tcvk @ 4 lit lshift 8 lit + 10 lit tcvc @ hdom ;
+
+\ tcblk ( a -- )  a condition's sponge blocks, at vp (Cond::blocks).
+: tcblk
+dup c@ swap 1 lit + swap
+dup 0= if drop
+	tthr  tmode @ v, tm @ v, tn @ v,  5 lit 0 lit do 0 lit v, loop
+	tmode @ if tchan @ vd, else 8 lit 0 lit do 0 lit v, loop then
+	tn @ ?dup if 0 lit do tkeys @ i 5 lit lshift + vd, loop then
+else dup 1 lit = if drop vd, else
+	5 lit = if dup 1 lit + swap c@ vp @ tcovd  vp @ 20 lit + vp ! else
+	le@ v,  7 lit 0 lit do 0 lit v, loop then then then ;
+
+\ tproot  tprt = the first policy input's root: its leaf's hash
+\ (hash_domain 13 of its blocks), then the path.
+: tproot
+tlb @ vp !
+tpc @ v,  4 lit 0 lit do i tpc @ u< if tcnd @ i w@ c@ 1 lit + else 0 lit then v, loop  3 lit 0 lit do 0 lit v, loop
+tpc @ 0 lit do tcnd @ i w@ tcblk loop
+tlb @ vp @ tlb @ - 2 lit rshift D lit tprt @ hdom
+4 lit 0 lit do
+	tpol @ 11 lit + i 5 lit lshift + tsbl @ dle
+	tpol @ 10 lit + c@ i rshift 1 lit and if tsbl @ tprt @ tprt @ compress else tprt @ tsbl @ tprt @ compress then
+loop ;
+
 : tparse  ( a n -- flag )
 dup tsz !  over + bq ! bp !  0 lit bcode !
 tin @ ?dup if free then  tops @ ?dup if free then  tcom @ ?dup if free then
@@ -44,7 +148,9 @@ tin @ ?dup if free then  tops @ ?dup if free then  tcom @ ?dup if free then
 tnin @ ?dup if 0 lit do bcode @ 0= if
 	tkey  dup tin @ i w!  10 lit btake drop  tsig
 then loop then
-bu32 tnpol !  tnpol @ if bbad then
+bu32 tnpol !  0 lit tpk !
+tnpol @ bleft 98 lit / u> if bbad 0 lit tnpol ! then
+tnpol @ ?dup if 0 lit do bcode @ 0= if tpin then loop then
 3C lit tcnt tnout !  bp @ tout !  tnout @ 3C lit * btake drop
 bcode @ 0= if tnout @ ?dup if 0 lit do tout @ i 3C lit * + dup 8 lit bcanon 28 lit + 5 lit bcanon loop then then
 35 lit tcnt tnops !  tnops @ C lit * 4 lit + malloc tops !
@@ -62,6 +168,7 @@ bcode @ 0= if tnout @ ?dup if 0 lit do
 	tkb @ vp !  tout @ i 3C lit * +  dup vd,  20 lit + vamount
 	tkb @ B lit 2 lit tcom @ i 5 lit lshift + hdom
 loop then then
+bcode @ 0= tnpol @ and if tproot then
 bcode @ 0= ;
 
 \ tpkh ( pk c -- )  c = H(pubkey): hash_domain 1 of the root, the seed
@@ -72,16 +179,21 @@ tkb @ D lit 1 lit 3 lit pick hdom drop ;
 
 \ tikh ( i c -- )  c = H(H(pubkey) || amount) of input i.
 : tikh
-swap tin @ swap w@  2dup swap tpkh
-tkb @ vp !  over vp @ 8 lit wcopy  vp @ 20 lit + vp !  31 lit + vamount
+over tnin @ = if
+	nip tkb @ vp !  tprt @ vp @ 8 lit wcopy  vp @ 20 lit + vp !  tpol @ vamount
+else
+	swap tin @ swap w@  2dup swap tpkh
+	tkb @ vp !  over vp @ 8 lit wcopy  vp @ 20 lit + vp !  31 lit + vamount
+then
 tkb @ B lit 2 lit 3 lit pick hdom drop ;
 
 : tbody  ( c -- )
-tnin @ 4 lit lshift tnout @ 18 lit * + tnops @ 3 lit lshift + 8 lit + 2 lit lshift malloc dup vb ! vp !
+tnall 4 lit lshift tnout @ 18 lit * + tnops @ 3 lit lshift + 8 lit + 2 lit lshift malloc dup vb ! vp !
 tnin @ v, tnout @ v, tnops @ v, tnpol @ v,  4 lit 0 lit do 0 lit v, loop
 tnin @ ?dup if 0 lit do
 	tin @ i w@  dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  31 lit + vamount  0 lit v,
 loop then
+tnpol @ if tprt @ vp @ 8 lit wcopy  vp @ 20 lit + vp !  4 lit 0 lit do 0 lit v, loop  tpol @ vamount  1 lit v, then
 tnout @ ?dup if 0 lit do
 	tcom @ i 5 lit lshift + vp @ 8 lit wcopy  vp @ 20 lit + vp !
 	tout @ i 3C lit * +  dup 20 lit + vamount  5 lit 0 lit do 0 lit v, loop
@@ -93,8 +205,40 @@ vb @ free ;
 
 \ tamt ( a -- lo hi )  an 8-byte amount.
 : tamt  dup le@ swap 4 lit + le@ ;
-\ tpos ( i -- lo hi )  input i's position.
-: tpos  tin @ swap w@ 39 lit + tamt ;
+\ tpos ( i -- lo hi )  input i's position (i = tnin: the policy input's).
+: tpos  dup tnin @ = if drop tpol @ 8 lit + else tin @ swap w@ 39 lit + then tamt ;
+
+\ trows ( -- n )  tx_rows with the policy input: 2, each input's (a
+\ signature's fragment, 3 + 67 17 + 2 its height, and 89), the policy
+\ input's (97, its conditions', its signatures' fragments and 3 each),
+\ the outputs' (89, 2 more covered, 3 more the run's last), 2 an
+\ operation.
+: trw variable ;  : trs variable ;  : trc variable ;
+: tfrag  1 lit lshift 476 lit + ;             \ ( h -- rows )  a signature's fragment
+: trows
+2 lit trw !
+tnin @ ?dup if 0 lit do tin @ i w@ 30 lit + c@ tfrag 59 lit + trw @ + trw ! loop then
+61 lit trw @ + trw !
+tpc @ 0 lit do
+	tcnd @ i w@ dup c@
+	dup 0= if drop 1 lit + tthr tn @ tm @ + 2 lit + else nip 1 lit = if 2 lit else 1 lit then then
+	trw @ + trw !
+	tcnd @ i w@ c@ 0= if
+		twit @ i w@ dup c@ trc !  1 lit +
+		trc @ ?dup if 0 lit do
+			dup 31 lit + c@ dup tfrag 3 lit + trw @ + trw !
+			5 lit lshift 888 lit + 32 lit + +
+		loop then drop
+	then
+loop
+tpol @ 95 lit + c@ trs !  tpol @ 96 lit + c@ trc !
+tnout @ ?dup if 0 lit do
+	59 lit
+	i trs @ u< 0=  i trs @ trc @ + u< and if 2 lit + then
+	i 1 lit + trs @ trc @ + =  trc @ 0= 0= and if 3 lit + then
+	trw @ + trw !
+loop then
+tnops @ 1 lit lshift trw @ + ;
 
 : tcd variable ;
 : tfl  tcd @ 0= if tcd ! else drop then ;    \ ( code -- )  the first refusal stands
@@ -103,6 +247,7 @@ vb @ free ;
 0 lit tcd !
 tnin @ tnpol @ or 0= if FFFFFFFE lit tfl then
 tnpol @ 1 lit u> if FFFFFFFD lit tfl then
+tok tnpol @ and if trows 7FFF lit u> if FFFFFFEC lit tfl then then
 tsz @ 20000 lit u> if FFFFFFFC lit tfl then
 tok if
 	0 lit tnout @ ?dup if 0 lit do tout @ i 3C lit * + 20 lit + tamt or 0= or loop then
@@ -121,9 +266,9 @@ tok if
 	if FFFFFFFB lit tfl then
 then
 \ an input twice
-tok tnin @ 1 lit u> and if
+tok tnall 1 lit u> and if
 	0 lit
-	tnin @ 1 lit do i 0 lit do
+	tnall 1 lit do i 0 lit do
 		j tpos i tpos  rot = -rot = and or
 	loop loop
 	if FFFFFFFD lit tfl then
@@ -132,6 +277,7 @@ then
 tok if
 	tacc @ 4 lit wzero  tacc2 @ 4 lit wzero
 	tnin @ ?dup if 0 lit do tin @ i w@ 31 lit + tamt tacc @ amount+ loop then
+	tnpol @ if tpol @ tamt tacc @ amount+ then
 	tnout @ ?dup if 0 lit do tout @ i 3C lit * + 20 lit + tamt tacc2 @ amount+ loop then
 	tacc @ tacc2 @ tacc @ 4 lit wsub if FFFFFFFA lit tfl then
 then
@@ -147,4 +293,6 @@ tcd @ ;
 
 : tinit
 0 lit tin !  0 lit tops !  0 lit tcom !
+10 lit alloc tcnd !  10 lit alloc twit !  4 lit alloc ttag !  20 lit alloc tprt !  20 lit alloc tsbl !
+1200 lit alloc tlb !  2100 lit alloc tcvb !
 40 lit alloc tkb !  10 lit alloc tacc !  10 lit alloc tacc2 !  8 lit alloc tfee ! ;
