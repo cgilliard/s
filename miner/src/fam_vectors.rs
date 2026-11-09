@@ -19,7 +19,11 @@
 //!   operations, built and connected by tabminer's own `Chain`, with bodies
 //!   breaking each state rule and tabminer's verdict on each; and
 //!   `statesnap.bin` (step 6), the snapshot after its block 150 as
-//!   tabminer serves it: its manifest, output parts and name parts.
+//!   tabminer serves it: its manifest, output parts and name parts;
+//! - `pool.bin` (step 7): transactions offered to tabminer's own
+//!   `Mempool` on a dev chain whose outputs pay known keys, each verdict as
+//!   it gave it, blocks mining some, the pool after each, and XMSS
+//!   signatures of other heights, verified and refused.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -36,6 +40,7 @@ mod tests {
     const POW_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pow_vectors.fam");
     const STATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain.bin");
     const SNAP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statesnap.bin");
+    const POOL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pool.bin");
     /// The block whose snapshot `statesnap.bin` holds.
     const SNAP_HEIGHT: u32 = 150;
     const HDR_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/headers_vectors.fam");
@@ -995,6 +1000,352 @@ mod tests {
         (file, snap)
     }
 
+    /// A verdict of `Mempool::insert` as `pool.bin` gives it: 0, or a
+    /// negative code (-1 for bytes that do not decode).
+    fn tx_code(r: &Result<crate::xmss::Digest, crate::mempool::Reject>) -> i32 {
+        use crate::mempool::{NameReject, Reject};
+        match r {
+            Ok(_) => 0,
+            Err(e) => match e {
+                Reject::NoInputs => -2,
+                Reject::Malformed => -3,
+                Reject::TooLarge(_) => -4,
+                Reject::Dust { .. } => -5,
+                Reject::NegativeFee => -6,
+                Reject::FeeTooLow { .. } => -7,
+                Reject::BadSignature => -8,
+                Reject::UnknownInput(_) => -9,
+                Reject::Known => -10,
+                Reject::NameConflict => -11,
+                Reject::ReplacementFee { .. } => -12,
+                Reject::Full => -13,
+                Reject::Name(NameReject::NoCommit) => -14,
+                Reject::Name(NameReject::Expired(_)) => -15,
+                Reject::Name(NameReject::Registered) => -16,
+                Reject::Name(NameReject::NotRegistered) => -17,
+                Reject::Name(NameReject::BadOwner) => -18,
+                Reject::Policy(_) => -19,
+                Reject::TooManyRows(_) => -20,
+                Reject::Expired => -21,
+                other => panic!("unexpected pool verdict {other:?}"),
+            },
+        }
+    }
+
+    /// The pool test for step 7, `pool.bin`: a count, then entries, each a
+    /// kind word and word padded:
+    /// - 0, a block: its header (204 bytes), its body's length and the
+    ///   body; tabminer connected it (its proof is not checked);
+    /// - 1, a transaction offered to the pool for the block after the tip:
+    ///   tabminer's verdict (`tx_code`), its id (8 canonical words, zero if
+    ///   it does not decode), its length and its bytes;
+    /// - 2, the pool after a block: a count and the ids it holds;
+    /// - 3, an XMSS signature: the flag tabminer's `verify` gives, the
+    ///   message (8 canonical words), the key (49 bytes), the signature's
+    ///   length and the signature.
+    fn generate_pool() -> Vec<u8> {
+        use crate::block::{Block, Body};
+        use crate::chain::{AcceptAllProofs, Chain, ChainParams};
+        use crate::mempool::Mempool;
+        use crate::names::{BlockNameOp, MIN_REVEAL, NameOp, Record, commit_hash, name_elements, name_hash};
+        use crate::poseidon2::{DIGEST, digest_to_bytes};
+        use crate::pow::{PowParams, SeedText};
+        use crate::transaction::{Key, Output, Transaction, UnsignedTransaction, pubkey_hash};
+        type Digest = [Fp; DIGEST];
+        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
+        let dir = std::env::temp_dir().join(format!("tabminer-fampool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chain = Chain::open(&dir, 256 << 20, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        chain.set_dataset(std::sync::Arc::new(dev_dataset().clone()));
+        chain.init_genesis(&p.genesis()).unwrap();
+        let data = dev_dataset();
+        let mut r = Rng(0x9001_7e57);
+        let digest = |r: &mut Rng| -> Digest { core::array::from_fn(|_| Fp::new(r.u32() % P)) };
+        let memo = |r: &mut Rng| -> crate::transaction::Memo { core::array::from_fn(|_| Fp::new(r.u32() % P)) };
+        let key = |tag: u8, height: usize| {
+            let mut s = [0u8; 32];
+            s[0] = 0x70;
+            s[1] = tag;
+            Key::generate_with_height(&s, height)
+        };
+        let mut keys: Vec<Key> = (0..8).map(|i| key(i, crate::transaction::TREE_HEIGHT)).collect();
+        let mut o0 = key(100, crate::transaction::TREE_HEIGHT);
+        let mut o1 = key(101, crate::transaction::TREE_HEIGHT);
+        let (h0, h1) = (pubkey_hash(&o0.public_key()), pubkey_hash(&o1.public_key()));
+        let mut out: Vec<u8> = Vec::new();
+        let mut entries = 0u32;
+        let pad = |out: &mut Vec<u8>| out.resize(out.len().div_ceil(4) * 4, 0);
+        let words = |out: &mut Vec<u8>, d: &Digest| out.extend_from_slice(&digest_to_bytes(d));
+        let mut ts = p.genesis_timestamp;
+        // A block of the reward (to key `to`) and the transactions.
+        let block = |out: &mut Vec<u8>, ts: u64, to: &Key, txs: &[&Transaction], ops: Vec<BlockNameOp>, r: &mut Rng| {
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let fees: i128 = txs.iter().map(|t| t.balance()).sum();
+            let reward = Output::with_memo(&pubkey_hash(&to.public_key()), p.subsidy(height) + fees as u64, memo(r));
+            let mut body = Body { outputs: vec![reward.block_output()], ..Default::default() };
+            for t in txs {
+                body.inputs.extend(t.spent_positions());
+                body.outputs.extend(t.outputs.iter().map(Output::block_output));
+                body.ops.extend(t.ops.iter().map(NameOp::block_op));
+            }
+            body.ops.extend(ops);
+            let mut header = chain.template(&body, ts).unwrap();
+            header.mix = header.pow_output(data).mix;
+            let b = Block { header, body };
+            chain.apply_block(&b, ts + 60).unwrap();
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&b.header.to_bytes());
+            let body = b.body.to_bytes();
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            pad(out);
+        };
+        let next = |chain: &Chain<AcceptAllProofs>| chain.utxo().next_position(&chain.env().read_txn().unwrap()).unwrap();
+        // Blocks 1 to 16: rewards to the keys in turn (block h's at
+        // position `reward[h]`); commits for "second" (owner o1, at 3) and
+        // "pooltest" (owner o0, at 2; and owner o1, at 4, left unrevealed);
+        // "pooltest" revealed at 15.
+        let name = |n: &str| name_hash(&name_elements(n.as_bytes()).unwrap());
+        let (s0, s1, s2) = (digest(&mut r), digest(&mut r), digest(&mut r));
+        let mut reward = vec![0u64];
+        let mut amount = vec![0u64];
+        let mut commit_at = std::collections::HashMap::new();
+        let pt = Record::new(b"pooltest", h0, digest(&mut r), digest(&mut r)).unwrap();
+        for h in 1..=16u32 {
+            ts += 10;
+            reward.push(next(&chain));
+            amount.push(p.subsidy(h));
+            let mut ops = vec![];
+            let c = match h {
+                2 => Some(commit_hash(&name("pooltest"), &s0, &h0)),
+                3 => Some(commit_hash(&name("second"), &s1, &h1)),
+                4 => Some(commit_hash(&name("pooltest"), &s2, &h1)),
+                _ => None,
+            };
+            if let Some(c) = c {
+                ops.push(BlockNameOp::Commit { commit: c, memo: memo(&mut r) });
+                commit_at.insert(h, reward[h as usize] + 1);
+            }
+            if h == 2 + MIN_REVEAL + 1 {
+                ops.push(BlockNameOp::Reveal { record: pt.clone(), commit: commit_at[&2] });
+            }
+            let to = h as usize % 8;
+            let k = keys[to].clone();
+            block(&mut out, ts, &k, &[], ops, &mut r);
+            entries += 1;
+        }
+        let owner = |h: u32| h as usize % 8;
+        let mut pool = Mempool::new(crate::mempool::DEFAULT_CAPACITY);
+        let offer = |out: &mut Vec<u8>, pool: &mut Mempool, bytes: &[u8], want: i32| {
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let (code, id) = match Transaction::from_bytes(bytes) {
+                None => (-1, [Fp::ZERO; DIGEST]),
+                Some(tx) => {
+                    let id = tx.txid();
+                    let rtxn = chain.env().read_txn().unwrap();
+                    (tx_code(&pool.insert(tx, chain.utxo(), chain.names(), &rtxn, height)), id)
+                }
+            };
+            assert_eq!(code, want, "pool verdict");
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&code.to_le_bytes());
+            words(out, &id);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+            pad(out);
+        };
+        let ids = |out: &mut Vec<u8>, pool: &Mempool| {
+            let mut v = pool.ids();
+            v.sort_by_key(digest_to_bytes);
+            out.extend_from_slice(&2u32.to_le_bytes());
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for id in &v {
+                words(out, id);
+            }
+        };
+        // A transaction spending (block, amount) rewards, signed by their
+        // keys, paying `outs` (key, amount) and the rest less `fee` back to
+        // the first's key.
+        let make = |keys: &mut [Key], reward: &[u64], spends: &[(u32, u64)], outs: &[(usize, u64)], fee: u64, ops: Vec<NameOp>, r: &mut Rng| -> Transaction {
+            let total: u64 = spends.iter().map(|s| s.1).sum();
+            let paid: u64 = outs.iter().map(|o| o.1).sum();
+            let mut outputs: Vec<Output> =
+                outs.iter().map(|&(k, a)| Output::with_memo(&pubkey_hash(&keys[k].public_key()), a, memo(r))).collect();
+            if let Some(change) = total.checked_sub(paid + fee).filter(|c| *c > 0) {
+                outputs.push(Output::with_memo(&pubkey_hash(&keys[owner(spends[0].0)].public_key()), change, memo(r)));
+            }
+            let inputs = spends.iter().map(|s| (keys[owner(s.0)].public_key(), s.1)).collect();
+            let unsigned = UnsignedTransaction::with_ops(inputs, outputs, ops);
+            let mut tx = unsigned.sign::<()>(|i, _, msg| Ok(keys[owner(spends[i].0)].sign(msg).unwrap())).unwrap();
+            tx.set_positions(&spends.iter().map(|s| reward[s.0 as usize]).collect::<Vec<_>>());
+            tx
+        };
+        let s = amount[1];
+        let coin = 100_000_000u64;
+        // T1, again, a replacement short of the fee, one paying it.
+        let t1 = make(&mut keys, &reward, &[(1, s)], &[(4, coin)], 100_000, vec![], &mut r);
+        offer(&mut out, &mut pool, &t1.to_bytes(), 0);
+        offer(&mut out, &mut pool, &t1.to_bytes(), -10);
+        let t2 = make(&mut keys, &reward, &[(1, s)], &[(5, coin)], 100_000 + 10, vec![], &mut r);
+        offer(&mut out, &mut pool, &t2.to_bytes(), -12);
+        let t3 = make(&mut keys, &reward, &[(1, s)], &[(4, coin)], 100_000 + 10 * 2600, vec![], &mut r);
+        offer(&mut out, &mut pool, &t3.to_bytes(), 0);
+        entries += 4;
+        // A changed signature (canonical still), an input elsewhere, an
+        // amount not the output's.
+        let mut t = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 100_000, vec![], &mut r);
+        t.inputs[0].signature.wots[7][3] = t.inputs[0].signature.wots[7][3].add(&Fp::ONE);
+        offer(&mut out, &mut pool, &t.to_bytes(), -8);
+        let mut t = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 100_000, vec![], &mut r);
+        t.set_positions(&[reward[3]]);
+        offer(&mut out, &mut pool, &t.to_bytes(), -9);
+        let t = make(&mut keys, &reward, &[(2, s + 1)], &[(5, coin)], 100_000, vec![], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -9);
+        entries += 3;
+        // The static rules: outputs above the inputs, a fee below the
+        // floor, dust, an output of zero, an input twice, no inputs.
+        let t = make(&mut keys, &reward, &[(2, s)], &[(5, s + 1)], 0, vec![], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -6);
+        let t = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 10, vec![], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -7);
+        let t = make(&mut keys, &reward, &[(2, s)], &[(5, 100)], 100_000, vec![], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -5);
+        let mut t = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 100_000, vec![], &mut r);
+        t.outputs.push(Output::with_memo(&h0, 0, memo(&mut r)));
+        offer(&mut out, &mut pool, &t.to_bytes(), -3);
+        let t = make(&mut keys, &reward, &[(2, s), (2, s)], &[(5, coin)], 100_000, vec![], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -3);
+        let t = Transaction { inputs: vec![], policy_inputs: vec![], outputs: t.outputs.clone(), ops: vec![] };
+        offer(&mut out, &mut pool, &t.to_bytes(), -2);
+        entries += 6;
+        // Bytes that do not decode: cut short, an element not canonical, a
+        // key of height zero, a byte left over.
+        let good = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 100_000, vec![], &mut r).to_bytes();
+        offer(&mut out, &mut pool, &good[..good.len() - 1], -1);
+        let mut b = good.clone();
+        b[4 + 49 + 16 + 8 + 100..4 + 49 + 16 + 8 + 104].copy_from_slice(&P.to_le_bytes());
+        offer(&mut out, &mut pool, &b, -1);
+        let mut b = good.clone();
+        b[4 + 48] = 0;
+        offer(&mut out, &mut pool, &b, -1);
+        let mut b = good.clone();
+        b.push(0);
+        offer(&mut out, &mut pool, &b, -1);
+        entries += 4;
+        // Names: "second" revealed; again by another; with the wrong salt;
+        // "pooltest", registered, revealed from its other commit.
+        let sec = Record::new(b"second", h1, digest(&mut r), digest(&mut r)).unwrap();
+        let t15 = make(&mut keys, &reward, &[(2, s)], &[(5, coin)], 200_000, vec![NameOp::Reveal { record: sec.clone(), salt: s1, commit: commit_at[&3] }], &mut r);
+        offer(&mut out, &mut pool, &t15.to_bytes(), 0);
+        let t = make(&mut keys, &reward, &[(3, s)], &[], 200_000, vec![NameOp::Reveal { record: sec.clone(), salt: s1, commit: commit_at[&3] }], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -11);
+        let t = make(&mut keys, &reward, &[(3, s)], &[], 200_000, vec![NameOp::Reveal { record: sec.clone(), salt: s0, commit: commit_at[&3] }], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -14);
+        let pt1 = Record { owner: h1, ..pt.clone() };
+        let t = make(&mut keys, &reward, &[(3, s)], &[], 200_000, vec![NameOp::Reveal { record: pt1.clone(), salt: s2, commit: commit_at[&4] }], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -16);
+        entries += 4;
+        // Updates: "pooltest" to o1 by o0; by the wrong key; of no name;
+        // keeping the owner; another of "pooltest" while one is pooled.
+        let up = NameOp::update(pt1.clone(), &mut o0).unwrap();
+        let t19 = make(&mut keys, &reward, &[(3, s)], &[], 200_000, vec![up], &mut r);
+        offer(&mut out, &mut pool, &t19.to_bytes(), 0);
+        let bad = NameOp::update(Record { value: digest(&mut r), ..pt1.clone() }, &mut o1).unwrap();
+        let t = make(&mut keys, &reward, &[(4, s)], &[], 200_000, vec![bad], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -18);
+        let none = NameOp::update(Record::new(b"nobody", h1, digest(&mut r), digest(&mut r)).unwrap(), &mut o0).unwrap();
+        let t = make(&mut keys, &reward, &[(4, s)], &[], 200_000, vec![none], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -17);
+        let same = NameOp::update(Record { value: digest(&mut r), ..pt.clone() }, &mut o0).unwrap();
+        let t = make(&mut keys, &reward, &[(4, s)], &[], 200_000, vec![same], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -18);
+        let other = NameOp::update(Record { value: digest(&mut r), ..pt1.clone() }, &mut o0).unwrap();
+        let t = make(&mut keys, &reward, &[(7, s)], &[], 200_000, vec![other], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -11);
+        entries += 5;
+        // Two inputs; a commit; two commits.
+        let t23 = make(&mut keys, &reward, &[(4, s), (5, s)], &[(6, coin), (7, 2 * coin)], 150_000, vec![], &mut r);
+        offer(&mut out, &mut pool, &t23.to_bytes(), 0);
+        let commit = |r: &mut Rng| NameOp::Commit { commit: digest(r), memo: memo(r) };
+        let t24 = make(&mut keys, &reward, &[(6, s)], &[], 200_000, vec![commit(&mut r)], &mut r);
+        offer(&mut out, &mut pool, &t24.to_bytes(), 0);
+        let t = make(&mut keys, &reward, &[(7, s)], &[], 200_000, vec![commit(&mut r), commit(&mut r)], &mut r);
+        offer(&mut out, &mut pool, &t.to_bytes(), -3);
+        entries += 3;
+        // Block 17 mines T3, T15 and T23; T19 and T24 stay.
+        ts += 10;
+        reward.push(next(&chain));
+        let k = keys[0].clone();
+        block(&mut out, ts, &k, &[&t3, &t15, &t23], vec![], &mut r);
+        {
+            let rtxn = chain.env().read_txn().unwrap();
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+            pool.revalidate(chain.utxo(), chain.names(), &rtxn, height, &moved, &created).unwrap();
+        }
+        ids(&mut out, &pool);
+        entries += 2;
+        // T1's input, spent now; T3's payment, spent; T19 again.
+        offer(&mut out, &mut pool, &t1.to_bytes(), -9);
+        let paid = t3.outputs[0];
+        let mut t29 = {
+            let inputs = vec![(keys[4].public_key(), paid.amount)];
+            let outputs = vec![Output::with_memo(&h0, paid.amount - 50_000, memo(&mut r))];
+            UnsignedTransaction::new(inputs, outputs).sign::<()>(|_, _, msg| Ok(keys[4].sign(msg).unwrap())).unwrap()
+        };
+        t29.set_positions(&[reward[17] + 1]);
+        offer(&mut out, &mut pool, &t29.to_bytes(), 0);
+        offer(&mut out, &mut pool, &t19.to_bytes(), -10);
+        entries += 3;
+        // Block 18 mines the rest.
+        ts += 10;
+        reward.push(next(&chain));
+        block(&mut out, ts, &k, &[&t19, &t24, &t29], vec![], &mut r);
+        {
+            let rtxn = chain.env().read_txn().unwrap();
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let (moved, created) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+            pool.revalidate(chain.utxo(), chain.names(), &rtxn, height, &moved, &created).unwrap();
+        }
+        ids(&mut out, &pool);
+        entries += 2;
+        // XMSS on its own: keys of heights 1, 3 and 6, signed, a message,
+        // the randomizer and the index changed.
+        for (tag, height) in [(200u8, 1usize), (201, 3), (202, 6)] {
+            let mut k = key(tag, height);
+            let msg = digest(&mut r);
+            let sig = k.sign(&msg).unwrap();
+            let sig2 = k.sign(&msg).unwrap();
+            let mut cases = vec![(msg, sig.clone()), (digest(&mut r), sig.clone()), (msg, sig2.clone())];
+            let mut s = sig.clone();
+            s.randomizer[0] = s.randomizer[0].add(&Fp::ONE);
+            cases.push((msg, s));
+            let mut s = sig2.clone();
+            s.index ^= 1;
+            cases.push((msg, s));
+            let mut s = sig.clone();
+            s.auth_path[height - 1][5] = s.auth_path[height - 1][5].add(&Fp::ONE);
+            cases.push((msg, s));
+            for (m, s) in cases {
+                let ok = k.public_key().verify(&m, &s);
+                out.extend_from_slice(&3u32.to_le_bytes());
+                out.extend_from_slice(&(ok as u32).to_le_bytes());
+                words(&mut out, &m);
+                out.extend_from_slice(&k.public_key().to_bytes());
+                let b = s.to_bytes();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+                pad(&mut out);
+                entries += 1;
+            }
+        }
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut file = entries.to_le_bytes().to_vec();
+        file.extend_from_slice(&out);
+        file
+    }
+
     #[test]
     fn fam_vectors_are_current() {
         let file = std::fs::read_to_string(PATH).expect("node/src/user/node/arith_vectors.fam");
@@ -1012,6 +1363,8 @@ mod tests {
         assert!(file == state, "the fam node's state chain is stale: run write_fam_vectors");
         let file = std::fs::read(SNAP_PATH).expect("node/src/user/node/statesnap.bin");
         assert!(file == snap, "the fam node's snapshot is stale: run write_fam_vectors");
+        let file = std::fs::read(POOL_PATH).expect("node/src/user/node/pool.bin");
+        assert!(file == generate_pool(), "the fam node's pool test is stale: run write_fam_vectors");
     }
 
     #[test]
@@ -1025,6 +1378,7 @@ mod tests {
         let (state, snap) = generate_state();
         std::fs::write(STATE_PATH, state).unwrap();
         std::fs::write(SNAP_PATH, snap).unwrap();
+        std::fs::write(POOL_PATH, generate_pool()).unwrap();
     }
 }
 
