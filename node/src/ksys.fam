@@ -460,12 +460,29 @@ dup "cwd" streq if 5 lit pk ! then
 dup "user" streq if 6 lit pk ! then
 "kill" streq if 4 lit pk ! then ;
 
+\ rtc0 ( -- s )  the date, seconds since 1970: QEMU's goldfish RTC (the
+\ virt machine's, at 0x101000) gives nanoseconds, its low word read first
+\ (which latches the high), divided by 10^9 a bit at a time.  The caller
+\ holds klk (rtcsec takes it).
+: rl variable ;  : rh variable ;  : rr variable ;  : rq variable ;
+: rtc0
+101000 lit @ rl !  101004 lit @ rh !  0 lit rr !  0 lit rq !
+40 lit 0 lit do
+	rr @ 1 lit lshift rh @ 1F lit rshift or rr !
+	rh @ 1 lit lshift rl @ 1F lit rshift or rh !
+	rl @ 1 lit lshift rl !
+	rq @ 1 lit lshift rq !
+	rr @ 3B9ACA00 lit u< 0= if rr @ 3B9ACA00 lit - rr !  rq @ 1 lit or rq ! then
+loop
+rq @ ;
+
 \ pgen ( q -- )  key q's text, a newline last.
 : pgen
 dup 1 lit = if area@ tproc pid tn then
 dup 2 lit = if nharts @ tn then
 dup 3 lit = if pgfree# 2 lit lshift tn then
 dup 4 lit = if 0 lit htick harr @ dup 64 lit / tn 2E lit tc 64 lit % dup A lit u< if 30 lit tc then tn then
+dup 11 lit = if rtc0 tn then
 dup 5 lit = if pp @ pstatus then
 dup 6 lit = if pp @ pcmd then
 dup A lit = if pp @ C4 lit + @ tn 20 lit tc pp @ C8 lit + @ tn then
@@ -475,7 +492,8 @@ dup 7 lit = if pp @ 20 lit + @ tn then
 A lit tc ;
 
 \ popen ( s mode -- f | 0 | error )  a key under /proc: self, harts, mem
-\ (KiB free), uptime (seconds), net (TCP's sockets in use, its
+\ (KiB free), uptime (seconds), time (the date: seconds since 1970), net
+\ (TCP's sockets in use, its
 \ retransmissions), halt (written only, by root: the machine stops), and
 \ <pid>/ status, cmd, tickets (also written: the process's tickets), kill
 \ (written only: it ends, -9).
@@ -485,6 +503,7 @@ dup "self" streq if 1 lit pq ! then
 dup "harts" streq if 2 lit pq ! then
 dup "mem" streq if 3 lit pq ! then
 dup "uptime" streq if 4 lit pq ! then
+dup "time" streq if 11 lit pq ! then
 dup "net" streq if 10 lit pq ! then
 dup "halt" streq if B lit pq ! then
 pq @ if drop else
@@ -648,7 +667,7 @@ dup 1 lit = if "console" tl "null" tl rngk @ if "random" tl then "tty/" tl then
 dup 2 lit = if 10 lit 0 lit do i 2 lit lshift kpty @ + @ if i tn A lit tc then loop then
 dup 3 lit = if
 	phi @ 0 lit do i prn @ if i 1 lit + tn "/" tl then loop
-	"halt" tl "harts" tl "mem" tl "net" tl "self" tl "uptime" tl
+	"halt" tl "harts" tl "mem" tl "net" tl "self" tl "time" tl "uptime" tl
 then
 4 lit = if "cmd" tl "cwd" tl "kill" tl "status" tl "tickets" tl "user" tl then ;
 
@@ -1212,20 +1231,8 @@ klk @ unlock dup BLK = if drop else sret then ;
 :M XN    F90 lit ;  :M XD    F94 lit ;  :M XB    F98 lit ;  :M XSZ  F9C lit ;
 :M TREE 100 lit ;  :M CREATE 200 lit ;  :M TRUNC 400 lit ;  :M APPEND 800 lit ;   \ open's flags
 
-\ rtcsec ( -- s )  the seconds since 1970, QEMU's clock's (goldfish, at
-\ 0x101000: nanoseconds, the low word first) divided down.
-: rl variable ;  : rh variable ;  : rr variable ;  : rq variable ;
-: rtcsec
-klk @ lock
-101000 lit @ rl !  101004 lit @ rh !  0 lit rr !  0 lit rq !
-40 lit 0 lit do
-	rr @ 1 lit lshift rh @ 1F lit rshift or rr !
-	rh @ 1 lit lshift rl @ 1F lit rshift or rh !
-	rl @ 1 lit lshift rl !
-	rq @ 1 lit lshift rq !
-	rr @ 3B9ACA00 lit u< 0= if rr @ 3B9ACA00 lit - rr !  rq @ 1 lit or rq ! then
-loop
-rq @ klk @ unlock ;
+\ rtcsec ( -- s )  the seconds since 1970 (rtc0), under klk.
+: rtcsec  klk @ lock rtc0 klk @ unlock ;
 
 : bzero  ?dup if 0 lit do 0 lit over i + c! loop then drop ;   \ ( a n -- )
 
