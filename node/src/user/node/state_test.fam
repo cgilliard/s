@@ -1,0 +1,51 @@
+\ state_test.fam — a dev chain's state (docs/NODE.md, step 5), a program
+\ for the OS after arith.fam, poseidon2.fam, difficulty.fam, pow.fam and
+\ state.fam, with a disk.  /lib/statechain is miner/src/fam_vectors.rs's
+\ statechain.bin: blocks with tabminer's verdicts.  Each is connected and
+\ given tabminer's verdict, every root matching; then every block is
+\ disconnected down to genesis, each time the root its parent's; then all
+\ connected again.
+
+: cta variable ;  : ctn variable ;  : cvp variable ;  : cvf variable ;
+: hl variable ;  : nh variable ;  : cr variable ;
+
+\ rdfile ( path -- addr n )  a whole file of at most 1 MiB, in memory.
+: rdfile
+0 lit open  dup 0< if "state_test: no file" puts 0A lit putc then
+100000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  100000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: vok  if cvp @ 1 lit + cvp ! else cvf @ 1 lit + cvf ! then ;
+: ep variable ;  : ecode variable ;  : eh variable ;  : en variable ;  : eb variable ;
+: hb variable ;  : hn variable ;  : gr variable ;
+\ entry  the next block of the file: its verdict, header, body and length.
+: entry  ep @ @ ecode !  ep @ 4 lit + eh !  ep @ D0 lit + @ en !  ep @ D4 lit + eb !  eb @ en @ + 3 lit + FFFFFFFC lit and ep ! ;
+
+"/t-state" TREE CREATE or 2 lit or open stinit
+800 lit alloc hl !  800 lit alloc hb !  800 lit alloc hn !  20 lit alloc cr !  20 lit alloc gr !
+"/lib/statechain" rdfile drop dup @ ctn ! 4 lit + ep !
+0 lit nh !  0 lit cvp !  0 lit cvf !
+ctn @ 0 lit do
+	entry
+	eh @ eb @ en @ sconnect
+	dup ecode @ = dup vok 0= if "block " puts i u. " got " puts dup . " not " puts ecode @ . 0A lit putc then drop
+	ecode @ 0= if eh @ hl @ nh @ w!  eb @ hb @ nh @ w!  en @ hn @ nh @ w!  nh @ 1 lit + nh ! then
+loop
+"connected: " puts cvp @ u. " as tabminer, " puts cvf @ u. " not" puts 0A lit putc
+\ Every block disconnected: the root its parent's (genesis's the empty tree's).
+0 lit cvp !  0 lit cvf !
+28 lit dfl gr @ 8 lit wcopy  gr @ dfrom
+nh @ 0 lit do
+	sundo  cr @ sroot
+	nh @ 1 lit - i - ?dup if 1 lit - hl @ swap w@ 4C lit + else gr @ then
+	cr @ swap 8 lit wcmp 0= vok
+loop
+"disconnected: " puts cvp @ u. " roots right, " puts cvf @ u. " wrong" puts 0A lit putc
+0 lit cvp !  0 lit cvf !
+nh @ 0 lit do hl @ i w@ hb @ i w@ hn @ i w@ sconnect 0= vok loop
+"connected again: " puts cvp @ u. " right, " puts cvf @ u. " wrong" puts 0A lit putc
+bye

@@ -144,6 +144,15 @@ printf '"headers: " puts vpass @ u. " passed, " puts vfail @ u. " failed" puts 0
 ./tools/fam --user -o "$T/thdr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/headers_test.fam $ND/headers_vectors.fam "$T/hdr_tail.fam" > "$T/thdr.build" 2>&1 || fail headers "build: $(head -c 300 "$T/thdr.build")"
 sh scripts/mkimage.sh "$T/hdr.img" bin/kernel init="$T/thdr.bin":4096 akjv.txt.gz=../resources/akjv.txt.gz:0 2> "$T/hdr.mk" || fail headers "mkimage: $(cat "$T/hdr.mk")"
 expect headers 124 '^headers: 25 passed, 0 failed' 120 ./tools/q32 "$T/hdr.img"
+# The state (step 5), a program for the OS with a disk: a dev chain's
+# blocks (/lib/statechain), each verdict and state root tabminer's; every
+# block disconnected to genesis, each root its parent's; all connected again.
+./tools/fam --user -o "$T/tst.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/state_test.fam > "$T/tst.build" 2>&1 || fail state "build: $(head -c 300 "$T/tst.build")"
+sh scripts/mkimage.sh "$T/st.img" bin/kernel init="$T/tst.bin":8192 statechain=$ND/statechain.bin:0 2> "$T/st.mk" || fail state "mkimage: $(cat "$T/st.mk")"
+rm -f "$T/st.disk"; dd if=/dev/zero of="$T/st.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect state 124 '^connected again: 302 right, 0 wrong' 120 ./tools/q32 --disk="$T/st.disk" "$T/st.img"
+has state '^connected: 312 as tabminer, 0 not'; has state '^disconnected: 302 roots right, 0 wrong'
+rm -f "$T/st.disk"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

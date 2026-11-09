@@ -18,8 +18,8 @@
 \ powinit ( text n -- )  the seed file in memory.
 \ window ( w c -- )  c (8 words) = window w.
 \ item ( index c -- )  c (16 words) = dataset item index (parents: pwpar).
-\ hashmix ( hh nonce mix res -- )  tabminer's hashimoto (a name fam's dictionary
-\ cannot take: it clashes): the 8-word mix and result for the
+\ hashmix ( hh nonce mix res -- )  tabminer's hashimoto (fam's names are at
+\ most 8 characters): the 8-word mix and result for the
 \ header hash hh (8 words) and the 32-byte nonce, from pwitems items and
 \ pwacc accesses.
 \ hdr-ok ( h -- flag )  the 204-byte header's digests are canonical.

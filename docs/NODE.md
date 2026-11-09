@@ -797,8 +797,8 @@ Each step done when its test passes.
      off; oscheck's `difficulty`.
    - `pow.fam`: the seed file's windows, items computed from the file,
      hashimoto, the header's two hashes, the quick check and the full
-     one (`hashmix`: fam's dictionary cannot take the name
-     `hashimoto`). Against tabminer's vectors under the OS, with the
+     one (`hashmix`: fam's names are at most 8 characters, and a
+     longer one is not found). Against tabminer's vectors under the OS, with the
      file as `/lib/akjv.txt.gz` (`pow_vectors.fam`, 43 checks: the
      first and last windows, items to the dataset's last, hashes of a
      height past p and the largest timestamp, hashimoto at the dev
@@ -821,7 +821,32 @@ Each step done when its test passes.
      regenerate without mining.
 5. **The state**: the state tree and the names trie in the store, a
    block applied and undone. Done when the state roots of a dev chain
-   match, block by block.
+   match, block by block. Done (2026-11-08): `state.fam`.
+   - In one tree of the store: unspent outputs by position, the
+     outputs' tree from level 8 up (each group of 256 positions
+     recomputed from its outputs, as tabminer's `GROUP_LOG`), the name
+     trie (canonical, variable depth, as `name_trie.rs`, removal
+     included for undoing), records, commits, spent inputs, and each
+     block's undo record in values of up to 1 KiB.
+   - `sconnect` is tabminer's `check_body` and `connect` but for the
+     proof: the body parsed and validated (errors found in tabminer's
+     order), its commitment, the size, the inputs spent, the outputs
+     added, the names section (commits, reveals in their window,
+     updates, sweeps once expired), the state root, the supply. A block
+     refused changes nothing. `sundo` disconnects the last block.
+   - A dev chain (`statechain.bin`, from `fam_vectors.rs`): 302 blocks
+     built and connected by tabminer's own `Chain`, with spends, nine
+     commits, eight reveals, two updates and a sweep 289 blocks after
+     its commit; and ten bodies refused by tabminer, one for each rule
+     (a spent input, the supply, the state root, the body commitment,
+     an input twice, an update of no name, a sweep in the window, a
+     name registered, a reveal before its window, a reveal of no
+     commit). oscheck's `state`: all 312 verdicts as tabminer's, every
+     root matching; then every block disconnected to genesis, each
+     root its parent's; then all connected again. About 33 s.
+   - Not yet: the proof's check in `sconnect` (step 3's verifier,
+     joined in step 6), and large blocks: the dirty groups a block
+     touches are held in a sorted list (16,384 at most), fine for now.
 6. **The protocol**: peers, headers first, bodies, fast sync from a
    snapshot. Done when a fam node syncs a dev chain from tabminer over
    UDP.

@@ -1,0 +1,702 @@
+\ state.fam — the chain's state in the store (docs/NODE.md, step 5), after
+\ arith.fam, poseidon2.fam, difficulty.fam and pow.fam.  As tabminer's
+\ miner/src/utxo.rs, state_tree.rs, name_trie.rs, names.rs, block.rs's
+\ body, and Chain's connect and disconnect (miner/src/chain.rs).
+\
+\ The state root compresses two halves of a depth-40 tree: the left the
+\ outputs, a leaf at each counter position (the commitment and memo slot
+\ compressed, then that with the creation height; empty once spent), the
+\ right the name trie's root.  An empty subtree has a fixed hash a level.
+\
+\ In one tree of the store (the caller's, open as a file), keys by their
+\ first byte:
+\   o pos(5)          an unspent output: commitment, slot (canonical), height
+\   n level index(4)  a node of the outputs' tree, levels 8 to 39, where it
+\                     is not the empty one (Montgomery); the levels below
+\                     recomputed from the outputs, 256 at most
+\   t depth key(15)   a node of the name trie (tag, then its hash, or its
+\                     key, value and hash; Montgomery)
+\   r key(15)         a name's record, as a block lists it
+\   c pos(5)          the commit at an output position: hash, height
+\   m p | m h         the counter; the height of the last block connected
+\   u height chunk    a block's undo record, in values of up to 1 KiB
+\ Positions are a word and a byte (lo, hi): below 2^39.  Not reentrant.
+\ Field values in memory are Montgomery words.
+\
+\ stinit ( fd -- )  the state in the tree open as fd (genesis's, empty, if
+\ new).
+\ sconnect ( h body n -- code )  connects the block with header h and body
+\ (n bytes) on the last one: 0, or the rule it breaks (tabminer's
+\ ChainError, as fam_vectors.rs's state_code numbers them: -10 malformed,
+\ -11 the body commitment, -12 too large, -13 an unknown input, -15 the
+\ state root, -16 the supply; -20 to -26 the name rules; -30 to -35 the
+\ body's own).  A block refused changes nothing.  Its proof is not
+\ checked here.
+\ sundo ( -- )  undoes the last block connected.
+\ sroot ( c -- )  c (8 words, canonical) = the state root.
+
+\ ── The store ──
+
+: stfd variable ;  : stx variable ;  : kb variable ;  : kb2 variable ;  : sbuf variable ;
+: sgl variable ;  : sgb variable ;  : sgn variable ;  : serr variable ;
+
+: sget  sgn ! sgb ! sgl !  stx @ kb @ sgl @ sgb @ sgn @ txget ;   \ ( klen buf n -- vlen | <0 )
+: sput  sgn ! sgb ! sgl !  stx @ kb @ sgl @ sgb @ sgn @ txput 0< if 1 lit serr ! then ;   \ ( klen val n -- )
+: sdel  stx @ kb @ rot txdel drop ;           \ ( klen -- )
+: knext  stx @ kb @ rot kb2 @ txnext ;        \ ( klen -- klen' )  the key after kb's, in kb2
+
+\ be! ( x a n -- )  x as n bytes, big-endian; be@ ( a n -- x ); le@ ( a -- x )
+\ 4 bytes little-endian, any alignment; bcopy ( a c n -- ) bytes.
+: be!  begin dup while 1 lit -  2 lit pick 2 lit pick 2 lit pick + c!  rot 8 lit rshift -rot repeat 2drop drop ;
+: be@  0 lit -rot 0 lit do swap 8 lit lshift over i + c@ or swap loop drop ;
+: le@  dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: bcopy  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;
+\ dle ( a c -- )  c (8 words) = the 8 canonical little-endian words at a
+\ (any alignment), in Montgomery form.
+: dle  8 lit 0 lit do over i 2 lit lshift + le@ tom over i w! loop 2drop ;
+
+\ Keys in kb.
+: kpos  kb @ 1 lit + c!  kb @ 2 lit + 4 lit be!  kb @ c!  6 lit ;   \ ( c lo hi -- klen )
+: knode  kb @ 2 lit + 4 lit be!  kb @ 1 lit + c!  6E lit kb @ c!  6 lit ;   \ ( level index -- klen )
+: kmeta  kb @ 1 lit + c!  6D lit kb @ c!  2 lit ;                    \ ( c -- klen )
+: mget  kmeta sbuf @ 4 lit sget 4 lit = if sbuf @ @ else 0 lit then ;   \ ( c -- x )
+: mput  swap sbuf @ ! kmeta sbuf @ 4 lit sput ;                         \ ( x c -- )
+
+\ ── Hashing ──
+
+: hdx variable ;  : hdn variable ;  : hdd variable ;  : hdc variable ;
+\ hdom ( x n dom c -- )  c (8 words) = tabminer's hash_domain(dom, the n
+\ words at x): the domain and length in the capacity, the words absorbed
+\ eight at a time (one permutation if none).
+: hdom
+hdc ! hdd ! hdn ! hdx !
+p2s @ 10 lit wzero  hdd @ tom p2s @ 8 lit w!
+hdn @ 3FFFFFFF lit and tom p2s @ 9 lit w!  hdn @ 1E lit rshift tom p2s @ A lit w!
+hdn @ 0= if p2s @ perm16 then
+begin hdn @ while
+	hdn @ 8 lit u< if hdn @ else 8 lit then
+	dup 0 lit do p2s @ i w@ hdx @ i w@ f+ p2s @ i w! loop
+	p2s @ perm16
+	dup 2 lit lshift hdx @ + hdx !  hdn @ swap - hdn !
+repeat
+p2s @ hdc @ 8 lit wcopy ;
+
+\ ── The outputs' tree ──
+
+: dflt variable ;
+: dfl  5 lit lshift dflt @ + ;                \ ( level -- digest )  the empty subtree's
+: lvs variable ;  : tmpa variable ;  : tmpb variable ;  : tmpd variable ;
+: nl variable ;  : ni variable ;  : nc variable ;  : gg variable ;  : lc variable ;
+: dirty variable ;  : ndirty variable ;  : dx variable ;  : nxd variable ;
+: d=  8 lit wcmp 0= ;                         \ ( a b -- flag )
+
+: nget  ( level index c -- )
+nc !  2dup ni ! nl !  knode sbuf @ 20 lit sget 20 lit = if sbuf @ else nl @ dfl then nc @ 8 lit wcopy ;
+: nput  ( digest level index -- )
+2dup ni ! nl !  knode  over nl @ dfl d= if nip sdel else swap 20 lit sput then ;
+
+\ rleaf ( rec c -- )  c = the leaf of the output record rec (commitment,
+\ slot, height): compress(compress(commitment, slot), height).
+: rleaf
+lc !  dup tmpa @ dle  dup 20 lit + tmpb @ dle  tmpa @ tmpb @ tmpa @ compress
+tmpb @ 8 lit wzero  40 lit + le@ tom tmpb @ !  tmpa @ tmpb @ lc @ compress ;
+
+\ dadd ( x -- )  x into the sorted dirty set.
+: dadd
+dx !
+0 lit begin dup ndirty @ u< if dup dirty @ swap w@ dx @ u< else 0 lit then while 1 lit + repeat
+dup ndirty @ u< if dup dirty @ swap w@ dx @ = else 0 lit then
+if drop else
+	ndirty @ begin 2dup u< while 1 lit - dup dirty @ swap w@ over 1 lit + dirty @ swap w! repeat drop
+	dx @ swap dirty @ swap w!  ndirty @ 1 lit + ndirty !
+then ;
+: gdirty  18 lit lshift swap 8 lit rshift or dadd ;   \ ( lo hi -- )  its group dirty
+
+\ grefresh ( g -- )  the group's node at level 8, from its outputs.
+: grefresh
+dup gg !
+lvs @ 800 lit wzero
+dup 0= if drop 6F lit kb @ c! 1 lit else
+	dup 8 lit lshift swap 18 lit rshift over 0= if 1 lit - then swap 1 lit - swap
+	6F lit -rot kpos
+then
+begin
+	knext dup 6 lit = if
+		kb2 @ c@ 6F lit =  kb2 @ 1 lit + c@ 18 lit lshift kb2 @ 2 lit + 4 lit be@ 8 lit rshift or gg @ = and
+	else drop 0 lit then
+while
+	kb2 @ kb @ 6 lit bcopy
+	6 lit sbuf @ 44 lit sget drop
+	sbuf @  kb @ 5 lit + c@ 5 lit lshift lvs @ +  rleaf
+	6 lit
+repeat
+8 lit 0 lit do
+	100 lit i 1 lit + rshift 0 lit do
+		i 6 lit lshift lvs @ +
+		dup j dfl d= over 20 lit + j dfl d= and if
+			j 1 lit + dfl  i 5 lit lshift lvs @ +  8 lit wcopy drop
+		else
+			dup 20 lit + i 5 lit lshift lvs @ + compress
+		then
+	loop
+loop
+lvs @ 8 lit gg @ nput ;
+
+\ sprop  the dirty groups' nodes, then their parents to level 39.
+: sprop
+ndirty @ ?dup if 0 lit do dirty @ i w@ grefresh loop then
+1F lit 0 lit do
+	0 lit nxd !
+	ndirty @ ?dup if 0 lit do
+		dirty @ i w@ 1 lit rshift
+		nxd @ if dup dirty @ nxd @ 1 lit - w@ = else 0 lit then
+		if drop else dirty @ nxd @ w!  nxd @ 1 lit + nxd ! then
+	loop then
+	nxd @ ndirty !
+	ndirty @ ?dup if 0 lit do
+		j 8 lit +  dirty @ i w@ 1 lit lshift  tmpa @ nget
+		j 8 lit +  dirty @ i w@ 1 lit lshift 1 lit +  tmpb @ nget
+		tmpa @ tmpb @ tmpd @ compress
+		tmpd @  j 9 lit +  dirty @ i w@  nput
+	loop then
+loop
+0 lit ndirty ! ;
+
+\ Output records: oget ( lo hi -- flag ) into sbuf; oput ( rec lo hi -- );
+\ odel ( lo hi -- ).  Each marks its group.
+: oget  6F lit -rot kpos sbuf @ 44 lit sget 44 lit = ;
+: oput  2dup gdirty  6F lit -rot kpos swap 44 lit sput ;
+: odel  2dup gdirty  6F lit -rot kpos sdel ;
+
+\ ── The name trie ──
+
+: tnb variable ;  : tnode variable ;  : tkp variable ;  : tkq variable ;  : tz variable ;
+: tha variable ;  : thb variable ;  : thc variable ;  : tmpk variable ;
+: kpc variable ;  : kpd variable ;  : kpt variable ;  : kda variable ;  : kdb variable ;  : kdr variable ;
+: twk variable ;  : trk variable ;  : trd variable ;  : tcc variable ;  : tval variable ;  : tdep variable ;
+: tpart variable ;  : toth variable ;
+
+\ Keys: 120 bits in 4 words, least significant first; bit d counts from
+\ the top.  kbit ( k d -- b ), kprefix ( k d c -- ) c = k's first d bits,
+\ kxbit ( k pos -- ) flips the bit at pos (from the bottom), kdiff ( a b --
+\ d ) the first bit where they differ.
+: kbit  77 lit swap -  dup 5 lit rshift rot swap w@ swap 1F lit and rshift 1 lit and ;
+: kprefix
+kpc ! kpd !  kpc @ 4 lit wcopy  78 lit kpd @ - kpt !
+4 lit 0 lit do
+	i 5 lit lshift dup 20 lit + kpt @ u> 0= if drop 0 lit kpc @ i w! else
+		kpt @ over u> if kpt @ swap - 1 lit swap lshift 1 lit - invert kpc @ i w@ and kpc @ i w! else drop then
+	then
+loop ;
+: kxbit  dup 5 lit rshift rot swap 2 lit lshift + swap 1F lit and 1 lit swap lshift over @ xor swap ! ;
+: kdiff
+kdb ! kda !  FFFFFFFF lit kdr !
+4 lit 0 lit do
+	3 lit i -  dup kda @ swap w@ over kdb @ swap w@ xor
+	kdr @ 0< over and if nbits 1 lit - swap 5 lit lshift + 77 lit swap - kdr ! else 2drop then
+loop kdr @ ;
+
+\ A node's key in kb: 't', its depth, the prefix's 15 bytes big-endian.
+: ktrie  ( depth p -- klen )
+74 lit kb @ c!  swap kb @ 1 lit + c!
+dup 3 lit w@ kb @ 2 lit + 3 lit be!  dup 2 lit w@ kb @ 5 lit + 4 lit be!
+dup 1 lit w@ kb @ 9 lit + 4 lit be!  0 lit w@ kb @ D lit + 4 lit be!  11 lit ;
+\ Nodes: a tag word (0 internal, 1 leaf), then the hash (internal), or the
+\ key (4 words), value and hash (leaf).
+: tget  ktrie tnb @ 44 lit sget 0< if FFFFFFFF lit else tnb @ @ then ;   \ ( depth p -- tag | -1 )  into tnb
+: tput  ktrie swap dup @ if 44 lit else 24 lit then sput ;              \ ( node depth p -- )
+: tdel  ktrie sdel ;
+: thash  tnb @ @ if tnb @ 24 lit + else tnb @ 4 lit + then ;             \ ( -- digest )  tnb's
+: tchild  tcc !  tget 0< if tcc @ 8 lit wzero else thash tcc @ 8 lit wcopy then ;   \ ( depth p c -- )
+
+\ twalk ( key -- depth tag|-1 )  where the key's path ends: a leaf or an
+\ empty slot (the node in tnb).
+: twalk
+twk !  0 lit
+begin  twk @ over tkp @ kprefix  dup tkp @ tget  dup 0=  while drop 1 lit + repeat ;
+
+\ tlhash ( key value c -- )  hash_domain(4, the key's four 30-bit limbs,
+\ highest first, and the value).
+: tlhash
+thc ! tval ! tmpk !
+4 lit 0 lit do
+	tmpk @ thb @ 4 lit 3 lit i - 1E lit * wshr  thb @ @ 3FFFFFFF lit and tom tha @ i w!
+loop
+tval @ tha @ 10 lit + 8 lit wcopy
+tha @ C lit 4 lit thc @ hdom ;
+
+\ trehash ( key from -- )  the internal nodes on the key's path above
+\ depth from.
+: trehash
+trd ! trk !
+begin trd @ while
+	trd @ 1 lit - trd !
+	trk @ trd @ tkp @ kprefix
+	trd @ 1 lit + tkp @ tha @ tchild
+	tkp @ tkq @ 4 lit wcopy  tkq @ 77 lit trd @ - kxbit
+	trd @ 1 lit + tkq @ thb @ tchild
+	tha @ thb @ tnode @ 4 lit + compress  0 lit tnode @ !
+	tnode @ trd @ tkp @ tput
+repeat ;
+
+\ tleaf ( key value -- )  tnode = the leaf.
+: tleaf  1 lit tnode @ !  over tnode @ 4 lit + 4 lit wcopy  dup tnode @ 14 lit + 8 lit wcopy  tnode @ 24 lit + tlhash ;
+
+: tik variable ;  : tiv variable ;
+\ tinsert ( key value -- )  the key absent: the leaf where its path ends,
+\ or, if another key's leaf is there, a chain of internal nodes down to
+\ where the two part, and both leaves below it.
+: tinsert
+tiv ! tik !
+tik @ tiv @ tleaf
+tik @ twalk 0< if
+	dup tdep !  tik @ over tkp @ kprefix  tnode @ swap tkp @ tput  tdep @
+else
+	tdep !  tnb @ toth @ 11 lit wcopy
+	tik @ toth @ 4 lit + kdiff tpart !
+	tpart @ 1 lit + tdep @ do
+		tik @ i tkp @ kprefix  0 lit tha @ !  tha @ 4 lit + 8 lit wzero  tha @ i tkp @ tput
+	loop
+	toth @ 4 lit + tpart @ 1 lit + tkp @ kprefix  toth @ tpart @ 1 lit + tkp @ tput
+	tik @ tpart @ 1 lit + tkp @ kprefix  tnode @ tpart @ 1 lit + tkp @ tput
+	tpart @ 1 lit +
+then
+tik @ swap trehash ;
+
+\ tupdate ( key value -- )  the key present.
+: tupdate
+tiv ! tik !  tik @ tiv @ tleaf
+tik @ twalk drop tdep !
+tik @ tdep @ tkp @ kprefix  tnode @ tdep @ tkp @ tput
+tik @ tdep @ trehash ;
+
+\ tremove ( key -- )  the key present (undoing a block): a leaf left alone
+\ under a chain climbs to the first depth where it has a sibling.
+: tremove
+tik !
+tik @ twalk drop tdep !
+tik @ tdep @ tkp @ kprefix  tdep @ tkp @ tdel
+tdep @ if
+	tkp @ tkq @ 4 lit wcopy  tkq @ 78 lit tdep @ - kxbit
+	tdep @ tkq @ tget 1 lit = if
+		tnb @ toth @ 11 lit wcopy  tdep @ tkq @ tdel
+		tdep @ 1 lit -
+		begin
+			dup if
+				toth @ 4 lit + over tkp @ kprefix  tkp @ tkq @ 4 lit wcopy
+				tkq @ 78 lit 2 lit pick - kxbit  dup tkq @ tget 0<
+			else 0 lit then
+		while
+			dup tkp @ tdel  1 lit -
+		repeat
+		toth @ 4 lit + over tkp @ kprefix  toth @ over tkp @ tput
+		tdep !
+	then
+	tik @ tdep @ trehash
+then ;
+
+\ troot ( c -- )  the trie's root: the empty subtree's at level 39 if none.
+: troot  tcc !  0 lit tz @ tget 0< if 27 lit dfl else thash then tcc @ 8 lit wcopy ;
+
+\ ── Names ──
+
+: nel variable ;  : nin variable ;  : nkey variable ;  : nrec variable ;  : nlv variable ;
+
+\ nhash ( name len c -- )  the name's hash: its characters as elements 1
+\ to 37 (a-z, 0-9, _), zero padded to 32, hash_domain 5.
+: nhash
+-rot  nel @ 20 lit wzero
+0 lit do
+	dup i + c@  dup 61 lit - 1A lit u< if 60 lit - else
+		dup 30 lit - A lit u< if 15 lit - else drop 25 lit then then
+	tom nel @ i w!
+loop drop
+nel @ 20 lit 5 lit 3 lit pick hdom drop ;
+
+\ keyof ( hash k -- )  the key: the low 30 bits of the first four
+\ elements, the first highest.
+: keyof
+dup 4 lit wzero
+4 lit 0 lit do
+	dup dup 4 lit 1E lit wshl
+	over i w@ fromm 3FFFFFFF lit and over @ or over !
+loop 2drop ;
+
+\ rvalue ( rec c -- )  a record's leaf value (rec its bytes as a block
+\ lists them: length, name, owner, value, memo): hash_domain 6 of the
+\ name's hash, owner, value and memo; nkey its key.
+: rvalue
+nlv !
+dup 1 lit + over c@ nin @ nhash
+nin @ nkey @ keyof
+dup c@ 1 lit + +
+dup nin @ 20 lit + dle  dup 20 lit + nin @ 40 lit + dle  40 lit + nin @ 60 lit + dle
+nin @ 20 lit 6 lit nlv @ hdom ;
+
+\ Records: krec ( k -- klen ), 'r' and the key's 15 bytes.
+: krec
+72 lit kb @ c!
+dup 3 lit w@ kb @ 1 lit + 3 lit be!  dup 2 lit w@ kb @ 4 lit + 4 lit be!
+dup 1 lit w@ kb @ 8 lit + 4 lit be!  0 lit w@ kb @ C lit + 4 lit be!  10 lit ;
+: rsize  c@ 61 lit + ;                         \ ( rec -- n )  97 and the name
+
+\ cleaf ( hash height c -- )  a commit's leaf commitment: hash_domain 8 of
+\ its hash (canonical bytes) and height.
+: cleaf  -rot tom nin @ 8 lit w!  nin @ dle  nin @ 9 lit 8 lit 3 lit pick hdom drop ;
+: cget  63 lit -rot kpos sbuf @ 24 lit sget 24 lit = ;   \ ( lo hi -- flag )  the commit at a position, in sbuf
+\ inwin ( h ch -- flag ), expired ( h ch -- flag )
+: inwin  2dup u< if 2drop 0 lit else - dup C lit u< 0= swap 120 lit u> 0= and then ;
+: expired  2dup u> if - 120 lit u> else 2drop 0 lit then ;
+
+\ ── The body (block.rs's Body::parse and validate) ──
+
+: bp variable ;  : bq variable ;  : bcode variable ;
+: bnin variable ;  : bin variable ;  : bnout variable ;  : bout variable ;
+: bnops variable ;  : bops variable ;  : bnsw variable ;  : bsw variable ;  : bnpr variable ;  : bpr variable ;
+: bset variable ;  : bmask variable ;  : bcnt variable ;
+
+: bfail  bcode @ 0= if bcode ! else drop then ;   \ ( code -- )  the first error stands
+: bbad  FFFFFFF6 lit bfail ;                  \ malformed: -10
+: bleft  bq @ bp @ - ;
+: btake  dup bleft u> if drop bbad bq @ else bp @ swap over + bp ! then ;   \ ( n -- a )
+: bu32  4 lit btake  bcode @ if drop 0 lit else le@ then ;
+\ bcanon ( a n -- )  n canonical little-endian words at a.
+: bcanon  0 lit do dup i 2 lit lshift + le@ P u< 0= if bbad then loop drop ;
+\ bpos ( -- n a )  a count and that many five-byte positions.
+: bpos  bu32 dup bleft 5 lit / u> if drop bbad 0 lit bp @ else dup 5 lit * btake then ;
+: pos@  dup le@ swap 4 lit + c@ ;             \ ( a -- lo hi )
+\ name-ok ( a n -- flag )  1 to 32 characters of a-z, 0-9, _.
+: name-ok
+dup 1 lit - 20 lit u< if
+	-1 lit swap 0 lit do
+		over i + c@ dup 61 lit - 1A lit u< over 30 lit - A lit u< or swap 5F lit = or and
+	loop nip
+else 2drop 0 lit then ;
+\ brec ( -- a )  a record (length, name, owner, value, memo): its name
+\ well formed, its digests canonical.
+: brec
+bp @  1 lit btake drop  bcode @ if 0 lit else dup c@ then
+dup 60 lit + btake drop
+bcode @ 0= if
+	over 1 lit + over name-ok 0= if bbad then
+	over 1 lit + over + 18 lit bcanon
+then drop ;
+
+\ The positions seen: a set, open addressing, the high byte plus one
+\ marking a slot taken.
+: bsinit  ( n -- )
+2 lit * 10 lit + 1 lit begin 2dup u> while 1 lit lshift repeat nip
+dup 1 lit - bmask !  3 lit lshift dup malloc dup bset ! swap 2 lit rshift wzero ;
+: bsadd  ( lo hi -- new )
+over dup 10 lit rshift xor over 8 lit lshift xor bmask @ and
+begin
+	dup 3 lit lshift bset @ + dup 4 lit + @
+	dup if
+		1 lit - 3 lit pick = over @ 5 lit pick = and if drop drop 2drop 0 lit -1 lit else drop 1 lit + bmask @ and 0 lit then
+	else
+		drop  3 lit pick over ! 2 lit pick 1 lit + swap 4 lit + !  drop 2drop -1 lit -1 lit
+	then
+until ;
+\ rpos ( op -- a )  the position a reveal spends: after its record.
+: rpos  4 lit + @ dup rsize + ;
+
+: bvalid
+bnin @ bnsw @ + bnops @ + bsinit
+bnin @ ?dup if 0 lit do
+	bin @ i 5 lit * + pos@
+	dup 80 lit u< 0= if 2drop FFFFFFE1 lit bfail else bsadd 0= if FFFFFFE2 lit bfail then then
+loop then
+bnops @ ?dup if 0 lit do
+	bops @ i 3 lit lshift + dup @ 2 lit = if
+		rpos pos@ dup 80 lit u< 0= if 2drop FFFFFFE0 lit bfail else bsadd 0= if FFFFFFDF lit bfail then then
+	else drop then
+loop then
+bnsw @ ?dup if 0 lit do
+	bsw @ i 5 lit * + pos@
+	dup 80 lit u< 0= if 2drop FFFFFFE0 lit bfail else bsadd 0= if FFFFFFDF lit bfail then then
+loop then
+bset @ free
+\ The caps, counting in order: a commit, two reveals, eight updates, then
+\ sixteen sweeps.
+0 lit 0 lit 0 lit
+bnops @ ?dup if 0 lit do
+	bops @ i 3 lit lshift + @
+	dup 1 lit = if drop rot 1 lit + dup 1 lit u> if FFFFFFDE lit bfail then -rot else
+	2 lit = if swap 1 lit + dup 2 lit u> if FFFFFFDE lit bfail then swap else
+	1 lit + dup 8 lit u> if FFFFFFDE lit bfail then then then
+loop then
+2drop drop
+bnsw @ 10 lit u> if FFFFFFDE lit bfail then ;
+
+: bparse  ( body n -- )
+over + bq ! bp !
+bpos bin ! bnin !
+bu32 dup bleft 3C lit / u> if drop bbad 0 lit then  dup bnout !  3C lit * btake bout !
+bcode @ 0= if bnout @ ?dup if 0 lit do bout @ i 3C lit * + D lit bcanon loop then then
+bu32 bnops !
+bleft 35 lit / 1 lit + dup bcnt !  3 lit lshift malloc bops !
+bnops @ bcnt @ u> if bbad 0 lit bnops ! then
+0 lit begin dup bnops @ u< bcode @ 0= and while
+	bp @ c@  1 lit btake drop
+	dup bops @ 3 lit pick 3 lit lshift + !  bp @ bops @ 3 lit pick 3 lit lshift + 4 lit + !
+	dup 1 lit = if drop 34 lit btake 0D lit bcanon else
+	dup 2 lit = if drop brec drop 5 lit btake drop else
+	3 lit = if brec drop else bbad then then then
+	1 lit +
+repeat drop
+bpos bsw ! bnsw !
+bu32 dup bnpr !  btake bpr !
+bcode @ 0= if bvalid then
+bcode @ 0= bp @ bq @ <> and if bbad then ;
+
+\ ── The body commitment (Body::commitment) ──
+
+: vp variable ;  : vb variable ;  : ob variable ;  : pb variable ;
+: v,  tom vp @ !  vp @ 4 lit + vp ! ;         \ ( x -- )  a canonical value, in
+: vd,  vp @ dle  vp @ 20 lit + vp ! ;          \ ( a -- )  8 canonical bytes-words
+\ vpos ( n a -- )  a count, then each position as 30 bits and the rest.
+: vpos
+over v,
+swap ?dup if 0 lit do
+	dup i 5 lit * + pos@  over 3FFFFFFF lit and v,  swap 1E lit rshift swap 2 lit lshift or v,
+loop then drop ;
+\ vamount ( a -- )  the 8-byte amount at a as its three limbs (30, 30, 4).
+: vamount  dup le@ swap 4 lit + le@  over 3FFFFFFF lit and v,  over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and v,  1C lit rshift v, drop ;
+
+\ opdigest ( op c -- )  hash_domain 9 of the tag's block and the commit and
+\ memo slot (amount zero), or the record's leaf value.
+: opdigest
+swap ob @ 18 lit wzero  dup @ dup tom ob @ !
+1 lit = if
+	4 lit + @ dup ob @ 20 lit + dle  20 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ tom ob @ 10 lit i + w! loop drop
+	ob @ 18 lit 9 lit 3 lit pick hdom drop
+else
+	4 lit + @ ob @ 20 lit + rvalue  ob @ 10 lit 9 lit 3 lit pick hdom drop
+then ;
+
+\ bcommit ( c -- )  the body's commitment.
+: bcommit
+bnin @ bnsw @ + bnops @ + 1 lit lshift bnout @ 4 lit lshift + bnops @ 3 lit lshift + 20 lit + 2 lit lshift malloc dup vb ! vp !
+bnin @ bin @ vpos
+bnout @ v,
+bnout @ ?dup if 0 lit do bout @ i 3C lit * +  dup vd,  dup 20 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  34 lit + vamount loop then
+bnops @ v,
+bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + vp @ opdigest vp @ 20 lit + vp ! loop then
+\ the positions reveals spend, then the sweeps
+0 lit bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + @ 2 lit = if 1 lit + then loop then  v,
+bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + dup @ 2 lit = if
+	rpos pos@ over 3FFFFFFF lit and v,  swap 1E lit rshift swap 2 lit lshift or v,
+else drop then loop then
+bnsw @ bsw @ vpos
+\ the proof's hash: hash_domain 0x13 of its length and its bytes packed
+bnpr @ 3 lit / 2 lit + 2 lit lshift malloc pb !
+bnpr @ P 2dup u< 0= if - else drop then tom pb @ !
+bnpr @ if bpr @ bnpr @ pb @ 4 lit + pack3 then
+pb @ bnpr @ 2 lit + 3 lit / 1 lit + 13 lit vp @ hdom  vp @ 20 lit + vp !
+pb @ free
+vb @ vp @ vb @ - 2 lit rshift 12 lit 3 lit pick hdom drop
+vb @ free ;
+
+\ subsidy ( h -- lo hi )  mainnet's emission (the dev networks' too): 1500
+\ coins for 3.5 years, 500 for 3.5 years, 7 for 1000, then none.
+: subsidy
+dup 0= if drop 0 lit 0 lit else
+dup 2CE99 lit u< if drop 75ABF000 lit DA4 lit else
+dup 59D31 lit u< if drop 27395000 lit 48C lit else
+3279DB1 lit u< if 4C533C00 lit 10 lit else 0 lit 0 lit then then then then ;
+
+\ ── Connecting and disconnecting (Chain::connect, disconnect) ──
+
+: tk2 variable ;  : nlv2 variable ;  : srt variable ;  : urem variable ;  : up variable ;  : uk variable ;
+: bh variable ;  : sh variable ;  : scnt variable ;  : sfirst variable ;
+: ub variable ;  : ux variable ;  : rb variable ;  : cb variable ;
+: spent variable ;  : made variable ;  : sw4 variable ;
+: ev variable ;  : nev variable ;
+
+: u,  ux @ !  ux @ 4 lit + ux ! ;             \ ( x -- )  a word to the undo record
+: kspent  73 lit -rot kpos ;                   \ ( lo hi -- klen )  's', a spent input's record
+: kcommit  63 lit -rot kpos ;
+\ amount+ ( lo hi acc -- )  a 4-word sum.
+: amount+  sw4 @ 4 lit wzero  -rot sw4 @ 1 lit w! sw4 @ !  dup sw4 @ swap 4 lit wadd drop ;
+\ slotamt ( slot -- lo hi )  the amount a canonical slot holds.
+: slotamt  dup 14 lit + le@ over 18 lit + le@ rot 1C lit + le@  ( l0 l1 l2 )
+	1C lit lshift over 2 lit rshift or  -rot 1E lit lshift or swap ;
+
+\ consume ( lo hi -- )  the commit at the position, its output spent: its
+\ hash, height and slot to the undo record.  -22 if the output is not
+\ the commit's.
+: consume
+2dup cget drop  sbuf @ cb @ 9 lit wcopy             \ the commit: hash, height
+2dup oget if sbuf @ rb @ 11 lit wcopy else rb @ 11 lit wzero then
+cb @ cb @ 20 lit + @ tmpd @ cleaf  tmpd @ dfrom
+2dup oget if sbuf @ tmpd @ d= else 0 lit then
+if
+	1 lit u,  over u, dup u,  cb @ ux @ 9 lit wcopy  ux @ 24 lit + ux !  rb @ 20 lit + ux @ 8 lit wcopy  ux @ 20 lit + ux !
+	2dup odel  kcommit sdel
+else 2drop FFFFFFEA lit bfail then ;
+
+\ The names section, in order, then the sweeps (NameSet::apply).
+: snames
+bnops @ ?dup if 0 lit do bcode @ 0= if
+	bops @ i 3 lit lshift + dup @
+	dup 1 lit = if drop
+		4 lit + @  dup sh @ tmpd @ cleaf  tmpd @ dfrom
+		tmpd @ rb @ 8 lit wcopy  dup 20 lit + rb @ 20 lit + 14 lit bcopy  rb @ 34 lit + 3 lit wzero  sh @ rb @ 40 lit + !
+		rb @ scnt @ 0 lit oput
+		cb @ 20 lit bcopy  sh @ cb @ 20 lit + !
+		scnt @ 0 lit kcommit cb @ 24 lit sput
+		4 lit u,  scnt @ 1 lit + scnt !
+	else 2 lit = if
+		dup rpos pos@  rot 4 lit + @ dup nlv2 @ rvalue  -rot      ( rec lo hi )
+		2dup cget 0= if 2drop drop FFFFFFEA lit bfail else
+			sh @ sbuf @ 20 lit + @ inwin 0= if 2drop drop FFFFFFE9 lit bfail else
+				nkey @ krec sbuf @ 100 lit sget 0< 0= if 2drop drop FFFFFFE8 lit bfail else
+					nkey @ tk2 @ 4 lit wcopy
+					tk2 @ nlv2 @ tinsert
+					2 lit u,  tk2 @ ux @ 4 lit wcopy  ux @ 10 lit + ux !
+					rot dup tk2 @ krec swap dup rsize sput -rot
+					consume drop
+				then
+			then
+		then
+	else
+		4 lit + @ dup nlv2 @ rvalue
+		nkey @ krec sbuf @ 100 lit sget dup 0< if 2drop FFFFFFE7 lit bfail else
+			3 lit u,  dup u,  sbuf @ ux @ rot bcopy  ux @ 84 lit + ux !
+			nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
+			tk2 @ krec swap dup rsize sput
+		then
+	then then
+then loop then
+bnsw @ ?dup if 0 lit do bcode @ 0= if
+	bsw @ i 5 lit * + pos@
+	2dup cget 0= if 2drop FFFFFFEA lit bfail else
+		sh @ sbuf @ 20 lit + @ expired 0= if 2drop FFFFFFE6 lit bfail else consume then
+	then
+then loop then ;
+
+\ The undo record's keys: 'u', the height, the chunk.
+: kundo  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  75 lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
+
+: sroot0  srt !  27 lit 0 lit tmpa @ nget  tmpb @ troot  tmpa @ tmpb @ srt @ compress  srt @ dfrom ;   \ ( c -- )  in a transaction
+: sroot  stfd @ 0 lit txbegin stx !  sroot0  stx @ txcommit drop ;
+
+: sconnect  ( h body n -- code )
+rot bh !  0 lit bcode !  0 lit ndirty !
+2dup bparse nip
+bcode @ 0= if tmpd @ bcommit  tmpd @ dfrom  tmpd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
+bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
+bcode @ 0= if
+	stfd @ 1 lit txbegin stx !
+	bh @ 20 lit + @ sh !
+	70 lit mget dup scnt ! sfirst !
+	bnin @ 3 lit lshift 400 lit + malloc dup ub ! ux !
+	0 lit u,  sfirst @ u,  bnout @ u,  0 lit u,  bnin @ u,
+	spent @ 4 lit wzero  made @ 4 lit wzero
+	\ the inputs spent
+	bnin @ ?dup if 0 lit do bcode @ 0= if
+		bin @ i 5 lit * + pos@  over u, dup u,
+		2dup oget if
+			sbuf @ 20 lit + slotamt spent @ amount+
+			2dup kspent sbuf @ 44 lit sput
+			odel
+		else 2drop FFFFFFF3 lit bfail then
+	then loop then
+	\ the outputs added
+	bcode @ 0= if bnout @ ?dup if 0 lit do
+		bout @ i 3C lit * +  dup rb @ 34 lit bcopy
+		34 lit + dup le@ swap 4 lit + le@
+		2dup made @ amount+
+		over 3FFFFFFF lit and rb @ 34 lit + !
+		over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
+		nip 1C lit rshift rb @ 3C lit + !
+		sh @ rb @ 40 lit + !
+		rb @ scnt @ 0 lit oput  scnt @ 1 lit + scnt !
+	loop then then
+	bcode @ 0= if snames then
+	bcode @ 0= if sprop  tmpd @ sroot0  tmpd @ bh @ 4C lit + 8 lit wcmp if FFFFFFF1 lit bfail then then
+	\ the supply: what the outputs make, what the inputs held and the subsidy
+	bcode @ 0= if sh @ subsidy spent @ amount+  made @ spent @ 4 lit wcmp if FFFFFFF0 lit bfail then then
+	bcode @ 0= if
+		ux @ ub @ - 2 lit rshift ub @ !
+		ub @ @ 2 lit lshift urem !  ub @ up !  0 lit uk !
+		begin urem @ while
+			urem @ 400 lit u< if urem @ else 400 lit then
+			sh @ uk @ kundo up @ 2 lit pick sput
+			dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
+		repeat
+		scnt @ 70 lit mput  sh @ 68 lit mput
+		serr @ if FFFFFFF6 lit bfail then
+	then
+	bcode @ if stx @ txabort drop 0 lit ndirty ! else stx @ txcommit drop then
+	ub @ free
+then
+bops @ free
+bcode @ ;
+
+\ uevent ( p -- )  undoes one event of the names section.
+: uevent
+dup @
+dup 1 lit = if drop
+	4 lit + dup @ swap 4 lit + dup @ swap 4 lit +
+	dup dup 20 lit + @ tmpd @ cleaf  tmpd @ dfrom
+	tmpd @ rb @ 8 lit wcopy  dup 24 lit + rb @ 20 lit + 8 lit wcopy  dup 20 lit + @ rb @ 40 lit + !
+	-rot 2dup rb @ -rot oput
+	kcommit swap 24 lit sput
+else dup 2 lit = if drop
+	4 lit + dup krec sdel  tremove
+else 3 lit = if
+	4 lit + dup @ swap 4 lit + swap
+	over nlv2 @ rvalue  nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
+	tk2 @ krec -rot sput
+else drop then then then ;
+
+: sundo
+stfd @ 1 lit txbegin stx !
+68 lit mget sh !
+sh @ 0 lit kundo sbuf @ 400 lit sget drop
+sbuf @ @ 2 lit lshift dup malloc dup ub ! up ! urem !
+0 lit uk !
+begin urem @ while
+	sh @ uk @ kundo up @ 400 lit sget  dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
+repeat
+ub @ 4 lit + @ sfirst !  70 lit mget scnt !
+\ the block's outputs and commits leave
+scnt @ sfirst @ 2dup u> if do i 0 lit odel  i 0 lit kcommit sdel loop else 2drop then
+\ the inputs return
+ub @ 10 lit + @ ?dup if 0 lit do
+	ub @ 14 lit + i 3 lit lshift + dup @ swap 4 lit + @
+	2dup kspent sbuf @ 44 lit sget drop
+	2dup sbuf @ -rot oput
+	kspent sdel
+loop then
+\ the names section, last event first
+ub @ 14 lit + ub @ 10 lit + @ 3 lit lshift +
+0 lit nev !
+begin dup ub @ ub @ @ 2 lit lshift + u< while
+	dup ev @ nev @ w!  nev @ 1 lit + nev !
+	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
+repeat drop
+nev @ ?dup if 0 lit do ev @ nev @ 1 lit - i - w@ uevent loop then
+sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput
+ub @ @ 2 lit lshift 3FF lit + A lit rshift 0 lit do sh @ i kundo sdel loop
+sprop
+stx @ txcommit drop
+ub @ free ;
+
+: stinit  ( fd -- )
+stfd !  p2init dvinit
+100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
+520 lit alloc dflt !  2000 lit alloc lvs !
+20 lit alloc tmpa !  20 lit alloc tmpb !  20 lit alloc tmpd !
+10000 lit alloc dirty !  0 lit ndirty !
+44 lit alloc tnb !  44 lit alloc tnode !  44 lit alloc toth !
+10 lit alloc tkp !  10 lit alloc tkq !  10 lit alloc tz !  10 lit alloc tmpk !
+40 lit alloc tha !  40 lit alloc thb !
+80 lit alloc nel !  80 lit alloc nin !  10 lit alloc nkey !  60 lit alloc ob !
+44 lit alloc rb !  24 lit alloc cb !
+10 lit alloc spent !  10 lit alloc made !  10 lit alloc sw4 !
+100 lit alloc ev !  10 lit alloc tk2 !  20 lit alloc nlv2 !
+tz @ 4 lit wzero  dflt @ 8 lit wzero
+28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
+0 lit serr ! ;
