@@ -693,6 +693,14 @@ mod tests {
     /// The fam node's copy of mainnet's chain-proof verifier.
     const FAM_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/chainver.bin");
 
+    /// The recursive dev network's, for the fam node's sync test.
+    const FAM_DEV_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/chainver_dev.bin");
+
+    fn dev_recursive() -> Arc<ChainVerifier> {
+        let c = crate::aggregate::DEV_RECURSIVE_CHAIN.unwrap();
+        chain_verifier(&crate::aggregate::AggregatorParams::DEV_RECURSIVE.wrap, c.log_n, c.hash_log_n)
+    }
+
     fn mainnet() -> Arc<ChainVerifier> {
         let c = crate::aggregate::MAINNET_CHAIN.unwrap();
         chain_verifier(&crate::aggregate::AggregatorParams::MAINNET.wrap, c.log_n, c.hash_log_n)
@@ -702,6 +710,8 @@ mod tests {
     fn fam_verifier_is_current() {
         let file = std::fs::read(FAM_FILE).expect("node/src/user/node/chainver.bin: run write_fam_verifier");
         assert!(file == mainnet().to_bytes(), "chainver.bin is stale: run write_fam_verifier");
+        let file = std::fs::read(FAM_DEV_FILE).expect("node/src/user/node/chainver_dev.bin: run write_fam_verifier");
+        assert!(file == dev_recursive().to_bytes(), "chainver_dev.bin is stale: run write_fam_verifier");
     }
 
     /// The fam node's mainnet chain proof (`chainproof.bin`: its public
@@ -720,10 +730,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "writes node/src/user/node/chainver.bin"]
+    #[ignore = "writes node/src/user/node/chainver.bin and chainver_dev.bin"]
     fn write_fam_verifier() {
-        let v = mainnet();
-        std::fs::write(FAM_FILE, v.to_bytes()).unwrap();
-        println!("{} operations, {} words of memory, a stream of {}", v.ops.len(), v.mem, v.stream_len);
+        for (v, path) in [(mainnet(), FAM_FILE), (dev_recursive(), FAM_DEV_FILE)] {
+            std::fs::write(path, v.to_bytes()).unwrap();
+            println!("{path}: {} operations, {} words of memory, a stream of {}", v.ops.len(), v.mem, v.stream_len);
+        }
     }
 }

@@ -17,7 +17,9 @@
 //!   breaking each rule; plain code for a program under the OS.
 //! - `statechain.bin` (step 5): a dev chain of blocks with spends and name
 //!   operations, built and connected by tabminer's own `Chain`, with bodies
-//!   breaking each state rule and tabminer's verdict on each.
+//!   breaking each state rule and tabminer's verdict on each; and
+//!   `statesnap.bin` (step 6), the snapshot after its block 150 as
+//!   tabminer serves it: its manifest, output parts and name parts.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -33,6 +35,9 @@ mod tests {
     const P2_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/poseidon2_vectors.fam");
     const POW_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pow_vectors.fam");
     const STATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain.bin");
+    const SNAP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statesnap.bin");
+    /// The block whose snapshot `statesnap.bin` holds.
+    const SNAP_HEIGHT: u32 = 150;
     const HDR_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/headers_vectors.fam");
     const DIFF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/difficulty_vectors.fam");
 
@@ -786,7 +791,7 @@ mod tests {
     /// block its verdict (a signed word), its header (204 bytes), its
     /// body's length and the body, zero padded to a word. Blocks with a
     /// nonzero verdict are refused and leave the chain as it was.
-    fn generate_state() -> Vec<u8> {
+    fn generate_state() -> (Vec<u8>, Vec<u8>) {
         use crate::block::{Block, BlockOutput, Body, Header};
         use crate::chain::{AcceptAllProofs, Chain, ChainParams};
         use crate::names::{BlockNameOp, MAX_REVEAL, MIN_REVEAL, Record};
@@ -963,11 +968,31 @@ mod tests {
             entries += 1;
             unspent.extend(first..first + n_out);
         }
+        // The snapshot after block SNAP_HEIGHT: a height, then the
+        // manifest, and each part (outputs, then names), each its length
+        // and bytes, word padded.
+        let id = chain.header_at(SNAP_HEIGHT).unwrap().unwrap().hash();
+        let m = chain.snapshot_manifest(&id).unwrap().unwrap();
+        let mut snap = SNAP_HEIGHT.to_le_bytes().to_vec();
+        let put = |snap: &mut Vec<u8>, b: &[u8]| {
+            snap.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            snap.extend_from_slice(b);
+            snap.resize(snap.len().div_ceil(4) * 4, 0);
+        };
+        put(&mut snap, &crate::net::encode_manifest(&m));
+        snap.extend_from_slice(&((m.roots.len() + m.names.len()) as u32).to_le_bytes());
+        for i in 0..m.roots.len() as u64 {
+            let (outs, commits) = chain.snapshot_part(&id, i).unwrap().unwrap();
+            put(&mut snap, &crate::net::encode_part(&outs, &commits));
+        }
+        for j in 0..m.names.len() as u64 {
+            put(&mut snap, &crate::net::encode_name_part(&chain.snapshot_name_part(&id, j).unwrap().unwrap()));
+        }
         drop(chain);
         let _ = std::fs::remove_dir_all(&dir);
         let mut file = entries.to_le_bytes().to_vec();
         file.extend_from_slice(&out);
-        file
+        (file, snap)
     }
 
     #[test]
@@ -982,8 +1007,11 @@ mod tests {
         assert!(file == generate_pow(), "the fam node's proof-of-work vectors are stale: run write_fam_vectors");
         let file = std::fs::read_to_string(HDR_PATH).expect("node/src/user/node/headers_vectors.fam");
         assert!(file == generate_headers(), "the fam node's header vectors are stale: run write_fam_vectors");
+        let (state, snap) = generate_state();
         let file = std::fs::read(STATE_PATH).expect("node/src/user/node/statechain.bin");
-        assert!(file == generate_state(), "the fam node's state chain is stale: run write_fam_vectors");
+        assert!(file == state, "the fam node's state chain is stale: run write_fam_vectors");
+        let file = std::fs::read(SNAP_PATH).expect("node/src/user/node/statesnap.bin");
+        assert!(file == snap, "the fam node's snapshot is stale: run write_fam_vectors");
     }
 
     #[test]
@@ -994,6 +1022,49 @@ mod tests {
         std::fs::write(DIFF_PATH, generate_difficulty()).unwrap();
         std::fs::write(POW_PATH, generate_pow()).unwrap();
         std::fs::write(HDR_PATH, generate_headers()).unwrap();
-        std::fs::write(STATE_PATH, generate_state()).unwrap();
+        let (state, snap) = generate_state();
+        std::fs::write(STATE_PATH, state).unwrap();
+        std::fs::write(SNAP_PATH, snap).unwrap();
+    }
+}
+
+/// Dumps a dev-recursive chain's blocks for the fam node's tests:
+/// `TABMINER_DEV_DATA=DIR TABMINER_DEV_OUT=FILE TABMINER_DEV_BLOCKS=N
+/// cargo test --release --features dev --lib dump_dev_chain -- --ignored`,
+/// DIR a `--network dev-recursive` node's data directory (it may be
+/// running). FILE is a count; the chain's constants (the base program's
+/// digest, the step's, the plan root: 24 words); genesis's header; then
+/// as `statechain.bin`, per block a zero verdict, its header, its body's
+/// length and the body, word padded.
+#[cfg(all(test, feature = "dev"))]
+mod dump {
+    #[test]
+    #[ignore = "dumps a dev-recursive chain: set TABMINER_DEV_DATA, TABMINER_DEV_OUT"]
+    fn dump_dev_chain() {
+        use crate::chain::{AcceptAllProofs, Chain, ChainParams};
+        use crate::pow::{PowParams, SeedText};
+        let dir = std::env::var("TABMINER_DEV_DATA").expect("TABMINER_DEV_DATA");
+        let out = std::env::var("TABMINER_DEV_OUT").expect("TABMINER_DEV_OUT");
+        let n: u32 = std::env::var("TABMINER_DEV_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX);
+        let chain = Chain::open(&std::path::Path::new(&dir).join("chain"), 1 << 34, ChainParams::DEV_RECURSIVE, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        let tip = chain.tip().unwrap().unwrap().height.min(n);
+        let mut file = tip.to_le_bytes().to_vec();
+        let c = crate::aggregate::DEV_RECURSIVE_CHAIN.unwrap();
+        for w in c.base.iter().chain(&c.step).chain(&c.plan_root) {
+            file.extend_from_slice(&w.to_le_bytes());
+        }
+        file.extend_from_slice(&ChainParams::DEV_RECURSIVE.genesis().header.to_bytes());
+        for h in 1..=tip {
+            let header = chain.header_at(h).unwrap().unwrap();
+            let bytes = chain.block_bytes(&header.hash()).unwrap().expect("a body");
+            file.extend_from_slice(&0i32.to_le_bytes());
+            file.extend_from_slice(&bytes[..crate::block::HEADER_SIZE]);
+            let body = &bytes[crate::block::HEADER_SIZE..];
+            file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            file.extend_from_slice(body);
+            file.resize(file.len().div_ceil(4) * 4, 0);
+        }
+        std::fs::write(&out, &file).unwrap();
+        println!("{tip} blocks, {} bytes", file.len());
     }
 }
