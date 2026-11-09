@@ -724,6 +724,18 @@ kernel too much to add at the end.
    once take 30-160 ms each. Not yet: no window scaling, persist
    timer, congestion control or delayed ACKs; out-of-order segments
    are dropped, not kept; one interface, its address fixed; no DNS.
+   - Loopback (2026-11-08, for the node's API, `docs/NODE.md` step 8):
+     an IPv4 packet to this machine (10.0.2.15) is not given to the
+     device. `nsend` queues it (16 frames of up to 2 KiB, more dropped,
+     which TCP sends again), and hart 0 takes it from the queue as if it
+     had arrived (`nloop`, in its timed work, holding no lock, so what
+     it answers queues behind it). A TCP connect to 127.x.x.x goes to
+     this machine as to 10.0.2.15, and needs no gateway. So a program
+     reaches a server in the OS on its own port. Each segment waits for
+     hart 0's next tick or idle pass. Checked: a listener, connections
+     to 127.0.0.1 and to 10.0.2.15 accepted and written both ways, on
+     one hart and on four (oscheck's `tcp_loop`). Not yet: UDP to
+     127.x.x.x (10.0.2.15 works).
 10. **Terminals and the window manager.** `pty`, `/dev/tty/N`, and the
     HTTP and WebSocket server with terminals in the browser. Done when
     a browser opens a shell and runs `ls`. Done (2026-11-07), with the

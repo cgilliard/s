@@ -749,6 +749,26 @@ for n in 1 4; do
 done
 expect tcp_lossy 124 '^connect 0 wrote 409600 read 17 got 409600 intact$' 20 ./tools/q32 --net "$T/up.img"
 has tcp_lossy '^tcp 0 retransmits [1-9]'
+# TCP to this machine (docs/OS.md, loopback): a listener, a connection to
+# 127.0.0.1 and one to 10.0.2.15 accepted, written each way.
+usrc tloop ': b variable ;  : l variable ;  : c variable ;  : a variable ;  : sp  20 lit putc ;
+: once
+2 lit socket c !  c @ 2 lit rot E9A lit net "connect " puts . sp
+l @ accept a !  "accept " puts a @ 0< . sp
+c @ "hello loop" A lit write "write " puts . sp
+a @ b @ 100 lit read dup "read " puts . sp b @ + 0 lit swap c! b @ puts sp
+a @ "back" 4 lit write drop
+c @ b @ 100 lit read dup "reply " puts . sp b @ + 0 lit swap c! b @ puts 0A lit putc
+c @ close drop  a @ close drop ;
+100 lit alloc b !
+2 lit socket l !  l @ 1 lit 0 lit E9A lit net "bind " puts . sp  l @ 3 lit 0 lit 0 lit net "listen " puts . 0A lit putc
+7F000001 lit once  A00020F lit once  bye'
+uimage loop bin/kernel init=tloop
+for n in 1 4; do
+	expect "tcp_loop_$n" 124 'kernel: init ended: 0' 6 ./tools/q32 --smp=$n --net "$T/loop.img"
+	[ "$(grep -c '^connect 0 accept 0 write 10 read 10 hello loop reply 4 back$' "$T/tcp_loop_$n.out")" = 2 ] \
+		|| fail "tcp_loop_$n" "$(head -c 300 "$T/tcp_loop_$n.out")"
+done
 kill $EP
 
 # A web server: httpd (src/user/httpd.fam) serving files from the store,

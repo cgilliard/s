@@ -1128,7 +1128,7 @@ klk @ unlock sret ;
 
 \ tnet ( p -- r | BLK )  net() on a TCP socket: 1 bind, 3 listen (bound),
 \ 2 connect (waiting until it is, or is refused: -111, or times out:
-\ -110; -113 no gateway yet).
+\ -110; -113 no gateway yet, unless to this machine: 127.x.x.x is it).
 : tnet
 2C lit sysarg 1 lit = if
 	34 lit sysarg FFFF lit u> over 4 lit + @ or if drop FFFFFFEA lit else
@@ -1143,8 +1143,8 @@ else 2C lit sysarg 2 lit = if
 	dup cst @ 3 lit u> if drop 0 lit else
 	dup cst @ if drop FFFFFFEA lit else
 	30 lit sysarg 0= 34 lit sysarg 0= or 34 lit sysarg FFFF lit u> or if drop FFFFFFEA lit else
-	ngwok @ 0= if drop FFFFFF8F lit else
-		30 lit sysarg over 8 lit + !  34 lit sysarg over C lit + !
+	ngwok @ 0= 30 lit sysarg nlocal MYIP <> and if drop FFFFFF8F lit else
+		30 lit sysarg nlocal over 8 lit + !  34 lit sysarg over C lit + !
 		dup 4 lit + @ 0= if cephem over 4 lit + ! then
 		mtime@ over ciss !  dup ciss @ over cuna !  dup ciss @ over cnxt !
 		dup 2 lit 0 lit ntcpout

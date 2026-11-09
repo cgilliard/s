@@ -11,6 +11,11 @@
 \ hart's: a frame is built in the one transmit buffer under nlk (ntx ...
 \ nsend) and waited for until the device has taken it.  Neither sleeps,
 \ and neither holds klk while it holds nlk.
+\
+\ A frame to this machine (an IPv4 packet to 10.0.2.15; TCP connects to
+\ 127.x.x.x as to it) is not sent: nsend queues it (NLQ frames, more
+\ dropped), and hart 0 takes it from the queue as if it had arrived
+\ (nloop, at its ticks and while idle), holding no lock.
 
 \ ── Bytes in network order ──
 
@@ -25,6 +30,9 @@
 
 :M MYIP  A00020F lit ;       \ 10.0.2.15
 :M GWIP  A000202 lit ;       \ 10.0.2.2
+:M NLQ   10 lit ;            \ the loopback queue: 16 frames of 2 KiB
+\ nlocal ( ip -- ip' )  127.x.x.x is this machine: our address.
+: nlocal  dup 18 lit rshift 7F lit = if drop MYIP then ;
 
 \ ── virtio-net (legacy MMIO): queue 0 receives, queue 1 sends ──
 
@@ -48,6 +56,9 @@
 : na1    variable ;          \ narp's arguments (under nlk)
 : na2    variable ;
 : na3    variable ;
+: nlq    variable ;          \ the loopback queue (0: none)
+: nlh    variable ;          \ frames taken from it (hart 0's)
+: nlt    variable ;          \ frames put in it (under nlk)
 
 \ nfind ( -- base | 0 )  the virtio-mmio slot holding a network device.
 : nfind
@@ -95,6 +106,7 @@ ntb @ ntq @ !                \ what is sent: descriptor 0, the buffer
 8 lit alloc ngw !  0 lit ngwok !
 8 lit alloc dup nbc !  FFFFFFFF lit over !  FFFFFFFF lit swap 4 lit + !
 lknew nlk !
+8 lit pgalloc dup 0= if "no memory for the network's loopback" panic then nlq !  0 lit nlh !  0 lit nlt !
 mtime@ 989680 lit - narpt !  \ ask for the gateway at once
 7 lit nk @ 70 lit + !        \ running
 fence 0 lit nk @ 50 lit + ! ;
@@ -104,9 +116,16 @@ fence 0 lit nk @ 50 lit + ! ;
 : nf    ntb @ A lit + ;      \ ( -- frame ) the frame being built (nlk held)
 
 \ ntx  the transmit buffer, taken (nlk); nsend ( len -- )  the frame built
-\ there sent, and the buffer given back once the device has it.
+\ there sent, and the buffer given back once the device has it (or, to
+\ this machine, once it is queued: nloopq).
 : ntx   nlk @ lock ;
-: nsend
+: nloopq
+nlt @ nlh @ - NLQ u< if
+	dup nlt @ NLQ 1 lit - and B lit lshift nlq @ + tuck !  4 lit + nf swap rot bcpy
+	fence nlt @ 1 lit + nlt !
+else drop then
+nlk @ unlock ;
+: ndev
 A lit + ntq @ 8 lit + !
 0 lit  ntav @ NQN 1 lit - and 1 lit lshift ntq @ 104 lit + + h!
 fence
@@ -115,6 +134,7 @@ fence
 1 lit nk @ 50 lit + !
 begin ntq @ 1002 lit + h@ ntav @ FFFF lit and = until
 nlk @ unlock ;
+: nsend  nf C lit + b16@ 800 lit =  nf 1E lit + b32@ MYIP = and if nloopq else ndev then ;
 
 \ neth ( dst type -- )  the frame's Ethernet header: to dst (6 bytes), from us.
 : neth  nf C lit + b16!  nf 6 lit bcpy  nmac @ nf 6 lit + 6 lit bcpy ;
@@ -623,6 +643,14 @@ begin nrq @ 1002 lit + h@ nseen @ FFFF lit and <> while
 	0 lit nk @ 50 lit + !
 repeat ;
 
+\ nloop  the frames queued to this machine, taken as arrived (hart 0's,
+\ holding no lock: what they answer is queued behind them).
+: nloop
+begin nlh @ nlt @ <> while
+	nlh @ NLQ 1 lit - and B lit lshift nlq @ +  dup 4 lit + swap @ nframe
+	nlh @ 1 lit + nlh !
+repeat ;
+
 \ narpwait  the gateway asked for, and its answer waited for (polled) for
 \ up to 100 ms: at boot, before interrupts are taken.
 : narpwait
@@ -635,11 +663,13 @@ begin nrx ngwok @ mtime@ narpt @ - F4240 lit u< 0= or until ;
 
 
 \ npoll  hart 0's timed work (at its user-mode ticks, and while idle): the
-\ gateway asked for each second until it answers; TCP's (csweep).
+\ gateway asked for each second until it answers; the loopback queue
+\ (nloop); TCP's (csweep).
 : npoll
 nk @ if
 	ngwok @ 0= if
 		mtime@ narpt @ - 989680 lit u< 0= if mtime@ narpt !  1 lit nbc @ GWIP narp then
 	then
+	nloop
 	csweep
 then ;
