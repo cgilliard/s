@@ -132,7 +132,7 @@ stfd !  p2init dvinit
 520 lit alloc dflt !  2000 lit alloc lvs !
 20 lit alloc tmpa !  20 lit alloc tmpb !  20 lit alloc stmd !
 10000 lit alloc dirty !  0 lit ndirty !
-44 lit alloc tnb !  44 lit alloc tnode !  44 lit alloc toth !
+54 lit alloc tnb !  54 lit alloc tnode !  54 lit alloc toth !
 10 lit alloc tkp !  10 lit alloc tkq !  10 lit alloc tz !  10 lit alloc tmpk !
 40 lit alloc tha !  40 lit alloc thb !
 80 lit alloc nel !  80 lit alloc nin !  10 lit alloc nkey !  60 lit alloc ob !

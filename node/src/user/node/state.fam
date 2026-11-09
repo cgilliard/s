@@ -125,9 +125,9 @@ dup 0= if drop 6F lit kb @ c! 1 lit else
 	6F lit -rot kpos
 then
 begin
-	knext dup 6 lit = if
+	knext 6 lit = if
 		kb2 @ c@ 6F lit =  kb2 @ 1 lit + c@ 18 lit lshift kb2 @ 2 lit + 4 lit be@ 8 lit rshift or gg @ = and
-	else drop 0 lit then
+	else 0 lit then
 while
 	kb2 @ kb @ 6 lit bcopy
 	6 lit sbuf @ 44 lit sget drop
@@ -196,11 +196,11 @@ loop kdr @ ;
 dup 3 lit w@ kb @ 2 lit + 3 lit be!  dup 2 lit w@ kb @ 5 lit + 4 lit be!
 dup 1 lit w@ kb @ 9 lit + 4 lit be!  0 lit w@ kb @ D lit + 4 lit be!  11 lit ;
 \ Nodes: a tag word (0 internal, 1 leaf), then the hash (internal), or the
-\ key (4 words), value and hash (leaf).
-: tget  ktrie tnb @ 44 lit sget 0< if FFFFFFFF lit else tnb @ @ then ;   \ ( depth p -- tag | -1 )  into tnb
-: tput  ktrie swap dup @ if 44 lit else 24 lit then sput ;              \ ( node depth p -- )
+\ key (4 words), value and hash (leaf: 0x54 bytes, the hash at 0x34).
+: tget  ktrie tnb @ 54 lit sget 0< if FFFFFFFF lit else tnb @ @ then ;   \ ( depth p -- tag | -1 )  into tnb
+: tput  ktrie swap dup @ if 54 lit else 24 lit then sput ;              \ ( node depth p -- )
 : tdel  ktrie sdel ;
-: thash  tnb @ @ if tnb @ 24 lit + else tnb @ 4 lit + then ;             \ ( -- digest )  tnb's
+: thash  tnb @ @ if tnb @ 34 lit + else tnb @ 4 lit + then ;             \ ( -- digest )  tnb's
 : tchild  tcc !  tget 0< if tcc @ 8 lit wzero else thash tcc @ 8 lit wcopy then ;   \ ( depth p c -- )
 
 \ twalk ( key -- depth tag|-1 )  where the key's path ends: a leaf or an
@@ -234,7 +234,7 @@ begin trd @ while
 repeat ;
 
 \ tleaf ( key value -- )  tnode = the leaf.
-: tleaf  1 lit tnode @ !  over tnode @ 4 lit + 4 lit wcopy  dup tnode @ 14 lit + 8 lit wcopy  tnode @ 24 lit + tlhash ;
+: tleaf  1 lit tnode @ !  over tnode @ 4 lit + 4 lit wcopy  dup tnode @ 14 lit + 8 lit wcopy  tnode @ 34 lit + tlhash ;
 
 : tik variable ;  : tiv variable ;
 \ tinsert ( key value -- )  the key absent: the leaf where its path ends,
@@ -246,7 +246,7 @@ tik @ tiv @ tleaf
 tik @ twalk 0< if
 	dup tdep !  tik @ over tkp @ kprefix  tnode @ swap tkp @ tput  tdep @
 else
-	tdep !  tnb @ toth @ 11 lit wcopy
+	tdep !  tnb @ toth @ 15 lit wcopy
 	tik @ toth @ 4 lit + kdiff tpart !
 	tpart @ 1 lit + tdep @ do
 		tik @ i tkp @ kprefix  0 lit tha @ !  tha @ 4 lit + 8 lit wzero  tha @ i tkp @ tput
@@ -273,7 +273,7 @@ tik @ tdep @ tkp @ kprefix  tdep @ tkp @ tdel
 tdep @ if
 	tkp @ tkq @ 4 lit wcopy  tkq @ 78 lit tdep @ - kxbit
 	tdep @ tkq @ tget 1 lit = if
-		tnb @ toth @ 11 lit wcopy  tdep @ tkq @ tdel
+		tnb @ toth @ 15 lit wcopy  tdep @ tkq @ tdel
 		tdep @ 1 lit -
 		begin
 			dup if
