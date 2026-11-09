@@ -264,8 +264,9 @@ half-applied one.
   (`docs/ONION.md`), are not in the first node.
 - **Images:** the node serves its own image to tabernacles: GetImages,
   Images, GetImage and ImageChunk (64 to 67, `docs/TABERNACLE.md`), and
-  answers anyone's Ping and GetPeers, as tabminer does. It takes over
-  from `tools/server.py` (step 9).
+  answers anyone's Ping and GetPeers, as tabminer does (step 9).
+  `tools/server.py` does the same without a node, and stays as a
+  backup.
 - **The API:** HTTP on its own TCP port (3738 unless configured), in
   its own process. By default it listens for the machine only: wm's
   terminals, programs in the OS, and the host through a forwarded port
@@ -1037,8 +1038,9 @@ Each step done when its test passes.
      versions; image requests are answered only between blocks, since a
      block's verification holds the loop a few seconds and tabernacle
      drops a peer after 4 s with no chunks (verification on its own
-     thread, step 8's not yet). `tools/server.py` remains for the
-     seeds until the node runs on them as a daemon (step 10).
+     thread, step 8's not yet). `tools/server.py` stays: the
+     seeds need it until the node runs there (step 10), and it is a
+     backup after.
 10. **The daemon**: in the image, started by init, its `/proc` keys,
     restart after a kill. Done when a booted OS runs the node on its
     own, synced, and answers the API.

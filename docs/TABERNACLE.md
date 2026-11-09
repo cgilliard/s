@@ -170,8 +170,9 @@ tabernacle from a node with no `server.py` anywhere.
 
 ## A stand-in node: `tools/server.py`
 
-Before the fam node served its image, `server.py` played one, on the
-seeds for testing. It is the old one
+`server.py` plays a node, on the seeds, until the fam node runs there,
+and stays after as a backup: it serves an image without a node behind
+it. It is the old one
 (`GET_HOSTS`/`GET_BIN` on its own `TBRN` magic, one image named by its
 hash) brought to this protocol and to versions:
 
