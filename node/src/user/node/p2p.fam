@@ -17,7 +17,8 @@
 \
 \ Blocks, manifests and parts come as 1,024-byte chunks, asked for in
 \ windows of PWIN: the guest's socket queues eight datagrams, and more in
-\ flight would be dropped.  Headers come as up to ten datagrams of six,
+\ flight would be dropped.  The next window is asked for as soon as the
+\ last has come; only a chunk lost waits (300 ms), then is asked again.  Headers come as up to ten datagrams of six,
 \ from a height; those lost are asked for again from the first gap.
 \
 \ pinit ( ip port lport -- )  the socket (bound to lport) and peer 0,
@@ -26,6 +27,11 @@
 \ seconds): its status in pst.
 \ pann ( id k -- )  TxInv (id: 32 canonical bytes) to every peer that
 \ answered but k.
+\ pkeep  each peer pinged when its time comes, as tabminer does: every
+\ 30 s while it answers; one that has not answered within 35 s again
+\ after 2 s, then 4, 8 and so on to 30, for good (a peer restarted forgets
+\ us until we ping it).  Silent for 180 s it is said lost (with vrb), and
+\ back when it answers.
 \ pdeq ( -- e | 0 )  the oldest queued announcement: its id (32 bytes),
 \ then its peer; valid until the next pwait.
 \ phdrs ( h -- n )  up to 60 main-chain headers from height h, into phb in
@@ -76,10 +82,12 @@ pkey @ pkd @ pko @ compress  pko @ mtok @ 8 lit bcopy ;
 myh @ w32  myh @ 1 lit + w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
 A lit 0 lit w64  A lit 0 lit w64 ;
 
-: prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status
+: prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
+\ then (pkeep's, in secs) when to ping it next (A4), the wait after that
+\ (A8), when it last answered (AC), whether said lost (B0)
 : psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
 : puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
-: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec A4 lit + 4 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
 \ pwho ( ip port -- k | -1 )
 : pwho
 FFFFFFFF lit pfk !
@@ -185,6 +193,11 @@ prx @ 11 lit + c@  dup 2 lit lshift 12 lit + prn @ =  rot and if
 	loop then
 else drop then ;
 
+\ pshow ( k -- )  peer k's address.
+: pshow
+prec dup @  dup 18 lit rshift u. 2E lit putc  dup 10 lit rshift FF lit and u. 2E lit putc
+dup 8 lit rshift FF lit and u. 2E lit putc  FF lit and u. 3A lit putc  4 lit + @ u. ;
+
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
@@ -203,6 +216,8 @@ prdy if
 			prx @ 5 lit + mnon @ 8 lit d8= if
 				prx @ 5 lit + pfk @ prec 18 lit + 8C lit bcopy  prx @ 11 lit + pfk @ prec 10 lit + 8 lit bcopy
 				1 lit pfk @ prec 8 lit + !  pfk @ pcur @ = if 1 lit pok ! then
+				secs pfk @ prec AC lit + !
+				pfk @ prec B0 lit + @ if 0 lit pfk @ prec B0 lit + !  vrb @ if nhead "peer " puts pfk @ pshow " back" puts 0A lit putc then then
 			then
 		then
 		dup 8 lit = if pgive then
@@ -211,6 +226,23 @@ prdy if
 		then
 	then
 else 0 lit then ;
+
+\ pkeep
+: pkt variable ;
+: pkeep
+pnp @ ?dup if 0 lit do
+	secs pkt !
+	pkt @ i prec A4 lit + @ - 0< 0= if
+		i prec @ i prec 4 lit + @ ptokn  1 lit wbeg  mnon @ wstatus  i psend
+		pkt @ i prec AC lit + @ - 23 lit u< i prec AC lit + @ and if 1E lit else
+			i prec A8 lit + @ 1 lit lshift  dup 2 lit u< if drop 2 lit then  dup 1E lit u> if drop 1E lit then
+		then
+		dup i prec A8 lit + !  pkt @ + i prec A4 lit + !
+		pkt @ i prec AC lit + @ - B4 lit u> i prec B0 lit + @ 0= and if
+			1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 180 s, still asking" puts 0A lit putc then
+		then
+	then
+loop then ;
 
 \ pann ( id k -- )
 : pann
@@ -250,14 +282,14 @@ drop pgap ;
 \ ── Chunks ──
 
 : pcp variable ;  : pcl variable ;  : pci variable ;  : pcn variable ;
-: prc variable ;  : pnr variable ;  : ptk variable ;  : plast variable ;
+: prc variable ;  : pnr variable ;  : ptk variable ;  : plast variable ;  : pask variable ;  : prcv variable ;
 : wkind  pkind @ w8  pkind @ 3 lit = if ppart @ w32 then ;
 \ preq  a GetChunks: chunks 0 to PWIN-1 while the length is not known,
 \ else the first PWIN missing, as ranges.
 : preq
 8 lit wbeg wtok wkind pid @ 20 lit wbs
 pobj @ 0= if
-	1 lit w8 0 lit w16 PWIN w16
+	1 lit w8 0 lit w16 PWIN w16  PWIN pask !
 else
 	ptp @ prc !  0 lit w8
 	0 lit pnr !  0 lit ptk !  FFFFFFFE lit plast !
@@ -267,8 +299,9 @@ else
 			i plast !  ptk @ 1 lit + ptk !
 		then
 	loop
-	pnr @ prc @ c!
+	pnr @ prc @ c!  ptk @ pask !
 then
+0 lit prcv !
 wsend ;
 
 \ pchunk  the Chunk in prx, if it is of the object being fetched.
@@ -287,7 +320,7 @@ pcp @ pid @ 20 lit d8= and if
 		pcp @ prx @ - 28 lit + pcn @ + prn @ u> 0= and
 		dup if drop pci @ pmap @ + c@ 0= then
 		if
-			pcp @ 28 lit + pobj @ pci @ A lit lshift + pcn @ bcopy  1 lit pci @ pmap @ + c!  1 lit pnew !
+			pcp @ 28 lit + pobj @ pci @ A lit lshift + pcn @ bcopy  1 lit pci @ pmap @ + c!  1 lit pnew !  prcv @ 1 lit + prcv !
 		then
 	then
 then ;
@@ -299,7 +332,12 @@ begin
 	pobj @ if pdone 0= else -1 lit then  pidle @ 1E lit u< and
 while
 	preq  0 lit pnew !
-	begin 11E1A300 lit pwait ?dup while 9 lit = if pchunk then repeat
+	\ until what was asked for has come (then the next ask at once), or
+	\ 300 ms pass with nothing (one lost: asked for again)
+	begin
+		prcv @ pask @ u<  pobj @ if pdone 0= and then
+		if 11E1A300 lit pwait else 0 lit then
+	?dup while 9 lit = if pchunk then repeat
 	pnew @ if 0 lit pidle ! else pidle @ 1 lit + pidle ! then
 repeat
 pobj @ if

@@ -8,8 +8,10 @@
 \ most work, each block counting 2^256 / (target + 1); a tie keeps the
 \ first.  A header that breaks a rule is not stored.
 \
-\ Headers are held in memory for now (an entry each, found by its id
-\ through a table), until the store takes them (step 6).  Not reentrant.
+\ Headers are held in memory (an entry each, 288 bytes, found by its id
+\ through a table of at least twice as many slots); the node keeps the
+\ main chain's in its store too, and loads them at a start (main.fam).
+\ Not reentrant.
 \
 \ A network is 25 words: the dataset's log2 items, parents and accesses;
 \ the genesis target (8 words); the easiest target (8 words); the drift; the
@@ -23,7 +25,10 @@
 \ parent unknown, -3 a wrong height, -4 past the chain's end, -5 a timestamp
 \ not after the median, -6 one past the clock and its drift, -7 its proof
 \ of work refused.  As tabminer's verdicts: known, UnknownParent, BadHeight,
-\ ChainEnded, TimestampTooOld, TimestampTooNew, BadProofOfWork.
+\ ChainEnded, TimestampTooOld, TimestampTooNew, BadProofOfWork; -8 no room;
+\ -9 its parent set aside (hmark: a block of its branch refused).
+\ hmark ( e -- )  entry e set aside, its block refused, and every entry
+\ above it: none is the best again, nor takes a child.
 \ hbest ( -- e ), hid ( e -- id ), hwork ( e -- work ), hhdr ( e -- h )
 \ the best entry; an entry's id and cumulative work (8 canonical words) and
 \ header.
@@ -36,7 +41,8 @@
 : hc variable ;  : hh variable ;  : hnl variable ;  : hnh variable ;
 
 :M HENT 120 lit ;                             \ an entry's bytes
-:M HTABN 1000 lit ;                           \ the table's slots
+: htn variable ;
+:M HTABN htn @ ;                              \ the table's slots: a power of two, at least twice the room
 
 : nw  2 lit lshift hnet @ + @ ;               \ ( k -- x )  network word k
 : he  HENT * hent @ + ;                       \ ( i -- e )
@@ -45,6 +51,8 @@
 : hwork  EC lit + ;
 : hparent  10C lit + ;                        \ ( e -- addr )  the parent's index
 : hfirst  110 lit + ;                         \ ( e -- addr )  block 1 of its branch (-1: none)
+: hout  114 lit + ;                           \ ( e -- addr )  set aside (hmark): not 0
+: hidx  hent @ - HENT / ;                     \ ( e -- i )
 : hheight  20 lit + @ ;
 : htslo  24 lit + @ ;  : htshi  28 lit + @ ;
 : hbest  hbst @ he ;
@@ -65,15 +73,16 @@ begin dup 2 lit lshift htab @ + @ while 1 lit + HTABN 1 lit - and repeat
 2 lit lshift htab @ + swap 1 lit + swap ! ;
 
 : hinit  ( net genesis cap -- )
-dup hcap !  HENT * alloc hent !
-HTABN 2 lit lshift alloc dup htab ! HTABN wzero
+dup hcap !  HENT * malloc hent !               \ (malloc's: mapped as needed, not the program's fixed memory)
+1 lit begin dup hcap @ 1 lit lshift u< while 1 lit lshift repeat htn !
+HTABN 2 lit lshift malloc dup htab ! HTABN wzero
 swap 64 lit alloc dup hnet ! 19 lit wcopy
 1 lit 0 lit nw lshift pwitems !  1 lit nw pwpar !  2 lit nw pwacc !
 20 lit alloc htg !  54 lit alloc hsch !  14 lit nw 3 lit lshift alloc hts !  20 lit alloc hidb !  20 lit alloc hwk !
 0 lit he 33 lit wcopy
 0 lit he dup hid blockid  0 lit he hid dfrom
 0 lit he hwork 8 lit wzero
-FFFFFFFF lit 0 lit he hparent !  FFFFFFFF lit 0 lit he hfirst !
+FFFFFFFF lit 0 lit he hparent !  FFFFFFFF lit 0 lit he hfirst !  0 lit 0 lit he hout !
 1 lit hcnt !  0 lit hbst !  0 lit hindex ;
 
 \ u64> ( alo ahi blo bhi -- flag )  a above b, unsigned.
@@ -132,7 +141,7 @@ hcnt @ hcap @ u< 0= if -8 lit hc ! else
 	hh @ hnew @ 33 lit wcopy
 	hidb @ hnew @ hid 8 lit wcopy
 	htg @ hwk @ bwork  hpar @ he hwork hwk @ hnew @ hwork wsat+
-	hpar @ hnew @ hparent !
+	hpar @ hnew @ hparent !  0 lit hnew @ hout !
 	hh @ hheight 1 lit = if hcnt @ else hpar @ he hfirst @ then hnew @ hfirst !
 	hcnt @ hindex
 	hnew @ hwork hbest hwork 8 lit wcmp 0 lit > if hcnt @ hbst ! then
@@ -144,6 +153,7 @@ hnh ! hnl ! hh !  0 lit hc !
 hh @ hdr-ok 0= if -1 lit hc ! then
 hc @ 0= if hh @ hidb @ blockid  hidb @ dfrom  hidb @ hfind 0< 0= if 1 lit hc ! then then
 hc @ 0= if hh @ hfind dup hpar ! 0< if -2 lit hc ! then then
+hc @ 0= if hpar @ he hout @ if -9 lit hc ! then then
 hc @ 0= if hpar @ he hheight 1 lit + dup 0= swap hh @ hheight <> or if -3 lit hc ! then then
 hc @ 0= if hh @ hheight 15 lit nw u> if -4 lit hc ! then then
 hc @ 0= if hh @ htslo hh @ htshi hpar @ he hmedian u64> 0= if -5 lit hc ! then then
@@ -156,6 +166,38 @@ hc @ 0= if hpar @ he htarget  hh @ htg @ hquick @ if quickpow else fullpow then 
 hc @ 0= if hstore then
 hc @ ;
 
+\ vrb  set (the program node does), the sync's progress said on the
+\ console, each step a line "node: ...": here each header's full proof
+\ of work; in sync.fam the sync's steps and each block followed.
+: vrb variable ;
+
+
+\ nhead  "node: " and the time of day (UTC, to the hundredth: the date
+\ /proc/time gave at the first line, and the time register since), so
+\ the lines show what took how long, whatever the parts measured.  The
+\ seconds are counted on from the last line, a second at a time: right
+\ however far apart lines are.
+: cok variable ;  : cdate variable ;  : clo variable ;  : chi variable ;  : csec variable ;  : cfr variable ;
+: cdl variable ;  : cdh variable ;  : cbuf variable ;
+: cstart
+20 lit alloc cbuf !  0 lit cbuf @ c!
+"/proc/time" 0 lit open dup 0< if drop else dup cbuf @ 1F lit read dup 0< if drop 0 lit then cbuf @ + 0 lit swap c! close drop then
+cbuf @ atoi cdate !  tnow chi ! clo !  0 lit csec !  0 lit cfr !  1 lit cok ! ;
+: ctick
+tnow  dup chi @ - cdh !  chi !
+dup clo @ u< if cdh @ 1 lit - cdh ! then  dup clo @ - cdl !  clo !
+begin cdh @ cdl @ 989680 lit u< 0= or while
+	cdl @ 989680 lit u< if cdh @ 1 lit - cdh ! then  cdl @ 989680 lit - cdl !  csec @ 1 lit + csec !
+repeat
+cfr @ cdl @ +  dup 989680 lit u< 0= if 989680 lit - csec @ 1 lit + csec ! then  cfr ! ;
+\ secs ( -- s )  seconds since the first (the same count nhead keeps).
+: secs  cok @ 0= if cstart then  ctick csec @ ;
+: n2d  dup A lit u< if 30 lit putc then u. ;     \ ( n -- )  two digits at least
+: nhead
+"node: " puts  cok @ 0= if cstart then  ctick
+cdate @ csec @ + 15180 lit %  dup E10 lit / n2d 3A lit putc  dup E10 lit % 3C lit / n2d 3A lit putc
+3C lit % n2d 2E lit putc  cfr @ 186A0 lit / n2d 20 lit putc ;
+
 \ hat ( h -- e | 0 )  the best branch's entry at height h.
 : hat  hbest begin dup hheight 2 lit pick u> while hparent @ he repeat  nip ;
 \ hconf ( from -- flag )  the full proof of work of the best branch's
@@ -163,6 +205,16 @@ hc @ ;
 : hconf
 -1 lit swap  hbest
 begin dup hheight 2 lit pick u< 0= over hheight and while
+	vrb @ if nhead "the proof of work of header " puts dup hheight u. 0A lit putc then
 	dup hparent @ he htarget  dup htg @ fullpow 0= if rot drop 0 lit -rot then
 	hparent @ he
 repeat 2drop ;
+
+\ hmark ( e -- )
+: hmark
+hidx  hcnt @ over do
+	i over = if 1 lit i he hout ! else i he hparent @ he hout @ if 1 lit i he hout ! then then
+loop drop
+0 lit  hcnt @ 1 lit do
+	i he hout @ 0= if i he hwork over he hwork 8 lit wcmp 0 lit > if drop i then then
+loop hbst ! ;

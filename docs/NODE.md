@@ -24,10 +24,12 @@ transactions it does.
   change to tabminer, made first, so the node never checks old work.
 - **Full validation, as tabminer.** The node checks the full proof of
   work of every block it accepts that no verified chain proof covers:
-  the fast-sync block and those after it, then each new block, before
-  accepting it (decided 2026-11-08). It does not defer a block's work
-  to its child's proof, which would leave the tip unchecked: at every
-  moment it accepts exactly what tabminer accepts.
+  the tip when a fast sync ends (the fast-sync block and those after it
+  but the tip are covered by the proofs of the blocks after them,
+  verified as they are connected: 2026-11-09), then each new block,
+  before accepting it (decided 2026-11-08). It does not defer a block's
+  work to its child's proof, which would leave the tip unchecked: at
+  every moment it accepts exactly what tabminer accepts.
 - **The seed file, whole and as shipped.** The proof of work reads the
   King James text as the 1,291,059-byte gzip file embedded in the
   binaries, never decompressed, and each of hashimoto's accesses reads a
@@ -518,8 +520,13 @@ A node starting from scratch:
 3. Verifies `S`'s chain proof, bound to `S`'s header chain. That covers
    every state transition before `S` (as now) and now the true `mix` of
    every header before `S`.
-4. Checks the full proof of work natively for the headers from `S` to
-   the tip, and fetches the snapshot and the blocks after `S` as now.
+4. Checks the full proof of work natively for the tip's header only,
+   and fetches the snapshot and the blocks after `S` as now. The work of
+   `S` and each header after it but the tip is covered by the next
+   block's chain proof, which attests to its parent's work and is
+   verified as that block is connected (the fam node since 2026-11-09:
+   checking them natively too, as at first, cost 2.2 s a header for
+   nothing).
 
 No header before `S` has its dataset items computed by anyone but the
 miners who proved them. The sync section above is this.
@@ -676,10 +683,12 @@ Each step done when its test passes.
 ### Its open questions
 
 - **The sync depth:** today 144 blocks. The full proof of work is
-  checked natively for every header after `S`, so a deeper `S` costs a
-  node more, and the fam node most: about 145 headers at 2.2 s each
-  (measured in step 4), 5.3 minutes on one hart, before the harts share
-  them.
+  checked natively only for the tip's header (the others are covered by
+  the chain proofs of the blocks after them), so a deeper `S` costs a
+  node only the blocks it connects. (Checking every header after `S`,
+  as at first, was about 145 headers at 2.2 s each, 5.3 minutes on one
+  hart for the fam node.) tabminer's `confirm_work` still checks them
+  all; it may do as the fam node does.
 - **The first block:** settled in step 4. Genesis's `mix` is empty, so
   its true mix is computed once from the seed text, and the base program
   (height 1) fixes genesis's hash and that work as constants.
@@ -1058,9 +1067,66 @@ Each step done when its test passes.
     - Its tree, `/var/node`, is made afresh at each start: resuming from
       it is not done yet, and a removed tree's pages are not given back
       yet, so each start costs its size on the disk.
-    - Not yet: started by init, restart after a kill, configuration
-      (network, peers, port), more than 4,096 headers (`hinit`'s room),
-      a log and a way to read its state from the shell.
+    - What it is doing, on the console (2026-11-09): each line
+      `node: HH:MM:SS.cc ...` (UTC, from `/proc/time` and the time
+      register, which user mode may now read: `docs/OS.md`). The sync's
+      steps (the peer's height, headers, S, the tip's work, S's proof,
+      the snapshot's parts, each block after S); then each block
+      followed, with what it took: `headers to N, fetched and their
+      work checked in ...` and `height N (fetch, body, state, proof,
+      store; total)`. Measured on dev-recursive, one hart: the tip's
+      proof of work 2.1 s (on an idle host core; up to 2.5 times that
+      when the host is busy, as QEMU's one thread is placed), a block
+      0.5 s (its proof 0.3, its body's hash 0.1).
+    - Fixed on the way: `pfetch` waited for 300 ms of silence after
+      every window of 4 chunks, even with all of them come, so a dev
+      block (35 KB) took 3 s to fetch; it now asks for the next window
+      as soon as the last has come (0.01 to 0.05 s).
+    - Peers kept, as tabminer keeps them: in the serving loop (`nstep`)
+      each peer pinged every 30 s, one not answering after 2 s doubling
+      to 30, for good; said lost after 180 s silent, and back. A Pong
+      showing the peer ahead is caught up to, as an announcement is. So
+      a tabminer restarted (which forgets the node) is found again.
+      Tried: the miner killed and restarted; the node went on following.
+    - The tests' tabminers moved to UDP 37471 (and 37472 for a wallet),
+      so a dev miner of one's own on 3747 runs beside them.
+    - Resuming (2026-11-09): the store holds every main-chain header
+      (a fast sync stores 1 to S once its snapshot is in; `sconnect` each
+      block's after), so at a start the node loads them from `/var/node`
+      (quick-checked again: each was checked in full, or covered by a
+      proof, before it was stored), takes its tip from the store, and
+      catches up from the peer; only a store with no tip is made afresh
+      and synced. Room for 65,536 headers (a year of mainnet; 19 MB,
+      `malloc`'d), the lookup table at least twice that (it was exactly
+      the room, so a full table would have looped).
+    - Reorganizing: headers asked for from lower (2, 4, 8... below the
+      best) when the first does not join; if our tip is off the best
+      branch, our blocks above the fork undone (`sundo`, with each
+      block's undo data; none for S and below, so no deeper) and the
+      best branch's connected. A block refused sets its header and those
+      above it aside (`hmark`: never the best, refusing children, -9),
+      so the next turn goes back. Not yet: the transactions of blocks
+      undone returned to the pool.
+    - A bug found on the way: a resumed node connected blocks without
+      checking their proofs (only `nsync` turned the check on). Fixed:
+      on whenever there is a chain.
+    - `scripts/reorgtest.sh`, the image's own `node` run from its shell:
+      tabminer A mines; the node syncs and follows; it is killed and run
+      again, and resumes (no new sync; the next block's proof checked).
+      Then A stops, tabminer B (a copy of A at 6) mines its own branch
+      two past A's, and A, started again with B as its peer, reorganizes
+      onto it: the node undoes its blocks above 6 and connects B's to
+      B's tip.
+    - Not yet: started by init (held back while it is tried by hand),
+      configuration (network, peers, port), several peers and finding
+      them (`GetPeers`, the seeds), catching up after downtime with only
+      the tip's work checked in full, more than 65,536 headers (the store
+      holding them, a window in memory),
+      a log and a way to read its state from the shell; relaying the
+      blocks it follows to its other peers (only after their work is
+      checked in full, as tabminer: relaying on the quick check alone
+      would let a block with no real work cost every node that passes
+      it on).
 
 ## Open questions
 

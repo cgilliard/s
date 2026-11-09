@@ -2,11 +2,14 @@
 \ relay of transactions (step 7), after p2p.fam.
 \ As tabminer's node.rs: headers first, each checked but for its proof of
 \ work in full (the quick check from its claimed mix); then the block S a
-\ depth below the best, the full proof of work of S and every header after
-\ it (hconf), S's body and its snapshot's manifest, S's chain proof
-\ (which covers every block before it), the snapshot's parts, the state
+\ depth below the best, the full proof of work of the best header (hconf),
+\ S's body and its snapshot's manifest, S's chain proof (which covers
+\ every block before it, their work too), the snapshot's parts, the state
 \ checked whole; then the blocks after S, each connected with its proof
-\ checked.  Then the tip followed: each block a peer announces (Inv), its
+\ checked, which attests to its parent's work (docs/NODE.md, the work in
+\ the chain proof).  So every header's work is checked: the best's
+\ directly, each other's by a verified proof (S's by S+1's, and so on).
+\ None needs its own full check but the best, which no proof covers.  Then the tip followed: each block a peer announces (Inv), its
 \ header checked in full, fetched and connected.
 \
 \ nsync ( depth -- code )  0, or where it stopped: -1 no Pong, -2 another
@@ -36,16 +39,73 @@ hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
 
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
 \ header the entry's: the bytes the same).
+: nft variable ;  : btf variable ;
 : nblock
+ticks nft !
 dup hid 0 lit 0 lit rot pfetch nbn ! nblk !
 nblk @ if
 	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= else drop 0 lit then
 	dup 0= if nblk @ free 0 lit nblk ! then
-else drop 0 lit then ;
+else drop 0 lit then
+ticks nft @ - btf ! ;
+
+\ nhex ( a -- )  the first 4 bytes at a, in hex.
+: nhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )  a hex digit
+: nhex  4 lit 0 lit do dup i + c@ dup 4 lit rshift nhd putc F lit and nhd putc loop drop ;
+\ nsay ( s -- )  "node: s", if vrb.
+: nsay  vrb @ if nhead puts else drop then ;
+\ nsec ( ticks -- )  as seconds, to the hundredth.
+: nsec  2710 lit / dup 3E8 lit / u. 2E lit putc 3E8 lit % A lit / dup A lit u< if 30 lit putc then u. ;
+\ nbrk  what the last block took, by part (sconnect's btb...).
+: nbrk
+"  (fetch " puts btf @ nsec  ", body " puts btb @ nsec  ", state " puts bts @ nsec  ", proof " puts btp @ nsec
+", store " puts btc @ nsec  "; " puts btf @ btb @ + bts @ + btp @ + btc @ + nsec " s)" puts ;
+: nt0 variable ;  : nh0 variable ;
+: nsayn  vrb @ if u. 0A lit putc else drop then ;   \ ( n -- )  a number ending the line
+
+\ nsave ( n -- )  the main chain's headers 1 to n into the store (a
+\ transaction a 1,024): after a fast sync's snapshot, so that the store
+\ holds every header from genesis to its tip (sconnect stores each block's
+\ after), for a start to load (nload).
+: nsv variable ;
+: nsave
+nsv !  1 lit
+begin dup nsv @ u> 0= while
+	stfd @ 1 lit txbegin stx !
+	dup 400 lit + nsv @ 1 lit + umin  over do  i khdr i hat hhdr CC lit sput  loop
+	stx @ txcommit drop
+	400 lit +
+repeat drop ;
+
+\ nload ( -- flag )  the store's chain taken up, if it has one: its
+\ headers, genesis to its tip, offered again (the quick check: each was
+\ checked in full, or covered by a proof, before it was stored), and our
+\ status from its tip.  0 if the store has no tip, or a header is missing
+\ or refused.
+: nlh variable ;  : nlok variable ;
+: nload
+stfd @ 0 lit txbegin stx !  68 lit mget nlh !  -1 lit nlok !
+nlh @ 0= if 0 lit nlok ! then
+nlok @ if
+	"loading " nsay vrb @ if nlh @ u. " headers from the store" puts 0A lit putc then
+	ticks nt0 !  -1 lit hquick !
+	nlh @ 1 lit + 1 lit do
+		nlok @ if
+			i khdr sbuf @ CC lit sget CC lit = if
+				sbuf @ ntime 0 lit hacc 1 lit u> if 0 lit nlok ! then
+			else 0 lit nlok ! then
+		then
+	loop
+	0 lit hquick !
+	nlok @ hbest hheight nlh @ = and nlok !
+then
+stx @ txcommit drop
+nlok @ if nstat  -1 lit sprchk !  vrb @ if nhead "resumed at height " puts myh @ u. ", the headers loaded in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
+nlok @ ;
 
 : nsync  ( depth -- code )
 nS !  0 lit ncode !
-pping 0= if FFFFFFFF lit nfail then
+pping 0= if FFFFFFFF lit nfail else "the peer is at height " nsay pst-h nsayn then
 ncode @ 0= if pst @ 14 lit + mygen @ 20 lit d8= 0= if FFFFFFFE lit nfail then then
 \ headers, quick-checked
 ncode @ 0= if
@@ -54,6 +114,7 @@ ncode @ 0= if
 		dup phdrs ?dup if
 			0 lit do phb @ i CC lit * +  ntime 0 lit hacc  1 lit u> if FFFFFFFD lit nfail then loop
 			hbest hheight 1 lit + max
+			"headers to " nsay hbest hheight nsayn
 		else FFFFFFFD lit nfail then
 	repeat drop
 	0 lit hquick !
@@ -61,7 +122,9 @@ then
 \ S, and the full proof of work from it up
 ncode @ 0= if
 	hbest hheight dup nH !  nS @ - dup 1 lit < if drop 1 lit then nS !
-	nS @ hconf 0= if FFFFFFFC lit nfail then
+	"fast sync from block S = " nsay nS @ nsayn
+	ticks nt0 !
+	nH @ hconf 0= if FFFFFFFC lit nfail else vrb @ if nhead "its work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
 then
 \ S's block and manifest, its parent's header, its proof
 ncode @ 0= if
@@ -73,20 +136,23 @@ ncode @ 0= if
 	then
 then
 ncode @ 0= if
+	"S's block and its snapshot's manifest fetched; checking its chain proof" nsay vrb @ if 0A lit putc then
 	nS @ 1 lit - hat hhdr shdr
-	nS @ hat hhdr  nblk @ CC lit +  nbn @ CC lit -  sverify 0= if FFFFFFFA lit nfail then
+	nS @ hat hhdr  nblk @ CC lit +  nbn @ CC lit -  sverify 0= if FFFFFFFA lit nfail else
+		"S's chain proof checked (it covers every block before S); snapshot parts: " nsay snr @ snn @ + nsayn
+	then
 then
 \ the parts, then the whole
 ncode @ 0= if
 	snr @ snn @ + ?dup if 0 lit do
 		ncode @ 0= if
 			3 lit i nid @ pfetch over if
-				2dup i -rot snpart if FFFFFFF9 lit nfail then drop free
+				2dup i -rot snpart if FFFFFFF9 lit nfail else "snapshot part " nsay i 1 lit + nsayn then drop free
 			else 2drop FFFFFFFB lit nfail then
 		then
 	loop then
 then
-ncode @ 0= if nS @ hat hhdr snfin if FFFFFFF8 lit nfail then then
+ncode @ 0= if nS @ hat hhdr snfin if FFFFFFF8 lit nfail else "the snapshot's state checked against S" nsay vrb @ if 0A lit putc then  nS @ nsave then then
 nblk @ ?dup if free 0 lit nblk ! then
 \ the blocks after S, each with its proof
 ncode @ 0= if
@@ -95,7 +161,7 @@ ncode @ 0= if
 		nH @ 1 lit + nS @ 1 lit + do
 			ncode @ 0= if
 				i hat dup nblock if
-					hhdr nblk @ CC lit + nbn @ CC lit - sconnect if FFFFFFF7 lit nfail then
+					hhdr nblk @ CC lit + nbn @ CC lit - sconnect if FFFFFFF7 lit nfail else vrb @ if nhead "block " puts i u. " of " puts nH @ u. " connected" puts nbrk 0A lit putc then then
 					nblk @ free 0 lit nblk !
 				else drop FFFFFFFB lit nfail then
 			then
@@ -106,27 +172,66 @@ then
 ncode @ ;
 
 \ ncatch  headers from the best to the peer's height, each checked in
-\ full; then every block from the state's tip to the best header
-\ connected.  nk counts them.
-: nfl variable ;  : nhb variable ;
+\ full: asked for from the best's height on, or, when the first of them
+\ does not join (its parent unknown: the peer's chain forked below our
+\ best), from 2, 4, 8... lower until it does.  Then, if our tip is not on
+\ the best branch, our blocks above where it joins undone (sundo: there
+\ is undo data for every block connected, none for a fast sync's S and
+\ below, so no deeper); then every block from our tip to the best header
+\ connected.  A block refused sets its header aside (hmark), so the best
+\ is another branch, ours or the old: the next turn goes back to it.  nk
+\ counts the blocks connected.
+: nfl variable ;  : nhb variable ;  : nstp variable ;  : nbk variable ;  : nfk variable ;
+\ nundo? ( -- flag )  undo data for our tip's block.
+: nundo?  stfd @ 0 lit txbegin stx !  myh @ 0 lit kundo sbuf @ 4 lit sget 0 lit >  stx @ txcommit drop ;
 : ncatch
-0 lit nfl !
+0 lit nfl !  ticks nt0 !  hbest hheight nh0 !  1 lit nstp !
 begin hbest hheight pst-h u< nfl @ 0= and while
-	hbest hheight 1 lit + phdrs ?dup if
-		0 lit do nfl @ 0= if phb @ i CC lit * + ntime 0 lit hacc 1 lit u> if 1 lit nfl ! then then loop
+	hbest hheight 1 lit +  nstp @ 1 lit -  over 1 lit - umin  -
+	0 lit nbk !
+	dup phdrs ?dup if
+		0 lit do nfl @ 0= nbk @ 0= and if
+			phb @ i CC lit * + ntime 0 lit hacc
+			dup FFFFFFFE lit = i 0= and if
+				drop  1 lit nbk !
+				dup 1 lit = if 1 lit nfl ! else nstp @ 1 lit lshift nstp ! then
+			else 1 lit u> if 1 lit nfl ! then then
+		then loop
 	else 1 lit nfl ! then
+	drop
 repeat
+vrb @ hbest hheight nh0 @ u> and if
+	nhead "headers to " puts hbest hheight u. ", fetched and their work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
+then
 0 lit nfl !
-myh @ hbest hheight u< if
+\ our tip off the best branch: undone down to where it joins
+myh @ if mytip @ hfind dup 0< if drop else
+	he begin dup dup hheight hat <> while hparent @ he repeat hheight nfk !
+	myh @ nfk @ u> if
+		vrb @ if nhead "reorganizing: our " puts myh @ nfk @ - u. " blocks above " puts nfk @ u. " leave for the best branch" puts 0A lit putc then
+		begin myh @ nfk @ u> nfl @ 0= and while
+			nundo? if sundo nstat  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
+			else
+				vrb @ if nhead "cannot undo block " puts myh @ u. " (none is kept for a fast sync's start and below): a new sync is needed" puts 0A lit putc then
+				1 lit nfl !
+			then
+		repeat
+	then
+then then
+myh @ hbest hheight u< nfl @ 0= and if
 	hbest hheight 1 lit + myh @ 1 lit + do
 		nfl @ 0= if
 			i hat dup nblock if
-				hhdr nblk @ CC lit + nbn @ CC lit - sconnect if 1 lit nfl ! else nk @ 1 lit + nk ! nstat then
+				hhdr nblk @ CC lit + nbn @ CC lit - sconnect ?dup if
+					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
+					i hat hmark  1 lit nfl !
+				else nk @ 1 lit + nk ! nstat  vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then then
 				nblk @ free 0 lit nblk !
-			else drop 1 lit nfl ! then
+			else drop "block not fetched: " nsay i nsayn 1 lit nfl ! then
 		then
 	loop
-	qcheck
+	ticks nt0 !  qcheck
+	vrb @ qnum @ and if nhead "the pool rechecked (" puts qnum @ u. " held) in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then
 then ;
 
 \ pfollow ( n -- k )  each announcement (Inv) taken as the peer's height,
@@ -140,9 +245,6 @@ dup 3C lit * 0 lit do
 loop drop nk @ ;
 
 : nrid variable ;  : nrk variable ;  : nrm variable ;  : nrc variable ;
-\ nhex ( a -- )  the first 4 bytes at a, in hex.
-: nhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )  a hex digit
-: nhex  4 lit 0 lit do dup i + c@ dup 4 lit rshift nhd putc F lit and nhd putc loop drop ;
 : nrelay
 begin pdeq ?dup while
 	dup nrid @ 20 lit bcopy  20 lit + @ nrk !
@@ -156,11 +258,17 @@ begin pdeq ?dup while
 	then
 repeat ;
 
+\ nstep  a turn of following, up to a second: an announcement (Inv)
+\ taken as the peer's height, or a Pong showing it ahead of us, caught up
+\ to (so a block announced while we were lost to the peer is not missed);
+\ the peers kept (pkeep); the transactions announced relayed.
+: nstep
+3B9ACA00 lit pwait
+dup 7 lit = if drop prx @ 25 lit + le@ pst @ 34 lit + !  ncatch else
+2 lit = if pst-h myh @ u> if ncatch then then then
+pkeep  nrelay ;
+
 \ nserve ( s -- )
-: nserve
-0 lit do
-	3B9ACA00 lit pwait 7 lit = if  prx @ 25 lit + le@ pst @ 34 lit + !  ncatch  then
-	nrelay
-loop ;
+: nserve  0 lit do nstep loop ;
 
 : ninit  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk !  20 lit alloc nrid !  20 lit alloc nrm ! ;

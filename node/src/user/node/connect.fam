@@ -31,11 +31,19 @@ else drop then ;
 : sroot0  srt !  27 lit 0 lit tmpa @ nget  tmpb @ troot  tmpa @ tmpb @ srt @ compress  srt @ dfrom ;   \ ( c -- )  in a transaction
 : sroot  stfd @ 0 lit txbegin stx !  sroot0  stx @ txcommit drop ;
 
+\ What connecting a block took, in ticks, by part: its body decoded and
+\ its commitment checked (btb), the state changed and its root checked
+\ (bts), its chain proof (btp), the store's writes and commit (btc).
+: bt0 variable ;  : btb variable ;  : bts variable ;  : btp variable ;  : btc variable ;
+: btick  ticks dup bt0 @ - rot ! bt0 ! ;          \ ( var -- )  the time since the last, into var
+
 : sconnect  ( h body n -- code )
+ticks bt0 !
 rot bh !  2dup bbn ! bbody !  0 lit bcode !  0 lit ndirty !
 2dup bparse nip
 bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
 bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
+btb btick
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
 	bh @ 20 lit + @ sh !
@@ -67,8 +75,10 @@ bcode @ 0= if
 	bcode @ 0= if sprop  stmd @ sroot0  stmd @ bh @ 4C lit + 8 lit wcmp if FFFFFFF1 lit bfail then then
 	\ the supply: what the outputs make, what the inputs held and the subsidy
 	bcode @ 0= if sh @ subsidy spent @ amount+  made @ spent @ 4 lit wcmp if FFFFFFF0 lit bfail then then
+	bts btick
 	\ the proof, last (tabminer's order)
 	bcode @ 0= sprchk @ and if sproof 0= if FFFFFFEF lit bfail then then
+	btp btick
 	bcode @ 0= if
 		ux @ ub @ - 2 lit rshift ub @ !
 		ub @ @ 2 lit lshift urem !  ub @ up !  0 lit uk !
@@ -90,6 +100,7 @@ bcode @ 0= if
 		serr @ if FFFFFFF6 lit bfail then
 	then
 	bcode @ if stx @ txabort drop 0 lit ndirty ! else stx @ txcommit drop then
+	btc btick
 	ub @ free
 then
 bops @ free

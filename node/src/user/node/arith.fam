@@ -843,3 +843,20 @@ sqt @ 0= if
 	10 lit alloc et1 !  10 lit alloc et2 !  10 lit alloc et3 !
 	10 lit alloc lgt !  10 lit alloc lgp !
 then ;
+
+\ ticks ( -- t )  the time register's low word (rdtime, which user mode
+\ may read: docs/OS.md): 10 MHz on QEMU's virt board, so an interval up
+\ to 429 s is the difference of two.
+:M ticks
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+:M tickh                    \ ( -- t )  its high word (rdtimeh)
+1301C1FF ,   \ addi sp,sp,-4
+F32710C8 ,   \ rdtimeh a5
+2320F100 ,   \ sw a5,0(sp)
+;
+\ tnow ( -- lo hi )  the whole time register, the high word read twice so
+\ the two agree.
+: tnow  begin tickh ticks tickh rot over <> while 2drop repeat ;

@@ -454,8 +454,7 @@ abod @ ?dup if free 0 lit abod ! then ;
 : aserve
 ntime + aend !
 begin ntime aend @ u< while
-	3B9ACA00 lit pwait 7 lit = if  prx @ 25 lit + le@ pst @ 34 lit + !  ncatch  then
-	nrelay
+	nstep
 	pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then
 	awake
 repeat ;
