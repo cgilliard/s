@@ -111,6 +111,9 @@ expect() {
 	grep -q -- "$pat" "$T/$name.out" || fail "$name" "output $(head -c 300 "$T/$name.out"), expected /$pat/"
 }
 
+# has NAME PATTERN — the output of check NAME matches PATTERN too.
+has() { grep -q -- "$2" "$T/$1.out" || fail "$1" "output $(head -c 300 "$T/$1.out"), expected /$2/ too"; }
+
 [ -f bin/img ] && [ -f bin/tabernacle ] || { echo "oscheck.sh: run scripts/build.sh first" >&2; exit 1; }
 
 for n in 1 2 8 64; do
@@ -211,8 +214,6 @@ bye'
 expect usys 124 '^-14,-38,-9,A1$' 4 ./tools/q32 "$T/usys.img"
 grep -q 'kernel: init ended: 0' "$T/usys.out" || fail usys "init did not end 0: $(head -c 300 "$T/usys.out")"
 
-# has NAME PATTERN — the output of check NAME matches PATTERN too.
-has() { grep -q -- "$2" "$T/$1.out" || fail "$1" "output $(head -c 300 "$T/$1.out"), expected /$2/ too"; }
 # usrc NAME SOURCE — a program in user mode: $T/NAME.bin.
 usrc() {
 	printf '%s\n' "$2" > "$T/$1.fam"
