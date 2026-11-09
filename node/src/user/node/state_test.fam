@@ -1,10 +1,16 @@
 \ state_test.fam — a dev chain's state (docs/NODE.md, step 5), a program
-\ for the OS after arith.fam, poseidon2.fam, difficulty.fam, pow.fam and
-\ state.fam, with a disk.  /lib/statechain is miner/src/fam_vectors.rs's
-\ statechain.bin: blocks with tabminer's verdicts.  Each is connected and
-\ given tabminer's verdict, every root matching; then every block is
-\ disconnected down to genesis, each time the root its parent's; then all
-\ connected again.
+\ for the OS after arith.fam, poseidon2.fam, difficulty.fam, pow.fam,
+\ headers.fam, chainver.fam, state.fam, proofs.fam, manifest.fam,
+\ connect.fam, query.fam and serve.fam, with a disk.  /lib/statechain is
+\ miner/src/fam_vectors.rs's statechain.bin: blocks with tabminer's
+\ verdicts.  Each is connected and given tabminer's verdict, every root
+\ matching; then, with /lib/statesnap (statesnap.bin: the snapshot after a
+\ block as tabminer serves it), the node's manifest after that block and
+\ every part it serves (step 10) compared byte for byte; then every block
+\ is disconnected down to genesis, each time the root its parent's; then
+\ all connected again.  With /lib/statefirst (8 bytes), the counter starts
+\ there (statechain40.bin: outputs from just below 2^32) and no manifests
+\ are taken (from there each lists 2^18 parts).
 
 : cta variable ;  : ctn variable ;  : tpas variable ;  : tfai variable ;
 : hl variable ;  : nh variable ;  : cr variable ;
@@ -25,7 +31,24 @@ rot close drop ;
 \ entry  the next block of the file: its verdict, header, body and length.
 : entry  ep @ @ ecode !  ep @ 4 lit + eh !  ep @ D0 lit + @ en !  ep @ D4 lit + eb !  eb @ en @ + 3 lit + FFFFFFFC lit and ep ! ;
 
+\ bsame ( a b n -- flag )  n bytes equal.
+: bsame  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;
+: sns variable ;  : snp variable ;  : snh variable ;  : snk variable ;
+\ scmp ( a n -- )  the bytes the node made, against the next of the
+\ snapshot file's (its length, its bytes, word padded); freed.
+: scmp
+2dup snp @ @ = if snp @ 4 lit + rot bsame else 2drop 0 lit then     ( a flag )
+dup 0= if "part " puts snk @ . " differs" puts 0A lit putc then vok
+snp @ @ 3 lit + FFFFFFFC lit and 4 lit + snp @ + snp !
+?dup if free then ;
+
 "/t-state" TREE CREATE or 2 lit or open stinit
+\ the counter to start from, if given: no manifests then
+"/lib/statefirst" 0 lit open dup 0< if drop else
+	dup sbuf @ 8 lit read drop close drop
+	stfd @ 1 lit txbegin stx !  sbuf @ @ sbuf @ 4 lit + @ swap 70 lit mput 71 lit mput  stx @ txcommit drop
+	-1 lit msoff !
+then
 800 lit alloc hl !  800 lit alloc hb !  800 lit alloc hn !  20 lit alloc cr !  20 lit alloc gr !
 "/lib/statechain" rdfile drop dup @ ctn ! 4 lit + ep !
 0 lit nh !  0 lit tpas !  0 lit tfai !
@@ -36,6 +59,16 @@ ctn @ 0 lit do
 	ecode @ 0= if eh @ hl @ nh @ w!  eb @ hb @ nh @ w!  en @ hn @ nh @ w!  nh @ 1 lit + nh ! then
 loop
 "connected: " puts tpas @ u. " as tabminer, " puts tfai @ u. " not" puts 0A lit putc
+\ The snapshot after block snh as the node serves it: its manifest, then
+\ every part (outputs, then names), each tabminer's bytes.
+"/lib/statesnap" 0 lit open dup 0< if drop else close drop
+	0 lit tpas !  0 lit tfai !
+	"/lib/statesnap" rdfile drop dup sns !  dup @ snh !  4 lit + snp !
+	FFFFFFFF lit snk !  snh @ zman scmp
+	snp @ @  snp @ 4 lit + snp !
+	?dup if 0 lit do i snk !  snh @ i zpart scmp loop then
+	"served: " puts tpas @ u. " as tabminer, " puts tfai @ u. " not" puts 0A lit putc
+then
 \ Every block disconnected: the root its parent's (genesis's the empty tree's).
 0 lit tpas !  0 lit tfai !
 28 lit dfl gr @ 8 lit wcopy  gr @ dfrom

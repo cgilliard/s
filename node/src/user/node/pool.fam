@@ -341,7 +341,8 @@ QSLOTS 2 lit lshift alloc qvic !  20 lit alloc qmsg !  20 lit alloc qcov !  50 l
 bnout @ ?dup if 0 lit do
 	qnmv @ QMV u< if
 		bout @ i 3C lit * +  qmv @ qnmv @ 28 lit * + dle
-		sfirst @ i +  qmv @ qnmv @ 28 lit * + 20 lit + !  0 lit qmv @ qnmv @ 28 lit * + 24 lit + !
+		sfirst @ i +  dup qmv @ qnmv @ 28 lit * + 20 lit + !
+		sfirst @ u< sfirsth @ swap if 1 lit + then  qmv @ qnmv @ 28 lit * + 24 lit + !
 		qnmv @ 1 lit + qnmv !
 	then
 loop then ;

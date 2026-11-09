@@ -61,6 +61,12 @@ A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
 \ the headers held (-w N), and the peers given: their addresses in mpa
 \ (8 of 2 words), mpn of them, from argument mpf on
 : mpa variable ;  : mpn variable ;  : mpf variable ;  : mhc variable ;
+\ The heap reserved, first: one arena of 32 MiB, mapped once and kept
+\ (free never unmaps the last). A process has 4 map slots, and malloc's
+\ arenas grow from 64 KiB, so small allocations first would leave them
+\ full at half a MiB, and every buffer past that refused (a snapshot's
+\ part not served, a block not taken).
+2000000 lit malloc ?dup if free then
 4000 lit mhc !  1 lit mpf !
 argn 2 lit u> if 1 lit arg "-w" streq if
 	2 lit arg dup c@ 30 lit - A lit u< if atoi 10 lit max mhc ! else drop then  3 lit mpf !

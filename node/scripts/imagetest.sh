@@ -33,7 +33,7 @@ HP=${IMAGETEST_PORT:-37370}
 rm -rf "$T"; mkdir -p "$T"
 
 ./tools/fam --user -o "$T/tnode.bin" $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
-	$N/chainver.fam $N/state.fam $N/proofs.fam $N/connect.fam $N/query.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
+	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
 	$N/pool.fam $N/p2p.fam $N/api.fam $N/sync.fam $N/api_test.fam
 printf '0\n' > "$T/version"
 sh scripts/mkimage.sh "$T/node.img" bin/kernel init="$T/tnode.bin":24576 \

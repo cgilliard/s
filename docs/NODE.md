@@ -1206,10 +1206,48 @@ Each step done when its test passes.
       `-w 16` to 26 blocks (headers moved to the store several times),
       asks the API for header 3 (the store's, its id A's) by height and
       by id, and resumes from 8 headers, following on.
+    - Serving snapshots (2026-11-09), as tabminer's `take_snapshot`,
+      `snapshot_part` and `snapshot_name_part`, so peers fast-sync from
+      the node: a manifest taken after each block connected (and S's,
+      after a fast sync), kept for the undo window (`manifest.fam`:
+      the counter, each output part's root, the name trie's root, each
+      name part's first key and hash, from a table of the name buckets,
+      'B', each hashed again when a block changes its records); parts
+      built on request (`serve.fam`): an output part the outputs
+      unspent now in its range with those spent since (their records,
+      's') and those reveals consumed since (rebuilt as `sundo` does),
+      and its commits; a name part the records in its range with the
+      blocks since undone. Served as GetChunks kinds 2 and 3. oscheck's
+      `state` compares the node's manifest after block 150 of
+      `statechain.bin`, and every part, with tabminer's (`statesnap.bin`)
+      byte for byte; `scripts/snaptest.sh` has a new tabminer, its only
+      peer the node and `--sync-point 4`, fast-sync from it from before a
+      burn (the coin it spent served as spent since).
+    - Positions are 40 bits throughout (the state tree's capacity): the
+      output counter (meta 70, its high byte 71), a block's first
+      position (its undo record's fourth word, 0 before), the statement's
+      positions, snapshots' counters, parts and installs, the pool's
+      moved inputs, the API's positions. oscheck's `state40`:
+      `statechain40.bin`, the same chain from just below 2^32
+      (`fam_vectors.rs`'s FIRST40), every verdict, root and undo as
+      tabminer's.
+    - A cost found on the way, the protocol's (tabminer's as much): a
+      manifest lists every output part from position 0, so once 4
+      billion outputs have been made each is 2^18 roots (8 MB), and one
+      is kept for each block of the undo window (8 GB). To change before
+      the chain gets there: parts by subtree, by the unspent outputs they
+      hold, and manifests kept as changes (being built).
+    - Found by `snaptest.sh`: the node's status said it kept no block
+      (its oldest past its tip), so tabminer asked it for no snapshot;
+      now its first body kept (meta 62) or the window's start. And the
+      node's heap: a process has 4 map slots and `malloc`'s arenas grow
+      from 64 KiB, so with small allocations first they filled at half a
+      MiB and every buffer past that was refused (a part not served).
+      The node maps 32 MiB first (`main.fam`), and `malloc` falls back
+      to what is needed when a larger arena cannot be had.
     - Not yet: started by init (held back while it is tried by hand),
       configuration (network, port),
-      a log and a way to read its state from the shell, serving
-      snapshots.
+      a log and a way to read its state from the shell.
 
 ## Open questions
 

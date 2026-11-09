@@ -41,6 +41,7 @@
 : be!  begin dup while 1 lit -  2 lit pick 2 lit pick 2 lit pick + c!  rot 8 lit rshift -rot repeat 2drop drop ;
 : be@  0 lit -rot 0 lit do swap 8 lit lshift over i + c@ or swap loop drop ;
 : le@  dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: umin  2dup u> if swap then drop ;           \ ( a b -- min )  unsigned
 : bcopy  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;
 \ dle ( a c -- )  c (8 words) = the 8 canonical little-endian words at a
 \ (any alignment), in Montgomery form.
@@ -334,6 +335,17 @@ dup 3 lit w@ kb @ 1 lit + 3 lit be!  dup 2 lit w@ kb @ 4 lit + 4 lit be!
 dup 1 lit w@ kb @ 8 lit + 4 lit be!  0 lit w@ kb @ C lit + 4 lit be!  10 lit ;
 : rsize  c@ 61 lit + ;                         \ ( rec -- n )  97 and the name
 
+\ rtouch ( k -- )  record k's bucket (its key's top 16 bits: names.rs's
+\ bucket_of) noted as changed, for manifest.fam to hash again (a block's
+\ worth, 256 at most; past that, all: rtall).
+: rtb variable ;  : rtn variable ;  : rtall variable ;
+: rtouch
+3 lit w@ 8 lit rshift FFFF lit and
+rtall @ if drop else
+	0 lit  rtn @ ?dup if 0 lit do over rtb @ i w@ = or loop then
+	if drop else rtn @ 100 lit u< if rtb @ rtn @ w!  rtn @ 1 lit + rtn ! else drop -1 lit rtall ! then then
+then ;
+
 \ cleaf ( hash height c -- )  a commit's leaf commitment: hash_domain 8 of
 \ its hash (canonical bytes) and height.
 : cleaf  -rot tom nin @ 8 lit w!  nin @ dle  nin @ 9 lit 8 lit 3 lit pick hdom drop ;
@@ -503,6 +515,11 @@ dup 59D31 lit u< if drop 27395000 lit 48C lit else
 
 : tk2 variable ;  : nlv2 variable ;  : srt variable ;  : urem variable ;  : up variable ;  : uk variable ;
 : bh variable ;  : sh variable ;  : sctr variable ;  : sfirst variable ;
+\ The output counter is 40 bits (the tree holds 2^40 positions): sctr its
+\ low word, sctrh its high byte (meta 70 and 71); sfirst and sfirsth the
+\ first position a block made.  sinc counts one.
+: sctrh variable ;  : sfirsth variable ;
+: sinc  sctr @ 1 lit + dup sctr !  0= if sctrh @ 1 lit + sctrh ! then ;
 : ub variable ;  : ux variable ;  : rb variable ;  : cb variable ;
 : spent variable ;  : made variable ;  : sw4 variable ;
 : ev variable ;  : nev variable ;
@@ -536,17 +553,17 @@ bnops @ ?dup if 0 lit do bcode @ 0= if
 	dup 1 lit = if drop
 		4 lit + @  dup sh @ stmd @ cleaf  stmd @ dfrom
 		stmd @ rb @ 8 lit wcopy  dup 20 lit + rb @ 20 lit + 14 lit bcopy  rb @ 34 lit + 3 lit wzero  sh @ rb @ 40 lit + !
-		rb @ sctr @ 0 lit oput
+		rb @ sctr @ sctrh @ oput
 		cb @ 20 lit bcopy  sh @ cb @ 20 lit + !
-		sctr @ 0 lit kcommit cb @ 24 lit sput
-		4 lit u,  sctr @ 1 lit + sctr !
+		sctr @ sctrh @ kcommit cb @ 24 lit sput
+		4 lit u,  sinc
 	else 2 lit = if
 		dup rpos pos@  rot 4 lit + @ dup nlv2 @ rvalue  -rot      ( rec lo hi )
 		2dup cget 0= if 2drop drop FFFFFFEA lit bfail else
 			sh @ sbuf @ 20 lit + @ inwin 0= if 2drop drop FFFFFFE9 lit bfail else
 				nkey @ krec sbuf @ 100 lit sget 0< 0= if 2drop drop FFFFFFE8 lit bfail else
 					nkey @ tk2 @ 4 lit wcopy
-					tk2 @ nlv2 @ tinsert
+					tk2 @ nlv2 @ tinsert  tk2 @ rtouch
 					2 lit u,  tk2 @ ux @ 4 lit wcopy  ux @ 10 lit + ux !
 					rot dup tk2 @ krec swap dup rsize sput -rot
 					consume drop
@@ -557,7 +574,7 @@ bnops @ ?dup if 0 lit do bcode @ 0= if
 		4 lit + @ dup nlv2 @ rvalue
 		nkey @ krec sbuf @ 100 lit sget dup 0< if 2drop FFFFFFE7 lit bfail else
 			3 lit u,  dup u,  sbuf @ ux @ rot bcopy  ux @ 84 lit + ux !
-			nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
+			nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate  tk2 @ rtouch
 			tk2 @ krec swap dup rsize sput
 		then
 	then then

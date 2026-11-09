@@ -29,7 +29,7 @@ HP=${APITEST_PORT:-37380}
 rm -rf "$T"; mkdir -p "$T"
 
 ./tools/fam --user -o "$T/tapi.bin" $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
-	$N/chainver.fam $N/state.fam $N/proofs.fam $N/connect.fam $N/query.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
+	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
 	$N/pool.fam $N/p2p.fam $N/api.fam $N/sync.fam $N/api_test.fam
 ./tools/fam --user -o "$T/apicli.bin" $N/apicli.fam
 

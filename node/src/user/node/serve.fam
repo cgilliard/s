@@ -1,0 +1,298 @@
+\ serve.fam — what a peer's fast sync asks for (docs/NODE.md, step 10),
+\ after query.fam and before p2p.fam, which serves it (GetChunks kinds 2
+\ and 3): the manifest after a block (manifest.fam keeps them), and its
+\ parts as tabminer's snapshot_part and snapshot_name_part (chain.rs),
+\ in net.rs's encode_part and encode_name_part bytes.  The state is the
+\ tip's; a part after block H is it with the blocks above H undone, from
+\ their undo records:
+\ - an output part: the outputs unspent now in its positions (below the
+\   counter after H), with those spent since (their records kept at 's')
+\   and those a commit's reveal consumed since (rebuilt as sundo does:
+\   the commit's leaf, the slot kept, the commit's height), ascending;
+\   then its commits: those now, with those consumed since;
+\ - a name part: the records in its key range now, each block above H
+\   undone, the last first (a name registered since gone, one updated
+\   since back as it was), in key order.
+\ Each in transactions of its own (stx kept for whatever the caller
+\ holds).
+\
+\ zheight ( id -- h | -1 )  the block with that id (8 canonical words) on
+\ our chain, to our tip: its height.
+\ zman ( h -- a n | 0 0 )  the manifest after block h, if kept.
+\ zpart ( h i -- a n | 0 0 )  part i of the snapshot after block h.
+\ All malloc'd.
+
+: zstx variable ;  : zh variable ;  : zt variable ;  : zi variable ;  : zm variable ;  : zmn variable ;
+: znr variable ;  : znn variable ;  : znx variable ;  : znxh variable ;  : zlo variable ;  : zphi variable ;  : zcnt variable ;
+: ze variable ;  : zen variable ;  : zc variable ;  : zcn variable ;  : zu variable ;  : zun variable ;
+: zev variable ;  : znev variable ;  : zo variable ;  : zop variable ;  : zk variable ;  : zkl variable ;  : zkh variable ;
+: zlv variable ;  : zrb variable ;
+
+: zbegin  stx @ zstx !  stfd @ 0 lit txbegin stx ! ;
+\ (the name events a block holds: 4,096 at most here)
+: zend  stx @ txcommit drop  zstx @ stx ! ;
+: zinit  zrb @ 0= if 50 lit alloc zrb !  20 lit alloc zlv !  20 lit alloc zk !  10 lit alloc zkl !  10 lit alloc zkh !  4000 lit alloc zev ! then ;
+\ zbufs ( -- flag )  zout's tables (outputs, commits), malloc'd once and
+\ kept; none to be had: 0 (and said, if verbose: nothing served).
+: zbufs
+ze @ 0= if 40000 lit malloc ze ! then  zc @ 0= if 10000 lit malloc zc ! then
+ze @ zc @ and dup 0= if "serve: no memory for an output part" puts 0A lit putc then ;
+
+: zheight
+zinit  dup yfind ?dup if
+	hheight  dup hat ?dup 0= if dup yentry then          ( id h e|0 )
+	dup if hid 2 lit pick 8 lit wcmp if drop FFFFFFFF lit then else drop drop FFFFFFFF lit then
+	nip
+	dup 0< 0= if zbegin 68 lit mget zend over u< if drop FFFFFFFF lit then then
+else drop FFFFFFFF lit then ;
+
+: zman  zbegin mread zend ;
+
+\ zundo ( h -- a | 0 )  block h's undo record (malloc'd), in the
+\ transaction open: its words' count, the first output's position, the
+\ outputs, 0, the inputs and their positions (lo, hi), then its names
+\ section's events.
+: zundo
+dup 0 lit kundo sbuf @ 400 lit sget 0 lit > if
+	sbuf @ @ 2 lit lshift dup malloc  ( h n a )
+	dup if
+		over 3FF lit + A lit rshift 0 lit do
+			2 lit pick i kundo  over i A lit lshift + 400 lit sget drop
+		loop
+	else "serve: no memory for an undo record" puts 0A lit putc then
+	nip nip
+else drop 0 lit then ;
+\ zevents ( u -- )  zev: the addresses of undo record u's name events, znev
+\ of them.
+: zevents
+0 lit znev !
+dup 10 lit + @ 3 lit lshift 14 lit + over +    ( u p )
+begin dup 2 lit pick dup @ 2 lit lshift + u< while
+	dup zev @ znev @ w!  znev @ 1 lit + znev !
+	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
+repeat 2drop ;
+
+\ ── Output parts ──
+
+\ An entry (4C bytes): the position (lo, hi), then the record (44 bytes:
+\ commitment, slot, height); a commit (2C): the position, hash, height.
+: zadd  ( lo hi rec -- )  ze @ zen @ 4C lit * +  tuck 8 lit + 44 lit bcopy  tuck 4 lit + !  !  zen @ 1 lit + zen ! ;
+: zcadd  ( lo hi c -- )  zc @ zcn @ 2C lit * +  tuck 8 lit + 24 lit bcopy  tuck 4 lit + !  !  zcn @ 1 lit + zcn ! ;
+: zin?  ( lo hi -- flag )  zphi @ = swap zlo @ - zcnt @ u< and ;   \ in the part: its 40-bit positions
+\ zfrom ( c -- klen )  kb the key just before the part's first position
+\ under prefix c (or c alone, for position 0), for knext.
+: zfrom
+zlo @ zphi @ or if
+	zlo @ if zlo @ 1 lit - zphi @ else FFFFFFFF lit zphi @ 1 lit - then kpos
+else kb @ c! 1 lit then ;
+\ zkat? ( c -- flag )  the key knext found (kb2, 6 bytes) one under c in
+\ the part.
+: zkpos  kb2 @ 2 lit + 4 lit be@  kb2 @ 1 lit + c@ ;      \ ( -- lo hi )
+: zkat?  kb2 @ c@ =  zkpos zin? and ;
+\ zsort ( a n size -- )  n entries of size bytes at a, by their first
+\ word, ascending (insertion: the additions are few).
+: zsz variable ;  : zsa variable ;
+: zsort
+zsz ! swap zsa !
+dup 1 lit u> if
+	1 lit do
+		i begin
+			dup if dup 1 lit - zsz @ * zsa @ + @  over zsz @ * zsa @ + @ u> else 0 lit then
+		while
+			dup zsz @ * zsa @ +  dup zsz @ -  zsz @ 0 lit do
+				over i + c@ over i + c@  3 lit pick i + c!  over i + c!
+			loop 2drop
+			1 lit -
+		repeat drop
+	loop
+else drop then ;
+
+: zout  ( i -- a n | 0 0 )
+zbufs if
+\ the part's positions: from part << 14 (40 bits: a part never crosses a
+\ multiple of 2^32), as many as there are below the counter, 2^14 at most
+dup E lit lshift zlo !  12 lit rshift zphi !
+znxh @ zphi @ u> if 4000 lit else znxh @ zphi @ = if znx @ zlo @ - 4000 lit umin else 0 lit then then zcnt !
+0 lit zen !  0 lit zcn !
+zbegin
+\ the outputs now: 'o' keys from the part's first position
+6F lit zfrom
+begin
+	knext dup 6 lit = if drop 6F lit zkat? else drop 0 lit then
+	zen @ D00 lit u< and
+while
+	zkpos  kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 44 lit sget drop
+	sbuf @ zadd  6 lit
+repeat
+\ the commits now: 'c' keys likewise
+63 lit zfrom
+begin
+	knext dup 6 lit = if drop 63 lit zkat? else drop 0 lit then
+	zcn @ 5D0 lit u< and
+while
+	zkpos  kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 24 lit sget drop
+	sbuf @ zcadd  6 lit
+repeat
+\ the blocks above H: what they spent, and the commits they consumed
+68 lit mget zt !
+zt @ zh @ u> if zt @ 1 lit + zh @ 1 lit + do
+	i zundo ?dup if
+		zu !
+		zu @ 10 lit + @ ?dup if 0 lit do
+			zu @ 14 lit + i 3 lit lshift + dup @ swap 4 lit + @  2dup zin? if
+				2dup kspent sbuf @ 44 lit sget 44 lit = if sbuf @ zadd else 2drop then
+			else 2drop then
+		loop then
+		zu @ zevents
+		znev @ ?dup if 0 lit do
+			zev @ i w@ dup @ 1 lit = if
+				dup 4 lit + @ over 8 lit + @  2dup zin? if
+					\ the commit, and its output as sundo rebuilds it
+					2dup 4 lit pick C lit + zcadd
+					2 lit pick C lit + dup 20 lit + @ stmd @ cleaf  stmd @ dfrom
+					stmd @ zrb @ 8 lit wcopy  2 lit pick 30 lit + zrb @ 20 lit + 8 lit wcopy  2 lit pick 2C lit + @ zrb @ 40 lit + !
+					zrb @ zadd
+				else 2drop then
+			then drop
+		loop then
+		zu @ free
+	then
+loop then
+zend
+ze @ zen @ 4C lit zsort  zc @ zcn @ 2C lit zsort
+\ the bytes: net.rs's encode_part
+zen @ 48 lit * zcn @ 2C lit * + 10 lit + malloc dup zo ! zop !
+zo @ if
+zen @ zop @ !  zop @ 4 lit + zop !
+zen @ ?dup if 0 lit do
+	ze @ i 4C lit * +
+	dup @ zop @ !  dup 4 lit + @ zop @ 4 lit + !
+	dup 8 lit + zop @ 8 lit + 34 lit bcopy
+	\ the amount from its limbs (30, 30, 4 bits)
+	dup 3C lit + @  over 40 lit + @  1E lit lshift or  zop @ 3C lit + !
+	dup 40 lit + @ 2 lit rshift  over 44 lit + @ 1C lit lshift or  zop @ 40 lit + !
+	48 lit + @ zop @ 44 lit + !
+	zop @ 48 lit + zop !
+loop then
+zcn @ zop @ !  zop @ 4 lit + zop !
+zcn @ ?dup if 0 lit do
+	zc @ i 2C lit * +  zop @ 2C lit bcopy  zop @ 2C lit + zop !
+loop then
+zo @ zop @ zo @ -
+else "serve: no memory for an output part's bytes" puts 0A lit putc 0 lit 0 lit then
+else drop 0 lit 0 lit then ;
+
+\ ── Name parts ──
+
+\ A record held (18 bytes): its key, 15 bytes big-endian (krec's order),
+\ and a byte of padding; its bytes (malloc'd); their length.  zr: znh of
+\ them.
+: zr variable ;  : znh variable ;
+:M ZRN 2000 lit ;                              \ records a name part holds, at most (4,096 a part; one bucket alone may be more)
+\ zkbe ( k a -- )  key k (4 words) as 15 big-endian bytes at a.
+: zkbe  over 3 lit w@ over 3 lit be!  over 2 lit w@ over 3 lit + 4 lit be!  over 1 lit w@ over 7 lit + 4 lit be!  swap 0 lit w@ swap B lit + 4 lit be! ;
+\ zkcmp ( a b -- n )  15 bytes at a against b: <0, 0, >0.
+: zkcmp
+0 lit F lit 0 lit do
+	dup 0= if drop over i + c@ over i + c@ - then
+loop nip nip ;
+: zkin?  dup zkl @ zkcmp 0< 0=  swap zkh @ zkcmp 0< and ;    \ ( a -- flag )  15 bytes in the range
+: zre  18 lit * zr @ + ;                         \ ( j -- e )
+\ zrfind ( a -- j | -1 )  the record held with the key (15 bytes) at a.
+: zrfind
+FFFFFFFF lit swap  znh @ ?dup if 0 lit do
+	dup i zre zkcmp 0= if nip i swap then
+loop then drop ;
+\ zrdel ( j -- )  record j dropped.
+: zrdel
+dup zre 10 lit + @ free
+zre dup 18 lit + swap  znh @ 1 lit -  2 lit pick zr @ - 18 lit / - 18 lit *  bcopy
+znh @ 1 lit - znh ! ;
+\ zrset ( a rec n -- )  the key at a (15 bytes) its record now n bytes at rec.
+: zrset
+dup malloc  rot over 3 lit pick bcopy  swap        ( a b n )
+2 lit pick zrfind dup 0< if
+	drop  znh @ ZRN u< if znh @ dup 1 lit + znh ! else FFFFFFFF lit then
+else dup zre 10 lit + @ free then
+dup 0< if drop drop free drop else
+	zre  tuck 14 lit + !  tuck 10 lit + !  F lit bcopy
+then ;
+\ zrsort  the records held in key order (insertion: the additions few).
+: zrsort
+znh @ 1 lit u> if
+	znh @ 1 lit do
+		i begin
+			dup if dup 1 lit - zre over zre zkcmp 0 lit > else 0 lit then
+		while
+			dup zre dup 18 lit -  18 lit 0 lit do
+				over i + c@ over i + c@  3 lit pick i + c!  over i + c!
+			loop 2drop
+			1 lit -
+		repeat drop
+	loop
+then ;
+
+: zname  ( j -- a n | 0 0 )
+zr @ 0= if ZRN 18 lit * malloc zr ! then
+zr @ if
+\ its key range, from the manifest (2F bytes a name part)
+dup 2F lit * zmn @ +  zkl @ F lit bcopy
+1 lit + dup znn @ u< if 2F lit * zmn @ + zkh @ F lit bcopy else drop zkh @ F lit 0 lit do FF lit over i + c! loop drop then
+0 lit znh !
+zbegin
+\ the records now, keys from the range's first (one exactly it, not
+\ to be had from a name's hash, aside)
+72 lit kb @ c!  zkl @ kb @ 1 lit + F lit bcopy
+10 lit
+begin
+	knext dup 10 lit = if drop kb2 @ c@ 72 lit =  kb2 @ 1 lit + zkh @ zkcmp 0< and else drop 0 lit then
+	znh @ ZRN u< and
+while
+	kb2 @ kb @ 10 lit bcopy  10 lit sbuf @ 200 lit sget
+	dup 0 lit > if kb @ 1 lit + sbuf @ rot zrset else drop then
+	10 lit
+repeat
+\ the blocks above H undone, the last first, each's events last first
+68 lit mget zt !
+zt @ zh @ u> if zt @ zh @ - 0 lit do
+	zt @ i - zundo ?dup if
+		zu !  zu @ zevents
+		znev @ ?dup if 0 lit do
+			zev @ znev @ 1 lit - i - w@
+			dup @ 2 lit = if
+				4 lit + zk @ zkbe  zk @ zkin? if zk @ zrfind dup 0< if drop else zrdel then then
+			else dup @ 3 lit = if
+				8 lit + dup zlv @ rvalue  nkey @ zk @ zkbe
+				zk @ zkin? if zk @ swap dup rsize zrset else drop then
+			else drop then then
+		loop then
+		zu @ free
+	then
+loop then
+zend
+zrsort
+\ the bytes: net.rs's encode_name_part
+4 lit  znh @ ?dup if 0 lit do i zre 14 lit + @ + loop then  dup malloc dup zo ! zop !
+zo @ if
+	znh @ zop @ !  zop @ 4 lit + zop !
+	znh @ ?dup if 0 lit do
+		i zre dup 10 lit + @ swap 14 lit + @  ( b n )
+		over zop @ 2 lit pick bcopy  zop @ + zop !  free
+	loop then
+else
+	"serve: no memory for a name part's bytes" puts 0A lit putc
+	znh @ ?dup if 0 lit do i zre 10 lit + @ free loop then
+then
+zo @ swap
+else drop "serve: no memory for a name part" puts 0A lit putc 0 lit 0 lit then ;
+
+: zpart  ( h i -- a n | 0 0 )
+zinit  zi !  zh !
+zh @ zman ?dup if
+	drop zm !
+	zm @ @ znx !  zm @ 4 lit + @ znxh !  zm @ 8 lit + @ znr !
+	zm @ C lit + znr @ 5 lit lshift + 20 lit + dup @ znn !  4 lit + zmn !
+	zi @ znr @ u< if zi @ zout
+	else zi @ znr @ - dup znn @ u< if zname else drop 0 lit 0 lit then then
+	zm @ free
+else drop 0 lit 0 lit then ;

@@ -19,7 +19,9 @@
 //!   operations, built and connected by tabminer's own `Chain`, with bodies
 //!   breaking each state rule and tabminer's verdict on each; and
 //!   `statesnap.bin` (step 6), the snapshot after its block 150 as
-//!   tabminer serves it: its manifest, output parts and name parts;
+//!   tabminer serves it: its manifest, output parts and name parts; and
+//!   the same chain as `statechain40.bin`, its outputs' positions from
+//!   just below 2^32 (FIRST40), crossing it;
 //! - `pool.bin` (step 7): transactions offered to tabminer's own
 //!   `Mempool` on a dev chain whose outputs pay known keys, each verdict as
 //!   it gave it, policy inputs spent through each kind of leaf, blocks
@@ -42,6 +44,11 @@ mod tests {
     const POW_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pow_vectors.fam");
     const STATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain.bin");
     const SNAP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statesnap.bin");
+    const STATE40_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain40.bin");
+    /// The 40-bit chain's first output position: its outputs, spends,
+    /// commits, reveals and sweep cross 2^32 (the fam node's
+    /// node/scripts/oscheck.sh gives its state test the same).
+    const FIRST40: u64 = (1 << 32) - 24;
     const POOL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pool.bin");
     /// The block whose snapshot `statesnap.bin` holds.
     const SNAP_HEIGHT: u32 = 150;
@@ -797,8 +804,10 @@ mod tests {
     /// The dev chain for step 5, as `statechain.bin`: a count, then per
     /// block its verdict (a signed word), its header (204 bytes), its
     /// body's length and the body, zero padded to a word. Blocks with a
-    /// nonzero verdict are refused and leave the chain as it was.
-    fn generate_state() -> (Vec<u8>, Vec<u8>) {
+    /// nonzero verdict are refused and leave the chain as it was. Its
+    /// outputs' positions from `first` (0; `statechain40.bin`'s FIRST40):
+    /// the counter set after genesis, which no root includes.
+    fn generate_state(first: u64) -> (Vec<u8>, Vec<u8>) {
         use crate::block::{Block, BlockOutput, Body, Header};
         use crate::chain::{AcceptAllProofs, Chain, ChainParams};
         use crate::names::{BlockNameOp, MAX_REVEAL, MIN_REVEAL, Record};
@@ -806,11 +815,19 @@ mod tests {
         type Digest = [Fp; DIGEST];
         use crate::pow::{PowParams, SeedText};
         let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
-        let dir = std::env::temp_dir().join(format!("tabminer-famstate-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tabminer-famstate-{}-{first}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let chain = Chain::open(&dir, 256 << 20, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        let chain = Chain::open(&dir, 8 << 30, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        // From high positions a manifest lists every part from 0 (2^18 of
+        // them at 2^32: 8 MB): an undo window of 2 keeps two, not 150.
+        let chain = if first > 0 { chain.with_max_undo(Some(2)) } else { chain };
         chain.set_dataset(std::sync::Arc::new(dev_dataset().clone()));
         chain.init_genesis(&p.genesis()).unwrap();
+        if first > 0 {
+            let mut wtxn = chain.env().write_txn().unwrap();
+            chain.utxo().set_next_position(&mut wtxn, first).unwrap();
+            wtxn.commit().unwrap();
+        }
         let data = dev_dataset();
         let mut r = Rng(0x5eed_57a7);
         let digest = |r: &mut Rng| -> Digest { core::array::from_fn(|_| Fp::new(r.u32() % P)) };
@@ -977,7 +994,14 @@ mod tests {
         }
         // The snapshot after block SNAP_HEIGHT: a height, then the
         // manifest, and each part (outputs, then names), each its length
-        // and bytes, word padded.
+        // and bytes, word padded (none for the 40-bit chain: see above).
+        if first > 0 {
+            drop(chain);
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut file = entries.to_le_bytes().to_vec();
+            file.extend_from_slice(&out);
+            return (file, vec![]);
+        }
         let id = chain.header_at(SNAP_HEIGHT).unwrap().unwrap().hash();
         let m = chain.snapshot_manifest(&id).unwrap().unwrap();
         let mut snap = SNAP_HEIGHT.to_le_bytes().to_vec();
@@ -1575,11 +1599,14 @@ mod tests {
         assert!(file == generate_pow(), "the fam node's proof-of-work vectors are stale: run write_fam_vectors");
         let file = std::fs::read_to_string(HDR_PATH).expect("node/src/user/node/headers_vectors.fam");
         assert!(file == generate_headers(), "the fam node's header vectors are stale: run write_fam_vectors");
-        let (state, snap) = generate_state();
+        let (state, snap) = generate_state(0);
         let file = std::fs::read(STATE_PATH).expect("node/src/user/node/statechain.bin");
         assert!(file == state, "the fam node's state chain is stale: run write_fam_vectors");
         let file = std::fs::read(SNAP_PATH).expect("node/src/user/node/statesnap.bin");
         assert!(file == snap, "the fam node's snapshot is stale: run write_fam_vectors");
+        let (state, _) = generate_state(FIRST40);
+        let file = std::fs::read(STATE40_PATH).expect("node/src/user/node/statechain40.bin");
+        assert!(file == state, "the fam node's 40-bit state chain is stale: run write_fam_vectors");
         let file = std::fs::read(POOL_PATH).expect("node/src/user/node/pool.bin");
         assert!(file == generate_pool(), "the fam node's pool test is stale: run write_fam_vectors");
     }
@@ -1592,9 +1619,11 @@ mod tests {
         std::fs::write(DIFF_PATH, generate_difficulty()).unwrap();
         std::fs::write(POW_PATH, generate_pow()).unwrap();
         std::fs::write(HDR_PATH, generate_headers()).unwrap();
-        let (state, snap) = generate_state();
+        let (state, snap) = generate_state(0);
         std::fs::write(STATE_PATH, state).unwrap();
         std::fs::write(SNAP_PATH, snap).unwrap();
+        let (state, _) = generate_state(FIRST40);
+        std::fs::write(STATE40_PATH, state).unwrap();
         std::fs::write(POOL_PATH, generate_pool()).unwrap();
     }
 }

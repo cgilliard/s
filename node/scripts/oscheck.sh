@@ -150,18 +150,29 @@ expect headers 124 '^headers: 25 passed, 0 failed' 120 ./tools/q32 "$T/hdr.img"
 # The state (step 5), a program for the OS with a disk: a dev chain's
 # blocks (/lib/statechain), each verdict and state root tabminer's; every
 # block disconnected to genesis, each root its parent's; all connected again.
-./tools/fam --user -o "$T/tst.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/state_test.fam > "$T/tst.build" 2>&1 || fail state "build: $(head -c 300 "$T/tst.build")"
-sh scripts/mkimage.sh "$T/st.img" bin/kernel init="$T/tst.bin":8192 statechain=$ND/statechain.bin:0 2> "$T/st.mk" || fail state "mkimage: $(cat "$T/st.mk")"
+# Then (step 10) the snapshot after its block 150 as the node serves it,
+# its manifest and every part, against tabminer's (/lib/statesnap).  And the
+# same chain from just below 2^32 (statechain40.bin, the counter given as
+# /lib/statefirst: miner/src/fam_vectors.rs's FIRST40), its positions
+# crossing it: every verdict, root and undo as tabminer's.
+./tools/fam --user -o "$T/tst.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/serve.fam $ND/state_test.fam > "$T/tst.build" 2>&1 || fail state "build: $(head -c 300 "$T/tst.build")"
+sh scripts/mkimage.sh "$T/st.img" bin/kernel init="$T/tst.bin":8192 statechain=$ND/statechain.bin:0 statesnap=$ND/statesnap.bin:0 2> "$T/st.mk" || fail state "mkimage: $(cat "$T/st.mk")"
 rm -f "$T/st.disk"; dd if=/dev/zero of="$T/st.disk" bs=1 count=0 seek=268435456 2>/dev/null
-expect state 124 '^connected again: 302 right, 0 wrong' 120 ./tools/q32 --disk="$T/st.disk" "$T/st.img"
+expect state 124 '^connected again: 302 right, 0 wrong' 180 ./tools/q32 --disk="$T/st.disk" "$T/st.img"
 has state '^connected: 312 as tabminer, 0 not'; has state '^disconnected: 302 roots right, 0 wrong'
+has state '^served: [1-9][0-9]* as tabminer, 0 not'
+printf '\350\377\377\377\000\000\000\000' > "$T/first40"
+sh scripts/mkimage.sh "$T/st40.img" bin/kernel init="$T/tst.bin":8192 statechain=$ND/statechain40.bin:0 statefirst="$T/first40":0 2> "$T/st40.mk" || fail state40 "mkimage: $(cat "$T/st40.mk")"
+rm -f "$T/st.disk"; dd if=/dev/zero of="$T/st.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect state40 124 '^connected again: 302 right, 0 wrong' 180 ./tools/q32 --disk="$T/st.disk" "$T/st40.img"
+has state40 '^connected: 312 as tabminer, 0 not'; has state40 '^disconnected: 302 roots right, 0 wrong'
 rm -f "$T/st.disk"
 # Chain proofs (step 6): the recursive dev network's first blocks, from a
 # tabminer that mined them (/lib/devchain), each proof checked against the
 # statement the node makes of its block; a block with a changed proof is
 # refused for its body commitment, and with a header committing to it, for
 # its proof.
-./tools/fam --user -o "$T/tpr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/proofs_test.fam > "$T/tpr.build" 2>&1 || fail proofs "build: $(head -c 300 "$T/tpr.build")"
+./tools/fam --user -o "$T/tpr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/proofs_test.fam > "$T/tpr.build" 2>&1 || fail proofs "build: $(head -c 300 "$T/tpr.build")"
 sh scripts/mkimage.sh "$T/pr.img" bin/kernel init="$T/tpr.bin":16384 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$ND/chainver_dev.bin:0 devchain=$ND/devchain.bin:0 2> "$T/pr.mk" || fail proofs "mkimage: $(cat "$T/pr.mk")"
 rm -f "$T/pr.disk"; dd if=/dev/zero of="$T/pr.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect proofs 124 '^proofs: 8 as expected, 0 not' 120 ./tools/q32 --disk="$T/pr.disk" "$T/pr.img"
@@ -170,7 +181,7 @@ rm -f "$T/pr.disk"
 # as tabminer serves it (/lib/statesnap): a changed manifest, a changed part
 # and finishing early refused; installed with the block's state root; then
 # the chain's later blocks, every root right.
-./tools/fam --user -o "$T/tsn.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/snap.fam $ND/snap_test.fam > "$T/tsn.build" 2>&1 || fail snap "build: $(head -c 300 "$T/tsn.build")"
+./tools/fam --user -o "$T/tsn.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/snap.fam $ND/snap_test.fam > "$T/tsn.build" 2>&1 || fail snap "build: $(head -c 300 "$T/tsn.build")"
 sh scripts/mkimage.sh "$T/sn.img" bin/kernel init="$T/tsn.bin":16384 statesnap=$ND/statesnap.bin:0 statechain=$ND/statechain.bin:0 2> "$T/sn.mk" || fail snap "mkimage: $(cat "$T/sn.mk")"
 rm -f "$T/sn.disk"; dd if=/dev/zero of="$T/sn.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect snap 124 '^after it: 152 connected, 0 not' 120 ./tools/q32 --disk="$T/sn.disk" "$T/sn.img"
@@ -182,7 +193,7 @@ rm -f "$T/sn.disk"
 # pool after each; proofs of outputs and names (step 8) as tabminer's; and
 # XMSS signatures of
 # other heights, verified and refused.
-./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/query.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
+./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
 sh scripts/mkimage.sh "$T/po.img" bin/kernel init="$T/tpo.bin":16384 pool=$ND/pool.bin:0 2> "$T/po.mk" || fail pool "mkimage: $(cat "$T/po.mk")"
 rm -f "$T/po.disk"; dd if=/dev/zero of="$T/po.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect pool 124 '^pool: 102 as tabminer, 0 not' 120 ./tools/q32 --disk="$T/po.disk" "$T/po.img"

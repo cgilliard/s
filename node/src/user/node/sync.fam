@@ -33,7 +33,9 @@
 
 \ nstat  our status from the state: the tip's height and id, its work.
 : nstat
-68 lit stfd @ 0 lit txbegin stx ! mget stx @ txcommit drop  dup myh !
+stfd @ 0 lit txbegin stx !  62 lit mget myold !  68 lit mget  stx @ txcommit drop  dup myh !
+\ the oldest body kept: the first, or the window's (1,008) start
+myold @ if myh @ 3EF lit - myold @ max myh @ 3EF lit u< if drop myold @ then myold ! then
 hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
 
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its

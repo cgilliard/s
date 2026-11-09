@@ -314,7 +314,10 @@ mlk lock
 fwalk
 mcur @ if mtake else
 	mneed @ 10000 lit max mbytes @ max FFF lit + FFFFF000 lit and
-	dup map dup 0= if 2drop 0 lit else
+	dup map
+	\ that much not to be had: only what is needed
+	dup 0= if 2drop  mneed @ 10000 lit max FFF lit + FFFFF000 lit and  dup map then
+	dup 0= if 2drop 0 lit else
 		2dup marec
 		swap over !
 		0 lit over 4 lit + !

@@ -58,7 +58,7 @@ else drop then ;
 
 : spend variable ;  : stxo variable ;
 : sconn1  ( h body n -- )
-ticks bt0 !
+ticks bt0 !  0 lit rtn !  0 lit rtall !
 rot bh !  2dup bbn ! bbody !  0 lit bcode !  0 lit ndirty !
 2dup bparse nip
 bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
@@ -68,9 +68,9 @@ btb btick
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !  1 lit stxo !
 	bh @ 20 lit + @ sh !
-	70 lit mget dup sctr ! sfirst !
+	70 lit mget dup sctr ! sfirst !  71 lit mget dup sctrh ! sfirsth !
 	bnin @ 3 lit lshift 400 lit + malloc dup ub ! ux !
-	0 lit u,  sfirst @ u,  bnout @ u,  0 lit u,  bnin @ u,
+	0 lit u,  sfirst @ u,  bnout @ u,  sfirsth @ u,  bnin @ u,
 	spent @ 4 lit wzero  made @ 4 lit wzero
 	\ the inputs spent
 	bnin @ ?dup if 0 lit do bcode @ 0= if
@@ -90,7 +90,7 @@ bcode @ 0= if
 		over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
 		nip 1C lit rshift rb @ 3C lit + !
 		sh @ rb @ 40 lit + !
-		rb @ sctr @ 0 lit oput  sctr @ 1 lit + sctr !
+		rb @ sctr @ sctrh @ oput  sinc
 	loop then then
 	bcode @ 0= if snames then
 	bcode @ 0= if sprop  stmd @ sroot0  stmd @ bh @ 4C lit + 8 lit wcmp if FFFFFFF1 lit bfail then then
@@ -116,6 +116,9 @@ stxo @ if
 		repeat
 		\ the body, kept for 1,008 blocks
 		bbn @ sbuf @ !  sh @ FFFF lit kbody sbuf @ 4 lit sput
+		\ the first body kept, once (meta 62: what our status says we hold
+		\ from, sync.fam's nstat)
+		62 lit mget 0= if sh @ 62 lit mput then
 		bbody @ up !  bbn @ urem !  0 lit uk !
 		begin urem @ while
 			urem @ 400 lit u< if urem @ else 400 lit then
@@ -123,7 +126,9 @@ stxo @ if
 			dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
 		repeat
 		sh @ 3F0 lit u> if sh @ 3F0 lit - bdrop then
-		sctr @ 70 lit mput  sh @ 68 lit mput  sh @ khdr bh @ CC lit sput
+		\ the snapshot after it, to serve (manifest.fam), for as long
+		mbuckets  msoff @ 0= if sh @ sctr @ sctrh @ msnap  sh @ 3F0 lit u> if sh @ 3F0 lit - mdrop then then
+		sctr @ 70 lit mput  sctrh @ 71 lit mput  sh @ 68 lit mput  sh @ khdr bh @ CC lit sput
 		swk @ ?dup if shidx then
 		serr @ if FFFFFFF6 lit bfail then
 	then
@@ -146,11 +151,11 @@ dup 1 lit = if drop
 	-rot 2dup rb @ -rot oput
 	kcommit swap 24 lit sput
 else dup 2 lit = if drop
-	4 lit + dup krec sdel  tremove
+	4 lit + dup rtouch  dup krec sdel  tremove
 else 3 lit = if
 	4 lit + dup @ swap 4 lit + swap
 	over nlv2 @ rvalue  nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
-	tk2 @ krec -rot sput
+	tk2 @ krec -rot sput  tk2 @ rtouch
 else drop then then then ;
 
 : sundo
@@ -162,9 +167,13 @@ sbuf @ @ 2 lit lshift dup malloc dup ub ! up ! urem !
 begin urem @ while
 	sh @ uk @ kundo up @ 400 lit sget  dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
 repeat
-ub @ 4 lit + @ sfirst !  70 lit mget sctr !
+ub @ 4 lit + @ sfirst !  ub @ C lit + @ sfirsth !  70 lit mget sctr !  71 lit mget sctrh !
 \ the block's outputs and commits leave
-sctr @ sfirst @ 2dup u> if do i 0 lit odel  i 0 lit kcommit sdel loop else 2drop then
+\ (40-bit positions, from sfirst, as many as the counter passed)
+sfirst @ sfirsth @  sctr @ sfirst @ -  ?dup if 0 lit do
+	2dup odel  2dup kcommit sdel
+	swap 1 lit + dup 0= if swap 1 lit + else swap then
+loop then 2drop
 \ the inputs return
 ub @ 10 lit + @ ?dup if 0 lit do
 	ub @ 14 lit + i 3 lit lshift + dup @ swap 4 lit + @
@@ -180,15 +189,17 @@ begin dup ub @ ub @ @ 2 lit lshift + u< while
 	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
 repeat drop
 nev @ ?dup if 0 lit do ev @ nev @ 1 lit - i - w@ uevent loop then
-sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput  sh @ khdr sdel  sh @ kwork sdel  sh @ bdrop
+sfirst @ 70 lit mput  sfirsth @ 71 lit mput  sh @ 1 lit - 68 lit mput
+62 lit mget sh @ = if 0 lit 62 lit mput then  sh @ khdr sdel  sh @ kwork sdel  sh @ bdrop  sh @ mdrop
 ub @ @ 2 lit lshift 3FF lit + A lit rshift 0 lit do sh @ i kundo sdel loop
+mbuckets
 sprop
 stx @ txcommit drop
 ub @ free ;
 
 : stinit  ( fd -- )
 stfd !  p2init dvinit
-100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
+100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !  400 lit alloc rtb !  0 lit rtn !  0 lit rtall !  minit
 520 lit alloc dflt !  2000 lit alloc lvs !
 20 lit alloc tmpa !  20 lit alloc tmpb !  20 lit alloc stmd !
 10000 lit alloc dirty !  0 lit ndirty !

@@ -1,0 +1,154 @@
+\ manifest.fam — snapshots to serve (docs/NODE.md, step 10), after
+\ proofs.fam and before connect.fam: tabminer's take_snapshot and the
+\ name buckets behind it (miner/src/chain.rs, names.rs), so peers fast-sync
+\ from the node.  The manifest after each block connected is kept, as the
+\ bodies are, for the undo window: the output counter, each output part's
+\ root (the tree's level-14 node: 2^14 positions), the name trie's root,
+\ and each name part's first key and hash, in net.rs's encode_manifest's
+\ bytes, at 'M', the height, the chunk (1 KiB each), its length at chunk
+\ FFFF.
+\
+\ The name parts come from the buckets (a key's top 16 bits), each kept
+\ at 'B' and the bucket (2 bytes): its records' count and hash_domain 12
+\ of the count and their bytes packed (as snap.fam checks them); the
+\ buckets a block changes (rtouch) hashed again before its manifest.  A
+\ part: buckets in order while their records are at most 4,096 (one
+\ larger alone); its first key its first bucket's start, its hash
+\ hash_domain 11 of each bucket and its hash.
+\
+\ minit  its buffers (stinit calls it).
+\ mbuckets  the buckets noted (rtouch; all if rtall) hashed again.
+\ msnap ( h lo hi -- )  the manifest after block h (the counter: 40 bits).
+\ msoff set: none taken (a test's chain from high positions, whose
+\ manifests list 2^18 parts).
+\ mread ( h -- a n | 0 0 )  block h's manifest, if kept (malloc'd).
+\ mdrop ( h -- )  block h's manifest dropped.
+
+: kman  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  4D lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
+: kbkt  kb @ 1 lit + 2 lit be!  42 lit kb @ c!  3 lit ;                          \ ( b -- klen )
+: mrb variable ;  : mrn variable ;  : mrc variable ;  : mrk variable ;  : mhb variable ;  : mb variable ;  : mpk variable ;
+: mo variable ;  : mop variable ;  : mgb variable ;  : mgn variable ;  : mgc variable ;  : mgf variable ;  : mtmp variable ;
+: mhh variable ;  : mdn variable ;  : mnp variable ;  : mrch variable ;  : msoff variable ;
+:M MRBN 40000 lit ;                            \ a bucket's records' bytes, at most
+:M MNAMES 40000 lit ;                          \ the name parts' bytes in a manifest, at most (5,577 parts: 22 million names)
+
+: minit
+mrb @ 0= if
+	MRBN malloc mrb !  MRBN 3 lit / 2 lit lshift 10 lit + malloc mpk !
+	40 lit alloc mtmp !  40 lit alloc mhh !  40 lit alloc mhb !  10000 lit malloc mgb !
+then ;
+
+\ mcanon, ( m -- )  8 Montgomery words at m, as 32 canonical bytes at mop.
+: mcanon,  8 lit 0 lit do dup i w@ fromm mop @ i 2 lit lshift + ! loop drop  mop @ 20 lit + mop ! ;
+: m32,  mop @ !  mop @ 4 lit + mop ! ;                \ ( x -- )
+\ mzero ( a n -- )  n bytes of zeros.
+: mzero  ?dup if 0 lit do 0 lit over i + c! loop then drop ;
+
+\ mbhash ( b -- )  bucket b hashed again from its records (dropped if none).
+: mbhash
+dup mb !  0 lit mrn !  0 lit mrc !
+\ its records, in key order, their bytes one after another in mrb
+72 lit kb @ c!  mb @ kb @ 1 lit + 2 lit be!  kb @ 3 lit + D lit mzero
+10 lit
+begin
+	knext dup 10 lit = if drop kb2 @ c@ 72 lit =  kb2 @ 1 lit + 2 lit be@ mb @ = and else drop 0 lit then
+while
+	kb2 @ kb @ 10 lit bcopy
+	mrn @ 200 lit + MRBN u< if
+		10 lit mrb @ mrn @ + 200 lit sget  dup 0< if drop else mrn @ + mrn !  mrc @ 1 lit + mrc ! then
+	then
+	10 lit
+repeat
+mb @ kbkt
+mrc @ if
+	mrc @ tom mpk @ !
+	mrb @ mrn @ mpk @ 4 lit + pack3
+	mpk @ mrn @ 2 lit + 3 lit / 1 lit +  C lit  mhb @ 4 lit + hdom
+	mrc @ mhb @ !  mhb @ 24 lit sput
+else sdel then ;
+
+\ mball  every bucket dropped, then each with records hashed again.
+: mball
+42 lit kb @ c!  kb @ 1 lit + 2 lit mzero
+3 lit begin knext dup 3 lit = if drop kb2 @ c@ 42 lit = else drop 0 lit then while
+	kb2 @ kb @ 3 lit bcopy  3 lit sdel  3 lit
+repeat
+72 lit kb @ c!  kb @ 1 lit + F lit mzero  0 lit mdn !
+begin
+	mdn @ 0= if 10 lit knext 10 lit = if kb2 @ c@ 72 lit = else 0 lit then else 0 lit then
+while
+	kb2 @ 1 lit + 2 lit be@  dup mbhash
+	\ on from the next bucket's start
+	dup FFFF lit = if drop 1 lit mdn ! else
+		1 lit + 72 lit kb @ c!  kb @ 1 lit + 2 lit be!  kb @ 3 lit + D lit mzero
+	then
+repeat ;
+
+: mbuckets
+rtall @ if mball else rtn @ ?dup if 0 lit do rtb @ i w@ mbhash loop then then
+0 lit rtn !  0 lit rtall ! ;
+
+\ mgclose  the name part gathered (mgb: mgn words, each bucket's index then
+\ hash) written: its first key (its first bucket's start) and hash.
+: mgclose
+mgn @ 0= 0=  mop @ mo @ u< and if
+	mgf @ mop @ 2 lit be!  mop @ 2 lit + D lit mzero  mop @ F lit + mop !
+	mgb @ mgn @ B lit mtmp @ hdom  mtmp @ mcanon,
+	mnp @ 1 lit + mnp !
+then
+0 lit mgn !  0 lit mgc ! ;
+\ mmore ( b n -- )  bucket b (its n records, its hash at mtmp+4) in a part:
+\ a new one if this one would pass 4,096 records.
+: mmore
+mtmp @ 4 lit + mhh @ 8 lit wcopy
+mgn @ if mgc @ over + 1000 lit u> if mgclose then then
+mgn @ 0= if over mgf ! then
+mgc @ + mgc !
+tom mgb @ mgn @ w!  mhh @ mgb @ mgn @ 1 lit + 2 lit lshift + 8 lit wcopy  mgn @ 9 lit + mgn ! ;
+
+: msnap  ( h lo hi -- )
+mrch ! mrc ! mb !
+\ the parts: the counter over 2^14, rounded up (40 bits)
+mrc @ E lit rshift  mrch @ 12 lit lshift or  mrc @ 3FFF lit and if 1 lit + then  mrk !
+mrk @ 5 lit lshift 40 lit + MNAMES + malloc dup mo ! mop !
+mrc @ m32,  mrch @ m32,  mrk @ m32,
+mrk @ ?dup if 0 lit do E lit i mtmp @ nget  mtmp @ mcanon, loop then
+mtmp @ troot  mtmp @ mcanon,
+\ the name parts (their count written once known)
+mop @ mhh @ 20 lit + !  0 lit m32,
+0 lit mnp !  0 lit mgn !  0 lit mgc !
+mo @ mrk @ 5 lit lshift + 40 lit + MNAMES + 2F lit -  mo !     \ the limit, for mgclose
+0 lit kbkt mtmp @ 24 lit sget 24 lit = if 0 lit mtmp @ @ mmore then
+3 lit begin knext dup 3 lit = if drop kb2 @ c@ 42 lit = else drop 0 lit then while
+	kb2 @ kb @ 3 lit bcopy  3 lit mtmp @ 24 lit sget drop
+	kb2 @ 1 lit + 2 lit be@ mtmp @ @ mmore
+	3 lit
+repeat
+mgclose
+mo @ 2F lit + MNAMES - mrk @ 5 lit lshift - 40 lit - mo !
+mnp @ mhh @ 20 lit + @ !
+\ stored, in chunks
+mop @ mo @ - mrn !
+mrn @ sbuf @ !  mb @ FFFF lit kman sbuf @ 4 lit sput
+mo @ mop !  0 lit mrc !
+begin mrn @ while
+	mrn @ 400 lit u< if mrn @ else 400 lit then
+	mb @ mrc @ kman mop @ 2 lit pick sput
+	dup mop @ + mop !  mrn @ swap - mrn !  mrc @ 1 lit + mrc !
+repeat
+mo @ free ;
+
+: mread  ( h -- a n | 0 0 )
+dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
+	sbuf @ @ dup malloc  ( h n a )
+	over 3FF lit + A lit rshift 0 lit do
+		2 lit pick i kman  over i A lit lshift + 400 lit sget drop
+	loop
+	rot drop swap
+else drop 0 lit 0 lit then ;
+
+: mdrop
+dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
+	sbuf @ @ 3FF lit + A lit rshift ?dup if 0 lit do dup i kman sdel loop then
+	FFFF lit kman sdel
+else drop then ;

@@ -24,14 +24,17 @@
 
 : snx variable ;  : snr variable ;  : sroots variable ;  : snroot variable ;  : snn variable ;  : snam variable ;
 : sdone variable ;  : ssum variable ;  : sbig variable ;  : sents variable ;  : snent variable ;
-: scom variable ;  : sncom variable ;  : slo variable ;  : shi variable ;  : sbh variable ;
+: scom variable ;  : sncom variable ;  : slo variable ;  : sbh variable ;
+: snxh variable ;  : spart variable ;  : sphi variable ;  : spcnt variable ;
 : srecs variable ;  : snrec variable ;  : skey variable ;  : spk variable ;  : sval variable ;
 : cla variable ;  : clc variable ;  : sbi variable ;  : sbn variable ;  : sba variable ;  : sbl variable ;  : skl variable ;  : skh variable ;  : spb variable ;  : spp variable ;  : sbk variable ;  : sbs variable ;
 
 : sbad  FFFFFFD8 lit bfail ;                  \ -40
 : sread  over + bq ! bp !  0 lit bcode ! ;           \ ( a n -- )  the reader on these bytes
-: bu64  bu32 bu32 if bbad then ;              \ ( -- lo )  a counter or position (below 2^32 here)
-: umin  2dup u> if swap then drop ;
+: bu64  bu32 bu32 dup FF lit u> if bbad then ;   \ ( -- lo hi )  a counter or position (40 bits)
+\ sparts ( -- n )  the output parts of the counter (snx, snxh): over 2^14,
+\ rounded up.
+: sparts  snx @ E lit rshift  snxh @ 12 lit lshift or  snx @ 3FFF lit and if 1 lit + then ;
 : kcmp  4 lit wcmp ;                          \ ( a b -- c )  4-word keys
 \ k15 ( a k -- )  the key k (4 words) from 15 big-endian bytes at a.
 : k15  over 3 lit be@ over 3 lit w!  over 3 lit + 4 lit be@ over 2 lit w!  over 7 lit + 4 lit be@ over 1 lit w!  swap B lit + 4 lit be@ swap ! ;
@@ -52,7 +55,7 @@ loop ;
 
 : snman  ( m n hS -- code )
 sbh !  sread
-bu64 snx !
+bu64 snxh ! snx !
 bu32 dup bleft 5 lit rshift u> if drop bbad 0 lit then dup snr !  5 lit lshift btake sroots !
 bcode @ 0= if sroots @ snr @ 3 lit lshift bcanon then
 20 lit btake snroot !  bcode @ 0= if snroot @ 8 lit bcanon then
@@ -60,7 +63,7 @@ bu32 dup bleft 2F lit / u> if drop bbad 0 lit then dup snn !  2F lit * btake sna
 bcode @ 0= if snn @ ?dup if 0 lit do snam @ i 2F lit * + F lit + 8 lit bcanon loop then then
 bcode @ 0= bp @ bq @ <> and if bbad then
 bcode @ 0= if
-	snr @ snx @ 3FFF lit + E lit rshift <> if sbad then
+	snr @ sparts <> if sbad then
 	snn @ 1 lit u> if snn @ 1 lit do
 		snam @ i 1 lit - 2F lit * + tmpa @ k15  snam @ i 2F lit * + tmpb @ k15
 		tmpa @ tmpb @ kcmp 0 lit < 0= if sbad then
@@ -90,16 +93,21 @@ nip 1C lit rshift rb @ 3C lit + !
 : sfind  FFFFFFFF lit swap snent @ ?dup if 0 lit do dup i epos = if nip i swap then loop then drop ;   \ ( pos -- k | -1 )
 
 : snpout  ( i p n -- )
-sread  slo !
+sread  spart !
+\ the part's positions: from part << 14 (40 bits: its high byte sphi, the
+\ same for all, as a part never crosses a multiple of 2^32), as many as
+\ are below the counter, 2^14 at most
+spart @ E lit lshift slo !  spart @ 12 lit rshift sphi !
+snxh @ sphi @ u> if 4000 lit else snxh @ sphi @ = if snx @ slo @ - 4000 lit umin else 0 lit then then spcnt !
 bu32 dup bleft 48 lit / u> if drop bbad 0 lit then dup snent !  48 lit * btake sents !
-bcode @ 0= if snent @ ?dup if 0 lit do sents @ i 48 lit * + dup 4 lit + le@ if bbad then 8 lit + D lit bcanon loop then then
+bcode @ 0= if snent @ ?dup if 0 lit do sents @ i 48 lit * + dup 4 lit + le@ FF lit u> if bbad then 8 lit + D lit bcanon loop then then
 bu32 dup bleft 2C lit / u> if drop bbad 0 lit then dup sncom !  2C lit * btake scom !
-bcode @ 0= if sncom @ ?dup if 0 lit do scom @ i 2C lit * + dup 4 lit + le@ if bbad then 8 lit + 8 lit bcanon loop then then
+bcode @ 0= if sncom @ ?dup if 0 lit do scom @ i 2C lit * + dup 4 lit + le@ FF lit u> if bbad then 8 lit + 8 lit bcanon loop then then
 bcode @ 0= bp @ bq @ <> and if bbad then
 \ positions ascending within the part, below the counter
-slo @ E lit lshift  dup 4000 lit + snx @ umin shi !  slo !
 bcode @ 0= if snent @ ?dup if 0 lit do
-	i epos  dup slo @ u< over shi @ u< 0= or if sbad then
+	sents @ i 48 lit * + 4 lit + le@ sphi @ <> if sbad then
+	i epos  dup slo @ - spcnt @ u< 0= if sbad then
 	i if i 1 lit - epos over u< 0= if sbad then then drop
 loop then then
 \ the part's root: its 64 groups, then six levels up
@@ -116,11 +124,12 @@ bcode @ 0= if
 	loop drop
 	sbig @ 40 lit 8 lit E lit climb
 	sbig @ stmd @ 8 lit wcopy  stmd @ dfrom
-	stmd @ sroots @ slo @ E lit rshift 5 lit lshift + 8 lit wcmp if sbad then
+	stmd @ sroots @ spart @ 5 lit lshift + 8 lit wcmp if sbad then
 	sbig @ free
 then
 \ each commit one of the outputs, holding its commit's leaf
 bcode @ 0= if sncom @ ?dup if 0 lit do
+	scom @ i 2C lit * + 4 lit + le@ sphi @ <> if sbad then
 	scom @ i 2C lit * +  dup le@ sfind
 	dup 0< if 2drop sbad else
 		48 lit * sents @ + 8 lit +  swap dup 8 lit + swap 28 lit + le@ stmd @ cleaf
@@ -131,11 +140,11 @@ loop then then
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
 	snent @ ?dup if 0 lit do
-		i 48 lit * sents @ + dup srec  rb @ swap le@ 0 lit oput
+		i 48 lit * sents @ + dup srec  rb @ swap le@ sphi @ oput
 		i 48 lit * sents @ + 3C lit + dup le@ swap 4 lit + le@ ssum @ amount+
 	loop then
 	sncom @ ?dup if 0 lit do
-		scom @ i 2C lit * + dup 8 lit + cb @ 24 lit bcopy  le@ 0 lit kcommit cb @ 24 lit sput
+		scom @ i 2C lit * + dup 8 lit + cb @ 24 lit bcopy  le@ sphi @ kcommit cb @ 24 lit sput
 	loop then
 	serr @ if sbad stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
 	0 lit ndirty !
@@ -186,7 +195,7 @@ then
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
 	snrec @ ?dup if 0 lit do
-		skey @ i 4 lit lshift + krec  srecs @ i w@ dup rsize sput
+		skey @ i 4 lit lshift + dup rtouch krec  srecs @ i w@ dup rsize sput
 		skey @ i 4 lit lshift +  sval @ i 5 lit lshift + tinsert
 	loop then
 	serr @ if sbad stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
@@ -213,13 +222,16 @@ sbh !  0 lit bcode !
 sdone @ snr @ snn @ + <> if sbad then
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
-	snx @ 70 lit mput
-	snx @ FF lit + 8 lit rshift ?dup if 0 lit do i dadd loop then
+	snx @ 70 lit mput  snxh @ 71 lit mput
+	\ every group below the counter (256 positions each; 40 bits)
+	snx @ 8 lit rshift  snxh @ 18 lit lshift or  snx @ FF lit and if 1 lit + then  ?dup if 0 lit do i dadd loop then
 	sprop
 	tmpb @ troot  tmpb @ dfrom  tmpb @ snroot @ 8 lit wcmp if sbad then
 	stmd @ sroot0  stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then
 	sbh @ 20 lit + @ sis @ issued  ssum @ sis @ 4 lit wcmp if sbad then
 	sbh @ 20 lit + @ 68 lit mput  sbh @ 20 lit + @ khdr sbh @ CC lit sput
+	\ its buckets, all, and its own manifest (manifest.fam): served too
+	-1 lit rtall !  mbuckets  msoff @ 0= if sbh @ 20 lit + @ snx @ snxh @ msnap then
 	bcode @ serr @ or if stx @ txabort drop else stx @ txcommit drop then
 	0 lit ndirty !
 then
@@ -234,7 +246,9 @@ bparse
 bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
 bcode @ 0= if
 	0 lit bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + @ 1 lit = if 1 lit + then loop then
-	bnout @ +  snx @ swap - sfirst !  snx @ sctr !
+	\ S's first position: the counter less what S made (40 bits)
+	bnout @ +  dup snx @ swap - sfirst !  snx @ u> snxh @ swap if 1 lit - then sfirsth !
+	snx @ sctr !  snxh @ sctrh !
 	stfd @ 0 lit txbegin stx !  sproof  stx @ txcommit drop
 else 0 lit then
 bops @ free ;

@@ -64,8 +64,9 @@ sh @ 1 lit - khdr ppar @ CC lit sget CC lit = if
 		nip 1C lit rshift tom ptmp @ 7 lit w!
 		ptmp @ sab8
 	loop then  spcs,
-	sfirst @ dup 3FFFFFFF lit and pv, 1E lit rshift pv,
-	sctr @ dup 3FFFFFFF lit and pv, 1E lit rshift pv,
+	\ the first position and the counter, 40 bits each: 30, then 10
+	sfirst @ dup 3FFFFFFF lit and pv, 1E lit rshift sfirsth @ 2 lit lshift or pv,
+	sctr @ dup 3FFFFFFF lit and pv, 1E lit rshift sctrh @ 2 lit lshift or pv,
 	sh @ subsidy  over FFFF lit and pv,  swap 10 lit rshift pv,  dup FFFF lit and pv,  10 lit rshift pv,  0 lit pv,  0 lit pv,
 	sh @ pv,
 	23 lit sp0  bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + ptmp @ opdigest ptmp @ sab8 loop then  spcs,

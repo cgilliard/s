@@ -23,7 +23,7 @@ N=src/user/node
 rm -rf "$T"; mkdir -p "$T"
 
 ./tools/fam --user -o "$T/trl.bin" $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
-	$N/chainver.fam $N/state.fam $N/proofs.fam $N/connect.fam $N/query.fam $N/snap.fam $N/xmss.fam $N/tx.fam $N/pool.fam \
+	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam $N/pool.fam \
 	$N/p2p.fam $N/api.fam $N/sync.fam $N/relay_test.fam
 sh scripts/mkimage.sh "$T/rl.img" bin/kernel init="$T/trl.bin":24576 akjv.txt.gz=../resources/akjv.txt.gz:0 \
 	chainver=$N/chainver_dev.bin:0 devchain=$N/devchain.bin:0

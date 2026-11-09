@@ -54,8 +54,8 @@
 : pidle variable ;  : pnew variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
-: myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
-: pnest variable ;  : pgkd variable ;  : pbid variable ;  : pbb variable ;  : pbn variable ;  : pbl variable ;  : pbsrc variable ;
+: myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;  : myold variable ;
+: pnest variable ;  : pgkd variable ;  : pgo variable ;  : pbk variable ;  : pbpt variable ;  : pbid variable ;  : pbb variable ;  : pbn variable ;  : pbl variable ;  : pbsrc variable ;
 : pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
 
 :M PWIN 4 lit ;                               \ chunks in flight
@@ -83,7 +83,10 @@ pkey @ pkd @ pko @ compress  pko @ mtok @ 8 lit bcopy ;
 \ mtok's token (ptokn for whom it goes to).
 : wstatus
 8 lit wbs  A lit w32  mtok @ 8 lit wbs  mygen @ 20 lit wbs
-myh @ w32  myh @ 1 lit + w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
+\ the oldest block whose body (and snapshot) we keep: tabminer asks a
+\ peer for a block or a snapshot only from there up (myold: sync.fam's
+\ nstat; none kept, our height and one)
+myh @ w32  myold @ ?dup 0= if myh @ 1 lit + then w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
 A lit 0 lit w64  A lit 0 lit w64 ;
 
 : prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
@@ -151,7 +154,7 @@ else 0 lit then ;
 \ if there is one, to peer pfk.
 : pcko
 dup A lit lshift dup pgn @ u< if
-	9 lit wbeg  pgkd @ w8  prx @ E lit + 20 lit wbs  pgn @ w32  swap w16
+	9 lit wbeg  pgkd @ w8  pgkd @ 3 lit = if prx @ E lit + le@ w32 then  prx @ E lit + pgo @ + 20 lit wbs  pgn @ w32  swap w16
 	pgn @ over - dup 400 lit u> if drop 400 lit then  dup w16  swap pgb @ + swap wbs
 	pfk @ psend
 else 2drop then ;
@@ -162,7 +165,7 @@ else 2drop then ;
 \ (the store's, kept for 1,008 blocks), as a block is fetched.  The last
 \ one built is kept (pbid), as each GetChunks asks for a few chunks.
 : pblock
-prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and if -1 lit else
+prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and pbk @ 0= and if -1 lit else
 	prx @ E lit + pidm @ 20 lit bcopy
 	pidm @ hfind dup 0< if drop 0 lit else
 		he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if
@@ -173,25 +176,56 @@ prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and if -1 lit else
 				pbl @ CC lit + dup pbn !  malloc pbb !
 				dup hhdr pbb @ CC lit bcopy  drop
 				pbsrc @ pbb @ CC lit + pbl @ bcopy  pbsrc @ free
-				prx @ E lit + pbid @ 20 lit bcopy  -1 lit
+				prx @ E lit + pbid @ 20 lit bcopy  0 lit pbk !  -1 lit
 			else 2drop drop 0 lit then
 		else drop 0 lit then
 	then
 then ;
+\ psnap ( -- flag )  pbb/pbn the manifest (kind 2) or part (kind 3) of
+\ the snapshot after the block whose id is at prx+E (+4 for a part, its
+\ index first), if on our chain and kept (serve.fam); the last kept.
+: psnap
+prx @ E lit + pgo @ + pbid @ 20 lit d8=  pbb @ 0= 0= and  pbk @ pgkd @ = and
+pgkd @ 3 lit = if prx @ E lit + le@ pbpt @ = and then
+if -1 lit else
+	prx @ E lit + pgo @ + pidm @ 20 lit bcopy
+	pidm @ zheight dup 0< if
+		drop 0 lit  vrb @ if nhead "a snapshot asked for of a block not on our chain (or past our tip)" puts 0A lit putc then
+	else
+		dup pgkd @ 2 lit = if zman else prx @ E lit + le@ zpart then
+		over if
+			pbb @ ?dup if free then  pbn ! pbb !
+			prx @ E lit + pgo @ + pbid @ 20 lit bcopy  pgkd @ pbk !  pgkd @ 3 lit = if prx @ E lit + le@ pbpt ! then
+			vrb @ if
+				nhead "serving the snapshot after block " puts u.
+				pgkd @ 2 lit = if ": its manifest (" puts else ": part " puts prx @ E lit + le@ u. " (" puts then
+				pbn @ u. " bytes)" puts 0A lit putc
+			else drop then
+			-1 lit
+		else
+			2drop  vrb @ if nhead "the snapshot after block " puts u. " not kept: none served" puts 0A lit putc else drop then
+			0 lit
+		then
+	then
+then ;
 \ pgive  the GetChunks in prx, if it carries our token: the chunks of a
-\ pooled transaction (kind 1), or of a block on our chain (kind 0).
+\ pooled transaction (kind 1), a block on our chain (kind 0), or a
+\ snapshot's manifest (kind 2) or part (kind 3, its index before the id).
 : pgive
 prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
-	prx @ D lit + c@ dup pgkd !
+	prx @ D lit + c@ dup pgkd !  dup 3 lit = if 4 lit else 0 lit then pgo !
+	prn @ 2F lit pgo @ + u< if drop 0 lit else
 	dup 1 lit = if
 		drop  prx @ E lit + pidm @ dle  pidm @ qfind dup 0< if drop 0 lit else qslot dup @ pgb !  4 lit + @ pgn !  -1 lit then
+	else dup 0= if
+		drop  pnest @ 0= if pblock if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
 	else
-		0= pnest @ 0= and if pblock if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
-	then
+		2 lit - 2 lit u<  pnest @ 0= and if psnap if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
+	then then then
 	if
-		prx @ 2E lit + c@  dup 2 lit lshift 2F lit + prn @ u> if drop 0 lit then
+		prx @ 2E lit + pgo @ + c@  dup 2 lit lshift 2F lit + pgo @ + prn @ u> if drop 0 lit then
 		?dup if 0 lit do
-			prx @ 2F lit + i 2 lit lshift +  dup u16@ swap 2 lit + u16@
+			prx @ 2F lit + pgo @ + i 2 lit lshift +  dup u16@ swap 2 lit + u16@
 			dup if over + swap do i pcko loop else 2drop then
 		loop then
 	then

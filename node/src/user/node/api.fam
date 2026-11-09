@@ -38,6 +38,7 @@
 : aqw variable ;  : arw variable ;  : ab32 variable ;  : asib variable ;  : aauth variable ;  : apk variable ;
 : awt variable ;  : ah variable ;  : ae variable ;  : ahp variable ;  : ablen variable ;  : amp variable ;
 : amn variable ;  : amf variable ;  : afrom variable ;  : acnt variable ;  : an variable ;  : alast variable ;
+: afromh variable ;  : alasth variable ;  : al0 variable ;  : al1 variable ;  : al2 variable ;
 : aerrs variable ;  : ahh variable ;  : aend variable ;
 
 \ ── The response ──
@@ -265,23 +266,41 @@ ae !  "{" a" "position" akey au64 acom
 "amount" akey ae @ 20 lit + slotamt au64 acom
 "height" akey ae @ 40 lit + @ anum "}" a" ;
 
+\ a40 ( s -- lo hi )  a decimal position (40 bits), in 16-bit limbs so no
+\ product overflows.
+: a40
+0 lit al0 !  0 lit al1 !  0 lit al2 !
+begin dup c@ 30 lit - A lit u< while
+	dup c@ 30 lit -  al0 @ A lit * + dup FFFF lit and al0 !  10 lit rshift
+	al1 @ A lit * + dup FFFF lit and al1 !  10 lit rshift
+	al2 @ A lit * + al2 !
+	1 lit +
+repeat drop
+al0 @ al1 @ 10 lit lshift or  al2 @ ;
+
 : aoutputs
-"from=" 0 lit anarg afrom !  "count=" 64 lit anarg 3E8 lit 2dup u> if swap then drop acnt !
+"from=" aqv ?dup if a40 else 0 lit 0 lit then afromh ! afrom !
+"count=" 64 lit anarg 3E8 lit 2dup u> if swap then drop acnt !
 abegin "{" a" "outputs" akey "[" a"
-afrom @ alast !
+afrom @ alast !  afromh @ alasth !
 stfd @ 0 lit txbegin stx !
-afrom @ if 6F lit afrom @ 1 lit - 0 lit kpos else 6F lit kb @ c! 1 lit then
+\ from the key before the first position asked for (40 bits)
+afrom @ afromh @ or if
+	6F lit  afrom @ 1 lit -  afrom @ if afromh @ else afromh @ 1 lit - then  kpos
+else 6F lit kb @ c! 1 lit then
 0 lit an !
 begin
 	an @ acnt @ u< if knext dup 6 lit = if drop kb2 @ c@ 6F lit = else drop 0 lit then else drop 0 lit then
 while
 	kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 44 lit sget drop
 	an @ if acom then
-	kb @ 2 lit + 4 lit be@ kb @ 1 lit + c@  over 1 lit + alast !  sbuf @ ajrec
+	kb @ 2 lit + 4 lit be@ kb @ 1 lit + c@
+	over 1 lit + dup alast !  0= if dup 1 lit + else dup then alasth !
+	sbuf @ ajrec
 	an @ 1 lit + an !  6 lit
 repeat
 stx @ txcommit drop
-"]" a" acom "next" akey alast @ anum "}" a"
+"]" a" acom "next" akey alast @ alasth @ au64 "}" a"
 "200 OK" asend ;
 
 \ aspent  the positions each block kept spent: inputs, commits revealed
@@ -334,11 +353,11 @@ apath @ 9 lit + dup strlen 2dup name-ok 0= if 2drop "bad name" "400 Bad Request"
 then ;
 
 : aproof
-apath @ 11 lit + atoi afrom !
+apath @ 11 lit + a40 afromh ! afrom !
 stfd @ 0 lit txbegin stx !
-afrom @ 0 lit asib @ yoproof
-abegin "{" a" "position" akey afrom @ anum acom
-afrom @ 0 lit oget if
+afrom @ afromh @ asib @ yoproof
+abegin "{" a" "position" akey afrom @ afromh @ au64 acom
+afrom @ afromh @ oget if
 	"commitment" akey sbuf @ adig acom "memo" akey sbuf @ 20 lit + 14 lit ahx" acom
 	"amount" akey sbuf @ 20 lit + slotamt au64 acom "created" akey sbuf @ 40 lit + @ anum acom
 else "commitment" akey "null" a" acom then
