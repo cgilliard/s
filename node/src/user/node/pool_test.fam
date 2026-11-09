@@ -1,10 +1,11 @@
 \ pool_test.fam — the pool (docs/NODE.md, step 7), a program for the OS
 \ after arith, poseidon2, difficulty, pow, chainver, state, proofs,
-\ connect, xmss, tx and pool, with a disk.  /lib/pool is
+\ connect, query, xmss, tx and pool, with a disk.  /lib/pool is
 \ miner/src/fam_vectors.rs's pool.bin: a dev chain whose outputs pay known
 \ keys, transactions offered to tabminer's pool with its verdicts, blocks
 \ mining some and the pool after each, and XMSS signatures of other
-\ heights.  Each is given tabminer's answer.
+\ heights; then proofs of outputs and names against the tip's state.
+\ Each is given tabminer's answer.
 
 : tpas variable ;  : tfai variable ;  : ep variable ;  : ctn variable ;  : tbuf variable ;  : tk variable ;
 
@@ -55,8 +56,38 @@ dup 0= if tsay "signature verdict differs" puts 0A lit putc then
 vok
 ep @ 5D lit + ep @ 59 lit + le@ + epad ;
 
+\ An output's proof: the 40 siblings as tabminer's.
+: tpb variable ;
+: toproof
+stfd @ 0 lit txbegin stx !
+ep @ 4 lit + @ ep @ 8 lit + @ tpb @ yoproof
+stx @ txcommit drop
+tpb @ ep @ C lit + 140 lit wcmp 0=
+dup 0= if tsay "output proof differs" puts 0A lit putc then
+vok
+ep @ C lit + 500 lit + ep ! ;
+
+\ A name's proof: the terminal, the depth and the siblings as tabminer's.
+: tnk variable ;
+: tnproof
+stfd @ 0 lit txbegin stx !
+ep @ 8 lit + ep @ 4 lit + @ tnk @ ykey
+tnk @ tpb @ ynproof
+stx @ txcommit drop
+\ ( depth tag )
+1 lit = ep @ 28 lit + @ 1 lit = = 
+ep @ 28 lit + @ if
+	yterm @ 4 lit + ep @ 2C lit + 4 lit wcmp 0= and
+	yterm @ 14 lit + tbuf @ ycanon  tbuf @ ep @ 3C lit + 8 lit wcmp 0= and
+then
+over ep @ 5C lit + @ = and
+over 3 lit lshift ?dup if tpb @ ep @ 60 lit + rot wcmp 0= and then
+dup 0= if tsay "name proof differs" puts 0A lit putc then
+vok
+5 lit lshift ep @ + 60 lit + ep ! ;
+
 "/t-pool" TREE CREATE or 2 lit or open stinit
-xinit tinit qinit  20 lit alloc tbuf !
+xinit tinit qinit yinit  20 lit alloc tbuf !  500 lit alloc tpb !  10 lit alloc tnk !
 "/lib/pool" rdfile drop dup @ ctn ! 4 lit + ep !
 0 lit tpas !  0 lit tfai !
 ctn @ 0 lit do
@@ -65,7 +96,9 @@ ctn @ 0 lit do
 	dup 0= if drop tblock else
 	dup 1 lit = if drop ttx else
 	dup 2 lit = if drop tids else
-	3 lit = if txmss else tsay "unknown entry" puts 0A lit putc then then then then
+	dup 3 lit = if drop txmss else
+	dup 4 lit = if drop toproof else
+	5 lit = if tnproof else tsay "unknown entry" puts 0A lit putc then then then then then then
 loop
 "pool: " puts tpas @ u. " as tabminer, " puts tfai @ u. " not" puts 0A lit putc
 bye

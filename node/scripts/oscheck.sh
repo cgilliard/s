@@ -179,12 +179,13 @@ rm -f "$T/sn.disk"
 # The pool (step 7): a dev chain whose outputs pay known keys (/lib/pool),
 # transactions offered with tabminer's pool's verdict on each and their
 # ids, policy inputs through each kind of leaf, blocks mining some and the
-# pool after each, and XMSS signatures of
+# pool after each; proofs of outputs and names (step 8) as tabminer's; and
+# XMSS signatures of
 # other heights, verified and refused.
-./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
+./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/query.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
 sh scripts/mkimage.sh "$T/po.img" bin/kernel init="$T/tpo.bin":16384 pool=$ND/pool.bin:0 2> "$T/po.mk" || fail pool "mkimage: $(cat "$T/po.mk")"
 rm -f "$T/po.disk"; dd if=/dev/zero of="$T/po.disk" bs=1 count=0 seek=268435456 2>/dev/null
-expect pool 124 '^pool: 89 as tabminer, 0 not' 120 ./tools/q32 --disk="$T/po.disk" "$T/po.img"
+expect pool 124 '^pool: 102 as tabminer, 0 not' 120 ./tools/q32 --disk="$T/po.disk" "$T/po.img"
 rm -f "$T/po.disk"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:

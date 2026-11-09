@@ -947,7 +947,57 @@ Each step done when its test passes.
 8. **The API**: the HTTP server, the token, and the endpoints above.
    Done when a program in the OS and a client on the host read the
    chain and send a transaction through it with the token, and are
-   refused without it.
+   refused without it. Done (2026-11-08):
+   - `api.fam`: HTTP/1.0 on TCP 3738, polled in the node's one loop
+     with its peers (`p2p.fam`'s `poll` takes the listener too), one
+     request a connection (its header 8 KiB at most, 2 s a read at
+     most). The token as decided: made at the first start, kept in
+     `/etc/node/token` (mode 600, set before it is written), checked
+     exactly ("Authorization: Bearer" and 64 hex digits); 401 with an
+     empty body otherwise; `POST /v1/token` makes a new one. Every
+     endpoint above, in JSON: digests and bytes in hex (a digest as its
+     32 canonical bytes; work as 32 bytes little-endian), numbers in
+     decimal. `POST /v1/tx` takes the transaction's bytes as the body
+     (`Transaction::to_bytes`), pools it as a peer's would be and
+     announces it to every peer; a refusal answers 400 with the pool's
+     code and its reason. `GET /v1/tip?after=` waits (8 requests at
+     most) until the tip moves, 30 s at most. `/v1/fees` gives the
+     floor and dust limit; the node has no estimates yet (`null`).
+   - `query.fam`: the proofs, tabminer's own: an output's 40 siblings
+     (`state_tree::Proof`, the group's 256 leaves made again from its
+     outputs, the stored nodes above), a name's terminal and siblings
+     (`name_trie::NameProof`). `pool.bin` gains 8 output proofs and 5
+     name proofs from tabminer's chain; oscheck's `pool` compares the
+     node's byte for byte: 102 entries, all as tabminer.
+   - Blocks' bodies are now kept (`connect.fam`), for the last 1,008
+     blocks as tabminer's default: `/v1/block` and `/v1/spent` read
+     them. Blocks before a fast sync's S have none.
+   - The OS gained loopback (`docs/OS.md`, step 9): TCP to 127.0.0.1 or
+     10.0.2.15 reaches a server in the OS, which is how programs in it
+     reach the API. oscheck's `tcp_loop`.
+   - Two bugs in `state.fam` found on the way: a name trie leaf's hash
+     was written over the second half of its value (the hash, which
+     consensus uses, made before; the value is needed whole by a
+     proof), and `grefresh` left a cell on the data stack for each
+     output it read (enough, on a block touching many groups, to
+     overflow it). Both fixed; the state, snapshot and pool checks pass
+     as before.
+   - `scripts/apitest.sh`: a tabminer mines the recursive dev network;
+     a copy of it with the wallet and no peers burns a coin twice and
+     quits, its pool saved: two transactions from tabminer's wallet,
+     sent nowhere. The node boots with one of them, syncs and serves.
+     In the OS, `apicli` (`src/user/node/apicli.fam`) is refused the
+     status and refused sending without the token; with it reads the
+     status, a header and outputs, and sends its transaction. On the
+     host, a client is refused without the token and with another;
+     reads every endpoint; sends the other transaction (and bytes that
+     do not decode, and the same transaction again, each refused with
+     its reason); waits for the tip to move; sees both transactions
+     mined (the pool empty, the miner's log taking both from the node);
+     makes a new token and is refused with the old one.
+   - Not yet: the read-only endpoints opened by configuration, the port
+     configured (the daemon's, step 10), fee estimates, verification on
+     a thread of its own (a proof's second or so stalls the API).
 9. **Images**: serving tabernacles. Done when a tabernacle boots from
    a fam node with `tools/server.py` gone.
 10. **The daemon**: in the image, started by init, its `/proc` keys,

@@ -1,0 +1,65 @@
+\ query.fam — the state read for the API (docs/NODE.md, step 8), after
+\ connect.fam.  Each word runs in a transaction the caller opened (stx).
+\
+\ yoproof ( lo hi c -- )  c (40 digests, canonical words) = the path of
+\ the output at position lo hi (below 2^40) to the state root, its leaf's
+\ sibling first and the names trie's root last (tabminer's UtxoSet::prove,
+\ state_tree::Proof): the group's 256 leaves made again from its outputs,
+\ the levels above from the stored nodes.
+\ ynproof ( key c -- depth tag )  c = the siblings (canonical) from the
+\ key's terminal up to the trie's root (NameTrie::prove); the terminal in
+\ yterm as tget leaves a node (tag 1 a leaf: its key, value, hash; -1 an
+\ empty slot).
+\ ykey ( name len k -- )  k (4 words) = a name's key.
+\ ybody ( h -- a n | 0 0 )  block h's body, if kept (malloc'd).
+
+: yc variable ;  : ylo variable ;  : yhi variable ;  : yix variable ;  : ylv variable ;  : ytmp variable ;
+: yk variable ;  : ykp variable ;  : ydep variable ;  : ytag variable ;  : yterm variable ;  : yhb variable ;
+
+\ ycanon ( m c -- )  8 Montgomery words at m as canonical words at c.
+: ycanon  8 lit 0 lit do over i w@ fromm over i w! loop 2drop ;
+
+\ ypidx ( level -- index )  the position's node at a level.
+: ypidx  dup 20 lit u< if ylo @ over rshift  yhi @ rot 20 lit swap - lshift or else yhi @ swap 20 lit - rshift then ;
+
+: yoproof  ( lo hi c -- )
+yc ! yhi ! ylo !
+ylv @ 800 lit wzero
+100 lit 0 lit do
+	ylo @ FFFFFF00 lit and i or  yhi @ oget if sbuf @ ylv @ i 5 lit lshift + rleaf then
+loop
+ylo @ FF lit and yix !
+8 lit 0 lit do
+	ylv @ yix @ 1 lit xor 5 lit lshift + yc @ i 5 lit lshift + ycanon
+	100 lit i 1 lit + rshift 0 lit do  ylv @ i 6 lit lshift +  dup 20 lit + ylv @ i 5 lit lshift + compress  loop
+	yix @ 1 lit rshift yix !
+loop
+27 lit 8 lit do
+	i ypidx 1 lit xor  i swap ytmp @ nget
+	ytmp @ yc @ i 5 lit lshift + ycanon
+loop
+ytmp @ troot  ytmp @ yc @ 4E0 lit + ycanon ;
+
+: ynproof  ( key c -- depth tag )
+yc ! yk !
+yk @ twalk ytag ! ydep !  tnb @ yterm @ 15 lit wcopy
+ydep @ ?dup if 0 lit do
+	ydep @ i -
+	yk @ over ykp @ kprefix  ykp @ 78 lit 2 lit pick - kxbit
+	ykp @ ytmp @ tchild
+	ytmp @ yc @ i 5 lit lshift + ycanon
+loop then
+ydep @ ytag @ ;
+
+: ykey  ( name len k -- )  -rot ytmp @ nhash  ytmp @ swap keyof ;
+
+: ybody  ( h -- a n | 0 0 )
+dup FFFF lit kbody sbuf @ 4 lit sget 4 lit = if
+	sbuf @ @ dup malloc  ( h n a )
+	over 3FF lit + A lit rshift 0 lit do
+		2 lit pick i kbody  over i A lit lshift + 400 lit sget drop
+	loop
+	rot drop swap
+else drop 0 lit 0 lit then ;
+
+: yinit  2000 lit alloc ylv !  20 lit alloc ytmp !  10 lit alloc ykp !  54 lit alloc yterm !  20 lit alloc yhb ! ;

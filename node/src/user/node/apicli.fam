@@ -1,0 +1,43 @@
+\ apicli.fam — a program in the OS using the node's API (docs/NODE.md,
+\ step 8): over TCP to 127.0.0.1:3738, with the token from
+\ /etc/node/token.  Asks for the status without the token (refused), then
+\ with it; a header; outputs; and sends /lib/tx (a transaction's bytes),
+\ refused without the token, then with it.  A line each ("cli: ...").
+
+: tk variable ;  : rb variable ;  : rn variable ;  : s variable ;  : txb variable ;  : txn variable ;  : rq variable ;
+
+\ ask ( method path body n auth -- status )  one request; the answer in
+\ rb (rn bytes), its status code returned.
+: aw variable ;  : an variable ;  : ab variable ;  : ap variable ;  : am variable ;
+: ask
+aw ! an ! ab ! ap ! am !
+2 lit socket s !
+s @ 2 lit 7F000001 lit E9A lit net drop
+rq @ am @ scpy 20 lit over c! 1 lit + ap @ scpy " HTTP/1.0" scpy D lit over c! 1 lit + A lit over c! 1 lit +
+aw @ if "Authorization: Bearer " scpy tk @ scpy D lit over c! 1 lit + A lit over c! 1 lit + then
+an @ if "Content-Length: " scpy an @ snum D lit over c! 1 lit + A lit over c! 1 lit + then
+D lit over c! 1 lit + A lit over c! 1 lit +
+s @ rq @ rot rq @ - write drop
+an @ if s @ ab @ an @ write drop then
+0 lit rn !
+begin s @ rb @ rn @ + 10000 lit rn @ - read dup 0 lit > while rn @ + rn ! repeat drop
+s @ close drop
+0 lit rb @ rn @ + c!
+rn @ C lit u< if 0 lit else rb @ 9 lit + atoi then ;
+\ body ( -- a )  the answer's body.
+: body  rb @ begin dup c@ D lit = over 1 lit + c@ A lit = and over 2 lit + c@ D lit = and over 3 lit + c@ A lit = and 0= while 1 lit + repeat 4 lit + ;
+: say  "cli: " puts puts " " puts . " " puts ;   \ ( status what -- )
+\ show ( -- )  the body, its first 120 bytes.
+: show  body dup strlen 78 lit u> if 0 lit over 78 lit + c! then puts 0A lit putc ;
+
+10100 lit alloc rb !  1000 lit alloc rq !  48 lit alloc tk !  21000 lit alloc txb !
+"/etc/node/token" 0 lit open dup tk @ 40 lit read drop close drop  0 lit tk @ 40 lit + c!
+"/lib/tx" 0 lit open dup txb @ 21000 lit read txn ! close drop
+"GET" "/v1/status" 0 lit 0 lit 0 lit ask "status without the token" say 0A lit putc
+"GET" "/v1/status" 0 lit 0 lit 1 lit ask "status" say show
+"GET" "/v1/header/1" 0 lit 0 lit 1 lit ask "header 1" say show
+"GET" "/v1/outputs?from=0&count=2" 0 lit 0 lit 1 lit ask "outputs" say show
+"POST" "/v1/tx" txb @ txn @ 0 lit ask "tx without the token" say 0A lit putc
+"POST" "/v1/tx" txb @ txn @ 1 lit ask "tx" say show
+"cli: done" puts 0A lit putc
+bye

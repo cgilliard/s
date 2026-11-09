@@ -1,0 +1,489 @@
+\ api.fam — the node's API (docs/NODE.md, step 8), after sync.fam and
+\ query.fam: JSON over HTTP/1.0, one request a connection, on a TCP port
+\ (3738 unless configured), polled in the node's one loop with its peers.
+\ Every request carries the token, "Authorization: Bearer <64 hex digits>";
+\ without it, or with another, 401 and nothing else.  The token is made at
+\ the first start (32 bytes from /dev/random, in hex) and kept in
+\ /etc/node/token, mode 600; POST /v1/token makes a new one.
+\
+\   GET  /v1/status                      height, tip, work, peers, pool
+\   GET  /v1/header/<height|id>[?raw]    a header, decoded (or its bytes)
+\   GET  /v1/block/<height|id>[?raw]     a block kept (the last 1,008)
+\   GET  /v1/outputs?from=<p>&count=<n>  outputs in position order (1,000)
+\   GET  /v1/spent?from=<height>         positions spent, block by block
+\   GET  /v1/name/<name>                 a record and its proof
+\   GET  /v1/proof/output/<position>     an output's path to the state root
+\   GET  /v1/fees                        the pool's floor and dust limit
+\   GET  /v1/mempool                     what the pool holds
+\   GET  /v1/tip?after=<id>              when the tip is not <id> (30 s at most)
+\   POST /v1/tx                          a transaction's bytes: pooled, relayed
+\   POST /v1/token                       a new token
+\
+\ Digests and bytes are in hex (a digest's 32 canonical bytes; work, 32
+\ bytes little-endian), numbers in decimal.  The proofs are tabminer's: an
+\ output's 40 siblings, the leaf's first, the names trie's root last
+\ (state_tree::Proof); a name's terminal and its siblings from it up
+\ (name_trie::NameProof), with the outputs' root, which compressed with
+\ the trie's makes the state root.
+\
+\ ainit ( port -- )  the token, the listener.
+\ aserve ( s -- )  s seconds of the node's loop: its peers (as nserve),
+\ the API's requests, and those waiting for the tip.
+
+: alfd variable ;  : acfd variable ;  : atk variable ;  : arq variable ;  : arn variable ;  : ahe variable ;
+: apath variable ;  : aqs variable ;  : apost variable ;  : abod variable ;  : abn variable ;  : aclen variable ;
+: ao variable ;  : aop variable ;  : aoct variable ;  : aent variable ;  : aw variable ;  : aten variable ;
+: aqw variable ;  : arw variable ;  : ab32 variable ;  : asib variable ;  : aauth variable ;  : apk variable ;
+: awt variable ;  : ah variable ;  : ae variable ;  : ahp variable ;  : ablen variable ;  : amp variable ;
+: amn variable ;  : amf variable ;  : afrom variable ;  : acnt variable ;  : an variable ;  : alast variable ;
+: aerrs variable ;  : ahh variable ;  : aend variable ;
+
+\ ── The response ──
+
+: a,  aop @ c!  aop @ 1 lit + aop ! ;           \ ( c -- )
+: a"  begin dup c@ ?dup while a, 1 lit + repeat drop ;   \ ( s -- )
+: anum  aop @ swap snum aop ! ;                  \ ( u -- )  decimal
+: ahex  ?dup if 0 lit do dup i + c@ dup 4 lit rshift nhd a, F lit and nhd a, loop then drop ;   \ ( a n -- )
+: aqt  22 lit a, ;
+: akey  aqt a" aqt 3A lit a, ;                  \ ( s -- )  "s":
+: ahx"  aqt ahex aqt ;                           \ ( a n -- )  "hex"
+: adig  20 lit ahx" ;                            \ ( a -- )  32 bytes
+: acom  2C lit a, ;
+: abegin  ao @ aop !  0 lit aoct ! ;             \ a body begun at ao
+\ au64 ( lo hi -- )  a 64-bit number in decimal.
+: au64
+aw @ 1 lit w! aw @ !
+aw @ 1 lit w@ 0= if aw @ @ anum else
+	0 lit
+	begin aw @ @ aw @ 1 lit w@ or while
+		aw @ aten @ aqw @ arw @ 2 lit wdivmod  arw @ @ 30 lit + swap 1 lit +  aqw @ aw @ 2 lit wcopy
+	repeat
+	0 lit do a, loop
+then ;
+
+: h,  ahp @ c!  ahp @ 1 lit + ahp ! ;
+: h"  begin dup c@ ?dup while h, 1 lit + repeat drop ;
+: hcrlf  D lit h, A lit h, ;
+\ asend ( status -- )  the response, its status line ("200 OK"), headers
+\ and the body built at ao; the connection closed.
+: asend
+aop @ ao @ - ablen !
+arq @ ahp !  "HTTP/1.0 " h"  h"  hcrlf
+aoct @ if "Content-Type: application/octet-stream" else "Content-Type: application/json" then h"  hcrlf
+"Content-Length: " h"  ahp @ ablen @ snum ahp !  hcrlf hcrlf
+acfd @ arq @ ahp @ arq @ - write drop
+ablen @ if acfd @ ao @ ablen @ write drop then
+acfd @ close drop  0 lit acfd ! ;
+\ afail ( message status -- )  {"error": message}.
+: afail  swap abegin "{" a" "error" akey aqt a" aqt "}" a" asend ;
+: anotf  "not found" "404 Not Found" afail ;
+
+\ ── The request ──
+
+\ ardy ( -- flag )  the connection readable within 2 s.
+: ardy  acfd @ aent @ !  1 lit aent @ 4 lit + !  aent @ 1 lit 77359400 lit poll 0 lit > ;
+\ ahend ( -- flag )  the header whole: its end, after the empty line, in ahe.
+: ahend
+0 lit arn @ 3 lit u> if
+	arn @ 3 lit - 0 lit do
+		dup 0= if
+			arq @ i + dup c@ D lit = over 1 lit + c@ A lit = and
+			over 2 lit + c@ D lit = and swap 3 lit + c@ A lit = and
+			if drop i 4 lit + ahe ! -1 lit then
+		then
+	loop
+then ;
+\ areq ( -- ok )  the header read (8 KiB at most, 2 s a read at most).
+: areq
+0 lit arn !
+begin
+	ardy if acfd @ arq @ arn @ + 1FFF lit arn @ - read else 0 lit then
+	dup 0 lit > if arn @ + arn !  ahend arn @ 1FFF lit = or else drop -1 lit then
+until
+arn @ 0 lit > if ahend else 0 lit then ;
+
+\ alow ( c -- c' )  a letter in lower case.
+: alow  dup 41 lit - 1A lit u< if 20 lit + then ;
+\ amatch ( a name -- flag )  the bytes at a are name, in any case.
+: amatch
+amn ! amp !  -1 lit amf !
+begin amn @ c@ while  amp @ c@ alow amn @ c@ = amf @ and amf !  amp @ 1 lit + amp !  amn @ 1 lit + amn ! repeat
+amf @ ;
+\ ahdr ( name -- a | 0 )  a header line's value (name in lower case, with
+\ its colon), its spaces skipped; 0 if none.
+: ahdr
+0 lit ahh !
+ahe @ 0 lit do
+	ahh @ 0= if
+		i 0= if -1 lit else arq @ i + 1 lit - c@ A lit = then
+		if arq @ i + over amatch if arq @ i + over strlen + ahh ! then then
+	then
+loop drop
+ahh @ dup if begin dup c@ 20 lit = while 1 lit + repeat then ;
+\ ahexb ( s a n -- ok )  n bytes at a from 2n hex digits at s.
+: ahd  dup 30 lit - A lit u< if 30 lit - else alow 57 lit - dup A lit - 6 lit u< 0= if drop FF lit then then ;   \ ( c -- v | FF )
+: ahexb
+-1 lit swap 0 lit do
+	2 lit pick i 1 lit lshift + dup c@ ahd swap 1 lit + c@ ahd
+	2dup or F lit u> if 2drop drop 0 lit else swap 4 lit lshift or 2 lit pick i + c! then
+loop nip nip ;
+\ acopy ( s d -- s' )  bytes from s to d (NUL ended) up to a space, a CR
+\ or, if stop, a question mark.
+: astop variable ;
+: acopy
+begin over c@ dup 20 lit = over D lit = or swap 3F lit = astop @ and or 0= while
+	over c@ over c!  1 lit + swap 1 lit + swap
+repeat
+0 lit swap c! ;
+
+\ aparse ( -- ok )  the method and path (and query: apath, aqs), the
+\ token checked (aauth), the body read (Content-Length; 132 KiB at most).
+: aparse
+arq @ "GET " 4 lit d8= if 4 lit 0 lit else arq @ "POST " 5 lit d8= if 5 lit -1 lit else 0 lit 0 lit then then
+apost !
+?dup if
+	arq @ +  -1 lit astop !  apath @ acopy
+	dup c@ 3F lit = if 1 lit +  0 lit astop !  aqs @ acopy else 0 lit aqs @ c! then
+	drop
+	"authorization:" ahdr ?dup if
+		dup "Bearer " 7 lit d8= if 7 lit + dup atk @ 40 lit d8= swap 40 lit + c@ D lit = and else drop 0 lit then
+	else 0 lit then aauth !
+	0 lit abn !  0 lit abod !
+	"content-length:" ahdr ?dup if atoi else 0 lit then aclen !
+	aclen @ 21000 lit u> if 0 lit else
+		aclen @ if
+			aclen @ malloc abod !
+			arn @ ahe @ - aclen @ 2dup u> if swap then drop
+			dup abn !  arq @ ahe @ + abod @ rot bcopy
+			begin abn @ aclen @ u< if ardy else 0 lit then while
+				acfd @ abod @ abn @ + aclen @ abn @ - read
+				dup 0 lit > if abn @ + abn ! else drop aclen @ 1 lit + abn ! then
+			repeat
+			abn @ aclen @ =
+		else -1 lit then
+	then
+else 0 lit then ;
+
+\ apre ( s -- flag )  the path begins with s.
+: apre  apath @ swap dup strlen d8= ;
+\ aqv ( name -- a | 0 )  a query parameter's value (name with its "=").
+: aqv
+0 lit ahh !
+aqs @ strlen ?dup if 0 lit do
+	ahh @ 0= if
+		i 0= if -1 lit else aqs @ i + 1 lit - c@ 26 lit = then
+		if aqs @ i + over dup strlen d8= if aqs @ i + over strlen + ahh ! then then
+	then
+loop then
+drop ahh @ ;
+\ anarg ( name default -- n )  a numeric parameter.
+: anarg  swap aqv ?dup if nip atoi then ;
+
+\ aid ( s -- e | 0 )  a header entry by height (decimal) or id (hex).
+\ (Entries are addresses, above 2^31 in a process: 0 is none.)
+: aid
+dup strlen 40 lit = if
+	ab32 @ 20 lit ahexb if
+		0 lit hbest
+		begin
+			dup hid ab32 @ 20 lit d8= if nip dup then
+			dup hheight 0= 2 lit pick 0= 0= or if -1 lit else hparent @ he 0 lit then
+		until drop
+	else 0 lit then
+else
+	dup c@ 30 lit - A lit u< if atoi dup hbest hheight u> if drop 0 lit else hat then else drop 0 lit then
+then ;
+
+\ ── The answers ──
+
+\ ajhdr ( e -- )  a header's object.
+: ajhdr
+dup hhdr ah !
+"{" a" "height" akey ah @ 20 lit + @ anum acom
+"id" akey hid adig acom
+"prev" akey ah @ adig acom
+"timestamp" akey ah @ 24 lit + tamt au64 acom
+"body_commitment" akey ah @ 2C lit + adig acom
+"state_root" akey ah @ 4C lit + adig acom
+"aux" akey ah @ 6C lit + adig acom
+"mix" akey ah @ 8C lit + adig acom
+"nonce" akey ah @ AC lit + adig "}" a" ;
+
+: astatus
+abegin "{" a"
+"height" akey myh @ anum acom
+"tip" akey mytip @ adig acom
+"work" akey mywork @ adig acom
+"headers" akey hbest hheight anum acom
+"peers" akey  0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then  anum acom
+"pool" akey "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum "}" a" acom
+"version" akey aqt "fam-node 0.1" a" aqt acom
+"protocol" akey A lit anum "}" a"
+"200 OK" asend ;
+
+: aheader
+apath @ B lit + aid dup 0= if drop "no such header" "404 Not Found" afail else
+	abegin
+	"raw" aqv if -1 lit aoct !  hhdr ao @ CC lit bcopy  ao @ CC lit + aop ! else ajhdr then
+	"200 OK" asend
+then ;
+
+\ ajout ( o -- )  a block's output: commitment, memo, amount.
+: ajout  "{" a" "commitment" akey dup adig acom "memo" akey dup 20 lit + 14 lit ahx" acom "amount" akey 34 lit + tamt au64 "}" a" ;
+\ ajpos ( n a -- )  n five-byte positions at a, a list.
+: ajpos  "[" a" swap ?dup if 0 lit do i if acom then dup i 5 lit * + pos@ au64 loop then drop "]" a" ;
+
+: ablock
+apath @ A lit + aid dup 0= if drop "no such block" "404 Not Found" afail else
+	ae !
+	stfd @ 0 lit txbegin stx !  ae @ hhdr 20 lit + @ ybody  stx @ txcommit drop
+	over 0= if 2drop "no body kept" "404 Not Found" afail else
+		abegin
+		"raw" aqv if
+			-1 lit aoct !  ae @ hhdr ao @ CC lit bcopy
+			2dup ao @ CC lit + swap bcopy  ao @ CC lit + + aop !
+		else
+			2dup 0 lit bcode ! bparse
+			"{" a" "header" akey ae @ ajhdr acom
+			"inputs" akey bnin @ bin @ ajpos acom
+			"outputs" akey "[" a" bnout @ ?dup if 0 lit do i if acom then bout @ i 3C lit * + ajout loop then "]" a" acom
+			"ops" akey bnops @ anum acom
+			"sweeps" akey bnsw @ bsw @ ajpos acom
+			"proof_bytes" akey bnpr @ anum "}" a"
+			bops @ free  drop
+		then
+		free  "200 OK" asend
+	then
+then ;
+
+\ ajrec ( lo hi rec -- )  an output record at a position.
+: ajrec
+ae !  "{" a" "position" akey au64 acom
+"commitment" akey ae @ adig acom
+"memo" akey ae @ 20 lit + 14 lit ahx" acom
+"amount" akey ae @ 20 lit + slotamt au64 acom
+"height" akey ae @ 40 lit + @ anum "}" a" ;
+
+: aoutputs
+"from=" 0 lit anarg afrom !  "count=" 64 lit anarg 3E8 lit 2dup u> if swap then drop acnt !
+abegin "{" a" "outputs" akey "[" a"
+afrom @ alast !
+stfd @ 0 lit txbegin stx !
+afrom @ if 6F lit afrom @ 1 lit - 0 lit kpos else 6F lit kb @ c! 1 lit then
+0 lit an !
+begin
+	an @ acnt @ u< if knext dup 6 lit = if drop kb2 @ c@ 6F lit = else drop 0 lit then else drop 0 lit then
+while
+	kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 44 lit sget drop
+	an @ if acom then
+	kb @ 2 lit + 4 lit be@ kb @ 1 lit + c@  over 1 lit + alast !  sbuf @ ajrec
+	an @ 1 lit + an !  6 lit
+repeat
+stx @ txcommit drop
+"]" a" acom "next" akey alast @ anum "}" a"
+"200 OK" asend ;
+
+\ aspent  the positions each block kept spent: inputs, commits revealed
+\ and swept.
+: aspent
+"from=" 0 lit anarg afrom !
+myh @ 3EF lit u> if myh @ 3EF lit - afrom @ max afrom ! then
+abegin "{" a" "spent" akey "[" a"  0 lit an !
+stfd @ 0 lit txbegin stx !
+myh @ 1 lit + afrom @ u> if
+	myh @ 1 lit + afrom @ do
+		i ybody over if
+			2dup 0 lit bcode ! bparse
+			an @ if acom then  an @ 1 lit + an !
+			"{" a" "height" akey i anum acom "positions" akey "[" a"
+			bnin @ ?dup if 0 lit do i if acom then bin @ i 5 lit * + pos@ au64 loop then
+			bnin @ 0= 0= ahh !
+			bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + dup @ 2 lit = if ahh @ if acom then -1 lit ahh ! rpos pos@ au64 else drop then loop then
+			bnsw @ ?dup if 0 lit do ahh @ if acom then -1 lit ahh ! bsw @ i 5 lit * + pos@ au64 loop then
+			"]" a" "}" a"
+			bops @ free  drop free
+		else 2drop then
+	loop
+then
+stx @ txcommit drop
+"]" a" acom "height" akey myh @ anum "}" a"
+"200 OK" asend ;
+
+: aname
+apath @ 9 lit + dup strlen 2dup name-ok 0= if 2drop "bad name" "400 Bad Request" afail else
+	apk @ ykey
+	stfd @ 0 lit txbegin stx !
+	abegin "{" a" "name" akey aqt apath @ 9 lit + a" aqt acom
+	"key" akey apk @ 10 lit ahx" acom
+	"record" akey
+	apk @ krec sbuf @ 100 lit sget 0< if "null" a" else
+		"{" a" "owner" akey sbuf @ dup c@ 1 lit + + dup adig acom "value" akey dup 20 lit + adig acom "memo" akey 40 lit + adig "}" a"
+	then acom
+	apk @ asib @ ynproof
+	"proof" akey "{" a" "terminal" akey
+	1 lit = if
+		"{" a" "key" akey yterm @ 4 lit + 10 lit ahx" acom "value" akey yterm @ 14 lit + ab32 @ ycanon ab32 @ adig "}" a"
+	else "null" a" then acom
+	"siblings" akey "[" a" ?dup if 0 lit do i if acom then asib @ i 5 lit lshift + adig loop then "]" a" "}" a" acom
+	"outputs_root" akey 27 lit 0 lit ab32 @ nget  ab32 @ ab32 @ ycanon  ab32 @ adig acom
+	"state_root" akey ab32 @ sroot0 ab32 @ adig acom
+	"height" akey myh @ anum "}" a"
+	stx @ txcommit drop
+	"200 OK" asend
+then ;
+
+: aproof
+apath @ 11 lit + atoi afrom !
+stfd @ 0 lit txbegin stx !
+afrom @ 0 lit asib @ yoproof
+abegin "{" a" "position" akey afrom @ anum acom
+afrom @ 0 lit oget if
+	"commitment" akey sbuf @ adig acom "memo" akey sbuf @ 20 lit + 14 lit ahx" acom
+	"amount" akey sbuf @ 20 lit + slotamt au64 acom "created" akey sbuf @ 40 lit + @ anum acom
+else "commitment" akey "null" a" acom then
+"siblings" akey "[" a" 28 lit 0 lit do i if acom then asib @ i 5 lit lshift + adig loop "]" a" acom
+"state_root" akey ab32 @ sroot0 ab32 @ adig acom
+"height" akey myh @ anum "}" a"
+stx @ txcommit drop
+"200 OK" asend ;
+
+: afees
+abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "estimates" akey "null" a" "}" a"
+"200 OK" asend ;
+
+: amempool
+abegin "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum acom "transactions" akey "[" a"
+0 lit an !
+QSLOTS 0 lit do
+	i qused if
+		an @ if acom then  an @ 1 lit + an !
+		i qslot ae !
+		"{" a" "id" akey ae @ 10 lit + ab32 @ ycanon ab32 @ adig acom
+		"fee" akey ae @ 8 lit + dup @ swap 4 lit + @ au64 acom "size" akey ae @ 4 lit + @ anum "}" a"
+	then
+loop
+"]" a" "}" a"
+"200 OK" asend ;
+
+\ awhy ( code -- s )  what a pool's refusal means (qadmit's codes).
+: awhy  0 lit swap - dup 15 lit u< if 2 lit lshift aerrs @ + @ else drop "refused" then ;
+
+\ atx  the transaction offered to the pool; relayed if pooled.
+: atx
+abod @ 0= if "no transaction" "400 Bad Request" afail else
+	abod @ abn @ qadmit
+	dup 0= if
+		drop  qid @ ab32 @ ycanon  ab32 @ FFFFFFFF lit pann
+		"api: tx 0 " puts ab32 @ nhex 0A lit putc
+		abegin "{" a" "accepted" akey "true" a" acom "id" akey ab32 @ adig "}" a" "200 OK" asend
+	else
+		"api: tx " puts dup . 0A lit putc
+		abegin "{" a" "accepted" akey "false" a" acom
+		"code" akey 2D lit a, dup 0 lit swap - anum acom
+		"reason" akey aqt awhy a" aqt "}" a"
+		"400 Bad Request" asend
+	then
+then ;
+
+\ agen  a new token: 32 random bytes in hex, written to /etc/node/token
+\ (made mode 600 before it is written).
+: agen
+"/dev/random" 0 lit open dup ab32 @ 20 lit read drop close drop
+20 lit 0 lit do
+	ab32 @ i + c@  dup 4 lit rshift nhd atk @ i 1 lit lshift + c!  F lit and nhd atk @ i 1 lit lshift + 1 lit + c!
+loop
+0 lit atk @ 40 lit + c!
+"/etc/node/token" 601 lit open
+"/etc/node/token" 180 lit chmod drop
+dup atk @ 40 lit write drop close drop ;
+
+: atoken
+agen
+abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
+"200 OK" asend ;
+
+\ atipr  the tip, answered.
+: atipr  abegin "{" a" "height" akey myh @ anum acom "tip" akey mytip @ adig "}" a"  "200 OK" asend ;
+\ A request waiting for the tip (8 at most): its connection, until when
+\ (s), the tip it knew.
+: atip
+"after=" aqv ?dup if ab32 @ 20 lit ahexb if ab32 @ mytip @ 20 lit d8= else 0 lit then else 0 lit then
+if
+	FFFFFFFF lit 8 lit 0 lit do awt @ i 28 lit * + @ 0= if drop i then loop
+	dup 0< if drop atipr else
+		28 lit * awt @ +  acfd @ over !  ntime 1E lit + over 4 lit + !  ab32 @ swap 8 lit + 20 lit bcopy  0 lit acfd !
+	then
+else atipr then ;
+\ awake  the waiting requests whose tip moved, or whose time is up, answered.
+: awake
+8 lit 0 lit do
+	awt @ i 28 lit * + dup @ if
+		dup 8 lit + mytip @ 20 lit d8= 0=  ntime 2 lit pick 4 lit + @ u< 0= or if
+			dup @ acfd !  0 lit swap !  atipr
+		else drop then
+	else drop then
+loop ;
+
+: aroute
+apost @ if
+	apath @ "/v1/tx" streq if atx else
+	apath @ "/v1/token" streq if atoken else anotf then then
+else
+	apath @ "/v1/status" streq if astatus else
+	"/v1/header/" apre if aheader else
+	"/v1/block/" apre if ablock else
+	apath @ "/v1/outputs" streq if aoutputs else
+	apath @ "/v1/spent" streq if aspent else
+	"/v1/name/" apre if aname else
+	"/v1/proof/output/" apre if aproof else
+	apath @ "/v1/fees" streq if afees else
+	apath @ "/v1/mempool" streq if amempool else
+	apath @ "/v1/tip" streq if atip else anotf
+	then then then then then then then then then then
+then ;
+
+\ aone  the connection in acfd: its request read, checked, answered.
+: aone
+areq if aparse else 0 lit then
+0= if "bad request" "400 Bad Request" afail else
+	aauth @ 0= if abegin "401 Unauthorized" asend else aroute then
+then
+abod @ ?dup if free 0 lit abod ! then ;
+
+\ aserve ( s -- )
+: aserve
+ntime + aend !
+begin ntime aend @ u< while
+	3B9ACA00 lit pwait 7 lit = if  prx @ 25 lit + le@ pst @ 34 lit + !  ncatch  then
+	nrelay
+	pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then
+	awake
+repeat ;
+
+: ainit  ( port -- )
+2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
+10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
+20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
+140 lit alloc dup awt ! 50 lit wzero
+A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
+54 lit alloc aerrs !
+"does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !
+"too large" aerrs @ 10 lit + !  "an output below the dust limit" aerrs @ 14 lit + !
+"outputs exceed inputs" aerrs @ 18 lit + !  "fee below the minimum" aerrs @ 1C lit + !
+"invalid signature" aerrs @ 20 lit + !  "spends an output that is not unspent" aerrs @ 24 lit + !
+"already in the pool" aerrs @ 28 lit + !  "a name or commit already claimed" aerrs @ 2C lit + !
+"a replacement short of its fee" aerrs @ 30 lit + !  "the pool is full" aerrs @ 34 lit + !
+"no commit for the reveal" aerrs @ 38 lit + !  "the commit expired" aerrs @ 3C lit + !
+"the name is registered" aerrs @ 40 lit + !  "the name is not registered" aerrs @ 44 lit + !
+"not the owner's update" aerrs @ 48 lit + !  "a policy input's leaf not satisfied" aerrs @ 4C lit + !
+"too many signatures for a segment" aerrs @ 50 lit + !
+\ the token: kept, or made
+"/etc" mkdir drop  "/etc/node" mkdir drop
+"/etc/node/token" 0 lit open dup 0< if drop agen else
+	dup atk @ 40 lit read 40 lit = if close drop 0 lit atk @ 40 lit + c! else close drop agen then
+then
+\ the listener
+2 lit socket alfd !
+alfd @ 1 lit 0 lit 3 lit pick net drop  drop
+alfd @ 3 lit 0 lit 0 lit net drop
+alfd @ pxfd ! ;

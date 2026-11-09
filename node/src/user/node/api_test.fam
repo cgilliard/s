@@ -1,0 +1,54 @@
+\ api_test.fam — the API (docs/NODE.md, step 8), a program for the OS with
+\ a disk and the network, after what sync_test.fam is, query.fam and
+\ api.fam.  scripts/apitest.sh runs a tabminer mining the recursive dev
+\ network on the host (UDP 3747, seen from the guest at 10.0.2.2) and
+\ forwards a host port to the API's (3738).  The node syncs as
+\ sync_test.fam does, starts the API (its token made, /etc/node/token),
+\ starts /bin/apicli (a program in the OS using the API), says the token
+\ for the host's client (as the user would give it), then serves: its
+\ peers, the API, for ten minutes.
+
+: tnet variable ;  : tdc variable ;  : tcr variable ;  : tseen variable ;
+
+\ rdfile ( path -- addr n )  a whole file of at most 1.25 MiB, in memory.
+: rdfile
+0 lit open  dup 0< if "sync_test: no file" puts 0A lit putc then
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+\ The recursive dev network (tabminer's ChainParams::DEV_RECURSIVE), as
+\ headers.fam takes it: 2^10 items, 254 parents, 64 accesses; genesis's
+\ target 2^228; the easiest 2^248 - 1; the drift 7,200 s; the median of
+\ 11; the final height; 10 s blocks, a half-life of 300 s, from block 1.
+: tparams
+64 lit alloc dup tnet !
+A lit over 0 lit w!  FE lit over 1 lit w!  40 lit over 2 lit w!
+dup 3 lit 2 lit lshift + 8 lit wzero  10 lit over A lit w!
+8 lit 0 lit do FFFFFFFF lit over i B lit + w! loop  FFFFFF lit over 12 lit w!
+1C20 lit over 13 lit w!  B lit over 14 lit w!  3279DB0 lit over 15 lit w!
+A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
+
+"/lib/akjv.txt.gz" rdfile powinit
+"/lib/chainver" rdfile drop cvinit
+"/t-sync" TREE CREATE or 2 lit or open stinit  sninit  ninit  xinit tinit qinit yinit
+"/lib/devchain" rdfile drop 4 lit + tdc !
+tparams  tnet @ tdc @ 60 lit + 1000 lit hinit
+tdc @ dup 60 lit + prinit
+\ our status: genesis, no work
+20 lit alloc dup mygen !  0 lit he hid swap 8 lit wcopy
+20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
+20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
+20 lit alloc tcr !
+A000202 lit EA3 lit E99 lit pinit
+4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
+0= if
+	E9A lit ainit
+	"api: listening, token " puts atk @ puts 0A lit putc
+	"apicli" spawn drop
+	258 lit aserve
+then
+bye

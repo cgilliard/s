@@ -36,7 +36,7 @@
 : ptx variable ;  : ptp variable ;  : prx variable ;  : prn variable ;  : pent variable ;  : pfrom variable ;
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
-: pidle variable ;  : pnew variable ;
+: pidle variable ;  : pnew variable ;  : pxfd variable ;  : pxrdy variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
@@ -74,7 +74,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ 1 lit 0 lit rot net drop
-600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  10 lit alloc pfrom !
+600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
@@ -85,8 +85,14 @@ padd puse
 \ d8= ( a b n -- flag )  n bytes equal.
 : d8=  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
 
-\ prdy ( ns -- flag )  a datagram waiting within ns.
-: prdy  pfd @ pent @ !  1 lit pent @ 4 lit + !  pent @ 1 lit rot poll 0 lit > ;
+\ prdy ( ns -- flag )  a datagram waiting within ns; or, sooner, the
+\ descriptor in pxfd (if any: the API's listener) readable, pxrdy set.
+: prdy
+pfd @ pent @ !  1 lit pent @ 4 lit + !  pxfd @ pent @ 8 lit + !  1 lit pent @ C lit + !
+pent @ pxfd @ if 2 lit else 1 lit then rot poll 0 lit > if
+	pent @ C lit + @ 10 lit rshift 0= 0= pxfd @ 0= 0= and pxrdy !
+	pent @ 4 lit + @ 10 lit rshift 0= 0=
+else 0 lit then ;
 
 : u16@  dup c@ swap 1 lit + c@ 8 lit lshift or ;   \ ( a -- x )
 \ pcko ( index -- )  chunk index of the transaction at pgb (pgn bytes),
