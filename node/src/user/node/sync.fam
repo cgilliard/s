@@ -171,8 +171,10 @@ ncode @ 0= if
 then
 ncode @ ;
 
-\ ncatch  headers from the best to the peer's height, each checked in
-\ full: asked for from the best's height on, or, when the first of them
+\ ncatch  headers from the best to the peer's height, each quick-checked
+\ and the best's work then in full (as a fast sync: each other's is
+\ covered by the proof of the block after it, checked as it connects; a
+\ best whose work fails is set aside): asked for from the best's height on, or, when the first of them
 \ does not join (its parent unknown: the peer's chain forked below our
 \ best), from 2, 4, 8... lower until it does.  Then, if our tip is not on
 \ the best branch, our blocks above where it joins undone (sundo: there
@@ -181,11 +183,24 @@ ncode @ ;
 \ connected.  A block refused sets its header aside (hmark), so the best
 \ is another branch, ours or the old: the next turn goes back to it.  nk
 \ counts the blocks connected.
-: nfl variable ;  : nhb variable ;  : nstp variable ;  : nbk variable ;  : nfk variable ;
+: nfl variable ;  : nhb variable ;  : nstp variable ;  : nbk variable ;  : nfk variable ;  : nuw variable ;  : nchg variable ;  : nb0 variable ;  : ncn variable ;  : nln variable ;  : nrl variable ;
+\ nann  our tip announced (Inv: its header and its block's length) to
+\ every answering peer but the current, as tabminer relays a block it
+\ accepts: only ever the best header, whose work is checked in full
+\ before it is the best; a peer that wants it asks for its chunks (pgive).
+: nann
+0 lit nrl !
+pnp @ ?dup if 0 lit do
+	i pcur @ <>  i prec 8 lit + @ and  i prec B0 lit + @ 0= and if
+		7 lit wbeg  myh @ hat hhdr CC lit wbs  nln @ w32  i psend  nrl @ 1 lit + nrl !
+	then
+loop then
+vrb @ nrl @ and if nhead "block " puts myh @ u. " relayed to " puts nrl @ u. " peers" puts 0A lit putc then ;
 \ nundo? ( -- flag )  undo data for our tip's block.
 : nundo?  stfd @ 0 lit txbegin stx !  myh @ 0 lit kundo sbuf @ 4 lit sget 0 lit >  stx @ txcommit drop ;
 : ncatch
-0 lit nfl !  ticks nt0 !  hbest hheight nh0 !  1 lit nstp !
+0 lit nfl !  ticks nt0 !  hbest hheight nh0 !  1 lit nstp !  0 lit nuw !  0 lit nchg !  qmvoff
+hbst @ nb0 !  0 lit ncn !  -1 lit hquick !
 begin hbest hheight pst-h u< nfl @ 0= and while
 	hbest hheight 1 lit +  nstp @ 1 lit -  over 1 lit - umin  -
 	0 lit nbk !
@@ -200,8 +215,16 @@ begin hbest hheight pst-h u< nfl @ 0= and while
 	else 1 lit nfl ! then
 	drop
 repeat
-vrb @ hbest hheight nh0 @ u> and if
-	nhead "headers to " puts hbest hheight u. ", fetched and their work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
+0 lit hquick !
+\ the best's work in full; one that fails set aside, until one passes
+hbst @ nb0 @ <> if
+	begin hbst @ nb0 @ <> if hbest hheight hconf 0= else 0 lit then while
+		vrb @ if nhead "header " puts hbest hheight u. "'s proof of work refused; its branch set aside" puts 0A lit putc then
+		hbest hmark
+	repeat
+	vrb @ if
+		nhead "headers to " puts hbest hheight u. ", fetched and the best's work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
+	then
 then
 0 lit nfl !
 \ our tip off the best branch: undone down to where it joins
@@ -210,7 +233,7 @@ myh @ if mytip @ hfind dup 0< if drop else
 	myh @ nfk @ u> if
 		vrb @ if nhead "reorganizing: our " puts myh @ nfk @ - u. " blocks above " puts nfk @ u. " leave for the best branch" puts 0A lit putc then
 		begin myh @ nfk @ u> nfl @ 0= and while
-			nundo? if sundo nstat  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
+			nundo? if sundo nstat  1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
 			else
 				vrb @ if nhead "cannot undo block " puts myh @ u. " (none is kept for a fast sync's start and below): a new sync is needed" puts 0A lit putc then
 				1 lit nfl !
@@ -225,14 +248,26 @@ myh @ hbest hheight u< nfl @ 0= and if
 				hhdr nblk @ CC lit + nbn @ CC lit - sconnect ?dup if
 					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
 					i hat hmark  1 lit nfl !
-				else nk @ 1 lit + nk ! nstat  vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then then
+				else
+					nk @ 1 lit + nk ! nstat  1 lit nchg !  nuw @ if qmvblk then  ncn @ 1 lit + ncn !  nbn @ nln !
+					vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then
+				then
 				nblk @ free 0 lit nblk !
 			else drop "block not fetched: " nsay i nsayn 1 lit nfl ! then
 		then
 	loop
-	ticks nt0 !  qcheck
-	vrb @ qnum @ and if nhead "the pool rechecked (" puts qnum @ u. " held) in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then
-then ;
+then
+\ the pool: out what the new blocks spent or settled otherwise, onto the
+\ shelf; back from the shelf what is valid again (the blocks undone)
+nchg @ if
+	0 lit qout !  ticks nt0 !  qcheck qreturn
+	vrb @ qnum @ qout @ or qbk @ or and if
+		nhead "the pool: " puts qnum @ u. " held, " puts qout @ u. " out (mined or conflicted), " puts qbk @ u. " back; in " puts
+		ticks nt0 @ - nsec " s" puts 0A lit putc
+	then
+	qmvoff
+then
+ncn @ myh @ hbest hheight = and if nann then ;
 
 \ pfollow ( n -- k )  each announcement (Inv) taken as the peer's height,
 \ and caught up to; up to a minute a block.
@@ -258,15 +293,33 @@ begin pdeq ?dup while
 	then
 repeat ;
 
-\ nstep  a turn of following, up to a second: an announcement (Inv)
-\ taken as the peer's height, or a Pong showing it ahead of us, caught up
-\ to (so a block announced while we were lost to the peer is not missed);
-\ the peers kept (pkeep); the transactions announced relayed.
+\ nstep  a turn of following, up to a second: the peers kept (pkeep);
+\ the answering peer furthest ahead of us, by its last Pong or
+\ announcement (Inv), made the current and caught up to (so a block
+\ announced while we were lost to it is not missed, and a peer gone is
+\ replaced by another); one whose claim brought nothing passed over for
+\ a minute; the transactions announced relayed.
+: nah variable ;  : nahh variable ;
+\ nahead ( -- k | -1 )
+: nahead
+FFFFFFFF lit nah !  myh @ nahh !
+pnp @ ?dup if 0 lit do
+	i prec 8 lit + @  i prec B0 lit + @ 0= and  secs i prec B4 lit + @ - 0< 0= and if
+		i prec 4C lit + @ nahh @ u> if i nah !  i prec 4C lit + @ nahh ! then
+	then
+loop then nah @ ;
 : nstep
-3B9ACA00 lit pwait
-dup 7 lit = if drop prx @ 25 lit + le@ pst @ 34 lit + !  ncatch else
-2 lit = if pst-h myh @ u> if ncatch then then then
-pkeep  nrelay ;
+3B9ACA00 lit pwait drop
+pkeep
+nahead dup 0< if drop else
+	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop
+	ncatch
+	nchg @ 0= if
+		secs 3C lit + pcur @ prec B4 lit + !
+		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
+	then
+then
+nrelay ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;

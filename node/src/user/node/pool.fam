@@ -12,8 +12,8 @@
 \ replaces and 10 a byte more; room, the lowest-paying evicted for it.
 \
 \ The pool's policy is the node's own (docs/FEES.md): tabminer's floor,
-\ dust and replacement rules; not yet its rolling minimum, aged reserve,
-\ expiry or shelf.  Up to QSLOTS transactions, QBYTES bytes.
+\ dust and replacement rules, and its shelf; not yet its rolling minimum,
+\ aged reserve or expiry.  Up to QSLOTS transactions, QBYTES bytes.
 \
 \ qadmit ( a n -- code )  the transaction offered: 0, or why not: -1 it
 \ does not decode, tstatic's codes, -8 a signature, -9 an input not
@@ -23,7 +23,15 @@
 \ not registered, -18 not the owner's update, -19 a policy input's leaf
 \ not satisfied.  Its id in qid.
 \ qcheck  after the tip moved: the transactions whose inputs are spent or
-\ whose operations fail now dropped.
+\ whose operations fail now taken out, onto the shelf (qout counts them).
+\ qreturn  after that: each shelved transaction offered again (qadmit),
+\ back in the pool if admitted (qbk counts them); an input whose output is
+\ not at its position but was made again, at another, by a block of a
+\ branch that replaced ours (qmvblk noted it) moved there first, as
+\ tabminer's Mempool::revalidate does: positions are not signed.  The
+\ shelf holds QSHELF, the oldest leaving first.
+\ qmvblk  the outputs of the block just connected (sconnect's bout, from
+\ sfirst) noted for qreturn; qmvoff forgets them.
 \ qfind ( id -- k | -1 )  the slot holding a pooled id.
 \ A slot (64 bytes): the bytes (0 if free), their length, the fee (2
 \ words), the id (8 Montgomery words), the positions spent (a count, then
@@ -196,11 +204,25 @@ repeat
 qroom ;
 
 \ qdrop ( k -- )  slot k emptied.
-: qdrop
-qslot dup @ ?dup if
-	free  dup 30 lit + @ free  dup 34 lit + @ free
-	qbytes @ over 4 lit + @ - qbytes !  qnum @ 1 lit - qnum !
-	0 lit swap !
+\ qrel ( a -- )  slot a emptied, its other parts freed (its bytes not).
+: qrel
+dup 30 lit + @ free  dup 34 lit + @ free
+qbytes @ over 4 lit + @ - qbytes !  qnum @ 1 lit - qnum !
+0 lit swap ! ;
+: qdrop  qslot dup @ ?dup if free qrel else drop then ;
+
+\ The shelf: QSHELF (a power of two) entries of 8 bytes, the bytes (0
+\ empty) and their length, filled in turn from qshh.
+:M QSHELF 100 lit ;
+: qsh variable ;  : qshh variable ;  : qout variable ;  : qbk variable ;
+: qmv variable ;  : qnmv variable ;
+\ qshelve ( k -- )  slot k's transaction taken out, onto the shelf.
+: qshelve
+qslot dup @ if
+	qsh @ qshh @ 3 lit lshift +  dup @ ?dup if free then
+	over @ over !  over 4 lit + @ swap 4 lit + !
+	qshh @ 1 lit + QSHELF 1 lit - and qshh !
+	qrel  qout @ 1 lit + qout !
 else drop then ;
 
 \ qadd ( a n -- )  the transaction parsed (its id in qid, fee in tfee,
@@ -298,14 +320,64 @@ QSLOTS 0 lit do
 		0 lit qcode !  0 lit qncf !
 		tnall ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
 		qok tnops @ 0= 0= and if qops then
-		qok 0= if qka @ qdrop then
+		qok 0= if qka @ qshelve then
 	then
 loop
 stx @ txcommit drop ;
 
 : qinit
 QSLOTS 6 lit lshift alloc dup qbase !  QSLOTS 4 lit lshift wzero
+QSHELF 3 lit lshift alloc dup qsh !  QSHELF 1 lit lshift wzero  0 lit qshh !
+A000 lit malloc qmv !  0 lit qnmv !
 0 lit qbytes !  0 lit qnum !  0 lit qord !
 20 lit alloc qid !  40 lit alloc qtmp !  20 lit alloc qkc !  20 lit alloc qlv !  60 lit alloc qcb !
 20 lit alloc qch !  20 lit alloc qown !  20 lit alloc qum !  400 lit alloc qcf !  200 lit alloc qcl !
 QSLOTS 2 lit lshift alloc qvic !  20 lit alloc qmsg !  20 lit alloc qcov !  50 lit alloc qrb !  10 lit alloc qm1 !  10 lit alloc qm2 !  4 lit alloc qw1 !  4 lit alloc qw2 ! ;
+
+\ The outputs a replacing branch made: QMV at most, 40 bytes each (the
+\ commitment, 8 Montgomery words as the store's; the position, 2 words).
+:M QMV 400 lit ;
+: qmvblk
+bnout @ ?dup if 0 lit do
+	qnmv @ QMV u< if
+		bout @ i 3C lit * +  qmv @ qnmv @ 28 lit * + dle
+		sfirst @ i +  qmv @ qnmv @ 28 lit * + 20 lit + !  0 lit qmv @ qnmv @ 28 lit * + 24 lit + !
+		qnmv @ 1 lit + qnmv !
+	then
+loop then ;
+: qmvoff  0 lit qnmv ! ;
+
+\ q4! ( x a -- )  x at a, 4 bytes little-endian (a need not be aligned).
+: q4!  4 lit 0 lit do 2dup c! 1 lit + swap 8 lit rshift swap loop 2drop ;
+\ qmove ( a n -- a n )  the inputs of the transaction at a whose outputs
+\ are not at their positions moved where qmvblk saw them made, if they
+\ hold there and no pooled transaction spends them (its bytes changed).
+: qmi variable ;
+: qmove
+qnmv @ if 2dup tparse if
+	stfd @ 0 lit txbegin stx !
+	tnin @ ?dup if 0 lit do
+		i qholds 0= if
+			i qmi !  i qkc @ tikh
+			qnmv @ 0 lit do
+				qmv @ i 28 lit * +  dup qkc @ 8 lit wcmp 0= if
+					dup 20 lit + @ over 24 lit + @  2dup qspender 0< if
+						2dup oget if sbuf @ qtmp @ dle  qtmp @ qkc @ 8 lit wcmp 0= else 0 lit then
+						if
+							tin @ qmi @ w@ 39 lit +  rot over q4!  4 lit + q4!
+						else 2drop then
+					else 2drop then
+				then drop
+			loop
+		then
+	loop then
+	stx @ txcommit drop
+then then ;
+
+: qreturn
+0 lit qbk !
+QSHELF 0 lit do
+	qsh @ i 3 lit lshift +  dup @ if
+		dup @ over 4 lit + @  qmove  qadmit 0= if  dup @ free  0 lit swap !  qbk @ 1 lit + qbk ! else drop then
+	else drop then
+loop ;

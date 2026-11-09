@@ -28,6 +28,7 @@
 \ pann ( id k -- )  TxInv (id: 32 canonical bytes) to every peer that
 \ answered but k.
 \ pkeep  each peer pinged when its time comes, as tabminer does: every
+\ (and, while fewer than PPEERS answer, more asked for: pdisc)
 \ 30 s while it answers; one that has not answered within 35 s again
 \ after 2 s, then 4, 8 and so on to 30, for good (a peer restarted forgets
 \ us until we ping it).  Silent for 180 s it is said lost (with vrb), and
@@ -52,11 +53,12 @@
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
+: pgkd variable ;  : pbid variable ;  : pbb variable ;  : pbn variable ;  : pbl variable ;  : pbsrc variable ;
 : pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
 
 :M PWIN 4 lit ;                               \ chunks in flight
 :M PMAX 400000 lit ;                          \ the largest object taken: 4 MiB
-:M PPEERS 4 lit ;
+:M PPEERS 8 lit ;
 
 \ Writing a datagram at ptx.
 : w8  ptp @ c!  ptp @ 1 lit + ptp ! ;
@@ -84,10 +86,11 @@ A lit 0 lit w64  A lit 0 lit w64 ;
 
 : prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
 \ then (pkeep's, in secs) when to ping it next (A4), the wait after that
-\ (A8), when it last answered (AC), whether said lost (B0)
+\ (A8), when it last answered (AC), whether said lost (B0); until when its
+\ claims are passed over (B4: it claimed a height it did not deliver)
 : psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
 : puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
-: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec A4 lit + 4 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec 4C lit + 0 lit swap !  pnp @ prec A4 lit + 5 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
 \ pwho ( ip port -- k | -1 )
 : pwho
 FFFFFFFF lit pfk !
@@ -96,7 +99,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
-600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
+600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  10 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
@@ -132,16 +135,42 @@ else 0 lit then ;
 \ if there is one, to peer pfk.
 : pcko
 dup A lit lshift dup pgn @ u< if
-	9 lit wbeg  1 lit w8  prx @ E lit + 20 lit wbs  pgn @ w32  swap w16
+	9 lit wbeg  pgkd @ w8  prx @ E lit + 20 lit wbs  pgn @ w32  swap w16
 	pgn @ over - dup 400 lit u> if drop 400 lit then  dup w16  swap pgb @ + swap wbs
 	pfk @ psend
 else 2drop then ;
-\ pgive  the GetChunks in prx: the chunks of a pooled transaction, if it
-\ carries our token.
+\ pblock ( -- flag )  pbb/pbn the block whose id is at prx+E (32 bytes),
+\ if it is on our chain at or below our tip: its header then its body
+\ (the store's, kept for 1,008 blocks), as a block is fetched.  The last
+\ one built is kept (pbid), as each GetChunks asks for a few chunks.
+: pblock
+prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and if -1 lit else
+	prx @ E lit + pidm @ 20 lit bcopy
+	pidm @ hfind dup 0< if drop 0 lit else
+		he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if
+			stfd @ 0 lit txbegin stx !  dup hheight ybody  stx @ txcommit drop
+			dup if
+				pbl ! pbsrc !
+				pbb @ ?dup if free then
+				pbl @ CC lit + dup pbn !  malloc pbb !
+				dup hhdr pbb @ CC lit bcopy  drop
+				pbsrc @ pbb @ CC lit + pbl @ bcopy  pbsrc @ free
+				prx @ E lit + pbid @ 20 lit bcopy  -1 lit
+			else 2drop drop 0 lit then
+		else drop 0 lit then
+	then
+then ;
+\ pgive  the GetChunks in prx, if it carries our token: the chunks of a
+\ pooled transaction (kind 1), or of a block on our chain (kind 0).
 : pgive
-prx @ 5 lit + mtok @ 8 lit d8=  prx @ D lit + c@ 1 lit = and  prn @ 2F lit u< 0= and if
-	prx @ E lit + pidm @ dle  pidm @ qfind dup 0< if drop else
-		qslot dup @ pgb !  4 lit + @ pgn !
+prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
+	prx @ D lit + c@ dup pgkd !
+	dup 1 lit = if
+		drop  prx @ E lit + pidm @ dle  pidm @ qfind dup 0< if drop 0 lit else qslot dup @ pgb !  4 lit + @ pgn !  -1 lit then
+	else
+		0= if pblock if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
+	then
+	if
 		prx @ 2E lit + c@  dup 2 lit lshift 2F lit + prn @ u> if drop 0 lit then
 		?dup if 0 lit do
 			prx @ 2F lit + i 2 lit lshift +  dup u16@ swap 2 lit + u16@
@@ -198,6 +227,28 @@ else drop then ;
 prec dup @  dup 18 lit rshift u. 2E lit putc  dup 10 lit rshift FF lit and u. 2E lit putc
 dup 8 lit rshift FF lit and u. 2E lit putc  FF lit and u. 3A lit putc  4 lit + @ u. ;
 
+\ plearn ( ip port -- k | -1 )  an address added if new and there is
+\ room (its index, else -1): pinged by pkeep from then on.
+: plearn  2dup pwho 0<  pnp @ PPEERS u< and if padd else 2drop FFFFFFFF lit then ;
+\ ppeerin  the Peers in prx: each address added (plearn).  As a peer sees
+\ them: a loopback one from a peer at QEMU's host address (10.0.2.2) is
+\ that host's, as the guest reaches it; other loopback ones, ours
+\ (10.0.2.15) and 0 left out.
+: ppeerin
+prx @ 5 lit + c@  dup 6 lit * 6 lit + prn @ u> if drop else
+	?dup if 0 lit do
+		prx @ 6 lit + i 6 lit * +
+		dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or over 3 lit + c@ or
+		swap 4 lit + u16@
+		over 18 lit rshift 7F lit = if
+			pfrom @ @ A000202 lit = if nip A000202 lit swap else 2drop 0 lit 0 lit then
+		then
+		over 0= over 0= or  2 lit pick A00020F lit = or if 2drop else
+			plearn dup 0< if drop else vrb @ if nhead "peer " puts dup pshow " told of; asking it" puts 0A lit putc then drop then
+		then
+	loop then
+then ;
+
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
@@ -205,7 +256,15 @@ prdy if
 	pfrom @ @ pfrom @ 4 lit + @ 2dup pwho drop ptokn
 	prn @ 5 lit u< prx @ @ 31424154 lit <> or if 0 lit else
 		prx @ 4 lit + c@
-		dup 1 lit =  prn @ 91 lit u< 0= and if  2 lit wbeg  prx @ 5 lit + wstatus  prply  then
+		dup 1 lit =  prn @ 91 lit u< 0= and if
+			2 lit wbeg  prx @ 5 lit + wstatus  prply
+			\ a pinger on our chain (its genesis ours) taken as a peer, as
+			\ tabminer takes them (a tabernacle's Ping is all zeros: not)
+			pfk @ 0<  prx @ 19 lit + mygen @ 20 lit d8= and if
+				pfrom @ @ pfrom @ 4 lit + @ plearn
+				dup 0< if drop else vrb @ if nhead "peer " puts dup pshow " pinged us; asking it" puts 0A lit putc then drop then
+			then
+		then
 		prn @ D lit u< 0=  prx @ 5 lit + mtok @ 8 lit d8= and if
 			dup 3 lit = prn @ D lit = and if ppeers then
 			dup 40 lit = prn @ D lit = and if pimgs then
@@ -222,13 +281,33 @@ prdy if
 		then
 		dup 8 lit = if pgive then
 		dup A lit = if pqinv then
+		dup 4 lit = if ppeerin then
+		dup 7 lit = prn @ 29 lit u< 0= and if prx @ 25 lit + le@ pfk @ prec 4C lit + ! then   \ an Inv: the peer's height
 		pfk @ pcur @ = 0= if drop 0 lit then
 		then
 	then
 else 0 lit then ;
 
 \ pkeep
-: pkt variable ;
+: pkt variable ;  : pdn variable ;  : pdk variable ;
+\ panswer ( -- n )  how many peers answer.
+: panswer  0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ i prec B0 lit + @ 0= and if 1 lit + then loop then ;
+\ pdisc  while fewer than PPEERS answer, a GetPeers to one that does (in
+\ turn), each minute.
+: pdf variable ;
+: pdisc
+secs pdn @ - 0< 0=  panswer dup PPEERS u< swap 0= 0= and and if
+	0 lit pdf !
+	pnp @ 0 lit do
+		pdf @ 0= if
+			pdk @ 1 lit + dup pnp @ u< 0= if drop 0 lit then pdk !
+			pdk @ prec 8 lit + @ pdk @ prec B0 lit + @ 0= and if
+				3 lit wbeg  pdk @ prec 10 lit + 8 lit wbs  pdk @ psend  1 lit pdf !
+			then
+		then
+	loop
+	secs 3C lit + pdn !
+then ;
 : pkeep
 pnp @ ?dup if 0 lit do
 	secs pkt !
@@ -242,7 +321,8 @@ pnp @ ?dup if 0 lit do
 			1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 180 s, still asking" puts 0A lit putc then
 		then
 	then
-loop then ;
+loop then
+pdisc ;
 
 \ pann ( id k -- )
 : pann

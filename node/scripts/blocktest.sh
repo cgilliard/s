@@ -1,0 +1,75 @@
+#!/bin/sh
+# blocktest.sh — the node (bin/img's, run from its shell) relaying blocks
+# (docs/NODE.md, step 10).  On the host, tabminer A mines the recursive dev
+# network (UDP 37471) to 6 blocks; its data is copied for tabminer C,
+# which does not mine and whose only peer is the node (its UDP port
+# forwarded from the host).  The node syncs from A (not mining then); C
+# pings it and the node takes C as a peer.  Then A mines on: each block
+# reaches C only through the node, which announces its tip once connected
+# (its work checked in full) and serves the block's chunks.  C must take
+# two blocks from the node.
+# Needs tabminer built with the dev networks:
+#   (cd ../miner && cargo build --release --features dev)
+# Usage: scripts/blocktest.sh
+set -e
+cd "$(dirname "$0")/.."
+MINER=../miner/target/release/tabminer
+T=tmp/blocktest
+PA=${BLOCKTEST_A:-37471}; PC=${BLOCKTEST_C:-37478}; FWD=${BLOCKTEST_FWD:-37379}
+[ -x "$MINER" ] || { echo "blocktest.sh: build tabminer first: (cd ../miner && cargo build --release --features dev)" >&2; exit 1; }
+[ -f bin/img ] || { echo "blocktest.sh: run scripts/build.sh first" >&2; exit 1; }
+rm -rf "$T"; mkdir -p "$T"
+dd if=/dev/zero of="$T/node.disk" bs=1 count=0 seek=268435456 2>/dev/null
+
+AP=; CP=; QP=
+trap 'st=$?; exec 3>&- 2>/dev/null; for p in $QP $CP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM
+minera() {
+	TABMINER_THREADS=${TABMINER_THREADS:-4} "$MINER" mine --network dev-recursive --data "$T/a" --no-seeds \
+		--listen 127.0.0.1:$PA --no-prompt "$@" >> "$T/a.out" 2>&1 &
+	AP=$!
+}
+stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null || true; }
+# wait_for FILE PATTERN SECONDS WHAT
+wait_for() {
+	i=0
+	until grep -qE "$2" "$1" 2>/dev/null; do
+		[ $i -lt "$3" ] || { echo "blocktest.sh: $4: not in $3 s" >&2; exit 1; }
+		sleep 2; i=$((i + 2))
+	done
+}
+
+echo "blocktest.sh: A mining 6 blocks"
+minera
+wait_for "$T/a.out" 'is the tip at height 6$' 600 "A's 6 blocks"
+stop $AP; AP=
+cp -r "$T/a" "$T/c"
+minera --no-mine
+
+echo "blocktest.sh: the node syncing from A"
+mkfifo "$T/in"
+./tools/q32 --net --hostfwd=udp::$FWD-:3737 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
+QP=$!
+exec 3> "$T/in"
+wait_for "$T/os.out" '^\$ ' 60 "the shell"
+echo "node 10.0.2.2:$PA &" >&3
+wait_for "$T/os.out" '^node: .* synced, height 6' 900 "the node's sync"
+
+echo "blocktest.sh: C, its only peer the node"
+"$MINER" mine --no-mine --network dev-recursive --data "$T/c" --no-seeds --listen 127.0.0.1:$PC \
+	--peer 127.0.0.1:$FWD --no-prompt >> "$T/c.out" 2>&1 &
+CP=$!
+wait_for "$T/os.out" '^node: .* pinged us' 120 "C pinging the node"
+grep 'pinged us' "$T/os.out"
+# the node pinged C back, and C answered (its next keepalive at most 30 s on)
+sleep 1
+stop $AP; AP=
+minera
+echo "blocktest.sh: A mining on"
+wait_for "$T/c/tabminer.log" 'is the tip at height 7$' 600 "C taking block 7"
+wait_for "$T/c/tabminer.log" 'is the tip at height 8$' 600 "C taking block 8"
+grep -E 'is the tip at height (7|8)$' "$T/c/tabminer.log"
+grep -E '^node: .* relayed' "$T/os.out" | tail -3
+grep -qE "block from 127\\.0\\.0\\.1:$FWD .* is the tip at height 8$" "$T/c/tabminer.log" \
+	|| { echo "blocktest.sh: C's block 8 not from the node" >&2; exit 1; }
+echo "blocktest.sh: the node relayed A's blocks to C"

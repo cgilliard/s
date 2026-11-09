@@ -1117,16 +1117,40 @@ Each step done when its test passes.
       two past A's, and A, started again with B as its peer, reorganizes
       onto it: the node undoes its blocks above 6 and connects B's to
       B's tip.
+    - The pool's shelf (2026-11-09), as tabminer's `Mempool::revalidate`:
+      what leaves the pool when blocks spend or settle it goes on a
+      shelf (256 transactions, the oldest leaving first); after each tip
+      change each is offered again (`qadmit`), back if admitted; after a
+      reorganization an input whose output was made again at another
+      position by the new branch is moved there (positions are not
+      signed). `reorgtest.sh` has A's wallet burn a coin the node pools,
+      shelves once mined, and takes back when the node reorganizes onto
+      B's branch, which never mined it. Not yet: a policy input moved.
+    - Catching up as the fast sync does: new headers quick-checked, the
+      best's work in full (a best that fails set aside), each other's
+      covered by the next block's proof as it connects. A day away on
+      mainnet costs one header's check, not 144.
+    - Several peers (up to 8): `node IP:PORT ...` (the OS has no DNS:
+      the seeds by address for now); while fewer than 8 answer, GetPeers
+      to one that does, each minute, its Peers' addresses added (a
+      loopback one from QEMU's host is the host's); a pinger on our
+      chain taken as a peer, as tabminer takes them. The node follows
+      the answering peer furthest ahead (by its Pongs and Invs), one
+      whose claim brought nothing passed over for a minute; a fresh sync
+      tries each given in turn. `scripts/peertest.sh`: the node, given A
+      only, is told of B by A, and follows B once A is killed.
+    - Relaying blocks: once a turn's blocks are connected and our tip is
+      the best header (its work checked in full), it is announced (Inv)
+      to every answering peer but the one it came from, and its chunks
+      served (GetChunks kind 0: the header and the stored body).
+      `scripts/blocktest.sh`: tabminer C, its only peer the node, takes
+      A's blocks from it.
     - Not yet: started by init (held back while it is tried by hand),
-      configuration (network, peers, port), several peers and finding
-      them (`GetPeers`, the seeds), catching up after downtime with only
-      the tip's work checked in full, more than 65,536 headers (the store
-      holding them, a window in memory),
-      a log and a way to read its state from the shell; relaying the
-      blocks it follows to its other peers (only after their work is
-      checked in full, as tabminer: relaying on the quick check alone
-      would let a block with no real work cost every node that passes
-      it on).
+      configuration (network, port), serving headers, manifests and parts
+      to peers syncing from the node, striking peers that misbehave, more
+      than 65,536 headers (the store holding them, a window in memory),
+      a log and a way to read its state from the shell, verification on
+      a thread of its own.
 
 ## Open questions
 
