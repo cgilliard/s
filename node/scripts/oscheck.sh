@@ -389,6 +389,15 @@ f @ "x" 1 lit write "write " puts . 0A lit putc
 f @ close drop bye'
 sh scripts/mkimage.sh "$T/rnd.img" bin/kernel init="$T/trnd.bin" 2> "$T/rnd.mk" || fail rnd "mkimage: $(cat "$T/rnd.mk")"
 expect rnd 124 '^random ok read 32 32 differ yes rest 192 next 256 write -9$' 5 ./tools/q32 --smp=2 "$T/rnd.img"
+# The date: /proc/time from QEMU's real-time clock (node step 6), within a
+# minute of the host's, and in the /proc listing.
+usrc ttime ': b variable ;  20 lit alloc b !
+"/proc/time" 0 lit open dup b @ 20 lit read b @ + 0 lit swap c! close drop
+"time " puts b @ puts bye'
+sh scripts/mkimage.sh "$T/time.img" bin/kernel init="$T/ttime.bin" 2> "$T/time.mk" || fail time "mkimage: $(cat "$T/time.mk")"
+expect time 124 '^time [0-9]' 5 ./tools/q32 "$T/time.img"
+GT=$(sed -n 's/^time \([0-9]*\).*/\1/p' "$T/time.out" | head -1); HT=$(date +%s)
+[ -n "$GT" ] && [ $((GT - HT)) -lt 60 ] && [ $((HT - GT)) -lt 60 ] || fail time "guest $GT, host $HT"
 # The shell from the console: the image's programs and one writing 100 KiB,
 # commands typed a line at a time, on one hart and on four; one in the
 # background (&: its pid shown, then told done), and & before a line's end;

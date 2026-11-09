@@ -1,0 +1,170 @@
+\ p2p.fam — tabminer's peer protocol over UDP (docs/NODE.md, step 6), after
+\ the node's other words.  As tabminer's miner/src/net.rs: every datagram
+\ is "TAB1", a type byte and a little-endian payload, at most 1,232 bytes.
+\ A request carries the token the peer gave us in its last Ping or Pong; a
+\ peer serves requests only from an address that answered its Ping with
+\ the nonce echoed, so every Ping is answered.  One peer for now.
+\
+\ Blocks, manifests and parts come as 1,024-byte chunks, asked for in
+\ windows of PWIN: the guest's socket queues eight datagrams, and more in
+\ flight would be dropped.  Headers come as up to ten datagrams of six,
+\ from a height; those lost are asked for again from the first gap.
+\
+\ pinit ( ip port lport -- )  the socket (bound to lport) and the peer.
+\ pping ( -- flag )  a Ping until its Pong (a few seconds): the peer's
+\ status in pst.
+\ phdrs ( h -- n )  up to 60 main-chain headers from height h, into phb in
+\ order: how many arrived without a gap.
+\ pfetch ( kind part id -- a n | 0 0 )  an object: a block (kind 0), the
+\ manifest (2) or part `part` (3) of the snapshot after block id
+\ (canonical words); malloc'd.
+\ pwait ( ns -- type | 0 )  the next datagram from the peer, in prx (Pings
+\ answered, Pongs taken, meanwhile).
+\ Our status (myh, mytip, mywork, mygen) is the caller's to keep.
+
+: pfd variable ;  : pip variable ;  : ppt variable ;
+: ptok variable ;  : mtok variable ;  : mnon variable ;  : pst variable ;  : pok variable ;
+: ptx variable ;  : ptp variable ;  : prx variable ;  : prn variable ;  : pent variable ;  : pfrom variable ;
+: phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
+: pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
+: pidle variable ;  : pnew variable ;
+: myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
+
+:M PWIN 4 lit ;                               \ chunks in flight
+:M PMAX 400000 lit ;                          \ the largest object taken: 4 MiB
+
+\ Writing a datagram at ptx.
+: w8  ptp @ c!  ptp @ 1 lit + ptp ! ;
+: w16  dup w8 8 lit rshift w8 ;
+: w32  dup w16 10 lit rshift w16 ;
+: w64  swap w32 w32 ;                         \ ( lo hi -- )
+: wbs  tuck ptp @ swap bcopy  ptp @ + ptp ! ;  \ ( a n -- )
+: wbeg  ptx @ ptp !  54 lit w8 41 lit w8 42 lit w8 31 lit w8  w8 ;   \ ( type -- )
+: wsend  begin pfd @ ptx @ ptp @ ptx @ - pip @ ppt @ sendto FFFFFF8F lit = while 5F5E100 lit sleep repeat ;
+: wtok  ptok @ 8 lit wbs ;                     \ the peer's token for us
+
+\ wstatus ( nonce -- )  our status, with the nonce at its address.
+: wstatus
+8 lit wbs  A lit w32  mtok @ 8 lit wbs  mygen @ 20 lit wbs
+myh @ w32  myh @ 1 lit + w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
+A lit 0 lit w64  A lit 0 lit w64 ;
+
+: pinit  ( ip port lport -- )
+1 lit socket pfd !  pfd @ 1 lit 0 lit rot net drop
+ppt ! pip !
+600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  10 lit alloc pfrom !
+10 lit alloc ptok !  10 lit alloc mtok !  10 lit alloc mnon !  90 lit alloc pst !
+BF40 lit alloc phb !  40 lit alloc pgot !
+\ our token and nonce: random
+"/dev/random" 0 lit open dup mtok @ 8 lit read drop dup mnon @ 8 lit read drop close drop ;
+
+\ d8= ( a b n -- flag )  n bytes equal.
+: d8=  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
+
+\ prdy ( ns -- flag )  a datagram waiting within ns.
+: prdy  pfd @ pent @ !  1 lit pent @ 4 lit + !  pent @ 1 lit rot poll 0 lit > ;
+
+\ pwait ( ns -- type | 0 )
+: pwait
+prdy if
+	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
+	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfrom @ @ pip @ <> or  pfrom @ 4 lit + @ ppt @ <> or if 0 lit else
+		prx @ 4 lit + c@
+		dup 1 lit = if  2 lit wbeg  prx @ 5 lit + wstatus  wsend  then
+		dup 2 lit = if
+			prx @ 5 lit + mnon @ 8 lit d8= if
+				prx @ 5 lit + pst @ 8C lit bcopy  prx @ 11 lit + ptok @ 8 lit bcopy  1 lit pok !
+			then
+		then
+	then
+else 0 lit then ;
+
+: pping
+0 lit pok !
+8 lit 0 lit do
+	pok @ 0= if
+		1 lit wbeg  mnon @ wstatus  wsend
+		A lit 0 lit do pok @ 0= if 5F5E100 lit pwait drop then loop
+	then
+loop pok @ ;
+: pst-h  pst @ 34 lit + @ ;                   \ ( -- h )  the peer's height
+
+\ phdrs ( h -- n )
+: pgap  0 lit begin dup 3C lit u< if dup pgot @ + c@ else 0 lit then while 1 lit + repeat ;   \ ( -- g )
+: phdrs
+phh !  pgot @ 10 lit wzero  0 lit prnd !
+begin
+	pgap  dup 3C lit u<  over phh @ + pst-h 1 lit + u< and  prnd @ 4 lit u< and
+while
+	B lit wbeg wtok  phh @ + w32 wsend  prnd @ 1 lit + prnd !
+	begin 1DCD6500 lit pwait ?dup while
+		6 lit = if
+			prx @ 5 lit + c@ ?dup if 0 lit do
+				prx @ 6 lit + i CC lit * +  dup 20 lit + le@ phh @ -
+				dup 3C lit u< if dup pgot @ + 1 lit swap c!  CC lit * phb @ + CC lit bcopy else 2drop then
+			loop then
+		then
+	repeat
+repeat
+drop pgap ;
+
+\ ── Chunks ──
+
+: pcp variable ;  : pcl variable ;  : pci variable ;  : pcn variable ;
+: prc variable ;  : pnr variable ;  : ptk variable ;  : plast variable ;
+: wkind  pkind @ w8  pkind @ 3 lit = if ppart @ w32 then ;
+: u16@  dup c@ swap 1 lit + c@ 8 lit lshift or ;   \ ( a -- x )
+\ preq  a GetChunks: chunks 0 to PWIN-1 while the length is not known,
+\ else the first PWIN missing, as ranges.
+: preq
+8 lit wbeg wtok wkind pid @ 20 lit wbs
+pobj @ 0= if
+	1 lit w8 0 lit w16 PWIN w16
+else
+	ptp @ prc !  0 lit w8
+	0 lit pnr !  0 lit ptk !  FFFFFFFE lit plast !
+	pcnt @ 0 lit do
+		ptk @ PWIN u< i pmap @ + c@ 0= and if
+			i plast @ 1 lit + = if ptp @ 2 lit - dup c@ 1 lit + swap c! else i w16 1 lit w16 pnr @ 1 lit + pnr ! then
+			i plast !  ptk @ 1 lit + ptk !
+		then
+	loop
+	pnr @ prc @ c!
+then
+wsend ;
+
+\ pchunk  the Chunk in prx, if it is of the object being fetched.
+: pchunk
+prx @ 5 lit + pcp !
+pcp @ c@ pkind @ =
+pkind @ 3 lit = if pcp @ 1 lit + le@ ppart @ = and  pcp @ 5 lit + pcp ! else pcp @ 1 lit + pcp ! then
+pcp @ pid @ 20 lit d8= and if
+	pcp @ 20 lit + le@ pcl !  pcp @ 24 lit + u16@ pci !  pcp @ 26 lit + u16@ pcn !
+	pobj @ 0= pcl @ 1 lit - PMAX u< and if
+		pcl @ dup plen !  malloc pobj !  pcl @ 3FF lit + A lit rshift dup pcnt !  dup malloc dup pmap !  swap 0 lit do 0 lit over i + c! loop drop
+	then
+	pobj @ if
+		pcl @ plen @ =  pci @ pcnt @ u< and
+		pci @ 1 lit + pcnt @ = if plen @ pci @ A lit lshift - else 400 lit then pcn @ = and
+		pcp @ prx @ - 28 lit + pcn @ + prn @ u> 0= and
+		dup if drop pci @ pmap @ + c@ 0= then
+		if
+			pcp @ 28 lit + pobj @ pci @ A lit lshift + pcn @ bcopy  1 lit pci @ pmap @ + c!  1 lit pnew !
+		then
+	then
+then ;
+: pdone  -1 lit pcnt @ 0 lit do i pmap @ + c@ 0= 0= and loop ;
+
+: pfetch  ( kind part id -- a n | 0 0 )
+pid ! ppart ! pkind !  0 lit pobj !  0 lit plen !  0 lit pidle !
+begin
+	pobj @ if pdone 0= else -1 lit then  pidle @ 1E lit u< and
+while
+	preq  0 lit pnew !
+	begin 11E1A300 lit pwait ?dup while 9 lit = if pchunk then repeat
+	pnew @ if 0 lit pidle ! else pidle @ 1 lit + pidle ! then
+repeat
+pobj @ if
+	pmap @ free
+	pdone if pobj @ plen @ else pobj @ free 0 lit 0 lit then
+else 0 lit 0 lit then ;

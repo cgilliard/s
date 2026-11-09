@@ -28,6 +28,7 @@
 \ the best entry; an entry's id and cumulative work (8 canonical words) and
 \ header.
 
+: hquick variable ;                           \ set: the quick check only (a fast sync's headers; hconf after)
 : hnet variable ;  : hent variable ;  : hcap variable ;  : hcnt variable ;
 : htab variable ;  : hbst variable ;
 : htg variable ;  : hsch variable ;  : hts variable ;  : hidb variable ;  : hwk variable ;
@@ -151,6 +152,17 @@ hc @ 0= if
 	hnh @ swap if dup FFFFFFFF lit = if 2drop FFFFFFFF lit FFFFFFFF lit else 1 lit + then then
 	hh @ htslo -rot hh @ htshi -rot u64> if -6 lit hc ! then
 then
-hc @ 0= if hpar @ he htarget  hh @ htg @ fullpow 0= if -7 lit hc ! then then
+hc @ 0= if hpar @ he htarget  hh @ htg @ hquick @ if quickpow else fullpow then 0= if -7 lit hc ! then then
 hc @ 0= if hstore then
 hc @ ;
+
+\ hat ( h -- e | 0 )  the best branch's entry at height h.
+: hat  hbest begin dup hheight 2 lit pick u> while hparent @ he repeat  nip ;
+\ hconf ( from -- flag )  the full proof of work of the best branch's
+\ headers from height `from` up (tabminer's confirm_work).
+: hconf
+-1 lit swap  hbest
+begin dup hheight 2 lit pick u< 0= over hheight and while
+	dup hparent @ he htarget  dup htg @ fullpow 0= if rot drop 0 lit -rot then
+	hparent @ he
+repeat 2drop ;

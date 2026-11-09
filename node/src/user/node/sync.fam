@@ -1,0 +1,136 @@
+\ sync.fam — a fast sync from a peer (docs/NODE.md, step 6), after p2p.fam.
+\ As tabminer's node.rs: headers first, each checked but for its proof of
+\ work in full (the quick check from its claimed mix); then the block S a
+\ depth below the best, the full proof of work of S and every header after
+\ it (hconf), S's body and its snapshot's manifest, S's chain proof
+\ (which covers every block before it), the snapshot's parts, the state
+\ checked whole; then the blocks after S, each connected with its proof
+\ checked.  Then the tip followed: each block a peer announces (Inv), its
+\ header checked in full, fetched and connected.
+\
+\ nsync ( depth -- code )  0, or where it stopped: -1 no Pong, -2 another
+\ genesis, -3 headers refused or not coming, -4 a proof of work, -5 a
+\ block or manifest not fetched, -6 S's proof, -7 a part, -8 the state,
+\ -9 a block after S.
+\ pfollow ( n -- k )  the tip followed until n more blocks are connected
+\ (a minute each at most): on each announcement (Inv), the headers and
+\ blocks missing fetched and connected (ncatch), so one missed costs
+\ nothing.  How many.
+\ ntime ( -- s )  the date (/proc/time).
+
+: nbuf variable ;  : nS variable ;  : nH variable ;  : ncode variable ;  : nid variable ;
+: nblk variable ;  : nbn variable ;  : nk variable ;
+
+: ntime  "/proc/time" 0 lit open dup nbuf @ 20 lit read nbuf @ + 0 lit swap c! close drop nbuf @ atoi ;
+: nfail  ncode @ 0= if ncode ! else drop then ;   \ ( code -- )
+
+\ nstat  our status from the state: the tip's height and id, its work.
+: nstat
+68 lit stfd @ 0 lit txbegin stx ! mget stx @ txcommit drop  dup myh !
+hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
+
+\ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
+\ header the entry's: the bytes the same).
+: nblock
+dup hid 0 lit 0 lit rot pfetch nbn ! nblk !
+nblk @ if
+	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= else drop 0 lit then
+	dup 0= if nblk @ free 0 lit nblk ! then
+else drop 0 lit then ;
+
+: nsync  ( depth -- code )
+nS !  0 lit ncode !
+pping 0= if FFFFFFFF lit nfail then
+ncode @ 0= if pst @ 14 lit + mygen @ 20 lit d8= 0= if FFFFFFFE lit nfail then then
+\ headers, quick-checked
+ncode @ 0= if
+	-1 lit hquick !  1 lit
+	begin dup pst-h u> 0= ncode @ 0= and while
+		dup phdrs ?dup if
+			0 lit do phb @ i CC lit * +  ntime 0 lit hacc  1 lit u> if FFFFFFFD lit nfail then loop
+			hbest hheight 1 lit + max
+		else FFFFFFFD lit nfail then
+	repeat drop
+	0 lit hquick !
+then
+\ S, and the full proof of work from it up
+ncode @ 0= if
+	hbest hheight dup nH !  nS @ - dup 1 lit < if drop 1 lit then nS !
+	nS @ hconf 0= if FFFFFFFC lit nfail then
+then
+\ S's block and manifest, its parent's header, its proof
+ncode @ 0= if
+	nS @ hat dup nblock 0= if drop FFFFFFFB lit nfail else
+		hid nid !
+		2 lit 0 lit nid @ pfetch ?dup if
+			nS @ hat hhdr snman if FFFFFFF8 lit nfail then
+		else drop FFFFFFFB lit nfail then
+	then
+then
+ncode @ 0= if
+	nS @ 1 lit - hat hhdr shdr
+	nS @ hat hhdr  nblk @ CC lit +  nbn @ CC lit -  sverify 0= if FFFFFFFA lit nfail then
+then
+\ the parts, then the whole
+ncode @ 0= if
+	snr @ snn @ + ?dup if 0 lit do
+		ncode @ 0= if
+			3 lit i nid @ pfetch over if
+				2dup i -rot snpart if FFFFFFF9 lit nfail then drop free
+			else 2drop FFFFFFFB lit nfail then
+		then
+	loop then
+then
+ncode @ 0= if nS @ hat hhdr snfin if FFFFFFF8 lit nfail then then
+nblk @ ?dup if free 0 lit nblk ! then
+\ the blocks after S, each with its proof
+ncode @ 0= if
+	-1 lit sprchk !
+	nH @ nS @ u> if
+		nH @ 1 lit + nS @ 1 lit + do
+			ncode @ 0= if
+				i hat dup nblock if
+					hhdr nblk @ CC lit + nbn @ CC lit - sconnect if FFFFFFF7 lit nfail then
+					nblk @ free 0 lit nblk !
+				else drop FFFFFFFB lit nfail then
+			then
+		loop
+	then
+	nstat
+then
+ncode @ ;
+
+\ ncatch  headers from the best to the peer's height, each checked in
+\ full; then every block from the state's tip to the best header
+\ connected.  nk counts them.
+: nfl variable ;  : nhb variable ;
+: ncatch
+0 lit nfl !
+begin hbest hheight pst-h u< nfl @ 0= and while
+	hbest hheight 1 lit + phdrs ?dup if
+		0 lit do nfl @ 0= if phb @ i CC lit * + ntime 0 lit hacc 1 lit u> if 1 lit nfl ! then then loop
+	else 1 lit nfl ! then
+repeat
+0 lit nfl !
+myh @ hbest hheight u< if
+	hbest hheight 1 lit + myh @ 1 lit + do
+		nfl @ 0= if
+			i hat dup nblock if
+				hhdr nblk @ CC lit + nbn @ CC lit - sconnect if 1 lit nfl ! else nk @ 1 lit + nk ! nstat then
+				nblk @ free 0 lit nblk !
+			else drop 1 lit nfl ! then
+		then
+	loop
+then ;
+
+\ pfollow ( n -- k )  each announcement (Inv) taken as the peer's height,
+\ and caught up to; up to a minute a block.
+: pfollow
+0 lit nk !
+dup 3C lit * 0 lit do
+	nk @ over u< if
+		3B9ACA00 lit pwait 7 lit = if  prx @ 25 lit + le@ pst @ 34 lit + !  ncatch  then
+	then
+loop drop nk @ ;
+
+: ninit  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk ! ;

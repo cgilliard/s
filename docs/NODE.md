@@ -874,10 +874,29 @@ Each step done when its test passes.
      (`statesnap.bin`), a changed manifest, a changed part and finishing
      early refused; installed; then the chain's 152 later blocks, every
      root right.
-   - (c) The network: UDP, Ping and Pong, tokens, headers in batches,
-     chunks in windows small enough for the guest's socket (eight
-     datagrams queued). (d) A fast sync from a tabminer mining the
-     recursive dev network on the host, then following its tip.
+   - (c) Done (2026-11-08): the network (`p2p.fam`): a UDP socket,
+     our token and nonce from `/dev/random`, Ping and Pong with our
+     status (and the peer's Pings answered, which is what lets a
+     tabminer serve us), `GetHeadersFrom` with the replies placed by
+     height and the gaps asked for again (ten datagrams answer it, the
+     guest's socket queues eight), and objects fetched as chunks four in
+     flight, ranges merged as tabminer requires.
+   - (d) Done (2026-11-08): the sync (`sync.fam`): headers with the
+     quick check (`hacc` with `hquick`), the full proof of work from S
+     up (`hconf`), block S and its manifest, S's chain proof, the parts,
+     the state checked whole, the blocks after S each with its proof;
+     then the tip followed, each announcement caught up to (`ncatch`:
+     headers checked in full, every block missing connected, so a missed
+     announcement costs nothing). The date for the header rule is the
+     OS's new `/proc/time` (QEMU's goldfish RTC; oscheck's `time`).
+     `scripts/synctest.sh` runs a tabminer mining the recursive dev
+     network on the host from nothing, and once it has 12 blocks boots
+     the node, which syncs from the snapshot 4 below its best, ends on
+     the tip's state root, and follows more blocks. Against a tabminer
+     already 805 blocks in: synced in about 76 s on one hart (805
+     headers, S 801), then followed. Not yet: more than one peer, peers
+     from `GetPeers`, serving others, and headers in the store (they are
+     in memory, 4,096 here).
 7. **The pool**: XMSS verification, admission, replacement, relay.
    Done when transactions from tabminer's wallet are accepted, relayed
    and mined by a tabminer peer.
