@@ -625,7 +625,9 @@ then ;
 \ user mode reaches nothing else, since an access matching no entry is
 \ denied in user mode (allowed in machine mode).  An empty block's entry is
 \ off: a zero-length range is not enough, since QEMU takes a TOR range's end
-\ as the bound less one, and [0, 0) as all of memory.
+\ as the bound less one, and [0, 0) as all of memory.  And the time register
+\ readable in user mode (mcounteren and scounteren's TM), so a program
+\ times itself with rdtime and no call.
 : upmp
 F3220034 ,   \ csrrs t0,mscratch,zero
 03A3020A ,   \ lw t1,160(t0)              ( code start )
@@ -692,6 +694,9 @@ B3FE6E00 ,   \ and t4,t4,t1
 33036040 ,   \ neg t1,t1
 137EB300 ,   \ andi t3,t1,11
 73103E3A ,   \ csrw pmpcfg3,t3
+13032000 ,   \ li t1,2                   ( user mode may read time: rdtime, docs/OS.md )
+73106330 ,   \ csrw mcounteren,t1
+73106310 ,   \ csrw scounteren,t1
 ;
 
 \ hfresh  upmp, this hart's stale mark cleared first: an unmap that marks

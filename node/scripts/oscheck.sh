@@ -420,6 +420,17 @@ uimage img bin/kernel init=timg
 set -- $(od -An -tu4 -N4 "$T/img.img") $(od -An -tu4 -j$(($(wc -c < "$T/img.img") - 8)) -N4 "$T/img.img")
 expect image 124 "^image ok size $(wc -c < "$T/img.img" | tr -d ' ') tail 8 $2 PROG first $1 here 8 write -13 null -29\$" 5 ./tools/q32 "$T/img.img"
 has image '^image$'
+# The time register read in user mode (rdtime, no call: the node times its
+# blocks with it), on every hart: it moves on across a sleep.
+usrc ttime ':M ticks
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+: t0 variable ;
+ticks t0 !  989680 lit sleep  ticks t0 @ - 0 lit > if "rdtime ok" else "rdtime stuck" then puts 0A lit putc bye'
+uimage time bin/kernel init=ttime
+for n in 1 4; do expect "rdtime_$n" 124 '^rdtime ok$' 5 ./tools/q32 --smp=$n "$T/time.img"; done
 # The date: /proc/time from QEMU's real-time clock (node step 6), within a
 # minute of the host's, and in the /proc listing.
 usrc ttime ': b variable ;  20 lit alloc b !

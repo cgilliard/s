@@ -912,6 +912,11 @@ kernel too much to add at the end.
     size the image file's, its first word and last 8 bytes the file's
     after seeking, a write refused, `/dev`'s listing naming it.
 
+    `rdtime` in user mode (2026-11-09), as section 5 has it: `upmp` sets
+    `mcounteren` and `scounteren` (TM), so a program reads the time
+    register (10 MHz) with no call; the node times its blocks with it.
+    Before, it was an illegal instruction. Checked by `rdtime_1/4`.
+
     Checked by `exec_1/4` (with a disk):
     - `/bin` there, and `cd /proc`;
     - a copied echo refused without x, then run by its path, by a
