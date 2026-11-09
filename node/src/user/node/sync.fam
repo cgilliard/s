@@ -1,4 +1,5 @@
-\ sync.fam — a fast sync from a peer (docs/NODE.md, step 6), after p2p.fam.
+\ sync.fam — a fast sync from a peer (docs/NODE.md, step 6), and the
+\ relay of transactions (step 7), after p2p.fam.
 \ As tabminer's node.rs: headers first, each checked but for its proof of
 \ work in full (the quick check from its claimed mix); then the block S a
 \ depth below the best, the full proof of work of S and every header after
@@ -17,6 +18,10 @@
 \ blocks missing fetched and connected (ncatch), so one missed costs
 \ nothing.  How many.
 \ ntime ( -- s )  the date (/proc/time).
+\ nrelay  each announced transaction not pooled fetched from its peer and
+\ offered to the pool (a line "pool: code id" for each); if pooled,
+\ announced to the other peers.
+\ nserve ( s -- )  s seconds of following the tip and relaying.
 
 : nbuf variable ;  : nS variable ;  : nH variable ;  : ncode variable ;  : nid variable ;
 : nblk variable ;  : nbn variable ;  : nk variable ;
@@ -121,6 +126,7 @@ myh @ hbest hheight u< if
 			else drop 1 lit nfl ! then
 		then
 	loop
+	qcheck
 then ;
 
 \ pfollow ( n -- k )  each announcement (Inv) taken as the peer's height,
@@ -133,4 +139,28 @@ dup 3C lit * 0 lit do
 	then
 loop drop nk @ ;
 
-: ninit  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk ! ;
+: nrid variable ;  : nrk variable ;  : nrm variable ;  : nrc variable ;
+\ nhex ( a -- )  the first 4 bytes at a, in hex.
+: nhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )  a hex digit
+: nhex  4 lit 0 lit do dup i + c@ dup 4 lit rshift nhd putc F lit and nhd putc loop drop ;
+: nrelay
+begin pdeq ?dup while
+	dup nrid @ 20 lit bcopy  20 lit + @ nrk !
+	nrid @ nrm @ dle  nrm @ qfind 0< if
+		pcur @ nrc !  nrk @ puse  1 lit 0 lit nrid @ pfetch  nrc @ puse
+		?dup if
+			2dup qadmit  "pool: " puts dup . 20 lit putc nrid @ nhex 0A lit putc
+			0= if nrid @ nrk @ pann then
+			drop free
+		else drop then
+	then
+repeat ;
+
+\ nserve ( s -- )
+: nserve
+0 lit do
+	3B9ACA00 lit pwait 7 lit = if  prx @ 25 lit + le@ pst @ 34 lit + !  ncatch  then
+	nrelay
+loop ;
+
+: ninit  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk !  20 lit alloc nrid !  20 lit alloc nrm ! ;

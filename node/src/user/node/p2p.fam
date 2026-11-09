@@ -3,16 +3,25 @@
 \ is "TAB1", a type byte and a little-endian payload, at most 1,232 bytes.
 \ A request carries the token the peer gave us in its last Ping or Pong; a
 \ peer serves requests only from an address that answered its Ping with
-\ the nonce echoed, so every Ping is answered.  One peer for now.
+\ the nonce echoed, so every Ping is answered.  Up to PPEERS peers, one
+\ the current (puse): requests go to it and only its replies are taken;
+\ meanwhile any peer's Pings are answered, its requests for pooled
+\ transactions served (GetChunks, kind 1, with our token), and its
+\ announcements of transactions (TxInv) queued for the relay (pinq).
 \
 \ Blocks, manifests and parts come as 1,024-byte chunks, asked for in
 \ windows of PWIN: the guest's socket queues eight datagrams, and more in
 \ flight would be dropped.  Headers come as up to ten datagrams of six,
 \ from a height; those lost are asked for again from the first gap.
 \
-\ pinit ( ip port lport -- )  the socket (bound to lport) and the peer.
-\ pping ( -- flag )  a Ping until its Pong (a few seconds): the peer's
-\ status in pst.
+\ pinit ( ip port lport -- )  the socket (bound to lport) and peer 0,
+\ the current; padd ( ip port -- k ) another; puse ( k -- ) the current.
+\ pping ( -- flag )  a Ping to the current peer until its Pong (a few
+\ seconds): its status in pst.
+\ pann ( id k -- )  TxInv (id: 32 canonical bytes) to every peer that
+\ answered but k.
+\ pdeq ( -- e | 0 )  the oldest queued announcement: its id (32 bytes),
+\ then its peer; valid until the next pwait.
 \ phdrs ( h -- n )  up to 60 main-chain headers from height h, into phb in
 \ order: how many arrived without a gap.
 \ pfetch ( kind part id -- a n | 0 0 )  an object: a block (kind 0), the
@@ -28,10 +37,13 @@
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
 : pidle variable ;  : pnew variable ;
+: ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
+: pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
 
 :M PWIN 4 lit ;                               \ chunks in flight
 :M PMAX 400000 lit ;                          \ the largest object taken: 4 MiB
+:M PPEERS 4 lit ;
 
 \ Writing a datagram at ptx.
 : w8  ptp @ c!  ptp @ 1 lit + ptp ! ;
@@ -40,7 +52,8 @@
 : w64  swap w32 w32 ;                         \ ( lo hi -- )
 : wbs  tuck ptp @ swap bcopy  ptp @ + ptp ! ;  \ ( a n -- )
 : wbeg  ptx @ ptp !  54 lit w8 41 lit w8 42 lit w8 31 lit w8  w8 ;   \ ( type -- )
-: wsend  begin pfd @ ptx @ ptp @ ptx @ - pip @ ppt @ sendto FFFFFF8F lit = while 5F5E100 lit sleep repeat ;
+: wsendto  begin pfd @ ptx @ ptp @ ptx @ - 4 lit pick 4 lit pick sendto FFFFFF8F lit = while 5F5E100 lit sleep repeat 2drop ;   \ ( ip port -- )
+: wsend  pip @ ppt @ wsendto ;
 : wtok  ptok @ 8 lit wbs ;                     \ the peer's token for us
 
 \ wstatus ( nonce -- )  our status, with the nonce at its address.
@@ -49,12 +62,23 @@
 myh @ w32  myh @ 1 lit + w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
 A lit 0 lit w64  A lit 0 lit w64 ;
 
+: prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status
+: psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
+: puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
+: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+\ pwho ( ip port -- k | -1 )
+: pwho
+FFFFFFFF lit pfk !
+pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! then  loop then
+2drop pfk @ ;
+
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ 1 lit 0 lit rot net drop
-ppt ! pip !
 600 lit alloc ptx !  800 lit alloc prx !  10 lit alloc pent !  10 lit alloc pfrom !
-10 lit alloc ptok !  10 lit alloc mtok !  10 lit alloc mnon !  90 lit alloc pst !
+10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !
+PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
+padd puse
 \ our token and nonce: random
 "/dev/random" 0 lit open dup mtok @ 8 lit read drop dup mnon @ 8 lit read drop close drop ;
 
@@ -64,20 +88,62 @@ BF40 lit alloc phb !  40 lit alloc pgot !
 \ prdy ( ns -- flag )  a datagram waiting within ns.
 : prdy  pfd @ pent @ !  1 lit pent @ 4 lit + !  pent @ 1 lit rot poll 0 lit > ;
 
+: u16@  dup c@ swap 1 lit + c@ 8 lit lshift or ;   \ ( a -- x )
+\ pcko ( index -- )  chunk index of the transaction at pgb (pgn bytes),
+\ if there is one, to peer pfk.
+: pcko
+dup A lit lshift dup pgn @ u< if
+	9 lit wbeg  1 lit w8  prx @ E lit + 20 lit wbs  pgn @ w32  swap w16
+	pgn @ over - dup 400 lit u> if drop 400 lit then  dup w16  swap pgb @ + swap wbs
+	pfk @ psend
+else 2drop then ;
+\ pgive  the GetChunks in prx: the chunks of a pooled transaction, if it
+\ carries our token.
+: pgive
+prx @ 5 lit + mtok @ 8 lit d8=  prx @ D lit + c@ 1 lit = and  prn @ 2F lit u< 0= and if
+	prx @ E lit + pidm @ dle  pidm @ qfind dup 0< if drop else
+		qslot dup @ pgb !  4 lit + @ pgn !
+		prx @ 2E lit + c@  dup 2 lit lshift 2F lit + prn @ u> if drop 0 lit then
+		?dup if 0 lit do
+			prx @ 2F lit + i 2 lit lshift +  dup u16@ swap 2 lit + u16@
+			dup if over + swap do i pcko loop else 2drop then
+		loop then
+	then
+then ;
+\ pqinv  the TxInv in prx queued (16 at most).
+: pqinv
+pint @ 10 lit u< prn @ 25 lit u< 0= and if
+	pinh @ pint @ + F lit and 24 lit * pinq @ +
+	prx @ 5 lit + over 20 lit bcopy  pfk @ swap 20 lit + !
+	pint @ 1 lit + pint !
+then ;
+: pdeq  pint @ if pinh @ 24 lit * pinq @ +  pinh @ 1 lit + F lit and pinh !  pint @ 1 lit - pint ! else 0 lit then ;
+
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
 	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
-	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfrom @ @ pip @ <> or  pfrom @ 4 lit + @ ppt @ <> or if 0 lit else
+	pfrom @ @ pfrom @ 4 lit + @ pwho drop
+	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfk @ 0< or if 0 lit else
 		prx @ 4 lit + c@
-		dup 1 lit = if  2 lit wbeg  prx @ 5 lit + wstatus  wsend  then
+		dup 1 lit = if  2 lit wbeg  prx @ 5 lit + wstatus  pfk @ psend  then
 		dup 2 lit = if
 			prx @ 5 lit + mnon @ 8 lit d8= if
-				prx @ 5 lit + pst @ 8C lit bcopy  prx @ 11 lit + ptok @ 8 lit bcopy  1 lit pok !
+				prx @ 5 lit + pfk @ prec 18 lit + 8C lit bcopy  prx @ 11 lit + pfk @ prec 10 lit + 8 lit bcopy
+				1 lit pfk @ prec 8 lit + !  pfk @ pcur @ = if 1 lit pok ! then
 			then
 		then
+		dup 8 lit = if pgive then
+		dup A lit = if pqinv then
+		pfk @ pcur @ = 0= if drop 0 lit then
 	then
 else 0 lit then ;
+
+\ pann ( id k -- )
+: pann
+pnp @ ?dup if 0 lit do
+	dup i = 0=  i prec 8 lit + @ and if  A lit wbeg  over 20 lit wbs  i psend  then
+loop then 2drop ;
 
 : pping
 0 lit pok !
@@ -113,7 +179,6 @@ drop pgap ;
 : pcp variable ;  : pcl variable ;  : pci variable ;  : pcn variable ;
 : prc variable ;  : pnr variable ;  : ptk variable ;  : plast variable ;
 : wkind  pkind @ w8  pkind @ 3 lit = if ppart @ w32 then ;
-: u16@  dup c@ swap 1 lit + c@ 8 lit lshift or ;   \ ( a -- x )
 \ preq  a GetChunks: chunks 0 to PWIN-1 while the length is not known,
 \ else the first PWIN missing, as ranges.
 : preq

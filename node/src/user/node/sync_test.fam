@@ -1,7 +1,7 @@
 \ sync_test.fam — a fast sync from a tabminer (docs/NODE.md, step 6), a
 \ program for the OS with a disk and the network, after arith, poseidon2,
-\ difficulty, pow, headers, chainver, state, proofs, connect, snap, p2p and
-\ sync.  scripts/synctest.sh runs a tabminer mining the recursive dev
+\ difficulty, pow, headers, chainver, state, proofs, connect, snap, xmss,
+\ tx, pool, p2p and sync.  scripts/synctest.sh runs a tabminer mining the recursive dev
 \ network on the host (UDP 3747, seen from the guest at 10.0.2.2), and
 \ gives the image /lib/akjv.txt.gz, /lib/chainver (the network's verifier)
 \ and /lib/devchain (for the chain's constants and genesis).  The node
@@ -34,7 +34,7 @@ A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
 
 "/lib/akjv.txt.gz" rdfile powinit
 "/lib/chainver" rdfile drop cvinit
-"/t-sync" TREE CREATE or 2 lit or open stinit  sninit  ninit
+"/t-sync" TREE CREATE or 2 lit or open stinit  sninit  ninit  xinit tinit qinit
 "/lib/devchain" rdfile drop 4 lit + tdc !
 tparams  tnet @ tdc @ 60 lit + 1000 lit hinit
 tdc @ dup 60 lit + prinit
