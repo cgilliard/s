@@ -1,0 +1,144 @@
+\ connect.fam — connecting and disconnecting blocks (docs/NODE.md, steps 5
+\ and 6), after state.fam and proofs.fam: tabminer's Chain::connect and
+\ disconnect (miner/src/chain.rs).
+\
+\ stinit ( fd -- )  the state in the tree open as fd (genesis's, empty, if
+\ new).
+\ sconnect ( h body n -- code )  connects the block with header h and body
+\ (n bytes) on the last one: 0, or the rule it breaks (tabminer's
+\ ChainError, as fam_vectors.rs's state_code numbers them: -10 malformed,
+\ -11 the body commitment, -12 too large, -13 an unknown input, -15 the
+\ state root, -16 the supply, -17 the proof; -20 to -26 the name rules;
+\ -30 to -35 the body's own).  A block refused changes nothing.  Its chain
+\ proof is checked when sprchk is set (prinit first).
+\ sundo ( -- )  undoes the last block connected.
+
+: sprchk variable ;
+
+\ The undo record's keys: 'u', the height, the chunk.
+: kundo  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  75 lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
+
+: sroot0  srt !  27 lit 0 lit tmpa @ nget  tmpb @ troot  tmpa @ tmpb @ srt @ compress  srt @ dfrom ;   \ ( c -- )  in a transaction
+: sroot  stfd @ 0 lit txbegin stx !  sroot0  stx @ txcommit drop ;
+
+: sconnect  ( h body n -- code )
+rot bh !  0 lit bcode !  0 lit ndirty !
+2dup bparse nip
+bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
+bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
+bcode @ 0= if
+	stfd @ 1 lit txbegin stx !
+	bh @ 20 lit + @ sh !
+	70 lit mget dup sctr ! sfirst !
+	bnin @ 3 lit lshift 400 lit + malloc dup ub ! ux !
+	0 lit u,  sfirst @ u,  bnout @ u,  0 lit u,  bnin @ u,
+	spent @ 4 lit wzero  made @ 4 lit wzero
+	\ the inputs spent
+	bnin @ ?dup if 0 lit do bcode @ 0= if
+		bin @ i 5 lit * + pos@  over u, dup u,
+		2dup oget if
+			sbuf @ 20 lit + slotamt spent @ amount+
+			2dup kspent sbuf @ 44 lit sput
+			odel
+		else 2drop FFFFFFF3 lit bfail then
+	then loop then
+	\ the outputs added
+	bcode @ 0= if bnout @ ?dup if 0 lit do
+		bout @ i 3C lit * +  dup rb @ 34 lit bcopy
+		34 lit + dup le@ swap 4 lit + le@
+		2dup made @ amount+
+		over 3FFFFFFF lit and rb @ 34 lit + !
+		over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
+		nip 1C lit rshift rb @ 3C lit + !
+		sh @ rb @ 40 lit + !
+		rb @ sctr @ 0 lit oput  sctr @ 1 lit + sctr !
+	loop then then
+	bcode @ 0= if snames then
+	bcode @ 0= if sprop  stmd @ sroot0  stmd @ bh @ 4C lit + 8 lit wcmp if FFFFFFF1 lit bfail then then
+	\ the supply: what the outputs make, what the inputs held and the subsidy
+	bcode @ 0= if sh @ subsidy spent @ amount+  made @ spent @ 4 lit wcmp if FFFFFFF0 lit bfail then then
+	\ the proof, last (tabminer's order)
+	bcode @ 0= sprchk @ and if sproof 0= if FFFFFFEF lit bfail then then
+	bcode @ 0= if
+		ux @ ub @ - 2 lit rshift ub @ !
+		ub @ @ 2 lit lshift urem !  ub @ up !  0 lit uk !
+		begin urem @ while
+			urem @ 400 lit u< if urem @ else 400 lit then
+			sh @ uk @ kundo up @ 2 lit pick sput
+			dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
+		repeat
+		sctr @ 70 lit mput  sh @ 68 lit mput  sh @ khdr bh @ CC lit sput
+		serr @ if FFFFFFF6 lit bfail then
+	then
+	bcode @ if stx @ txabort drop 0 lit ndirty ! else stx @ txcommit drop then
+	ub @ free
+then
+bops @ free
+bcode @ ;
+
+\ uevent ( p -- )  undoes one event of the names section.
+: uevent
+dup @
+dup 1 lit = if drop
+	4 lit + dup @ swap 4 lit + dup @ swap 4 lit +
+	dup dup 20 lit + @ stmd @ cleaf  stmd @ dfrom
+	stmd @ rb @ 8 lit wcopy  dup 24 lit + rb @ 20 lit + 8 lit wcopy  dup 20 lit + @ rb @ 40 lit + !
+	-rot 2dup rb @ -rot oput
+	kcommit swap 24 lit sput
+else dup 2 lit = if drop
+	4 lit + dup krec sdel  tremove
+else 3 lit = if
+	4 lit + dup @ swap 4 lit + swap
+	over nlv2 @ rvalue  nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
+	tk2 @ krec -rot sput
+else drop then then then ;
+
+: sundo
+stfd @ 1 lit txbegin stx !
+68 lit mget sh !
+sh @ 0 lit kundo sbuf @ 400 lit sget drop
+sbuf @ @ 2 lit lshift dup malloc dup ub ! up ! urem !
+0 lit uk !
+begin urem @ while
+	sh @ uk @ kundo up @ 400 lit sget  dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
+repeat
+ub @ 4 lit + @ sfirst !  70 lit mget sctr !
+\ the block's outputs and commits leave
+sctr @ sfirst @ 2dup u> if do i 0 lit odel  i 0 lit kcommit sdel loop else 2drop then
+\ the inputs return
+ub @ 10 lit + @ ?dup if 0 lit do
+	ub @ 14 lit + i 3 lit lshift + dup @ swap 4 lit + @
+	2dup kspent sbuf @ 44 lit sget drop
+	2dup sbuf @ -rot oput
+	kspent sdel
+loop then
+\ the names section, last event first
+ub @ 14 lit + ub @ 10 lit + @ 3 lit lshift +
+0 lit nev !
+begin dup ub @ ub @ @ 2 lit lshift + u< while
+	dup ev @ nev @ w!  nev @ 1 lit + nev !
+	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
+repeat drop
+nev @ ?dup if 0 lit do ev @ nev @ 1 lit - i - w@ uevent loop then
+sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput  sh @ khdr sdel
+ub @ @ 2 lit lshift 3FF lit + A lit rshift 0 lit do sh @ i kundo sdel loop
+sprop
+stx @ txcommit drop
+ub @ free ;
+
+: stinit  ( fd -- )
+stfd !  p2init dvinit
+100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
+520 lit alloc dflt !  2000 lit alloc lvs !
+20 lit alloc tmpa !  20 lit alloc tmpb !  20 lit alloc stmd !
+10000 lit alloc dirty !  0 lit ndirty !
+44 lit alloc tnb !  44 lit alloc tnode !  44 lit alloc toth !
+10 lit alloc tkp !  10 lit alloc tkq !  10 lit alloc tz !  10 lit alloc tmpk !
+40 lit alloc tha !  40 lit alloc thb !
+80 lit alloc nel !  80 lit alloc nin !  10 lit alloc nkey !  60 lit alloc ob !
+44 lit alloc rb !  24 lit alloc cb !
+10 lit alloc spent !  10 lit alloc made !  10 lit alloc sw4 !
+100 lit alloc ev !  10 lit alloc tk2 !  20 lit alloc nlv2 !
+tz @ 4 lit wzero  dflt @ 8 lit wzero
+28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
+0 lit serr ! ;

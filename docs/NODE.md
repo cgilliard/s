@@ -850,6 +850,34 @@ Each step done when its test passes.
 6. **The protocol**: peers, headers first, bodies, fast sync from a
    snapshot. Done when a fam node syncs a dev chain from tabminer over
    UDP.
+   The dev chain is the recursive dev network's (`--network
+   dev-recursive`): the direct dev network's blocks carry proofs the node
+   cannot check, so syncing it would not be full validation. In parts:
+   - (a) Done (2026-11-08): a block's chain proof checked in
+     `sconnect` (`proofs.fam`; connecting and disconnecting moved to
+     `connect.fam`, after it): the statement made from the block, its
+     parent's header (headers now kept in the store) and the counters,
+     hashed with the height and the chain's constants into the public
+     values, then the verifier program (the recursive dev network's is
+     `chainver_dev.bin`). oscheck's `proofs`: the network's first six
+     blocks, mined by tabminer (`devchain.bin`, from `fam_vectors.rs`'s
+     `dump_dev_chain`), each proof accepted; a block with a changed proof
+     refused for its body commitment, and, its header committing to it,
+     for its proof.
+   - (b) Done (2026-11-08): the state from a snapshot (`snap.fam`): the
+     manifest (its root climbed from the parts' roots to S's state
+     root), output parts (positions, their level-14 roots, each commit
+     on its output), name parts (their bucket hashes), installed; the
+     trie's root, the state root and the coins issued checked at the
+     end; S's own proof (`sverify`). oscheck's `snap`: the snapshot after
+     block 150 of the state test's chain as tabminer serves it
+     (`statesnap.bin`), a changed manifest, a changed part and finishing
+     early refused; installed; then the chain's 152 later blocks, every
+     root right.
+   - (c) The network: UDP, Ping and Pong, tokens, headers in batches,
+     chunks in windows small enough for the guest's socket (eight
+     datagrams queued). (d) A fast sync from a tabminer mining the
+     recursive dev network on the host, then following its tip.
 7. **The pool**: XMSS verification, admission, replacement, relay.
    Done when transactions from tabminer's wallet are accepted, relayed
    and mined by a tabminer peer.

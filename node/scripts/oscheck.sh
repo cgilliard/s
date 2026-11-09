@@ -147,12 +147,32 @@ expect headers 124 '^headers: 25 passed, 0 failed' 120 ./tools/q32 "$T/hdr.img"
 # The state (step 5), a program for the OS with a disk: a dev chain's
 # blocks (/lib/statechain), each verdict and state root tabminer's; every
 # block disconnected to genesis, each root its parent's; all connected again.
-./tools/fam --user -o "$T/tst.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/state_test.fam > "$T/tst.build" 2>&1 || fail state "build: $(head -c 300 "$T/tst.build")"
+./tools/fam --user -o "$T/tst.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/state_test.fam > "$T/tst.build" 2>&1 || fail state "build: $(head -c 300 "$T/tst.build")"
 sh scripts/mkimage.sh "$T/st.img" bin/kernel init="$T/tst.bin":8192 statechain=$ND/statechain.bin:0 2> "$T/st.mk" || fail state "mkimage: $(cat "$T/st.mk")"
 rm -f "$T/st.disk"; dd if=/dev/zero of="$T/st.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect state 124 '^connected again: 302 right, 0 wrong' 120 ./tools/q32 --disk="$T/st.disk" "$T/st.img"
 has state '^connected: 312 as tabminer, 0 not'; has state '^disconnected: 302 roots right, 0 wrong'
 rm -f "$T/st.disk"
+# Chain proofs (step 6): the recursive dev network's first blocks, from a
+# tabminer that mined them (/lib/devchain), each proof checked against the
+# statement the node makes of its block; a block with a changed proof is
+# refused for its body commitment, and with a header committing to it, for
+# its proof.
+./tools/fam --user -o "$T/tpr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/proofs_test.fam > "$T/tpr.build" 2>&1 || fail proofs "build: $(head -c 300 "$T/tpr.build")"
+sh scripts/mkimage.sh "$T/pr.img" bin/kernel init="$T/tpr.bin":16384 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$ND/chainver_dev.bin:0 devchain=$ND/devchain.bin:0 2> "$T/pr.mk" || fail proofs "mkimage: $(cat "$T/pr.mk")"
+rm -f "$T/pr.disk"; dd if=/dev/zero of="$T/pr.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect proofs 124 '^proofs: 8 as expected, 0 not' 120 ./tools/q32 --disk="$T/pr.disk" "$T/pr.img"
+rm -f "$T/pr.disk"
+# A snapshot (step 6): the state after block 150 of the state test's chain
+# as tabminer serves it (/lib/statesnap): a changed manifest, a changed part
+# and finishing early refused; installed with the block's state root; then
+# the chain's later blocks, every root right.
+./tools/fam --user -o "$T/tsn.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/connect.fam $ND/snap.fam $ND/snap_test.fam > "$T/tsn.build" 2>&1 || fail snap "build: $(head -c 300 "$T/tsn.build")"
+sh scripts/mkimage.sh "$T/sn.img" bin/kernel init="$T/tsn.bin":16384 statesnap=$ND/statesnap.bin:0 statechain=$ND/statechain.bin:0 2> "$T/sn.mk" || fail snap "mkimage: $(cat "$T/sn.mk")"
+rm -f "$T/sn.disk"; dd if=/dev/zero of="$T/sn.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect snap 124 '^after it: 152 connected, 0 not' 120 ./tools/q32 --disk="$T/sn.disk" "$T/sn.img"
+has snap '^snapshot: 9 as expected, 0 not'
+rm -f "$T/sn.disk"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

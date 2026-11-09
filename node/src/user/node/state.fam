@@ -23,16 +23,7 @@
 \ Positions are a word and a byte (lo, hi): below 2^39.  Not reentrant.
 \ Field values in memory are Montgomery words.
 \
-\ stinit ( fd -- )  the state in the tree open as fd (genesis's, empty, if
-\ new).
-\ sconnect ( h body n -- code )  connects the block with header h and body
-\ (n bytes) on the last one: 0, or the rule it breaks (tabminer's
-\ ChainError, as fam_vectors.rs's state_code numbers them: -10 malformed,
-\ -11 the body commitment, -12 too large, -13 an unknown input, -15 the
-\ state root, -16 the supply; -20 to -26 the name rules; -30 to -35 the
-\ body's own).  A block refused changes nothing.  Its proof is not
-\ checked here.
-\ sundo ( -- )  undoes the last block connected.
+\ Connecting and disconnecting blocks are connect.fam's, after proofs.fam.
 \ sroot ( c -- )  c (8 words, canonical) = the state root.
 
 \ ── The store ──
@@ -85,7 +76,7 @@ p2s @ hdc @ 8 lit wcopy ;
 
 : dflt variable ;
 : dfl  5 lit lshift dflt @ + ;                \ ( level -- digest )  the empty subtree's
-: lvs variable ;  : tmpa variable ;  : tmpb variable ;  : tmpd variable ;
+: lvs variable ;  : tmpa variable ;  : tmpb variable ;  : stmd variable ;
 : nl variable ;  : ni variable ;  : nc variable ;  : gg variable ;  : lc variable ;
 : dirty variable ;  : ndirty variable ;  : dx variable ;  : nxd variable ;
 : d=  8 lit wcmp 0= ;                         \ ( a b -- flag )
@@ -112,6 +103,19 @@ if drop else
 then ;
 : gdirty  18 lit lshift swap 8 lit rshift or dadd ;   \ ( lo hi -- )  its group dirty
 
+\ lvroot  lvs[0] = the root of the 256 leaves at lvs, empty pairs skipped.
+: lvroot
+8 lit 0 lit do
+	100 lit i 1 lit + rshift 0 lit do
+		i 6 lit lshift lvs @ +
+		dup j dfl d= over 20 lit + j dfl d= and if
+			j 1 lit + dfl  i 5 lit lshift lvs @ +  8 lit wcopy drop
+		else
+			dup 20 lit + i 5 lit lshift lvs @ + compress
+		then
+	loop
+loop ;
+
 \ grefresh ( g -- )  the group's node at level 8, from its outputs.
 : grefresh
 dup gg !
@@ -130,17 +134,7 @@ while
 	sbuf @  kb @ 5 lit + c@ 5 lit lshift lvs @ +  rleaf
 	6 lit
 repeat
-8 lit 0 lit do
-	100 lit i 1 lit + rshift 0 lit do
-		i 6 lit lshift lvs @ +
-		dup j dfl d= over 20 lit + j dfl d= and if
-			j 1 lit + dfl  i 5 lit lshift lvs @ +  8 lit wcopy drop
-		else
-			dup 20 lit + i 5 lit lshift lvs @ + compress
-		then
-	loop
-loop
-lvs @ 8 lit gg @ nput ;
+lvroot  lvs @ 8 lit gg @ nput ;
 
 \ sprop  the dirty groups' nodes, then their parents to level 39.
 : sprop
@@ -156,8 +150,8 @@ ndirty @ ?dup if 0 lit do dirty @ i w@ grefresh loop then
 	ndirty @ ?dup if 0 lit do
 		j 8 lit +  dirty @ i w@ 1 lit lshift  tmpa @ nget
 		j 8 lit +  dirty @ i w@ 1 lit lshift 1 lit +  tmpb @ nget
-		tmpa @ tmpb @ tmpd @ compress
-		tmpd @  j 9 lit +  dirty @ i w@  nput
+		tmpa @ tmpb @ stmd @ compress
+		stmd @  j 9 lit +  dirty @ i w@  nput
 	loop then
 loop
 0 lit ndirty ! ;
@@ -508,7 +502,7 @@ dup 59D31 lit u< if drop 27395000 lit 48C lit else
 \ ── Connecting and disconnecting (Chain::connect, disconnect) ──
 
 : tk2 variable ;  : nlv2 variable ;  : srt variable ;  : urem variable ;  : up variable ;  : uk variable ;
-: bh variable ;  : sh variable ;  : scnt variable ;  : sfirst variable ;
+: bh variable ;  : sh variable ;  : sctr variable ;  : sfirst variable ;
 : ub variable ;  : ux variable ;  : rb variable ;  : cb variable ;
 : spent variable ;  : made variable ;  : sw4 variable ;
 : ev variable ;  : nev variable ;
@@ -528,8 +522,8 @@ dup 59D31 lit u< if drop 27395000 lit 48C lit else
 : consume
 2dup cget drop  sbuf @ cb @ 9 lit wcopy             \ the commit: hash, height
 2dup oget if sbuf @ rb @ 11 lit wcopy else rb @ 11 lit wzero then
-cb @ cb @ 20 lit + @ tmpd @ cleaf  tmpd @ dfrom
-2dup oget if sbuf @ tmpd @ d= else 0 lit then
+cb @ cb @ 20 lit + @ stmd @ cleaf  stmd @ dfrom
+2dup oget if sbuf @ stmd @ d= else 0 lit then
 if
 	1 lit u,  over u, dup u,  cb @ ux @ 9 lit wcopy  ux @ 24 lit + ux !  rb @ 20 lit + ux @ 8 lit wcopy  ux @ 20 lit + ux !
 	2dup odel  kcommit sdel
@@ -540,12 +534,12 @@ else 2drop FFFFFFEA lit bfail then ;
 bnops @ ?dup if 0 lit do bcode @ 0= if
 	bops @ i 3 lit lshift + dup @
 	dup 1 lit = if drop
-		4 lit + @  dup sh @ tmpd @ cleaf  tmpd @ dfrom
-		tmpd @ rb @ 8 lit wcopy  dup 20 lit + rb @ 20 lit + 14 lit bcopy  rb @ 34 lit + 3 lit wzero  sh @ rb @ 40 lit + !
-		rb @ scnt @ 0 lit oput
+		4 lit + @  dup sh @ stmd @ cleaf  stmd @ dfrom
+		stmd @ rb @ 8 lit wcopy  dup 20 lit + rb @ 20 lit + 14 lit bcopy  rb @ 34 lit + 3 lit wzero  sh @ rb @ 40 lit + !
+		rb @ sctr @ 0 lit oput
 		cb @ 20 lit bcopy  sh @ cb @ 20 lit + !
-		scnt @ 0 lit kcommit cb @ 24 lit sput
-		4 lit u,  scnt @ 1 lit + scnt !
+		sctr @ 0 lit kcommit cb @ 24 lit sput
+		4 lit u,  sctr @ 1 lit + sctr !
 	else 2 lit = if
 		dup rpos pos@  rot 4 lit + @ dup nlv2 @ rvalue  -rot      ( rec lo hi )
 		2dup cget 0= if 2drop drop FFFFFFEA lit bfail else
@@ -575,128 +569,5 @@ bnsw @ ?dup if 0 lit do bcode @ 0= if
 	then
 then loop then ;
 
-\ The undo record's keys: 'u', the height, the chunk.
-: kundo  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  75 lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
-
-: sroot0  srt !  27 lit 0 lit tmpa @ nget  tmpb @ troot  tmpa @ tmpb @ srt @ compress  srt @ dfrom ;   \ ( c -- )  in a transaction
-: sroot  stfd @ 0 lit txbegin stx !  sroot0  stx @ txcommit drop ;
-
-: sconnect  ( h body n -- code )
-rot bh !  0 lit bcode !  0 lit ndirty !
-2dup bparse nip
-bcode @ 0= if tmpd @ bcommit  tmpd @ dfrom  tmpd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
-bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
-bcode @ 0= if
-	stfd @ 1 lit txbegin stx !
-	bh @ 20 lit + @ sh !
-	70 lit mget dup scnt ! sfirst !
-	bnin @ 3 lit lshift 400 lit + malloc dup ub ! ux !
-	0 lit u,  sfirst @ u,  bnout @ u,  0 lit u,  bnin @ u,
-	spent @ 4 lit wzero  made @ 4 lit wzero
-	\ the inputs spent
-	bnin @ ?dup if 0 lit do bcode @ 0= if
-		bin @ i 5 lit * + pos@  over u, dup u,
-		2dup oget if
-			sbuf @ 20 lit + slotamt spent @ amount+
-			2dup kspent sbuf @ 44 lit sput
-			odel
-		else 2drop FFFFFFF3 lit bfail then
-	then loop then
-	\ the outputs added
-	bcode @ 0= if bnout @ ?dup if 0 lit do
-		bout @ i 3C lit * +  dup rb @ 34 lit bcopy
-		34 lit + dup le@ swap 4 lit + le@
-		2dup made @ amount+
-		over 3FFFFFFF lit and rb @ 34 lit + !
-		over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
-		nip 1C lit rshift rb @ 3C lit + !
-		sh @ rb @ 40 lit + !
-		rb @ scnt @ 0 lit oput  scnt @ 1 lit + scnt !
-	loop then then
-	bcode @ 0= if snames then
-	bcode @ 0= if sprop  tmpd @ sroot0  tmpd @ bh @ 4C lit + 8 lit wcmp if FFFFFFF1 lit bfail then then
-	\ the supply: what the outputs make, what the inputs held and the subsidy
-	bcode @ 0= if sh @ subsidy spent @ amount+  made @ spent @ 4 lit wcmp if FFFFFFF0 lit bfail then then
-	bcode @ 0= if
-		ux @ ub @ - 2 lit rshift ub @ !
-		ub @ @ 2 lit lshift urem !  ub @ up !  0 lit uk !
-		begin urem @ while
-			urem @ 400 lit u< if urem @ else 400 lit then
-			sh @ uk @ kundo up @ 2 lit pick sput
-			dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
-		repeat
-		scnt @ 70 lit mput  sh @ 68 lit mput
-		serr @ if FFFFFFF6 lit bfail then
-	then
-	bcode @ if stx @ txabort drop 0 lit ndirty ! else stx @ txcommit drop then
-	ub @ free
-then
-bops @ free
-bcode @ ;
-
-\ uevent ( p -- )  undoes one event of the names section.
-: uevent
-dup @
-dup 1 lit = if drop
-	4 lit + dup @ swap 4 lit + dup @ swap 4 lit +
-	dup dup 20 lit + @ tmpd @ cleaf  tmpd @ dfrom
-	tmpd @ rb @ 8 lit wcopy  dup 24 lit + rb @ 20 lit + 8 lit wcopy  dup 20 lit + @ rb @ 40 lit + !
-	-rot 2dup rb @ -rot oput
-	kcommit swap 24 lit sput
-else dup 2 lit = if drop
-	4 lit + dup krec sdel  tremove
-else 3 lit = if
-	4 lit + dup @ swap 4 lit + swap
-	over nlv2 @ rvalue  nkey @ tk2 @ 4 lit wcopy  tk2 @ nlv2 @ tupdate
-	tk2 @ krec -rot sput
-else drop then then then ;
-
-: sundo
-stfd @ 1 lit txbegin stx !
-68 lit mget sh !
-sh @ 0 lit kundo sbuf @ 400 lit sget drop
-sbuf @ @ 2 lit lshift dup malloc dup ub ! up ! urem !
-0 lit uk !
-begin urem @ while
-	sh @ uk @ kundo up @ 400 lit sget  dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
-repeat
-ub @ 4 lit + @ sfirst !  70 lit mget scnt !
-\ the block's outputs and commits leave
-scnt @ sfirst @ 2dup u> if do i 0 lit odel  i 0 lit kcommit sdel loop else 2drop then
-\ the inputs return
-ub @ 10 lit + @ ?dup if 0 lit do
-	ub @ 14 lit + i 3 lit lshift + dup @ swap 4 lit + @
-	2dup kspent sbuf @ 44 lit sget drop
-	2dup sbuf @ -rot oput
-	kspent sdel
-loop then
-\ the names section, last event first
-ub @ 14 lit + ub @ 10 lit + @ 3 lit lshift +
-0 lit nev !
-begin dup ub @ ub @ @ 2 lit lshift + u< while
-	dup ev @ nev @ w!  nev @ 1 lit + nev !
-	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
-repeat drop
-nev @ ?dup if 0 lit do ev @ nev @ 1 lit - i - w@ uevent loop then
-sfirst @ 70 lit mput  sh @ 1 lit - 68 lit mput
-ub @ @ 2 lit lshift 3FF lit + A lit rshift 0 lit do sh @ i kundo sdel loop
-sprop
-stx @ txcommit drop
-ub @ free ;
-
-: stinit  ( fd -- )
-stfd !  p2init dvinit
-100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
-520 lit alloc dflt !  2000 lit alloc lvs !
-20 lit alloc tmpa !  20 lit alloc tmpb !  20 lit alloc tmpd !
-10000 lit alloc dirty !  0 lit ndirty !
-44 lit alloc tnb !  44 lit alloc tnode !  44 lit alloc toth !
-10 lit alloc tkp !  10 lit alloc tkq !  10 lit alloc tz !  10 lit alloc tmpk !
-40 lit alloc tha !  40 lit alloc thb !
-80 lit alloc nel !  80 lit alloc nin !  10 lit alloc nkey !  60 lit alloc ob !
-44 lit alloc rb !  24 lit alloc cb !
-10 lit alloc spent !  10 lit alloc made !  10 lit alloc sw4 !
-100 lit alloc ev !  10 lit alloc tk2 !  20 lit alloc nlv2 !
-tz @ 4 lit wzero  dflt @ 8 lit wzero
-28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
-0 lit serr ! ;
+\ The headers of the blocks connected, genesis's first: 'h' and the height.
+: khdr  kb @ 1 lit + 4 lit be!  68 lit kb @ c!  5 lit ;   \ ( height -- klen )

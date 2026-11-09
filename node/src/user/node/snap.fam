@@ -1,0 +1,243 @@
+\ snap.fam — the state from a snapshot (docs/NODE.md, step 6), after
+\ connect.fam.  As tabminer's fast sync (miner/src/chain.rs's stage_part_in,
+\ stage_name_part and finish_snapshot; net.rs's manifest and part
+\ formats): the state after a block S, from its manifest and parts, each
+\ checked, then the whole against S's state root and the coins issued to
+\ S's height; S's own chain proof covers every block before it.
+\
+\ A manifest: the counter after S (u64), the root of each output part (a
+\ subtree of 2^14 positions; a count and digests), the name trie's root,
+\ and each name part's first key (15 bytes, big-endian) and hash (a count
+\ and entries).  An output part: its unspent outputs (position u64,
+\ commitment, memo, amount u64, creation height u32) ascending, then which
+\ are commits (position, hash, height), ascending.  A name part: its
+\ records, in key order.
+\
+\ snman ( m n hS -- code )  the manifest of the block with header hS.
+\ snpart ( i p n -- code )  part i (outputs, then names), checked and
+\ installed.
+\ snfin ( hS -- code )  the state complete.  Codes: 0, -40 (tabminer's
+\ BadSnapshot), or -10 for bytes that do not decode.
+\ shdr ( h -- )  a header stored at its height (S's parent, for S's proof).
+\ sverify ( hS body n -- flag )  S's body and chain proof, its statement's
+\ first output position from the manifest's counter (snman first).
+
+: snx variable ;  : snr variable ;  : sroots variable ;  : snroot variable ;  : snn variable ;  : snam variable ;
+: sdone variable ;  : ssum variable ;  : sbig variable ;  : sents variable ;  : snent variable ;
+: scom variable ;  : sncom variable ;  : slo variable ;  : shi variable ;  : sbh variable ;
+: srecs variable ;  : snrec variable ;  : skey variable ;  : spk variable ;  : sval variable ;
+: cla variable ;  : clc variable ;  : sbi variable ;  : sbn variable ;  : sba variable ;  : sbl variable ;  : skl variable ;  : skh variable ;  : spb variable ;  : spp variable ;  : sbk variable ;  : sbs variable ;
+
+: sbad  FFFFFFD8 lit bfail ;                  \ -40
+: sread  over + bq ! bp !  0 lit bcode ! ;           \ ( a n -- )  the reader on these bytes
+: bu64  bu32 bu32 if bbad then ;              \ ( -- lo )  a counter or position (below 2^32 here)
+: umin  2dup u> if swap then drop ;
+: kcmp  4 lit wcmp ;                          \ ( a b -- c )  4-word keys
+\ k15 ( a k -- )  the key k (4 words) from 15 big-endian bytes at a.
+: k15  over 3 lit be@ over 3 lit w!  over 3 lit + 4 lit be@ over 2 lit w!  over 7 lit + 4 lit be@ over 1 lit w!  swap B lit + 4 lit be@ swap ! ;
+
+\ climb ( a c from to -- )  the c digests at a, nodes at level `from` with
+\ indexes 0 to c-1, climbed to level `to` (above `from`) in place: a pair's
+\ parent is their compression, a missing sibling the empty subtree's.
+: climb
+rot clc ! rot cla !
+swap do
+	clc @ 1 lit + 1 lit rshift 0 lit do
+		cla @ i 6 lit lshift +
+		i 1 lit lshift 1 lit + clc @ u< if dup 20 lit + else j dfl then
+		cla @ i 5 lit lshift + compress
+	loop
+	clc @ 1 lit + 1 lit rshift clc !
+loop ;
+
+: snman  ( m n hS -- code )
+sbh !  sread
+bu64 snx !
+bu32 dup bleft 5 lit rshift u> if drop bbad 0 lit then dup snr !  5 lit lshift btake sroots !
+bcode @ 0= if sroots @ snr @ 3 lit lshift bcanon then
+20 lit btake snroot !  bcode @ 0= if snroot @ 8 lit bcanon then
+bu32 dup bleft 2F lit / u> if drop bbad 0 lit then dup snn !  2F lit * btake snam !
+bcode @ 0= if snn @ ?dup if 0 lit do snam @ i 2F lit * + F lit + 8 lit bcanon loop then then
+bcode @ 0= bp @ bq @ <> and if bbad then
+bcode @ 0= if
+	snr @ snx @ 3FFF lit + E lit rshift <> if sbad then
+	snn @ 1 lit u> if snn @ 1 lit do
+		snam @ i 1 lit - 2F lit * + tmpa @ k15  snam @ i 2F lit * + tmpb @ k15
+		tmpa @ tmpb @ kcmp 0 lit < 0= if sbad then
+	loop then
+then
+bcode @ 0= if
+	snr @ 5 lit lshift 20 lit + malloc sbig !
+	snr @ ?dup if 0 lit do sroots @ i 5 lit lshift + sbig @ i 5 lit lshift + dle loop then
+	snr @ if sbig @ snr @ E lit 27 lit climb else 27 lit dfl sbig @ 8 lit wcopy then
+	snroot @ tmpb @ dle  sbig @ tmpb @ stmd @ compress  stmd @ dfrom
+	stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then
+	sbig @ free
+then
+0 lit sdone !  ssum @ 4 lit wzero
+bcode @ ;
+
+\ srec ( e -- )  an output part's entry as a record in rb: commitment,
+\ slot (memo and the amount's limbs), height.
+: srec
+dup 8 lit + rb @ 34 lit bcopy
+dup 3C lit + le@ over 40 lit + le@
+over 3FFFFFFF lit and rb @ 34 lit + !
+over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
+nip 1C lit rshift rb @ 3C lit + !
+44 lit + le@ rb @ 40 lit + ! ;
+: epos  48 lit * sents @ + le@ ;             \ ( k -- pos )
+: sfind  FFFFFFFF lit swap snent @ ?dup if 0 lit do dup i epos = if nip i swap then loop then drop ;   \ ( pos -- k | -1 )
+
+: snpout  ( i p n -- )
+sread  slo !
+bu32 dup bleft 48 lit / u> if drop bbad 0 lit then dup snent !  48 lit * btake sents !
+bcode @ 0= if snent @ ?dup if 0 lit do sents @ i 48 lit * + dup 4 lit + le@ if bbad then 8 lit + D lit bcanon loop then then
+bu32 dup bleft 2C lit / u> if drop bbad 0 lit then dup sncom !  2C lit * btake scom !
+bcode @ 0= if sncom @ ?dup if 0 lit do scom @ i 2C lit * + dup 4 lit + le@ if bbad then 8 lit + 8 lit bcanon loop then then
+bcode @ 0= bp @ bq @ <> and if bbad then
+\ positions ascending within the part, below the counter
+slo @ E lit lshift  dup 4000 lit + snx @ umin shi !  slo !
+bcode @ 0= if snent @ ?dup if 0 lit do
+	i epos  dup slo @ u< over shi @ u< 0= or if sbad then
+	i if i 1 lit - epos over u< 0= if sbad then then drop
+loop then then
+\ the part's root: its 64 groups, then six levels up
+bcode @ 0= if
+	800 lit malloc sbig !
+	0 lit
+	40 lit 0 lit do
+		lvs @ 800 lit wzero
+		begin dup snent @ u< if dup epos 8 lit rshift 3F lit and i = else 0 lit then while
+			dup 48 lit * sents @ + srec  rb @  over epos FF lit and 5 lit lshift lvs @ +  rleaf
+			1 lit +
+		repeat
+		lvroot  lvs @ sbig @ i 5 lit lshift + 8 lit wcopy
+	loop drop
+	sbig @ 40 lit 8 lit E lit climb
+	sbig @ stmd @ 8 lit wcopy  stmd @ dfrom
+	stmd @ sroots @ slo @ E lit rshift 5 lit lshift + 8 lit wcmp if sbad then
+	sbig @ free
+then
+\ each commit one of the outputs, holding its commit's leaf
+bcode @ 0= if sncom @ ?dup if 0 lit do
+	scom @ i 2C lit * +  dup le@ sfind
+	dup 0< if 2drop sbad else
+		48 lit * sents @ + 8 lit +  swap dup 8 lit + swap 28 lit + le@ stmd @ cleaf
+		stmd @ dfrom  stmd @ swap 8 lit wcmp if sbad then
+	then
+loop then then
+\ installed
+bcode @ 0= if
+	stfd @ 1 lit txbegin stx !
+	snent @ ?dup if 0 lit do
+		i 48 lit * sents @ + dup srec  rb @ swap le@ 0 lit oput
+		i 48 lit * sents @ + 3C lit + dup le@ swap 4 lit + le@ ssum @ amount+
+	loop then
+	sncom @ ?dup if 0 lit do
+		scom @ i 2C lit * + dup 8 lit + cb @ 24 lit bcopy  le@ 0 lit kcommit cb @ 24 lit sput
+	loop then
+	serr @ if sbad stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
+	0 lit ndirty !
+then ;
+
+\ ── Name parts (names.rs's part_hash) ──
+
+\ sbucket ( k -- b )  a key's bucket: its top 16 bits.
+: sbucket  3 lit w@ 8 lit rshift ;
+
+: snpname  ( j p n -- )
+sread  spk !
+bu32 dup bleft 61 lit / u> if drop bbad 0 lit then snrec !
+snrec @ 3 lit lshift 20 lit + malloc srecs !
+snrec @ ?dup if 0 lit do bcode @ 0= if brec srecs @ i w! then loop then
+bcode @ 0= bp @ bq @ <> and if bbad then
+\ the part's keys, from its first to the next part's
+spk @ 2F lit * snam @ + skl @ k15
+spk @ 1 lit + snn @ u< if spk @ 1 lit + 2F lit * snam @ + skh @ k15 else skh @ 4 lit 0 lit do FFFFFFFF lit over i w! loop drop then
+bcode @ 0= if
+	snrec @ 4 lit lshift 10 lit + malloc skey !  snrec @ 5 lit lshift 20 lit + malloc sval !
+	snrec @ ?dup if 0 lit do
+		srecs @ i w@ sval @ i 5 lit lshift + rvalue  nkey @ skey @ i 4 lit lshift + 4 lit wcopy
+		skey @ i 4 lit lshift +  dup skl @ kcmp 0< over skh @ kcmp 0< 0= or if sbad then
+		i if dup 10 lit - over kcmp 0< 0= if sbad then then drop
+	loop then
+	\ the hash: per bucket, hash_domain 12 of the count and the records'
+	\ bytes packed; then hash_domain 11 of each bucket and its hash
+	snrec @ 9 lit * 20 lit + 2 lit lshift malloc spb !  spb @ spp !
+	snrec @ if bp @ srecs @ @ - else 0 lit then 3 lit / 10 lit + 2 lit lshift malloc sbk !
+	0 lit
+	begin dup snrec @ u< while
+		dup sbi !
+		dup 4 lit lshift skey @ + sbucket sbs !
+		dup begin 1 lit + dup snrec @ u< if dup 4 lit lshift skey @ + sbucket sbs @ = else 0 lit then 0= until nip
+		dup sbi @ - sbn !
+		sbs @ tom spp @ !  spp @ 4 lit + spp !
+		sbn @ tom sbk @ !
+		srecs @ sbi @ w@ sba !  srecs @ over 1 lit - w@ dup rsize + sba @ - sbl !
+		sba @ sbl @ sbk @ 4 lit + pack3
+		sbk @ sbl @ 2 lit + 3 lit / 1 lit + C lit spp @ hdom  spp @ 20 lit + spp !
+	repeat drop
+	spb @ spp @ spb @ - 2 lit rshift B lit stmd @ hdom  stmd @ dfrom
+	stmd @ spk @ 2F lit * snam @ + F lit + 8 lit wcmp if sbad then
+	spb @ free  sbk @ free
+then
+\ installed: each record, and its leaf in the trie
+bcode @ 0= if
+	stfd @ 1 lit txbegin stx !
+	snrec @ ?dup if 0 lit do
+		skey @ i 4 lit lshift + krec  srecs @ i w@ dup rsize sput
+		skey @ i 4 lit lshift +  sval @ i 5 lit lshift + tinsert
+	loop then
+	serr @ if sbad stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
+	skey @ free  sval @ free
+then
+srecs @ free ;
+
+: snpart  ( i p n -- code )
+rot dup snr @ u< if -rot snpout else snr @ - -rot snpname then  bcode @ ;
+
+\ issued ( h acc -- )  acc (4 words) = the coins issued by blocks 1 to h
+\ (tabminer's ChainParams::issued): 1500 coins a block for the first era,
+\ 500 for the second, 7 for the third.
+: sac variable ;  : sma variable ;  : smb variable ;  : smc variable ;  : sih variable ;  : sis variable ;
+: sera  ( n lo hi -- )  smb @ 1 lit w!  smb @ !  sma @ !  smc @ 4 lit wzero  sma @ 1 lit smb @ 2 lit smc @ wmul  sac @ smc @ sac @ 4 lit wadd drop ;
+: issued
+sac ! sih !  sac @ 4 lit wzero
+sih @ 2CE98 lit umin  75ABF000 lit DA4 lit sera
+sih @ 2CE98 lit u> if sih @ 2CE98 lit - 2CE98 lit umin  27395000 lit 48C lit sera then
+sih @ 59D30 lit u> if sih @ 59D30 lit - 3220080 lit umin  4C533C00 lit 10 lit sera then ;
+
+: snfin  ( hS -- code )
+sbh !  0 lit bcode !
+sdone @ snr @ snn @ + <> if sbad then
+bcode @ 0= if
+	stfd @ 1 lit txbegin stx !
+	snx @ 70 lit mput
+	snx @ FF lit + 8 lit rshift ?dup if 0 lit do i dadd loop then
+	sprop
+	tmpb @ troot  tmpb @ dfrom  tmpb @ snroot @ 8 lit wcmp if sbad then
+	stmd @ sroot0  stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then
+	sbh @ 20 lit + @ sis @ issued  ssum @ sis @ 4 lit wcmp if sbad then
+	sbh @ 20 lit + @ 68 lit mput  sbh @ 20 lit + @ khdr sbh @ CC lit sput
+	bcode @ serr @ or if stx @ txabort drop else stx @ txcommit drop then
+	0 lit ndirty !
+then
+bcode @ ;
+
+: shdr  ( h -- )
+stfd @ 1 lit txbegin stx !  dup 20 lit + @ khdr swap CC lit sput  stx @ txcommit drop ;
+
+: sverify  ( hS body n -- flag )
+rot bh !  bh @ 20 lit + @ sh !  0 lit bcode !
+bparse
+bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
+bcode @ 0= if
+	0 lit bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + @ 1 lit = if 1 lit + then loop then
+	bnout @ +  snx @ swap - sfirst !  snx @ sctr !
+	stfd @ 0 lit txbegin stx !  sproof  stx @ txcommit drop
+else 0 lit then
+bops @ free ;
+
+\ sninit  the snapshot's scratch.
+: sninit  20 lit alloc ssum !  20 lit alloc sis !  10 lit alloc skl !  10 lit alloc skh !  10 lit alloc sma !  10 lit alloc smb !  20 lit alloc smc ! ;

@@ -1,0 +1,49 @@
+\ proofs_test.fam — real dev-recursive blocks connected with their chain
+\ proofs checked (docs/NODE.md, step 6), a program for the OS after arith,
+\ poseidon2, difficulty, pow, chainver, state, proofs and connect, with a
+\ disk.  /lib/akjv.txt.gz is the seed file, /lib/chainver the recursive dev
+\ network's verifier (chainver_dev.bin), /lib/devchain its first blocks
+\ (devchain.bin, from fam_vectors.rs's dump_dev_chain: the chain's
+\ constants, genesis, then the blocks).  Each block connects; block 4 with
+\ a byte of its proof changed is refused first, changing nothing: for its
+\ body commitment, and with a header committing to it, for its proof.
+
+: tpas variable ;  : tfai variable ;  : ctn variable ;  : tbuf variable ;  : thdr variable ;
+: ep variable ;  : ecode variable ;  : eh variable ;  : en variable ;  : eb variable ;
+
+\ rdfile ( path -- addr n )  a whole file of at most 1.25 MiB, in memory.
+: rdfile
+0 lit open  dup 0< if "proofs_test: no file" puts 0A lit putc then
+140000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  140000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: vok  if tpas @ 1 lit + tpas ! else tfai @ 1 lit + tfai ! then ;
+: entry  ep @ @ ecode !  ep @ 4 lit + eh !  ep @ D0 lit + @ en !  ep @ D4 lit + eb !  eb @ en @ + 3 lit + FFFFFFFC lit and ep ! ;
+
+"/lib/akjv.txt.gz" rdfile powinit  400 lit pwitems !
+"/lib/chainver" rdfile drop cvinit
+"/t-proofs" TREE CREATE or 2 lit or open stinit
+"/lib/devchain" rdfile drop  dup @ ctn !  4 lit + dup 60 lit + prinit
+"/lib/devchain" rdfile drop 4 lit + 60 lit + CC lit + ep !
+-1 lit sprchk !  0 lit tpas !  0 lit tfai !  10000 lit alloc tbuf !  CC lit alloc thdr !
+ctn @ 0 lit do
+	entry
+	i 3 lit = if
+		eb @ tbuf @ en @ bcopy  tbuf @ en @ + 64 lit - dup c@ 1 lit xor swap c!
+		\ as it is: its header commits to another body
+		eh @ tbuf @ en @ sconnect dup FFFFFFF5 lit = vok
+		dup FFFFFFF5 lit <> if "tampered block 4 got " puts dup . 0A lit putc then drop
+		\ its header given the tampered body's commitment: the proof is refused
+		eh @ thdr @ CC lit bcopy  0 lit bcode !  tbuf @ en @ bparse  thdr @ 2C lit + bcommit  thdr @ 2C lit + dfrom
+		thdr @ tbuf @ en @ sconnect dup FFFFFFEF lit = vok
+		dup FFFFFFEF lit <> if "its proof got " puts dup . 0A lit putc then drop
+	then
+	eh @ eb @ en @ sconnect dup 0= vok
+	dup if "block " puts i 1 lit + u. " got " puts dup . 0A lit putc then drop
+loop
+"proofs: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+bye

@@ -1,0 +1,83 @@
+\ proofs.fam — a block's chain proof checked (docs/NODE.md, step 6), after
+\ arith.fam, poseidon2.fam, difficulty.fam, pow.fam, chainver.fam and
+\ state.fam.  As tabminer's Statement::from_block and chain_output
+\ (miner/src/aggregate.rs) and the sponges of block_air.rs: the public
+\ values a block's chain proof is checked against are the program digest
+\ (the base program's at height 1, the step's after) and the hash of the
+\ height, the statement, the step digest and the plan root.  The statement
+\ is the parent's state root and the block's, the sponge states over the
+\ inputs' positions, the outputs, the name operations' digests and the
+\ swept positions, the first and next output positions, the subsidy in
+\ 16-bit limbs, the height, the parent's work (its pow_hash, nonce and
+\ mix; genesis's mix computed from the seed file) and the parent's hash.
+\
+\ prinit ( consts genesis -- )  the chain's constants (24 canonical words:
+\ the base program's digest, the step's, the plan root) and its genesis
+\ header (stored, its work computed: powinit and cvinit first).
+\ sproof ( -- flag )  within sconnect, after the supply: whether the block
+\ being connected has a valid chain proof.
+
+: prk variable ;  : pcs variable ;  : pin variable ;  : pvp variable ;  : ppub variable ;
+: pgw variable ;  : ptmp variable ;  : ppar variable ;
+
+: pv,  tom pvp @ !  pvp @ 4 lit + pvp ! ;     \ ( x -- )  a canonical value
+: pvm,  pvp @ swap wcopy ;                     \ ( a n -- )  n Montgomery words (then pvp+)
+: pvadv  2 lit lshift pvp @ + pvp ! ;          \ ( n -- )
+: sp0  pcs @ 10 lit wzero  tom pcs @ 8 lit w! ;   \ ( dom -- )  a sponge, its domain in the capacity
+: sab8  8 lit 0 lit do pcs @ i w@ over i w@ f+ pcs @ i w! loop drop  pcs @ perm16 ;   \ ( a -- )
+\ sabpos ( lo hi -- )  a position: its low 30 bits and the rest.
+: sabpos
+over 3FFFFFFF lit and tom pcs @ @ f+ pcs @ !
+swap 1E lit rshift swap 2 lit lshift or tom pcs @ 4 lit + @ f+ pcs @ 4 lit + !
+pcs @ perm16 ;
+: spcs,  pcs @ 10 lit pvm,  10 lit pvadv ;    \ the sponge's 16 words
+
+: prinit  ( consts genesis -- )
+400 lit alloc pin !  40 lit alloc pcs !  40 lit alloc ppub !  40 lit alloc pgw !  40 lit alloc ptmp !
+CC lit alloc ppar !
+swap 60 lit alloc dup prk ! 18 lit wcopy
+\ genesis: stored, its pow_hash and true mix
+stfd @ 1 lit txbegin stx !  dup 0 lit khdr swap CC lit sput  stx @ txcommit drop
+dup pgw @ powhash
+pgw @ swap AC lit + pgw @ 20 lit + pwr @ hashmix ;
+
+: sproof  ( -- flag )
+sh @ 1 lit - khdr ppar @ CC lit sget CC lit = if
+	pin @ pvp !
+	sh @ pv,
+	ppar @ 4C lit + pvp @ dle 8 lit pvadv
+	bh @ 4C lit + pvp @ dle 8 lit pvadv
+	21 lit sp0  bnin @ ?dup if 0 lit do bin @ i 5 lit * + pos@ sabpos loop then  spcs,
+	22 lit sp0
+	bnout @ ?dup if 0 lit do
+		bout @ i 3C lit * +  dup ptmp @ dle  ptmp @ sab8
+		ptmp @ 8 lit wzero  dup 20 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ tom ptmp @ i w! loop drop
+		34 lit + dup le@ swap 4 lit + le@
+		over 3FFFFFFF lit and tom ptmp @ 5 lit w!
+		over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and tom ptmp @ 6 lit w!
+		nip 1C lit rshift tom ptmp @ 7 lit w!
+		ptmp @ sab8
+	loop then  spcs,
+	sfirst @ dup 3FFFFFFF lit and pv, 1E lit rshift pv,
+	sctr @ dup 3FFFFFFF lit and pv, 1E lit rshift pv,
+	sh @ subsidy  over FFFF lit and pv,  swap 10 lit rshift pv,  dup FFFF lit and pv,  10 lit rshift pv,  0 lit pv,  0 lit pv,
+	sh @ pv,
+	23 lit sp0  bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + ptmp @ opdigest ptmp @ sab8 loop then  spcs,
+	24 lit sp0  bnsw @ ?dup if 0 lit do bsw @ i 5 lit * + pos@ sabpos loop then  spcs,
+	sh @ 1 lit = if
+		pgw @ 8 lit pvm, 8 lit pvadv
+		ppar @ AC lit + 20 lit pvp @ pack3 B lit pvadv
+		pgw @ 20 lit + 8 lit pvm, 8 lit pvadv
+	else
+		ppar @ pvp @ powhash 8 lit pvadv
+		ppar @ AC lit + 20 lit pvp @ pack3 B lit pvadv
+		ppar @ 8C lit + pvp @ dle 8 lit pvadv
+	then
+	bh @ pvp @ dle 8 lit pvadv
+	prk @ 20 lit + pvp @ dtom 8 lit pvadv
+	prk @ 40 lit + pvp @ dtom 8 lit pvadv
+	pin @ pvp @ pin @ - 2 lit rshift ptmp @ hash  ptmp @ dfrom
+	sh @ 1 lit = if prk @ else prk @ 20 lit + then ppub @ 8 lit wcopy
+	ptmp @ ppub @ 20 lit + 8 lit wcopy
+	ppub @ bpr @ bnpr @ cvverify
+else 0 lit then ;

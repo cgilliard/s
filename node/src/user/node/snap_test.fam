@@ -1,0 +1,58 @@
+\ snap_test.fam — the state from a snapshot (docs/NODE.md, step 6), a
+\ program for the OS after arith, poseidon2, difficulty, pow, chainver,
+\ state, proofs, connect and snap, with a disk.  /lib/statesnap is the
+\ snapshot after block 150 of the state test's chain as tabminer serves it
+\ (statesnap.bin), /lib/statechain that chain (statechain.bin).  A changed
+\ manifest and a changed part are refused, and finishing early; the
+\ snapshot installs with the block's state root; then the chain's later
+\ blocks connect, every root right.
+
+: tpas variable ;  : tfai variable ;  : ctn variable ;  : tbuf variable ;
+: ep variable ;  : ecode variable ;  : eh variable ;  : en variable ;  : eb variable ;
+: hl variable ;  : hb variable ;  : hn variable ;  : nh variable ;  : sp variable ;  : np variable ;
+: mf variable ;  : mfn variable ;  : cr variable ;
+
+: rdfile
+0 lit open  dup 0< if "snap_test: no file" puts 0A lit putc then
+100000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  100000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: vok  if tpas @ 1 lit + tpas ! else tfai @ 1 lit + tfai ! then ;
+: entry  ep @ @ ecode !  ep @ 4 lit + eh !  ep @ D0 lit + @ en !  ep @ D4 lit + eb !  eb @ en @ + 3 lit + FFFFFFFC lit and ep ! ;
+: next4  dup @ swap 4 lit + swap 2dup + 3 lit + FFFFFFFC lit and ;   \ ( p -- a n p' )  a length and bytes
+: hS  hl @ 95 lit w@ ;                         \ block 150's header (the 150th connected)
+
+"/t-snap" TREE CREATE or 2 lit or open stinit  sninit
+800 lit alloc hl !  800 lit alloc hb !  800 lit alloc hn !  20 lit alloc cr !  400000 lit alloc tbuf !
+\ the chain's blocks, by height
+"/lib/statechain" rdfile drop dup @ ctn ! 4 lit + ep !  0 lit nh !
+ctn @ 0 lit do entry ecode @ 0= if eh @ hl @ nh @ w!  eb @ hb @ nh @ w!  en @ hn @ nh @ w!  nh @ 1 lit + nh ! then loop
+\ the snapshot: the manifest, then each part
+"/lib/statesnap" rdfile drop 4 lit + next4 sp !  mfn ! mf !
+sp @ @ np !  sp @ 4 lit + sp !
+0 lit tpas !  0 lit tfai !
+\ a changed manifest refused; the manifest
+mf @ tbuf @ mfn @ bcopy  tbuf @ 10 lit + dup c@ 1 lit xor swap c!
+tbuf @ mfn @ hS snman 0= 0= vok
+mf @ mfn @ hS snman 0= vok
+\ finishing before the parts are in: refused
+hS snfin FFFFFFD8 lit = vok
+np @ 0 lit do
+	sp @ next4 sp !
+	\ a changed copy refused (a byte of its first entry), then the part
+	2dup tbuf @ swap bcopy  tbuf @ 18 lit + dup c@ 1 lit xor swap c!
+	i tbuf @ 2 lit pick snpart 0= 0= vok
+	i -rot snpart 0= vok
+loop
+hS snfin 0= vok
+cr @ sroot  cr @ hS 4C lit + 8 lit wcmp 0= vok
+"snapshot: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+\ the blocks after it
+0 lit tpas !  0 lit tfai !
+nh @ 96 lit do hl @ i w@ hb @ i w@ hn @ i w@ sconnect 0= vok loop
+"after it: " puts tpas @ u. " connected, " puts tfai @ u. " not" puts 0A lit putc
+bye
