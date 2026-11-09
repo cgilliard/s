@@ -23,8 +23,9 @@
 //! - `pool.bin` (step 7): transactions offered to tabminer's own
 //!   `Mempool` on a dev chain whose outputs pay known keys, each verdict as
 //!   it gave it, policy inputs spent through each kind of leaf, blocks
-//!   mining some, the pool after each, and XMSS signatures of other
-//!   heights, verified and refused.
+//!   mining some, the pool after each, XMSS signatures of other heights,
+//!   verified and refused; and (step 8) proofs of outputs and names
+//!   against the tip's state, as tabminer makes them.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -1044,6 +1045,12 @@ mod tests {
     /// - 3, an XMSS signature: the flag tabminer's `verify` gives, the
     ///   message (8 canonical words), the key (49 bytes), the signature's
     ///   length and the signature.
+    /// - 4, an output's proof against the tip's state root: its position
+    ///   (8 bytes), the 40 siblings (canonical words), leaf first;
+    /// - 5, a name's proof against the trie: the name's length and the
+    ///   name (32 bytes, zero padded), the terminal (0 empty, or 1, its key
+    ///   as 16 bytes and its value), the depth and the siblings from the
+    ///   terminal's up.
     fn generate_pool() -> Vec<u8> {
         use crate::block::{Block, Body};
         use crate::chain::{AcceptAllProofs, Chain, ChainParams};
@@ -1513,6 +1520,41 @@ mod tests {
                 pad(&mut out);
                 entries += 1;
             }
+        }
+        // Proofs against the tip's state root (docs/NODE.md, step 8):
+        // outputs unspent and spent, in groups apart, and one past the
+        // counter; names registered and not.
+        let made = next(&chain);
+        for position in [0, 1, reward[2] + 1, reward[17] + 1, reward[21], made - 1, made, 300] {
+            let (_, _, proof) = chain.output_proof(position).unwrap().unwrap();
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&position.to_le_bytes());
+            for sib in &proof.siblings {
+                words(&mut out, sib);
+            }
+            entries += 1;
+        }
+        for name in ["pooltest", "second", "alpha", "nobody", "a"] {
+            let rtxn = chain.env().read_txn().unwrap();
+            let proof = chain.names().prove(&rtxn, name.as_bytes()).unwrap();
+            out.extend_from_slice(&5u32.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            let mut n = name.as_bytes().to_vec();
+            n.resize(32, 0);
+            out.extend_from_slice(&n);
+            match proof.terminal {
+                crate::name_trie::Terminal::Empty => out.extend_from_slice(&[0u8; 4 + 16 + 32]),
+                crate::name_trie::Terminal::Leaf { key, value } => {
+                    out.extend_from_slice(&1u32.to_le_bytes());
+                    out.extend_from_slice(&key.to_le_bytes());
+                    words(&mut out, &value);
+                }
+            }
+            out.extend_from_slice(&(proof.siblings.len() as u32).to_le_bytes());
+            for sib in &proof.siblings {
+                words(&mut out, sib);
+            }
+            entries += 1;
         }
         drop(chain);
         let _ = std::fs::remove_dir_all(&dir);
