@@ -663,7 +663,7 @@ else 0 lit then then then then then ;
 \ vgen ( q -- )  directory q's listing.
 : tl  ts A lit tc ;                                          \ ( s -- )  a line
 : vgen
-dup 1 lit = if "console" tl "null" tl rngk @ if "random" tl then "tty/" tl then
+dup 1 lit = if "console" tl progtab if "image" tl then "null" tl rngk @ if "random" tl then "tty/" tl then
 dup 2 lit = if 10 lit 0 lit do i 2 lit lshift kpty @ + @ if i tn A lit tc then loop then
 dup 3 lit = if
 	phi @ 0 lit do i prn @ if i 1 lit + tn "/" tl then loop
@@ -671,7 +671,19 @@ dup 3 lit = if
 then
 4 lit = if "cmd" tl "cwd" tl "kill" tl "status" tl "tickets" tl "user" tl then ;
 
-\ 15 open(path, flags): /dev/console, /dev/null, /dev/random, /dev/tty/<N>, a /proc key,
+\ dimage ( mode -- f | 0 | error )  /dev/image: the image this machine
+\ booted, as tabernacle checked it (0x80000000 to s10, its end: kind 11,
+\ as an image program read as /bin/<name>), to read only (-13 to write);
+\ -2 with no image (the kernel alone).  So the node serves its own image
+\ (docs/NODE.md, step 9).
+: dimage
+progtab 0= if drop FFFFFFFE lit else
+1 lit = 0= if FFFFFFF3 lit else
+B lit 1 lit fnew dup if
+	80000000 lit over 8 lit + !  s10@ 80000000 lit - over 10 lit + !  0 lit over C lit + !
+then then then ;
+
+\ 15 open(path, flags): /dev/console, /dev/image, /dev/null, /dev/random, /dev/tty/<N>, a /proc key,
 \ or one of the directories above (to read); flags 0 read, 1 write, 2
 \ both.  Its descriptor; -2 no such, -13 not that way, -21 a directory to
 \ write, -22 bad flags, -24 no descriptor free, -12 no room.
@@ -680,12 +692,13 @@ klk @ lock
 kvpath 0= if FFFFFFF2 lit else
 2C lit sysarg 3 lit and dup 2 lit u> if drop FFFFFFEA lit else 1 lit +
 	vdir ?dup if swap 1 lit <> if drop FFFFFFEB lit else ptext dup if swap vgen tbend else nip then then else
+	kpb @ "/dev/image" streq if dimage else
 	kpb @ "/dev/console" streq if 1 lit swap fnew else
 	kpb @ "/dev/null" streq if 2 lit swap fnew else
 	kpb @ "/dev/random" streq if rngk @ if C lit swap fnew else drop FFFFFFFE lit then else
 	kpb @ "/dev/tty/" kpfx ?dup if swap yopen else
 	kpb @ "/proc/" kpfx ?dup if swap popen else drop FFFFFFFE lit then
-	then then then then then
+	then then then then then then
 	dup 0= if drop FFFFFFF4 lit else
 	dup kerr? 0= if
 		dup area@ tproc fdput dup 0< if swap fclose else nip then
@@ -1621,16 +1634,29 @@ then then then then ;
 \ fsize ( f -- f size )  the file's size now.
 : fsize  fst @ 1 lit tbegin if dup fpath hget 1 lit = if XVAL xa 10 lit + @ else 0 lit then tcommit drop else 0 lit then ;
 
+\ mseek ( f -- place | -22 )  seek on a text in memory (kinds 4 and 11:
+\ a listing, a /proc key, the image or one of its programs), its size at
+\ 10.  Under klk.
+: mseek
+30 lit sysarg dup 0= if drop 2C lit sysarg else
+	dup 1 lit = if drop dup C lit + @ 2C lit sysarg + else
+	2 lit = if dup 10 lit + @ 2C lit sysarg + else FFFFFFEA lit then then then
+dup FFFFFFEA lit = if nip else tuck swap C lit + ! then ;
+\ mfile? ( -- f | 0 )  the call's descriptor, if a text in memory.  Under klk.
+: mfile?  28 lit sysarg ufd dup if dup @ dup 4 lit = swap B lit = or 0= if drop 0 lit then then ;
+
 \ 18 seek(fd, offset, whence): a file's place set: whence 0 from its
-\ start, 1 from its place, 2 from its end.  The place; -29 not a file.
+\ start, 1 from its place, 2 from its end.  The place; -29 not a file
+\ (nor a text in memory).
 : sseek
+klk @ lock mfile? ?dup if mseek klk @ unlock sret else klk @ unlock
 kfile? ?dup 0= if FFFFFFE3 lit sret else
 dup @ 7 lit = 0= if kfdone FFFFFFE3 lit sret else
 30 lit sysarg dup 0= if drop 2C lit sysarg else
 	dup 1 lit = if drop dup C lit + @ 2C lit sysarg + else
 	2 lit = if fsize 2C lit sysarg + else FFFFFFEA lit then then then
 dup FFFFFFEA lit = if swap kfdone sret else over C lit + !  dup C lit + @ swap kfdone sret then
-then then ;
+then then then ;
 
 \ 35 remove(path): a file, a tree (its pages are not given back yet) or an
 \ empty directory taken out (its directory must allow it).  0; -2 none

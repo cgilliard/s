@@ -902,6 +902,16 @@ kernel too much to add at the end.
     the device's interrupt; `poll` sees it readable when bytes are
     ready. `q32` and `node.sh` give QEMU the device. Checked by `rnd`.
 
+    `/dev/image` (2026-11-09, for the node serving its image,
+    `docs/NODE.md` step 9): the image this machine booted, as tabernacle
+    checked it (or q32 loaded it), from `0x80000000` to its end: file
+    kind 11, as an image program read as `/bin/<name>`; read only (-13
+    to write), absent with no image (the kernel alone). `seek` now works
+    on texts in memory too (kinds 4 and 11: listings, `/proc` keys, the
+    image and its programs), not only on files. Checked by `image`: its
+    size the image file's, its first word and last 8 bytes the file's
+    after seeking, a write refused, `/dev`'s listing naming it.
+
     Checked by `exec_1/4` (with a disk):
     - `/bin` there, and `cd /proc`;
     - a copied echo refused without x, then run by its path, by a

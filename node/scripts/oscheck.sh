@@ -401,6 +401,25 @@ f @ "x" 1 lit write "write " puts . 0A lit putc
 f @ close drop bye'
 sh scripts/mkimage.sh "$T/rnd.img" bin/kernel init="$T/trnd.bin" 2> "$T/rnd.mk" || fail rnd "mkimage: $(cat "$T/rnd.mk")"
 expect rnd 124 '^random ok read 32 32 differ yes rest 192 next 256 write -9$' 5 ./tools/q32 --smp=2 "$T/rnd.img"
+# The image this machine booted: /dev/image (node step 9), its size the
+# image's, its bytes the image's (its first word, its last 8 bytes, the
+# table's offset and "PROG", read after seeking), to read only; seeking a
+# device that is not a file still refused; /dev's listing names it.
+usrc timg ': b variable ;  : f variable ;  : sp  20 lit putc ;
+100 lit alloc b !
+"/dev/image" 0 lit open dup f ! 0< if "image bad" else "image ok" then puts sp
+f @ 0 lit 2 lit seek dup "size " puts . sp
+8 lit - f @ swap 0 lit seek drop  f @ b @ 10 lit read "tail " puts . sp  b @ @ u. sp  0 lit b @ 8 lit + c!  b @ 4 lit + puts sp
+f @ 0 lit 0 lit seek drop  f @ b @ 4 lit read drop  "first " puts b @ @ u. sp
+f @ 4 lit 1 lit seek "here " puts . sp
+"/dev/image" 1 lit open "write " puts . sp
+"/dev/null" 0 lit open 0 lit 0 lit seek "null " puts . 0A lit putc
+"/dev" 0 lit open dup b @ 100 lit read b @ + 0 lit swap c! close drop b @ puts
+f @ close drop bye'
+uimage img bin/kernel init=timg
+set -- $(od -An -tu4 -N4 "$T/img.img") $(od -An -tu4 -j$(($(wc -c < "$T/img.img") - 8)) -N4 "$T/img.img")
+expect image 124 "^image ok size $(wc -c < "$T/img.img" | tr -d ' ') tail 8 $2 PROG first $1 here 8 write -13 null -29\$" 5 ./tools/q32 "$T/img.img"
+has image '^image$'
 # The date: /proc/time from QEMU's real-time clock (node step 6), within a
 # minute of the host's, and in the /proc listing.
 usrc ttime ': b variable ;  20 lit alloc b !
