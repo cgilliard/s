@@ -248,7 +248,7 @@ ncode @ ;
 : nann
 0 lit nrl !
 pnp @ ?dup if 0 lit do
-	i pcur @ <>  i prec 8 lit + @ and  i prec B0 lit + @ 0= and if
+	i pcur @ <>  i prec 8 lit + @ and  i prec B0 lit + @ 0= and  i pbanned 0= and if
 		7 lit wbeg  myh @ hat hhdr CC lit wbs  nln @ w32  i psend  nrl @ 1 lit + nrl !
 	then
 loop then
@@ -267,7 +267,14 @@ begin hbest hheight pst-h u< nfl @ 0= and while
 			dup FFFFFFFE lit = i 0= and if
 				drop  1 lit nbk !
 				dup 1 lit = if 1 lit nfl ! else nstp @ 1 lit lshift nstp ! then
-			else 1 lit u> if 1 lit nfl ! then then
+			else
+				\ refused: the peer struck, but for a timestamp ahead of our
+				\ clock, a branch set aside, or our room
+				dup 1 lit u> if
+					dup FFFFFFFA lit <> over FFFFFFF7 lit <> and over FFFFFFF8 lit <> and if pcur @ pstrike then
+					1 lit nfl !
+				then drop
+			then
 		then loop
 	else 1 lit nfl ! then
 	drop
@@ -277,7 +284,7 @@ repeat
 hbst @ nb0 @ <> if
 	begin hbst @ nb0 @ <> if hbest hheight nconf 0= else 0 lit then while
 		vrb @ if nhead "header " puts hbest hheight u. "'s proof of work refused; its branch set aside" puts 0A lit putc then
-		hbest hmark
+		hbest hmark  pcur @ pstrike
 	repeat
 	vrb @ if
 		nhead "headers to " puts hbest hheight u. ", fetched and the best's work checked in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
@@ -304,7 +311,7 @@ myh @ hbest hheight u< nfl @ 0= and if
 			i hat dup nblock if
 				hhdr nblk @ CC lit + nbn @ CC lit - nconnect ?dup if
 					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
-					i hat hmark  1 lit nfl !
+					i hat hmark  pcur @ pstrike  1 lit nfl !
 				else
 					nk @ 1 lit + nk ! nstat  1 lit nchg !  nuw @ if qmvblk then  ncn @ 1 lit + ncn !  nbn @ nln !
 					vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then
@@ -344,6 +351,7 @@ begin pdeq ?dup while
 		pcur @ nrc !  nrk @ puse  1 lit 0 lit nrid @ pfetch  nrc @ puse
 		?dup if
 			2dup qadmit  "pool: " puts dup . 20 lit putc nrid @ nhex 0A lit putc
+			dup FFFFFFFF lit = if nrk @ pstrike then   \ bytes that do not decode
 			0= if nrid @ nrk @ pann then
 			drop free
 		else drop then
@@ -361,7 +369,7 @@ repeat ;
 : nahead
 FFFFFFFF lit nah !  myh @ nahh !
 pnp @ ?dup if 0 lit do
-	i prec 8 lit + @  i prec B0 lit + @ 0= and  secs i prec B4 lit + @ - 0< 0= and if
+	i prec 8 lit + @  i prec B0 lit + @ 0= and  secs i prec B4 lit + @ - 0< 0= and  i pbanned 0= and if
 		i prec 4C lit + @ nahh @ u> if i nah !  i prec 4C lit + @ nahh ! then
 	then
 loop then nah @ ;

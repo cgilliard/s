@@ -1172,10 +1172,19 @@ Each step done when its test passes.
       behind, with the node its only peer, and catches up from it, then
       takes A's next block through it. Not yet: snapshots' manifests and
       parts (a peer's fast sync needs a tabminer).
+    - Strikes, as tabminer's `Peers::strike`: a peer is struck for
+      headers refused (but for a timestamp ahead of our clock, a branch
+      set aside, or our room), a best header whose work fails, a block
+      refused, a transaction that does not decode; strikes are forgotten
+      10 minutes after the last, and at 5 the peer is banned for an hour
+      (not pinged, followed or told of blocks, what it sends dropped).
+      tabminer bans the host; here the address and port, as peers under
+      QEMU share the host's address. `scripts/striketest.sh`: a fake peer
+      (Python) claims a height far ahead and answers with malformed
+      headers: struck once a minute, banned at the fifth, while the node
+      follows A throughout.
     - Not yet: started by init (held back while it is tried by hand),
-      configuration (network, port), serving headers, manifests and parts
-      to peers syncing from the node, striking peers that misbehave, more
-      than 65,536 headers (the store holding them, a window in memory),
+      configuration (network, port), more than 65,536 headers (the store holding them, a window in memory),
       a log and a way to read its state from the shell, serving
       snapshots.
 

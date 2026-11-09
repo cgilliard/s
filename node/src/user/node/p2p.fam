@@ -89,10 +89,11 @@ A lit 0 lit w64  A lit 0 lit w64 ;
 : prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
 \ then (pkeep's, in secs) when to ping it next (A4), the wait after that
 \ (A8), when it last answered (AC), whether said lost (B0); until when its
-\ claims are passed over (B4: it claimed a height it did not deliver)
+\ claims are passed over (B4: it claimed a height it did not deliver, or
+\ it is banned); its strikes (B8) and when the last was (BC)
 : psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
 : puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
-: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec 4C lit + 0 lit swap !  pnp @ prec A4 lit + 5 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec 4C lit + 0 lit swap !  pnp @ prec A4 lit + 7 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
 \ pwho ( ip port -- k | -1 )
 : pwho
 FFFFFFFF lit pfk !
@@ -297,12 +298,33 @@ prn @ 11 lit u< 0= if
 		phat @ 1 lit + phsend
 	then
 then ;
+\ pstrike ( k -- )  a bad reply from peer k, as tabminer's Peers::strike:
+\ its strikes forgotten 10 minutes after the last; at 5 it is banned for
+\ an hour (pbanned): not pinged, followed or told of blocks, and what it
+\ sends dropped.  (tabminer bans the host; here the address and port,
+\ as peers under QEMU share the host's address.)
+: pstrike
+secs over prec BC lit + @ - 258 lit u< 0= if 0 lit over prec B8 lit + ! then
+dup prec B8 lit + dup @ 1 lit + swap !  secs over prec BC lit + !
+dup prec B8 lit + @ 5 lit u< 0= if
+	secs E10 lit + over prec B4 lit + !
+	vrb @ if nhead "peer " puts dup pshow " banned for an hour (5 strikes)" puts 0A lit putc then
+else
+	vrb @ if nhead "peer " puts dup pshow " struck (" puts dup prec B8 lit + @ u. " of 5)" puts 0A lit putc then
+then drop ;
+\ pbanned ( k -- flag )  banned and its hour not up (once up, its strikes
+\ forgotten).
+: pbanned
+dup prec B8 lit + @ 5 lit u< if drop 0 lit else
+	secs over prec B4 lit + @ - 0< if drop -1 lit else 0 lit swap prec B8 lit + ! 0 lit then
+then ;
+
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
 	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
 	pfrom @ @ pfrom @ 4 lit + @ 2dup pwho drop ptokn
-	prn @ 5 lit u< prx @ @ 31424154 lit <> or if 0 lit else
+	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfk @ 0< 0= if pfk @ pbanned or then if 0 lit else
 		prx @ 4 lit + c@
 		dup 1 lit =  prn @ 91 lit u< 0= and if
 			2 lit wbeg  prx @ 5 lit + wstatus  prply
@@ -360,15 +382,17 @@ secs pdn @ - 0< 0=  panswer dup PPEERS u< swap 0= 0= and and if
 then ;
 : pkeep
 pnp @ ?dup if 0 lit do
-	secs pkt !
-	pkt @ i prec A4 lit + @ - 0< 0= if
-		i prec @ i prec 4 lit + @ ptokn  1 lit wbeg  mnon @ wstatus  i psend
-		pkt @ i prec AC lit + @ - 23 lit u< i prec AC lit + @ and if 1E lit else
-			i prec A8 lit + @ 1 lit lshift  dup 2 lit u< if drop 2 lit then  dup 1E lit u> if drop 1E lit then
-		then
-		dup i prec A8 lit + !  pkt @ + i prec A4 lit + !
-		pkt @ i prec AC lit + @ - B4 lit u> i prec B0 lit + @ 0= and if
-			1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 180 s, still asking" puts 0A lit putc then
+	i pbanned 0= if
+		secs pkt !
+		pkt @ i prec A4 lit + @ - 0< 0= if
+			i prec @ i prec 4 lit + @ ptokn  1 lit wbeg  mnon @ wstatus  i psend
+			pkt @ i prec AC lit + @ - 23 lit u< i prec AC lit + @ and if 1E lit else
+				i prec A8 lit + @ 1 lit lshift  dup 2 lit u< if drop 2 lit then  dup 1E lit u> if drop 1E lit then
+			then
+			dup i prec A8 lit + !  pkt @ + i prec A4 lit + !
+			pkt @ i prec AC lit + @ - B4 lit u> i prec B0 lit + @ 0= and if
+				1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 180 s, still asking" puts 0A lit putc then
+			then
 		then
 	then
 loop then
