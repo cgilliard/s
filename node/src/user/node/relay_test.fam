@@ -1,8 +1,8 @@
 \ relay_test.fam — a transaction relayed (docs/NODE.md, step 7), a program
 \ for the OS with a disk and the network, after what sync_test.fam is.
 \ scripts/pooltest.sh runs two tabminers on the host: one mining the
-\ recursive dev network (UDP 3747, seen from the guest at 10.0.2.2), and
-\ one with a wallet that does not mine (3748), whose only peer is this
+\ recursive dev network (UDP 37471, seen from the guest at 10.0.2.2), and
+\ one with a wallet that does not mine (37472), whose only peer is this
 \ node.  The node syncs from the miner as sync_test.fam does, takes the
 \ wallet's node for a second peer, then follows the tip and relays: the
 \ wallet's transaction fetched, pooled, announced to the miner, and gone
@@ -43,11 +43,11 @@ tdc @ dup 60 lit + prinit
 20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
 20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
 20 lit alloc tcr !
-A000202 lit EA3 lit E99 lit pinit
+A000202 lit 925F lit E99 lit pinit
 4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
 0= if
 	\ the wallet's node
-	A000202 lit EA4 lit padd puse  pping  0 lit puse
+	A000202 lit 9260 lit padd puse  pping  0 lit puse
 	if "wallet peer: answered" else "wallet peer: no answer" then puts 0A lit putc
 	\ up to ten minutes: following, relaying; until a transaction pooled
 	\ has left the pool

@@ -1,7 +1,7 @@
 #!/bin/sh
 # imagetest.sh — the node serving its image to tabernacles (docs/NODE.md,
 # step 9; docs/TABERNACLE.md), with no tools/server.py.  On the host: a
-# tabminer mining the recursive dev network (UDP 3747, a fresh data
+# tabminer mining the recursive dev network (UDP 37471, a fresh data
 # directory, no seeds) to 12 blocks.  The node (src/user/node/api_test.fam:
 # it syncs, then serves its peers and the API) in an image of its own, with
 # its version as /lib/version, booted by q32 with its UDP port forwarded
@@ -50,7 +50,7 @@ trap 'st=$?; [ -n "$BP" ] && pkill -P $BP 2>/dev/null; for p in $BP $QP $MP; do 
 trap 'exit 130' INT; trap 'exit 143' TERM
 mine() {
 	TABMINER_THREADS=${TABMINER_THREADS:-8} "$MINER" mine --network dev-recursive --data "$T/miner" --no-seeds \
-		--listen 127.0.0.1:3747 --no-prompt >> "$T/miner.out" 2>&1 &
+		--listen 127.0.0.1:37471 --no-prompt >> "$T/miner.out" 2>&1 &
 	MP=$!
 }
 # wait_for FILE PATTERN SECONDS WHAT
@@ -113,7 +113,7 @@ check(f'GetImages: {body.hex()}', kind == 65 and body == bytes([1]) + struct.pac
 send(3, token)
 kind, body = recv()
 peers = [(socket.inet_ntoa(body[1 + 6 * i:5 + 6 * i]), struct.unpack_from('<H', body, 5 + 6 * i)[0]) for i in range(body[0])]
-check(f'GetPeers: {peers}', kind == 4 and ('10.0.2.2', 3747) in peers)
+check(f'GetPeers: {peers}', kind == 4 and ('10.0.2.2', 37471) in peers)
 chunks = (len(img) + 1023) // 1024
 def chunk_ok(body, i):
     v, size, idx, n = struct.unpack_from('<IIHH', body)

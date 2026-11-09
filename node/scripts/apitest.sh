@@ -1,6 +1,6 @@
 #!/bin/sh
 # apitest.sh — the node's API (docs/NODE.md, step 8).  On the host: a
-# tabminer mining the recursive dev network (UDP 3747, a fresh data
+# tabminer mining the recursive dev network (UDP 37471, a fresh data
 # directory, no seeds) to 12 blocks; then stopped, its directory copied for
 # a second tabminer with the wallet and no peers, which burns a coin twice
 # and quits, its pool saved (the two transactions, made by tabminer's
@@ -38,7 +38,7 @@ trap 'st=$?; exec 3>&- 2>/dev/null; for p in $QP $WP $MP; do kill $p 2>/dev/null
 trap 'exit 130' INT; trap 'exit 143' TERM
 mine() {
 	TABMINER_THREADS=${TABMINER_THREADS:-8} "$MINER" mine --network dev-recursive --data "$T/miner" --no-seeds \
-		--listen 127.0.0.1:3747 --no-prompt >> "$T/miner.out" 2>&1 &
+		--listen 127.0.0.1:37471 --no-prompt >> "$T/miner.out" 2>&1 &
 	MP=$!
 }
 # wait_for FILE PATTERN SECONDS WHAT
@@ -59,7 +59,7 @@ mine
 
 # The wallet: two burns, pooled where it is (it has no peers), then quit.
 mkfifo "$T/wallet.in"
-"$MINER" mine --no-mine --network dev-recursive --data "$T/wallet" --no-seeds --listen 127.0.0.1:3748 \
+"$MINER" mine --no-mine --network dev-recursive --data "$T/wallet" --no-seeds --listen 127.0.0.1:37472 \
 	< "$T/wallet.in" > "$T/wallet.out" 2>&1 &
 WP=$!
 exec 3> "$T/wallet.in"

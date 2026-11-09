@@ -1,7 +1,7 @@
 \ api_test.fam — the API (docs/NODE.md, step 8), a program for the OS with
 \ a disk and the network, after what sync_test.fam is, query.fam and
 \ api.fam.  scripts/apitest.sh runs a tabminer mining the recursive dev
-\ network on the host (UDP 3747, seen from the guest at 10.0.2.2) and
+\ network on the host (UDP 37471, seen from the guest at 10.0.2.2) and
 \ forwards a host port to the API's (3738).  The node syncs as
 \ sync_test.fam does, starts the API (its token made, /etc/node/token),
 \ starts /bin/apicli (a program in the OS using the API), says the token
@@ -43,7 +43,7 @@ tdc @ dup 60 lit + prinit
 20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
 20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
 20 lit alloc tcr !
-A000202 lit EA3 lit E99 lit pinit
+A000202 lit 925F lit E99 lit pinit
 4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
 0= if
 	E9A lit ainit

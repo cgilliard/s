@@ -1,7 +1,7 @@
 #!/bin/sh
 # synctest.sh — the fam node syncing from a tabminer over UDP (docs/NODE.md,
 # step 6).  A tabminer mining the recursive dev network runs on the host
-# (UDP 3747, a fresh data directory, no seeds); once it has 12 blocks, the
+# (UDP 37471, a fresh data directory, no seeds); once it has 12 blocks, the
 # node boots (src/user/node/sync_test.fam) and fast-syncs from the
 # snapshot 4 blocks below its best header: headers, the full proof of work
 # from there up, the block and its snapshot, its chain proof, the blocks
@@ -26,7 +26,7 @@ sh scripts/mkimage.sh "$T/sy.img" bin/kernel init="$T/tsy.bin":24576 akjv.txt.gz
 dd if=/dev/zero of="$T/sy.disk" bs=1 count=0 seek=268435456 2>/dev/null
 
 TABMINER_THREADS=${TABMINER_THREADS:-8} "$MINER" mine --network dev-recursive --data "$T/miner" --no-seeds \
-	--listen 127.0.0.1:3747 --no-prompt > "$T/miner.out" 2>&1 &
+	--listen 127.0.0.1:37471 --no-prompt > "$T/miner.out" 2>&1 &
 MP=$!
 trap 'st=$?; kill $MP 2>/dev/null; wait $MP 2>/dev/null || true; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM

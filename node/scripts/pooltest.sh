@@ -1,9 +1,9 @@
 #!/bin/sh
 # pooltest.sh — a transaction from tabminer's wallet relayed by the fam node
 # and mined (docs/NODE.md, step 7).  On the host: a tabminer mining the
-# recursive dev network (UDP 3747, a fresh data directory, no seeds) to 12
+# recursive dev network (UDP 37471, a fresh data directory, no seeds) to 12
 # blocks; then stopped, its directory copied for a second tabminer, which
-# does not mine (3748) and keeps the wallet, and the miner started again.
+# does not mine (37472) and keeps the wallet, and the miner started again.
 # The two never meet: each has only the node for a peer.  The node boots
 # (src/user/node/relay_test.fam), syncs from the miner and pings the
 # wallet's node; once that one has the node for a live peer, the wallet
@@ -34,7 +34,7 @@ trap 'st=$?; exec 3>&- 2>/dev/null; for p in $QP $WP $MP; do kill $p 2>/dev/null
 trap 'exit 130' INT; trap 'exit 143' TERM
 mine() {
 	TABMINER_THREADS=${TABMINER_THREADS:-8} "$MINER" mine --network dev-recursive --data "$T/miner" --no-seeds \
-		--listen 127.0.0.1:3747 --no-prompt >> "$T/miner.out" 2>&1 &
+		--listen 127.0.0.1:37471 --no-prompt >> "$T/miner.out" 2>&1 &
 	MP=$!
 }
 # wait_for FILE PATTERN SECONDS WHAT
@@ -53,7 +53,7 @@ kill $MP; wait $MP 2>/dev/null || true
 cp -r "$T/miner" "$T/wallet"
 mine
 mkfifo "$T/wallet.in"
-"$MINER" mine --no-mine --network dev-recursive --data "$T/wallet" --no-seeds --listen 127.0.0.1:3748 \
+"$MINER" mine --no-mine --network dev-recursive --data "$T/wallet" --no-seeds --listen 127.0.0.1:37472 \
 	< "$T/wallet.in" > "$T/wallet.out" 2>&1 &
 WP=$!
 exec 3> "$T/wallet.in"

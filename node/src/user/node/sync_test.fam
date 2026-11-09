@@ -2,7 +2,7 @@
 \ program for the OS with a disk and the network, after arith, poseidon2,
 \ difficulty, pow, headers, chainver, state, proofs, connect, snap, xmss,
 \ tx, pool, p2p and sync.  scripts/synctest.sh runs a tabminer mining the recursive dev
-\ network on the host (UDP 3747, seen from the guest at 10.0.2.2), and
+\ network on the host (UDP 37471, seen from the guest at 10.0.2.2), and
 \ gives the image /lib/akjv.txt.gz, /lib/chainver (the network's verifier)
 \ and /lib/devchain (for the chain's constants and genesis).  The node
 \ syncs from the snapshot 4 blocks below the best header, then follows two
@@ -43,7 +43,7 @@ tdc @ dup 60 lit + prinit
 20 lit alloc dup mytip !  mygen @ swap 8 lit wcopy
 20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
 20 lit alloc tcr !
-A000202 lit EA3 lit E99 lit pinit
+A000202 lit 925F lit E99 lit pinit
 4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
 0= if
 	\ the state root, the tip's
