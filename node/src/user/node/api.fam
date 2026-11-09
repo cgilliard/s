@@ -28,7 +28,9 @@
 \
 \ ainit ( port -- )  the token, the listener.
 \ aserve ( s -- )  s seconds of the node's loop: its peers (as nserve),
-\ the API's requests, and those waiting for the tip.
+\ the API's requests, and those waiting for the tip (in sync.fam, after
+\ this: api.fam comes before it, so its verifier's wait serves the API).
+\ aaccept  a connection waiting, answered.
 
 : alfd variable ;  : acfd variable ;  : atk variable ;  : arq variable ;  : arn variable ;  : ahe variable ;
 : apath variable ;  : aqs variable ;  : apost variable ;  : abod variable ;  : abn variable ;  : aclen variable ;
@@ -450,14 +452,8 @@ areq if aparse else 0 lit then
 then
 abod @ ?dup if free 0 lit abod ! then ;
 
-\ aserve ( s -- )
-: aserve
-ntime + aend !
-begin ntime aend @ u< while
-	nstep
-	pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then
-	awake
-repeat ;
+\ aaccept  a connection to the API, if one waits (pxrdy), answered.
+: aaccept  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
 
 : ainit  ( port -- )
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !

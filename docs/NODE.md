@@ -1155,18 +1155,29 @@ Each step done when its test passes.
       a process has its own copy of each. `sconnect` is split around the
       proof (`sconn1` to its public values, `sconn2` the rest), `hconf`
       run as `nconf`; while waiting, the node answers Pings, peers,
-      images and pooled transactions, not the API or blocks' chunks
-      (they read the store a block's connection holds open), so those
-      wait as before. Measured, two harts: 1,160 Pings over two minutes
-      of syncing and following, none lost, the slowest 0.52 s (each
-      block stalled them 2 to 3 s before). Without `nodev` the node
-      checks inline, as before.
+      images, pooled transactions, headers and the API (each request
+      in a store transaction of its own, the block's kept aside), not
+      blocks' chunks (they share the store's buffers a block's
+      connection holds). Measured, two harts: 1,160 Pings over two
+      minutes of syncing and following, none lost, the slowest 0.52 s;
+      490 API requests over 100 s and four blocks, the slowest 0.24 s
+      (each block stalled them 2 to 3 s before). Without `nodev` the
+      node checks inline, as before. (`api.fam` now comes before
+      `sync.fam`, so the verifier's wait can answer it; `aserve` is in
+      `sync.fam`.)
+    - Serving headers: GetHeadersFrom and GetHeaders (a locator) as
+      tabminer's `headers_from` and `headers_after`, our chain's to our
+      tip, 60 at most, 6 a datagram. With blocks' chunks, a peer behind
+      catches up from the node: `blocktest.sh`'s C starts three blocks
+      behind, with the node its only peer, and catches up from it, then
+      takes A's next block through it. Not yet: snapshots' manifests and
+      parts (a peer's fast sync needs a tabminer).
     - Not yet: started by init (held back while it is tried by hand),
       configuration (network, port), serving headers, manifests and parts
       to peers syncing from the node, striking peers that misbehave, more
       than 65,536 headers (the store holding them, a window in memory),
-      a log and a way to read its state from the shell, the API answered
-      while a block is verified.
+      a log and a way to read its state from the shell, serving
+      snapshots.
 
 ## Open questions
 

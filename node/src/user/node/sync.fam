@@ -29,7 +29,6 @@
 : nbuf variable ;  : nS variable ;  : nH variable ;  : ncode variable ;  : nid variable ;
 : nblk variable ;  : nbn variable ;  : nk variable ;
 
-: ntime  "/proc/time" 0 lit open dup nbuf @ 20 lit read nbuf @ + 0 lit swap c! close drop nbuf @ atoi ;
 : nfail  ncode @ 0= if ncode ! else drop then ;   \ ( code -- )
 
 \ nstat  our status from the state: the tip's height and id, its work.
@@ -49,9 +48,6 @@ nblk @ if
 else drop 0 lit then
 ticks nft @ - btf ! ;
 
-\ nhex ( a -- )  the first 4 bytes at a, in hex.
-: nhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )  a hex digit
-: nhex  4 lit 0 lit do dup i + c@ dup 4 lit rshift nhd putc F lit and nhd putc loop drop ;
 \ nsay ( s -- )  "node: s", if vrb.
 : nsay  vrb @ if nhead puts else drop then ;
 \ nsec ( ticks -- )  as seconds, to the hundredth.
@@ -68,9 +64,9 @@ ticks nft @ - btf ! ;
 \ serves.  vinit starts it (its 0 reading the jobs' pipe, its 1 writing
 \ the verdicts'); vjw is 0 if it could not be, or once it is gone: the
 \ checks then run here, as before.  vwait serves the network while it
-\ works (Pings, peers, images, pooled transactions; not blocks, which
-\ read the store a block's connection may hold open: pnest), the API
-\ waiting.
+\ works (Pings, peers, headers, images, pooled transactions; not blocks'
+\ chunks, which share the store's transaction a block's connection may
+\ hold open: pnest) and the API.
 : vjw variable ;  : vjr variable ;  : vwk variable ;  : vp1 variable ;  : vp2 variable ;  : vfds variable ;  : vsav variable ;
 \ vput ( a n -- )  bytes to nodev; a write that fails, it gone (vjw 0).
 : vput
@@ -91,12 +87,17 @@ vp1 @ pipe 0< 0=  vp2 @ pipe 0< 0= and if
 		0 lit vw  pwitems @ vw  pwpar @ vw  pwacc @ vw
 	then
 then ;
-\ vwait ( -- flag | -2 )  nodev's verdict, the network served meanwhile;
-\ -2 if it is gone (the caller checks here).
+\ vwait ( -- flag | -2 )  nodev's verdict, the network served meanwhile,
+\ and the API (its requests read the store in transactions of their own:
+\ stx, which a block's connection may hold, kept for it); -2 if nodev is
+\ gone (the caller checks here).
 : vwait
-pxfd @ vsav !  vjr @ pxfd !  0 lit pxrdy !  1 lit pnest !
-begin vjw @ if pxrdy @ 0= else 0 lit then while 3B9ACA00 lit pwait drop repeat
-vsav @ pxfd !  0 lit pxrdy !  0 lit pnest !
+vjr @ pyfd !  0 lit pyrdy !  1 lit pnest !
+begin vjw @ if pyrdy @ 0= else 0 lit then while
+	3B9ACA00 lit pwait drop
+	pxrdy @ if stx @ vsav !  aaccept  vsav @ stx ! then
+repeat
+0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
 vjw @ if
 	vjr @ vwk @ 4 lit read 4 lit = if vwk @ @ else 0 lit vjw ! FFFFFFFE lit then
 else FFFFFFFE lit then ;
@@ -381,3 +382,12 @@ nrelay ;
 : nserve  0 lit do nstep loop ;
 
 : ninit  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk !  20 lit alloc nrid !  20 lit alloc nrm ! ;
+
+\ aserve ( s -- )  (api.fam's)
+: aserve
+ntime + aend !
+begin ntime aend @ u< while
+	nstep
+	aaccept
+	awake
+repeat ;

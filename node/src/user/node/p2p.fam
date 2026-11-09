@@ -6,7 +6,9 @@
 \ the nonce echoed, so every Ping is answered, whoever sends it.  Our
 \ token for an address is a keyed hash of it (ptokn), as tabminer's
 \ token_for, so a request with it shows it came from there.  Anyone with
-\ their token is answered GetPeers (the peers that answered us) and, as
+\ their token is answered GetPeers (the peers that answered us),
+\ GetHeadersFrom and GetHeaders (our chain's headers, to our tip),
+\ GetChunks of a block on our chain or a pooled transaction, and, as
 \ docs/TABERNACLE.md has it, GetImages and GetImage: the image this
 \ machine booted (/dev/image), as the version in its /lib/version, in
 \ 1,024-byte chunks, 64 an ask at most.  Up to PPEERS peers, one
@@ -49,7 +51,7 @@
 : ptx variable ;  : ptp variable ;  : prx variable ;  : prn variable ;  : pent variable ;  : pfrom variable ;
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
-: pidle variable ;  : pnew variable ;  : pxfd variable ;  : pxrdy variable ;
+: pidle variable ;  : pnew variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;
@@ -99,7 +101,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
-600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  10 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
+600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
@@ -118,15 +120,28 @@ p2init  20 lit alloc pkey !  20 lit alloc pkd !  20 lit alloc pko !
 	then
 then ;
 
+\ ntime ( -- s )  the date (/proc/time).
+: ptbuf variable ;
+: ntime  ptbuf @ 0= if 40 lit alloc ptbuf ! then  "/proc/time" 0 lit open dup ptbuf @ 20 lit read ptbuf @ + 0 lit swap c! close drop ptbuf @ atoi ;
+\ nhex ( a -- )  the first 4 bytes at a, in hex.
+: nhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )  a hex digit
+: nhex  4 lit 0 lit do dup i + c@ dup 4 lit rshift nhd putc F lit and nhd putc loop drop ;
+
 \ d8= ( a b n -- flag )  n bytes equal.
 : d8=  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
 
 \ prdy ( ns -- flag )  a datagram waiting within ns; or, sooner, the
-\ descriptor in pxfd (if any: the API's listener) readable, pxrdy set.
+\ descriptor in pxfd (if any: the API's listener) readable, pxrdy set, or
+\ the one in pyfd (if any: the verifier's verdicts, sync.fam's vwait),
+\ pyrdy set.
+\ pent1 ( fd -- k )  an entry for fd: its index.
+: pent1  pnk @ 3 lit lshift pent @ +  tuck !  1 lit swap 4 lit + !  pnk @ dup 1 lit + pnk ! ;
 : prdy
-pfd @ pent @ !  1 lit pent @ 4 lit + !  pxfd @ pent @ 8 lit + !  1 lit pent @ C lit + !
-pent @ pxfd @ if 2 lit else 1 lit then rot poll 0 lit > if
-	pent @ C lit + @ 10 lit rshift 0= 0= pxfd @ 0= 0= and pxrdy !
+0 lit pnk !  pfd @ pent1 drop  0 lit pxi !  0 lit pyi !
+pxfd @ if pxfd @ pent1 pxi ! then  pyfd @ if pyfd @ pent1 pyi ! then
+pent @ pnk @ rot poll 0 lit > if
+	pxi @ if pxi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pxrdy ! then
+	pyi @ if pyi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pyrdy ! then
 	pent @ 4 lit + @ 10 lit rshift 0= 0=
 else 0 lit then ;
 
@@ -251,6 +266,37 @@ prx @ 5 lit + c@  dup 6 lit * 6 lit + prn @ u> if drop else
 	loop then
 then ;
 
+\ phsend ( from -- )  Headers: our chain's (to our tip) from height
+\ from, 60 at most, 6 a datagram, as tabminer's headers_from.
+: phs variable ;  : phe variable ;
+: phsend
+dup phs !  3C lit +  myh @ 1 lit +  umin phe !
+begin phs @ phe @ u< while
+	6 lit wbeg  phe @ phs @ - 6 lit umin dup w8
+	0 lit do phs @ i + hat hhdr CC lit wbs loop
+	prply  phs @ 6 lit + phs !
+repeat ;
+\ phfrom  the GetHeadersFrom in prx: its height's headers on.
+: phfrom  prn @ 11 lit u< 0= if prx @ D lit + le@ phsend then ;
+\ phloc  the GetHeaders in prx: the headers after the first of its
+\ locator's ids on our chain (to our tip), or after genesis, as tabminer's
+\ headers_after.
+: phat variable ;
+: phloc
+prn @ 11 lit u< 0= if
+	prx @ D lit + le@  dup 20 lit u> over 5 lit lshift 11 lit + prn @ u> or if drop else
+		0 lit phat !
+		?dup if 0 lit do
+			phat @ 0= if
+				prx @ 11 lit + i 5 lit lshift + pidm @ 20 lit bcopy
+				pidm @ hfind dup 0< if drop else
+					he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if hheight phat ! else drop then
+				then
+			then
+		loop then
+		phat @ 1 lit + phsend
+	then
+then ;
 \ pwait ( ns -- type | 0 )
 : pwait
 prdy if
@@ -271,6 +317,8 @@ prdy if
 			dup 3 lit = prn @ D lit = and if ppeers then
 			dup 40 lit = prn @ D lit = and if pimgs then
 			dup 42 lit = if pimage then
+			dup B lit = if phfrom then
+			dup 5 lit = if phloc then
 		then
 		pfk @ 0< if drop 0 lit else
 		dup 2 lit = if
