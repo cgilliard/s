@@ -15,6 +15,9 @@
 //!   tabminer's own `Chain::accept_headers` one at a time, each verdict as
 //!   it gave it, a heavier branch of fewer blocks taking over, and headers
 //!   breaking each rule; plain code for a program under the OS.
+//! - `statechain.bin` (step 5): a dev chain of blocks with spends and name
+//!   operations, built and connected by tabminer's own `Chain`, with bodies
+//!   breaking each state rule and tabminer's verdict on each.
 //!
 //! `write_fam_vectors` writes the files; `fam_vectors_are_current` checks
 //! them.
@@ -29,6 +32,7 @@ mod tests {
     const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/arith_vectors.fam");
     const P2_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/poseidon2_vectors.fam");
     const POW_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/pow_vectors.fam");
+    const STATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain.bin");
     const HDR_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/headers_vectors.fam");
     const DIFF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/difficulty_vectors.fam");
 
@@ -742,6 +746,230 @@ mod tests {
         o
     }
 
+
+    /// The verdict codes `state.fam` gives: 0 connected; body errors from
+    /// -30, the connect rules from -10, the name rules from -20.
+    fn state_code(e: &crate::chain::ChainError) -> i32 {
+        use crate::block::BodyError;
+        use crate::chain::ChainError;
+        use crate::names::ApplyError;
+        match e {
+            ChainError::Body(b) => match b {
+                BodyError::DuplicateInput(_) => -30,
+                BodyError::InputOutOfRange(_) => -31,
+                BodyError::SpendOutOfRange(_) => -32,
+                BodyError::DuplicateSpend(_) => -33,
+                BodyError::TooMany(_) => -34,
+                BodyError::BadName => -35,
+                BodyError::Malformed => -10,
+            },
+            ChainError::BadBodyCommitment => -11,
+            ChainError::TooLarge(_) => -12,
+            ChainError::UnknownInput(_) => -13,
+            ChainError::StateRootMismatch { .. } => -15,
+            ChainError::Supply { .. } => -16,
+            ChainError::Name(n) => match n {
+                ApplyError::TooMany(_) => -20,
+                ApplyError::BadName => -21,
+                ApplyError::NoCommit => -22,
+                ApplyError::Window(_) => -23,
+                ApplyError::Registered => -24,
+                ApplyError::NotRegistered => -25,
+                ApplyError::NotExpired(_) => -26,
+                other => panic!("unexpected name verdict {other:?}"),
+            },
+            other => panic!("unexpected verdict {other:?}"),
+        }
+    }
+
+    /// The dev chain for step 5, as `statechain.bin`: a count, then per
+    /// block its verdict (a signed word), its header (204 bytes), its
+    /// body's length and the body, zero padded to a word. Blocks with a
+    /// nonzero verdict are refused and leave the chain as it was.
+    fn generate_state() -> Vec<u8> {
+        use crate::block::{Block, BlockOutput, Body, Header};
+        use crate::chain::{AcceptAllProofs, Chain, ChainParams};
+        use crate::names::{BlockNameOp, MAX_REVEAL, MIN_REVEAL, Record};
+        use crate::poseidon2::DIGEST;
+        type Digest = [Fp; DIGEST];
+        use crate::pow::{PowParams, SeedText};
+        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
+        let dir = std::env::temp_dir().join(format!("tabminer-famstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chain = Chain::open(&dir, 256 << 20, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
+        chain.set_dataset(std::sync::Arc::new(dev_dataset().clone()));
+        chain.init_genesis(&p.genesis()).unwrap();
+        let data = dev_dataset();
+        let mut r = Rng(0x5eed_57a7);
+        let digest = |r: &mut Rng| -> Digest { core::array::from_fn(|_| Fp::new(r.u32() % P)) };
+        let memo = |r: &mut Rng| -> crate::transaction::Memo { core::array::from_fn(|_| Fp::new(r.u32() % P)) };
+        let mut out: Vec<u8> = Vec::new();
+        let mut entries = 0u32;
+        let mut ts = p.genesis_timestamp;
+        let solve = |mut h: Header| -> Header {
+            h.mix = h.pow_output(data).mix;
+            h
+        };
+        let write = |out: &mut Vec<u8>, code: i32, b: &Block| {
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&b.header.to_bytes());
+            let body = b.body.to_bytes();
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            out.resize(out.len().div_ceil(4) * 4, 0);
+        };
+        // A body paying the subsidy and what it spends to its outputs (the
+        // first gets it all).
+        let pay = |chain: &Chain<AcceptAllProofs>, body: &mut Body| {
+            let height = chain.tip().unwrap().unwrap().height + 1;
+            let rtxn = chain.env().read_txn().unwrap();
+            let spent: u64 = body
+                .inputs
+                .iter()
+                .map(|&q| crate::transaction::slot_parts(&chain.utxo().slot(&rtxn, q).unwrap()).unwrap().1)
+                .sum();
+            body.outputs[0].amount = spent + p.subsidy(height);
+        };
+        let names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota_9"];
+        let mut commits: Vec<(u32, u64, Digest)> = Vec::new(); // height, position, hash
+        let mut records: Vec<Record> = Vec::new();
+        let mut unspent: Vec<u64> = Vec::new();
+        let connect = |chain: &Chain<AcceptAllProofs>, out: &mut Vec<u8>, body: Body, ts: u64| -> Block {
+            let header = solve(chain.template(&body, ts).unwrap());
+            let b = Block { header, body };
+            chain.apply_block(&b, ts + 60).unwrap();
+            write(out, 0, &b);
+            b
+        };
+        // A refused block on the tip: built with the given state root
+        // (the tip's own when none), offered, its verdict recorded.
+        let refuse = |chain: &Chain<AcceptAllProofs>, out: &mut Vec<u8>, body: Body, ts: u64, root: Option<Digest>, commitment: Option<Digest>| -> i32 {
+            let tip = chain.tip().unwrap().unwrap();
+            let header = solve(Header {
+                prev_hash: tip.hash(),
+                height: tip.height + 1,
+                timestamp: ts,
+                body_commitment: commitment.unwrap_or_else(|| body.commitment()),
+                state_root: root.unwrap_or(tip.state_root),
+                aux: [0x5a; 32],
+                mix: [Fp::ZERO; 8],
+                nonce: [0; 32],
+            });
+            let b = Block { header, body };
+            let code = state_code(&chain.apply_block(&b, ts + 60).unwrap_err());
+            write(out, code, &b);
+            code
+        };
+        let last = 2 + 8 + MAX_REVEAL + 4;
+        for h in 1..=last {
+            ts += 10;
+            let mut body = Body { outputs: vec![BlockOutput { commitment: digest(&mut r), memo: memo(&mut r), amount: 0 }], ..Default::default() };
+            if h % 3 == 0 && unspent.len() > 2 {
+                // Spend two of the oldest and make a second output.
+                body.inputs = vec![unspent.remove(0), unspent.remove(1)];
+                body.outputs.push(BlockOutput { commitment: digest(&mut r), memo: memo(&mut r), amount: 0 });
+            }
+            let first = chain.utxo().next_position(&chain.env().read_txn().unwrap()).unwrap();
+            if (2..=10).contains(&h) {
+                let hash = digest(&mut r);
+                body.ops.push(BlockNameOp::Commit { commit: hash, memo: memo(&mut r) });
+                commits.push((h, first + body.outputs.len() as u64, hash));
+            }
+            // Reveals: two a block, from the window's start; the commit made
+            // at height 3 left for the sweep.
+            let due: Vec<usize> = commits
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.0 != 3 && h >= c.0 + MIN_REVEAL)
+                .map(|(i, _)| i)
+                .collect();
+            let mut revealed = 0;
+            for i in due {
+                if revealed == 2 || commits[i].1 == u64::MAX {
+                    continue;
+                }
+                let name = names[records.len()];
+                let rec = Record::new(name.as_bytes(), digest(&mut r), digest(&mut r), digest(&mut r)).unwrap();
+                body.ops.push(BlockNameOp::Reveal { record: rec.clone(), commit: commits[i].1 });
+                commits[i].1 = u64::MAX;
+                records.push(rec);
+                revealed += 1;
+            }
+            if h == 40 || h == 41 {
+                // Updates of the first names.
+                let mut rec = records[(h - 40) as usize].clone();
+                rec.owner = digest(&mut r);
+                rec.memo = digest(&mut r);
+                records[(h - 40) as usize] = rec.clone();
+                body.ops.push(BlockNameOp::Update(rec));
+            }
+            let c3 = commits.iter().find(|c| c.0 == 3).map_or(0, |c| c.1);
+            if h == 3 + MAX_REVEAL + 1 {
+                body.sweeps.push(c3);
+            }
+            // Refused bodies, before the block, at chosen heights.
+            if h == 20 {
+                let mut b = body.clone();
+                b.inputs = vec![0];
+                assert_eq!(refuse(&chain, &mut out, b, ts, None, None), -13, "a spent input");
+                entries += 1;
+                let mut b = Body { outputs: body.outputs.clone(), ..Default::default() };
+                pay(&chain, &mut b);
+                b.outputs[0].amount += 1;
+                let root = chain.preview_state_root(&b).unwrap();
+                assert_eq!(refuse(&chain, &mut out, b, ts, Some(root), None), -16, "the supply");
+                entries += 1;
+                let mut b = Body { outputs: body.outputs.clone(), ..Default::default() };
+                pay(&chain, &mut b);
+                assert_eq!(refuse(&chain, &mut out, b.clone(), ts, Some(digest(&mut r)), None), -15, "a wrong state root");
+                entries += 1;
+                assert_eq!(refuse(&chain, &mut out, b.clone(), ts, None, Some(digest(&mut r))), -11, "a wrong body commitment");
+                entries += 1;
+                let mut d = b.clone();
+                let spend = unspent[0];
+                d.inputs = vec![spend, spend];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -30, "an input twice");
+                entries += 1;
+                let mut d = b.clone();
+                d.ops = vec![BlockNameOp::Update(Record::new(b"nobody", digest(&mut r), digest(&mut r), digest(&mut r)).unwrap())];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -25, "an update of no name");
+                entries += 1;
+                let mut d = b.clone();
+                d.sweeps = vec![c3];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -26, "a sweep in the window");
+                entries += 1;
+                let mut d = b.clone();
+                d.ops = vec![BlockNameOp::Reveal { record: records[0].clone(), commit: c3 }];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -24, "a name registered");
+                entries += 1;
+                let mut d = b.clone();
+                d.ops = vec![BlockNameOp::Reveal {
+                    record: Record::new(b"late", digest(&mut r), digest(&mut r), digest(&mut r)).unwrap(),
+                    commit: commits.iter().find(|c| c.0 == 10).unwrap().1,
+                }];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -23, "a reveal before its window");
+                entries += 1;
+                let mut d = b.clone();
+                d.ops = vec![BlockNameOp::Reveal {
+                    record: Record::new(b"nocommit", digest(&mut r), digest(&mut r), digest(&mut r)).unwrap(),
+                    commit: 1,
+                }];
+                assert_eq!(refuse(&chain, &mut out, d, ts, None, None), -22, "a reveal of no commit");
+                entries += 1;
+            }
+            pay(&chain, &mut body);
+            let n_out = body.outputs.len() as u64;
+            connect(&chain, &mut out, body, ts);
+            entries += 1;
+            unspent.extend(first..first + n_out);
+        }
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut file = entries.to_le_bytes().to_vec();
+        file.extend_from_slice(&out);
+        file
+    }
+
     #[test]
     fn fam_vectors_are_current() {
         let file = std::fs::read_to_string(PATH).expect("node/src/user/node/arith_vectors.fam");
@@ -754,6 +982,8 @@ mod tests {
         assert!(file == generate_pow(), "the fam node's proof-of-work vectors are stale: run write_fam_vectors");
         let file = std::fs::read_to_string(HDR_PATH).expect("node/src/user/node/headers_vectors.fam");
         assert!(file == generate_headers(), "the fam node's header vectors are stale: run write_fam_vectors");
+        let file = std::fs::read(STATE_PATH).expect("node/src/user/node/statechain.bin");
+        assert!(file == generate_state(), "the fam node's state chain is stale: run write_fam_vectors");
     }
 
     #[test]
@@ -764,5 +994,6 @@ mod tests {
         std::fs::write(DIFF_PATH, generate_difficulty()).unwrap();
         std::fs::write(POW_PATH, generate_pow()).unwrap();
         std::fs::write(HDR_PATH, generate_headers()).unwrap();
+        std::fs::write(STATE_PATH, generate_state()).unwrap();
     }
 }
