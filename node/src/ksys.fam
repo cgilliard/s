@@ -1080,7 +1080,8 @@ then then then
 klk @ unlock sret ;
 
 \ fready ( f -- events )  1 readable (or at its end), 4 writable, 16 the
-\ other end gone; only those its mode allows (and 16).
+\ other end gone; only those its mode allows (and 16).  A file in the
+\ store (kind 7) is always both: reading or writing it never waits.
 : fready
 dup @ 1 lit = if ceof @ ctail @ crdy @ <> or if 5 lit else 4 lit then else
 dup @ 2 lit = if 5 lit else
@@ -1092,10 +1093,11 @@ dup @ 3 lit = if
 	then
 else
 dup @ 4 lit = over @ B lit = or if 1 lit else
+dup @ 7 lit = if 5 lit else
 dup @ 9 lit = over @ A lit = or if dup yready else
 dup @ 8 lit = if dup 8 lit + @ dup @ 1 lit = if dup 10 lit + @ swap 14 lit + @ <> if 5 lit else 4 lit then else cready then else
 dup @ C lit = if rngbusy @ if rngdone? if rngtake then then rnglen @ rngpos @ <> if 5 lit else rngbusy @ 0= if rngreq then 4 lit then else 4 lit
-then then then then then then then
+then then then then then then then then
 swap 1C lit + @ dup 1 lit and if 1 lit else 0 lit then swap 2 lit and if 4 lit or then 10 lit or and ;
 
 \ 22 poll(fds, n, ns): fds n entries of 8 bytes (a descriptor; the events
