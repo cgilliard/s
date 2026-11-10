@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # reorgtest.sh — the node (bin/img's, run from its shell) resuming and
 # reorganizing (docs/NODE.md, step 10).  On the host, tabminer A mines the
 # recursive dev network (UDP 37471) to 6 blocks and stops; its data is

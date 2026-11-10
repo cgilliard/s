@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # snaptest.sh — a tabminer fast-syncing from the node (docs/NODE.md, step
 # 10): the node (bin/img's, run from its shell) serves headers, blocks,
 # and snapshots' manifests and parts.  On the host, tabminer A mines the

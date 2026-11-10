@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # apitest.sh — the node's API (docs/NODE.md, step 8).  On the host: a
 # tabminer mining the recursive dev network (UDP 37471, a fresh data
 # directory, no seeds) to 12 blocks; then stopped, its directory copied for

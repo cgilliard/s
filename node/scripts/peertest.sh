@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # peertest.sh — the node (bin/img's, run from its shell) finding peers and
 # keeping to the chain when one goes (docs/NODE.md, step 10).  On the host,
 # tabminers A (UDP 37471) and B (37477) mine the recursive dev network

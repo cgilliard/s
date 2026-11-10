@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # striketest.sh — the node (bin/img's, run from its shell) striking and
 # banning a peer that misbehaves (docs/NODE.md, step 10), as tabminer's
 # Peers::strike.  On the host, tabminer A mines the recursive dev network

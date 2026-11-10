@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # blocktest.sh — the node (bin/img's, run from its shell) serving and
 # relaying blocks (docs/NODE.md, step 10).  On the host, tabminer A mines
 # the recursive dev network (UDP 37471) to 6 blocks; its data is copied

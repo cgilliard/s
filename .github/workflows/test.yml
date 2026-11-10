@@ -149,6 +149,69 @@ jobs:
       - name: OS checks
         run: sh scripts/oscheck.sh
 
+  # The node's scripts (node/scripts/*test.sh: the node in the OS against
+  # tabminer, over QEMU's network), each marked "slow: one job each", in
+  # jobs of their own side by side. tabminer (with the dev networks) and
+  # the OS's image are built once and handed to them.
+  node-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+          shared-key: node
+      - run: cargo build --release --features dev
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+      - name: the OS's image, built from the seed
+        working-directory: node
+        run: sh scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-build
+          path: |
+            miner/target/release/tabminer
+            node/bin/
+          retention-days: 3
+
+  node-slow:
+    name: node ${{ matrix.script }}
+    needs: node-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - storetest
+          - synctest
+          - pooltest
+          - apitest
+          - imagetest
+          - reorgtest
+          - peertest
+          - blocktest
+          - striketest
+          - windowtest
+          - snaptest
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: node-build
+          path: .
+      - run: chmod +x ../miner/target/release/tabminer
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+      - run: sh scripts/${{ matrix.script }}.sh
+      - name: its logs, if it failed
+        if: failure()
+        run: for f in $(find tmp -name '*.out' -o -name '*.log' | head -20); do echo "== $f"; tail -40 "$f"; done
+
   # Every test marked slow has a job above.
   slow-listed:
     runs-on: ubuntu-latest
@@ -159,4 +222,7 @@ jobs:
         run: |
           marked=$(grep -rh -A1 'ignore = "slow: one job each' miner/src miner/tests | grep -o 'fn [a-z0-9_]*' | sed 's/fn //' | sort)
           listed=$(grep -o 'test: [a-z][a-z_0-9:]*' .github/workflows/test.yml | sed 's/.*[: ]//' | sort)
+          diff <(echo "$marked") <(echo "$listed")
+          marked=$(grep -l 'slow: one job each' node/scripts/*.sh | xargs -n1 basename | sed 's/\.sh$//' | sort)
+          listed=$(sed -n '/^  node-slow:/,/^    defaults:/p' .github/workflows/test.yml | grep -o '^          - [a-z]*test$' | sed 's/.* //' | sort)
           diff <(echo "$marked") <(echo "$listed")

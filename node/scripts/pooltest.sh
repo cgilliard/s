@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # pooltest.sh — a transaction from tabminer's wallet relayed by the fam node
 # and mined (docs/NODE.md, step 7).  On the host: a tabminer mining the
 # recursive dev network (UDP 37471, a fresh data directory, no seeds) to 12

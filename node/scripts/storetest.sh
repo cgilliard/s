@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # storetest.sh — the store's checks (docs/OS.md, step 8): src/storetest.fam
 # (after the kernel: src/kernel.fam, src/store.fam, src/ksys.fam) on a bare
 # machine, on one disk file in tmp/: a new store and its checks; the same

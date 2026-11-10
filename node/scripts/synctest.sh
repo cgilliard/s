@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # synctest.sh — the fam node syncing from a tabminer over UDP (docs/NODE.md,
 # step 6).  A tabminer mining the recursive dev network runs on the host
 # (UDP 37471, a fresh data directory, no seeds); once it has 12 blocks, the

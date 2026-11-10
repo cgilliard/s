@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # imagetest.sh — the node serving its image to tabernacles (docs/NODE.md,
 # step 9; docs/TABERNACLE.md), with no tools/server.py.  On the host: a
 # tabminer mining the recursive dev network (UDP 37471, a fresh data
