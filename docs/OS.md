@@ -993,6 +993,18 @@ kernel too much to add at the end.
       test (logged in first, every check as before); wm_idle (`wm 80
       8`: a terminal left untouched closed by wm, the cookie refused
       after).
+
+    The wallet's window (2026-11-10, `docs/GUI_WALLET.md`, phase 1,
+    The wallet's messages). A wallet icon in the dock beside the
+    terminal's opens the session's wallet window (one; clicked again,
+    it is focused); its WebSocket, `GET /wallet`, gets `wallet` started
+    as the user (`runas USER GROUP wallet`) on two pipes instead of a
+    pty, wm relaying text frames and lines both ways, the password from
+    logging in (kept in the session's record until it ends) written
+    first. A client record now also holds a wallet's input pipe and a
+    4 KiB buffer for its lines; a wallet window takes three of wm's
+    descriptors, a terminal two. `wallet` is a stub so far
+    (`src/user/wallet.fam`: fixed answers).
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

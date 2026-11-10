@@ -114,6 +114,57 @@ come after, as the user who logged in.
   bound to localhost); root can read any process's memory, as on any
   OS.
 
+## The wallet's messages
+
+Between the wallet window and `wallet`, through wm (phase 1; built
+2026-11-10, with `wallet` a stub answering fixed data until the real one
+is written).
+- **The way:** the window opens `GET /wallet`, a WebSocket that needs the
+  session's cookie as `/tty` does (403 without). wm starts `wallet` as
+  the session's user in the user's home (`runas USER GROUP wallet`) on
+  two pipes, its errors nowhere, and relays: each text frame from the
+  window a line on the wallet's input (any newline in it made a space),
+  each line the wallet writes a text frame. One JSON object a frame and a
+  line, at most 3,800 bytes. Either side closing ends the other: the
+  window closed, the wallet's input ends and it exits; the wallet gone,
+  wm closes the WebSocket. Logging out, or the session idle past its
+  time, closes it as it does the terminals. One wallet window a session
+  (the dock's icon focuses it if open).
+- **Unlocking:** wm writes the first line itself,
+  `{"op":"unlock","password":"..."}`, the password as typed at logging
+  in (kept in the session's record in wm's memory until the session
+  ends; JSON-escaped). The wallet answers `{"op":"unlock","ok":true,
+  "wallet":true}` (`"wallet":false`: none made yet), or `"ok":false` and
+  an `"error"`; wm relays the answer to the window like any other. Only
+  the first line unlocks: a later `unlock` is refused, so a page cannot
+  try passwords.
+- **Requests and answers:** the window asks `{"id":N,"op":"...",...}`;
+  each answer carries the same `"id"`, `"ok":true` and its fields, or
+  `"ok":false` and `"error"` (a sentence to show). Answers may come out
+  of order. Amounts are strings in coins as tabminer prints them (up to
+  ten decimal places): a 64-bit amount does not fit a JavaScript number.
+  Files are paths in the user's home.
+
+  | op | asks | answers |
+  |---|---|---|
+  | `overview` | | `confirmed`, `pending`, `unverified`, `reserved`, `locked`; `height`, the tip; `node`, its state |
+  | `receive` | | `address` (`tab1…`); `name`, a name pointing at it, if any |
+  | `answer` | `slate`, a file sent by a payer | `slate`, the answer written; `amount` |
+  | `fees` | | `speeds`: each a `speed` (`block`, `hour`, `day`, `economy`), its `rate` as `/v1/fees` gives it, `wait` in seconds |
+  | `send` | `to` (an address or `@name`), `amount`, `speed`, `slate`, the file to write | `slate`; `fee` |
+  | `finalize` | `slate`, the recipient's answer | `tx`, the transaction sent to the pool; `fee` |
+  | `activity` | | `items`: each `tx`, `kind` (`sent`, `received`, `burn`), `amount`, `state` (`pending`, `confirmed`, `cancelled`), `height` (0 unconfirmed) |
+  | `cancel` | `tx` | `tx`, the replacement |
+  | `bump` | `tx`, `speed` | `tx`, the replacement |
+  | `create` | | `words`, the new phrase (shown once) |
+  | `phrase` | `password`, typed again | `words` |
+  | `restore` | `words`, `passphrase` | nothing more; a scan follows |
+  | `scan` | | nothing more; `scan` events follow |
+- **Events,** unasked, with `"event"` in place of an id: `tip`
+  (`height`, `hash`) when the tip moves; `payment` (`tx`, `kind`,
+  `amount`, `state`) when one arrives or changes state; `scan` (`height`,
+  `of`) as a scan goes; `locked` when the wallet locks itself.
+
 ## What it does
 
 As tabminer's wallet commands, in screens:
@@ -162,11 +213,13 @@ memos faster than every output in order.
 0. **Logging in:** passwords hashed, wm's login form and sessions, the
    programs run as the user. Needed whatever the wallet. Done
    (2026-11-09, `docs/OS.md`: steps 8 and 10's notes); the session's
-   password kept for the wallet comes with phase 1.
+   password kept for the wallet came with phase 1.
 1. **A wallet of its own, by files:** create or restore from a phrase,
    scan, balance and activity; receive and send by slate files; fees;
    cancel and bump. Everything but the message layer. A tabminer wallet
-   and this one pay each other by files.
+   and this one pay each other by files. wm's side done (2026-11-10:
+   the wallet's icon and window, `/wallet`, the password kept; The
+   wallet's messages), with `wallet` a stub (`src/user/wallet.fam`).
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a

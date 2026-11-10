@@ -5,7 +5,7 @@
 \ each window's WebSocket (GET /tty) gets a terminal of its own (pty) with
 \ the program running on it, what is typed going to the terminal and what
 \ it shows coming back, until either end closes (the program ending closes
-\ its window).  Twelve clients at once (each two of wm's 32 descriptors),
+\ its window).  Twelve clients at once (each two of wm's 32 descriptors, a wallet three),
 \ on one poll loop; a thread reaps the programs that end.
 \
 \ Logging in (docs/GUI_WALLET.md, Logging in): without a session, GET / is
@@ -17,6 +17,12 @@
 \ windows; so does 30 minutes idle (no request with its cookie, no typing
 \ in its windows).  Eight sessions at once.  wm must run as root.  The page and
 \ the form travel in plain HTTP: reach it from the host only.
+\
+\ The wallet (docs/GUI_WALLET.md, The wallet's messages): GET /wallet, a
+\ WebSocket as /tty is, gets `wallet` started as the session's user on two
+\ pipes rather than a terminal; wm writes it the session's password first
+\ (kept from logging in until the session ends), then each text frame as a
+\ line, and sends each line it writes as a text frame.
 \ uses: crypto/sha512.fam crypto/passwd.fam
 
 \ SHA-1 (for the WebSocket handshake's accept key) and base64.
@@ -89,8 +95,11 @@ nip ;
 \ ── The clients ──
 \
 \ A client (32 bytes): its socket 0 (-1: a free slot), state 4 (0 reading
-\ the request, 1 a WebSocket), its terminal's master end 8, bytes buffered
-\ C, its buffer 10 (4 KiB: the request, then frames arriving).
+\ the request, 1 a terminal's WebSocket, 2 a wallet's), its terminal's
+\ master end 8 (a wallet's: the pipe it writes to), bytes buffered C, its
+\ buffer 10 (4 KiB: the request, then frames arriving), its session 14, a
+\ wallet's input 18 (the pipe wm writes to), a wallet's lines 1C (4 KiB
+\ and a count first: what it wrote, up to a newline).
 
 :M NC C lit ;
 : cl variable ;  : lsn variable ;  : idle variable ;  : port variable ;
@@ -107,11 +116,13 @@ nip ;
 : wr    cfd @ swap dup strlen write drop ;                   \ ( s -- )
 : crlf  cfd @ e2 @ 2 lit write drop ;
 
-\ cclose ( c -- )  a client gone: its socket and terminal closed.
+\ cclose ( c -- )  a client gone: its socket and terminal (or a wallet's
+\ pipes) closed.
 : cclose
 dup @ dup 0< if drop else close drop then
 dup 8 lit + @ dup 0< if drop else close drop then
-0 lit over 14 lit + !
+dup 18 lit + @ dup 0< if drop else close drop then
+0 lit over 14 lit + !  FFFFFFFF lit over 18 lit + !
 FFFFFFFF lit over !  FFFFFFFF lit swap 8 lit + ! ;
 
 \ hfind ( c s -- a | 0 )  where s ends in what the client sent, if there
@@ -185,119 +196,193 @@ then
 "dd;color:#111}.fbg{color:#111}.bfg{background:#ddd}.bd{font-weight:bold}.f0{color:#2e3436}.f1{color:" wr
 "#cc3333}.f2{color:#4e9a06}.f3{color:#c4a000}.f4{color:#3465a4}.f5{color:#a656a8}.f6{color:#06989a}.f" wr
 "7{color:#d3d7cf}.f8{color:#555753}.f9{color:#ef4040}.f10{color:#8ae234}.f11{color:#fce94f}.f12{color" wr
-":#729fcf}.f13{color:#ad7fa8}.f14{color:#34e2e2}.f15{color:#eeeeec}.b0{background:#2e3436}.b1{backgro" wr
-"und:#cc3333}.b2{background:#4e9a06}.b3{background:#c4a000}.b4{background:#3465a4}.b5{background:#a65" wr
-"6a8}.b6{background:#06989a}.b7{background:#d3d7cf}.b8{background:#555753}.b9{background:#ef4040}.b10" wr
-"{background:#8ae234}.b11{background:#fce94f}.b12{background:#729fcf}.b13{background:#ad7fa8}.b14{bac" wr
-"kground:#34e2e2}.b15{background:#eeeeec}</style></head><body><div id=dock><button class=app id=newt " wr
-"title='New terminal'><svg width=34 height=34 viewBox='0 0 24 24'><rect x=2 y=4 width=20 height=16 rx" wr
-"=2.5 fill='#222' stroke='#bbb' stroke-width=1.2 /><path d='M6 9.5l3 2.5-3 2.5M11 15h6' stroke='#7ee7" wr
-"87' stroke-width=1.8 fill=none stroke-linecap=round stroke-linejoin=round /></svg></button></div><di" wr
-"v id=desk></div><div id=bar><div id=tasks></div><span id=clock></span><form method=post action=/logo" wr
-"ut id=out><button class=task title='Log out'>Log out</button></form></div><script>var desk=document." wr
-"getElementById('desk'),tasks=document.getElementById('tasks'),wins=[],z=1,n=0;var wsurl=(location.pr" wr
-"otocol=='https:'?'wss://':'ws://')+location.host+'/tty';var ESC=String.fromCharCode(27),CUR=String.f" wr
-"romCharCode(9608),NL=String.fromCharCode(10);function el(g,c,p){var e=document.createElement(g);if(c" wr
-")e.className=c;if(p)p.appendChild(e);return e}function topw(){var b=null;wins.forEach(function(o){if" wr
-"(!o.min&&(!b||o.z>b.z))b=o});return b}function focusw(w){wins.forEach(function(o){if(o!=w){o.d.class" wr
-"List.add('off');o.k.classList.remove('on')}});if(!w)return;w.min=false;w.z=++z;w.d.style.zIndex=w.z;" wr
-"w.d.style.display='flex';w.d.classList.remove('off');w.k.classList.add('on');w.k.classList.remove('m" wr
-"in');w.t.focus();fit(w);}function minw(w){w.min=true;w.d.style.display='none';w.k.classList.remove('" wr
-"on');w.k.classList.add('min');focusw(topw())}function maxw(w){w.d.classList.toggle('max');focusw(w)}" wr
-"function closew(w){var i=wins.indexOf(w);if(i<0)return;wins.splice(i,1);if(w.ws.readyState<2)w.ws.cl" wr
-"ose();w.d.remove();w.k.remove();focusw(topw());}function newrow(C){var r={t:[],a:[],h:null};for(var " wr
-"i=0;i<C;i++){r.t.push(' ');r.a.push(0)}return r}function Term(){var T={R:24,C:80,x:0,y:0,at:0,wrap:f" wr
-"alse,hist:[],scr:[],main:null,st:0,par:'',cv:true,sx:0,sy:0,u:0,un:0};for(var i=0;i<T.R;i++)T.scr.pu" wr
-"sh(newrow(T.C));return T;}function dirty(T,y){if(T.scr[y])T.scr[y].h=null}function scrollup(T){var r" wr
-"=T.scr.shift();if(!T.main){T.hist.push(r);if(T.hist.length>2000)T.hist.shift()}T.scr.push(newrow(T.C" wr
-"));}function lf(T){if(T.y==T.R-1)scrollup(T);else T.y++}function put(T,ch){if(T.wrap){T.x=0;lf(T);T." wr
-"wrap=false}var r=T.scr[T.y];r.t[T.x]=ch;r.a[T.x]=T.at;r.h=null;if(T.x==T.C-1)T.wrap=true;else T.x++;" wr
-"}function clrrow(T,y,x0,x1){var r=T.scr[y];for(var i=x0;i<x1;i++){r.t[i]=' ';r.a[i]=0}r.h=null}funct" wr
-"ion resize(T,R,C){if(R<2||C<2||(R==T.R&&C==T.C))return false;var all=[T.scr];if(T.main)all.push(T.ma" wr
-"in.scr);all.forEach(function(scr){scr.forEach(function(r){while(r.t.length<C){r.t.push(' ');r.a.push" wr
-"(0)}r.t.length=C;r.a.length=C;r.h=null});while(scr.length>R){if(scr===T.scr&&T.y>0){var t=scr.shift(" wr
-");if(!T.main)T.hist.push(t);T.y--}else scr.pop()}while(scr.length<R)scr.push(newrow(C));});T.R=R;T.C" wr
-"=C;if(T.x>=C)T.x=C-1;if(T.y>=R)T.y=R-1;T.wrap=false;return true;}function sgr(T,ps){if(!ps.length)ps" wr
-"=[0];var rv=T.at&1,bd=(T.at>>1)&1,fg=((T.at>>2)&31)-1,bg=((T.at>>7)&31)-1;for(var i=0;i<ps.length;i+" wr
-"+){var p=ps[i];if(p==0){rv=0;bd=0;fg=-1;bg=-1}else if(p==1)bd=1;else if(p==22)bd=0;else if(p==7)rv=1" wr
-";else if(p==27)rv=0;else if(p>=30&&p<=37)fg=p-30;else if(p>=90&&p<=97)fg=p-82;else if(p==39)fg=-1;el" wr
-"se if(p>=40&&p<=47)bg=p-40;else if(p>=100&&p<=107)bg=p-92;else if(p==49)bg=-1}T.at=rv|(bd<<1)|((fg+1" wr
-")<<2)|((bg+1)<<7);}function csi(w,T,f){var priv=T.par.charAt(0)=='?',s=priv?T.par.slice(1):T.par,ps=" wr
-"s.length?s.split(';').map(function(v){return parseInt(v,10)||0}):[];var p1=ps.length?ps[0]:0,n=p1||1" wr
-",i;T.wrap=false;if(priv){if(p1==25)T.cv=(f=='h');if(p1==1049||p1==47||p1==1047){if(f=='h'&&!T.main){" wr
-"T.main={scr:T.scr,x:T.x,y:T.y};T.scr=[];for(i=0;i<T.R;i++)T.scr.push(newrow(T.C));T.x=0;T.y=0}if(f==" wr
-"'l'&&T.main){T.scr=T.main.scr;T.x=T.main.x;T.y=T.main.y;T.main=null;T.scr.forEach(function(r){r.h=nu" wr
-"ll})}}return;}if(f=='A')T.y=Math.max(0,T.y-n);else if(f=='B')T.y=Math.min(T.R-1,T.y+n);else if(f=='C" wr
-"')T.x=Math.min(T.C-1,T.x+n);else if(f=='D')T.x=Math.max(0,T.x-n);else if(f=='G')T.x=Math.min(T.C-1,n" wr
-"-1);else if(f=='d')T.y=Math.min(T.R-1,n-1);else if(f=='H'||f=='f'){T.y=Math.min(T.R-1,Math.max(0,(ps" wr
-"[0]||1)-1));T.x=Math.min(T.C-1,Math.max(0,(ps[1]||1)-1))}else if(f=='J'){if(p1==0){clrrow(T,T.y,T.x," wr
-"T.C);for(i=T.y+1;i<T.R;i++)clrrow(T,i,0,T.C)}else if(p1==1){clrrow(T,T.y,0,T.x+1);for(i=0;i<T.y;i++)" wr
-"clrrow(T,i,0,T.C)}else{for(i=0;i<T.R;i++)clrrow(T,i,0,T.C)}}else if(f=='K'){if(p1==0)clrrow(T,T.y,T." wr
-"x,T.C);else if(p1==1)clrrow(T,T.y,0,T.x+1);else clrrow(T,T.y,0,T.C)}else if(f=='m')sgr(T,ps);else if" wr
-"(f=='L'){for(i=0;i<n;i++){T.scr.splice(T.y,0,newrow(T.C));T.scr.pop()}T.scr.forEach(function(r){r.h=" wr
-"null})}else if(f=='M'){for(i=0;i<n;i++){T.scr.splice(T.y,1);T.scr.push(newrow(T.C))}T.scr.forEach(fu" wr
-"nction(r){r.h=null})}else if(f=='P'){var r=T.scr[T.y];for(i=0;i<n;i++){r.t.splice(T.x,1);r.t.push(' " wr
-"');r.a.splice(T.x,1);r.a.push(0)}r.h=null}else if(f=='@'){var q=T.scr[T.y];for(i=0;i<n;i++){q.t.spli" wr
-"ce(T.x,0,' ');q.t.pop();q.a.splice(T.x,0,0);q.a.pop()}q.h=null}else if(f=='X')clrrow(T,T.y,T.x,Math." wr
-"min(T.C,T.x+n));else if(f=='s'){T.sx=T.x;T.sy=T.y}else if(f=='u'){T.x=T.sx;T.y=T.sy}else if(f=='n'&&" wr
-"p1==6)sendkeys(w,ESC+'['+(T.y+1)+';'+(T.x+1)+'R');}function feed(w,c){var T=w.T;if(T.un){if((c&192)=" wr
-"=128){T.u=(T.u<<6)|(c&63);if(--T.un==0)put(T,String.fromCharCode(T.u))}else T.un=0;if(T.un||(c&192)=" wr
-"=128)return}if(T.st==1){if(c==91){T.st=2;T.par=''}else if(c==55){T.sx=T.x;T.sy=T.y;T.st=0}else if(c=" wr
-"=56){T.x=T.sx;T.y=T.sy;T.st=0}else T.st=(c==93?3:0);return}if(T.st==2){if(c>=64&&c<=126){T.st=0;csi(" wr
-"w,T,String.fromCharCode(c))}else T.par+=String.fromCharCode(c);return}if(T.st==3){if(c==7||c==27)T.s" wr
-"t=0;return}if(c==27){T.st=1;return}if(c==13){T.x=0;T.wrap=false;return}if(c==10){lf(T);T.wrap=false;" wr
-"return}if(c==8){if(T.x>0)T.x--;T.wrap=false;return}if(c==9){T.x=Math.min(T.C-1,(T.x+8)&~7);return}if" wr
-"(c<32||c==127)return;if(c>=192){T.un=c>=240?3:(c>=224?2:1);T.u=c&(c>=240?7:(c>=224?15:31));return}pu" wr
-"t(T,String.fromCharCode(c));}function esc(ch){return ch=='&'?'&amp;':(ch=='<'?'&lt;':(ch=='>'?'&gt;'" wr
-":ch))}function rowhtml(r,cx){var h='',run='',ca=-2;for(var i=0;i<r.t.length;i++){var a=(i===cx)?-1:r" wr
-".a[i];if(a!==ca){if(run)h+=span(ca,run);run='';ca=a}run+=esc(r.t[i]);}if(run)h+=span(ca,run);return " wr
-"h;}function span(a,s){if(a==0)return s;if(a==-1)return '<span class=cur>'+s+'</span>';var c='',fg=((" wr
-"a>>2)&31)-1,bg=((a>>7)&31)-1;if(a&2)c+=' bd';if(a&1){c+=bg>=0?' f'+bg:' fbg';c+=fg>=0?' b'+fg:' bfg'" wr
-"}else{if(fg>=0)c+=' f'+fg;if(bg>=0)c+=' b'+bg}return '<span class='+String.fromCharCode(39)+c.slice(" wr
-"1)+String.fromCharCode(39)+'>'+s+'</span>';}function plain(T,cur){var rows=(T.main?[]:T.hist).concat" wr
-"(T.scr),out=[],base=rows.length-T.R;rows.forEach(function(r,i){var t=r.t.slice();if(cur&&i==base+T.y" wr
-")t[T.x]=CUR;out.push(t.join('').replace(/ +$/,''))});while(out.length&&out[out.length-1]=='')out.pop" wr
-"();return out.join(NL);}function show(w){if(w.pend)return;w.pend=1;(window.requestAnimationFrame||fu" wr
-"nction(f){setTimeout(f,16)})(function(){w.pend=0;draw(w)});}function draw(w){var T=w.T,t=w.t,b=t.scr" wr
-"ollTop+t.clientHeight>=t.scrollHeight-4,h='',cur=T.cv&&!w.done;if(!T.main)T.hist.forEach(function(r)" wr
-"{if(r.h===null)r.h=rowhtml(r,-1);h+=r.h+NL});T.scr.forEach(function(r,y){h+=(cur&&y==T.y?rowhtml(r,T" wr
-".x):(r.h===null?(r.h=rowhtml(r,-1)):r.h))+NL});t.innerHTML=h;t.plain=plain(T,cur);if(b||T.main)t.scr" wr
-"ollTop=t.scrollHeight;}function sendkeys(w,s){if(w.ws.readyState==1)w.ws.send(new TextEncoder().enco" wr
-"de(s))}function fit(w){if(!w.up||w.min)return;var m=w.m.getBoundingClientRect?w.m.getBoundingClientR" wr
-"ect():null,cw=m&&m.width?m.width/10:8,ch=m&&m.height?m.height:18;var R=Math.floor((w.t.clientHeight-" wr
-"12)/ch),C=Math.floor((w.t.clientWidth-16)/cw);if(!(R>1&&C>1)){R=24;C=80}if(resize(w.T,R,C)||!w.sized" wr
-"){w.sized=1;if(w.ws.readyState==1)w.ws.send(R+' '+C);show(w)}}var KEYS={ArrowUp:'[A',ArrowDown:'[B'," wr
-"ArrowRight:'[C',ArrowLeft:'[D',Home:'[H',End:'[F',PageUp:'[5~',PageDown:'[6~',Delete:'[3~',Insert:'[" wr
-"2~'};function openw(){var w={min:false,z:0,T:Term()},i=++n,o=(wins.length%8)*28;w.d=el('div','win',d" wr
-"esk);w.d.style.left=(24+o)+'px';w.d.style.top=(20+o)+'px';w.d.style.width='720px';w.d.style.height='" wr
-"440px';var tb=el('div','tb',w.d),tt=el('span','tt',tb);tt.textContent='Terminal '+i;var bm=el('butto" wr
-"n','wb',tb),bx=el('button','wb',tb),bc=el('button','wb x',tb);bm.innerHTML='&#8211;';bx.innerHTML='&" wr
-"#9633;';bc.innerHTML='&#215;';bm.title='Minimize';bx.title='Maximize';bc.title='Close';w.t=el('pre'," wr
-"'term',w.d);w.t.tabIndex=0;w.m=el('span','meas',w.d);w.m.textContent='MMMMMMMMMM';w.k=el('button','t" wr
-"ask',tasks);w.k.textContent='Terminal '+i;w.k.title='Terminal '+i;bm.onclick=function(e){e.stopPropa" wr
-"gation();minw(w)};bx.onclick=function(e){e.stopPropagation();maxw(w)};bc.onclick=function(e){e.stopP" wr
-"ropagation();closew(w)};tb.ondblclick=function(e){if(e.target==tb||e.target==tt)maxw(w)};w.d.addEven" wr
-"tListener('mousedown',function(){if(wins.indexOf(w)>=0&&topw()!=w)focusw(w)});w.t.onfocus=function()" wr
-"{if(topw()!=w)focusw(w)};w.k.onclick=function(){if(!w.min&&topw()==w)minw(w);else focusw(w)};tb.onmo" wr
-"usedown=function(e){if(e.button!=0||(e.target!=tb&&e.target!=tt)||w.d.classList.contains('max'))retu" wr
-"rn;var x=e.clientX-w.d.offsetLeft,y=e.clientY-w.d.offsetTop;function mv(e){w.d.style.left=Math.max(0" wr
-",e.clientX-x)+'px';w.d.style.top=Math.max(0,e.clientY-y)+'px'}function up(){document.removeEventList" wr
-"ener('mousemove',mv);document.removeEventListener('mouseup',up)}document.addEventListener('mousemove" wr
-"',mv);document.addEventListener('mouseup',up);e.preventDefault();};if(window.ResizeObserver)new Resi" wr
-"zeObserver(function(){fit(w)}).observe(w.t);w.ws=new WebSocket(wsurl);w.ws.binaryType='arraybuffer';" wr
-"w.ws.onopen=function(){w.up=1;fit(w)};w.ws.onmessage=function(e){var a=new Uint8Array(e.data);for(va" wr
-"r j=0;j<a.length;j++)feed(w,a[j]);show(w)};w.ws.onclose=w.ws.onerror=function(){if(w.up){closew(w);r" wr
-"eturn}if(w.done)return;w.done=1;'[no terminal: the server has none free]'.split('').forEach(function" wr
-"(c){feed(w,c.charCodeAt(0))});show(w);};w.t.onkeydown=function(e){var k=e.key,s=null,c=-1;if(KEYS[k]" wr
-")s=ESC+KEYS[k];else if(k=='Enter')c=13;else if(k=='Backspace')c=127;else if(k=='Tab')c=9;else if(k==" wr
-"'Escape')c=27;else if(e.ctrlKey&&k.length==1)c=k.toUpperCase().charCodeAt(0)-64;else if(k.length==1&" wr
-"&!e.metaKey&&!e.altKey)c=k.charCodeAt(0);if(s===null&&c>=0&&c<128)s=String.fromCharCode(c);if(s!==nu" wr
-"ll&&w.ws.readyState==1){w.ws.send(new TextEncoder().encode(s));e.preventDefault()}};w.t.onpaste=func" wr
-"tion(e){if(w.ws.readyState==1)w.ws.send(new TextEncoder().encode(e.clipboardData.getData('text')));e" wr
-".preventDefault()};wins.push(w);focusw(w);show(w);return w;}document.getElementById('newt').onclick=" wr
-"function(){openw()};function tick(){var d=new Date();document.getElementById('clock').textContent=('" wr
-"0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}tick();setInterval(tick,10000);</scrip" wr
-"t></body></html>" wr ;
+":#729fcf}.f13{color:#ad7fa8}.f14{color:#34e2e2}.f15{color:#eeeeec}.wal{flex:1;display:flex;flex-dire" wr
+"ction:column;min-height:0;background:#15171c;color:#ddd;outline:none}.wnav{flex:none;display:flex;al" wr
+"ign-items:center;gap:2px;padding:6px 8px 0;background:#1c1f26}.wtab{border:0;border-radius:6px 6px " wr
+"0 0;background:transparent;color:#aaa;padding:6px 12px;cursor:pointer;font:inherit}.wtab:hover{color" wr
+":#fff}.wtab.on{background:#15171c;color:#fff}.wst{margin-left:auto;padding:0 6px 4px;font-size:12px;" wr
+"color:#8a8f98;font-variant-numeric:tabular-nums}.wbody{flex:1;overflow:auto;padding:10px 14px}.wrow{" wr
+"display:flex;align-items:baseline;gap:12px;padding:3px 0}.wk{width:110px;flex:none;color:#8a8f98}.wv" wr
+"{font-variant-numeric:tabular-nums;word-break:break-all}.wh{color:#fff;font-weight:600;margin:12px " wr
+"0 4px}.wf{display:flex;flex-direction:column;gap:5px;margin:6px 0 14px;max-width:440px}.wf label{col" wr
+"or:#8a8f98;font-size:12px}.wf input,.wf select{background:#0e0f13;color:#ddd;border:1px solid #3a3f4" wr
+"b;border-radius:5px;padding:5px 7px;font:inherit}.wgo{align-self:flex-start;background:#2f5d8a;color" wr
+":#fff;border:0;border-radius:5px;padding:5px 12px;cursor:pointer;font:inherit}.wgo:hover{background:" wr
+"#3a72a8}.werr{color:#ff7b72}.b0{background:#2e3436}.b1{background:#cc3333}.b2{background:#4e9a06}.b3" wr
+"{background:#c4a000}.b4{background:#3465a4}.b5{background:#a656a8}.b6{background:#06989a}.b7{backgro" wr
+"und:#d3d7cf}.b8{background:#555753}.b9{background:#ef4040}.b10{background:#8ae234}.b11{background:#f" wr
+"ce94f}.b12{background:#729fcf}.b13{background:#ad7fa8}.b14{background:#34e2e2}.b15{background:#eeeee" wr
+"c}</style></head><body><div id=dock><button class=app id=newt title='New terminal'><svg width=34 hei" wr
+"ght=34 viewBox='0 0 24 24'><rect x=2 y=4 width=20 height=16 rx=2.5 fill='#222' stroke='#bbb' stroke-" wr
+"width=1.2 /><path d='M6 9.5l3 2.5-3 2.5M11 15h6' stroke='#7ee787' stroke-width=1.8 fill=none stroke-" wr
+"linecap=round stroke-linejoin=round /></svg></button><button class=app id=neww title='Wallet'><svg w" wr
+"idth=34 height=34 viewBox='0 0 24 24'><path d='M3.5 8h15a1.5 1.5 0 0 1 1.5 1.5v8.5a1.5 1.5 0 0 1-1." wr
+"5 1.5h-13.5a1.5 1.5 0 0 1-1.5-1.5z' fill='#222' stroke='#bbb' stroke-width=1.2 /><path d='M3.5 8.5v-" wr
+"1a2.5 2.5 0 0 1 2.5-2.5h10' fill=none stroke='#bbb' stroke-width=1.2 stroke-linecap=round /><rect x=" wr
+"14 y=11.5 width=6 height=4 rx=1.2 fill='#2a2a2a' stroke='#e3b341' stroke-width=1.2 /><circle cx=16." wr
+"3 cy=13.5 r=0.9 fill='#e3b341' /></svg></button></div><div id=desk></div><div id=bar><div id=tasks><" wr
+"/div><span id=clock></span><form method=post action=/logout id=out><button class=task title='Log out" wr
+"'>Log out</button></form></div><script>var desk=document.getElementById('desk'),tasks=document.getEl" wr
+"ementById('tasks'),wins=[],z=1,n=0;var wsbase=(location.protocol=='https:'?'wss://':'ws://')+locatio" wr
+"n.host,wsurl=wsbase+'/tty',walw=null;var ESC=String.fromCharCode(27),CUR=String.fromCharCode(9608),N" wr
+"L=String.fromCharCode(10);function el(g,c,p){var e=document.createElement(g);if(c)e.className=c;if(p" wr
+")p.appendChild(e);return e}function topw(){var b=null;wins.forEach(function(o){if(!o.min&&(!b||o.z>b" wr
+".z))b=o});return b}function focusw(w){wins.forEach(function(o){if(o!=w){o.d.classList.add('off');o.k" wr
+".classList.remove('on')}});if(!w)return;w.min=false;w.z=++z;w.d.style.zIndex=w.z;w.d.style.display='" wr
+"flex';w.d.classList.remove('off');w.k.classList.add('on');w.k.classList.remove('min');w.t.focus();fi" wr
+"t(w);}function minw(w){w.min=true;w.d.style.display='none';w.k.classList.remove('on');w.k.classList." wr
+"add('min');focusw(topw())}function maxw(w){w.d.classList.toggle('max');focusw(w)}function closew(w){" wr
+"var i=wins.indexOf(w);if(i<0)return;wins.splice(i,1);if(w==walw)walw=null;if(w.ws.readyState<2)w.ws." wr
+"close();w.d.remove();w.k.remove();focusw(topw());}function newrow(C){var r={t:[],a:[],h:null};for(va" wr
+"r i=0;i<C;i++){r.t.push(' ');r.a.push(0)}return r}function Term(){var T={R:24,C:80,x:0,y:0,at:0,wrap" wr
+":false,hist:[],scr:[],main:null,st:0,par:'',cv:true,sx:0,sy:0,u:0,un:0};for(var i=0;i<T.R;i++)T.scr." wr
+"push(newrow(T.C));return T;}function dirty(T,y){if(T.scr[y])T.scr[y].h=null}function scrollup(T){va" wr
+"r r=T.scr.shift();if(!T.main){T.hist.push(r);if(T.hist.length>2000)T.hist.shift()}T.scr.push(newrow(" wr
+"T.C));}function lf(T){if(T.y==T.R-1)scrollup(T);else T.y++}function put(T,ch){if(T.wrap){T.x=0;lf(T)" wr
+";T.wrap=false}var r=T.scr[T.y];r.t[T.x]=ch;r.a[T.x]=T.at;r.h=null;if(T.x==T.C-1)T.wrap=true;else T.x" wr
+"++;}function clrrow(T,y,x0,x1){var r=T.scr[y];for(var i=x0;i<x1;i++){r.t[i]=' ';r.a[i]=0}r.h=null}fu" wr
+"nction resize(T,R,C){if(R<2||C<2||(R==T.R&&C==T.C))return false;var all=[T.scr];if(T.main)all.push(T" wr
+".main.scr);all.forEach(function(scr){scr.forEach(function(r){while(r.t.length<C){r.t.push(' ');r.a.p" wr
+"ush(0)}r.t.length=C;r.a.length=C;r.h=null});while(scr.length>R){if(scr===T.scr&&T.y>0){var t=scr.shi" wr
+"ft();if(!T.main)T.hist.push(t);T.y--}else scr.pop()}while(scr.length<R)scr.push(newrow(C));});T.R=R;" wr
+"T.C=C;if(T.x>=C)T.x=C-1;if(T.y>=R)T.y=R-1;T.wrap=false;return true;}function sgr(T,ps){if(!ps.length" wr
+")ps=[0];var rv=T.at&1,bd=(T.at>>1)&1,fg=((T.at>>2)&31)-1,bg=((T.at>>7)&31)-1;for(var i=0;i<ps.length" wr
+";i++){var p=ps[i];if(p==0){rv=0;bd=0;fg=-1;bg=-1}else if(p==1)bd=1;else if(p==22)bd=0;else if(p==7)r" wr
+"v=1;else if(p==27)rv=0;else if(p>=30&&p<=37)fg=p-30;else if(p>=90&&p<=97)fg=p-82;else if(p==39)fg=-1" wr
+";else if(p>=40&&p<=47)bg=p-40;else if(p>=100&&p<=107)bg=p-92;else if(p==49)bg=-1}T.at=rv|(bd<<1)|((f" wr
+"g+1)<<2)|((bg+1)<<7);}function csi(w,T,f){var priv=T.par.charAt(0)=='?',s=priv?T.par.slice(1):T.par," wr
+"ps=s.length?s.split(';').map(function(v){return parseInt(v,10)||0}):[];var p1=ps.length?ps[0]:0,n=p1" wr
+"||1,i;T.wrap=false;if(priv){if(p1==25)T.cv=(f=='h');if(p1==1049||p1==47||p1==1047){if(f=='h'&&!T.mai" wr
+"n){T.main={scr:T.scr,x:T.x,y:T.y};T.scr=[];for(i=0;i<T.R;i++)T.scr.push(newrow(T.C));T.x=0;T.y=0}if(" wr
+"f=='l'&&T.main){T.scr=T.main.scr;T.x=T.main.x;T.y=T.main.y;T.main=null;T.scr.forEach(function(r){r.h" wr
+"=null})}}return;}if(f=='A')T.y=Math.max(0,T.y-n);else if(f=='B')T.y=Math.min(T.R-1,T.y+n);else if(f=" wr
+"='C')T.x=Math.min(T.C-1,T.x+n);else if(f=='D')T.x=Math.max(0,T.x-n);else if(f=='G')T.x=Math.min(T.C-" wr
+"1,n-1);else if(f=='d')T.y=Math.min(T.R-1,n-1);else if(f=='H'||f=='f'){T.y=Math.min(T.R-1,Math.max(0," wr
+"(ps[0]||1)-1));T.x=Math.min(T.C-1,Math.max(0,(ps[1]||1)-1))}else if(f=='J'){if(p1==0){clrrow(T,T.y,T" wr
+".x,T.C);for(i=T.y+1;i<T.R;i++)clrrow(T,i,0,T.C)}else if(p1==1){clrrow(T,T.y,0,T.x+1);for(i=0;i<T.y;i" wr
+"++)clrrow(T,i,0,T.C)}else{for(i=0;i<T.R;i++)clrrow(T,i,0,T.C)}}else if(f=='K'){if(p1==0)clrrow(T,T.y" wr
+",T.x,T.C);else if(p1==1)clrrow(T,T.y,0,T.x+1);else clrrow(T,T.y,0,T.C)}else if(f=='m')sgr(T,ps);els" wr
+"e if(f=='L'){for(i=0;i<n;i++){T.scr.splice(T.y,0,newrow(T.C));T.scr.pop()}T.scr.forEach(function(r){" wr
+"r.h=null})}else if(f=='M'){for(i=0;i<n;i++){T.scr.splice(T.y,1);T.scr.push(newrow(T.C))}T.scr.forEac" wr
+"h(function(r){r.h=null})}else if(f=='P'){var r=T.scr[T.y];for(i=0;i<n;i++){r.t.splice(T.x,1);r.t.pus" wr
+"h(' ');r.a.splice(T.x,1);r.a.push(0)}r.h=null}else if(f=='@'){var q=T.scr[T.y];for(i=0;i<n;i++){q.t." wr
+"splice(T.x,0,' ');q.t.pop();q.a.splice(T.x,0,0);q.a.pop()}q.h=null}else if(f=='X')clrrow(T,T.y,T.x,M" wr
+"ath.min(T.C,T.x+n));else if(f=='s'){T.sx=T.x;T.sy=T.y}else if(f=='u'){T.x=T.sx;T.y=T.sy}else if(f=='" wr
+"n'&&p1==6)sendkeys(w,ESC+'['+(T.y+1)+';'+(T.x+1)+'R');}function feed(w,c){var T=w.T;if(T.un){if((c&1" wr
+"92)==128){T.u=(T.u<<6)|(c&63);if(--T.un==0)put(T,String.fromCharCode(T.u))}else T.un=0;if(T.un||(c&1" wr
+"92)==128)return}if(T.st==1){if(c==91){T.st=2;T.par=''}else if(c==55){T.sx=T.x;T.sy=T.y;T.st=0}else i" wr
+"f(c==56){T.x=T.sx;T.y=T.sy;T.st=0}else T.st=(c==93?3:0);return}if(T.st==2){if(c>=64&&c<=126){T.st=0;" wr
+"csi(w,T,String.fromCharCode(c))}else T.par+=String.fromCharCode(c);return}if(T.st==3){if(c==7||c==27" wr
+")T.st=0;return}if(c==27){T.st=1;return}if(c==13){T.x=0;T.wrap=false;return}if(c==10){lf(T);T.wrap=fa" wr
+"lse;return}if(c==8){if(T.x>0)T.x--;T.wrap=false;return}if(c==9){T.x=Math.min(T.C-1,(T.x+8)&~7);retur" wr
+"n}if(c<32||c==127)return;if(c>=192){T.un=c>=240?3:(c>=224?2:1);T.u=c&(c>=240?7:(c>=224?15:31));retur" wr
+"n}put(T,String.fromCharCode(c));}function esc(ch){return ch=='&'?'&amp;':(ch=='<'?'&lt;':(ch=='>'?'&" wr
+"gt;':ch))}function rowhtml(r,cx){var h='',run='',ca=-2;for(var i=0;i<r.t.length;i++){var a=(i===cx)?" wr
+"-1:r.a[i];if(a!==ca){if(run)h+=span(ca,run);run='';ca=a}run+=esc(r.t[i]);}if(run)h+=span(ca,run);ret" wr
+"urn h;}function span(a,s){if(a==0)return s;if(a==-1)return '<span class=cur>'+s+'</span>';var c='',f" wr
+"g=((a>>2)&31)-1,bg=((a>>7)&31)-1;if(a&2)c+=' bd';if(a&1){c+=bg>=0?' f'+bg:' fbg';c+=fg>=0?' b'+fg:' " wr
+"bfg'}else{if(fg>=0)c+=' f'+fg;if(bg>=0)c+=' b'+bg}return '<span class='+String.fromCharCode(39)+c.sl" wr
+"ice(1)+String.fromCharCode(39)+'>'+s+'</span>';}function plain(T,cur){var rows=(T.main?[]:T.hist).co" wr
+"ncat(T.scr),out=[],base=rows.length-T.R;rows.forEach(function(r,i){var t=r.t.slice();if(cur&&i==base" wr
+"+T.y)t[T.x]=CUR;out.push(t.join('').replace(/ +$/,''))});while(out.length&&out[out.length-1]=='')out" wr
+".pop();return out.join(NL);}function show(w){if(w.pend)return;w.pend=1;(window.requestAnimationFrame" wr
+"||function(f){setTimeout(f,16)})(function(){w.pend=0;draw(w)});}function draw(w){var T=w.T,t=w.t,b=t" wr
+".scrollTop+t.clientHeight>=t.scrollHeight-4,h='',cur=T.cv&&!w.done;if(!T.main)T.hist.forEach(functio" wr
+"n(r){if(r.h===null)r.h=rowhtml(r,-1);h+=r.h+NL});T.scr.forEach(function(r,y){h+=(cur&&y==T.y?rowhtml" wr
+"(r,T.x):(r.h===null?(r.h=rowhtml(r,-1)):r.h))+NL});t.innerHTML=h;t.plain=plain(T,cur);if(b||T.main)t" wr
+".scrollTop=t.scrollHeight;}function sendkeys(w,s){if(w.ws.readyState==1)w.ws.send(new TextEncoder()." wr
+"encode(s))}function fit(w){if(!w.up||w.min||!w.T)return;var m=w.m.getBoundingClientRect?w.m.getBound" wr
+"ingClientRect():null,cw=m&&m.width?m.width/10:8,ch=m&&m.height?m.height:18;var R=Math.floor((w.t.cli" wr
+"entHeight-12)/ch),C=Math.floor((w.t.clientWidth-16)/cw);if(!(R>1&&C>1)){R=24;C=80}if(resize(w.T,R,C)" wr
+"||!w.sized){w.sized=1;if(w.ws.readyState==1)w.ws.send(R+' '+C);show(w)}}var KEYS={ArrowUp:'[A',Arrow" wr
+"Down:'[B',ArrowRight:'[C',ArrowLeft:'[D',Home:'[H',End:'[F',PageUp:'[5~',PageDown:'[6~',Delete:'[3~'" wr
+",Insert:'[2~'};function frame(title,wd,ht){var w={min:false,z:0},o=(wins.length%8)*28;w.d=el('div','" wr
+"win',desk);w.d.style.left=(24+o)+'px';w.d.style.top=(20+o)+'px';w.d.style.width=wd+'px';w.d.style.he" wr
+"ight=ht+'px';var tb=el('div','tb',w.d),tt=el('span','tt',tb);tt.textContent=title;var bm=el('button'" wr
+",'wb',tb),bx=el('button','wb',tb),bc=el('button','wb x',tb);bm.innerHTML='&#8211;';bx.innerHTML='&#9" wr
+"633;';bc.innerHTML='&#215;';bm.title='Minimize';bx.title='Maximize';bc.title='Close';w.k=el('button'" wr
+",'task',tasks);w.k.textContent=title;w.k.title=title;bm.onclick=function(e){e.stopPropagation();minw" wr
+"(w)};bx.onclick=function(e){e.stopPropagation();maxw(w)};bc.onclick=function(e){e.stopPropagation();" wr
+"closew(w)};tb.ondblclick=function(e){if(e.target==tb||e.target==tt)maxw(w)};w.d.addEventListener('mo" wr
+"usedown',function(){if(wins.indexOf(w)>=0&&topw()!=w)focusw(w)});w.k.onclick=function(){if(!w.min&&t" wr
+"opw()==w)minw(w);else focusw(w)};tb.onmousedown=function(e){if(e.button!=0||(e.target!=tb&&e.target!" wr
+"=tt)||w.d.classList.contains('max'))return;var x=e.clientX-w.d.offsetLeft,y=e.clientY-w.d.offsetTop;" wr
+"function mv(e){w.d.style.left=Math.max(0,e.clientX-x)+'px';w.d.style.top=Math.max(0,e.clientY-y)+'px" wr
+"'}function up(){document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup'," wr
+"up)}document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);e.preventDefau" wr
+"lt();};return w;}function openw(){var i=++n,w=frame('Terminal '+i,720,440);w.T=Term();w.t=el('pre','" wr
+"term',w.d);w.t.tabIndex=0;w.m=el('span','meas',w.d);w.m.textContent='MMMMMMMMMM';w.t.onfocus=functio" wr
+"n(){if(topw()!=w)focusw(w)};if(window.ResizeObserver)new ResizeObserver(function(){fit(w)}).observe(" wr
+"w.t);w.ws=new WebSocket(wsurl);w.ws.binaryType='arraybuffer';w.ws.onopen=function(){w.up=1;fit(w)};w" wr
+".ws.onmessage=function(e){var a=new Uint8Array(e.data);for(var j=0;j<a.length;j++)feed(w,a[j]);show(" wr
+"w)};w.ws.onclose=w.ws.onerror=function(){if(w.up){closew(w);return}if(w.done)return;w.done=1;'[no te" wr
+"rminal: the server has none free]'.split('').forEach(function(c){feed(w,c.charCodeAt(0))});show(w);}" wr
+";w.t.onkeydown=function(e){var k=e.key,s=null,c=-1;if(KEYS[k])s=ESC+KEYS[k];else if(k=='Enter')c=13;" wr
+"else if(k=='Backspace')c=127;else if(k=='Tab')c=9;else if(k=='Escape')c=27;else if(e.ctrlKey&&k.leng" wr
+"th==1)c=k.toUpperCase().charCodeAt(0)-64;else if(k.length==1&&!e.metaKey&&!e.altKey)c=k.charCodeAt(0" wr
+");if(s===null&&c>=0&&c<128)s=String.fromCharCode(c);if(s!==null&&w.ws.readyState==1){w.ws.send(new T" wr
+"extEncoder().encode(s));e.preventDefault()}};w.t.onpaste=function(e){if(w.ws.readyState==1)w.ws.send" wr
+"(new TextEncoder().encode(e.clipboardData.getData('text')));e.preventDefault()};wins.push(w);focusw(" wr
+"w);show(w);return w;}var WTABS=[['overview','Overview'],['receive','Receive'],['send','Send'],['acti" wr
+"vity','Activity'],['settings','Settings']];function wask(w,op,a,cb){a.op=op;a.id=++w.nid;w.q[a.id]=c" wr
+"b;if(w.ws.readyState==1)w.ws.send(JSON.stringify(a))}function wrow(p,k,v){var r=el('div','wrow',p);e" wr
+"l('span','wk',r).textContent=k;el('span','wv',r).textContent=v==null?'':String(v);return r}function " wr
+"wbad(p,m){if(m.ok)return false;el('div','werr',p).textContent='Error: '+(m.error||'unknown');return " wr
+"true}function wfield(f,label,type){el('label','',f).textContent=label;var i=el(type=='select'?'selec" wr
+"t':'input','',f);if(type!='select')i.type=type;return i}function wbtn(f,label,fn){var b=el('button'," wr
+"'wgo',f);b.textContent=label;b.onclick=fn;return b}function wh(p,s){el('div','wh',p).textContent=s}f" wr
+"unction wwait(s){return s<3600?Math.round(s/60)+' min':(s<86400?Math.round(s/3600)+' h':Math.round(s" wr
+"/86400)+' days')}function wshow(w,t){w.tab=t;w.tabs.forEach(function(b){if(b.tab==t)b.classList.add(" wr
+"'on');else b.classList.remove('on')});if(w.b)w.b.remove();var p=w.b=el('div','wbody',w.t);if(!w.unl)" wr
+"{el('div','',p).textContent=w.lockmsg||'Unlocking...';return}if(w.none&&t!='settings'){wh(p,'No wall" wr
+"et yet');el('div','',p).textContent='Create one here, or restore one from its phrase in Settings.';v" wr
+"ar co=el('div','wv',p);wbtn(p,'Create a wallet',function(){wask(w,'create',{},function(m){if(wbad(co" wr
+",m))return;w.none=false;co.textContent='Write these words down, in order: '+m.words})});return;}if(t" wr
+"=='overview')wask(w,'overview',{},function(m){if(wbad(p,m))return;wh(p,'Balance');wrow(p,'Confirmed'" wr
+",m.confirmed);wrow(p,'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.rese" wr
+"rved);wrow(p,'Locked',m.locked);wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);});else i" wr
+"f(t=='receive'){var a=el('div','',p);wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This " wr
+"wallet');wrow(a,'Address',m.address);if(m.name)wrow(a,'Name',m.name)});var f=el('div','wf',p);wh(f,'" wr
+"Answer a slate file');var s=wfield(f,'Slate file (in your home)','text'),o=el('div','wv',f);wbtn(f,'" wr
+"Answer',function(){wask(w,'answer',{slate:s.value},function(m){o.textContent=m.ok?'Answered: '+m.sla" wr
+"te+' ('+m.amount+'); send it back to the payer':'Error: '+m.error})});}else if(t=='send'){var f=el('" wr
+"div','wf',p);wh(f,'Pay by slate file');var to=wfield(f,'To (an address or a @name)','text'),am=wfiel" wr
+"d(f,'Amount','text'),sp=wfield(f,'Speed','select'),sl=wfield(f,'Slate file to write','text'),o=el('d" wr
+"iv','wv',f);wask(w,'fees',{},function(m){if(m.ok)m.speeds.forEach(function(x){var e=el('option','',s" wr
+"p);e.value=x.speed;e.textContent=x.speed+': '+x.rate+', about '+wwait(x.wait)})});wbtn(f,'Make the s" wr
+"late',function(){wask(w,'send',{to:to.value,amount:am.value,speed:sp.value,slate:sl.value},function(" wr
+"m){o.textContent=m.ok?'Written: '+m.slate+' (fee '+m.fee+'); give it to the recipient, then finaliz" wr
+"e their answer':'Error: '+m.error})});var g=el('div','wf',p);wh(g,'Finalize an answered slate');var " wr
+"fs=wfield(g,'Answered slate file','text'),fo=el('div','wv',g);wbtn(g,'Finalize',function(){wask(w,'f" wr
+"inalize',{slate:fs.value},function(m){fo.textContent=m.ok?'Sent: '+m.tx+' (fee '+m.fee+')':'Error: '" wr
+"+m.error})});}else if(t=='activity')wask(w,'activity',{},function(m){if(wbad(p,m))return;if(!m.items" wr
+".length)el('div','',p).textContent='Nothing yet.';m.items.forEach(function(x){var r=wrow(p,x.kind,x." wr
+"amount+'  '+x.state+(x.height?' at '+x.height:'')+'  '+x.tx.slice(0,16));if(x.state=='pending'){var " wr
+"re=function(m){if(m.ok)wshow(w,'activity');else el('div','werr',p).textContent='Error: '+m.error};wb" wr
+"tn(r,'Cancel',function(){wask(w,'cancel',{tx:x.tx},re)});wbtn(r,'Bump',function(){wask(w,'bump',{tx:" wr
+"x.tx,speed:'hour'},re)});}});});else{var f=el('div','wf',p);wh(f,'Recovery phrase');var pw=wfield(f," wr
+"'Password','password'),o=el('div','wv',f);wbtn(f,'Show the phrase',function(){wask(w,'phrase',{passw" wr
+"ord:pw.value},function(m){pw.value='';o.textContent=m.ok?m.words:'Error: '+m.error})});var g=el('div" wr
+"','wf',p);wh(g,'Restore from a phrase');var ph=wfield(g,'The 12 words','text'),pp=wfield(g,'Passphra" wr
+"se (if any)','password'),go=el('div','wv',g);wbtn(g,'Restore',function(){wask(w,'restore',{words:ph." wr
+"value,passphrase:pp.value},function(m){ph.value='';pp.value='';if(m.ok)w.none=false;go.textContent=m" wr
+".ok?'Restored; scanning the chain':'Error: '+m.error})});wbtn(g,'Scan again',function(){wask(w,'scan" wr
+"',{},function(m){go.textContent=m.ok?'Scanning the chain':'Error: '+m.error})});}}function wmsg(w,m)" wr
+"{if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.ok?'':'Locked: '+(m" wr
+".error||'');wshow(w,w.tab);return}if(m.event=='tip'){w.st.textContent='Tip '+m.height;return}if(m.ev" wr
+"ent=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}if(m.event){if(w.unl&&(w.tab=='" wr
+"overview'||w.tab=='activity'))wshow(w,w.tab);return}var cb=w.q[m.id];if(cb){delete w.q[m.id];cb(m)}}" wr
+"function openwal(){if(walw){focusw(walw);return walw}var w=walw=frame('Wallet',620,460);w.q={};w.nid" wr
+"=0;w.tab='overview';w.t=el('div','wal',w.d);w.t.tabIndex=0;var nav=el('div','wnav',w.t);w.tabs=WTABS" wr
+".map(function(x){var b=el('button','wtab',nav);b.tab=x[0];b.textContent=x[1];b.onclick=function(){ws" wr
+"how(w,x[0])};return b});w.st=el('span','wst',nav);w.t.onfocus=function(){if(topw()!=w)focusw(w)};w.w" wr
+"s=new WebSocket(wsbase+'/wallet');w.ws.onopen=function(){w.up=1};w.ws.onmessage=function(e){var m;tr" wr
+"y{m=JSON.parse(e.data)}catch(x){return}wmsg(w,m)};w.ws.onclose=w.ws.onerror=function(){if(w.up){clos" wr
+"ew(w);return}if(w.done)return;w.done=1;w.unl=false;w.lockmsg='[no wallet: the server has none free]'" wr
+";wshow(w,w.tab);};wins.push(w);focusw(w);wshow(w,w.tab);return w;}document.getElementById('newt').on" wr
+"click=function(){openw()};document.getElementById('neww').onclick=function(){openwal()};function tic" wr
+"k(){var d=new Date();document.getElementById('clock').textContent=('0'+d.getHours()).slice(-2)+':'+(" wr
+"'0'+d.getMinutes()).slice(-2)}tick();setInterval(tick,10000);</script></body></html>" wr ;
 
 \ lpage  the login form's page (from src/user/wm-login.html, as page).
 : lpage
@@ -323,14 +408,17 @@ then
 
 \ ── Sessions ──
 \
-\ NS records of 100 bytes: in use (+0); the token, 32 hex digits and a
+\ NS records of 200 bytes: in use (+0); the token, 32 hex digits and a
 \ NUL (+4); the user and group, decimal (+28, +30); the home (+38, 64
 \ bytes); runas's arguments, runas USER GROUP SHELL, each NUL-ended and an
-\ empty one last (+78, 128).
+\ empty one last (+78, 128); last active (+F8); the password as typed at
+\ logging in, NUL-ended, for the wallet (+100, 128); runas's arguments for
+\ the wallet, runas USER GROUP wallet (+180, 128).  A record is zeroed when
+\ its session ends.
 :M NS 8 lit ;
 : ss variable ;  : cs variable ;  : sq variable ;  : fgp variable ;  : fge variable ;  : fgk variable ;  : fgd variable ;
 : lnm variable ;  : lpw variable ;  : lnf variable ;
-: srec  8 lit lshift ss @ + ;                                \ ( i -- a )
+: srec  9 lit lshift ss @ + ;                                \ ( i -- a )
 \ wnow ( -- t )  the time, Unix seconds (/proc/time).
 : wtb variable ;  : wnn variable ;
 : wnow
@@ -388,9 +476,10 @@ dup if
 	FFFFFFFF lit NS 0 lit do i srec @ 0= over 0< and if drop i then loop
 	dup 0< if drop 0 lit else 1 lit + then  nip
 then
-lpw @ 80 lit 0 lit do 0 lit over i + c! loop drop
 ?dup if
 	1 lit - dup wtouch srec  1 lit over !
+	\ the password kept for the wallet until the session ends
+	dup 100 lit + lpw @ scpy 0 lit swap c!
 	"/dev/random" 0 lit open dup 0< if drop else dup lnf @ 10 lit read drop close drop then
 	lnf @ 10 lit 2 lit pick 4 lit + pwhex 0 lit swap c!
 	dup 28 lit + 2 lit pwfld scpy 0 lit swap c!
@@ -399,8 +488,11 @@ lpw @ 80 lit 0 lit do 0 lit over i + c! loop drop
 	\ runas's arguments as spawnv takes them: each NUL-ended, an empty one last
 	dup 78 lit + "runas" scpy 0 lit over c! 1 lit +  2 lit pwfld scpy 0 lit over c! 1 lit +  3 lit pwfld scpy 0 lit over c! 1 lit +
 	5 lit pwfld dup c@ 0= if drop "sh" then scpy 0 lit over c! 1 lit +  0 lit swap c!
+	dup 180 lit + "runas" scpy 0 lit over c! 1 lit +  2 lit pwfld scpy 0 lit over c! 1 lit +  3 lit pwfld scpy 0 lit over c! 1 lit +
+	"wallet" scpy 0 lit over c! 1 lit +  0 lit swap c!
 	"/" seeother "Set-Cookie: wm=" wr 4 lit + wr "; Path=/; HttpOnly; SameSite=Strict" wr crlf crlf
 else "/?bad" seeother crlf then
+lpw @ 80 lit 0 lit do 0 lit over i + c! loop drop
 cclose ;
 \ send ( i -- )  session i ended: each of its windows told (a WebSocket
 \ close) and closed, its record cleared.
@@ -409,7 +501,7 @@ cclose ;
 NC 0 lit do i crec 14 lit + @ over 1 lit + = if
 	i crec @ cfd !  0 lit 0 lit 8 lit wsend  i crec cclose
 then loop
-srec 100 lit 0 lit do 0 lit over i + c! loop drop ;
+srec 200 lit 0 lit do 0 lit over i + c! loop drop ;
 : plogout
 dup sfind dup 0< 0= if send else drop then
 dup @ cfd !  "/" seeother "Set-Cookie: wm=; Path=/; Max-Age=0" wr crlf crlf  cclose ;
@@ -420,29 +512,89 @@ NS 0 lit do
 	i srec @ if wnn @ i srec F8 lit + @ - idle @ u> if i send then then
 loop ;
 
-\ upgrade ( c -- )  the WebSocket's handshake answered (its key hashed
-\ with RFC 6455's GUID), a terminal made and the program started on it.
-: upgrade
-dup "Sec-WebSocket-Key: " hfind ?dup 0= if "HTTP/1.0 400 Bad Request" wr crlf crlf cclose else
+\ wskey ( c -- c flag )  the WebSocket handshake's accept key (the key the
+\ client sent hashed with RFC 6455's GUID) at ab; 0 if it sent none.
+\ w101  the handshake's answer.
+: wskey
+dup "Sec-WebSocket-Key: " hfind ?dup if
 	kb @ begin over c@ 20 lit u> while over c@ over c! 1 lit + swap 1 lit + swap repeat nip
 	"258EAFA5-E914-47DA-95CA-C5AB0DC85B11" scpy kb @ -  kb @ swap sha1
-	shd @ 14 lit ab @ b64 0 lit swap c!
+	shd @ 14 lit ab @ b64 0 lit swap c!  1 lit
+else 0 lit then ;
+: w101
+"HTTP/1.1 101 Switching Protocols" wr crlf "Upgrade: websocket" wr crlf "Connection: Upgrade" wr crlf
+"Sec-WebSocket-Accept: " wr ab @ wr crlf crlf ;
+\ uspawn ( args -- )  runas started with those arguments (packed, from the
+\ session's record), in the session's user's home, its descriptors as fdv
+\ says (wm being root).
+: uspawn
+"/proc/self/cwd" 1 lit open dup 0< if drop else dup cs @ srec 38 lit + dup strlen write drop close drop then
+"runas" swap fdv @ spawnv drop
+"/proc/self/cwd" 1 lit open dup 0< if drop else dup "/" 1 lit write drop close drop then ;
+
+\ upgrade ( c -- )  a terminal's WebSocket: the handshake answered, a
+\ terminal made and the session's user's shell started on it.
+: upgrade
+wskey 0= if "HTTP/1.0 400 Bad Request" wr crlf crlf cclose else
 	fdv @ 8 lit + pty 0< if "HTTP/1.0 503 Service Unavailable" wr crlf crlf cclose else
 		fdv @ 8 lit + @ over 8 lit + !
-		"HTTP/1.1 101 Switching Protocols" wr crlf "Upgrade: websocket" wr crlf "Connection: Upgrade" wr crlf
-		"Sec-WebSocket-Accept: " wr ab @ wr crlf crlf
+		w101
 		fdv @ C lit + @ dup fdv @ 4 lit + !  dup fdv @ 8 lit + !  fdv @ C lit + !  3 lit fdv @ !
-		\ the session's user's shell, in its home (runas, wm being root)
 		cs @ 1 lit + over 14 lit + !
-		"/proc/self/cwd" 1 lit open dup 0< if drop else dup cs @ srec 38 lit + dup strlen write drop close drop then
-		"runas" cs @ srec 78 lit + fdv @ spawnv drop
-		"/proc/self/cwd" 1 lit open dup 0< if drop else dup "/" 1 lit write drop close drop then
+		cs @ srec 78 lit + uspawn
 		fdv @ 4 lit + @ close drop
 		1 lit over 4 lit + !  0 lit swap C lit + !
 	then
 then ;
 
-\ request ( c -- )  more of a request read; once whole: the page, the
+\ jq ( dst s -- dst' )  s copied, each ' a double quote (fam's strings
+\ hold none).  jesc ( dst s -- dst' )  s copied as a JSON string's
+\ inside: a double quote and a backslash escaped, a control byte \u00XX.
+: jd variable ;  : ub variable ;
+: jq  begin dup c@ ?dup while dup 27 lit = if drop 22 lit then 2 lit pick c! swap 1 lit + swap 1 lit + repeat drop ;
+: jput  jd @ c!  jd @ 1 lit + jd ! ;                        \ ( c -- )
+: jhex  F lit and dup A lit u< if 30 lit + else 57 lit + then ;   \ ( n -- c )
+: jesc
+swap jd !
+begin dup c@ ?dup while
+	dup 20 lit u< if
+		5C lit jput 75 lit jput 30 lit jput 30 lit jput  dup 4 lit rshift jhex jput  jhex jput
+	else
+		dup 22 lit = over 5C lit = or if 5C lit jput then jput
+	then
+	1 lit +
+repeat drop jd @ ;
+\ wunlk ( c -- )  the wallet's first line: {"op":"unlock","password":...},
+\ the session's password; the copy made for it cleared after.
+: wunlk
+ub @ "{'op':'unlock','password':'" jq  over 14 lit + @ 1 lit - srec 100 lit + jesc  "'}" jq  A lit over c! 1 lit +
+ub @ -  swap 18 lit + @ ub @ rot write drop
+ub @ 400 lit 0 lit do 0 lit over i + c! loop drop ;
+
+\ wupgr ( c -- )  a wallet's WebSocket: the handshake answered, two pipes
+\ made (the wallet's input, its output) and `wallet` started on them as
+\ the session's user, its errors nowhere; the password written it first.
+: wupgr
+wskey 0= if "HTTP/1.0 400 Bad Request" wr crlf crlf cclose else
+	fdv @ 10 lit + pipe 0< if "HTTP/1.0 503 Service Unavailable" wr crlf crlf cclose else
+	fdv @ 18 lit + pipe 0< if
+		fdv @ 10 lit + @ close drop  fdv @ 14 lit + @ close drop
+		"HTTP/1.0 503 Service Unavailable" wr crlf crlf cclose
+	else
+		\ fdv: 10 its input's read end, 14 its write end (wm's); 18 its
+		\ output's read end (wm's), 1C its write end
+		fdv @ 18 lit + @ over 8 lit + !  fdv @ 14 lit + @ over 18 lit + !
+		w101
+		fdv @ 10 lit + @ fdv @ 4 lit + !  fdv @ 1C lit + @ fdv @ 8 lit + !  FFFFFFFF lit fdv @ C lit + !  3 lit fdv @ !
+		cs @ 1 lit + over 14 lit + !
+		cs @ srec 180 lit + uspawn
+		fdv @ 10 lit + @ close drop  fdv @ 1C lit + @ close drop
+		0 lit over 1C lit + @ !  2 lit over 4 lit + !  0 lit over C lit + !
+		wunlk
+	then then
+then ;
+
+\ request ( c -- )  more of a request read; once whole: the page, a
 \ WebSocket, or 404.
 : request
 dup @ over 10 lit + @ 2 lit pick C lit + @ + FFF lit 3 lit pick C lit + @ - read
@@ -456,11 +608,14 @@ dup 0 lit > 0= if drop cclose else
 			dup "GET /tty " pfx? if
 				dup sfind dup cs ! 0< if "HTTP/1.0 403 Forbidden" wr crlf crlf cclose else upgrade then
 			else
+			dup "GET /wallet " pfx? if
+				dup sfind dup cs ! 0< if "HTTP/1.0 403 Forbidden" wr crlf crlf cclose else wupgr then
+			else
 			dup "POST /logout " pfx? if plogout else
 			dup "GET / " pfx? over "GET /? " pfx? or over "GET /?" pfx? or if
 				dup sfind 0< if lpage else page then cclose
 			else
-			"HTTP/1.0 404 Not Found" wr crlf crlf cclose then then then
+			"HTTP/1.0 404 Not Found" wr crlf crlf cclose then then then then
 		then
 	else dup C lit + @ FFF lit = if cclose else drop then then
 then ;
@@ -478,10 +633,17 @@ then ;
 loop drop
 wr1 @ 10 lit lshift wr2 @ or 3 lit swap tty drop ;
 
+\ wtext ( c a n -- )  a message to the wallet: one line (any newline in
+\ it made a space), on its input.
+: wtext
+2dup 0 lit do dup i + c@ dup A lit = swap D lit = or if 20 lit over i + c! then loop drop
+rot 18 lit + @ -rot  2 lit pick -rot write drop  e2 @ 1 lit + 1 lit write drop ;
+
 \ frame1 ( c -- more )  the first frame buffered, if whole, taken: typing
-\ (a binary frame) to the terminal, its size (a text frame, wsize), a ping
-\ answered, a close returned (the client closed: 0); what follows kept.  1
-\ when there may be another.
+\ (a binary frame) to the terminal, its size (a text frame, wsize), a
+\ wallet's message (a text frame, wtext), a ping answered, a close
+\ returned (the client closed: 0); what follows kept.  1 when there may be
+\ another.
 : fbuf variable ;  : fn variable ;  : fh variable ;  : fl variable ;
 : frame1
 dup 10 lit + @ fbuf !  dup C lit + @ fn !
@@ -497,8 +659,10 @@ fl @ 7E lit = fn @ 4 lit u< and if drop 0 lit else
 			0 lit do fbuf @ fh @ + i + dup c@ fbuf @ fh @ + 4 lit - i 3 lit and + c@ xor swap c! loop
 		then then
 		fbuf @ c@ F lit and
-		dup 2 lit = fl @ and if over 8 lit + @ fbuf @ fh @ + fl @ write drop then
-		dup 1 lit = fl @ and if over 8 lit + @ fbuf @ fh @ + fl @ wsize then
+		dup 2 lit = fl @ and  2 lit pick 4 lit + @ 1 lit = and if over 8 lit + @ fbuf @ fh @ + fl @ write drop then
+		dup 1 lit = fl @ and if
+			over 4 lit + @ 2 lit = if over fbuf @ fh @ + fl @ wtext else over 8 lit + @ fbuf @ fh @ + fl @ wsize then
+		then
 		dup 9 lit = if fbuf @ fh @ + fl @ A lit wsend then
 		8 lit = if 0 lit 0 lit 8 lit wsend cclose 0 lit else
 			fn @ fh @ fl @ + - ?dup if 0 lit do fbuf @ fh @ + fl @ + i + c@ fbuf @ i + c! loop then
@@ -520,6 +684,28 @@ dup 0 lit > 0= if drop cclose else over C lit + dup @ rot + swap !  frames then 
 dup 8 lit + @ io @ 1000 lit read
 dup 0 lit > if io @ swap 2 lit wsend drop else drop 0 lit 0 lit 8 lit wsend cclose then ;
 
+\ wread ( c -- )  what the wallet wrote: each whole line a text frame
+\ (an empty one none); when it is done (its output closed, or a line
+\ past 4 KiB), a close, and the client gone.
+: wlb variable ;  : wl variable ;  : wp variable ;
+: wlines
+0 lit wp !
+begin
+	wp @ wl !
+	begin wl @ wlb @ @ u<  wlb @ 4 lit + wl @ + c@ A lit <> and while wl @ 1 lit + wl ! repeat
+	wl @ wlb @ @ u<
+while
+	wl @ wp @ - ?dup if wlb @ 4 lit + wp @ + swap 1 lit wsend then
+	wl @ 1 lit + wp !
+repeat
+\ the rest, a line begun, moved to the front
+wlb @ @ wp @ - dup if dup 0 lit do wlb @ 4 lit + wp @ + i + c@ wlb @ 4 lit + i + c! loop then
+wlb @ ! ;
+: wread
+dup 1C lit + @ wlb !
+dup 8 lit + @  wlb @ 4 lit + wlb @ @ +  FFC lit wlb @ @ -  read
+dup 0 lit > if wlb @ @ + wlb @ !  wlines drop else drop 0 lit 0 lit 8 lit wsend cclose then ;
+
 \ accept1  a client taken (if all the slots are busy, answered 503 and
 \ closed at once: a WebSocket's handshake then fails, its window says so).
 : accept1
@@ -531,7 +717,7 @@ lsn @ accept dup 0< if drop else
 then ;
 
 \ entries  poll's entries made: the listener; each client's socket, and
-\ its terminal once it has one.
+\ its terminal (or its wallet's output) once it has one.
 : pent  np @ 3 lit lshift pe @ + tuck !  1 lit swap 4 lit + !  np @ 2 lit lshift pm @ + !  np @ 1 lit + np ! ;   \ ( tag fd -- )
 : entries
 0 lit np !
@@ -546,7 +732,7 @@ loop ;
 \ handle ( tag -- )  an entry with something to do.
 : handle
 ?dup 0= if accept1 else
-dup 1 lit and if 1 lit - dup @ 0< 0= over 8 lit + @ 0< 0= and if dup @ cfd ! ttyread else drop then else
+dup 1 lit and if 1 lit - dup @ 0< 0= over 8 lit + @ 0< 0= and if dup @ cfd !  dup 4 lit + @ 2 lit = if wread else ttyread then else drop then else
 dup @ 0< if drop else
 dup @ cfd !  dup 4 lit + @ if  dup 14 lit + @ ?dup if 1 lit - wtouch then  wsread else request then
 then then then ;
@@ -556,13 +742,16 @@ then then then ;
 \ each) from malloc, which maps more.
 tcode[ drop begin FFFFFFFF lit st2 wait 0< if 5F5E100 lit sleep then 0 lit until ]tcode
 4000 lit alloc 4000 lit + 0 lit thread 0< if "wm: no thread" eputs 0A lit eputc 1 lit exit then
-NS 8 lit lshift alloc dup ss !  NS 6 lit lshift 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+NS 9 lit lshift alloc dup ss !  NS 7 lit lshift 0 lit do 0 lit over i 2 lit lshift + ! loop drop
 80 lit alloc lnm !  80 lit alloc lpw !  100 lit alloc lnf !  20 lit alloc wtb !  wnow wnn !
-1010 lit malloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  10 lit alloc fdv !
+1010 lit malloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  20 lit alloc fdv !  400 lit alloc ub !
 A0D0A0D lit e2 @ !  0 lit e2 @ 4 lit + c!
 NC 5 lit lshift alloc cl !
-NC 0 lit do FFFFFFFF lit i crec !  FFFFFFFF lit i crec 8 lit + !  1000 lit malloc i crec 10 lit + ! loop
-NC 0 lit do i crec 10 lit + @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exit then loop
+NC 0 lit do
+	FFFFFFFF lit i crec !  FFFFFFFF lit i crec 8 lit + !  FFFFFFFF lit i crec 18 lit + !  0 lit i crec 14 lit + !
+	1000 lit malloc i crec 10 lit + !  1004 lit malloc i crec 1C lit + !
+loop
+NC 0 lit do i crec 10 lit + @ 0= i crec 1C lit + @ 0= or if "wm: no memory" eputs 0A lit eputc 1 lit exit then loop
 io @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exit then
 NC 1 lit lshift 1 lit + dup 3 lit lshift alloc pe !  2 lit lshift alloc pm !
 1 lit arg ?dup if atoi else 50 lit then port !

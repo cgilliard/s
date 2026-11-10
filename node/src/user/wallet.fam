@@ -1,0 +1,126 @@
+\ wallet.fam — A STUB of the wallet, for wm's wallet window
+\ (docs/GUI_WALLET.md, phase 1, wm's side): no keys, no records, no node;
+\ every answer is fixed data, made up.  It speaks the wallet's messages
+\ (docs/GUI_WALLET.md, The wallet's messages) as the wallet will: a JSON
+\ object a line on its input and its output, the first line wm's unlock
+\ (any password but an empty one taken), then each request answered by its
+\ op with its id echoed, and a tip told after the unlock.  It reads compact
+\ JSON only (as JSON.stringify writes it).  It ends when its input does.
+: ibuf variable ;  : icnt variable ;  : obuf variable ;  : opos variable ;
+: idb variable ;  : opb variable ;  : unl variable ;  : jr variable ;
+: lp variable ;  : le variable ;
+
+\ jo ( s -- )  s added to the line being written, each ' a double quote
+\ (fam's strings hold none); jraw ( s -- ) s as it is; jend the line
+\ written, a newline after it.
+: jo
+opos @ swap
+begin dup c@ ?dup while dup 27 lit = if drop 22 lit then 2 lit pick c! swap 1 lit + swap 1 lit + repeat
+drop opos ! ;
+: jraw  opos @ swap scpy opos ! ;
+: jend  A lit opos @ c!  1 lit obuf @ opos @ obuf @ - 1 lit + write drop  obuf @ opos ! ;
+
+\ jfm ( a key -- flag )  key (' for a double quote) at a.
+\ jfind ( line key -- a | 0 )  just past the first key in the line.
+: jfm
+begin dup c@ if over c@ over c@ dup 27 lit = if drop 22 lit then = else 0 lit then while
+	1 lit + swap 1 lit + swap
+repeat
+nip c@ 0= ;
+: jfind
+0 lit jr !  swap
+begin dup c@ jr @ 0= and while
+	2dup swap jfm if dup 2 lit pick strlen + jr ! then
+	1 lit +
+repeat 2drop jr @ ;
+
+\ getid ( line -- )  the request's id at idb as sent (up to a comma or a
+\ brace), or null; getop ( line -- ) its op at opb (31 bytes at most), or
+\ empty.
+: getid
+idb @ swap "'id':" jfind ?dup if
+	begin dup c@ dup 2C lit <> over 7D lit <> and and while dup c@ 2 lit pick c! swap 1 lit + swap 1 lit + repeat drop
+else "null" scpy then
+0 lit swap c! ;
+: getop
+opb @ swap "'op':'" jfind ?dup if
+	begin dup c@ dup 22 lit <> and  2 lit pick opb @ - 1F lit u< and while
+		dup c@ 2 lit pick c! swap 1 lit + swap 1 lit + repeat drop
+then
+0 lit swap c! ;
+
+\ jok  an answer begun: its id, ok; jerr ( s -- ) an error answered.
+: jok  "{'id':" jo idb @ jraw ",'ok':true" jo ;
+: jerr  "{'id':" jo idb @ jraw ",'ok':false,'error':'" jo jo "'}" jo jend ;
+: op?  opb @ swap streq ;                                    \ ( s -- flag )
+: tip  "{'event':'tip','height':1234,'hash':'00000c4f9e2d7a1b3c5e7f9a1b3c5e7f9a1b3c5e7f9a1b3c5e7f9a1b3c5e7f9a'}" jo jend ;
+: words  ",'words':'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'}" jo jend ;
+
+\ unlk ( line -- )  the first line: wm's, the session's password.
+: unlk
+"unlock" op? if
+	"'password':'" jfind dup if c@ 22 lit <> then
+	if
+		1 lit unl !  "{'op':'unlock','ok':true,'wallet':true}" jo jend  tip
+	else "{'op':'unlock','ok':false,'error':'no password'}" jo jend then
+else drop "locked" jerr then ;
+
+\ answer  a request answered by its op.
+: answer
+"overview" op? if
+	jok ",'confirmed':'12.5','pending':'0.25','unverified':'0','reserved':'0','locked':'1.5'," jo
+	"'height':1234,'node':'synced'}" jo jend
+else "receive" op? if
+	jok ",'address':'tab1qstub7w3x9k2m5d8f0h4j6l1n3p5r7t9v2x4z6c8','name':'@stub'}" jo jend
+else "fees" op? if
+	jok ",'speeds':[{'speed':'block','rate':'0.0000002','wait':60},{'speed':'hour','rate':'0.0000001','wait':3600}," jo
+	"{'speed':'day','rate':'0.00000005','wait':86400},{'speed':'economy','rate':'0.00000001','wait':604800}]}" jo jend
+else "send" op? if
+	jok ",'slate':'pay-1.slate','fee':'0.0000452'}" jo jend
+else "answer" op? if
+	jok ",'slate':'pay-1.slate.response','amount':'2.5'}" jo jend
+else "finalize" op? if
+	jok ",'tx':'5d1e0a7c9b3f2e4d6c8a0b1c3e5f7a9b1d3f5e7c9a0b2d4f6e8c0a1b3d5f7e9c','fee':'0.0000452'}" jo jend
+else "activity" op? if
+	jok ",'items':[{'tx':'8a2c4e6f8a0c2e4f6a8c0e2f4a6c8e0f2a4c6e8f0a2c4e6f8a0c2e4f6a8c0e2f'," jo
+	"'kind':'received','amount':'12.5','state':'confirmed','height':1200}," jo
+	"{'tx':'3b5d7f9b1d3f5b7d9f1b3d5f7b9d1f3b5d7f9b1d3f5b7d9f1b3d5f7b9d1f3b5d'," jo
+	"'kind':'sent','amount':'0.25','state':'pending','height':0}]}" jo jend
+else "cancel" op? "bump" op? or if
+	jok ",'tx':'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00'}" jo jend
+else "phrase" op? "create" op? or if
+	jok words
+else "restore" op? "scan" op? or if
+	jok "}" jo jend  "{'event':'scan','height':1234,'of':1234}" jo jend
+else "unlock" op? if "unlocked already" jerr
+else "unknown op" jerr
+then then then then then then then then then then then ;
+
+\ hline ( line -- )  a line read.
+: hline
+dup getid  dup getop
+unl @ if drop answer else unlk then ;
+
+\ lines  each whole line read handled; the rest, a line begun, kept.
+: lines
+0 lit lp !
+begin
+	lp @ le !
+	begin le @ icnt @ u<  ibuf @ le @ + c@ A lit <> and while le @ 1 lit + le ! repeat
+	le @ icnt @ u<
+while
+	0 lit ibuf @ le @ + c!  ibuf @ lp @ + hline
+	le @ 1 lit + lp !
+repeat
+icnt @ lp @ - dup if dup 0 lit do ibuf @ lp @ + i + c@ ibuf @ i + c! loop then
+icnt ! ;
+
+1004 lit alloc ibuf !  1000 lit alloc obuf !  1000 lit alloc idb !  20 lit alloc opb !
+0 lit icnt !  0 lit unl !  obuf @ opos !
+begin
+	0 lit ibuf @ icnt @ + FFF lit icnt @ - read
+	dup 0 lit >
+while
+	icnt @ + icnt !  lines
+repeat
+drop bye
