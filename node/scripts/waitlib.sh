@@ -14,12 +14,21 @@ wprogress() {
 	find "$T" -type f \( -name '*.out' -o -name '*.log' \) -exec cat {} + 2>/dev/null | wc -c
 }
 
+# wdump — the end of each of the test's logs, on stderr: a failed wait
+# shows why wherever the script runs (CI's own step after it may be
+# folded away).
+wdump() {
+	for f in $(find "$T" -type f \( -name '*.out' -o -name '*.log' \) | sort); do
+		echo "== $f (last 40 lines)" >&2; tail -40 "$f" >&2
+	done
+}
+
 # wait_for FILE REGEX IDLE WHAT — until REGEX (extended) is in FILE; fails
 # when nothing under $T has grown for IDLE seconds.
 wait_for() {
 	wf_last=$(wprogress); wf_idle=0
 	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ "$wf_idle" -lt "$3" ] || { echo "$WNAME: $4: nothing new for $3 s" >&2; exit 1; }
+		[ "$wf_idle" -lt "$3" ] || { echo "$WNAME: $4: nothing new for $3 s" >&2; wdump; exit 1; }
 		sleep 2
 		wf_now=$(wprogress)
 		if [ "$wf_now" != "$wf_last" ]; then wf_last=$wf_now; wf_idle=0; else wf_idle=$((wf_idle + 2)); fi
@@ -32,7 +41,7 @@ wait_while_busy() {
 	wb_max=$1; wb_what=$2; shift 2
 	wb_last=$(wprogress); wb_idle=0
 	until "$@"; do
-		[ "$wb_idle" -lt "$wb_max" ] || { echo "$WNAME: $wb_what: nothing new for $wb_max s" >&2; exit 1; }
+		[ "$wb_idle" -lt "$wb_max" ] || { echo "$WNAME: $wb_what: nothing new for $wb_max s" >&2; wdump; exit 1; }
 		sleep 2
 		wb_now=$(wprogress)
 		if [ "$wb_now" != "$wb_last" ]; then wb_last=$wb_now; wb_idle=0; else wb_idle=$((wb_idle + 2)); fi
