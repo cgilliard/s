@@ -104,6 +104,10 @@ const AVOID: Duration = Duration::from_secs(300);
 const WRONG_KEY_AVOID: Duration = Duration::from_secs(3600);
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// After a first "offline" for a send, how long before asking again: a
+/// recipient's sessions move (rebuilt around a relay that stopped, or to
+/// a new point), and a lookup between two can find none.
+const OFFLINE_RETRY: Duration = Duration::from_secs(3);
 const MAX_SENDS: usize = 64;
 /// A broadcast unanswered by then is tried on another circuit.
 const BROADCAST_WAIT: Duration = Duration::from_secs(15);
@@ -187,6 +191,9 @@ enum Stage {
     Sent(Digest),
     /// Delivered; the circuit held open for the answer, since then.
     Awaiting(Instant),
+    /// Told the recipient was offline, once: asked again (a lookup on the
+    /// same circuit) from then.
+    Retry(Instant),
 }
 
 struct Job {
@@ -197,6 +204,8 @@ struct Job {
     /// The return route the payload carries, and the one-time key its
     /// answer is sealed to.
     route: Option<(onion::Route, crate::mlkem::SecretKey)>,
+    /// Told "offline" once already: the next time is final.
+    retried: bool,
 }
 
 /// A circuit for one send or one broadcast, carrying no session of ours.
@@ -1374,7 +1383,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         && match j.stage {
                             Stage::Lookup => j.out.to == subject,
                             Stage::Sent(o) => o == subject,
-                            Stage::Waiting | Stage::Awaiting(_) => false,
+                            Stage::Waiting | Stage::Awaiting(_) | Stage::Retry(_) => false,
                         }
                 }) {
                     if code == NOTICE_FORWARDED {
@@ -1389,6 +1398,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             let job = self.part.jobs.remove(j);
                             self.finish_outbound(handle, job.out.group, "sent", now);
                         }
+                    } else if code == NOTICE_OFFLINE
+                        && !self.part.jobs[j].retried
+                        && now.duration_since(self.part.jobs[j].started) + OFFLINE_RETRY < SEND_TIMEOUT
+                    {
+                        // Its sessions may be moving: asked again shortly,
+                        // its announce looked up afresh.
+                        let job = &mut self.part.jobs[j];
+                        job.retried = true;
+                        job.out.recipient = None;
+                        job.stage = Stage::Retry(now + OFFLINE_RETRY);
+                        let to = job.out.to;
+                        self.chatter(&format!("onion: {} offline for now; asking again", onion::short(&to)));
                     } else {
                         let why = match code {
                             NOTICE_OFFLINE => "offline: none of its rendezvous points holds a session for it",
@@ -1499,7 +1520,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.jobs.len() >= MAX_SENDS {
             return self.rv.note(Note::Failed { tag: out.tag, to: out.to, why: "too many sends in progress".into() });
         }
-        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None });
+        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None, retried: false });
         self.progress_onion_sends(now);
     }
 
@@ -1521,6 +1542,20 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 i += 1;
                 continue;
+            }
+            // A retry due: its lookup again, on its circuit.
+            if let Stage::Retry(at) = self.part.jobs[i].stage
+                && now >= at
+            {
+                match self.part.jobs[i].circuit {
+                    Some(h) => {
+                        let to = self.part.jobs[i].out.to;
+                        self.part.jobs[i].stage = Stage::Lookup;
+                        let last = self.circuit_hops(h).saturating_sub(1);
+                        let _ = self.circuit_send(h, last, circuit::GET_ANNOUNCE, &digest_to_bytes(&to), now);
+                    }
+                    None => self.part.jobs[i].stage = Stage::Waiting,
+                }
             }
             if now.duration_since(self.part.jobs[i].started) >= SEND_TIMEOUT {
                 let why = match self.part.jobs[i].stage {
