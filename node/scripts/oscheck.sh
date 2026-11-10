@@ -723,26 +723,31 @@ rm -f "$T/tpw.disk"
 # /etc/init yet): /etc/passwd and /etc/init written, a home for alice
 # hers alone.  Then init runs login: a wrong password refused; alice in,
 # her user and home, her file, root's file and the root directory closed
-# to her; root in after her, everything open to it.  The passwords were
+# to her; root in after her, everything open to it; root adds bob
+# (adduser), who logs in next, his user 1000, his home.  The passwords were
 # written in plain text: each is kept hashed after its first use
 # (crypto/passwd.fam), as root's cat of /etc/passwd shows.
 printf '%s\n' 'mkdir /etc' 'echo root:rootpw:0:0:/:sh > /etc/passwd' 'echo alice:apw:1:1:/home/alice:sh >> /etc/passwd' \
 	'chmod 600 /etc/passwd' 'mkdir /home' 'mkdir /home/alice' 'chown 1 1 /home/alice' 'chmod 700 /home/alice' \
 	'echo restart 0 100 login > /etc/init' 'id' 'ls /etc' > "$T/u1.in"
 printf '%s\n' 'alice' 'wrong' 'alice' 'apw' 'id' 'pwd' 'echo mine > f' 'cat f' 'cat /etc/passwd' 'mkdir /tmp2' 'ls /home' \
-	'exit' 'root' 'rootpw' 'id' 'cat /etc/passwd' 'ls /home/alice' > "$T/u2.in"
+	'exit' 'root' 'rootpw' 'id' 'cat /etc/passwd' 'ls /home/alice' 'adduser bob' 'bobpw1' 'bobpw1' 'ls /home' \
+	'exit' 'bob' 'bobpw1' 'id' 'pwd' > "$T/u2.in"
 rm -f "$T/users.disk"; dd if=/dev/zero of="$T/users.disk" bs=1 count=0 seek=268435456 2>/dev/null
 N=$((N + 1))
 feed 60 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
-feed 60 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
+feed 180 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
 for pat in '^\([$] \)*0 0$' '^\([$] \)*init$' '^\([$] \)*passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
 for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/alice$' '^mine$' '^cat: cannot open /etc/passwd$' \
 	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^f$' \
 	'^root:[$]p5[$]4e20[$][0-9a-f]\{32\}[$][0-9a-f]\{64\}:0:0:/:sh$' \
-	'^alice:[$]p5[$]4e20[$][0-9a-f]\{32\}[$][0-9a-f]\{64\}:1:1:/home/alice:sh$'; do
+	'^alice:[$]p5[$]4e20[$][0-9a-f]\{32\}[$][0-9a-f]\{64\}:1:1:/home/alice:sh$' \
+	'^adduser: bob, user 1000, home /home/bob$' '^bob/$' '^1000 1000$' '^/home/bob$'; do
 	grep -q -- "$pat" "$T/u2.out" || fail users_boot2 "no /$pat/ in: $(head -c 900 "$T/u2.out")"
 done
 [ "$(grep -c '0 0$' "$T/u2.out")" = 1 ] || fail users_boot2 "root's id not once after alice's: $(head -c 900 "$T/u2.out")"
+# typed passwords never shown (the terminal raw while they are read)
+! grep -qE 'wrong|apw|rootpw|bobpw1' "$T/u2.out" || fail users_boot2 "a password shown as typed: $(grep -E 'wrong|apw|rootpw|bobpw1' "$T/u2.out" | head -3)"
 rm -f "$T/users.disk"
 
 # The network (step 9): UDP.  A program asks an echo server on the host
@@ -1188,6 +1193,51 @@ for n in 1 4; do
 		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
 	done
 done
+rm -f "$T/wm.disk"
+# A session idle past wm's idle time (8 seconds here, `wm 80 8`) ends: a
+# terminal left untouched closed by wm, the cookie refused after.
+cat > "$T/idle.py" <<'IDLEEOF'
+import socket, base64, os, sys, time
+port = int(sys.argv[1])
+def http(req):
+    c = socket.create_connection(("127.0.0.1", port), timeout=60); c.sendall(req); b = b""
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        b += d
+    return b
+f = b"name=root&password=pw"
+g = http(b"POST /login HTTP/1.0\r\nContent-Length: " + str(len(f)).encode() + b"\r\n\r\n" + f)
+ck = [l for l in g.split(b"\r\n") if l.startswith(b"Set-Cookie: wm=")]
+cookie = b"Cookie: " + ck[0][12:].split(b";")[0] + b"\r\n" if ck else b""
+def ws():
+    c = socket.create_connection(("127.0.0.1", port), timeout=5)
+    c.sendall(b"GET /tty HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + cookie + b"Sec-WebSocket-Key: " + base64.b64encode(os.urandom(16)) + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    return c
+s = ws(); t0 = time.time(); got = b""; closed = False
+# nothing typed: wm closes it once the session is idle (the frames shown,
+# the close or the end of the connection the sign), within a minute
+while time.time() < t0 + 60 and not closed:
+    try: d = s.recv(4096)
+    except socket.timeout: continue
+    if not d: closed = True
+    got += d
+    if b"\x88" in got.split(b"$ ", 1)[-1]: closed = True
+print("idle", closed and time.time() - t0 >= 8, round(time.time() - t0))
+h = ws().recv(200); print("after", h.split(b"\r\n")[0].decode())
+IDLEEOF
+N=$((N + 1))
+WP=$((TP + 7))
+rm -f "$T/wm.disk" "$T/wm.in"; dd if=/dev/zero of="$T/wm.disk" bs=1 count=0 seek=268435456 2>/dev/null; mkfifo "$T/wm.in"
+./tools/q32 --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < "$T/wm.in" > "$T/wm_idle.out" 2>&1 &
+QP=$!
+exec 5> "$T/wm.in"
+i=0; while [ $i -lt 120 ] && ! grep -q '[$] ' "$T/wm_idle.out"; do sleep 0.5; i=$((i + 1)); done
+printf '%s\n' 'mkdir /etc' 'echo root:pw:0:0:/:sh > /etc/passwd' 'wm 80 8 &' >&5
+i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_idle.out"; do sleep 0.5; i=$((i + 1)); done
+lim 300 python3 "$T/idle.py" $WP > "$T/idle.out" 2>&1
+exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
+for pat in '^idle True' '^after HTTP/1.0 403 Forbidden$'; do grep -q -- "$pat" "$T/idle.out" || { fail wm_idle "no /$pat/: $(head -c 400 "$T/idle.out")"; break; }; done
 rm -f "$T/wm.disk"
 
 scripts/makenode.sh --disk="$T/disk.img" > /dev/null

@@ -2,24 +2,13 @@
 \ /etc/passwd (crypto/passwd.fam): the new one typed twice.  Root only:
 \ /etc/passwd is root's to write (a user's own goes through wm).
 \ uses: crypto/sha512.fam crypto/passwd.fam
-: rb variable ;  : p1 variable ;  : p2 variable ;  : nf variable ;
-
-\ rdl ( buf -- n | -1 )  a line of the input, NUL-ended; -1 at its end.
-: rdl
-rb !  0 lit
-begin
-	getc dup 0< if drop dup 0= if drop FFFFFFFF lit then 1 lit else
-	dup A lit = if drop 1 lit else
-	over 7E lit u< if over rb @ + c! 1 lit + else drop then 0 lit
-	then then
-until
-dup 0< 0= if 0 lit over rb @ + c! then ;
+: p1 variable ;  : p2 variable ;  : nf variable ;
 
 80 lit alloc p1 !  80 lit alloc p2 !  100 lit alloc nf !
 argn 2 lit u< if "usage: passwd NAME" eputs 0A lit eputc 1 lit exit then
 1 lit arg pwfind 0= if "passwd: no such user: " eputs 1 lit arg eputs 0A lit eputc 1 lit exit then
-"new password: " puts p1 @ rdl 0< if 1 lit exit then
-"again: " puts p2 @ rdl 0< if 1 lit exit then
+"new password: " puts p1 @ pwget 0< if 1 lit exit then
+"again: " puts p2 @ pwget 0< if 1 lit exit then
 p1 @ p2 @ streq 0= if "passwd: they differ; unchanged" eputs 0A lit eputc 1 lit exit then
 p1 @ c@ 0= if "passwd: empty; unchanged" eputs 0A lit eputc 1 lit exit then
 p1 @ nf @ pwmake

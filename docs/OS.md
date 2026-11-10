@@ -681,9 +681,9 @@ kernel too much to add at the end.
    The second boot's `init` runs `login`, which refuses a wrong
    password. Alice gets her user and home, writes a file of her own,
    and is refused `/etc/passwd` and a directory at the root. Root then
-   logs in after her and may read everything. Not yet: passwords are
-   echoed as typed; the search right is checked only on a path's last
-   directory; a removed tree's pages are not given back.
+   logs in after her and may read everything. Not yet: the search
+   right is checked only on a path's last directory; a removed tree's
+   pages are not given back.
 
    Passwords hashed (2026-11-09, `docs/GUI_WALLET.md`, phase 0):
    `/etc/passwd` keeps each as `$p5$ITERATIONS$SALT$HASH`, PBKDF2-
@@ -695,9 +695,14 @@ kernel too much to add at the end.
    (`tools/gensha512.py`), about 100 times the fam version's speed: a
    login's check about 1.4 s, BIP39's seed a tenth of a second. A
    program names such modules in a `\ uses:` line (`scripts/build.sh`).
+   A password is read with the terminal raw (`pwget`): not shown as it
+   is typed. `adduser NAME` (root) makes a user: the next number from
+   1000 (a group the same), a home only it may enter, the password
+   typed twice.
    Checked: `sha512` against Python's hashlib (BIP39's case among
    them), `passwd`, and `users` now finding both lines hashed after
-   their logins.
+   their logins, root adding bob and bob logging in, and no password
+   typed ever shown.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
    reads a page served from the guest. Done (2026-11-07):
@@ -977,11 +982,17 @@ kernel too much to add at the end.
       SHELL` there. `/tty` without a session is refused (403).
     - The taskbar's Log out (`POST /logout`) ends the session and closes
       its windows (a WebSocket close each). The cookie is refused after.
+      So does being idle: no request with its cookie and no typing in
+      its windows for `wm [port [idle]]`'s idle seconds (1,800 unless
+      given; wm's second argument was the terminals' program, which is
+      now each user's shell).
     - The page travels in plain HTTP: reach it from the host only.
     - Checked: wm_1/4, `wsc.py` (the form, 403, a wrong password, the
       cookie, a terminal as root, its password found hashed, logout
       closing a terminal and the cookie refused after) and the page
-      test (logged in first, every check as before).
+      test (logged in first, every check as before); wm_idle (`wm 80
+      8`: a terminal left untouched closed by wm, the cookie refused
+      after).
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

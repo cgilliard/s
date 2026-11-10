@@ -1,5 +1,5 @@
-\ wm.fam — the window manager (docs/OS.md, section 7): wm [port [program]]
-\ (80, sh).  An HTTP and WebSocket server: GET / is a desktop page (a dock
+\ wm.fam — the window manager (docs/OS.md, section 7): wm [port [idle]]
+\ (80; 1,800 seconds a session may be idle).  An HTTP and WebSocket server: GET / is a desktop page (a dock
 \ whose terminal button opens a window, windows that move, resize,
 \ minimize, maximize and close, a taskbar with one button per window);
 \ each window's WebSocket (GET /tty) gets a terminal of its own (pty) with
@@ -14,7 +14,8 @@
 \ text hashed at its first use) and starts a session, a random token in
 \ the cookie wm; each window's program then runs as that user, in its
 \ home, its shell (runas); POST /logout ends the session and closes its
-\ windows.  Eight sessions at once.  wm must run as root.  The page and
+\ windows; so does 30 minutes idle (no request with its cookie, no typing
+\ in its windows).  Eight sessions at once.  wm must run as root.  The page and
 \ the form travel in plain HTTP: reach it from the host only.
 \ uses: crypto/sha512.fam crypto/passwd.fam
 
@@ -92,7 +93,7 @@ nip ;
 \ C, its buffer 10 (4 KiB: the request, then frames arriving).
 
 :M NC C lit ;
-: cl variable ;  : lsn variable ;  : prog variable ;  : port variable ;
+: cl variable ;  : lsn variable ;  : idle variable ;  : port variable ;
 : pe variable ;              \ poll's entries: the listener, then each client's socket and terminal
 : pm variable ;              \ which client each entry is (bit 0: its terminal)
 : np variable ;
@@ -330,6 +331,14 @@ then
 : ss variable ;  : cs variable ;  : sq variable ;  : fgp variable ;  : fge variable ;  : fgk variable ;  : fgd variable ;
 : lnm variable ;  : lpw variable ;  : lnf variable ;
 : srec  8 lit lshift ss @ + ;                                \ ( i -- a )
+\ wnow ( -- t )  the time, Unix seconds (/proc/time).
+: wtb variable ;  : wnn variable ;
+: wnow
+"/proc/time" 0 lit open dup 0< if drop 0 lit else
+	dup wtb @ 1F lit read dup 0< if drop 0 lit then wtb @ + 0 lit swap c!  close drop  wtb @ atoi
+then ;
+\ wtouch ( i -- )  session i active now.
+: wtouch  srec F8 lit + wnn @ swap ! ;
 \ sfind ( c -- i | -1 )  the session the client's cookie names.
 : sfind
 FFFFFFFF lit sq !
@@ -340,7 +349,7 @@ FFFFFFFF lit sq !
 		3 lit +  NS 0 lit do i srec @ if dup i srec 4 lit + 20 lit pwsame if i sq ! then then loop
 	then drop
 then
-sq @ ;
+sq @ dup 0< 0= if dup wtouch then ;
 \ fget ( b e key dst -- )  the form's field key (b to e, name=value&...)
 \ at dst, decoded (+ a space, %XX a byte), NUL-ended, 127 bytes at most;
 \ empty if not there.
@@ -381,7 +390,7 @@ dup if
 then
 lpw @ 80 lit 0 lit do 0 lit over i + c! loop drop
 ?dup if
-	1 lit - srec  1 lit over !
+	1 lit - dup wtouch srec  1 lit over !
 	"/dev/random" 0 lit open dup 0< if drop else dup lnf @ 10 lit read drop close drop then
 	lnf @ 10 lit 2 lit pick 4 lit + pwhex 0 lit swap c!
 	dup 28 lit + 2 lit pwfld scpy 0 lit swap c!
@@ -393,17 +402,23 @@ lpw @ 80 lit 0 lit do 0 lit over i + c! loop drop
 	"/" seeother "Set-Cookie: wm=" wr 4 lit + wr "; Path=/; HttpOnly; SameSite=Strict" wr crlf crlf
 else "/?bad" seeother crlf then
 cclose ;
+\ send ( i -- )  session i ended: each of its windows told (a WebSocket
+\ close) and closed, its record cleared.
 \ plogout ( c -- )  its session ended, every window of it closed.
+: send
+NC 0 lit do i crec 14 lit + @ over 1 lit + = if
+	i crec @ cfd !  0 lit 0 lit 8 lit wsend  i crec cclose
+then loop
+srec 100 lit 0 lit do 0 lit over i + c! loop drop ;
 : plogout
-dup sfind dup 0< 0= if
-	\ each of its windows told (a WebSocket close) and closed
-	NC 0 lit do i crec 14 lit + @ over 1 lit + = if i crec 2 lit pick <> if
-		i crec @ cfd !  0 lit 0 lit 8 lit wsend  i crec cclose
-	then then loop
-	over @ cfd !
-	srec 100 lit 0 lit do 0 lit over i + c! loop drop
-else drop then
-"/" seeother "Set-Cookie: wm=; Path=/; Max-Age=0" wr crlf crlf  cclose ;
+dup sfind dup 0< 0= if send else drop then
+dup @ cfd !  "/" seeother "Set-Cookie: wm=; Path=/; Max-Age=0" wr crlf crlf  cclose ;
+\ wexpire  each session idle past idle seconds (no request with its
+\ cookie, no typing in its windows) ended, as by logout.
+: wexpire
+NS 0 lit do
+	i srec @ if wnn @ i srec F8 lit + @ - idle @ u> if i send then then
+loop ;
 
 \ upgrade ( c -- )  the WebSocket's handshake answered (its key hashed
 \ with RFC 6455's GUID), a terminal made and the program started on it.
@@ -533,7 +548,7 @@ loop ;
 ?dup 0= if accept1 else
 dup 1 lit and if 1 lit - dup @ 0< 0= over 8 lit + @ 0< 0= and if dup @ cfd ! ttyread else drop then else
 dup @ 0< if drop else
-dup @ cfd !  dup 4 lit + @ if wsread else request then
+dup @ cfd !  dup 4 lit + @ if  dup 14 lit + @ ?dup if 1 lit - wtouch then  wsread else request then
 then then then ;
 
 \ The reaper's stacks first: the kernel wants them in the memory it gave
@@ -542,7 +557,7 @@ then then then ;
 tcode[ drop begin FFFFFFFF lit st2 wait 0< if 5F5E100 lit sleep then 0 lit until ]tcode
 4000 lit alloc 4000 lit + 0 lit thread 0< if "wm: no thread" eputs 0A lit eputc 1 lit exit then
 NS 8 lit lshift alloc dup ss !  NS 6 lit lshift 0 lit do 0 lit over i 2 lit lshift + ! loop drop
-80 lit alloc lnm !  80 lit alloc lpw !  100 lit alloc lnf !
+80 lit alloc lnm !  80 lit alloc lpw !  100 lit alloc lnf !  20 lit alloc wtb !  wnow wnn !
 1010 lit malloc io !  100 lit alloc kb !  40 lit alloc ab !  8 lit alloc e2 !  10 lit alloc fdv !
 A0D0A0D lit e2 @ !  0 lit e2 @ 4 lit + c!
 NC 5 lit lshift alloc cl !
@@ -551,14 +566,15 @@ NC 0 lit do i crec 10 lit + @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exi
 io @ 0= if "wm: no memory" eputs 0A lit eputc 1 lit exit then
 NC 1 lit lshift 1 lit + dup 3 lit lshift alloc pe !  2 lit lshift alloc pm !
 1 lit arg ?dup if atoi else 50 lit then port !
-2 lit arg ?dup 0= if "sh" then prog !
+2 lit arg ?dup if atoi else 708 lit then idle !
 2 lit socket dup lsn ! 0< if "wm: no socket" eputs 0A lit eputc 1 lit exit then
 lsn @ 1 lit 0 lit port @ net ?dup if "wm: cannot bind: " eputs . 0A lit eputc 1 lit exit then
 lsn @ 3 lit 0 lit 0 lit net drop
-"wm: port " puts port @ u. ", " puts prog @ puts 0A lit putc
+"wm: port " puts port @ u. ", sessions idle " puts idle @ u. " s at most" puts 0A lit putc
 begin
 	entries
-	pe @ np @ 0 lit poll drop
+	pe @ np @ EE6B2800 lit poll drop
+	wnow wnn !  wexpire
 	np @ 0 lit do
 		i 3 lit lshift pe @ + 6 lit + h@ if i 2 lit lshift pm @ + @ handle then
 	loop

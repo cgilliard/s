@@ -11,6 +11,9 @@
 \ pwok ( pw field -- flag )  pw the password the field holds.
 \ pwmake ( pw out -- )  pw's field, NUL-ended, at out (128 bytes).
 \ pwset ( name field -- flag )  name's password field set (root only).
+\ pwget ( buf -- n | -1 )  a password from the input, not shown (the
+\ terminal raw while it is typed, if it is one; Backspace taken),
+\ NUL-ended, 126 bytes at most; -1 at the input's end.
 
 :M PWIT 4E20 lit ;          \ iterations a new hash takes: 20,000 (about 1.4 s here)
 
@@ -133,3 +136,18 @@ pwread if
 	then
 then
 pwok? @ ;
+
+: pwrb variable ;  : pwraw variable ;
+: pwget
+pwrb !
+0 lit 1 lit 1 lit tty 0< 0= pwraw !
+0 lit
+begin
+	getc dup 0< if drop dup 0= if drop FFFFFFFF lit then 1 lit else
+	dup D lit = over A lit = or if drop 1 lit else
+	dup 7F lit = over 8 lit = or if drop dup if 1 lit - then 0 lit else
+	over 7E lit u< if over pwrb @ + c! 1 lit + else drop then 0 lit
+	then then then
+until
+pwraw @ if 0 lit 1 lit 0 lit tty drop  0A lit putc then
+dup 0< 0= if 0 lit over pwrb @ + c! then ;

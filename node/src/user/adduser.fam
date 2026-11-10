@@ -1,0 +1,56 @@
+\ adduser.fam — `adduser NAME`: a user made: a line in /etc/passwd (the
+\ next user number from 1000, a group of the same number, its home
+\ /home/NAME, the shell sh), the home made, the user's alone (700), and
+\ the password typed twice, kept hashed (crypto/passwd.fam).  Root only.
+\ A name is 1 to 31 letters, digits, _ or -, not one already there.
+\ uses: crypto/sha512.fam crypto/passwd.fam
+: p1 variable ;  : p2 variable ;  : nf variable ;  : hm variable ;  : nu variable ;  : ln variable ;  : nmx variable ;  : ll variable ;
+
+\ ok? ( s -- flag )  a name as allowed.
+: okc  dup 61 lit - 1A lit u< over 30 lit - A lit u< or over 5F lit = or swap 2D lit = or ;   \ ( c -- flag )
+: ok?  dup strlen dup 0= 0= swap 20 lit u< and swap begin dup c@ while dup c@ okc rot and swap 1 lit + repeat drop ;
+\ nmax  nmx: the highest user number of /etc/passwd's lines (999 if none
+\ is past it).
+: nmax
+3E7 lit nmx !
+pwread if
+	pwbuf @ begin ?dup while pwfields  2 lit pwfld atoi nmx @ max nmx ! repeat
+then ;
+\ unum ( n dst -- dst' )  n in decimal.
+: unum
+over 9 lit u> if
+	\ the digits above first
+	over A lit / swap unum
+	swap dup A lit / A lit * - 30 lit + over c! 1 lit +
+else swap 30 lit + over c! 1 lit + then ;
+
+80 lit alloc p1 !  80 lit alloc p2 !  100 lit alloc nf !  80 lit alloc hm !  100 lit alloc ln !
+argn 2 lit u< if "usage: adduser NAME" eputs 0A lit eputc 1 lit exit then
+1 lit arg ok? 0= if "adduser: a name is 1 to 31 of a-z, 0-9, _ and -" eputs 0A lit eputc 1 lit exit then
+1 lit arg pwfind if "adduser: there is a user " eputs 1 lit arg eputs 0A lit eputc 1 lit exit then
+"password: " puts p1 @ pwget 0< if 1 lit exit then
+"again: " puts p2 @ pwget 0< if 1 lit exit then
+p1 @ p2 @ streq 0= if "adduser: they differ; no user made" eputs 0A lit eputc 1 lit exit then
+p1 @ c@ 0= if "adduser: empty; no user made" eputs 0A lit eputc 1 lit exit then
+\ the line: NAME:FIELD:N:N:/home/NAME:sh, after the others
+nmax  nmx @ 1 lit + nu !
+p1 @ nf @ pwmake
+hm @ "/home/" scpy 1 lit arg scpy 0 lit swap c!
+ln @ 1 lit arg scpy 3A lit over c! 1 lit + nf @ scpy 3A lit over c! 1 lit +
+nu @ swap unum 3A lit over c! 1 lit + nu @ swap unum 3A lit over c! 1 lit +
+hm @ scpy ":sh" scpy A lit over c! 1 lit +  ln @ - ll !
+"/etc" mkdir drop
+pwread drop
+"/etc/passwd" 1 lit CREATE or TRUNC or open dup 0< if "adduser: cannot write /etc/passwd (only root may)" eputs 0A lit eputc 1 lit exit then
+pwbuf @ strlen ?dup if
+	over pwbuf @ rot write drop
+	\ the last line ended, if it was not
+	pwbuf @ dup strlen + 1 lit - c@ A lit = 0= if A lit nf @ c!  dup nf @ 1 lit write drop then
+then
+dup ln @ ll @ write drop  close drop
+"/etc/passwd" 180 lit chmod drop
+"/home" mkdir drop
+hm @ mkdir drop
+nmax  hm @ nmx @ nmx @ chown drop  hm @ 1C0 lit chmod drop
+"adduser: " puts 1 lit arg puts ", user " puts nmx @ u. ", home " puts hm @ puts 0A lit putc
+0 lit exit

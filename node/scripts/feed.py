@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # feed.py — type a script into a program's console, a line at a time, each
 # only once the program is ready for it: what it prints since the last line
-# ends with a prompt ("$ ", "login: ", "password: ").  Its output goes to
+# ends with a prompt ("$ ", "login: ", "password: ", "again: ").  Its output goes to
 # stdout as it comes.  Used by scripts/oscheck.sh, so the tests don't depend
 # on the machine's speed (typed ahead, a line is echoed among the output).
 #
@@ -18,7 +18,7 @@
 #   second more, then it is stopped (exit 124) if it has not ended.
 import os, select, subprocess, sys, time
 
-PROMPTS = (b"$ ", b"login: ", b"password: ")
+PROMPTS = (b"$ ", b"login: ", b"password: ", b"again: ")
 LINE_LIMIT = 60.0                       # seconds to wait for a prompt or text
 
 

@@ -106,8 +106,9 @@ come after, as the user who logged in.
 - **Changing the password** re-encrypts the wallet's phrase in the same
   step; a wallet created before a password, or restored, takes the
   login password at once.
-- **A session** ends at logout, or when the page is closed; the wallet
-  locks with it (its keys out of memory).
+- **A session** ends at logout, or after 30 minutes idle (no request
+  and no typing in its windows; wm's idle seconds); the wallet locks
+  with it (its keys out of memory).
 - **Limits:** the page and its form travel in plain HTTP, so until wm
   has TLS the desktop is reached only from the host itself (the forward
   bound to localhost); root can read any process's memory, as on any
