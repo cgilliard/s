@@ -1,0 +1,107 @@
+\ xsign.fam — XMSS keys and signing (docs/GUI_WALLET.md, phase 1), after
+\ xmss.fam (and so arith.fam, poseidon2.fam and state.fam's le@ and dle).
+\ As tabminer's miner/src/xmss.rs SecretKey: a key made from a 32-byte
+\ seed (generate_with_height; an output's key is made from the seed
+\ H(master, nonce), miner/src/wallet.rs's key), its whole tree kept; its
+\ public key and its signatures byte for byte as tabminer's to_bytes.
+\
+\ Leaves are the caller's to keep.  XMSS is stateful: two signatures at one
+\ leaf give the key away.  The caller must record a leaf as used (durably,
+\ where the key's state is kept) before a signature made at it leaves the
+\ program; xksign signs at whatever leaf it is given.
+\
+\ A key's record (Montgomery words): its height; the secret seed (8); the
+\ public seed (4); the tree in heap order (position 1 the root, leaf i at
+\ 2^h + i), 2^(h+1) digests of 8.
+\
+\ xkinit ( -- )  the buffers (and p2init, xinit, if not yet).
+\ xksize ( h -- n )  a record's bytes at height h (1 to 20).
+\ xkgen ( seed h k -- )  the key of the 32 bytes at seed, height h, made at
+\ k (xksize bytes): 1,139 permutations a leaf (18,239 at height 4: about
+\ 2.3 s under QEMU).
+\ xkpub ( k dst -- )  its public key at dst: 49 bytes (as xverify takes).
+\ xksign ( k msg n leaf dst -- )  dst (8 + (68 + h) 32 bytes) = the
+\ signature of the n Montgomery words at msg (n at most 256) at the leaf
+\ (below 2^h): about 570 permutations (about 90 ms under QEMU).
+
+: xkk variable ;  : xkh variable ;  : xkl variable ;  : xkc variable ;  : xko variable ;
+: xkm variable ;  : xkn variable ;  : xkb variable ;  : xks variable ;
+
+: xkinit  p2init xsd @ 0= if xinit then  xkb @ 0= if 440 lit alloc xkb ! then ;
+: xksize  1 lit swap 1 lit + lshift 5 lit lshift 34 lit + ;
+: xknode  5 lit lshift xkk @ 34 lit + + ;     \ ( pos -- a )  the tree's digest at pos
+
+\ xkw ( x dst -- dst' )  x, 4 bytes little-endian.
+: xkw  4 lit 0 lit do over i 3 lit lshift rshift over i + c! loop 4 lit + nip ;
+\ xkput ( a dst n -- dst' )  the n Montgomery words at a, canonical bytes.
+: xkput  0 lit do over i w@ fromm swap xkw loop nip ;
+
+\ xkfps ( seed -- )  xkb (11 words) = the 32 bytes three to a word, little-
+\ endian (tabminer's bytes_to_fps), Montgomery.
+: xkfps
+B lit 0 lit do
+	0 lit
+	3 lit 0 lit do
+		j 3 lit * i + dup 20 lit u< if 2 lit pick + c@ i 3 lit lshift lshift or else drop then
+	loop
+	tom xkb @ i w!
+loop drop ;
+
+\ xkleaf ( i -- )  leaf i's WOTS+ public key, at its place in the tree:
+\ each chain from its start (the secret seed's PRF) to its end.
+: xkleaf
+xix !
+43 lit 0 lit do
+	i xkc !  xends @ i 5 lit lshift + xko !
+	1 lit xix @ 0 lit xkc @ thcap  xkk @ 4 lit + 8 lit xko @ thabs
+	F lit 0 lit do xko @ xkc @ i 10 lit lshift or xstep loop
+loop
+3 lit xix @ 0 lit 0 lit thcap  xends @ 218 lit  1 lit xkh @ lshift xix @ + xknode  thabs ;
+
+: xkgen
+xkk ! xkh !  xkh @ xkk @ !
+xkfps
+\ the seeds: the secret one, then the public one (the first four words)
+xsd @ 4 lit wzero
+7 lit 0 lit 0 lit 0 lit thcap  xkb @ B lit xkk @ 4 lit + thabs
+7 lit 1 lit 0 lit 0 lit thcap  xkb @ B lit xmd @ thabs
+xmd @ xkk @ 24 lit + 4 lit wcopy
+xkk @ 24 lit + xsd @ 4 lit wcopy
+1 lit xkh @ lshift 0 lit do i xkleaf loop
+\ the levels above, to the root
+xkh @ 1 lit + 1 lit do
+	1 lit xkh @ i - lshift xks !  i xkl !
+	xks @ 0 lit do
+		4 lit i xkh @ xkl @ thcap
+		xks @ i + dup 1 lit lshift xknode 10 lit rot xknode thabs
+	loop
+loop ;
+
+: xkpub
+swap xkk !
+xkk @ 54 lit + swap 8 lit xkput
+xkk @ 24 lit + swap 4 lit xkput
+xkk @ @ swap c! ;
+
+: xksign
+xko ! xkl ! xkn ! xkm ! xkk !  xkk @ @ xkh !
+xkk @ 24 lit + xsd @ 4 lit wcopy  xkl @ xix !
+\ the leaf's index (8 bytes), the randomizer
+xkl @ xko @ xkw  0 lit swap xkw xko !
+6 lit xkl @ 0 lit 0 lit thcap  xkk @ 4 lit + 8 lit xkb @ thabs
+xkb @ xko @ 8 lit xkput xko !
+\ the message's digest: the randomizer, the count, the words
+xkn @ tom xkb @ 8 lit w!
+xkn @ ?dup if xkm @ xkb @ 24 lit + rot wcopy then
+5 lit xkl @ 0 lit 0 lit thcap  xkb @ xkn @ 9 lit + xmd @ thabs
+xdigits
+\ each chain's value: its start run to its digit
+43 lit 0 lit do
+	i xkc !
+	1 lit xkl @ 0 lit xkc @ thcap  xkk @ 4 lit + 8 lit xkb @ thabs
+	xd @ i + c@ ?dup if 0 lit do xkb @ xkc @ i 10 lit lshift or xstep loop then
+	xkb @ xko @ 8 lit xkput xko !
+loop
+\ the path: each level's sibling
+1 lit xkh @ lshift xkl @ +
+xkh @ 0 lit do dup 1 lit xor xknode xko @ 8 lit xkput xko !  1 lit rshift loop drop ;

@@ -15,6 +15,8 @@ pub mod consensus;
 pub mod difficulty;
 pub mod ext;
 pub mod fam_vectors;
+#[cfg(test)]
+mod fam_xmss_vectors;
 pub mod field;
 #[rustfmt::skip]
 pub mod genesis;

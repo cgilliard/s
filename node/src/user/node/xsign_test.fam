@@ -1,0 +1,58 @@
+\ xsign_test.fam — xsign.fam's keys and signatures (docs/GUI_WALLET.md,
+\ phase 1), a program for the OS after arith, poseidon2, difficulty, pow,
+\ state, xmss and xsign.  /lib/xsign is miner/src/fam_xmss_vectors.rs's
+\ xsign_vectors.bin: keys tabminer made from seeds, and its signatures of
+\ messages at several leaves.  Each key's public key and each signature is
+\ compared with tabminer's bytes; a signature of 8 words is also verified
+\ with xmss.fam's xverify, and refused for another message.
+
+: ztp variable ;  : ztf variable ;  : zte variable ;  : ztk variable ;  : zti variable ;
+: ztr variable ;  : ztb variable ;  : ztg variable ;  : ztm variable ;  : zth variable ;
+: ztn variable ;  : ztz variable ;  : ztl variable ;  : ztq variable ;
+
+\ ztread ( path -- addr n )  a whole file of at most 256 KiB, in memory.
+: ztread
+0 lit open  dup 0< if "xsign_test: no file" puts 0A lit putc then
+40000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  40000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+
+: ztok  if ztp @ 1 lit + ztp ! else ztf @ 1 lit + ztf ! then ;
+: ztsame  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;   \ ( a b n -- flag )
+: ztsay  "key " puts ztk @ u. " signature " puts zti @ u. ": " puts ;
+
+: ztmain
+xkinit
+40 lit alloc ztb !  1000 lit alloc ztg !  400 lit alloc ztm !
+"/lib/xsign" ztread drop  dup 4 lit + zte !  @
+0 lit do
+	i ztk !
+	zte @ @ zth !  zth @ xksize alloc ztr !
+	zte @ 4 lit + zth @ ztr @ xkgen
+	ztr @ ztb @ xkpub
+	ztb @ zte @ 24 lit + 31 lit ztsame dup ztok 0= if "key " puts ztk @ u. ": the public key differs" puts 0A lit putc then
+	zte @ 24 lit + ztq !
+	zte @ 58 lit + @  zte @ 5C lit + zte !
+	0 lit do
+		i zti !
+		zte @ @ ztl !  zte @ 4 lit + @ ztz !
+		ztz @ ?dup if 0 lit do zte @ 8 lit + i w@ tom ztm @ i w! loop then
+		zte @ 8 lit + ztz @ 2 lit lshift + zte !
+		ztr @ ztm @ ztz @ ztl @ ztg @ xksign
+		zth @ 44 lit + 5 lit lshift 8 lit + ztn !
+		ztg @ zte @ ztn @ ztsame dup ztok 0= if ztsay "differs" puts 0A lit putc then
+		ztz @ 8 lit = if
+			ztq @ ztg @ ztm @ xverify dup ztok 0= if ztsay "not verified" puts 0A lit putc then
+			ztm @ 0 lit w@ ONE f+ ztm @ 0 lit w!
+			ztq @ ztg @ ztm @ xverify 0= dup ztok 0= if ztsay "verified for another message" puts 0A lit putc then
+		then
+		zte @ ztn @ + zte !
+	loop
+loop ;
+
+ztmain
+"xsign: " puts ztp @ u. " as expected, " puts ztf @ u. " not" puts 0A lit putc
+0 lit exit
