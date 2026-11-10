@@ -230,7 +230,12 @@ memos faster than every output in order.
    (`node/wkeys.fam`: the master, an output's key seed, memo and
    commitment, a memo recognised, the identity's seed, id and `tab1…`
    address; checked against a tabminer wallet restored from the same
-   phrase). Left: transactions and slates, the wallet program.
+   phrase); slates and transactions (`node/wslate.fam`: a slate
+   decoded and built, the answer and its receipt, the body hash, the
+   signed transaction, a sender tag, `finalize`'s checks; checked
+   against a payment tabminer's own types made). Left: the wallet
+   program (its records, the phrase at rest, scanning through the
+   node, the leaves used, replacing the stub).
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a

@@ -1,0 +1,201 @@
+\ wslate.fam — slates and their transactions (docs/GUI_WALLET.md, phase 1),
+\ as tabminer's wallet.rs (Slate, receive_slate, finalize's checks),
+\ proofs.rs (Receipt, sender_tag) and transaction.rs (the body hash, the
+\ signed transaction's bytes).  After wkeys.fam and xsign.fam, with
+\ crypto/dilithium.fam loaded first.  Amounts are 8 bytes, little-endian,
+\ passed by address.
+\
+\ A slate: "tabslt05", its id (32), the sender (32), the stage (1: the
+\ sender's inputs and change; 2: the recipient's output and receipt
+\ added), the amount and fee (8 each), how many outputs are change (4),
+\ the inputs (4: how many; each a public key, 49, and its amount), the
+\ outputs (4; each the key's hash, 32, the amount, the memo, 20), at
+\ stage 2 the receipt (the recipient's Dilithium public key, 1,952; its
+\ signature, 3,309, of the output's commitment, amount and memo, the
+\ slate's id and the sender, context "tab-receipt").
+\
+\ wsinit  the buffers (once).
+\ wsparse ( a n -- flag )  a slate decoded (Slate::from_bytes): wsa,
+\ wsstg, wschg, wsnin, wsins, wsnout, wsouts, wsrc (0 at stage 1).
+\ wsbody ( c -- )  c (8 Montgomery words) = the parsed slate's body hash
+\ (its transaction's id, what each input signs).
+\ wsmkout ( pk amt memo dst -- )  an output (60 bytes) paying amt to the
+\ 49-byte XMSS key pk, with the 20-byte memo.
+\ wsbeg ( id sender amt fee -- )  a stage-1 slate begun at wsbuf;
+\ wsaddin ( pk amt -- ) an input; wsaddout ( out -- ) an output (after
+\ the inputs); wsfix ( change -- n ) its change count set, its length.
+\ wsans ( o sk pk -- n )  the parsed stage-1 slate answered at wsbuf: the
+\ output o added, the receipt signed with the Dilithium key (sk, its
+\ public key pk); its length.
+\ wstx ( keys leaves poss -- n )  the parsed stage-2 slate's transaction
+\ at wstxb, each input signed (keys: XMSS keys' addresses, leaves: words,
+\ poss: 8-byte positions, one each per input); its length.
+\ wstag ( secret c -- )  c = sender_tag of a 32-byte secret.
+\ wsfin ( pins np amt fee chg snd -- code )  finalize's checks of the
+\ parsed slate against the sender's pending record: its np inputs (pins:
+\ each 57 bytes, a key and its amount, as the slate's), the amount and
+\ fee offered, its change output (60 bytes, or 0),
+\ the sender (32).  0 ok; 1 not stage 2, 2 the inputs changed, 3 no
+\ recipient output, 4 the amount or fee changed, 5 not balanced, 6 the
+\ change changed, 7 an output zero or below the dust limit, 8 too large,
+\ 9 not one recipient output, 10 the receipt does not hold.
+
+: wsa variable ;  : wsn variable ;  : wsstg variable ;  : wschg variable ;  : wsnin variable ;  : wsins variable ;
+: wsnout variable ;  : wsouts variable ;  : wsrc variable ;  : wsok variable ;
+: wsbuf variable ;  : wstxb variable ;  : wsbb variable ;  : wsd variable ;  : wsm variable ;  : wsvp variable ;
+: wsp variable ;  : wsac variable ;  : wsaa variable ;  : wscy variable ;  : wsai variable ;  : wsao variable ;  : wsap variable ;
+: wsinit
+wkinit
+wsbuf @ 0= if 8000 lit alloc wsbuf !  10000 lit alloc wstxb !  4000 lit alloc wsbb !  20 lit alloc wsd !  80 lit alloc wsm !
+	C lit alloc wsai !  C lit alloc wsao !  C lit alloc wsap ! then ;
+
+\ wscanw ( a n -- flag )  n words at a, each canonical (below p).
+: wscanw  -1 lit swap ?dup if 0 lit do over i 2 lit lshift + le@ 78000001 lit u< and loop then nip ;
+: wsrlen  7A0 lit CED lit + ;                     \ a receipt's bytes
+: wsparse
+wsn !  wsa !  0 lit wsrc !  -1 lit wsok !
+wsn @ 65 lit u< if 0 lit wsok ! then
+wsok @ if
+	wsa @ "tabslt05" 8 lit 0 lit do over i + c@ over i + c@ = wsok @ and wsok ! loop 2drop
+	wsa @ 28 lit + 8 lit wscanw wsok @ and wsok !
+	wsa @ 48 lit + c@ dup wsstg !  1 lit - 2 lit u< wsok @ and wsok !
+	wsa @ 59 lit + le@ wschg !  wsa @ 5D lit + le@ wsnin !  wsa @ 61 lit + wsins !
+	wsnin @ 1000 lit u< wsok @ and wsok !
+then
+wsok @ if
+	wsins @ wsnin @ 39 lit * + wsa @ - 4 lit + wsn @ u> if 0 lit wsok ! then
+then
+wsok @ if
+	wsnin @ ?dup if 0 lit do
+		wsins @ i 39 lit * +  dup C lit wscanw  swap 30 lit + c@ 1 lit - 14 lit u< and  wsok @ and wsok !
+	loop then
+	wsins @ wsnin @ 39 lit * + dup le@ wsnout !  4 lit + wsouts !
+	wsnout @ 1000 lit u< wsok @ and wsok !
+then
+wsok @ if
+	\ the outputs, the receipt at stage 2, and nothing after
+	wsouts @ wsnout @ 3C lit * +  wsstg @ 2 lit = if dup wsrc ! wsrlen + then
+	wsa @ wsn @ + = wsok @ and wsok !
+then
+wsok @ if
+	wsnout @ ?dup if 0 lit do
+		wsouts @ i 3C lit * +  dup 8 lit wscanw  swap 28 lit + 5 lit wscanw and  wsok @ and wsok !
+	loop then
+	wschg @ wsnout @ u> if 0 lit wsok ! then
+then
+wsok @ ;
+
+\ wsocom ( o c -- )  c = an output's commitment (H(key hash || amount)).
+: wsocom
+vp @ wsvp !  wkb @ vp !  over vd,  over 20 lit + vamount
+wkb @ B lit 2 lit 3 lit pick hdom 2drop  wsvp @ vp ! ;
+: wsbody
+wsbb @ vp !  wsnin @ v,  wsnout @ v,  0 lit v,  0 lit v,  4 lit 0 lit do 0 lit v, loop
+wsnin @ ?dup if 0 lit do
+	wsins @ i 39 lit * +  dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  31 lit + vamount  0 lit v,
+loop then
+wsnout @ ?dup if 0 lit do
+	wsouts @ i 3C lit * +
+	dup wsd @ wsocom  wsd @ vp @ 8 lit wcopy  vp @ 20 lit + vp !
+	dup 20 lit + vamount  5 lit 0 lit do 0 lit v, loop
+	dup 28 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  20 lit + vamount
+loop then
+wsbb @ vp @ wsbb @ - 2 lit rshift 3 lit 3 lit pick hdom drop ;
+
+: wsq variable ;  : wsy variable ;  : wsz variable ;  : wsob variable ;  : wso variable ;  : wssk variable ;  : wspk variable ;
+: wsks variable ;  : wslv variable ;  : wsps variable ;  : wsh variable ;  : wscode variable ;
+: wfp variable ;  : wfn variable ;  : wfa variable ;  : wff variable ;  : wfc variable ;  : wfs variable ;  : wsaq variable ;
+: wsmkout
+wsq !  wsy !  wsz !  wsd @ wkpkh  wsd @ wsq @ wkcan
+wsz @ wsq @ 20 lit + 8 lit bcopy  wsy @ wsq @ 28 lit + 14 lit bcopy ;
+
+\ The stage-1 slate, built at wsbuf; wsp the end so far, wsob where the
+\ outputs' count is (0 before the first).
+: wsbeg
+wsbuf @ 51 lit + 8 lit bcopy  wsbuf @ 49 lit + 8 lit bcopy  wsbuf @ 28 lit + 20 lit bcopy  wsbuf @ 8 lit + 20 lit bcopy
+"tabslt05" wsbuf @ 8 lit bcopy  1 lit wsbuf @ 48 lit + c!
+0 lit wsbuf @ 59 lit + wkle!  0 lit wsbuf @ 5D lit + wkle!
+wsbuf @ 61 lit + wsp !  0 lit wsob ! ;
+: wsaddin
+wsp @ 31 lit + 8 lit bcopy  wsp @ 31 lit bcopy  wsp @ 39 lit + wsp !
+wsbuf @ 5D lit + dup le@ 1 lit + swap wkle! ;
+: wsobeg  wsob @ 0= if wsp @ wsob !  0 lit wsp @ wkle!  wsp @ 4 lit + wsp ! then ;
+: wsaddout  wsobeg  wsp @ 3C lit bcopy  wsp @ 3C lit + wsp !  wsob @ dup le@ 1 lit + swap wkle! ;
+: wsfix  wsobeg  wsbuf @ 59 lit + wkle!  wsp @ wsbuf @ - ;
+
+\ wsrmsg ( o -- )  wsm (124 bytes) = what a receipt for output o signs:
+\ its commitment, amount and memo, the parsed slate's id and sender.
+: wsrmsg
+dup wsd @ wsocom  wsd @ wsm @ wkcan
+dup 20 lit + wsm @ 20 lit + 8 lit bcopy  28 lit + wsm @ 28 lit + 14 lit bcopy
+wsa @ 8 lit + wsm @ 3C lit + 20 lit bcopy  wsa @ 28 lit + wsm @ 5C lit + 20 lit bcopy ;
+: wsans
+wspk !  wssk !  wso !
+wsa @ wsbuf @ wsn @ bcopy
+wso @ wsbuf @ wsn @ + 3C lit bcopy
+wsbuf @ wsouts @ wsa @ - 4 lit - + dup le@ 1 lit + swap wkle!
+2 lit wsbuf @ 48 lit + c!
+wspk @ wsbuf @ wsn @ + 3C lit + 7A0 lit bcopy
+wso @ wsrmsg
+wssk @ wsm @ 7C lit "tab-receipt" B lit wsbuf @ wsn @ + 3C lit + 7A0 lit + dilsign
+wsn @ 3C lit + wsrlen + ;
+
+\ The signed transaction: the inputs (key, amount, position, signature),
+\ no policy inputs, the outputs, no operations.
+: wstx
+wsps !  wslv !  wsks !
+wsh @ 0= if 20 lit alloc wsh ! then
+wsh @ wsbody
+wstxb @ wsp !  wsnin @ wsp @ wkle!  wsp @ 4 lit + wsp !
+wsnin @ ?dup if 0 lit do
+	wsins @ i 39 lit * +  dup wsp @ 39 lit bcopy  wsp @ 39 lit + wsp !
+	wsps @ i 3 lit lshift + wsp @ 8 lit bcopy  wsp @ 8 lit + wsp !
+	wsks @ i w@ wsh @ 8 lit wslv @ i w@ wsp @ xksign
+	30 lit + c@ 44 lit + 5 lit lshift 8 lit + wsp @ + wsp !
+loop then
+0 lit wsp @ wkle!  wsnout @ wsp @ 4 lit + wkle!  wsp @ 8 lit + wsp !
+wsouts @ wsp @ wsnout @ 3C lit * bcopy  wsp @ wsnout @ 3C lit * + wsp !
+0 lit wsp @ wkle!  wsp @ 4 lit + wstxb @ - ;
+: wstag  swap 20 lit wkpack  wkb @ swap 18 lit 3 lit pick hdom drop ;
+
+\ 12-byte sums of amounts.
+: wsacz  0 lit over !  0 lit over 4 lit + !  0 lit swap 8 lit + ! ;     \ ( acc -- )
+: wsadd
+wsac !  wsaa !
+wsac @ @ wsaa @ le@ +  dup wsac @ @ u< 1 lit and wscy !  wsac @ !
+wsac @ 4 lit + @ wsaa @ 4 lit + le@ +  dup wsac @ 4 lit + @ u< 1 lit and
+swap wscy @ + dup 0= wscy @ and 1 lit and  rot or
+swap wsac @ 4 lit + !  wsac @ 8 lit + @ + wsac @ 8 lit + ! ;
+: wssame  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;   \ ( a b n -- flag )
+: wsset  swap wscode @ 0= and if wscode ! else drop then ;      \ ( flag n -- )
+: wsfin
+wfs !  wfc !  wff !  wfa !  wfn !  wfp !  0 lit wscode !
+wsstg @ 2 lit <> 1 lit wsset
+wfn @ wsnin @ <> 2 lit wsset
+wscode @ 0= if wsnin @ ?dup if 0 lit do wsins @ i 39 lit * + wfp @ i 39 lit * + 39 lit wssame 0= 2 lit wsset loop then then
+wsnout @ wschg @ u> 0= 3 lit wsset
+wsa @ 49 lit + wfa @ 8 lit wssame  wsa @ 51 lit + wff @ 8 lit wssame and 0= 4 lit wsset
+\ the balance: what is paid is the amount; the inputs, the outputs and the fee
+wsai @ wsacz  wsao @ wsacz  wsap @ wsacz
+wsnin @ ?dup if 0 lit do wsins @ i 39 lit * + 31 lit + wsai @ wsadd loop then
+wsnout @ ?dup if 0 lit do
+	wsouts @ i 3C lit * + 20 lit +  dup wsao @ wsadd  i wschg @ u< if drop else wsap @ wsadd then
+loop then
+wff @ wsao @ wsadd
+wsaq @ 0= if C lit alloc wsaq ! then  wsaq @ wsacz  wfa @ wsaq @ wsadd
+wsap @ wsaq @ C lit wssame  wsai @ wsao @ C lit wssame and 0= 5 lit wsset
+wfc @ if wschg @ 1 lit =  wsouts @ wfc @ 3C lit wssame and else wschg @ 0= then 0= 6 lit wsset
+wsnout @ ?dup if 0 lit do
+	wsouts @ i 3C lit * + 20 lit +  dup 4 lit + le@ 0=  swap le@ 5CDA lit u< and 7 lit wsset
+loop then
+wsnin @ 949 lit *  wsnout @ 3C lit * + C lit +  20000 lit u> 8 lit wsset
+wsnout @ wschg @ 1 lit + <> 9 lit wsset
+wscode @ 0= if
+	wsa @ 28 lit + wfs @ 20 lit wssame
+	dup if
+		drop  wsouts @ wschg @ 3C lit * + wsrmsg
+		wsrc @ wsm @ 7C lit "tab-receipt" B lit wsrc @ 7A0 lit + dilver
+	then
+	0= A lit wsset
+then
+wscode @ ;

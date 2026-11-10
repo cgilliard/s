@@ -20,6 +20,8 @@ mod fam_dilithium_vectors;
 #[cfg(test)]
 mod fam_xmss_vectors;
 #[cfg(test)]
+mod fam_slate_vectors;
+#[cfg(test)]
 mod fam_wkeys_vectors;
 pub mod field;
 #[rustfmt::skip]

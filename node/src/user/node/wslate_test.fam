@@ -1,0 +1,77 @@
+\ wslate_test.fam — wslate.fam against tabminer (docs/GUI_WALLET.md, phase
+\ 1): /lib/wslate is miner/src/fam_slate_vectors.rs's wslate_vectors.bin,
+\ a payment made by tabminer's own types.  From its inputs, the stage-1
+\ slate built, the recipient's answer (its output and receipt), the body
+\ hash, the signed transaction and an unnamed sender's tag, each byte for
+\ byte as tabminer's; finalize's checks passing the payment and refusing
+\ each changed slate with tabminer's reason; malformed slates refused.  A
+\ program after crypto/keccak and dilithium and the node's arith,
+\ poseidon2, difficulty, pow, state, xmss, xsign, wkeys and wslate.
+\ Prints "wslate: N as expected, M not".
+
+: ztp variable ;  : ztf variable ;  : zv variable ;  : zx variable ;  : zb variable ;  : zk1 variable ;  : zk2 variable ;
+: zpk variable ;  : zsk variable ;  : zks variable ;  : zlv variable ;  : zps variable ;  : zpin variable ;  : zchg variable ;
+: zread
+0 lit open  dup 0< if "wslate: no /lib/wslate" puts 0A lit putc then
+20000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  20000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+: zchk  swap if drop ztp @ 1 lit + ztp ! else "wslate: " puts puts 0A lit putc ztf @ 1 lit + ztf ! then ;   \ ( flag str -- )
+\ zblob ( -- a n )  the blob at zx, zx past it.
+: zblob  zx @ 4 lit + zx @ @  dup 3 lit + 3 lit invert and zx @ 4 lit + + zx ! ;
+: zsame  wssame ;
+: zl variable ;  : zs1 variable ;  : zs2 variable ;  : zc variable ;
+\ zgot ( a n -- flag )  the blob at zx (zx past it) is the n bytes at a.
+: zgn variable ;  : zga variable ;
+: zgot  zgn !  zga !  zblob  zgn @ =  swap zga @ zgn @ zsame and ;
+
+: zmain
+wsinit xkinit
+200 lit alloc zb !  4 lit xksize alloc zk1 !  4 lit xksize alloc zk2 !  7A0 lit alloc zpk !  FC0 lit alloc zsk !
+10 lit alloc zks !  10 lit alloc zlv !  10 lit alloc zps !  80 lit alloc zpin !  40 lit alloc zchg !
+"/lib/wslate" zread drop zv !
+\ the inputs' keys (seeds at 50 and 84; amount, leaf, position after each)
+zv @ 50 lit + 4 lit zk1 @ xkgen  zk1 @ zpin @ xkpub  zv @ 70 lit + zpin @ 31 lit + 8 lit bcopy
+zv @ 84 lit + 4 lit zk2 @ xkgen  zk2 @ zpin @ 39 lit + xkpub  zv @ A4 lit + zpin @ 6A lit + 8 lit bcopy
+\ the change output, from its key
+zv @ B8 lit + 4 lit zk1 @ xkgen  zk1 @ zb @ xkpub
+zb @ zv @ D8 lit + zv @ E0 lit + zchg @ wsmkout
+\ stage 1, built
+zv @ zv @ 20 lit + zv @ 40 lit + zv @ 48 lit + wsbeg
+zpin @ zv @ 70 lit + wsaddin  zpin @ 39 lit + zv @ A4 lit + wsaddin
+zchg @ wsaddout  1 lit wsfix zl !
+zv @ 168 lit + zx !
+zx @ 4 lit + zs1 !  wsbuf @ zl @ zgot "the stage-1 slate differs" zchk
+zs1 @ zs1 @ 4 lit - @ wsparse wsstg @ 1 lit = and "the stage-1 slate not parsed" zchk
+\ the recipient's answer: its output, its receipt
+zv @ F4 lit + 4 lit zk2 @ xkgen  zk2 @ zb @ xkpub
+zb @ zv @ 40 lit + zv @ 114 lit + zb @ 40 lit + wsmkout
+zv @ 128 lit + zpk @ zsk @ dilkey
+zb @ 40 lit + zsk @ zpk @ wsans zl !
+zx @ 4 lit + zs2 !  wsbuf @ zl @ zgot "the answered slate differs" zchk
+zs2 @ zs2 @ 4 lit - @ wsparse wsstg @ 2 lit = and "the answered slate not parsed" zchk
+\ the body hash; the transaction, signed
+zb @ wsbody  zb @ zb @ 100 lit + wkcan  zb @ 100 lit + zx @ 20 lit zsame "the body hash differs" zchk  zx @ 20 lit + zx !
+zv @ 50 lit + 4 lit zk1 @ xkgen  zv @ 84 lit + 4 lit zk2 @ xkgen
+zk1 @ zks @ !  zk2 @ zks @ 4 lit + !  zv @ 78 lit + @ zlv @ !  zv @ AC lit + @ zlv @ 4 lit + !
+zv @ 7C lit + zps @ 8 lit bcopy  zv @ B0 lit + zps @ 8 lit + 8 lit bcopy
+zks @ zlv @ zps @ wstx zl !
+wstxb @ zl @ zgot "the signed transaction differs" zchk
+\ an unnamed sender's tag
+zv @ 148 lit + zb @ wstag  zb @ zb @ 100 lit + wkcan  zb @ 100 lit + zx @ 20 lit zsame "the sender tag differs" zchk  zx @ 20 lit + zx !
+\ finalize: the payment passes; each changed slate refused for its reason
+zs2 @ zs2 @ 4 lit - @ wsparse drop
+zpin @ 2 lit zv @ 40 lit + zv @ 48 lit + zchg @ zv @ 20 lit + wsfin 0= "finalize refused the payment" zchk
+zx @ @ zx @ 4 lit + zx !
+0 lit do
+	zx @ @ zc !  zx @ 4 lit + zx !  zblob wsparse
+	zpin @ 2 lit zv @ 40 lit + zv @ 48 lit + zchg @ zv @ 20 lit + wsfin  zc @ = and "finalize: a changed slate not refused for its reason" zchk
+loop
+zx @ @ zx @ 4 lit + zx !
+0 lit do zblob wsparse 0= "a malformed slate parsed" zchk loop
+"wslate: " puts ztp @ u. " as expected, " puts ztf @ u. " not" puts 0A lit putc ;
+zmain
+0 lit exit

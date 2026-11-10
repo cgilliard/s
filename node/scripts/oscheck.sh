@@ -238,6 +238,13 @@ expect xsign 124 '^xsign: 28 as expected, 0 not' 60 ./tools/q32 "$T/xs.img"
 	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wkeys_test.fam > "$T/twk.build" 2>&1 || fail wkeys "build: $(head -c 300 "$T/twk.build")"
 sh scripts/mkimage.sh "$T/wk.img" bin/kernel init="$T/twk.bin":8192 bip39=../resources/bip39-english.txt:0 wkeys=$ND/wkeys_vectors.bin:0 2> "$T/wk.mk" || fail wkeys "mkimage: $(cat "$T/wk.mk")"
 expect wkeys 124 '^wkeys: 35 as expected, 0 not' 60 ./tools/q32 "$T/wk.img"
+# Slates and transactions (wslate.fam): a payment as tabminer makes it, the
+# stage-1 slate, the answer and its receipt, the body hash, the signed
+# transaction and a sender tag byte for byte; finalize's checks.
+./tools/fam --user -o "$T/tws.bin" src/user/crypto/keccak.fam src/user/crypto/dilithium.fam \
+	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wslate.fam $ND/wslate_test.fam > "$T/tws.build" 2>&1 || fail wslate "build: $(head -c 300 "$T/tws.build")"
+sh scripts/mkimage.sh "$T/ws.img" bin/kernel init="$T/tws.bin":8192 wslate=$ND/wslate_vectors.bin:0 2> "$T/ws.mk" || fail wslate "mkimage: $(cat "$T/ws.mk")"
+expect wslate 124 '^wslate: 23 as expected, 0 not' 60 ./tools/q32 "$T/ws.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.
