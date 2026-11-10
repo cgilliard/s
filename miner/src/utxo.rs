@@ -462,24 +462,42 @@ impl UtxoSet {
     }
 
     /// Completes a staged snapshot: checks that the stored root of every
-    /// part matches `roots` (the parts of height `level`, in order), writes
-    /// the levels above them and sets the counter to `next`.
-    pub fn finish_staged(&self, wtxn: &mut RwTxn, level: usize, roots: &[Digest], next: u64) -> Result<Digest> {
-        if roots.len() as u64 != next.div_ceil(1 << level) {
+    /// part `(level, index, root)` (disjoint, ascending, below `next`)
+    /// matches, writes the levels above them and sets the counter to
+    /// `next`.
+    pub fn finish_staged(&self, wtxn: &mut RwTxn, parts: &[(usize, u64, Digest)], next: u64) -> Result<Digest> {
+        if next > OUTPUT_CAPACITY
+            || parts.iter().any(|&(l, i, _)| l < GROUP_LOG || l >= state_tree::DEPTH || i << l >= next)
+            || parts.windows(2).any(|w| (w[0].1 + 1) << w[0].0 > w[1].1 << w[1].0)
+        {
             return Err(Error::CorruptIndex);
         }
-        let mut nodes = Vec::new();
-        for (p, r) in roots.iter().enumerate() {
-            if self.tree.node(wtxn, level, p as u64)? != *r {
+        for &(level, index, root) in parts {
+            if self.tree.node(wtxn, level, index)? != root {
                 return Err(Error::CorruptIndex);
             }
-            if *r != state_tree::default_hashes()[level] {
-                nodes.push((p as u64, *r));
-            }
         }
-        let root = self.tree.build_from(wtxn, level, &nodes)?;
+        let root = self.tree.build_above(wtxn, parts)?;
         self.meta.put(wtxn, META_NEXT_POSITION, &next)?;
         Ok(root)
+    }
+
+    /// The unspent outputs at positions `first..end`, counted up to
+    /// `limit` (a count past it may stop there).
+    pub fn count_in(&self, rtxn: &RoTxn, first: u64, end: u64, limit: u64) -> Result<u64> {
+        if end <= first {
+            return Ok(0);
+        }
+        let mut n = 0;
+        let start = self.bucket_key(rtxn, first)?.unwrap_or(first);
+        for item in self.outputs.range(rtxn, &(start..end))? {
+            let (key, bytes) = item?;
+            n += decode_bucket(key, bytes)?.iter().filter(|(p, _)| *p >= first && *p < end).count() as u64;
+            if n > limit {
+                break;
+            }
+        }
+        Ok(n)
     }
 
     /// Empties the set.
@@ -1397,7 +1415,7 @@ mod tests {
                 .unwrap_or(0)
         }
         let n: u64 = std::env::var("TABMINER_SCALE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
-        let level = crate::chain::SNAPSHOT_PART_LOG;
+        let level = crate::chain::PART_MIN_LEVEL;
         let next = n * 20;
         let parts = next.div_ceil(1 << level);
         let dir = TempDir::new("staged");
@@ -1433,16 +1451,19 @@ mod tests {
             }
             count += outputs.len() as u64;
             let mut wtxn = env.write_txn().unwrap();
-            roots.push(set.stage(&mut wtxn, level, p, &outputs, next).unwrap());
+            let root = set.stage(&mut wtxn, level, p, &outputs, next).unwrap();
+            if !outputs.is_empty() {
+                roots.push((level, p, root));
+            }
             wtxn.commit().unwrap();
             peak = peak.max(rss_anon_kb());
         }
         let mut wtxn = env.write_txn().unwrap();
-        let root = set.finish_staged(&mut wtxn, level, &roots, next).unwrap();
+        let root = set.finish_staged(&mut wtxn, &roots, next).unwrap();
         wtxn.commit().unwrap();
         peak = peak.max(rss_anon_kb());
         let secs = start.elapsed().as_secs_f64();
-        assert_eq!(root, state_tree::root_from_subtrees(level, &roots, &crate::name_trie::empty_root()));
+        assert_eq!(root, state_tree::root_from_parts(&roots, &crate::name_trie::empty_root()));
         eprintln!(
             "{count} outputs in {parts} parts: {secs:.1} s ({:.1} µs each, 170M in {:.0} min); heap grew at most {:.1} MB",
             secs * 1e6 / count as f64,
@@ -1494,7 +1515,7 @@ mod tests {
         let span = unspent * 5;
         if set.next_position(&env.read_txn().unwrap()).unwrap() == 0 {
             let start = std::time::Instant::now();
-            let level = crate::chain::SNAPSHOT_PART_LOG;
+            let level = crate::chain::PART_MIN_LEVEL;
             let parts = span.div_ceil(1 << level);
             let mut next = rng(0x0bad_cafe_1234_5679);
             let mut roots = Vec::with_capacity(parts as usize);
@@ -1508,7 +1529,10 @@ mod tests {
                         (p, digest(&mut next), crate::transaction::memo_slot(&memo, next() % 1_000_000), 0)
                     })
                     .collect();
-                roots.push(set.stage(&mut wtxn, level, part, &outputs, span).unwrap());
+                let root = set.stage(&mut wtxn, level, part, &outputs, span).unwrap();
+                if !outputs.is_empty() {
+                    roots.push((level, part, root));
+                }
                 if part % 256 == 255 {
                     wtxn.commit().unwrap();
                     wtxn = env.write_txn().unwrap();
@@ -1521,7 +1545,7 @@ mod tests {
                     }
                 }
             }
-            set.finish_staged(&mut wtxn, level, &roots, span).unwrap();
+            set.finish_staged(&mut wtxn, &roots, span).unwrap();
             wtxn.commit().unwrap();
             eprintln!("built {unspent} unspent outputs in {:.0} s", start.elapsed().as_secs_f64());
         }

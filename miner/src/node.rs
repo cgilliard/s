@@ -86,7 +86,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{Block, Header};
 use crate::chain::{
-    Applied, CarriedNamePart, CarriedPart, Chain, ChainError, Manifest, ProofVerifier, SNAPSHOT_PART_LOG,
+    Applied, CarriedNamePart, CarriedPart, Chain, ChainError, Manifest, OutputPart, ProofVerifier,
     aux_merkle_root,
 };
 use crate::consensus;
@@ -287,11 +287,8 @@ struct Snap {
 /// Parts staged for an earlier snapshot, to be carried forward to the
 /// snapshot being fetched once the bodies between them are in.
 struct Carry {
-    /// The earlier snapshot's output counter: parts wholly below it are
-    /// carried, the one it ends in is fetched again.
-    next: u64,
-    /// The output parts staged for it.
-    staged: Vec<u32>,
+    /// The output parts staged for it: their subtrees.
+    staged: Vec<(usize, u64)>,
     /// The name parts staged for it: their records stay, and satisfy the
     /// later manifest's name parts where its hashes agree.
     names: usize,
@@ -447,12 +444,13 @@ enum Deferred {
 /// A block handed to the applier thread, with who sent it.
 enum Job {
     Block(Block, Option<SocketAddr>),
-    /// A fast-sync output part, checked against its manifest root and stored.
+    /// A fast-sync output part, checked against its manifest entry and
+    /// stored.
     Part {
         index: u32,
         bytes: Vec<u8>,
         next: u64,
-        root: Digest,
+        part: OutputPart,
         from: SocketAddr,
     },
     /// A fast-sync name part, checked against its manifest hash and stored.
@@ -907,9 +905,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             let mut outcomes: Vec<Outcome> = Vec::new();
                             let mut slots = Vec::new();
                             for (n, job) in batch.into_iter().enumerate() {
-                                let Job::Part { index, bytes, next, root, from } = job else { unreachable!() };
+                                let Job::Part { index, bytes, next, part, from } = job else { unreachable!() };
                                 if let Some((outputs, commits)) = net::decode_part(&bytes) {
-                                    decoded.push((index as u64, outputs, commits, next, root));
+                                    decoded.push((part, outputs, commits, next));
                                     slots.push(n);
                                 }
                                 outcomes.push(Outcome::Part { index, from, result: Err(ChainError::BadSnapshot) });
@@ -936,8 +934,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             };
                             Outcome::Part { index, from, result }
                         }
+                        // A part the later manifest has none for: no slot
+                        // (out of range, so nothing recorded).
                         Job::Carry { parts, next } => Outcome::Carry {
-                            indexes: parts.iter().map(|p| p.index as u32).collect(),
+                            indexes: parts.iter().map(|p| p.slot.unwrap_or(u32::MAX)).collect(),
                             result: chain.carry_snapshot_parts(&parts, next),
                         },
                         Job::CarryNames(parts) => Outcome::Carry {
@@ -3290,9 +3290,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // Moving again before carrying: the same parts, more bodies.
                 (Some(c), _) => c,
                 (None, Some(m)) => Carry {
-                    next: m.next,
-                    staged: (0..m.roots.len() as u32).filter(|&i| snap.parts[i as usize]).collect(),
-                    names: snap.parts[m.roots.len()..].iter().filter(|p| **p).count(),
+                    staged: m
+                        .outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| snap.parts[*i])
+                        .map(|(_, p)| (p.level as usize, p.index))
+                        .collect(),
+                    names: snap.parts[m.outputs.len()..].iter().filter(|p| **p).count(),
                     wanted: HashMap::new(),
                     spent: Vec::new(),
                 },
@@ -3379,25 +3384,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let (Some(carry), Some(manifest)) = (snap.carry.take(), snap.manifest.as_ref()) else {
             return;
         };
-        let (next, roots) = (&manifest.next, &manifest.roots);
+        let (next, outputs) = (manifest.next, &manifest.outputs);
         let mut spent = carry.spent;
         spent.sort_unstable();
         spent.dedup();
+        // Each staged part against the later manifest's part for the same
+        // subtree, if it has one (a part grown since fails its root).
         let parts: Vec<CarriedPart> = carry
             .staged
             .iter()
-            .map(|&i| {
-                let first = (i as u64) << SNAPSHOT_PART_LOG;
-                let end = first + (1 << SNAPSHOT_PART_LOG);
+            .map(|&(level, index)| {
+                let (first, end) = (index << level, (index + 1) << level);
                 let (lo, hi) = (spent.partition_point(|p| *p < first), spent.partition_point(|p| *p < end));
-                // The part the earlier counter ends in has grown since.
-                let root = if end <= carry.next { roots.get(i as usize).copied() } else { None };
-                CarriedPart { index: i as u64, spent: spent[lo..hi].to_vec(), root }
+                let slot = outputs
+                    .binary_search_by_key(&first, |p| p.first())
+                    .ok()
+                    .filter(|&i| outputs[i].level as usize == level);
+                CarriedPart {
+                    level,
+                    index,
+                    spent: spent[lo..hi].to_vec(),
+                    part: slot.map(|i| outputs[i]),
+                    slot: slot.map(|i| i as u32),
+                }
             })
             .collect();
-        let next = *next;
         for batch in parts.chunks(CARRY_BATCH) {
-            snap.staging.extend(batch.iter().map(|p| p.index as u32));
+            snap.staging.extend(batch.iter().filter_map(|p| p.slot));
             if let Some(jobs) = &self.jobs {
                 let _ = jobs.send(Job::Carry { parts: batch.to_vec(), next });
             }
@@ -3409,7 +3422,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             (0..manifest.names.len())
                 .filter_map(|j| {
                     let (lo, hi) = manifest.name_range(j)?;
-                    let index = (roots.len() + j) as u32;
+                    let index = (outputs.len() + j) as u32;
                     Some(CarriedNamePart { index, lo, hi, hash: manifest.names[j].hash })
                 })
                 .collect()
@@ -3747,11 +3760,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 let Some(manifest) = net::decode_manifest(bytes) else {
                     return false;
                 };
-                let parts = manifest.next.div_ceil(1 << SNAPSHOT_PART_LOG);
-                if manifest.roots.len() as u64 != parts
-                    || manifest.state_root() != snap.target.state_root
-                    || manifest.names.windows(2).any(|w| w[0].first >= w[1].first)
-                {
+                if !manifest.well_formed() || manifest.state_root() != snap.target.state_root {
                     return false;
                 }
                 snap.parts = vec![false; manifest.parts()];
@@ -3769,11 +3778,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // Checked against its root or hash and stored on the
                 // applier thread, hashed once, while the network goes on;
                 // one part in memory there at a time.
-                let job = if (i as usize) < manifest.roots.len() {
-                    let root = manifest.roots[i as usize];
-                    Job::Part { index: i, bytes: bytes.to_vec(), next: manifest.next, root, from }
+                let job = if let Some(&part) = manifest.outputs.get(i as usize) {
+                    Job::Part { index: i, bytes: bytes.to_vec(), next: manifest.next, part, from }
                 } else {
-                    let j = i as usize - manifest.roots.len();
+                    let j = i as usize - manifest.outputs.len();
                     let (Some(part), Some((lo, hi))) = (manifest.names.get(j), manifest.name_range(j)) else {
                         return false;
                     };
@@ -3811,7 +3819,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Manifest => net::encode_manifest(&self.chain.snapshot_manifest(id).ok().flatten()?),
             Kind::Part(i) => {
                 let manifest = self.chain.snapshot_manifest(id).ok().flatten()?;
-                if (i as usize) < manifest.roots.len() {
+                if (i as usize) < manifest.outputs.len() {
                     let (outputs, commits) = match self.chain.snapshot_part(id, i as u64) {
                         Ok(p) => p?,
                         // A part this node should hold: say why it cannot.
@@ -3822,7 +3830,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     };
                     net::encode_part(&outputs, &commits)
                 } else {
-                    let j = i as u64 - manifest.roots.len() as u64;
+                    let j = i as u64 - manifest.outputs.len() as u64;
                     net::encode_name_part(&self.chain.snapshot_name_part(id, j).ok().flatten()?)
                 }
             }

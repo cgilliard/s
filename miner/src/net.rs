@@ -65,7 +65,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::block::{HEADER_SIZE, Header};
-use crate::chain::{Manifest, NamePart, PartCommits};
+use crate::chain::{Manifest, NamePart, OutputPart, PartCommits};
 use crate::codec::{Reader, Writer};
 use crate::difficulty::U256;
 use crate::name_trie::Key;
@@ -187,23 +187,32 @@ impl Kind {
     }
 }
 
-/// Largest manifest: about a million parts, 17 billion positions.
+/// Largest manifest: about 600,000 output parts (5 billion unspent
+/// outputs at least), or as many name parts.
 pub const MAX_MANIFEST: usize = 32 << 20;
-/// Largest part: every position of an output part unspent and a commit,
-/// which also bounds a name part of [`NAME_PART_RECORDS`] records.
-pub const MAX_PART: usize = 8 + (1 << crate::chain::SNAPSHOT_PART_LOG) * (PART_ENTRY + COMMIT_ENTRY);
+/// Largest part: every output of an output part a commit, which also
+/// bounds a name part of [`NAME_PART_RECORDS`] records.
+pub const MAX_PART: usize = 8 + crate::chain::PART_OUTPUTS as usize * (PART_ENTRY + COMMIT_ENTRY);
+/// An output part in a manifest: level, index, count, root.
+const MANIFEST_PART: usize = 1 + 8 + 4 + 32;
 /// An output in a part: position, commitment, memo, amount, height.
 const PART_ENTRY: usize = 8 + 32 + crate::transaction::MEMO_BYTES + 8 + 4;
 const COMMIT_ENTRY: usize = 8 + 32 + 4;
 const _: () = assert!(MAX_PART >= 4 + NAME_PART_RECORDS * (1 + 32 + 96));
 
-/// A manifest: the output counter after the block, the root of every
-/// output part's subtree, the name root, and every name part's first key
-/// and hash.
+/// A manifest: the output counter after the block, every output part's
+/// subtree (level, index), count of unspent outputs and root, the name
+/// root, and every name part's first key and hash.
 pub fn encode_manifest(m: &Manifest) -> Vec<u8> {
-    let mut w = Writer::with_capacity(48 + 32 * m.roots.len() + 47 * m.names.len());
+    let mut w = Writer::with_capacity(48 + MANIFEST_PART * m.outputs.len() + 47 * m.names.len());
     w.u64(m.next);
-    w.digest_vec(&m.roots);
+    w.u32(m.outputs.len() as u32);
+    for p in &m.outputs {
+        w.0.push(p.level);
+        w.u64(p.index);
+        w.u32(p.count);
+        w.digest(&p.root);
+    }
     w.digest(&m.name_root);
     w.u32(m.names.len() as u32);
     for n in &m.names {
@@ -216,7 +225,12 @@ pub fn encode_manifest(m: &Manifest) -> Vec<u8> {
 pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
     let mut r = Reader(bytes);
     let next = r.u64()?;
-    let roots = r.digest_vec()?;
+    let n = r.len(MANIFEST_PART)?;
+    let mut outputs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let level = r.take(1)?[0];
+        outputs.push(OutputPart { level, index: r.u64()?, count: r.u32()?, root: r.digest()? });
+    }
     let name_root = r.digest()?;
     let n = r.len(15 + 32)?;
     let mut names = Vec::with_capacity(n);
@@ -225,7 +239,7 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
         k[1..].copy_from_slice(r.take(15)?);
         names.push(NamePart { first: Key::from_be_bytes(k), hash: r.digest()? });
     }
-    r.is_empty().then_some(Manifest { next, roots, name_root, names })
+    r.is_empty().then_some(Manifest { next, outputs, name_root, names })
 }
 
 /// An output part: its unspent outputs, position, commitment, memo and
@@ -2175,7 +2189,10 @@ mod tests {
         };
         let manifest = Manifest {
             next: 20_000,
-            roots: vec![d(1), d(2)],
+            outputs: vec![
+                OutputPart { level: 14, index: 0, count: 3, root: d(1) },
+                OutputPart { level: 14, index: 1, count: 9, root: d(2) },
+            ],
             name_root: d(3),
             names: vec![NamePart { first: 0, hash: d(4) }, NamePart { first: 1 << 100, hash: d(5) }],
         };

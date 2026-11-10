@@ -817,10 +817,7 @@ mod tests {
         let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
         let dir = std::env::temp_dir().join(format!("tabminer-famstate-{}-{first}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let chain = Chain::open(&dir, 8 << 30, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
-        // From high positions a manifest lists every part from 0 (2^18 of
-        // them at 2^32: 8 MB): an undo window of 2 keeps two, not 150.
-        let chain = if first > 0 { chain.with_max_undo(Some(2)) } else { chain };
+        let chain = Chain::open(&dir, 1 << 30, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
         chain.set_dataset(std::sync::Arc::new(dev_dataset().clone()));
         chain.init_genesis(&p.genesis()).unwrap();
         if first > 0 {
@@ -1011,8 +1008,8 @@ mod tests {
             snap.resize(snap.len().div_ceil(4) * 4, 0);
         };
         put(&mut snap, &crate::net::encode_manifest(&m));
-        snap.extend_from_slice(&((m.roots.len() + m.names.len()) as u32).to_le_bytes());
-        for i in 0..m.roots.len() as u64 {
+        snap.extend_from_slice(&((m.outputs.len() + m.names.len()) as u32).to_le_bytes());
+        for i in 0..m.outputs.len() as u64 {
             let (outs, commits) = chain.snapshot_part(&id, i).unwrap().unwrap();
             put(&mut snap, &crate::net::encode_part(&outs, &commits));
         }

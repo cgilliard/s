@@ -478,10 +478,20 @@ const META_FLOOR: &str = "floor";
 const META_STAGING: &str = "staging";
 /// The output counter after the snapshot block.
 const META_FLOOR_NEXT: &str = "floor_next";
-/// Positions per snapshot part (a subtree of the state tree).
-pub const SNAPSHOT_PART_LOG: usize = 14;
+/// Most unspent outputs in a snapshot's output part: a subtree holding
+/// more is split into its halves (see [`Manifest`]).
+pub const PART_OUTPUTS: u64 = 1 << 14;
+/// The lowest level of an output part: a subtree there spans
+/// [`PART_OUTPUTS`] positions, so it never holds more and its children are
+/// never parts.
+pub const PART_MIN_LEVEL: usize = 14;
+const _: () = assert!(1 << PART_MIN_LEVEL == PART_OUTPUTS);
 // Part roots are read from the stored tree, which starts at this level.
-const _: () = assert!(SNAPSHOT_PART_LOG >= crate::utxo::GROUP_LOG);
+const _: () = assert!(PART_MIN_LEVEL >= crate::utxo::GROUP_LOG);
+/// A manifest is stored whole at heights that are multiples of this (and
+/// whenever its parent's is not kept), and otherwise as changes from its
+/// parent's: reading one applies at most this many less one.
+const MANIFEST_WHOLE_EVERY: u32 = 64;
 const META_FORMAT: &str = "format";
 /// The amounts of every unspent output summed, a `u128`: `issued(h)` at
 /// the tip `h`, kept with each block connected and disconnected.
@@ -500,8 +510,9 @@ pub const AUX_LEAVES: usize = 16;
 /// block bodies with a name section; 11 keeps the name registry, name undo
 /// records and snapshot manifests with the name half; 12 keeps the
 /// registry's bucket table; 13 stores each output's creation height, part
-/// of its leaf.
-const FORMAT: u8 = 14;
+/// of its leaf; 15 keeps snapshot manifests with output parts by subtree,
+/// as changes from their parents'.
+const FORMAT: u8 = 15;
 
 /// Status byte of a stored block, after its work in the index.
 const STATUS_HEADER_VALID: u8 = 0;
@@ -643,8 +654,13 @@ fn read_spent_entry(value: &[u8]) -> Option<(u32, u32, Commitment, Slot)> {
 }
 
 /// A snapshot manifest: the state after a block, as fast sync transfers it
-/// in parts. The output half comes in parts of `2^SNAPSHOT_PART_LOG`
-/// positions with the root of each; the name half in parts of up to
+/// in parts. The output half comes in parts that are subtrees of the
+/// state tree, chosen by what they hold: from the half's root down, a
+/// subtree holding more than [`PART_OUTPUTS`] unspent outputs is split
+/// into its halves and one holding none is left out (its root the empty
+/// subtree's), so the parts follow the unspent outputs, not every output
+/// ever made, and every node lays them out alike. Each comes with its
+/// count and root. The name half comes in parts of up to
 /// [`NAME_PART_RECORDS`] records in key order, each with the key its range
 /// starts at (the next part's starts its end) and a hash of its records;
 /// the trie's root checks them all at the end.
@@ -652,8 +668,8 @@ fn read_spent_entry(value: &[u8]) -> Option<(u32, u32, Commitment, Slot)> {
 pub struct Manifest {
     /// The output counter after the block.
     pub next: u64,
-    /// Root of every output part's subtree.
-    pub roots: Vec<Digest>,
+    /// The output parts, ascending by position.
+    pub outputs: Vec<OutputPart>,
     /// The name trie's root: the tree's right half.
     pub name_root: Digest,
     pub names: Vec<NamePart>,
@@ -665,15 +681,98 @@ pub struct NamePart {
     pub hash: Digest,
 }
 
+/// An output part: the subtree of height `level` at `index` (positions
+/// `index << level` on), its unspent outputs' count and its root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputPart {
+    pub level: u8,
+    pub index: u64,
+    pub count: u32,
+    pub root: Digest,
+}
+
+impl OutputPart {
+    pub fn first(&self) -> u64 {
+        self.index << self.level
+    }
+    pub fn end(&self) -> u64 {
+        (self.index + 1) << self.level
+    }
+    fn node(&self) -> (usize, u64, Digest) {
+        (self.level as usize, self.index, self.root)
+    }
+}
+
+/// The output parts a set of unspent outputs is laid out in, as
+/// [`Manifest`] describes: `(level, index, count)`, ascending, from their
+/// positions (ascending).
+pub fn output_layout(positions: &[u64]) -> Vec<(usize, u64, u32)> {
+    fn split(positions: &[u64], level: usize, index: u64, out: &mut Vec<(usize, u64, u32)>) {
+        let (first, end) = (index << level, (index + 1) << level);
+        let (lo, hi) = (positions.partition_point(|p| *p < first), positions.partition_point(|p| *p < end));
+        let n = (hi - lo) as u64;
+        if n > PART_OUTPUTS {
+            split(positions, level - 1, index * 2, out);
+            split(positions, level - 1, index * 2 + 1, out);
+        } else if n > 0 {
+            out.push((level, index, n as u32));
+        }
+    }
+    let mut out = Vec::new();
+    split(positions, crate::state_tree::DEPTH - 1, 0, &mut out);
+    out
+}
+
 impl Manifest {
     /// Parts in all: output parts, then name parts, indexed together.
     pub fn parts(&self) -> usize {
-        self.roots.len() + self.names.len()
+        self.outputs.len() + self.names.len()
+    }
+
+    /// The output parts as tree nodes: `(level, index, root)`.
+    pub fn output_nodes(&self) -> Vec<(usize, u64, Digest)> {
+        self.outputs.iter().map(OutputPart::node).collect()
     }
 
     /// The state root the manifest composes to.
     pub fn state_root(&self) -> Digest {
-        crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &self.roots, &self.name_root)
+        crate::state_tree::root_from_parts(&self.output_nodes(), &self.name_root)
+    }
+
+    /// Whether the output parts are laid out as every node lays them out,
+    /// given their counts (each checked as its part arrives): subtrees of
+    /// the output half, ascending and disjoint, below the counter, each
+    /// holding 1 to [`PART_OUTPUTS`] outputs, and each one's parent more
+    /// (else the parent would be the part). The name parts' keys ascend.
+    pub fn well_formed(&self) -> bool {
+        let top = crate::state_tree::DEPTH - 1;
+        let parts = &self.outputs;
+        let shape = parts.iter().all(|p| {
+            let level = p.level as usize;
+            (PART_MIN_LEVEL..=top).contains(&level)
+                && p.index < 1 << (top - level)
+                && (1..=PART_OUTPUTS).contains(&(p.count as u64))
+                && p.first() < self.next
+        });
+        if !shape || parts.windows(2).any(|w| w[0].end() > w[1].first()) {
+            return false;
+        }
+        let mut sums = Vec::with_capacity(parts.len() + 1);
+        sums.push(0u64);
+        for p in parts {
+            sums.push(sums.last().unwrap() + p.count as u64);
+        }
+        let parents_full = parts.iter().all(|p| {
+            if p.level as usize == top {
+                return true;
+            }
+            let (level, index) = (p.level as usize + 1, p.index >> 1);
+            let (first, end) = (index << level, (index + 1) << level);
+            let lo = parts.partition_point(|q| q.first() < first);
+            let hi = parts.partition_point(|q| q.first() < end);
+            sums[hi] - sums[lo] > PART_OUTPUTS
+        });
+        parents_full && self.names.windows(2).all(|w| w[0].first < w[1].first)
     }
 
     /// The key range of name part `part`.
@@ -683,41 +782,212 @@ impl Manifest {
         Some((lo, hi))
     }
 
-    fn to_bytes(&self, id: &Digest) -> Vec<u8> {
-        let mut value = Vec::with_capacity(80 + 32 * self.roots.len() + 47 * self.names.len());
-        value.extend_from_slice(&digest_bytes(id));
-        value.extend_from_slice(&self.next.to_le_bytes());
-        value.extend_from_slice(&(self.roots.len() as u32).to_le_bytes());
-        for r in &self.roots {
-            value.extend_from_slice(&digest_bytes(r));
+    /// The stored form: the block's id, then the manifest whole (0) or,
+    /// with `parent` (its parent block's), as the changes from it (1):
+    /// each list as splices, where the parent's from an index on loses
+    /// some entries and gains others.
+    fn to_bytes(&self, id: &Digest, parent: Option<&Manifest>) -> Vec<u8> {
+        let mut v = Vec::with_capacity(80 + 45 * self.outputs.len() + 47 * self.names.len());
+        v.extend_from_slice(&digest_bytes(id));
+        v.push(parent.is_some() as u8);
+        v.extend_from_slice(&self.next.to_le_bytes());
+        v.extend_from_slice(&digest_bytes(&self.name_root));
+        match parent {
+            None => {
+                put_splices(&mut v, &[(0, 0, &self.outputs[..])], put_output_part);
+                put_splices(&mut v, &[(0, 0, &self.names[..])], put_name_part);
+            }
+            Some(p) => {
+                put_splices(&mut v, &splices(&p.outputs, &self.outputs, OutputPart::first), put_output_part);
+                put_splices(&mut v, &splices(&p.names, &self.names, |n| n.first), put_name_part);
+            }
         }
-        value.extend_from_slice(&digest_bytes(&self.name_root));
-        value.extend_from_slice(&(self.names.len() as u32).to_le_bytes());
-        for n in &self.names {
-            value.extend_from_slice(&n.first.to_be_bytes()[1..]);
-            value.extend_from_slice(&digest_bytes(&n.hash));
-        }
-        value
+        v
     }
 
-    /// Parses a stored manifest, checking it is `id`'s.
-    fn from_bytes(id: &Digest, value: &[u8]) -> Option<Manifest> {
+    /// Parses a stored manifest, checking it is `id`'s: whether it is
+    /// stored as changes, and the manifest (applied to `parent` if so,
+    /// which must then be given).
+    fn from_bytes(id: &Digest, value: &[u8], parent: Option<&Manifest>) -> Option<Manifest> {
         let mut r = crate::codec::Reader(value);
         if r.digest()? != *id {
             return None;
         }
+        let changes = r.take(1)?[0] == 1;
         let next = r.u64()?;
-        let roots = r.digest_vec()?;
         let name_root = r.digest()?;
-        let n = r.u32()? as usize;
-        let mut names = Vec::with_capacity(n.min(value.len() / 47));
-        for _ in 0..n {
-            let mut k = [0u8; 16];
-            k[1..].copy_from_slice(r.take(15)?);
-            names.push(NamePart { first: Key::from_be_bytes(k), hash: r.digest()? });
-        }
-        r.is_empty().then_some(Manifest { next, roots, name_root, names })
+        let (outputs, names) = match (changes, parent) {
+            (false, _) => (
+                get_splices(&mut r, &[], get_output_part)?,
+                get_splices(&mut r, &[], get_name_part)?,
+            ),
+            (true, Some(p)) => (
+                get_splices(&mut r, &p.outputs, get_output_part)?,
+                get_splices(&mut r, &p.names, get_name_part)?,
+            ),
+            (true, None) => return None,
+        };
+        r.is_empty().then_some(Manifest { next, outputs, name_root, names })
     }
+
+    /// Whether stored `value` is a manifest kept as changes from its
+    /// parent's.
+    fn stored_as_changes(value: &[u8]) -> bool {
+        value.get(32) == Some(&1)
+    }
+}
+
+/// The output parts after a block, from those before it (`old`, if
+/// kept): a subtree the block did not touch keeps its parts, and one it
+/// did is counted again, from the old counts and the block's changes
+/// where the old parts tell them, from the outputs where it lay within an
+/// old part. Without `old`, every subtree is counted from the outputs.
+struct OutputLayout<'a> {
+    utxo: &'a UtxoSet,
+    rtxn: &'a RoTxn<'a>,
+    old: Option<&'a [OutputPart]>,
+    /// Positions the block emptied, ascending.
+    emptied: &'a [u64],
+    /// Positions the block filled: from the first to the counter.
+    made: (u64, u64),
+}
+
+impl OutputLayout<'_> {
+    fn parts(&self) -> Result<Vec<OutputPart>> {
+        let mut out = Vec::new();
+        let mut sums = vec![0u64];
+        for p in self.old.unwrap_or(&[]) {
+            sums.push(sums.last().unwrap() + p.count as u64);
+        }
+        self.walk(crate::state_tree::DEPTH - 1, 0, &sums, &mut out)?;
+        Ok(out)
+    }
+
+    fn walk(&self, level: usize, index: u64, sums: &[u64], out: &mut Vec<OutputPart>) -> Result<()> {
+        let (first, end) = (index << level, (index + 1) << level);
+        let old = self.old.unwrap_or(&[]);
+        let (lo, hi) = (old.partition_point(|p| p.end() <= first), old.partition_point(|p| p.first() < end));
+        let olds = &old[lo..hi];
+        // An old part holding the whole subtree, and more.
+        let within = olds.len() == 1 && (olds[0].level as usize) > level;
+        let emptied = (self.emptied.partition_point(|p| *p < first)..self.emptied.partition_point(|p| *p < end)).len();
+        let made = self.made.1.min(end).saturating_sub(self.made.0.max(first));
+        let touched = emptied > 0 || made > 0;
+        if self.old.is_some() && !touched && !within {
+            out.extend_from_slice(olds);
+            return Ok(());
+        }
+        let count = if self.old.is_none() || within {
+            self.utxo.count_in(self.rtxn, first, end, PART_OUTPUTS)?
+        } else {
+            (sums[hi] - sums[lo] + made as u64)
+                .checked_sub(emptied as u64)
+                .ok_or(ChainError::Corrupt("a manifest's counts"))?
+        };
+        if count > PART_OUTPUTS {
+            self.walk(level - 1, index * 2, sums, out)?;
+            self.walk(level - 1, index * 2 + 1, sums, out)?;
+        } else if count > 0 {
+            let root = self.utxo.subtree(self.rtxn, level, index)?;
+            out.push(OutputPart { level: level as u8, index, count: count as u32, root });
+        }
+        Ok(())
+    }
+}
+
+fn put_output_part(v: &mut Vec<u8>, p: &OutputPart) {
+    v.push(p.level);
+    v.extend_from_slice(&p.index.to_le_bytes());
+    v.extend_from_slice(&p.count.to_le_bytes());
+    v.extend_from_slice(&digest_bytes(&p.root));
+}
+
+fn get_output_part(r: &mut crate::codec::Reader) -> Option<OutputPart> {
+    let level = r.take(1)?[0];
+    Some(OutputPart { level, index: r.u64()?, count: r.u32()?, root: r.digest()? })
+}
+
+fn put_name_part(v: &mut Vec<u8>, n: &NamePart) {
+    v.extend_from_slice(&n.first.to_be_bytes()[1..]);
+    v.extend_from_slice(&digest_bytes(&n.hash));
+}
+
+fn get_name_part(r: &mut crate::codec::Reader) -> Option<NamePart> {
+    let mut k = [0u8; 16];
+    k[1..].copy_from_slice(r.take(15)?);
+    Some(NamePart { first: Key::from_be_bytes(k), hash: r.digest()? })
+}
+
+/// How `new` differs from `old` (both ascending by `key`): splices `(at,
+/// removed, inserted)`, ascending, each removing `removed` entries of
+/// `old` from index `at` and putting `inserted` in their place.
+fn splices<'a, T: PartialEq, K: Ord>(old: &[T], new: &'a [T], key: impl Fn(&T) -> K) -> Vec<(usize, usize, &'a [T])> {
+    let mut out: Vec<(usize, usize, &'a [T])> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i] == new[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        // A run of differences, until the lists agree again.
+        let (at, from) = (i, j);
+        while i < old.len() || j < new.len() {
+            match (old.get(i), new.get(j)) {
+                (Some(a), Some(b)) if a == b => break,
+                (Some(a), Some(b)) => match key(a).cmp(&key(b)) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        i += 1;
+                        j += 1;
+                    }
+                },
+                (Some(_), None) => i += 1,
+                (None, Some(_)) => j += 1,
+                (None, None) => unreachable!(),
+            }
+        }
+        out.push((at, i - at, &new[from..j]));
+    }
+    out
+}
+
+fn put_splices<T>(v: &mut Vec<u8>, splices: &[(usize, usize, &[T])], put: impl Fn(&mut Vec<u8>, &T)) {
+    v.extend_from_slice(&(splices.len() as u32).to_le_bytes());
+    for (at, removed, inserted) in splices {
+        v.extend_from_slice(&(*at as u32).to_le_bytes());
+        v.extend_from_slice(&(*removed as u32).to_le_bytes());
+        v.extend_from_slice(&(inserted.len() as u32).to_le_bytes());
+        for x in *inserted {
+            put(v, x);
+        }
+    }
+}
+
+/// `old` with the splices read from `r` applied.
+fn get_splices<T: Clone>(
+    r: &mut crate::codec::Reader,
+    old: &[T],
+    get: impl Fn(&mut crate::codec::Reader) -> Option<T>,
+) -> Option<Vec<T>> {
+    let n = r.len(12)?;
+    let mut out = Vec::with_capacity(old.len());
+    let mut i = 0;
+    for _ in 0..n {
+        let (at, removed) = (r.u32()? as usize, r.u32()? as usize);
+        let inserted = r.len(1)?;
+        if at < i || at.checked_add(removed)? > old.len() {
+            return None;
+        }
+        out.extend_from_slice(&old[i..at]);
+        for _ in 0..inserted {
+            out.push(get(r)?);
+        }
+        i = at + removed;
+    }
+    out.extend_from_slice(&old[i..]);
+    Some(out)
 }
 
 /// The commits among an output part's outputs: position, commit hash and
@@ -728,11 +998,16 @@ pub type PartCommits = Vec<(u64, Digest, u32)>;
 /// [`Chain::carry_snapshot_parts`].
 #[derive(Clone, Debug)]
 pub struct CarriedPart {
+    /// The staged part's subtree.
+    pub level: usize,
     pub index: u64,
     /// Positions in the part spent since, ascending.
     pub spent: Vec<u64>,
-    /// Its root in the later manifest; `None` clears it.
-    pub root: Option<Digest>,
+    /// The later manifest's part for the same subtree; `None` (it has
+    /// none: the subtree was split or merged, or emptied) clears it.
+    pub part: Option<OutputPart>,
+    /// That part's index among the later manifest's parts.
+    pub slot: Option<u32>,
 }
 
 /// A name part of a later snapshot's manifest, to be satisfied by staged
@@ -787,6 +1062,9 @@ pub struct Chain<V: ProofVerifier> {
     /// [`Chain::missing_bodies`] last saw it: extended as headers arrive
     /// rather than walked again.
     branch: Mutex<Vec<Header>>,
+    /// The last manifest taken or read, by block id: the next block's is
+    /// made from it.
+    last_manifest: Mutex<Option<(Digest, std::sync::Arc<Manifest>)>>,
     /// Seconds each phase of the last block applied took
     /// ([`Chain::last_timings`]).
     timings: Mutex<Vec<(&'static str, f64)>>,
@@ -866,6 +1144,7 @@ impl<V: ProofVerifier> Chain<V> {
             aux,
             files,
             branch: Mutex::new(Vec::new()),
+            last_manifest: Mutex::new(None),
             timings: Mutex::new(Vec::new()),
             dataset: std::sync::RwLock::new(None),
             genesis_work: std::sync::OnceLock::new(),
@@ -1304,9 +1583,11 @@ impl<V: ProofVerifier> Chain<V> {
         let name_root = self.utxo.name_root(&rtxn)?;
         drop(rtxn);
         let next = made + n * spacing;
-        let level = SNAPSHOT_PART_LOG;
+        // Staged in chunks of a part's lowest level; the nodes above them
+        // are written once at the end.
+        let level = PART_MIN_LEVEL;
         let parts = next.div_ceil(1 << level);
-        let mut roots = Vec::with_capacity(parts as usize);
+        let mut roots: Vec<(usize, u64, Digest)> = Vec::new();
         let mut wtxn = if header_only { None } else { Some(self.env.write_txn()?) };
         for p in 0..parts {
             let (first, end) = (p << level, ((p + 1) << level).min(next));
@@ -1316,28 +1597,32 @@ impl<V: ProofVerifier> Chain<V> {
             let from = first.max(made);
             let from = from + (spacing - (from - made) % spacing) % spacing;
             outputs.extend((from..end).step_by(spacing as usize).map(debug_output));
-            match wtxn.as_mut() {
-                None => roots.push(UtxoSet::part_root(level, &outputs)),
+            let root = match wtxn.as_mut() {
+                None => UtxoSet::part_root(level, &outputs),
                 Some(w) => {
                     if first < made {
                         self.utxo.unstage(w, level, p)?;
                     }
-                    roots.push(self.utxo.stage(w, level, p, &outputs, next)?);
+                    let root = self.utxo.stage(w, level, p, &outputs, next)?;
                     // A transaction per 64 parts, about a million outputs.
                     if p % 64 == 63 {
                         wtxn.take().unwrap().commit()?;
                         wtxn = Some(self.env.write_txn()?);
                     }
+                    root
                 }
+            };
+            if !outputs.is_empty() {
+                roots.push((level, p, root));
             }
             if p % 64 == 63 {
                 progress((end - made).div_ceil(spacing));
             }
         }
         let (wtxn, state_root) = match wtxn {
-            None => (self.env.write_txn()?, crate::state_tree::root_from_subtrees(level, &roots, &name_root)),
+            None => (self.env.write_txn()?, crate::state_tree::root_from_parts(&roots, &name_root)),
             Some(mut w) => {
-                self.utxo.finish_staged(&mut w, level, &roots, next)?;
+                self.utxo.finish_staged(&mut w, &roots, next)?;
                 let root = self.utxo.root(&w)?;
                 (w, root)
             }
@@ -1669,6 +1954,9 @@ impl<V: ProofVerifier> Chain<V> {
         for (p, c, m) in &names.consumed {
             self.spent.put(wtxn, p, &spent_entry(header.height, c.height, &commit_leaf(&c.hash, c.height), m))?;
         }
+        // The positions the block emptied, for its manifest.
+        let mut emptied: Vec<u64> = body.inputs.clone();
+        emptied.extend(names.consumed.iter().map(|(p, _, _)| *p));
         let outputs = body.outputs.len() as u32;
         self.undo.put(wtxn, &id, &Undo { first_output_position, outputs, names }.to_bytes())?;
         self.by_height.put(wtxn, &header.height, &id)?;
@@ -1682,7 +1970,7 @@ impl<V: ProofVerifier> Chain<V> {
             Some(keep) => header.height + keep >= self.best_header_in(wtxn)?.height,
         };
         if within {
-            self.take_snapshot(wtxn, header)?;
+            self.take_snapshot(wtxn, header, first_output_position, emptied)?;
         }
         self.lap("manifest", &mut t);
         // The block leaving the undo window keeps only its header.
@@ -2196,13 +2484,15 @@ impl<V: ProofVerifier> Chain<V> {
         }
         self.begin_snapshot()?;
         let result = (|| {
-            let parts = next_position.div_ceil(1 << SNAPSHOT_PART_LOG);
-            let mut roots = Vec::with_capacity(parts as usize);
+            let positions: Vec<u64> = outputs.iter().map(|o| o.0).collect();
+            let mut parts = Vec::new();
             let mut rest = outputs;
-            for p in 0..parts {
-                let n = rest.iter().take_while(|o| o.0 >> SNAPSHOT_PART_LOG == p).count();
-                let in_part: PartCommits = commits.iter().copied().filter(|c| c.0 >> SNAPSHOT_PART_LOG == p).collect();
-                roots.push(self.stage_snapshot_part(p, &rest[..n], &in_part, next_position, None)?);
+            for (level, index, count) in output_layout(&positions) {
+                let (first, end) = (index << level, (index + 1) << level);
+                let in_part: PartCommits = commits.iter().copied().filter(|c| c.0 >= first && c.0 < end).collect();
+                let n = count as usize;
+                let root = self.stage_snapshot_part((level, index), &rest[..n], &in_part, next_position, None)?;
+                parts.push(OutputPart { level: level as u8, index, count, root });
                 rest = &rest[n..];
             }
             if !records.is_empty() {
@@ -2221,7 +2511,7 @@ impl<V: ProofVerifier> Chain<V> {
                 .map(|(first, hash)| NamePart { first, hash })
                 .collect();
             drop(rtxn);
-            self.finish_snapshot(block, &Manifest { next: next_position, roots, name_root, names })
+            self.finish_snapshot(block, &Manifest { next: next_position, outputs: parts, name_root, names })
         })();
         if result.is_err() {
             self.abort_snapshot()?;
@@ -2277,19 +2567,20 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(())
     }
 
-    /// Stores snapshot part `part`: its unspent outputs, ascending, all in
-    /// the part and below `next_position`, and which of them are commits
-    /// (checked: the output's commitment must be the commit's leaf).
-    /// Returns the part's root; with `expected` (the manifest's), a part
-    /// with another root is refused and nothing stored. Each part is its
-    /// own transaction, so memory stays bounded by one part.
+    /// Stores snapshot output part `part`, the subtree `(level, index)`:
+    /// its unspent outputs, ascending, all in the part and below
+    /// `next_position`, and which of them are commits (checked: the
+    /// output's commitment must be the commit's leaf). Returns the part's
+    /// root; with `expected` (the manifest's entry), a part with another
+    /// root or count is refused and nothing stored. Each part is its own
+    /// transaction, so memory stays bounded by one part.
     pub fn stage_snapshot_part(
         &self,
-        part: u64,
+        part: (usize, u64),
         outputs: &[(u64, Commitment, Slot, u32)],
         commits: &[(u64, Digest, u32)],
         next_position: u64,
-        expected: Option<&Digest>,
+        expected: Option<&OutputPart>,
     ) -> Result<Digest> {
         let mut wtxn = self.env.write_txn()?;
         let root = self.stage_part_in(&mut wtxn, part, outputs, commits, next_position, expected)?;
@@ -2303,7 +2594,7 @@ impl<V: ProofVerifier> Chain<V> {
     #[allow(clippy::type_complexity)]
     pub fn stage_snapshot_parts(
         &self,
-        parts: &[(u64, Vec<(u64, Commitment, Slot, u32)>, Vec<(u64, Digest, u32)>, u64, Digest)],
+        parts: &[(OutputPart, Vec<(u64, Commitment, Slot, u32)>, Vec<(u64, Digest, u32)>, u64)],
     ) -> Vec<Result<Digest>> {
         let mut wtxn = match self.env.write_txn() {
             Ok(t) => t,
@@ -2313,9 +2604,10 @@ impl<V: ProofVerifier> Chain<V> {
             }
         };
         let mut results = Vec::with_capacity(parts.len());
-        for (part, outputs, commits, next, root) in parts {
+        for (part, outputs, commits, next) in parts {
+            let at = (part.level as usize, part.index);
             let r = match self.env.nested_write_txn(&mut wtxn) {
-                Ok(mut nested) => match self.stage_part_in(&mut nested, *part, outputs, commits, *next, Some(root)) {
+                Ok(mut nested) => match self.stage_part_in(&mut nested, at, outputs, commits, *next, Some(part)) {
                     Ok(d) => nested.commit().map(|_| d).map_err(ChainError::Heed),
                     Err(e) => Err(e),
                 },
@@ -2333,21 +2625,24 @@ impl<V: ProofVerifier> Chain<V> {
     fn stage_part_in(
         &self,
         wtxn: &mut RwTxn,
-        part: u64,
+        part: (usize, u64),
         outputs: &[(u64, Commitment, Slot, u32)],
         commits: &[(u64, Digest, u32)],
         next_position: u64,
-        expected: Option<&Digest>,
+        expected: Option<&OutputPart>,
     ) -> Result<Digest> {
         if !self.staging_in(wtxn)? {
             return Err(ChainError::Corrupt("no snapshot is staging"));
         }
+        if expected.is_some_and(|e| (e.level as usize, e.index) != part || e.count as usize != outputs.len()) {
+            return Err(ChainError::BadSnapshot);
+        }
         // A database error is this node's; anything else, the part's.
-        let root = self.utxo.stage(wtxn, SNAPSHOT_PART_LOG, part, outputs, next_position).map_err(|e| match e {
+        let root = self.utxo.stage(wtxn, part.0, part.1, outputs, next_position).map_err(|e| match e {
             utxo::Error::Heed(_) => ChainError::Utxo(e),
             _ => ChainError::BadSnapshot,
         })?;
-        if expected.is_some_and(|e| *e != root) {
+        if expected.is_some_and(|e| e.root != root) {
             return Err(ChainError::BadSnapshot);
         }
         for &(p, hash, height) in commits {
@@ -2408,30 +2703,32 @@ impl<V: ProofVerifier> Chain<V> {
 
     /// Carries staged parts forward to a later snapshot, whose counter is
     /// `next_position`: each part loses the outputs spent since, and must
-    /// then have the later manifest's root. Parts that do not, or that are
-    /// given no root, are cleared, to be fetched again. Returns, for each
-    /// part, whether it was carried. One transaction for them all.
+    /// then have the root and count of the later manifest's part for the
+    /// same subtree. Parts that do not, or that it has no part for, are
+    /// cleared, to be fetched again. Returns, for each part, whether it
+    /// was carried. One transaction for them all.
     pub fn carry_snapshot_parts(&self, parts: &[CarriedPart], next_position: u64) -> Result<Vec<bool>> {
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
             return Err(ChainError::BadSnapshot);
         }
         let mut carried = Vec::with_capacity(parts.len());
-        for part in parts {
+        for carry in parts {
+            let (level, index) = (carry.level, carry.index);
             // Untouched parts keep their root: only check it.
-            if part.spent.is_empty()
-                && let Some(root) = &part.root
-                && self.utxo.subtree(&wtxn, SNAPSHOT_PART_LOG, part.index)? == *root
+            if carry.spent.is_empty()
+                && let Some(part) = &carry.part
+                && self.utxo.subtree(&wtxn, level, index)? == part.root
             {
                 carried.push(true);
                 continue;
             }
-            let mut outputs = self.utxo.unstage(&mut wtxn, SNAPSHOT_PART_LOG, part.index)?;
+            let mut outputs = self.utxo.unstage(&mut wtxn, level, index)?;
             // Commits spent since leave with their outputs; a cleared part
             // loses them all, to be fetched again.
-            let (first, end) = (part.index << SNAPSHOT_PART_LOG, (part.index + 1) << SNAPSHOT_PART_LOG);
-            let gone: Vec<u64> = match part.root {
-                Some(_) => part.spent.clone(),
+            let (first, end) = (index << level, (index + 1) << level);
+            let gone: Vec<u64> = match carry.part {
+                Some(_) => carry.spent.clone(),
                 None => self
                     .names
                     .commits_in(&wtxn, first, end)
@@ -2445,20 +2742,22 @@ impl<V: ProofVerifier> Chain<V> {
                     self.names.remove_commit(&mut wtxn, p).map_err(|e| ChainError::Name(e.into()))?;
                 }
             }
-            let Some(root) = &part.root else {
+            let Some(part) = &carry.part else {
                 carried.push(false);
                 continue;
             };
-            outputs.retain(|o| part.spent.binary_search(&o.0).is_err());
+            outputs.retain(|o| carry.spent.binary_search(&o.0).is_err());
             let leaves: Vec<(u64, Digest)> =
                 outputs.iter().map(|(p, c, m, h)| (*p, crate::transaction::leaf(c, m, *h))).collect();
-            if crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, first, &leaves) != *root {
+            if outputs.len() != part.count as usize || crate::state_tree::subtree_root(level, first, &leaves) != part.root {
+                // Its commits go with it, to be fetched again.
+                for (p, _) in self.names.commits_in(&wtxn, first, end).map_err(|e| ChainError::Name(e.into()))? {
+                    self.names.remove_commit(&mut wtxn, p).map_err(|e| ChainError::Name(e.into()))?;
+                }
                 carried.push(false);
                 continue;
             }
-            self.utxo
-                .stage(&mut wtxn, SNAPSHOT_PART_LOG, part.index, &outputs, next_position)
-                .map_err(|_| ChainError::BadSnapshot)?;
+            self.utxo.stage(&mut wtxn, level, index, &outputs, next_position).map_err(|_| ChainError::BadSnapshot)?;
             carried.push(true);
         }
         wtxn.commit()?;
@@ -2482,7 +2781,7 @@ impl<V: ProofVerifier> Chain<V> {
     /// proof the caller has verified); `block` becomes the tip and the
     /// floor below which nothing reorganizes.
     pub fn finish_snapshot(&self, block: &Block, manifest: &Manifest) -> Result<()> {
-        let (roots, next_position) = (&manifest.roots[..], manifest.next);
+        let (parts, next_position) = (manifest.output_nodes(), manifest.next);
         let mut wtxn = self.env.write_txn()?;
         if !self.staging_in(&wtxn)? {
             return Err(ChainError::BadSnapshot);
@@ -2500,7 +2799,7 @@ impl<V: ProofVerifier> Chain<V> {
         }
         self.check_body(&header, &block.body)?;
         self.utxo
-            .finish_staged(&mut wtxn, SNAPSHOT_PART_LOG, roots, next_position)
+            .finish_staged(&mut wtxn, &parts, next_position)
             .map_err(|_| ChainError::BadSnapshot)?;
         let name_root = self.names.root(&wtxn).map_err(|e| ChainError::Name(e.into()))?;
         if name_root != manifest.name_root {
@@ -2563,14 +2862,22 @@ impl<V: ProofVerifier> Chain<V> {
     /// Drops the manifests that can no longer be served, with the tip at
     /// `tip`: a part needs the outputs spent by every block after its
     /// snapshot, and those leave the spent log with the undo window. An
-    /// archive (no window) keeps them all, as its status promises.
+    /// archive (no window) keeps them all, as its status promises. Kept
+    /// as changes, the oldest served needs those below it back to one
+    /// kept whole, which stay (not served).
     fn prune_snapshots(&self, wtxn: &mut RwTxn, tip: u32) -> Result<()> {
         let Some(keep) = self.max_undo else {
             return Ok(());
         };
-        let Some(oldest) = tip.checked_sub(keep) else {
+        let Some(mut oldest) = tip.checked_sub(keep) else {
             return Ok(());
         };
+        while oldest > 0
+            && let Some(v) = self.snapshots.get(wtxn, &oldest)?
+            && Manifest::stored_as_changes(v)
+        {
+            oldest -= 1;
+        }
         let stale: Vec<u32> =
             self.snapshots.range(wtxn, &(..oldest))?.map(|e| e.map(|(h, _)| h)).collect::<heed::Result<_>>()?;
         for h in stale {
@@ -2579,14 +2886,23 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(())
     }
 
-    /// Takes the snapshot after `header`, just connected: the roots of its
-    /// parts are read from the state tree as it stands, and the name parts
-    /// from the registry.
-    fn take_snapshot(&self, wtxn: &mut RwTxn, header: &Header) -> Result<()> {
+    /// Takes the snapshot after `header`, just connected, whose outputs
+    /// start at `first` and which emptied the positions `emptied`. Made
+    /// from its parent's manifest where that is kept: only the subtrees
+    /// the block touched are counted again ([`OutputLayout`]); otherwise
+    /// laid out from the outputs. The name parts come from the registry.
+    fn take_snapshot(&self, wtxn: &mut RwTxn, header: &Header, first: u64, mut emptied: Vec<u64>) -> Result<()> {
         let next = self.utxo.next_position(wtxn)?;
-        let parts = next.div_ceil(1 << SNAPSHOT_PART_LOG);
-        let roots =
-            (0..parts).map(|p| self.utxo.subtree(wtxn, SNAPSHOT_PART_LOG, p)).collect::<utxo::Result<Vec<_>>>()?;
+        let parent = self.manifest_of(wtxn, &header.prev_hash, header.height.wrapping_sub(1))?;
+        emptied.sort_unstable();
+        let outputs = OutputLayout {
+            utxo: &self.utxo,
+            rtxn: wtxn,
+            old: parent.as_ref().map(|p| &p.outputs[..]),
+            emptied: &emptied,
+            made: (first, next),
+        }
+        .parts()?;
         let names = self
             .names
             .name_parts(wtxn)
@@ -2595,29 +2911,88 @@ impl<V: ProofVerifier> Chain<V> {
             .map(|(first, hash)| NamePart { first, hash })
             .collect();
         let name_root = self.utxo.name_root(wtxn)?;
-        self.put_snapshot(wtxn, header, &Manifest { next, roots, name_root, names })
-    }
-
-    /// Stores a snapshot manifest.
-    fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, manifest: &Manifest) -> Result<()> {
-        self.snapshots.put(wtxn, &header.height, &manifest.to_bytes(&header.hash()))?;
+        let manifest = Manifest { next, outputs, name_root, names };
+        #[cfg(debug_assertions)]
+        if next < 1 << 16 {
+            let all: Vec<u64> = self.utxo.unspent_in(wtxn, 0, next)?.into_iter().map(|(p, _)| p).collect();
+            let fresh: Vec<(usize, u64, u32)> =
+                manifest.outputs.iter().map(|p| (p.level as usize, p.index, p.count)).collect();
+            debug_assert_eq!(fresh, output_layout(&all), "the manifest's layout, made from its parent's");
+            debug_assert_eq!(manifest.state_root(), header.state_root);
+        }
+        let parent = parent.filter(|_| header.height % MANIFEST_WHOLE_EVERY != 0);
+        self.snapshots.put(wtxn, &header.height, &manifest.to_bytes(&header.hash(), parent.as_deref()))?;
+        *self.last_manifest.lock().unwrap() = Some((header.hash(), std::sync::Arc::new(manifest)));
         Ok(())
     }
 
-    /// The kept snapshot after the main-chain block `id`: its height and
-    /// manifest.
-    fn snapshot_in(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u32, Manifest)>> {
+    /// Stores a snapshot manifest, whole.
+    fn put_snapshot(&self, wtxn: &mut RwTxn, header: &Header, manifest: &Manifest) -> Result<()> {
+        self.snapshots.put(wtxn, &header.height, &manifest.to_bytes(&header.hash(), None))?;
+        Ok(())
+    }
+
+    /// The manifest kept for the block `id` at `height`, if any: read
+    /// whole, or from the one kept whole below it and the changes since
+    /// (each stored with its block's id, checked along the way).
+    fn manifest_of(&self, rtxn: &RoTxn, id: &Digest, height: u32) -> Result<Option<std::sync::Arc<Manifest>>> {
+        // The cache only once the block's manifest is known kept.
+        match self.snapshots.get(rtxn, &height)? {
+            Some(v) if v.len() >= 32 && v[..32] == digest_bytes(id) => {}
+            _ => return Ok(None),
+        }
+        if let Some((cached, m)) = self.last_manifest.lock().unwrap().as_ref()
+            && cached == id
+        {
+            return Ok(Some(std::sync::Arc::clone(m)));
+        }
+        // Down to one kept whole, noting each block's id.
+        let mut chain: Vec<(u32, Digest)> = Vec::new();
+        let (mut h, mut want) = (height, *id);
+        loop {
+            let Some(value) = self.snapshots.get(rtxn, &h)? else {
+                return Ok(None);
+            };
+            if value.len() < 32 || value[..32] != digest_bytes(&want) {
+                return Ok(None);
+            }
+            chain.push((h, want));
+            if !Manifest::stored_as_changes(value) {
+                break;
+            }
+            let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(&want))? else {
+                return Ok(None);
+            };
+            if h == 0 {
+                return Err(ChainError::Corrupt("snapshot manifest"));
+            }
+            (h, want) = (h - 1, header.prev_hash);
+        }
+        let mut manifest: Option<Manifest> = None;
+        for (h, id) in chain.into_iter().rev() {
+            let value = self.snapshots.get(rtxn, &h)?.ok_or(ChainError::Corrupt("snapshot manifest"))?;
+            manifest = Some(
+                Manifest::from_bytes(&id, value, manifest.as_ref()).ok_or(ChainError::Corrupt("snapshot manifest"))?,
+            );
+        }
+        let manifest = std::sync::Arc::new(manifest.ok_or(ChainError::Corrupt("snapshot manifest"))?);
+        *self.last_manifest.lock().unwrap() = Some((*id, std::sync::Arc::clone(&manifest)));
+        Ok(Some(manifest))
+    }
+
+    /// The kept snapshot after the main-chain block `id`, if it is served
+    /// (within the undo window): its height and manifest.
+    fn snapshot_in(&self, rtxn: &RoTxn, id: &Digest) -> Result<Option<(u32, std::sync::Arc<Manifest>)>> {
         let Some(header) = self.header_by_hash_in(rtxn, &digest_bytes(id))? else {
             return Ok(None);
         };
-        let Some(value) = self.snapshots.get(rtxn, &header.height)? else {
-            return Ok(None);
-        };
-        if value.len() < 32 || value[..32] != digest_bytes(id) {
+        if let Some(keep) = self.max_undo
+            && let Some(tip) = self.tip_in(rtxn)?
+            && header.height + keep < tip.height
+        {
             return Ok(None);
         }
-        let manifest = Manifest::from_bytes(id, value).ok_or(ChainError::Corrupt("snapshot manifest"))?;
-        Ok(Some((header.height, manifest)))
+        Ok(self.manifest_of(rtxn, id, header.height)?.map(|m| (header.height, m)))
     }
 
     /// A snapshot manifest of the state after the main-chain block `id`.
@@ -2625,7 +3000,7 @@ impl<V: ProofVerifier> Chain<V> {
     /// kept.
     pub fn snapshot_manifest(&self, id: &Digest) -> Result<Option<Manifest>> {
         let rtxn = self.env.read_txn()?;
-        Ok(self.snapshot_in(&rtxn, id)?.map(|(_, m)| m))
+        Ok(self.snapshot_in(&rtxn, id)?.map(|(_, m)| (*m).clone()))
     }
 
     /// The name undo records of the main-chain blocks above `height`, from
@@ -2646,10 +3021,10 @@ impl<V: ProofVerifier> Chain<V> {
         Ok(out)
     }
 
-    /// The unspent outputs in part `part` of the snapshot after the
-    /// main-chain block `id` (positions `part << SNAPSHOT_PART_LOG` and on,
-    /// below its counter): those unspent now, with those spent since; and
-    /// which of them were commits.
+    /// The unspent outputs in output part `part` of the snapshot after the
+    /// main-chain block `id` (its subtree's positions, below the counter):
+    /// those unspent now, with those spent since; and which of them were
+    /// commits.
     #[allow(clippy::type_complexity)]
     pub fn snapshot_part(
         &self,
@@ -2660,11 +3035,10 @@ impl<V: ProofVerifier> Chain<V> {
         let Some((height, manifest)) = self.snapshot_in(&rtxn, id)? else {
             return Ok(None);
         };
-        if part >= manifest.roots.len() as u64 {
+        let Some(p) = manifest.outputs.get(part as usize) else {
             return Ok(None);
-        }
-        let first = part << SNAPSHOT_PART_LOG;
-        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
+        };
+        let (first, end) = (p.first(), p.end().min(manifest.next));
         let out = self.outputs_then(&rtxn, height, first, end)?;
         let mut commits: PartCommits = self
             .names
@@ -2734,23 +3108,27 @@ impl<V: ProofVerifier> Chain<V> {
         let Some((_, manifest)) = self.snapshot_in(&rtxn, &header.hash())? else {
             return Ok(None);
         };
-        let part = position >> SNAPSHOT_PART_LOG;
-        let first = part << SNAPSHOT_PART_LOG;
-        let end = (first + (1 << SNAPSHOT_PART_LOG)).min(manifest.next);
-        let outputs = if first < end { self.outputs_then(&rtxn, height, first, end)? } else { vec![] };
+        // The part holding the position; or, in a subtree holding no
+        // output then, an empty one of the parts' lowest level.
+        let i = manifest.outputs.partition_point(|p| p.end() <= position);
+        let held = manifest.outputs.get(i).filter(|p| p.first() <= position);
+        let (level, index) = match held {
+            Some(p) => (p.level as usize, p.index),
+            None => (PART_MIN_LEVEL, position >> PART_MIN_LEVEL),
+        };
+        let first = index << level;
+        let end = ((index + 1) << level).min(manifest.next);
+        let outputs = match held {
+            Some(_) if first < end => self.outputs_then(&rtxn, height, first, end)?,
+            _ => vec![],
+        };
         let leaves: Vec<(u64, Digest)> =
             outputs.iter().map(|(p, c, s, h)| (*p, crate::transaction::leaf(c, s, *h))).collect();
-        let (root, mut siblings) = crate::state_tree::subtree_path(SNAPSHOT_PART_LOG, first, &leaves, position);
-        let expected = manifest.roots.get(part as usize).copied().unwrap_or(root);
-        if root != expected {
+        let (root, mut siblings) = crate::state_tree::subtree_path(level, first, &leaves, position);
+        if held.is_some_and(|p| p.root != root) {
             return Err(ChainError::Corrupt("snapshot part root"));
         }
-        siblings.extend(crate::state_tree::path_from_subtrees(
-            SNAPSHOT_PART_LOG,
-            &manifest.roots,
-            &manifest.name_root,
-            part,
-        ));
+        siblings.extend(crate::state_tree::path_from_parts(&manifest.output_nodes(), &manifest.name_root, level, index));
         let siblings: [Digest; crate::state_tree::DEPTH] =
             siblings.try_into().map_err(|_| ChainError::Corrupt("state path"))?;
         let output = outputs.iter().find(|o| o.0 == position).map(|&(_, c, s, h)| (c, s, h));
@@ -3917,16 +4295,16 @@ mod tests {
         let chain = Chain::open(Path::new(&path), 1 << 40, p, SeedText::new(p.pow), AcceptAllProofs).unwrap();
         let header = chain.header_at(height).unwrap().unwrap();
         let manifest = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
-        let (next, roots) = (manifest.next, &manifest.roots);
-        let ok = manifest.state_root() == header.state_root;
-        eprintln!("block {height}: {next} positions, {} parts, composes to the state root: {ok}", roots.len());
+        let (next, parts) = (manifest.next, &manifest.outputs);
+        let ok = manifest.state_root() == header.state_root && manifest.well_formed();
+        eprintln!("block {height}: {next} positions, {} parts, well formed and composes to the state root: {ok}", parts.len());
         let mut bad = 0;
-        for (i, r) in roots.iter().enumerate().filter(|_| std::env::var("TABMINER_DEBUG_TIP_ONLY").is_err()) {
+        for (i, p) in parts.iter().enumerate().filter(|_| std::env::var("TABMINER_DEBUG_TIP_ONLY").is_err()) {
             let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
             let leaves: Vec<(u64, Digest)> =
                 part.iter().map(|(pos, c, m, h)| (*pos, crate::transaction::leaf(c, m, *h))).collect();
-            let full = crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves);
-            if full != *r {
+            let full = crate::state_tree::subtree_root(p.level as usize, p.first(), &leaves);
+            if full != p.root || part.len() != p.count as usize {
                 bad += 1;
                 if bad <= 5 {
                     eprintln!("  part {i}: manifest root differs from the part's outputs ({} outputs)", part.len());
@@ -3941,24 +4319,25 @@ mod tests {
         let leaves: Vec<(u64, Digest)> =
             all.iter().map(|(pos, (c, m, h))| (*pos, crate::transaction::leaf(c, m, *h))).collect();
         let tip_next = chain.utxo().next_position(&rtxn).unwrap();
-        let parts: Vec<Digest> = (0..tip_next.div_ceil(1 << SNAPSHOT_PART_LOG))
+        // In chunks of the parts' lowest level.
+        let l = PART_MIN_LEVEL;
+        let parts: Vec<Digest> = (0..tip_next.div_ceil(1 << l))
             .map(|i| {
-                let lo = i << SNAPSHOT_PART_LOG;
-                let hi = lo + (1 << SNAPSHOT_PART_LOG);
+                let lo = i << l;
+                let hi = lo + (1 << l);
                 let these: Vec<(u64, Digest)> = leaves.iter().copied().filter(|(p, _)| (lo..hi).contains(p)).collect();
-                crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, lo, &these)
+                crate::state_tree::subtree_root(l, lo, &these)
             })
             .collect();
         eprintln!(
             "tip {}: stored root matches its outputs: {}; matches its header: {}",
             tip.height,
-            crate::state_tree::root_from_subtrees(SNAPSHOT_PART_LOG, &parts, &crate::name_trie::empty_root())
+            crate::state_tree::root_from_subtrees(l, &parts, &crate::name_trie::empty_root())
                 == chain.utxo().root(&rtxn).unwrap(),
             chain.utxo().root(&rtxn).unwrap() == tip.state_root
         );
-        let stored_bad = (0..parts.len())
-            .filter(|&i| chain.utxo().subtree(&rtxn, SNAPSHOT_PART_LOG, i as u64).unwrap() != parts[i])
-            .count();
+        let stored_bad =
+            (0..parts.len()).filter(|&i| chain.utxo().subtree(&rtxn, l, i as u64).unwrap() != parts[i]).count();
         eprintln!("{stored_bad} stored part roots differ from their outputs");
         // Down to the stored subtrees of 256 positions.
         let groups = tip_next.div_ceil(1 << crate::utxo::GROUP_LOG);
@@ -4233,19 +4612,18 @@ mod tests {
         }
         let check = |chain: &Chain<AcceptAllProofs>, header: &Header| {
             let manifest = chain.snapshot_manifest(&header.hash()).unwrap().unwrap();
-            let (n, roots) = (manifest.next, manifest.roots.clone());
+            let (n, parts) = (manifest.next, manifest.outputs.clone());
             assert_eq!(manifest.state_root(), header.state_root);
-            for (i, r) in roots.iter().enumerate() {
+            assert!(manifest.well_formed());
+            for (i, r) in parts.iter().enumerate() {
                 let (part, _) = chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
                 assert!(part.iter().all(|o| o.0 < n));
+                assert_eq!(part.len(), r.count as usize);
                 let leaves: Vec<(u64, Digest)> =
                     part.iter().map(|(p, c, m, h)| (*p, crate::transaction::leaf(c, m, *h))).collect();
-                assert_eq!(
-                    crate::state_tree::subtree_root(SNAPSHOT_PART_LOG, (i as u64) << SNAPSHOT_PART_LOG, &leaves),
-                    *r
-                );
+                assert_eq!(crate::state_tree::subtree_root(r.level as usize, r.first(), &leaves), r.root);
             }
-            (n, roots)
+            (n, parts)
         };
         let kept = |chain: &Chain<AcceptAllProofs>, blocks: &[Block]| {
             (1..=blocks.len())
@@ -4304,6 +4682,140 @@ mod tests {
     }
 
     #[test]
+    fn manifest_parts_follow_the_unspent_outputs() {
+        // Blocks 1 to 3 make 20,000 outputs each; then blocks spend: most
+        // of a split subtree (its halves merge), all of a part (it goes),
+        // a few scattered (counts change), and make more (the last part
+        // grows and splits). Each block's manifest, made from its parent's,
+        // is laid out as from scratch and reads back the same, whole or as
+        // changes.
+        let big = || ChainParams { max_block_size: ChainParams::MAINNET.max_block_size, ..params() };
+        let dir = TempDir::new("layout");
+        let seed = seed();
+        let dataset = Dataset::generate(&seed);
+        let chain = Chain::open(&dir.0, 1 << 30, big(), seed, AcceptAllProofs).unwrap();
+        chain.init_genesis(&genesis_block(vec![])).unwrap();
+        let f = Fixture { _dir: dir, chain, dataset };
+        let k = pk(15);
+        let mut t = GENESIS_TIME;
+        let mut unspent: std::collections::BTreeSet<u64> = (0..f.chain.utxo().next_position(&f.chain.env().read_txn().unwrap()).unwrap()).collect();
+        let mut next = unspent.len() as u64;
+        let plan: Vec<(Vec<u64>, u64)> = vec![
+            (vec![], 20_000),
+            (vec![], 20_000),
+            (vec![], 20_000),
+            // 8,000..31,000: 0..32,768 falls under the bound, and its
+            // halves merge.
+            ((8_000..31_000).collect(), 1),
+            // All of 32,768..49,152: that part goes (and its sibling, alone
+            // under their parent, becomes the parent).
+            ((32_768..49_152).collect(), 1),
+            // Scattered.
+            ((0..60_000).step_by(997).collect(), 3),
+            // The last part grows past the bound.
+            (vec![], 20_000),
+            (vec![], 5),
+        ];
+        let mut headers = Vec::new();
+        for (h, (spend, make)) in plan.into_iter().enumerate() {
+            t += 600;
+            let inputs: Vec<u64> = spend.into_iter().filter(|p| unspent.remove(p)).collect();
+            let outputs = (0..make).map(|i| Output::new(&k, (h as u64 + 1) * 100_000 + i).block_output()).collect();
+            unspent.extend(next..next + make);
+            next += make;
+            let block = mine(&f, Body { inputs, outputs, proof: vec![], ..Default::default() }, t);
+            f.chain.apply_block(&block, t + 1).unwrap();
+            let m = f.chain.snapshot_manifest(&block.header.hash()).unwrap().unwrap();
+            let all: Vec<u64> = unspent.iter().copied().collect();
+            let layout: Vec<(usize, u64, u32)> = m.outputs.iter().map(|p| (p.level as usize, p.index, p.count)).collect();
+            assert_eq!(layout, output_layout(&all), "block {}", h + 1);
+            assert!(m.well_formed());
+            assert_eq!(m.state_root(), block.header.state_root);
+            headers.push((block.header, m));
+        }
+        // After the merge: 0..32,768 is one part of level 15.
+        assert!(headers[2].1.outputs.iter().any(|p| (p.level, p.index) == (14, 0)));
+        assert!(headers[3].1.outputs.iter().any(|p| (p.level, p.index) == (15, 0)));
+        assert!(headers[3].1.outputs.iter().any(|p| (p.level, p.index) == (14, 2)));
+        assert!(!headers[4].1.outputs.iter().any(|p| p.level == 14 && p.index <= 3));
+        // Read back from storage alone (the cache cleared), from the one
+        // kept whole through the changes.
+        *f.chain.last_manifest.lock().unwrap() = None;
+        for (header, m) in &headers {
+            *f.chain.last_manifest.lock().unwrap() = None;
+            assert_eq!(&f.chain.snapshot_manifest(&header.hash()).unwrap().unwrap(), m);
+        }
+        let rtxn = f.chain.env().read_txn().unwrap();
+        let stored: Vec<bool> =
+            (1..=headers.len() as u32).map(|h| Manifest::stored_as_changes(f.chain.snapshots.get(&rtxn, &h).unwrap().unwrap())).collect();
+        assert!(stored[1..].iter().all(|c| *c), "after the first, as changes: {stored:?}");
+        // Every part served holds its count, and rebuilds its root.
+        let (header, m) = headers.last().unwrap();
+        for (i, p) in m.outputs.iter().enumerate() {
+            let (part, _) = f.chain.snapshot_part(&header.hash(), i as u64).unwrap().unwrap();
+            let leaves: Vec<(u64, Digest)> = part.iter().map(|(q, c, s, h)| (*q, crate::transaction::leaf(c, s, *h))).collect();
+            assert_eq!((part.len(), crate::state_tree::subtree_root(p.level as usize, p.first(), &leaves)), (p.count as usize, p.root));
+        }
+    }
+
+    #[test]
+    fn manifests_are_checked_for_their_layout() {
+        let d = |x: u32| [crate::poseidon2::Fp::new(x); crate::poseidon2::DIGEST];
+        let part = |level: u8, index: u64, count: u32| OutputPart { level, index, count, root: d(index as u32 + 1) };
+        let m = |outputs: Vec<OutputPart>| Manifest { next: 1 << 20, outputs, name_root: d(9), names: vec![] };
+        // 0..32,768 split (20,000 outputs), its halves parts.
+        assert!(m(vec![part(14, 0, 12_000), part(14, 1, 8_000)]).well_formed());
+        assert!(m(vec![part(39, 0, 5)]).well_formed());
+        assert!(m(vec![]).well_formed());
+        // Halves whose parent holds few enough: it should be the part.
+        assert!(!m(vec![part(14, 0, 100), part(14, 1, 100)]).well_formed());
+        // Too many in one part; none; below the lowest level; overlapping;
+        // out of order; past the counter.
+        assert!(!m(vec![part(39, 0, 20_000)]).well_formed());
+        assert!(!m(vec![part(14, 0, 0), part(14, 1, 17_000)]).well_formed());
+        assert!(!m(vec![part(13, 0, 9_000), part(13, 1, 9_000)]).well_formed());
+        assert!(!m(vec![part(15, 0, 9_000), part(14, 1, 9_000)]).well_formed());
+        assert!(!m(vec![part(14, 1, 9_000), part(14, 0, 9_000)]).well_formed());
+        assert!(!m(vec![part(14, 64, 12_000), part(14, 65, 8_000)]).well_formed());
+        // Index past the output half.
+        assert!(!m(vec![part(38, 2, 5)]).well_formed());
+    }
+
+    #[test]
+    fn manifest_changes_round_trip() {
+        let d = |x: u32| [crate::poseidon2::Fp::new(x); crate::poseidon2::DIGEST];
+        let part = |index: u64, count: u32| OutputPart { level: 14, index, count, root: d(count) };
+        let name = |first: crate::name_trie::Key| NamePart { first, hash: d(first as u32) };
+        let id = d(77);
+        let a = Manifest {
+            next: 100 << 14,
+            outputs: (0..50).map(|i| part(i * 2, 9_000)).collect(),
+            name_root: d(1),
+            names: (0..20).map(|i| name(i * 10)).collect(),
+        };
+        let mut b = a.clone();
+        b.next += 3;
+        b.outputs.remove(0);
+        b.outputs[7].count = 9_001;
+        b.outputs.insert(10, part(21, 9_500));
+        b.outputs.push(part(200, 9_000));
+        b.names.insert(3, name(25));
+        b.names.remove(15);
+        for (old, new) in [(&a, &b), (&b, &a), (&a, &a)] {
+            let whole = new.to_bytes(&id, None);
+            assert_eq!(Manifest::from_bytes(&id, &whole, None).as_ref(), Some(new));
+            let changes = new.to_bytes(&id, Some(old));
+            assert!(Manifest::stored_as_changes(&changes) && !Manifest::stored_as_changes(&whole));
+            assert_eq!(Manifest::from_bytes(&id, &changes, Some(old)).as_ref(), Some(new));
+            assert!(Manifest::from_bytes(&id, &changes, None).is_none());
+            assert!(Manifest::from_bytes(&d(78), &changes, Some(old)).is_none());
+        }
+        // A few changes are small.
+        assert!(b.to_bytes(&id, Some(&a)).len() < 400);
+        assert_eq!(a.to_bytes(&id, Some(&a)).len(), 32 + 1 + 8 + 32 + 4 + 4);
+    }
+
+    #[test]
     fn staged_parts_are_carried_to_a_later_snapshot() {
         // Blocks 1 to 3 make 20,000 outputs each: parts 0 to 2 full, part
         // 3 begun. Blocks 4 to 8 make one each and spend in parts 0 and 2.
@@ -4338,8 +4850,10 @@ mod tests {
         let (s4, s8) = (blocks[3].header, blocks[7].header);
         let m4 = a.chain.snapshot_manifest(&s4.hash()).unwrap().unwrap();
         let m8 = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
-        let (next4, roots4, next8, roots8) = (m4.next, m4.roots.clone(), m8.next, m8.roots.clone());
-        assert_eq!((next4, roots4.len(), next8, roots8.len()), (60_001, 4, 60_005, 4));
+        let (next4, parts4, next8, parts8) = (m4.next, m4.outputs.clone(), m8.next, m8.outputs.clone());
+        assert_eq!((next4, parts4.len(), next8, parts8.len()), (60_001, 4, 60_005, 4));
+        // Four subtrees of the lowest level, in both.
+        assert!(parts4.iter().chain(&parts8).all(|p| p.level as usize == PART_MIN_LEVEL));
 
         // b stages the snapshot after block 4, then moves to block 8's.
         let b = make("carry-b");
@@ -4347,29 +4861,37 @@ mod tests {
             b.chain.accept_header(&block.header, t + 1).unwrap();
         }
         b.chain.begin_snapshot().unwrap();
-        for (i, root) in roots4.iter().enumerate() {
+        for (i, p) in parts4.iter().enumerate() {
             let (part, commits) = a.chain.snapshot_part(&s4.hash(), i as u64).unwrap().unwrap();
-            b.chain.stage_snapshot_part(i as u64, &part, &commits, next4, Some(root)).unwrap();
+            b.chain.stage_snapshot_part((p.level as usize, p.index), &part, &commits, next4, Some(p)).unwrap();
         }
         let mut spent: Vec<u64> = blocks[4..8].iter().flat_map(|b| b.body.inputs.clone()).collect();
         spent.sort_unstable();
-        let in_part = |i: u64| -> Vec<u64> { spent.iter().copied().filter(|p| p >> SNAPSHOT_PART_LOG == i).collect() };
+        let in_part = |i: u64| -> Vec<u64> { spent.iter().copied().filter(|p| p >> PART_MIN_LEVEL == i).collect() };
+        let carry = |i: usize, spent: Vec<u64>| CarriedPart {
+            level: PART_MIN_LEVEL,
+            index: i as u64,
+            spent,
+            part: Some(parts8[i]),
+            slot: Some(i as u32),
+        };
         let parts = [
             // Spends carried away.
-            CarriedPart { index: 0, spent: in_part(0), root: Some(roots8[0]) },
+            carry(0, in_part(0)),
             // Untouched.
-            CarriedPart { index: 1, spent: in_part(1), root: Some(roots8[1]) },
+            carry(1, in_part(1)),
             // A spend missed (a lying body would do this): cleared.
-            CarriedPart { index: 2, spent: vec![34_000], root: Some(roots8[2]) },
-            // Begun at block 4, grown since: cleared.
-            CarriedPart { index: 3, spent: in_part(3), root: None },
+            carry(2, vec![34_000]),
+            // Begun at block 4, grown since: its root differs, cleared.
+            carry(3, in_part(3)),
         ];
         assert!(in_part(1).is_empty());
         assert_eq!(b.chain.carry_snapshot_parts(&parts, next8).unwrap(), [true, true, false, false]);
         // The cleared parts are fetched at block 8 and the install completes.
-        for i in [2u64, 3] {
-            let (part, commits) = a.chain.snapshot_part(&s8.hash(), i).unwrap().unwrap();
-            b.chain.stage_snapshot_part(i, &part, &commits, next8, Some(&roots8[i as usize])).unwrap();
+        for i in [2usize, 3] {
+            let (part, commits) = a.chain.snapshot_part(&s8.hash(), i as u64).unwrap().unwrap();
+            let p = &parts8[i];
+            b.chain.stage_snapshot_part((p.level as usize, p.index), &part, &commits, next8, Some(p)).unwrap();
         }
         b.chain.finish_snapshot(&blocks[7], &m8).unwrap();
         let rtxn = b.chain.env().read_txn().unwrap();
@@ -4399,7 +4921,7 @@ mod tests {
         }
         let s8 = blocks[7].header;
         let manifest = a.chain.snapshot_manifest(&s8.hash()).unwrap().unwrap();
-        let (next, roots) = (manifest.next, manifest.roots.clone());
+        let (next, parts) = (manifest.next, manifest.outputs.clone());
         assert_eq!(next, 16);
         assert_eq!(manifest.state_root(), s8.state_root);
         assert!(manifest.names.is_empty());
@@ -4409,6 +4931,10 @@ mod tests {
         // positions, so 10 unspent after block 8; later spends are restored.
         assert_eq!(part.len(), 10);
         assert!(a.chain.snapshot_part(&s8.hash(), 1).unwrap().is_none());
+        // One part, the output half's whole subtree.
+        let p0 = parts[0];
+        assert_eq!((parts.len(), p0.level as usize, p0.index, p0.count), (1, crate::state_tree::DEPTH - 1, 0, 10));
+        let at = (p0.level as usize, p0.index);
         assert!(a.chain.snapshot_manifest(&blocks[0].header.prev_hash).unwrap().is_none());
 
         // b: headers first, then the snapshot, then the tail.
@@ -4438,21 +4964,27 @@ mod tests {
         b.chain.begin_snapshot().unwrap();
         assert!(matches!(b.chain.apply_block(&blocks[8], t + 1), Err(ChainError::SnapshotInProgress)));
         assert!(matches!(b.chain.finish_snapshot(&blocks[7], &manifest), Err(ChainError::BadSnapshot)));
-        let mut wrong = roots[0];
-        wrong[0] += crate::poseidon2::Fp::ONE;
-        assert!(matches!(b.chain.stage_snapshot_part(0, &part, &[], next, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        let mut wrong = p0;
+        wrong.root[0] += crate::poseidon2::Fp::ONE;
+        assert!(matches!(b.chain.stage_snapshot_part(at, &part, &[], next, Some(&wrong)), Err(ChainError::BadSnapshot)));
+        // So is one with another count than the manifest's.
+        let miscounted = OutputPart { count: 9, ..p0 };
+        assert!(matches!(
+            b.chain.stage_snapshot_part(at, &part, &[], next, Some(&miscounted)),
+            Err(ChainError::BadSnapshot)
+        ));
         // A commit entry whose leaf is not the output's is refused.
         let fake = vec![(part[0].0, [crate::poseidon2::Fp::ONE; 8], 3u32)];
         assert!(matches!(
-            b.chain.stage_snapshot_part(0, &part, &fake, next, Some(&roots[0])),
+            b.chain.stage_snapshot_part(at, &part, &fake, next, Some(&p0)),
             Err(ChainError::BadSnapshot)
         ));
         // Several in one transaction: a refused one leaves nothing behind,
         // the next lands.
-        let batch = vec![(0, part.clone(), vec![], next, wrong), (0, part.clone(), vec![], next, roots[0])];
+        let batch = vec![(wrong, part.clone(), vec![], next), (p0, part.clone(), vec![], next)];
         let results = b.chain.stage_snapshot_parts(&batch);
         assert!(matches!(results[0], Err(ChainError::BadSnapshot)));
-        assert_eq!(results[1].as_ref().unwrap(), &roots[0]);
+        assert_eq!(results[1].as_ref().unwrap(), &p0.root);
         b.chain.finish_snapshot(&blocks[7], &manifest).unwrap();
         assert!(!b.chain.staging().unwrap());
         assert_eq!(b.chain.utxo().len(&b.chain.env().read_txn().unwrap()).unwrap(), 10);
@@ -4463,7 +4995,7 @@ mod tests {
             d.accept_header(&block.header, t + 1).unwrap();
         }
         d.begin_snapshot().unwrap();
-        d.stage_snapshot_part(0, &part, &[], next, None).unwrap();
+        d.stage_snapshot_part(at, &part, &[], next, None).unwrap();
         drop(d);
         let d = Chain::open(&d_dir.0, 64 << 20, params(), seed(), AcceptAllProofs).unwrap();
         assert!(!d.staging().unwrap());
@@ -4723,7 +5255,7 @@ mod tests {
         // name part of two records as they were (alice before her update).
         let m16 = a.chain.snapshot_manifest(&s16.hash()).unwrap().unwrap();
         assert_eq!(m16.state_root(), s16.state_root);
-        assert_eq!((m16.next, m16.roots.len(), m16.names.len()), (4, 1, 1));
+        assert_eq!((m16.next, m16.outputs.len(), m16.names.len()), (4, 1, 1));
         let (outputs16, commits16) = a.chain.snapshot_part(&s16.hash(), 0).unwrap().unwrap();
         assert_eq!(outputs16.iter().map(|o| o.0).collect::<Vec<_>>(), vec![0, 3]);
         assert_eq!(commits16, vec![(3, d(14), 3)]);
@@ -4748,7 +5280,14 @@ mod tests {
         }
         b.chain.verify_snapshot_block(&blocks[15], m16.next).unwrap();
         b.chain.begin_snapshot().unwrap();
-        b.chain.stage_snapshot_part(0, &outputs16, &commits16, m16.next, Some(&m16.roots[0])).unwrap();
+        b.chain.stage_snapshot_part(
+            (m16.outputs[0].level as usize, m16.outputs[0].index),
+            &outputs16,
+            &commits16,
+            m16.next,
+            Some(&m16.outputs[0]),
+        )
+        .unwrap();
         // A name part with another hash, or out of order, is refused.
         let mut wrong = m16.names[0].hash;
         wrong[0] += crate::poseidon2::Fp::ONE;
@@ -4783,7 +5322,14 @@ mod tests {
             c.chain.accept_header(&block.header, t.get() + 1).unwrap();
         }
         c.chain.begin_snapshot().unwrap();
-        c.chain.stage_snapshot_part(0, &outputs16, &commits16, m16.next, Some(&m16.roots[0])).unwrap();
+        c.chain.stage_snapshot_part(
+            (m16.outputs[0].level as usize, m16.outputs[0].index),
+            &outputs16,
+            &commits16,
+            m16.next,
+            Some(&m16.outputs[0]),
+        )
+        .unwrap();
         c.chain.stage_name_part(&names16, lo16, hi16, None).unwrap();
         // Carrying to a manifest with the same part keeps it; with another
         // hash, the range is cleared and the commits kept.

@@ -181,6 +181,55 @@ pub fn path_from_subtrees(level: usize, roots: &[Digest], right: &Digest, index:
     siblings
 }
 
+/// The left-half nodes `parts` (`(level, index, root)`, disjoint subtrees,
+/// ascending by first position) merged, level by level, into the nodes
+/// composed so far: at each level, the parts there join the parents of
+/// the level below.
+fn compose_parts(parts: &[(usize, u64, Digest)], mut visit: impl FnMut(usize, &[(u64, Digest)])) -> Digest {
+    let mut nodes: Vec<(u64, Digest)> = Vec::new();
+    for l in 0..DEPTH - 1 {
+        let here: Vec<(u64, Digest)> = parts.iter().filter(|p| p.0 == l).map(|p| (p.1, p.2)).collect();
+        if !here.is_empty() {
+            nodes.extend(here);
+            nodes.sort_unstable_by_key(|n| n.0);
+        }
+        visit(l, &nodes);
+        nodes = parents(l, &nodes);
+    }
+    if let Some(top) = parts.iter().find(|p| p.0 == DEPTH - 1) {
+        nodes = vec![(top.1, top.2)];
+    }
+    visit(DEPTH - 1, &nodes);
+    nodes.iter().find(|n| n.0 == 0).map_or(default_hashes()[DEPTH - 1], |n| n.1)
+}
+
+/// Root of the whole tree from left-half subtrees of any heights, `(level,
+/// index, root)` (disjoint, ascending by first position; every other
+/// position empty), and the right half's root `right`.
+pub fn root_from_parts(parts: &[(usize, u64, Digest)], right: &Digest) -> Digest {
+    compress(&compose_parts(parts, |_, _| {}), right)
+}
+
+/// The siblings from level `level` up of the subtree of height `level` at
+/// `index`, in the tree that [`root_from_parts`] composes from `parts` and
+/// `right`: the last is `right`. The subtree is one of the parts, or holds
+/// none (and is in none); with a path inside it ([`subtree_path`]) before
+/// them, a whole path of [`DEPTH`] siblings.
+pub fn path_from_parts(parts: &[(usize, u64, Digest)], right: &Digest, level: usize, index: u64) -> Vec<Digest> {
+    let mut siblings = Vec::with_capacity(DEPTH - level);
+    compose_parts(parts, |l, nodes| {
+        if l >= level && l < DEPTH - 1 {
+            let want = (index >> (l - level)) ^ 1;
+            siblings.push(match nodes.binary_search_by_key(&want, |&(k, _)| k) {
+                Ok(i) => nodes[i].1,
+                Err(_) => default_hashes()[l],
+            });
+        }
+    });
+    siblings.push(*right);
+    siblings
+}
+
 fn node_key(level: usize, index: u64) -> u64 {
     // Lowest levels last: new nodes there, the most numerous, are then
     // appended at the end of the database, which LMDB packs tightly.
@@ -543,6 +592,29 @@ impl StateTree {
         self.root(wtxn)
     }
 
+    /// Writes the levels above the left-half subtrees `parts` (`(level,
+    /// index, root)`, disjoint, ascending by first position, each at least
+    /// the base and its own nodes stored), up to the root. Returns it.
+    pub fn build_above(&self, wtxn: &mut RwTxn, parts: &[(usize, u64, Digest)]) -> Result<Digest> {
+        assert!(parts.iter().all(|p| p.0 >= self.base && p.0 < DEPTH));
+        let mut level_nodes: Vec<(u64, Digest)> = Vec::new();
+        for level in self.base..DEPTH {
+            let here: Vec<(u64, Digest)> = parts.iter().filter(|p| p.0 == level).map(|p| (p.1, p.2)).collect();
+            if !here.is_empty() {
+                level_nodes.extend(here);
+                level_nodes.sort_unstable_by_key(|n| n.0);
+            }
+            for (i, v) in &level_nodes {
+                self.put_node(wtxn, level, *i, v)?;
+            }
+            level_nodes = self.stored_parents(wtxn, level, &level_nodes)?;
+        }
+        for (i, v) in &level_nodes {
+            self.put_node(wtxn, DEPTH, *i, v)?;
+        }
+        self.root(wtxn)
+    }
+
     /// Writes one subtree with its top at `top`: its non-default base-level
     /// nodes `nodes` (ascending, all under one node at `top`) and every
     /// level up to `top`. Returns the subtree's root.
@@ -564,10 +636,20 @@ impl StateTree {
     /// index `index`, the top included.
     pub fn clear_subtree(&self, wtxn: &mut RwTxn, top: usize, index: u64) -> Result<()> {
         assert!(top >= self.base && top <= DEPTH);
+        // Only the stored nodes, found by key (a high subtree spans far
+        // more indexes than it holds nodes); ranges end by value
+        // ([`LeU64`]).
         for level in self.base..=top {
             let width = 1u64 << (top - level);
-            for i in index * width..(index + 1) * width {
-                self.db.delete(wtxn, &node_key(level, i))?;
+            let (lo, hi) = (node_key(level, index * width), node_key(level, (index + 1) * width));
+            let keys: Vec<u64> = self
+                .db
+                .range(wtxn, &(lo..))?
+                .map(|e| e.map(|(k, _)| k))
+                .take_while(|k| k.as_ref().is_ok_and(|k| *k < hi))
+                .collect::<heed::Result<_>>()?;
+            for k in keys {
+                self.db.delete(wtxn, &k)?;
             }
         }
         Ok(())
@@ -678,6 +760,65 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Parts of mixed heights compose to the root a tree with their
+    /// leaves has, give its paths, and staged as subtrees build it; a high
+    /// subtree clears by its stored nodes alone.
+    #[test]
+    fn parts_of_any_height_compose_the_tree() {
+        let (_d, env, tree) = setup("parts");
+        let v = |k: u64| -> Digest { core::array::from_fn(|i| Fp::new((k as u32).wrapping_mul(7) + i as u32 + 1)) };
+        // Leaves in subtrees of heights 3, 5 and 20 (a sparse high one),
+        // and the right half.
+        let groups: [(usize, u64, Vec<u64>); 3] =
+            [(3, 1, vec![8, 9, 15]), (5, 1, vec![32, 40, 63]), (20, 3, vec![3 << 20, (3 << 20) + 777, (4 << 20) - 1])];
+        let right = v(999);
+        let mut wtxn = env.write_txn().unwrap();
+        for (_, _, keys) in &groups {
+            for &k in keys {
+                tree.update(&mut wtxn, k, &v(k)).unwrap();
+            }
+        }
+        tree.set_right(&mut wtxn, &right).unwrap();
+        let root = tree.root(&wtxn).unwrap();
+        let parts: Vec<(usize, u64, Digest)> = groups
+            .iter()
+            .map(|(l, i, keys)| (*l, *i, subtree_root(*l, i << l, &keys.iter().map(|&k| (k, v(k))).collect::<Vec<_>>())))
+            .collect();
+        assert_eq!(root_from_parts(&parts, &right), root);
+        for (l, i, keys) in &groups {
+            let leaves: Vec<(u64, Digest)> = keys.iter().map(|&k| (k, v(k))).collect();
+            let (_, mut path) = subtree_path(*l, i << l, &leaves, keys[1]);
+            path.extend(path_from_parts(&parts, &right, *l, *i));
+            let proof = Proof { siblings: path.try_into().unwrap() };
+            assert!(proof.verify(&root, keys[1], &v(keys[1])));
+        }
+        // An empty subtree among them: its path proves the key empty.
+        let (_, mut path) = subtree_path(3, 12 << 3, &[], 100);
+        path.extend(path_from_parts(&parts, &right, 3, 12));
+        assert!(Proof { siblings: path.try_into().unwrap() }.verify(&root, 100, &EMPTY));
+        // The top of the output half as the one part.
+        let all: Vec<(u64, Digest)> = groups.iter().flat_map(|(_, _, ks)| ks.iter().map(|&k| (k, v(k)))).collect();
+        let top = (DEPTH - 1, 0, subtree_root(DEPTH - 1, 0, &all));
+        assert_eq!(root_from_parts(&[top], &right), root);
+        // Built from the parts' subtrees, written alone, then the levels
+        // above.
+        let (_d2, env2, tree2) = setup("parts-built");
+        let mut w2 = env2.write_txn().unwrap();
+        tree2.set_right(&mut w2, &right).unwrap();
+        for (l, i, keys) in &groups {
+            let leaves: Vec<(u64, Digest)> = keys.iter().map(|&k| (k, v(k))).collect();
+            tree2.write_subtree(&mut w2, *l, *i, &leaves).unwrap();
+        }
+        assert_eq!(tree2.build_above(&mut w2, &parts).unwrap(), root);
+        // Clearing the high subtree leaves the others' nodes.
+        let before = tree2.stored_nodes(&w2).unwrap();
+        tree2.clear_subtree(&mut w2, 20, 3).unwrap();
+        assert!(tree2.stored_nodes(&w2).unwrap() < before);
+        assert_eq!(tree2.node(&w2, 20, 3).unwrap(), default_hashes()[20]);
+        assert_eq!(tree2.node(&w2, 5, 1).unwrap(), parts[1].2);
+        drop(wtxn);
     }
 
     fn setup(name: &str) -> (TempDir, Env, StateTree) {

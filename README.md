@@ -135,7 +135,7 @@ on meanwhile. A fast sync of a 1,487-block chain from three peers took
 38 s on a first start, 29 s of it building the dataset, against 92 s
 before. Transaction announcements are ignored until a node has caught up.
 
-The state comes in parts of 16,384 positions, up to 32 at once from every
+The state comes in parts of up to 16,384 unspent outputs, up to 32 at once from every
 peer that can serve them. Every download (blocks, parts, files) keeps a
 window of 1 KiB chunks in flight, learned per peer as TCP learns a
 connection's: 64 for a peer not yet measured, doubling per round trip until
@@ -164,10 +164,30 @@ starts), or if no peer serves it, the node moves to a later one, fetches
 the blocks in between and carries the parts it has forward, removing the
 outputs those blocks spent and checking each part against the later
 manifest; only parts that do not match are fetched again.
-A snapshot stores only its manifest, about 150 KB with millions of outputs
-and names: the output counter, each output part's root, the name root and
-each name part's hash, read from the state tree and the registry's bucket
-table when the block connects. The outputs spent
+A snapshot stores only its manifest: the output counter, the output
+parts, the name root and each name part's hash, made when the block
+connects. An output part is a subtree of the state tree chosen by what it
+holds: from the top of the output half down, a subtree holding more than
+16,384 unspent outputs is split into its halves, and one holding none is
+left out (its root the empty subtree's). The manifest lists each part's
+level, index, count and root; a peer checks that the parts are laid out
+so (from the counts: each part holds 1 to 16,384, each one's parent
+more), that they compose to the block's state root, and each part, as it
+arrives, against its count and root. Positions are never reused, so
+parts of a fixed size (as before 2026-11-09) left a root in every
+manifest for every 16,384 positions ever made; these follow the unspent
+outputs instead: 50 million unspent among 4 billion made is about 6,000
+parts, some 270 KB. Every node lays the parts out alike, so a part is
+asked for by its index from any peer holding the snapshot. A block's
+manifest is made from its parent's: only the subtrees it touched are
+counted again, from the parent's counts and the block's changes. It is
+stored as its parent's with changes (splices of the parts and name parts
+lists; every 64th block's whole), so the window's 1008 cost about 16
+whole manifests and the changes; the oldest served keeps those below it
+back to a whole one. A part staged for one snapshot is carried to a later
+one if the later manifest has the same subtree and the part, less the
+outputs spent between, has its count and root; otherwise (it grew, split,
+merged or was emptied) it is fetched again. The outputs spent
 by blocks in the undo window are kept once, by position, with the height
 spending them; disconnecting a block restores its inputs from there, and a
 part is served from the outputs unspent now in its range plus those spent
