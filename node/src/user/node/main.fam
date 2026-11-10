@@ -8,10 +8,11 @@
 \ proof constants and genesis from /lib/netmain or /lib/netdevrec, its
 \ verifier /lib/chainver or /lib/chainverdev.  Settings first from
 \ /etc/node/config (below), the command line over them.  Its peers at
-\ IP:PORT, up to 8 (for devrec, none given: 10.0.2.2:3747, the host seen
-\ from QEMU's user-mode network; mainnet's seeds by name are not looked
-\ up yet), and more as they tell of them (GetPeers).  It syncs from the
-\ first that answers, then serves for good: its peers, the API (TCP 3738,
+\ HOST:PORT (an address, or a name looked up: dns.fam), up to 8; none
+\ given, mainnet's seeds (tabminer's, tabernacle1/2.root.sx:3737, or the
+\ configuration's), and for devrec 10.0.2.2:3747 (the host seen from
+\ QEMU's user-mode network); and more as they tell of them (GetPeers).
+\ It syncs from the first that answers on its chain, then serves for good: its peers, the API (TCP 3738,
 \ the token in /etc/node/token) and its image to tabernacles (UDP 3737).
 \ Its state is the tree /var/node: at a start, if it holds a chain, the
 \ node resumes from its tip (its headers loaded, then whatever the peer
@@ -58,12 +59,35 @@ mpt @ c@ 0= and ;
 : mpa variable ;  : mpn variable ;  : mpf variable ;  : mhc variable ;
 : mnname variable ;  : mudp variable ;  : mapi variable ;  : mcpa variable ;  : mcfn variable ;
 : mcb2 variable ;  : mls variable ;  : mle variable ;  : mlnx variable ;  : mlv variable ;  : mkn variable ;
-: musage  "usage: node [-n main|devrec] [-w N] [IP:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit ;
-\ madd ( s -- )  a peer from the configuration.
-: madd
-dup maddr if
-	drop  mcfn @ 8 lit u< if mip @ mcpa @ mcfn @ 3 lit lshift + !  mport @ mcpa @ mcfn @ 3 lit lshift + 4 lit + !  mcfn @ 1 lit + mcfn ! then
-else nhead "config: not IP:PORT: " puts puts 0A lit putc then ;
+: musage  "usage: node [-n main|devrec] [-w N] [HOST:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit ;
+\ mpeer  the peer's address on the line.
+: mpeer
+mip @ 18 lit rshift u. 2E lit putc  mip @ 10 lit rshift FF lit and u. 2E lit putc
+mip @ 8 lit rshift FF lit and u. 2E lit putc  mip @ FF lit and u. 3A lit putc  mport @ u. ;
+\ The resolver (mres, mrpt), the configuration's peers and seeds (as
+\ given: HOST:PORT, looked up once it is all read), the names' scratch.
+: mres variable ;  : mrpt variable ;  : msds variable ;  : msdn variable ;  : mhnb variable ;
+\ madd ( s -- )  a peer from the configuration, kept.
+: madd  mcfn @ 8 lit u< if mcpa @ mcfn @ 2 lit lshift + !  mcfn @ 1 lit + mcfn ! else drop then ;
+\ mseed ( s -- )  a seed from the configuration, kept.
+: mseed  msdn @ 8 lit u< if msds @ msdn @ 2 lit lshift + !  msdn @ 1 lit + msdn ! else drop then ;
+\ mhost ( s -- flag )  HOST:PORT at s into mip and mport: an IPv4
+\ address, or a name looked up at the resolver (dns.fam).
+: mhost
+dup maddr if drop -1 lit else
+	0 lit begin 2dup + c@ dup 0= 0= swap 3A lit <> and over FF lit u< and while 1 lit + repeat
+	2dup + c@ 3A lit = if
+		2dup mhnb @ swap bcopy  0 lit mhnb @ 2 lit pick + c!
+		+ 1 lit + atoi mport !
+		mport @ dup 0= 0= swap 10000 lit u< and if
+			mhnb @ mres @ mrpt @ dlook dup mip !
+			dup if nhead mhnb @ puts " is " puts mpeer 0A lit putc else nhead mhnb @ puts ": not found" puts 0A lit putc then
+			0= 0=
+		else 0 lit then
+	else 2drop 0 lit then
+then ;
+\ mpush ( -- )  mip, mport the next peer (8 at most).
+: mpush  mpn @ 8 lit u< if mip @ mpa @ mpn @ 3 lit lshift + !  mport @ mpa @ mpn @ 3 lit lshift + 4 lit + !  mpn @ 1 lit + mpn ! then ;
 \ mline ( s -- )  a line of the configuration applied.
 : mline
 dup c@ dup 0= swap 23 lit = or if drop else
@@ -76,6 +100,11 @@ dup c@ dup 0= swap 23 lit = or if drop else
 		dup "api-port" streq if mlv @ atoi mapi !  1 lit mkn ! then
 		dup "window" streq if mlv @ atoi 10 lit max mhc !  1 lit mkn ! then
 		dup "peer" streq if mlv @ madd  1 lit mkn ! then
+		dup "seed" streq if mlv @ mseed  1 lit mkn ! then
+		dup "resolver" streq if
+			mlv @ maddr if mip @ mres !  mport @ mrpt ! else nhead "config: the resolver not IP:PORT" puts 0A lit putc then
+			1 lit mkn !
+		then
 	then
 	mkn @ if drop else nhead "config: not understood: " puts puts 0A lit putc then
 then ;
@@ -97,6 +126,7 @@ then ;
 \ /etc/node made if missing, for the configuration (and the API's token)
 "/etc" mkdir drop  "/etc/node" mkdir drop
 "main" mnname !  E99 lit mudp !  E9A lit mapi !  4000 lit mhc !  0 lit mcfn !  40 lit alloc mcpa !
+A000203 lit mres !  35 lit mrpt !  20 lit alloc msds !  0 lit msdn !  100 lit alloc mhnb !
 mcfg
 \ flags, then peers
 1 lit mpf !
@@ -114,22 +144,24 @@ then
 40 lit alloc mpa !  0 lit mpn !
 argn mpf @ - 8 lit u> if musage then
 argn mpf @ u> if
-	argn mpf @ - mpn !
-	mpn @ 0 lit do
-		i mpf @ + arg maddr 0= if nhead "not IP:PORT: " puts i mpf @ + arg puts 0A lit putc 1 lit exit then
-		mip @ mpa @ i 3 lit lshift + !  mport @ mpa @ i 3 lit lshift + 4 lit + !
+	\ the command line's, every one needed
+	argn mpf @ - 0 lit do
+		i mpf @ + arg mhost if mpush else nhead "not HOST:PORT (or not found): " puts i mpf @ + arg puts 0A lit putc 1 lit exit then
 	loop
 else
-	mcfn @ if mcpa @ mpa @ mcfn @ 3 lit lshift bcopy  mcfn @ mpn ! then
+	\ the configuration's, those found
+	mcfn @ ?dup if 0 lit do mcpa @ i 2 lit lshift + @ mhost if mpush then loop then
 then
-\ none given: the recursive dev network's at the host's 3747 (a tabminer
-\ there, seen from QEMU's user-mode network); mainnet's seeds by name are
-\ not looked up yet
+\ none: mainnet's seeds (the configuration's, or tabminer's), by name;
+\ the recursive dev network's at the host's 3747 (a tabminer there, seen
+\ from QEMU's user-mode network)
 mpn @ 0= if
-	nnet @ if A000202 lit mpa @ !  EA3 lit mpa @ 4 lit + !  1 lit mpn ! else
-		nhead "no peers given (mainnet's seeds, by name, are not looked up yet): node [-n NETWORK] IP:PORT ..." puts 0A lit putc 1 lit exit
+	nnet @ if A000202 lit mip !  EA3 lit mport !  mpush else
+		msdn @ 0= if "tabernacle1.root.sx:3737" mseed  "tabernacle2.root.sx:3737" mseed then
+		msdn @ 0 lit do msds @ i 2 lit lshift + @ mhost if mpush then loop
 	then
 then
+mpn @ 0= if nhead "no peers: none given, and none found" puts 0A lit putc 1 lit exit then
 mpa @ @ mip !  mpa @ 4 lit + @ mport !
 \ mrest  the peers given after the first added (peer 0 is pinit's).
 : mrest  mpn @ 1 lit u> if mpn @ 1 lit do mpa @ i 3 lit lshift + dup @ swap 4 lit + @ padd drop loop then ;
@@ -138,10 +170,6 @@ mpa @ @ mip !  mpa @ 4 lit + @ mport !
 nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop cvinit
 \ mtree ( -- fd )  /var/node, made if missing.
 : mtree  "/var/node" TREE CREATE or 2 lit or open  dup 0< if nhead "no store (a disk is needed): " puts . 0A lit putc 1 lit exit then ;
-\ mpeer  the peer's address on the line.
-: mpeer
-mip @ 18 lit rshift u. 2E lit putc  mip @ 10 lit rshift FF lit and u. 2E lit putc
-mip @ 8 lit rshift FF lit and u. 2E lit putc  mip @ FF lit and u. 3A lit putc  mport @ u. ;
 
 "/var" mkdir drop
 mtree stinit  sninit  ninit  xinit tinit qinit yinit
@@ -175,10 +203,11 @@ else
 	\ first block, left in it gone)
 	stfd @ close drop  "/var/node" remove drop  mtree stfd !
 	mip @ mport @ mudp @ pinit  mrest
-	\ from each given in turn while none answers
+	\ from each given in turn while none answers, or each is on another
+	\ chain (a seed serving images only, say)
 	FFFFFFFF lit
 	mpn @ 0 lit do
-		dup FFFFFFFF lit = if
+		dup FFFFFFFF lit =  over FFFFFFFE lit = or if
 			drop  i puse  i prec @ mip !  i prec 4 lit + @ mport !
 			nhead "syncing from " puts mpeer 0A lit putc
 			90 lit nsync

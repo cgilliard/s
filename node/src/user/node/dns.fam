@@ -1,0 +1,76 @@
+\ dns.fam — names to IPv4 addresses (docs/NODE.md), for the node's seeds
+\ and peers given by name: one A query over UDP to the resolver (QEMU's
+\ user-mode network has one at 10.0.2.3:53; the configuration's
+\ `resolver` instead), recursion asked for; the answer's first A record.
+\ Three tries, two seconds each.  The OS has no resolver of its own.
+\
+\ dlook ( name ip port -- ip | 0 )  name (NUL-terminated, dotted) looked
+\ up at the resolver ip:port; 0 if not found or no answer.
+
+: dfd variable ;  : dqb variable ;  : dqn variable ;  : dab variable ;  : dan variable ;  : dpe variable ;
+: did variable ;  : dip variable ;  : dfr variable ;  : dlen variable ;  : drip variable ;  : drpt variable ;  : dsv variable ;
+: dinit  dqb @ 0= if 200 lit alloc dqb !  200 lit alloc dab !  10 lit alloc dpe !  10 lit alloc dfr ! then ;
+
+\ dput ( b -- )  a byte to the query.
+: dput  dqb @ dqn @ + c!  dqn @ 1 lit + dqn ! ;
+\ dname ( s -- )  name s as labels: each its length, then its bytes; 0.
+: dname
+begin
+	dqn @ dlen !  0 lit dput
+	begin dup c@ dup 0= 0= swap 2E lit <> and while dup c@ dput 1 lit + repeat
+	dqn @ dlen @ - 1 lit -  dqb @ dlen @ + c!
+	dup c@ 2E lit =
+while 1 lit + repeat
+drop 0 lit dput ;
+\ dask ( name -- )  the query: id, flags (recursion desired), one
+\ question (the name, type A, class IN).
+: dask
+0 lit dqn !
+did @ 8 lit rshift dput  did @ FF lit and dput
+1 lit dput  0 lit dput
+0 lit dput  1 lit dput  6 lit 0 lit do 0 lit dput loop
+dname
+0 lit dput  1 lit dput  0 lit dput  1 lit dput ;
+
+: db@  dab @ + c@ ;                               \ ( i -- b )  a byte of the answer
+: dw@  dup db@ 8 lit lshift swap 1 lit + db@ or ;  \ ( i -- w )  a big-endian 16 bits
+\ dskip ( i -- i' )  past the name at i: labels to a 0, or a pointer.
+: dskip
+begin dup dan @ u< if dup db@ dup 0= 0= swap C0 lit and 0= and else 0 lit then while dup db@ + 1 lit + repeat
+dup dan @ u< if dup db@ C0 lit and if 2 lit + else 1 lit + then then ;
+\ danswer  dip: the first A record of the answer at dab (dan bytes), if
+\ it answers our query (its id, a response, no error).
+: danswer
+dan @ C lit u< 0= if
+	0 lit dw@ did @ =  2 lit db@ 80 lit and 0= 0= and  3 lit db@ F lit and 0= and if
+		6 lit dw@  C lit dskip 4 lit +  swap
+		?dup if 0 lit do
+			dip @ 0= if
+				dskip  dup A lit + dan @ u> if drop dan @ else
+					dup dw@ 1 lit =  over 2 lit + dw@ 1 lit = and  over 8 lit + dw@ 4 lit = and if
+						dup A lit + dup db@ 18 lit lshift  over 1 lit + db@ 10 lit lshift or
+						over 2 lit + db@ 8 lit lshift or  swap 3 lit + db@ or  dip !
+					then
+					dup 8 lit + dw@ + A lit +
+				then
+			then
+		loop then drop
+	then
+then ;
+
+: dlook  ( name ip port -- ip | 0 )
+drpt ! drip ! dsv !  dinit  0 lit dip !
+1 lit socket dfd !
+ticks FFFF lit and did !
+dsv @ dask
+3 lit 0 lit do
+	dip @ 0= if
+		dfd @ dqb @ dqn @ drip @ drpt @ sendto drop
+		dfd @ dpe @ !  1 lit dpe @ 4 lit + !
+		dpe @ 1 lit 77359400 lit poll 0 lit > if
+			dfd @ dab @ 200 lit dfr @ recvfrom dan !
+			danswer
+		then
+	then
+loop
+dfd @ close drop  dip @ ;

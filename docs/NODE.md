@@ -1277,6 +1277,16 @@ Each step done when its test passes.
       `api-port` (3738), `window` (headers held), `peer IP:PORT` (again
       for more); the command line over it (`-n`, `-w`, peers); a key not
       understood is said. The scripts run `node -n devrec`.
+    - Names (2026-11-09, `dns.fam`): a peer may be `NAME:PORT`, looked
+      up with one A query over UDP to the resolver (QEMU's user-mode
+      one, 10.0.2.3:53, or the configuration's `resolver IP:PORT`):
+      three tries of two seconds, the answer's first A record. With no
+      peers given, a node on mainnet looks up the seeds (tabminer's,
+      `tabernacle1/2.root.sx:3737`, or the configuration's `seed
+      NAME:PORT`). It syncs from each in turn while one does not answer
+      or is on another chain (a seed serving only images, as the seeds
+      do until mainnet starts). Tried live: both seeds found at the
+      addresses the host finds.
     - The scripts' waits have no deadlines (2026-11-09,
       `scripts/waitlib.sh`): a step is waited for as long as the test's
       logs under `tmp/<script>/` (the miners' and the OS's output) keep
@@ -1284,8 +1294,7 @@ Each step done when its test passes.
       slower machine (CI's four cores) waits longer, a stuck run still
       fails. The CI job's time limit is the backstop. oscheck's checks
       still have deadlines (each a few times what it takes).
-    - Not yet: mainnet's seeds by name (no DNS: a node on mainnet needs
-      peers given), started by init (held back while it is tried by
+    - Not yet: started by init (held back while it is tried by
       hand), a log and a way to read its state from the shell.
 
 ## Open questions
