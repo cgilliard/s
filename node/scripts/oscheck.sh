@@ -225,6 +225,11 @@ rm -f "$T/po.disk"
 ./tools/fam --user -o "$T/tfe.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/serve.fam $ND/snap.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/fees_test.fam > "$T/tfe.build" 2>&1 || fail fees "build: $(head -c 300 "$T/tfe.build")"
 sh scripts/mkimage.sh "$T/fe.img" bin/kernel init="$T/tfe.bin":8192 2> "$T/fe.mk" || fail fees "mkimage: $(cat "$T/fe.mk")"
 expect fees 124 '^fees: 11 as expected, 0 not' 60 ./tools/q32 "$T/fe.img"
+# XMSS signing (docs/GUI_WALLET.md, phase 1): keys from seeds and signatures
+# at several leaves, as tabminer's (/lib/xsign), each verified with xverify.
+./tools/fam --user -o "$T/txs.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/xsign_test.fam > "$T/txs.build" 2>&1 || fail xsign "build: $(head -c 300 "$T/txs.build")"
+sh scripts/mkimage.sh "$T/xs.img" bin/kernel init="$T/txs.bin":8192 xsign=$ND/xsign_vectors.bin:0 2> "$T/xs.mk" || fail xsign "mkimage: $(cat "$T/xs.mk")"
+expect xsign 124 '^xsign: 28 as expected, 0 not' 60 ./tools/q32 "$T/xs.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.
