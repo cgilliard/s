@@ -1,0 +1,141 @@
+# A GUI wallet in the window manager
+
+A wallet with a window of its own on wm's desktop (`docs/OS.md`, section
+7): balances, payments, receiving, names and the recovery phrase, without
+a terminal. It runs beside the fam node (`docs/NODE.md`) in the same OS,
+and is the same wallet as tabminer's: the same phrase finds the same
+coins, and either can pay the other.
+
+Status: a design, to be decided before anything is built (2026-11-09).
+
+## What is fixed already
+
+By tabminer's wallet (`README.md`, Wallet; `miner/src/wallet.rs`), which
+this one must interoperate with:
+- **The phrase:** 12 BIP39 words (128 bits, the standard PBKDF2 seed, an
+  optional passphrase), shown once at creation and again on request.
+- **Keys:** every output its own one-time XMSS key, H(master, nonce)
+  with a random nonce; no key indices. 16 one-time leaves a key: 0 to 7
+  for the wallet's own outputs (a spend and up to seven cancellations),
+  8 to 15, from a random start, for outputs found by a restore.
+- **Outputs on chain:** a commitment and a 20-byte memo (the nonce and a
+  tag from the phrase); amounts public (`docs/AMOUNTS.md`). A wallet
+  finds its outputs by scanning memos; no key or address is on chain
+  (`docs/PRIVACY.md`).
+- **Payments:** a slate passed between the two wallets: the sender's
+  inputs and change, the recipient's output and its receipt (signed by
+  the recipient's address key, ML-DSA), then the sender's signatures.
+  Over the message layer (`docs/ONION.md`) when both are online, or as
+  files. `cancel` and `bump` replace a payment before it confirms.
+- **Addresses:** `tab1…`, the id of an ML-DSA key; names (`@alice`) point
+  at addresses (`docs/NAMES.md`, `docs/SUBNAMES.md`).
+- **At rest:** the phrase and seed encrypted under a password
+  (ChaCha20-Poly1305, a PBKDF2 key); the rest readable by the wallet's
+  owner only.
+- **Fees:** the node's suggestions (`/v1/fees`: a block, an hour, a day,
+  economy), as tabminer's `fees`.
+
+By the OS and the node:
+- wm serves one page, the desktop, over HTTP; each window today is a
+  terminal on a WebSocket (`/tty`) with a program on a pty behind it.
+- The node's API (`/v1/...`, JSON over HTTP on 3738, a token in
+  `/etc/node/token`) gives the chain and the pool: outputs from a
+  position, spends since a height, output and name proofs, fees, the
+  pool, transactions in, the tip by long poll.
+- Keys never reach the node (`docs/NODE.md`, The API).
+
+## The shape proposed
+
+Three parts:
+
+1. **`wallet`, a program in the OS** (fam), one per wallet: the keys,
+   the wallet's records (in a store tree of its own, `/var/wallet`), the
+   transactions built and signed. It reads the chain through the node's
+   API and gives it transactions. It is the only part that holds the
+   phrase or a key.
+2. **A wallet window in wm's page:** HTML and plain JavaScript, as the
+   page is now, on a WebSocket of its own (`/wallet`). wm starts
+   `wallet` for it, on a pipe rather than a pty, and passes JSON both
+   ways: the window asks (the balance, a payment, an address), the
+   program answers and tells (a payment arrived, the tip moved). The
+   window keeps nothing: closing it loses nothing, and a password typed
+   in it goes to `wallet` and no further.
+3. **The node**, as it is: the chain, the pool, the network. The wallet
+   asks the API for what it needs; scanning for its outputs is the
+   heaviest (every output's memo since its last scan, `/v1/outputs`).
+
+So the browser shows the wallet but never holds it; the OS does, as it
+holds the node.
+
+## What it does
+
+As tabminer's wallet commands, in screens:
+- **Overview:** confirmed, pending, unverified, reserved and locked
+  funds; the tip and the node's state.
+- **Receive:** this wallet's address (and a name pointing at it); slates
+  answered as they come; a slate file to answer.
+- **Send:** to an address, a `@name`, or a slate file; the fee as a
+  speed (a block, an hour, a day, economy) with its rate and wait;
+  `finalize` for a file answered.
+- **Activity:** payments sent and received, burns; each one's state;
+  `cancel` and `bump` while unconfirmed; a payment's proof.
+- **Names:** register, update, sub-names.
+- **Settings:** the phrase (behind the password), the password, restore
+  from a phrase (`scan`).
+
+## What has to be built
+
+In fam, each ported from tabminer and checked against vectors it writes
+(as the node's modules are):
+- **BIP39:** the word list, the checksum, the seed (PBKDF2-HMAC-SHA512,
+  2,048 rounds). SHA-512 is new to the OS.
+- **Keys:** H(master, nonce) (Poseidon2, which the node has), the memo
+  and its tag, and recognising an output by its memo.
+- **XMSS signing:** a key's tree and a leaf's signature. The node has
+  verification (`xmss.fam`); signing and the leaf bookkeeping (never a
+  leaf twice, written before a signature leaves) are new.
+- **Transactions and slates:** building, encoding, the checks
+  `finalize` makes; the wallet's records, written in one store
+  transaction with the signatures they hold (as tabminer's).
+- **ML-DSA:** receipts signed (receiving) and checked (sending); the
+  address. New, and heavier than anything the node runs.
+- **ChaCha20-Poly1305 and PBKDF2:** the phrase at rest.
+- **The message layer** (online payments): ML-KEM, circuits,
+  rendezvous sessions (`docs/ONION.md`). The largest part; tabminer's
+  `onion.rs`, `node/participant.rs` and `channel.rs` together.
+- **wm:** the `/wallet` WebSocket on a pipe, the window kind, its page.
+
+The node needs little: what it serves already, perhaps a way to scan
+memos faster than every output in order.
+
+## Phases proposed
+
+1. **A wallet of its own, by files:** create or restore from a phrase,
+   scan, balance and activity; receive and send by slate files; fees;
+   cancel and bump. Everything but the message layer. A tabminer wallet
+   and this one pay each other by files.
+2. **Payments and names in full:** proofs of payment, burns, names and
+   sub-names.
+3. **Online payments:** the message layer, so `send` to an address or a
+   name needs no file.
+
+Each phase ends with tests as the node's: vectors from tabminer for every
+primitive, then a tabminer wallet and this one paying each other on the
+recursive dev network, in both directions.
+
+## To decide
+
+1. **Where the wallet runs.** In the OS, in fam (above), or in the page
+   (JavaScript in the browser, keys in the browser's storage). The
+   first keeps keys with the node and off whatever machine shows the
+   page; the second is much less to build (the crypto exists for the
+   browser) but puts keys in the browser.
+2. **What is encrypted at rest.** The phrase alone, as tabminer's, or
+   the whole wallet (its records say who was paid what).
+3. **One wallet or several:** one per OS user, or any number named at
+   creation.
+4. **The message layer:** in the first phase (online payments from the
+   start, much more to build first) or the third (files first).
+5. **Who may open it:** wm's page is reachable by whoever reaches its
+   port; the wallet should ask for its password at least when opened,
+   and perhaps the OS login first.
