@@ -198,19 +198,6 @@ hn @ 3 lit - 0 lit do
 		if hbuf @ i + 4 lit + hres ! then
 	then
 loop ;
-\ hget ( path -- body | 0 )  a GET answered 200: its body, NUL-ended.
-: hget
-hpath !  0 lit hn !  0 lit hres !
-2 lit socket hs !
-hs @ 2 lit 7F000001 lit E9A lit net 0< 0= if
-	hreq @ "GET " scpy hpath @ scpy " HTTP/1.0" scpy wcrlf wcrlf hreq @ -
-	hs @ hreq @ rot write drop
-	begin hs @ hbuf @ hn @ + HMAX 1 lit - hn @ - read  dup 0 lit > while hn @ + hn ! repeat drop
-	0 lit hbuf @ hn @ + c!
-	hn @ C lit u< 0= if hbuf @ 9 lit + "200" 3 lit wssame if hbody then then
-then
-hs @ close drop  hres @ ;
-
 \ Numbers of 64 bits, as nlo and dhi.
 : nlo variable ;  : nhi variable ;  : ndc variable ;  : nla variable ;  : nlb variable ;  : nca variable ;  : ncb variable ;
 : nls variable ;  : nc1 variable ;  : nc2 variable ;  : nq0 variable ;  : nq1 variable ;  : nq2 variable ;  : nq3 variable ;
@@ -249,6 +236,31 @@ ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ jc  ndn @ 1 lit - i - A lit = if 2E
 : dstr  -rot 1 lit ddig  ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ over c!  1 lit + loop  0 lit over c! ;
 \ jhexb ( a dst n -- )  n bytes from 2n hex digits at a.
 : jhexb  0 lit do over i 1 lit lshift + c@ jhx 4 lit lshift  2 lit pick i 1 lit lshift + 1 lit + c@ jhx or  over i + c! loop 2drop ;
+
+\ hask ( method path body n -- body | 0 )  a request (a body of n bytes
+\ unless n is 0) answered: its body, NUL-ended; the status in hcode (0:
+\ the node not reached).
+: hcode variable ;  : hmeth variable ;  : hbd variable ;  : hbn variable ;
+: hask
+hbn !  hbd !  hpath !  hmeth !  0 lit hn !  0 lit hres !  0 lit hcode !
+2 lit socket hs !
+hs @ 2 lit 7F000001 lit E9A lit net 0< 0= if
+	hreq @ hmeth @ scpy " " scpy hpath @ scpy " HTTP/1.0" scpy wcrlf
+	hbn @ if "Content-Length: " scpy hbn @ 0 lit rot dstr wcrlf then
+	wcrlf hreq @ -
+	hs @ hreq @ rot write drop
+	hbn @ if hs @ hbd @ hbn @ write drop then
+	begin hs @ hbuf @ hn @ + HMAX 1 lit - hn @ - read  dup 0 lit > while hn @ + hn ! repeat drop
+	0 lit hbuf @ hn @ + c!
+	hn @ C lit u< 0= if
+		hbuf @ 9 lit + c@ 30 lit - 64 lit *  hbuf @ A lit + c@ 30 lit - A lit * +  hbuf @ B lit + c@ 30 lit - + hcode !
+		hbody
+	then
+then
+hs @ close drop  hres @ ;
+\ hget ( path -- body | 0 )  a GET answered 200: its body.
+: hget  "GET" swap 0 lit 0 lit hask  hcode @ C8 lit = and ;
+
 \ ── The outputs: records "o" || commitment (33 bytes), 48 bytes each ──
 \ +0 the nonce (4 canonical words), +10 the amount, +18 the position (8;
 \ all ones: not yet in the set), +20 the height it was made at, +24 the
@@ -259,7 +271,7 @@ ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ jc  ndn @ 1 lit - i - A lit = if 2E
 : okey variable ;  : orec variable ;  : wkl variable ;  : sgen variable ;
 : ecom variable ;  : emem variable ;  : eamt variable ;  : epos variable ;  : eh variable ;  : ecb variable ;
 : xk variable ;  : wxpk variable ;  : kseed variable ;  : scur variable ;  : scnt variable ;  : sfrom variable ;
-: ltip variable ;  : lh variable ;  : nodeok variable ;  : okn variable ;  : ppath variable ;
+: ltip variable ;  : ntip variable ;  : lh variable ;  : nodeok variable ;  : okn variable ;  : ppath variable ;
 \ wgetk ( key klen buf n -- vlen )  in the writer's transaction.
 : wgetk  wf2 !  wf1 !  wkl !  wgk !  wtx @ wgk @ wkl @ wf1 @ wf2 @ txget ;
 : wsetk  wf2 !  wf1 !  wkl !  wgk !  wtx @ wgk @ wkl @ wf1 @ wf2 @ txput drop ;
@@ -267,7 +279,7 @@ ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ jc  ndn @ 1 lit - i - A lit = if 2E
 \ known one's position and scan noted; an unknown one with this wallet's
 \ tag, its key derived and its commitment checked, recorded as found.
 : wone
-79 lit okey @ c!  ecom @ okey @ 1 lit + 20 lit bcopy
+6F lit okey @ c!  ecom @ okey @ 1 lit + 20 lit bcopy
 okey @ 21 lit orec @ 30 lit wgetk 30 lit = if
 	epos @ orec @ 18 lit + 8 lit bcopy  eh @ @ orec @ 20 lit + !  sgen @ orec @ 28 lit + !
 	okey @ 21 lit orec @ 30 lit wsetk
@@ -307,8 +319,8 @@ scnt @ ;
 \ wspent  the outputs once in the set and not seen by this scan: spent.
 : wspent
 wbeg
-79 lit okey @ c!  1 lit
-begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 79 lit = else 0 lit then while
+6F lit okey @ c!  1 lit
+begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then while
 	drop  okn @ okey @ 21 lit bcopy
 	okey @ 21 lit orec @ 30 lit wgetk drop
 	orec @ 1C lit + @ FFFFFFFF lit <>  orec @ 28 lit + @ sgen @ <> and  orec @ 24 lit + c@ 2 lit <> and if
@@ -333,45 +345,382 @@ nodeok @ ;
 have @ if
 	"/v1/status" hget ?dup if
 		dup "'height':" jfind jnum drop nlo @ lh !
-		"'tip':'" jfind wtmp @ 40 lit bcopy  0 lit wtmp @ 40 lit + c!
-		wtmp @ ltip @ streq 0= if
+		"'tip':'" jfind ntip @ 40 lit bcopy  0 lit ntip @ 40 lit + c!
+		ntip @ ltip @ streq 0= if
 			wscan if
-				ltip @ wtmp @ scpy drop
+				ltip @ ntip @ scpy drop
 				"{'event':'tip','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw "'}" jo jend
 			then
 		then
 	else 0 lit nodeok ! then
 then ;
-\ wsum ( state pend acc -- )  the amounts of the outputs in a state added
-\ up at acc (8 bytes): pend 0 those in the set, 1 those not yet, 2 both.
-: sst variable ;  : sacc variable ;  : spend variable ;
-: wsum
-sacc !  spend !  sst !
-0 lit sacc @ !  0 lit sacc @ 4 lit + !
+: wsum.  dup @ swap 4 lit + @ wamt ;                      \ ( acc -- )  written
+
+: nowal  "no wallet yet: create or restore one" jerr ;
+
+\ ── Payments (step 3): files, amounts, new outputs ──
+
+: fbuf variable ;  : fn variable ;  : ffd variable ;
+:M FMAX 8000 lit ;
+\ fread ( path -- n | -1 )  a file of FMAX bytes at most into fbuf.
+: fread
+0 lit open dup ffd !  0< if FFFFFFFF lit else
+	0 lit fn !
+	begin ffd @ fbuf @ fn @ + FMAX fn @ - read  dup 0 lit > fn @ FMAX u< and while fn @ + fn ! repeat drop
+	ffd @ close drop  fn @
+then ;
+\ fwrite ( path a n -- ok )  a file written whole (made, or emptied).
+: fwa variable ;  : fwn variable ;
+: fwrite
+fwn !  fwa !  1 lit CREATE or TRUNC or open dup ffd !
+0< if 0 lit else ffd @ fwa @ fwn @ write fwn @ =  ffd @ close drop then ;
+
+\ Amounts, 8 bytes at an address.
+: aa variable ;  : ab variable ;  : ad variable ;
+\ a8add ( a b dst -- )  dst = a + b; a8sub ( a b dst -- ) dst = a - b.
+: a8add
+ad !  ab !  aa !
+aa @ @ ab @ @ +  dup aa @ @ u< 1 lit and  aa @ 4 lit + @ +  ab @ 4 lit + @ +
+ad @ 4 lit + !  ad @ ! ;
+: a8sub
+ad !  ab !  aa !
+aa @ @ ab @ @ -  aa @ @ ab @ @ u< 1 lit and  aa @ 4 lit + @ ab @ 4 lit + @ - swap -
+ad @ 4 lit + !  ad @ ! ;
+\ a8lt ( a b -- flag )  a below b.
+: a8lt
+ab !  aa !
+aa @ 4 lit + @ ab @ 4 lit + @ = if aa @ @ ab @ @ u< else aa @ 4 lit + @ ab @ 4 lit + @ u< then ;
+\ a8set ( lo hi dst -- )
+: a8set  ad !  ad @ 4 lit + !  ad @ ! ;
+
+\ jcoins ( s dst -- ok )  coins as text (up to ten decimals) into base
+\ units at dst.
+: jcs variable ;  : jcd variable ;  : jcn variable ;  : jcf variable ;  : jck variable ;
+: jcs+  jcs @ 1 lit + jcs ! ;
+: jdig?  jcs @ c@ 30 lit - A lit u< ;
+: jcoins
+jcd !  jcs !  0 lit nlo !  0 lit nhi !  0 lit jcn !  0 lit jcf !  -1 lit jck !
+begin jdig? while jcs @ c@ 30 lit - d10+ jcs+ jcn @ 1 lit + jcn ! repeat
+jcs @ c@ 2E lit = if
+	jcs+
+	begin jdig? while jcs @ c@ 30 lit - d10+ jcs+ jcn @ 1 lit + jcn !  jcf @ 1 lit + jcf ! repeat
+then
+jcf @ A lit u> if 0 lit jck ! then
+jcs @ c@ if 0 lit jck ! then
+jcn @ 0= if 0 lit jck ! then
+jck @ if A lit jcf @ - ?dup if 0 lit do 0 lit d10+ loop then then
+nlo @ nhi @ jcd @ a8set  jck @ ;
+
+\ wrfp ( a -- )  a random field element (below p) at a.
+: wrfp
+begin wtmp @ 4 lit wrand  wtmp @ @ 7FFFFFFF lit and  dup 78000001 lit u< 0= while drop repeat
+swap ! ;
+\ wnew ( amt kind -- )  a new output of this wallet's, in the writer's
+\ transaction: a random nonce, its key, its memo; onew the output (60
+\ bytes), ecom its commitment; recorded as not yet in the set (kind: 0
+\ found, 1 received by an answer, 2 change).
+: wna variable ;  : wnk variable ;  : nb variable ;  : wmb variable ;  : onew variable ;
+: wnew
+wnk !  wna !
+4 lit 0 lit do nb @ i 2 lit lshift + wrfp loop
+nb @ wknon  kseed @ wkkey  kseed @ 4 lit xk @ xkgen  xk @ wxpk @ xkpub  wmb @ wkmemo
+wxpk @ wna @ wmb @ onew @ wsmkout
+wxpk @ wna @ ecb @ wkcom  ecb @ ecom @ wkcan
+orec @ 30 lit 0 lit do 0 lit over i + c! loop drop
+nb @ orec @ 10 lit bcopy  wna @ orec @ 10 lit + 8 lit bcopy
+FFFFFFFF lit orec @ 18 lit + !  FFFFFFFF lit orec @ 1C lit + !  wnk @ orec @ 29 lit + c!
+6F lit okey @ c!  ecom @ okey @ 1 lit + 20 lit bcopy
+okey @ 21 lit orec @ 30 lit wsetk ;
+
+\ wrget ( key klen buf n -- vlen )  one record, read in a snapshot.
+: wrget  wf2 !  wf1 !  wkl !  wgk !  wfd @ 0 lit txbegin  dup wgk @ wkl @ wf1 @ wf2 @ txget  swap txabort drop ;
+\ jhex ( a n -- )  n bytes written in hex.
+: jhd  F lit and dup A lit u< if 30 lit + else 57 lit + then jc ;
+: jhex  ?dup if 0 lit do dup i + c@ dup 4 lit rshift jhd jhd loop then drop ;
+: a8.  dup @ swap 4 lit + @ wamt ;                     \ ( a -- )  in coins, written
+: fpath variable ;  : fout variable ;  : fpn variable ;
+
+\ oanswer ( line -- )  a payer's slate (stage 1) answered: this wallet's
+\ output added and recorded, its receipt signed, the answer written to
+\ the file's name and ".received" (as tabminer's receive).
+: oanswer
+have @ 0= if drop nowal else
+"'slate':'" fpath @ 100 lit jstr 0= if "no slate file" jerr else
+fpath @ fread fpn !  fpn @ 0< if "the slate file cannot be read" jerr else
+fbuf @ fpn @ wsparse 0= if "not a slate" jerr else
+wsstg @ 1 lit <> if "not a slate to answer" jerr else
+wsnout @ wschg @ <> if "the slate is answered already" jerr else
+	waddr!
+	wbeg  wsa @ 49 lit + 1 lit wnew  wend
+	if
+		onew @ wsk @ wpk @ wsans fpn !
+		fout @ fpath @ scpy ".received" scpy drop
+		fout @ wsbuf @ fpn @ fwrite if
+			jok ",'slate':'" jo fout @ jraw "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
+		else "the answer cannot be written" jerr then
+	else "the wallet could not be written" jerr then
+then then then then then then ;
+
+\ The fees: /v1/fees's rates (a byte) for a block, an hour, a day, and
+\ economy.
+: frk variable ;
+\ frate ( body speed -- rate )  a speed's rate (10, the floor, if unknown).
+: frate
+frk @ "'" scpy swap scpy "':{'rate':" scpy drop
+frk @ jfind ?dup if jnum drop nlo @ else A lit then ;
+: ofees
+"/v1/fees" hget ?dup 0= if "the node is not reached" jerr else
+	jok ",'speeds':[{'speed':'block','rate':" jo dup "block" frate 0 lit wdec
+	",'wait':600},{'speed':'hour','rate':" jo dup "hour" frate 0 lit wdec
+	",'wait':3600},{'speed':'day','rate':" jo dup "day" frate 0 lit wdec
+	",'wait':86400},{'speed':'economy','rate':" jo "economy" frate 0 lit wdec ",'wait':604800}]}" jo jend
+then ;
+
+\ The coins to spend: sel, entries of 40 bytes (the commitment, the
+\ amount), largest first; nsel of them.
+: sel variable ;  : nsel variable ;  : se variable ;  : sk variable ;
+: selent  6 lit lshift sel @ + ;                         \ ( i -- a )
+\ wsels  the confirmed unspent outputs gathered (64 at most), sorted.
+: wsels
+0 lit nsel !
 wfd @ 0 lit txbegin wtx !
-79 lit okey @ c!  1 lit
-begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 79 lit = else 0 lit then while
+6F lit okey @ c!  1 lit
+begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then while
 	drop  okn @ okey @ 21 lit bcopy
 	okey @ 21 lit orec @ 30 lit wgetk drop
-	orec @ 24 lit + c@ sst @ =
-	spend @ 2 lit =  orec @ 1C lit + @ FFFFFFFF lit = 1 lit and spend @ = or  and if
-		orec @ 10 lit + @ sacc @ @ + dup sacc @ @ u< 1 lit and  orec @ 14 lit + @ + sacc @ 4 lit + @ + sacc @ 4 lit + !  sacc @ !
+	orec @ 24 lit + c@ 0=  orec @ 1C lit + @ FFFFFFFF lit <> and  nsel @ 40 lit u< and if
+		okey @ 1 lit + nsel @ selent 20 lit bcopy  orec @ 10 lit + nsel @ selent 20 lit + 8 lit bcopy
+		nsel @ 1 lit + nsel !
 	then
 	21 lit
 repeat drop
+wtx @ txabort drop
+\ largest first: each place takes the largest of those after it
+nsel @ ?dup if 0 lit do
+	i se !
+	nsel @ i do  se @ selent 20 lit + i selent 20 lit + a8lt if i se ! then  loop
+	se @ i <> if
+		i selent wtmp @ 40 lit bcopy  se @ selent i selent 40 lit bcopy  wtmp @ se @ selent 40 lit bcopy
+	then
+loop then ;
+
+\ The payment's numbers, 8 bytes each: the amount, the fee, what is
+\ needed, what the coins picked hold, the change; the rate, the inputs.
+: samt variable ;  : sfee variable ;  : sneed variable ;  : stot variable ;  : schg variable ;
+: srate variable ;  : snin variable ;  : spick variable ;  : sdone variable ;  : sdust variable ;
+: pend variable ;  : sid variable ;  : ssec variable ;  : ssnd variable ;  : pkb variable ;
+\ spick! ( -- )  coins taken largest first until they hold sneed: spick of
+\ them, stot their sum.
+: spick!
+0 lit spick !  0 lit stot @ !  0 lit stot @ 4 lit + !
+begin spick @ nsel @ u<  stot @ sneed @ a8lt and while
+	stot @ spick @ selent 20 lit + stot @ a8add  spick @ 1 lit + spick !
+repeat ;
+\ wfee  sfee = the rate times a payment's size with snin inputs (16 +
+\ 2,377 each + two outputs of 60), sneed = samt + sfee.
+: wfee  snin @ 949 lit * 88 lit +  srate @ *  0 lit sfee @ a8set  samt @ sfee @ sneed @ a8add ;
+\ wpkof ( commitment dst -- )  an output's public key (49 bytes): its key
+\ derived from its record's nonce.
+: wpkof
+swap 6F lit okey @ c!  okey @ 1 lit + 20 lit bcopy
+okey @ 21 lit orec @ 30 lit wrget drop
+orec @ wknon  kseed @ wkkey  kseed @ 4 lit xk @ xkgen  xk @ swap xkpub ;
+\ osend ( line -- )  a payment begun by file: coins picked, change made,
+\ the coins reserved and the payment recorded in one transaction, the
+\ stage-1 slate written for the recipient.  The sender is unnamed (the
+\ hash of a secret kept, docs/PRIVACY.md).
+: osend
+have @ 0= if drop nowal else
+dup "'amount':'" wtmp @ 40 lit jstr  wtmp @ samt @ jcoins and 0= if drop "not an amount" jerr else
+samt @ sdust @ a8lt if drop "the amount is below the dust limit" jerr else
+dup "'slate':'" fpath @ 100 lit jstr 0= if drop "no slate file" jerr else
+"'speed':'" wtmp @ 20 lit jstr drop
+"/v1/fees" hget ?dup if wtmp @ frate else A lit then srate !
+wsels
+1 lit snin !  0 lit sdone !
+begin sdone @ 0= while
+	wfee spick!
+	stot @ sneed @ a8lt if 2 lit sdone ! else
+	spick @ snin @ u> if spick @ snin ! else 1 lit sdone ! then then
+repeat
+sdone @ 2 lit = if "not enough confirmed coins" jerr else
+	\ the change, or below the dust limit, the fee's
+	stot @ sneed @ schg @ a8sub
+	schg @ sdust @ a8lt if sfee @ schg @ sfee @ a8add  0 lit 0 lit schg @ a8set then
+	sid @ 20 lit wrand  ssec @ 20 lit wrand  ssec @ wsd @ wstag  wsd @ ssnd @ wkcan
+	\ the record: inputs, change, amount, fee, sender, secret, change's
+	\ commitment, the inputs' commitments
+	pend @ 78 lit 0 lit do 0 lit over i + c! loop drop
+	spick @ pend @ !  samt @ pend @ 8 lit + 8 lit bcopy  sfee @ pend @ 10 lit + 8 lit bcopy
+	ssnd @ pend @ 18 lit + 20 lit bcopy  ssec @ pend @ 38 lit + 20 lit bcopy
+	spick @ 0 lit do i selent pend @ 78 lit + i 5 lit lshift + 20 lit bcopy loop
+	wbeg
+	schg @ @ schg @ 4 lit + @ or if
+		schg @ 2 lit wnew  1 lit pend @ 4 lit + !  ecom @ pend @ 58 lit + 20 lit bcopy
+	then
+	spick @ 0 lit do
+		6F lit okey @ c!  i selent okey @ 1 lit + 20 lit bcopy
+		okey @ 21 lit orec @ 30 lit wgetk drop  1 lit orec @ 24 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
+	loop
+	73 lit okey @ c!  sid @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit pend @ 78 lit spick @ 5 lit lshift + wsetk
+	wend if
+		\ the slate: its inputs' keys derived, its change
+		sid @ ssnd @ samt @ sfee @ wsbeg
+		spick @ 0 lit do  i selent pkb @ wpkof  pkb @ i selent 20 lit + wsaddin  loop
+		pend @ 4 lit + @ if onew @ wsaddout then
+		pend @ 4 lit + @ wsfix fpn !
+		fpath @ wsbuf @ fpn @ fwrite if
+			jok ",'slate':'" jo fpath @ jraw "','fee':'" jo sfee @ a8. "'}" jo jend
+		else "the slate cannot be written" jerr then
+	else "the wallet could not be written" jerr then
+then
+then then then then ;
+
+\ ofinal ( line -- )  the recipient's answer finalized: tabminer's checks
+\ against the payment's record (wsfin); each input's next leaf recorded as
+\ used, committed, before any signature is made; the transaction signed
+\ and sent to the node; accepted, the inputs spent, the payment recorded.
+: fkeys variable ;  : fka variable ;  : flv variable ;  : fps variable ;  : pins variable ;  : fchg variable ;
+: fcode variable ;  : fnin variable ;  : ftx variable ;  : fbad variable ;
+\ wfmsg ( code -- )  wsfin's refusal answered.
+: wfmsg
+dup 1 lit = if drop "not an answered slate" else dup 2 lit = if drop "its inputs changed" else
+dup 3 lit = if drop "no output for the recipient" else dup 4 lit = if drop "its amount or fee changed" else
+dup 5 lit = if drop "its amounts do not balance" else dup 6 lit = if drop "its change changed" else
+dup 7 lit = if drop "an output is zero or below the dust limit" else dup 8 lit = if drop "it is too large" else
+9 lit = if "not one output for the recipient" else "the receipt does not hold" then
+then then then then then then then then jerr ;
+: ofinal
+have @ 0= if drop nowal else
+"'slate':'" fpath @ 100 lit jstr 0= if "no slate file" jerr else
+fpath @ fread fpn !  fpn @ 0< if "the slate file cannot be read" jerr else
+fbuf @ fpn @ wsparse 0= if "not a slate" jerr else
+73 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy
+okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr else
+	pend @ @ fnin !  0 lit fbad !
+	\ the inputs: keys, public keys and amounts, leaves, positions
+	fnin @ 0 lit do
+		6F lit okey @ c!  pend @ 78 lit + i 5 lit lshift + okey @ 1 lit + 20 lit bcopy
+		okey @ 21 lit orec @ 30 lit wrget drop
+		orec @ wknon  kseed @ wkkey  fkeys @ i 440 lit * + dup fka @ i 2 lit lshift + !
+		kseed @ 4 lit rot xkgen
+		fka @ i 2 lit lshift + @ pins @ i 39 lit * + xkpub  orec @ 10 lit + pins @ i 39 lit * + 31 lit + 8 lit bcopy
+		orec @ 18 lit + fps @ i 3 lit lshift + 8 lit bcopy
+		orec @ 26 lit + c@ 8 lit u< 0= if 1 lit fbad ! then
+		orec @ 25 lit + c@ orec @ 26 lit + c@ + 7 lit and  orec @ 27 lit + c@ if 8 lit + then  flv @ i 2 lit lshift + !
+	loop
+	\ the change output as made
+	0 lit fchg !
+	pend @ 4 lit + @ if
+		pend @ 58 lit + pkb @ wpkof
+		orec @ wknon  wmb @ wkmemo  pkb @ orec @ 10 lit + wmb @ onew @ wsmkout  onew @ fchg !
+	then
+	fbad @ if "an input has signed all it may" jerr else
+	pins @ fnin @ pend @ 8 lit + pend @ 10 lit + fchg @ pend @ 18 lit + wsfin dup fcode !
+	if fcode @ wfmsg else
+		\ the leaves used, recorded before any signature
+		wbeg
+		fnin @ 0 lit do
+			6F lit okey @ c!  pend @ 78 lit + i 5 lit lshift + okey @ 1 lit + 20 lit bcopy
+			okey @ 21 lit orec @ 30 lit wgetk drop
+			orec @ 26 lit + c@ 1 lit + orec @ 26 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
+		loop
+		wend 0= if "the wallet could not be written" jerr else
+			fka @ flv @ fps @ wstx ftx !
+			"POST" "/v1/tx" wstxb @ ftx @ hask
+			hcode @ C8 lit = if
+				drop
+				\ spent, the payment recorded (by its id: the body hash)
+				wsd @ wsbody  wsd @ ecb @ wkcan
+				wbeg
+				fnin @ 0 lit do
+					6F lit okey @ c!  pend @ 78 lit + i 5 lit lshift + okey @ 1 lit + 20 lit bcopy
+					okey @ 21 lit orec @ 30 lit wgetk drop  2 lit orec @ 24 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
+				loop
+				73 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
+				orec @ 30 lit 0 lit do 0 lit over i + c! loop drop
+				pend @ 8 lit + orec @ 8 lit bcopy  pend @ 10 lit + orec @ 8 lit + 8 lit bcopy
+				wsouts @ wschg @ 3C lit * + wsd @ wsocom  wsd @ orec @ 10 lit + wkcan
+				70 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit orec @ 30 lit wsetk
+				wend drop
+				jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo pend @ 10 lit + a8. "'}" jo jend
+			else
+				?dup if "'reason':'" wtmp @ 100 lit jstr drop "the node refused it: " wtmp @ 100 lit + swap scpy wtmp @ scpy drop wtmp @ 100 lit + jerr
+				else "the node is not reached" jerr then
+			then
+		then
+	then then
+then then then then then ;
+
+\ hexs ( a n dst -- )  n bytes in hex, a string at dst.
+: hxd  F lit and dup A lit u< if 30 lit + else 57 lit + then ;
+: hexs
+swap ?dup if 0 lit do over i + c@ dup 4 lit rshift hxd 2 lit pick c!  hxd over 1 lit + c!  2 lit + loop then
+0 lit swap c!  drop ;
+\ oact  the activity: payments sent (by their id; pending while the
+\ node's pool holds them), outputs received (by their commitment).
+: anum variable ;
+: oact
+have @ 0= if nowal else
+	"/v1/mempool" hget wtmp @ !
+	jok ",'items':[" jo  0 lit anum !
+	wfd @ 0 lit txbegin wtx !
+	70 lit okey @ c!  1 lit
+	begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 70 lit = else 0 lit then  anum @ 10 lit u< and while
+		drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit orec @ 30 lit wgetk drop
+		anum @ if "," jo then  anum @ 1 lit + anum !
+		"{'tx':'" jo okey @ 1 lit + 20 lit jhex "','kind':'sent','amount':'" jo orec @ a8. "','state':'" jo
+		okey @ 1 lit + 20 lit fout @ hexs
+		wtmp @ @ ?dup if fout @ jfind else 0 lit then if "pending" else "confirmed" then jo "','height':0}" jo
+		21 lit
+	repeat drop
+	6F lit okey @ c!  1 lit
+	begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then  anum @ 10 lit u< and while
+		drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit orec @ 30 lit wgetk drop
+		orec @ 29 lit + c@ 2 lit <> if
+			anum @ if "," jo then  anum @ 1 lit + anum !
+			"{'tx':'" jo okey @ 1 lit + 20 lit jhex "','kind':'received','amount':'" jo orec @ 10 lit + a8.
+			"','state':'" jo orec @ 1C lit + @ FFFFFFFF lit = if "pending" else "confirmed" then jo
+			"','height':" jo orec @ 20 lit + @ 0 lit wdec "}" jo
+		then
+		21 lit
+	repeat drop
+	wtx @ txabort drop
+	"]}" jo jend
+then ;
+
+\ wsums  the balance in tabminer's five sums (wallet.rs's Balance), 8
+\ bytes each: sa1 confirmed (unspent, in the set), sa2 pending (unspent,
+\ not yet in it: change, rewards), sa4 unverified (an output added to
+\ another's slate, not yet in the set), sa3 reserved (picked for a slate,
+\ not signed), sa5 locked (signed away, still in the set).
+: sa1 variable ;  : sa2 variable ;  : sa3 variable ;  : sa4 variable ;  : sa5 variable ;  : sacc variable ;
+: a8z  0 lit over !  0 lit swap 4 lit + ! ;               \ ( a -- )
+: wsums
+sa1 @ a8z  sa2 @ a8z  sa3 @ a8z  sa4 @ a8z  sa5 @ a8z
+wfd @ 0 lit txbegin wtx !
+6F lit okey @ c!  1 lit
+begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then while
+	drop  okn @ okey @ 21 lit bcopy
+	okey @ 21 lit orec @ 30 lit wgetk drop
+	0 lit sacc !
+	orec @ 24 lit + c@ dup 0= if
+		drop orec @ 1C lit + @ FFFFFFFF lit <> if sa1 else orec @ 29 lit + c@ 1 lit = if sa4 else sa2 then then @ sacc !
+	else 1 lit = if sa3 @ sacc ! else
+		orec @ 1C lit + @ FFFFFFFF lit <>  orec @ 28 lit + @ sgen @ = and if sa5 @ sacc ! then
+	then then
+	sacc @ if orec @ 10 lit + sacc @ sacc @ a8add then
+	21 lit
+repeat drop
 wtx @ txabort drop ;
-: wsum.  dup @ swap 4 lit + @ wamt ;                      \ ( acc -- )  written
 
 \ ── The requests ──
 
 : tried variable ;
-: nowal  "no wallet yet: create or restore one" jerr ;
-: sa1 variable ;  : sa2 variable ;  : sa3 variable ;
 : oview
-wtick
-0 lit 0 lit sa1 @ wsum  0 lit 1 lit sa2 @ wsum  1 lit 2 lit sa3 @ wsum
-jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'0.0000000000','reserved':'" jo sa3 @ wsum.
-"','locked':'0.0000000000','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo "'}" jo jend ;
+wtick  wsums
+jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'" jo sa4 @ wsum.  "','reserved':'" jo sa3 @ wsum.
+"','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo "'}" jo jend ;
 \ oscan  the whole set scanned again now; the tip and the scan told.
 : oscan
 have @ 0= if nowal else
@@ -435,10 +784,14 @@ else drop "locked" jerr then ;
 "phrase" op? if ophrase else
 "unlock" op? if drop "unlocked already" jerr else
 "scan" op? if drop oscan else
-"fees" op? "send" op? or "answer" op? or "finalize" op? or "activity" op? or
-"cancel" op? or "bump" op? or if drop "not built yet" jerr else
+"fees" op? if drop ofees else
+"answer" op? if oanswer else
+"send" op? if osend else
+"finalize" op? if ofinal else
+"activity" op? if drop oact else
+"cancel" op? "bump" op? or if drop "not built yet" jerr else
 drop "unknown op" jerr
-then then then then then then then then ;
+then then then then then then then then then then then then then ;
 
 \ hline ( line -- )  a line read: only the first may unlock.
 : hline
@@ -466,8 +819,14 @@ wsinit  b39load drop  xkinit
 HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntmp !
 24 lit alloc okey !  24 lit alloc okn !  30 lit alloc orec !  20 lit alloc ecom !  14 lit alloc emem !  8 lit alloc eamt !
 8 lit alloc epos !  4 lit alloc eh !  40 lit alloc ecb !  4 lit xksize alloc xk !  34 lit alloc wxpk !  20 lit alloc kseed !
-8 lit alloc sfrom !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
+8 lit alloc sfrom !  48 lit alloc ntip !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
+8 lit alloc sa4 !  8 lit alloc sa5 !
 0 lit lh !  0 lit nodeok !
+FMAX alloc fbuf !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
+8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
+8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  20 lit alloc sid !  20 lit alloc ssec !
+20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
+440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
 : pfd variable ;  8 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
 0 lit icnt !  0 lit unl !  0 lit tried !  0 lit have !  FFFFFFFF lit wfd !  obuf @ opos !
 \ a line when one comes; the node every 4 s while none does

@@ -239,9 +239,17 @@ memos faster than every output in order.
    `restore`, `phrase`, `receive` (done 2026-11-10); 2 the node (its
    API, whose reads need no token since 2026-11-10): the unspent set
    scanned for the wallet's outputs, `overview`, `scan`, the tip told
-   (done 2026-11-10, `scripts/wallettest.sh`); 3 payments: `answer`,
-   `send`, `finalize`, `activity`; 4 a tabminer wallet and this one
-   paying each other on the recursive dev network.
+   (done 2026-11-10, `scripts/wallettest.sh`); 3 payments by file:
+   `answer` (the output and receipt added, `FILE.received` written, as
+   tabminer's `receive`), `send` (tabminer's coin choice and fee loop, an
+   unnamed sender, the coins reserved and the payment recorded in one
+   transaction), `finalize` (tabminer's checks; each input's leaf
+   recorded as used before any signature; the transaction to the node),
+   `activity`, `fees`, the overview in tabminer's five sums (done
+   2026-11-10: wallettest's two wallets in the OS pay each other, the
+   transaction mined; `cancel` and `bump` not yet); 4 a tabminer wallet
+   and this one paying each other on the recursive dev network (slate
+   files carried between the host and the OS: not yet).
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a
