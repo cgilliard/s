@@ -211,7 +211,13 @@ qroom ;
 
 \ qdrop ( k -- )  slot k emptied.
 \ qrel ( a -- )  slot a emptied, its other parts freed (its bytes not).
+: qsvd variable ;  : qpend variable ;  : qpn variable ;  : qpall variable ;  : qcwr variable ;
+\ qpq ( id -- )  a saved transaction's id, to be deleted from the store
+\ (qpersist); too many: all rewritten.
+: qpq  qpn @ 400 lit u< if qpend @ qpn @ 4 lit lshift + 10 lit bcopy  qpn @ 1 lit + qpn ! else drop -1 lit qpall ! then ;
 : qrel
+\ saved: its record to go
+dup qbase @ - 6 lit rshift 2 lit lshift qsvd @ +  dup @ if 0 lit swap !  dup 10 lit + qpq else drop then
 dup 30 lit + @ free  dup 34 lit + @ free
 qbytes @ over 4 lit + @ - qbytes !  qnum @ 1 lit - qnum !
 0 lit swap ! ;
@@ -246,7 +252,7 @@ qord @ qsav @ 38 lit + !  qord @ 1 lit + qord !  0 lit qsav @ 3C lit + !
 \ commitment), for the estimates. Its outputs are all made by the block
 \ that confirms it, so its first stands for all (tabminer's revalidate
 \ asks for every one). None: zeros.
-qsav @ qbase @ - 6 lit rshift  dup qnow swap 2 lit lshift qatm @ + !  0 lit over 2 lit lshift qctm @ + !
+qsav @ qbase @ - 6 lit rshift  dup qnow swap 2 lit lshift qatm @ + !  0 lit over 2 lit lshift qctm @ + !  0 lit over 2 lit lshift qsvd @ + !
 5 lit lshift qfo @ +  tnout @ if tcom @ over 8 lit wcopy dfrom else 20 lit 0 lit do 0 lit over i + c! loop drop then
 qbytes @ qsav @ 4 lit + @ + qbytes !  qnum @ 1 lit + qnum ! ;
 
@@ -339,6 +345,7 @@ then
 : qtot variable ;  : qyes variable ;  : qcont variable ;  : qend variable ;
 : qeinit
 QCN C lit * alloc qcr !  0 lit qcrn !  0 lit qcrh !
+QSLOTS 2 lit lshift alloc dup qsvd !  QSLOTS wzero  4000 lit alloc qpend !  0 lit qpn !  0 lit qpall !  0 lit qcwr !
 40000 lit malloc qhs !  QCN QSLOTS + 3 lit lshift alloc qsm !
 8 lit alloc qd1 !  8 lit alloc qd2 !  8 lit alloc qd3 !  8 lit alloc qd4 ! ;
 \ qrate ( k -- r )  slot k's rate: its fee over its size, base units a
@@ -353,7 +360,8 @@ if qd3 @ @ 1 lit + else qd3 @ @ then ;
 \ forgotten past QCN).
 : qremem
 qcrh @ qcrn @ +  dup QCN u< 0= if QCN - then  C lit * qcr @ +  tuck 8 lit + !  tuck 4 lit + !  !
-qcrn @ QCN u< if qcrn @ 1 lit + qcrn ! else qcrh @ 1 lit +  dup QCN = if drop 0 lit then qcrh ! then ;
+qcrn @ QCN u< if qcrn @ 1 lit + qcrn ! else qcrh @ 1 lit +  dup QCN = if drop 0 lit then qcrh ! then
+qcwr @ QCN u< if qcwr @ 1 lit + qcwr ! then ;
 \ qnote ( k -- )  slot k, leaving the pool: if seen confirmed, noted.
 : qnote
 dup 2 lit lshift qctm @ + @ ?dup if
@@ -498,3 +506,96 @@ QSHELF 0 lit do
 		dup @ over 4 lit + @  qmove  qadmit 0= if  dup @ free  0 lit swap !  qbk @ 1 lit + qbk ! else drop then
 	else drop then
 loop ;
+
+\ ── Kept across restarts (as tabminer saves its pool, confirmations too) ──
+\
+\ Each pooled transaction at 'P', its id (16 bytes), the chunk: its bytes
+\ in 1 KiB chunks, and at chunk FF its length and arrival; each
+\ confirmation at 'F', its index in the ring (2 bytes); the ring's count
+\ and head at meta 7A, 7B.  Written between steps (qpersist, called by
+\ sync.fam's nstep: never inside another's transaction); a transaction
+\ leaving the pool queues its record's deletion (qrel).  At a start
+\ (qload): the confirmations read back, and each transaction kept
+\ offered to the pool again against the state now, its arrival kept.
+: qpk variable ;  : qpa variable ;  : qpl variable ;  : qpid variable ;  : qpld variable ;
+: kpool  kb @ 11 lit + c!  kb @ 1 lit + 10 lit bcopy  50 lit kb @ c!  12 lit ;   \ ( id chunk -- klen )
+: kconf  kb @ 1 lit + 2 lit be!  46 lit kb @ c!  3 lit ;                           \ ( i -- klen )
+\ qpsave ( k -- )  slot k's transaction written.
+: qpsave
+dup qpk !  qslot dup 10 lit + qpid !  dup @ qpa !  4 lit + @ qpl !
+qpl @ sbuf @ !  qpk @ 2 lit lshift qatm @ + @ sbuf @ 4 lit + !
+qpid @ FF lit kpool sbuf @ 8 lit sput
+qpl @ 3FF lit + A lit rshift ?dup if 0 lit do
+	qpid @ i kpool  qpa @ i A lit lshift +  qpl @ i A lit lshift - 400 lit umin  sput
+loop then ;
+\ qpdel ( id -- )  a transaction's record deleted.
+: qpdel
+dup FF lit kpool sbuf @ 8 lit sget 8 lit = if
+	sbuf @ @ 3FF lit + A lit rshift ?dup if 0 lit do dup i kpool sdel loop then
+	FF lit kpool sdel
+else drop then ;
+\ qpwork ( -- flag )  anything to write.
+: qpwork
+qpall @ qpn @ or qcwr @ or
+QSLOTS 0 lit do i qused  i 2 lit lshift qsvd @ + @ 0= and or loop ;
+: qpersist
+qpwork if
+	stfd @ 1 lit txbegin stx !
+	qpall @ if
+		\ every record gone, every transaction written again
+		50 lit kb @ c!  1 lit
+		begin knext dup 12 lit = if drop kb2 @ c@ 50 lit = else drop 0 lit then while
+			kb2 @ kb @ 12 lit bcopy  12 lit sdel  12 lit
+		repeat
+		qsvd @ QSLOTS wzero  0 lit qpall !
+	else qpn @ ?dup if 0 lit do qpend @ i 4 lit lshift + qpdel loop then then
+	0 lit qpn !
+	QSLOTS 0 lit do
+		i qused  i 2 lit lshift qsvd @ + @ 0= and if i qpsave  1 lit i 2 lit lshift qsvd @ + ! then
+	loop
+	\ the confirmations noted since
+	qcwr @ qcrn @ umin ?dup if 0 lit do
+		qcrh @ qcrn @ + 1 lit - i -  dup QCN u< 0= if QCN - then
+		dup kconf  swap C lit * qcr @ +  C lit sput
+	loop then
+	qcrn @ 7A lit mput  qcrh @ 7B lit mput  0 lit qcwr !
+	stx @ txcommit drop
+then ;
+\ qload  the confirmations and transactions kept, at a start; says how
+\ many transactions came back.
+: qlb variable ;  : qln variable ;  : qlok variable ;  : qarv variable ;
+: qload
+QSLOTS 4 lit lshift malloc qlb !  0 lit qln !
+stfd @ 0 lit txbegin stx !
+7A lit mget QCN umin qcrn !  7B lit mget dup QCN u< 0= if drop 0 lit then qcrh !
+qcrn @ ?dup if 0 lit do
+	qcrh @ i +  dup QCN u< 0= if QCN - then  dup kconf  swap C lit * qcr @ +  C lit sget drop
+loop then
+\ the ids kept (a record's chunk FF)
+50 lit kb @ c!  1 lit
+begin knext dup 12 lit = if drop kb2 @ c@ 50 lit = else drop 0 lit then while
+	kb2 @ 11 lit + c@ FF lit =  qln @ QSLOTS u< and if kb2 @ 1 lit + qlb @ qln @ 4 lit lshift + 10 lit bcopy  qln @ 1 lit + qln ! then
+	kb2 @ kb @ 12 lit bcopy  12 lit
+repeat
+stx @ txcommit drop
+0 lit qlok !
+qln @ ?dup if 0 lit do
+	qlb @ i 4 lit lshift + qpid !
+	stfd @ 0 lit txbegin stx !
+	qpid @ FF lit kpool sbuf @ 8 lit sget 8 lit = if
+		sbuf @ @ qpl !  sbuf @ 4 lit + @ qarv !
+		qpl @ malloc qpa !
+		qpl @ 3FF lit + A lit rshift ?dup if 0 lit do
+			qpid @ i kpool  qpa @ i A lit lshift +  400 lit sget drop
+		loop then
+	else 0 lit qpa ! then
+	stx @ txcommit drop
+	qpa @ if
+		qpa @ qpl @ qadmit 0= if
+			qid @ qfind  dup 0< if drop else  qarv @ over 2 lit lshift qatm @ + !  1 lit swap 2 lit lshift qsvd @ + !  then
+			qlok @ 1 lit + qlok !
+		else qpid @ qpq then
+		qpa @ free
+	then
+loop then
+qlb @ free ;

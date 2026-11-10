@@ -220,6 +220,8 @@ else
 	then
 	nhead "synced, height " puts myh @ u. 0A lit putc
 then
+\ the pool kept from before (pool.fam's qload), against the state now
+qload  qln @ if nhead "the pool: " puts qlok @ u. " of " puts qln @ u. " kept from before taken back" puts 0A lit putc then
 mapi @ ainit
 nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
 begin E10 lit aserve 0 lit until

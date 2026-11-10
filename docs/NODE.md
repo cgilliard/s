@@ -1311,6 +1311,18 @@ Each step done when its test passes.
       confirmations were seen. `fees_test.fam` (oscheck's `fees`):
       tabminer's `estimates_follow_what_confirmed`; apitest: both its
       transactions seen confirmed.
+    - The pool across restarts (2026-11-09, `pool.fam`), as tabminer
+      saves its pool with its confirmations: each pooled transaction
+      kept in the store ('P', its id, its bytes in chunks with its
+      length and arrival), each confirmation ('F', its place in the
+      ring), written between the node's steps (`qpersist`, never inside
+      another's transaction), a transaction leaving queuing its
+      record's deletion. At a start (`qload`) the confirmations come
+      back and each transaction kept is offered to the pool again
+      against the state now, its arrival kept; one refused now (its
+      input spent meanwhile) is forgotten. Not the shelf. reorgtest
+      ends with the node killed and run again, nothing mining, its
+      pool the same after.
     - Not yet: started by init (held back while it is tried by
       hand), a log and a way to read its state from the shell.
 

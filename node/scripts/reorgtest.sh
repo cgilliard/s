@@ -109,4 +109,26 @@ wait_for "$T/os.out" "^node: .* height $b  \\(" 600 "the node at B's tip ($b)"
 wait_for "$T/os.out" '^node: .* the pool: 1 held, .* 1 back' 120 "the burn back in the node's pool"
 grep -E '^node: .* (reorganizing|undone|height|refused|cannot|the pool)' "$T/os.out" | tail -14
 ! grep -qE '^node: .* (refused|cannot undo)' "$T/os.out" || { echo "reorgtest.sh: a block refused, or one not undone" >&2; exit 1; }
-echo "reorgtest.sh: the node resumed, reorganized onto the longer branch, and took the burn back into its pool"
+# The pool kept across a restart: B stopped (and A not mining), so nothing
+# mines the burn; once the node has B's last block, what it holds is
+# final; killed and run again, it takes the same back.
+stop $BP; BP=
+b=$(tip "$T/b")
+wait_for "$T/os.out" "^node: .* height $b  \\(" 600 "the node at B's last tip ($b)"
+held=$(grep -E '^node: .* the pool: [0-9]+ held' "$T/os.out" | tail -1 | sed -n 's/.* the pool: \([0-9]*\) held.*/\1/p')
+PID=$(sed -n 's/^\$* *\[\([0-9]*\)\]$/\1/p' "$T/os.out" | tail -1)
+echo "reorgtest.sh: B stopped; the node (pid $PID, $held pooled) killed, and run again"
+# (pids are used again: the first run's "[3] done" is no sign of this one's)
+dones=$(grep -c "\[$PID\] done" "$T/os.out")
+echo "echo 1 > /proc/$PID/kill" >&3
+ended() { [ "$(grep -c "\[$PID\] done" "$T/os.out")" -gt "$dones" ]; }
+wait_while_busy 30 "the node ending" ended
+apis=$(grep -c '^node: .* the API on port' "$T/os.out")
+echo "node -n devrec 10.0.2.2:$PA &" >&3
+started() { [ "$(grep -c '^node: .* the API on port' "$T/os.out")" -gt "$apis" ]; }
+wait_while_busy 300 "the node serving again" started
+if [ "$held" -gt 0 ]; then
+	grep -E "^node: .* the pool: $held of $held kept from before taken back" "$T/os.out" \
+		|| { echo "reorgtest.sh: the pool not taken back after the restart ($held held before)" >&2; exit 1; }
+fi
+echo "reorgtest.sh: the node resumed, reorganized onto the longer branch, took the burn back into its pool, and kept its pool across a restart"

@@ -434,7 +434,7 @@ nahead dup 0< if drop else
 		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
 	then
 then
-nrelay ;
+nrelay  qpersist ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;
