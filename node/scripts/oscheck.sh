@@ -984,7 +984,12 @@ done
 # taskbar, maximize, exit and the close button each closing a window, then
 # thirteen at once (twelve, the last told none is free) and no zombie left;
 # escape sequences fed to a window; vi in one (typed, written, the shell's
-# screen back after).
+# screen back after).  The wallet's WebSocket (/wallet, the stub wallet,
+# src/user/wallet.fam, behind it): refused without a session; with one,
+# wm's unlock answered, the tip told, a request answered with its id, and
+# logging out closing it; on the page, its window from the dock (a second
+# click focusing it, not a second window), the overview and another screen
+# shown, its program ending when its window closes.
 cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
@@ -999,10 +1004,10 @@ def http(req):
     return body
 def post(path, form, cookie=b""):
     return http(b"POST " + path + b" HTTP/1.0\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + str(len(form)).encode() + b"\r\n" + cookie + b"\r\n" + form)
-def wsopen(cookie):
+def wsopen(cookie, path=b"/tty"):
     c = socket.create_connection(("127.0.0.1", port), timeout=30)
     key = base64.b64encode(os.urandom(16))
-    c.sendall(b"GET /tty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + cookie + b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    c.sendall(b"GET " + path + b" HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + cookie + b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
     h = b""
     while b"\r\n\r\n" not in h:
         d = c.recv(1)
@@ -1060,6 +1065,20 @@ pump(b"$ ")
 lo = post(b"/logout", b"", cookie)
 print("logout", b"Location: /" in lo and pump(b"[close]", 30))
 c2, h2, _ = wsopen(cookie); print("after", h2.split(b"\r\n")[0].decode())
+# the wallet: refused without a session; with one, the stub's answer to
+# wm's unlock, the tip, a request answered with its id; logging out closes it
+c3, h3, _ = wsopen(b"", b"/wallet"); print("wallet refused", h3.split(b"\r\n")[0].decode())
+good = post(b"/login", b"name=root&password=wm%21pw")
+ck = [l for l in good.split(b"\r\n") if l.startswith(b"Set-Cookie: wm=")]
+cookie = b"Cookie: " + ck[0][12:].split(b";")[0] + b"\r\n" if ck else b""
+s, h, want = wsopen(cookie, b"/wallet"); buf = b""; out = b""; closed = False
+print("wallet upgrade", h.split(b"\r\n")[0].decode(), (b"Sec-WebSocket-Accept: " + want) in h)
+print("unlock", pump(b'{"op":"unlock","ok":true'))
+print("tip", pump(b'{"event":"tip","height":'))
+out = b""; send(b'{"op":"overview","id":7}', 1)
+print("overview", pump(b'"node":"synced"}') and out.startswith(b'{"id":7,"ok":true,"confirmed":"'))
+lo = post(b"/logout", b"", cookie)
+print("wallet logout", b"Location: /" in lo and pump(b"[close]", 30))
 WSCEOF
 cat > "$T/page.js" <<'PAGEEOF'
 // Run the page wm serves: its script, with a small stub DOM; the dock's
@@ -1177,10 +1196,34 @@ const port = process.argv[2];
   console.log('vi back', await wait(() => /\$ vi \/v\.txt\n\$ █$/.test(t3.plain), 60000));
   type(t3, 'cat /v.txt\r'); console.log('vi wrote', await wait(() => /\nhi there\n\$ █$/.test(t3.plain), 60000));
   console.log(JSON.stringify(t3.plain));
+  // the wallet: its window from the dock, the stub's overview once wm has
+  // unlocked it; a second click focuses it (no second window); the
+  // Receive screen; closed from its button, its program gone (ps)
+  const text = (e) => [e.textContent].concat(e.kids.map(text)).join(' ');
+  const wal = () => all(desk, 'wal');
+  byId.neww.onclick();
+  console.log('wallet', await wait(() => wal().length === 1 && /Confirmed\s+12\.5/.test(text(wal()[0])), 60000));
+  const running = () => /wallet$/m.test(t3.plain.slice(t3.plain.lastIndexOf('CMD')));
+  { const n0 = heads(); type(t3, 'ps\r'); await wait(() => heads() > n0 && prompt.test(t3.plain), 20000); }
+  console.log('wallet running', running());
+  t3.focus(); byId.neww.onclick();
+  console.log('wallet once', wal().length === 1 && all(tasks, 'task').filter((k) => k.textContent === 'Wallet').length === 1 && doc.active === wal()[0]);
+  all(wal()[0], 'wtab')[1].onclick();
+  console.log('wallet receive', await wait(() => /Address\s+tab1qstub/.test(text(wal()[0])), 60000));
+  all(all(desk, 'win').find((d) => all(d, 'wal').length), 'wb')[2].onclick({ stopPropagation() {} });
+  console.log('wallet closed', wal().length === 0 && !all(tasks, 'task').some((k) => k.textContent === 'Wallet'));
+  let gone = false;
+  for (let k = 0; k < 60 && !gone; k++) {
+    const n0 = heads(); type(t3, 'ps\r');
+    await wait(() => heads() > n0 && prompt.test(t3.plain), 20000);
+    gone = !running();
+    if (!gone) await new Promise((r) => setTimeout(r, 1000));
+  }
+  console.log('wallet ended', gone);
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))
@@ -1195,12 +1238,15 @@ for n in 1 4; do
 	lim 300 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
-		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$' \
+			'^wallet true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^login form HTTP/1.0 200 OK True$' '^tty refused HTTP/1.0 403 Forbidden$' '^bad True$' '^cookie True$' \
 		'^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^hashed True$' \
-		'^ping True$' '^exit True$' '^logout True$' '^after HTTP/1.0 403 Forbidden$'; do
+		'^ping True$' '^exit True$' '^logout True$' '^after HTTP/1.0 403 Forbidden$' \
+		'^wallet refused HTTP/1.0 403 Forbidden$' '^wallet upgrade HTTP/1.1 101 Switching Protocols True$' '^unlock True$' \
+		'^tip True$' '^overview True$' '^wallet logout True$'; do
 		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
 	done
 done

@@ -43,10 +43,10 @@ this one must interoperate with:
   (`docs/PRIVACY.md`).
 - **Payments:** a slate passed between the two wallets: the sender's
   inputs and change, the recipient's output and its receipt (signed by
-  the recipient's address key, ML-DSA), then the sender's signatures.
+  the recipient's address key, Dilithium), then the sender's signatures.
   Over the message layer (`docs/ONION.md`) when both are online, or as
   files. `cancel` and `bump` replace a payment before it confirms.
-- **Addresses:** `tab1…`, the id of an ML-DSA key; names (`@alice`) point
+- **Addresses:** `tab1…`, the id of a Dilithium key; names (`@alice`) point
   at addresses (`docs/NAMES.md`, `docs/SUBNAMES.md`).
 - **At rest:** the phrase and seed encrypted under a password
   (ChaCha20-Poly1305, a PBKDF2 key); the rest readable by the wallet's
@@ -195,10 +195,10 @@ In fam, each ported from tabminer and checked against vectors it writes
 - **Transactions and slates:** building, encoding, the checks
   `finalize` makes; the wallet's records, written in one store
   transaction with the signatures they hold (as tabminer's).
-- **ML-DSA:** receipts signed (receiving) and checked (sending); the
+- **Dilithium (ML-DSA):** receipts signed (receiving) and checked (sending); the
   address. New, and heavier than anything the node runs.
 - **ChaCha20-Poly1305 and PBKDF2:** the phrase at rest.
-- **The message layer** (online payments): ML-KEM, circuits,
+- **The message layer** (online payments): Kyber (ML-KEM), circuits,
   rendezvous sessions (`docs/ONION.md`). The largest part; tabminer's
   `onion.rs`, `node/participant.rs` and `channel.rs` together.
 - **wm:** the login form and the session (passwords as salted PBKDF2
