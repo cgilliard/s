@@ -1,25 +1,27 @@
 \ main.fam — the node (docs/NODE.md), the program /bin/node in the image
 \ (scripts/build.sh): the node's modules in order, then this.
 \
-\     node [IP:PORT ...]
+\     node [-n main|devrec] [-w N] [IP:PORT ...]
 \
-\ Its peers at IP:PORT, up to 8 (default 10.0.2.2:3747: the host, seen
-\ from QEMU's user-mode network; the OS has no DNS, so the seeds' names
-\ are not looked up yet), and more as they tell of them (GetPeers).  It
-\ syncs from the first that answers, then serves for good: its peers, the API
-\ (TCP 3738, the token in /etc/node/token) and its image to tabernacles
-\ (UDP 3737).  For now only the recursive dev network (tabminer's
-\ --network dev-recursive): there is no mainnet chain yet.  Its state is
-\ the tree /var/node: at a start, if it holds a chain, the node resumes
-\ from its tip (its headers loaded, then whatever the peer has since
-\ caught up to, by nstep, once the peer answers); if not, the tree is
-\ made afresh and the node syncs (a removed tree's pages are not given
-\ back yet, so that costs its size on the disk).  The fast sync's block S
-\ is 144 below the best header, as tabminer's.  Room for 16,384 headers
-\ in memory (4.7 MB): when it fills, those below the newest half go to
-\ the store alone (sync.fam's ncompact), and a start loads the last
-\ 2,048 (nload).  `node -w N ...` (for tests) holds N instead.
-
+\ The network: mainnet (main, the default) or the recursive dev network
+\ (devrec: tabminer's --network dev-recursive), its parameters, chain
+\ proof constants and genesis from /lib/netmain or /lib/netdevrec, its
+\ verifier /lib/chainver or /lib/chainverdev.  Settings first from
+\ /etc/node/config (below), the command line over them.  Its peers at
+\ IP:PORT, up to 8 (for devrec, none given: 10.0.2.2:3747, the host seen
+\ from QEMU's user-mode network; mainnet's seeds by name are not looked
+\ up yet), and more as they tell of them (GetPeers).  It syncs from the
+\ first that answers, then serves for good: its peers, the API (TCP 3738,
+\ the token in /etc/node/token) and its image to tabernacles (UDP 3737).
+\ Its state is the tree /var/node: at a start, if it holds a chain, the
+\ node resumes from its tip (its headers loaded, then whatever the peer
+\ has since caught up to, by nstep, once the peer answers); if not, the
+\ tree is made afresh and the node syncs (a removed tree's pages are not
+\ given back yet, so that costs its size on the disk).  The fast sync's
+\ block S is 144 below the best header, as tabminer's.  Room for 16,384
+\ headers in memory (4.7 MB): when it fills, those below the newest half
+\ go to the store alone (sync.fam's ncompact), and a start loads the last
+\ 2,048 (nload).  `-w N` (for tests) holds N instead.
 : mdc variable ;  : mnet variable ;  : mpt variable ;  : mip variable ;  : mport variable ;
 
 \ mfile ( path -- addr n )  a whole data file of at most 1.25 MiB, in memory.
@@ -46,40 +48,94 @@ mpt @ c@ 3A lit = and  mpt @ 1 lit + mpt !
 mpt @ c@ 30 lit - A lit u< and  mnum dup mport !  dup 0= 0= swap 10000 lit u< and and
 mpt @ c@ 0= and ;
 
-\ The recursive dev network (tabminer's ChainParams::DEV_RECURSIVE), as
-\ headers.fam takes it: 2^10 items, 254 parents, 64 accesses; genesis's
-\ target 2^228; the easiest 2^248 - 1; the drift 7,200 s; the median of
-\ 11; the final height; 10 s blocks, a half-life of 300 s, from block 1.
-: mparams
-64 lit alloc dup mnet !
-A lit over 0 lit w!  FE lit over 1 lit w!  40 lit over 2 lit w!
-dup 3 lit 2 lit lshift + 8 lit wzero  10 lit over A lit w!
-8 lit 0 lit do FFFFFFFF lit over i B lit + w! loop  FFFFFF lit over 12 lit w!
-1C20 lit over 13 lit w!  B lit over 14 lit w!  3279DB0 lit over 15 lit w!
-A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
-
-\ the headers held (-w N), and the peers given: their addresses in mpa
-\ (8 of 2 words), mpn of them, from argument mpf on
+\ Settings: the network (its file, /lib/netmain or /lib/netdevrec, made by
+\ tabminer's fam_vectors.rs: its parameters, its chain proof's constants,
+\ genesis's header; and its verifier, /lib/chainver or /lib/chainverdev),
+\ the ports (UDP for peers, TCP for the API), the headers held, the peers.
+\ From /etc/node/config if there, lines "key value" (# a comment):
+\ network, port, api-port, window, peer (IP:PORT, again for more); then
+\ the command line: -n NETWORK, -w N, and peers, which replace the file's.
 : mpa variable ;  : mpn variable ;  : mpf variable ;  : mhc variable ;
-4000 lit mhc !  1 lit mpf !
-argn 2 lit u> if 1 lit arg "-w" streq if
-	2 lit arg dup c@ 30 lit - A lit u< if atoi 10 lit max mhc ! else drop then  3 lit mpf !
-then then
-40 lit alloc mpa !  A000202 lit mpa @ !  EA3 lit mpa @ 4 lit + !  1 lit mpn !
-argn mpf @ - 8 lit u> if "usage: node [-w N] [IP:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit then
+: mnname variable ;  : mudp variable ;  : mapi variable ;  : mcpa variable ;  : mcfn variable ;
+: mcb2 variable ;  : mls variable ;  : mle variable ;  : mlnx variable ;  : mlv variable ;  : mkn variable ;
+: musage  "usage: node [-n main|devrec] [-w N] [IP:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit ;
+\ madd ( s -- )  a peer from the configuration.
+: madd
+dup maddr if
+	drop  mcfn @ 8 lit u< if mip @ mcpa @ mcfn @ 3 lit lshift + !  mport @ mcpa @ mcfn @ 3 lit lshift + 4 lit + !  mcfn @ 1 lit + mcfn ! then
+else nhead "config: not IP:PORT: " puts puts 0A lit putc then ;
+\ mline ( s -- )  a line of the configuration applied.
+: mline
+dup c@ dup 0= swap 23 lit = or if drop else
+	dup begin dup c@ dup 0= 0= swap 20 lit <> and while 1 lit + repeat
+	dup c@ if 0 lit over c! 1 lit + else drop 0 lit then mlv !
+	0 lit mkn !
+	mlv @ if
+		dup "network" streq if mlv @ mnname !  1 lit mkn ! then
+		dup "port" streq if mlv @ atoi mudp !  1 lit mkn ! then
+		dup "api-port" streq if mlv @ atoi mapi !  1 lit mkn ! then
+		dup "window" streq if mlv @ atoi 10 lit max mhc !  1 lit mkn ! then
+		dup "peer" streq if mlv @ madd  1 lit mkn ! then
+	then
+	mkn @ if drop else nhead "config: not understood: " puts puts 0A lit putc then
+then ;
+\ mcfg  /etc/node/config, if there (4 KiB at most).
+: mcfg
+"/etc/node/config" 0 lit open dup 0< if drop else
+	1000 lit alloc mcb2 !
+	dup mcb2 @ FFF lit read  dup 0< if drop 0 lit then  mcb2 @ + 0 lit swap c!  close drop
+	mcb2 @ mls !
+	begin mls @ c@ while
+		mls @ begin dup c@ dup 0= 0= swap A lit <> and while 1 lit + repeat mle !
+		mle @ c@ if mle @ 1 lit + else mle @ then mlnx !
+		0 lit mle @ c!
+		mls @ mline
+		mlnx @ mls !
+	repeat
+then ;
+
+\ /etc/node made if missing, for the configuration (and the API's token)
+"/etc" mkdir drop  "/etc/node" mkdir drop
+"main" mnname !  E99 lit mudp !  E9A lit mapi !  4000 lit mhc !  0 lit mcfn !  40 lit alloc mcpa !
+mcfg
+\ flags, then peers
+1 lit mpf !
+begin argn mpf @ u> if mpf @ arg c@ 2D lit = else 0 lit then while
+	argn mpf @ 1 lit + u> 0= if musage then
+	mpf @ arg "-w" streq if mpf @ 1 lit + arg atoi 10 lit max mhc ! else
+	mpf @ arg "-n" streq if mpf @ 1 lit + arg mnname ! else musage then then
+	mpf @ 2 lit + mpf !
+repeat
+mnname @ "main" streq if 0 lit nnet ! else
+	mnname @ "devrec" streq if 1 lit nnet ! else
+		nhead "no network " puts mnname @ puts " (main, devrec)" puts 0A lit putc 1 lit exit
+	then
+then
+40 lit alloc mpa !  0 lit mpn !
+argn mpf @ - 8 lit u> if musage then
 argn mpf @ u> if
 	argn mpf @ - mpn !
 	mpn @ 0 lit do
 		i mpf @ + arg maddr 0= if nhead "not IP:PORT: " puts i mpf @ + arg puts 0A lit putc 1 lit exit then
 		mip @ mpa @ i 3 lit lshift + !  mport @ mpa @ i 3 lit lshift + 4 lit + !
 	loop
+else
+	mcfn @ if mcpa @ mpa @ mcfn @ 3 lit lshift bcopy  mcfn @ mpn ! then
+then
+\ none given: the recursive dev network's at the host's 3747 (a tabminer
+\ there, seen from QEMU's user-mode network); mainnet's seeds by name are
+\ not looked up yet
+mpn @ 0= if
+	nnet @ if A000202 lit mpa @ !  EA3 lit mpa @ 4 lit + !  1 lit mpn ! else
+		nhead "no peers given (mainnet's seeds, by name, are not looked up yet): node [-n NETWORK] IP:PORT ..." puts 0A lit putc 1 lit exit
+	then
 then
 mpa @ @ mip !  mpa @ 4 lit + @ mport !
 \ mrest  the peers given after the first added (peer 0 is pinit's).
 : mrest  mpn @ 1 lit u> if mpn @ 1 lit do mpa @ i 3 lit lshift + dup @ swap 4 lit + @ padd drop loop then ;
 
 "/lib/akjv.txt.gz" mfile powinit
-"/lib/chainver" mfile drop cvinit
+nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop cvinit
 \ mtree ( -- fd )  /var/node, made if missing.
 : mtree  "/var/node" TREE CREATE or 2 lit or open  dup 0< if nhead "no store (a disk is needed): " puts . 0A lit putc 1 lit exit then ;
 \ mpeer  the peer's address on the line.
@@ -89,8 +145,9 @@ mip @ 8 lit rshift FF lit and u. 2E lit putc  mip @ FF lit and u. 3A lit putc  m
 
 "/var" mkdir drop
 mtree stinit  sninit  ninit  xinit tinit qinit yinit
-"/lib/devchain" mfile drop 4 lit + mdc !
-mparams  mnet @ mdc @ 60 lit + mhc @ hinit
+\ the network: its parameters, then its chain proof's constants and genesis
+nnet @ if "/lib/netdevrec" else "/lib/netmain" then mfile drop  dup mnet !  64 lit + mdc !
+mnet @ mdc @ 60 lit + mhc @ hinit
 mhc @ 1 lit rshift nkeep !  mhc @ 1 lit rshift 800 lit umin nldn !
 mdc @ dup 60 lit + prinit
 \ our status: genesis, no work
@@ -103,7 +160,7 @@ vinit  vjw @ if nhead "verifying in nodev (a process of its own)" puts else nhea
 nload if
 	\ resumed: the peer asked, and caught up to if ahead; if it does not
 	\ answer yet, nstep goes on asking
-	mip @ mport @ E99 lit pinit  mrest
+	mip @ mport @ mudp @ pinit  mrest
 	pping if
 		nhead "the peer " puts mpeer " is at height " puts pst-h u. 0A lit putc
 		pst-h myh @ u> if ncatch then
@@ -117,7 +174,7 @@ else
 	\ afresh: the tree made again (whatever a sync cut short, before its
 	\ first block, left in it gone)
 	stfd @ close drop  "/var/node" remove drop  mtree stfd !
-	mip @ mport @ E99 lit pinit  mrest
+	mip @ mport @ mudp @ pinit  mrest
 	\ from each given in turn while none answers
 	FFFFFFFF lit
 	mpn @ 0 lit do
@@ -134,6 +191,6 @@ else
 	then
 	nhead "synced, height " puts myh @ u. 0A lit putc
 then
-E9A lit ainit
-nhead "the API on port 3738, token " puts atk @ puts 0A lit putc
+mapi @ ainit
+nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
 begin E10 lit aserve 0 lit until

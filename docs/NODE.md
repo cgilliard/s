@@ -1265,9 +1265,21 @@ Each step done when its test passes.
       MiB and every buffer past that was refused (a part not served).
       The node maps 32 MiB first (`main.fam`), and `malloc` falls back
       to what is needed when a larger arena cannot be had.
-    - Not yet: started by init (held back while it is tried by hand),
-      configuration (network, port),
-      a log and a way to read its state from the shell.
+    - Configuration and networks (2026-11-09): `node -n main|devrec`
+      (mainnet the default, as tabminer's), each network a file
+      tabminer writes (`fam_vectors.rs`'s `generate_network`, checked
+      current): its proof-of-work and difficulty parameters, its chain
+      proof's constants and genesis's header (`/lib/netmain`,
+      `/lib/netdevrec`), and its verifier (`/lib/chainver`,
+      `/lib/chainverdev`; nodev told which in its first job). The image
+      carries both. `/etc/node/config` (made at a start if missing),
+      lines `key value`, `#` a comment: `network`, `port` (UDP, 3737),
+      `api-port` (3738), `window` (headers held), `peer IP:PORT` (again
+      for more); the command line over it (`-n`, `-w`, peers); a key not
+      understood is said. The scripts run `node -n devrec`.
+    - Not yet: mainnet's seeds by name (no DNS: a node on mainnet needs
+      peers given), started by init (held back while it is tried by
+      hand), a log and a way to read its state from the shell.
 
 ## Open questions
 

@@ -48,7 +48,7 @@ mkfifo "$T/in"
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
-echo "node -w 16 10.0.2.2:$PA &" >&3
+echo "node -n devrec -w 16 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* synced' 900 "the node's sync"
 wait_for "$T/os.out" '^node: .* height 26  \(' 900 "the node at 26"
 grep 'now only in the store' "$T/os.out" | tail -3
@@ -79,7 +79,7 @@ echo "windowtest.sh: the node (pid $PID) killed, and run again"
 echo "echo 1 > /proc/$PID/kill" >&3
 wait_for "$T/os.out" "\[$PID\] done" 30 "the node ending"
 n=$(heights)
-echo "node -w 16 10.0.2.2:$PA &" >&3
+echo "node -n devrec -w 16 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* resumed at height' 120 "the node resuming"
 grep -E '^node: .* (loading|resumed)' "$T/os.out" | tail -2
 grep -E '^node: .* loading 8 headers' "$T/os.out" > /dev/null || { echo "windowtest.sh: not resumed from a window" >&2; exit 1; }

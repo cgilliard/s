@@ -45,6 +45,48 @@ mod tests {
     const STATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain.bin");
     const SNAP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statesnap.bin");
     const STATE40_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain40.bin");
+    const NET_MAIN_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/net_main.bin");
+    const NET_DEVREC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/net_devrec.bin");
+
+    /// A network as the fam node takes it (its `-n`): the parameters
+    /// (words, little-endian: the dataset's log2 items, parents, accesses;
+    /// genesis's target and the easiest, 8 words each; the drift, the
+    /// median window, the final height; the block time, the half-life,
+    /// whether the schedule starts at block 1), the chain proof's constants
+    /// (the base program's digest, the step's, the plan root: 24 words),
+    /// and genesis's header.
+    fn generate_network(p: &crate::chain::ChainParams, c: &crate::aggregate::ChainSetupConst) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut w = |x: u32| v.extend_from_slice(&x.to_le_bytes());
+        w(p.pow.log_dataset_items);
+        w(p.pow.parents as u32);
+        w(p.pow.accesses as u32);
+        for t in [p.genesis_target, p.max_target] {
+            for limb in t.0 {
+                w(limb as u32);
+                w((limb >> 32) as u32);
+            }
+        }
+        w(p.max_future_drift as u32);
+        w(p.median_time_window as u32);
+        w(p.final_height());
+        w(p.schedule.block_time as u32);
+        w(p.schedule.half_life as u32);
+        w(p.schedule.from_first_block as u32);
+        for x in c.base.iter().chain(&c.step).chain(&c.plan_root) {
+            w(*x);
+        }
+        v.extend_from_slice(&p.genesis().header.to_bytes());
+        v
+    }
+
+    fn generate_networks() -> (Vec<u8>, Vec<u8>) {
+        use crate::chain::ChainParams;
+        (
+            generate_network(&ChainParams::MAINNET, &crate::aggregate::MAINNET_CHAIN.unwrap()),
+            generate_network(&ChainParams::DEV_RECURSIVE, &crate::aggregate::DEV_RECURSIVE_CHAIN.unwrap()),
+        )
+    }
     /// The 40-bit chain's first output position: its outputs, spends,
     /// commits, reveals and sweep cross 2^32 (the fam node's
     /// node/scripts/oscheck.sh gives its state test the same).
@@ -1606,6 +1648,11 @@ mod tests {
         assert!(file == state, "the fam node's 40-bit state chain is stale: run write_fam_vectors");
         let file = std::fs::read(POOL_PATH).expect("node/src/user/node/pool.bin");
         assert!(file == generate_pool(), "the fam node's pool test is stale: run write_fam_vectors");
+        let (main, devrec) = generate_networks();
+        let file = std::fs::read(NET_MAIN_PATH).expect("node/src/user/node/net_main.bin");
+        assert!(file == main, "the fam node's mainnet file is stale: run write_fam_vectors");
+        let file = std::fs::read(NET_DEVREC_PATH).expect("node/src/user/node/net_devrec.bin");
+        assert!(file == devrec, "the fam node's dev-recursive file is stale: run write_fam_vectors");
     }
 
     #[test]
@@ -1622,6 +1669,9 @@ mod tests {
         let (state, _) = generate_state(FIRST40);
         std::fs::write(STATE40_PATH, state).unwrap();
         std::fs::write(POOL_PATH, generate_pool()).unwrap();
+        let (main, devrec) = generate_networks();
+        std::fs::write(NET_MAIN_PATH, main).unwrap();
+        std::fs::write(NET_DEVREC_PATH, devrec).unwrap();
     }
 }
 

@@ -4,7 +4,8 @@
 \ difficulty, pow and chainver (it shares nothing with the node: its own
 \ copy of every buffer).  The node starts it with a pipe on its 0 (jobs)
 \ and another on its 1 (verdicts).  A job is a word, its kind, then:
-\   0  the proof of work's parameters: items, parents, accesses (3 words)
+\   0  the network: its proof of work's parameters (items, parents,
+\      accesses) and its verifier (0 /lib/chainver, 1 /lib/chainverdev)
 \   1  a header's full proof of work: the header (204 bytes) and its
 \      target (8 words, as headers.fam's htarget leaves it): fullpow
 \   2  a chain proof: its 16 public values (words), its length n (a word)
@@ -34,12 +35,13 @@ repeat 2drop ;
 : vsay  vwd @ !  1 lit vwd @ 4 lit write drop ;  \ ( x -- )  a verdict
 
 "/lib/akjv.txt.gz" vfile powinit
-"/lib/chainver" vfile drop cvinit
 10 lit alloc vwd !  CC lit alloc vh !  20 lit alloc vtg !  40 lit alloc vpub !
 10000 lit dup vcap ! malloc vbuf !
 begin
 	vword
-	dup 0= if drop  vword pwitems !  vword pwpar !  vword pwacc ! else
+	\ first: the network's proof-of-work parameters, and which verifier
+	dup 0= if drop  vword pwitems !  vword pwpar !  vword pwacc !
+		vword if "/lib/chainverdev" else "/lib/chainver" then vfile drop cvinit else
 	dup 1 lit = if drop  vh @ CC lit vread  vtg @ 20 lit vread  vh @ vtg @ fullpow vsay else
 	2 lit = if
 		vpub @ 40 lit vread  vword

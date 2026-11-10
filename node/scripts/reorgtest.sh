@@ -77,14 +77,14 @@ mkfifo "$T/in"
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
-echo "node 10.0.2.2:$PA &" >&3
+echo "node -n devrec 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* height [0-9]+  \(' 900 "the node following A"
 PID=$(sed -n 's/^\$* *\[\([0-9]*\)\]$/\1/p' "$T/os.out" | head -1)
 echo "reorgtest.sh: the node (pid $PID) killed, and run again"
 echo "echo 1 > /proc/$PID/kill" >&3
 wait_for "$T/os.out" "\[$PID\] done" 30 "the node ending"
 n=$(heights)
-echo "node 10.0.2.2:$PA &" >&3
+echo "node -n devrec 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* resumed at height|^node: .* syncing from.*$' 120 "the node starting again"
 [ "$(grep -c 'syncing from' "$T/os.out")" = 1 ] || { echo "reorgtest.sh: the node synced again rather than resume" >&2; exit 1; }
 i=0; until [ "$(heights)" -gt "$n" ]; do [ $i -lt 300 ] || { echo "reorgtest.sh: no block followed after resuming" >&2; exit 1; }; sleep 2; i=$((i + 2)); done

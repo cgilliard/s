@@ -50,7 +50,7 @@ mkfifo "$T/in"
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
-echo "node 10.0.2.2:$PA &" >&3
+echo "node -n devrec 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* synced' 900 "the node's sync"
 
 echo "snaptest.sh: A's wallet burning a coin"

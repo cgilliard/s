@@ -50,7 +50,7 @@ mkfifo "$T/in"
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
-echo "node 10.0.2.2:$PA &" >&3
+echo "node -n devrec 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* (synced|resumed)' 900 "the node's sync"
 # B told of by A (GetPeers), or B, told of the node by A, pinging it first
 wait_for "$T/os.out" "^node: .* peer 10\\.0\\.2\\.2:$PB (told of|pinged us)" 180 "the node learning of B"

@@ -72,7 +72,7 @@ echo "Building $N → bin/user/node (user mode)" >&2
 echo "Building $N/vmain.fam → bin/user/nodev (user mode)" >&2
 ./tools/fam --user -o bin/user/nodev $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/chainver.fam \
 	$N/vmain.fam || { echo "build.sh: nodev did not build" >&2; exit 1; }
-progs="$progs node=bin/user/node:24576 nodev=bin/user/nodev:8192 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$N/chainver_dev.bin:0 devchain=$N/devchain.bin:0"
+progs="$progs node=bin/user/node:24576 nodev=bin/user/nodev:8192 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$N/chainver.bin:0 chainverdev=$N/chainver_dev.bin:0 netmain=$N/net_main.bin:0 netdevrec=$N/net_devrec.bin:0"
 # The compiler too (famc: bin/fam, unpacked and unchanged, as a machine
 # program with 8 MiB: the kernel stands in for its UART and test finisher),
 # and the libraries it compiles a program with (data files, read as

@@ -69,6 +69,9 @@ ticks nft @ - btf ! ;
 \ works (Pings, peers, headers, images, pooled transactions; not blocks'
 \ chunks, which share the store's transaction a block's connection may
 \ hold open: pnest) and the API.
+\ nnet: the network (0 mainnet, 1 the recursive dev network: main.fam's
+\ -n), whose verifier nodev loads.
+: nnet variable ;
 : vjw variable ;  : vjr variable ;  : vwk variable ;  : vp1 variable ;  : vp2 variable ;  : vfds variable ;  : vsav variable ;
 \ vput ( a n -- )  bytes to nodev; a write that fails, it gone (vjw 0).
 : vput
@@ -86,7 +89,7 @@ vp1 @ pipe 0< 0=  vp2 @ pipe 0< 0= and if
 	else
 		vp1 @ 4 lit + @ vjw !  vp2 @ @ vjr !
 		vp1 @ @ close drop  vp2 @ 4 lit + @ close drop
-		0 lit vw  pwitems @ vw  pwpar @ vw  pwacc @ vw
+		0 lit vw  pwitems @ vw  pwpar @ vw  pwacc @ vw  nnet @ vw
 	then
 then ;
 \ vwait ( -- flag | -2 )  nodev's verdict, the network served meanwhile,
