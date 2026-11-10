@@ -6,7 +6,18 @@ a terminal. It runs beside the fam node (`docs/NODE.md`) in the same OS,
 and is the same wallet as tabminer's: the same phrase finds the same
 coins, and either can pay the other.
 
-Status: a design, to be decided before anything is built (2026-11-09).
+Status: a design, partly decided (2026-11-09); see Decided and To
+decide.
+
+## Decided
+
+1. **In the OS** (`wallet`, in fam: The shape, below). A wallet icon in
+   wm's dock, beside the terminal's, opens the user's wallet in a window.
+2. **One wallet per OS user:** the icon opens that user's; there is no
+   choosing among several.
+3. **Logging in unlocks it:** wm asks for a name and password before it
+   shows the desktop (Logging in, below), and that password is the
+   wallet's: no second password to remember or type.
 
 ## What is fixed already
 
@@ -48,8 +59,8 @@ By the OS and the node:
 
 Three parts:
 
-1. **`wallet`, a program in the OS** (fam), one per wallet: the keys,
-   the wallet's records (in a store tree of its own, `/var/wallet`), the
+1. **`wallet`, a program in the OS** (fam), one per user: the keys,
+   the wallet's records (a store tree in the user's home, `wallet`), the
    transactions built and signed. It reads the chain through the node's
    API and gives it transactions. It is the only part that holds the
    phrase or a key.
@@ -66,6 +77,32 @@ Three parts:
 
 So the browser shows the wallet but never holds it; the OS does, as it
 holds the node.
+
+## Logging in
+
+wm shows a login form first; the desktop, its terminals and the wallet
+come after, as the user who logged in.
+- **Passwords kept as hashes:** `/etc/passwd` holds each password in
+  plain text today (`docs/OS.md`, step 5; only root reads it). It will
+  hold a salt and a slow hash (PBKDF2, as tabminer's wallet uses), for
+  `login` and wm alike.
+- **wm checks the password** as `login` does, then runs each window's
+  program (the shell, `wallet`) as that user, in that user's home.
+- **The wallet's key comes from the same password:** the phrase and
+  seed stored encrypted (ChaCha20-Poly1305) under a key derived from the
+  login password with a salt of the wallet's own, a different
+  derivation from the login's hash, so neither gives the other. wm
+  hands the password to `wallet` on its pipe when it starts it, and
+  keeps nothing.
+- **Changing the password** re-encrypts the wallet's phrase in the same
+  step; a wallet created before a password, or restored, takes the
+  login password at once.
+- **A session** ends at logout, or when the page is closed; the wallet
+  locks with it (its keys out of memory).
+- **Limits:** the page and its form travel in plain HTTP, so until wm
+  has TLS the desktop is reached only from the host itself (the forward
+  bound to localhost); root can read any process's memory, as on any
+  OS.
 
 ## What it does
 
@@ -103,13 +140,17 @@ In fam, each ported from tabminer and checked against vectors it writes
 - **The message layer** (online payments): ML-KEM, circuits,
   rendezvous sessions (`docs/ONION.md`). The largest part; tabminer's
   `onion.rs`, `node/participant.rs` and `channel.rs` together.
-- **wm:** the `/wallet` WebSocket on a pipe, the window kind, its page.
+- **wm:** the login form and the session (passwords as salted PBKDF2
+  hashes in `/etc/passwd`, `login` the same); the wallet icon, the
+  `/wallet` WebSocket on a pipe, the window kind, its page.
 
 The node needs little: what it serves already, perhaps a way to scan
 memos faster than every output in order.
 
 ## Phases proposed
 
+0. **Logging in:** passwords hashed, wm's login form and sessions, the
+   programs run as the user. Needed whatever the wallet.
 1. **A wallet of its own, by files:** create or restore from a phrase,
    scan, balance and activity; receive and send by slate files; fees;
    cancel and bump. Everything but the message layer. A tabminer wallet
@@ -125,17 +166,7 @@ recursive dev network, in both directions.
 
 ## To decide
 
-1. **Where the wallet runs.** In the OS, in fam (above), or in the page
-   (JavaScript in the browser, keys in the browser's storage). The
-   first keeps keys with the node and off whatever machine shows the
-   page; the second is much less to build (the crypto exists for the
-   browser) but puts keys in the browser.
-2. **What is encrypted at rest.** The phrase alone, as tabminer's, or
-   the whole wallet (its records say who was paid what).
-3. **One wallet or several:** one per OS user, or any number named at
-   creation.
-4. **The message layer:** in the first phase (online payments from the
-   start, much more to build first) or the third (files first).
-5. **Who may open it:** wm's page is reachable by whoever reaches its
-   port; the wallet should ask for its password at least when opened,
-   and perhaps the OS login first.
+1. **The message layer:** in the first phase (online payments from the
+   start, much more to build first) or the third, as proposed (by
+   files first, a tabminer wallet and this one paying each other that
+   way).
