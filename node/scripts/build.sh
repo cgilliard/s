@@ -81,10 +81,11 @@ progs="$progs node=bin/user/node:24576 nodev=bin/user/nodev:8192 akjv.txt.gz=../
 # program with 8 MiB: the kernel stands in for its UART and test finisher),
 # and the libraries it compiles a program with (data files, read as
 # /lib/<name>: docs/OS.md, step 11).
-# Its version, which the node serves it as (/lib/version, in decimal).
+# Its version, which the node serves it as (/lib/version, in decimal), and
+# BIP39's word list (/lib/bip39: the wallet's phrases).
 printf '%s\n' "$IMAGE_VERSION" > bin/version
 progs="$progs famc=bin/fam.uncompressed:8192:m stdlib.fam=lib/stdlib.fam:0 user.fam=lib/user.fam:0 build.fam=lib/build.fam:0"
-progs="$progs version=bin/version:0"
+progs="$progs version=bin/version:0 bip39=../resources/bip39-english.txt:0"
 sh scripts/mkimage.sh bin/img bin/kernel $progs
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 patch_config bin/tabernacle.uncompressed bin/img "$IMAGE_VERSION"

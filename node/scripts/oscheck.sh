@@ -709,7 +709,8 @@ rm -f "$T/files.disk"
 
 # The crypto modules (src/user/crypto/): SHA-512, HMAC and PBKDF2 against
 # Python's hashlib (BIP39's own case among them); then the passwords kept
-# in /etc/passwd as PBKDF2 hashes, made, checked (hashlib's too), set.
+# in /etc/passwd as PBKDF2 hashes, made, checked (hashlib's too), set;
+# BIP39; ChaCha20-Poly1305.
 ./tools/fam --user -o "$T/t5.bin" src/user/crypto/sha512.fam src/user/crypto/sha512_test.fam > "$T/t5.build" 2>&1 || fail sha512 "build: $(head -c 300 "$T/t5.build")"
 sh scripts/mkimage.sh "$T/t5.img" bin/kernel init="$T/t5.bin":1024 2> "$T/t5.mk" || fail sha512 "mkimage: $(cat "$T/t5.mk")"
 expect sha512 124 '^sha512: 10 as expected, 0 not' 60 ./tools/q32 "$T/t5.img"
@@ -718,6 +719,16 @@ sh scripts/mkimage.sh "$T/tpw.img" bin/kernel init="$T/tpw.bin":1024 2> "$T/tpw.
 rm -f "$T/tpw.disk"; dd if=/dev/zero of="$T/tpw.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect passwd 124 '^passwd: 12 as expected, 0 not' 60 ./tools/q32 --disk="$T/tpw.disk" "$T/tpw.img"
 rm -f "$T/tpw.disk"
+# BIP39 (the wallet's phrase): SHA-256, phrases, entropy, seeds against
+# Python's standard computation (the word list as /lib/bip39).
+./tools/fam --user -o "$T/tb3.bin" src/user/crypto/sha512.fam src/user/crypto/sha256.fam src/user/crypto/bip39.fam src/user/crypto/bip39_test.fam > "$T/tb3.build" 2>&1 || fail bip39 "build: $(head -c 300 "$T/tb3.build")"
+sh scripts/mkimage.sh "$T/tb3.img" bin/kernel init="$T/tb3.bin":1024 bip39=../resources/bip39-english.txt:0 2> "$T/tb3.mk" || fail bip39 "mkimage: $(cat "$T/tb3.mk")"
+expect bip39 124 '^bip39: 29 as expected, 0 not' 60 ./tools/q32 "$T/tb3.img"
+# ChaCha20-Poly1305 (the wallet's phrase at rest): RFC 8439's vectors and
+# Python's cryptography, tampering refused.
+./tools/fam --user -o "$T/tcc.bin" src/user/crypto/chacha.fam src/user/crypto/chacha_test.fam > "$T/tcc.build" 2>&1 || fail chacha "build: $(head -c 300 "$T/tcc.build")"
+sh scripts/mkimage.sh "$T/tcc.img" bin/kernel init="$T/tcc.bin":1024 2> "$T/tcc.mk" || fail chacha "mkimage: $(cat "$T/tcc.mk")"
+expect chacha 124 '^chacha: 29 as expected, 0 not' 60 ./tools/q32 "$T/tcc.img"
 
 # Users (step 8, part 5): a disk booted twice.  First as root (no
 # /etc/init yet): /etc/passwd and /etc/init written, a home for alice

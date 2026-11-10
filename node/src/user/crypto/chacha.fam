@@ -1,0 +1,139 @@
+\ crypto/chacha.fam — ChaCha20, Poly1305 and their AEAD (RFC 8439): the
+\ wallet's phrase at rest (docs/GUI_WALLET.md), under a PBKDF2 key.  Plain
+\ fam: the wallet seals a few hundred bytes.  Poly1305 as TweetNaCl's:
+\ 17 limbs of 8 bits, so every product fits 32 bits (no multiply
+\ instruction: `*` is shift-and-add).  A module
+\ (`\ uses: crypto/chacha.fam`).
+\
+\ chacha20 ( key nonce ctr src dst len -- )  len bytes at src, XORed with
+\ the stream of a 32-byte key, a 12-byte nonce, the block counter from
+\ ctr, to dst (which may be src).
+\ poly1305 ( msg len key out -- )  the 16-byte tag of len bytes, one-time
+\ key 32 bytes.
+\ aeseal ( key nonce aad alen msg len dst -- )  msg sealed: len bytes of
+\ ciphertext at dst, then the 16-byte tag.
+\ aeopen ( key nonce aad alen ct len dst -- ok )  ct (len bytes, the tag
+\ after them) checked, then opened to dst; not ok: dst untouched.
+
+: c2s variable ;  : c2x variable ;  : c2src variable ;  : c2dst variable ;  : c2n variable ;
+: c2qa variable ;  : c2qb variable ;  : c2qc variable ;  : c2qd variable ;
+: c2min  2dup u> if swap then drop ;                      \ ( a b -- min )
+: c2rl  2dup lshift -rot 20 lit swap - rshift or ;        \ ( x n -- x' )  rotated left
+: c2le@  dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: c2w  2 lit lshift + ;                                   \ ( a i -- a' )  word i
+: c2xi  c2x @ swap c2w ;
+\ c2qr ( a b c d -- )  a quarter round on the working words.
+: c2qr
+c2xi c2qd !  c2xi c2qc !  c2xi c2qb !  c2xi c2qa !
+c2qa @ @ c2qb @ @ + c2qa @ !  c2qd @ @ c2qa @ @ xor 10 lit c2rl c2qd @ !
+c2qc @ @ c2qd @ @ + c2qc @ !  c2qb @ @ c2qc @ @ xor C lit c2rl c2qb @ !
+c2qa @ @ c2qb @ @ + c2qa @ !  c2qd @ @ c2qa @ @ xor 8 lit c2rl c2qd @ !
+c2qc @ @ c2qd @ @ + c2qc @ !  c2qb @ @ c2qc @ @ xor 7 lit c2rl c2qb @ ! ;
+\ c2init ( key nonce ctr -- )  the state.
+: c2init
+c2s @ 0= if 40 lit alloc c2s !  40 lit alloc c2x ! then
+c2s @ C lit c2w !
+3 lit 0 lit do dup i 2 lit lshift + c2le@ c2s @ D lit i + c2w ! loop drop
+8 lit 0 lit do dup i 2 lit lshift + c2le@ c2s @ 4 lit i + c2w ! loop drop
+61707865 lit c2s @ !  3320646E lit c2s @ 4 lit + !  79622D32 lit c2s @ 8 lit + !  6B206574 lit c2s @ C lit + ! ;
+\ c2blk  the next 64 bytes of stream at c2x (its words, little-endian as
+\ the machine's), the counter on.
+: c2blk
+10 lit 0 lit do c2s @ i c2w @ c2x @ i c2w ! loop
+A lit 0 lit do
+	0 lit 4 lit 8 lit C lit c2qr  1 lit 5 lit 9 lit D lit c2qr  2 lit 6 lit A lit E lit c2qr  3 lit 7 lit B lit F lit c2qr
+	0 lit 5 lit A lit F lit c2qr  1 lit 6 lit B lit C lit c2qr  2 lit 7 lit 8 lit D lit c2qr  3 lit 4 lit 9 lit E lit c2qr
+loop
+10 lit 0 lit do c2x @ i c2w @ c2s @ i c2w @ + c2x @ i c2w ! loop
+c2s @ C lit c2w @ 1 lit + c2s @ C lit c2w ! ;
+: chacha20
+c2n !  c2dst !  c2src !  c2init
+begin c2n @ while
+	c2blk
+	c2n @ 40 lit c2min 0 lit do c2src @ i + c@ c2x @ i + c@ xor c2dst @ i + c! loop
+	c2n @ 40 lit c2min dup c2src @ + c2src !  dup c2dst @ + c2dst !  c2n @ swap - c2n !
+repeat ;
+
+\ Poly1305: h the accumulator, r the clamped key, 17 words each.
+: p1h variable ;  : p1r variable ;  : p1c variable ;  : p1x variable ;  : p1g variable ;  : p1mp variable ;
+: p1k variable ;  : p1m variable ;  : p1pd variable ;  : p1q variable ;
+: p1hi  p1h @ swap c2w ;
+\ p1add ( c -- )  h += the 17 limbs at c.
+: p1add  0 lit 11 lit 0 lit do over i c2w @ + i p1hi @ + dup FF lit and i p1hi ! 8 lit rshift loop 2drop ;
+\ p1car ( u -- u' )  the low 16 limbs carried.
+: p1car  10 lit 0 lit do i p1hi @ + dup FF lit and i p1hi ! 8 lit rshift loop ;
+\ p1init ( key -- )  r from the key's first half, h zero.
+: p1init
+p1h @ 0= if 44 lit alloc p1h !  44 lit alloc p1r !  44 lit alloc p1c !  44 lit alloc p1x !  44 lit alloc p1g !  44 lit alloc p1mp !
+	11 lit 0 lit do 0 lit p1mp @ i c2w ! loop  5 lit p1mp @ !  FC lit p1mp @ 10 lit c2w ! then
+dup p1k !
+11 lit 0 lit do 0 lit i p1hi !  0 lit p1r @ i c2w ! loop
+10 lit 0 lit do dup i + c@ p1r @ i c2w ! loop drop
+p1r @ 3 lit c2w dup @ F lit and swap !  p1r @ 4 lit c2w dup @ FC lit and swap !
+p1r @ 7 lit c2w dup @ F lit and swap !  p1r @ 8 lit c2w dup @ FC lit and swap !
+p1r @ B lit c2w dup @ F lit and swap !  p1r @ C lit c2w dup @ FC lit and swap !
+p1r @ F lit c2w dup @ F lit and swap ! ;
+\ p1blk  the block at p1c into h: h = (h + c) r, partly reduced.
+: p1blk
+p1c @ p1add
+11 lit 0 lit do
+	0 lit
+	11 lit 0 lit do
+		i p1hi @
+		i j u> if j i - 11 lit + p1r @ swap c2w @ 140 lit * else j i - p1r @ swap c2w @ then
+		* +
+	loop
+	p1x @ i c2w !
+loop
+11 lit 0 lit do p1x @ i c2w @ i p1hi ! loop
+0 lit p1car  10 lit p1hi @ +  dup 3 lit and 10 lit p1hi !  2 lit rshift 5 lit *
+p1car  10 lit p1hi @ + 10 lit p1hi ! ;
+\ p1chk ( a m -- )  m bytes (16 at most) as a block: the 1 after them, or
+\ (p1pd set: padded) after 16.
+: p1chk
+p1m !
+11 lit 0 lit do 0 lit p1c @ i c2w ! loop
+p1m @ ?dup if 0 lit do dup i + c@ p1c @ i c2w ! loop then drop
+1 lit p1c @ p1pd @ if 10 lit else p1m @ then c2w !
+p1blk ;
+\ p1upd ( a n -- )  n bytes in blocks of 16.
+: p1upd
+begin dup while
+	2dup 10 lit c2min p1chk
+	dup 10 lit c2min p1q !  p1q @ - swap p1q @ + swap
+repeat 2drop ;
+\ p1fin ( out -- )  the tag: h reduced mod 2^130 - 5, plus s.
+: p1fin
+11 lit 0 lit do i p1hi @ p1g @ i c2w ! loop
+p1mp @ p1add
+10 lit p1hi @ 7 lit rshift 1 lit and if 11 lit 0 lit do p1g @ i c2w @ i p1hi ! loop then
+11 lit 0 lit do 0 lit p1c @ i c2w ! loop
+10 lit 0 lit do p1k @ 10 lit + i + c@ p1c @ i c2w ! loop
+p1c @ p1add
+10 lit 0 lit do i p1hi @ over i + c! loop drop ;
+: poly1305  swap p1init  -rot 0 lit p1pd !  p1upd  p1fin ;
+
+\ The AEAD: the one-time key from block 0, the text from block 1; the tag
+\ over aad, ct (each padded to 16) and their lengths (64-bit, little).
+: aek variable ;  : aeno variable ;  : aea variable ;  : aeal variable ;  : aem variable ;  : aen variable ;  : aed variable ;
+: aeotk variable ;  : aeln variable ;  : aetag variable ;
+: aeargs
+aed !  aen !  aem !  aeal !  aea !  aeno !  aek !
+aeotk @ 0= if 20 lit alloc aeotk !  10 lit alloc aeln !  10 lit alloc aetag ! then
+aek @ aeno @ 0 lit c2init c2blk  20 lit 0 lit do c2x @ i + c@ aeotk @ i + c! loop ;
+\ aemac ( ct -- )  the tag of aad and ct at aetag.
+: aemac
+aeotk @ p1init  1 lit p1pd !
+aea @ aeal @ p1upd  aen @ p1upd
+aeal @ aeln @ !  0 lit aeln @ 4 lit + !  aen @ aeln @ 8 lit + !  0 lit aeln @ C lit + !
+aeln @ 10 lit p1upd  aetag @ p1fin ;
+: aeseal
+aeargs
+aek @ aeno @ 1 lit aem @ aed @ aen @ chacha20
+aed @ aemac
+10 lit 0 lit do aetag @ i + c@ aed @ aen @ + i + c! loop ;
+: aeopen
+aeargs
+aem @ aemac
+0 lit 10 lit 0 lit do aetag @ i + c@ aem @ aen @ + i + c@ xor or loop 0=
+dup if aek @ aeno @ 1 lit aem @ aed @ aen @ chacha20 then ;
