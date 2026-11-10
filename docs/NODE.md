@@ -1293,7 +1293,9 @@ Each step done when its test passes.
       growing, and fails only after its idle window with nothing new: a
       slower machine (CI's four cores) waits longer, a stuck run still
       fails. The CI job's time limit is the backstop. oscheck's checks
-      still have deadlines (each a few times what it takes).
+      too (its `lim`, `upto` and `boots`): each limit an idle window,
+      pushed back whenever anything under `tmp/oscheck/` changes (the
+      checks' output, the guests' disks).
     - Not yet: started by init (held back while it is tried by
       hand), a log and a way to read its state from the shell.
 

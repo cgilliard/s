@@ -23,14 +23,23 @@ FAILS=0; N=0
 
 # lim SECONDS CMD... — as in scripts/check.sh: CMD killed after SECONDS with
 # everything it started (exit 124), its stdin /dev/null.
+# No check has a deadline: each time limit below is an idle window,
+# pushed back whenever anything under $T changes (the checks' output, the
+# guests' disks, which the store writes), so a slower machine only takes
+# longer and a stuck check still ends.  WPROG: prog(), a sum of the times
+# and sizes of everything under $WT.
+WPROG='use File::Find; sub prog { my $s = 0; find(sub { my @st = lstat($_); $s += $st[9] + $st[7] if @st }, $ENV{WT}); return $s }'
 lim() {
-	perl -e '
+	WT="$T" perl -e "$WPROG"'
 		$t = shift;
 		$p = fork // die "fork: $!";
 		if (!$p) { setpgrp(0, 0); exec @ARGV or die "exec: $!" }
-		$SIG{ALRM} = sub { kill "KILL", -$p; waitpid($p, 0); exit 124 };
-		alarm $t;
-		waitpid($p, 0);
+		$last = prog(); $end = time + $t; $scan = time + 2;
+		while (waitpid($p, 1) == 0) {
+			if (time >= $end) { kill "KILL", -$p; waitpid($p, 0); exit 124 }
+			select(undef, undef, undef, 0.25);
+			if (time >= $scan) { $scan = time + 2; $n = prog(); if ($n != $last) { $last = $n; $end = time + $t } }
+		}
 		exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
 	' "$@" < /dev/null
 }
@@ -41,18 +50,20 @@ lim() {
 # exit 124 then, as if the time ran out, so a slow machine only takes
 # longer, and a fast one doesn't wait out SECS.
 upto() {
-	perl -e '
+	WT="$T" perl -e "$WPROG"'
 		$t = shift;
 		pipe(R, W) or die "pipe: $!";
 		$p = fork // die "fork: $!";
 		if (!$p) { close R; setpgrp(0, 0); open STDOUT, ">&W"; open STDERR, ">&W"; exec @ARGV or die "exec: $!" }
 		close W;
 		$end = time + $t; $buf = ""; $rin = ""; vec($rin, fileno(R), 1) = 1; $eof = 0;
+		$last = prog(); $scan = time + 2;
 		while (time < $end) {
+			if (time >= $scan) { $scan = time + 2; $g = prog(); if ($g != $last) { $last = $g; $end = time + $t } }
 			if (select($rout = $rin, undef, undef, 0.25)) {
 				$n = sysread(R, $d, 65536);
 				if (!$n) { $eof = 1; last }
-				syswrite(STDOUT, $d); $buf .= $d;
+				syswrite(STDOUT, $d); $buf .= $d;  $end = time + $t;
 				if ($buf =~ /^kernel: init ended: \S+\r?\n/m) { kill "KILL", -$p; waitpid($p, 0); exit 124 }
 			}
 		}
@@ -74,12 +85,12 @@ served() {
 }
 # boots NAME REGEX SECS CMD... — CMD run (its own process group, stdin
 # /dev/null) until its output matches REGEX (Perl's, multi-line), then
-# stopped; SECS at most, so a slow machine only takes longer.  Fails if it
-# never matched.
+# stopped; or after SECS with nothing new under $T.  Fails if it never
+# matched.
 boots() {
 	name=$1; pat=$2; secs=$3; shift 3
 	N=$((N + 1))
-	perl -e '
+	WT="$T" perl -e "$WPROG"'
 		($f, $pat, $t) = splice(@ARGV, 0, 3);
 		$p = fork // die "fork: $!";
 		if (!$p) {
@@ -87,9 +98,10 @@ boots() {
 			open STDIN, "<", "/dev/null"; open STDOUT, ">", $f; open STDERR, ">&STDOUT";
 			exec @ARGV or die "exec: $!";
 		}
-		$end = time + $t;
+		$end = time + $t; $last = prog(); $scan = time + 2;
 		while (time < $end) {
 			select(undef, undef, undef, 0.25);
+			if (time >= $scan) { $scan = time + 2; $g = prog(); if ($g != $last) { $last = $g; $end = time + $t } }
 			open F, "<", $f; local $/; $c = <F>; close F;
 			last if $c =~ /$pat/m;
 			last if waitpid($p, 1) > 0;
@@ -97,11 +109,12 @@ boots() {
 		kill "KILL", -$p; waitpid($p, 0);
 	' "$T/$name.out" "$pat" "$secs" "$@"
 	perl -e 'local $/; $c = <STDIN>; exit($c =~ /$ARGV[0]/m ? 0 : 1)' "$pat" < "$T/$name.out" \
-		|| fail "$name" "no /$pat/ in $secs s: $(head -c 300 "$T/$name.out")"
+		|| fail "$name" "no /$pat/, nothing new for $secs s: $(head -c 300 "$T/$name.out")"
 }
 
-# expect NAME EXIT PATTERN SECONDS CMD... — CMD exits EXIT (124: still
-# running when the time was up) and its output matches PATTERN.
+# expect NAME EXIT PATTERN SECONDS CMD... — CMD exits EXIT and its output
+# matches PATTERN.  124: ended for it, when its guest's init ended, or
+# after six times SECONDS with nothing new under $T (the guest idle).
 expect() {
 	name=$1; want=$2; pat=$3; secs=$4; shift 4
 	N=$((N + 1))
