@@ -1,0 +1,27 @@
+<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>tabernacle</title>
+<link rel=icon type=image/svg+xml href=ICON>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font:14px system-ui,sans-serif;color:#ddd}
+body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42);display:flex;align-items:center;justify-content:center}
+form{background:rgba(8,8,12,.85);border-radius:12px;padding:28px 28px 22px;width:300px;display:flex;flex-direction:column;gap:12px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 6px;font-size:18px;font-weight:600;color:#fff}
+label{display:flex;flex-direction:column;gap:5px;color:#bbb}
+input{font:inherit;padding:8px 10px;border-radius:6px;border:1px solid #444;background:#111;color:#eee}
+input:focus{outline:none;border-color:#6cb6ff}
+button{font:inherit;margin-top:6px;padding:9px;border:0;border-radius:6px;background:#3a6ea5;color:#fff;cursor:pointer}
+button:hover{background:#4a80bb}
+#bad{color:#ff8a80;min-height:1em}
+</style></head><body>
+<form method=post action=/login autocomplete=off>
+<h1>tabernacle</h1>
+<label>Name<input name=name autofocus></label>
+<label>Password<input name=password type=password></label>
+<div id=bad></div>
+<button type=submit>Log in</button>
+</form>
+<script>
+if(location.search=='?bad')document.getElementById('bad').textContent='Login incorrect';
+</script>
+</body></html>

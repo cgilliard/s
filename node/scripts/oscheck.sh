@@ -956,8 +956,13 @@ done
 
 # The window manager: wm (src/user/wm.fam) serving its page and, over a
 # WebSocket, a shell on a terminal, from the host through a forwarded
-# port: the page, the handshake's key, the prompt, a directory made and
-# seen by ls, a ping answered, exit closing it.  With node 22 or later, the
+# port.  The disk's /etc/passwd written first (root's password in plain
+# text), wm started from the shell.  Logging in: the login form without a
+# session, /tty refused (403), a wrong password sent to /?bad, the right
+# one a cookie; then the page, the handshake's key, the prompt, a
+# directory made and seen by ls, root's password kept hashed (cat
+# /etc/passwd), a ping answered, exit closing it; a second terminal
+# closed by logging out, the cookie refused after.  With node 22 or later, the
 # desktop page's own script too, on a stub DOM: two terminals from the
 # dock, typing (a backspace among it), minimize and restore from the
 # taskbar, maximize, exit and the close button each closing a window, then
@@ -968,19 +973,38 @@ cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
 G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-page = socket.create_connection(("127.0.0.1", port), timeout=30)
-page.sendall(b"GET / HTTP/1.0\r\n\r\n"); body = b""
-while True:
-    d = page.recv(65536)
-    if not d: break
-    body += d
+def http(req):
+    c = socket.create_connection(("127.0.0.1", port), timeout=60)
+    c.sendall(req); body = b""
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        body += d
+    return body
+def post(path, form, cookie=b""):
+    return http(b"POST " + path + b" HTTP/1.0\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + str(len(form)).encode() + b"\r\n" + cookie + b"\r\n" + form)
+def wsopen(cookie):
+    c = socket.create_connection(("127.0.0.1", port), timeout=30)
+    key = base64.b64encode(os.urandom(16))
+    c.sendall(b"GET /tty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + cookie + b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    h = b""
+    while b"\r\n\r\n" not in h:
+        d = c.recv(1)
+        if not d: break
+        h += d
+    return c, h, base64.b64encode(hashlib.sha1(key + G).digest())
+body = http(b"GET / HTTP/1.0\r\n\r\n")
+print("login form", body.split(b"\r\n")[0].decode(), b"action=/login" in body and b"new WebSocket" not in body)
+c0, h0, _ = wsopen(b""); print("tty refused", h0.split(b"\r\n")[0].decode())
+bad = post(b"/login", b"name=root&password=nope")
+print("bad", b"Location: /?bad" in bad and b"Set-Cookie" not in bad)
+good = post(b"/login", b"name=root&password=wm%21pw")
+ck = [l for l in good.split(b"\r\n") if l.startswith(b"Set-Cookie: wm=")]
+cookie = b"Cookie: " + ck[0][12:].split(b";")[0] + b"\r\n" if ck else b""
+print("cookie", len(cookie) == 8 + 3 + 32 + 2)
+body = http(b"GET / HTTP/1.0\r\n" + cookie + b"\r\n")
 print("page", body.split(b"\r\n")[0].decode(), b"new WebSocket" in body)
-s = socket.create_connection(("127.0.0.1", port), timeout=30)
-key = base64.b64encode(os.urandom(16))
-s.sendall(b"GET /tty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
-h = b""
-while b"\r\n\r\n" not in h: h += s.recv(1)
-want = base64.b64encode(hashlib.sha1(key + G).digest())
+s, h, want = wsopen(cookie)
 print("upgrade", h.split(b"\r\n")[0].decode(), (b"Sec-WebSocket-Accept: " + want) in h)
 buf = b""; out = b""; closed = False
 def send(data, op=2):
@@ -1011,15 +1035,25 @@ send(b"mkdir /d\r")
 pump(b"$ mkdir"); out = b""
 send(b"ls /\r"); ok = pump(b"d/\r\n")
 print("ls", ok, repr(out[-60:]))
+out = b""; send(b"cat /etc/passwd\r"); print("hashed", pump(b":0:0:/:sh") and b"root:$p5$4e20$" in out)
 send(b"hi", 9); print("ping", pump(b"[pong:hi]"))
 send(b"exit\r"); print("exit", pump(b"[close]"))
+# logging out closes a terminal of the session; the cookie is no good after
+s, h, want = wsopen(cookie); buf = b""; out = b""; closed = False
+pump(b"$ ")
+lo = post(b"/logout", b"", cookie)
+print("logout", b"Location: /" in lo and pump(b"[close]", 30))
+c2, h2, _ = wsopen(cookie); print("after", h2.split(b"\r\n")[0].decode())
 WSCEOF
 cat > "$T/page.js" <<'PAGEEOF'
 // Run the page wm serves: its script, with a small stub DOM; the dock's
 // terminal button clicked, keys typed as a browser would.
 const port = process.argv[2];
 (async () => {
-  const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+  const lr = await fetch(`http://127.0.0.1:${port}/login`, { method: 'POST', redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'name=root&password=wm%21pw' });
+  const cookie = (lr.headers.get('set-cookie') || '').split(';')[0];
+  const html = await (await fetch(`http://127.0.0.1:${port}/`, { headers: { Cookie: cookie } })).text();
   const js = html.split('<script>')[1].split('</script>')[0];
   const byId = {};
   class El {
@@ -1043,7 +1077,7 @@ const port = process.argv[2];
     getElementById: (id) => byId[id] || (byId[id] = new El('div')) };
   globalThis.document = doc;
   globalThis.window = globalThis;
-  const WSS = []; const RW = globalThis.WebSocket; globalThis.WebSocket = class extends RW { constructor(u) { super(u); WSS.push(this); } };
+  const WSS = []; const RW = globalThis.WebSocket; globalThis.WebSocket = class extends RW { constructor(u) { super(u, { headers: { Cookie: cookie } }); WSS.push(this); } };
   globalThis.location = { protocol: 'http:', host: `127.0.0.1:${port}` };
   new Function(js)();
   const all = (e, c, out = []) => { if (e.classList && e.classList.has(c)) out.push(e); e.kids.forEach((k) => all(k, c, out)); return out; };
@@ -1061,7 +1095,7 @@ const port = process.argv[2];
   console.log('focused', doc.active === t2 && wins[0].classList.has('off') && !wins[1].classList.has('off'));
   type(t2, 'mkdir /e\r'); await wait(() => /mkdir \/e\n\$ █$/.test(t2.plain), 60000);
   type(t2, 'ls /x'); key(t2, 'Backspace'); type(t2, '\r');
-  console.log('ls', await wait(() => /e\/\ndev\/\nproc\/\n\$ █$/.test(t2.plain), 60000) && !/ls/.test(t1.plain));
+  console.log('ls', await wait(() => /e\/\netc\/\ndev\/\nproc\/\n\$ █$/.test(t2.plain), 60000) && !/ls/.test(t1.plain));
   // the second minimized from its button: hidden, the first focused; restored from the taskbar
   all(wins[1], 'wb')[0].onclick({ stopPropagation() {} });
   const k2 = all(tasks, 'task')[1];
@@ -1114,7 +1148,8 @@ const port = process.argv[2];
     const n0 = heads(); type(t3, 'ps\r');
     await wait(() => heads() > n0 && prompt.test(t3.plain), 20000);
     last = t3.plain.slice(t3.plain.lastIndexOf('CMD'));
-    reaped = !/ Z /.test(last) && (last.match(/ sh$/gm) || []).length === 1;
+    // one shell left (its runas above it, wm's way of running it as the user)
+    reaped = !/ Z /.test(last) && (last.match(/^(?!.*runas).* sh$/gm) || []).length === 1;
     if (!reaped) await new Promise((r) => setTimeout(r, 1000));
   }
   console.log('reaped', reaped);
@@ -1129,21 +1164,27 @@ const port = process.argv[2];
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/wm sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))
 	rm -f "$T/wm.disk"; dd if=/dev/zero of="$T/wm.disk" bs=1 count=0 seek=268435456 2>/dev/null
-	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < /dev/null > "$T/wm_$n.out" 2>&1 &
+	rm -f "$T/wm.in"; mkfifo "$T/wm.in"
+	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < "$T/wm.in" > "$T/wm_$n.out" 2>&1 &
 	QP=$!
+	exec 5> "$T/wm.in"
+	i=0; while [ $i -lt 120 ] && ! grep -q '[$] ' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	printf '%s\n' 'mkdir /etc' 'echo root:wm!pw:0:0:/:sh > /etc/passwd' 'wm &' >&5
 	i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
 	lim 300 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
 		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
-	kill $QP 2>/dev/null; wait $QP 2>/dev/null
-	for pat in '^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^ping True$' '^exit True$'; do
+	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
+	for pat in '^login form HTTP/1.0 200 OK True$' '^tty refused HTTP/1.0 403 Forbidden$' '^bad True$' '^cookie True$' \
+		'^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^hashed True$' \
+		'^ping True$' '^exit True$' '^logout True$' '^after HTTP/1.0 403 Forbidden$'; do
 		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
 	done
 done

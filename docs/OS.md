@@ -682,9 +682,22 @@ kernel too much to add at the end.
    password. Alice gets her user and home, writes a file of her own,
    and is refused `/etc/passwd` and a directory at the root. Root then
    logs in after her and may read everything. Not yet: passwords are
-   kept in plain text (`/etc/passwd` only root may read) and echoed as
-   typed; the search right is checked only on a path's last directory;
-   a removed tree's pages are not given back.
+   echoed as typed; the search right is checked only on a path's last
+   directory; a removed tree's pages are not given back.
+
+   Passwords hashed (2026-11-09, `docs/GUI_WALLET.md`, phase 0):
+   `/etc/passwd` keeps each as `$p5$ITERATIONS$SALT$HASH`, PBKDF2-
+   HMAC-SHA512 (20,000 iterations, a 16-byte random salt), made and
+   checked by `src/user/crypto/passwd.fam`; a password still in plain
+   text is taken and hashed in its place at its first use. `passwd
+   NAME` (root) sets one. SHA-512, HMAC and PBKDF2 are
+   `src/user/crypto/sha512.fam`, the compression a raw word
+   (`tools/gensha512.py`), about 100 times the fam version's speed: a
+   login's check about 1.4 s, BIP39's seed a tenth of a second. A
+   program names such modules in a `\ uses:` line (`scripts/build.sh`).
+   Checked: `sha512` against Python's hashlib (BIP39's case among
+   them), `passwd`, and `users` now finding both lines hashed after
+   their logins.
 9. **The network.** virtio-net, IP, UDP sockets (the node's protocol,
    in fam), then TCP. Done when a program fetches over UDP and the host
    reads a page served from the guest. Done (2026-11-07):
@@ -949,6 +962,26 @@ kernel too much to add at the end.
       arrow's sequence dropped in line mode, the size through the pty),
       and the page test feeding escape sequences to a window (positions,
       erase, the alternate screen and back).
+
+    Logging in (2026-11-09, `docs/GUI_WALLET.md`, phase 0). wm asks
+    for a name and password before the desktop:
+    - Without a session, `GET /` is a login form (`src/user/wm-login.html`,
+      put into `wm.fam` by `scripts/wmpage.py` with the desktop).
+      `POST /login` checks the form against `/etc/passwd` as `login`
+      does (a plain password hashed at its first use) and starts a
+      session: a random token in the cookie `wm` (HttpOnly,
+      SameSite=Strict), eight sessions at once. A wrong password goes
+      back to `/?bad`, which the form says.
+    - Each window's program runs as the session's user, its shell from
+      `/etc/passwd`, in its home: wm (root) starts `runas USER GROUP
+      SHELL` there. `/tty` without a session is refused (403).
+    - The taskbar's Log out (`POST /logout`) ends the session and closes
+      its windows (a WebSocket close each). The cookie is refused after.
+    - The page travels in plain HTTP: reach it from the host only.
+    - Checked: wm_1/4, `wsc.py` (the form, 403, a wrong password, the
+      cookie, a terminal as root, its password found hashed, logout
+      closing a terminal and the cookie refused after) and the page
+      test (logged in first, every check as before).
 11. **The tools.** The editor, and the fam compiler as a program (its
     I/O through system calls, a larger heap). Done when a program is
     written, built and run inside the OS.

@@ -100,8 +100,9 @@ come after, as the user who logged in.
   seed stored encrypted (ChaCha20-Poly1305) under a key derived from the
   login password with a salt of the wallet's own, a different
   derivation from the login's hash, so neither gives the other. wm
-  hands the password to `wallet` on its pipe when it starts it, and
-  keeps nothing.
+  keeps the password in memory for the session only (the wallet may be
+  opened any time after logging in), hands it to `wallet` on its pipe
+  when it starts it, and forgets it at logout.
 - **Changing the password** re-encrypts the wallet's phrase in the same
   step; a wallet created before a password, or restored, takes the
   login password at once.
@@ -158,7 +159,9 @@ memos faster than every output in order.
 ## Phases proposed
 
 0. **Logging in:** passwords hashed, wm's login form and sessions, the
-   programs run as the user. Needed whatever the wallet.
+   programs run as the user. Needed whatever the wallet. Done
+   (2026-11-09, `docs/OS.md`: steps 8 and 10's notes); the session's
+   password kept for the wallet comes with phase 1.
 1. **A wallet of its own, by files:** create or restore from a phrase,
    scan, balance and activity; receive and send by slate files; fees;
    cancel and bump. Everything but the message layer. A tabminer wallet
