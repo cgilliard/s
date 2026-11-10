@@ -18,6 +18,14 @@ decide.
 3. **Logging in unlocks it:** wm asks for a name and password before it
    shows the desktop (Logging in, below), and that password is the
    wallet's: no second password to remember or type.
+4. **The message layer in phase 3:** slates by file until then. The
+   message layer is the onion routing of payments (`docs/ONION.md`):
+   the sender reaches the recipient's rendezvous point over a circuit
+   of three hops, and neither learns the other's address. Its other use
+   comes with it: until then the wallet's own transactions go to the
+   node's pool through the API and are relayed by the node to its peers
+   from its address, as everyone's are; tabminer in onion mode hands
+   them to a relay over a circuit instead.
 
 ## What is fixed already
 
@@ -163,10 +171,3 @@ memos faster than every output in order.
 Each phase ends with tests as the node's: vectors from tabminer for every
 primitive, then a tabminer wallet and this one paying each other on the
 recursive dev network, in both directions.
-
-## To decide
-
-1. **The message layer:** in the first phase (online payments from the
-   start, much more to build first) or the third, as proposed (by
-   files first, a tabminer wallet and this one paying each other that
-   way).
