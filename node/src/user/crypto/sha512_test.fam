@@ -1,0 +1,120 @@
+\ crypto/sha512_test.fam — the SHA-512 module (crypto/sha512.fam) against
+\ Python's hashlib (the values written by this file's generator, in the
+\ commit that added it): digests of 0, 3, 111, 112 and 300 bytes (one
+\ block, the padding's edge, several); HMAC-SHA512 with a short key and
+\ one over a block (hashed first); PBKDF2-HMAC-SHA512 at 1 and 2
+\ iterations, and BIP39's own (2,048, salt "mnemonicTREZOR").  Prints
+\ "sha512: N as expected, M not".
+
+: tpas variable ;  : tfai variable ;  : tbuf variable ;  : tbn variable ;  : tex variable ;  : tout variable ;
+: tchk  swap if drop tpas @ 1 lit + tpas ! else "sha512: " puts puts 0A lit putc tfai @ 1 lit + tfai ! then ;   \ ( flag str -- )
+\ tb ( c -- )  a byte to the input; tx ( c -- )  a byte to the expected.
+: tb  tbuf @ tbn @ + c!  tbn @ 1 lit + tbn ! ;
+: txp variable ;
+: tx  tex @ txp @ + c!  txp @ 1 lit + txp ! ;
+: tsame  ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
+800 lit alloc tbuf !  80 lit alloc tex !  80 lit alloc tout !
+: tnew  0 lit tbn !  0 lit txp ! ;
+
+\ sha512 of 0 bytes
+tnew
+CF lit tx 83 lit tx E1 lit tx 35 lit tx 7E lit tx EF lit tx B8 lit tx BD lit tx F1 lit tx 54 lit tx 28 lit tx 50 lit tx D6 lit tx 6D lit tx 80 lit tx 7 lit tx D6 lit tx 20 lit tx E4 lit tx 5 lit tx B lit tx 57 lit tx 15 lit tx DC lit tx
+83 lit tx F4 lit tx A9 lit tx 21 lit tx D3 lit tx 6C lit tx E9 lit tx CE lit tx 47 lit tx D0 lit tx D1 lit tx 3C lit tx 5D lit tx 85 lit tx F2 lit tx B0 lit tx FF lit tx 83 lit tx 18 lit tx D2 lit tx 87 lit tx 7E lit tx EC lit tx 2F lit tx
+63 lit tx B9 lit tx 31 lit tx BD lit tx 47 lit tx 41 lit tx 7A lit tx 81 lit tx A5 lit tx 38 lit tx 32 lit tx 7A lit tx F9 lit tx 27 lit tx DA lit tx 3E lit tx
+tbuf @ tbn @ sha512  h5d @ tex @ 40 lit tsame "the digest of 0 bytes" tchk
+\ sha512 of 3 bytes
+tnew
+61 lit tb 62 lit tb 63 lit tb
+DD lit tx AF lit tx 35 lit tx A1 lit tx 93 lit tx 61 lit tx 7A lit tx BA lit tx CC lit tx 41 lit tx 73 lit tx 49 lit tx AE lit tx 20 lit tx 41 lit tx 31 lit tx 12 lit tx E6 lit tx FA lit tx 4E lit tx 89 lit tx A9 lit tx 7E lit tx A2 lit tx
+A lit tx 9E lit tx EE lit tx E6 lit tx 4B lit tx 55 lit tx D3 lit tx 9A lit tx 21 lit tx 92 lit tx 99 lit tx 2A lit tx 27 lit tx 4F lit tx C1 lit tx A8 lit tx 36 lit tx BA lit tx 3C lit tx 23 lit tx A3 lit tx FE lit tx EB lit tx BD lit tx
+45 lit tx 4D lit tx 44 lit tx 23 lit tx 64 lit tx 3C lit tx E8 lit tx E lit tx 2A lit tx 9A lit tx C9 lit tx 4F lit tx A5 lit tx 4C lit tx A4 lit tx 9F lit tx
+tbuf @ tbn @ sha512  h5d @ tex @ 40 lit tsame "the digest of 3 bytes" tchk
+\ sha512 of 111 bytes
+tnew
+0 lit tb 1 lit tb 2 lit tb 3 lit tb 4 lit tb 5 lit tb 6 lit tb 7 lit tb 8 lit tb 9 lit tb A lit tb B lit tb C lit tb D lit tb E lit tb F lit tb 10 lit tb 11 lit tb 12 lit tb 13 lit tb 14 lit tb 15 lit tb 16 lit tb 17 lit tb
+18 lit tb 19 lit tb 1A lit tb 1B lit tb 1C lit tb 1D lit tb 1E lit tb 1F lit tb 20 lit tb 21 lit tb 22 lit tb 23 lit tb 24 lit tb 25 lit tb 26 lit tb 27 lit tb 28 lit tb 29 lit tb 2A lit tb 2B lit tb 2C lit tb 2D lit tb 2E lit tb 2F lit tb
+30 lit tb 31 lit tb 32 lit tb 33 lit tb 34 lit tb 35 lit tb 36 lit tb 37 lit tb 38 lit tb 39 lit tb 3A lit tb 3B lit tb 3C lit tb 3D lit tb 3E lit tb 3F lit tb 40 lit tb 41 lit tb 42 lit tb 43 lit tb 44 lit tb 45 lit tb 46 lit tb 47 lit tb
+48 lit tb 49 lit tb 4A lit tb 4B lit tb 4C lit tb 4D lit tb 4E lit tb 4F lit tb 50 lit tb 51 lit tb 52 lit tb 53 lit tb 54 lit tb 55 lit tb 56 lit tb 57 lit tb 58 lit tb 59 lit tb 5A lit tb 5B lit tb 5C lit tb 5D lit tb 5E lit tb 5F lit tb
+60 lit tb 61 lit tb 62 lit tb 63 lit tb 64 lit tb 65 lit tb 66 lit tb 67 lit tb 68 lit tb 69 lit tb 6A lit tb 6B lit tb 6C lit tb 6D lit tb 6E lit tb
+A1 lit tx A1 lit tx 11 lit tx 44 lit tx 9B lit tx 19 lit tx 8D lit tx 9B lit tx 1F lit tx 53 lit tx 8B lit tx AD lit tx 7F lit tx 3F lit tx C1 lit tx 2 lit tx 2B lit tx 3A lit tx 5B lit tx 1A lit tx 5E lit tx 90 lit tx A0 lit tx BC lit tx
+86 lit tx D lit tx E8 lit tx 51 lit tx 27 lit tx 46 lit tx CB lit tx C3 lit tx 15 lit tx 99 lit tx E6 lit tx C8 lit tx 34 lit tx DE lit tx 3A lit tx 32 lit tx 35 lit tx 32 lit tx 7A lit tx F0 lit tx B5 lit tx 1F lit tx F5 lit tx 7B lit tx
+F7 lit tx AC lit tx F1 lit tx 97 lit tx 4A lit tx 73 lit tx 1 lit tx 4D lit tx 9C lit tx 39 lit tx 53 lit tx 81 lit tx 2E lit tx DC lit tx 7C lit tx 8D lit tx
+tbuf @ tbn @ sha512  h5d @ tex @ 40 lit tsame "the digest of 111 bytes" tchk
+\ sha512 of 112 bytes
+tnew
+0 lit tb 1 lit tb 2 lit tb 3 lit tb 4 lit tb 5 lit tb 6 lit tb 7 lit tb 8 lit tb 9 lit tb A lit tb B lit tb C lit tb D lit tb E lit tb F lit tb 10 lit tb 11 lit tb 12 lit tb 13 lit tb 14 lit tb 15 lit tb 16 lit tb 17 lit tb
+18 lit tb 19 lit tb 1A lit tb 1B lit tb 1C lit tb 1D lit tb 1E lit tb 1F lit tb 20 lit tb 21 lit tb 22 lit tb 23 lit tb 24 lit tb 25 lit tb 26 lit tb 27 lit tb 28 lit tb 29 lit tb 2A lit tb 2B lit tb 2C lit tb 2D lit tb 2E lit tb 2F lit tb
+30 lit tb 31 lit tb 32 lit tb 33 lit tb 34 lit tb 35 lit tb 36 lit tb 37 lit tb 38 lit tb 39 lit tb 3A lit tb 3B lit tb 3C lit tb 3D lit tb 3E lit tb 3F lit tb 40 lit tb 41 lit tb 42 lit tb 43 lit tb 44 lit tb 45 lit tb 46 lit tb 47 lit tb
+48 lit tb 49 lit tb 4A lit tb 4B lit tb 4C lit tb 4D lit tb 4E lit tb 4F lit tb 50 lit tb 51 lit tb 52 lit tb 53 lit tb 54 lit tb 55 lit tb 56 lit tb 57 lit tb 58 lit tb 59 lit tb 5A lit tb 5B lit tb 5C lit tb 5D lit tb 5E lit tb 5F lit tb
+60 lit tb 61 lit tb 62 lit tb 63 lit tb 64 lit tb 65 lit tb 66 lit tb 67 lit tb 68 lit tb 69 lit tb 6A lit tb 6B lit tb 6C lit tb 6D lit tb 6E lit tb 6F lit tb
+C5 lit tx FB lit tx D7 lit tx 31 lit tx D1 lit tx 9D lit tx 2A lit tx E1 lit tx 18 lit tx F lit tx 0 lit tx 1B lit tx E7 lit tx 2C lit tx 2C lit tx 1A lit tx AB lit tx A1 lit tx D7 lit tx B0 lit tx 94 lit tx B3 lit tx 74 lit tx 88 lit tx
+80 lit tx E2 lit tx 45 lit tx 93 lit tx B8 lit tx E1 lit tx 17 lit tx A7 lit tx 50 lit tx E1 lit tx 1C lit tx 1B lit tx D8 lit tx 67 lit tx CC lit tx 2F lit tx 96 lit tx DA lit tx CE lit tx 8C lit tx 8B lit tx 74 lit tx AB lit tx D2 lit tx
+D5 lit tx C4 lit tx F2 lit tx 36 lit tx BE lit tx 44 lit tx 4E lit tx 77 lit tx D3 lit tx D lit tx 19 lit tx 16 lit tx 17 lit tx 40 lit tx 70 lit tx B9 lit tx
+tbuf @ tbn @ sha512  h5d @ tex @ 40 lit tsame "the digest of 112 bytes" tchk
+\ sha512 of 300 bytes
+tnew
+0 lit tb 7 lit tb E lit tb 15 lit tb 1C lit tb 23 lit tb 2A lit tb 31 lit tb 38 lit tb 3F lit tb 46 lit tb 4D lit tb 54 lit tb 5B lit tb 62 lit tb 69 lit tb 70 lit tb 77 lit tb 7E lit tb 85 lit tb 8C lit tb 93 lit tb 9A lit tb A1 lit tb
+A8 lit tb AF lit tb B6 lit tb BD lit tb C4 lit tb CB lit tb D2 lit tb D9 lit tb E0 lit tb E7 lit tb EE lit tb F5 lit tb FC lit tb 3 lit tb A lit tb 11 lit tb 18 lit tb 1F lit tb 26 lit tb 2D lit tb 34 lit tb 3B lit tb 42 lit tb 49 lit tb
+50 lit tb 57 lit tb 5E lit tb 65 lit tb 6C lit tb 73 lit tb 7A lit tb 81 lit tb 88 lit tb 8F lit tb 96 lit tb 9D lit tb A4 lit tb AB lit tb B2 lit tb B9 lit tb C0 lit tb C7 lit tb CE lit tb D5 lit tb DC lit tb E3 lit tb EA lit tb F1 lit tb
+F8 lit tb FF lit tb 6 lit tb D lit tb 14 lit tb 1B lit tb 22 lit tb 29 lit tb 30 lit tb 37 lit tb 3E lit tb 45 lit tb 4C lit tb 53 lit tb 5A lit tb 61 lit tb 68 lit tb 6F lit tb 76 lit tb 7D lit tb 84 lit tb 8B lit tb 92 lit tb 99 lit tb
+A0 lit tb A7 lit tb AE lit tb B5 lit tb BC lit tb C3 lit tb CA lit tb D1 lit tb D8 lit tb DF lit tb E6 lit tb ED lit tb F4 lit tb FB lit tb 2 lit tb 9 lit tb 10 lit tb 17 lit tb 1E lit tb 25 lit tb 2C lit tb 33 lit tb 3A lit tb 41 lit tb
+48 lit tb 4F lit tb 56 lit tb 5D lit tb 64 lit tb 6B lit tb 72 lit tb 79 lit tb 80 lit tb 87 lit tb 8E lit tb 95 lit tb 9C lit tb A3 lit tb AA lit tb B1 lit tb B8 lit tb BF lit tb C6 lit tb CD lit tb D4 lit tb DB lit tb E2 lit tb E9 lit tb
+F0 lit tb F7 lit tb FE lit tb 5 lit tb C lit tb 13 lit tb 1A lit tb 21 lit tb 28 lit tb 2F lit tb 36 lit tb 3D lit tb 44 lit tb 4B lit tb 52 lit tb 59 lit tb 60 lit tb 67 lit tb 6E lit tb 75 lit tb 7C lit tb 83 lit tb 8A lit tb 91 lit tb
+98 lit tb 9F lit tb A6 lit tb AD lit tb B4 lit tb BB lit tb C2 lit tb C9 lit tb D0 lit tb D7 lit tb DE lit tb E5 lit tb EC lit tb F3 lit tb FA lit tb 1 lit tb 8 lit tb F lit tb 16 lit tb 1D lit tb 24 lit tb 2B lit tb 32 lit tb 39 lit tb
+40 lit tb 47 lit tb 4E lit tb 55 lit tb 5C lit tb 63 lit tb 6A lit tb 71 lit tb 78 lit tb 7F lit tb 86 lit tb 8D lit tb 94 lit tb 9B lit tb A2 lit tb A9 lit tb B0 lit tb B7 lit tb BE lit tb C5 lit tb CC lit tb D3 lit tb DA lit tb E1 lit tb
+E8 lit tb EF lit tb F6 lit tb FD lit tb 4 lit tb B lit tb 12 lit tb 19 lit tb 20 lit tb 27 lit tb 2E lit tb 35 lit tb 3C lit tb 43 lit tb 4A lit tb 51 lit tb 58 lit tb 5F lit tb 66 lit tb 6D lit tb 74 lit tb 7B lit tb 82 lit tb 89 lit tb
+90 lit tb 97 lit tb 9E lit tb A5 lit tb AC lit tb B3 lit tb BA lit tb C1 lit tb C8 lit tb CF lit tb D6 lit tb DD lit tb E4 lit tb EB lit tb F2 lit tb F9 lit tb 0 lit tb 7 lit tb E lit tb 15 lit tb 1C lit tb 23 lit tb 2A lit tb 31 lit tb
+38 lit tb 3F lit tb 46 lit tb 4D lit tb 54 lit tb 5B lit tb 62 lit tb 69 lit tb 70 lit tb 77 lit tb 7E lit tb 85 lit tb 8C lit tb 93 lit tb 9A lit tb A1 lit tb A8 lit tb AF lit tb B6 lit tb BD lit tb C4 lit tb CB lit tb D2 lit tb D9 lit tb
+E0 lit tb E7 lit tb EE lit tb F5 lit tb FC lit tb 3 lit tb A lit tb 11 lit tb 18 lit tb 1F lit tb 26 lit tb 2D lit tb
+C5 lit tx 9C lit tx DE lit tx C0 lit tx AD lit tx 3E lit tx 78 lit tx 2B lit tx 46 lit tx 89 lit tx 53 lit tx 75 lit tx B8 lit tx 72 lit tx 1D lit tx ED lit tx 4 lit tx FE lit tx 27 lit tx 67 lit tx 26 lit tx 3E lit tx A5 lit tx 2A lit tx
+D3 lit tx F7 lit tx 94 lit tx E9 lit tx 8E lit tx 99 lit tx D lit tx 60 lit tx B8 lit tx 3D lit tx 26 lit tx 71 lit tx 43 lit tx D lit tx 34 lit tx C6 lit tx E2 lit tx 7C lit tx 5D lit tx F lit tx 55 lit tx 6A lit tx 30 lit tx 96 lit tx
+4F lit tx 12 lit tx 43 lit tx B7 lit tx CB lit tx 4F lit tx 98 lit tx C2 lit tx 1E lit tx A8 lit tx B8 lit tx BD lit tx E9 lit tx 90 lit tx 7F lit tx DA lit tx
+tbuf @ tbn @ sha512  h5d @ tex @ 40 lit tsame "the digest of 300 bytes" tchk
+\ hmac512, a short key
+tnew
+B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb B lit tb 48 lit tb 69 lit tb 20 lit tb 54 lit tb
+68 lit tb 65 lit tb 72 lit tb 65 lit tb
+87 lit tx AA lit tx 7C lit tx DE lit tx A5 lit tx EF lit tx 61 lit tx 9D lit tx 4F lit tx F0 lit tx B4 lit tx 24 lit tx 1A lit tx 1D lit tx 6C lit tx B0 lit tx 23 lit tx 79 lit tx F4 lit tx E2 lit tx CE lit tx 4E lit tx C2 lit tx 78 lit tx
+7A lit tx D0 lit tx B3 lit tx 5 lit tx 45 lit tx E1 lit tx 7C lit tx DE lit tx DA lit tx A8 lit tx 33 lit tx B7 lit tx D6 lit tx B8 lit tx A7 lit tx 2 lit tx 3 lit tx 8B lit tx 27 lit tx 4E lit tx AE lit tx A3 lit tx F4 lit tx E4 lit tx
+BE lit tx 9D lit tx 91 lit tx 4E lit tx EB lit tx 61 lit tx F1 lit tx 70 lit tx 2E lit tx 69 lit tx 6C lit tx 20 lit tx 3A lit tx 12 lit tx 68 lit tx 54 lit tx
+tbuf @ 14 lit  tbuf @ 14 lit + 8 lit hmac512  h5d @ tex @ 40 lit tsame "hmac512 with a short key" tchk
+\ hmac512, a key over a block
+tnew
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb
+AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb AA lit tb 54 lit tb 65 lit tb 73 lit tb 74 lit tb 20 lit tb 55 lit tb 73 lit tb 69 lit tb 6E lit tb 67 lit tb 20 lit tb 4C lit tb 61 lit tb
+72 lit tb 67 lit tb 65 lit tb 72 lit tb 20 lit tb 54 lit tb 68 lit tb 61 lit tb 6E lit tb 20 lit tb 42 lit tb 6C lit tb 6F lit tb 63 lit tb 6B lit tb 2D lit tb 53 lit tb 69 lit tb 7A lit tb 65 lit tb 20 lit tb 4B lit tb 65 lit tb 79 lit tb
+20 lit tb 2D lit tb 20 lit tb 48 lit tb 61 lit tb 73 lit tb 68 lit tb 20 lit tb 4B lit tb 65 lit tb 79 lit tb 20 lit tb 46 lit tb 69 lit tb 72 lit tb 73 lit tb 74 lit tb
+80 lit tx B2 lit tx 42 lit tx 63 lit tx C7 lit tx C1 lit tx A3 lit tx EB lit tx B7 lit tx 14 lit tx 93 lit tx C1 lit tx DD lit tx 7B lit tx E8 lit tx B4 lit tx 9B lit tx 46 lit tx D1 lit tx F4 lit tx 1B lit tx 4A lit tx EE lit tx C1 lit tx
+12 lit tx 1B lit tx 1 lit tx 37 lit tx 83 lit tx F8 lit tx F3 lit tx 52 lit tx 6B lit tx 56 lit tx D0 lit tx 37 lit tx E0 lit tx 5F lit tx 25 lit tx 98 lit tx BD lit tx F lit tx D2 lit tx 21 lit tx 5D lit tx 6A lit tx 1E lit tx 52 lit tx
+95 lit tx E6 lit tx 4F lit tx 73 lit tx F6 lit tx 3F lit tx A lit tx EC lit tx 8B lit tx 91 lit tx 5A lit tx 98 lit tx 5D lit tx 78 lit tx 65 lit tx 98 lit tx
+tbuf @ 83 lit  tbuf @ 83 lit + 36 lit hmac512  h5d @ tex @ 40 lit tsame "hmac512 with a key over a block" tchk
+\ pbkdf512, 1 iteration
+tnew
+70 lit tb 61 lit tb 73 lit tb 73 lit tb 77 lit tb 6F lit tb 72 lit tb 64 lit tb 73 lit tb 61 lit tb 6C lit tb 74 lit tb
+86 lit tx 7F lit tx 70 lit tx CF lit tx 1A lit tx DE lit tx 2 lit tx CF lit tx F3 lit tx 75 lit tx 25 lit tx 99 lit tx A3 lit tx A5 lit tx 3D lit tx C4 lit tx AF lit tx 34 lit tx C7 lit tx A6 lit tx 69 lit tx 81 lit tx 5A lit tx E5 lit tx
+D5 lit tx 13 lit tx 55 lit tx 4E lit tx 1C lit tx 8C lit tx F2 lit tx 52 lit tx C0 lit tx 2D lit tx 47 lit tx A lit tx 28 lit tx 5A lit tx 5 lit tx 1 lit tx BA lit tx D9 lit tx 99 lit tx BF lit tx E9 lit tx 43 lit tx C0 lit tx 8F lit tx
+5 lit tx 2 lit tx 35 lit tx D7 lit tx D6 lit tx 8B lit tx 1D lit tx A5 lit tx 5E lit tx 63 lit tx F7 lit tx 3B lit tx 60 lit tx A5 lit tx 7F lit tx CE lit tx
+tbuf @ 8 lit  tbuf @ 8 lit + 4 lit  1 lit  tout @ 40 lit pbkdf512  tout @ tex @ 40 lit tsame "pbkdf512, 1 iteration" tchk
+\ pbkdf512, 2 iterations, 32 bytes
+tnew
+70 lit tb 61 lit tb 73 lit tb 73 lit tb 77 lit tb 6F lit tb 72 lit tb 64 lit tb 73 lit tb 61 lit tb 6C lit tb 74 lit tb
+E1 lit tx D9 lit tx C1 lit tx 6A lit tx A6 lit tx 81 lit tx 70 lit tx 8A lit tx 45 lit tx F5 lit tx C7 lit tx C4 lit tx E2 lit tx 15 lit tx CE lit tx B6 lit tx 6E lit tx 1 lit tx 1A lit tx 2E lit tx 9F lit tx 0 lit tx 40 lit tx 71 lit tx
+3F lit tx 18 lit tx AE lit tx FD lit tx B8 lit tx 66 lit tx D5 lit tx 3C lit tx
+tbuf @ 8 lit  tbuf @ 8 lit + 4 lit  2 lit  tout @ 20 lit pbkdf512  tout @ tex @ 20 lit tsame "pbkdf512, 2 iterations, 32 bytes" tchk
+\ pbkdf512, BIP39's (2,048)
+tnew
+61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb
+61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb
+61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb
+61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 61 lit tb 6E lit tb 64 lit tb 6F lit tb 6E lit tb 20 lit tb 61 lit tb 62 lit tb 6F lit tb 75 lit tb 74 lit tb 6D lit tb 6E lit tb 65 lit tb
+6D lit tb 6F lit tb 6E lit tb 69 lit tb 63 lit tb 54 lit tb 52 lit tb 45 lit tb 5A lit tb 4F lit tb 52 lit tb
+C5 lit tx 52 lit tx 57 lit tx C3 lit tx 60 lit tx C0 lit tx 7C lit tx 72 lit tx 2 lit tx 9A lit tx EB lit tx C1 lit tx B5 lit tx 3C lit tx 5 lit tx ED lit tx 3 lit tx 62 lit tx AD lit tx A3 lit tx 8E lit tx AD lit tx 3E lit tx 3E lit tx
+9E lit tx FA lit tx 37 lit tx 8 lit tx E5 lit tx 34 lit tx 95 lit tx 53 lit tx 1F lit tx 9 lit tx A6 lit tx 98 lit tx 75 lit tx 99 lit tx D1 lit tx 82 lit tx 64 lit tx C1 lit tx E1 lit tx C9 lit tx 2F lit tx 2C lit tx F1 lit tx 41 lit tx
+63 lit tx C lit tx 7A lit tx 3C lit tx 4A lit tx B7 lit tx C8 lit tx 1B lit tx 2F lit tx 0 lit tx 16 lit tx 98 lit tx E7 lit tx 46 lit tx 3B lit tx 4 lit tx
+tbuf @ 5D lit  tbuf @ 5D lit + E lit  800 lit  tout @ 40 lit pbkdf512  tout @ tex @ 40 lit tsame "pbkdf512, BIP39's (2,048)" tchk
+"sha512: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+0 lit exit

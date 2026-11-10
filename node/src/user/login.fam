@@ -1,9 +1,11 @@
 \ login.fam — a user in: a name and a password from the input, checked
-\ against /etc/passwd (lines of name:password:user:group:home:shell); the
-\ process then that user's (/proc/self/user), in its home, running its
-\ shell, and ends when the shell does.  It must start as root.
-: buf variable ;  : nm variable ;  : pw variable ;  : fl variable ;  : rb variable ;  : t variable ;  : st variable ;
-: fld  2 lit lshift fl @ + @ ;                           \ ( i -- s ) field i of the line found
+\ against /etc/passwd (lines of name:password:user:group:home:shell; the
+\ password kept hashed, crypto/passwd.fam); the process then that user's
+\ (/proc/self/user), in its home, running its shell, and ends when the
+\ shell does.  It must start as root.  A password still kept in plain
+\ text is hashed in its place once it is used.
+\ uses: crypto/sha512.fam crypto/passwd.fam
+: nm variable ;  : pw variable ;  : rb variable ;  : t variable ;  : st variable ;  : nf variable ;
 
 \ rdl ( buf -- n | -1 )  a line of the input, NUL-ended; -1 at its end.
 : rdl
@@ -16,44 +18,31 @@ begin
 until
 dup 0< 0= if 0 lit over rb @ + c! then ;
 
-\ fields ( p -- p' | 0 )  the line at p split at its colons into fl (six
-\ fields, those missing empty); where the next line begins (0: none).
-: pp variable ;  : fi variable ;  : es variable ;  : ok variable ;
-: fl!  2 lit lshift fl @ + ! ;                           \ ( s i -- )
-: fields
-6 lit 0 lit do es @ i fl! loop
-pp !  0 lit fi !  pp @ 0 lit fl!
-begin
-	pp @ c@
-	dup 0= if drop 0 lit 1 lit else
-	dup 3A lit = if drop 0 lit pp @ c!  fi @ 1 lit + fi !  fi @ 6 lit u< if pp @ 1 lit + fi @ fl! then  pp @ 1 lit + pp !  0 lit else
-	A lit = if 0 lit pp @ c!  pp @ 1 lit +  1 lit else pp @ 1 lit + pp !  0 lit then then then
-until ;
-
-\ found? ( -- ok )  the name and password those of a line of /etc/passwd
-\ (its fields then in fl).
+\ found? ( -- ok )  the name's line found and the password its own; a
+\ plain one hashed in its place (its fields read again after).
 : found?
-"/etc/passwd" 0 lit open dup 0< if drop "login: no /etc/passwd" eputs 0A lit eputc 0 lit exit then
-dup buf @ FFF lit read dup 0< if drop 0 lit then buf @ + 0 lit swap c!  close drop
-0 lit ok !  buf @
-begin ?dup while
-	fields
-	0 lit fld nm @ streq 1 lit fld pw @ streq and nm @ c@ 0= 0= and if 1 lit ok ! drop 0 lit then
-repeat
-ok @ ;
+nm @ c@ 0= if 0 lit else
+	nm @ pwfind if
+		pw @ 1 lit pwfld pwok dup if
+			1 lit pwfld pwp5? 0= if
+				pw @ nf @ pwmake  nm @ nf @ pwset drop  nm @ pwfind drop
+			then
+		then
+	else 0 lit then
+then ;
 
 : put  \ ( path s1 s2 -- )  path written with s1, a space, s2
 t @ rot scpy 20 lit over c! 1 lit + swap scpy 0 lit swap c!
 1 lit open dup 0< 0= if dup t @ dup strlen write drop close drop else drop then ;
 
-4 lit alloc es !  0 lit es @ !  1000 lit alloc buf !  80 lit alloc nm !  80 lit alloc pw !  20 lit alloc fl !  100 lit alloc t !
+80 lit alloc nm !  80 lit alloc pw !  100 lit alloc t !  100 lit alloc nf !
 begin
 	"login: " puts nm @ rdl 0< if bye then
 	"password: " puts pw @ rdl drop
 	found? if
-		"/proc/self/user" 2 lit fld 3 lit fld put
-		"/proc/self/cwd" 1 lit open dup 0< 0= if dup 4 lit fld dup strlen write drop close drop else drop then
-		5 lit fld spawn dup 0< if "login: no shell" puts 0A lit putc drop else st wait drop then
+		"/proc/self/user" 2 lit pwfld 3 lit pwfld put
+		"/proc/self/cwd" 1 lit open dup 0< 0= if dup 4 lit pwfld dup strlen write drop close drop else drop then
+		5 lit pwfld spawn dup 0< if "login: no shell" puts 0A lit putc drop else st wait drop then
 		bye
 	then
 	"login incorrect" puts 0A lit putc

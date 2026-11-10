@@ -1,0 +1,135 @@
+\ crypto/passwd.fam — passwords (docs/GUI_WALLET.md, Logging in): kept in
+\ /etc/passwd (lines name:password:user:group:home:shell) as
+\ $p5$ITERATIONS$SALT$HASH: PBKDF2-HMAC-SHA512 of the password with a
+\ random 16-byte salt, 32 bytes, all in hex.  A field without $p5$ is a
+\ password in plain text, as the OS kept them before (2026-11-09), still
+\ taken: login writes its hash at its first use.  After crypto/sha512.fam
+\ (a program lists both: `\ uses: crypto/sha512.fam crypto/passwd.fam`).
+\
+\ pwfind ( name -- flag )  the line of /etc/passwd for name; its fields
+\ then pwfld ( i -- s ), 0 to 5.
+\ pwok ( pw field -- flag )  pw the password the field holds.
+\ pwmake ( pw out -- )  pw's field, NUL-ended, at out (128 bytes).
+\ pwset ( name field -- flag )  name's password field set (root only).
+
+:M PWIT 4E20 lit ;          \ iterations a new hash takes: 20,000 (about 1.4 s here)
+
+: pwbuf variable ;  : pwfl variable ;  : pwpp variable ;  : pwfi variable ;  : pwes variable ;  : pwok? variable ;
+: pwsl variable ;  : pwhs variable ;  : pwhx variable ;  : pwit variable ;  : pwtmp variable ;
+: pwinit
+pwbuf @ 0= if
+	1001 lit alloc pwbuf !  18 lit alloc pwfl !  4 lit alloc pwes !  0 lit pwes @ !
+	10 lit alloc pwsl !  20 lit alloc pwhs !  20 lit alloc pwhx !  1100 lit alloc pwtmp !
+then ;
+: pwfld  2 lit lshift pwfl @ + @ ;                    \ ( i -- s )
+: pwfl!  2 lit lshift pwfl @ + ! ;                    \ ( s i -- )
+
+\ pwfields ( p -- p' | 0 )  the line at p split at its colons (six fields,
+\ those missing empty); where the next begins (0: none).
+: pwfields
+6 lit 0 lit do pwes @ i pwfl! loop
+pwpp !  0 lit pwfi !  pwpp @ 0 lit pwfl!
+begin
+	pwpp @ c@
+	dup 0= if drop 0 lit 1 lit else
+	dup 3A lit = if drop 0 lit pwpp @ c!  pwfi @ 1 lit + pwfi !  pwfi @ 6 lit u< if pwpp @ 1 lit + pwfi @ pwfl! then  pwpp @ 1 lit + pwpp !  0 lit else
+	A lit = if 0 lit pwpp @ c!  pwpp @ 1 lit +  1 lit else pwpp @ 1 lit + pwpp !  0 lit then then then
+until ;
+\ pwread ( -- flag )  /etc/passwd into pwbuf (4 KiB at most).
+: pwread
+pwinit
+"/etc/passwd" 0 lit open dup 0< if drop 0 lit else
+	dup pwbuf @ 1000 lit read dup 0< if drop 0 lit then pwbuf @ + 0 lit swap c!  close drop  -1 lit
+then ;
+: pwnm variable ;
+: pwfind
+pwnm !  0 lit pwok? !
+pwread if
+	pwbuf @
+	begin ?dup while
+		pwfields
+		pwok? @ 0= if 0 lit pwfld pwnm @ streq pwnm @ c@ 0= 0= and if -1 lit pwok? ! then then
+		pwok? @ if drop 0 lit then
+	repeat
+then
+pwok? @ ;
+
+\ Hex: pwhex ( src n dst -- dst' ); pwunhex ( src n dst -- flag ), n
+\ bytes from 2n digits.
+: pwhd  dup A lit u< if 30 lit else 57 lit then + ;   \ ( n -- c )
+: pwhex
+swap 0 lit do
+	over i + c@  dup 4 lit rshift pwhd  2 lit pick c!
+	F lit and pwhd  over 1 lit + c!  2 lit +
+loop nip ;
+: pwdv  dup 30 lit - A lit u< if 30 lit - else dup 61 lit - 6 lit u< if 57 lit - else drop FFFFFFFF lit then then ;   \ ( c -- n | -1 )
+: pwunhex
+-1 lit pwok? !
+swap 0 lit do
+	over i 1 lit lshift + dup c@ pwdv swap 1 lit + c@ pwdv
+	2dup or 0< if 0 lit pwok? ! 2drop 0 lit else swap 4 lit lshift or then
+	over i + c!
+loop 2drop pwok? @ ;
+
+\ pwhash ( pw -- )  pwhs = PBKDF2 of pw with the salt pwsl, pwit times.
+: pwhash  dup strlen pwsl @ 10 lit pwit @ pwhs @ 20 lit pbkdf512 ;
+: pwp variable ;  : pwpw variable ;
+: pwsame  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+\ pwp5? ( s -- flag )  a field kept hashed ($p5$).
+: pwp5?  dup c@ 24 lit =  over 1 lit + c@ 70 lit = and  over 2 lit + c@ 35 lit = and  swap 3 lit + c@ 24 lit = and ;
+: pwok
+pwinit  pwp !  pwpw !
+pwp @ pwp5? 0= if pwpw @ pwp @ streq else
+	pwp @ 4 lit + pwp !  0 lit pwit !
+	begin pwp @ c@ dup 24 lit <> swap 0= 0= and while pwit @ 4 lit lshift pwp @ c@ pwdv or pwit !  pwp @ 1 lit + pwp ! repeat
+	\ at the $ before the salt: 32 digits, $, 64 digits
+	pwp @ c@ 24 lit = if pwp @ 1 lit + 10 lit pwsl @ pwunhex else 0 lit then
+	if pwp @ 21 lit + c@ 24 lit = else 0 lit then
+	if pwp @ 22 lit + 20 lit pwhx @ pwunhex else 0 lit then
+	pwit @ 0= 0= and
+	if pwpw @ pwhash  pwhs @ pwhx @ 20 lit pwsame else 0 lit then
+then ;
+\ pwhexn ( n dst -- dst' )  n in hex, no leading zeros.
+: pwhexn
+0 lit pwfi !
+8 lit 0 lit do
+	over 1C lit i 2 lit lshift - rshift F lit and
+	dup pwfi @ or i 7 lit = or if 1 lit pwfi !  pwhd over c! 1 lit + else drop then
+loop nip ;
+: pwmake
+pwinit  pwp !
+"/dev/random" 0 lit open dup 0< if drop else dup pwsl @ 10 lit read drop close drop then
+PWIT pwit !  pwhash
+pwp @ "$p5$" scpy  pwit @ swap pwhexn  24 lit over c! 1 lit +
+pwsl @ 10 lit rot pwhex  24 lit over c! 1 lit +
+pwhs @ 20 lit rot pwhex  0 lit swap c! ;
+\ pwset ( name field -- flag )  /etc/passwd written again with name's
+\ password field this (the others as they were); root only.
+: pwsf variable ;  : pwq variable ;  : pwln variable ;
+: pwset
+pwsf !  pwnm !  0 lit pwok? !
+pwread if
+	pwbuf @ pwp !  pwtmp @ pwq !
+	begin pwp @ c@ while
+		\ the name: copied to its colon
+		pwp @ pwln !
+		begin pwp @ c@ dup 3A lit <> over A lit <> and swap 0= 0= and while pwp @ c@ pwq @ c! pwq @ 1 lit + pwq !  pwp @ 1 lit + pwp ! repeat
+		pwp @ c@ 3A lit = if
+			0 lit pwp @ c!  pwln @ pwnm @ streq  3A lit pwp @ c!
+			3A lit pwq @ c!  pwq @ 1 lit + pwq !  pwp @ 1 lit + pwp !
+			if
+				-1 lit pwok? !  pwq @ pwsf @ scpy pwq !
+				begin pwp @ c@ dup 3A lit <> over A lit <> and swap 0= 0= and while pwp @ 1 lit + pwp ! repeat
+			then
+		then
+		\ the rest of the line
+		begin pwp @ c@ dup A lit <> swap 0= 0= and while pwp @ c@ pwq @ c! pwq @ 1 lit + pwq !  pwp @ 1 lit + pwp ! repeat
+		pwp @ c@ if A lit pwq @ c!  pwq @ 1 lit + pwq !  pwp @ 1 lit + pwp ! then
+	repeat
+	pwok? @ if
+		"/etc/passwd" 1 lit TRUNC or open dup 0< if drop 0 lit pwok? ! else
+			dup pwtmp @ pwq @ pwtmp @ - write 0< if 0 lit pwok? ! then  close drop
+		then
+	then
+then
+pwok? @ ;

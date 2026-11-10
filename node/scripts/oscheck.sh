@@ -707,11 +707,25 @@ for pat in '^home/$' '^/home$'; do grep -q -- "$pat" "$T/fs1.out" || fail fs_boo
 for pat in '^hello files$' '^a second line$' '^2 5 26$' '^cat: cannot open notes$'; do grep -q -- "$pat" "$T/fs2.out" || fail fs_boot2 "no /$pat/ in: $(head -c 600 "$T/fs2.out")"; done
 rm -f "$T/files.disk"
 
+# The crypto modules (src/user/crypto/): SHA-512, HMAC and PBKDF2 against
+# Python's hashlib (BIP39's own case among them); then the passwords kept
+# in /etc/passwd as PBKDF2 hashes, made, checked (hashlib's too), set.
+./tools/fam --user -o "$T/t5.bin" src/user/crypto/sha512.fam src/user/crypto/sha512_test.fam > "$T/t5.build" 2>&1 || fail sha512 "build: $(head -c 300 "$T/t5.build")"
+sh scripts/mkimage.sh "$T/t5.img" bin/kernel init="$T/t5.bin":1024 2> "$T/t5.mk" || fail sha512 "mkimage: $(cat "$T/t5.mk")"
+expect sha512 124 '^sha512: 10 as expected, 0 not' 60 ./tools/q32 "$T/t5.img"
+./tools/fam --user -o "$T/tpw.bin" src/user/crypto/sha512.fam src/user/crypto/passwd.fam src/user/crypto/passwd_test.fam > "$T/tpw.build" 2>&1 || fail passwd "build: $(head -c 300 "$T/tpw.build")"
+sh scripts/mkimage.sh "$T/tpw.img" bin/kernel init="$T/tpw.bin":1024 2> "$T/tpw.mk" || fail passwd "mkimage: $(cat "$T/tpw.mk")"
+rm -f "$T/tpw.disk"; dd if=/dev/zero of="$T/tpw.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect passwd 124 '^passwd: 12 as expected, 0 not' 60 ./tools/q32 --disk="$T/tpw.disk" "$T/tpw.img"
+rm -f "$T/tpw.disk"
+
 # Users (step 8, part 5): a disk booted twice.  First as root (no
 # /etc/init yet): /etc/passwd and /etc/init written, a home for alice
 # hers alone.  Then init runs login: a wrong password refused; alice in,
 # her user and home, her file, root's file and the root directory closed
-# to her; root in after her, everything open to it.
+# to her; root in after her, everything open to it.  The passwords were
+# written in plain text: each is kept hashed after its first use
+# (crypto/passwd.fam), as root's cat of /etc/passwd shows.
 printf '%s\n' 'mkdir /etc' 'echo root:rootpw:0:0:/:sh > /etc/passwd' 'echo alice:apw:1:1:/home/alice:sh >> /etc/passwd' \
 	'chmod 600 /etc/passwd' 'mkdir /home' 'mkdir /home/alice' 'chown 1 1 /home/alice' 'chmod 700 /home/alice' \
 	'echo restart 0 100 login > /etc/init' 'id' 'ls /etc' > "$T/u1.in"
@@ -723,7 +737,9 @@ feed 60 "$T/u1.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u1.out" 2>&1
 feed 60 "$T/u2.in" ./tools/q32 --disk="$T/users.disk" bin/img > "$T/u2.out" 2>&1
 for pat in '^\([$] \)*0 0$' '^\([$] \)*init$' '^\([$] \)*passwd$'; do grep -q -- "$pat" "$T/u1.out" || fail users_boot1 "no /$pat/ in: $(head -c 800 "$T/u1.out")"; done
 for pat in '^init: /etc/init: 1 programs$' '^login incorrect$' '^1 1$' '^/home/alice$' '^mine$' '^cat: cannot open /etc/passwd$' \
-	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^root:rootpw:0:0:/:sh$' '^f$'; do
+	'^mkdir: cannot make /tmp2: -13$' '^alice/$' '^f$' \
+	'^root:[$]p5[$]4e20[$][0-9a-f]\{32\}[$][0-9a-f]\{64\}:0:0:/:sh$' \
+	'^alice:[$]p5[$]4e20[$][0-9a-f]\{32\}[$][0-9a-f]\{64\}:1:1:/home/alice:sh$'; do
 	grep -q -- "$pat" "$T/u2.out" || fail users_boot2 "no /$pat/ in: $(head -c 900 "$T/u2.out")"
 done
 [ "$(grep -c '0 0$' "$T/u2.out")" = 1 ] || fail users_boot2 "root's id not once after alice's: $(head -c 900 "$T/u2.out")"

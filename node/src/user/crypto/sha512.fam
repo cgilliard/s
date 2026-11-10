@@ -1,0 +1,789 @@
+\ crypto/sha512.fam — SHA-512, HMAC-SHA512 and PBKDF2-HMAC-SHA512, for the
+\ OS's passwords (docs/GUI_WALLET.md, Logging in) and BIP39's seed (the
+\ wallet).  A module, not a program: a program names it in its first
+\ lines (`\ uses: crypto/sha512.fam`, scripts/build.sh).  A 64-bit value
+\ is two words, the high one first, in memory and on the stack.
+\
+\ sha512 ( src len -- )  the digest of len bytes at src, at h5d (64).
+\ hmac512 ( key klen msg mlen -- )  HMAC-SHA512 of the message, at h5d.
+\ pbkdf512 ( pw pwlen salt slen iters out olen -- )  PBKDF2-HMAC-SHA512:
+\ olen bytes (64 at most, one block) at out; the salt 400 bytes at most.
+
+: h5st variable ;  : h5ws variable ;  : h5k variable ;  : h5v variable ;  : h5b variable ;  : h5d variable ;
+: h5n variable ;  : h5t variable ;  : h5ip variable ;  : h5op variable ;  : h5u variable ;  : h5x variable ;
+: h5kb variable ;  : h5sb variable ;  : h5iv0 variable ;
+: h5sa variable ;  : h5sc variable ;  : h5sn variable ;  : h5fa variable ;  : h5fb variable ;
+: h5ma variable ;  : h5mn variable ;  : h5pp variable ;  : h5pn variable ;  : h5it variable ;  : h5o variable ;  : h5on variable ;
+
+: h5tt variable ;
+\ h5bc ( src dst n -- )  n bytes copied; h5wc ( src dst n -- )  n words.
+: h5bc  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;
+: h5wc  0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop 2drop ;
+: @64  dup @ swap 4 lit + @ ;                       \ ( a -- hi lo )
+: !64  tuck 4 lit + ! ! ;                            \ ( hi lo a -- )
+: x64  rot xor -rot xor swap ;                       \ ( a b -- a^b )  pairs
+: &64  rot and -rot and swap ;                       \ ( a b -- a&b )
+: ~64  invert swap invert swap ;                     \ ( a -- ~a )
+\ +64 ( a b -- a+b )  with the carry.
+: +64  rot over + tuck u> 1 lit and  rot + rot + swap ;
+\ r64 ( hi lo n -- hi' lo' )  rotated right by n (not 0 nor 32).
+: r64
+h5sn !  h5sc ! h5sa !
+h5sn @ 20 lit u< 0= if h5sa @ h5sc @ h5sa ! h5sc !  h5sn @ 20 lit - h5sn ! then
+h5sa @ h5sn @ rshift  h5sc @ 20 lit h5sn @ - lshift or
+h5sc @ h5sn @ rshift  h5sa @ 20 lit h5sn @ - lshift or ;
+\ s64 ( hi lo n -- hi' lo' )  shifted right by n (1 to 31).
+: s64
+h5sn !  h5sc ! h5sa !
+h5sa @ h5sn @ rshift
+h5sc @ h5sn @ rshift  h5sa @ 20 lit h5sn @ - lshift or ;
+\ The functions ( hi lo -- hi' lo' ): S0, S1 of the state, s0, s1 of the
+\ schedule.
+: hS0  h5fb ! h5fa !  h5fa @ h5fb @ 1C lit r64  h5fa @ h5fb @ 22 lit r64 x64  h5fa @ h5fb @ 27 lit r64 x64 ;
+: hS1  h5fb ! h5fa !  h5fa @ h5fb @ E lit r64  h5fa @ h5fb @ 12 lit r64 x64  h5fa @ h5fb @ 29 lit r64 x64 ;
+: hs0  h5fb ! h5fa !  h5fa @ h5fb @ 1 lit r64  h5fa @ h5fb @ 8 lit r64 x64  h5fa @ h5fb @ 7 lit s64 x64 ;
+: hs1  h5fb ! h5fa !  h5fa @ h5fb @ 13 lit r64  h5fa @ h5fb @ 3D lit r64 x64  h5fa @ h5fb @ 6 lit s64 x64 ;
+
+: h5be@  dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or swap 3 lit + c@ or ;   \ ( a -- x )
+: h5be!  over 18 lit rshift over c!  over 10 lit rshift over 1 lit + c!  over 8 lit rshift over 2 lit + c!  3 lit + c! ;  \ ( x a -- )
+: h5k!  3 lit lshift h5k @ + !64 ;                  \ ( hi lo i -- )
+: h5i!  3 lit lshift h5iv0 @ + !64 ;
+: h5w  3 lit lshift h5ws @ + ;                      \ ( i -- a )  schedule word i
+: h5s  3 lit lshift h5v @ + ;                       \ ( i -- a )  working word i (a to h)
+: h5init
+h5st @ 0= if
+	40 lit alloc h5st !  7C4 lit alloc h5ws !  40 lit alloc h5v !  100 lit alloc h5b !  40 lit alloc h5d !
+	40 lit alloc h5ip !  40 lit alloc h5op !  40 lit alloc h5u !  40 lit alloc h5x !  80 lit alloc h5kb !
+	404 lit alloc h5sb !  280 lit alloc h5k !  40 lit alloc h5iv0 !  8 lit alloc h5tt !
+	428A2F98 lit D728AE22 lit 0 lit h5k!  71374491 lit 23EF65CD lit 1 lit h5k!  B5C0FBCF lit EC4D3B2F lit 2 lit h5k!  E9B5DBA5 lit 8189DBBC lit 3 lit h5k!
+	3956C25B lit F348B538 lit 4 lit h5k!  59F111F1 lit B605D019 lit 5 lit h5k!  923F82A4 lit AF194F9B lit 6 lit h5k!  AB1C5ED5 lit DA6D8118 lit 7 lit h5k!
+	D807AA98 lit A3030242 lit 8 lit h5k!  12835B01 lit 45706FBE lit 9 lit h5k!  243185BE lit 4EE4B28C lit A lit h5k!  550C7DC3 lit D5FFB4E2 lit B lit h5k!
+	72BE5D74 lit F27B896F lit C lit h5k!  80DEB1FE lit 3B1696B1 lit D lit h5k!  9BDC06A7 lit 25C71235 lit E lit h5k!  C19BF174 lit CF692694 lit F lit h5k!
+	E49B69C1 lit 9EF14AD2 lit 10 lit h5k!  EFBE4786 lit 384F25E3 lit 11 lit h5k!  FC19DC6 lit 8B8CD5B5 lit 12 lit h5k!  240CA1CC lit 77AC9C65 lit 13 lit h5k!
+	2DE92C6F lit 592B0275 lit 14 lit h5k!  4A7484AA lit 6EA6E483 lit 15 lit h5k!  5CB0A9DC lit BD41FBD4 lit 16 lit h5k!  76F988DA lit 831153B5 lit 17 lit h5k!
+	983E5152 lit EE66DFAB lit 18 lit h5k!  A831C66D lit 2DB43210 lit 19 lit h5k!  B00327C8 lit 98FB213F lit 1A lit h5k!  BF597FC7 lit BEEF0EE4 lit 1B lit h5k!
+	C6E00BF3 lit 3DA88FC2 lit 1C lit h5k!  D5A79147 lit 930AA725 lit 1D lit h5k!  6CA6351 lit E003826F lit 1E lit h5k!  14292967 lit A0E6E70 lit 1F lit h5k!
+	27B70A85 lit 46D22FFC lit 20 lit h5k!  2E1B2138 lit 5C26C926 lit 21 lit h5k!  4D2C6DFC lit 5AC42AED lit 22 lit h5k!  53380D13 lit 9D95B3DF lit 23 lit h5k!
+	650A7354 lit 8BAF63DE lit 24 lit h5k!  766A0ABB lit 3C77B2A8 lit 25 lit h5k!  81C2C92E lit 47EDAEE6 lit 26 lit h5k!  92722C85 lit 1482353B lit 27 lit h5k!
+	A2BFE8A1 lit 4CF10364 lit 28 lit h5k!  A81A664B lit BC423001 lit 29 lit h5k!  C24B8B70 lit D0F89791 lit 2A lit h5k!  C76C51A3 lit 654BE30 lit 2B lit h5k!
+	D192E819 lit D6EF5218 lit 2C lit h5k!  D6990624 lit 5565A910 lit 2D lit h5k!  F40E3585 lit 5771202A lit 2E lit h5k!  106AA070 lit 32BBD1B8 lit 2F lit h5k!
+	19A4C116 lit B8D2D0C8 lit 30 lit h5k!  1E376C08 lit 5141AB53 lit 31 lit h5k!  2748774C lit DF8EEB99 lit 32 lit h5k!  34B0BCB5 lit E19B48A8 lit 33 lit h5k!
+	391C0CB3 lit C5C95A63 lit 34 lit h5k!  4ED8AA4A lit E3418ACB lit 35 lit h5k!  5B9CCA4F lit 7763E373 lit 36 lit h5k!  682E6FF3 lit D6B2B8A3 lit 37 lit h5k!
+	748F82EE lit 5DEFB2FC lit 38 lit h5k!  78A5636F lit 43172F60 lit 39 lit h5k!  84C87814 lit A1F0AB72 lit 3A lit h5k!  8CC70208 lit 1A6439EC lit 3B lit h5k!
+	90BEFFFA lit 23631E28 lit 3C lit h5k!  A4506CEB lit DE82BDE9 lit 3D lit h5k!  BEF9A3F7 lit B2C67915 lit 3E lit h5k!  C67178F2 lit E372532B lit 3F lit h5k!
+	CA273ECE lit EA26619C lit 40 lit h5k!  D186B8C7 lit 21C0C207 lit 41 lit h5k!  EADA7DD6 lit CDE0EB1E lit 42 lit h5k!  F57D4F7F lit EE6ED178 lit 43 lit h5k!
+	6F067AA lit 72176FBA lit 44 lit h5k!  A637DC5 lit A2C898A6 lit 45 lit h5k!  113F9804 lit BEF90DAE lit 46 lit h5k!  1B710B35 lit 131C471B lit 47 lit h5k!
+	28DB77F5 lit 23047D84 lit 48 lit h5k!  32CAAB7B lit 40C72493 lit 49 lit h5k!  3C9EBE0A lit 15C9BEBC lit 4A lit h5k!  431D67C4 lit 9C100D4C lit 4B lit h5k!
+	4CC5D4BE lit CB3E42B6 lit 4C lit h5k!  597F299C lit FC657E2A lit 4D lit h5k!  5FCB6FAB lit 3AD6FAEC lit 4E lit h5k!  6C44198C lit 4A475817 lit 4F lit h5k!
+	6A09E667 lit F3BCC908 lit 0 lit h5i!  BB67AE85 lit 84CAA73B lit 1 lit h5i!  3C6EF372 lit FE94F82B lit 2 lit h5i!  A54FF53A lit 5F1D36F1 lit 3 lit h5i!
+	510E527F lit ADE682D1 lit 4 lit h5i!  9B05688C lit 2B3E6C1F lit 5 lit h5i!  1F83D9AB lit FB41BD6B lit 6 lit h5i!  5BE0CD19 lit 137E2179 lit 7 lit h5i!
+then ;
+
+\ h5raw ( blk st k s -- )  the compression, raw: the block at blk into the
+\ state at st, with the constants at k and the scratch at s (0x7C4
+\ bytes).  From tools/gensha512.py through tools/asm2fam.py; the fam
+\ words above (hS0 ...) are what it does, kept for reading.
+: h5raw
+83260100 ,   \ lw a3,0(sp)   ( s: W )
+03264100 ,   \ lw a2,4(sp)   ( k )
+83228100 ,   \ lw t0,8(sp)   ( st )
+0323C100 ,   \ lw t1,12(sp)   ( blk )
+13010101 ,   \ addi sp,sp,16
+23A0567C ,   \ sw t0,0x7C0(a3)   ( st kept )
+13850628 ,   \ addi a0,a3,0x280   ( A )
+93850652 ,   \ addi a1,a3,0x520   ( E )
+83430300 ,   \ lbu t2,0(t1)
+93938301 ,   \ slli t2,t2,24
+034E1300 ,   \ lbu t3,1(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2300 ,   \ lbu t3,2(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3300 ,   \ lbu t3,3(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A07600 ,   \ sw t2,0(a3)
+83434300 ,   \ lbu t2,4(t1)
+93938301 ,   \ slli t2,t2,24
+034E5300 ,   \ lbu t3,5(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6300 ,   \ lbu t3,6(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7300 ,   \ lbu t3,7(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A27600 ,   \ sw t2,4(a3)
+83438300 ,   \ lbu t2,8(t1)
+93938301 ,   \ slli t2,t2,24
+034E9300 ,   \ lbu t3,9(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA300 ,   \ lbu t3,10(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB300 ,   \ lbu t3,11(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A47600 ,   \ sw t2,8(a3)
+8343C300 ,   \ lbu t2,12(t1)
+93938301 ,   \ slli t2,t2,24
+034ED300 ,   \ lbu t3,13(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE300 ,   \ lbu t3,14(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF300 ,   \ lbu t3,15(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A67600 ,   \ sw t2,12(a3)
+83430301 ,   \ lbu t2,16(t1)
+93938301 ,   \ slli t2,t2,24
+034E1301 ,   \ lbu t3,17(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2301 ,   \ lbu t3,18(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3301 ,   \ lbu t3,19(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A87600 ,   \ sw t2,16(a3)
+83434301 ,   \ lbu t2,20(t1)
+93938301 ,   \ slli t2,t2,24
+034E5301 ,   \ lbu t3,21(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6301 ,   \ lbu t3,22(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7301 ,   \ lbu t3,23(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AA7600 ,   \ sw t2,20(a3)
+83438301 ,   \ lbu t2,24(t1)
+93938301 ,   \ slli t2,t2,24
+034E9301 ,   \ lbu t3,25(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA301 ,   \ lbu t3,26(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB301 ,   \ lbu t3,27(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AC7600 ,   \ sw t2,24(a3)
+8343C301 ,   \ lbu t2,28(t1)
+93938301 ,   \ slli t2,t2,24
+034ED301 ,   \ lbu t3,29(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE301 ,   \ lbu t3,30(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF301 ,   \ lbu t3,31(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AE7600 ,   \ sw t2,28(a3)
+83430302 ,   \ lbu t2,32(t1)
+93938301 ,   \ slli t2,t2,24
+034E1302 ,   \ lbu t3,33(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2302 ,   \ lbu t3,34(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3302 ,   \ lbu t3,35(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A07602 ,   \ sw t2,32(a3)
+83434302 ,   \ lbu t2,36(t1)
+93938301 ,   \ slli t2,t2,24
+034E5302 ,   \ lbu t3,37(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6302 ,   \ lbu t3,38(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7302 ,   \ lbu t3,39(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A27602 ,   \ sw t2,36(a3)
+83438302 ,   \ lbu t2,40(t1)
+93938301 ,   \ slli t2,t2,24
+034E9302 ,   \ lbu t3,41(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA302 ,   \ lbu t3,42(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB302 ,   \ lbu t3,43(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A47602 ,   \ sw t2,40(a3)
+8343C302 ,   \ lbu t2,44(t1)
+93938301 ,   \ slli t2,t2,24
+034ED302 ,   \ lbu t3,45(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE302 ,   \ lbu t3,46(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF302 ,   \ lbu t3,47(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A67602 ,   \ sw t2,44(a3)
+83430303 ,   \ lbu t2,48(t1)
+93938301 ,   \ slli t2,t2,24
+034E1303 ,   \ lbu t3,49(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2303 ,   \ lbu t3,50(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3303 ,   \ lbu t3,51(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A87602 ,   \ sw t2,48(a3)
+83434303 ,   \ lbu t2,52(t1)
+93938301 ,   \ slli t2,t2,24
+034E5303 ,   \ lbu t3,53(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6303 ,   \ lbu t3,54(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7303 ,   \ lbu t3,55(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AA7602 ,   \ sw t2,52(a3)
+83438303 ,   \ lbu t2,56(t1)
+93938301 ,   \ slli t2,t2,24
+034E9303 ,   \ lbu t3,57(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA303 ,   \ lbu t3,58(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB303 ,   \ lbu t3,59(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AC7602 ,   \ sw t2,56(a3)
+8343C303 ,   \ lbu t2,60(t1)
+93938301 ,   \ slli t2,t2,24
+034ED303 ,   \ lbu t3,61(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE303 ,   \ lbu t3,62(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF303 ,   \ lbu t3,63(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AE7602 ,   \ sw t2,60(a3)
+83430304 ,   \ lbu t2,64(t1)
+93938301 ,   \ slli t2,t2,24
+034E1304 ,   \ lbu t3,65(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2304 ,   \ lbu t3,66(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3304 ,   \ lbu t3,67(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A07604 ,   \ sw t2,64(a3)
+83434304 ,   \ lbu t2,68(t1)
+93938301 ,   \ slli t2,t2,24
+034E5304 ,   \ lbu t3,69(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6304 ,   \ lbu t3,70(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7304 ,   \ lbu t3,71(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A27604 ,   \ sw t2,68(a3)
+83438304 ,   \ lbu t2,72(t1)
+93938301 ,   \ slli t2,t2,24
+034E9304 ,   \ lbu t3,73(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA304 ,   \ lbu t3,74(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB304 ,   \ lbu t3,75(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A47604 ,   \ sw t2,72(a3)
+8343C304 ,   \ lbu t2,76(t1)
+93938301 ,   \ slli t2,t2,24
+034ED304 ,   \ lbu t3,77(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE304 ,   \ lbu t3,78(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF304 ,   \ lbu t3,79(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A67604 ,   \ sw t2,76(a3)
+83430305 ,   \ lbu t2,80(t1)
+93938301 ,   \ slli t2,t2,24
+034E1305 ,   \ lbu t3,81(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2305 ,   \ lbu t3,82(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3305 ,   \ lbu t3,83(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A87604 ,   \ sw t2,80(a3)
+83434305 ,   \ lbu t2,84(t1)
+93938301 ,   \ slli t2,t2,24
+034E5305 ,   \ lbu t3,85(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6305 ,   \ lbu t3,86(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7305 ,   \ lbu t3,87(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AA7604 ,   \ sw t2,84(a3)
+83438305 ,   \ lbu t2,88(t1)
+93938301 ,   \ slli t2,t2,24
+034E9305 ,   \ lbu t3,89(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA305 ,   \ lbu t3,90(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB305 ,   \ lbu t3,91(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AC7604 ,   \ sw t2,88(a3)
+8343C305 ,   \ lbu t2,92(t1)
+93938301 ,   \ slli t2,t2,24
+034ED305 ,   \ lbu t3,93(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE305 ,   \ lbu t3,94(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF305 ,   \ lbu t3,95(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AE7604 ,   \ sw t2,92(a3)
+83430306 ,   \ lbu t2,96(t1)
+93938301 ,   \ slli t2,t2,24
+034E1306 ,   \ lbu t3,97(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2306 ,   \ lbu t3,98(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3306 ,   \ lbu t3,99(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A07606 ,   \ sw t2,96(a3)
+83434306 ,   \ lbu t2,100(t1)
+93938301 ,   \ slli t2,t2,24
+034E5306 ,   \ lbu t3,101(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6306 ,   \ lbu t3,102(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7306 ,   \ lbu t3,103(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A27606 ,   \ sw t2,100(a3)
+83438306 ,   \ lbu t2,104(t1)
+93938301 ,   \ slli t2,t2,24
+034E9306 ,   \ lbu t3,105(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA306 ,   \ lbu t3,106(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB306 ,   \ lbu t3,107(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A47606 ,   \ sw t2,104(a3)
+8343C306 ,   \ lbu t2,108(t1)
+93938301 ,   \ slli t2,t2,24
+034ED306 ,   \ lbu t3,109(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE306 ,   \ lbu t3,110(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF306 ,   \ lbu t3,111(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A67606 ,   \ sw t2,108(a3)
+83430307 ,   \ lbu t2,112(t1)
+93938301 ,   \ slli t2,t2,24
+034E1307 ,   \ lbu t3,113(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E2307 ,   \ lbu t3,114(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E3307 ,   \ lbu t3,115(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23A87606 ,   \ sw t2,112(a3)
+83434307 ,   \ lbu t2,116(t1)
+93938301 ,   \ slli t2,t2,24
+034E5307 ,   \ lbu t3,117(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034E6307 ,   \ lbu t3,118(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034E7307 ,   \ lbu t3,119(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AA7606 ,   \ sw t2,116(a3)
+83438307 ,   \ lbu t2,120(t1)
+93938301 ,   \ slli t2,t2,24
+034E9307 ,   \ lbu t3,121(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EA307 ,   \ lbu t3,122(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EB307 ,   \ lbu t3,123(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AC7606 ,   \ sw t2,120(a3)
+8343C307 ,   \ lbu t2,124(t1)
+93938301 ,   \ slli t2,t2,24
+034ED307 ,   \ lbu t3,125(t1)
+131E0E01 ,   \ slli t3,t3,16
+B3E3C301 ,   \ or t2,t2,t3
+034EE307 ,   \ lbu t3,126(t1)
+131E8E00 ,   \ slli t3,t3,8
+B3E3C301 ,   \ or t2,t2,t3
+034EF307 ,   \ lbu t3,127(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23AE7606 ,   \ sw t2,124(a3)
+13830608 ,   \ addi t1,a3,128   ( &W[16] )
+13870628 ,   \ addi a4,a3,640   ( &W[80] )
+\ h5_sched:
+832203FF ,   \ lw t0,-16(t1)
+832E43FF ,   \ lw t4,-12(t1)   ( W[t-2] )
+93D73201 ,   \ srli a5,t0,19
+939FDE00 ,   \ slli t6,t4,13
+B3E7F701 ,   \ or a5,a5,t6
+13D83E01 ,   \ srli a6,t4,19
+939FD200 ,   \ slli t6,t0,13
+3368F801 ,   \ or a6,a6,t6
+93D3DE01 ,   \ srli t2,t4,29
+939F3200 ,   \ slli t6,t0,3
+B3E3F301 ,   \ or t2,t2,t6
+13DED201 ,   \ srli t3,t0,29
+939F3E00 ,   \ slli t6,t4,3
+336EFE01 ,   \ or t3,t3,t6
+B3C77700 ,   \ xor a5,a5,t2
+3348C801 ,   \ xor a6,a6,t3
+93D36200 ,   \ srli t2,t0,6
+13DE6E00 ,   \ srli t3,t4,6
+939FA201 ,   \ slli t6,t0,26
+336EFE01 ,   \ or t3,t3,t6
+B3C77700 ,   \ xor a5,a5,t2
+3348C801 ,   \ xor a6,a6,t3
+832283FC ,   \ lw t0,-56(t1)
+832EC3FC ,   \ lw t4,-52(t1)   ( W[t-7] )
+3308D801 ,   \ add a6,a6,t4
+333FD801 ,   \ sltu t5,a6,t4
+B3875700 ,   \ add a5,a5,t0
+B387E701 ,   \ add a5,a5,t5
+832283F8 ,   \ lw t0,-120(t1)
+832EC3F8 ,   \ lw t4,-116(t1)   ( W[t-15] )
+93D81200 ,   \ srli a7,t0,1
+939FFE01 ,   \ slli t6,t4,31
+B3E8F801 ,   \ or a7,a7,t6
+93D01E00 ,   \ srli ra,t4,1
+939FF201 ,   \ slli t6,t0,31
+B3E0F001 ,   \ or ra,ra,t6
+93D38200 ,   \ srli t2,t0,8
+939F8E01 ,   \ slli t6,t4,24
+B3E3F301 ,   \ or t2,t2,t6
+13DE8E00 ,   \ srli t3,t4,8
+939F8201 ,   \ slli t6,t0,24
+336EFE01 ,   \ or t3,t3,t6
+B3C87800 ,   \ xor a7,a7,t2
+B3C0C001 ,   \ xor ra,ra,t3
+93D37200 ,   \ srli t2,t0,7
+13DE7E00 ,   \ srli t3,t4,7
+939F9201 ,   \ slli t6,t0,25
+336EFE01 ,   \ or t3,t3,t6
+B3C87800 ,   \ xor a7,a7,t2
+B3C0C001 ,   \ xor ra,ra,t3
+33081800 ,   \ add a6,a6,ra
+333F1800 ,   \ sltu t5,a6,ra
+B3871701 ,   \ add a5,a5,a7
+B387E701 ,   \ add a5,a5,t5
+832203F8 ,   \ lw t0,-128(t1)
+832E43F8 ,   \ lw t4,-124(t1)   ( W[t-16] )
+3308D801 ,   \ add a6,a6,t4
+333FD801 ,   \ sltu t5,a6,t4
+B3875700 ,   \ add a5,a5,t0
+B387E701 ,   \ add a5,a5,t5
+2320F300 ,   \ sw a5,0(t1)
+23220301 ,   \ sw a6,4(t1)
+13038300 ,   \ addi t1,t1,8
+E312E3F0 ,   \ bne t1,a4,h5_sched
+03A3067C ,   \ lw t1,0x7C0(a3)   ( st )
+83238301 ,   \ lw t2,24(t1)
+032EC301 ,   \ lw t3,28(t1)
+23207500 ,   \ sw t2,0(a0)
+2322C501 ,   \ sw t3,4(a0)
+83230301 ,   \ lw t2,16(t1)
+032E4301 ,   \ lw t3,20(t1)
+23247500 ,   \ sw t2,8(a0)
+2326C501 ,   \ sw t3,12(a0)
+83238300 ,   \ lw t2,8(t1)
+032EC300 ,   \ lw t3,12(t1)
+23287500 ,   \ sw t2,16(a0)
+232AC501 ,   \ sw t3,20(a0)
+83230300 ,   \ lw t2,0(t1)
+032E4300 ,   \ lw t3,4(t1)
+232C7500 ,   \ sw t2,24(a0)
+232EC501 ,   \ sw t3,28(a0)
+83238303 ,   \ lw t2,56(t1)
+032EC303 ,   \ lw t3,60(t1)
+23A07500 ,   \ sw t2,0(a1)
+23A2C501 ,   \ sw t3,4(a1)
+83230303 ,   \ lw t2,48(t1)
+032E4303 ,   \ lw t3,52(t1)
+23A47500 ,   \ sw t2,8(a1)
+23A6C501 ,   \ sw t3,12(a1)
+83238302 ,   \ lw t2,40(t1)
+032EC302 ,   \ lw t3,44(t1)
+23A87500 ,   \ sw t2,16(a1)
+23AAC501 ,   \ sw t3,20(a1)
+83230302 ,   \ lw t2,32(t1)
+032E4302 ,   \ lw t3,36(t1)
+23AC7500 ,   \ sw t2,24(a1)
+23AEC501 ,   \ sw t3,28(a1)
+13070628 ,   \ addi a4,a2,640   ( the end of K )
+\ h5_round:
+83A28501 ,   \ lw t0,24(a1)
+03A3C501 ,   \ lw t1,28(a1)
+93D7E200 ,   \ srli a5,t0,14
+931F2301 ,   \ slli t6,t1,18
+B3E7F701 ,   \ or a5,a5,t6
+1358E300 ,   \ srli a6,t1,14
+939F2201 ,   \ slli t6,t0,18
+3368F801 ,   \ or a6,a6,t6
+93D32201 ,   \ srli t2,t0,18
+931FE300 ,   \ slli t6,t1,14
+B3E3F301 ,   \ or t2,t2,t6
+135E2301 ,   \ srli t3,t1,18
+939FE200 ,   \ slli t6,t0,14
+336EFE01 ,   \ or t3,t3,t6
+B3C77700 ,   \ xor a5,a5,t2
+3348C801 ,   \ xor a6,a6,t3
+93539300 ,   \ srli t2,t1,9
+939F7201 ,   \ slli t6,t0,23
+B3E3F301 ,   \ or t2,t2,t6
+13DE9200 ,   \ srli t3,t0,9
+931F7301 ,   \ slli t6,t1,23
+336EFE01 ,   \ or t3,t3,t6
+B3C77700 ,   \ xor a5,a5,t2
+3348C801 ,   \ xor a6,a6,t3
+83A30501 ,   \ lw t2,16(a1)
+03AE4501 ,   \ lw t3,20(a1)
+83AE8500 ,   \ lw t4,8(a1)
+03AFC500 ,   \ lw t5,12(a1)
+B3C3D301 ,   \ xor t2,t2,t4
+334EEE01 ,   \ xor t3,t3,t5
+B3F35300 ,   \ and t2,t2,t0
+337E6E00 ,   \ and t3,t3,t1
+B3C3D301 ,   \ xor t2,t2,t4
+334EEE01 ,   \ xor t3,t3,t5
+3308C801 ,   \ add a6,a6,t3
+B33FC801 ,   \ sltu t6,a6,t3
+B3877700 ,   \ add a5,a5,t2
+B387F701 ,   \ add a5,a5,t6
+83A30500 ,   \ lw t2,0(a1)
+03AE4500 ,   \ lw t3,4(a1)
+3308C801 ,   \ add a6,a6,t3
+B33FC801 ,   \ sltu t6,a6,t3
+B3877700 ,   \ add a5,a5,t2
+B387F701 ,   \ add a5,a5,t6
+83230600 ,   \ lw t2,0(a2)
+032E4600 ,   \ lw t3,4(a2)
+3308C801 ,   \ add a6,a6,t3
+B33FC801 ,   \ sltu t6,a6,t3
+B3877700 ,   \ add a5,a5,t2
+B387F701 ,   \ add a5,a5,t6
+83A30600 ,   \ lw t2,0(a3)
+03AE4600 ,   \ lw t3,4(a3)
+3308C801 ,   \ add a6,a6,t3
+B33FC801 ,   \ sltu t6,a6,t3
+B3877700 ,   \ add a5,a5,t2
+B387F701 ,   \ add a5,a5,t6
+83230500 ,   \ lw t2,0(a0)
+032E4500 ,   \ lw t3,4(a0)
+330E0E01 ,   \ add t3,t3,a6
+B33F0E01 ,   \ sltu t6,t3,a6
+B383F300 ,   \ add t2,t2,a5
+B383F301 ,   \ add t2,t2,t6
+23A07502 ,   \ sw t2,32(a1)
+23A2C503 ,   \ sw t3,36(a1)
+83228501 ,   \ lw t0,24(a0)
+0323C501 ,   \ lw t1,28(a0)
+93D8C201 ,   \ srli a7,t0,28
+931F4300 ,   \ slli t6,t1,4
+B3E8F801 ,   \ or a7,a7,t6
+9350C301 ,   \ srli ra,t1,28
+939F4200 ,   \ slli t6,t0,4
+B3E0F001 ,   \ or ra,ra,t6
+93532300 ,   \ srli t2,t1,2
+939FE201 ,   \ slli t6,t0,30
+B3E3F301 ,   \ or t2,t2,t6
+13DE2200 ,   \ srli t3,t0,2
+931FE301 ,   \ slli t6,t1,30
+336EFE01 ,   \ or t3,t3,t6
+B3C87800 ,   \ xor a7,a7,t2
+B3C0C001 ,   \ xor ra,ra,t3
+93537300 ,   \ srli t2,t1,7
+939F9201 ,   \ slli t6,t0,25
+B3E3F301 ,   \ or t2,t2,t6
+13DE7200 ,   \ srli t3,t0,7
+931F9301 ,   \ slli t6,t1,25
+336EFE01 ,   \ or t3,t3,t6
+B3C87800 ,   \ xor a7,a7,t2
+B3C0C001 ,   \ xor ra,ra,t3
+83230501 ,   \ lw t2,16(a0)
+032E4501 ,   \ lw t3,20(a0)
+832E8500 ,   \ lw t4,8(a0)
+032FC500 ,   \ lw t5,12(a0)
+B3EF7200 ,   \ or t6,t0,t2
+B3FFDF01 ,   \ and t6,t6,t4
+B3F35300 ,   \ and t2,t2,t0
+B3E3F301 ,   \ or t2,t2,t6
+B36FC301 ,   \ or t6,t1,t3
+B3FFEF01 ,   \ and t6,t6,t5
+337E6E00 ,   \ and t3,t3,t1
+336EFE01 ,   \ or t3,t3,t6
+B380C001 ,   \ add ra,ra,t3
+B3BFC001 ,   \ sltu t6,ra,t3
+B3887800 ,   \ add a7,a7,t2
+B388F801 ,   \ add a7,a7,t6
+B3800001 ,   \ add ra,ra,a6
+B3BF0001 ,   \ sltu t6,ra,a6
+B388F800 ,   \ add a7,a7,a5
+B388F801 ,   \ add a7,a7,t6
+23201503 ,   \ sw a7,32(a0)
+23221502 ,   \ sw ra,36(a0)
+13058500 ,   \ addi a0,a0,8
+93858500 ,   \ addi a1,a1,8
+13068600 ,   \ addi a2,a2,8
+93868600 ,   \ addi a3,a3,8
+E31CE6E2 ,   \ bne a2,a4,h5_round
+938606D8 ,   \ addi a3,a3,-640   ( W again )
+03A3067C ,   \ lw t1,0x7C0(a3)   ( st )
+83230300 ,   \ lw t2,0(t1)
+032E4300 ,   \ lw t3,4(t1)
+832E8501 ,   \ lw t4,24(a0)
+032FC501 ,   \ lw t5,28(a0)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23207300 ,   \ sw t2,0(t1)
+2322C301 ,   \ sw t3,4(t1)
+83238300 ,   \ lw t2,8(t1)
+032EC300 ,   \ lw t3,12(t1)
+832E0501 ,   \ lw t4,16(a0)
+032F4501 ,   \ lw t5,20(a0)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23247300 ,   \ sw t2,8(t1)
+2326C301 ,   \ sw t3,12(t1)
+83230301 ,   \ lw t2,16(t1)
+032E4301 ,   \ lw t3,20(t1)
+832E8500 ,   \ lw t4,8(a0)
+032FC500 ,   \ lw t5,12(a0)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23287300 ,   \ sw t2,16(t1)
+232AC301 ,   \ sw t3,20(t1)
+83238301 ,   \ lw t2,24(t1)
+032EC301 ,   \ lw t3,28(t1)
+832E0500 ,   \ lw t4,0(a0)
+032F4500 ,   \ lw t5,4(a0)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+232C7300 ,   \ sw t2,24(t1)
+232EC301 ,   \ sw t3,28(t1)
+83230302 ,   \ lw t2,32(t1)
+032E4302 ,   \ lw t3,36(t1)
+83AE8501 ,   \ lw t4,24(a1)
+03AFC501 ,   \ lw t5,28(a1)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23207302 ,   \ sw t2,32(t1)
+2322C303 ,   \ sw t3,36(t1)
+83238302 ,   \ lw t2,40(t1)
+032EC302 ,   \ lw t3,44(t1)
+83AE0501 ,   \ lw t4,16(a1)
+03AF4501 ,   \ lw t5,20(a1)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23247302 ,   \ sw t2,40(t1)
+2326C303 ,   \ sw t3,44(t1)
+83230303 ,   \ lw t2,48(t1)
+032E4303 ,   \ lw t3,52(t1)
+83AE8500 ,   \ lw t4,8(a1)
+03AFC500 ,   \ lw t5,12(a1)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+23287302 ,   \ sw t2,48(t1)
+232AC303 ,   \ sw t3,52(t1)
+83238303 ,   \ lw t2,56(t1)
+032EC303 ,   \ lw t3,60(t1)
+83AE0500 ,   \ lw t4,0(a1)
+03AF4500 ,   \ lw t5,4(a1)
+330EEE01 ,   \ add t3,t3,t5
+B33FEE01 ,   \ sltu t6,t3,t5
+B383D301 ,   \ add t2,t2,t4
+B383F301 ,   \ add t2,t2,t6
+232C7302 ,   \ sw t2,56(t1)
+232EC303 ,   \ sw t3,60(t1)
+;
+\ h5blk ( blk -- )  one 128-byte block into the state.
+: h5blk  h5st @ h5k @ h5ws @ h5raw ;
+
+\ h5go ( src len pre -- )  len bytes at src into the state, then the
+\ padding (pre bytes went before them); the digest at h5d.
+: h5go
+h5t !  dup h5t @ + h5t !  h5n !
+begin h5n @ 80 lit u< 0= while dup h5blk 80 lit +  h5n @ 80 lit - h5n ! repeat
+h5b @ 100 lit 0 lit do 0 lit over i + c! loop drop
+h5b @ h5n @ h5bc
+80 lit h5b @ h5n @ + c!
+h5n @ 11 lit + 80 lit u> if 100 lit else 80 lit then
+h5t @ 1D lit rshift  over 8 lit - h5b @ + h5be!
+h5t @ 3 lit lshift  over 4 lit - h5b @ + h5be!
+h5b @ h5blk  100 lit = if h5b @ 80 lit + h5blk then
+8 lit 0 lit do i 3 lit lshift h5st @ + @64  i 3 lit lshift h5d @ + tuck 4 lit + h5be! h5be! loop ;
+: h5iv  h5iv0 @ h5st @ 10 lit h5wc ;
+: sha512  h5init h5iv 0 lit h5go ;
+
+\ h5key ( key klen -- )  HMAC's two pad states for this key, kept.
+: h5key
+h5init
+dup 80 lit u> if sha512  h5d @ 40 lit else then  h5pn ! h5pp !
+h5kb @ 80 lit 0 lit do 0 lit over i + c! loop drop
+h5pp @ h5kb @ h5pn @ h5bc
+h5iv  80 lit 0 lit do h5kb @ i + c@ 36 lit xor h5b @ i + c! loop  h5b @ h5blk  h5st @ h5ip @ 10 lit h5wc
+h5iv  80 lit 0 lit do h5kb @ i + c@ 5C lit xor h5b @ i + c! loop  h5b @ h5blk  h5st @ h5op @ 10 lit h5wc ;
+\ h5mac ( msg mlen -- )  HMAC of the message under the key h5key took.
+: h5mac
+h5ip @ h5st @ 10 lit h5wc  80 lit h5go
+h5d @ h5u @ 40 lit h5bc  h5op @ h5st @ 10 lit h5wc  h5u @ 40 lit 80 lit h5go ;
+: hmac512  h5mn ! h5ma !  h5key  h5ma @ h5mn @ h5mac ;
+: pbkdf512
+h5on ! h5o !  h5it !  h5mn ! h5ma !  h5key
+\ U1 = HMAC(P, S || 1)
+h5ma @ h5sb @ h5mn @ h5bc  0 lit h5sb @ h5mn @ + h5be! 1 lit h5sb @ h5mn @ + 3 lit + c!
+h5sb @ h5mn @ 4 lit + h5mac
+h5d @ h5x @ 40 lit h5bc
+h5it @ 1 lit u> if h5it @ 1 lit do
+	h5d @ h5sb @ 40 lit h5bc  h5sb @ 40 lit h5mac
+	40 lit 0 lit do h5x @ i + dup c@ h5d @ i + c@ xor swap c! loop
+loop then
+h5x @ h5o @ h5on @ h5bc ;
