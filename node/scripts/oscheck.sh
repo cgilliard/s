@@ -755,6 +755,61 @@ expect chacha 124 '^chacha: 29 as expected, 0 not' 60 ./tools/q32 "$T/tcc.img"
 sh scripts/mkimage.sh "$T/tdl.img" bin/kernel init="$T/tdl.bin":1024 2> "$T/tdl.mk" || fail dilithium "mkimage: $(cat "$T/tdl.mk")"
 expect dilithium 124 '^dilithium: 108 as expected, 0 not' 60 ./tools/q32 "$T/tdl.img"
 
+# The wallet (docs/GUI_WALLET.md, phase 1), driven as wm drives it
+# (src/user/tests/walletrun.fam: requests on a pipe, each answer printed):
+# none at first; one created, its phrase shown, its address; made again
+# refused; its phrase only for its password; a second unlock refused; run
+# again with another password locked, with its own the same address; in
+# another directory, phrases refused for their reasons, one restored (case
+# and spacing its own), given back normalized.
+./tools/fam --user -o "$T/twr.bin" src/user/tests/walletrun.fam > "$T/twr.build" 2>&1 || fail wallet "build: $(head -c 300 "$T/twr.build")"
+cat > "$T/wreq" <<'WREQEOF'
+{"op":"unlock","password":"pw\"1\\x"}
+{"id":1,"op":"overview"}
+{"id":2,"op":"create"}
+{"id":3,"op":"receive"}
+{"id":4,"op":"create"}
+{"id":5,"op":"phrase","password":"nope"}
+{"id":6,"op":"phrase","password":"pw\"1\\x"}
+{"id":7,"op":"unlock","password":"x"}
+{"id":8,"op":"overview"}
+---
+{"op":"unlock","password":"other"}
+{"id":9,"op":"receive"}
+---
+{"op":"unlock","password":"pw\"1\\x"}
+{"id":10,"op":"receive"}
+{"id":11,"op":"restore","words":"abandon abandon","passphrase":""}
+--- /r
+{"op":"unlock","password":"rpw"}
+{"id":12,"op":"restore","words":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon","passphrase":""}
+{"id":13,"op":"restore","words":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandonx","passphrase":""}
+{"id":14,"op":"restore","words":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"}
+{"id":15,"op":"restore","words":"  Abandon abandon ABANDON abandon abandon abandon abandon abandon abandon abandon abandon about ","passphrase":"TREZOR"}
+{"id":16,"op":"phrase","password":"rpw"}
+WREQEOF
+sh scripts/mkimage.sh "$T/twr.img" bin/kernel init="$T/twr.bin":1024 wallet=bin/user/wallet:4096 bip39=../resources/bip39-english.txt:0 wreq="$T/wreq":0 2> "$T/twr.mk" || fail wallet "mkimage: $(cat "$T/twr.mk")"
+rm -f "$T/twr.disk"; dd if=/dev/zero of="$T/twr.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect wallet 124 '^walletrun: done' 120 ./tools/q32 --disk="$T/twr.disk" "$T/twr.img"
+W="$T/wallet.out"
+for pat in '^w: {"op":"unlock","ok":true,"wallet":false}$' '^w: {"id":1,"ok":false,"error":"no wallet yet: create or restore one"}$' \
+	'^w: {"id":2,"ok":true,"words":"\([a-z]\{3,8\} \)\{11\}[a-z]\{3,8\}"}$' '^w: {"id":3,"ok":true,"address":"tab1[02-9ac-hj-np-z]\{58\}"}$' \
+	'^w: {"id":4,"ok":false,"error":"there is a wallet already"}$' '^w: {"id":5,"ok":false,"error":"not the password"}$' \
+	'^w: {"id":7,"ok":false,"error":"unlocked already"}$' '^w: {"id":8,"ok":true,"confirmed":"0.0000000000","pending":"0.0000000000","unverified":"0.0000000000","reserved":"0.0000000000","locked":"0.0000000000","height":0,"node":"not reached"}$' \
+	'^w: {"op":"unlock","ok":false,"error":"the wallet is sealed under another password than the session"}$' \
+	'^w: {"id":9,"ok":false,"error":"locked"}$' '^w: {"op":"unlock","ok":true,"wallet":true}$' \
+	'^w: {"id":11,"ok":false,"error":"there is a wallet already"}$' \
+	'^w: {"id":12,"ok":false,"error":"the checksum of the words does not match: a word is wrong"}$' \
+	'^w: {"id":13,"ok":false,"error":"a word is not in the list"}$' '^w: {"id":14,"ok":false,"error":"a phrase is 12 words"}$' \
+	'^w: {"id":15,"ok":true}$' '^w: {"id":16,"ok":true,"words":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"}$'; do
+	grep -q -- "$pat" "$W" || fail wallet_answers "no /$pat/ in: $(grep '^w: ' "$W" | head -c 1500)"
+done
+[ "$(sed -n 's/^w: {"id":2,"ok":true,"words":"\(.*\)"}$/\1/p' "$W")" = "$(sed -n 's/^w: {"id":6,"ok":true,"words":"\(.*\)"}$/\1/p' "$W")" ] \
+	|| fail wallet_answers "the phrase given back is not the one made"
+[ "$(sed -n 's/^w: {"id":3,"ok":true,"address":"\(.*\)"}$/\1/p' "$W")" = "$(sed -n 's/^w: {"id":10,"ok":true,"address":"\(.*\)"}$/\1/p' "$W")" ] \
+	|| fail wallet_answers "the address changed when run again"
+rm -f "$T/twr.disk"
+
 # Users (step 8, part 5): a disk booted twice.  First as root (no
 # /etc/init yet): /etc/passwd and /etc/init written, a home for alice
 # hers alone.  Then init runs login: a wrong password refused; alice in,
@@ -1009,12 +1064,13 @@ done
 # taskbar, maximize, exit and the close button each closing a window, then
 # thirteen at once (twelve, the last told none is free) and no zombie left;
 # escape sequences fed to a window; vi in one (typed, written, the shell's
-# screen back after).  The wallet's WebSocket (/wallet, the stub wallet,
+# screen back after).  The wallet's WebSocket (/wallet, the wallet,
 # src/user/wallet.fam, behind it): refused without a session; with one,
-# wm's unlock answered, the tip told, a request answered with its id, and
-# logging out closing it; on the page, its window from the dock (a second
-# click focusing it, not a second window), the overview and another screen
-# shown, its program ending when its window closes.
+# wm's unlock answered, a request answered with its id, and logging out
+# closing it; on the page, its window from the dock (no wallet yet; one
+# created, its words shown; a second click focusing it, not a second
+# window), the Receive screen's address, its program ending when its
+# window closes.
 cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
@@ -1090,8 +1146,8 @@ pump(b"$ ")
 lo = post(b"/logout", b"", cookie)
 print("logout", b"Location: /" in lo and pump(b"[close]", 30))
 c2, h2, _ = wsopen(cookie); print("after", h2.split(b"\r\n")[0].decode())
-# the wallet: refused without a session; with one, the stub's answer to
-# wm's unlock, the tip, a request answered with its id; logging out closes it
+# the wallet: refused without a session; with one, its answer to wm's
+# unlock, a request answered with its id; logging out closes it
 c3, h3, _ = wsopen(b"", b"/wallet"); print("wallet refused", h3.split(b"\r\n")[0].decode())
 good = post(b"/login", b"name=root&password=wm%21pw")
 ck = [l for l in good.split(b"\r\n") if l.startswith(b"Set-Cookie: wm=")]
@@ -1099,9 +1155,8 @@ cookie = b"Cookie: " + ck[0][12:].split(b";")[0] + b"\r\n" if ck else b""
 s, h, want = wsopen(cookie, b"/wallet"); buf = b""; out = b""; closed = False
 print("wallet upgrade", h.split(b"\r\n")[0].decode(), (b"Sec-WebSocket-Accept: " + want) in h)
 print("unlock", pump(b'{"op":"unlock","ok":true'))
-print("tip", pump(b'{"event":"tip","height":'))
 out = b""; send(b'{"op":"overview","id":7}', 1)
-print("overview", pump(b'"node":"synced"}') and out.startswith(b'{"id":7,"ok":true,"confirmed":"'))
+print("overview", pump(b'"}') and out.startswith(b'{"id":7,"ok":'))
 lo = post(b"/logout", b"", cookie)
 print("wallet logout", b"Location: /" in lo and pump(b"[close]", 30))
 WSCEOF
@@ -1221,20 +1276,23 @@ const port = process.argv[2];
   console.log('vi back', await wait(() => /\$ vi \/v\.txt\n\$ █$/.test(t3.plain), 60000));
   type(t3, 'cat /v.txt\r'); console.log('vi wrote', await wait(() => /\nhi there\n\$ █$/.test(t3.plain), 60000));
   console.log(JSON.stringify(t3.plain));
-  // the wallet: its window from the dock, the stub's overview once wm has
-  // unlocked it; a second click focuses it (no second window); the
-  // Receive screen; closed from its button, its program gone (ps)
+  // the wallet: its window from the dock, none yet once wm has unlocked
+  // it; one created (its twelve words shown); a second click focuses it
+  // (no second window); the Receive screen, its address; closed from its
+  // button, its program gone (ps)
   const text = (e) => [e.textContent].concat(e.kids.map(text)).join(' ');
   const wal = () => all(desk, 'wal');
   byId.neww.onclick();
-  console.log('wallet', await wait(() => wal().length === 1 && /Confirmed\s+12\.5/.test(text(wal()[0])), 60000));
+  console.log('wallet', await wait(() => wal().length === 1 && /No wallet yet/.test(text(wal()[0])), 60000));
+  all(wal()[0], 'wgo').find((b) => b.textContent === 'Create a wallet').onclick();
+  console.log('wallet created', await wait(() => /Write these words down, in order: ([a-z]+ ){11}[a-z]+/.test(text(wal()[0])), 120000));
   const running = () => /wallet$/m.test(t3.plain.slice(t3.plain.lastIndexOf('CMD')));
   { const n0 = heads(); type(t3, 'ps\r'); await wait(() => heads() > n0 && prompt.test(t3.plain), 20000); }
   console.log('wallet running', running());
   t3.focus(); byId.neww.onclick();
   console.log('wallet once', wal().length === 1 && all(tasks, 'task').filter((k) => k.textContent === 'Wallet').length === 1 && doc.active === wal()[0]);
   all(wal()[0], 'wtab')[1].onclick();
-  console.log('wallet receive', await wait(() => /Address\s+tab1qstub/.test(text(wal()[0])), 60000));
+  console.log('wallet receive', await wait(() => /Address\s+tab1[02-9ac-hj-np-z]{58}/.test(text(wal()[0])), 60000));
   all(all(desk, 'win').find((d) => all(d, 'wal').length), 'wb')[2].onclick({ stopPropagation() {} });
   console.log('wallet closed', wal().length === 0 && !all(tasks, 'task').some((k) => k.textContent === 'Wallet'));
   let gone = false;
@@ -1248,7 +1306,7 @@ const port = process.argv[2];
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet:4096 bip39=../resources/bip39-english.txt:0 sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))
@@ -1264,14 +1322,14 @@ for n in 1 4; do
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
 		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$' \
-			'^wallet true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^login form HTTP/1.0 200 OK True$' '^tty refused HTTP/1.0 403 Forbidden$' '^bad True$' '^cookie True$' \
 		'^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^hashed True$' \
 		'^ping True$' '^exit True$' '^logout True$' '^after HTTP/1.0 403 Forbidden$' \
 		'^wallet refused HTTP/1.0 403 Forbidden$' '^wallet upgrade HTTP/1.1 101 Switching Protocols True$' '^unlock True$' \
-		'^tip True$' '^overview True$' '^wallet logout True$'; do
+		'^overview True$' '^wallet logout True$'; do
 		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
 	done
 done

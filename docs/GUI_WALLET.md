@@ -233,9 +233,15 @@ memos faster than every output in order.
    phrase); slates and transactions (`node/wslate.fam`: a slate
    decoded and built, the answer and its receipt, the body hash, the
    signed transaction, a sender tag, `finalize`'s checks; checked
-   against a payment tabminer's own types made). Left: the wallet
-   program (its records, the phrase at rest, scanning through the
-   node, the leaves used, replacing the stub).
+   against a payment tabminer's own types made). The wallet program
+   (`src/user/wallet.fam`, replacing the stub), in four steps: 1 its
+   records (a tree, `~/.wallet`, mode 700), unlocking, `create`,
+   `restore`, `phrase`, `receive` (done 2026-11-10); 2 the node (its
+   API, whose reads need no token since 2026-11-10): the unspent set
+   scanned for the wallet's outputs, `overview`, `scan`, the tip told
+   (done 2026-11-10, `scripts/wallettest.sh`); 3 payments: `answer`,
+   `send`, `finalize`, `activity`; 4 a tabminer wallet and this one
+   paying each other on the recursive dev network.
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a

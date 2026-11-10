@@ -8,7 +8,8 @@
 \ crypto/sha256.fam.
 \
 \ b39load ( -- flag )  the word list read (once).
-\ b39phr ( ent dst -- )  the phrase of 16 bytes at ent, NUL-ended.
+\ b39phr ( ent dst -- )  the phrase of 16 bytes at ent, NUL-ended (after
+\ b39load).
 \ b39ent ( phrase ent -- code )  its entropy at ent: 0, or -1 not 12
 \ words, -2 a word not in the list, -3 the checksum wrong.
 \ b39seed ( phrase pass dst -- code )  its seed (64 bytes) at dst; the code

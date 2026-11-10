@@ -1,0 +1,58 @@
+\ walletrun.fam — drives the wallet as wm does (docs/GUI_WALLET.md): runs
+\ /bin/wallet on two pipes, writes it each line of /lib/wreq, and prints
+\ each line it answers as "w: <line>" (one answer a request; wm's unlock
+\ line the first of each run).  A line "---" ends that wallet (its input
+\ closed, its end waited for) and starts another; "--- /dir" starts it
+\ in /dir (made), so a fresh wallet there.  A test program, not
+\ in the image: oscheck's wallet checks build it with the wallet.
+: rq variable ;  : rqn variable ;  : pin variable ;  : pout variable ;  : fdv variable ;  : pid variable ;
+: ab variable ;  : an variable ;  : lp variable ;  : st variable ;  : wargs variable ;
+: wstart
+pin @ pipe drop  pout @ pipe drop
+3 lit fdv @ !  pin @ @ fdv @ 4 lit + !  pout @ 4 lit + @ fdv @ 8 lit + !  2 lit fdv @ C lit + !
+"wallet" wargs @ fdv @ spawnv pid !
+pin @ @ close drop  pout @ 4 lit + @ close drop  0 lit an ! ;
+: wstop  pin @ 4 lit + @ close drop  pid @ st @ wait drop  pout @ @ close drop ;
+\ wnl ( -- i )  where the first newline of what was read is (an: none).
+: wnl  0 lit begin dup an @ u< if dup ab @ + c@ A lit <> else 0 lit then while 1 lit + repeat ;
+\ wline  the wallet's next line, printed ("(it ended)" if it ended first).
+: wline
+begin wnl an @ = while
+	pout @ @ ab @ an @ + FFF lit an @ - read
+	dup 0 lit > if an @ + an ! else
+		drop ab @ an @ + "(it ended)" scpy A lit over c! 1 lit + ab @ - an !
+	then
+repeat
+wnl  0 lit over ab @ + c!  "w: " puts ab @ puts 0A lit putc
+an @ over 1 lit + - ?dup if 0 lit do ab @ over 1 lit + + i + c@ ab @ i + c! loop then
+an @ swap 1 lit + - an ! ;
+
+: ls variable ;  : le variable ;  : nl variable ;
+\ isdash ( a -- flag )  the line at a is "---".
+: isdash
+dup c@ 2D lit =  over 1 lit + c@ 2D lit = and  over 2 lit + c@ 2D lit = and
+swap 3 lit + c@ dup A lit = over 0= or swap 20 lit = or and ;
+1000 lit alloc rq !  1000 lit alloc ab !  8 lit alloc pin !  8 lit alloc pout !  10 lit alloc fdv !  8 lit alloc st !  4 lit alloc nl !
+A lit nl @ c!  10 lit alloc wargs !  wargs @ "wallet" scpy 0 lit over c! 0 lit swap 1 lit + c!
+"/lib/wreq" 0 lit open dup rq @ FFF lit read rqn ! close drop  0 lit rq @ rqn @ + c!
+wstart
+rq @ lp !
+begin lp @ c@ while
+	lp @ ls !  lp @ begin dup c@ dup A lit <> and while 1 lit + repeat le !
+	ls @ isdash if
+		wstop
+		ls @ 3 lit + c@ 20 lit = if
+			0 lit le @ c!  ls @ 4 lit + mkdir drop
+			"/proc/self/cwd" 1 lit open dup ls @ 4 lit + dup strlen write drop close drop
+			A lit le @ c!
+		then
+		wstart
+	else
+		pin @ 4 lit + @ ls @ le @ ls @ - write drop  pin @ 4 lit + @ nl @ 1 lit write drop
+		wline
+	then
+	le @ c@ if le @ 1 lit + else le @ then lp !
+repeat
+wstop
+"walletrun: done" puts 0A lit putc
+0 lit exit

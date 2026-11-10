@@ -54,13 +54,15 @@ mkdir -p bin/user
 progs=""
 # A program may name modules of src/user/ it needs, before its own code,
 # in lines "\ uses: crypto/sha512.fam" (src/user/crypto/: SHA-512, HMAC,
-# PBKDF2).
+# PBKDF2); and its memory to start with, in KiB, in a line
+# "\ memory: 4096" (64 unless given).
 for prog in src/user/*.fam; do
 	name=$(basename "$prog" .fam)
 	uses=$(sed -n 's|^\\ uses: *||p' "$prog" | tr ' ' '\n' | sed '/^$/d; s|^|src/user/|' | tr '\n' ' ')
 	echo "Building $prog → bin/user/$name (user mode)" >&2
 	./tools/fam --user -o "bin/user/$name" $uses "$prog" || { echo "build.sh: $prog did not build" >&2; exit 1; }
-	progs="$progs $name=bin/user/$name"
+	mem=$(sed -n 's|^\\ memory: *\([0-9]*\).*|\1|p' "$prog" | head -1)
+	progs="$progs $name=bin/user/$name${mem:+:$mem}"
 done
 # The node (docs/NODE.md): its modules in order, then its main, as one
 # program with 24 MiB to start; and the data files it reads: the seed text

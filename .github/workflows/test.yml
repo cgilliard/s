@@ -196,6 +196,7 @@ jobs:
           - striketest
           - windowtest
           - snaptest
+          - wallettest
     defaults:
       run:
         working-directory: node
