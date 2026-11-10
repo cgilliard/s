@@ -226,8 +226,11 @@ memos faster than every output in order.
    (`node/xsign.fam`: a 16-leaf key about 2.3 s, a signature about
    0.1 s under QEMU); Dilithium and SHA-3 (`crypto/dilithium.fam`,
    `crypto/keccak.fam`: ML-DSA-65, deterministic signing as tabminer's;
-   keys about 0.1 s, a signature 0.1 to 0.4 s). Left: the keys and
-   memos, transactions and slates, the wallet program.
+   keys about 0.1 s, a signature 0.1 to 0.4 s); the keys and memos
+   (`node/wkeys.fam`: the master, an output's key seed, memo and
+   commitment, a memo recognised, the identity's seed, id and `tab1…`
+   address; checked against a tabminer wallet restored from the same
+   phrase). Left: transactions and slates, the wallet program.
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a

@@ -1233,6 +1233,12 @@ impl Wallet {
         mldsa::keygen(&seed)
     }
 
+    /// The address counter (the fam wallet's vectors).
+    #[cfg(test)]
+    pub(crate) fn address_index(&self) -> u64 {
+        self.address.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Whether the address is off: no sessions, nobody can reach the
     /// wallet, though it can still pay.
     pub fn address_off(&self) -> bool {

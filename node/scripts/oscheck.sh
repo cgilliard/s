@@ -230,6 +230,14 @@ expect fees 124 '^fees: 11 as expected, 0 not' 60 ./tools/q32 "$T/fe.img"
 ./tools/fam --user -o "$T/txs.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/xsign_test.fam > "$T/txs.build" 2>&1 || fail xsign "build: $(head -c 300 "$T/txs.build")"
 sh scripts/mkimage.sh "$T/xs.img" bin/kernel init="$T/txs.bin":8192 xsign=$ND/xsign_vectors.bin:0 2> "$T/xs.mk" || fail xsign "mkimage: $(cat "$T/xs.mk")"
 expect xsign 124 '^xsign: 28 as expected, 0 not' 60 ./tools/q32 "$T/xs.img"
+# A wallet's keys and memos (wkeys.fam): from a phrase, the master, the
+# identities (Dilithium seed, id, tab1 address) and outputs (key seed,
+# memo, public key, commitment; memos recognised, strangers' not), as a
+# tabminer wallet restored from the same phrase.
+./tools/fam --user -o "$T/twk.bin" src/user/crypto/sha512.fam src/user/crypto/sha256.fam src/user/crypto/bip39.fam src/user/crypto/keccak.fam src/user/crypto/dilithium.fam \
+	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wkeys_test.fam > "$T/twk.build" 2>&1 || fail wkeys "build: $(head -c 300 "$T/twk.build")"
+sh scripts/mkimage.sh "$T/wk.img" bin/kernel init="$T/twk.bin":8192 bip39=../resources/bip39-english.txt:0 wkeys=$ND/wkeys_vectors.bin:0 2> "$T/wk.mk" || fail wkeys "mkimage: $(cat "$T/wk.mk")"
+expect wkeys 124 '^wkeys: 35 as expected, 0 not' 60 ./tools/q32 "$T/wk.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

@@ -1,0 +1,58 @@
+\ wkeys_test.fam — wkeys.fam against tabminer's wallet (docs/GUI_WALLET.md,
+\ phase 1): /lib/wkeys is miner/src/fam_wkeys_vectors.rs's
+\ wkeys_vectors.bin, checked there against a tabminer wallet restored from
+\ the same phrase.  The phrase's seed (crypto/bip39.fam, /lib/bip39) and
+\ master; each identity's Dilithium seed, id and address; each output's
+\ key seed, memo, public key (xsign.fam) and commitment, its memo
+\ recognised; strangers' memos not.  A program after crypto/sha512,
+\ sha256, bip39, keccak, dilithium and the node's arith, poseidon2,
+\ difficulty, pow, state, xmss, xsign and wkeys.  Prints "wkeys: N as
+\ expected, M not".
+
+: ytp variable ;  : ytf variable ;  : yte variable ;  : ytb variable ;  : ytk variable ;  : ytpk variable ;
+: ytsk variable ;  : ytc variable ;  : yti variable ;  : ytx variable ;
+: ytread
+0 lit open  dup 0< if "wkeys: no /lib/wkeys" puts 0A lit putc then
+4000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  4000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+: ytsame  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;   \ ( a b n -- flag )
+: ytchk  swap if drop ytp @ 1 lit + ytp ! else "wkeys: " puts puts " (" puts yti @ u. ")" puts 0A lit putc ytf @ 1 lit + ytf ! then ;   \ ( flag str -- )
+
+: ytmain
+wkinit xkinit
+100 lit alloc ytb !  20 lit alloc ytc !  7A0 lit alloc ytpk !  FC0 lit alloc ytsk !
+4 lit xksize alloc ytk !
+"/lib/wkeys" ytread drop yte !
+\ the phrase's seed, the master
+0 lit yti !
+yte @ "" ytb @ b39seed 0=  ytb @ yte @ 80 lit + 40 lit ytsame and "the phrase's seed" ytchk
+yte @ 80 lit + wkmast  wkm @ ytb @ wkcan  ytb @ yte @ C0 lit + 20 lit ytsame "the master" ytchk
+yte @ E4 lit + ytx !
+yte @ E0 lit + @ 0 lit do
+	i yti !
+	ytx @ ytb @ wkidsd  ytb @ ytx @ 8 lit + 20 lit ytsame "an identity's Dilithium seed" ytchk
+	ytb @ ytpk @ ytsk @ dilkey
+	ytpk @ ytc @ wkid  ytc @ ytb @ wkcan  ytb @ ytx @ 28 lit + 20 lit ytsame "an identity's id" ytchk
+	ytc @ ytb @ wkaddr  ytb @ ytx @ 48 lit + 3F lit ytsame "an identity's address" ytchk
+	ytx @ 88 lit + ytx !
+loop
+ytx @ 4 lit + ytx !  ytx @ 4 lit - @ 0 lit do
+	i yti !
+	ytx @ wknon
+	ytb @ wkkey  ytb @ ytx @ 18 lit + 20 lit ytsame "an output's key seed" ytchk
+	ytb @ 80 lit + wkmemo  ytb @ 80 lit + ytx @ 38 lit + 14 lit ytsame "an output's memo" ytchk
+	ytb @ 4 lit ytk @ xkgen  ytk @ ytb @ 40 lit + xkpub  ytb @ 40 lit + ytx @ 4C lit + 31 lit ytsame "an output's public key" ytchk
+	ytb @ 40 lit + ytx @ 10 lit + ytc @ wkcom  ytc @ ytb @ wkcan  ytb @ ytx @ 80 lit + 20 lit ytsame "an output's commitment" ytchk
+	ytx @ 38 lit + wkopen "an output's memo not recognised" ytchk
+	ytx @ A0 lit + ytx !
+loop
+ytx @ 4 lit + ytx !  ytx @ 4 lit - @ 0 lit do
+	i yti !  ytx @ wkopen 0= "a stranger's memo taken for ours" ytchk  ytx @ 14 lit + ytx !
+loop
+"wkeys: " puts ytp @ u. " as expected, " puts ytf @ u. " not" puts 0A lit putc ;
+ytmain
+0 lit exit

@@ -19,6 +19,8 @@ pub mod fam_vectors;
 mod fam_dilithium_vectors;
 #[cfg(test)]
 mod fam_xmss_vectors;
+#[cfg(test)]
+mod fam_wkeys_vectors;
 pub mod field;
 #[rustfmt::skip]
 pub mod genesis;

@@ -1,0 +1,91 @@
+\ wkeys.fam — a wallet's keys and memos (docs/GUI_WALLET.md, phase 1), as
+\ tabminer's wallet.rs: the master from the BIP39 seed, H(master, nonce)
+\ for an output's key and its memo's tag, recognising a memo, a key's
+\ commitment, the identity (Dilithium) key's seed by the address counter,
+\ the id of its public key and the `tab1…` address (address.rs).  After
+\ arith, poseidon2, difficulty, pow and state (hdom; vp, v, vd, vamount);
+\ the wallet uses xsign.fam for the keys, crypto/dilithium.fam for the
+\ identity.  Words in Montgomery form unless said canonical.
+\
+\ wkinit  the buffers (once).
+\ wkmast ( seed -- )  the master (wkm) of a 64-byte BIP39 seed.
+\ wknon ( a -- )  the nonce (wkn) from 4 canonical words at a.
+\ wkkey ( dst -- )  the 32-byte XMSS seed of wkn's output key.
+\ wkmemo ( dst -- )  its 20-byte memo (canonical): the nonce, the tag.
+\ wkopen ( memo -- flag )  the memo's nonce to wkn; whether its tag is
+\ this wallet's (a stranger's matches once in 2^31: the commitment
+\ confirms).
+\ wkpkh ( pk c -- )  c = H(pubkey) of a 49-byte XMSS public key.
+\ wkcom ( pk amt c -- )  c = H(H(pubkey) || amount), amt 8 bytes.
+\ wkidsd ( ia dst -- )  the 32-byte Dilithium seed of the address counter
+\ at ia (8 bytes).
+\ wkid ( pk c -- )  c = the id of a 1,952-byte Dilithium public key.
+\ wkaddr ( c dst -- )  the address of id c (62 characters), NUL-ended.
+\ wkcan ( c dst -- )  a digest's 32 canonical bytes.
+
+: wkm variable ;  : wkb variable ;  : wkn variable ;  : wkd variable ;  : wkab variable ;  : wkav variable ;
+: wka variable ;  : wkbt variable ;  : wkdn variable ;  : wkdst variable ;  : wkpm variable ;
+: wkinit
+p2init
+wkm @ 0= if 20 lit alloc wkm !  A40 lit alloc wkb !  10 lit alloc wkn !  20 lit alloc wkd !  20 lit alloc wkab !  40 lit alloc wkav ! then ;
+: wkle!  4 lit 0 lit do over i 3 lit lshift rshift over i + c! loop 2drop ;   \ ( x a -- )
+: wkcan  8 lit 0 lit do over i w@ fromm over i 2 lit lshift + wkle! loop 2drop ;
+\ wkpack ( a n -- words )  n bytes into wkb, 3 a word, little-endian.
+: wkpack
+wkb @ vp !
+begin dup while
+	over over 3 lit umin  0 lit swap 0 lit do over i + c@ i 3 lit lshift lshift or loop nip  v,
+	dup 3 lit umin  tuck - -rot + swap
+repeat 2drop  vp @ wkb @ - 2 lit rshift ;
+: wkmast  40 lit wkpack  wkb @ swap 30 lit wkm @ hdom ;
+: wknon  4 lit 0 lit do dup i 2 lit lshift + le@ tom wkn @ i w! loop drop ;
+\ wkwith ( dom c -- )  c = hash_domain(dom, master || nonce).
+: wkwith
+wkm @ wkb @ 8 lit wcopy  wkn @ wkb @ 20 lit + 4 lit wcopy
+wkb @ C lit 3 lit pick 3 lit pick hdom 2drop ;
+: wkkey  32 lit wkd @ wkwith  wkd @ swap wkcan ;
+: wkmemo
+4 lit 0 lit do wkn @ i w@ fromm over i 2 lit lshift + wkle! loop
+31 lit wkd @ wkwith  wkd @ @ fromm swap 10 lit + wkle! ;
+: wkopen  dup wknon  31 lit wkd @ wkwith  10 lit + le@  wkd @ @ fromm = ;
+: wkpkh
+swap wkb @ vp !  dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  30 lit + c@ v,
+wkb @ D lit 1 lit 3 lit pick hdom drop ;
+: wkcom
+rot wkd @ wkpkh
+wkd @ wkb @ 8 lit wcopy  wkb @ 20 lit + vp !  swap vamount
+wkb @ B lit 2 lit 3 lit pick hdom drop ;
+: wkidsd
+wkm @ wkb @ 8 lit wcopy  wkb @ 20 lit + vp !
+swap dup le@ swap 4 lit + le@
+over 3FFFFFFF lit and v,  swap 1E lit rshift swap 2 lit lshift or 3FFFFFFF lit and v,
+wkb @ A lit 36 lit wkd @ hdom  wkd @ swap wkcan ;
+: wkid  swap 7A0 lit wkpack  wkb @ swap 12 lit 3 lit pick hdom drop ;
+
+\ The address: bech32m (BIP 350) of the id's bytes, prefix "tab".
+: wkg  dup 0= if drop 3B6A57B2 lit else dup 1 lit = if drop 26508E6D lit else dup 2 lit = if drop 1EA119FA lit else
+	3 lit = if 3D4233DD lit else 2A1462B3 lit then then then then ;
+\ wkpoly ( chk v -- chk' )  one value into the checksum.
+: wkpoly
+swap dup 19 lit rshift swap 1FFFFFF lit and 5 lit lshift rot xor swap
+5 lit 0 lit do dup i rshift 1 lit and if swap i wkg xor swap then loop drop ;
+: wkput  wkdst @ c!  wkdst @ 1 lit + wkdst ! ;          \ ( c -- )
+: wkaddr
+wkdst !  wkab @ wkcan
+0 lit wka !  0 lit wkbt !  0 lit wkdn !
+20 lit 0 lit do
+	wka @ 8 lit lshift wkab @ i + c@ or wka !  wkbt @ 8 lit + wkbt !
+	begin wkbt @ 4 lit u> while
+		wkbt @ 5 lit - wkbt !  wka @ wkbt @ rshift 1F lit and wkav @ wkdn @ + c!  wkdn @ 1 lit + wkdn !
+	repeat
+loop
+wkbt @ if wka @ 5 lit wkbt @ - lshift 1F lit and wkav @ wkdn @ + c!  wkdn @ 1 lit + wkdn ! then
+\ the checksum: "tab" expanded, the data, six zeros
+1 lit  3 lit wkpoly 3 lit wkpoly 3 lit wkpoly 0 lit wkpoly 14 lit wkpoly 1 lit wkpoly 2 lit wkpoly
+wkdn @ 0 lit do wkav @ i + c@ wkpoly loop
+6 lit 0 lit do 0 lit wkpoly loop
+2BC830A3 lit xor wkpm !
+74 lit wkput 61 lit wkput 62 lit wkput 31 lit wkput
+wkdn @ 0 lit do "qpzry9x8gf2tvdw0s3jn54khce6mua7l" wkav @ i + c@ + c@ wkput loop
+6 lit 0 lit do "qpzry9x8gf2tvdw0s3jn54khce6mua7l" wkpm @ 5 lit i - 5 lit * rshift 1F lit and + c@ wkput loop
+0 lit wkput ;
