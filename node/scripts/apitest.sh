@@ -8,11 +8,11 @@
 # wallet, never sent anywhere); the miner started again.  The node boots
 # (src/user/node/api_test.fam) with one transaction as /lib/tx, syncs from
 # the miner and starts its API (port 3738, forwarded from the host).
-# - In the OS, /bin/apicli (src/user/node/apicli.fam) asks for the status
-#   without the token (401), then with it; a header; outputs; and sends its
-#   transaction without the token (401), then with it.
-# - On the host, a client (below) does the same with the other
-#   transaction, and reads every endpoint; waits for the tip to move (long
+# - In the OS, /bin/apicli (src/user/node/apicli.fam) asks, without the
+#   token as a user's wallet does, for the status, a header and outputs; a
+#   new token (401: that alone needs the token); and sends its transaction.
+# - On the host, a client (below) reads every endpoint without the token,
+#   sends the other transaction without it; waits for the tip to move (long
 #   polling); waits until both transactions are mined (the pool empty, the
 #   miner's log saying it took both from the node); makes a new token, the
 #   old one refused after.
@@ -89,9 +89,9 @@ TOKEN=$(sed -n 's/^api: listening, token \([0-9a-f]*\)$/\1/p' "$T/node.out")
 [ ${#TOKEN} = 64 ] || { echo "apitest.sh: no API" >&2; exit 1; }
 wait_for "$T/node.out" '^cli: done' 120 "the program in the OS"
 grep -E '^cli:' "$T/node.out"
-grep -q '^cli: status without the token 401' "$T/node.out" && grep -q '^cli: status 200 {"height":' "$T/node.out" \
+grep -q '^cli: status 200 {"height":' "$T/node.out" \
 	&& grep -q '^cli: header 1 200 {"height":1,' "$T/node.out" && grep -q '^cli: outputs 200 {"outputs":\[' "$T/node.out" \
-	&& grep -q '^cli: tx without the token 401' "$T/node.out" && grep -q '^cli: tx 200 {"accepted":true' "$T/node.out" \
+	&& grep -q '^cli: token without the token 401' "$T/node.out" && grep -q '^cli: tx 200 {"accepted":true' "$T/node.out" \
 	|| { echo "apitest.sh: the program in the OS was not answered as expected" >&2; exit 1; }
 
 python3 - "$HP" "$TOKEN" "$T/tx1.bin" "$T/miner/tabminer.log" <<'EOF'
@@ -116,11 +116,11 @@ def j(path, **kw):
     check(f'{path} 200', st == 200)
     return json.loads(body)
 st, body = ask('/v1/status', tok=None)
-check('without the token 401, nothing else', st == 401 and body == b'')
-st, body = ask('/v1/status', tok='0' * 64)
-check('another token 401', st == 401)
-st, _ = ask('/v1/tx', data=open(txfile, 'rb').read(), tok=None)
-check('a transaction without the token 401', st == 401)
+check('the status without the token', st == 200 and body.startswith(b'{"height":'))
+st, body = ask('/v1/token', data=b'', tok=None)
+check('a new token without the token 401, nothing else', st == 401 and body == b'')
+st, body = ask('/v1/token', data=b'', tok='0' * 64)
+check('with another token 401', st == 401)
 s = j('/v1/status')
 h = s['height']
 check(f'status: height {h}, {s["peers"]} peers', h >= 12 and len(s['tip']) == 64)
@@ -146,9 +146,9 @@ check(f'the pool: {m["count"]} (the program in the OS sent one)', m['count'] == 
 st, body = ask('/v1/tx', data=b'\x01\x02')
 r = json.loads(body)
 check(f'bytes that do not decode refused: {r["reason"]}', st == 400 and r['accepted'] is False and r['code'] == -1)
-st, body = ask('/v1/tx', data=open(txfile, 'rb').read())
+st, body = ask('/v1/tx', data=open(txfile, 'rb').read(), tok=None)
 r = json.loads(body)
-check(f'our transaction accepted: {r.get("id", "")[:16]}', st == 200 and r['accepted'] is True)
+check(f'our transaction accepted, without the token: {r.get("id", "")[:16]}', st == 200 and r['accepted'] is True)
 st, body = ask('/v1/tx', data=open(txfile, 'rb').read())
 check('again: already in the pool', st == 400 and json.loads(body)['code'] == -10)
 t0 = time.time()
@@ -171,9 +171,9 @@ took = re.findall(r'transaction from 127\.0\.0\.1:\d+ \S+ pooled', open(minerlog
 check(f'the miner took both from the node', len(took) == 2)
 new = j('/v1/token', data=b'')['token']
 check('a new token', len(new) == 64 and new != token)
-st, _ = ask('/v1/status')
+st, _ = ask('/v1/token', data=b'')
 check('the old one refused', st == 401)
-st, _ = ask('/v1/status', tok=new)
-check('the new one taken', st == 200)
+new2 = j('/v1/token', data=b'', tok=new)['token']
+check('the new one taken', len(new2) == 64 and new2 != new)
 EOF
 echo "apitest.sh: the API answered in the OS and on the host"

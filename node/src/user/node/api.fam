@@ -1,10 +1,13 @@
 \ api.fam — the node's API (docs/NODE.md, step 8), after sync.fam and
 \ query.fam: JSON over HTTP/1.0, one request a connection, on a TCP port
 \ (3738 unless configured), polled in the node's one loop with its peers.
-\ Every request carries the token, "Authorization: Bearer <64 hex digits>";
-\ without it, or with another, 401 and nothing else.  The token is made at
-\ the first start (32 bytes from /dev/random, in hex) and kept in
-\ /etc/node/token, mode 600; POST /v1/token makes a new one.
+\ Reading needs no token, nor does POST /v1/tx: it is all public (the
+\ chain, the pool, a transaction to relay, as any peer could), and the
+\ wallets of the OS's users read it (docs/GUI_WALLET.md).  POST /v1/token
+\ carries the token, "Authorization: Bearer <64 hex digits>"; without it,
+\ or with another, 401 and nothing else.  The token is made at the first
+\ start (32 bytes from /dev/random, in hex) and kept in /etc/node/token,
+\ mode 600; POST /v1/token makes a new one.
 \
 \   GET  /v1/status                      height, tip, work, peers, pool
 \   GET  /v1/header/<height|id>[?raw]    a header, decoded (or its bytes)
@@ -479,7 +482,9 @@ then ;
 : aone
 areq if aparse else 0 lit then
 0= if "bad request" "400 Bad Request" afail else
-	aauth @ 0= if abegin "401 Unauthorized" asend else aroute then
+	\ only a new token needs the token: the rest is public (the chain, the
+	\ pool, a transaction to relay, as any peer could)
+	aauth @ 0=  apost @ and  apath @ "/v1/token" streq and if abegin "401 Unauthorized" asend else aroute then
 then
 abod @ ?dup if free 0 lit abod ! then ;
 

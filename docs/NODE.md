@@ -14,7 +14,8 @@ transactions it does.
 - **Verification only.** The node does not prove or mine.
 - **A daemon with an API.** It has no interface of its own; wallets and
   other clients use its HTTP API, served by its own process.
-- **An API token.** Every request carries it (The API, below).
+- **An API token.** Making a new token needs it; reading and sending a
+  transaction do not (The API, below).
 - **A 25 GB disk.** It holds essentially the whole chain, even at
   Bitcoin's scale, with tabminer's full undo window. The store must be
   made to scale to it first (step 0).
@@ -280,9 +281,13 @@ half-applied one.
 JSON over HTTP, one request a connection to begin with. Paths are
 versioned (`/v1/...`) so they can change without breaking wallets.
 
-**The token** (decided). Every request carries it, as `Authorization:
-Bearer <token>`. A request without it, or with another, gets 401 and
-nothing else.
+**The token** (decided; reads opened 2026-11-10). Only `POST
+/v1/token` carries it, as `Authorization: Bearer <token>`; without it,
+or with another, 401 and nothing else. Every read, and `POST /v1/tx`,
+needs none: what they serve is public (the chain, the pool), anyone can
+relay a transaction to any peer anyway, and each user's wallet in the OS
+reads the node though only root can read the token
+(`docs/GUI_WALLET.md`). A port forwarded out of the OS opens them too.
 - The node makes the token at its first start: 32 random bytes, in hex.
   It writes it to `/etc/node/token`, owned by the node's user, mode 600
   (`docs/OS.md`, section 11). A wallet run by that user (or root)
@@ -293,8 +298,6 @@ nothing else.
 - Randomness for it: the OS has no source yet. QEMU's virtio-rng device
   (`-device virtio-rng-device`) gives one: a small driver, and
   `/dev/random`.
-- Configuration may open the read-only endpoints without the token
-  (for a public explorer). Writing always needs it.
 
 - **Reading:**
   - `GET /v1/status`: height, tip, work, sync progress, peers, version.
@@ -320,8 +323,7 @@ nothing else.
   A WebSocket for events can come later; the framing is wm's.
 
 The API holds nothing secret but the token. A wallet's keys never
-reach the node. Whether to answer only local programs, or anyone, is
-configuration; the token is needed either way.
+reach the node.
 
 ## In the OS
 
@@ -998,10 +1000,11 @@ Each step done when its test passes.
      a copy of it with the wallet and no peers burns a coin twice and
      quits, its pool saved: two transactions from tabminer's wallet,
      sent nowhere. The node boots with one of them, syncs and serves.
-     In the OS, `apicli` (`src/user/node/apicli.fam`) is refused the
-     status and refused sending without the token; with it reads the
-     status, a header and outputs, and sends its transaction. On the
-     host, a client is refused without the token and with another;
+     In the OS, `apicli` (`src/user/node/apicli.fam`), without the
+     token (since 2026-11-10, as a user's wallet), reads the status, a
+     header and outputs, is refused a new token, and sends its
+     transaction. On the host, a client is refused a new token without
+     the token and with another;
      reads every endpoint; sends the other transaction (and bytes that
      do not decode, and the same transaction again, each refused with
      its reason); waits for the tip to move; sees both transactions
