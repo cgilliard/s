@@ -96,11 +96,16 @@ tmpb @ 8 lit wzero  40 lit + le@ tom tmpb @ !  tmpa @ tmpb @ lc @ compress ;
 \ dadd ( x -- )  x into the sorted dirty set.
 : dadd
 dx !
+\ past the last (outputs come in order): at the end
+ndirty @ if dirty @ ndirty @ 1 lit - w@ dx @ u< else -1 lit then if
+	dx @ dirty @ ndirty @ w!  ndirty @ 1 lit + ndirty !
+else
 0 lit begin dup ndirty @ u< if dup dirty @ swap w@ dx @ u< else 0 lit then while 1 lit + repeat
 dup ndirty @ u< if dup dirty @ swap w@ dx @ = else 0 lit then
 if drop else
 	ndirty @ begin 2dup u< while 1 lit - dup dirty @ swap w@ over 1 lit + dirty @ swap w! repeat drop
 	dx @ swap dirty @ swap w!  ndirty @ 1 lit + ndirty !
+then
 then ;
 : gdirty  18 lit lshift swap 8 lit rshift or dadd ;   \ ( lo hi -- )  its group dirty
 

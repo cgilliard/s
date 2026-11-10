@@ -187,6 +187,15 @@ rm -f "$T/sn.disk"; dd if=/dev/zero of="$T/sn.disk" bs=1 count=0 seek=268435456 
 expect snap 124 '^after it: 152 connected, 0 not' 120 ./tools/q32 --disk="$T/sn.disk" "$T/sn.img"
 has snap '^snapshot: 9 as expected, 0 not'
 rm -f "$T/sn.disk"
+# The manifests' output parts (manifest.fam): 34,000 outputs put straight
+# into the store, parts split, merged and emptied; each block's manifest,
+# made from its parent's, the same as one made from the outputs alone; one
+# rebuilt from the last kept whole and the changes since.
+./tools/fam --user -o "$T/tmf.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/manifest_test.fam > "$T/tmf.build" 2>&1 || fail manifest "build: $(head -c 300 "$T/tmf.build")"
+sh scripts/mkimage.sh "$T/mf.img" bin/kernel init="$T/tmf.bin":8192 2> "$T/mf.mk" || fail manifest "mkimage: $(cat "$T/mf.mk")"
+rm -f "$T/mf.disk"; dd if=/dev/zero of="$T/mf.disk" bs=1 count=0 seek=268435456 2>/dev/null
+expect manifest 124 '^manifest: [0-9]* as expected, 0 not' 120 ./tools/q32 --disk="$T/mf.disk" "$T/mf.img"
+rm -f "$T/mf.disk"
 # The pool (step 7): a dev chain whose outputs pay known keys (/lib/pool),
 # transactions offered with tabminer's pool's verdict on each and their
 # ids, policy inputs through each kind of leaf, blocks mining some and the

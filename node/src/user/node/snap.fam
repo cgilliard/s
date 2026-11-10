@@ -53,30 +53,101 @@ swap do
 	clc @ 1 lit + 1 lit rshift clc !
 loop ;
 
+: spe variable ;  : sel variable ;  : seh variable ;  : swf variable ;
+: sca variable ;  : scb variable ;  : scn variable ;  : scm variable ;  : sci variable ;  : scj variable ;
+: scl variable ;  : scp variable ;  : scq variable ;
+: sce  24 lit * ;                             \ ( k -- off )  a node: its index, its digest
+\ smerge ( l -- )  scb (scm nodes) = sca's (scn) with the parts at level l,
+\ by index.
+: smerge
+scl !  0 lit scm !  0 lit sci !  0 lit scj !
+begin
+	begin scj @ snr @ u< if scj @ 30 lit * sroots @ + @ scl @ <> else 0 lit then while scj @ 1 lit + scj ! repeat
+	sci @ scn @ u<  scj @ snr @ u<  or
+while
+	scj @ snr @ u< if
+		sci @ scn @ u< if sci @ sce sca @ + @  scj @ 30 lit * sroots @ + 4 lit + @ u< else 0 lit then
+	else -1 lit then
+	if sci @ sce sca @ +  scm @ sce scb @ +  24 lit bcopy  sci @ 1 lit + sci !
+	else
+		scj @ 30 lit * sroots @ + dup 4 lit + @ scm @ sce scb @ + !  10 lit + scm @ sce scb @ + 4 lit + dle
+		scj @ 1 lit + scj !
+	then
+	scm @ 1 lit + scm !
+repeat ;
+\ sparent ( l -- )  sca (scn nodes) = the parents of scb's (scm) at level l.
+: sparent
+scl !  0 lit scn !  0 lit sci !
+begin sci @ scm @ u< while
+	sci @ sce scb @ + scp !
+	scp @ @ 1 lit rshift  scn @ sce sca @ + !
+	scn @ sce sca @ + 4 lit + scq !
+	scp @ @ 1 lit and if
+		scl @ dfl  scp @ 4 lit +  scq @ compress  sci @ 1 lit + sci !
+	else
+		sci @ 1 lit + scm @ u< if scp @ 24 lit + @ scp @ @ 1 lit + = else 0 lit then
+		if scp @ 4 lit +  scp @ 28 lit +  scq @ compress  sci @ 2 lit + sci !
+		else scp @ 4 lit +  scl @ dfl  scq @ compress  sci @ 1 lit + sci ! then
+	then
+	scn @ 1 lit + scn !
+repeat ;
+\ scomp  stmd: the state root the parts and the name root compose to.
+: scomp
+snr @ 2 lit + sce dup malloc sca !  malloc scb !  0 lit scn !
+27 lit E lit do i smerge i sparent loop
+27 lit smerge
+scm @ if scb @ 4 lit + else 27 lit dfl then  tmpa @ 8 lit wcopy
+snroot @ tmpb @ dle  tmpa @ tmpb @ stmd @ compress  stmd @ dfrom
+sca @ free  scb @ free ;
+\ swell ( -- flag )  the output parts laid out as every node lays them out
+\ (tabminer's Manifest::well_formed): subtrees of the output half from
+\ level 14, below the counter, ascending and apart, holding 1 to 2^14
+\ outputs each, each one's parent more.
+: swell
+sroots @ mob !  snr @ mon !  -1 lit swf !
+snr @ ?dup if 0 lit do
+	i ope @ dup E lit u< swap 27 lit u> or if 0 lit swf ! then
+	i ope 8 lit + @ if 0 lit swf ! then
+	swf @ if i ope 4 lit + @  27 lit i ope @ - rshift if 0 lit swf ! then then
+	i ope C lit + @ dup 0= swap 4000 lit u> or if 0 lit swf ! then
+	swf @ if i opf snx @ snxh @ p< 0= if 0 lit swf ! then then
+	swf @ i 0= 0= and if i opf i 1 lit - ope2 p< if 0 lit swf ! then then
+loop then
+snr @ 1 lit + 2 lit lshift malloc mos !  0 lit mos @ 0 lit w!
+snr @ ?dup if 0 lit do mos @ i w@ i ope C lit + @ + mos @ i 1 lit + w! loop then
+swf @ if snr @ ?dup if 0 lit do
+	i ope @ 27 lit u< if
+		i ope @ 1 lit +  i ope 4 lit + @ 1 lit rshift
+		2dup p40 wfh ! wfl !  1 lit + p40 weh ! wel !
+		mohi mos @ swap w@  molo mos @ swap w@ -  4000 lit u> 0= if 0 lit swf ! then
+	then
+loop then then
+mos @ free  0 lit mob !  0 lit mon !
+swf @ ;
+
 : snman  ( m n hS -- code )
 sbh !  sread
+sroots @ ?dup if free then  0 lit sroots !  0 lit snr !
 bu64 snxh ! snx !
-bu32 dup bleft 5 lit rshift u> if drop bbad 0 lit then dup snr !  5 lit lshift btake sroots !
-bcode @ 0= if sroots @ snr @ 3 lit lshift bcanon then
+bu32 dup bleft 2D lit / u> if drop bbad 0 lit then dup snr !
+30 lit * 30 lit + malloc sroots !
+snr @ ?dup if 0 lit do bcode @ 0= if
+	sroots @ i 30 lit * +
+	1 lit btake c@ over !  bu32 over 4 lit + !  bu32 over 8 lit + !  bu32 over C lit + !
+	20 lit btake dup 8 lit bcanon  over 10 lit + 20 lit bcopy  drop
+then loop then
 20 lit btake snroot !  bcode @ 0= if snroot @ 8 lit bcanon then
 bu32 dup bleft 2F lit / u> if drop bbad 0 lit then dup snn !  2F lit * btake snam !
 bcode @ 0= if snn @ ?dup if 0 lit do snam @ i 2F lit * + F lit + 8 lit bcanon loop then then
 bcode @ 0= bp @ bq @ <> and if bbad then
 bcode @ 0= if
-	snr @ sparts <> if sbad then
+	swell 0= if sbad then
 	snn @ 1 lit u> if snn @ 1 lit do
 		snam @ i 1 lit - 2F lit * + tmpa @ k15  snam @ i 2F lit * + tmpb @ k15
 		tmpa @ tmpb @ kcmp 0 lit < 0= if sbad then
 	loop then
 then
-bcode @ 0= if
-	snr @ 5 lit lshift 20 lit + malloc sbig !
-	snr @ ?dup if 0 lit do sroots @ i 5 lit lshift + sbig @ i 5 lit lshift + dle loop then
-	snr @ if sbig @ snr @ E lit 27 lit climb else 27 lit dfl sbig @ 8 lit wcopy then
-	snroot @ tmpb @ dle  sbig @ tmpb @ stmd @ compress  stmd @ dfrom
-	stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then
-	sbig @ free
-then
+bcode @ 0= if scomp  stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then then
 0 lit sdone !  ssum @ 4 lit wzero
 bcode @ ;
 
@@ -90,63 +161,54 @@ over 1E lit rshift over 2 lit lshift or 3FFFFFFF lit and rb @ 38 lit + !
 nip 1C lit rshift rb @ 3C lit + !
 44 lit + le@ rb @ 40 lit + ! ;
 : epos  48 lit * sents @ + le@ ;             \ ( k -- pos )
-: sfind  FFFFFFFF lit swap snent @ ?dup if 0 lit do dup i epos = if nip i swap then loop then drop ;   \ ( pos -- k | -1 )
+: epos2  48 lit * sents @ + dup le@ swap 4 lit + le@ ;    \ ( k -- lo hi )
+\ sfind ( lo hi -- k | -1 )  the output at a position.
+: sfind  FFFFFFFF lit -rot snent @ ?dup if 0 lit do 2dup i epos2 rot = -rot = and if rot drop i -rot then loop then 2drop ;
+
+\ sin? ( lo hi -- flag )  in the part: from its first position to its end
+\ or the counter.
+: sin?  2dup slo @ sphi @ p< 0= -rot sel @ seh @ p< and ;
 
 : snpout  ( i p n -- )
 sread  spart !
-\ the part's positions: from part << 14 (40 bits: its high byte sphi, the
-\ same for all, as a part never crosses a multiple of 2^32), as many as
-\ are below the counter, 2^14 at most
-spart @ E lit lshift slo !  spart @ 12 lit rshift sphi !
-snxh @ sphi @ u> if 4000 lit else snxh @ sphi @ = if snx @ slo @ - 4000 lit umin else 0 lit then then spcnt !
+\ the part: its subtree (the manifest's entry), below the counter
+spart @ 30 lit * sroots @ + spe !
+spe @ @  spe @ 4 lit + @  2dup p40 sphi ! slo !  1 lit + p40 seh ! sel !
+snx @ snxh @ sel @ seh @ p< if snx @ sel !  snxh @ seh ! then
 bu32 dup bleft 48 lit / u> if drop bbad 0 lit then dup snent !  48 lit * btake sents !
 bcode @ 0= if snent @ ?dup if 0 lit do sents @ i 48 lit * + dup 4 lit + le@ FF lit u> if bbad then 8 lit + D lit bcanon loop then then
 bu32 dup bleft 2C lit / u> if drop bbad 0 lit then dup sncom !  2C lit * btake scom !
 bcode @ 0= if sncom @ ?dup if 0 lit do scom @ i 2C lit * + dup 4 lit + le@ FF lit u> if bbad then 8 lit + 8 lit bcanon loop then then
 bcode @ 0= bp @ bq @ <> and if bbad then
-\ positions ascending within the part, below the counter
+\ as many as the manifest says; ascending, in the part
+bcode @ 0= if snent @ spe @ C lit + @ <> if sbad then then
 bcode @ 0= if snent @ ?dup if 0 lit do
-	sents @ i 48 lit * + 4 lit + le@ sphi @ <> if sbad then
-	i epos  dup slo @ - spcnt @ u< 0= if sbad then
-	i if i 1 lit - epos over u< 0= if sbad then then drop
+	i epos2 sin? 0= if sbad then
+	i if i 1 lit - epos2 i epos2 p< 0= if sbad then then
 loop then then
-\ the part's root: its 64 groups, then six levels up
-bcode @ 0= if
-	800 lit malloc sbig !
-	0 lit
-	40 lit 0 lit do
-		lvs @ 800 lit wzero
-		begin dup snent @ u< if dup epos 8 lit rshift 3F lit and i = else 0 lit then while
-			dup 48 lit * sents @ + srec  rb @  over epos FF lit and 5 lit lshift lvs @ +  rleaf
-			1 lit +
-		repeat
-		lvroot  lvs @ sbig @ i 5 lit lshift + 8 lit wcopy
-	loop drop
-	sbig @ 40 lit 8 lit E lit climb
-	sbig @ stmd @ 8 lit wcopy  stmd @ dfrom
-	stmd @ sroots @ spart @ 5 lit lshift + 8 lit wcmp if sbad then
-	sbig @ free
-then
 \ each commit one of the outputs, holding its commit's leaf
 bcode @ 0= if sncom @ ?dup if 0 lit do
-	scom @ i 2C lit * + 4 lit + le@ sphi @ <> if sbad then
-	scom @ i 2C lit * +  dup le@ sfind
+	scom @ i 2C lit * + dup le@ swap 4 lit + le@ sin? 0= if sbad then
+	scom @ i 2C lit * +  dup le@ over 4 lit + le@ sfind
 	dup 0< if 2drop sbad else
 		48 lit * sents @ + 8 lit +  swap dup 8 lit + swap 28 lit + le@ stmd @ cleaf
 		stmd @ dfrom  stmd @ swap 8 lit wcmp if sbad then
 	then
 loop then then
-\ installed
+\ installed, and its subtree's root, from the tree, the manifest's
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
+	0 lit ndirty !
 	snent @ ?dup if 0 lit do
-		i 48 lit * sents @ + dup srec  rb @ swap le@ sphi @ oput
+		i 48 lit * sents @ + dup srec  rb @ swap dup le@ swap 4 lit + le@ oput
 		i 48 lit * sents @ + 3C lit + dup le@ swap 4 lit + le@ ssum @ amount+
 	loop then
 	sncom @ ?dup if 0 lit do
-		scom @ i 2C lit * + dup 8 lit + cb @ 24 lit bcopy  le@ sphi @ kcommit cb @ 24 lit sput
+		scom @ i 2C lit * + dup 8 lit + cb @ 24 lit bcopy  dup le@ swap 4 lit + le@ kcommit cb @ 24 lit sput
 	loop then
-	serr @ if sbad stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
+	sprop
+	spe @ @  spe @ 4 lit + @  tmpa @ nget  tmpa @ dfrom  tmpa @ spe @ 10 lit + 8 lit wcmp if sbad then
+	serr @ bcode @ or if serr @ if sbad then stx @ txabort drop else stx @ txcommit drop sdone @ 1 lit + sdone ! then
 	0 lit ndirty !
 then ;
 
@@ -223,15 +285,13 @@ sdone @ snr @ snn @ + <> if sbad then
 bcode @ 0= if
 	stfd @ 1 lit txbegin stx !
 	snx @ 70 lit mput  snxh @ 71 lit mput
-	\ every group below the counter (256 positions each; 40 bits)
-	snx @ 8 lit rshift  snxh @ 18 lit lshift or  snx @ FF lit and if 1 lit + then  ?dup if 0 lit do i dadd loop then
-	sprop
+	\ (each part's subtree built as it came, and the levels above it)
 	tmpb @ troot  tmpb @ dfrom  tmpb @ snroot @ 8 lit wcmp if sbad then
 	stmd @ sroot0  stmd @ sbh @ 4C lit + 8 lit wcmp if sbad then
 	sbh @ 20 lit + @ sis @ issued  ssum @ sis @ 4 lit wcmp if sbad then
 	sbh @ 20 lit + @ 68 lit mput  sbh @ 20 lit + @ khdr sbh @ CC lit sput
 	\ its buckets, all, and its own manifest (manifest.fam): served too
-	-1 lit rtall !  mbuckets  msoff @ 0= if sbh @ 20 lit + @ snx @ snxh @ msnap then
+	-1 lit rtall !  mbuckets  sroots @ snr @ mgiven  sbh @ 20 lit + @ snx @ snxh @ 0 lit msnap
 	bcode @ serr @ or if stx @ txabort drop else stx @ txcommit drop then
 	0 lit ndirty !
 then

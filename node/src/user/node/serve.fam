@@ -35,7 +35,7 @@
 \ zbufs ( -- flag )  zout's tables (outputs, commits), malloc'd once and
 \ kept; none to be had: 0 (and said, if verbose: nothing served).
 : zbufs
-ze @ 0= if 40000 lit malloc ze ! then  zc @ 0= if 10000 lit malloc zc ! then
+ze @ 0= if 130000 lit malloc ze ! then  zc @ 0= if B0000 lit malloc zc ! then
 ze @ zc @ and dup 0= if "serve: no memory for an output part" puts 0A lit putc then ;
 
 : zheight
@@ -46,7 +46,7 @@ zinit  dup yfind ?dup if
 	dup 0< 0= if zbegin 68 lit mget zend over u< if drop FFFFFFFF lit then then
 else drop FFFFFFFF lit then ;
 
-: zman  zbegin mread zend ;
+: zman  zbegin dup 3EF lit + 68 lit mget u< if drop 0 lit 0 lit else mread then zend ;
 
 \ zundo ( h -- a | 0 )  block h's undo record (malloc'd), in the
 \ transaction open: its words' count, the first output's position, the
@@ -76,9 +76,12 @@ repeat 2drop ;
 
 \ An entry (4C bytes): the position (lo, hi), then the record (44 bytes:
 \ commitment, slot, height); a commit (2C): the position, hash, height.
-: zadd  ( lo hi rec -- )  ze @ zen @ 4C lit * +  tuck 8 lit + 44 lit bcopy  tuck 4 lit + !  !  zen @ 1 lit + zen ! ;
-: zcadd  ( lo hi c -- )  zc @ zcn @ 2C lit * +  tuck 8 lit + 24 lit bcopy  tuck 4 lit + !  !  zcn @ 1 lit + zcn ! ;
-: zin?  ( lo hi -- flag )  zphi @ = swap zlo @ - zcnt @ u< and ;   \ in the part: its 40-bit positions
+: zadd  ( lo hi rec -- )  zen @ 4000 lit u< if ze @ zen @ 4C lit * +  tuck 8 lit + 44 lit bcopy  tuck 4 lit + !  !  zen @ 1 lit + zen ! else drop 2drop then ;
+: zcadd  ( lo hi c -- )  zcn @ 4000 lit u< if zc @ zcn @ 2C lit * +  tuck 8 lit + 24 lit bcopy  tuck 4 lit + !  !  zcn @ 1 lit + zcn ! else drop 2drop then ;
+\ zin? ( lo hi -- flag )  in the part: from its first position (zlo,
+\ zphi) to its end or the counter (zel, zeh), 40 bits.
+: zel variable ;  : zeh variable ;
+: zin?  2dup zlo @ zphi @ p< 0= -rot zel @ zeh @ p< and ;
 \ zfrom ( c -- klen )  kb the key just before the part's first position
 \ under prefix c (or c alone, for position 0), for knext.
 : zfrom
@@ -97,7 +100,7 @@ zsz ! swap zsa !
 dup 1 lit u> if
 	1 lit do
 		i begin
-			dup if dup 1 lit - zsz @ * zsa @ + @  over zsz @ * zsa @ + @ u> else 0 lit then
+			dup if dup zsz @ * zsa @ + dup @ swap 4 lit + @  2 lit pick 1 lit - zsz @ * zsa @ + dup @ swap 4 lit + @ p< else 0 lit then
 		while
 			dup zsz @ * zsa @ +  dup zsz @ -  zsz @ 0 lit do
 				over i + c@ over i + c@  3 lit pick i + c!  over i + c!
@@ -107,19 +110,19 @@ dup 1 lit u> if
 	loop
 else drop then ;
 
-: zout  ( i -- a n | 0 0 )
+: zout  ( e -- a n | 0 0 )
 zbufs if
-\ the part's positions: from part << 14 (40 bits: a part never crosses a
-\ multiple of 2^32), as many as there are below the counter, 2^14 at most
-dup E lit lshift zlo !  12 lit rshift zphi !
-znxh @ zphi @ u> if 4000 lit else znxh @ zphi @ = if znx @ zlo @ - 4000 lit umin else 0 lit then then zcnt !
+\ the part's positions: its subtree's (the manifest's entry e: level,
+\ index), below the counter
+dup c@ swap 1 lit + le@  2dup p40 zphi ! zlo !  1 lit + p40 zeh ! zel !
+znx @ znxh @ zel @ zeh @ p< if znx @ zel !  znxh @ zeh ! then
 0 lit zen !  0 lit zcn !
 zbegin
 \ the outputs now: 'o' keys from the part's first position
 6F lit zfrom
 begin
 	knext dup 6 lit = if drop 6F lit zkat? else drop 0 lit then
-	zen @ D00 lit u< and
+	zen @ 4000 lit u< and
 while
 	zkpos  kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 44 lit sget drop
 	sbuf @ zadd  6 lit
@@ -128,7 +131,7 @@ repeat
 63 lit zfrom
 begin
 	knext dup 6 lit = if drop 63 lit zkat? else drop 0 lit then
-	zcn @ 5D0 lit u< and
+	zcn @ 4000 lit u< and
 while
 	zkpos  kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 24 lit sget drop
 	sbuf @ zcadd  6 lit
@@ -291,8 +294,8 @@ zinit  zi !  zh !
 zh @ zman ?dup if
 	drop zm !
 	zm @ @ znx !  zm @ 4 lit + @ znxh !  zm @ 8 lit + @ znr !
-	zm @ C lit + znr @ 5 lit lshift + 20 lit + dup @ znn !  4 lit + zmn !
-	zi @ znr @ u< if zi @ zout
+	zm @ C lit + znr @ 2D lit * + 20 lit + dup le@ znn !  4 lit + zmn !
+	zi @ znr @ u< if zm @ C lit + zi @ 2D lit * + zout
 	else zi @ znr @ - dup znn @ u< if zname else drop 0 lit 0 lit then then
 	zm @ free
 else drop 0 lit 0 lit then ;

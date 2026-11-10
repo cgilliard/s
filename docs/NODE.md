@@ -222,7 +222,8 @@ half-applied one.
 - **Blocks and headers:** headers all kept; bodies within the undo
   window, and proofs only for the tip.
 - **Undo records** for reorganisations, within the undo window: as
-  tabminer, 1,008 blocks, with a snapshot manifest each (about 150 KB;
+  tabminer, 1,008 blocks, with a snapshot manifest each (kept as
+  changes from the last; the window's bodies and undo records about
   3.2 GB with full blocks). So the node can serve fast sync to others
   as tabminer does.
 - **The disk: 25 GB** (decided), sparse, as `node.sh` and `makenode.sh`
@@ -1232,11 +1233,30 @@ Each step done when its test passes.
       (`fam_vectors.rs`'s FIRST40), every verdict, root and undo as
       tabminer's.
     - A cost found on the way, the protocol's (tabminer's as much): a
-      manifest lists every output part from position 0, so once 4
-      billion outputs have been made each is 2^18 roots (8 MB), and one
-      is kept for each block of the undo window (8 GB). To change before
-      the chain gets there: parts by subtree, by the unspent outputs they
-      hold, and manifests kept as changes (being built).
+      manifest listed every output part from position 0, so once 4
+      billion outputs had been made each would be 2^18 roots (8 MB),
+      one kept for each block of the undo window (8 GB). Both now lay
+      parts out by subtree, by the unspent outputs they hold, and keep
+      manifests as changes (README, Fast sync). The node's
+      (`manifest.fam`): a block's parts made from its parent's by a
+      walk from the output half's top, counting again only the
+      subtrees the block touched (its emptied positions from its undo
+      record, sorted; its outputs from its first position to the
+      counter), from the outputs only within an old part; each kept as
+      splices of its parent's, whole every 64th block, the records
+      below the oldest served dropped 64 at a time; after a fast sync
+      the manifest received is kept as it is. Installing a part writes
+      its outputs and the tree above them, and checks the stored
+      subtree's root and the part's count against the manifest, which
+      is checked first for its layout and its root (`snap.fam`), so the
+      install no longer walks every position. `manifest_test.fam`
+      (oscheck's `manifest`): 34,000 outputs put straight into the
+      store, parts split, merged and emptied, each block's manifest
+      from its parent's the same as one from the outputs alone.
+    - The node now drops a block's undo record and the records of the
+      outputs it spent as it leaves the window (they were kept for
+      good), and its list of the groups a block changed has room for a
+      full block (65,536; it was 16,384).
     - Found by `snaptest.sh`: the node's status said it kept no block
       (its oldest past its tip), so tabminer asked it for no snapshot;
       now its first body kept (meta 62) or the window's start. And the

@@ -1,12 +1,12 @@
 \ manifest.fam — snapshots to serve (docs/NODE.md, step 10), after
 \ proofs.fam and before connect.fam: tabminer's take_snapshot and the
 \ name buckets behind it (miner/src/chain.rs, names.rs), so peers fast-sync
-\ from the node.  The manifest after each block connected is kept, as the
-\ bodies are, for the undo window: the output counter, each output part's
-\ root (the tree's level-14 node: 2^14 positions), the name trie's root,
-\ and each name part's first key and hash, in net.rs's encode_manifest's
-\ bytes, at 'M', the height, the chunk (1 KiB each), its length at chunk
-\ FFFF.
+\ from the node.  The manifest after each block connected is kept for the
+\ undo window: the output counter, the output parts (subtrees of the
+\ state tree holding 1 to 2^14 unspent outputs, each one's parent more:
+\ their level, index, count and root), the name trie's root, and each
+\ name part's first key and hash; kept as changes from the parent's
+\ (below), served as net.rs's encode_manifest.
 \
 \ The name parts come from the buckets (a key's top 16 bits), each kept
 \ at 'B' and the bucket (2 bytes): its records' count and hash_domain 12
@@ -18,17 +18,19 @@
 \
 \ minit  its buffers (stinit calls it).
 \ mbuckets  the buckets noted (rtouch; all if rtall) hashed again.
-\ msnap ( h lo hi -- )  the manifest after block h (the counter: 40 bits).
-\ msoff set: none taken (a test's chain from high positions, whose
-\ manifests list 2^18 parts).
-\ mread ( h -- a n | 0 0 )  block h's manifest, if kept (malloc'd).
+\ msnap ( h lo hi u -- )  the manifest after block h (the counter: 40
+\ bits), from its parent's and its undo record u (0: from the outputs, as
+\ after a snapshot).
+\ mread ( h -- a n | 0 0 )  block h's manifest, if kept and served
+\ (malloc'd), as encode_manifest.
 \ mdrop ( h -- )  block h's manifest dropped.
 
 : kman  kb @ 5 lit + 2 lit be!  kb @ 1 lit + 4 lit be!  4D lit kb @ c!  7 lit ;   \ ( h chunk -- klen )
 : kbkt  kb @ 1 lit + 2 lit be!  42 lit kb @ c!  3 lit ;                          \ ( b -- klen )
 : mrb variable ;  : mrn variable ;  : mrc variable ;  : mrk variable ;  : mhb variable ;  : mb variable ;  : mpk variable ;
 : mo variable ;  : mop variable ;  : mgb variable ;  : mgn variable ;  : mgc variable ;  : mgf variable ;  : mtmp variable ;
-: mhh variable ;  : mdn variable ;  : mnp variable ;  : mrch variable ;  : msoff variable ;
+: mhh variable ;  : mdn variable ;  : mnp variable ;  : mrch variable ;
+: mtp variable ;  : mch variable ;
 :M MRBN 40000 lit ;                            \ a bucket's records' bytes, at most
 :M MNAMES 40000 lit ;                          \ the name parts' bytes in a manifest, at most (5,577 parts: 22 million names)
 
@@ -36,6 +38,7 @@
 mrb @ 0= if
 	MRBN malloc mrb !  MRBN 3 lit / 2 lit lshift 10 lit + malloc mpk !
 	40 lit alloc mtmp !  40 lit alloc mhh !  40 lit alloc mhb !  10000 lit malloc mgb !
+	30 lit alloc mtp !  FFFFFFFF lit mch !
 then ;
 
 \ mcanon, ( m -- )  8 Montgomery words at m, as 32 canonical bytes at mop.
@@ -106,18 +109,276 @@ mgn @ 0= if over mgf ! then
 mgc @ + mgc !
 tom mgb @ mgn @ w!  mhh @ mgb @ mgn @ 1 lit + 2 lit lshift + 8 lit wcopy  mgn @ 9 lit + mgn ! ;
 
-: msnap  ( h lo hi -- )
-mrch ! mrc ! mb !
-\ the parts: the counter over 2^14, rounded up (40 bits)
-mrc @ E lit rshift  mrch @ 12 lit lshift or  mrc @ 3FFF lit and if 1 lit + then  mrk !
-mrk @ 5 lit lshift 40 lit + MNAMES + malloc dup mo ! mop !
-mrc @ m32,  mrch @ m32,  mrk @ m32,
-mrk @ ?dup if 0 lit do E lit i mtmp @ nget  mtmp @ mcanon, loop then
+\ ── Output parts (tabminer's Manifest, OutputLayout) ──
+\
+\ A part in memory, 30 bytes: its level, index (two words: the second 0),
+\ count, root (8 canonical words). The parts after a block are made from
+\ its parent's: a subtree the block did not touch keeps its parts; one it
+\ did is counted again, from the parent's counts and the block's changes
+\ (its outputs, from its first position to the counter; the positions it
+\ emptied, from its undo record), or from the outputs where it lay within
+\ a parent's part. A subtree holding more than 2^14 outputs is split.
+:M MK 4000 lit ;
+
+: mob variable ;  : mon variable ;  : mos variable ;  : mold variable ;   \ the parent's parts, their sums
+: mnb variable ;  : mnn variable ;  : mncap variable ;                     \ the new ones
+: mcb variable ;  : mcn variable ;                       \ the last made, kept (height)
+: mea variable ;  : men variable ;                                          \ the emptied positions
+: mml variable ;  : mmh variable ;  : mnl variable ;  : mnh variable ;     \ first made, the counter
+: wfl variable ;  : wfh variable ;  : wel variable ;  : weh variable ;     \ the subtree's range
+: mlo variable ;  : mhi variable ;  : mwi variable ;  : mec variable ;  : mmd variable ;
+: mbl variable ;  : mbh variable ;  : mt0 variable ;  : mt1 variable ;  : mcn2 variable ;
+: ma0 variable ;  : ma1 variable ;  : mb0 variable ;  : mb1 variable ;  : mse variable ;
+: mu variable ;  : mxa variable ;  : mxn variable ;  : mss variable ;  : msp variable ;
+: mrh variable ;  : mok variable ;  : mpi variable ;  : mj variable ;  : mat variable ;  : mfr variable ;  : mgo variable ;
+
+\ p40 ( level index -- lo hi )  a subtree's first position (40 bits).
+: p40
+over 20 lit u< if
+	2dup swap lshift  -rot  20 lit rot - rshift
+else
+	swap 20 lit - lshift 0 lit swap
+then ;
+\ p< ( alo ahi blo bhi -- flag )  a below b (40 bits).
+: p<  rot 2dup = if 2drop u< else u> nip nip then ;
+\ p- ( alo ahi blo bhi -- n )  a less b, below 2^32.
+: p-  rot 2drop - ;
+
+: ope  30 lit * mob @ + ;                                \ ( k -- a )  the parent's part k
+: opf  ope dup @ swap 4 lit + @ p40 ;                     \ ( k -- lo hi )  its first position
+: ope2  ope dup @ swap 4 lit + @ 1 lit + p40 ;            \ ( k -- lo hi )  past its last
+: mne  30 lit * mnb @ + ;                                 \ ( k -- a )  new part k
+: mnf  mne dup @ swap 4 lit + @ p40 ;
+
+\ ekey ( k -- lo hi )  emptied position k; e< ( i j -- flag ); eswap ( i j -- ).
+: ekey  3 lit lshift mea @ + dup @ swap 4 lit + @ ;
+: e<  swap ekey rot ekey p< ;
+: eswap
+3 lit lshift mea @ + swap 3 lit lshift mea @ +
+2 lit 0 lit do over i w@ over i w@  3 lit pick i w!  over i w! loop 2drop ;
+\ msift ( root end -- )  heapsort's sift down; msort  the emptied, ascending.
+: msift
+mse !
+begin dup 1 lit lshift 1 lit + dup mse @ u< while
+	dup 1 lit + mse @ u< if dup dup 1 lit + e< if 1 lit + then then
+	2dup e< if 2dup eswap nip else 2drop mse @ then
+repeat 2drop ;
+: msort
+men @ 1 lit u> if
+	men @ 1 lit rshift begin dup while 1 lit - dup men @ msift repeat drop
+	men @ begin dup 1 lit u> while 1 lit - 0 lit over eswap  0 lit over msift repeat drop
+then ;
+\ memp ( u -- )  the positions undo record u's block emptied: its inputs
+\ and the commits it consumed (its name events of type 1), sorted.
+: memp
+dup @ 2 lit lshift 100 lit + malloc mea !  0 lit men !
+dup 10 lit + @ ?dup if 0 lit do
+	dup 14 lit + i 3 lit lshift + mea @ men @ 3 lit lshift + 8 lit bcopy  men @ 1 lit + men !
+loop then
+dup 10 lit + @ 3 lit lshift 14 lit + over +    ( u p )
+begin dup 2 lit pick dup @ 2 lit lshift + u< while
+	dup @ 1 lit = if dup 4 lit + mea @ men @ 3 lit lshift + 8 lit bcopy  men @ 1 lit + men ! then
+	dup @ dup 1 lit = if drop 50 lit else dup 2 lit = if drop 14 lit else 3 lit = if 8C lit else 4 lit then then then +
+repeat 2drop
+msort ;
+\ epp ( lo hi -- k )  the emptied positions below.
+: epp
+mt1 ! mt0 !  0 lit mbl !  men @ mbh !
+begin mbl @ mbh @ u< while
+	mbl @ mbh @ + 1 lit rshift
+	dup ekey mt0 @ mt1 @ p< if 1 lit + mbl ! else mbh ! then
+repeat mbl @ ;
+\ molo ( -- k )  the parent's parts ending at or before the subtree's
+\ first position; mohi ( -- k )  those starting before its end.
+: molo
+0 lit mbl !  mon @ mbh !
+begin mbl @ mbh @ u< while
+	mbl @ mbh @ + 1 lit rshift
+	dup ope2 mt1 ! mt0 !  wfl @ wfh @ mt0 @ mt1 @ p< if mbh ! else 1 lit + mbl ! then
+repeat mbl @ ;
+: mohi
+0 lit mbl !  mon @ mbh !
+begin mbl @ mbh @ u< while
+	mbl @ mbh @ + 1 lit rshift
+	dup opf wel @ weh @ p< if 1 lit + mbl ! else mbh ! then
+repeat mbl @ ;
+\ wmade ( -- n )  the positions the block made in the subtree.
+: wmade
+wfl @ wfh @ mml @ mmh @ p< if mml @ mmh @ else wfl @ wfh @ then ma1 ! ma0 !
+wel @ weh @ mnl @ mnh @ p< if wel @ weh @ else mnl @ mnh @ then mb1 ! mb0 !
+ma0 @ ma1 @ mb0 @ mb1 @ p< if mb0 @ mb1 @ ma0 @ ma1 @ p- else 0 lit then ;
+\ mcount ( -- n )  the outputs in the subtree, counted to 2^14 + 1.
+: mcount
+wfl @ wfh @ or if
+	wfl @ if wfl @ 1 lit - wfh @ else FFFFFFFF lit wfh @ 1 lit - then 6F lit -rot kpos
+else 6F lit kb @ c! 1 lit then
+0 lit mcn2 !
+begin
+	knext dup 6 lit = if
+		drop kb2 @ c@ 6F lit =  kb2 @ 2 lit + 4 lit be@ kb2 @ 1 lit + c@ wel @ weh @ p< and
+	else drop 0 lit then
+	mcn2 @ MK u> 0= and
+while
+	kb2 @ kb @ 6 lit bcopy  mcn2 @ 1 lit + mcn2 !  6 lit
+repeat mcn2 @ ;
+
+\ mapp ( a -- )  a part appended to the new ones (their room doubled
+\ when full).
+: mapp
+mnn @ mncap @ = if
+	mncap @ 1 lit lshift 40 lit max  dup 30 lit * malloc
+	mnb @ over mnn @ 30 lit * bcopy  mnb @ ?dup if free then  mnb ! mncap !
+then
+mnb @ mnn @ 30 lit * + 30 lit bcopy  mnn @ 1 lit + mnn ! ;
+\ mpart ( level index count -- )  a new part, its root from the tree.
+: mpart
+mtp @ C lit + !  2dup mtp @ 4 lit + !  mtp @ !  0 lit mtp @ 8 lit + !
+mtmp @ nget
+8 lit 0 lit do mtmp @ i w@ fromm mtp @ 10 lit + i w! loop
+mtp @ mapp ;
+
+\ mw ( level index -- )  the subtree's parts, appended.
+: mw
+2dup p40 wfh ! wfl !  2dup 1 lit + p40 weh ! wel !
+molo mlo !  mohi mhi !
+mhi @ mlo @ - 1 lit = if mlo @ ope @ 2 lit pick u> else 0 lit then mwi !
+wel @ weh @ epp  wfl @ wfh @ epp -  mec !
+wmade mmd !
+mold @  mec @ mmd @ or 0= and  mwi @ 0= and if
+	mhi @ mlo @ - ?dup if 0 lit do mlo @ i + ope mapp loop then  2drop
+else
+	mold @ 0= mwi @ or if mcount else  mos @ mhi @ w@ mos @ mlo @ w@ - mmd @ + mec @ - then
+	dup MK u> if
+		drop  over 1 lit - over 1 lit lshift mw  over 1 lit - over 1 lit lshift 1 lit + mw  2drop
+	else ?dup if mpart else 2drop then then
+then ;
+
+\ ── Kept: whole, or as changes ──
+\
+\ At 'M', the height, the chunk (1 KiB each; the length at chunk FFFF):
+\ whole (0) or as changes from the parent's (1); the counter (two words);
+\ the name root (canonical); the name parts' count and the parts (as
+\ encode_manifest has them: first key, hash); then, from a word boundary,
+\ the output parts as splices of the parent's: their count, and each one's
+\ index there, the parts it removes, the parts it puts in their place and
+\ those (30 bytes each). Whole: one splice of every part. Whole every 64th
+\ block, or when the parent's is not kept, so one is rebuilt from at most
+\ 63; those below the oldest kept whole are dropped (mprune).
+
+\ mrec ( h -- a | 0 )  block h's record (malloc'd).
+: mrec
+dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
+	sbuf @ @ dup malloc  ( h n a )
+	over 3FF lit + A lit rshift 0 lit do
+		2 lit pick i kman  over i A lit lshift + 400 lit sget drop
+	loop
+	nip nip
+else drop 0 lit then ;
+\ mspl ( rec -- p )  its splices.
+: mspl  dup 2C lit + @ 2F lit * 30 lit + 3 lit + FFFFFFFC lit and + ;
+\ mcpy ( a n -- )  n parts from a, appended to mxa (mxn of them).
+: mcpy  dup 30 lit *  mxa @ mxn @ 30 lit * +  swap rot  mxn @ + mxn !  bcopy ;
+\ mapply ( rec -- )  mob (mon parts) with the record's splices applied.
+: mapply
+mspl dup @ mss !  4 lit + msp !
+mon @  msp @  mss @ ?dup if 0 lit do dup 8 lit + @ rot + swap  dup 8 lit + @ 30 lit * C lit + + loop then drop
+30 lit * 30 lit + malloc mxa !  0 lit mxn !  0 lit mpi !
+msp @ mss @ ?dup if 0 lit do
+	mpi @ ope over @ mpi @ - mcpy
+	dup C lit + over 8 lit + @ mcpy
+	dup @ over 4 lit + @ + mpi !
+	dup 8 lit + @ 30 lit * C lit + +
+loop then drop
+mpi @ ope mon @ mpi @ - mcpy
+mob @ ?dup if free then  mxa @ mob !  mxn @ mon ! ;
+\ mrebuild ( h -- flag )  mob, mon: block h's parts, from the record kept
+\ whole at or below it and the changes since.
+: mrebuild
+dup mrh !  0 lit mob !  0 lit mon !  -1 lit mok !
+begin
+	mrh @ 0 lit kman sbuf @ 400 lit sget 4 lit < if 0 lit mok ! 0 lit else sbuf @ @ then
+	mok @ and  mrh @ 0= 0= and
+while mrh @ 1 lit - mrh ! repeat
+mok @ if mrh @ 0 lit kman sbuf @ 400 lit sget 4 lit < if 0 lit mok ! else sbuf @ @ if 0 lit mok ! then then then
+mok @ if
+	1 lit + mrh @ do mok @ if i mrec ?dup if dup mapply free else 0 lit mok ! then then loop
+else drop then
+mok @ ;
+\ mparts ( h -- flag )  mob, mon: block h's parts (the last made, taken,
+\ if they are h's).
+: mparts
+dup mch @ = mcb @ 0= 0= and if
+	drop mcb @ mob !  mcn @ mon !  0 lit mcb !  FFFFFFFF lit mch !  -1 lit
+else mrebuild then ;
+
+\ msput ( r -- r' )  the output parts' splices at r: the new parts
+\ against the parent's (tabminer's splices), or one of them all (mold 0).
+: msput
+mold @ 0= if
+	1 lit over !  0 lit over 4 lit + !  0 lit over 8 lit + !  mnn @ over C lit + !
+	10 lit +  mnb @ over mnn @ 30 lit * bcopy  mnn @ 30 lit * +
+else
+	dup mss !  4 lit +  0 lit mpi !  0 lit mj !  0 lit mt0 !
+	begin mpi @ mon @ u< mj @ mnn @ u< or while
+		mpi @ mon @ u< mj @ mnn @ u< and if mpi @ ope mj @ mne C lit wcmp 0= else 0 lit then
+		if mpi @ 1 lit + mpi !  mj @ 1 lit + mj ! else
+			\ a run of differences, until they agree again
+			mpi @ mat !  mj @ mfr !  -1 lit mgo !
+			begin mgo @  mpi @ mon @ u< mj @ mnn @ u< or  and while
+				mpi @ mon @ u< mj @ mnn @ u< and if
+					mpi @ ope mj @ mne C lit wcmp 0= if 0 lit mgo ! else
+						mpi @ opf mj @ mnf p< if mpi @ 1 lit + mpi ! else
+							mj @ mnf mpi @ opf p< if mj @ 1 lit + mj ! else mpi @ 1 lit + mpi !  mj @ 1 lit + mj ! then
+						then
+					then
+				else mpi @ mon @ u< if mpi @ 1 lit + mpi ! else mj @ 1 lit + mj ! then then
+			repeat
+			mat @ over !  mpi @ mat @ - over 4 lit + !  mj @ mfr @ - over 8 lit + !
+			C lit +  mfr @ mne over mj @ mfr @ - 30 lit * bcopy  mj @ mfr @ - 30 lit * +
+			mt0 @ 1 lit + mt0 !
+		then
+	repeat
+	mt0 @ mss @ !
+then ;
+
+\ mdrop ( h -- )  block h's record dropped.
+: mdrop
+dup mch @ = if mcb @ ?dup if free then  0 lit mcb !  FFFFFFFF lit mch ! then
+dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
+	sbuf @ @ 3FF lit + A lit rshift ?dup if 0 lit do dup i kman sdel loop then
+	FFFF lit kman sdel
+else drop then ;
+\ mprune ( h -- )  with block h the tip, the records no longer needed:
+\ those below the oldest served (h - 1,007), down to one kept whole, go
+\ 64 at a time.
+: mprune
+3EF lit - dup 0< 0= over 3F lit and 0= and over 40 lit u< 0= and if
+	dup 40 lit - do i mdrop loop
+else drop then ;
+
+: mrst variable ;  : mgvp variable ;  : mgvn variable ;
+\ mgiven ( a n -- )  the next manifest's output parts these (a fast
+\ sync's, checked), not counted again from the outputs.
+: mgiven  mgvn ! mgvp ! ;
+: msnap  ( h lo hi u -- )
+mu ! mnh ! mnl ! mb !
+\ the parent's parts, or none (counted from the outputs)
+mu @ if mb @ 1 lit - mparts else 0 lit then mold !
+mold @ 0= if mob @ ?dup if free then  0 lit mob !  0 lit mon ! then
+mu @ if mu @ 4 lit + @ mml !  mu @ C lit + @ mmh !  mu @ memp else mnl @ mml !  mnh @ mmh !  0 lit mea !  0 lit men ! then
+mon @ 1 lit + 2 lit lshift malloc mos !  0 lit mos @ 0 lit w!
+mon @ ?dup if 0 lit do mos @ i w@ i ope C lit + @ + mos @ i 1 lit + w! loop then
+0 lit mnn !
+mgvp @ if mgvn @ ?dup if 0 lit do mgvp @ i 30 lit * + mapp loop then  0 lit mgvp ! else 27 lit 0 lit mw then
+\ kept whole every 64th block
+mb @ 3F lit and 0= if 0 lit mold ! then
+mnn @ 3C lit * MNAMES + 80 lit + malloc dup mo ! mop !  mo @ mrst !
+mold @ if 1 lit else 0 lit then m32,  mnl @ m32,  mnh @ m32,
 mtmp @ troot  mtmp @ mcanon,
 \ the name parts (their count written once known)
 mop @ mhh @ 20 lit + !  0 lit m32,
 0 lit mnp !  0 lit mgn !  0 lit mgc !
-mo @ mrk @ 5 lit lshift + 40 lit + MNAMES + 2F lit -  mo !     \ the limit, for mgclose
+mrst @ 30 lit + MNAMES + 2F lit -  mo !     \ the limit, for mgclose
 0 lit kbkt mtmp @ 24 lit sget 24 lit = if 0 lit mtmp @ @ mmore then
 3 lit begin knext dup 3 lit = if drop kb2 @ c@ 42 lit = else drop 0 lit then while
 	kb2 @ kb @ 3 lit bcopy  3 lit mtmp @ 24 lit sget drop
@@ -125,10 +386,10 @@ mo @ mrk @ 5 lit lshift + 40 lit + MNAMES + 2F lit -  mo !     \ the limit, for 
 	3 lit
 repeat
 mgclose
-mo @ 2F lit + MNAMES - mrk @ 5 lit lshift - 40 lit - mo !
 mnp @ mhh @ 20 lit + @ !
+mop @ 3 lit + FFFFFFFC lit and  msput mop !
 \ stored, in chunks
-mop @ mo @ - mrn !
+mrst @ mo !  mop @ mo @ - mrn !
 mrn @ sbuf @ !  mb @ FFFF lit kman sbuf @ 4 lit sput
 mo @ mop !  0 lit mrc !
 begin mrn @ while
@@ -136,19 +397,31 @@ begin mrn @ while
 	mb @ mrc @ kman mop @ 2 lit pick sput
 	dup mop @ + mop !  mrn @ swap - mrn !  mrc @ 1 lit + mrc !
 repeat
-mo @ free ;
+mo @ free
+\ the new parts kept for the next block's
+mcb @ ?dup if free then  mnb @ mcb !  mnn @ mcn !  mb @ mch !  0 lit mnb !  0 lit mncap !
+mob @ ?dup if free then  0 lit mob !  mos @ free  mea @ ?dup if free then
+mb @ mprune ;
 
-: mread  ( h -- a n | 0 0 )
-dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
-	sbuf @ @ dup malloc  ( h n a )
-	over 3FF lit + A lit rshift 0 lit do
-		2 lit pick i kman  over i A lit lshift + 400 lit sget drop
-	loop
-	rot drop swap
+\ mread ( h -- a n | 0 0 )  the manifest after block h, if kept, as
+\ net.rs's encode_manifest (malloc'd): the counter, the output parts
+\ (level, index, count, root), the name root, the name parts.
+: mown variable ;  : mrr variable ;
+: mread
+dup mrec ?dup if
+	mrr !
+	dup mch @ = mcb @ 0= 0= and if drop mcb @ mob !  mcn @ mon !  0 lit mown !  -1 lit else mrebuild  -1 lit mown ! then
+	if
+		mon @ 2D lit *  mrr @ 2C lit + @ 2F lit * +  30 lit + dup malloc dup mo ! mop !
+		mrr @ 4 lit + @ m32,  mrr @ 8 lit + @ m32,  mon @ m32,
+		mon @ ?dup if 0 lit do
+			i ope @ mop @ c!  i ope 4 lit + mop @ 1 lit + 2C lit bcopy  mop @ 2D lit + mop !
+		loop then
+		mrr @ C lit + mop @ 20 lit bcopy  mop @ 20 lit + mop !
+		mrr @ 2C lit + @ m32,
+		mrr @ 30 lit + mop @ mrr @ 2C lit + @ 2F lit * bcopy
+		mo @ swap
+	else 0 lit 0 lit then
+	mown @ if mob @ ?dup if free then then  0 lit mob !
+	mrr @ free
 else drop 0 lit 0 lit then ;
-
-: mdrop
-dup FFFF lit kman sbuf @ 4 lit sget 4 lit = if
-	sbuf @ @ 3FF lit + A lit rshift ?dup if 0 lit do dup i kman sdel loop then
-	FFFF lit kman sdel
-else drop then ;

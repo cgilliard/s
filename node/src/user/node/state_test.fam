@@ -43,11 +43,10 @@ snp @ @ 3 lit + FFFFFFFC lit and 4 lit + snp @ + snp !
 ?dup if free then ;
 
 "/t-state" TREE CREATE or 2 lit or open stinit
-\ the counter to start from, if given: no manifests then
+\ the counter to start from, if given
 "/lib/statefirst" 0 lit open dup 0< if drop else
 	dup sbuf @ 8 lit read drop close drop
 	stfd @ 1 lit txbegin stx !  sbuf @ @ sbuf @ 4 lit + @ swap 70 lit mput 71 lit mput  stx @ txcommit drop
-	-1 lit msoff !
 then
 800 lit alloc hl !  800 lit alloc hb !  800 lit alloc hn !  20 lit alloc cr !  20 lit alloc gr !
 "/lib/statechain" rdfile drop dup @ ctn ! 4 lit + ep !

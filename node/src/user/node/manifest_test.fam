@@ -1,0 +1,83 @@
+\ manifest_test.fam — manifest.fam's output parts (docs/NODE.md, step
+\ 10), after connect.fam: outputs put straight into the store (no blocks),
+\ each "block" an undo record made by hand, its manifest made from its
+\ parent's and compared with one made from the outputs alone (as
+\ tabminer's take_snapshot checks itself in its tests). Parts split past
+\ 2^14 outputs, merge under it, go when emptied; the emptied positions
+\ come unsorted; past block 64 a manifest is rebuilt from the one kept
+\ whole and the changes since. Prints "manifest: N as expected, M not".
+
+: tpas variable ;  : tfai variable ;  : trec variable ;  : tu variable ;  : tk variable ;
+: th variable ;  : tnx variable ;  : ta variable ;  : tan variable ;  : tb variable ;  : tbn variable ;
+
+: bsame  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;
+\ tchk ( flag str -- )
+: tchk  swap if drop tpas @ 1 lit + tpas ! else "manifest: block " puts th @ u. ": " puts puts 0A lit putc tfai @ 1 lit + tfai ! then ;
+
+\ tfill ( pos -- )  an output's record, made from its position.
+: tfill  10 lit 0 lit do dup i + 1 lit + trec @ i w! loop drop  1 lit trec @ 40 lit + ! ;
+\ tmake ( n -- )  n outputs at the counter.
+: tmake  0 lit do tnx @ dup tfill  trec @ swap 0 lit oput  tnx @ 1 lit + tnx ! loop ;
+\ tub  the block's undo record begun: its outputs from the counter.
+: tub  5 lit tu @ 0 lit w!  tnx @ tu @ 1 lit w!  0 lit tu @ 2 lit w!  0 lit tu @ 3 lit w!  0 lit tu @ 4 lit w! ;
+\ tin ( pos -- )  an output spent by the block, if unspent.
+: tin
+dup 0 lit oget if
+	dup 0 lit odel
+	tu @ 4 lit w@ tk !
+	tu @ tk @ 1 lit lshift 5 lit + w!  0 lit tu @ tk @ 1 lit lshift 6 lit + w!
+	tk @ 1 lit + tu @ 4 lit w!  tk @ 1 lit + 1 lit lshift 5 lit + tu @ 0 lit w!
+else drop then ;
+
+\ tgetp ( a k -- level index count )  part k of encoded manifest a.
+: tgetp  2D lit * + C lit +  dup c@ swap  dup 1 lit + le@ swap 9 lit + le@ ;
+\ texp ( level index count k -- )  part k of block th's manifest these.
+: tl variable ;  : ti variable ;  : tc variable ;
+: texp  ta @ swap tgetp  tc ! ti ! tl !  tc @ = swap ti @ = and swap tl @ = and  "a part not as expected" tchk ;
+\ tnp ( n -- )  block th's manifest has n output parts.
+: tnp  ta @ 8 lit + le@ =  "another number of parts" tchk ;
+
+\ tblk  block th + 1: the tree, its manifest from its parent's, and (tcmp
+\ set) one from the outputs alone (at th + 500, then dropped): the same.
+: tcmp variable ;
+: tblk
+th @ 1 lit + th !
+sprop
+th @ tnx @ 0 lit tu @ msnap
+th @ mread tan ! ta !  0 lit tb !
+ta @ 0= 0= "no manifest" tchk
+tcmp @ if
+	th @ 1F4 lit + tnx @ 0 lit 0 lit msnap
+	th @ 1F4 lit + mread tbn ! tb !
+	tan @ tbn @ = if ta @ tb @ tan @ bsame else 0 lit then "made from its parent's, not as from the outputs" tchk
+	th @ 1F4 lit + mdrop
+then ;
+: tbeg  stfd @ 1 lit txbegin stx !  tub ;
+: tend  tblk  stx @ txcommit drop ;
+: tfree  ta @ ?dup if free then  tb @ ?dup if free then ;
+
+"/t-man" TREE CREATE or 2 lit or open stinit
+44 lit alloc trec !  10000 lit alloc tu !
+0 lit tnx !  0 lit th !  0 lit tpas !  0 lit tfai !  -1 lit tcmp !
+\ 1: 17,000 outputs: split, at the lowest level
+tbeg 4268 lit tmake tend
+2 lit tnp  E lit 0 lit 4000 lit 0 lit texp  E lit 1 lit 268 lit 1 lit texp  tfree
+\ 2: 1,000 spent, given from the last: 16,000 left, the output half's one part
+tbeg 3E8 lit 0 lit do 3E7 lit i - 3 lit lshift tin loop tend
+1 lit tnp  27 lit 0 lit 3E80 lit 0 lit texp  tfree
+\ 3: 17,000 more: split again, down to three
+tbeg 4268 lit tmake tend
+3 lit tnp  E lit 0 lit 3C18 lit 0 lit texp  E lit 1 lit 4000 lit 1 lit texp  F lit 1 lit 4D0 lit 2 lit texp  tfree
+\ 4: all of 32,768 on spent: that part gone
+tbeg 4D0 lit 0 lit do 8000 lit i + tin loop tend
+2 lit tnp  E lit 0 lit 3C18 lit 0 lit texp  E lit 1 lit 4000 lit 1 lit texp  tfree
+\ 5: scattered
+tbeg 23 lit 0 lit do i 3E5 lit * tin loop tend  tfree
+\ 6 to 70: a few each, past the one kept whole at 64 (the last compared)
+0 lit tcmp !
+41 lit 0 lit do i 40 lit = tcmp !  tbeg 3 lit tmake  th @ D lit * 9 lit + tin tend tfree loop
+\ block 66's, rebuilt from 64's (kept whole) and the changes since
+stfd @ 0 lit txbegin stx !  th @ 4 lit - mread tan ! ta !  stx @ txcommit drop
+ta @ 0= 0= "block 66's manifest not rebuilt" tchk  ta @ ?dup if free then
+"manifest: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+0 lit exit
