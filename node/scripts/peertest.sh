@@ -30,13 +30,7 @@ miner() {
 		--listen 127.0.0.1:$2 --peer 127.0.0.1:$3 --no-prompt >> "$T/$1.out" 2>&1 &
 }
 # wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "peertest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 tip() { sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$1" | tail -1; }
 
 echo "peertest.sh: A and B mining together to 6"

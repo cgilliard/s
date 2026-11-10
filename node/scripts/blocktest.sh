@@ -34,13 +34,7 @@ minera() {
 }
 stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null || true; }
 # wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "blocktest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 
 echo "blocktest.sh: A mining 6 blocks"
 minera

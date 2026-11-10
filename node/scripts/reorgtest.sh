@@ -49,13 +49,7 @@ minerb() {
 }
 stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null || true; }
 # wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "reorgtest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 # tip DIR — the last height a tabminer's log (its data directory's: with
 # its prompt open it says little on its output) has as its tip
 tip() { sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$1/tabminer.log" | tail -1; }
@@ -87,7 +81,8 @@ n=$(heights)
 echo "node -n devrec 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* resumed at height|^node: .* syncing from.*$' 120 "the node starting again"
 [ "$(grep -c 'syncing from' "$T/os.out")" = 1 ] || { echo "reorgtest.sh: the node synced again rather than resume" >&2; exit 1; }
-i=0; until [ "$(heights)" -gt "$n" ]; do [ $i -lt 300 ] || { echo "reorgtest.sh: no block followed after resuming" >&2; exit 1; }; sleep 2; i=$((i + 2)); done
+more() { [ "$(heights)" -gt "$n" ]; }
+wait_while_busy 300 "a block followed after resuming" more
 grep '^node: .* resumed at' "$T/os.out"
 grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -1 | grep -qv 'proof 0\.00' \
 	|| { echo "reorgtest.sh: a block followed after resuming without its proof checked" >&2; exit 1; }

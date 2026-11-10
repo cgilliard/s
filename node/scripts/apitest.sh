@@ -43,13 +43,7 @@ mine() {
 	MP=$!
 }
 # wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "apitest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 
 echo "apitest.sh: mining 12 blocks (about ten seconds each)"
 mine
@@ -101,7 +95,7 @@ grep -q '^cli: status without the token 401' "$T/node.out" && grep -q '^cli: sta
 	|| { echo "apitest.sh: the program in the OS was not answered as expected" >&2; exit 1; }
 
 python3 - "$HP" "$TOKEN" "$T/tx1.bin" "$T/miner/tabminer.log" <<'EOF'
-import json, sys, time, urllib.request, urllib.error, re
+import json, os, sys, time, urllib.request, urllib.error, re
 port, token, txfile, minerlog = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 base = f'http://127.0.0.1:{port}'
 def ask(path, data=None, tok=token, timeout=40):
@@ -161,10 +155,14 @@ t0 = time.time()
 tip = j('/v1/status')['tip']
 moved = j(f'/v1/tip?after={tip}', timeout=60)
 check(f'the tip waited for: height {moved["height"]} after {time.time() - t0:.0f} s', moved['tip'] != tip or time.time() - t0 >= 25)
-for _ in range(60):
-    if j('/v1/mempool')['count'] == 0:
-        break
+# Until both are mined: waited for as long as the miner is getting on
+# (its log growing), failed after 300 s with nothing new.
+last, idle = os.path.getsize(minerlog), 0
+while j('/v1/mempool')['count'] != 0 and idle < 300:
     time.sleep(5)
+    size = os.path.getsize(minerlog)
+    idle = 0 if size != last else idle + 5
+    last = size
 check('both mined: the pool empty', j('/v1/mempool')['count'] == 0)
 took = re.findall(r'transaction from 127\.0\.0\.1:\d+ \S+ pooled', open(minerlog).read())
 check(f'the miner took both from the node', len(took) == 2)

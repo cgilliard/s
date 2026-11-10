@@ -32,19 +32,13 @@ MP=$!
 trap 'st=$?; kill $MP 2>/dev/null; wait $MP 2>/dev/null || true; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
 echo "synctest.sh: mining $WANT blocks (about ten seconds each)"
-until grep -q "is the tip at height $WANT\$" "$T/miner.out"; do
-	kill -0 $MP 2>/dev/null || { echo "synctest.sh: the miner ended: $(tail -c 300 "$T/miner.out")" >&2; exit 1; }
-	sleep 5
-done
+. scripts/waitlib.sh
+wait_for "$T/miner.out" "is the tip at height $WANT\$" 600 "the miner's $WANT blocks"
 echo "synctest.sh: syncing"
 ./tools/q32 --net --disk="$T/sy.disk" "$T/sy.img" > "$T/node.out" 2>&1 &
 QP=$!
-i=0
-until grep -q '^kernel: init ended' "$T/node.out"; do
-	kill -0 $QP 2>/dev/null || break
-	sleep 2; i=$((i + 2))
-	[ $i -lt 900 ] || { echo "synctest.sh: the node took too long" >&2; break; }
-done
+ended() { grep -q '^kernel: init ended' "$T/node.out" || ! kill -0 $QP 2>/dev/null; }
+wait_while_busy 900 "the node's sync" ended
 kill $QP 2>/dev/null; wait $QP 2>/dev/null || true
 cat "$T/node.out" | grep -E "^(sync|state root|followed):"
 grep -q '^sync: 0 ' "$T/node.out" || { echo "synctest.sh: the sync failed" >&2; exit 1; }

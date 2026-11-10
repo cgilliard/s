@@ -38,14 +38,7 @@ mine() {
 		--listen 127.0.0.1:37471 --no-prompt >> "$T/miner.out" 2>&1 &
 	MP=$!
 }
-# wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "pooltest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 
 echo "pooltest.sh: mining 12 blocks (about ten seconds each)"
 mine

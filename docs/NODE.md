@@ -1277,6 +1277,13 @@ Each step done when its test passes.
       `api-port` (3738), `window` (headers held), `peer IP:PORT` (again
       for more); the command line over it (`-n`, `-w`, peers); a key not
       understood is said. The scripts run `node -n devrec`.
+    - The scripts' waits have no deadlines (2026-11-09,
+      `scripts/waitlib.sh`): a step is waited for as long as the test's
+      logs under `tmp/<script>/` (the miners' and the OS's output) keep
+      growing, and fails only after its idle window with nothing new: a
+      slower machine (CI's four cores) waits longer, a stuck run still
+      fails. The CI job's time limit is the backstop. oscheck's checks
+      still have deadlines (each a few times what it takes).
     - Not yet: mainnet's seeds by name (no DNS: a node on mainnet needs
       peers given), started by init (held back while it is tried by
       hand), a log and a way to read its state from the shell.

@@ -27,13 +27,7 @@ dd if=/dev/zero of="$T/node.disk" bs=1 count=0 seek=268435456 2>/dev/null
 AP=; QP=
 trap 'st=$?; exec 3>&- 2>/dev/null; for p in $QP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "windowtest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 heights() { grep -c '^node: .* height [0-9]*  (' "$T/os.out" || true; }
 
 echo "windowtest.sh: A mining 8 blocks"
@@ -83,7 +77,8 @@ echo "node -n devrec -w 16 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* resumed at height' 120 "the node resuming"
 grep -E '^node: .* (loading|resumed)' "$T/os.out" | tail -2
 grep -E '^node: .* loading 8 headers' "$T/os.out" > /dev/null || { echo "windowtest.sh: not resumed from a window" >&2; exit 1; }
-i=0; until [ "$(heights)" -ge $((n + 2)) ]; do [ $i -lt 300 ] || { echo "windowtest.sh: no blocks followed after resuming" >&2; exit 1; }; sleep 2; i=$((i + 2)); done
+more() { [ "$(heights)" -ge $((n + 2)) ]; }
+wait_while_busy 300 "blocks followed after resuming" more
 grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -2
 grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -1 | grep -qv 'proof 0\.00' || { echo "windowtest.sh: a block followed without its proof checked" >&2; exit 1; }
 echo "windowtest.sh: headers moved to the store and served from it, and resumed from a window"

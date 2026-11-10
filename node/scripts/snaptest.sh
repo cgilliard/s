@@ -27,13 +27,7 @@ dd if=/dev/zero of="$T/node.disk" bs=1 count=0 seek=268435456 2>/dev/null
 AP=; DP=; QP=
 trap 'st=$?; exec 3>&- 4>&- 2>/dev/null; for p in $QP $DP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "snaptest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 tip() { sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$1/tabminer.log" | tail -1; }
 
 echo "snaptest.sh: A mining, its prompt open"

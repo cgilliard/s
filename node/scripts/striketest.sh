@@ -26,13 +26,7 @@ AP=; FP=; QP=
 trap 'st=$?; exec 3>&- 2>/dev/null; for p in $QP $FP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
 # wait_for FILE PATTERN SECONDS WHAT
-wait_for() {
-	i=0
-	until grep -qE "$2" "$1" 2>/dev/null; do
-		[ $i -lt "$3" ] || { echo "striketest.sh: $4: not in $3 s" >&2; exit 1; }
-		sleep 2; i=$((i + 2))
-	done
-}
+. scripts/waitlib.sh
 
 echo "striketest.sh: A mining 4 blocks"
 TABMINER_THREADS=${TABMINER_THREADS:-4} "$MINER" mine --network dev-recursive --data "$T/a" --no-seeds \
@@ -90,9 +84,7 @@ wait_for "$T/os.out" "^node: .* peer 10\\.0\\.2\\.2:$PF struck \\(1 of 5\\)" 300
 wait_for "$T/os.out" "^node: .* peer 10\\.0\\.2\\.2:$PF banned" 600 "the fake banned"
 grep -E "struck|banned|passed over" "$T/os.out"
 n=$(grep -c '^node: .* height [0-9]*  (' "$T/os.out")
-i=0; until [ "$(grep -c '^node: .* height [0-9]*  (' "$T/os.out")" -gt "$n" ]; do
-	[ $i -lt 300 ] || { echo "striketest.sh: no block from A after the ban" >&2; exit 1; }
-	sleep 2; i=$((i + 2))
-done
+more() { [ "$(grep -c '^node: .* height [0-9]*  (' "$T/os.out")" -gt "$n" ]; }
+wait_while_busy 300 "a block from A after the ban" more
 grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -2
 echo "striketest.sh: the fake struck five times and banned; A followed throughout"
