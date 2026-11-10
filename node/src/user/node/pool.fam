@@ -41,7 +41,13 @@
 :M QSLOTS 200 lit ;
 :M QBYTES 400000 lit ;
 
-: qbase variable ;  : qbytes variable ;  : qnum variable ;  : qord variable ;  : qcode variable ;  : qht variable ;
+: qbase variable ;  : qbytes variable ;  : qnum variable ;  : qord variable ;
+\ For fee estimates (qest, below): each slot's arrival (secs), when it was
+\ seen confirmed (0: not), its first output's commitment (32 bytes).
+: qatm variable ;  : qctm variable ;  : qfo variable ;
+: qnow  secs cdate @ + ;                          \ ( -- t )  the time, Unix seconds
+\ qbs ( a b n -- flag )  n bytes equal.
+: qbs  -1 lit swap ?dup if 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop then nip nip ;  : qcode variable ;  : qht variable ;
 : qid variable ;  : qtmp variable ;  : qkc variable ;  : qlv variable ;  : qcb variable ;  : qch variable ;  : qown variable ;
 : qum variable ;  : qcf variable ;  : qncf variable ;  : qcl variable ;  : qncl variable ;  : qvic variable ;  : qnvic variable ;
 : qlo variable ;  : qhi variable ;  : qplo variable ;  : qphi variable ;  : qsk variable ;  : qhc variable ;  : qhf variable ;
@@ -235,6 +241,13 @@ tnall 3 lit lshift 4 lit + malloc  dup qsav @ 30 lit + !  tnall over !
 tnall ?dup if 0 lit do i tpos 2 lit pick i 3 lit lshift + 8 lit + !  over i 3 lit lshift + 4 lit + ! loop then drop
 qncl @ 14 lit * 4 lit + malloc  dup qsav @ 34 lit + !  qncl @ over !  qcl @ swap 4 lit + qncl @ 5 lit * wcopy
 qord @ qsav @ 38 lit + !  qord @ 1 lit + qord !  0 lit qsav @ 3C lit + !
+\ its arrival, and its first output's commitment (as a block carries it:
+\ canonical; the transaction carries the key hash, tparse made the
+\ commitment), for the estimates. Its outputs are all made by the block
+\ that confirms it, so its first stands for all (tabminer's revalidate
+\ asks for every one). None: zeros.
+qsav @ qbase @ - 6 lit rshift  dup qnow swap 2 lit lshift qatm @ + !  0 lit over 2 lit lshift qctm @ + !
+5 lit lshift qfo @ +  tnout @ if tcom @ over 8 lit wcopy dfrom else 20 lit 0 lit do 0 lit over i + c! loop drop then
 qbytes @ qsav @ 4 lit + @ + qbytes !  qnum @ 1 lit + qnum ! ;
 
 \ qthr ( i -- )  threshold condition i (tthr's fields set): m of its n
@@ -311,6 +324,108 @@ then
 2drop qcode @ ;
 
 \ qcheck  after the tip moved (Mempool::revalidate, without its shelf).
+\ ── Fee estimates (tabminer's Mempool::estimate and suggest) ──
+\
+\ Each pooled transaction seen confirmed (its first output among a new
+\ block's: qconfs) is noted with its rate (base units a byte, rounded up),
+\ its wait (its arrival to the block's timestamp, never past the clock)
+\ and when, for a week, 5,000 at most (QCN).  An estimate for a wait is
+\ the lowest rate at which, of the transactions seen at or above it
+\ (those confirmed, and those pooled waiting past it), 85% confirmed in
+\ time, once 20 at least are counted; none until then.
+:M QCN 1388 lit ;
+: qcr variable ;  : qcrn variable ;  : qcrh variable ;  : qhs variable ;  : qsm variable ;  : qsn variable ;
+: qd1 variable ;  : qd2 variable ;  : qd3 variable ;  : qd4 variable ;  : qse variable ;
+: qtot variable ;  : qyes variable ;  : qcont variable ;  : qend variable ;
+: qeinit
+QCN C lit * alloc qcr !  0 lit qcrn !  0 lit qcrh !
+40000 lit malloc qhs !  QCN QSLOTS + 3 lit lshift alloc qsm !
+8 lit alloc qd1 !  8 lit alloc qd2 !  8 lit alloc qd3 !  8 lit alloc qd4 ! ;
+\ qrate ( k -- r )  slot k's rate: its fee over its size, base units a
+\ byte rounded up (as tabminer's per_byte of its scaled rate).
+: qrate
+qslot  dup 8 lit + qd1 @ 2 lit wcopy  4 lit + @ dup qd2 @ !  0 lit qd2 @ 4 lit + !
+qd1 @ qd2 @ qd3 @ qd4 @ 2 lit wdivmod
+\ up when the remainder, scaled by 2^16, is a whole unit of the size
+FFFF lit + 10 lit rshift  qd4 @ @ dup if swap u< 0= else nip then
+if qd3 @ @ 1 lit + else qd3 @ @ then ;
+\ qremem ( rate waited at -- )  a confirmation noted (the oldest
+\ forgotten past QCN).
+: qremem
+qcrh @ qcrn @ +  dup QCN u< 0= if QCN - then  C lit * qcr @ +  tuck 8 lit + !  tuck 4 lit + !  !
+qcrn @ QCN u< if qcrn @ 1 lit + qcrn ! else qcrh @ 1 lit +  dup QCN = if drop 0 lit then qcrh ! then ;
+\ qnote ( k -- )  slot k, leaving the pool: if seen confirmed, noted.
+: qnote
+dup 2 lit lshift qctm @ + @ ?dup if
+	over qrate  swap dup 3 lit pick 2 lit lshift qatm @ + @  2dup u< if 2drop 0 lit else - then  swap qremem
+then drop ;
+\ qconfs  the block just connected (bh, its outputs bout, bnout): each
+\ pooled transaction whose first output is among them seen confirmed, at
+\ the block's timestamp (never past the clock).  A table of the outputs
+\ (by a commitment's first word; 65,536 words) found them.
+: qhw  FFFF lit and 2 lit lshift qhs @ + ;   \ ( key -- a )
+: qconfs
+qnum @ 0= 0=  bnout @ 0= 0= and if
+	qhs @ 10000 lit wzero
+	bnout @ 8000 lit umin 0 lit do
+		bout @ i 3C lit * + @ begin dup qhw @ while 1 lit + repeat  i 1 lit + swap qhw !
+	loop
+	bh @ 24 lit + @ qnow umin qse !
+	QSLOTS 0 lit do
+		i qused  i 2 lit lshift qctm @ + @ 0= and if
+			i 5 lit lshift qfo @ +  dup @
+			begin dup qhw @ ?dup if
+				1 lit - 3C lit * bout @ +  2 lit pick 20 lit qbs
+				if qse @ i 2 lit lshift qctm @ + !  0 lit else 1 lit + -1 lit then
+			else 0 lit then while repeat 2drop
+		then
+	loop
+then ;
+\ qsw ( i j -- )  samples i and j swapped; qs< ( i j -- flag )  i's rate
+\ above j's (so the sort is by rate, the highest first).
+: qsa  3 lit lshift qsm @ + ;
+: qsw  qsa swap qsa  2 lit 0 lit do over i w@ over i w@  3 lit pick i w!  over i w! loop 2drop ;
+: qs<  qsa @ swap qsa @ swap u> ;
+: qsft
+qend !
+begin dup 1 lit lshift 1 lit + dup qend @ u< while
+	dup 1 lit + qend @ u< if dup dup 1 lit + qs< if 1 lit + then then
+	2dup qs< if 2dup qsw nip else 2drop qend @ then
+repeat 2drop ;
+\ qest ( target -- rate | -1 )  the estimate for a wait of target seconds.
+: qest
+qnow qse !  0 lit qsn !
+qcrn @ ?dup if 0 lit do
+	qcrh @ i +  dup QCN u< 0= if QCN - then  C lit * qcr @ +
+	qse @ over 8 lit + @ - 93A80 lit u< if
+		dup @ qsn @ qsa !  4 lit + @ over u> 0= qsn @ qsa 4 lit + !  qsn @ 1 lit + qsn !
+	else drop then
+loop then
+QSLOTS 0 lit do
+	i qused if qse @ i 2 lit lshift qatm @ + @ - over u> if
+		i qrate qsn @ qsa !  0 lit qsn @ qsa 4 lit + !  qsn @ 1 lit + qsn !
+	then then
+loop
+drop
+\ the highest first (heapsort, "less" being the higher rate)
+qsn @ 1 lit u> if
+	qsn @ 1 lit rshift begin dup while 1 lit - dup qsn @ qsft repeat drop
+	qsn @ begin dup 1 lit u> while 1 lit - 0 lit over qsw  0 lit over qsft repeat drop
+then
+FFFFFFFF lit  0 lit qtot !  0 lit qyes !  -1 lit qcont !
+qsn @ ?dup if 0 lit do qcont @ if
+	qtot @ 1 lit + qtot !  i qsa 4 lit + @ if qyes @ 1 lit + qyes ! then
+	\ once every sample at this rate is counted, and 20 at least
+	i 1 lit + qsn @ u< if i 1 lit + qsa @ i qsa @ = else 0 lit then  qtot @ 14 lit u< or 0= if
+		qyes @ 14 lit *  qtot @ 11 lit * u< if 0 lit qcont ! else drop i qsa @ then
+	then
+then loop then ;
+\ qsugg ( target -- rate )  the rate to suggest for a simple payment
+\ (2,513 bytes) to confirm within target: the pool's minimum while the
+\ pool would fit one block with it, else the estimate, at least that.
+: qsugg
+qbytes @ 9D1 lit + 1B6338 lit u> if qest dup 0< if drop A lit else A lit max then else drop A lit then ;
+
 : qcheck
 stfd @ 0 lit txbegin stx !  68 lit mget 1 lit + qht !
 QSLOTS 0 lit do
@@ -320,7 +435,7 @@ QSLOTS 0 lit do
 		0 lit qcode !  0 lit qncf !
 		tnall ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
 		qok tnops @ 0= 0= and if qops then
-		qok 0= if qka @ qshelve then
+		qok 0= if qka @ qnote  qka @ qshelve then
 	then
 loop
 stx @ txcommit drop ;
@@ -332,6 +447,7 @@ A000 lit malloc qmv !  0 lit qnmv !
 0 lit qbytes !  0 lit qnum !  0 lit qord !
 20 lit alloc qid !  40 lit alloc qtmp !  20 lit alloc qkc !  20 lit alloc qlv !  60 lit alloc qcb !
 20 lit alloc qch !  20 lit alloc qown !  20 lit alloc qum !  400 lit alloc qcf !  200 lit alloc qcl !
+QSLOTS 2 lit lshift alloc qatm !  QSLOTS 2 lit lshift alloc qctm !  QSLOTS 5 lit lshift alloc qfo !  qeinit
 QSLOTS 2 lit lshift alloc qvic !  20 lit alloc qmsg !  20 lit alloc qcov !  50 lit alloc qrb !  10 lit alloc qm1 !  10 lit alloc qm2 !  4 lit alloc qw1 !  4 lit alloc qw2 ! ;
 
 \ The outputs a replacing branch made: QMV at most, 40 bytes each (the

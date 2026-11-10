@@ -13,7 +13,9 @@
 \   GET  /v1/spent?from=<height>         positions spent, block by block
 \   GET  /v1/name/<name>                 a record and its proof
 \   GET  /v1/proof/output/<position>     an output's path to the state root
-\   GET  /v1/fees                        the pool's floor and dust limit
+\   GET  /v1/fees                        the pool's floor and dust limit, the
+\                                        rates to suggest (a block, an hour,
+\                                        a day; pool.fam's qsugg), economy
 \   GET  /v1/mempool                     what the pool holds
 \   GET  /v1/tip?after=<id>              when the tip is not <id> (30 s at most)
 \   POST /v1/tx                          a transaction's bytes: pooled, relayed
@@ -367,8 +369,19 @@ else "commitment" akey "null" a" acom then
 stx @ txcommit drop
 "200 OK" asend ;
 
+\ afe ( target -- )  the suggestion for a wait of target seconds: its
+\ rate, and whether the pool has seen enough to estimate it (else it is
+\ the minimum).
+: afe  "{" a" "rate" akey dup qsugg anum acom "estimated" akey qest 0< if "false" else "true" then a" "}" a" ;
+\ afees  as tabminer's `fees`: for a simple payment (2,513 bytes), the
+\ rates for a block, an hour, a day; economy, the minimum, waiting at
+\ most the pool's bytes over the aged reserve (179,500 a block) in blocks.
 : afees
-abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "estimates" akey "null" a" "}" a"
+abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "payment_size" akey 9D1 lit anum acom
+"estimates" akey "{" a" "block" akey 258 lit afe acom "hour" akey E10 lit afe acom "day" akey 15180 lit afe "}" a" acom
+"economy" akey "{" a" "rate" akey A lit anum acom "blocks" akey qbytes @ 9D1 lit + 2BD2B lit + 2BD2C lit / anum "}" a" acom
+"confirmations" akey qcrn @ anum
+"}" a"
 "200 OK" asend ;
 
 : amempool

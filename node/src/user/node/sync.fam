@@ -363,7 +363,7 @@ myh @ hbest hheight u< nfl @ 0= and if
 					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
 					i hat hmark  pcur @ pstrike  1 lit nfl !
 				else
-					nk @ 1 lit + nk ! nstat  1 lit nchg !  nuw @ if qmvblk then  ncn @ 1 lit + ncn !  nbn @ nln !
+					nk @ 1 lit + nk ! nstat  1 lit nchg !  nuw @ if qmvblk then  qconfs  ncn @ 1 lit + ncn !  nbn @ nln !
 					vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then
 				then
 				nblk @ free 0 lit nblk !

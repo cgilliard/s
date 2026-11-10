@@ -1,0 +1,40 @@
+\ fees_test.fam — the pool's fee estimates (pool.fam's qest, qsugg,
+\ qrate; docs/FEES.md), after pool.fam, as tabminer's
+\ estimates_follow_what_confirmed has them: nothing seen, no estimate and
+\ the minimum; 30 at 50 a byte confirmed in five minutes and 30 at 20 in
+\ an hour and a half, 50 for a block and an hour, 20 for a day; a week
+\ old, none; the pool fitting a block, the minimum whatever was seen; a
+\ rate rounded up to base units a byte as tabminer's per_byte.  Prints
+\ "fees: N as expected, M not".
+
+: tpas variable ;  : tfai variable ;
+: tchk  swap if drop tpas @ 1 lit + tpas ! else "fees: " puts puts 0A lit putc tfai @ 1 lit + tfai ! then ;   \ ( flag str -- )
+
+qinit
+\ nothing seen
+258 lit qest FFFFFFFF lit =  "an estimate with nothing seen" tchk
+E10 lit qsugg A lit =  "not the minimum suggested with nothing seen" tchk
+\ 30 at 50 a byte in 300 s, 30 at 20 in 5,000 s, just now
+1E lit 0 lit do 32 lit 12C lit qnow qremem  14 lit 1388 lit qnow qremem loop
+258 lit qest 32 lit =  "for a block, not 50" tchk
+E10 lit qest 32 lit =  "for an hour, not 50" tchk
+15180 lit qest 14 lit =  "for a day, not 20" tchk
+\ the pool fitting a block: the minimum, whatever was seen
+258 lit qsugg A lit =  "not the minimum while the pool fits a block" tchk
+\ a pool too full for one block: the estimate
+1B6338 lit qbytes !
+258 lit qsugg 32 lit =  "not the estimate with the pool full" tchk
+15180 lit qsugg 14 lit =  "not the day's estimate with the pool full" tchk
+0 lit qbytes !
+\ seen a week and a day ago: none
+0 lit qcrn !  0 lit qcrh !
+1E lit 0 lit do 32 lit 12C lit qnow A8C00 lit - qremem loop
+15180 lit qest FFFFFFFF lit =  "an estimate from confirmations a week old" tchk
+\ rates rounded up as tabminer's per_byte: 100,000 over 2,513 bytes, 40;
+\ seven a byte exactly, 7
+0 lit qslot  9D1 lit over 4 lit + !  186A0 lit over 8 lit + !  0 lit swap C lit + !
+0 lit qrate 28 lit =  "100,000 over 2,513 bytes not 40 a byte" tchk
+0 lit qslot  4497 lit over 8 lit + !  drop
+0 lit qrate 7 lit =  "17,591 over 2,513 bytes not 7 a byte" tchk
+"fees: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+0 lit exit

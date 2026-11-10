@@ -164,6 +164,9 @@ while j('/v1/mempool')['count'] != 0 and idle < 300:
     idle = 0 if size != last else idle + 5
     last = size
 check('both mined: the pool empty', j('/v1/mempool')['count'] == 0)
+f = j('/v1/fees')
+check(f'both seen confirmed, for the estimates: {f["confirmations"]}', f['confirmations'] == 2)
+check('too few seen to estimate: the minimum', all(f['estimates'][t] == {'rate': 10, 'estimated': False} for t in ('block', 'hour', 'day')))
 took = re.findall(r'transaction from 127\.0\.0\.1:\d+ \S+ pooled', open(minerlog).read())
 check(f'the miner took both from the node', len(took) == 2)
 new = j('/v1/token', data=b'')['token']

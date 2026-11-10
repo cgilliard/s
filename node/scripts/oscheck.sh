@@ -220,6 +220,11 @@ sh scripts/mkimage.sh "$T/po.img" bin/kernel init="$T/tpo.bin":16384 pool=$ND/po
 rm -f "$T/po.disk"; dd if=/dev/zero of="$T/po.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect pool 124 '^pool: 102 as tabminer, 0 not' 120 ./tools/q32 --disk="$T/po.disk" "$T/po.img"
 rm -f "$T/po.disk"
+# The pool's fee estimates (pool.fam's qest, qsugg, qrate), as tabminer's
+# estimates_follow_what_confirmed has them (fees_test.fam).
+./tools/fam --user -o "$T/tfe.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/serve.fam $ND/snap.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/fees_test.fam > "$T/tfe.build" 2>&1 || fail fees "build: $(head -c 300 "$T/tfe.build")"
+sh scripts/mkimage.sh "$T/fe.img" bin/kernel init="$T/tfe.bin":8192 2> "$T/fe.mk" || fail fees "mkimage: $(cat "$T/fe.mk")"
+expect fees 124 '^fees: 11 as expected, 0 not' 60 ./tools/q32 "$T/fe.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.

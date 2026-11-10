@@ -1296,6 +1296,21 @@ Each step done when its test passes.
       too (its `lim`, `upto` and `boots`): each limit an idle window,
       pushed back whenever anything under `tmp/oscheck/` changes (the
       checks' output, the guests' disks).
+    - Fee estimates (2026-11-09, `pool.fam`), as tabminer's
+      `Mempool::estimate` and `suggest`: each pooled transaction seen
+      confirmed (its first output among a new block's outputs: a table
+      of the block's, probed by each one's computed commitment) noted
+      with its rate (base units a byte, rounded up as `per_byte`), its
+      wait (its arrival to the block's timestamp, never past the clock)
+      and when, for a week, 5,000 at most; an estimate the lowest rate
+      at which 85% of at least 20 seen at or above it confirmed in time
+      (those pooled waiting past it counting late). `/v1/fees` as
+      tabminer's `fees`: for a simple payment (2,513 bytes), the rate
+      for a block, an hour, a day (each saying whether estimated or the
+      minimum), economy and its wait in blocks, and how many
+      confirmations were seen. `fees_test.fam` (oscheck's `fees`):
+      tabminer's `estimates_follow_what_confirmed`; apitest: both its
+      transactions seen confirmed.
     - Not yet: started by init (held back while it is tried by
       hand), a log and a way to read its state from the shell.
 
