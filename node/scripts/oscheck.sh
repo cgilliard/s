@@ -715,7 +715,7 @@ rm -f "$T/files.disk"
 # The crypto modules (src/user/crypto/): SHA-512, HMAC and PBKDF2 against
 # Python's hashlib (BIP39's own case among them); then the passwords kept
 # in /etc/passwd as PBKDF2 hashes, made, checked (hashlib's too), set;
-# BIP39; ChaCha20-Poly1305.
+# BIP39; ChaCha20-Poly1305; Dilithium.
 ./tools/fam --user -o "$T/t5.bin" src/user/crypto/sha512.fam src/user/crypto/sha512_test.fam > "$T/t5.build" 2>&1 || fail sha512 "build: $(head -c 300 "$T/t5.build")"
 sh scripts/mkimage.sh "$T/t5.img" bin/kernel init="$T/t5.bin":1024 2> "$T/t5.mk" || fail sha512 "mkimage: $(cat "$T/t5.mk")"
 expect sha512 124 '^sha512: 10 as expected, 0 not' 60 ./tools/q32 "$T/t5.img"
@@ -734,6 +734,11 @@ expect bip39 124 '^bip39: 29 as expected, 0 not' 60 ./tools/q32 "$T/tb3.img"
 ./tools/fam --user -o "$T/tcc.bin" src/user/crypto/chacha.fam src/user/crypto/chacha_test.fam > "$T/tcc.build" 2>&1 || fail chacha "build: $(head -c 300 "$T/tcc.build")"
 sh scripts/mkimage.sh "$T/tcc.img" bin/kernel init="$T/tcc.bin":1024 2> "$T/tcc.mk" || fail chacha "mkimage: $(cat "$T/tcc.mk")"
 expect chacha 124 '^chacha: 29 as expected, 0 not' 60 ./tools/q32 "$T/tcc.img"
+# Dilithium (ML-DSA-65, receipts and addresses) and SHA-3: keys, signatures
+# and verdicts (tampered ones among them) as tabminer's mldsa.rs.
+./tools/fam --user -o "$T/tdl.bin" src/user/crypto/keccak.fam src/user/crypto/dilithium.fam src/user/crypto/dilithium_vectors.fam src/user/crypto/dilithium_test.fam > "$T/tdl.build" 2>&1 || fail dilithium "build: $(head -c 300 "$T/tdl.build")"
+sh scripts/mkimage.sh "$T/tdl.img" bin/kernel init="$T/tdl.bin":1024 2> "$T/tdl.mk" || fail dilithium "mkimage: $(cat "$T/tdl.mk")"
+expect dilithium 124 '^dilithium: 108 as expected, 0 not' 60 ./tools/q32 "$T/tdl.img"
 
 # Users (step 8, part 5): a disk booted twice.  First as root (no
 # /etc/init yet): /etc/passwd and /etc/init written, a home for alice

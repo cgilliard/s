@@ -220,6 +220,14 @@ memos faster than every output in order.
    and this one pay each other by files. wm's side done (2026-11-10:
    the wallet's icon and window, `/wallet`, the password kept; The
    wallet's messages), with `wallet` a stub (`src/user/wallet.fam`).
+   The primitives so far (2026-11-10, each checked in oscheck against
+   vectors): SHA-256 and BIP39 (`crypto/bip39.fam`, `/lib/bip39`);
+   ChaCha20-Poly1305 (`crypto/chacha.fam`, RFC 8439); XMSS signing
+   (`node/xsign.fam`: a 16-leaf key about 2.3 s, a signature about
+   0.1 s under QEMU); Dilithium and SHA-3 (`crypto/dilithium.fam`,
+   `crypto/keccak.fam`: ML-DSA-65, deterministic signing as tabminer's;
+   keys about 0.1 s, a signature 0.1 to 0.4 s). Left: the keys and
+   memos, transactions and slates, the wallet program.
 2. **Payments and names in full:** proofs of payment, burns, names and
    sub-names.
 3. **Online payments:** the message layer, so `send` to an address or a
