@@ -1,0 +1,72 @@
+\ crypto/bip39_test.fam — BIP39 (crypto/bip39.fam, crypto/sha256.fam)
+\ against Python (the standard, from the same word list: values written
+\ by this file's generator in the commit that added it): SHA-256 of 0, 3
+\ and 16 bytes; five entropies (the standard's first, 7f..., 80..., ff...
+\ and one more): the phrase, the entropy back from it, the seed with
+\ "TREZOR", one with none; a phrase in mixed case and spacing taken, its
+\ seed the same; 11 words, a word not in the list, a wrong checksum
+\ refused.  Prints "bip39: N as expected, M not".
+
+: tpas variable ;  : tfai variable ;  : tex variable ;  : tout variable ;  : tent variable ;  : txp variable ;
+: tchk  swap if drop tpas @ 1 lit + tpas ! else "bip39: " puts puts 0A lit putc tfai @ 1 lit + tfai ! then ;   \ ( flag str -- )
+: tx  tex @ txp @ + c!  txp @ 1 lit + txp ! ;
+: tsame  ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
+80 lit alloc tex !  200 lit alloc tout !  20 lit alloc tent !
+b39load "the word list not loaded" tchk
+tout @  drop
+0 lit txp !  E3 lit tx B0 lit tx C4 lit tx 42 lit tx 98 lit tx FC lit tx 1C lit tx 14 lit tx 9A lit tx FB lit tx F4 lit tx C8 lit tx 99 lit tx 6F lit tx B9 lit tx 24 lit tx 27 lit tx AE lit tx 41 lit tx E4 lit tx 64 lit tx 9B lit tx 93 lit tx 4C lit tx A4 lit tx 95 lit tx 99 lit tx 1B lit tx 78 lit tx 52 lit tx B8 lit tx 55 lit tx
+tout @ 0 lit sha256  h2d @ tex @ 20 lit tsame "sha256 of 0 bytes" tchk
+tout @ 61 lit over 0 lit + c! 62 lit over 1 lit + c! 63 lit over 2 lit + c! drop
+0 lit txp !  BA lit tx 78 lit tx 16 lit tx BF lit tx 8F lit tx 1 lit tx CF lit tx EA lit tx 41 lit tx 41 lit tx 40 lit tx DE lit tx 5D lit tx AE lit tx 22 lit tx 23 lit tx B0 lit tx 3 lit tx 61 lit tx A3 lit tx 96 lit tx 17 lit tx 7A lit tx 9C lit tx B4 lit tx 10 lit tx FF lit tx 61 lit tx F2 lit tx 0 lit tx 15 lit tx AD lit tx
+tout @ 3 lit sha256  h2d @ tex @ 20 lit tsame "sha256 of 3 bytes" tchk
+tout @ 0 lit over 0 lit + c! 1 lit over 1 lit + c! 2 lit over 2 lit + c! 3 lit over 3 lit + c! 4 lit over 4 lit + c! 5 lit over 5 lit + c! 6 lit over 6 lit + c! 7 lit over 7 lit + c! 8 lit over 8 lit + c! 9 lit over 9 lit + c! A lit over A lit + c! B lit over B lit + c! C lit over C lit + c! D lit over D lit + c! E lit over E lit + c! F lit over F lit + c! drop
+0 lit txp !  BE lit tx 45 lit tx CB lit tx 26 lit tx 5 lit tx BF lit tx 36 lit tx BE lit tx BD lit tx E6 lit tx 84 lit tx 84 lit tx 1A lit tx 28 lit tx F0 lit tx FD lit tx 43 lit tx C6 lit tx 98 lit tx 50 lit tx A3 lit tx DC lit tx E5 lit tx FE lit tx DB lit tx A6 lit tx 99 lit tx 28 lit tx EE lit tx 3A lit tx 89 lit tx 91 lit tx
+tout @ 10 lit sha256  h2d @ tex @ 20 lit tsame "sha256 of 16 bytes" tchk
+\ entropy 00000000000000000000000000000000
+tent @ 0 lit over 0 lit + c! 0 lit over 1 lit + c! 0 lit over 2 lit + c! 0 lit over 3 lit + c! 0 lit over 4 lit + c! 0 lit over 5 lit + c! 0 lit over 6 lit + c! 0 lit over 7 lit + c! 0 lit over 8 lit + c! 0 lit over 9 lit + c! 0 lit over A lit + c! 0 lit over B lit + c! 0 lit over C lit + c! 0 lit over D lit + c! 0 lit over E lit + c! 0 lit over F lit + c! drop
+tent @ tout @ b39phr  tout @ "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" streq "the phrase of 00000000..." tchk
+tent @ 10 lit 0 lit do 0 lit over i + c! loop drop  "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" tent @ b39ent 0=  "the entropy of a phrase not taken" tchk
+0 lit txp !  0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx 0 lit tx
+tent @ tex @ 10 lit tsame "the entropy back from the phrase of 00000000..." tchk
+0 lit txp !  C5 lit tx 52 lit tx 57 lit tx C3 lit tx 60 lit tx C0 lit tx 7C lit tx 72 lit tx 2 lit tx 9A lit tx EB lit tx C1 lit tx B5 lit tx 3C lit tx 5 lit tx ED lit tx 3 lit tx 62 lit tx AD lit tx A3 lit tx 8E lit tx AD lit tx 3E lit tx 3E lit tx 9E lit tx FA lit tx 37 lit tx 8 lit tx E5 lit tx 34 lit tx 95 lit tx 53 lit tx 1F lit tx 9 lit tx A6 lit tx 98 lit tx 75 lit tx 99 lit tx D1 lit tx 82 lit tx 64 lit tx C1 lit tx E1 lit tx C9 lit tx 2F lit tx 2C lit tx F1 lit tx 41 lit tx 63 lit tx C lit tx 7A lit tx 3C lit tx 4A lit tx B7 lit tx C8 lit tx 1B lit tx 2F lit tx 0 lit tx 16 lit tx 98 lit tx E7 lit tx 46 lit tx 3B lit tx 4 lit tx
+"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" "TREZOR" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "the seed of 00000000... with TREZOR" tchk
+\ entropy 7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f
+tent @ 7F lit over 0 lit + c! 7F lit over 1 lit + c! 7F lit over 2 lit + c! 7F lit over 3 lit + c! 7F lit over 4 lit + c! 7F lit over 5 lit + c! 7F lit over 6 lit + c! 7F lit over 7 lit + c! 7F lit over 8 lit + c! 7F lit over 9 lit + c! 7F lit over A lit + c! 7F lit over B lit + c! 7F lit over C lit + c! 7F lit over D lit + c! 7F lit over E lit + c! 7F lit over F lit + c! drop
+tent @ tout @ b39phr  tout @ "legal winner thank year wave sausage worth useful legal winner thank yellow" streq "the phrase of 7f7f7f7f..." tchk
+tent @ 10 lit 0 lit do 0 lit over i + c! loop drop  "legal winner thank year wave sausage worth useful legal winner thank yellow" tent @ b39ent 0=  "the entropy of a phrase not taken" tchk
+0 lit txp !  7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx 7F lit tx
+tent @ tex @ 10 lit tsame "the entropy back from the phrase of 7f7f7f7f..." tchk
+0 lit txp !  2E lit tx 89 lit tx 5 lit tx 81 lit tx 9B lit tx 87 lit tx 23 lit tx FE lit tx 2C lit tx 1D lit tx 16 lit tx 18 lit tx 60 lit tx E5 lit tx EE lit tx 18 lit tx 30 lit tx 31 lit tx 8D lit tx BF lit tx 49 lit tx A8 lit tx 3B lit tx D4 lit tx 51 lit tx CF lit tx B8 lit tx 44 lit tx C lit tx 28 lit tx BD lit tx 6F lit tx A4 lit tx 57 lit tx FE lit tx 12 lit tx 96 lit tx 10 lit tx 65 lit tx 59 lit tx A3 lit tx C8 lit tx 9 lit tx 37 lit tx A1 lit tx C1 lit tx 6 lit tx 9B lit tx E3 lit tx A3 lit tx A5 lit tx BD lit tx 38 lit tx 1E lit tx E6 lit tx 26 lit tx E lit tx 8D lit tx 97 lit tx 39 lit tx FC lit tx E1 lit tx F6 lit tx 7 lit tx
+"legal winner thank year wave sausage worth useful legal winner thank yellow" "TREZOR" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "the seed of 7f7f7f7f... with TREZOR" tchk
+\ entropy 80808080808080808080808080808080
+tent @ 80 lit over 0 lit + c! 80 lit over 1 lit + c! 80 lit over 2 lit + c! 80 lit over 3 lit + c! 80 lit over 4 lit + c! 80 lit over 5 lit + c! 80 lit over 6 lit + c! 80 lit over 7 lit + c! 80 lit over 8 lit + c! 80 lit over 9 lit + c! 80 lit over A lit + c! 80 lit over B lit + c! 80 lit over C lit + c! 80 lit over D lit + c! 80 lit over E lit + c! 80 lit over F lit + c! drop
+tent @ tout @ b39phr  tout @ "letter advice cage absurd amount doctor acoustic avoid letter advice cage above" streq "the phrase of 80808080..." tchk
+tent @ 10 lit 0 lit do 0 lit over i + c! loop drop  "letter advice cage absurd amount doctor acoustic avoid letter advice cage above" tent @ b39ent 0=  "the entropy of a phrase not taken" tchk
+0 lit txp !  80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx 80 lit tx
+tent @ tex @ 10 lit tsame "the entropy back from the phrase of 80808080..." tchk
+0 lit txp !  D7 lit tx 1D lit tx E8 lit tx 56 lit tx F8 lit tx 1A lit tx 8A lit tx CC lit tx 65 lit tx E6 lit tx FC lit tx 85 lit tx 1A lit tx 38 lit tx D4 lit tx D7 lit tx EC lit tx 21 lit tx 6F lit tx D0 lit tx 79 lit tx 6D lit tx A lit tx 68 lit tx 27 lit tx A3 lit tx AD lit tx 6E lit tx D5 lit tx 51 lit tx 1A lit tx 30 lit tx FA lit tx 28 lit tx F lit tx 12 lit tx EB lit tx 2E lit tx 47 lit tx ED lit tx 2A lit tx C0 lit tx 3B lit tx 5C lit tx 46 lit tx 2A lit tx 3 lit tx 58 lit tx D1 lit tx 8D lit tx 69 lit tx FE lit tx 4F lit tx 98 lit tx 5E lit tx C8 lit tx 17 lit tx 78 lit tx C1 lit tx B3 lit tx 70 lit tx B6 lit tx 52 lit tx A8 lit tx
+"letter advice cage absurd amount doctor acoustic avoid letter advice cage above" "TREZOR" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "the seed of 80808080... with TREZOR" tchk
+\ entropy ffffffffffffffffffffffffffffffff
+tent @ FF lit over 0 lit + c! FF lit over 1 lit + c! FF lit over 2 lit + c! FF lit over 3 lit + c! FF lit over 4 lit + c! FF lit over 5 lit + c! FF lit over 6 lit + c! FF lit over 7 lit + c! FF lit over 8 lit + c! FF lit over 9 lit + c! FF lit over A lit + c! FF lit over B lit + c! FF lit over C lit + c! FF lit over D lit + c! FF lit over E lit + c! FF lit over F lit + c! drop
+tent @ tout @ b39phr  tout @ "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong" streq "the phrase of ffffffff..." tchk
+tent @ 10 lit 0 lit do 0 lit over i + c! loop drop  "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong" tent @ b39ent 0=  "the entropy of a phrase not taken" tchk
+0 lit txp !  FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx FF lit tx
+tent @ tex @ 10 lit tsame "the entropy back from the phrase of ffffffff..." tchk
+0 lit txp !  AC lit tx 27 lit tx 49 lit tx 54 lit tx 80 lit tx 22 lit tx 52 lit tx 22 lit tx 7 lit tx 9D lit tx 7B lit tx E1 lit tx 81 lit tx 58 lit tx 37 lit tx 51 lit tx E8 lit tx 6F lit tx 57 lit tx 10 lit tx 27 lit tx B0 lit tx 49 lit tx 7B lit tx 5B lit tx 5D lit tx 11 lit tx 21 lit tx 8E lit tx A lit tx 8A lit tx 13 lit tx 33 lit tx 25 lit tx 72 lit tx 91 lit tx 7F lit tx F lit tx 8E lit tx 5A lit tx 58 lit tx 96 lit tx 20 lit tx C6 lit tx F1 lit tx 5B lit tx 11 lit tx C6 lit tx 1D lit tx EE lit tx 32 lit tx 76 lit tx 51 lit tx A1 lit tx 4C lit tx 34 lit tx E1 lit tx 82 lit tx 31 lit tx 5 lit tx 2E lit tx 48 lit tx C0 lit tx 69 lit tx
+"zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong" "TREZOR" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "the seed of ffffffff... with TREZOR" tchk
+\ entropy 9e885d952ad362caeb4efe34a8e91bd2
+tent @ 9E lit over 0 lit + c! 88 lit over 1 lit + c! 5D lit over 2 lit + c! 95 lit over 3 lit + c! 2A lit over 4 lit + c! D3 lit over 5 lit + c! 62 lit over 6 lit + c! CA lit over 7 lit + c! EB lit over 8 lit + c! 4E lit over 9 lit + c! FE lit over A lit + c! 34 lit over B lit + c! A8 lit over C lit + c! E9 lit over D lit + c! 1B lit over E lit + c! D2 lit over F lit + c! drop
+tent @ tout @ b39phr  tout @ "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic" streq "the phrase of 9e885d95..." tchk
+tent @ 10 lit 0 lit do 0 lit over i + c! loop drop  "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic" tent @ b39ent 0=  "the entropy of a phrase not taken" tchk
+0 lit txp !  9E lit tx 88 lit tx 5D lit tx 95 lit tx 2A lit tx D3 lit tx 62 lit tx CA lit tx EB lit tx 4E lit tx FE lit tx 34 lit tx A8 lit tx E9 lit tx 1B lit tx D2 lit tx
+tent @ tex @ 10 lit tsame "the entropy back from the phrase of 9e885d95..." tchk
+0 lit txp !  27 lit tx 4D lit tx DC lit tx 52 lit tx 58 lit tx 2 lit tx F7 lit tx C8 lit tx 28 lit tx D8 lit tx EF lit tx 7D lit tx DB lit tx CD lit tx C5 lit tx 30 lit tx 4E lit tx 87 lit tx AC lit tx 35 lit tx 35 lit tx 91 lit tx 36 lit tx 11 lit tx FB lit tx BF lit tx A9 lit tx 86 lit tx D0 lit tx C9 lit tx E5 lit tx 47 lit tx 6C lit tx 91 lit tx 68 lit tx 9F lit tx 9C lit tx 8A lit tx 54 lit tx FD lit tx 55 lit tx BD lit tx 38 lit tx 60 lit tx 6A lit tx A6 lit tx A8 lit tx 59 lit tx 5A lit tx D2 lit tx 13 lit tx D4 lit tx C9 lit tx C9 lit tx F9 lit tx AC lit tx A3 lit tx FB lit tx 21 lit tx 70 lit tx 69 lit tx A4 lit tx 10 lit tx 28 lit tx
+"ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic" "TREZOR" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "the seed of 9e885d95... with TREZOR" tchk
+0 lit txp !  E2 lit tx F8 lit tx 8A lit tx 4 lit tx 37 lit tx 76 lit tx C8 lit tx 28 lit tx 6 lit tx 3D lit tx 4C lit tx 3C lit tx 97 lit tx 17 lit tx 39 lit tx 44 lit tx D3 lit tx 2C lit tx F8 lit tx 47 lit tx A9 lit tx 25 lit tx B6 lit tx E4 lit tx B lit tx B lit tx 8B lit tx D0 lit tx B4 lit tx BE lit tx AD lit tx 3B lit tx A7 lit tx 34 lit tx BD lit tx DA lit tx 52 lit tx 50 lit tx D4 lit tx 69 lit tx 8B lit tx 31 lit tx A lit tx 71 lit tx C9 lit tx 93 lit tx 4E lit tx 1A lit tx 48 lit tx E5 lit tx 62 lit tx 31 lit tx 5C lit tx E2 lit tx 2B lit tx F8 lit tx 5F lit tx 89 lit tx 45 lit tx 9D lit tx F0 lit tx E7 lit tx 3A lit tx 6C lit tx
+"ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic" "" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "a seed with no passphrase" tchk
+"  OZONE drill grab FIBER curtain	 grace PUDDING thank cruise ELDER eight picnic  " "" tout @ b39seed 0=  tout @ tex @ 40 lit tsame and  "a phrase in mixed case and spacing not taken as the same" tchk
+"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon" tent @ b39ent FFFFFFFF lit =  "11 words not refused (-1)" tchk
+"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandonx" tent @ b39ent FFFFFFFE lit =  "a word not in the list not refused (-2)" tchk
+"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon" tent @ b39ent FFFFFFFD lit =  "a wrong checksum not refused (-3)" tchk
+"bip39: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+0 lit exit

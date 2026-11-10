@@ -1,0 +1,68 @@
+\ crypto/sha256.fam — SHA-256 (BIP39's checksum: the wallet,
+\ docs/GUI_WALLET.md).  Plain fam: a phrase's checksum is one block, so
+\ speed does not matter here.  A module (`\ uses: crypto/sha256.fam`).
+\
+\ sha256 ( src len -- )  the digest of len bytes at src, at h2d (32).
+
+: h2k variable ;  : h2s variable ;  : h2w variable ;  : h2iv variable ;  : h2b variable ;  : h2d variable ;
+: h2n variable ;  : h2t variable ;
+: h2a variable ;  : h2bb variable ;  : h2c variable ;  : h2dd variable ;  : h2e variable ;  : h2f variable ;  : h2g variable ;  : h2h variable ;
+
+: h2ror  2dup rshift -rot 20 lit swap - lshift or ;            \ ( x n -- x' )  rotated right
+: h2be@  dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or swap 3 lit + c@ or ;
+: h2be!  over 18 lit rshift over c!  over 10 lit rshift over 1 lit + c!  over 8 lit rshift over 2 lit + c!  3 lit + c! ;
+: h2+!  dup @ rot + swap ! ;                                   \ ( x a -- )  added in
+: h2k!  2 lit lshift h2k @ + ! ;                               \ ( x i -- )
+: h2i!  2 lit lshift h2iv @ + ! ;
+: h2wi  2 lit lshift h2w @ + ;                                 \ ( i -- a )
+: h2init
+h2k @ 0= if
+	100 lit alloc h2k !  20 lit alloc h2s !  100 lit alloc h2w !  20 lit alloc h2iv !  80 lit alloc h2b !  20 lit alloc h2d !
+	428A2F98 lit 0 lit h2k!  71374491 lit 1 lit h2k!  B5C0FBCF lit 2 lit h2k!  E9B5DBA5 lit 3 lit h2k!  3956C25B lit 4 lit h2k!  59F111F1 lit 5 lit h2k!  923F82A4 lit 6 lit h2k!  AB1C5ED5 lit 7 lit h2k!
+	D807AA98 lit 8 lit h2k!  12835B01 lit 9 lit h2k!  243185BE lit A lit h2k!  550C7DC3 lit B lit h2k!  72BE5D74 lit C lit h2k!  80DEB1FE lit D lit h2k!  9BDC06A7 lit E lit h2k!  C19BF174 lit F lit h2k!
+	E49B69C1 lit 10 lit h2k!  EFBE4786 lit 11 lit h2k!  FC19DC6 lit 12 lit h2k!  240CA1CC lit 13 lit h2k!  2DE92C6F lit 14 lit h2k!  4A7484AA lit 15 lit h2k!  5CB0A9DC lit 16 lit h2k!  76F988DA lit 17 lit h2k!
+	983E5152 lit 18 lit h2k!  A831C66D lit 19 lit h2k!  B00327C8 lit 1A lit h2k!  BF597FC7 lit 1B lit h2k!  C6E00BF3 lit 1C lit h2k!  D5A79147 lit 1D lit h2k!  6CA6351 lit 1E lit h2k!  14292967 lit 1F lit h2k!
+	27B70A85 lit 20 lit h2k!  2E1B2138 lit 21 lit h2k!  4D2C6DFC lit 22 lit h2k!  53380D13 lit 23 lit h2k!  650A7354 lit 24 lit h2k!  766A0ABB lit 25 lit h2k!  81C2C92E lit 26 lit h2k!  92722C85 lit 27 lit h2k!
+	A2BFE8A1 lit 28 lit h2k!  A81A664B lit 29 lit h2k!  C24B8B70 lit 2A lit h2k!  C76C51A3 lit 2B lit h2k!  D192E819 lit 2C lit h2k!  D6990624 lit 2D lit h2k!  F40E3585 lit 2E lit h2k!  106AA070 lit 2F lit h2k!
+	19A4C116 lit 30 lit h2k!  1E376C08 lit 31 lit h2k!  2748774C lit 32 lit h2k!  34B0BCB5 lit 33 lit h2k!  391C0CB3 lit 34 lit h2k!  4ED8AA4A lit 35 lit h2k!  5B9CCA4F lit 36 lit h2k!  682E6FF3 lit 37 lit h2k!
+	748F82EE lit 38 lit h2k!  78A5636F lit 39 lit h2k!  84C87814 lit 3A lit h2k!  8CC70208 lit 3B lit h2k!  90BEFFFA lit 3C lit h2k!  A4506CEB lit 3D lit h2k!  BEF9A3F7 lit 3E lit h2k!  C67178F2 lit 3F lit h2k!
+	6A09E667 lit 0 lit h2i!  BB67AE85 lit 1 lit h2i!  3C6EF372 lit 2 lit h2i!  A54FF53A lit 3 lit h2i!  510E527F lit 4 lit h2i!  9B05688C lit 5 lit h2i!  1F83D9AB lit 6 lit h2i!  5BE0CD19 lit 7 lit h2i!
+then ;
+
+\ h2blk ( blk -- )  one 64-byte block into the state.
+: h2blk
+10 lit 0 lit do dup i 2 lit lshift + h2be@ i h2wi ! loop drop
+40 lit 10 lit do
+	i 2 lit - h2wi @  dup 11 lit h2ror over 13 lit h2ror xor swap A lit rshift xor
+	i 7 lit - h2wi @ +
+	i F lit - h2wi @  dup 7 lit h2ror over 12 lit h2ror xor swap 3 lit rshift xor +
+	i 10 lit - h2wi @ +  i h2wi !
+loop
+h2s @ @ h2a !  h2s @ 4 lit + @ h2bb !  h2s @ 8 lit + @ h2c !  h2s @ C lit + @ h2dd !
+h2s @ 10 lit + @ h2e !  h2s @ 14 lit + @ h2f !  h2s @ 18 lit + @ h2g !  h2s @ 1C lit + @ h2h !
+40 lit 0 lit do
+	\ T1 = h + S1(e) + Ch(e, f, g) + K + W
+	h2h @  h2e @ dup 6 lit h2ror over B lit h2ror xor swap 19 lit h2ror xor +
+	h2e @ h2f @ and  h2e @ invert h2g @ and xor +
+	i 2 lit lshift h2k @ + @ +  i h2wi @ +
+	\ T2 = S0(a) + Maj(a, b, c)
+	h2a @ dup 2 lit h2ror over D lit h2ror xor swap 16 lit h2ror xor
+	h2a @ h2bb @ and  h2a @ h2c @ and xor  h2bb @ h2c @ and xor +
+	h2g @ h2h !  h2f @ h2g !  h2e @ h2f !  over h2dd @ + h2e !
+	h2c @ h2dd !  h2bb @ h2c !  h2a @ h2bb !  + h2a !
+loop
+h2a @ h2s @ h2+!  h2bb @ h2s @ 4 lit + h2+!  h2c @ h2s @ 8 lit + h2+!  h2dd @ h2s @ C lit + h2+!
+h2e @ h2s @ 10 lit + h2+!  h2f @ h2s @ 14 lit + h2+!  h2g @ h2s @ 18 lit + h2+!  h2h @ h2s @ 1C lit + h2+! ;
+
+: sha256
+h2init  h2iv @ h2s @ 20 lit 0 lit do over i + c@ over i + c! loop 2drop
+dup h2t !  h2n !
+begin h2n @ 40 lit u< 0= while dup h2blk 40 lit +  h2n @ 40 lit - h2n ! repeat
+h2b @ 80 lit 0 lit do 0 lit over i + c! loop drop
+h2n @ ?dup if 0 lit do dup i + c@ h2b @ i + c! loop then drop
+80 lit h2b @ h2n @ + c!
+h2n @ 9 lit + 40 lit u> if 80 lit else 40 lit then
+h2t @ 1D lit rshift  over 8 lit - h2b @ + h2be!
+h2t @ 3 lit lshift  over 4 lit - h2b @ + h2be!
+h2b @ h2blk  80 lit = if h2b @ 40 lit + h2blk then
+8 lit 0 lit do h2s @ i 2 lit lshift + @ h2d @ i 2 lit lshift + h2be! loop ;

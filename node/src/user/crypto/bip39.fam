@@ -1,0 +1,119 @@
+\ crypto/bip39.fam — BIP39 phrases (docs/GUI_WALLET.md), as tabminer's
+\ miner/src/bip39.rs: 12 words from the standard English list (/lib/bip39,
+\ resources/bip39-english.txt in the image), 11 bits each: 16 bytes of
+\ entropy and a 4-bit checksum (the first bits of its SHA-256); the
+\ 64-byte seed PBKDF2-HMAC-SHA512(phrase, "mnemonic" || passphrase,
+\ 2,048).  A phrase is taken whatever its case and spacing (normalized:
+\ lower case, single spaces).  After crypto/sha512.fam and
+\ crypto/sha256.fam.
+\
+\ b39load ( -- flag )  the word list read (once).
+\ b39phr ( ent dst -- )  the phrase of 16 bytes at ent, NUL-ended.
+\ b39ent ( phrase ent -- code )  its entropy at ent: 0, or -1 not 12
+\ words, -2 a word not in the list, -3 the checksum wrong.
+\ b39seed ( phrase pass dst -- code )  its seed (64 bytes) at dst; the code
+\ as b39ent's (the phrase checked first).
+
+: b3l variable ;  : b3w variable ;  : b3e variable ;  : b3n variable ;  : b3t variable ;  : b3p variable ;
+: b3q variable ;  : b3lo variable ;  : b3hi variable ;  : b3k variable ;  : b3c variable ;  : b3s variable ;
+: b3wd  2 lit lshift b3w @ + @ ;                          \ ( i -- s )  word i
+\ cmovb ( src dst n -- )  n bytes copied.
+: cmovb  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;
+: b3load
+b3w @ 0= if
+	"/lib/bip39" 0 lit open dup 0< if drop 0 lit else
+		4000 lit alloc b3l !  2000 lit alloc b3w !  80 lit alloc b3t !  14 lit alloc b3e !  100 lit alloc b3s !
+		0 lit begin
+			over b3l @ 2 lit pick + 3FFF lit 3 lit pick - read
+			dup 0 lit > while +
+		repeat drop  b3l @ + 0 lit swap c!  close drop
+		\ the lines: each word's start, its end a NUL
+		b3l @ 0 lit b3n !
+		begin dup c@ b3n @ 800 lit u< and while
+			dup b3n @ 2 lit lshift b3w @ + !  b3n @ 1 lit + b3n !
+			begin dup c@ dup A lit <> swap D lit <> and over c@ and while 1 lit + repeat
+			begin dup c@ dup A lit = swap D lit = or while 0 lit over c! 1 lit + repeat
+		repeat drop
+	then
+then
+b3w @ 0= 0= b3n @ 800 lit = and ;
+: b39load  b3load ;
+
+\ b3cmp ( a b -- n )  strcmp's sign.
+: b3cmp
+begin over c@ over c@ = over c@ and while 1 lit + swap 1 lit + swap repeat
+c@ swap c@ swap - ;
+\ b3find ( s -- i | -1 )  a word's place in the list.
+: b3find
+b3k !  0 lit b3lo !  800 lit b3hi !  FFFFFFFF lit
+begin b3lo @ b3hi @ u< while
+	b3lo @ b3hi @ + 1 lit rshift
+	dup b3wd b3k @ swap b3cmp  dup 0= if drop nip dup b3lo ! dup b3hi ! else
+	0< if b3hi ! else 1 lit + b3lo ! then then
+repeat ;
+
+\ b3bit ( i -- b )  bit i of the 17 bytes at b3e (most significant first).
+: b3bit  dup 3 lit rshift b3e @ + c@  swap 7 lit and 7 lit swap - rshift 1 lit and ;
+: b3set  dup 3 lit rshift b3e @ +  swap 7 lit and 7 lit swap - 1 lit swap lshift  over c@ or swap c! ;   \ ( i -- )
+
+: b39phr
+b3p !  b3e @ 10 lit cmovb
+b3e @ 10 lit sha256  h2d @ c@ F0 lit and b3e @ 10 lit + c!
+C lit 0 lit do
+	0 lit  B lit 0 lit do 1 lit lshift  j B lit * i + b3bit or loop
+	i if 20 lit b3p @ c!  b3p @ 1 lit + b3p ! then
+	b3wd b3p @ swap scpy b3p !
+loop
+0 lit b3p @ c! ;
+
+\ b3ws? ( c -- flag )  whitespace.
+: b3bad variable ;
+: b3ws?  dup 20 lit = over 9 lit = or over A lit = or swap D lit = or ;
+\ b3norm ( phrase -- n )  the phrase's words, lower case, at b3s, single
+\ spaces between, NUL-ended; how many (as tabminer's normalize).
+: b3norm
+b3q !  b3s @ b3p !  0 lit b3n !
+begin
+	begin b3q @ c@ dup b3ws? and while b3q @ 1 lit + b3q ! repeat
+	b3q @ c@
+while
+	b3n @ if 20 lit b3p @ c!  b3p @ 1 lit + b3p ! then
+	begin b3q @ c@ dup b3ws? 0= and  b3p @ b3s @ - FE lit u< and while
+		b3q @ c@ dup 41 lit - 1A lit u< if 20 lit or then b3p @ c!  b3p @ 1 lit + b3p !  b3q @ 1 lit + b3q !
+	repeat
+	\ (a word past the room: the rest of it skipped)
+	begin b3q @ c@ dup b3ws? 0= and while b3q @ 1 lit + b3q ! repeat
+	b3n @ 1 lit + b3n !
+repeat
+0 lit b3p @ c!  b3n @ ;
+: b39ent
+b3c !  b3load drop
+b3norm C lit <> if FFFFFFFF lit else
+	b3e @ 14 lit 0 lit do 0 lit over i + c! loop drop
+	0 lit b3bad !  b3s @ b3q !
+	C lit 0 lit do
+		\ the word, copied out and looked up
+		b3t @ b3p !
+		begin b3q @ c@ dup 20 lit <> and while b3q @ c@ b3p @ c!  b3p @ 1 lit + b3p !  b3q @ 1 lit + b3q ! repeat
+		0 lit b3p @ c!  b3q @ c@ if b3q @ 1 lit + b3q ! then
+		b3t @ b3find dup 0< if drop 1 lit b3bad ! 0 lit then
+		B lit 0 lit do dup A lit i - rshift 1 lit and if j B lit * i + b3set then loop drop
+	loop
+	b3bad @ if FFFFFFFE lit else
+		b3e @ 10 lit sha256  h2d @ c@ F0 lit and  b3e @ 10 lit + c@ = if
+			b3e @ b3c @ 10 lit cmovb  0 lit
+		else FFFFFFFD lit then
+	then
+then ;
+: b3pp variable ;  : b3dst variable ;  : b3sl variable ;  : b3x variable ;  : b3salt variable ;
+: b39seed
+b3dst !  b3pp !
+b3load drop  b3x @ 0= if 10 lit alloc b3x !  100 lit alloc b3salt ! then
+b3x @ b39ent
+dup 0= if
+	drop
+	\ the phrase normalized (at b3s, by b39ent); the salt "mnemonic" || pass
+	b3salt @ "mnemonic" scpy b3pp @ scpy b3salt @ - b3sl !
+	b3s @ dup strlen b3salt @ b3sl @ 800 lit b3dst @ 40 lit pbkdf512
+	0 lit
+then ;
