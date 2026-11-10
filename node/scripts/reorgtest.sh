@@ -44,7 +44,7 @@ minerp() {
 }
 minerb() {
 	TABMINER_THREADS=${TABMINER_THREADS:-4} "$MINER" mine --network dev-recursive --data "$T/b" --no-seeds \
-		--listen 127.0.0.1:$PB --no-prompt >> "$T/b.out" 2>&1 &
+		--listen 127.0.0.1:$PB --no-prompt "$@" >> "$T/b.out" 2>&1 &
 	BP=$!
 }
 stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null || true; }
@@ -99,6 +99,12 @@ wait $AP 2>/dev/null || true; AP=
 echo "reorgtest.sh: A stopped at $a; B mining its own branch from 6 to $((a + 2))"
 minerb
 wait_for "$T/b.out" "is the tip at height $((a + 2))\$" 600 "B's branch"
+# B's branch fixed from here (B serving, not mining): the waits below see
+# a stall as one (B's mining kept the logs growing, so a reorganization
+# that never came was waited for until CI's limit), and the burn is not
+# mined on B's branch.
+stop $BP; BP=
+minerb --no-mine
 echo "reorgtest.sh: A again, not mining, B its peer"
 minera --no-mine --peer 127.0.0.1:$PB
 wait_for "$T/a.out" 'reorganized onto' 300 "A reorganizing"

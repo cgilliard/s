@@ -207,9 +207,12 @@ jobs:
           path: .
       - run: chmod +x ../miner/target/release/tabminer
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+      # (its own limit below the job's, so a stall fails the step and the
+      # logs below are printed: a cancelled job prints nothing)
       - run: sh scripts/${{ matrix.script }}.sh
+        timeout-minutes: 50
       - name: its logs, if it failed
-        if: failure()
+        if: failure() || cancelled()
         run: for f in $(find tmp -name '*.out' -o -name '*.log' | head -20); do echo "== $f"; tail -40 "$f"; done
 
   # Every test marked slow has a job above.
