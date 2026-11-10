@@ -1,0 +1,85 @@
+\ crypto/dilithium_test.fam — crypto/keccak.fam and crypto/dilithium.fam
+\ against tabminer (crypto/dilithium_vectors.fam, written by
+\ miner/src/fam_dilithium_vectors.rs): SHAKE128, SHAKE256, SHA3-256 and
+\ SHA3-512 of inputs across the rates, one absorbed and squeezed in
+\ pieces; then for each Dilithium case the keys of its seed (their hashes
+\ tabminer's), its signature (likewise), and the verdicts on it as signed
+\ and changed (tampered signatures, another message, context or key), each
+\ tabminer's.  Prints each case's times (ms: key generation, signing, the
+\ first verification), then "dilithium: N as expected, M not".
+\ uses: crypto/keccak.fam crypto/dilithium.fam crypto/dilithium_vectors.fam
+
+: tpas variable ;  : tfai variable ;  : tin variable ;  : tout variable ;  : tpks variable ;  : tsk variable ;
+: tsig variable ;  : th variable ;  : tppk variable ;  : tt variable ;  : tdk variable ;  : tds variable ;
+: tdv variable ;  : tvd variable ;  : tcln variable ;  : tcas variable ;  : tm variable ;  : tc variable ;
+: tcl variable ;
+: tchk  swap if drop tpas @ 1 lit + tpas ! else "dilithium: " puts puts 0A lit putc tfai @ 1 lit + tfai ! then ;   \ ( flag str -- )
+: tsame  FFFFFFFF lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+\ tclk ( -- t )  the time register's low word (10 MHz on QEMU's virt board).
+: tclk
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+: tms  tclk tt @ - 2710 lit / ;                      \ ( -- ms )  since tt
+: tflip  dup c@ tc @ xor swap c! ;                   \ ( a -- )  the byte xored with tc
+\ thsh ( src len -- flag )  its SHAKE256-256 against the 32 bytes at th.
+: thsh  tout @ 20 lit shake256  tout @ th @ 20 lit tsame ;
+
+dvbufs
+200 lit alloc tin !  100 lit alloc tout !  2000 lit alloc tpks !  1000 lit alloc tsk !  D00 lit alloc tsig !
+20 lit alloc th !  7A0 lit alloc tppk !
+
+\ the hashes
+dvkn 0 lit do
+	i dvk
+	dvkl @ ?dup if 0 lit do i 7 lit * 1 lit + tin @ i + c! loop then
+	dvkf @ 0= if tin @ dvkl @ tout @ dvko @ shake128 then
+	dvkf @ 1 lit = if tin @ dvkl @ tout @ dvko @ shake256 then
+	dvkf @ 2 lit = if tin @ dvkl @ tout @ sha3256 then
+	dvkf @ 3 lit = if tin @ dvkl @ tout @ sha3512 then
+	tout @ dvkx @ dvko @ tsame "a hash" tchk
+	\ the 300 bytes' SHAKE128 again, in pieces
+	dvkf @ 0= dvkl @ 12C lit = and if
+		A8 lit 1F lit kcinit  tin @ 64 lit kcabs  tin @ 64 lit + 0 lit kcabs  tin @ 64 lit + C8 lit kcabs
+		tout @ 1 lit kcsqz  tout @ 1 lit + 7 lit kcsqz  tout @ 8 lit + A0 lit kcsqz  tout @ A8 lit + 20 lit kcsqz
+		tout @ dvkx @ C8 lit tsame "SHAKE128 in pieces" tchk
+	then
+loop
+
+\ the public keys of every case first (a case's checks use the one before's)
+dvn 0 lit do
+	i dvset
+	dvsd @  tpks @ i 7A0 lit * +  tsk @  dilkey
+	dvpkh @ th @ 20 lit dlbc  tpks @ i 7A0 lit * + 7A0 lit thsh "a public key" tchk
+	dvskh @ th @ 20 lit dlbc  tsk @ FC0 lit thsh "a secret key" tchk
+loop
+dvn 0 lit do
+	i dvset  i tcas !
+	\ the keys again (timed), the signature
+	tclk tt !  dvsd @ tppk @ tsk @ dilkey  tms tdk !
+	tclk tt !  tsk @ dvmsg @ dvml @ dvctx @ dvcl @ tsig @ dilsign  tms tds !
+	dvsgh @ th @ 20 lit dlbc  tsig @ CED lit thsh "a signature" tchk
+	dvtn @ 0 lit do
+		i 4 lit lshift dvt @ + dup @ tm !  dup 4 lit + @ tcl !  dup 8 lit + @ tc !  C lit + @ tvd !
+		\ the inputs changed as the check says: kind tm, a tcl, b tc
+		tcas @ 7A0 lit * tpks @ + tppk @ 7A0 lit dlbc
+		tm @ 6 lit = if tcas @ dvn + 1 lit - dvn % 7A0 lit * tpks @ + tppk @ 7A0 lit dlbc then
+		tm @ 5 lit = if tppk @ tcl @ + tflip then
+		tm @ 1 lit = if tsig @ tcl @ + tflip then
+		tm @ 2 lit = if dvmsg @ tcl @ + tflip then
+		tm @ 3 lit = if dvctx @ tcl @ + tflip then
+		dvcl @ tcln !  tm @ 4 lit = if tc @ dvctx @ dvcl @ + c!  dvcl @ 1 lit + tcln ! then
+		i 0= if tclk tt ! then
+		tppk @ dvmsg @ dvml @ dvctx @ tcln @ tsig @ dilver
+		i 0= if tms tdv ! then
+		tvd @ = "a verdict" tchk
+		\ and back
+		tm @ 1 lit = if tsig @ tcl @ + tflip then
+		tm @ 2 lit = if dvmsg @ tcl @ + tflip then
+		tm @ 3 lit = if dvctx @ tcl @ + tflip then
+	loop
+	"dilithium: case " puts tcas @ u. ": keygen " puts tdk @ u. " ms, sign " puts tds @ u. " ms, verify " puts tdv @ u. " ms" puts 0A lit putc
+loop
+"dilithium: " puts tpas @ u. " as expected, " puts tfai @ u. " not" puts 0A lit putc
+0 lit exit

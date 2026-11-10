@@ -1,0 +1,509 @@
+\ crypto/dilithium_vectors.fam — tabminer's values for crypto/keccak.fam and
+\ crypto/dilithium.fam (docs/GUI_WALLET.md, phase 1).  Written by
+\ miner/src/fam_dilithium_vectors.rs (`cargo test --release --features dev
+\ --lib write_fam_dilithium_vectors -- --ignored`); not to be edited.  Read by
+\ crypto/dilithium_test.fam.
+\
+\ dvkn ( -- n )  the hash cases; dvk ( i -- )  case i: dvkf the function
+\ (0 SHAKE128, 1 SHAKE256, 2 SHA3-256, 3 SHA3-512), dvkl the input's
+\ length (byte j of it 7j+1), dvko the output's, its bytes at dvkx.
+\ dvn ( -- n )  the Dilithium cases; dvset ( i -- )  case i: the seed at
+\ dvsd (32), the message at dvmsg (dvml bytes), the context at dvctx
+\ (dvcl), SHAKE256-256 of the public key, secret key and signature at
+\ dvpkh dvskh dvsgh, and the checks at dvt (dvtn of them, four words
+\ each: kind, a, b, tabminer's verdict -1 or 0; the kinds as
+\ fam_dilithium_vectors.rs's checks).
+
+: dvp variable ;  : dvkf variable ;  : dvkl variable ;  : dvko variable ;  : dvkx variable ;
+: dvsd variable ;  : dvmsg variable ;  : dvml variable ;  : dvctx variable ;  : dvcl variable ;
+: dvpkh variable ;  : dvskh variable ;  : dvsgh variable ;  : dvt variable ;  : dvtn variable ;
+: dvc  dvp @ c!  dvp @ 1 lit + dvp ! ;
+: dvbufs
+dvkx @ 0= if
+	100 lit alloc dvkx !  20 lit alloc dvsd !  100 lit alloc dvmsg !  110 lit alloc dvctx !
+	20 lit alloc dvpkh !  20 lit alloc dvskh !  20 lit alloc dvsgh !  200 lit alloc dvt !
+then ;
+: dvck  dvtn @ 4 lit lshift dvt @ + tuck C lit + !  tuck 8 lit + !  tuck 4 lit + !  !  dvtn @ 1 lit + dvtn ! ;   \ ( kind a b verdict -- )
+
+: dvh0
+0 lit dvkf !  0 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+7F lit dvc 9C lit dvc 2B lit dvc A4 lit dvc E8 lit dvc 8F lit dvc 82 lit dvc 7D lit dvc 61 lit dvc 60 lit dvc 45 lit dvc 50 lit dvc 76 lit dvc 5 lit dvc 85 lit dvc 3E lit dvc D7 lit dvc 3B lit dvc 80 lit dvc 93 lit dvc F6 lit dvc EF lit dvc BC lit dvc 88 lit dvc
+EB lit dvc 1A lit dvc 6E lit dvc AC lit dvc FA lit dvc 66 lit dvc EF lit dvc 26 lit dvc 3C lit dvc B1 lit dvc EE lit dvc A9 lit dvc 88 lit dvc 0 lit dvc 4B lit dvc 93 lit dvc 10 lit dvc 3C lit dvc FB lit dvc A lit dvc EE lit dvc FD lit dvc 2A lit dvc 68 lit dvc
+6E lit dvc 1 lit dvc FA lit dvc 4A lit dvc 58 lit dvc E8 lit dvc A3 lit dvc 63 lit dvc 9C lit dvc A8 lit dvc A1 lit dvc E3 lit dvc F9 lit dvc AE lit dvc 57 lit dvc E2 lit dvc 35 lit dvc B8 lit dvc CC lit dvc 87 lit dvc 3C lit dvc 23 lit dvc DC lit dvc 62 lit dvc
+B8 lit dvc D2 lit dvc 60 lit dvc 16 lit dvc 9A lit dvc FA lit dvc 2F lit dvc 75 lit dvc AB lit dvc 91 lit dvc 6A lit dvc 58 lit dvc D9 lit dvc 74 lit dvc 91 lit dvc 88 lit dvc 35 lit dvc D2 lit dvc 5E lit dvc 6A lit dvc 43 lit dvc 50 lit dvc 85 lit dvc B2 lit dvc
+BA lit dvc DF lit dvc D6 lit dvc DF lit dvc AA lit dvc C3 lit dvc 59 lit dvc A5 lit dvc EF lit dvc BB lit dvc 7B lit dvc CC lit dvc 4B lit dvc 59 lit dvc D5 lit dvc 38 lit dvc DF lit dvc 9A lit dvc 4 lit dvc 30 lit dvc 2E lit dvc 10 lit dvc C8 lit dvc BC lit dvc
+1C lit dvc BF lit dvc 1A lit dvc B lit dvc 3A lit dvc 51 lit dvc 20 lit dvc EA lit dvc 17 lit dvc CD lit dvc A7 lit dvc CF lit dvc AD lit dvc 76 lit dvc 5F lit dvc 56 lit dvc 23 lit dvc 47 lit dvc 4D lit dvc 36 lit dvc 8C lit dvc CC lit dvc A8 lit dvc AF lit dvc
+0 lit dvc 7 lit dvc CD lit dvc 9F lit dvc 5E lit dvc 4C lit dvc 84 lit dvc 9F lit dvc 16 lit dvc 7A lit dvc 58 lit dvc B lit dvc 14 lit dvc AA lit dvc BD lit dvc EF lit dvc AE lit dvc E7 lit dvc EE lit dvc F4 lit dvc 7C lit dvc B0 lit dvc FC lit dvc A9 lit dvc
+76 lit dvc 7B lit dvc E1 lit dvc FD lit dvc A6 lit dvc 94 lit dvc 19 lit dvc DF lit dvc B9 lit dvc 27 lit dvc E9 lit dvc DF lit dvc 7 lit dvc 34 lit dvc 8B lit dvc 19 lit dvc 66 lit dvc 91 lit dvc AB lit dvc AE lit dvc B5 lit dvc 80 lit dvc B3 lit dvc 2D lit dvc
+EF lit dvc 58 lit dvc 53 lit dvc 8B lit dvc 8D lit dvc 23 lit dvc F8 lit dvc 77 lit dvc
+;
+: dvh1
+1 lit dvkf !  0 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+46 lit dvc B9 lit dvc DD lit dvc 2B lit dvc B lit dvc A8 lit dvc 8D lit dvc 13 lit dvc 23 lit dvc 3B lit dvc 3F lit dvc EB lit dvc 74 lit dvc 3E lit dvc EB lit dvc 24 lit dvc 3F lit dvc CD lit dvc 52 lit dvc EA lit dvc 62 lit dvc B8 lit dvc 1B lit dvc 82 lit dvc
+B5 lit dvc C lit dvc 27 lit dvc 64 lit dvc 6E lit dvc D5 lit dvc 76 lit dvc 2F lit dvc D7 lit dvc 5D lit dvc C4 lit dvc DD lit dvc D8 lit dvc C0 lit dvc F2 lit dvc 0 lit dvc CB lit dvc 5 lit dvc 1 lit dvc 9D lit dvc 67 lit dvc B5 lit dvc 92 lit dvc F6 lit dvc
+FC lit dvc 82 lit dvc 1C lit dvc 49 lit dvc 47 lit dvc 9A lit dvc B4 lit dvc 86 lit dvc 40 lit dvc 29 lit dvc 2E lit dvc AC lit dvc B3 lit dvc B7 lit dvc C4 lit dvc BE lit dvc 14 lit dvc 1E lit dvc 96 lit dvc 61 lit dvc 6F lit dvc B1 lit dvc 39 lit dvc 57 lit dvc
+69 lit dvc 2C lit dvc C7 lit dvc ED lit dvc D0 lit dvc B4 lit dvc 5A lit dvc E3 lit dvc DC lit dvc 7 lit dvc 22 lit dvc 3C lit dvc 8E lit dvc 92 lit dvc 93 lit dvc 7B lit dvc EF lit dvc 84 lit dvc BC lit dvc E lit dvc AB lit dvc 86 lit dvc 28 lit dvc 53 lit dvc
+34 lit dvc 9E lit dvc C7 lit dvc 55 lit dvc 46 lit dvc F5 lit dvc 8F lit dvc B7 lit dvc C2 lit dvc 77 lit dvc 5C lit dvc 38 lit dvc 46 lit dvc 2C lit dvc 50 lit dvc 10 lit dvc D8 lit dvc 46 lit dvc C1 lit dvc 85 lit dvc C1 lit dvc 51 lit dvc 11 lit dvc E5 lit dvc
+95 lit dvc 52 lit dvc 2A lit dvc 6B lit dvc CD lit dvc 16 lit dvc CF lit dvc 86 lit dvc F3 lit dvc D1 lit dvc 22 lit dvc 10 lit dvc 9E lit dvc 3B lit dvc 1F lit dvc DD lit dvc 94 lit dvc 3B lit dvc 6A lit dvc EC lit dvc 46 lit dvc 8A lit dvc 2D lit dvc 62 lit dvc
+1A lit dvc 7C lit dvc 6 lit dvc C6 lit dvc A9 lit dvc 57 lit dvc C6 lit dvc 2B lit dvc 54 lit dvc DA lit dvc FC lit dvc 3B lit dvc E8 lit dvc 75 lit dvc 67 lit dvc D6 lit dvc 77 lit dvc 23 lit dvc 13 lit dvc 95 lit dvc F6 lit dvc 14 lit dvc 72 lit dvc 93 lit dvc
+B6 lit dvc 8C lit dvc EA lit dvc B7 lit dvc A9 lit dvc E0 lit dvc C5 lit dvc 8D lit dvc 86 lit dvc 4E lit dvc 8E lit dvc FD lit dvc E4 lit dvc E1 lit dvc B9 lit dvc A4 lit dvc 6C lit dvc BE lit dvc 85 lit dvc 47 lit dvc 13 lit dvc 67 lit dvc 2F lit dvc 5C lit dvc
+AA lit dvc AE lit dvc 31 lit dvc 4E lit dvc D9 lit dvc 8 lit dvc 3D lit dvc AB lit dvc
+;
+: dvh2
+0 lit dvkf !  3 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+75 lit dvc 49 lit dvc 7D lit dvc 40 lit dvc 83 lit dvc B4 lit dvc 8F lit dvc 80 lit dvc E4 lit dvc 89 lit dvc 45 lit dvc 49 lit dvc 9C lit dvc 9A lit dvc 20 lit dvc 3D lit dvc 3D lit dvc 5D lit dvc B1 lit dvc E7 lit dvc 3C lit dvc 5B lit dvc EE lit dvc 3A lit dvc
+86 lit dvc A5 lit dvc 7 lit dvc 38 lit dvc DE lit dvc 1A lit dvc C3 lit dvc D2 lit dvc 64 lit dvc C2 lit dvc 8C lit dvc 40 lit dvc 42 lit dvc AE lit dvc FE lit dvc A1 lit dvc 32 lit dvc C lit dvc 4E lit dvc 6 lit dvc 40 lit dvc D5 lit dvc 56 lit dvc 89 lit dvc
+88 lit dvc E6 lit dvc E6 lit dvc 9E lit dvc 61 lit dvc 83 lit dvc F9 lit dvc F5 lit dvc 26 lit dvc 2E lit dvc 17 lit dvc 15 lit dvc B3 lit dvc 39 lit dvc 89 lit dvc 64 lit dvc 15 lit dvc 29 lit dvc 87 lit dvc 12 lit dvc 3A lit dvc DB lit dvc 41 lit dvc 4D lit dvc
+5C lit dvc 7 lit dvc B1 lit dvc 26 lit dvc D1 lit dvc 28 lit dvc F0 lit dvc DC lit dvc 75 lit dvc C6 lit dvc 99 lit dvc 1 lit dvc 64 lit dvc 4F lit dvc 9A lit dvc 87 lit dvc 77 lit dvc 60 lit dvc DF lit dvc 89 lit dvc 80 lit dvc 50 lit dvc A7 lit dvc 56 lit dvc
+71 lit dvc 91 lit dvc 34 lit dvc FB lit dvc 2D lit dvc 21 lit dvc 30 lit dvc 51 lit dvc 4C lit dvc 36 lit dvc 63 lit dvc AA lit dvc 3E lit dvc 3E lit dvc C7 lit dvc E7 lit dvc 7A lit dvc 11 lit dvc FB lit dvc 1 lit dvc 87 lit dvc 4D lit dvc 7E lit dvc 78 lit dvc
+7A lit dvc 6C lit dvc 7 lit dvc DF lit dvc 8F lit dvc 4A lit dvc 2D lit dvc E4 lit dvc 1A lit dvc 8A lit dvc 68 lit dvc F0 lit dvc 8 lit dvc 91 lit dvc 30 lit dvc EE lit dvc 10 lit dvc AC lit dvc E1 lit dvc 90 lit dvc E9 lit dvc F2 lit dvc 21 lit dvc 5B lit dvc
+6C lit dvc B3 lit dvc 8C lit dvc 4E lit dvc 62 lit dvc 7F lit dvc 69 lit dvc B3 lit dvc 43 lit dvc B5 lit dvc 35 lit dvc E7 lit dvc 92 lit dvc F4 lit dvc 51 lit dvc 1C lit dvc E6 lit dvc 3 lit dvc 37 lit dvc 44 lit dvc 71 lit dvc D lit dvc E2 lit dvc 1D lit dvc
+CA lit dvc B5 lit dvc EC lit dvc 18 lit dvc E7 lit dvc F8 lit dvc C7 lit dvc 4B lit dvc B2 lit dvc FA lit dvc 1 lit dvc EF lit dvc DA lit dvc 79 lit dvc 4B lit dvc 3E lit dvc 1F lit dvc 39 lit dvc 5B lit dvc A5 lit dvc 62 lit dvc 70 lit dvc 37 lit dvc 94 lit dvc
+B7 lit dvc 5F lit dvc 8 lit dvc 3C lit dvc 37 lit dvc 34 lit dvc 1C lit dvc 31 lit dvc
+;
+: dvh3
+1 lit dvkf !  3 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+34 lit dvc 9 lit dvc C8 lit dvc A9 lit dvc 82 lit dvc 40 lit dvc 31 lit dvc DD lit dvc 65 lit dvc DC lit dvc 94 lit dvc D5 lit dvc DD lit dvc 75 lit dvc 20 lit dvc 18 lit dvc AA lit dvc B6 lit dvc AC lit dvc CD lit dvc 42 lit dvc 94 lit dvc E4 lit dvc 9B lit dvc
+29 lit dvc 51 lit dvc 5F lit dvc 0 lit dvc 5A lit dvc 66 lit dvc A3 lit dvc 80 lit dvc D1 lit dvc 8D lit dvc 4 lit dvc B0 lit dvc 12 lit dvc C8 lit dvc 26 lit dvc 62 lit dvc 7B lit dvc 8B lit dvc 3A lit dvc 69 lit dvc 67 lit dvc C9 lit dvc EB lit dvc 5E lit dvc
+8E lit dvc 86 lit dvc 9B lit dvc 67 lit dvc F0 lit dvc 3A lit dvc DF lit dvc 44 lit dvc E2 lit dvc 5E lit dvc BC lit dvc 99 lit dvc FB lit dvc C6 lit dvc 7A lit dvc E0 lit dvc F5 lit dvc 10 lit dvc C8 lit dvc B lit dvc E lit dvc B8 lit dvc 37 lit dvc C8 lit dvc
+3 lit dvc 63 lit dvc 15 lit dvc D9 lit dvc C8 lit dvc EA lit dvc 11 lit dvc 2A lit dvc 69 lit dvc 96 lit dvc F lit dvc EA lit dvc 6 lit dvc 8B lit dvc FB lit dvc AF lit dvc C lit dvc 99 lit dvc DA lit dvc 51 lit dvc 16 lit dvc E5 lit dvc FC lit dvc 8C lit dvc
+65 lit dvc 94 lit dvc C8 lit dvc F2 lit dvc 69 lit dvc C9 lit dvc 63 lit dvc 38 lit dvc AB lit dvc 82 lit dvc 47 lit dvc 5B lit dvc 4F lit dvc E2 lit dvc 45 lit dvc C4 lit dvc 32 lit dvc EF lit dvc 6D lit dvc 96 lit dvc BE lit dvc 5D lit dvc 62 lit dvc 7A lit dvc
+D7 lit dvc 24 lit dvc 52 lit dvc AC lit dvc 22 lit dvc 23 lit dvc 6E lit dvc B7 lit dvc 9B lit dvc AA lit dvc 20 lit dvc 73 lit dvc F3 lit dvc 9F lit dvc 39 lit dvc 96 lit dvc D0 lit dvc 48 lit dvc DB lit dvc EB lit dvc A6 lit dvc B1 lit dvc EE lit dvc 45 lit dvc
+E4 lit dvc F9 lit dvc DA lit dvc D0 lit dvc 14 lit dvc 6C lit dvc 45 lit dvc 2E lit dvc 1 lit dvc 24 lit dvc BE lit dvc 89 lit dvc 44 lit dvc 5C lit dvc 65 lit dvc 45 lit dvc D6 lit dvc 53 lit dvc ED lit dvc 98 lit dvc A1 lit dvc A5 lit dvc 10 lit dvc 78 lit dvc
+27 lit dvc 0 lit dvc AE lit dvc 88 lit dvc 96 lit dvc 29 lit dvc CF lit dvc D8 lit dvc 5B lit dvc 97 lit dvc 99 lit dvc F7 lit dvc AF lit dvc 3 lit dvc E7 lit dvc EE lit dvc F3 lit dvc 63 lit dvc E3 lit dvc 3C lit dvc DD lit dvc A9 lit dvc DD lit dvc 48 lit dvc
+24 lit dvc F8 lit dvc 62 lit dvc CA lit dvc 21 lit dvc B6 lit dvc 4B lit dvc E8 lit dvc
+;
+: dvh4
+0 lit dvkf !  87 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+54 lit dvc C4 lit dvc 6 lit dvc 5E lit dvc 47 lit dvc 62 lit dvc 17 lit dvc 5C lit dvc B lit dvc E5 lit dvc 25 lit dvc 17 lit dvc 5F lit dvc 9A lit dvc 30 lit dvc 8B lit dvc 63 lit dvc 9C lit dvc 8D lit dvc 66 lit dvc 9 lit dvc 1A lit dvc 47 lit dvc AE lit dvc
+23 lit dvc 7 lit dvc 32 lit dvc F5 lit dvc CB lit dvc 44 lit dvc 16 lit dvc 9F lit dvc EF lit dvc 37 lit dvc 24 lit dvc 2B lit dvc 6B lit dvc 7A lit dvc AB lit dvc 81 lit dvc 4B lit dvc C4 lit dvc 8B lit dvc 9C lit dvc E7 lit dvc 55 lit dvc 7A lit dvc FB lit dvc
+C lit dvc E5 lit dvc 9E lit dvc 48 lit dvc 94 lit dvc 73 lit dvc C0 lit dvc 63 lit dvc D lit dvc F2 lit dvc 1E lit dvc 40 lit dvc DC lit dvc 44 lit dvc BC lit dvc FB lit dvc C2 lit dvc 8 lit dvc 29 lit dvc D lit dvc EC lit dvc BA lit dvc B8 lit dvc 2E lit dvc
+11 lit dvc E lit dvc FB lit dvc 5F lit dvc 36 lit dvc B6 lit dvc 76 lit dvc B2 lit dvc 87 lit dvc FE lit dvc AD lit dvc C5 lit dvc 44 lit dvc DF lit dvc E lit dvc 9B lit dvc 95 lit dvc 5 lit dvc 45 lit dvc 94 lit dvc 37 lit dvc 5F lit dvc 58 lit dvc 27 lit dvc
+A1 lit dvc 96 lit dvc 7F lit dvc B6 lit dvc 20 lit dvc 15 lit dvc 62 lit dvc AC lit dvc 4E lit dvc A6 lit dvc ED lit dvc E5 lit dvc CC lit dvc 67 lit dvc 6B lit dvc C8 lit dvc B1 lit dvc 5B lit dvc E9 lit dvc 5A lit dvc 49 lit dvc E2 lit dvc E lit dvc 95 lit dvc
+4C lit dvc 67 lit dvc 56 lit dvc DC lit dvc 83 lit dvc F1 lit dvc 4 lit dvc ED lit dvc 83 lit dvc 4 lit dvc 92 lit dvc 28 lit dvc 7D lit dvc 57 lit dvc 8A lit dvc F2 lit dvc 1 lit dvc D7 lit dvc F9 lit dvc 71 lit dvc CB lit dvc E7 lit dvc 5 lit dvc FF lit dvc
+A7 lit dvc 10 lit dvc 5C lit dvc AD lit dvc B8 lit dvc C9 lit dvc F4 lit dvc A6 lit dvc DB lit dvc F0 lit dvc 84 lit dvc 55 lit dvc 2B lit dvc 72 lit dvc 93 lit dvc 87 lit dvc DE lit dvc 2F lit dvc CE lit dvc CD lit dvc 59 lit dvc CC lit dvc DD lit dvc E4 lit dvc
+86 lit dvc 63 lit dvc A2 lit dvc 3E lit dvc 32 lit dvc DB lit dvc 9A lit dvc D7 lit dvc 69 lit dvc 60 lit dvc AF lit dvc 4 lit dvc D lit dvc 80 lit dvc 60 lit dvc 6A lit dvc FE lit dvc 38 lit dvc 36 lit dvc CC lit dvc B lit dvc 68 lit dvc D0 lit dvc 19 lit dvc
+80 lit dvc 5B lit dvc AF lit dvc 1 lit dvc ED lit dvc 54 lit dvc B7 lit dvc B0 lit dvc
+;
+: dvh5
+1 lit dvkf !  87 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+D2 lit dvc FB lit dvc E0 lit dvc A6 lit dvc DE lit dvc D4 lit dvc 94 lit dvc 50 lit dvc 1C lit dvc C3 lit dvc 7F lit dvc D4 lit dvc F5 lit dvc DA lit dvc 33 lit dvc B lit dvc 23 lit dvc E1 lit dvc 66 lit dvc 1 lit dvc B1 lit dvc 2E lit dvc 4C lit dvc 37 lit dvc
+F3 lit dvc 32 lit dvc FD lit dvc EB lit dvc 44 lit dvc 31 lit dvc 1E lit dvc 63 lit dvc 23 lit dvc DB lit dvc 9F lit dvc AF lit dvc A8 lit dvc 83 lit dvc 27 lit dvc 23 lit dvc 4A lit dvc B2 lit dvc 71 lit dvc A5 lit dvc E lit dvc 5E lit dvc 9F lit dvc 55 lit dvc
+57 lit dvc 5 lit dvc 95 lit dvc E8 lit dvc CE lit dvc C7 lit dvc 82 lit dvc 96 lit dvc D0 lit dvc F3 lit dvc F4 lit dvc E2 lit dvc 38 lit dvc 8D lit dvc 63 lit dvc 91 lit dvc 6F lit dvc 3B lit dvc 75 lit dvc 1C lit dvc D1 lit dvc D1 lit dvc F0 lit dvc 70 lit dvc
+5 lit dvc D4 lit dvc F6 lit dvc CB lit dvc E4 lit dvc C2 lit dvc 15 lit dvc EB lit dvc 87 lit dvc F3 lit dvc 81 lit dvc 95 lit dvc FE lit dvc E6 lit dvc FE lit dvc C lit dvc 81 lit dvc A6 lit dvc B1 lit dvc 1A lit dvc A7 lit dvc 4E lit dvc D2 lit dvc E7 lit dvc
+24 lit dvc B8 lit dvc 29 lit dvc 89 lit dvc E6 lit dvc 50 lit dvc D lit dvc A5 lit dvc 19 lit dvc E0 lit dvc 11 lit dvc 61 lit dvc 86 lit dvc 9C lit dvc 1B lit dvc EC lit dvc 2F lit dvc 68 lit dvc 6F lit dvc 45 lit dvc 92 lit dvc 59 lit dvc 3E lit dvc AA lit dvc
+4 lit dvc 3C lit dvc 2E lit dvc 2B lit dvc 8D lit dvc 12 lit dvc B3 lit dvc FC lit dvc C9 lit dvc 82 lit dvc 6B lit dvc 8D lit dvc C lit dvc 7F lit dvc 84 lit dvc 62 lit dvc 34 lit dvc 49 lit dvc BC lit dvc 75 lit dvc E lit dvc A8 lit dvc EA lit dvc 63 lit dvc
+AD lit dvc 38 lit dvc 33 lit dvc 18 lit dvc 5E lit dvc 6F lit dvc E3 lit dvc ED lit dvc 3E lit dvc 85 lit dvc AE lit dvc 17 lit dvc 8E lit dvc 63 lit dvc A6 lit dvc 79 lit dvc E1 lit dvc 31 lit dvc 8 lit dvc B lit dvc C1 lit dvc B5 lit dvc 42 lit dvc 4F lit dvc
+1A lit dvc CD lit dvc 26 lit dvc D1 lit dvc 28 lit dvc 64 lit dvc 15 lit dvc 81 lit dvc EF lit dvc F8 lit dvc 5D lit dvc BA lit dvc 13 lit dvc C lit dvc C8 lit dvc 5 lit dvc 89 lit dvc E9 lit dvc 1F lit dvc 29 lit dvc 3D lit dvc D8 lit dvc 8D lit dvc 23 lit dvc
+1 lit dvc 14 lit dvc CF lit dvc 0 lit dvc 37 lit dvc AE lit dvc 7E lit dvc 21 lit dvc
+;
+: dvh6
+0 lit dvkf !  88 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+61 lit dvc 5B lit dvc F8 lit dvc F3 lit dvc 71 lit dvc 5F lit dvc 33 lit dvc 5 lit dvc AA lit dvc A5 lit dvc FC lit dvc D lit dvc 5C lit dvc 2A lit dvc AD lit dvc 22 lit dvc 61 lit dvc FA lit dvc 31 lit dvc 7B lit dvc 66 lit dvc 63 lit dvc FD lit dvc 96 lit dvc
+CB lit dvc 67 lit dvc C1 lit dvc E9 lit dvc 9F lit dvc 95 lit dvc 45 lit dvc C3 lit dvc 97 lit dvc 80 lit dvc CD lit dvc 9E lit dvc 73 lit dvc E lit dvc 0 lit dvc C2 lit dvc 6D lit dvc FE lit dvc 39 lit dvc 72 lit dvc D2 lit dvc 1C lit dvc 3C lit dvc 9C lit dvc
+7A lit dvc F9 lit dvc D7 lit dvc 56 lit dvc 3E lit dvc 69 lit dvc CE lit dvc 33 lit dvc 89 lit dvc E2 lit dvc 20 lit dvc 6D lit dvc 69 lit dvc F5 lit dvc 52 lit dvc B7 lit dvc B2 lit dvc 54 lit dvc EE lit dvc 39 lit dvc 37 lit dvc 65 lit dvc 54 lit dvc 20 lit dvc
+77 lit dvc F2 lit dvc E0 lit dvc 57 lit dvc 4F lit dvc B7 lit dvc 91 lit dvc 9B lit dvc C7 lit dvc E9 lit dvc D1 lit dvc 5A lit dvc 91 lit dvc FF lit dvc A0 lit dvc D3 lit dvc 41 lit dvc 3A lit dvc 9E lit dvc 5D lit dvc BD lit dvc 8C lit dvc 24 lit dvc EC lit dvc
+9A lit dvc 38 lit dvc 89 lit dvc 53 lit dvc AA lit dvc F7 lit dvc 89 lit dvc 7F lit dvc BD lit dvc 45 lit dvc B6 lit dvc 22 lit dvc F2 lit dvc CD lit dvc 6 lit dvc CC lit dvc 1 lit dvc B1 lit dvc 89 lit dvc 8B lit dvc 82 lit dvc 61 lit dvc 10 lit dvc F0 lit dvc
+BA lit dvc 25 lit dvc F8 lit dvc 4F lit dvc 5F lit dvc CE lit dvc 61 lit dvc EE lit dvc 7F lit dvc D4 lit dvc 89 lit dvc 6A lit dvc 4A lit dvc F6 lit dvc E6 lit dvc 3 lit dvc 69 lit dvc 3E lit dvc C8 lit dvc D1 lit dvc 53 lit dvc 16 lit dvc 6 lit dvc FB lit dvc
+C5 lit dvc BF lit dvc 35 lit dvc 7D lit dvc 57 lit dvc 4D lit dvc B3 lit dvc 9F lit dvc A6 lit dvc 2F lit dvc A5 lit dvc 8B lit dvc 50 lit dvc 22 lit dvc 5B lit dvc 43 lit dvc A3 lit dvc 90 lit dvc 51 lit dvc 17 lit dvc 81 lit dvc 44 lit dvc 3C lit dvc 96 lit dvc
+B1 lit dvc 4C lit dvc 9F lit dvc 87 lit dvc 17 lit dvc 8E lit dvc 68 lit dvc C7 lit dvc BD lit dvc C8 lit dvc 84 lit dvc F1 lit dvc 30 lit dvc 23 lit dvc C3 lit dvc A4 lit dvc ED lit dvc 8A lit dvc 42 lit dvc 50 lit dvc FC lit dvc A4 lit dvc D4 lit dvc C9 lit dvc
+CD lit dvc 24 lit dvc 74 lit dvc 94 lit dvc 79 lit dvc 99 lit dvc 87 lit dvc 2B lit dvc
+;
+: dvh7
+1 lit dvkf !  88 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+98 lit dvc 2C lit dvc 21 lit dvc D1 lit dvc D3 lit dvc 28 lit dvc EA lit dvc C lit dvc 18 lit dvc 23 lit dvc 57 lit dvc 95 lit dvc 8A lit dvc 9F lit dvc 77 lit dvc 6C lit dvc A6 lit dvc A1 lit dvc 81 lit dvc 1B lit dvc F0 lit dvc F2 lit dvc C6 lit dvc 4B lit dvc
+14 lit dvc 26 lit dvc 2E lit dvc DE lit dvc F5 lit dvc D2 lit dvc 1 lit dvc C6 lit dvc 81 lit dvc A1 lit dvc 88 lit dvc 3A lit dvc A0 lit dvc 49 lit dvc 88 lit dvc 57 lit dvc 5F lit dvc 42 lit dvc 9A lit dvc DB lit dvc B0 lit dvc 8 lit dvc 59 lit dvc 98 lit dvc
+3E lit dvc 8F lit dvc 7 lit dvc E2 lit dvc 4 lit dvc 7D lit dvc 6D lit dvc D5 lit dvc 91 lit dvc 73 lit dvc E lit dvc 57 lit dvc E1 lit dvc 52 lit dvc 9C lit dvc 0 lit dvc 59 lit dvc F7 lit dvc 30 lit dvc 15 lit dvc 64 lit dvc 61 lit dvc F5 lit dvc 89 lit dvc
+B2 lit dvc 3A lit dvc 15 lit dvc 65 lit dvc 9B lit dvc 3B lit dvc E1 lit dvc 8B lit dvc 58 lit dvc AE lit dvc 6A lit dvc D9 lit dvc E7 lit dvc E9 lit dvc 9A lit dvc 3E lit dvc FA lit dvc 44 lit dvc A7 lit dvc 99 lit dvc 4E lit dvc 7B lit dvc E3 lit dvc 98 lit dvc
+74 lit dvc 47 lit dvc EE lit dvc AE lit dvc E2 lit dvc 72 lit dvc 6C lit dvc DD lit dvc 13 lit dvc CE lit dvc F4 lit dvc 83 lit dvc EB lit dvc 4A lit dvc 9D lit dvc 5A lit dvc 59 lit dvc 67 lit dvc EA lit dvc 7D lit dvc 6 lit dvc D2 lit dvc AA lit dvc 59 lit dvc
+F5 lit dvc EC lit dvc 88 lit dvc 5F lit dvc 1F lit dvc AB lit dvc 2B lit dvc D2 lit dvc 8F lit dvc ED lit dvc 5F lit dvc FD lit dvc 7D lit dvc 2 lit dvc A7 lit dvc 41 lit dvc A4 lit dvc 98 lit dvc B2 lit dvc 94 lit dvc B3 lit dvc C1 lit dvc F5 lit dvc CB lit dvc
+AC lit dvc 2F lit dvc 8A lit dvc CC lit dvc DC lit dvc A4 lit dvc 6D lit dvc BA lit dvc 55 lit dvc 31 lit dvc EE lit dvc CE lit dvc EB lit dvc DA lit dvc 6D lit dvc 68 lit dvc 63 lit dvc 13 lit dvc FA lit dvc F8 lit dvc B3 lit dvc C1 lit dvc 5C lit dvc DE lit dvc
+43 lit dvc E5 lit dvc 43 lit dvc E9 lit dvc A9 lit dvc FD lit dvc 88 lit dvc F6 lit dvc CC lit dvc 19 lit dvc 8 lit dvc 8 lit dvc 31 lit dvc 28 lit dvc C3 lit dvc 45 lit dvc FB lit dvc AA lit dvc 5 lit dvc E7 lit dvc E4 lit dvc C5 lit dvc 3A lit dvc 2A lit dvc
+CD lit dvc B0 lit dvc 68 lit dvc 8F lit dvc AC lit dvc 6E lit dvc 51 lit dvc 26 lit dvc
+;
+: dvh8
+0 lit dvkf !  89 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+7F lit dvc 94 lit dvc 18 lit dvc F6 lit dvc 5 lit dvc F lit dvc E5 lit dvc 20 lit dvc F1 lit dvc AF lit dvc 85 lit dvc 4B lit dvc 32 lit dvc 46 lit dvc 6B lit dvc FF lit dvc DD lit dvc 73 lit dvc B lit dvc FE lit dvc 71 lit dvc A2 lit dvc D lit dvc 54 lit dvc
+32 lit dvc 60 lit dvc 9F lit dvc 8F lit dvc 8B lit dvc 0 lit dvc A5 lit dvc BF lit dvc 57 lit dvc A0 lit dvc A8 lit dvc 19 lit dvc 68 lit dvc B3 lit dvc F1 lit dvc F5 lit dvc 1C lit dvc 3B lit dvc 15 lit dvc 15 lit dvc 61 lit dvc 19 lit dvc 8C lit dvc C5 lit dvc
+C1 lit dvc D3 lit dvc 3 lit dvc 84 lit dvc 73 lit dvc 52 lit dvc 2D lit dvc 9C lit dvc C5 lit dvc E0 lit dvc 93 lit dvc 7C lit dvc 71 lit dvc E5 lit dvc 4F lit dvc 7D lit dvc 64 lit dvc 11 lit dvc 30 lit dvc 52 lit dvc 28 lit dvc 93 lit dvc 38 lit dvc A8 lit dvc
+59 lit dvc D7 lit dvc 2D lit dvc 1C lit dvc 5 lit dvc E lit dvc 83 lit dvc 6B lit dvc 8 lit dvc B6 lit dvc A6 lit dvc 33 lit dvc 71 lit dvc F2 lit dvc 9F lit dvc 7F lit dvc 3 lit dvc DF lit dvc FF lit dvc F7 lit dvc CB lit dvc 57 lit dvc 53 lit dvc 22 lit dvc
+DA lit dvc D9 lit dvc EC lit dvc 27 lit dvc 18 lit dvc 57 lit dvc FA lit dvc 98 lit dvc A8 lit dvc 5C lit dvc 81 lit dvc FD lit dvc 48 lit dvc 42 lit dvc 71 lit dvc 69 lit dvc 1E lit dvc CB lit dvc 5D lit dvc 6E lit dvc E5 lit dvc 24 lit dvc 8F lit dvc B0 lit dvc
+6F lit dvc 2F lit dvc 32 lit dvc 2A lit dvc 9F lit dvc 39 lit dvc 30 lit dvc B5 lit dvc 9F lit dvc 85 lit dvc E6 lit dvc 8 lit dvc 3E lit dvc 72 lit dvc 0 lit dvc 0 lit dvc F4 lit dvc BA lit dvc 6A lit dvc 10 lit dvc 73 lit dvc 72 lit dvc 50 lit dvc 9F lit dvc
+8B lit dvc D lit dvc B8 lit dvc 15 lit dvc 28 lit dvc 5C lit dvc 30 lit dvc 55 lit dvc 7B lit dvc CA lit dvc 3C lit dvc 6 lit dvc 84 lit dvc 47 lit dvc 86 lit dvc 3C lit dvc 1A lit dvc C5 lit dvc 70 lit dvc A8 lit dvc 5E lit dvc 94 lit dvc 11 lit dvc 34 lit dvc
+D4 lit dvc 64 lit dvc 58 lit dvc 62 lit dvc CD lit dvc 5 lit dvc 45 lit dvc 7C lit dvc D3 lit dvc 48 lit dvc 1F lit dvc 6A lit dvc E6 lit dvc 8F lit dvc 6E lit dvc E0 lit dvc FD lit dvc C9 lit dvc 73 lit dvc 22 lit dvc DC lit dvc 8B lit dvc 79 lit dvc 32 lit dvc
+17 lit dvc 74 lit dvc 7 lit dvc 3D lit dvc AC lit dvc 78 lit dvc 7 lit dvc 9E lit dvc
+;
+: dvh9
+1 lit dvkf !  89 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+AC lit dvc A6 lit dvc 5E lit dvc 9D lit dvc 4A lit dvc 27 lit dvc 36 lit dvc 10 lit dvc 44 lit dvc D5 lit dvc 70 lit dvc D2 lit dvc 7 lit dvc 12 lit dvc AB lit dvc 5D lit dvc 6F lit dvc 8A lit dvc 43 lit dvc BF lit dvc C0 lit dvc F9 lit dvc D4 lit dvc EF lit dvc
+B lit dvc 6F lit dvc 52 lit dvc FF lit dvc 7E lit dvc 60 lit dvc 75 lit dvc 27 lit dvc 11 lit dvc 97 lit dvc 65 lit dvc 7D lit dvc B lit dvc 92 lit dvc 53 lit dvc BE lit dvc 17 lit dvc 31 lit dvc 92 lit dvc 1F lit dvc DA lit dvc 2C lit dvc 48 lit dvc E lit dvc
+A1 lit dvc B0 lit dvc 3B lit dvc 26 lit dvc 4F lit dvc C9 lit dvc CF lit dvc 89 lit dvc 4B lit dvc E1 lit dvc DA lit dvc 65 lit dvc 89 lit dvc A lit dvc DC lit dvc 98 lit dvc 9 lit dvc CE lit dvc 7F lit dvc 99 lit dvc 7B lit dvc 22 lit dvc 8D lit dvc 89 lit dvc
+2F lit dvc 1B lit dvc 30 lit dvc AA lit dvc 1D lit dvc 20 lit dvc 33 lit dvc 8E lit dvc 6A lit dvc 50 lit dvc CB lit dvc 8D lit dvc 8C lit dvc 38 lit dvc 3 lit dvc 55 lit dvc 73 lit dvc 1E lit dvc 7C lit dvc A lit dvc C3 lit dvc 1 lit dvc E8 lit dvc 1C lit dvc
+77 lit dvc 51 lit dvc F5 lit dvc CB lit dvc 5A lit dvc F2 lit dvc 8D lit dvc 16 lit dvc A6 lit dvc AD lit dvc 8D lit dvc F8 lit dvc 67 lit dvc 3C lit dvc 2C lit dvc 2A lit dvc 11 lit dvc 41 lit dvc 79 lit dvc B0 lit dvc 9A lit dvc 4 lit dvc BA lit dvc CF lit dvc
+4D lit dvc C6 lit dvc B4 lit dvc 74 lit dvc DE lit dvc 33 lit dvc B9 lit dvc 89 lit dvc 9A lit dvc AA lit dvc 58 lit dvc 8D lit dvc 35 lit dvc 54 lit dvc 9C lit dvc 5E lit dvc EF lit dvc 37 lit dvc 92 lit dvc 42 lit dvc 21 lit dvc 66 lit dvc 69 lit dvc E3 lit dvc
+24 lit dvc 3A lit dvc 59 lit dvc 2F lit dvc F1 lit dvc A6 lit dvc 84 lit dvc 8 lit dvc 87 lit dvc 6B lit dvc 22 lit dvc CB lit dvc 8A lit dvc 7A lit dvc 73 lit dvc E0 lit dvc 1 lit dvc C6 lit dvc C9 lit dvc ED lit dvc 2B lit dvc B9 lit dvc 15 lit dvc DD lit dvc
+70 lit dvc 42 lit dvc 90 lit dvc 6F lit dvc 8 lit dvc F2 lit dvc FB lit dvc A6 lit dvc 84 lit dvc BB lit dvc 79 lit dvc 81 lit dvc 9A lit dvc AF lit dvc 9F lit dvc 15 lit dvc 24 lit dvc EE lit dvc A lit dvc 5C lit dvc E3 lit dvc 6F lit dvc 6C lit dvc 4D lit dvc
+5D lit dvc BF lit dvc EF lit dvc 3E lit dvc E8 lit dvc 47 lit dvc 2C lit dvc 7D lit dvc
+;
+: dvh10
+0 lit dvkf !  A7 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+F5 lit dvc 56 lit dvc A4 lit dvc F5 lit dvc EC lit dvc 6D lit dvc 8C lit dvc 97 lit dvc 1F lit dvc 1D lit dvc C lit dvc A3 lit dvc C0 lit dvc DC lit dvc 1A lit dvc 33 lit dvc F4 lit dvc C2 lit dvc 87 lit dvc 8B lit dvc 8C lit dvc 54 lit dvc D3 lit dvc 13 lit dvc
+56 lit dvc A lit dvc 66 lit dvc BE lit dvc 26 lit dvc B6 lit dvc 26 lit dvc 6F lit dvc 49 lit dvc F4 lit dvc 48 lit dvc FB lit dvc 3B lit dvc 42 lit dvc 39 lit dvc DA lit dvc A1 lit dvc 9 lit dvc 3E lit dvc 7 lit dvc FA lit dvc E4 lit dvc F4 lit dvc 0 lit dvc
+C4 lit dvc 87 lit dvc 10 lit dvc B1 lit dvc A9 lit dvc 6 lit dvc 9D lit dvc 5 lit dvc 8 lit dvc 87 lit dvc 1F lit dvc B1 lit dvc 4D lit dvc D9 lit dvc 1A lit dvc 28 lit dvc 4F lit dvc 81 lit dvc 33 lit dvc A4 lit dvc 1 lit dvc D9 lit dvc 72 lit dvc 4D lit dvc
+24 lit dvc F0 lit dvc 6E lit dvc F8 lit dvc 29 lit dvc 4A lit dvc 9 lit dvc 3F lit dvc 9F lit dvc 1C lit dvc 50 lit dvc 33 lit dvc C lit dvc 5E lit dvc E2 lit dvc C9 lit dvc F7 lit dvc 2F lit dvc 72 lit dvc 9D lit dvc 71 lit dvc 93 lit dvc B8 lit dvc 6F lit dvc
+C4 lit dvc E1 lit dvc 2F lit dvc 96 lit dvc BC lit dvc DA lit dvc BA lit dvc C6 lit dvc BF lit dvc 4D lit dvc AF lit dvc 93 lit dvc BF lit dvc A2 lit dvc AA lit dvc 83 lit dvc A0 lit dvc 2A lit dvc C8 lit dvc DB lit dvc AF lit dvc C1 lit dvc EE lit dvc 17 lit dvc
+D2 lit dvc 2D lit dvc 3B lit dvc B3 lit dvc E8 lit dvc B5 lit dvc EA lit dvc 11 lit dvc D1 lit dvc FF lit dvc C1 lit dvc E lit dvc F8 lit dvc BE lit dvc EF lit dvc 9A lit dvc C0 lit dvc 40 lit dvc 5E lit dvc AF lit dvc 7A lit dvc 95 lit dvc F8 lit dvc 8F lit dvc
+F5 lit dvc B3 lit dvc 46 lit dvc 65 lit dvc 41 lit dvc 72 lit dvc 24 lit dvc 96 lit dvc 67 lit dvc 5B lit dvc 1E lit dvc 5C lit dvc A3 lit dvc AF lit dvc 8D lit dvc 28 lit dvc 55 lit dvc 72 lit dvc 6D lit dvc 7A lit dvc D7 lit dvc B8 lit dvc 8E lit dvc 6B lit dvc
+69 lit dvc 5D lit dvc BB lit dvc 44 lit dvc 24 lit dvc 7B lit dvc 39 lit dvc 7F lit dvc 8 lit dvc 68 lit dvc FB lit dvc AE lit dvc 83 lit dvc 77 lit dvc A lit dvc 59 lit dvc 1E lit dvc 21 lit dvc 29 lit dvc B2 lit dvc D9 lit dvc 30 lit dvc 82 lit dvc 72 lit dvc
+9C lit dvc A2 lit dvc E8 lit dvc C3 lit dvc C lit dvc 7A lit dvc EC lit dvc 93 lit dvc
+;
+: dvh11
+1 lit dvkf !  A7 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+93 lit dvc 91 lit dvc FE lit dvc 50 lit dvc DB lit dvc E lit dvc D2 lit dvc D7 lit dvc 99 lit dvc 7E lit dvc 2 lit dvc 56 lit dvc 9A lit dvc 59 lit dvc 15 lit dvc EA lit dvc 37 lit dvc 40 lit dvc C0 lit dvc 5B lit dvc 57 lit dvc 3D lit dvc 46 lit dvc D3 lit dvc
+C lit dvc 71 lit dvc C7 lit dvc 90 lit dvc E3 lit dvc 63 lit dvc 15 lit dvc 28 lit dvc 8C lit dvc 11 lit dvc ED lit dvc 9C lit dvc 0 lit dvc 68 lit dvc B3 lit dvc 7C lit dvc 1D lit dvc EE lit dvc 30 lit dvc DE lit dvc 27 lit dvc 71 lit dvc DD lit dvc AF lit dvc
+44 lit dvc D1 lit dvc 7B lit dvc F lit dvc D7 lit dvc E9 lit dvc E7 lit dvc E1 lit dvc 86 lit dvc 24 lit dvc D5 lit dvc DD lit dvc 54 lit dvc 86 lit dvc 4D lit dvc 63 lit dvc 59 lit dvc CE lit dvc 95 lit dvc 8 lit dvc 42 lit dvc 47 lit dvc 5B lit dvc B3 lit dvc
+C5 lit dvc F6 lit dvc 45 lit dvc 62 lit dvc 16 lit dvc C4 lit dvc 72 lit dvc 68 lit dvc FB lit dvc 32 lit dvc CF lit dvc A4 lit dvc 98 lit dvc D1 lit dvc B4 lit dvc CA lit dvc F lit dvc 41 lit dvc C8 lit dvc 2E lit dvc 24 lit dvc 55 lit dvc 8F lit dvc C lit dvc
+42 lit dvc AB lit dvc 9C lit dvc 45 lit dvc 70 lit dvc 67 lit dvc 6B lit dvc 80 lit dvc D3 lit dvc C4 lit dvc 31 lit dvc 16 lit dvc E3 lit dvc 25 lit dvc F lit dvc 3C lit dvc 5A lit dvc 36 lit dvc 7 lit dvc C1 lit dvc 7B lit dvc 48 lit dvc 96 lit dvc E3 lit dvc
+6 lit dvc DD lit dvc DA lit dvc 5F lit dvc 60 lit dvc 44 lit dvc 69 lit dvc 72 lit dvc A1 lit dvc 32 lit dvc C3 lit dvc FD lit dvc B lit dvc 35 lit dvc A lit dvc A1 lit dvc 63 lit dvc BE lit dvc DD lit dvc 39 lit dvc EF lit dvc F7 lit dvc 3E lit dvc FD lit dvc
+81 lit dvc F4 lit dvc 34 lit dvc 67 lit dvc DC lit dvc 2A lit dvc 11 lit dvc 81 lit dvc 34 lit dvc 5E lit dvc F3 lit dvc B lit dvc 4C lit dvc 26 lit dvc 0 lit dvc 0 lit dvc CD lit dvc D lit dvc F0 lit dvc 44 lit dvc A8 lit dvc 4D lit dvc A1 lit dvc 9A lit dvc
+D8 lit dvc 4A lit dvc 59 lit dvc 50 lit dvc 62 lit dvc 6B lit dvc 84 lit dvc DB lit dvc DB lit dvc 5D lit dvc 88 lit dvc 62 lit dvc FD lit dvc 62 lit dvc 6E lit dvc B9 lit dvc 13 lit dvc BF lit dvc 97 lit dvc EB lit dvc 8A lit dvc 17 lit dvc 11 lit dvc 39 lit dvc
+3E lit dvc 6 lit dvc AF lit dvc A4 lit dvc 1 lit dvc 4A lit dvc 71 lit dvc 6D lit dvc
+;
+: dvh12
+0 lit dvkf !  A8 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+A lit dvc 3 lit dvc 78 lit dvc 14 lit dvc 4C lit dvc AA lit dvc 79 lit dvc 6F lit dvc 9B lit dvc C4 lit dvc AF lit dvc 37 lit dvc B5 lit dvc 32 lit dvc 9E lit dvc EF lit dvc BF lit dvc 84 lit dvc 6D lit dvc D0 lit dvc F0 lit dvc 89 lit dvc D8 lit dvc 7C lit dvc
+E1 lit dvc F0 lit dvc 66 lit dvc 5E lit dvc 3 lit dvc 3F lit dvc 7D lit dvc 26 lit dvc 7B lit dvc D5 lit dvc B7 lit dvc 7 lit dvc 22 lit dvc 85 lit dvc 55 lit dvc 6E lit dvc 20 lit dvc 85 lit dvc 15 lit dvc 56 lit dvc 8A lit dvc 31 lit dvc C8 lit dvc 41 lit dvc
+A4 lit dvc B8 lit dvc A lit dvc 26 lit dvc ED lit dvc A9 lit dvc F1 lit dvc 5B lit dvc A4 lit dvc C8 lit dvc 40 lit dvc 6F lit dvc 6A lit dvc B5 lit dvc 98 lit dvc DC lit dvc 85 lit dvc 7E lit dvc AA lit dvc EA lit dvc 58 lit dvc 51 lit dvc 65 lit dvc B8 lit dvc
+73 lit dvc 52 lit dvc A2 lit dvc DC lit dvc 90 lit dvc F8 lit dvc 2D lit dvc 7C lit dvc 6D lit dvc B6 lit dvc E5 lit dvc 31 lit dvc 44 lit dvc 7D lit dvc 11 lit dvc 5F lit dvc D lit dvc DD lit dvc D3 lit dvc F9 lit dvc 83 lit dvc DE lit dvc 83 lit dvc 97 lit dvc
+D lit dvc B9 lit dvc 92 lit dvc B2 lit dvc E8 lit dvc 2F lit dvc A7 lit dvc BC lit dvc 65 lit dvc 66 lit dvc 96 lit dvc 55 lit dvc 60 lit dvc 2F lit dvc 58 lit dvc 91 lit dvc DC lit dvc CF lit dvc 9A lit dvc 73 lit dvc C7 lit dvc D7 lit dvc FA lit dvc 8E lit dvc
+0 lit dvc 9D lit dvc 1 lit dvc 99 lit dvc 1F lit dvc E7 lit dvc 79 lit dvc B2 lit dvc 64 lit dvc A5 lit dvc B4 lit dvc 78 lit dvc DF lit dvc AC lit dvc 48 lit dvc 65 lit dvc 5B lit dvc F6 lit dvc D6 lit dvc E6 lit dvc 77 lit dvc DF lit dvc C7 lit dvc 2F lit dvc
+33 lit dvc AB lit dvc BB lit dvc 58 lit dvc 93 lit dvc 11 lit dvc A6 lit dvc 58 lit dvc 44 lit dvc A0 lit dvc D lit dvc CA lit dvc 0 lit dvc 2C lit dvc 8D lit dvc 79 lit dvc 16 lit dvc 2B lit dvc D3 lit dvc FC lit dvc 96 lit dvc 17 lit dvc 4 lit dvc 37 lit dvc
+3D lit dvc E4 lit dvc C8 lit dvc 76 lit dvc AB lit dvc B lit dvc 35 lit dvc 75 lit dvc 19 lit dvc E1 lit dvc 52 lit dvc 4 lit dvc 6A lit dvc FD lit dvc F lit dvc E7 lit dvc 70 lit dvc 88 lit dvc 97 lit dvc 60 lit dvc 3A lit dvc B5 lit dvc FA lit dvc 6D lit dvc
+F9 lit dvc B7 lit dvc 35 lit dvc FA lit dvc 9D lit dvc 8B lit dvc E3 lit dvc 6D lit dvc
+;
+: dvh13
+1 lit dvkf !  A8 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+B6 lit dvc C1 lit dvc 26 lit dvc B lit dvc E lit dvc 36 lit dvc EB lit dvc D9 lit dvc C3 lit dvc 1 lit dvc 33 lit dvc 5E lit dvc 52 lit dvc A3 lit dvc B1 lit dvc 18 lit dvc 36 lit dvc 45 lit dvc 11 lit dvc B5 lit dvc 33 lit dvc F2 lit dvc 9 lit dvc 63 lit dvc
+9E lit dvc 76 lit dvc 38 lit dvc B1 lit dvc 4A lit dvc A2 lit dvc 3 lit dvc 13 lit dvc 3D lit dvc 3D lit dvc CA lit dvc 72 lit dvc D2 lit dvc 5D lit dvc B9 lit dvc 3A lit dvc 7A lit dvc F0 lit dvc EA lit dvc 49 lit dvc 78 lit dvc D2 lit dvc 86 lit dvc 2D lit dvc
+39 lit dvc EE lit dvc 8A lit dvc D7 lit dvc F2 lit dvc 16 lit dvc DB lit dvc B lit dvc AA lit dvc C lit dvc 94 lit dvc 3F lit dvc BE lit dvc 49 lit dvc 63 lit dvc 8A lit dvc 11 lit dvc 65 lit dvc 47 lit dvc 21 lit dvc CB lit dvc 9E lit dvc 9B lit dvc D lit dvc
+B2 lit dvc 31 lit dvc F9 lit dvc A3 lit dvc E8 lit dvc D8 lit dvc 27 lit dvc EC lit dvc 16 lit dvc 7A lit dvc FB lit dvc 99 lit dvc 78 lit dvc A7 lit dvc 28 lit dvc 8E lit dvc 70 lit dvc D8 lit dvc DB lit dvc F7 lit dvc A9 lit dvc 3F lit dvc 7C lit dvc A2 lit dvc
+7B lit dvc B lit dvc B2 lit dvc 31 lit dvc 53 lit dvc A4 lit dvc F8 lit dvc 19 lit dvc 84 lit dvc 60 lit dvc F3 lit dvc 92 lit dvc 95 lit dvc 2E lit dvc 93 lit dvc 7A lit dvc 0 lit dvc 4B lit dvc 9D lit dvc 89 lit dvc 49 lit dvc E4 lit dvc B4 lit dvc F3 lit dvc
+D6 lit dvc E5 lit dvc 7C lit dvc 3D lit dvc BE lit dvc 68 lit dvc 8A lit dvc 79 lit dvc 12 lit dvc DF lit dvc 43 lit dvc 5F lit dvc A lit dvc CC lit dvc 7E lit dvc 35 lit dvc F1 lit dvc FB lit dvc 2E lit dvc 1D lit dvc BF lit dvc 18 lit dvc A8 lit dvc E1 lit dvc
+F5 lit dvc 31 lit dvc F2 lit dvc 93 lit dvc BC lit dvc EC lit dvc F4 lit dvc D9 lit dvc 4F lit dvc 74 lit dvc 65 lit dvc 9 lit dvc F7 lit dvc E2 lit dvc C7 lit dvc 38 lit dvc 54 lit dvc 44 lit dvc 7B lit dvc FF lit dvc E9 lit dvc E8 lit dvc CF lit dvc E9 lit dvc
+ED lit dvc BA lit dvc CD lit dvc 4D lit dvc 7A lit dvc 70 lit dvc A1 lit dvc E3 lit dvc 65 lit dvc 73 lit dvc 3C lit dvc E6 lit dvc C3 lit dvc 54 lit dvc 55 lit dvc 49 lit dvc 83 lit dvc 8E lit dvc EB lit dvc 3 lit dvc 1F lit dvc C0 lit dvc B2 lit dvc C2 lit dvc
+48 lit dvc B lit dvc 5C lit dvc F7 lit dvc EA lit dvc 4E lit dvc C0 lit dvc A8 lit dvc
+;
+: dvh14
+0 lit dvkf !  A9 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+66 lit dvc 46 lit dvc 9A lit dvc A3 lit dvc D4 lit dvc EE lit dvc E6 lit dvc 2F lit dvc 20 lit dvc 73 lit dvc F8 lit dvc 8D lit dvc ED lit dvc D3 lit dvc 9E lit dvc 88 lit dvc C4 lit dvc 1B lit dvc DA lit dvc 26 lit dvc CD lit dvc 59 lit dvc 89 lit dvc D0 lit dvc
+2D lit dvc 74 lit dvc DE lit dvc 48 lit dvc C5 lit dvc 79 lit dvc 10 lit dvc A7 lit dvc 8A lit dvc 50 lit dvc 90 lit dvc 17 lit dvc 31 lit dvc F4 lit dvc 4A lit dvc AC lit dvc 60 lit dvc AF lit dvc C6 lit dvc 80 lit dvc 92 lit dvc EC lit dvc 98 lit dvc 4F lit dvc
+5A lit dvc 56 lit dvc 44 lit dvc C0 lit dvc 96 lit dvc 8A lit dvc 37 lit dvc 10 lit dvc A1 lit dvc 58 lit dvc 97 lit dvc 1F lit dvc A6 lit dvc 9C lit dvc CF lit dvc D lit dvc 71 lit dvc CB lit dvc 23 lit dvc 33 lit dvc 9A lit dvc 1A lit dvc 7D lit dvc 30 lit dvc
+E2 lit dvc 63 lit dvc 4D lit dvc 91 lit dvc F9 lit dvc 5A lit dvc 2D lit dvc 32 lit dvc 98 lit dvc 9F lit dvc 8C lit dvc 88 lit dvc D4 lit dvc 58 lit dvc F lit dvc B9 lit dvc 23 lit dvc EF lit dvc 4B lit dvc 36 lit dvc 5D lit dvc C2 lit dvc 24 lit dvc 63 lit dvc
+E4 lit dvc D7 lit dvc 3C lit dvc D4 lit dvc BE lit dvc 16 lit dvc 72 lit dvc D1 lit dvc 63 lit dvc 2F lit dvc E4 lit dvc D3 lit dvc 59 lit dvc 74 lit dvc 66 lit dvc 21 lit dvc 49 lit dvc C9 lit dvc 70 lit dvc 15 lit dvc B1 lit dvc A9 lit dvc 12 lit dvc 4B lit dvc
+F1 lit dvc 29 lit dvc 6B lit dvc FE lit dvc DE lit dvc D5 lit dvc 7E lit dvc 5A lit dvc CC lit dvc 76 lit dvc C4 lit dvc 50 lit dvc D7 lit dvc E0 lit dvc 6D lit dvc 54 lit dvc 78 lit dvc FC lit dvc 7 lit dvc 85 lit dvc 8B lit dvc 4B lit dvc 8D lit dvc 60 lit dvc
+EF lit dvc 20 lit dvc 18 lit dvc D0 lit dvc 14 lit dvc 3E lit dvc E2 lit dvc 5 lit dvc 3C lit dvc B8 lit dvc 9A lit dvc 8E lit dvc 1E lit dvc 9E lit dvc DD lit dvc D3 lit dvc 40 lit dvc 1B lit dvc A0 lit dvc 72 lit dvc 17 lit dvc 9A lit dvc BD lit dvc D7 lit dvc
+CF lit dvc 97 lit dvc D0 lit dvc DD lit dvc 65 lit dvc E5 lit dvc CC lit dvc C6 lit dvc AE lit dvc 5B lit dvc 1E lit dvc 16 lit dvc 4F lit dvc BE lit dvc F5 lit dvc 6E lit dvc 1E lit dvc 10 lit dvc 0 lit dvc E1 lit dvc 6E lit dvc 96 lit dvc 25 lit dvc 86 lit dvc
+A7 lit dvc E3 lit dvc D1 lit dvc 59 lit dvc 5B lit dvc E6 lit dvc 90 lit dvc 57 lit dvc
+;
+: dvh15
+1 lit dvkf !  A9 lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+8D lit dvc 33 lit dvc D lit dvc 82 lit dvc 85 lit dvc 4E lit dvc 10 lit dvc 60 lit dvc F4 lit dvc 18 lit dvc 7A lit dvc 20 lit dvc 67 lit dvc C0 lit dvc 67 lit dvc 1A lit dvc 7 lit dvc 13 lit dvc A0 lit dvc F6 lit dvc F1 lit dvc 8E lit dvc C5 lit dvc A0 lit dvc
+C lit dvc 15 lit dvc 22 lit dvc 4D lit dvc BE lit dvc 81 lit dvc 8C lit dvc EB lit dvc 2D lit dvc A3 lit dvc BC lit dvc 82 lit dvc 5B lit dvc 42 lit dvc D lit dvc 54 lit dvc 60 lit dvc A lit dvc 8C lit dvc B7 lit dvc F2 lit dvc 2E lit dvc B1 lit dvc DF lit dvc
+B4 lit dvc EF lit dvc 2B lit dvc 45 lit dvc ED lit dvc C7 lit dvc 26 lit dvc 3F lit dvc C7 lit dvc 6D lit dvc 5 lit dvc 5F lit dvc 2D lit dvc 4 lit dvc 74 lit dvc BD lit dvc 64 lit dvc DD lit dvc 7E lit dvc 8E lit dvc D1 lit dvc 1F lit dvc 31 lit dvc CC lit dvc
+5E lit dvc 51 lit dvc C lit dvc 61 lit dvc 17 lit dvc B lit dvc F7 lit dvc 2A lit dvc D lit dvc 60 lit dvc CC lit dvc B8 lit dvc 20 lit dvc 75 lit dvc 71 lit dvc E lit dvc A5 lit dvc 9E lit dvc 85 lit dvc 5D lit dvc EB lit dvc 55 lit dvc 6F lit dvc 67 lit dvc
+5 lit dvc 35 lit dvc 29 lit dvc 97 lit dvc D7 lit dvc 65 lit dvc C7 lit dvc 5 lit dvc AF lit dvc D8 lit dvc 72 lit dvc D6 lit dvc AC lit dvc F0 lit dvc 71 lit dvc 49 lit dvc B7 lit dvc 2D lit dvc 2E lit dvc D8 lit dvc D0 lit dvc A2 lit dvc C5 lit dvc 26 lit dvc
+F8 lit dvc F7 lit dvc 24 lit dvc 27 lit dvc FD lit dvc A0 lit dvc 9D lit dvc F6 lit dvc 1 lit dvc C6 lit dvc 4C lit dvc DE lit dvc 92 lit dvc 79 lit dvc 51 lit dvc 1D lit dvc 9 lit dvc E2 lit dvc D1 lit dvc CD lit dvc 18 lit dvc 3A lit dvc 6A lit dvc EA lit dvc
+1F lit dvc 9 lit dvc DF lit dvc D lit dvc 80 lit dvc 7C lit dvc 99 lit dvc 97 lit dvc 2A lit dvc BF lit dvc 6B lit dvc 93 lit dvc E1 lit dvc 7E lit dvc D6 lit dvc 6A lit dvc FE lit dvc 66 lit dvc 46 lit dvc 13 lit dvc B1 lit dvc 72 lit dvc 4 lit dvc 30 lit dvc
+44 lit dvc A3 lit dvc 25 lit dvc C0 lit dvc E5 lit dvc EA lit dvc 3C lit dvc C1 lit dvc E7 lit dvc 94 lit dvc 4A lit dvc F1 lit dvc 63 lit dvc 31 lit dvc E4 lit dvc 8E lit dvc D3 lit dvc AE lit dvc B2 lit dvc 9A lit dvc E7 lit dvc D7 lit dvc A0 lit dvc 96 lit dvc
+AE lit dvc 12 lit dvc BD lit dvc 59 lit dvc 66 lit dvc B4 lit dvc D6 lit dvc 7D lit dvc
+;
+: dvh16
+0 lit dvkf !  12C lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+21 lit dvc 43 lit dvc EF lit dvc E1 lit dvc 0 lit dvc 37 lit dvc 42 lit dvc E5 lit dvc 73 lit dvc DE lit dvc 3E lit dvc 9B lit dvc 11 lit dvc 6D lit dvc 89 lit dvc 50 lit dvc 33 lit dvc 79 lit dvc 93 lit dvc CE lit dvc 21 lit dvc BC lit dvc E7 lit dvc AE lit dvc
+A3 lit dvc EF lit dvc 40 lit dvc 1E lit dvc 70 lit dvc 51 lit dvc 63 lit dvc B9 lit dvc 50 lit dvc 33 lit dvc 6E lit dvc 95 lit dvc 82 lit dvc 62 lit dvc 4C lit dvc EB lit dvc C2 lit dvc 75 lit dvc 8D lit dvc 8D lit dvc 91 lit dvc C8 lit dvc 6 lit dvc C6 lit dvc
+5E lit dvc 1D lit dvc B4 lit dvc DA lit dvc 5D lit dvc 37 lit dvc 60 lit dvc 49 lit dvc 75 lit dvc 39 lit dvc 90 lit dvc DD lit dvc CE lit dvc 2 lit dvc 16 lit dvc 16 lit dvc FC lit dvc B0 lit dvc AF lit dvc 9C lit dvc BE lit dvc F2 lit dvc 57 lit dvc 49 lit dvc
+BC lit dvc 72 lit dvc E8 lit dvc A6 lit dvc 30 lit dvc DA lit dvc A4 lit dvc C4 lit dvc 18 lit dvc 3F lit dvc BF lit dvc A6 lit dvc 2B lit dvc 2B lit dvc 2B lit dvc BD lit dvc 4 lit dvc DD lit dvc 1 lit dvc 36 lit dvc 2C lit dvc 37 lit dvc CB lit dvc C0 lit dvc
+93 lit dvc 7B lit dvc A0 lit dvc B0 lit dvc CF lit dvc 91 lit dvc 90 lit dvc C6 lit dvc D1 lit dvc 40 lit dvc 57 lit dvc 92 lit dvc D8 lit dvc 75 lit dvc F4 lit dvc C7 lit dvc 4A lit dvc A8 lit dvc AF lit dvc ED lit dvc 99 lit dvc 83 lit dvc AA lit dvc C6 lit dvc
+D2 lit dvc B4 lit dvc 50 lit dvc 73 lit dvc AB lit dvc 4B lit dvc EA lit dvc F8 lit dvc 55 lit dvc 31 lit dvc CC lit dvc AD lit dvc DD lit dvc 69 lit dvc 72 lit dvc 9 lit dvc 56 lit dvc 82 lit dvc 8E lit dvc 95 lit dvc 13 lit dvc 1A lit dvc 5A lit dvc 27 lit dvc
+DC lit dvc 2 lit dvc 62 lit dvc 35 lit dvc F3 lit dvc C lit dvc A8 lit dvc 47 lit dvc 15 lit dvc F9 lit dvc 89 lit dvc 9B lit dvc FF lit dvc 28 lit dvc 5F lit dvc 82 lit dvc DF lit dvc 7B lit dvc FE lit dvc 5C lit dvc 85 lit dvc 68 lit dvc 25 lit dvc 9A lit dvc
+38 lit dvc 4A lit dvc 91 lit dvc CA lit dvc 46 lit dvc F6 lit dvc 4D lit dvc 9 lit dvc F8 lit dvc 77 lit dvc 9B lit dvc 18 lit dvc FB lit dvc C3 lit dvc 46 lit dvc 17 lit dvc 9A lit dvc C3 lit dvc E6 lit dvc 35 lit dvc E1 lit dvc 95 lit dvc 68 lit dvc 2F lit dvc
+84 lit dvc 47 lit dvc 62 lit dvc 2B lit dvc 92 lit dvc 32 lit dvc EC lit dvc 8C lit dvc
+;
+: dvh17
+1 lit dvkf !  12C lit dvkl !  C8 lit dvko !
+dvkx @ dvp !
+7 lit dvc ED lit dvc DB lit dvc 1A lit dvc 87 lit dvc 80 lit dvc D5 lit dvc 42 lit dvc 53 lit dvc 74 lit dvc 58 lit dvc 3D lit dvc FE lit dvc 77 lit dvc C2 lit dvc A6 lit dvc EA lit dvc A2 lit dvc FE lit dvc 98 lit dvc 50 lit dvc 56 lit dvc 1E lit dvc C5 lit dvc
+DA lit dvc 43 lit dvc B5 lit dvc 3C lit dvc A1 lit dvc FA lit dvc 3C lit dvc BD lit dvc 4D lit dvc C1 lit dvc 6E lit dvc 8A lit dvc 82 lit dvc 1A lit dvc 9F lit dvc F9 lit dvc 44 lit dvc 4A lit dvc D8 lit dvc 1 lit dvc 8C lit dvc 56 lit dvc 2C lit dvc 95 lit dvc
+32 lit dvc 6 lit dvc 52 lit dvc 5 lit dvc 60 lit dvc 89 lit dvc 69 lit dvc E0 lit dvc 96 lit dvc 29 lit dvc 31 lit dvc 77 lit dvc 7A lit dvc 7A lit dvc 45 lit dvc 22 lit dvc BE lit dvc 14 lit dvc AB lit dvc 8C lit dvc 16 lit dvc 9F lit dvc 76 lit dvc 24 lit dvc
+CB lit dvc 78 lit dvc DE lit dvc A lit dvc F lit dvc BA lit dvc EA lit dvc 77 lit dvc 8E lit dvc B6 lit dvc 2E lit dvc F0 lit dvc E8 lit dvc E5 lit dvc EB lit dvc A6 lit dvc 5C lit dvc 8F lit dvc 3C lit dvc 4F lit dvc B lit dvc AA lit dvc 23 lit dvc FC lit dvc
+8F lit dvc 98 lit dvc AD lit dvc 8E lit dvc 9 lit dvc CF lit dvc C8 lit dvc 4 lit dvc 3C lit dvc 99 lit dvc C6 lit dvc 85 lit dvc 96 lit dvc C6 lit dvc B1 lit dvc CE lit dvc 54 lit dvc C7 lit dvc FD lit dvc 79 lit dvc 3B lit dvc AD lit dvc 9C lit dvc 95 lit dvc
+62 lit dvc 19 lit dvc F9 lit dvc 5C lit dvc B6 lit dvc 66 lit dvc 8 lit dvc 60 lit dvc 5C lit dvc A lit dvc 8A lit dvc D1 lit dvc DA lit dvc AF lit dvc E5 lit dvc 3C lit dvc 63 lit dvc 57 lit dvc 8 lit dvc 99 lit dvc D1 lit dvc 79 lit dvc 3B lit dvc 2E lit dvc
+92 lit dvc 6 lit dvc 6E lit dvc 9A lit dvc F9 lit dvc F1 lit dvc E7 lit dvc C3 lit dvc A7 lit dvc FC lit dvc 24 lit dvc 61 lit dvc 6A lit dvc 2E lit dvc A5 lit dvc 3C lit dvc 19 lit dvc D3 lit dvc 53 lit dvc 10 lit dvc 3 lit dvc 17 lit dvc 1F lit dvc 4C lit dvc
+C4 lit dvc 39 lit dvc 30 lit dvc 74 lit dvc 22 lit dvc 68 lit dvc 3E lit dvc CB lit dvc 2E lit dvc 38 lit dvc 6F lit dvc AA lit dvc 9F lit dvc AB lit dvc 3D lit dvc 58 lit dvc E7 lit dvc 4A lit dvc B9 lit dvc 65 lit dvc 66 lit dvc 44 lit dvc 79 lit dvc 5C lit dvc
+E3 lit dvc 17 lit dvc 5D lit dvc 91 lit dvc FE lit dvc CD lit dvc 31 lit dvc 62 lit dvc
+;
+: dvh18
+2 lit dvkf !  0 lit dvkl !  20 lit dvko !
+dvkx @ dvp !
+A7 lit dvc FF lit dvc C6 lit dvc F8 lit dvc BF lit dvc 1E lit dvc D7 lit dvc 66 lit dvc 51 lit dvc C1 lit dvc 47 lit dvc 56 lit dvc A0 lit dvc 61 lit dvc D6 lit dvc 62 lit dvc F5 lit dvc 80 lit dvc FF lit dvc 4D lit dvc E4 lit dvc 3B lit dvc 49 lit dvc FA lit dvc
+82 lit dvc D8 lit dvc A lit dvc 4B lit dvc 80 lit dvc F8 lit dvc 43 lit dvc 4A lit dvc
+;
+: dvh19
+3 lit dvkf !  0 lit dvkl !  40 lit dvko !
+dvkx @ dvp !
+A6 lit dvc 9F lit dvc 73 lit dvc CC lit dvc A2 lit dvc 3A lit dvc 9A lit dvc C5 lit dvc C8 lit dvc B5 lit dvc 67 lit dvc DC lit dvc 18 lit dvc 5A lit dvc 75 lit dvc 6E lit dvc 97 lit dvc C9 lit dvc 82 lit dvc 16 lit dvc 4F lit dvc E2 lit dvc 58 lit dvc 59 lit dvc
+E0 lit dvc D1 lit dvc DC lit dvc C1 lit dvc 47 lit dvc 5C lit dvc 80 lit dvc A6 lit dvc 15 lit dvc B2 lit dvc 12 lit dvc 3A lit dvc F1 lit dvc F5 lit dvc F9 lit dvc 4C lit dvc 11 lit dvc E3 lit dvc E9 lit dvc 40 lit dvc 2C lit dvc 3A lit dvc C5 lit dvc 58 lit dvc
+F5 lit dvc 0 lit dvc 19 lit dvc 9D lit dvc 95 lit dvc B6 lit dvc D3 lit dvc E3 lit dvc 1 lit dvc 75 lit dvc 85 lit dvc 86 lit dvc 28 lit dvc 1D lit dvc CD lit dvc 26 lit dvc
+;
+: dvh20
+2 lit dvkf !  3 lit dvkl !  20 lit dvko !
+dvkx @ dvp !
+87 lit dvc 0 lit dvc 6F lit dvc C4 lit dvc 1B lit dvc 38 lit dvc 73 lit dvc 5B lit dvc 9F lit dvc 2 lit dvc C8 lit dvc 4 lit dvc 36 lit dvc 7B lit dvc 5D lit dvc B7 lit dvc 52 lit dvc 8B lit dvc 5A lit dvc 28 lit dvc 0 lit dvc 4F lit dvc E2 lit dvc 12 lit dvc
+CB lit dvc C9 lit dvc 2F lit dvc A8 lit dvc 17 lit dvc B2 lit dvc D2 lit dvc B1 lit dvc
+;
+: dvh21
+3 lit dvkf !  3 lit dvkl !  40 lit dvko !
+dvkx @ dvp !
+53 lit dvc 36 lit dvc 4 lit dvc B5 lit dvc C4 lit dvc C8 lit dvc 8E lit dvc DE lit dvc 41 lit dvc 18 lit dvc 4E lit dvc 3 lit dvc 63 lit dvc 89 lit dvc D2 lit dvc CB lit dvc 32 lit dvc 2D lit dvc 41 lit dvc 65 lit dvc BC lit dvc 75 lit dvc AD lit dvc C0 lit dvc
+F9 lit dvc AB lit dvc D8 lit dvc 36 lit dvc 10 lit dvc FB lit dvc B3 lit dvc 90 lit dvc 54 lit dvc 32 lit dvc 6B lit dvc BB lit dvc 50 lit dvc 6C lit dvc 50 lit dvc B7 lit dvc 4F lit dvc 5F lit dvc 81 lit dvc 4F lit dvc CA lit dvc 55 lit dvc BB lit dvc D3 lit dvc
+D6 lit dvc 1E lit dvc EF lit dvc 69 lit dvc 43 lit dvc EF lit dvc 52 lit dvc DE lit dvc 9F lit dvc C1 lit dvc 82 lit dvc B9 lit dvc 3B lit dvc EB lit dvc F1 lit dvc D2 lit dvc
+;
+: dvh22
+2 lit dvkf !  88 lit dvkl !  20 lit dvko !
+dvkx @ dvp !
+F1 lit dvc 6 lit dvc D1 lit dvc 2 lit dvc 4A lit dvc 85 lit dvc 5C lit dvc 6A lit dvc 20 lit dvc D3 lit dvc 0 lit dvc BB lit dvc 53 lit dvc EC lit dvc 54 lit dvc 72 lit dvc A1 lit dvc BA lit dvc E1 lit dvc 26 lit dvc FA lit dvc 63 lit dvc F lit dvc EE lit dvc
+78 lit dvc 21 lit dvc 9B lit dvc 51 lit dvc AD lit dvc D7 lit dvc D7 lit dvc 68 lit dvc
+;
+: dvh23
+3 lit dvkf !  88 lit dvkl !  40 lit dvko !
+dvkx @ dvp !
+9B lit dvc E6 lit dvc E lit dvc 62 lit dvc 8F lit dvc EB lit dvc AE lit dvc 57 lit dvc 6D lit dvc D2 lit dvc CD lit dvc DB lit dvc 3E lit dvc A6 lit dvc 2A lit dvc B4 lit dvc F1 lit dvc C7 lit dvc 4A lit dvc E6 lit dvc C4 lit dvc E0 lit dvc 3E lit dvc CA lit dvc
+1 lit dvc 4B lit dvc 2E lit dvc F lit dvc 5F lit dvc 47 lit dvc 5 lit dvc 9F lit dvc E6 lit dvc 65 lit dvc CB lit dvc D2 lit dvc D3 lit dvc BB lit dvc 4E lit dvc A lit dvc 9F lit dvc C2 lit dvc AD lit dvc D5 lit dvc 55 lit dvc 2B lit dvc 16 lit dvc 12 lit dvc
+9A lit dvc 4A lit dvc 8F lit dvc F5 lit dvc 15 lit dvc DF lit dvc E1 lit dvc F0 lit dvc 3F lit dvc FC lit dvc 43 lit dvc FE lit dvc 7A lit dvc B3 lit dvc 60 lit dvc 1A lit dvc
+;
+: dvh24
+2 lit dvkf !  C8 lit dvkl !  20 lit dvko !
+dvkx @ dvp !
+1B lit dvc EA lit dvc 1A lit dvc 85 lit dvc C8 lit dvc 2F lit dvc 14 lit dvc 1D lit dvc 11 lit dvc 89 lit dvc 88 lit dvc BE lit dvc 6F lit dvc 7A lit dvc 7C lit dvc 8 lit dvc 75 lit dvc A4 lit dvc 5C lit dvc 1A lit dvc 98 lit dvc 20 lit dvc F2 lit dvc E1 lit dvc
+D7 lit dvc 79 lit dvc 70 lit dvc 61 lit dvc D2 lit dvc B3 lit dvc D8 lit dvc 6A lit dvc
+;
+: dvh25
+3 lit dvkf !  C8 lit dvkl !  40 lit dvko !
+dvkx @ dvp !
+45 lit dvc 41 lit dvc 8D lit dvc BA lit dvc E0 lit dvc F4 lit dvc F lit dvc C9 lit dvc 6A lit dvc 0 lit dvc 35 lit dvc 1B lit dvc C4 lit dvc FE lit dvc AA lit dvc 22 lit dvc 76 lit dvc 4A lit dvc 6C lit dvc 20 lit dvc C9 lit dvc 0 lit dvc 34 lit dvc F1 lit dvc
+BE lit dvc F2 lit dvc 16 lit dvc 4B lit dvc 36 lit dvc D8 lit dvc F2 lit dvc E3 lit dvc D5 lit dvc AE lit dvc 8A lit dvc 1B lit dvc AD lit dvc 8E lit dvc D8 lit dvc 2C lit dvc 9 lit dvc C lit dvc 88 lit dvc F5 lit dvc 60 lit dvc 9D lit dvc 4D lit dvc EB lit dvc
+27 lit dvc 42 lit dvc B lit dvc 57 lit dvc 4D lit dvc 7E lit dvc A5 lit dvc E7 lit dvc 5F lit dvc 62 lit dvc AB lit dvc 88 lit dvc 76 lit dvc 99 lit dvc E0 lit dvc B0 lit dvc
+;
+: dvkn  1A lit ;
+: dvk
+dup 0 lit = if dvh0 then
+dup 1 lit = if dvh1 then
+dup 2 lit = if dvh2 then
+dup 3 lit = if dvh3 then
+dup 4 lit = if dvh4 then
+dup 5 lit = if dvh5 then
+dup 6 lit = if dvh6 then
+dup 7 lit = if dvh7 then
+dup 8 lit = if dvh8 then
+dup 9 lit = if dvh9 then
+dup A lit = if dvh10 then
+dup B lit = if dvh11 then
+dup C lit = if dvh12 then
+dup D lit = if dvh13 then
+dup E lit = if dvh14 then
+dup F lit = if dvh15 then
+dup 10 lit = if dvh16 then
+dup 11 lit = if dvh17 then
+dup 12 lit = if dvh18 then
+dup 13 lit = if dvh19 then
+dup 14 lit = if dvh20 then
+dup 15 lit = if dvh21 then
+dup 16 lit = if dvh22 then
+dup 17 lit = if dvh23 then
+dup 18 lit = if dvh24 then
+dup 19 lit = if dvh25 then
+drop ;
+
+: dvq0
+0 lit dvtn !
+dvsd @ dvp !
+0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc
+0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc 0 lit dvc
+dvmsg @ dvp !
+0 lit dvml !
+dvctx @ dvp !
+0 lit dvcl !
+dvpkh @ dvp !
+11 lit dvc 9C lit dvc 7C lit dvc BE lit dvc 3B lit dvc 3B lit dvc 48 lit dvc 9F lit dvc 2F lit dvc 54 lit dvc 22 lit dvc 38 lit dvc E8 lit dvc 36 lit dvc BE lit dvc 44 lit dvc EB lit dvc 55 lit dvc 2 lit dvc 18 lit dvc E5 lit dvc 5E lit dvc F7 lit dvc E4 lit dvc
+F5 lit dvc 70 lit dvc AE lit dvc 87 lit dvc 52 lit dvc AA lit dvc 46 lit dvc 24 lit dvc
+dvskh @ dvp !
+79 lit dvc C9 lit dvc 26 lit dvc CA lit dvc D9 lit dvc 90 lit dvc AD lit dvc 16 lit dvc D9 lit dvc 9C lit dvc 97 lit dvc 5E lit dvc 36 lit dvc F0 lit dvc 6A lit dvc 86 lit dvc A4 lit dvc 9D lit dvc 23 lit dvc 98 lit dvc A9 lit dvc 5C lit dvc 6B lit dvc 11 lit dvc
+A0 lit dvc 17 lit dvc C7 lit dvc 66 lit dvc B5 lit dvc 66 lit dvc 5D lit dvc 88 lit dvc
+dvsgh @ dvp !
+D lit dvc 44 lit dvc 9E lit dvc 5 lit dvc 3E lit dvc 50 lit dvc 9F lit dvc D3 lit dvc A lit dvc 83 lit dvc 1C lit dvc AB lit dvc 72 lit dvc 2E lit dvc 41 lit dvc CE lit dvc 9 lit dvc F9 lit dvc 84 lit dvc 2D lit dvc E4 lit dvc 0 lit dvc AC lit dvc 51 lit dvc
+90 lit dvc 5B lit dvc F2 lit dvc 58 lit dvc BF lit dvc 7A lit dvc BD lit dvc 28 lit dvc
+0 lit 0 lit 0 lit FFFFFFFF lit dvck
+1 lit 0 lit 1 lit 0 lit dvck
+1 lit 2F lit 80 lit 0 lit dvck
+1 lit 30 lit 1 lit 0 lit dvck
+1 lit 32 lit 80 lit 0 lit dvck
+1 lit 3E8 lit 4 lit 0 lit dvck
+1 lit CAF lit 10 lit 0 lit dvck
+1 lit CB0 lit 1 lit 0 lit dvck
+1 lit CE6 lit 40 lit 0 lit dvck
+1 lit CE7 lit 1 lit 0 lit dvck
+1 lit CEC lit 1 lit 0 lit dvck
+1 lit CEC lit 80 lit 0 lit dvck
+4 lit 0 lit 0 lit 0 lit dvck
+5 lit 0 lit 1 lit 0 lit dvck
+5 lit 3E8 lit 10 lit 0 lit dvck
+6 lit 0 lit 0 lit 0 lit dvck
+;
+: dvq1
+0 lit dvtn !
+dvsd @ dvp !
+0 lit dvc 1 lit dvc 2 lit dvc 3 lit dvc 4 lit dvc 5 lit dvc 6 lit dvc 7 lit dvc 8 lit dvc 9 lit dvc A lit dvc B lit dvc C lit dvc D lit dvc E lit dvc F lit dvc 10 lit dvc 11 lit dvc 12 lit dvc 13 lit dvc 14 lit dvc 15 lit dvc 16 lit dvc 17 lit dvc
+18 lit dvc 19 lit dvc 1A lit dvc 1B lit dvc 1C lit dvc 1D lit dvc 1E lit dvc 1F lit dvc
+dvmsg @ dvp !
+61 lit dvc 62 lit dvc 63 lit dvc
+3 lit dvml !
+dvctx @ dvp !
+74 lit dvc 61 lit dvc 62 lit dvc
+3 lit dvcl !
+dvpkh @ dvp !
+1B lit dvc 5 lit dvc 63 lit dvc E3 lit dvc CD lit dvc 33 lit dvc 46 lit dvc 14 lit dvc 9C lit dvc 8C lit dvc 9E lit dvc BC lit dvc F2 lit dvc 3B lit dvc A lit dvc 4E lit dvc 5A lit dvc 90 lit dvc E lit dvc EA lit dvc 9C lit dvc 65 lit dvc 62 lit dvc 79 lit dvc
+A lit dvc 7C lit dvc 63 lit dvc E3 lit dvc 86 lit dvc 63 lit dvc DA lit dvc A2 lit dvc
+dvskh @ dvp !
+FE lit dvc 87 lit dvc 5 lit dvc 8D lit dvc 58 lit dvc 2B lit dvc 89 lit dvc A4 lit dvc 7B lit dvc B1 lit dvc 8B lit dvc 7A lit dvc D9 lit dvc FD lit dvc 26 lit dvc 36 lit dvc E2 lit dvc C1 lit dvc 8A lit dvc F0 lit dvc 39 lit dvc C lit dvc 7A lit dvc D6 lit dvc
+10 lit dvc 1A lit dvc A6 lit dvc F7 lit dvc 8B lit dvc 1E lit dvc E9 lit dvc 4E lit dvc
+dvsgh @ dvp !
+10 lit dvc FD lit dvc A7 lit dvc 37 lit dvc A7 lit dvc AE lit dvc D2 lit dvc 14 lit dvc E5 lit dvc 52 lit dvc 39 lit dvc C3 lit dvc 30 lit dvc 42 lit dvc 78 lit dvc 75 lit dvc F lit dvc B0 lit dvc 88 lit dvc E lit dvc EB lit dvc 64 lit dvc DB lit dvc 77 lit dvc
+2B lit dvc 55 lit dvc 1C lit dvc 5A lit dvc D1 lit dvc B2 lit dvc 9A lit dvc E4 lit dvc
+0 lit 0 lit 0 lit FFFFFFFF lit dvck
+1 lit 0 lit 1 lit 0 lit dvck
+1 lit 2F lit 80 lit 0 lit dvck
+1 lit 30 lit 1 lit 0 lit dvck
+1 lit 32 lit 80 lit 0 lit dvck
+1 lit 3E8 lit 4 lit 0 lit dvck
+1 lit CAF lit 10 lit 0 lit dvck
+1 lit CB0 lit 1 lit 0 lit dvck
+1 lit CE6 lit 40 lit 0 lit dvck
+1 lit CE7 lit 1 lit 0 lit dvck
+1 lit CEC lit 1 lit 0 lit dvck
+1 lit CEC lit 80 lit 0 lit dvck
+2 lit 2 lit 1 lit 0 lit dvck
+3 lit 0 lit 20 lit 0 lit dvck
+4 lit 0 lit 0 lit 0 lit dvck
+5 lit 0 lit 1 lit 0 lit dvck
+5 lit 3E8 lit 10 lit 0 lit dvck
+6 lit 0 lit 0 lit 0 lit dvck
+;
+: dvq2
+0 lit dvtn !
+dvsd @ dvp !
+3 lit dvc A lit dvc 11 lit dvc 18 lit dvc 1F lit dvc 26 lit dvc 2D lit dvc 34 lit dvc 3B lit dvc 42 lit dvc 49 lit dvc 50 lit dvc 57 lit dvc 5E lit dvc 65 lit dvc 6C lit dvc 73 lit dvc 7A lit dvc 81 lit dvc 88 lit dvc 8F lit dvc 96 lit dvc 9D lit dvc A4 lit dvc
+AB lit dvc B2 lit dvc B9 lit dvc C0 lit dvc C7 lit dvc CE lit dvc D5 lit dvc DC lit dvc
+dvmsg @ dvp !
+5 lit dvc 12 lit dvc 1F lit dvc 2C lit dvc 39 lit dvc 46 lit dvc 53 lit dvc 60 lit dvc 6D lit dvc 7A lit dvc 87 lit dvc 94 lit dvc A1 lit dvc AE lit dvc BB lit dvc C8 lit dvc D5 lit dvc E2 lit dvc EF lit dvc FC lit dvc 9 lit dvc 16 lit dvc 23 lit dvc 30 lit dvc
+3D lit dvc 4A lit dvc 57 lit dvc 64 lit dvc 71 lit dvc 7E lit dvc 8B lit dvc 98 lit dvc A5 lit dvc B2 lit dvc BF lit dvc CC lit dvc D9 lit dvc E6 lit dvc F3 lit dvc 0 lit dvc D lit dvc 1A lit dvc 27 lit dvc 34 lit dvc 41 lit dvc 4E lit dvc 5B lit dvc 68 lit dvc
+75 lit dvc 82 lit dvc 8F lit dvc 9C lit dvc A9 lit dvc B6 lit dvc C3 lit dvc D0 lit dvc DD lit dvc EA lit dvc F7 lit dvc 4 lit dvc 11 lit dvc 1E lit dvc 2B lit dvc 38 lit dvc 45 lit dvc 52 lit dvc 5F lit dvc 6C lit dvc 79 lit dvc 86 lit dvc 93 lit dvc A0 lit dvc
+AD lit dvc BA lit dvc C7 lit dvc D4 lit dvc E1 lit dvc EE lit dvc FB lit dvc 8 lit dvc 15 lit dvc 22 lit dvc 2F lit dvc 3C lit dvc 49 lit dvc 56 lit dvc 63 lit dvc 70 lit dvc 7D lit dvc 8A lit dvc 97 lit dvc A4 lit dvc B1 lit dvc BE lit dvc CB lit dvc D8 lit dvc
+E5 lit dvc F2 lit dvc FF lit dvc C lit dvc 19 lit dvc 26 lit dvc 33 lit dvc 40 lit dvc 4D lit dvc 5A lit dvc 67 lit dvc 74 lit dvc 81 lit dvc 8E lit dvc 9B lit dvc A8 lit dvc B5 lit dvc C2 lit dvc CF lit dvc DC lit dvc E9 lit dvc F6 lit dvc 3 lit dvc 10 lit dvc
+1D lit dvc 2A lit dvc 37 lit dvc 44 lit dvc 51 lit dvc 5E lit dvc 6B lit dvc 78 lit dvc 85 lit dvc 92 lit dvc 9F lit dvc AC lit dvc B9 lit dvc C6 lit dvc D3 lit dvc E0 lit dvc ED lit dvc FA lit dvc 7 lit dvc 14 lit dvc 21 lit dvc 2E lit dvc 3B lit dvc 48 lit dvc
+55 lit dvc 62 lit dvc 6F lit dvc 7C lit dvc 89 lit dvc 96 lit dvc A3 lit dvc B0 lit dvc BD lit dvc CA lit dvc D7 lit dvc E4 lit dvc F1 lit dvc FE lit dvc B lit dvc 18 lit dvc 25 lit dvc 32 lit dvc 3F lit dvc 4C lit dvc 59 lit dvc 66 lit dvc 73 lit dvc 80 lit dvc
+8D lit dvc 9A lit dvc A7 lit dvc B4 lit dvc C1 lit dvc CE lit dvc DB lit dvc E8 lit dvc F5 lit dvc 2 lit dvc F lit dvc 1C lit dvc 29 lit dvc 36 lit dvc 43 lit dvc 50 lit dvc 5D lit dvc 6A lit dvc 77 lit dvc 84 lit dvc 91 lit dvc 9E lit dvc AB lit dvc B8 lit dvc
+C5 lit dvc D2 lit dvc DF lit dvc EC lit dvc F9 lit dvc 6 lit dvc 13 lit dvc 20 lit dvc
+C8 lit dvml !
+dvctx @ dvp !
+0 lit dvc 3 lit dvc 6 lit dvc 9 lit dvc C lit dvc F lit dvc 12 lit dvc 15 lit dvc 18 lit dvc 1B lit dvc 1E lit dvc 21 lit dvc 24 lit dvc 27 lit dvc 2A lit dvc 2D lit dvc 30 lit dvc 33 lit dvc 36 lit dvc 39 lit dvc 3C lit dvc 3F lit dvc 42 lit dvc 45 lit dvc
+48 lit dvc 4B lit dvc 4E lit dvc 51 lit dvc 54 lit dvc 57 lit dvc 5A lit dvc 5D lit dvc 60 lit dvc 63 lit dvc 66 lit dvc 69 lit dvc 6C lit dvc 6F lit dvc 72 lit dvc 75 lit dvc
+28 lit dvcl !
+dvpkh @ dvp !
+C4 lit dvc 9 lit dvc DA lit dvc E4 lit dvc ED lit dvc 0 lit dvc D3 lit dvc EC lit dvc 31 lit dvc C8 lit dvc B8 lit dvc 5D lit dvc C1 lit dvc 1 lit dvc 8F lit dvc 93 lit dvc 2E lit dvc 81 lit dvc 12 lit dvc E6 lit dvc A8 lit dvc C5 lit dvc C5 lit dvc 3A lit dvc
+8F lit dvc 90 lit dvc 71 lit dvc 5 lit dvc 6D lit dvc EB lit dvc D lit dvc 2C lit dvc
+dvskh @ dvp !
+94 lit dvc 6B lit dvc 13 lit dvc 3F lit dvc F9 lit dvc 2A lit dvc 3 lit dvc 96 lit dvc 2A lit dvc 2 lit dvc 2D lit dvc 5F lit dvc 9E lit dvc E lit dvc 92 lit dvc 69 lit dvc 52 lit dvc 85 lit dvc B2 lit dvc FA lit dvc EB lit dvc A3 lit dvc 9A lit dvc B6 lit dvc
+BE lit dvc 24 lit dvc 53 lit dvc B3 lit dvc F9 lit dvc 58 lit dvc 6C lit dvc DB lit dvc
+dvsgh @ dvp !
+B2 lit dvc 7E lit dvc C7 lit dvc 9E lit dvc A lit dvc 2 lit dvc F0 lit dvc 2F lit dvc 2C lit dvc 7E lit dvc 89 lit dvc F7 lit dvc 6C lit dvc BE lit dvc AE lit dvc 4 lit dvc 26 lit dvc 96 lit dvc E2 lit dvc A0 lit dvc 82 lit dvc C7 lit dvc 33 lit dvc 93 lit dvc
+D1 lit dvc 20 lit dvc E lit dvc 93 lit dvc 24 lit dvc 4F lit dvc 34 lit dvc 11 lit dvc
+0 lit 0 lit 0 lit FFFFFFFF lit dvck
+1 lit 0 lit 1 lit 0 lit dvck
+1 lit 2F lit 80 lit 0 lit dvck
+1 lit 30 lit 1 lit 0 lit dvck
+1 lit 32 lit 80 lit 0 lit dvck
+1 lit 3E8 lit 4 lit 0 lit dvck
+1 lit CAF lit 10 lit 0 lit dvck
+1 lit CB0 lit 1 lit 0 lit dvck
+1 lit CE6 lit 40 lit 0 lit dvck
+1 lit CE7 lit 1 lit 0 lit dvck
+1 lit CEC lit 1 lit 0 lit dvck
+1 lit CEC lit 80 lit 0 lit dvck
+2 lit C7 lit 1 lit 0 lit dvck
+3 lit 0 lit 20 lit 0 lit dvck
+4 lit 0 lit 0 lit 0 lit dvck
+5 lit 0 lit 1 lit 0 lit dvck
+5 lit 3E8 lit 10 lit 0 lit dvck
+6 lit 0 lit 0 lit 0 lit dvck
+;
+: dvq3
+0 lit dvtn !
+dvsd @ dvp !
+FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc
+FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc FF lit dvc
+dvmsg @ dvp !
+5A lit dvc
+1 lit dvml !
+dvctx @ dvp !
+0 lit dvcl !
+dvpkh @ dvp !
+7A lit dvc 25 lit dvc 1 lit dvc 6C lit dvc 6 lit dvc 8B lit dvc D5 lit dvc A9 lit dvc CA lit dvc 85 lit dvc 3D lit dvc 7A lit dvc F4 lit dvc B7 lit dvc 6 lit dvc 79 lit dvc 2 lit dvc 44 lit dvc A5 lit dvc B1 lit dvc 27 lit dvc DB lit dvc 6B lit dvc B0 lit dvc
+B7 lit dvc 1E lit dvc 3B lit dvc 1E lit dvc D7 lit dvc B2 lit dvc E lit dvc 54 lit dvc
+dvskh @ dvp !
+72 lit dvc 2A lit dvc CE lit dvc FC lit dvc 34 lit dvc 82 lit dvc F0 lit dvc C3 lit dvc B8 lit dvc E8 lit dvc C8 lit dvc BD lit dvc AE lit dvc 40 lit dvc 27 lit dvc AD lit dvc E7 lit dvc 9F lit dvc 4D lit dvc 13 lit dvc 17 lit dvc 85 lit dvc 94 lit dvc 3D lit dvc
+27 lit dvc AD lit dvc 6C lit dvc 5 lit dvc 94 lit dvc 96 lit dvc 48 lit dvc BD lit dvc
+dvsgh @ dvp !
+CE lit dvc 5 lit dvc 58 lit dvc 91 lit dvc 8A lit dvc E2 lit dvc 17 lit dvc 6E lit dvc 3E lit dvc 4 lit dvc 3A lit dvc 2F lit dvc BD lit dvc A3 lit dvc A4 lit dvc 16 lit dvc AB lit dvc 61 lit dvc 95 lit dvc FF lit dvc 5E lit dvc D4 lit dvc FC lit dvc D0 lit dvc
+CA lit dvc C3 lit dvc 96 lit dvc 92 lit dvc BE lit dvc B8 lit dvc 78 lit dvc 67 lit dvc
+0 lit 0 lit 0 lit FFFFFFFF lit dvck
+1 lit 0 lit 1 lit 0 lit dvck
+1 lit 2F lit 80 lit 0 lit dvck
+1 lit 30 lit 1 lit 0 lit dvck
+1 lit 32 lit 80 lit 0 lit dvck
+1 lit 3E8 lit 4 lit 0 lit dvck
+1 lit CAF lit 10 lit 0 lit dvck
+1 lit CB0 lit 1 lit 0 lit dvck
+1 lit CE6 lit 40 lit 0 lit dvck
+1 lit CE7 lit 1 lit 0 lit dvck
+1 lit CEC lit 1 lit 0 lit dvck
+1 lit CEC lit 80 lit 0 lit dvck
+2 lit 0 lit 1 lit 0 lit dvck
+4 lit 0 lit 0 lit 0 lit dvck
+5 lit 0 lit 1 lit 0 lit dvck
+5 lit 3E8 lit 10 lit 0 lit dvck
+6 lit 0 lit 0 lit 0 lit dvck
+;
+: dvn  4 lit ;
+: dvset
+dup 0 lit = if dvq0 then
+dup 1 lit = if dvq1 then
+dup 2 lit = if dvq2 then
+dup 3 lit = if dvq3 then
+drop ;

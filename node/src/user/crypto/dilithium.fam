@@ -1,0 +1,903 @@
+\ crypto/dilithium.fam — Dilithium (ML-DSA-65, FIPS 204), as tabminer's
+\ miner/src/mldsa.rs: the same parameters and encodings, so a key, a
+\ signature and a verdict here are tabminer's (crypto/dilithium_test.fam,
+\ with miner/src/fam_dilithium_vectors.rs's values).  The wallet's
+\ long-lived key (docs/GUI_WALLET.md).  After crypto/keccak.fam.
+\
+\ Keys: public 1,952 bytes (7A0), secret 4,032 (FC0), signatures 3,309
+\ (CED).  Key generation is deterministic from a 32-byte seed; signing is
+\ too (FIPS 204's zero randomness, tabminer's sign, not hedged), over a
+\ message with a context of at most 255 bytes.
+\
+\ dilkey ( seed pk sk -- )  the key pair of the 32 bytes at seed.
+\ dilsign ( sk msg mlen ctx clen sig -- )  the signature, at sig.
+\ dilver ( pk msg mlen ctx clen sig -- flag )  whether it is pk's.
+\
+\ A polynomial is 256 words, each below q (8,380,417), as tabminer's
+\ arrays after modq.  RV32I has no multiply: a product mod q is three
+\ rows of byte products from a table (128 KiB, dlmtab) and three
+\ reductions (2^23 = 2^13 - 1 mod q), in the raw words, which do the
+\ NTT, its inverse and the products a polynomial at a time.
+
+: dlmt variable ;  : dlzt variable ;  : dlpb variable ;
+: dla variable ;  : dls1 variable ;  : dls2 variable ;  : dlt0 variable ;  : dly variable ;  : dlyh variable ;
+: dlw variable ;  : dlz variable ;  : dlc variable ;  : dlch variable ;  : dltp variable ;  : dlh variable ;
+: dlct0 variable ;  : dlwc variable ;
+: dlin variable ;  : dlrho variable ;  : dlrp variable ;  : dlkk variable ;  : dltr variable ;  : dlmu variable ;
+: dlr2 variable ;  : dlct variable ;  : dlxb variable ;  : dlbf variable ;  : dlb2 variable ;  : dlz32 variable ;
+: dlpk variable ;  : dlsk variable ;  : dlsg variable ;  : dlmsg variable ;  : dlml variable ;  : dlctx variable ;
+: dlcl variable ;  : dlpp variable ;  : dlkap variable ;  : dlzn variable ;  : dlr0 variable ;  : dlcn variable ;
+: dlwt variable ;  : dlo variable ;  : dlres variable ;  : dlhs variable ;  : dlhx variable ;  : dlhe variable ;
+: dlhf variable ;  : dlok variable ;  : dlrd variable ;  : dlrj variable ;  : dlmi variable ;  : dlmd variable ;
+: dlmvv variable ;  : dlua variable ;  : dlun variable ;  : dlub variable ;  : dlubt variable ;  : dlus variable ;
+: dlupp variable ;
+
+\ The raw words, from tools/gendilithium.py through tools/asm2fam.py.
+\ dlmtab ( tbl -- )  the byte products: the halfword at tbl + 2(256a + b)
+\ is a*b.
+: dlmtab
+03250100 ,   \ lw a0,0(sp)   ( tbl )
+13014100 ,   \ addi sp,sp,4
+93050000 ,   \ li a1,0
+13070010 ,   \ li a4,256
+\ rowa:
+13060000 ,   \ li a2,0
+93060010 ,   \ li a3,256
+\ rowb:
+2310C500 ,   \ sh a2,0(a0)
+13052500 ,   \ addi a0,a0,2
+3306B600 ,   \ add a2,a2,a1
+9386F6FF ,   \ addi a3,a3,-1
+E39806FE ,   \ bnez a3,rowb
+93851500 ,   \ addi a1,a1,1
+E390E5FE ,   \ bne a1,a4,rowa
+;
+\ dlmmr ( x y tbl -- x*y mod q )
+: dlmmr
+03260100 ,   \ lw a2,0(sp)   ( tbl )
+83224100 ,   \ lw t0,4(sp)   ( y )
+03258100 ,   \ lw a0,8(sp)   ( x )
+13018100 ,   \ addi sp,sp,8
+137EF50F ,   \ andi t3,a0,255
+131E9E00 ,   \ slli t3,t3,9
+B30EC601 ,   \ add t4,a2,t3
+135E8500 ,   \ srli t3,a0,8
+137EFE0F ,   \ andi t3,t3,255
+131E9E00 ,   \ slli t3,t3,9
+330FC601 ,   \ add t5,a2,t3
+135E0501 ,   \ srli t3,a0,16
+131E9E00 ,   \ slli t3,t3,9
+B30FC601 ,   \ add t6,a2,t3
+93D30201 ,   \ srli t2,t0,16
+93931300 ,   \ slli t2,t2,1
+33837E00 ,   \ add t1,t4,t2
+03530300 ,   \ lhu t1,0(t1)
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93D38200 ,   \ srli t2,t0,8
+93F3F30F ,   \ andi t2,t2,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93F3F20F ,   \ andi t2,t0,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23206100 ,   \ sw t1,0(sp)
+;
+\ dlnttr ( p z tbl -- )  the NTT in place, the powers of zeta at z.
+: dlnttr
+03260100 ,   \ lw a2,0(sp)   ( tbl )
+83254100 ,   \ lw a1,4(sp)   ( z )
+03258100 ,   \ lw a0,8(sp)   ( p )
+1301C100 ,   \ addi sp,sp,12
+13080540 ,   \ addi a6,a0,1024   ( p's end )
+93060020 ,   \ li a3,512   ( len, in bytes )
+\ stage:
+13070500 ,   \ mv a4,a0
+\ block:
+93854500 ,   \ addi a1,a1,4
+83A80500 ,   \ lw a7,0(a1)
+13FEF80F ,   \ andi t3,a7,255
+131E9E00 ,   \ slli t3,t3,9
+B30EC601 ,   \ add t4,a2,t3
+13DE8800 ,   \ srli t3,a7,8
+137EFE0F ,   \ andi t3,t3,255
+131E9E00 ,   \ slli t3,t3,9
+330FC601 ,   \ add t5,a2,t3
+13DE0801 ,   \ srli t3,a7,16
+131E9E00 ,   \ slli t3,t3,9
+B30FC601 ,   \ add t6,a2,t3
+B307D700 ,   \ add a5,a4,a3
+B308D700 ,   \ add a7,a4,a3
+\ bfly:
+83A20800 ,   \ lw t0,0(a7)
+93D30201 ,   \ srli t2,t0,16
+93931300 ,   \ slli t2,t2,1
+33837E00 ,   \ add t1,t4,t2
+03530300 ,   \ lhu t1,0(t1)
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93D38200 ,   \ srli t2,t0,8
+93F3F30F ,   \ andi t2,t2,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93F3F20F ,   \ andi t2,t0,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+83200700 ,   \ lw ra,0(a4)
+B3826040 ,   \ sub t0,ra,t1
+93D3F241 ,   \ srai t2,t0,31
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+B3F3C301 ,   \ and t2,t2,t3
+B3827200 ,   \ add t0,t0,t2
+23A05800 ,   \ sw t0,0(a7)
+33836000 ,   \ add t1,ra,t1
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23206700 ,   \ sw t1,0(a4)
+13074700 ,   \ addi a4,a4,4
+93884800 ,   \ addi a7,a7,4
+E318F7E6 ,   \ bne a4,a5,bfly
+13870800 ,   \ mv a4,a7
+E31807E3 ,   \ bne a4,a6,block
+93D61600 ,   \ srli a3,a3,1
+93B24600 ,   \ sltiu t0,a3,4
+E38002E2 ,   \ beqz t0,stage
+;
+\ dlinttr ( p z tbl -- )  its inverse, the factor 1/256 included.
+: dlinttr
+03260100 ,   \ lw a2,0(sp)   ( tbl )
+83254100 ,   \ lw a1,4(sp)   ( z )
+03258100 ,   \ lw a0,8(sp)   ( p )
+1301C100 ,   \ addi sp,sp,12
+13080540 ,   \ addi a6,a0,1024   ( p's end )
+93850540 ,   \ addi a1,a1,1024   ( z, from its end )
+93064000 ,   \ li a3,4   ( len, in bytes )
+\ stage:
+13070500 ,   \ mv a4,a0
+\ block:
+9385C5FF ,   \ addi a1,a1,-4
+83A80500 ,   \ lw a7,0(a1)
+B7E27F00 ,   \ lui t0,0x7FE
+93821200 ,   \ addi t0,t0,1
+B3881241 ,   \ sub a7,t0,a7   ( -zeta )
+13FEF80F ,   \ andi t3,a7,255
+131E9E00 ,   \ slli t3,t3,9
+B30EC601 ,   \ add t4,a2,t3
+13DE8800 ,   \ srli t3,a7,8
+137EFE0F ,   \ andi t3,t3,255
+131E9E00 ,   \ slli t3,t3,9
+330FC601 ,   \ add t5,a2,t3
+13DE0801 ,   \ srli t3,a7,16
+131E9E00 ,   \ slli t3,t3,9
+B30FC601 ,   \ add t6,a2,t3
+B307D700 ,   \ add a5,a4,a3
+B308D700 ,   \ add a7,a4,a3
+\ bfly:
+83200700 ,   \ lw ra,0(a4)
+83A20800 ,   \ lw t0,0(a7)
+33835000 ,   \ add t1,ra,t0
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23206700 ,   \ sw t1,0(a4)
+B3825040 ,   \ sub t0,ra,t0
+93D3F241 ,   \ srai t2,t0,31
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+B3F3C301 ,   \ and t2,t2,t3
+B3827200 ,   \ add t0,t0,t2
+93D30201 ,   \ srli t2,t0,16
+93931300 ,   \ slli t2,t2,1
+33837E00 ,   \ add t1,t4,t2
+03530300 ,   \ lhu t1,0(t1)
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93D38200 ,   \ srli t2,t0,8
+93F3F30F ,   \ andi t2,t2,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93F3F20F ,   \ andi t2,t0,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23A06800 ,   \ sw t1,0(a7)
+13074700 ,   \ addi a4,a4,4
+93884800 ,   \ addi a7,a7,4
+E318F7E6 ,   \ bne a4,a5,bfly
+13870800 ,   \ mv a4,a7
+E31207E3 ,   \ bne a4,a6,block
+93961600 ,   \ slli a3,a3,1
+93020040 ,   \ li t0,1024
+E39A56E0 ,   \ bne a3,t0,stage
+B7687F00 ,   \ lui a7,2038
+93881802 ,   \ addi a7,a7,33
+13FEF80F ,   \ andi t3,a7,255
+131E9E00 ,   \ slli t3,t3,9
+B30EC601 ,   \ add t4,a2,t3
+13DE8800 ,   \ srli t3,a7,8
+137EFE0F ,   \ andi t3,t3,255
+131E9E00 ,   \ slli t3,t3,9
+330FC601 ,   \ add t5,a2,t3
+13DE0801 ,   \ srli t3,a7,16
+131E9E00 ,   \ slli t3,t3,9
+B30FC601 ,   \ add t6,a2,t3
+13070500 ,   \ mv a4,a0
+\ scale:
+83220700 ,   \ lw t0,0(a4)
+93D30201 ,   \ srli t2,t0,16
+93931300 ,   \ slli t2,t2,1
+33837E00 ,   \ add t1,t4,t2
+03530300 ,   \ lhu t1,0(t1)
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93D38200 ,   \ srli t2,t0,8
+93F3F30F ,   \ andi t2,t2,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93F3F20F ,   \ andi t2,t0,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23206700 ,   \ sw t1,0(a4)
+13074700 ,   \ addi a4,a4,4
+E31A07EB ,   \ bne a4,a6,scale
+;
+\ dlpmacr ( acc a b tbl -- )  acc[i] = acc[i] + a[i]*b[i] mod q.
+: dlpmacr
+03260100 ,   \ lw a2,0(sp)   ( tbl )
+83274100 ,   \ lw a5,4(sp)   ( b )
+03278100 ,   \ lw a4,8(sp)   ( a )
+8326C100 ,   \ lw a3,12(sp)   ( acc )
+13010101 ,   \ addi sp,sp,16
+13880640 ,   \ addi a6,a3,1024
+\ each:
+83280700 ,   \ lw a7,0(a4)
+13FEF80F ,   \ andi t3,a7,255
+131E9E00 ,   \ slli t3,t3,9
+B30EC601 ,   \ add t4,a2,t3
+13DE8800 ,   \ srli t3,a7,8
+137EFE0F ,   \ andi t3,t3,255
+131E9E00 ,   \ slli t3,t3,9
+330FC601 ,   \ add t5,a2,t3
+13DE0801 ,   \ srli t3,a7,16
+131E9E00 ,   \ slli t3,t3,9
+B30FC601 ,   \ add t6,a2,t3
+83A20700 ,   \ lw t0,0(a5)
+93D30201 ,   \ srli t2,t0,16
+93931300 ,   \ slli t2,t2,1
+33837E00 ,   \ add t1,t4,t2
+03530300 ,   \ lhu t1,0(t1)
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93D38200 ,   \ srli t2,t0,8
+93F3F30F ,   \ andi t2,t2,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+93F3F20F ,   \ andi t2,t0,255
+93931300 ,   \ slli t2,t2,1
+13138300 ,   \ slli t1,t1,8
+338E7E00 ,   \ add t3,t4,t2
+035E0E00 ,   \ lhu t3,0(t3)
+3303C301 ,   \ add t1,t1,t3
+330E7F00 ,   \ add t3,t5,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E8E00 ,   \ slli t3,t3,8
+3303C301 ,   \ add t1,t1,t3
+338E7F00 ,   \ add t3,t6,t2
+035E0E00 ,   \ lhu t3,0(t3)
+131E0E01 ,   \ slli t3,t3,16
+3303C301 ,   \ add t1,t1,t3
+93537301 ,   \ srli t2,t1,23
+13139300 ,   \ slli t1,t1,9
+13539300 ,   \ srli t1,t1,9
+139ED300 ,   \ slli t3,t2,13
+330E7E40 ,   \ sub t3,t3,t2
+3303C301 ,   \ add t1,t1,t3
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+83A20600 ,   \ lw t0,0(a3)
+33035300 ,   \ add t1,t1,t0
+37EE7F00 ,   \ lui t3,0x7FE
+130E1E00 ,   \ addi t3,t3,1
+330EC341 ,   \ sub t3,t1,t3
+9353FE41 ,   \ srai t2,t3,31
+3343C301 ,   \ xor t1,t1,t3
+33737300 ,   \ and t1,t1,t2
+3343C301 ,   \ xor t1,t1,t3
+23A06600 ,   \ sw t1,0(a3)
+93864600 ,   \ addi a3,a3,4
+13074700 ,   \ addi a4,a4,4
+93874700 ,   \ addi a5,a5,4
+E39E06E5 ,   \ bne a3,a6,each
+;
+
+: dlmm  dlmt @ dlmmr ;                               \ ( x y -- x*y mod q )
+: dlntt  dlzt @ dlmt @ dlnttr ;                      \ ( p -- )
+: dlintt  dlzt @ dlmt @ dlinttr ;                    \ ( p -- )
+: dlpmac  dlmt @ dlpmacr ;                           \ ( acc a b -- )
+\ dlbc ( src dst n -- )  n bytes copied.
+: dlbc  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;
+\ dlsame ( a b n -- flag )  n bytes alike.
+: dlsame  FFFFFFFF lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
+: dlpz  100 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop ;          \ ( p -- )  zero
+: dlpcp  100 lit 0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop 2drop ;   \ ( src dst -- )
+: dladd  + dup 7FE001 lit u< 0= if 7FE001 lit - then ;   \ ( a b -- a+b mod q )
+: dlsub  - dup 0< if 7FE001 lit + then ;                 \ ( a b -- a-b mod q )
+\ dlpadd dlpsub ( dst a b -- )  dst[i] = a[i] + b[i], a[i] - b[i].
+: dlpadd  100 lit 0 lit do 1 lit pick i 2 lit lshift + @  over i 2 lit lshift + @ dladd  3 lit pick i 2 lit lshift + ! loop drop 2drop ;
+: dlpsub  100 lit 0 lit do 1 lit pick i 2 lit lshift + @  over i 2 lit lshift + @ dlsub  3 lit pick i 2 lit lshift + ! loop drop 2drop ;
+\ dlbrv ( k -- r )  the 8 bits of k reversed.
+: dlbrv  0 lit swap 8 lit 0 lit do dup 1 lit and rot 1 lit lshift or swap 1 lit rshift loop drop ;
+: dlpl  A lit lshift dlpb @ + ;                      \ ( n -- p )  polynomial n of the area
+
+\ dlinit  the area (once): the table, the powers of zeta (1753, at
+\ bit-reversed places), the polynomials and the buffers.
+: dlinit
+dlmt @ 0= if
+	36800 lit malloc dup dlmt !  dup 20000 lit + dlzt !  20400 lit + dlpb !
+	0 lit dlpl dla !  1E lit dlpl dls1 !  23 lit dlpl dls2 !  29 lit dlpl dlt0 !  2F lit dlpl dly !  34 lit dlpl dlyh !
+	39 lit dlpl dlw !  3F lit dlpl dlz !  44 lit dlpl dlc !  45 lit dlpl dlch !  46 lit dlpl dltp !  47 lit dlpl dlh !
+	4D lit dlpl dlct0 !  53 lit dlpl dlwc !
+	40 lit alloc dlin !  20 lit alloc dlrho !  40 lit alloc dlrp !  20 lit alloc dlkk !  40 lit alloc dltr !
+	40 lit alloc dlmu !  40 lit alloc dlr2 !  30 lit alloc dlct !  300 lit alloc dlxb !  B0 lit alloc dlbf !
+	4 lit alloc dlb2 !  20 lit alloc dlz32 !
+	dlz32 @ 20 lit 0 lit do 0 lit over i + c! loop drop
+	dlmt @ dlmtab
+	1 lit 100 lit 0 lit do dup dltp @ i 2 lit lshift + !  6D9 lit dlmm loop drop
+	100 lit 0 lit do i dlbrv 2 lit lshift dltp @ + @  dlzt @ i 2 lit lshift + ! loop
+then ;
+
+\ dlmv ( vec dst i -- )  dst = row i of A times the 5 polynomials at vec
+\ (the NTT domain).
+: dlmv
+dlmi !  dlmd !  dlmvv !  dlmd @ dlpz
+5 lit 0 lit do dlmd @  dlmi @ 5 lit * i + A lit lshift dla @ +  i A lit lshift dlmvv @ +  dlpmac loop ;
+
+\ dlrej ( dst s r -- )  a uniform polynomial (the NTT domain) from
+\ SHAKE128(rho || s || r).
+: dlrej
+dlb2 @ 1 lit + c!  dlb2 @ c!  dlrd !
+A8 lit 1F lit kcinit  dlrho @ 20 lit kcabs  dlb2 @ 2 lit kcabs  0 lit dlrj !
+begin dlrj @ 100 lit u< while
+	dlbf @ A8 lit kcsqz
+	0 lit begin dup A8 lit u< dlrj @ 100 lit u< and while
+		dlbf @ over + dup c@  over 1 lit + c@ 8 lit lshift or  swap 2 lit + c@ 7F lit and 10 lit lshift or
+		dup 7FE001 lit u< if dlrd @ dlrj @ 2 lit lshift + !  dlrj @ 1 lit + dlrj ! else drop then
+		3 lit +
+	repeat drop
+repeat ;
+\ dlexpa  A (6 by 5) from rho.
+: dlexpa  6 lit 0 lit do 5 lit 0 lit do  j 5 lit * i + A lit lshift dla @ +  i j dlrej loop loop ;
+\ dlrb ( b -- )  a half-byte taken, if below 9, as 4 - b.
+: dlrb  dup 9 lit u< dlrj @ 100 lit u< and if 4 lit swap - dup 0< if 7FE001 lit + then dlrd @ dlrj @ 2 lit lshift + !  dlrj @ 1 lit + dlrj ! else drop then ;
+\ dlrejb ( dst nonce -- )  a polynomial in [-4, 4] from SHAKE256(rho' || nonce).
+: dlrejb
+dup FF lit and dlb2 @ c!  8 lit rshift dlb2 @ 1 lit + c!  dlrd !
+88 lit 1F lit kcinit  dlrp @ 40 lit kcabs  dlb2 @ 2 lit kcabs  0 lit dlrj !
+begin dlrj @ 100 lit u< while
+	dlbf @ 88 lit kcsqz
+	88 lit 0 lit do dlbf @ i + c@  dup F lit and dlrb  4 lit rshift dlrb loop
+repeat ;
+
+\ dlunp ( src bits b poly -- src' )  256 values of bits bits each (the
+\ least significant first) into poly: b - v mod q, or v if b is 0.
+: dlunp
+dlupp !  dlub !  dlubt !  dlus !  0 lit dlua !  0 lit dlun !
+100 lit 0 lit do
+	begin dlun @ dlubt @ u< while  dlus @ c@ dlun @ lshift dlua @ or dlua !  dlun @ 8 lit + dlun !  dlus @ 1 lit + dlus ! repeat
+	dlua @  1 lit dlubt @ lshift 1 lit - and
+	dlua @ dlubt @ rshift dlua !  dlun @ dlubt @ - dlun !
+	dlub @ if dlub @ swap - dup 0< if 7FE001 lit + then then
+	dlupp @ i 2 lit lshift + !
+loop dlus @ ;
+\ dlpack ( poly bits b dst -- dst' )  the reverse: b - (the value centered),
+\ or the value if b is 0.
+: dlpack
+dlus !  dlub !  dlubt !  dlupp !  0 lit dlua !  0 lit dlun !
+100 lit 0 lit do
+	dlupp @ i 2 lit lshift + @
+	dlub @ if dup 3FF000 lit u> if 7FE001 lit - then dlub @ swap - then
+	dlun @ lshift dlua @ or dlua !  dlun @ dlubt @ + dlun !
+	begin dlun @ 7 lit u> while dlua @ dlus @ c!  dlus @ 1 lit + dlus !  dlua @ 8 lit rshift dlua !  dlun @ 8 lit - dlun ! repeat
+loop dlus @ ;
+
+\ Rounding: dlhi ( r -- r1 ) and dllo ( r -- r0 ), r = 2 gamma2 r1 + r0
+\ (tabminer's decompose, the top end to r1 = 0), for r below q.
+: dlhi  7F lit + 7 lit rshift dup A lit lshift + 200000 lit + 16 lit rshift F lit and ;
+: dllo  dup dlhi dup 13 lit lshift swap 9 lit lshift - - dup 3FF000 lit > if 7FE001 lit - then ;
+: dlabs  dup 0< if 0 lit swap - then ;
+: dlnorm  dup 3FF000 lit u> if 7FE001 lit swap - then ;   \ ( x -- |x| ) centered
+: dlpnorm  0 lit swap 100 lit 0 lit do dup i 2 lit lshift + @ dlnorm rot max swap loop drop ;   \ ( p -- max )
+\ dluse ( h r -- r1 )  the hint used.
+: dluse  dup dlhi swap dllo  rot if 0 lit > if 1 lit + else 1 lit - then F lit and else drop then ;
+
+\ dlsib ( ct -- )  the challenge (49 of +-1) from the 48 bytes at ct, at dlc.
+: dlsib
+88 lit 1F lit kcinit  30 lit kcabs  dlbf @ 8 lit kcsqz  dlc @ dlpz
+100 lit CF lit do
+	begin dlbf @ 8 lit + 1 lit kcsqz  dlbf @ 8 lit + c@ i u> while repeat
+	dlbf @ 8 lit + c@
+	dlc @ over 2 lit lshift + @  dlc @ i 2 lit lshift + !
+	i CF lit -  dup 20 lit u< if dlbf @ @ swap rshift else 20 lit - dlbf @ 4 lit + @ swap rshift then 1 lit and
+	if 7FE000 lit else 1 lit then  dlc @ rot 2 lit lshift + !
+loop ;
+
+\ dlhup ( src -- flag )  the hints (61 bytes) into dlh, 0 or 1 a place;
+\ whether they are well formed (as tabminer's hint_bit_unpack).
+: dlhup
+dlhs !  0 lit dlhx !  FFFFFFFF lit dlok !
+6 lit 0 lit do i A lit lshift dlh @ + dlpz loop
+6 lit 0 lit do
+	dlok @ if
+		dlhs @ 37 lit + i + c@ dlhe !
+		dlhe @ dlhx @ u< dlhe @ 37 lit u> or if 0 lit dlok ! else
+			dlhx @ dlhf !
+			begin dlhx @ dlhe @ u< dlok @ and while
+				dlhx @ dlhf @ u> if dlhs @ dlhx @ + c@  dlhs @ dlhx @ + 1 lit - c@ u> 0= if 0 lit dlok ! then then
+				1 lit  dlhs @ dlhx @ + c@ 2 lit lshift  i A lit lshift dlh @ + + !
+				dlhx @ 1 lit + dlhx !
+			repeat
+		then
+	then
+loop
+dlok @ if dlhx @ 37 lit u< if 37 lit dlhx @ do dlhs @ i + c@ if 0 lit dlok ! then loop then then
+dlok @ ;
+\ dlhpk ( dst -- )  the hints at dlh packed (61 bytes).
+: dlhpk
+dlhs !  dlhs @ 3D lit 0 lit do 0 lit over i + c! loop drop  0 lit dlhx !
+6 lit 0 lit do
+	100 lit 0 lit do
+		j A lit lshift dlh @ + i 2 lit lshift + @ if i dlhs @ dlhx @ + c!  dlhx @ 1 lit + dlhx ! then
+	loop
+	dlhx @ dlhs @ 37 lit + i + c!
+loop ;
+
+\ dlmuc  mu = SHAKE256(tr || 0 || clen || ctx || msg), 64 bytes.
+: dlmuc
+88 lit 1F lit kcinit  dltr @ 40 lit kcabs
+0 lit dlb2 @ c!  dlcl @ dlb2 @ 1 lit + c!  dlb2 @ 2 lit kcabs
+dlctx @ dlcl @ kcabs  dlmsg @ dlml @ kcabs  dlmu @ 40 lit kcsqz ;
+\ dlw1c  the challenge's hash from mu and w1 (packed at dlxb), at dlct.
+: dlw1c  88 lit 1F lit kcinit  dlmu @ 40 lit kcabs  dlxb @ 300 lit kcabs  dlct @ 30 lit kcsqz ;
+
+: dilkey
+dlinit  dlsk !  dlpk !
+dlin @ 20 lit dlbc  6 lit dlin @ 20 lit + c!  5 lit dlin @ 21 lit + c!
+dlin @ 22 lit dlxb @ 80 lit shake256
+dlxb @ dlrho @ 20 lit dlbc  dlxb @ 20 lit + dlrp @ 40 lit dlbc  dlxb @ 60 lit + dlkk @ 20 lit dlbc
+dlexpa
+5 lit 0 lit do i A lit lshift dls1 @ +  i dlrejb loop
+6 lit 0 lit do i A lit lshift dls2 @ +  i 5 lit + dlrejb loop
+5 lit 0 lit do i A lit lshift dls1 @ +  i A lit lshift dlyh @ + dlpcp  i A lit lshift dlyh @ + dlntt loop
+dlrho @ dlpk @ 20 lit dlbc  dlpk @ 20 lit + dlpp !
+6 lit 0 lit do
+	dlyh @ dltp @ i dlmv  dltp @ dlintt  dltp @ dltp @ i A lit lshift dls2 @ + dlpadd
+	100 lit 0 lit do
+		dltp @ i 2 lit lshift + @ FFF lit +  dup 1FFF lit and
+		tuck - D lit rshift  dltp @ i 2 lit lshift + !
+		FFF lit - dup 0< if 7FE001 lit + then  j A lit lshift dlt0 @ + i 2 lit lshift + !
+	loop
+	dltp @ A lit 0 lit dlpp @ dlpack dlpp !
+loop
+dlpk @ 7A0 lit dltr @ 40 lit shake256
+dlrho @ dlsk @ 20 lit dlbc  dlkk @ dlsk @ 20 lit + 20 lit dlbc  dltr @ dlsk @ 40 lit + 40 lit dlbc
+dlsk @ 80 lit + dlpp !
+5 lit 0 lit do i A lit lshift dls1 @ + 4 lit 4 lit dlpp @ dlpack dlpp ! loop
+6 lit 0 lit do i A lit lshift dls2 @ + 4 lit 4 lit dlpp @ dlpack dlpp ! loop
+6 lit 0 lit do i A lit lshift dlt0 @ + D lit 1000 lit dlpp @ dlpack dlpp ! loop ;
+
+\ dlmask ( kappa -- )  y (5 polynomials, at dly) for the attempt kappa.
+: dlmask
+5 lit 0 lit do
+	dup i +  dup FF lit and dlb2 @ c!  8 lit rshift dlb2 @ 1 lit + c!
+	88 lit 1F lit kcinit  dlr2 @ 40 lit kcabs  dlb2 @ 2 lit kcabs  dlxb @ 280 lit kcsqz
+	dlxb @ 14 lit 80000 lit i A lit lshift dly @ + dlunp drop
+loop drop ;
+\ dltry ( -- flag )  one attempt at a signature: whether it is rejected
+\ (every bound checked in full each time, as tabminer's).
+: dltry
+dlkap @ dlmask  dlkap @ 5 lit + dlkap !
+5 lit 0 lit do i A lit lshift dup dly @ + swap dlyh @ + dup -rot dlpcp dlntt loop
+6 lit 0 lit do dlyh @ i A lit lshift dlw @ + i dlmv  i A lit lshift dlw @ + dlintt loop
+6 lit 0 lit do
+	100 lit 0 lit do j A lit lshift dlw @ + i 2 lit lshift + @ dlhi dltp @ i 2 lit lshift + ! loop
+	dltp @ 4 lit 0 lit dlxb @ i 7 lit lshift + dlpack drop
+loop
+dlw1c  dlct @ dlsib  dlc @ dlch @ dlpcp  dlch @ dlntt
+0 lit dlzn !
+5 lit 0 lit do
+	dltp @ dlpz  dltp @ dlch @ i A lit lshift dls1 @ + dlpmac  dltp @ dlintt
+	i A lit lshift dlz @ +  i A lit lshift dly @ +  dltp @ dlpadd
+	i A lit lshift dlz @ + dlpnorm dlzn @ max dlzn !
+loop
+0 lit dlr0 !
+6 lit 0 lit do
+	dltp @ dlpz  dltp @ dlch @ i A lit lshift dls2 @ + dlpmac  dltp @ dlintt
+	i A lit lshift dlwc @ +  i A lit lshift dlw @ +  dltp @ dlpsub
+	100 lit 0 lit do j A lit lshift dlwc @ + i 2 lit lshift + @ dllo dlabs dlr0 @ max dlr0 ! loop
+loop
+0 lit dlcn !
+6 lit 0 lit do i A lit lshift dlct0 @ + dup dlpz  dup dlch @ i A lit lshift dlt0 @ + dlpmac  dup dlintt  dlpnorm dlcn @ max dlcn ! loop
+0 lit dlwt !
+6 lit 0 lit do 100 lit 0 lit do
+	j A lit lshift i 2 lit lshift + dlo !
+	dlct0 @ dlo @ + @  dup 0 lit swap dlsub
+	swap dlwc @ dlo @ + @ dladd
+	tuck dladd dlhi swap dlhi <> 1 lit and
+	dup dlh @ dlo @ + !  dlwt @ + dlwt !
+loop loop
+dlzn @ 7FF3C lit u< 0=  dlr0 @ 3FE3C lit u< 0= or  dlcn @ 3FF00 lit u< 0= or  dlwt @ 37 lit u> or ;
+
+: dilsign
+dlinit  dlsg !  dlcl !  dlctx !  dlml !  dlmsg !  dlsk !
+dlsk @ dlrho @ 20 lit dlbc  dlsk @ 20 lit + dlkk @ 20 lit dlbc  dlsk @ 40 lit + dltr @ 40 lit dlbc
+dlsk @ 80 lit +
+5 lit 0 lit do 4 lit 4 lit i A lit lshift dls1 @ + dlunp loop
+6 lit 0 lit do 4 lit 4 lit i A lit lshift dls2 @ + dlunp loop
+6 lit 0 lit do D lit 1000 lit i A lit lshift dlt0 @ + dlunp loop  drop
+5 lit 0 lit do i A lit lshift dls1 @ + dlntt loop
+6 lit 0 lit do i A lit lshift dls2 @ + dlntt  i A lit lshift dlt0 @ + dlntt loop
+dlexpa  dlmuc
+88 lit 1F lit kcinit  dlkk @ 20 lit kcabs  dlz32 @ 20 lit kcabs  dlmu @ 40 lit kcabs  dlr2 @ 40 lit kcsqz
+0 lit dlkap !
+begin dltry while repeat
+dlct @ dlsg @ 30 lit dlbc  dlsg @ 30 lit + dlpp !
+5 lit 0 lit do i A lit lshift dlz @ + 14 lit 80000 lit dlpp @ dlpack dlpp ! loop
+dlpp @ dlhpk ;
+
+: dilver
+dlinit  dlsg !  dlcl !  dlctx !  dlml !  dlmsg !  dlpk !
+0 lit dlres !
+dlcl @ 100 lit u< if
+	dlsg @ 30 lit +  5 lit 0 lit do 14 lit 80000 lit i A lit lshift dlz @ + dlunp loop drop
+	dlsg @ CB0 lit + dlhup if
+		0 lit dlzn !  5 lit 0 lit do i A lit lshift dlz @ + dlpnorm dlzn @ max dlzn ! loop
+		dlzn @ 7FF3C lit u< if
+			dlpk @ dlrho @ 20 lit dlbc  dlexpa
+			dlpk @ 7A0 lit dltr @ 40 lit shake256  dlmuc
+			dlsg @ dlsib  dlc @ dlch @ dlpcp  dlch @ dlntt
+			5 lit 0 lit do i A lit lshift dlz @ + dlntt loop
+			dlpk @ 20 lit +
+			6 lit 0 lit do
+				A lit 0 lit dltp @ dlunp
+				100 lit 0 lit do dltp @ i 2 lit lshift + dup @ D lit lshift swap ! loop
+				dltp @ dlntt
+				dlz @ i A lit lshift dlw @ + i dlmv
+				dlct0 @ dup dlpz dlch @ dltp @ dlpmac
+				i A lit lshift dlw @ + dup dlct0 @ dlpsub
+				i A lit lshift dlw @ + dlintt
+				100 lit 0 lit do
+					j A lit lshift dlh @ + i 2 lit lshift + @  j A lit lshift dlw @ + i 2 lit lshift + @ dluse
+					dltp @ i 2 lit lshift + !
+				loop
+				dltp @ 4 lit 0 lit dlxb @ i 7 lit lshift + dlpack drop
+			loop drop
+			dlw1c  dlct @ dlsg @ 30 lit dlsame dlres !
+		then
+	then
+then
+dlres @ ;
