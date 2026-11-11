@@ -501,36 +501,29 @@ else drop FFFFFFFF lit then ;
 : a8.  dup @ swap 4 lit + @ wamt ;                     \ ( a -- )  in coins, written
 : fpath variable ;  : fout variable ;  : fpn variable ;
 
-\ A slate in: slin ( line -- n | -1 ) its bytes at sbin, pasted ("text",
-\ tmode 1) or from a file ("slate", tmode 0; the file binary or text,
-\ ftxt 1 if text); -1 none given, or not one.  A slate out: sout ( a n
-\ path -- ok ) to a file, text if the slate came as text or the name ends
-\ ".txt", else its bytes; stext ( a n -- ) as text, written in the answer.
-: sbin variable ;  : ttxt variable ;  : tout variable ;  : tmode variable ;  : ftxt variable ;
+\ A slate is text wherever a person handles it (base64 between its
+\ markers, as tabminer's: it has no other form outside the wallet).  A
+\ slate in: slin ( line -- n | -1 ) its bytes at sbin, pasted ("text",
+\ tmode 1) or from a file ("slate", tmode 0); -1 none given, or none in
+\ it.  A slate out: sout ( a n path -- ok ) as text to a file; stext ( a
+\ n -- ) as text, written in the answer.
+: sbin variable ;  : ttxt variable ;  : tout variable ;  : tmode variable ;
 : slin
-0 lit ftxt !
 dup "'text':'" ttxt @ 2400 lit jstr if
 	drop 1 lit tmode !  ttxt @ sbin @ b64in
 else
 	0 lit tmode !
 	"'slate':'" fpath @ 100 lit jstr 0= if FFFFFFFF lit else
 		fpath @ fread dup 0< 0= if
-			0 lit over fbuf @ + c!
-			fbuf @ "-----BEGIN TAB SLATE-----" jfind if
-				drop 1 lit ftxt !  fbuf @ sbin @ b64in
-			else fbuf @ sbin @ 2 lit pick bcopy then
+			0 lit swap fbuf @ + c!  fbuf @ sbin @ b64in
 		then
 	then
 then ;
 : stext  1 lit bjs !  b64out  0 lit bjs ! ;
 : sop variable ;  : soa variable ;  : son variable ;
-\ stxt? ( path -- flag )  a name ending ".txt".
-: stxt?  dup strlen dup 3 lit u> if + 4 lit - ".txt" streq else 2drop 0 lit then ;
 : sout
 sop !  son !  soa !
-ftxt @ tmode @ or  sop @ stxt? or if
-	0 lit bjs !  tout @ bbp !  soa @ son @ b64out  sop @ tout @ bbp @ tout @ - fwrite
-else sop @ soa @ son @ fwrite then ;
+0 lit bjs !  tout @ bbp !  soa @ son @ b64out  sop @ tout @ bbp @ tout @ - fwrite ;
 \ oanswer ( line -- )  a payer's slate (stage 1) answered: this wallet's
 \ output added and recorded, its receipt signed, the answer written to
 \ the file's name and ".received" (as tabminer's receive).
@@ -627,7 +620,7 @@ orec @ wknon  kseed @ wkkey  kseed @ 4 lit xk @ xkgen  xk @ swap xkpub ;
 have @ 0= if drop nowal else
 dup "'amount':'" wtmp @ 40 lit jstr  wtmp @ samt @ jcoins and 0= if drop "not an amount" jerr else
 samt @ sdust @ a8lt if drop "the amount is below the dust limit" jerr else
-dup "'text':true" jfind 0= 0= tmode !  0 lit ftxt !  0 lit fpath @ c!  dup "'slate':'" fpath @ 100 lit jstr drop
+dup "'text':true" jfind 0= 0= tmode !  0 lit fpath @ c!  dup "'slate':'" fpath @ 100 lit jstr drop
 tmode @ fpath @ c@ or 0= if drop "no slate file, nor text asked for" jerr else
 "'speed':'" wtmp @ 20 lit jstr drop
 "/v1/fees" hget ?dup if wtmp @ frate else A lit then srate !

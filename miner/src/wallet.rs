@@ -523,16 +523,6 @@ impl Slate {
         Slate::from_bytes(&crate::proofs::base64_decode(&b64)?)
     }
 
-    /// A slate from a file's bytes: as text if they hold its begin marker,
-    /// else as they are.
-    pub fn from_file_bytes(bytes: &[u8]) -> Option<Slate> {
-        let text = core::str::from_utf8(bytes).ok().filter(|t| t.contains(&format!("-----BEGIN {SLATE_MARKER}-----")));
-        match text {
-            Some(t) => Slate::from_text(t),
-            None => Slate::from_bytes(bytes),
-        }
-    }
-
     /// Whether `text` holds a slate's end marker: a paste is complete.
     pub fn text_ends(text: &str) -> bool {
         text.contains(&format!("-----END {SLATE_MARKER}-----"))
@@ -3932,9 +3922,10 @@ mod tests {
         assert!(pool.insert(tx, &u, &names, &rtxn, 1).is_ok());
     }
 
-    /// A slate as text (base64 between markers, as a proof's): the same
-    /// slate back, at either stage, whatever surrounds it; a file's bytes
-    /// read in either form; text cut short or not base64 refused.
+    /// A slate as text (base64 between markers, as a proof's; slates have
+    /// no other form outside the wallet): the same slate back, at either
+    /// stage, whatever surrounds it; its bytes, cut short, or not base64,
+    /// refused as text.
     #[test]
     fn slates_as_text() {
         let dir = TempDir::new("slate-text");
@@ -3957,8 +3948,7 @@ mod tests {
             // pasted among other words, its lines' ends changed
             let pasted = format!("here it is:\r\n{}\r\nthanks", text.replace('\n', "\r\n"));
             assert_eq!(Slate::from_text(&pasted).as_ref(), Some(&slate));
-            assert_eq!(Slate::from_file_bytes(text.as_bytes()).as_ref(), Some(&slate));
-            assert_eq!(Slate::from_file_bytes(&slate.to_bytes()).as_ref(), Some(&slate));
+            assert!(Slate::from_text(&String::from_utf8_lossy(&slate.to_bytes())).is_none());
             let cut = &text[..text.len() / 2];
             assert!(!Slate::text_ends(cut) && Slate::from_text(cut).is_none());
             assert!(Slate::from_text(&text.replacen('A', "*", 1)).is_none() || !text.contains('A'));

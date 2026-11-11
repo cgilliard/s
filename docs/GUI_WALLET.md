@@ -149,12 +149,12 @@ is written).
   `"ok":false` and `"error"` (a sentence to show). Answers may come out
   of order. Amounts are strings in coins as tabminer prints them (up to
   ten decimal places): a 64-bit amount does not fit a JavaScript number.
-  Files are paths in the user's home. A slate goes either way, chosen
-  in the window at each step: as a file (`slate`, its name; binary, or
-  text if its name ends `.txt` or it came as text, as tabminer's), or
-  as text to copy and paste (`text`: base64 between `-----BEGIN TAB
-  SLATE-----` and its END line, 64 characters a line, as tabminer's
-  `to_text`; an answer in the form its slate came).
+  Files are paths in the user's home. A slate is text, always (base64
+  between `-----BEGIN TAB SLATE-----` and its END line, 64 characters a
+  line, as tabminer's `to_text`; the binary form was dropped
+  2026-11-10: nobody handles one), and goes either way, chosen in the
+  window at each step: in a file (`slate`, its name), or copied and
+  pasted (`text`).
 
   | op | asks | answers |
   |---|---|---|

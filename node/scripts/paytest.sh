@@ -6,7 +6,7 @@
 # tabminer mines the recursive dev network (UDP 37493), its prompt read
 # from a pipe; in the OS (bin/img), the node follows it and wm serves
 # (forwarded).  Then:
-# - tabminer pays the OS's wallet 2.5: `send-file 2.5 s1.txt` (a slate as
+# - tabminer pays the OS's wallet 2.5: `send-file 2.5 s1.slate` (a slate as
 #   text), the wallet answers it pasted, tabminer finalizes the answer (a
 #   file); once mined, the wallet holds 2.5 confirmed;
 # - the OS's wallet pays tabminer 1: a slate made as text, tabminer
@@ -147,15 +147,15 @@ def confirmed():
     return ask('overview')['confirmed']
 
 # tabminer pays the wallet 2.5
-tab(f'send-file 2.5 {T}/s1.txt')
-wait('tabminer\'s slate', lambda: 'written to' in aout() and os.path.exists(f'{T}/s1.txt'))
-s1 = open(f'{T}/s1.txt').read()
+tab(f'send-file 2.5 {T}/s1.slate')
+wait('tabminer\'s slate', lambda: 'written to' in aout() and os.path.exists(f'{T}/s1.slate'))
+s1 = open(f'{T}/s1.slate').read()
 check(f'tabminer\'s slate as text ({len(s1)} characters)', s1.startswith('-----BEGIN TAB SLATE-----'))
 a = ask('answer', text=s1)
 check(f'the wallet answered it pasted: {a.get("amount", a.get("error"))}', a['ok'] and a['amount'] == '2.5000000000')
-open(f'{T}/s1.ans.txt', 'w').write(a['text'])
+open(f'{T}/s1.answer', 'w').write(a['text'])
 n0 = aout().count('pooled; broadcasting it')
-tab(f'finalize {T}/s1.ans.txt')
+tab(f'finalize {T}/s1.answer')
 wait('tabminer\'s finalize', lambda: aout().count('pooled; broadcasting it') > n0 or 'refused' in aout()[-2000:])
 check('tabminer finalized the answer and pooled it', aout().count('pooled; broadcasting it') > n0)
 got = wait('the 2.5 confirmed in the wallet', lambda: (time.sleep(3), confirmed() == '2.5000000000')[1])
@@ -164,10 +164,10 @@ check('the wallet holds 2.5 confirmed', got)
 # the wallet pays tabminer 1
 p = ask('send', to='', amount='1', speed='hour', text=True)
 check(f'the wallet made a slate as text: fee {p.get("fee", p.get("error"))}', p['ok'] and p['text'].startswith('-----BEGIN TAB SLATE-----'))
-open(f'{T}/s2.txt', 'w').write(p['text'])
-tab(f'receive {T}/s2.txt {T}/s2.ans.txt')
-wait('tabminer\'s answer', lambda: os.path.exists(f'{T}/s2.ans.txt') and os.path.getsize(f'{T}/s2.ans.txt') > 0 and 'return it to the sender' in aout())
-s2 = open(f'{T}/s2.ans.txt').read()
+open(f'{T}/s2.slate', 'w').write(p['text'])
+tab(f'receive {T}/s2.slate {T}/s2.answer')
+wait('tabminer\'s answer', lambda: os.path.exists(f'{T}/s2.answer') and os.path.getsize(f'{T}/s2.answer') > 0 and 'return it to the sender' in aout())
+s2 = open(f'{T}/s2.answer').read()
 check(f'tabminer answered in text ({len(s2)} characters)', s2.startswith('-----BEGIN TAB SLATE-----'))
 f = ask('finalize', text=s2)
 check(f'the wallet finalized it pasted: {f.get("tx", f.get("error"))}', f['ok'] and len(f['tx']) == 64)

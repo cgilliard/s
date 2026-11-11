@@ -16,8 +16,9 @@
 # empty: it is in a block.
 # B's confirmed balance is then 1.5; A's every output's but B's; A's
 # activity shows the payment, B's the output it received.  The slate files
-# are text (.txt: base64 between markers, as tabminer writes them); copy
-# and paste, through the window's WebSocket, is scripts/paytest.sh's.
+# are text (base64 between markers, as tabminer writes them: slates have
+# no other form); copy and paste, through the window's WebSocket, is
+# scripts/paytest.sh's.
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/wallettest.sh
@@ -94,7 +95,7 @@ miner
 {
 	echo 'echo {"op":"unlock","password":"wpw"} > /s.req'
 	echo 'echo {"id":5,"op":"fees"} >> /s.req'
-	echo 'echo {"id":6,"op":"send","to":"","amount":"1.5","speed":"hour","slate":"/p.slate.txt"} >> /s.req'
+	echo 'echo {"id":6,"op":"send","to":"","amount":"1.5","speed":"hour","slate":"/p.slate"} >> /s.req'
 	echo 'wallet < /s.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":6,' 600 "A's slate"
@@ -103,14 +104,14 @@ wait_for "$T/os.out" '^\{"id":6,' 600 "A's slate"
 	echo 'cd /b'
 	echo 'echo {"op":"unlock","password":"bpw"} > /b/r.req'
 	echo 'echo {"id":7,"op":"create"} >> /b/r.req'
-	echo 'echo {"id":8,"op":"answer","slate":"/p.slate.txt"} >> /b/r.req'
+	echo 'echo {"id":8,"op":"answer","slate":"/p.slate"} >> /b/r.req'
 	echo 'wallet < /b/r.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":8,' 600 "B's answer"
 {
 	echo 'cd /'
 	echo 'echo {"op":"unlock","password":"wpw"} > /f.req'
-	echo 'echo {"id":9,"op":"finalize","slate":"/p.slate.txt.received"} >> /f.req'
+	echo 'echo {"id":9,"op":"finalize","slate":"/p.slate.received"} >> /f.req'
 	echo 'wallet < /f.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":9,' 600 "A's finalize"
@@ -159,9 +160,9 @@ check('an address', answer(3)['address'].startswith('tab1') and len(answer(3)['a
 check('run again, unlocked from its records: the same', answer(4)['confirmed'] == want)
 # the payment
 check(f'the fees: {[s["rate"] for s in answer(5)["speeds"]]}', answer(5)['ok'] and len(answer(5)['speeds']) == 4)
-check(f'A sent by file (a text one, .txt): fee {answer(6).get("fee")}', answer(6)['ok'] and answer(6)['slate'] == '/p.slate.txt')
+check(f'A sent by file (text): fee {answer(6).get("fee")}', answer(6)['ok'] and answer(6)['slate'] == '/p.slate')
 check('B created', answer(7)['ok'])
-check('B answered', answer(8)['ok'] and answer(8)['slate'] == '/p.slate.txt.received' and answer(8)['amount'] == '1.5000000000')
+check('B answered', answer(8)['ok'] and answer(8)['slate'] == '/p.slate.received' and answer(8)['amount'] == '1.5000000000')
 check(f'A finalized: {answer(9).get("tx", answer(9).get("error"))}', answer(9)['ok'] and len(answer(9)['tx']) == 64)
 total = int(sys.argv[4])
 paid = 15 * 10**9
