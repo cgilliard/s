@@ -166,11 +166,12 @@ drop ;
 
 \ nusock ( port -- f | 0 )  the open UDP socket bound to port.  Under klk.
 \
-\ A socket is an open file of kind 8 whose page (at 8) is four pages: its
+\ A socket is an open file of kind 8 whose page (at 8) is 33 pages: its
 \ kind at 0 (1 UDP), its port 4, the address it is connected to 8 and that
 \ port C (0: none), datagrams in 10, taken 14 (free-running counts); then
-\ eight slots of 2 KiB from 40: a datagram's length 0, from address 4 and
-\ port 8, its bytes from C (1472 at most).
+\ 64 slots of 2 KiB from 40: a datagram's length 0, from address 4 and
+\ port 8, its bytes from C (1472 at most).  64: a peer's window of chunks
+\ (32 in flight, as tabminer's least) and what else comes meanwhile.
 : nusock
 0 lit MAXF 0 lit do
 	dup 0= if
@@ -231,8 +232,8 @@ nun @ 5C0 lit u> 0= if
 	nudp @ nusock ?dup if
 		8 lit + @
 		dup 8 lit + @ ?dup if nusip @ = over C lit + @ nusp @ = and else 1 lit then
-		over dup 10 lit + @ swap 14 lit + @ - 8 lit u< and if
-			dup dup 10 lit + @ 7 lit and B lit lshift + 40 lit +
+		over dup 10 lit + @ swap 14 lit + @ - 40 lit u< and if
+			dup dup 10 lit + @ 3F lit and B lit lshift + 40 lit +
 			nun @ over !  nusip @ over 4 lit + !  nusp @ over 8 lit + !
 			nuda @ swap C lit + nun @ bcpy
 			dup 10 lit + dup @ 1 lit + swap !

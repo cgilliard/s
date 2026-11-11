@@ -897,7 +897,7 @@ if drop else
 		dup 8 lit + @  over @ 9 lit = if 0 lit else 4 lit then + dup @ 1 lit - swap !
 		dup 8 lit + @ dup fwake  dup @ over 4 lit + @ or 0= if 0 lit over 20 lit + @ 2 lit lshift kpty @ + !  1 lit pgfree else drop then
 	then
-	dup @ 8 lit = if dup 8 lit + @ dup fwake dup @ 1 lit = if 4 lit pgfree else 38 lit + dup @ 1 lit or swap ! then then
+	dup @ 8 lit = if dup 8 lit + @ dup fwake dup @ 1 lit = if 21 lit pgfree else 38 lit + dup @ 1 lit or swap ! then then
 	dup @ 6 lit = if kdqn @ 40 lit u< if dup 8 lit + @ kdqn @ 2 lit lshift kdq @ + !  kdqn @ 1 lit + kdqn !  1 lit kdfl ! then then
 	0 lit swap !
 then ;

@@ -714,8 +714,9 @@ kernel too much to add at the end.
    each second until it answers. Everything goes by way of the gateway
    (QEMU's user networking: we are 10.0.2.15, it is 10.0.2.2). IPv4
    takes no fragments; UDP is sent without a checksum. A socket is an
-   open file of kind 8 over four pages. A UDP socket queues up to eight
-   datagrams of up to 1,472 bytes. A TCP socket has a 4 KiB receive
+   open file of kind 8 over 33 pages. A UDP socket queues up to 64
+   datagrams of up to 1,472 bytes (eight until 2026-11-10: a node's
+   window of chunks, 32 as tabminer's least, now fits). A TCP socket has a 4 KiB receive
    ring (the window it offers) and an 8 KiB send ring. TCP's sockets
    are also in a table of 32, since one outlives its descriptors until
    it is closed on the wire. Calls: `socket` (30, kind 1 UDP or 2 TCP),

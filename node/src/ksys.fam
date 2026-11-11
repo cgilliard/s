@@ -963,7 +963,7 @@ then then then ;
 \ from unless 0; waits for one.  Under klk.
 : urecv
 over dup 10 lit + @ swap 14 lit + @ = if drop 5 lit tretry BLK else
-	over dup 14 lit + @ 7 lit and B lit lshift + 40 lit +
+	over dup 14 lit + @ 3F lit and B lit lshift + 40 lit +
 	over if dup 4 lit + @ 2 lit pick !  dup 8 lit + @ 2 lit pick 4 lit + ! then
 	nip
 	dup @ 30 lit sysarg 2dup u> if swap then drop
@@ -1134,7 +1134,7 @@ klk @ lock
 28 lit sysarg dup 1 lit = swap 2 lit = or 0= if FFFFFFEA lit else
 nk @ 0= if FFFFFFED lit else
 8 lit 3 lit fnew ?dup 0= if FFFFFFE9 lit else
-28 lit sysarg 1 lit = if 4 lit pgalloc dup if dup 40 lit mzero  1 lit over ! then else cnew then
+28 lit sysarg 1 lit = if 21 lit pgalloc dup if dup 40 lit mzero  1 lit over ! then else cnew then
 ?dup 0= if 0 lit swap ! FFFFFFF4 lit else
 	over 8 lit + !
 	dup area@ tproc fdput dup 0< if swap fclose else nip then

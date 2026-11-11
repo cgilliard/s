@@ -59,7 +59,8 @@
 : pnest variable ;  : pgkd variable ;  : pgo variable ;  : pbk variable ;  : pbpt variable ;  : pbid variable ;  : pbb variable ;  : pbn variable ;  : pbl variable ;  : pbsrc variable ;
 : pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
 
-:M PWIN 4 lit ;                               \ chunks in flight
+:M PWIN 20 lit ;                              \ chunks in flight: 32, tabminer's least window
+                                              \ (the kernel queues 64 datagrams a UDP socket)
 :M PMAX 400000 lit ;                          \ the largest object taken: 4 MiB
 :M PPEERS 8 lit ;
 
