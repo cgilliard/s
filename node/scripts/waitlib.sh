@@ -10,7 +10,11 @@ WNAME=$(basename "$0")
 
 # wprogress — how much the test's logs hold: the miners' and the OS's
 # output (*.out) and the miners' own logs (*.log), all under $T.
+# WPROGRESS, if set: a command whose output stands for the progress
+# instead (a script sets it where the logs grow regardless, a miner
+# mining throughout, and only some of what they hold is the awaited).
 wprogress() {
+	if [ -n "${WPROGRESS:-}" ]; then eval "$WPROGRESS"; return; fi
 	find "$T" -type f \( -name '*.out' -o -name '*.log' \) -exec cat {} + 2>/dev/null | wc -c
 }
 

@@ -57,7 +57,7 @@ wait_for "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 
 wait_for "$T/os.out" 'wm: port 80' 60 "wm"
 
 echo "paytest.sh: the two wallets paying each other"
-python3 - "$WP" "$T" <<'EOF'
+python3 - "$WP" "$T" <<'EOF' || { wdump; exit 1; }
 import base64, hashlib, json, os, re, socket, struct, sys, time
 port, T = int(sys.argv[1]), sys.argv[2]
 G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -68,13 +68,20 @@ def aout():
     return open(f'{T}/a.out', errors='replace').read()
 def progress():
     return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(T) for f in fs if f.endswith(('.out', '.log')))
+def blocks():
+    return aout().count('is the tip at height')
 def wait(what, cond, idle=300):
-    last, still = progress(), 0
+    # The miner mines throughout, so its logs always grow: a wait fails
+    # when nothing new comes for the idle window, or when 30 blocks pass
+    # without what it waits for (blocks are the clock here).
+    last, still, b0 = progress(), 0, blocks()
     while True:
         r = cond()
         if r:
             return r
         time.sleep(2)
+        if blocks() > b0 + 30:
+            print(f'paytest: {what}: not in 30 blocks'); sys.exit(1)
         now = progress()
         if now != last:
             last, still = now, 0

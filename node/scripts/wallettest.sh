@@ -92,6 +92,10 @@ settotal > "$T/total1"
 echo "wallettest.sh: A paying B 1.5 by file, the miner mining meanwhile"
 stop $AP; AP=
 miner
+# the miner's logs and the node's following grow throughout: the wallets'
+# waits watch the wallets' answers alone (a wallet not answering fails
+# within the idle window, its logs shown)
+WPROGRESS="grep -c '^{\"id\"' \"\$T/os.out\""
 {
 	echo 'echo {"op":"unlock","password":"wpw"} > /s.req'
 	echo 'echo {"id":5,"op":"fees"} >> /s.req'
@@ -119,7 +123,14 @@ wait_for "$T/os.out" '^\{"id":9,' 600 "A's finalize"
 mined() {
 	python3 -c "import json,sys,urllib.request; sys.exit(0 if json.loads(urllib.request.urlopen('http://127.0.0.1:$HP/v1/mempool', timeout=30).read())['count'] == 0 else 1)"
 }
-wait_while_busy 600 "the payment mined" mined
+WPROGRESS=
+# blocks are the clock here: twenty followed without it, it is not coming
+nblocks() { grep -c '^node: .* height [0-9]*  (' "$T/os.out" || true; }
+b0=$(nblocks)
+until mined; do
+	[ "$(nblocks)" -le $((b0 + 20)) ] || { echo "wallettest.sh: the payment not mined in 20 blocks" >&2; wdump; exit 1; }
+	sleep 2
+done
 stop $AP; AP=
 miner --no-mine
 tip=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a/tabminer.log" | tail -1)
@@ -141,7 +152,7 @@ wait_for "$T/os.out" '^\{"id":13,' 600 "the wallets after the payment"
 grep -E '^\{"(id|op|event)"' "$T/os.out"
 
 settotal > "$T/total2"
-python3 - "$HP" "$T/os.out" "$(cat "$T/total1")" "$(cat "$T/total2")" <<'EOF'
+python3 - "$HP" "$T/os.out" "$(cat "$T/total1")" "$(cat "$T/total2")" <<'EOF' || { wdump; exit 1; }
 import json, sys, urllib.request
 port, out = sys.argv[1], sys.argv[2]
 total = int(sys.argv[3])
