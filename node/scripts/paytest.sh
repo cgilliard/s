@@ -207,8 +207,9 @@ if part in ('payments', 'proofs'):
     check('tabminer holds the 1 confirmed', wait('the 1 confirmed at tabminer', tab_has))
     check(f'the wallet holds 2.5 - 1 - fee = {want}', wait('the wallet\'s change confirmed', lambda: (time.sleep(3), confirmed() == want)[1]))
     acts = ask('activity')['items']
-    check('its activity: received 2.5, sent 1, both confirmed',
-          any(i['kind'] == 'received' and i['amount'] == '2.5000000000' and i['state'] == 'confirmed' for i in acts)
+    check('its activity: received 2.5 (spent), sent 1 (confirmed), no row for the change',
+          any(i['kind'] == 'received' and i['amount'] == '2.5000000000' and i['state'] == 'spent' for i in acts)
+          and not any(i['kind'] == 'received' and i['amount'] == want for i in acts)
           and any(i['kind'] == 'sent' and i['amount'] == '1.0000000000' and i['tx'] == f['tx'] and i['state'] == 'confirmed' for i in acts))
 
 if part == 'proofs':
@@ -241,7 +242,7 @@ if part == 'proofs':
         return os.path.exists(f'{T}/tb.txt')
     wait('tabminer\'s burn in a block, its proof', tab_burn_proof)
     v = ask('verify', text=open(f'{T}/tb.txt').read())
-    check(f'the wallet finds tabminer\'s burn holds, for it: {v}', v['ok'] and v['valid'] and v['kind'] == 'burn' and v['amount'] == '0.2500000000' and v['for'] == addr)
+    check(f'the wallet finds tabminer\'s burn holds, for it, its purpose grant: {v}', v['ok'] and v['valid'] and v['kind'] == 'burn' and v['amount'] == '0.2500000000' and v['for'] == addr and v.get('purpose') == 'grant')
     t = open(f'{T}/tb.txt').read().replace('-----BEGIN TAB BURN PROOF-----', '-----BEGIN TAB PAYMENT PROOF-----').replace('-----END TAB BURN PROOF-----', '-----END TAB PAYMENT PROOF-----')
     v = ask('verify', text=t)
     check(f'a burn passed off as a payment refused: {v.get("error", v.get("reason"))}', not v['ok'] or not v['valid'])

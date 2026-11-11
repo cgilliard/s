@@ -103,10 +103,12 @@ else drop then
 \ jok  an answer begun: its id, ok; jerr ( s -- ) an error answered.
 : jok  "{'id':" jo idb @ jraw ",'ok':true" jo ;
 \ jsafe ( s -- )  text from elsewhere made safe in an answer: its quotes and
-\ backslashes (jo would close the string on them) turned to backticks.
+\ backslashes (jo would close the string on them) turned to backticks, its
+\ control bytes to spaces.
 : jsafe
 begin dup c@ while
 	dup c@ dup 27 lit = over 22 lit = or swap 5C lit = or if 60 lit over c! then
+	dup c@ 20 lit u< if 20 lit over c! then
 	1 lit +
 repeat drop ;
 : jerr  "{'id':" jo idb @ jraw ",'ok':false,'error':'" jo jo "'}" jo jend ;
@@ -289,7 +291,8 @@ hs @ close drop  hres @ ;
 \ all ones: not yet in the set), +20 the height it was made at, +24 the
 \ state (0 unspent, 1 reserved, 2 spent), +25 the first leaf, +26 leaves
 \ used, +27 recovered (found by a scan, not made here: its leaves the
-\ second half's, as tabminer's), +28 the scan that last saw it.
+\ second half's, as tabminer's), +28 the scan that last saw it (4 bytes),
+\ +2C its kind (wnew's).
 
 : okey variable ;  : orec variable ;  : wkl variable ;  : sgen variable ;
 : ecom variable ;  : emem variable ;  : eamt variable ;  : epos variable ;  : eh variable ;  : ecb variable ;
@@ -475,7 +478,7 @@ wxpk @ wna @ wmb @ onew @ wsmkout
 wxpk @ wna @ ecb @ wkcom  ecb @ ecom @ wkcan
 orec @ 30 lit 0 lit do 0 lit over i + c! loop drop
 nb @ orec @ 10 lit bcopy  wna @ orec @ 10 lit + 8 lit bcopy
-FFFFFFFF lit orec @ 18 lit + !  FFFFFFFF lit orec @ 1C lit + !  wnk @ orec @ 29 lit + c!
+FFFFFFFF lit orec @ 18 lit + !  FFFFFFFF lit orec @ 1C lit + !  wnk @ orec @ 2C lit + c!
 6F lit okey @ c!  ecom @ okey @ 1 lit + 20 lit bcopy
 okey @ 21 lit orec @ 30 lit wsetk ;
 
@@ -886,7 +889,8 @@ wpget 0= if "the node gives no path for it (is it synced?)" jerr else
 then then then then then ;
 
 \ overify ( line -- )  a proof (pasted, "text") checked against the node's
-\ header at its height: valid or not, and why; what it shows.
+\ header at its height: valid or not, and why; what it shows (a burn's
+\ purpose and beneficiary, a payment's receiver).
 : vroot variable ;  : waddr2 variable ;
 : overify
 "'text':'" pftxt @ 3000 lit jstr 0= if "no proof given" jerr else
@@ -902,6 +906,9 @@ pbin @ swap wpparse 0= if "not a proof" jerr else
 			"','kind':'" jo wpfmt @ 2 lit = if "burn" else "payment" then jo
 			"','amount':'" jo wpa @ 2D lit + a8.  "','height':" jo wpa @ 1 lit + le@ 0 lit wdec
 			wpfmt @ 2 lit = if
+				\ the purpose (its bytes after the beneficiary and nonce), made safe
+				wpa @ WPCL + 41 lit +  pftxt @  wpa @ WPCL + 40 lit + c@ bcopy  0 lit pftxt @ wpa @ WPCL + 40 lit + c@ + c!
+				pftxt @ jsafe  ",'purpose':'" jo pftxt @ jo "'" jo
 				",'for':'" jo  wpa @ WPCL + wsd @ dle
 			else
 				",'to':'" jo  wpa @ WPCL + 41 lit + wsd @ wkid
@@ -1272,7 +1279,8 @@ then ;
 swap ?dup if 0 lit do over i + c@ dup 4 lit rshift hxd 2 lit pick c!  hxd over 1 lit + c!  2 lit + loop then
 0 lit swap c!  drop ;
 \ oact  the activity: payments sent (by their id; pending until the scan
-\ finds their output in the set), outputs received (by their commitment).
+\ finds their output in the set), outputs received (by their commitment;
+\ change left out, spent ones marked).
 : anum variable ;
 : oact
 have @ 0= if nowal else
@@ -1289,10 +1297,10 @@ have @ 0= if nowal else
 	6F lit okey @ c!  1 lit
 	begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then  anum @ 10 lit u< and while
 		drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit orec @ 30 lit wgetk drop
-		orec @ 29 lit + c@ 2 lit <> if
+		orec @ 2C lit + c@ 2 lit <> if
 			anum @ if "," jo then  anum @ 1 lit + anum !
 			"{'tx':'" jo okey @ 1 lit + 20 lit jhex "','kind':'received','amount':'" jo orec @ 10 lit + a8.
-			"','state':'" jo orec @ 1C lit + @ FFFFFFFF lit = if "pending" else "confirmed" then jo
+			"','state':'" jo orec @ 24 lit + c@ 2 lit = if "spent" else orec @ 1C lit + @ FFFFFFFF lit = if "pending" else "confirmed" then then jo
 			"','height':" jo orec @ 20 lit + @ 0 lit wdec "}" jo
 		then
 		21 lit
@@ -1317,7 +1325,7 @@ begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit
 	okey @ 21 lit orec @ 30 lit wgetk drop
 	0 lit sacc !
 	orec @ 24 lit + c@ dup 0= if
-		drop orec @ 1C lit + @ FFFFFFFF lit <> if sa1 else orec @ 29 lit + c@ 1 lit = if sa4 else sa2 then then @ sacc !
+		drop orec @ 1C lit + @ FFFFFFFF lit <> if sa1 else orec @ 2C lit + c@ 1 lit = if sa4 else sa2 then then @ sacc !
 	else 1 lit = if sa3 @ sacc ! else
 		orec @ 1C lit + @ FFFFFFFF lit <>  orec @ 28 lit + @ sgen @ = and if sa5 @ sacc ! then
 	then then

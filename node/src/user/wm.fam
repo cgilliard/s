@@ -396,8 +396,9 @@ then
 "lue=m.proof;wcopy(pf,t)});});}});});else if(t=='proofs'){var f=el('div','wf',p);wh(f,'Check a proof'" wr
 ");var pt=warea(f,'The proof (paste it here)'),po=el('div','',f);wbtn(f,'Check',function(){wask(w,'ve" wr
 "rify',{text:pt.value},function(m){po.textContent='';if(wbad(po,m))return;wrow(po,'Valid',m.valid?'ye" wr
-"s':'no');wrow(po,'Reason',m.reason);wrow(po,'Kind',m.kind);wrow(po,'Amount',m.amount);wrow(po,'Heigh" wr
-"t',m.height);if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);})});}else if(t=='names'){var " wr
+"s':'no');wrow(po,'Result',m.reason);wrow(po,'Kind',m.kind);wrow(po,'Amount',m.amount);wrow(po,'Heigh" wr
+"t',m.height);if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);" wr
+"if(m.purpose!=null)wrow(po,'Purpose',m.purpose);})});}else if(t=='names'){var " wr
 "a=el('div','',p);wh(a,'Your names');wask(w,'names',{},function(m){if(wbad(a,m))return;if(!m.items.le" wr
 "ngth)el('div','',a).textContent='None yet.';m.items.forEach(function(x){var r=wrow(a,x.name,x.state+" wr
 "(x.value?'  '+x.value.slice(0,16):'')+(x.state=='committed'?'  ready in '+x.ready+' blocks':''));va" wr
