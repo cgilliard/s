@@ -96,11 +96,16 @@ def wait(what, cond, idle=300):
     # when nothing new comes for the idle window, or when 30 blocks pass
     # without what it waits for (blocks are the clock here).
     last, still, b0 = progress(), 0, blocks()
+    told = b0
     while True:
         r = cond()
         if r:
             return r
         time.sleep(2)
+        # a line every five blocks, so a long wait shows in the log
+        if blocks() >= told + 5:
+            told = blocks()
+            print(f'paytest: ({what}: {told - b0} blocks so far)')
         if blocks() > b0 + 30:
             print(f'paytest: {what}: not in 30 blocks'); sys.exit(1)
         now = progress()
