@@ -22,6 +22,9 @@
 \ wkid ( pk c -- )  c = the id of a 1,952-byte Dilithium public key.
 \ wkaddr ( c dst -- )  the address of id c (62 characters), NUL-ended.
 \ wkcan ( c dst -- )  a digest's 32 canonical bytes.
+\ wkdec ( s c -- ok )  c = the id of the address s (as address.rs's
+\ decode: "tab1", 52 data characters and 6 of checksum, one case, the
+\ checksum bech32m's, the bytes a canonical digest).
 
 : wkm variable ;  : wkb variable ;  : wkn variable ;  : wkd variable ;  : wkab variable ;  : wkav variable ;
 : wka variable ;  : wkbt variable ;  : wkdn variable ;  : wkdst variable ;  : wkpm variable ;
@@ -89,3 +92,39 @@ wkdn @ 0 lit do wkav @ i + c@ wkpoly loop
 wkdn @ 0 lit do "qpzry9x8gf2tvdw0s3jn54khce6mua7l" wkav @ i + c@ + c@ wkput loop
 6 lit 0 lit do "qpzry9x8gf2tvdw0s3jn54khce6mua7l" wkpm @ 5 lit i - 5 lit * rshift 1F lit and + c@ wkput loop
 0 lit wkput ;
+
+\ wkdec: the characters' values (wkav), the checksum, then the bytes.
+: wkdc variable ;  : wkds variable ;  : wkdok variable ;  : wkup variable ;  : wklo variable ;
+\ wkchv ( c -- v | -1 )  an address character's value (either case).
+: wkchv
+dup 41 lit - 1A lit u< if 1 lit wkup ! 20 lit or else dup 61 lit - 1A lit u< if 1 lit wklo ! then then
+FFFFFFFF lit swap
+20 lit 0 lit do "qpzry9x8gf2tvdw0s3jn54khce6mua7l" i + c@ over = if nip i swap then loop drop ;
+: wkdec
+wkdc !  wkds !  -1 lit wkdok !  0 lit wkup !  0 lit wklo !
+wkds @ strlen 3E lit <> if 0 lit wkdok ! then
+wkdok @ if
+	wkds @ c@ 20 lit or 74 lit =  wkds @ 1 lit + c@ 20 lit or 61 lit = and
+	wkds @ 2 lit + c@ 20 lit or 62 lit = and  wkds @ 3 lit + c@ 31 lit = and  wkdok @ and wkdok !
+then
+wkdok @ if
+	3A lit 0 lit do wkds @ 4 lit + i + c@ wkchv dup 0< if drop 0 lit wkdok ! 0 lit then wkav @ i + c! loop
+	wkup @ wklo @ and if 0 lit wkdok ! then
+then
+wkdok @ if
+	1 lit  3 lit wkpoly 3 lit wkpoly 3 lit wkpoly 0 lit wkpoly 14 lit wkpoly 1 lit wkpoly 2 lit wkpoly
+	3A lit 0 lit do wkav @ i + c@ wkpoly loop
+	2BC830A3 lit = wkdok @ and wkdok !
+then
+wkdok @ if
+	\ the 52 values, five bits each, to 32 bytes (the four left over zero)
+	0 lit wka !  0 lit wkbt !  0 lit wkdn !
+	34 lit 0 lit do
+		wka @ 5 lit lshift wkav @ i + c@ or wka !  wkbt @ 5 lit + wkbt !
+		wkbt @ 7 lit u> if wkbt @ 8 lit - wkbt !  wka @ wkbt @ rshift FF lit and wkab @ wkdn @ + c!  wkdn @ 1 lit + wkdn ! then
+	loop
+	wka @ 1 lit wkbt @ lshift 1 lit - and if 0 lit wkdok ! then
+	8 lit 0 lit do wkab @ i 2 lit lshift + le@ 78000001 lit u< wkdok @ and wkdok ! loop
+	wkdok @ if wkab @ wkdc @ dle then
+then
+wkdok @ ;

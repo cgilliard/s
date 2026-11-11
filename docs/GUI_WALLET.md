@@ -171,6 +171,18 @@ is written).
   | `phrase` | `password`, typed again | `words` |
   | `restore` | `words`, `passphrase` | nothing more; a scan follows |
   | `scan` | | nothing more; `scan` events follow |
+  | `proof` | `tx`, a payment's or burn's id | `proof`, its text (`-----BEGIN TAB PAYMENT PROOF-----` or BURN), once its output is in a block |
+  | `verify` | `text`, a proof pasted | `valid` (true or false), `reason`, `kind` (`payment`, `burn`), `amount`, `height`; `to` (a payment's recipient) or `for` (a burn's beneficiary), an address |
+  | `burn` | `amount`, `purpose` (255 bytes at most), `for` (an address; this wallet's if none), `speed` | `tx`; `fee` |
+  | `names` | | `items`: each `name`, `state` (`committed`, `ready`, `revealed`, `owned`), `value`, `ready` (blocks until it may be revealed) |
+  | `name-commit` | `name`, `value` (64 hex digits, optional), `speed` | `tx`; `fee`; `ready`, blocks until the reveal |
+  | `name-reveal` | `name`, `speed` | `tx`; `fee` |
+  | `name-update` | `name`, `value`, `speed` | `tx`; `fee` |
+  | `name-lookup` | `name` | `found` (true or false); `owner`, `value`, `address` (the value as an address, if it is one), checked against the node's state root |
+
+  Phase 2's (2026-11-11): activity's `sent` and `burn` items take a
+  `proof` request; names are tabminer's (`docs/NAMES.md`), a reveal at
+  least 12 blocks after its commit.
 - **Events,** unasked, with `"event"` in place of an id: `tip`
   (`height`, `hash`) when the tip moves; `payment` (`tx`, `kind`,
   `amount`, `state`) when one arrives or changes state; `scan` (`height`,
