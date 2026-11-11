@@ -138,9 +138,10 @@ jobs:
       - name: Install QEMU (Linux)
         if: runner.os == 'Linux'
         run: |
-          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
+          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
           # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
           echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
             if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
@@ -173,9 +174,10 @@ jobs:
           shared-key: node
       - run: cargo build --release --features dev
       - run: |
-          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
+          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
           # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
           echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
             if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
@@ -227,9 +229,10 @@ jobs:
           path: .
       - run: chmod +x ../miner/target/release/tabminer
       - run: |
-          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
+          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
           # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
           echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
             if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
