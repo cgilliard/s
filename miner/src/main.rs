@@ -3780,6 +3780,15 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
                 abandon();
                 continue;
             }
+            // A block applied since the proof was made (the tip changed
+            // after the prover's last look) spent one of the inputs: as for
+            // a change while building or proving, start over, never stop.
+            Err(e) if cancel() || matches!(e, tabminer::chain::ChainError::UnknownInput(_)) => {
+                abandon();
+                let why = if cancel() { "the tip changed" } else { "a pooled transaction no longer applies" };
+                log::line(&format!("  {why} while finishing block {height} ({e}); starting over"));
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         let target = chain.expected_target(&tip)?;
