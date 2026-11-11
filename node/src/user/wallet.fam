@@ -1016,11 +1016,12 @@ wknon  nown @ wnown  nown @ nownc @ wkcan  nsalt @ wnsalt  nsalt @ nsaltc @ wkca
 nname @ nlen @ nnh @ wnhash  nnh @ nsalt @ nown @ ncom @ wncom  ncom @ ncomc @ wkcan  nmem @ wnmemo ;
 \ nname? ( line -- ok )  the request's name (nname, nlen), valid.
 : nname?  "'name':'" nname @ 40 lit jstr  nname @ strlen dup nlen !  nname @ swap wnok and ;
-\ nvalue ( line -- ok )  the request's value (64 hex digits) at nval, or
-\ this wallet's id if none.
+\ nvalue ( line -- ok )  the request's value (a tab1 address or 64 hex
+\ digits) at nval, or this wallet's id if none.
 : nvalue
 "'value':'" wtmp @ 80 lit jstr wtmp @ c@ 0= 0= and if
-	wtmp @ strlen 40 lit = dup if wtmp @ nval @ 20 lit jhexb then
+	wtmp @ strlen 3E lit = if wtmp @ wsd @ wkdec dup if wsd @ nval @ wkcan then
+	else wtmp @ strlen 40 lit = dup if wtmp @ nval @ 20 lit jhexb then then
 else waddr! wpk @ wsd @ wkid  wsd @ nval @ wkcan -1 lit then ;
 \ wcfind ( -- flag )  the commit ncomc among the node's (/v1/commits): its
 \ position at ncpos, its height ncht.
@@ -1101,7 +1102,7 @@ then ;
 have @ 0= if drop nowal else
 dup nname? 0= if drop "not a valid name (1 to 32 of a-z, 0-9, _)" jerr else
 nmget if drop "the wallet already has that name" jerr else
-dup nvalue 0= if drop "a value is 64 hex digits" jerr else
+dup nvalue 0= if drop "a value is a tab1 address or 64 hex digits" jerr else
 	wspeed
 	nrecb @ NRECN 0 lit do 0 lit over i + c! loop drop
 	4 lit 0 lit do nrecb @ i 2 lit lshift + wrfp loop
@@ -1142,7 +1143,7 @@ then then then then ;
 have @ 0= if drop nowal else
 dup nname? 0= if drop "not a valid name" jerr else
 nmget 0= if drop "this wallet has no such name" jerr else
-dup nvalue 0= if drop "a value is 64 hex digits" jerr else
+dup nvalue 0= if drop "a value is a tab1 address or 64 hex digits" jerr else
 nrecb @ 32 lit + c@ 8 lit u< 0= if drop "its owner key has signed all it may" jerr else
 	wspeed
 	nrecb @ nderive
@@ -1188,7 +1189,7 @@ then then ;
 have @ 0= if drop nowal else
 dup nname? 0= if drop "not a valid name" jerr else
 nmget if drop "the wallet already has that name" jerr else
-nvalue 0= if "a value is 64 hex digits" jerr else
+nvalue 0= if "a value is a tab1 address or 64 hex digits" jerr else
 	nrecb @ NRECN 0 lit do 0 lit over i + c! loop drop
 	4 lit 0 lit do nrecb @ i 2 lit lshift + wrfp loop
 	nrecb @ nderive

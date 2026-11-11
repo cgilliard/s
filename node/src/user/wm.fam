@@ -406,7 +406,7 @@ then
 "ror})});if(x.state=='owned'){var uv=wfield(r,'New value','text');wbtn(r,'Update',function(){wask(w,'" wr
 "name-update',{name:x.name,value:uv.value,speed:'hour'},function(m){ro.textContent=m.ok?'Updated: '+m" wr
 ".tx+' (fee '+m.fee+')':'Error: '+m.error})})}});});var f=el('div','wf',p);wh(f,'Register a name');va" wr
-"r nn=wfield(f,'Name','text'),nv=wfield(f,'Value (64 hex digits; optional)','text'),ns=wfield(f,'Spee" wr
+"r nn=wfield(f,'Name','text'),nv=wfield(f,'Value (a tab1 address or 64 hex digits; optional)','text'),ns=wfield(f,'Spee" wr
 "d','select'),no=el('div','wv',f);wspeeds(w,ns);wbtn(f,'Commit',function(){wask(w,'name-commit',{name" wr
 ":nn.value,value:nv.value,speed:ns.value},function(m){no.textContent=m.ok?'Committed: '+m.tx+' (fee '" wr
 "+m.fee+'); it may be revealed in '+m.ready+' blocks':'Error: '+m.error})});var g=el('div','wf',p);wh" wr
