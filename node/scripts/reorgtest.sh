@@ -10,7 +10,8 @@
 # reward: the wallet spends the oldest of equal coins): the node pools the
 # transaction, and when A mines it, shelves it.  Then A stops at height a,
 # and B (UDP 37476, no peers, its pool empty) mines its own branch from 6
-# to a + 2; A is started again, not mining, with B as its peer: A
+# until it outweighs A's (more work, not more blocks: B's may come at a
+# lower difficulty); A is started again, not mining, with B as its peer: A
 # reorganizes onto B's branch and the node, following A, must too: its
 # blocks above 6 undone, B's connected, up to B's tip; and the burn, mined
 # on no block of B's branch and its input unspent there, back in its pool.
@@ -96,9 +97,26 @@ grep -E 'pool: 0 |the pool: 0 held, 1 out' "$T/os.out"
 a=$(tip "$T/a")
 echo "quit" >&4; exec 4>&-
 wait $AP 2>/dev/null || true; AP=
-echo "reorgtest.sh: A stopped at $a; B mining its own branch from 6 to $((a + 2))"
+echo "reorgtest.sh: A stopped at $a; B mining its own branch from 6 until it outweighs A's"
 minerb
-wait_for "$T/b.out" "is the tip at height $((a + 2))\$" 600 "B's branch"
+# The heavier branch wins, not the longer: B's blocks may come at a lower
+# difficulty than A's did (a slower machine, longer gaps), so B mines
+# until its blocks above 6 hold a quarter more work than A's, each
+# block's work as its miner logged it.
+outweighs() {
+	python3 - "$T/a/tabminer.log" "$T/b/tabminer.log" <<'PYEOF'
+import re, sys
+def work(log):
+    t = open(log, errors='replace').read()
+    mined = {m.group(1): 2 ** float(m.group(2)) for m in re.finditer(r'mined ([0-9a-f]{16}) after \d+ hashes in [\d.]+s \(work 2\^([\d.]+)\)', t)}
+    tips = {m.group(1): int(m.group(2)) for m in re.finditer(r'our block ([0-9a-f]{16}) is the tip at height (\d+)', t)}
+    return sum(w for h, w in mined.items() if tips.get(h, 0) > 6)
+a, b = work(sys.argv[1]), work(sys.argv[2])
+sys.exit(0 if a > 0 and b > 1.25 * a else 1)
+PYEOF
+}
+wait_while_busy 600 "B's branch outweighing A's" outweighs
+grep -E 'mined .*\(work 2\^' "$T/b/tabminer.log" | tail -3
 # B's branch fixed from here (B serving, not mining): the waits below see
 # a stall as one (B's mining kept the logs growing, so a reorganization
 # that never came was waited for until CI's limit), and the burn is not
