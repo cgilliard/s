@@ -1,0 +1,274 @@
+\ node/wonion_vectors.fam — tabminer's values for node/wonion.fam
+\ (docs/ONION.md, onion mode; docs/GUI_WALLET.md, phase 3).  Written by
+\ miner/src/fam_onion_vectors.rs (`cargo test --release --features dev
+\ --lib write_fam_onion_vectors -- --ignored`); not to be edited.  Read by
+\ node/wonion_test.fam.  Hashes are SHAKE256-256.
+\
+\ Handshakes: the relay's Dilithium seed ovrs; the participant's Kyber
+\ seed ovks (64), challenge ovch, the relay's encapsulation randomness
+\ ovm, the channel ovchan (8).  The channel's: the hello's hash ovhh,
+\ the reply's ovrh, the participant's keys out ovko and in ovki; the
+\ circuit hop's (chan 0): ovcrh, ovcko, ovcki.
+\ Frames, on the channel: the participant sends 300 bytes (byte j
+\ 7j+1): its frame hashes to ovf1 (ovf1l bytes); the relay's
+\ acknowledgement to ova1 (ova1l); the relay sends 100 bytes (3j+2):
+\ ovr1 (ovr1l).
+\ Cells: three hops, forward keys byte j 16k+j+1, backward 16k+j+101
+\ (k the hop); a body of 875 bytes (5j+3): sealed to hop 0, then 1,
+\ then 2 (ovs0 ovs1 ovs2); then sent back by hop 0, 1 and 2 in turn
+\ (originated by the hop, passed by those before it: ovb0 ovb1 ovb2).
+\ Routes: a one-time Kyber key from the seeds ovqd ovqz; the route to
+\ the relay (token ovtk, 16); its reply id ovrid; a recipient (Dilithium
+\ seed ovas, Kyber seeds ovad ovaz; its announce seq/expiry ovseq ovexp,
+\ nonce 0); a payload of kind 1, 200 bytes (11j+5), m ovpm, nonce ovpn,
+\ sealed to it unnamed with the route: ovph (ovpl bytes); the answer,
+\ 150 bytes (13j+7), sealed along the route: ovah (oval bytes).
+\ ovwn ( -- n )  the weight cases; ovw ( i -- )  case i: the id at ovwid,
+\ the epoch ovwe, the points (3 relay indexes) at ovwx; the relays
+\ (seven) at ovwr, 32 bytes each.
+
+: ovp variable ;  : ovrs variable ;  : ovks variable ;  : ovch variable ;  : ovm variable ;  : ovchan variable ;
+: ovhh variable ;  : ovrh variable ;  : ovko variable ;  : ovki variable ;  : ovcrh variable ;  : ovcko variable ;
+: ovcki variable ;  : ovf1 variable ;  : ovf1l variable ;  : ova1 variable ;  : ova1l variable ;  : ovr1 variable ;
+: ovr1l variable ;  : ovs0 variable ;  : ovs1 variable ;  : ovs2 variable ;  : ovb0 variable ;  : ovb1 variable ;
+: ovb2 variable ;  : ovqd variable ;  : ovqz variable ;  : ovtk variable ;  : ovrid variable ;  : ovas variable ;
+: ovad variable ;  : ovaz variable ;  : ovseq variable ;  : ovexp variable ;  : ovpm variable ;  : ovpn variable ;
+: ovph variable ;  : ovpl variable ;  : ovah variable ;  : oval variable ;  : ovwid variable ;  : ovwe variable ;
+: ovwx variable ;  : ovwr variable ;  : ovnow variable ;
+: ovc  ovp @ c!  ovp @ 1 lit + ovp ! ;
+: ovbufs
+ovrs @ 0= if
+	20 lit alloc ovrs !  40 lit alloc ovks !  20 lit alloc ovch !  20 lit alloc ovm !  8 lit alloc ovchan !
+	20 lit alloc ovhh !  20 lit alloc ovrh !  20 lit alloc ovko !  20 lit alloc ovki !  20 lit alloc ovcrh !
+	20 lit alloc ovcko !  20 lit alloc ovcki !  20 lit alloc ovf1 !  20 lit alloc ova1 !  20 lit alloc ovr1 !
+	20 lit alloc ovs0 !  20 lit alloc ovs1 !  20 lit alloc ovs2 !  20 lit alloc ovb0 !  20 lit alloc ovb1 !
+	20 lit alloc ovb2 !  20 lit alloc ovqd !  20 lit alloc ovqz !  10 lit alloc ovtk !  20 lit alloc ovrid !
+	20 lit alloc ovas !  20 lit alloc ovad !  20 lit alloc ovaz !  8 lit alloc ovseq !  8 lit alloc ovexp !
+	20 lit alloc ovpm !  C lit alloc ovpn !  20 lit alloc ovph !  20 lit alloc ovah !  20 lit alloc ovwid !
+	4 lit alloc ovwx !  E0 lit alloc ovwr !
+then ;
+
+: ovset
+ovrs @ ovp !
+4 lit ovc D lit ovc 16 lit ovc 1F lit ovc 28 lit ovc 31 lit ovc 3A lit ovc 43 lit ovc 4C lit ovc 55 lit ovc 5E lit ovc 67 lit ovc 70 lit ovc 79 lit ovc 82 lit ovc 8B lit ovc 94 lit ovc 9D lit ovc A6 lit ovc AF lit ovc B8 lit ovc C1 lit ovc CA lit ovc D3 lit ovc
+DC lit ovc E5 lit ovc EE lit ovc F7 lit ovc 0 lit ovc 9 lit ovc 12 lit ovc 1B lit ovc
+ovks @ ovp !
+1 lit ovc 6 lit ovc B lit ovc 10 lit ovc 15 lit ovc 1A lit ovc 1F lit ovc 24 lit ovc 29 lit ovc 2E lit ovc 33 lit ovc 38 lit ovc 3D lit ovc 42 lit ovc 47 lit ovc 4C lit ovc 51 lit ovc 56 lit ovc 5B lit ovc 60 lit ovc 65 lit ovc 6A lit ovc 6F lit ovc 74 lit ovc
+79 lit ovc 7E lit ovc 83 lit ovc 88 lit ovc 8D lit ovc 92 lit ovc 97 lit ovc 9C lit ovc A1 lit ovc A6 lit ovc AB lit ovc B0 lit ovc B5 lit ovc BA lit ovc BF lit ovc C4 lit ovc C9 lit ovc CE lit ovc D3 lit ovc D8 lit ovc DD lit ovc E2 lit ovc E7 lit ovc EC lit ovc
+F1 lit ovc F6 lit ovc FB lit ovc 0 lit ovc 5 lit ovc A lit ovc F lit ovc 14 lit ovc 19 lit ovc 1E lit ovc 23 lit ovc 28 lit ovc 2D lit ovc 32 lit ovc 37 lit ovc 3C lit ovc
+ovch @ ovp !
+C8 lit ovc C5 lit ovc C2 lit ovc BF lit ovc BC lit ovc B9 lit ovc B6 lit ovc B3 lit ovc B0 lit ovc AD lit ovc AA lit ovc A7 lit ovc A4 lit ovc A1 lit ovc 9E lit ovc 9B lit ovc 98 lit ovc 95 lit ovc 92 lit ovc 8F lit ovc 8C lit ovc 89 lit ovc 86 lit ovc 83 lit ovc
+80 lit ovc 7D lit ovc 7A lit ovc 77 lit ovc 74 lit ovc 71 lit ovc 6E lit ovc 6B lit ovc
+ovm @ ovp !
+6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc
+6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc 6D lit ovc
+ovchan @ ovp !
+EF lit ovc CD lit ovc AB lit ovc 89 lit ovc 67 lit ovc 45 lit ovc 23 lit ovc 1 lit ovc
+ovhh @ ovp !
+56 lit ovc 59 lit ovc 2D lit ovc 5C lit ovc 7C lit ovc 7D lit ovc 95 lit ovc 7A lit ovc 8 lit ovc 41 lit ovc 10 lit ovc 90 lit ovc D2 lit ovc BA lit ovc 65 lit ovc 8C lit ovc 2 lit ovc 56 lit ovc 3 lit ovc 21 lit ovc 45 lit ovc 9C lit ovc 10 lit ovc E4 lit ovc
+E0 lit ovc 95 lit ovc B8 lit ovc 6B lit ovc C1 lit ovc F lit ovc 5C lit ovc 73 lit ovc
+ovrh @ ovp !
+FD lit ovc 60 lit ovc 5 lit ovc 45 lit ovc F5 lit ovc 48 lit ovc 68 lit ovc C3 lit ovc 78 lit ovc 98 lit ovc 55 lit ovc 88 lit ovc 6E lit ovc 5D lit ovc B7 lit ovc 58 lit ovc E7 lit ovc 39 lit ovc D0 lit ovc 25 lit ovc D lit ovc 4D lit ovc 2B lit ovc 67 lit ovc
+FD lit ovc F4 lit ovc BE lit ovc 4 lit ovc 48 lit ovc 71 lit ovc 3 lit ovc 2D lit ovc
+ovko @ ovp !
+88 lit ovc DA lit ovc 9F lit ovc A5 lit ovc 6D lit ovc 49 lit ovc 59 lit ovc EF lit ovc 42 lit ovc 86 lit ovc F lit ovc 33 lit ovc 2D lit ovc 11 lit ovc D7 lit ovc F3 lit ovc FD lit ovc 43 lit ovc C4 lit ovc 79 lit ovc E0 lit ovc 83 lit ovc 13 lit ovc 2E lit ovc
+E9 lit ovc E9 lit ovc 49 lit ovc 31 lit ovc 4F lit ovc 75 lit ovc F5 lit ovc AC lit ovc
+ovki @ ovp !
+E2 lit ovc 7B lit ovc C7 lit ovc A4 lit ovc 23 lit ovc 42 lit ovc 61 lit ovc BE lit ovc 2A lit ovc B0 lit ovc 69 lit ovc 10 lit ovc B2 lit ovc FD lit ovc 1C lit ovc 19 lit ovc 2F lit ovc 77 lit ovc 8E lit ovc 5A lit ovc FC lit ovc FF lit ovc F8 lit ovc 3F lit ovc
+16 lit ovc 98 lit ovc E5 lit ovc EE lit ovc FD lit ovc 90 lit ovc 9C lit ovc AA lit ovc
+ovcrh @ ovp !
+54 lit ovc 81 lit ovc 12 lit ovc 43 lit ovc D5 lit ovc 43 lit ovc DA lit ovc 4A lit ovc 1C lit ovc AF lit ovc AF lit ovc 79 lit ovc 14 lit ovc 8A lit ovc FD lit ovc F1 lit ovc 75 lit ovc 63 lit ovc 4 lit ovc EE lit ovc FD lit ovc A5 lit ovc D0 lit ovc A4 lit ovc
+C6 lit ovc 18 lit ovc D3 lit ovc E3 lit ovc 8B lit ovc B4 lit ovc FA lit ovc DC lit ovc
+ovcko @ ovp !
+E7 lit ovc E1 lit ovc 92 lit ovc 33 lit ovc 89 lit ovc D7 lit ovc 59 lit ovc BE lit ovc B7 lit ovc 2B lit ovc 26 lit ovc 92 lit ovc 17 lit ovc 5 lit ovc DC lit ovc 81 lit ovc E1 lit ovc DE lit ovc B4 lit ovc B5 lit ovc 9B lit ovc 81 lit ovc C4 lit ovc 81 lit ovc
+F4 lit ovc 67 lit ovc 71 lit ovc 79 lit ovc 30 lit ovc 7F lit ovc 3E lit ovc 7A lit ovc
+ovcki @ ovp !
+C1 lit ovc B2 lit ovc 4E lit ovc C1 lit ovc 0 lit ovc DF lit ovc DD lit ovc F lit ovc CC lit ovc F2 lit ovc 39 lit ovc 48 lit ovc 73 lit ovc B1 lit ovc B9 lit ovc F6 lit ovc DA lit ovc AB lit ovc DC lit ovc 55 lit ovc B5 lit ovc 3F lit ovc B7 lit ovc 21 lit ovc
+58 lit ovc 31 lit ovc 1B lit ovc 69 lit ovc 1C lit ovc 6B lit ovc 65 lit ovc 2C lit ovc
+ovf1 @ ovp !
+2A lit ovc B9 lit ovc 73 lit ovc A2 lit ovc 60 lit ovc 22 lit ovc 83 lit ovc 6C lit ovc B lit ovc 50 lit ovc F5 lit ovc 6D lit ovc C0 lit ovc 48 lit ovc 7F lit ovc F8 lit ovc 54 lit ovc 1B lit ovc 3D lit ovc 5B lit ovc 73 lit ovc 6B lit ovc 38 lit ovc DE lit ovc
+E7 lit ovc 98 lit ovc C1 lit ovc 32 lit ovc 2E lit ovc 80 lit ovc B7 lit ovc B1 lit ovc
+ova1 @ ovp !
+6C lit ovc EE lit ovc 58 lit ovc B3 lit ovc 9 lit ovc 9D lit ovc C5 lit ovc BB lit ovc 7A lit ovc E9 lit ovc 67 lit ovc 3A lit ovc 47 lit ovc B1 lit ovc 34 lit ovc 60 lit ovc 48 lit ovc F9 lit ovc 72 lit ovc D0 lit ovc 51 lit ovc B lit ovc 3F lit ovc 71 lit ovc
+83 lit ovc 6F lit ovc 2E lit ovc 1A lit ovc 62 lit ovc 6A lit ovc 67 lit ovc 6B lit ovc
+ovr1 @ ovp !
+1A lit ovc D0 lit ovc C1 lit ovc 1B lit ovc D9 lit ovc 64 lit ovc 61 lit ovc D0 lit ovc 97 lit ovc C9 lit ovc B5 lit ovc 4E lit ovc 0 lit ovc 94 lit ovc 24 lit ovc C0 lit ovc C7 lit ovc E6 lit ovc E0 lit ovc 91 lit ovc 1F lit ovc 1E lit ovc 46 lit ovc 79 lit ovc
+35 lit ovc AF lit ovc A4 lit ovc CC lit ovc BF lit ovc 28 lit ovc 17 lit ovc F2 lit ovc
+ovs0 @ ovp !
+56 lit ovc 84 lit ovc 5E lit ovc 6C lit ovc 73 lit ovc DF lit ovc 17 lit ovc 69 lit ovc A6 lit ovc 26 lit ovc 65 lit ovc 11 lit ovc 55 lit ovc 40 lit ovc 4D lit ovc BD lit ovc 9E lit ovc 9A lit ovc 82 lit ovc DA lit ovc 41 lit ovc C6 lit ovc 1D lit ovc 34 lit ovc
+42 lit ovc DF lit ovc B6 lit ovc F4 lit ovc 1F lit ovc 6A lit ovc C7 lit ovc 6D lit ovc
+ovs1 @ ovp !
+AC lit ovc 58 lit ovc 61 lit ovc E7 lit ovc BA lit ovc 35 lit ovc F8 lit ovc C2 lit ovc 1E lit ovc A7 lit ovc E2 lit ovc D lit ovc 80 lit ovc 36 lit ovc 88 lit ovc 85 lit ovc 39 lit ovc 7B lit ovc 9 lit ovc FB lit ovc AA lit ovc 74 lit ovc 2 lit ovc 5C lit ovc
+83 lit ovc E6 lit ovc 48 lit ovc 66 lit ovc 83 lit ovc 97 lit ovc B4 lit ovc 1C lit ovc
+ovs2 @ ovp !
+D4 lit ovc 8F lit ovc FD lit ovc 73 lit ovc CB lit ovc D lit ovc 95 lit ovc 6C lit ovc 52 lit ovc 1A lit ovc DD lit ovc C9 lit ovc 5F lit ovc 6B lit ovc 2D lit ovc E0 lit ovc 7E lit ovc DF lit ovc F9 lit ovc 48 lit ovc 4F lit ovc 55 lit ovc F9 lit ovc 15 lit ovc
+4B lit ovc 31 lit ovc B4 lit ovc 38 lit ovc E4 lit ovc 42 lit ovc F lit ovc C0 lit ovc
+ovb0 @ ovp !
+AB lit ovc B0 lit ovc 16 lit ovc FF lit ovc 7A lit ovc 14 lit ovc 6D lit ovc FF lit ovc 8A lit ovc 7D lit ovc 10 lit ovc 5C lit ovc 39 lit ovc 76 lit ovc 36 lit ovc 3 lit ovc C4 lit ovc AC lit ovc 1A lit ovc E3 lit ovc 0 lit ovc DA lit ovc DA lit ovc D6 lit ovc
+4B lit ovc B6 lit ovc 45 lit ovc 6E lit ovc 86 lit ovc 39 lit ovc 6F lit ovc 79 lit ovc
+ovb1 @ ovp !
+64 lit ovc 2A lit ovc 60 lit ovc 5D lit ovc 29 lit ovc 93 lit ovc C9 lit ovc 39 lit ovc 26 lit ovc 76 lit ovc E1 lit ovc EF lit ovc AA lit ovc 85 lit ovc FD lit ovc 62 lit ovc 3A lit ovc 4B lit ovc 41 lit ovc D lit ovc B1 lit ovc B2 lit ovc E3 lit ovc EC lit ovc
+19 lit ovc A5 lit ovc D9 lit ovc EB lit ovc 3 lit ovc 6D lit ovc D1 lit ovc 8 lit ovc
+ovb2 @ ovp !
+70 lit ovc B0 lit ovc 58 lit ovc 2D lit ovc CA lit ovc 25 lit ovc 58 lit ovc 8B lit ovc 80 lit ovc 48 lit ovc CD lit ovc 21 lit ovc D4 lit ovc 46 lit ovc B5 lit ovc D1 lit ovc 3B lit ovc B5 lit ovc BB lit ovc 4F lit ovc 3D lit ovc B lit ovc 82 lit ovc 0 lit ovc
+F8 lit ovc CB lit ovc 6C lit ovc 9A lit ovc CF lit ovc 41 lit ovc 33 lit ovc DF lit ovc
+ovqd @ ovp !
+51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc
+51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc 51 lit ovc
+ovqz @ ovp !
+52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc
+52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc 52 lit ovc
+ovtk @ ovp !
+A0 lit ovc A1 lit ovc A2 lit ovc A3 lit ovc A4 lit ovc A5 lit ovc A6 lit ovc A7 lit ovc A8 lit ovc A9 lit ovc AA lit ovc AB lit ovc AC lit ovc AD lit ovc AE lit ovc AF lit ovc
+ovrid @ ovp !
+BA lit ovc 7 lit ovc 5D lit ovc 21 lit ovc 7E lit ovc 45 lit ovc 7 lit ovc 46 lit ovc 37 lit ovc F1 lit ovc B6 lit ovc 73 lit ovc A9 lit ovc 48 lit ovc 7A lit ovc 34 lit ovc A4 lit ovc F4 lit ovc 48 lit ovc 30 lit ovc 95 lit ovc 22 lit ovc 8F lit ovc 2C lit ovc
+EC lit ovc 28 lit ovc C1 lit ovc 4F lit ovc 55 lit ovc 34 lit ovc 4B lit ovc 30 lit ovc
+ovas @ ovp !
+61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc
+61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc 61 lit ovc
+ovad @ ovp !
+62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc
+62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc 62 lit ovc
+ovaz @ ovp !
+63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc
+63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc 63 lit ovc
+ovseq @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 8B lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+ovexp @ ovp !
+0 lit ovc D2 lit ovc 49 lit ovc 6B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc
+ovpm @ ovp !
+71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc
+71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc 71 lit ovc
+ovpn @ ovp !
+72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc 72 lit ovc
+ovph @ ovp !
+DC lit ovc 42 lit ovc 76 lit ovc FB lit ovc A lit ovc 8B lit ovc F9 lit ovc E2 lit ovc 7C lit ovc AD lit ovc DB lit ovc 70 lit ovc 3F lit ovc C0 lit ovc D2 lit ovc 89 lit ovc 72 lit ovc FF lit ovc 1A lit ovc 59 lit ovc BB lit ovc E9 lit ovc 9 lit ovc D0 lit ovc
+F5 lit ovc DF lit ovc A6 lit ovc BE lit ovc EC lit ovc 7C lit ovc 42 lit ovc 72 lit ovc
+ovah @ ovp !
+2F lit ovc 99 lit ovc 4B lit ovc A4 lit ovc B lit ovc 70 lit ovc 1D lit ovc 75 lit ovc 71 lit ovc 5D lit ovc BB lit ovc BB lit ovc 78 lit ovc 8D lit ovc 3 lit ovc 4A lit ovc E7 lit ovc 52 lit ovc 56 lit ovc 15 lit ovc B0 lit ovc AF lit ovc 42 lit ovc AB lit ovc
+F5 lit ovc 3 lit ovc AA lit ovc D9 lit ovc 28 lit ovc 15 lit ovc 75 lit ovc 16 lit ovc
+15D lit ovf1l !  31 lit ova1l !  95 lit ovr1l !  A1B lit ovpl !  519 lit oval !  6553F100 lit ovnow !
+;
+: ovw0
+ovwid @ ovp !
+70 lit ovc 7 lit ovc 55 lit ovc 51 lit ovc D5 lit ovc 2F lit ovc DE lit ovc 54 lit ovc 2D lit ovc 52 lit ovc 3E lit ovc 29 lit ovc 78 lit ovc 29 lit ovc 10 lit ovc 77 lit ovc 20 lit ovc 64 lit ovc 54 lit ovc A lit ovc C0 lit ovc E3 lit ovc E7 lit ovc 49 lit ovc
+BB lit ovc 98 lit ovc 1E lit ovc 3C lit ovc 45 lit ovc 8D lit ovc AB lit ovc 60 lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+6 lit ovc 1 lit ovc 4 lit ovc
+0 lit ovwe !
+;
+: ovw1
+ovwid @ ovp !
+70 lit ovc 7 lit ovc 55 lit ovc 51 lit ovc D5 lit ovc 2F lit ovc DE lit ovc 54 lit ovc 2D lit ovc 52 lit ovc 3E lit ovc 29 lit ovc 78 lit ovc 29 lit ovc 10 lit ovc 77 lit ovc 20 lit ovc 64 lit ovc 54 lit ovc A lit ovc C0 lit ovc E3 lit ovc E7 lit ovc 49 lit ovc
+BB lit ovc 98 lit ovc 1E lit ovc 3C lit ovc 45 lit ovc 8D lit ovc AB lit ovc 60 lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+4 lit ovc 3 lit ovc 1 lit ovc
+1 lit ovwe !
+;
+: ovw2
+ovwid @ ovp !
+70 lit ovc 7 lit ovc 55 lit ovc 51 lit ovc D5 lit ovc 2F lit ovc DE lit ovc 54 lit ovc 2D lit ovc 52 lit ovc 3E lit ovc 29 lit ovc 78 lit ovc 29 lit ovc 10 lit ovc 77 lit ovc 20 lit ovc 64 lit ovc 54 lit ovc A lit ovc C0 lit ovc E3 lit ovc E7 lit ovc 49 lit ovc
+BB lit ovc 98 lit ovc 1E lit ovc 3C lit ovc 45 lit ovc 8D lit ovc AB lit ovc 60 lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+0 lit ovc 2 lit ovc 1 lit ovc
+1092 lit ovwe !
+;
+: ovw3
+ovwid @ ovp !
+9D lit ovc C6 lit ovc 87 lit ovc 71 lit ovc 8F lit ovc 6A lit ovc EF lit ovc 24 lit ovc 5A lit ovc 4F lit ovc B0 lit ovc A lit ovc EB lit ovc 44 lit ovc F4 lit ovc 1B lit ovc 24 lit ovc 9F lit ovc 79 lit ovc 4C lit ovc 0 lit ovc ED lit ovc 91 lit ovc 31 lit ovc
+11 lit ovc 9 lit ovc 6A lit ovc 77 lit ovc 41 lit ovc 29 lit ovc E9 lit ovc 3B lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+5 lit ovc 3 lit ovc 1 lit ovc
+0 lit ovwe !
+;
+: ovw4
+ovwid @ ovp !
+9D lit ovc C6 lit ovc 87 lit ovc 71 lit ovc 8F lit ovc 6A lit ovc EF lit ovc 24 lit ovc 5A lit ovc 4F lit ovc B0 lit ovc A lit ovc EB lit ovc 44 lit ovc F4 lit ovc 1B lit ovc 24 lit ovc 9F lit ovc 79 lit ovc 4C lit ovc 0 lit ovc ED lit ovc 91 lit ovc 31 lit ovc
+11 lit ovc 9 lit ovc 6A lit ovc 77 lit ovc 41 lit ovc 29 lit ovc E9 lit ovc 3B lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+5 lit ovc 0 lit ovc 2 lit ovc
+1 lit ovwe !
+;
+: ovw5
+ovwid @ ovp !
+9D lit ovc C6 lit ovc 87 lit ovc 71 lit ovc 8F lit ovc 6A lit ovc EF lit ovc 24 lit ovc 5A lit ovc 4F lit ovc B0 lit ovc A lit ovc EB lit ovc 44 lit ovc F4 lit ovc 1B lit ovc 24 lit ovc 9F lit ovc 79 lit ovc 4C lit ovc 0 lit ovc ED lit ovc 91 lit ovc 31 lit ovc
+11 lit ovc 9 lit ovc 6A lit ovc 77 lit ovc 41 lit ovc 29 lit ovc E9 lit ovc 3B lit ovc
+ovwr @ ovp !
+1 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 4E lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 9B lit ovc 0 lit ovc 0 lit ovc 0 lit ovc E8 lit ovc 0 lit ovc 0 lit ovc 0 lit ovc 35 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 82 lit ovc 1 lit ovc 0 lit ovc 0 lit ovc
+CF lit ovc 1 lit ovc 0 lit ovc 0 lit ovc 1C lit ovc 2 lit ovc 0 lit ovc 0 lit ovc 44 lit ovc 42 lit ovc F lit ovc 0 lit ovc 91 lit ovc 42 lit ovc F lit ovc 0 lit ovc DE lit ovc 42 lit ovc F lit ovc 0 lit ovc 2B lit ovc 43 lit ovc F lit ovc 0 lit ovc
+78 lit ovc 43 lit ovc F lit ovc 0 lit ovc C5 lit ovc 43 lit ovc F lit ovc 0 lit ovc 12 lit ovc 44 lit ovc F lit ovc 0 lit ovc 5F lit ovc 44 lit ovc F lit ovc 0 lit ovc 87 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc D4 lit ovc 84 lit ovc 1E lit ovc 0 lit ovc
+21 lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 6E lit ovc 85 lit ovc 1E lit ovc 0 lit ovc BB lit ovc 85 lit ovc 1E lit ovc 0 lit ovc 8 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc 55 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc A2 lit ovc 86 lit ovc 1E lit ovc 0 lit ovc
+CA lit ovc C6 lit ovc 2D lit ovc 0 lit ovc 17 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 64 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc B1 lit ovc C7 lit ovc 2D lit ovc 0 lit ovc FE lit ovc C7 lit ovc 2D lit ovc 0 lit ovc 4B lit ovc C8 lit ovc 2D lit ovc 0 lit ovc
+98 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc E5 lit ovc C8 lit ovc 2D lit ovc 0 lit ovc D lit ovc 9 lit ovc 3D lit ovc 0 lit ovc 5A lit ovc 9 lit ovc 3D lit ovc 0 lit ovc A7 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc F4 lit ovc 9 lit ovc 3D lit ovc 0 lit ovc
+41 lit ovc A lit ovc 3D lit ovc 0 lit ovc 8E lit ovc A lit ovc 3D lit ovc 0 lit ovc DB lit ovc A lit ovc 3D lit ovc 0 lit ovc 28 lit ovc B lit ovc 3D lit ovc 0 lit ovc 50 lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 9D lit ovc 4B lit ovc 4C lit ovc 0 lit ovc
+EA lit ovc 4B lit ovc 4C lit ovc 0 lit ovc 37 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 84 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc D1 lit ovc 4C lit ovc 4C lit ovc 0 lit ovc 1E lit ovc 4D lit ovc 4C lit ovc 0 lit ovc 6B lit ovc 4D lit ovc 4C lit ovc 0 lit ovc
+93 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc E0 lit ovc 8D lit ovc 5B lit ovc 0 lit ovc 2D lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 7A lit ovc 8E lit ovc 5B lit ovc 0 lit ovc C7 lit ovc 8E lit ovc 5B lit ovc 0 lit ovc 14 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+61 lit ovc 8F lit ovc 5B lit ovc 0 lit ovc AE lit ovc 8F lit ovc 5B lit ovc 0 lit ovc
+ovwx @ ovp !
+4 lit ovc 5 lit ovc 0 lit ovc
+1092 lit ovwe !
+;
+: ovwn  6 lit ;
+: ovw
+dup 0 lit = if ovw0 then
+dup 1 lit = if ovw1 then
+dup 2 lit = if ovw2 then
+dup 3 lit = if ovw3 then
+dup 4 lit = if ovw4 then
+dup 5 lit = if ovw5 then
+drop ;

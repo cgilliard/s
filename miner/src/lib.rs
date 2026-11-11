@@ -24,6 +24,8 @@ mod fam_msg_vectors;
 #[cfg(test)]
 mod fam_sub_vectors;
 #[cfg(test)]
+mod fam_onion_vectors;
+#[cfg(test)]
 mod fam_xmss_vectors;
 #[cfg(test)]
 mod fam_slate_vectors;
