@@ -430,6 +430,15 @@ pnp @ ?dup if 0 lit do
 		i prec 4C lit + @ nahh @ u> if i nah !  i prec 4C lit + @ nahh ! then
 	then
 loop then nah @ ;
+\ nrean  every pooled transaction announced again to every answering peer,
+\ each minute: a peer that missed the first (silent then, restarted, a
+\ datagram lost) asks for it now; one that has it does nothing.
+: nrat variable ;
+: nrean
+ntime nrat @ u< 0= if
+	ntime 3C lit + nrat !
+	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann then loop
+then ;
 : nstep
 3B9ACA00 lit pwait drop
 pkeep
@@ -441,7 +450,7 @@ nahead dup 0< if drop else
 		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
 	then
 then
-nrelay  qpersist ;
+nrelay  nrean  qpersist ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;
