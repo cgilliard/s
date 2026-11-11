@@ -30,9 +30,9 @@
 \
 \ Built so far (step 2 of 4): unlock, create, restore, phrase, receive,
 \ overview, scan; the tip told.  The rest are refused as not yet built.
-\ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam
-\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wslate.fam node/wproof.fam node/wname.fam
-\ memory: 4096
+\ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam crypto/kyber.fam
+\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wslate.fam node/wproof.fam node/wname.fam node/wmsg.fam node/dns.fam node/wnet.fam
+\ memory: 6144
 : ibuf variable ;  : icnt variable ;  : obuf variable ;  : opos variable ;
 : idb variable ;  : opb variable ;  : unl variable ;  : jr variable ;
 : lp variable ;  : le variable ;
@@ -681,12 +681,15 @@ orec @ wknon  kseed @ wkkey  kseed @ 4 lit xk @ xkgen  xk @ swap xkpub ;
 \ the coins reserved and the payment recorded in one transaction, the
 \ stage-1 slate written for the recipient.  The sender is unnamed (the
 \ hash of a secret kept, docs/PRIVACY.md).
+\ (wmon set: the slate made for osonl to send online, wmok set, nothing
+\ answered.)
+: wmon variable ;  : wmok variable ;
 : osend
 have @ 0= if drop nowal else
 dup "'amount':'" wtmp @ 40 lit jstr  wtmp @ samt @ jcoins and 0= if drop "not an amount" jerr else
 samt @ sdust @ a8lt if drop "the amount is below the dust limit" jerr else
 dup "'text':true" jfind 0= 0= tmode !  0 lit fpath @ c!  dup "'slate':'" fpath @ 100 lit jstr drop
-tmode @ fpath @ c@ or 0= if drop "no slate file, nor text asked for" jerr else
+tmode @ fpath @ c@ or wmon @ or 0= if drop "no slate file, nor text asked for" jerr else
 "'speed':'" wtmp @ 20 lit jstr drop
 "/v1/fees" hget ?dup if wtmp @ frate else A lit then srate !
 wsels
@@ -722,11 +725,12 @@ sdone @ 2 lit = if "not enough confirmed coins" jerr else
 		spick @ 0 lit do  i selent pkb @ wpkof  pkb @ i selent 20 lit + wsaddin  loop
 		pend @ 4 lit + @ if onew @ wsaddout then
 		pend @ 4 lit + @ wsfix fpn !
+		wmon @ if -1 lit wmok ! else
 		tmode @ if
 			jok ",'text':'" jo wsbuf @ fpn @ stext "','fee':'" jo sfee @ a8. "'}" jo jend
 		else wsbuf @ fpn @ fpath @ sout if
 			jok ",'slate':'" jo fpath @ jraw "','fee':'" jo sfee @ a8. "'}" jo jend
-		else "the slate cannot be written" jerr then then
+		else "the slate cannot be written" jerr then then then
 	else "the wallet could not be written" jerr then
 then
 then then then then ;
@@ -744,6 +748,7 @@ dup xrec @ !  ?dup if 0 lit do xsrc @ xst @ i * + xrec @ 38 lit + i 5 lit lshift
 78 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit xrec @ 38 lit xrec @ @ 5 lit lshift + wsetk ;
 : xzero  xrec @ 38 lit 0 lit do 0 lit over i + c! loop drop ;
 
+\ ofinb ( -- )  the slate at sbin (fpn bytes) finalized, as ofinal.
 \ ofinal ( line -- )  the recipient's answer finalized: tabminer's checks
 \ against the payment's record (wsfin); each input's next leaf recorded as
 \ used, committed, before any signature is made; the transaction signed
@@ -758,9 +763,7 @@ dup 5 lit = if drop "its amounts do not balance" else dup 6 lit = if drop "its c
 dup 7 lit = if drop "an output is zero or below the dust limit" else dup 8 lit = if drop "it is too large" else
 9 lit = if "not one output for the recipient" else "the receipt does not hold" then
 then then then then then then then then jerr ;
-: ofinal
-have @ 0= if drop nowal else
-slin fpn !  fpn @ 0< if "no slate given, or not one" jerr else
+: ofinb
 sbin @ fpn @ wsparse 0= if "not a slate" jerr else
 73 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy
 okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr else
@@ -823,7 +826,11 @@ okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr 
 			then
 		then
 	then then
-then then then then ;
+then then ;
+: ofinal
+have @ 0= if drop nowal else
+slin fpn !  fpn @ 0< if "no slate given, or not one" jerr else ofinb then
+then ;
 
 \ ── Proofs and burns (phase 2, docs/PROOFS.md) ──
 
@@ -1499,13 +1506,176 @@ xrec @ 4 lit + @ 0= if drop "it has no change to pay a higher fee from: cancel i
 	then then
 then then then ;
 
+\ ── The message layer (phase 3, docs/ONION.md, init mode): payments by
+\ address or name with no file.  Started once the wallet is open
+\ (wmstart): its seeds (/etc/wallet/config: "seed HOST:PORT" lines, or
+\ "messages off"; none, tabminer's), its identity (the address's Dilithium key), a
+\ session at each of its rendezvous points (node/wnet.fam).  A payment
+\ sent online (send-online) goes as a slate in a payload to the
+\ recipient's id, its answer finalized when it comes from that id; a
+\ payer's slate that comes is answered at once.  What happens is told as
+\ events: {"event":"message","text":...}, a finalized payment as the
+\ finalize request's answer with "event":"message" in place of the id. ──
+: wmtried variable ;  : wmoff variable ;  : wonline variable ;  : wmsd variable ;  : wmsn variable ;  : wmto variable ;  : wmsid variable ;  : wmkind variable ;
+: wmst0 variable ;  : wmlast variable ;  : wmx variable ;  : wmy variable ;
+\ wmscmp ( a b -- flag )  string a sorts before b (as bytes).
+: wmscmp
+begin over c@ over c@ = over c@ and while 1 lit + swap 1 lit + swap repeat
+c@ swap c@ swap u< ;
+\ wmadd ( s -- )  a seed (HOST:PORT) kept, in order, once.
+: wmadd
+wmsn @ 8 lit u< if
+	wmx !  0 lit wmy !
+	wmsn @ ?dup if 0 lit do wmsd @ i 6 lit lshift + wmx @ streq if -1 lit wmy ! then loop then
+	wmy @ 0= if
+		\ the place: after those before it
+		0 lit wmsn @ ?dup if 0 lit do wmsd @ i 6 lit lshift + wmx @ wmscmp if drop i 1 lit + then loop then
+		dup wmsn @ swap - ?dup if 0 lit do
+			wmsd @ wmsn @ i - 1 lit - 6 lit lshift +  dup 40 lit + 40 lit bcopy
+		loop then
+		wmsd @ swap 6 lit lshift + wmx @ scpy 0 lit swap c!
+		wmsn @ 1 lit + wmsn !
+	then
+then ;
+\ wmdots ( s -- ip ok )  a dotted IPv4 address (to a ':' or NUL).
+: wmdots
+0 lit swap  -1 lit wmy !
+4 lit 0 lit do
+	0 lit wmx !  dup c@ 30 lit - A lit u< 0= if 0 lit wmy ! then
+	begin dup c@ 30 lit - A lit u< while dup c@ 30 lit - wmx @ A lit * + wmx !  1 lit + repeat
+	swap 8 lit lshift wmx @ FF lit and or swap
+	i 3 lit < if dup c@ 2E lit = if 1 lit + else 0 lit wmy ! then then
+loop
+drop wmy @ ;
+\ wmseeds  /etc/wallet/config's "seed HOST:PORT" lines, else tabminer's
+\ seeds; sorted; each looked up (dns.fam, at QEMU's resolver) and added.
+\ A line "messages off": none (wmoff).
+: wmseeds
+0 lit wmsn !  0 lit wmoff !
+"/etc/wallet/config" fread dup 0< if drop else
+	0 lit swap fbuf @ + c!  fbuf @
+	begin dup c@ while
+		dup "messages off" C lit dlsame if -1 lit wmoff ! then
+		dup "seed " 5 lit dlsame if
+			5 lit + dup wtmp @ swap
+			begin dup c@ dup 20 lit u> swap 7F lit u< and while 2dup c@ swap c! swap 1 lit + swap 1 lit + repeat
+			drop 0 lit swap c!  wtmp @ wmadd
+		then
+		begin dup c@ dup 0= 0= swap A lit <> and while 1 lit + repeat
+		dup c@ if 1 lit + then
+	repeat drop
+then
+wmsn @ 0= wmoff @ 0= and if "tabernacle1.root.sx:3737" wmadd  "tabernacle2.root.sx:3737" wmadd then
+dinit
+wmsn @ ?dup if 0 lit do
+	wmsd @ i 6 lit lshift + wtmp @ swap scpy 0 lit swap c!
+	wtmp @ begin dup c@ dup 0= 0= swap 3A lit <> and while 1 lit + repeat
+	dup c@ if 0 lit over c! 1 lit + atoi else drop E99 lit then
+	wtmp @ wmdots 0= if drop wtmp @ A000203 lit 35 lit dlook then
+	swap mnseed
+loop then ;
+\ wmstart  the message layer begun: seeds, identity, the genesis's id.
+: wmstart
+-1 lit wmtried !
+mninit  wmseeds
+wmoff @ 0= if -1 lit wonline !  waddr!  wpk @ wsk @ mnkeys then
+"/v1/header/0" hget ?dup if "'id':'" jfind ?dup if mngen @ 20 lit jhexb then then
+mnms wmlast ! ;
+\ wmev ( s -- )  an event telling s.
+: wmev  "{'event':'message','text':'" jo jo "'}" jo jend ;
+\ wmidb ( s -- )  idb = s, each ' a double quote (jraw writes idb as it is).
+: wmidb  idb @ swap begin dup c@ while dup c@ dup 27 lit = if drop 22 lit then 2 lit pick c!  1 lit + swap 1 lit + swap repeat drop 0 lit swap c! ;
+\ wmcanc  the slate at wmsid abandoned (its send failed): its inputs free
+\ again, its change forgotten, its records gone.
+: wmcanc
+73 lit okey @ c!  wmsid @ okey @ 1 lit + 20 lit bcopy
+okey @ 21 lit pend @ 878 lit wrget 0< 0= if
+	wbeg
+	pend @ @ ?dup if 0 lit do
+		6F lit okey @ c!  pend @ 78 lit + i 5 lit lshift + okey @ 1 lit + 20 lit bcopy
+		okey @ 21 lit orec @ 30 lit wgetk drop  0 lit orec @ 24 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
+	loop then
+	pend @ 4 lit + @ if 6F lit okey @ c!  pend @ 58 lit + okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop then
+	73 lit okey @ c!  wmsid @ okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
+	74 lit okey @ c!  wtx @ okey @ 21 lit txdel drop
+	wend drop
+then ;
+\ wmto! ( s -- ok )  wmto = the id of s: a tab1 address, 64 hex digits,
+\ or @NAME (its value on chain, looked up through the node, its proof
+\ checked).
+: wmto!
+dup c@ 40 lit = if
+	1 lit + nname @ swap scpy 0 lit swap c!  nname @ strlen dup nlen !  nname @ swap wnok if
+		nlook if if nlval @ wmto @ 20 lit bcopy  0 lit  20 lit 0 lit do wmto @ i + c@ or loop 0= 0= else 0 lit then else 0 lit then
+	else 0 lit then
+else dup strlen 3E lit = if wsd @ wkdec dup if wsd @ wmto @ wkcan then
+else dup strlen 40 lit = if wmto @ 20 lit jhexb -1 lit else drop 0 lit then then then ;
+\ osonl ( line -- )  a payment sent online: "to" (an address or @NAME),
+\ "amount", "speed"; the slate made (as osend's), sent to the
+\ recipient's id; its answer finalized when it comes.
+: osonl
+have @ 0= if drop nowal else
+wonline @ 0= if drop "the message layer is not started" jerr else
+mnlive 0= if drop "not reachable yet: no rendezvous point holds a session for this wallet" jerr else
+mnss @ if drop "a message is under way; try again in a moment" jerr else
+dup "'to':'" wtmp @ 80 lit jstr 0= if drop "no recipient given" jerr else
+wtmp @ wmto! 0= if drop "not an address, nor a registered name" jerr else
+	-1 lit wmon !  0 lit wmok !  osend  0 lit wmon !
+	wmok @ if
+		sid @ wmsid @ 20 lit bcopy  1 lit wmkind !
+		wbeg  74 lit okey @ c!  sid @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit wmto @ 20 lit wsetk  wend drop
+		wmto @ 1 lit wsbuf @ fpn @ mnsend drop
+		jok ",'online':true,'fee':'" jo sfee @ a8. "'}" jo jend
+	then
+then then then then then then ;
+\ wmgot  a payload opened: a slate.  A payer's (stage 1) answered and
+\ sent back to it; a recipient's answer (stage 2) to a payment this
+\ wallet sent that id, finalized.
+: wmgot
+mgkind @ 1 lit =  mgil @ 8000 lit u< and if
+	mgin @ sbin @ mgil @ bcopy  mgil @ fpn !
+	sbin @ fpn @ wsparse if
+		wsstg @ 1 lit =  wsnout @ wschg @ = and  mnss @ 0= and if
+			waddr!
+			wbeg  wsa @ 49 lit + 1 lit wnew  wend if
+				onew @ wsk @ wpk @ wsans fpn !
+				2 lit wmkind !  mgfrom @ 1 lit wsbuf @ fpn @ mnsendr drop
+				"{'event':'message','text':'answered a slate of " jo wsa @ 49 lit + a8. " coins from a payer; it is paid once the payer sends it'}" jo jend
+			then
+		then
+		wsstg @ 2 lit = if
+			74 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy
+			okey @ 21 lit wtmp @ 20 lit wrget 20 lit =  wtmp @ mgfrom @ 20 lit dlsame and if
+				"null,'event':'message'" wmidb  ofinb  "null" wmidb
+				wbeg  74 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop  wend drop
+			then
+		then
+	then
+then ;
+\ wmrun  the message layer's turn in the loop: datagrams, the clock, the
+\ height and tip from the node, the send's end told.
+: wmrun
+mnin  mnrcv @ if wmgot then
+lh @ mnht !  ntip @ c@ if ntip @ mntip @ 20 lit jhexb then
+mntick
+mnst @ if
+	mnst @ 1 lit = if
+		wmkind @ 1 lit = if "the slate reached a rendezvous point of the recipient; waiting for the answer" wmev then
+	else
+		wmkind @ 1 lit = if wmcanc then
+		wtmp @ "the message was not delivered: " scpy mnwhy @ scpy 0 lit over c! drop  wtmp @ jsafe wtmp @ wmev
+	then
+	0 lit mnst !
+then ;
+
 \ ── The requests ──
 
 : tried variable ;
 : oview
 wtick  wsums
 jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'" jo sa4 @ wsum.  "','reserved':'" jo sa3 @ wsum.
-"','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo "'}" jo jend ;
+"','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo
+"','reach':" jo wonline @ if mnlive else 0 lit then 0 lit wdec  "}" jo jend ;
 \ oscan  the whole set scanned again now; the tip and the scan told.
 : oscan
 have @ 0= if nowal else
@@ -1584,10 +1754,11 @@ else drop "locked" jerr then ;
 "name-lookup" op? if onlook else
 "name-offer" op? if onoffer else
 "name-transfer" op? if onxfer else
+"send-online" op? if osonl else
 "cancel" op? if ocancel else
 "bump" op? if obump else
 drop "unknown op" jerr
-then then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ hline ( line -- )  a line read: only the first may unlock.
 : hline
@@ -1625,15 +1796,26 @@ NRECN alloc nrecb !  44 lit alloc nname !  20 lit alloc nown !  20 lit alloc now
 0 lit lh !  0 lit nodeok !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
-8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  20 lit alloc sid !  20 lit alloc ssec !
+8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
 440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
-: pfd variable ;  8 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
-0 lit icnt !  0 lit unl !  0 lit tried !  0 lit have !  FFFFFFFF lit wfd !  obuf @ opos !
-\ a line when one comes; the node every 4 s while none does
+: pfd variable ;  10 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
+0 lit icnt !  0 lit unl !  0 lit tried !  0 lit have !  0 lit wonline !  0 lit wmtried !  0 lit mnfd !  FFFFFFFF lit wfd !  obuf @ opos !
+\ a line when one comes; the node every 4 s while none does; once the
+\ wallet is open, the message layer's socket too, and its turn each
+\ second
 begin
-	pfd @ 1 lit EE6B2800 lit poll 0 lit > if
+	have @ wmtried @ 0= and nodeok @ and if wmstart then
+	0 lit pfd @ !  1 lit pfd @ 4 lit + !  mnfd @ pfd @ 8 lit + !  1 lit pfd @ C lit + !
+	pfd @  wonline @ if 2 lit 3B9ACA00 lit else 1 lit EE6B2800 lit then  poll drop
+	pfd @ 4 lit + @ 10 lit rshift if
 		0 lit ibuf @ icnt @ + 3FFF lit icnt @ - read  dup 0 lit > if icnt @ + icnt !  lines  1 lit else drop 0 lit then
-	else wtick 1 lit then
+	else 1 lit then
+	wonline @ if
+		wmrun
+		mnms wmlast @ - FA0 lit u< 0= if mnms wmlast !  wtick then
+	else
+		pfd @ 4 lit + @ 10 lit rshift 0= if wtick then
+	then
 while repeat
 bye

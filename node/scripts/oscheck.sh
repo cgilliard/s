@@ -816,7 +816,7 @@ cat > "$T/wreq" <<'WREQEOF'
 {"id":15,"op":"restore","words":"  Abandon abandon ABANDON abandon abandon abandon abandon abandon abandon abandon abandon about ","passphrase":"TREZOR"}
 {"id":16,"op":"phrase","password":"rpw"}
 WREQEOF
-sh scripts/mkimage.sh "$T/twr.img" bin/kernel init="$T/twr.bin":1024 wallet=bin/user/wallet:4096 bip39=../resources/bip39-english.txt:0 wreq="$T/wreq":0 2> "$T/twr.mk" || fail wallet "mkimage: $(cat "$T/twr.mk")"
+sh scripts/mkimage.sh "$T/twr.img" bin/kernel init="$T/twr.bin":1024 wallet=bin/user/wallet:6144 bip39=../resources/bip39-english.txt:0 wreq="$T/wreq":0 2> "$T/twr.mk" || fail wallet "mkimage: $(cat "$T/twr.mk")"
 rm -f "$T/twr.disk"; dd if=/dev/zero of="$T/twr.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect wallet 124 '^walletrun: done' 120 ./tools/q32 --disk="$T/twr.disk" "$T/twr.img"
 W="$T/wallet.out"
@@ -1399,7 +1399,7 @@ const port = process.argv[2];
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet:4096 bip39=../resources/bip39-english.txt:0 sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet:6144 bip39=../resources/bip39-english.txt:0 sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))

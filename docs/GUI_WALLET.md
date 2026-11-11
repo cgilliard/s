@@ -158,13 +158,14 @@ is written).
 
   | op | asks | answers |
   |---|---|---|
-  | `overview` | | `confirmed`, `pending`, `unverified`, `reserved`, `locked`; `height`, the tip; `node`, its state |
+  | `overview` | | `confirmed`, `pending`, `unverified`, `reserved`, `locked`; `height`, the tip; `node`, its state; `reach`, the rendezvous points holding a live session for the wallet (0: not reachable) |
   | `receive` | | `address` (`tab1…`); `name`, a name pointing at it, if any |
   | `answer` | `slate`, a file sent by a payer, or `text`, it pasted | `slate`, the answer written, or `text`, to copy back; `amount` |
   | `fees` | | `speeds`: each a `speed` (`block`, `hour`, `day`, `economy`), its `rate` as `/v1/fees` gives it, `wait` in seconds |
   | `send` | `to` (an address or `@name`), `amount`, `speed`; `slate`, the file to write, or `text`: true | `slate`, or `text`, the slate to copy; `fee` |
   | `finalize` | `slate`, the recipient's answer as a file, or `text`, pasted | `tx`, the transaction sent to the pool; `fee` |
   | `activity` | | `items`: each `tx`, `kind` (`sent`, a payment or burn; `received`, change left out), `amount`, `state` (`pending`, `confirmed`; a received output since spent, `spent`), `height` (0 unconfirmed) |
+  | `send-online` | `to` (an address, 64 hex digits, or `@name`), `amount`, `speed` | `online`: true, `fee`; the slate sent as a message to the recipient's id, which answers it by itself; then events: `message` with `text` (delivered, or not and why: the slate cancelled), and the answer finalized as `finalize` answers, with `"event":"message"` in place of the id |
   | `cancel` | `tx`, a payment or burn not yet in a block; `speed` | `tx`, the replacement (its inputs paid back to a new output of this wallet's); `fee`; the payment's records go |
   | `bump` | `tx`, the same; `speed` | `tx`, the replacement (the same outputs, the change paying the higher fee; below the dust limit, the change goes to the fee whole); `fee`; the payment's records move to it |
   | `create` | | `words`, the new phrase (shown once) |
@@ -317,7 +318,29 @@ memos faster than every output in order.
    server through the message layer's rendezvous points
    (`docs/SUBNAMES.md`), never on chain.
 3. **Online payments:** the message layer, so `send` to an address or a
-   name needs no file; sub-names with it.
+   name needs no file; sub-names with it. In init mode first, the mode
+   the network is in (no relays listed): the seeds are the rendezvous
+   points and a wallet reaches them directly; onion mode (circuits) once
+   relays are listed. Built so far (2026-11-11), each against tabminer:
+   1 Kyber (`crypto/kyber.fam`, ML-KEM-768 as `mlkem.rs`; vectors from
+   `fam_kyber_vectors.rs`, NIST ACVP's key generation seeds among them;
+   about 0.1 s an operation); 2 the objects (`node/wmsg.fam`, as
+   `onion.rs`: object ids, rendezvous indexes, announces, payloads
+   sealed and opened; vectors from `fam_msg_vectors.rs`); 3 the
+   transport (`node/wnet.fam`, as `node/sessions.rs` in init mode): the
+   wallet's own UDP socket to the seeds, pings and tokens, a session at
+   each of its points (an announce of a fresh Kyber key, the point's
+   nonce signed in; rotated hourly, on a lost session, or when a point
+   forgot it), objects pulled in chunks both ways, a send (the
+   recipient's announce asked for at one of its points, the payload
+   offered there, the point's notice); 4 payments: `send-online` (to an
+   address or `@name`), a payer's slate answered at once, the answer
+   finalized when it comes from the id paid (`scripts/msgtest.sh`). The
+   wallet is reachable while it is open (logged in) and the node
+   answers: the Overview tells at how many points. Its seeds are
+   tabminer's unless `/etc/wallet/config` names others (`seed
+   HOST:PORT` lines; `messages off` for none). Not yet: sub-names,
+   onion mode, the window's events beyond a status line.
 
 Each phase ends with tests as the node's: vectors from tabminer for every
 primitive, then a tabminer wallet and this one paying each other on the

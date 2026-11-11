@@ -1,0 +1,408 @@
+\ wnet.fam — the wallet's part in the message layer, init mode
+\ (docs/ONION.md; docs/GUI_WALLET.md, phase 3), as tabminer's
+\ node/sessions.rs: over its own UDP socket to the seeds, which are the
+\ rendezvous points, in tabminer's datagrams ("TAB1", a type byte, the
+\ payload; at most 1,232 bytes).  The wallet holds a session at each of
+\ its points (its Dilithium key and a Kyber key, announced with the
+\ point's nonce signed in), sends a payload to an id by asking one of the
+\ id's points for its announce and offering the sealed payload there, and
+\ takes the payloads its points offer it.  Objects (announces, payloads)
+\ go in 1,024-byte chunks, pulled by the side that takes them.  After
+\ wmsg.fam (mg*) and crypto/kyber.fam.
+\
+\ mninit ( -- )  the socket and buffers (once).
+\ mnseed ( ip port -- )  a seed added; the caller adds them sorted as
+\ tabminer sorts its seed list (as "host:port" text).
+\ mnkeys ( pk sk -- )  the participant's Dilithium key (its id derived);
+\ a Kyber key made fresh.
+\ mntick ( -- )  the clock's work, at least every second: pings, the
+\ sessions at the points of the epoch of mnht, retries, the send.
+\ mnin ( -- )  the datagrams waiting read and dealt with.
+\ mnsend ( to kind inner n -- ok )  a payload begun to the id at to (32
+\ canonical bytes); not ok: one is under way.  mnsendr ( ann kind inner
+\ n -- ok ) the same to the holder of an announce (a reply: no lookup).
+\ Its end in mnst: 0 under way, 1 delivered (a point forwarded it), 2
+\ failed (why in mnwhy, a string).
+\ mnlive ( -- n )  the points holding a live session for us.
+\ Received payloads: mnrcv set by mnin, the payload opened in mgkind,
+\ mgfrom (the sender's announce), mgin, mgil, until the next mnin.
+\ mnht, mngen, mntip: the height, the genesis's id and the tip's (32
+\ bytes each), from the node, for the epoch and our pings.
+
+\ mnrand ( dst n -- )  n bytes from /dev/random.
+: mnrf variable ;  : mnrd variable ;  : mnrnn variable ;
+: mnrand
+mnrnn !  mnrd !  "/dev/random" 0 lit open mnrf !
+begin mnrnn @ while
+	mnrf @ mnrd @ mnrnn @ read  dup 0 lit > if dup mnrd @ + mnrd !  mnrnn @ swap - mnrnn ! else drop then
+repeat
+mnrf @ close drop ;
+
+\ ── The clock: milliseconds from the time register (10 MHz); unix
+\ seconds from /proc/time at the start ──
+: mnlo variable ;  : mnrem variable ;  : mnnow variable ;  : mnux0 variable ;
+: mntime
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+\ mnms ( -- ms )  milliseconds since mninit (called at least every 400 s).
+: mnms
+mntime dup mnlo @ - mnrem @ +  swap mnlo !
+dup 2710 lit / mnnow @ + mnnow !  2710 lit % mnrem !
+mnnow @ ;
+: mnunix  mnms 3E8 lit / mnux0 @ + ;                   \ ( -- s )  the date
+\ 64-bit values (low word first): mn8set ( lo hi a -- ), mn8lt ( a b --
+\ flag ) a below b, mn8inc ( a -- ) one more.
+: mn8set  tuck 4 lit + !  ! ;
+: mn8lt  over 4 lit + @ over 4 lit + @ 2dup = if 2drop @ swap @ swap u< else u< nip nip then ;
+: mn8inc  dup @ 1 lit + dup rot tuck ! swap 0= if 4 lit + dup @ 1 lit + swap ! else drop then ;
+\ mnk1000 ( s a -- )  a = s times 1,000 (64 bits).
+: mnkx variable ;  : mnky variable ;
+: mnk1000
+mnkx !
+dup FFFF lit and 3E8 lit *  swap 10 lit rshift 3E8 lit *
+dup 10 lit lshift  rot tuck +  tuck u> 1 lit and
+rot 10 lit rshift +  swap mnkx @ !  mnkx @ 4 lit + ! ;
+
+\ ── State ──
+: mnfd variable ;  : mnsb variable ;  : mnrb variable ;  : mnrn variable ;  : mnsp variable ;  : mnfrom variable ;
+: mnback variable ;  : mnid variable ;  : mnpk variable ;  : mnsk variable ;  : mnek variable ;  : mndk variable ;
+: mnodk variable ;  : mnodt variable ;  : mnseq variable ;  : mnexp variable ;  : mnkt variable ;  : mnz8 variable ;
+: mnpt variable ;  : mnnp variable ;  : mnmine variable ;  : mnep variable ;  : mnht variable ;  : mngen variable ;  : mntip variable ;
+: mnrcv variable ;  : mnst variable ;  : mnwhy variable ;  : mnao variable ;  : mnaid variable ;  : mnk variable ;
+:M MNPN 8 lit ;                                \ seeds at most
+:M MNPR 60 lit ;                               \ a seed's record
+:M MNAO 1968 lit ;                             \ room for an announce object
+:M MNAOL 1966 lit ;                            \ its bytes: the tag, the announce
+\ A seed's record: +0 ip, +4 port, +8 its token for us (8), +10 answered
+\ our ping (handshaken), +14 the ping's nonce, +18 when pinged (ms), +1C
+\ the wait before the next ping (ms), +20 the session's nonce (8), +28
+\ the seq it holds for us (8), +30 when it last answered a Session, +34
+\ when we last sent one, +38 whether that was answered, +3C when we last
+\ offered our announce, +40 refused until (ms), +44 live, +48 whether
+\ asked anything since its last answer (a re-ping before a retry).
+: mnr  MNPR * mnpt @ + ;                               \ ( k -- rec )
+: mnf  swap mnr + ;                                    \ ( k off -- a )
+
+\ ── Datagrams: written at mnsb (mnsp the end), read at mnrb (mnrn bytes) ──
+: mnwb  mnsp @ c!  mnsp @ 1 lit + mnsp ! ;             \ ( b -- )
+: mnw16  dup mnwb 8 lit rshift mnwb ;
+: mnw32  dup mnw16 10 lit rshift mnw16 ;
+: mnwn  ?dup if 0 lit do dup i + c@ mnwb loop then drop ;   \ ( a n -- )
+: mnw0  ?dup if 0 lit do 0 lit mnwb loop then ;        \ ( n -- )  zeros
+: mnhd  mnsb @ mnsp !  54 lit mnwb 41 lit mnwb 42 lit mnwb 31 lit mnwb  mnwb ;   \ ( type -- )
+\ mnout ( k -- )  the datagram sent to seed k.
+: mnk2 variable ;
+: mnout  mnr mnk2 !  mnfd @ mnsb @ mnsp @ mnsb @ -  mnk2 @ @  mnk2 @ 4 lit + @ sendto drop ;
+: mnle@  dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: mnu16  dup c@ swap 1 lit + c@ 8 lit lshift or ;
+: mnsame  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+: mncp  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;   \ ( src dst n -- )
+: mnrx  mnrb @ + ;                                     \ ( off -- a )  in the datagram read
+
+\ ── Pings: tabminer's Status (140 bytes): the nonce, version 10, our
+\ token for the seed, the genesis, the height, the oldest kept (0), the
+\ tip, the work and the fees (0) ──
+\ mnstat ( n0 n1 -- )  a Status with the nonce's two words.
+: mnstat  swap mnw32 mnw32  A lit mnw32  mnback @ 8 lit mnwn  mngen @ 20 lit mnwn  mnht @ mnw32  0 lit mnw32
+mntip @ 20 lit mnwn  30 lit mnw0 ;
+\ mnping ( k -- )  a Ping to seed k, its nonce the record's.
+: mnping  mnms over 18 lit mnf !  1 lit mnhd  dup 14 lit mnf @ 0 lit mnstat  mnout ;
+
+\ ── The seeds ──
+: mnseed
+mnnp @ MNPN u< if
+	mnnp @ mnr MNPR 0 lit do 0 lit over i + c! loop
+	mn8set
+	mnrb @ 4 lit mnrand  mnrb @ @ mnnp @ 14 lit mnf !  0 lit mnnp @ 1C lit mnf !
+	mnnp @ 1 lit + mnnp !
+else 2drop then ;
+\ mnwho ( ip port -- k | -1 )  the seed at that address.
+: mnwho
+-1 lit  mnnp @ ?dup if 0 lit do
+	dup 0< if 2 lit pick i mnr @ =  2 lit pick i 4 lit mnf @ = and if drop i then then
+loop then nip nip ;
+
+\ ── Keys: the Kyber key announced; a new one at the start, when a
+\ session is lost or a point forgot us, and hourly; the last kept ten
+\ minutes for payloads sealed to it ──
+: mnnewk
+mndk @ mnodk @ 960 lit mncp  mnms mnodt !
+mnrb @ 40 lit mnrand  mnrb @ mnrb @ 20 lit + mnek @ mndk @ kykey
+mnunix mnrb @ mnk1000  mnseq @ mnrb @ mn8lt if mnrb @ mnseq @ 8 lit mncp else mnseq @ mn8inc then
+mnunix 1C20 lit + 0 lit mnexp @ mn8set
+mnms mnkt !
+mnnp @ ?dup if 0 lit do 0 lit i 44 lit mnf ! loop then
+\ the carried announce (nonce 0), for our payloads
+mnpk @ mgpk !  mnsk @ mgsk !  mnek @ mgek !  mgcar @ mnseq @ mnexp @ mnz8 @ mgann ;
+: mnkeys
+mnsk @ FC0 lit mncp  mnpk @ 7A0 lit mncp  mnpk @ mnrb @ wkid  mnrb @ mnid @ wkcan
+0 lit 0 lit mnseq @ mn8set  mnnewk  0 lit mnodt ! ;
+
+\ ── The outbox: our announce for each point (it carries the point's
+\ nonce), and the payload being sent; served to whoever pulls it ──
+: mnpo variable ;  : mnpl variable ;  : mnpid2 variable ;
+\ mnann ( k -- )  our announce for seed k (its nonce in), offered.
+: mnann
+mnk !
+1 lit mnk @ MNAO * mnao @ + c!
+mnpk @ mgpk !  mnsk @ mgsk !  mnek @ mgek !
+mnk @ MNAO * mnao @ + 1 lit +  mnseq @  mnexp @  mnk @ 20 lit mnf  mgann
+mnk @ MNAO * mnao @ +  MNAOL  mnk @ 20 lit * mnaid @ + mgoid
+13 lit mnhd  mnk @ 8 lit mnf 8 lit mnwn  mnk @ 20 lit * mnaid @ + 20 lit mnwn  MNAOL mnw32  mnback @ 8 lit mnwn
+mnk @ mnout  mnms mnk @ 3C lit mnf ! ;
+\ mnserve ( k a n -- )  the chunks the GetChunks read asks for, of the
+\ object at a (n bytes), to seed k.
+: mnsa variable ;  : mnsn variable ;  : mnsi variable ;
+: mnserve
+mnsn !  mnsa !  mnk !
+2E lit mnrx c@ 40 lit umin ?dup if 0 lit do
+	i 2 lit lshift 2F lit + mnrx dup mnu16 swap 2 lit + mnu16 40 lit umin
+	?dup if 0 lit do
+		dup i + mnsi !
+		mnsi @ A lit lshift mnsn @ u< if
+			9 lit mnhd  5 lit mnwb  E lit mnrx 20 lit mnwn  mnsn @ mnw32  mnsi @ mnw16
+			mnsn @ mnsi @ A lit lshift - 400 lit umin  dup mnw16  mnsa @ mnsi @ A lit lshift + swap mnwn
+			mnk @ mnout
+		then
+	loop then drop
+loop then ;
+
+\ ── Downloads: one object at a time, pulled from a seed 32 chunks at
+\ a time (the kernel queues 64 datagrams a socket); 400 ms without one,
+\ the missing asked again, eight times at most ──
+: mndb variable ;  : mndid variable ;  : mndk2 variable ;  : mndtk variable ;  : mndn variable ;  : mndgot variable ;
+: mndon variable ;  : mndt variable ;  : mndr variable ;  : mndc variable ;  : mndok variable ;  : mndtot variable ;
+: mndw variable ;  : mnrp variable ;  : mnrc variable ;  : mnlast variable ;  : mncnt variable ;  : mnask variable ;
+\ mndask  GetChunks for up to 32 chunks not yet come, as runs (ascending,
+\ none touching another).
+: mndask
+8 lit mnhd  mndtk @ 8 lit mnwn  5 lit mnwb  mndid @ 20 lit mnwn
+mnsp @ mnrp !  0 lit mnwb  0 lit mnrc !  0 lit mnask !  FFFF lit mnlast !
+mndn @ ?dup 0= if 40 lit then 0 lit do
+	mnask @ 20 lit u<  mndgot @ i + c@ 0= and if
+		i mnlast @ 1 lit + = if mncnt @ c@ 1 lit + mncnt @ c!
+		else i mnw16  mnsp @ mncnt !  1 lit mnw16  mnrc @ 1 lit + mnrc ! then
+		i mnlast !  mnask @ 1 lit + mnask !
+	then
+loop
+mnrc @ mnrp @ c!  mnask @ mndw !
+mnrc @ if mndk2 @ mnout then  mnms mndt ! ;
+\ mndl ( k token id -- )  a download begun of the object id from seed k.
+: mndl
+mndid @ 20 lit mncp  mndtk @ 8 lit mncp  mndk2 !
+mndgot @ 40 lit 0 lit do 0 lit over i + c! loop drop
+0 lit mndn !  0 lit mndc !  0 lit mndr !  0 lit mndok !  -1 lit mndon !  mndask ;
+\ mnchunk  a Chunk read: kept if of the download, from its seed, sound;
+\ mndok set when the object is whole.
+: mct variable ;  : mci variable ;  : mcl variable ;
+: mnchunk
+mndon @  mnrn @ 2E lit u< 0= and  5 lit mnrx c@ 5 lit = and  6 lit mnrx mndid @ 20 lit mnsame and
+mnfrom @ @ mnfrom @ 4 lit + @ mnwho mndk2 @ = and if
+	26 lit mnrx mnle@ mct !  2A lit mnrx mnu16 mci !  2C lit mnrx mnu16 mcl !
+	mct @ 0= 0=  mct @ 10001 lit u< and  mci @ 40 lit u< and  mcl @ 2E lit + mnrn @ = and
+	mci @ A lit lshift mct @ u< and  mct @ mci @ A lit lshift - 400 lit umin mcl @ = and
+	mndn @ 0= mct @ mndtot @ = or and if
+		mndn @ 0= if mct @ 3FF lit + A lit rshift mndn !  mct @ mndtot ! then
+		mndgot @ mci @ + c@ 0= if
+			2E lit mnrx  mndb @ mci @ A lit lshift +  mcl @ mncp
+			1 lit mndgot @ mci @ + c!  mndc @ 1 lit + mndc !  0 lit mndr !  mnms mndt !
+			mndw @ 1 lit - mndw !
+			mndc @ mndn @ = if 0 lit mndon !  -1 lit mndok ! else mndw @ 0= if mndask then then
+		then
+	then
+then ;
+
+\ ── Sending: the recipient's announce asked for at one of its points (or
+\ known: a reply), the payload sealed to it and offered there; the
+\ point's Notice says whether it was forwarded.  Eight seconds a step;
+\ then the next point ──
+: mnsnt variable ;  : mnss variable ;  : mnsto variable ;  : mnsj variable ;  : mnst0 variable ;  : mnsk3 variable ;  : mnhave variable ;
+: mnra variable ;  : mnsin variable ;  : mnsil variable ;  : mnskd variable ;  : mntps variable ;  : mnnx variable ;
+\ mnss: 0 idle, 1 asking for the announce, 2 offered the payload.
+: mnfail  mnwhy !  2 lit mnst !  0 lit mnss ! ;        \ ( why -- )
+\ mnseal ( -- ok )  the payload sealed to the announce at mnra, at mnpo
+\ (mnpl bytes, its id at mnpid2).
+: mnseal
+mnrb @ 2C lit mnrand
+mnpk @ mgpk !  mnsk @ mgsk !
+mnra @ mnskd @ mnsin @ mnsil @ mnrb @ mnrb @ 20 lit + mnpo @ mgseal dup mnpl !
+dup if mnpo @ mnpl @ mnpid2 @ mgoid  -1 lit mnhave ! then  0= 0= ;
+: mnlook
+12 lit mnhd  mnsk3 @ 8 lit mnf 8 lit mnwn  mnsto @ 20 lit mnwn  mnback @ 8 lit mnwn  mnsk3 @ mnout
+1 lit mnss !  -1 lit mnsk3 @ 48 lit mnf ! ;
+: mnoffer
+13 lit mnhd  mnsk3 @ 8 lit mnf 8 lit mnwn  mnpid2 @ 20 lit mnwn  mnpl @ mnw32  mnback @ 8 lit mnwn  mnsk3 @ mnout
+2 lit mnss !  -1 lit mnsk3 @ 48 lit mnf ! ;
+: mnstep  -1 lit mnsnt !  mnss @ 2 lit = if mnoffer else mnlook then ;
+\ mnnext  the next of the recipient's points from mnsj: asked for the
+\ announce, or offered the payload; none left, failed.
+: mnnext
+-1 lit mnnx !
+mnnp @ mnsj @ u> if mnnp @ mnsj @ do mnnx @ 0<  mntps @ i + c@ and if i mnnx ! then loop then
+mnnx @ 0< if mnwhy @ ?dup 0= if "none of the recipient's points answered" then mnfail else
+	mnnx @ 1 lit + mnsj !  mnnx @ mnsk3 !  mnms mnst0 !
+	mnhave @ if 2 lit else 1 lit then mnss !  0 lit mnsnt !
+	mnsk3 @ 10 lit mnf @ if mnstep else mnsk3 @ mnping then
+then ;
+\ mnpick ( id dst -- )  the points of id: a byte each seed, 1 a point;
+\ the epoch's, and the one before's for its first five blocks.
+: mnpid variable ;  : mnpdst variable ;
+: mnpick
+mnpdst !  mnpid !  mnpdst @ MNPN 0 lit do 0 lit over i + c! loop drop
+mnht @ 90 lit / mnep !
+mnnp @ if
+	mnpid @ mnep @ mnnp @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
+	mnep @ if mnht @ 90 lit % 5 lit u< if
+		mnpid @ mnep @ 1 lit - mnnp @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
+	then then
+then ;
+: mnbeg
+0 lit mnst !  0 lit mnwhy !  0 lit mnsj !
+mnsto @ mntps @ mnpick  mnnext ;
+: mnsend
+mnss @ if 2drop 2drop 0 lit else
+	dup mnsil !  mnsin @ swap mncp  mnskd !  mnsto @ 20 lit mncp  0 lit mnhave !
+	mnbeg  -1 lit
+then ;
+: mnsendr
+mnss @ if 2drop 2drop 0 lit else
+	dup mnsil !  mnsin @ swap mncp  mnskd !
+	dup mnra @ MGAN mncp  mnsto @ 20 lit mncp  0 lit mnhave !
+	mnseal 0= if "the recipient's Kyber key is malformed" mnfail 0 lit else mnbeg -1 lit then
+then ;
+
+\ ── Datagrams read ──
+: mnmy  mnmine @ + c@ ;                                \ ( k -- flag )  one of our points
+: mnlv?  dup 44 lit mnf @  swap 30 lit mnf @ mnms swap - 15F90 lit u< and ;   \ ( k -- flag )  live
+: mnlive  0 lit  mnnp @ ?dup if 0 lit do i mnmy if i mnlv? if 1 lit + then then loop then ;
+: mnpong  2 lit mnhd  5 lit mnrx mnle@  9 lit mnrx mnle@  mnstat  mnk @ mnout ;
+\ mnodone  a download whole: its id checked; an announce asked for (the
+\ send goes on), or a payload for us (opened: mnrcv).
+: mnoib variable ;
+: mnodone
+mndb @ mndtot @ mnoib @ mgoid
+mnoib @ mndid @ 20 lit mnsame 0= if mnss @ 1 lit = if mnnext then else
+mndb @ c@ 1 lit =  mndtot @ MNAOL = and if
+	mnss @ 1 lit =  mndk2 @ mnsk3 @ = and if
+		mndb @ 1 lit + mnsto @ 20 lit mnsame  mndb @ 1 lit + mnunix mgavf and if
+			mndb @ 1 lit + mnra @ MGAN mncp
+			mnseal if mnms mnst0 !  2 lit mnss !  mnstep else "the recipient's Kyber key is malformed" mnfail then
+		else mnnext then
+	then
+else mndb @ c@ 2 lit =  mndb @ 1 lit + mnid @ 20 lit mnsame and if
+	mndb @ mndtot @ mndk @ mnunix mgopen
+	dup 0= mnms mnodt @ - 927C0 lit u< and if drop mndb @ mndtot @ mnodk @ mnunix mgopen then
+	if -1 lit mnrcv ! then
+then then then ;
+: mnstate
+mnk @ 10 lit mnf @  5 lit mnrx mnid @ 20 lit mnsame and  mnk @ mnmy and if
+	25 lit mnrx mnk @ 20 lit mnf 8 lit mncp  2D lit mnrx mnk @ 28 lit mnf 8 lit mncp
+	mnms mnk @ 30 lit mnf !  1 lit mnk @ 38 lit mnf !  0 lit mnk @ 48 lit mnf !
+	mnk @ 28 lit mnf mnseq @ 8 lit mnsame if 1 lit mnk @ 44 lit mnf ! else
+		mnk @ 44 lit mnf @  mnk @ 28 lit mnf @ mnk @ 2C lit mnf @ or 0= and if mnnewk then
+		0 lit mnk @ 44 lit mnf !
+		mnms mnk @ 3C lit mnf @ - BB8 lit u< 0= if mnk @ mnann then
+	then
+then ;
+: mnnote
+0 lit mnk @ 48 lit mnf !  25 lit mnrx c@
+5 lit mnrx mnid @ 20 lit mnsame  over 2 lit = and if mnms EA60 lit + mnk @ 40 lit mnf ! then
+mnss @ 1 lit =  mnk @ mnsk3 @ = and  5 lit mnrx mnsto @ 20 lit mnsame and if
+	dup 1 lit = if "the recipient is offline" else "a point refused the lookup" then mnwhy !  mnnext
+then
+mnss @ 2 lit =  mnk @ mnsk3 @ = and  5 lit mnrx mnpid2 @ 20 lit mnsame and if
+	dup 0= if 1 lit mnst !  0 lit mnss ! else
+		dup 1 lit = if "the recipient is offline" else "a point refused the payload" then mnwhy !  mnnext
+	then
+then drop ;
+: mnoff
+5 lit mnrx mnback @ 8 lit mnsame  mndon @ 0= and
+mnk @ mnmy  mnss @ 1 lit = mnk @ mnsk3 @ = and or  and
+2D lit mnrx mnle@ dup 0= 0= swap 10001 lit u< and  and if
+	mnk @ 31 lit mnrx D lit mnrx mndl  0 lit mnk @ 48 lit mnf !
+then ;
+: mngets
+5 lit mnrx mnback @ 8 lit mnsame  D lit mnrx c@ 5 lit = and  mnrn @ 2F lit u< 0= and if
+	E lit mnrx mnk @ 20 lit * mnaid @ + 20 lit mnsame if mnk @  mnk @ MNAO * mnao @  MNAOL  mnserve
+	else mnhave @  E lit mnrx mnpid2 @ 20 lit mnsame and if mnk @ mnpo @ mnpl @ mnserve then then
+then ;
+\ mnone  the datagram read (mnrn bytes from mnfrom) dealt with.
+: mnone
+mnrn @ 5 lit u< 0=  mnrb @ @ 31424154 lit = and if
+	mnfrom @ @ mnfrom @ 4 lit + @ mnwho dup mnk !  0< 0= if
+		4 lit mnrx c@
+		dup 1 lit =  mnrn @ 91 lit = and if mnpong then
+		dup 2 lit =  mnrn @ 91 lit = and  5 lit mnrx mnle@ mnk @ 14 lit mnf @ = and if
+			1 lit mnk @ 10 lit mnf !  11 lit mnrx mnk @ 8 lit mnf 8 lit mncp  7530 lit mnk @ 1C lit mnf !
+			0 lit mnk @ 48 lit mnf !
+		then
+		dup 8 lit = if mngets then
+		dup 9 lit = if mnchunk  mndok @ if 0 lit mndok !  mnodone then then
+		dup 11 lit =  mnrn @ 35 lit = and if mnstate then
+		dup 13 lit =  mnrn @ 39 lit = and if mnoff then
+		dup 14 lit =  mnrn @ 26 lit = and if mnnote then
+		drop
+	then
+then ;
+\ mnin  every datagram waiting, until a payload for us is opened.
+: mnpe variable ;
+: mnin
+0 lit mnrcv !
+begin
+	mnfd @ mnpe @ !  1 lit mnpe @ 4 lit + !
+	\ (1 ns: a look, not a wait; 0 would wait for good)
+	mnrcv @ 0=  mnpe @ 1 lit 1 lit poll 0 lit > and
+while
+	mnfd @ mnrb @ 500 lit mnfrom @ recvfrom dup mnrn !  0 lit > if mnone then
+repeat ;
+
+\ ── The clock's work ──
+: mntick
+mnms drop
+mnms mnkt @ - 36EE80 lit u< 0= if mnnewk then
+mnid @ mnmine @ mnpick
+mnnp @ ?dup if 0 lit do
+	\ pings: unanswered 2, 4, 8, 16 then 30 s apart; answered, every 30 s
+	i 10 lit mnf @ if
+		mnms i 18 lit mnf @ - 7530 lit u< 0= if i mnping then
+	else
+		mnms i 18 lit mnf @ - i 1C lit mnf @ u< 0= if
+			i mnping  i 1C lit mnf @ 1 lit lshift 7D0 lit max 7530 lit umin i 1C lit mnf !
+		then
+	then
+	\ our session at our points
+	i mnmy  i 10 lit mnf @ and  mnms i 40 lit mnf @ - 0< 0= and if
+		i 44 lit mnf @  mnms i 30 lit mnf @ - 15F90 lit u< 0= and if mnnewk then
+		i 34 lit mnf @  i 38 lit mnf @ 0= and  mnms i 34 lit mnf @ - BB8 lit u< 0= and  i 48 lit mnf @ and if i mnping then
+		mnms i 34 lit mnf @ -  i 44 lit mnf @ i 38 lit mnf @ and if 7530 lit else BB8 lit then  u< 0= if
+			10 lit mnhd  i 8 lit mnf 8 lit mnwn  mnid @ 20 lit mnwn  mnback @ 8 lit mnwn  i mnout
+			mnms i 34 lit mnf !  0 lit i 38 lit mnf !  -1 lit i 48 lit mnf !
+		then
+	then
+loop then
+\ a download stalled; a step of the send that went unanswered
+mndon @  mnms mndt @ - 190 lit u< 0= and if
+	mndr @ 1 lit + dup mndr !  8 lit u> if 0 lit mndon !  mnss @ 1 lit = if mnnext then else mndask then
+then
+mnss @  mnsnt @ 0= and  mnsk3 @ 10 lit mnf @ and if mnstep then
+mnss @  mnms mnst0 @ - 1F40 lit u< 0= and if "a point did not answer" mnwhy !  mnnext then ;
+
+\ ── The start ──
+: mnpbuf variable ;
+: mninit
+mnsb @ 0= if
+	500 lit alloc mnsb !  600 lit alloc mnrb !  8 lit alloc mnfrom !  8 lit alloc mnback !  20 lit alloc mnid !
+	4A0 lit alloc mnek !  960 lit alloc mndk !  960 lit alloc mnodk !  8 lit alloc mnseq !  8 lit alloc mnexp !
+	8 lit alloc mnz8 !  0 lit 0 lit mnz8 @ mn8set  MNPN MNPR * alloc mnpt !  MNPN alloc mnmine !  MNPN alloc mntps !
+	20 lit alloc mngen !  20 lit alloc mntip !  MNPN MNAO * alloc mnao !  MNPN 20 lit * alloc mnaid !
+	MGMAX alloc mnpo !  MGMAX alloc mndb !  20 lit alloc mndid !  8 lit alloc mndtk !  40 lit alloc mndgot !
+	MGAN alloc mnra !  20 lit alloc mnoib !  7A0 lit alloc mnpk !  FC0 lit alloc mnsk !  MGMAX alloc mnsin !  20 lit alloc mnsto !  20 lit alloc mnpid2 !  10 lit alloc mnpe !  40 lit alloc mnpbuf !
+	mginit kyinit
+	mnback @ 8 lit mnrand  mntime mnlo !  0 lit mnrem !  0 lit mnnow !
+	"/proc/time" 0 lit open dup mnpbuf @ 20 lit read mnpbuf @ + 0 lit swap c! close drop  mnpbuf @ atoi mnux0 !
+	1 lit socket mnfd !
+	mnrb @ 2 lit mnrand  mnfd @ 1 lit 0 lit  mnrb @ c@ mnrb @ 1 lit + c@ 8 lit lshift or 3FFF lit and A000 lit +  net drop
+	0 lit mnnp !  0 lit mnss !  0 lit mnst !  0 lit mndon !  0 lit mnhave !  0 lit mnht !
+then ;

@@ -218,6 +218,7 @@ jobs:
           - paytest
           - prooftest
           - nametest
+          - msgtest
     defaults:
       run:
         working-directory: node

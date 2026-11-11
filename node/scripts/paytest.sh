@@ -68,6 +68,8 @@ wait_for "$T/os.out" '^\$ ' 60 "the shell"
 {
 	echo "node -n devrec 10.0.2.2:$PA &"
 	echo 'mkdir /etc'
+	echo 'mkdir /etc/wallet'
+	echo 'echo messages off > /etc/wallet/config'
 	echo 'echo root:paypw:0:0:/:sh > /etc/passwd'
 	echo 'wm 80 &'
 } >&3

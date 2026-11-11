@@ -358,7 +358,7 @@ then
 "lse;co.textContent='Write these words down, in order: '+m.words})});return;}if(t=='overview')wask(w," wr
 "'overview',{},function(m){if(wbad(p,m))return;wh(p,'Balance');wrow(p,'Confirmed',m.confirmed);wrow(p" wr
 ",'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.reserved);wrow(p,'Locked" wr
-"',m.locked);wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);});else if(t=='receive'){var " wr
+"',m.locked);wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);wrow(p,'Online',m.reach?'reachable at '+m.reach+' rendezvous points':'not reachable yet');});else if(t=='receive'){var " wr
 "a=el('div','',p);wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This wallet');wrow(a,'Add" wr
 "ress',m.address);if(m.name)wrow(a,'Name',m.name)});var f=el('div','wf',p);wh(f,'Answer a slate from " wr
 "the payer');wmodes(f,function(c,how){if(how=='paste'){var t=warea(c,'The slate (paste it here)'),o=e" wr
@@ -367,7 +367,13 @@ then
 "o the payer';r.value=m.text})});r=warea(c,'The answer',true);wcopy(c,r);}else{var s=wfield(c,'Slate " wr
 "file (in your home)','text'),o=el('div','wv',c);wbtn(c,'Answer',function(){wask(w,'answer',{slate:s." wr
 "value},function(m){o.textContent=m.ok?'Answered: '+m.slate+' ('+m.amount+'); send it back to the pay" wr
-"er':'Error: '+m.error})});}});}else if(t=='send'){var f=el('div','wf',p);wh(f,'Pay by slate');var to" wr
+"er':'Error: '+m.error})});}});}else if(t=='send'){" wr
+"var on=el('div','wf',p);wh(on,'Pay online (the recipient online too)');var oto=wfield(on,'To (an add" wr
+"ress or a @name)','text'),oam=wfield(on,'Amount','text'),osp=wfield(on,'Speed','select'),oo=el('div'" wr
+",'wv',on);wspeeds(w,osp);wbtn(on,'Send online',function(){wask(w,'send-online',{to:oto.value,amount:" wr
+"oam.value,speed:osp.value},function(m){oo.textContent=m.ok?'Sent (fee '+m.fee+'); waiting for the re" wr
+"cipient, who answers by itself':'Error: '+m.error})});" wr
+"var f=el('div','wf',p);wh(f,'Pay by slate');var to" wr
 "=wfield(f,'To (an address or a @name)','text'),am=wfield(f,'Amount','text'),sp=wfield(f,'Speed','sel" wr
 "ect');wask(w,'fees',{},function(m){if(m.ok)m.speeds.forEach(function(x){var e=el('option','',sp);e.v" wr
 "alue=x.speed;e.textContent=x.speed+': '+x.rate+', about '+wwait(x.wait)})});wmodes(f,function(c,how)" wr
@@ -437,7 +443,9 @@ then
 "ion(){wask(w,'scan',{},function(m){go.textContent=m.ok?'Scanning the chain':'Error: '+m.error})});}}" wr
 "function wmsg(w,m){if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.o" wr
 "k?'':'Locked: '+(m.error||'');wshow(w,w.tab);return}if(m.event=='tip'){w.st.textContent='Tip '+m.hei" wr
-"ght;return}if(m.event=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}if(m.event){i" wr
+"ght;return}if(m.event=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}" wr
+"if(m.event=='message')w.st.textContent=m.text||(m.ok?'Paid: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error);" wr
+"if(m.event){i" wr
 "f(w.unl&&(w.tab=='overview'||w.tab=='activity'))wshow(w,w.tab);return}var cb=w.q[m.id];if(cb){delet" wr
 "e w.q[m.id];cb(m)}}function openwal(){if(walw){focusw(walw);return walw}var w=walw=frame('Wallet',62" wr
 "0,460);w.q={};w.nid=0;w.tab='overview';w.t=el('div','wal',w.d);w.t.tabIndex=0;var nav=el('div','wnav" wr

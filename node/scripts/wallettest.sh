@@ -62,6 +62,9 @@ tip=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a/tabminer.log" | 
 wait_for "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "the node at the miner's tip ($tip)"
 wait_for "$T/os.out" '^node: .* the API on port' 120 "the node's API"
 {
+	echo 'mkdir /etc'
+	echo 'mkdir /etc/wallet'
+	echo 'echo messages off > /etc/wallet/config'
 	echo 'echo {"op":"unlock","password":"wpw"} > /w.req'
 	echo "echo {\"id\":1,\"op\":\"restore\",\"words\":\"$PHRASE\",\"passphrase\":\"\"} >> /w.req"
 	echo 'echo {"id":2,"op":"overview"} >> /w.req'
