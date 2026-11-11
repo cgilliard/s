@@ -15,7 +15,11 @@
 \   GET  /v1/outputs?from=<p>&count=<n>  outputs in position order (1,000)
 \   GET  /v1/spent?from=<height>         positions spent, block by block
 \   GET  /v1/name/<name>                 a record and its proof
-\   GET  /v1/proof/output/<position>     an output's path to the state root
+\   GET  /v1/proof/output/<position>[?at=<height>]
+\                                        an output's path to the state root:
+\                                        the tip's, or block <height>'s (its
+\                                        snapshot kept: the last 1,008), as a
+\                                        proof of payment needs (apast)
 \   GET  /v1/fees                        the pool's floor and dust limit, the
 \                                        rates to suggest (a block, an hour,
 \                                        a day; pool.fam's qsugg), economy
@@ -357,8 +361,117 @@ apath @ 9 lit + dup strlen 2dup name-ok 0= if 2drop "bad name" "400 Bad Request"
 	"200 OK" asend
 then ;
 
+\ apast ( h -- )  /v1/proof/output/<position>?at=<h>: the path of the
+\ output at position afrom/afromh to the state root of block h, as
+\ tabminer's Chain::output_proof_at (docs/PROOFS.md: a proof of payment is
+\ checked against the block that made its output): the snapshot after h
+\ (serve.fam's zman and zpart, from the undo records), the part holding
+\ the position or the empty subtree of the parts' lowest level, its
+\ leaves (the outputs unspent then: srec and rleaf), the path inside it
+\ (subtree_path), then the parts composed above it (path_from_parts: the
+\ names trie's root last).  400 when block h's snapshot is not kept (the
+\ last 1,008 blocks', as tabminer's undo window) or the position is 2^32
+\ or more (a part's leaves are indexed from its first position, a word);
+\ the output null if it was not unspent then.
+: kzh variable ;  : kzhd variable ;  : kzm variable ;  : kzmn variable ;  : kzpi variable ;  : kzlv variable ;
+: kzix variable ;  : kzfl variable ;  : kzfh variable ;  : kzel variable ;  : kzeh variable ;  : kzpt variable ;
+: kzpn variable ;  : kzo variable ;  : kza variable ;  : kzb variable ;  : kzn variable ;  : kzi variable ;
+: kzw variable ;  : kzd variable ;  : kzok variable ;  : kzsa variable ;  : kzsn variable ;  : kzsw variable ;
+\ kzsib ( arr n want l -- )  the node want among arr's n (24-byte nodes:
+\ an index, then a digest in Montgomery words), else level l's empty
+\ subtree: as path sibling l (canonical), at asib.
+: kzsib
+kzw !  kzsw !  kzsn !  kzsa !
+kzw @ dfl kzd !
+kzsn @ ?dup if 0 lit do kzsa @ i sce + dup @ kzsw @ = if 4 lit + kzd ! else drop then loop then
+kzd @ asib @ kzw @ 5 lit lshift + ycanon ;
+\ kzfind  the part holding the position (kzpi, or -1), its level and
+\ index (kzlv, kzix), its first position (kzfl kzfh).
+: kzfind
+FFFFFFFF lit kzpi !
+snr @ ?dup if 0 lit do
+	kzpi @ 0< if
+		i 30 lit * sroots @ + dup @ swap 4 lit + @  2dup p40 kzfh ! kzfl !
+		1 lit + p40 kzeh ! kzel !
+		snx @ snxh @ kzel @ kzeh @ p< if snx @ kzel !  snxh @ kzeh ! then
+		afrom @ afromh @ kzfl @ kzfh @ p< 0=  afrom @ afromh @ kzel @ kzeh @ p< and if i kzpi ! then
+	then
+loop then
+kzpi @ 0< if
+	E lit kzlv !  afrom @ E lit rshift afromh @ 12 lit lshift or kzix !
+	kzlv @ kzix @ p40 kzfh ! kzfl !
+else
+	kzpi @ 30 lit * sroots @ + dup @ kzlv !  4 lit + @ kzix !
+then ;
+\ kzsub  the path inside the part (levels 0 to its level less one): its
+\ outputs' leaves, climbed a level at a time (snap.fam's sparent), each
+\ level's sibling taken on the way; the part's root then checked against
+\ the manifest's (kzok 0 if it is not).
+: kzsub
+kzpn @ 2 lit + sce dup malloc kza !  malloc kzb !
+kzpn @ ?dup if 0 lit do
+	kzpt @ 4 lit + i 48 lit * + dup le@ kzfl @ - kza @ i sce + !
+	srec  rb @ kza @ i sce + 4 lit + rleaf
+loop then
+afrom @ kzfl @ - kzi !
+kzlv @ ?dup if 0 lit do
+	kza @ kzpn @ kzi @ 1 lit xor i kzsib
+	kza @ scb !  kzpn @ scm !  kzb @ sca !  i sparent
+	kza @ kzb @ kza ! kzb !  scn @ kzpn !
+	kzi @ 1 lit rshift kzi !
+loop then
+kzpi @ 0< 0= if
+	kzpi @ 30 lit * sroots @ + 10 lit + tmpb @ dle
+	kzpn @ if kza @ 4 lit + else kzlv @ dfl then tmpb @ 8 lit wcmp if 0 lit kzok ! then
+then
+kza @ free  kzb @ free ;
+\ kzup  the path above the part: the parts composed as snap.fam's scomp
+\ does, the sibling of the part's ancestor taken at each level from the
+\ part's up to the outputs' half's top; then the names trie's root.
+: kzup
+snr @ 2 lit + sce dup malloc sca !  malloc scb !  0 lit scn !
+27 lit E lit do
+	i smerge
+	i kzlv @ u< 0= if scb @ scm @ kzix @ i kzlv @ - rshift 1 lit xor i kzsib then
+	i sparent
+loop
+snroot @ asib @ 4E0 lit + 20 lit bcopy
+sca @ free  scb @ free ;
+: apast
+kzh !  -1 lit kzok !  0 lit kzpt !  0 lit kzo !
+kzh @ phget dup kzhd ! 0= if "no such height" "400 Bad Request" afail else
+kzh @ zman kzmn ! kzm !
+kzm @ 0= if "the snapshot after that block is not kept" "400 Bad Request" afail else
+kzm @ kzmn @ kzhd @ snman if kzm @ free "the snapshot after that block does not rebuild" "500 Internal Server Error" afail else
+	kzfind
+	\ (positions within a word: a part's leaves are indexed from its first)
+	afromh @ kzfh @ or if 0 lit kzok ! then
+	kzok @ if
+		0 lit kzpn !
+		kzpi @ 0< 0= if kzh @ kzpi @ zpart drop kzpt !  kzpt @ if kzpt @ le@ kzpn ! then then
+		\ the output there then
+		kzpn @ ?dup if 0 lit do
+			kzpt @ 4 lit + i 48 lit * + dup le@ afrom @ =  over 4 lit + le@ afromh @ = and if kzo ! else drop then
+		loop then
+		kzsub  kzok @ if kzup then
+	then
+	kzok @ 0= if "the position is not in a part this can prove" "400 Bad Request" afail else
+		abegin "{" a" "position" akey afrom @ afromh @ au64 acom
+		kzo @ ?dup if
+			"commitment" akey dup 8 lit + adig acom "memo" akey dup 28 lit + 14 lit ahx" acom
+			"amount" akey dup 3C lit + tamt au64 acom "created" akey 44 lit + le@ anum acom
+		else "commitment" akey "null" a" acom then
+		"siblings" akey "[" a" 28 lit 0 lit do i if acom then asib @ i 5 lit lshift + adig loop "]" a" acom
+		"state_root" akey kzhd @ 4C lit + adig acom
+		"height" akey kzh @ anum "}" a"
+		"200 OK" asend
+	then
+	kzpt @ ?dup if free then  kzm @ free
+then then then ;
+
 : aproof
 apath @ 11 lit + a40 afromh ! afrom !
+"at=" aqv ?dup if atoi apast else
 stfd @ 0 lit txbegin stx !
 afrom @ afromh @ asib @ yoproof
 abegin "{" a" "position" akey afrom @ afromh @ au64 acom
@@ -370,7 +483,8 @@ else "commitment" akey "null" a" acom then
 "state_root" akey ab32 @ sroot0 ab32 @ adig acom
 "height" akey myh @ anum "}" a"
 stx @ txcommit drop
-"200 OK" asend ;
+"200 OK" asend
+then ;
 
 \ afe ( target -- )  the suggestion for a wait of target seconds: its
 \ rate, and whether the pool has seen enough to estimate it (else it is

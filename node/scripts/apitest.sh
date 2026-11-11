@@ -16,6 +16,12 @@
 #   polling); waits until both transactions are mined (the pool empty, the
 #   miner's log saying it took both from the node); makes a new token, the
 #   old one refused after.
+# - Past paths (/v1/proof/output/<position>?at=<height>): the wallet's
+#   tabminer, run again and synced, gives each burn's proof (burn-proof);
+#   its path, made by tabminer's Chain::output_proof_at at the block that
+#   made the burn, must be the node's sibling for sibling, with that
+#   block's state root; at the block before, no output; at the tip, the
+#   tip's path; a height not kept refused (400).
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/apitest.sh
@@ -176,4 +182,75 @@ check('the old one refused', st == 401)
 new2 = j('/v1/token', data=b'', tok=new)['token']
 check('the new one taken', len(new2) == 64 and new2 != new)
 EOF
+
+# Past paths (?at=): the wallet's tabminer again, syncing from the miner,
+# its prompt open: its burn-proof of each burn holds the path tabminer's
+# own Chain::output_proof_at made, at the block that made the burn; the
+# node's /v1/proof/output/<position>?at=<height> must give the same
+# siblings and that block's state root.
+echo "apitest.sh: past paths, against tabminer's proofs of burn"
+mkfifo "$T/wallet2.in"
+"$MINER" mine --no-mine --network dev-recursive --data "$T/wallet" --no-seeds --listen 127.0.0.1:37472 \
+	--peer 127.0.0.1:37471 < "$T/wallet2.in" >> "$T/wallet2.out" 2>&1 &
+WP=$!
+exec 3> "$T/wallet2.in"
+python3 - "$HP" "$T" <<'EOF' || { wdump; exit 1; }
+import base64, json, os, re, sys, time, urllib.request, urllib.error
+port, T = sys.argv[1], sys.argv[2]
+base = f'http://127.0.0.1:{port}'
+def ask(path):
+    try:
+        with urllib.request.urlopen(base + path, timeout=40) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+def check(what, cond):
+    print(f'host: {what}: {"ok" if cond else "FAILED"}')
+    if not cond:
+        sys.exit(1)
+fifo = open(f'{T}/wallet2.in', 'w')
+def out():
+    return open(f'{T}/wallet2.out', errors='replace').read()
+def progress():
+    return sum(os.path.getsize(p) for p in (f'{T}/wallet2.out', f'{T}/miner/tabminer.log', f'{T}/wallet/tabminer.log') if os.path.exists(p))
+ids = re.findall(r'\(transaction ([0-9a-f]{16})\); burn-proof', open(f'{T}/wallet.out', errors='replace').read())
+check(f'the two burns made: {ids}', len(ids) == 2)
+tip = json.loads(ask('/v1/status')[1])['height']
+for tx in ids:
+    # asked until the wallet, synced, has the burn landed and its path
+    last, idle, text = progress(), 0, None
+    while text is None:
+        n0 = len(out())
+        fifo.write(f'burn-proof {tx}\n'); fifo.flush()
+        time.sleep(4)
+        m = re.search(r'-----BEGIN TAB BURN PROOF-----(.*?)-----END TAB BURN PROOF-----', out()[n0:], re.S)
+        if m:
+            text = m.group(1)
+            break
+        now = progress()
+        idle = 0 if now != last else idle + 4
+        last = now
+        if idle >= 300:
+            check(f'tabminer\'s burn-proof {tx}: nothing new for 300 s', False)
+    b = base64.b64decode(''.join(text.split()))
+    height = int.from_bytes(b[1:5], 'little'); position = int.from_bytes(b[5:13], 'little')
+    path = b[73:73 + 40 * 32]
+    st, body = ask(f'/v1/proof/output/{position}?at={height}')
+    check(f'burn {tx}: position {position} at height {height}: 200{"" if st == 200 else f" (got {st}: {body[:200]})"}', st == 200)
+    pr = json.loads(body)
+    got = bytes.fromhex(''.join(pr['siblings']))
+    check(f'burn {tx}: the path as tabminer\'s, sibling for sibling', got == path)
+    hd = json.loads(ask(f'/v1/header/{height}')[1])
+    check(f'burn {tx}: the state root that block\'s', pr['state_root'] == hd['state_root'] and pr['height'] == height and pr['created'] == height)
+    st, body = ask(f'/v1/proof/output/{position}?at={height - 1}')
+    check(f'burn {tx}: at the block before, no output there', st == 200 and json.loads(body)['commitment'] is None)
+    now = json.loads(ask(f'/v1/proof/output/{position}')[1])
+    at = json.loads(ask(f'/v1/proof/output/{position}?at={now["height"]}')[1])
+    check(f'burn {tx}: at the tip, the tip\'s path', at['siblings'] == now['siblings'] and at['state_root'] == now['state_root'])
+st, body = ask(f'/v1/proof/output/0?at={tip + 100000}')
+check('a height not kept: 400', st == 400)
+fifo.write('quit\n'); fifo.flush()
+EOF
+exec 3>&-
+wait $WP 2>/dev/null || true; WP=
 echo "apitest.sh: the API answered in the OS and on the host"

@@ -312,7 +312,15 @@ reads the node though only root can read the token
   - `GET /v1/name/<name>`: a name's record and its proof against the
     state root.
   - `GET /v1/proof/output/<position>`: a Merkle path to the state root,
-    for a wallet building a transaction.
+    for a wallet building a transaction. With `?at=<height>` (added
+    2026-11-10), the path to the state root of block `<height>` instead,
+    as tabminer's `Chain::output_proof_at`: a proof of payment or of
+    burn (`docs/PROOFS.md`) is checked against the block that made its
+    output. Rebuilt from that block's snapshot (its manifest, the part
+    holding the position, from the undo records), so only for the
+    blocks whose snapshots are kept (the last 1,008); 400 otherwise, or
+    for a position of 2^32 or more. The output is `null`
+    if it was not unspent then.
   - `GET /v1/fees`: the pool's minimum and estimates (`docs/FEES.md`).
   - `GET /v1/mempool`: its size and what it holds.
 - **Writing:**
