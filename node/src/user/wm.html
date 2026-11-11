@@ -271,7 +271,8 @@ w.t.onpaste=function(e){if(w.ws.readyState==1)w.ws.send(new TextEncoder().encode
 wins.push(w);focusw(w);show(w);
 return w;
 }
-var WTABS=[['overview','Overview'],['receive','Receive'],['send','Send'],['activity','Activity'],['settings','Settings']];
+var WTABS=[['overview','Overview'],['receive','Receive'],['send','Send'],['activity','Activity'],['proofs','Proofs'],['names','Names'],['settings','Settings']];
+function wspeeds(w,sp){wask(w,'fees',{},function(m){if(m.ok)m.speeds.forEach(function(x){var e=el('option','',sp);e.value=x.speed;e.textContent=x.speed+': '+x.rate+', about '+wwait(x.wait)})})}
 function wask(w,op,a,cb){a.op=op;a.id=++w.nid;w.q[a.id]=cb;if(w.ws.readyState==1)w.ws.send(JSON.stringify(a))}
 function wrow(p,k,v){var r=el('div','wrow',p);el('span','wk',r).textContent=k;el('span','wv',r).textContent=v==null?'':String(v);return r}
 function wbad(p,m){if(m.ok)return false;el('div','werr',p).textContent='Error: '+(m.error||'unknown');return true}
@@ -332,6 +333,10 @@ wmodes(g,function(c,how){
 var fs=how=='file'?wfield(c,'Answered slate file (in your home)','text'):warea(c,'The answer (paste it here)'),fo=el('div','wv',c);
 wbtn(c,'Finalize',function(){var a=how=='file'?{slate:fs.value}:{text:fs.value};wask(w,'finalize',a,function(m){fo.textContent=m.ok?'Sent: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
 });
+var b=el('div','wf',p);wh(b,'Burn coins');
+var ba=wfield(b,'Amount','text'),bp=wfield(b,'Purpose','text'),bf=wfield(b,'For (an address; this wallet if empty)','text'),bs=wfield(b,'Speed','select'),bo=el('div','wv',b);
+wspeeds(w,bs);
+wbtn(b,'Burn',function(){wask(w,'burn',{amount:ba.value,purpose:bp.value,for:bf.value,speed:bs.value},function(m){bo.textContent=m.ok?'Burned: '+m.tx+' (fee '+m.fee+'); its proof is in Activity once it is in a block':'Error: '+m.error})});
 }
 else if(t=='activity')wask(w,'activity',{},function(m){
 if(wbad(p,m))return;
@@ -343,8 +348,47 @@ var re=function(m){if(m.ok)wshow(w,'activity');else el('div','werr',p).textConte
 wbtn(r,'Cancel',function(){wask(w,'cancel',{tx:x.tx},re)});
 wbtn(r,'Bump',function(){wask(w,'bump',{tx:x.tx,speed:'hour'},re)});
 }
+if(x.kind=='sent'||x.kind=='burn'){
+wbtn(r,'Proof',function(){
+if(r.pf)r.pf.remove();var pf=r.pf=el('div','wf',p);
+wask(w,'proof',{tx:x.tx},function(m){if(wbad(pf,m))return;var t=warea(pf,'The proof of '+x.tx.slice(0,16),true);t.value=m.proof;wcopy(pf,t)});
+});
+}
 });
 });
+else if(t=='proofs'){
+var f=el('div','wf',p);wh(f,'Check a proof');
+var pt=warea(f,'The proof (paste it here)'),po=el('div','',f);
+wbtn(f,'Check',function(){wask(w,'verify',{text:pt.value},function(m){
+po.textContent='';if(wbad(po,m))return;
+wrow(po,'Valid',m.valid?'yes':'no');wrow(po,'Reason',m.reason);wrow(po,'Kind',m.kind);wrow(po,'Amount',m.amount);wrow(po,'Height',m.height);
+if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);
+})});
+}
+else if(t=='names'){
+var a=el('div','',p);wh(a,'Your names');
+wask(w,'names',{},function(m){
+if(wbad(a,m))return;
+if(!m.items.length)el('div','',a).textContent='None yet.';
+m.items.forEach(function(x){
+var r=wrow(a,x.name,x.state+(x.value?'  '+x.value.slice(0,16):'')+(x.state=='committed'?'  ready in '+x.ready+' blocks':''));
+var ro=el('div','wv',a);
+if(x.state=='ready')wbtn(r,'Reveal',function(){wask(w,'name-reveal',{name:x.name,speed:'hour'},function(m){ro.textContent=m.ok?'Revealed: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
+if(x.state=='owned'){var uv=wfield(r,'New value','text');wbtn(r,'Update',function(){wask(w,'name-update',{name:x.name,value:uv.value,speed:'hour'},function(m){ro.textContent=m.ok?'Updated: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})})}
+});
+});
+var f=el('div','wf',p);wh(f,'Register a name');
+var nn=wfield(f,'Name','text'),nv=wfield(f,'Value (64 hex digits; optional)','text'),ns=wfield(f,'Speed','select'),no=el('div','wv',f);
+wspeeds(w,ns);
+wbtn(f,'Commit',function(){wask(w,'name-commit',{name:nn.value,value:nv.value,speed:ns.value},function(m){no.textContent=m.ok?'Committed: '+m.tx+' (fee '+m.fee+'); it may be revealed in '+m.ready+' blocks':'Error: '+m.error})});
+var g=el('div','wf',p);wh(g,'Look up a name');
+var ln=wfield(g,'Name','text'),lo=el('div','',g);
+wbtn(g,'Look up',function(){wask(w,'name-lookup',{name:ln.value},function(m){
+lo.textContent='';if(wbad(lo,m))return;
+if(!m.found){el('div','',lo).textContent='Not registered.';return}
+wrow(lo,'Owner',m.owner);wrow(lo,'Value',m.value);if(m.address)wrow(lo,'Address',m.address);
+})});
+}
 else{
 var f=el('div','wf',p);wh(f,'Recovery phrase');
 var pw=wfield(f,'Password','password'),o=el('div','wv',f);

@@ -1352,6 +1352,11 @@ const port = process.argv[2];
   console.log('wallet once', wal().length === 1 && all(tasks, 'task').filter((k) => k.textContent === 'Wallet').length === 1 && doc.active === wal()[0]);
   all(wal()[0], 'wtab')[1].onclick();
   console.log('wallet receive', await wait(() => /Address\s+tab1[02-9ac-hj-np-z]{58}/.test(text(wal()[0])), 60000));
+  // phase 2's tabs: Proofs (a proof to check), Names (registering, looking up)
+  all(wal()[0], 'wtab')[4].onclick();
+  console.log('wallet proofs', await wait(() => /Check a proof/.test(text(wal()[0])), 30000));
+  all(wal()[0], 'wtab')[5].onclick();
+  console.log('wallet names', await wait(() => /Register a name/.test(text(wal()[0])) && /Look up a name/.test(text(wal()[0])), 30000));
   all(all(desk, 'win').find((d) => all(d, 'wal').length), 'wb')[2].onclick({ stopPropagation() {} });
   console.log('wallet closed', wal().length === 0 && !all(tasks, 'task').some((k) => k.textContent === 'Wallet'));
   let gone = false;
@@ -1397,7 +1402,7 @@ for n in 1 4; do
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
 		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$' \
-			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$' \
+			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet proofs true$' '^wallet names true$' '^wallet closed true$' '^wallet ended true$' \
 			'^files window true$' '^files once true$' '^files uploaded true$' '^files deleted true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
