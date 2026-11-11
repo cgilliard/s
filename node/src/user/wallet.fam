@@ -261,6 +261,22 @@ hs @ close drop  hres @ ;
 \ hget ( path -- body | 0 )  a GET answered 200: its body.
 : hget  "GET" swap 0 lit 0 lit hask  hcode @ C8 lit = and ;
 
+\ ── Payments made: records "p" || the transaction's id (33 bytes), PREC
+\ bytes each: +0 the amount, +8 the fee, +10 the commitment paid to, +30
+\ the slate's id, +50 the sender (an address's id, or a secret's tag),
+\ +70 1 if the secret is kept, +74 the secret, +94 where the output paid
+\ to landed (8; all ones: not yet), +9C its height, +A0 the output (60
+\ bytes: key hash, amount, memo); DC bytes in all.  The recipient's
+\ receipt (its Dilithium key, 1,952 bytes; its signature, 3,309) beside
+\ it in six parts ("q" || the id || the part's number, 896 bytes each but
+\ the last: the store's values are 1 KiB at most), read back after the
+\ record at +DC: all a proof of payment needs (docs/PROOFS.md) once the
+\ output has landed. ──
+:M PREC 1570 lit ;
+:M PRECN DC lit ;
+:M RPART 380 lit ;
+: prec variable ;  : lnd variable ;  : nlnd variable ;
+
 \ ── The outputs: records "o" || commitment (33 bytes), 48 bytes each ──
 \ +0 the nonce (4 canonical words), +10 the amount, +18 the position (8;
 \ all ones: not yet in the set), +20 the height it was made at, +24 the
@@ -297,6 +313,30 @@ else
 	then
 then ;
 \ wpage ( -- n )  a page of the set from sfrom (8 bytes) checked: how many.
+: wland
+nlnd @ ?dup if 0 lit do
+	lnd @ i 6 lit lshift + ecom @ 20 lit wssame if
+		70 lit okey @ c!  lnd @ i 6 lit lshift + 20 lit + okey @ 1 lit + 20 lit bcopy
+		okey @ 21 lit prec @ PRECN wgetk drop
+		epos @ prec @ 94 lit + 8 lit bcopy  eh @ @ prec @ 9C lit + !
+		okey @ 21 lit prec @ PRECN wsetk
+	then
+loop then ;
+\ wplist  the payments not yet landed (32 at most), their commitments and
+\ ids at lnd (64 bytes each), for the scan to find.
+: wplist
+0 lit nlnd !
+wfd @ 0 lit txbegin wtx !
+70 lit okey @ c!  1 lit
+begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 70 lit = else 0 lit then while
+	drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit prec @ PRECN wgetk drop
+	prec @ 98 lit + @ FFFFFFFF lit =  nlnd @ 20 lit u< and if
+		prec @ 10 lit + lnd @ nlnd @ 6 lit lshift + 20 lit bcopy  okey @ 1 lit + lnd @ nlnd @ 6 lit lshift + 20 lit + 20 lit bcopy
+		nlnd @ 1 lit + nlnd !
+	then
+	21 lit
+repeat drop
+wtx @ txabort drop ;
 : wpage
 0 lit scnt !
 ppath @ "/v1/outputs?from=" scpy  sfrom @ @ sfrom @ 4 lit + @ rot dstr "&count=1000" scpy drop
@@ -309,7 +349,7 @@ if
 		scur @ "'memo':'" jfind emem @ 14 lit jhexb
 		scur @ "'amount':" jfind jnum drop  nlo @ eamt @ !  nhi @ eamt @ 4 lit + !
 		scur @ "'height':" jfind jnum scur !  nlo @ eh @ !
-		wone  scnt @ 1 lit + scnt !
+		wone  wland  scnt @ 1 lit + scnt !
 		\ the next page from the position after this one
 		epos @ @ 1 lit + dup sfrom @ !  0= if epos @ 4 lit + @ 1 lit + else epos @ 4 lit + @ then sfrom @ 4 lit + !
 	repeat
@@ -332,7 +372,7 @@ wend drop ;
 \ wscan ( -- ok )  the whole unspent set read through the node.
 : wscan
 "gen" wtmp @ 4 lit wget 4 lit = if wtmp @ @ else 0 lit then 1 lit + sgen !
-0 lit sfrom @ !  0 lit sfrom @ 4 lit + !  1 lit nodeok !
+0 lit sfrom @ !  0 lit sfrom @ 4 lit + !  1 lit nodeok !  wplist
 begin wpage dup 0= if hres @ 0= if 0 lit nodeok ! then then 3E8 lit u< until
 nodeok @ if
 	wspent
@@ -495,6 +535,13 @@ else drop FFFFFFFF lit then ;
 
 \ wrget ( key klen buf n -- vlen )  one record, read in a snapshot.
 : wrget  wf2 !  wf1 !  wkl !  wgk !  wfd @ 0 lit txbegin  dup wgk @ wkl @ wf1 @ wf2 @ txget  swap txabort drop ;
+\ rpkey ( k -- )  okey (34 bytes) = "q", the id at okey+1 kept, part k.
+: rpkey  okey @ 21 lit + c!  71 lit okey @ c! ;
+: rplen  RPART * 148D lit swap - RPART umin ;            \ ( k -- n )
+\ wrcpt+ ( -- )  the receipt at prec+DC written in its parts, in the
+\ writer's transaction (okey+1 the id); wrcpt ( -- ) read back to prec+DC.
+: wrcpt+  6 lit 0 lit do i rpkey  okey @ 22 lit prec @ DC lit + i RPART * + i rplen wsetk loop  70 lit okey @ c! ;
+: wrcpt  6 lit 0 lit do i rpkey  okey @ 22 lit prec @ DC lit + i RPART * + i rplen wrget drop loop  70 lit okey @ c! ;
 \ jhex ( a n -- )  n bytes written in hex.
 : jhd  F lit and dup A lit u< if 30 lit + else 57 lit + then jc ;
 : jhex  ?dup if 0 lit do dup i + c@ dup 4 lit rshift jhd jhd loop then drop ;
@@ -567,7 +614,9 @@ then ;
 \ amount), largest first; nsel of them.
 : sel variable ;  : nsel variable ;  : se variable ;  : sk variable ;
 : selent  6 lit lshift sel @ + ;                         \ ( i -- a )
-\ wsels  the confirmed unspent outputs gathered (64 at most), sorted.
+\ wsels  the confirmed unspent outputs gathered, sorted: 28 at most, as a
+\ payment's pending record (its inputs' commitments) must fit the store's
+\ 1 KiB values.
 : wsels
 0 lit nsel !
 wfd @ 0 lit txbegin wtx !
@@ -575,7 +624,7 @@ wfd @ 0 lit txbegin wtx !
 begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then while
 	drop  okn @ okey @ 21 lit bcopy
 	okey @ 21 lit orec @ 30 lit wgetk drop
-	orec @ 24 lit + c@ 0=  orec @ 1C lit + @ FFFFFFFF lit <> and  nsel @ 40 lit u< and if
+	orec @ 24 lit + c@ 0=  orec @ 1C lit + @ FFFFFFFF lit <> and  nsel @ 1C lit u< and if
 		okey @ 1 lit + nsel @ selent 20 lit bcopy  orec @ 10 lit + nsel @ selent 20 lit + 8 lit bcopy
 		nsel @ 1 lit + nsel !
 	then
@@ -727,10 +776,14 @@ okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr 
 					okey @ 21 lit orec @ 30 lit wgetk drop  2 lit orec @ 24 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
 				loop
 				73 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
-				orec @ 30 lit 0 lit do 0 lit over i + c! loop drop
-				pend @ 8 lit + orec @ 8 lit bcopy  pend @ 10 lit + orec @ 8 lit + 8 lit bcopy
-				wsouts @ wschg @ 3C lit * + wsd @ wsocom  wsd @ orec @ 10 lit + wkcan
-				70 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit orec @ 30 lit wsetk
+				prec @ PREC 0 lit do 0 lit over i + c! loop drop
+				pend @ 8 lit + prec @ 8 lit bcopy  pend @ 10 lit + prec @ 8 lit + 8 lit bcopy
+				wsouts @ wschg @ 3C lit * + wsd @ wsocom  wsd @ prec @ 10 lit + wkcan
+				wsa @ 8 lit + prec @ 30 lit + 20 lit bcopy  pend @ 18 lit + prec @ 50 lit + 20 lit bcopy
+				1 lit prec @ 70 lit + !  pend @ 38 lit + prec @ 74 lit + 20 lit bcopy
+				FFFFFFFF lit prec @ 94 lit + !  FFFFFFFF lit prec @ 98 lit + !
+				wsouts @ wschg @ 3C lit * + prec @ A0 lit + 3C lit bcopy  wsrc @ prec @ DC lit + 148D lit bcopy
+				70 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit prec @ PRECN wsetk  wrcpt+
 				wend drop
 				jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo pend @ 10 lit + a8. "'}" jo jend
 			else
@@ -746,21 +799,19 @@ then then then then ;
 : hexs
 swap ?dup if 0 lit do over i + c@ dup 4 lit rshift hxd 2 lit pick c!  hxd over 1 lit + c!  2 lit + loop then
 0 lit swap c!  drop ;
-\ oact  the activity: payments sent (by their id; pending while the
-\ node's pool holds them), outputs received (by their commitment).
+\ oact  the activity: payments sent (by their id; pending until the scan
+\ finds their output in the set), outputs received (by their commitment).
 : anum variable ;
 : oact
 have @ 0= if nowal else
-	"/v1/mempool" hget wtmp @ !
 	jok ",'items':[" jo  0 lit anum !
 	wfd @ 0 lit txbegin wtx !
 	70 lit okey @ c!  1 lit
 	begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 70 lit = else 0 lit then  anum @ 10 lit u< and while
-		drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit orec @ 30 lit wgetk drop
+		drop  okn @ okey @ 21 lit bcopy  okey @ 21 lit prec @ PRECN wgetk drop
 		anum @ if "," jo then  anum @ 1 lit + anum !
-		"{'tx':'" jo okey @ 1 lit + 20 lit jhex "','kind':'sent','amount':'" jo orec @ a8. "','state':'" jo
-		okey @ 1 lit + 20 lit fout @ hexs
-		wtmp @ @ ?dup if fout @ jfind else 0 lit then if "pending" else "confirmed" then jo "','height':0}" jo
+		"{'tx':'" jo okey @ 1 lit + 20 lit jhex "','kind':'sent','amount':'" jo prec @ a8. "','state':'" jo
+		prec @ 98 lit + @ FFFFFFFF lit = if "pending','height':0}" jo else "confirmed','height':" jo prec @ 9C lit + @ 0 lit wdec "}" jo then
 		21 lit
 	repeat drop
 	6F lit okey @ c!  1 lit
@@ -909,7 +960,7 @@ HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntm
 24 lit alloc okey !  24 lit alloc okn !  30 lit alloc orec !  20 lit alloc ecom !  14 lit alloc emem !  8 lit alloc eamt !
 8 lit alloc epos !  4 lit alloc eh !  40 lit alloc ecb !  4 lit xksize alloc xk !  34 lit alloc wxpk !  20 lit alloc kseed !
 8 lit alloc sfrom !  48 lit alloc ntip !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
-8 lit alloc sa4 !  8 lit alloc sa5 !
+8 lit alloc sa4 !  8 lit alloc sa5 !  PREC alloc prec !  800 lit alloc lnd !  0 lit nlnd !
 0 lit lh !  0 lit nodeok !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !

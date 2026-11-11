@@ -245,6 +245,21 @@ expect wkeys 124 '^wkeys: 35 as expected, 0 not' 60 ./tools/q32 "$T/wk.img"
 	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wslate.fam $ND/wslate_test.fam > "$T/tws.build" 2>&1 || fail wslate "build: $(head -c 300 "$T/tws.build")"
 sh scripts/mkimage.sh "$T/ws.img" bin/kernel init="$T/tws.bin":8192 wslate=$ND/wslate_vectors.bin:0 2> "$T/ws.mk" || fail wslate "mkimage: $(cat "$T/ws.mk")"
 expect wslate 124 '^wslate: 23 as expected, 0 not' 60 ./tools/q32 "$T/ws.img"
+# Payment proofs and proofs of burn (wproof.fam): proofs tabminer made,
+# parsed, checked (each altered one refused for tabminer's reason), as
+# text both ways, built from their parts; bytes that do not parse refused.
+./tools/fam --user -o "$T/twp.bin" src/user/crypto/keccak.fam src/user/crypto/dilithium.fam \
+	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wslate.fam $ND/wproof.fam $ND/wproof_test.fam > "$T/twp.build" 2>&1 || fail wproof "build: $(head -c 300 "$T/twp.build")"
+sh scripts/mkimage.sh "$T/wp.img" bin/kernel init="$T/twp.bin":8192 wproof=$ND/wproof_vectors.bin:0 2> "$T/wp.mk" || fail wproof "mkimage: $(cat "$T/wp.mk")"
+expect wproof 124 '^wproof: 48 as expected, 0 not' 60 ./tools/q32 "$T/wp.img"
+# Names (wname.fam): names' rules, hashes and keys; a registration (owner
+# key, salt, commit, memo, record), the commit, reveal and update
+# operations and their digests; transactions carrying them; trie proofs,
+# members and absent names, refused when altered: as tabminer's.
+./tools/fam --user -o "$T/twn.bin" src/user/crypto/sha512.fam src/user/crypto/sha256.fam src/user/crypto/bip39.fam src/user/crypto/chacha.fam src/user/crypto/keccak.fam src/user/crypto/dilithium.fam \
+	$ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/state.fam $ND/xmss.fam $ND/xsign.fam $ND/wkeys.fam $ND/wslate.fam $ND/wname.fam $ND/wname_test.fam > "$T/twn.build" 2>&1 || fail wname "build: $(head -c 300 "$T/twn.build")"
+sh scripts/mkimage.sh "$T/wn.img" bin/kernel init="$T/twn.bin":8192 wname=$ND/wname_vectors.bin:0 2> "$T/wn.mk" || fail wname "mkimage: $(cat "$T/wn.mk")"
+expect wname 124 '^wname: 98 as expected, 0 not' 60 ./tools/q32 "$T/wn.img"
 
 # The store's benchmark (scripts/storebench.sh) builds beside the kernel:
 # its words and the kernel's share one name space.
