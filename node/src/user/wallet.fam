@@ -31,7 +31,7 @@
 \ Built so far (step 2 of 4): unlock, create, restore, phrase, receive,
 \ overview, scan; the tip told.  The rest are refused as not yet built.
 \ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam crypto/kyber.fam
-\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wslate.fam node/wproof.fam node/wname.fam node/wmsg.fam node/dns.fam node/wnet.fam
+\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wslate.fam node/wproof.fam node/wname.fam node/wmsg.fam node/dns.fam node/wnet.fam node/wsub.fam
 \ memory: 6144
 : ibuf variable ;  : icnt variable ;  : obuf variable ;  : opos variable ;
 : idb variable ;  : opb variable ;  : unl variable ;  : jr variable ;
@@ -1577,12 +1577,14 @@ loop then ;
 \ wmstart  the message layer begun: seeds, identity, the genesis's id.
 : wmstart
 -1 lit wmtried !
-mninit  wmseeds
+mninit  sbinit  wmseeds
 wmoff @ 0= if -1 lit wonline !  waddr!  wpk @ wsk @ mnkeys then
 "/v1/header/0" hget ?dup if "'id':'" jfind ?dup if mngen @ 20 lit jhexb then then
 mnms wmlast ! ;
-\ wmev ( s -- )  an event telling s.
-: wmev  "{'event':'message','text':'" jo jo "'}" jo jend ;
+\ wmev ( s -- )  an event telling s (made safe: an apostrophe or quote in
+\ it would end the string).
+: wmevb variable ;
+: wmev  wmevb @ swap scpy 0 lit swap c!  wmevb @ jsafe  "{'event':'message','text':'" jo wmevb @ jo "'}" jo jend ;
 \ wmidb ( s -- )  idb = s, each ' a double quote (jraw writes idb as it is).
 : wmidb  idb @ swap begin dup c@ while dup c@ dup 27 lit = if drop 22 lit then 2 lit pick c!  1 lit + swap 1 lit + swap repeat drop 0 lit swap c! ;
 \ wmcanc  the slate at wmsid abandoned (its send failed): its inputs free
@@ -1606,10 +1608,76 @@ then ;
 : wmto!
 dup c@ 40 lit = if
 	1 lit + nname @ swap scpy 0 lit swap c!  nname @ strlen dup nlen !  nname @ swap wnok if
-		nlook if if nlval @ wmto @ 20 lit bcopy  0 lit  20 lit 0 lit do wmto @ i + c@ or loop 0= 0= else 0 lit then else 0 lit then
+		nlook if if nlval @ wmto @ 20 lit bcopy  0 lit  20 lit 0 lit do wmto @ i + c@ or loop 0= 0= else 0 lit then else drop 0 lit then
 	else 0 lit then
 else dup strlen 3E lit = if wsd @ wkdec dup if wsd @ wmto @ wkcan then
 else dup strlen 40 lit = if wmto @ 20 lit jhexb -1 lit else drop 0 lit then then then ;
+\ Sub-names (docs/SUBNAME_CERT.md, init mode).  Records "u" || label "."
+\ name: the holder's id (32 bytes; zero: none, withdrawn), seq (8),
+\ expiry (8).  This wallet issues for its names whose value is its own
+\ id; a query for one is answered with a certificate signed then (renewed
+\ when under six days are left), for another label with none.  Paying
+\ @label.name asks the name's owner (on chain) and checks its answer.
+: wmk2 variable ;  : wmuk variable ;  : wmur variable ;  : wmab variable ;  : wmcb variable ;  : wmrq variable ;  : wmrs variable ;
+: wmrv variable ;  : wmrt variable ;  : wmme variable ;  : wmqn variable ;
+\ wmsplit ( s -- ok )  "label.name" into sblb/sbll and sbnm/sbnl.
+: wmsplit
+wmx !  wmx @ begin dup c@ dup 0= 0= swap 2E lit <> and while 1 lit + repeat wmy !
+wmy @ c@ 2E lit = if
+	wmy @ wmx @ - sbll !  wmx @ sblb @ sbll @ bcopy  0 lit sblb @ sbll @ + c!
+	wmy @ 1 lit + strlen sbnl !  wmy @ 1 lit + sbnm @ sbnl @ bcopy  0 lit sbnm @ sbnl @ + c!
+	sbll @ 1 lit - 20 lit u<  sbnl @ 1 lit - 20 lit u< and
+	dup if drop sblb @ sbll @ wnok  sbnm @ sbnl @ wnok and then
+else 0 lit then ;
+\ wmukey ( -- n )  the record's key at wmuk.
+: wmukey
+75 lit wmuk @ c!  sblb @ wmuk @ 1 lit + sbll @ bcopy  2E lit wmuk @ sbll @ + 1 lit + c!
+sbnm @ wmuk @ sbll @ + 2 lit + sbnl @ bcopy  sbll @ sbnl @ + 2 lit + ;
+\ wmmine ( -- ok )  sbnm is a name whose value on chain is this wallet's id.
+: wmmine
+sbnm @ nname @ sbnl @ 1 lit + bcopy  sbnl @ nlen !
+nlook if if waddr!  wpk @ wtmp @ wkid  wtmp @ wmme @ wkcan  nlval @ wmme @ 20 lit dlsame else 0 lit then else drop 0 lit then ;
+\ wmowner ( -- ok )  wmrv = the value on chain of the name sbnm (its
+\ proof checked), not zero.
+: wmowner
+sbnm @ nname @ sbnl @ 1 lit + bcopy  sbnl @ nlen !
+nlook if if nlval @ wmrv @ 20 lit bcopy  0 lit  20 lit 0 lit do wmrv @ i + c@ or loop 0= 0= else 0 lit then else drop 0 lit then ;
+\ wmuset ( holder -- )  the record of sbnm/sblb: the holder (0: none), seq
+\ one more, a week from now.
+: wmuset
+wmur @ 30 lit 0 lit do 0 lit over i + c! loop drop
+wmukey  wmuk @ swap wmur @ 30 lit wrget drop
+?dup if wmur @ 20 lit bcopy else wmur @ 20 lit 0 lit do 0 lit over i + c! loop drop then
+wmur @ 20 lit + mn8inc  mnunix 93A80 lit + 0 lit wmur @ 28 lit + mn8set
+wbeg  wmuk @ wmukey wmur @ 30 lit wsetk  wend drop ;
+\ wmquery  a query for sbnm/sblb answered (to the sender, mgfrom).
+: wmquery
+waddr!  wpk @ mgpk !  wsk @ mgsk !
+wmukey  wmuk @ swap wmur @ 30 lit wrget 30 lit = if
+	\ renewed when under six days are left
+	wmur @ 2C lit + @ 0=  wmur @ 28 lit + @ mnunix - 7E900 lit u< and if
+		wmur @ 20 lit + mn8inc  mnunix 93A80 lit + 0 lit wmur @ 28 lit + mn8set
+		wbeg  wmuk @ wmukey wmur @ 30 lit wsetk  wend drop
+	then
+	0 lit  20 lit 0 lit do wmur @ i + c@ or loop 0= 0= if 1 lit else 0 lit then sbkd !
+	wmur @ sbval @ 20 lit bcopy  wmur @ 20 lit + sbseq @ 8 lit bcopy  wmur @ 28 lit + sbexp @ 8 lit bcopy
+	wmcb @ sbcert  wmcb @ swap wmab @ sbans
+else 0 lit 0 lit wmab @ sbans then
+\ (kind 3, KIND_SUBNAME_ANSWER; wmkind 4 marks the send as an answer)
+wmqn !  mgfrom @ 3 lit wmab @ wmqn @ mnsendr if 4 lit wmkind ! then ;
+\ wmpay  the payment asked for once the sub-name resolved (wmto): the
+\ request kept at wmrq made as osend makes it, sent to wmto.
+: wmpay
+"null,'event':'message'" wmidb  -1 lit wmon !  0 lit wmok !  wmrq @ osend  0 lit wmon !  "null" wmidb
+wmok @ if
+	sid @ wmsid @ 20 lit bcopy  1 lit wmkind !
+	wbeg  74 lit okey @ c!  sid @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit wmto @ 20 lit wsetk  wend drop
+	wmto @ 1 lit wsbuf @ fpn @ mnsend drop
+	"{'event':'message','text':'the sub-name resolved; the slate sent, fee " jo sfee @ a8. "'}" jo jend
+then ;
+\ wmhasdot ( s -- flag )
+: wmhasdot  0 lit swap begin dup c@ while dup c@ 2E lit = if nip -1 lit swap then 1 lit + repeat drop ;
+
 \ osonl ( line -- )  a payment sent online: "to" (an address or @NAME),
 \ "amount", "speed"; the slate made (as osend's), sent to the
 \ recipient's id; its answer finalized when it comes.
@@ -1619,6 +1687,15 @@ wonline @ 0= if drop "the message layer is not started" jerr else
 mnlive 0= if drop "not reachable yet: no rendezvous point holds a session for this wallet" jerr else
 mnss @ if drop "a message is under way; try again in a moment" jerr else
 dup "'to':'" wtmp @ 80 lit jstr 0= if drop "no recipient given" jerr else
+wtmp @ c@ 40 lit =  wtmp @ wmhasdot and if
+	wtmp @ 1 lit + wmsplit 0= if drop "not a sub-name (label.name)" jerr else
+	wmowner 0= if drop "the name is not registered" jerr else
+		dup strlen 1 lit + wmrq @ swap bcopy
+		sbnm @ sbnl @ sblb @ sbll @ wmab @ sbqry wmqn !  wmrv @ 2 lit wmab @ wmqn @ mnsend drop
+		3 lit wmkind !  1 lit wmrs !  mnms wmrt !
+		jok ",'online':true,'resolving':true}" jo jend
+	then then
+else
 wtmp @ wmto! 0= if drop "not an address, nor a registered name" jerr else
 	-1 lit wmon !  0 lit wmok !  osend  0 lit wmon !
 	wmok @ if
@@ -1627,11 +1704,24 @@ wtmp @ wmto! 0= if drop "not an address, nor a registered name" jerr else
 		wmto @ 1 lit wsbuf @ fpn @ mnsend drop
 		jok ",'online':true,'fee':'" jo sfee @ a8. "'}" jo jend
 	then
-then then then then then then ;
+then then then then then then then ;
 \ wmgot  a payload opened: a slate.  A payer's (stage 1) answered and
 \ sent back to it; a recipient's answer (stage 2) to a payment this
 \ wallet sent that id, finalized.
 : wmgot
+\ a query for a sub-name of ours (not while resolving one of our own)
+mgkind @ 2 lit =  wmrs @ 0= and  mnss @ 0= and if
+	mgin @ mgil @ sbpq if wmquery then
+then
+\ the owner's answer to our query: the certificate checked, the payment on
+mgkind @ 3 lit =  wmrs @ 1 lit = and  mgfrom @ wmrv @ 20 lit dlsame and if
+	0 lit wmrs !
+	mgin @ mgil @ sbpa
+	dup 2 lit = if
+		drop sbca @ sbcn @ wmrv @ mnunix sbvf  sbtk @ 1 lit = and if sbtv @ wmto @ 20 lit bcopy  wmpay
+		else "the answer of the owner of the name does not hold" wmev then
+	else 1 lit = if "no such sub-name: its owner says so" wmev else "the answer of the owner of the name does not hold" wmev then then
+then
 mgkind @ 1 lit =  mgil @ 8000 lit u< and if
 	mgin @ sbin @ mgil @ bcopy  mgil @ fpn !
 	sbin @ fpn @ wsparse if
@@ -1653,19 +1743,66 @@ mgkind @ 1 lit =  mgil @ 8000 lit u< and if
 	then
 then ;
 \ wmrun  the message layer's turn in the loop: datagrams, the clock, the
-\ height and tip from the node, the send's end told.
+\ height and tip from the node, the send's end told; an owner that has
+\ not answered a query in a minute given up on.
 : wmrun
 mnin  mnrcv @ if wmgot then
+wmrs @  mnss @ 0= and  mnms wmrt @ - EA60 lit u< 0= and if 0 lit wmrs !  "the owner of the name did not answer (it must be online)" wmev then
 lh @ mnht !  ntip @ c@ if ntip @ mntip @ 20 lit jhexb then
 mntick
 mnst @ if
 	mnst @ 1 lit = if
 		wmkind @ 1 lit = if "the slate reached a rendezvous point of the recipient; waiting for the answer" wmev then
+		wmkind @ 3 lit = if "the query reached a rendezvous point of the owner of the name; waiting for its answer" wmev then
 	else
 		wmkind @ 1 lit = if wmcanc then
+		wmkind @ 3 lit = if 0 lit wmrs ! then
 		wtmp @ "the message was not delivered: " scpy mnwhy @ scpy 0 lit over c! drop  wtmp @ jsafe wtmp @ wmev
 	then
 	0 lit mnst !
+then ;
+
+\ osubset ( line -- )  "name" (this wallet's: its value this wallet's
+\ id), "label", "to" (an address or @name): label.name given to "to".
+\ osubdel ( line -- )  withdrawn ("name", "label"): answered with none.
+\ osubs  the sub-names issued: each label.name, its holder (an address;
+\ none when withdrawn), its expiry.
+: wmlbl  "'label':'" sblb @ 21 lit jstr  sblb @ strlen dup sbll !  sblb @ swap wnok and ;   \ ( line -- ok )
+: wmnam  "'name':'" sbnm @ 21 lit jstr  sbnm @ strlen dup sbnl !  sbnm @ swap wnok and ;    \ ( line -- ok )
+: osubset
+have @ 0= if drop nowal else
+wonline @ 0= if drop "the message layer is not started" jerr else
+dup wmnam 0= if drop "not a valid name" jerr else
+dup wmlbl 0= if drop "not a valid label" jerr else
+"'to':'" wtmp @ 80 lit jstr 0= if "no holder given" jerr else
+wtmp @ wmto! 0= if "the holder is not an address, nor a registered name" jerr else
+wmmine 0= if "the name does not point at this wallet: only its owner gives its sub-names" jerr else
+	wmto @ wmuset  jok "}" jo jend
+then then then then then then then ;
+: osubdel
+have @ 0= if drop nowal else
+wonline @ 0= if drop "the message layer is not started" jerr else
+dup wmnam 0= if drop "not a valid name" jerr else
+wmlbl 0= if "not a valid label" jerr else
+wmukey  wmuk @ swap wmur @ 30 lit wrget 30 lit <> if "no such sub-name" jerr else
+	0 lit wmuset  jok "}" jo jend
+then then then then then ;
+: osubs
+have @ 0= if nowal else
+	jok ",'items':[" jo  0 lit wmx !
+	wfd @ 0 lit txbegin wtx !
+	75 lit wmk2 @ c!  1 lit
+	begin wtx @ wmk2 @ rot wmuk @ txnext dup 1 lit u> if wmuk @ c@ 75 lit = else 0 lit then  wmx @ 20 lit u< and while
+		dup wmy !  wmuk @ wmk2 @ 2 lit pick bcopy
+		wmk2 @ swap wmur @ 30 lit wgetk drop
+		wmx @ if "," jo then  wmx @ 1 lit + wmx !
+		0 lit wmk2 @ wmy @ + c!  "{'sub':'" jo wmk2 @ 1 lit + jraw "','holder':'" jo
+		0 lit  20 lit 0 lit do wmur @ i + c@ or loop if wmur @ wsd @ dle  wsd @ waddr2 @ wkaddr  waddr2 @ jraw else "none" jo then
+		"','expiry':" jo wmur @ 28 lit + @ 0 lit wdec "}" jo
+		wmy @
+	repeat drop
+	wtx @ txabort drop
+	"]}" jo jend
 then ;
 
 \ ── The requests ──
@@ -1755,10 +1892,13 @@ else drop "locked" jerr then ;
 "name-offer" op? if onoffer else
 "name-transfer" op? if onxfer else
 "send-online" op? if osonl else
+"subname-set" op? if osubset else
+"subname-del" op? if osubdel else
+"subnames" op? if drop osubs else
 "cancel" op? if ocancel else
 "bump" op? if obump else
 drop "unknown op" jerr
-then then then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ hline ( line -- )  a line read: only the first may unlock.
 : hline
@@ -1796,7 +1936,7 @@ NRECN alloc nrecb !  44 lit alloc nname !  20 lit alloc nown !  20 lit alloc now
 0 lit lh !  0 lit nodeok !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
-8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  20 lit alloc sid !  20 lit alloc ssec !
+8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmevb !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  50 lit alloc wmuk !  50 lit alloc wmk2 !  30 lit alloc wmur !  1A00 lit alloc wmab !  1800 lit alloc wmcb !  1000 lit alloc wmrq !  20 lit alloc wmrv !  20 lit alloc wmme !  0 lit wmrs !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
 440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
 : pfd variable ;  10 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !

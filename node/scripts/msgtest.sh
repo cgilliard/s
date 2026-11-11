@@ -15,7 +15,12 @@
 #   mined, the wallet holds 2.5 confirmed;
 # - the wallet pays A 1 online (send-online to A's address): A answers by
 #   itself, the wallet finalizes the answer (an event); once mined, A holds
-#   1 confirmed and the wallet 2.5 - 1 - its fee.
+#   1 confirmed and the wallet 2.5 - 1 - its fee;
+# - names (docs/SUBNAME_CERT.md, init mode): the wallet registers famwal, A
+#   tabname; the wallet pays @tabname; A gives ex1.tabname to itself and
+#   the wallet pays @ex1.tabname (its query to A, the certificate checked
+#   against the chain); the wallet gives w1.famwal to itself and A pays
+#   @w1.famwal, the wallet answering A's query.
 # Waits as the node's scripts: no deadline, each fails when nothing new
 # has changed for its idle window (scripts/waitlib.sh's rule).
 # Needs tabminer built with the dev networks:
@@ -153,6 +158,8 @@ def pumpone():
         if op == 1:
             try:
                 msgs.append(json.loads(p))
+                if msgs[-1].get('event') == 'message':
+                    print('msgtest: (the wallet: ' + str(msgs[-1].get('text', msgs[-1])) + ')')
             except ValueError:
                 print('msgtest: not JSON from the wallet: ' + p.decode(errors='replace')[:2000]); raise
 nid = [0]
@@ -204,5 +211,73 @@ def tab_has():
     return re.search(r'\b1\.0000000000  confirmed', aout()) is not None
 check('A holds the 1 confirmed', wait('the 1 confirmed at A', tab_has))
 check(f'the wallet holds 2.5 - 1 - fee = {want}', wait('the wallet\'s change confirmed', lambda: (time.sleep(3), confirmed() == want)[1]))
+
+# names: the wallet's famwal, A's tabname; payments to @name and @label.name
+def settled():
+    time.sleep(3)
+    o = ask('overview')
+    return o['pending'] == '0.0000000000' and o['reserved'] == '0.0000000000'
+c = ask('name-commit', name='famwal', speed='hour')
+check(f'the wallet commits to famwal: {c.get("tx", c.get("error"))}', c['ok'])
+tab('name-commit tabname')
+wait('A\'s commit', lambda: 'committed to tabname' in aout())
+def wstate(name, state):
+    def f():
+        time.sleep(3)
+        it = [i for i in ask('names').get('items', []) if i['name'] == name]
+        return it[0] if it and it[0]['state'] == state else None
+    return f
+wait('the wallet\'s commit 12 blocks old', wstate('famwal', 'ready'))
+r = ask('name-reveal', name='famwal', speed='hour')
+check(f'the wallet reveals famwal: {r.get("tx", r.get("error"))}', r['ok'])
+def tab_reveal():
+    tab('name-reveal tabname'); time.sleep(5)
+    return 'revealing tabname' in aout()
+wait('A revealing tabname', tab_reveal)
+wait('famwal the wallet\'s on chain', wstate('famwal', 'owned'))
+def found(name):
+    def f():
+        time.sleep(3)
+        l = ask('name-lookup', name=name)
+        return l if l['ok'] and l['found'] else None
+    return f
+wait('tabname on chain', found('tabname'))
+def finalized(n0):
+    def f():
+        pumpone(); time.sleep(1)
+        done = [m for m in events('message') if 'tx' in m or (m.get('ok') is False and 'error' in m)]
+        return done[n0] if len(done) > n0 else None
+    return f
+def nfinal():
+    return len([m for m in events('message') if 'tx' in m or (m.get('ok') is False and 'error' in m)])
+
+# the wallet pays @tabname
+wait('the wallet\'s coins settled', settled)
+n0 = nfinal()
+p = ask('send-online', to='@tabname', amount='0.1', speed='hour')
+check(f'the wallet sends to @tabname online: {p.get("fee", p.get("error"))}', p['ok'])
+f = wait('the payment to @tabname finalized', finalized(n0))
+check(f'@tabname (A) answered, the wallet finalized it: {f.get("tx", f.get("error"))}', f.get('ok') and len(f.get('tx', '')) == 64)
+
+# A gives ex1.tabname to itself; the wallet pays @ex1.tabname (a query to A, its certificate checked)
+tab(f'subname set ex1.tabname {ma}')
+wait('the wallet\'s coins settled again', settled)
+n0 = nfinal()
+p = ask('send-online', to='@ex1.tabname', amount='0.1', speed='hour')
+check(f'the wallet asks the owner of tabname for ex1: {p}', p['ok'] and p.get('resolving'))
+f = wait('the payment to @ex1.tabname finalized', finalized(n0))
+check(f'ex1.tabname resolved through its owner, paid, finalized: {f.get("tx", f.get("error"))}', f.get('ok') and len(f.get('tx', '')) == 64)
+
+# the wallet gives w1.famwal to itself; A pays @w1.famwal (its query answered by the wallet)
+g = ask('subname-set', name='famwal', label='w1', to=addr)
+check(f'the wallet gives w1.famwal to itself: {g.get("error", "ok")}', g['ok'])
+subs = ask('subnames')['items']
+check(f'its sub-names: {subs}', any(i['sub'] == 'w1.famwal' and i['holder'] == addr for i in subs))
+na = len([m for m in events('message') if 'answered a slate of 0.0500000000' in m.get('text', '')])
+tab('send 0.05 @w1.famwal')
+def answered():
+    pumpone(); time.sleep(1)
+    return len([m for m in events('message') if 'answered a slate of 0.0500000000' in m.get('text', '')]) > na
+check('A resolved @w1.famwal by asking the wallet, and paid it: the wallet answered its slate', wait('A paying @w1.famwal', answered))
 EOF
 echo "msgtest.sh: done"

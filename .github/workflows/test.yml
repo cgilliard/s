@@ -198,9 +198,9 @@ jobs:
     name: node ${{ matrix.script }}
     needs: node-build
     runs-on: ubuntu-latest
-    # nametest waits out two 12-block reveals and more: ~45 blocks, about
-    # 46 s each on the runners
-    timeout-minutes: ${{ matrix.script == 'nametest' && 100 || 60 }}
+    # nametest and msgtest wait out 12-block reveals and more: ~45 blocks,
+    # about 46 s each on the runners
+    timeout-minutes: ${{ (matrix.script == 'nametest' || matrix.script == 'msgtest') && 100 || 60 }}
     strategy:
       fail-fast: false
       matrix:

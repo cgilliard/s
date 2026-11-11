@@ -165,7 +165,10 @@ is written).
   | `send` | `to` (an address or `@name`), `amount`, `speed`; `slate`, the file to write, or `text`: true | `slate`, or `text`, the slate to copy; `fee` |
   | `finalize` | `slate`, the recipient's answer as a file, or `text`, pasted | `tx`, the transaction sent to the pool; `fee` |
   | `activity` | | `items`: each `tx`, `kind` (`sent`, a payment or burn; `received`, change left out), `amount`, `state` (`pending`, `confirmed`; a received output since spent, `spent`), `height` (0 unconfirmed) |
-  | `send-online` | `to` (an address, 64 hex digits, or `@name`), `amount`, `speed` | `online`: true, `fee`; the slate sent as a message to the recipient's id, which answers it by itself; then events: `message` with `text` (delivered, or not and why: the slate cancelled), and the answer finalized as `finalize` answers, with `"event":"message"` in place of the id |
+  | `send-online` | `to` (an address, 64 hex digits, `@name` or `@label.name`), `amount`, `speed` | `online`: true, `fee`; the slate sent as a message to the recipient's id, which answers it by itself; then events: `message` with `text` (delivered, or not and why: the slate cancelled), and the answer finalized as `finalize` answers, with `"event":"message"` in place of the id |
+  | `subname-set` | `name` (the wallet's: its value this wallet's id), `label`, `to` (an address or `@name`) | nothing more; queries for `label.name` answered with a certificate naming `to` |
+  | `subname-del` | `name`, `label` | nothing more; answered with none from then |
+  | `subnames` | | `items`: each `sub` (label.name), `holder` (an address, or none), `expiry` |
   | `cancel` | `tx`, a payment or burn not yet in a block; `speed` | `tx`, the replacement (its inputs paid back to a new output of this wallet's); `fee`; the payment's records go |
   | `bump` | `tx`, the same; `speed` | `tx`, the replacement (the same outputs, the change paying the higher fee; below the dust limit, the change goes to the fee whole); `fee`; the payment's records move to it |
   | `create` | | `words`, the new phrase (shown once) |
@@ -339,8 +342,16 @@ memos faster than every output in order.
    wallet is reachable while it is open (logged in) and the node
    answers: the Overview tells at how many points. Its seeds are
    tabminer's unless `/etc/wallet/config` names others (`seed
-   HOST:PORT` lines; `messages off` for none). Not yet: sub-names,
-   onion mode, the window's events beyond a status line.
+   HOST:PORT` lines; `messages off` for none). Sub-names in init mode
+   (`docs/SUBNAME_CERT.md`, `node/wsub.fam` as `subnames.rs`): paying
+   `@label.name` asks the name's owner (a query to the value on chain),
+   checks its certificate against the chain, then pays the holder; the
+   wallet gives sub-names of its names that point at it (`subname-set`,
+   `subname-del`, `subnames`; the Names tab), answering queries with a
+   certificate signed then (renewed under six days from expiry), none
+   for a label it has not given. `msgtest.sh` checks @name, @label.name
+   both ways. Not yet: delegations (an issuer named by an owner kept
+   offline), onion mode, a rate limit on slates and queries.
 
 Each phase ends with tests as the node's: vectors from tabminer for every
 primitive, then a tabminer wallet and this one paying each other on the
