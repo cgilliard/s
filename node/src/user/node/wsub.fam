@@ -1,0 +1,106 @@
+\ wsub.fam — sub-name certificates (docs/SUBNAME_CERT.md; docs/GUI_WALLET.md,
+\ phase 3), as tabminer's subnames.rs: a name's owner signs, for a label,
+\ a certificate naming the holder's id; in init mode a resolver asks the
+\ owner (a query, KIND_SUBNAME_QUERY), which answers with the bundle it
+\ holds (KIND_SUBNAME_ANSWER), checked against the chain.  Here only the
+\ owner's own certificates count (case 1: the issuer key hashes to the
+\ name's value); a bundle with a delegation (an issuer the owner named)
+\ is refused for now.  After wkeys.fam and crypto/dilithium.fam.
+\
+\ A certificate: the name and the label (each its length, then its
+\ bytes), the type (0 none, 1 an id), the value's length (u16) and the
+\ value, seq (u64), expiry (u64), the issuer's Dilithium key, the
+\ signature (context "tab-subname") over all before it.  A bundle: the
+\ certificate's length (u32), the certificate, [a delegation].  A query:
+\ the name and the label; an answer: the same, then a bundle or nothing.
+\
+\ sbinit  the buffers (once).
+\ sbqry ( name nl label ll dst -- n )  a query's bytes.
+\ sbcert ( dst -- n )  a certificate signed: sbnm/sbnl, sblb/sbll, sbkd
+\ (the type), sbval (32 bytes, an id's), sbseq and sbexp (8 bytes each),
+\ the issuer's key mgpk/mgsk.
+\ sbans ( cert cn dst -- n )  an answer to the query read (sbnm.. set):
+\ the name and label, then the bundle of the certificate (cn bytes; 0:
+\ none).
+\ sbpq ( a n -- ok )  a query: its name and label at sbnm/sbnl, sblb/sbll.
+\ sbpa ( a n -- code )  an answer for the query sbnm/sblb: 0 malformed or
+\ for another name, 1 no certificate, 2 a certificate at sbca (sbcn
+\ bytes) with no delegation, 3 one with a delegation (not taken here).
+\ sbvf ( cert cn value now -- ok )  a sound certificate for sbnm/sblb
+\ from the owner whose id (32 canonical bytes) is value: the issuer the
+\ key's hash, in force (and at most 30 days off), a well-formed value,
+\ the signature holding; its type at sbtk, its value at sbtv.
+
+: sbnm variable ;  : sbnl variable ;  : sblb variable ;  : sbll variable ;  : sbkd variable ;  : sbval variable ;
+: sbseq variable ;  : sbexp variable ;  : sbca variable ;  : sbcn variable ;  : sbtk variable ;  : sbtv variable ;
+: sbtn variable ;  : sbtl variable ;  : sbvn variable ;  : sbvv variable ;  : sbpk variable ;  : sbsg variable ;
+: sbo variable ;  : sbp variable ;  : sbh variable ;  : sbw variable ;  : sbe variable ;  : sbt variable ;
+: sbinit  sbnm @ 0= if 40 lit alloc sbtn !  40 lit alloc sbtl !  40 lit alloc sbnm !  40 lit alloc sblb !  20 lit alloc sbval !  8 lit alloc sbseq !  8 lit alloc sbexp !  20 lit alloc sbh !  20 lit alloc sbw ! then ;
+: sbcp  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;      \ ( src dst n -- )
+: sbput  sbo @ c!  sbo @ 1 lit + sbo ! ;                               \ ( b -- )
+: sbbytes  tuck sbo @ swap sbcp  sbo @ + sbo ! ;                       \ ( a n -- )
+: sbputn  dup sbput sbbytes ;                                          \ ( a n -- )  its length, then it
+: sbput32  4 lit 0 lit do dup i 3 lit lshift rshift sbput loop drop ;  \ ( x -- )
+: sbput16  dup sbput 8 lit rshift sbput ;
+: sble@  dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: sbsame  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+
+: sbqry
+sbo !  sbo @ sbp !  sbvn !  sbvv !  sbputn  sbvv @ sbvn @ sbputn  sbo @ sbp @ - ;
+: sbcert
+sbo !  sbo @ sbp !
+sbnm @ sbnl @ sbputn  sblb @ sbll @ sbputn  sbkd @ sbput
+sbkd @ 1 lit = if 20 lit sbput16  sbval @ 20 lit sbbytes else 0 lit sbput16 then
+sbseq @ 8 lit sbbytes  sbexp @ 8 lit sbbytes  mgpk @ 7A0 lit sbbytes
+mgsk @ sbp @ sbo @ sbp @ - "tab-subname" B lit sbo @ dilsign
+sbo @ CED lit + sbp @ - ;
+: sbans
+sbo !  sbo @ sbp !  sbnm @ sbnl @ sbputn  sblb @ sbll @ sbputn
+?dup if dup sbput32 sbbytes else drop then
+sbo @ sbp @ - ;
+
+\ Reading: sbp the place, sbe the end.
+\ sbget ( dst -- len ok )  a name or label (1 to 32 bytes) to dst,
+\ NUL-ended.
+: sbget
+sbt !
+sbp @ sbe @ u< if
+	sbp @ c@  dup 1 lit - 20 lit u<  over sbp @ + 1 lit + sbe @ u> 0= and if
+		sbp @ 1 lit + sbt @ 2 lit pick sbcp  0 lit over sbt @ + c!
+		dup 1 lit + sbp @ + sbp !  -1 lit
+	else drop 0 lit 0 lit then
+else 0 lit 0 lit then ;
+\ sbis ( buf len a n -- flag )  the name read is a (n bytes).
+: sbis  rot over = if sbsame else 2drop drop 0 lit then ;
+: sbpq
+over + sbe !  sbp !
+sbnm @ sbget swap sbnl !  sblb @ sbget swap sbll !  and  sbp @ sbe @ = and ;
+: sbpa
+over + sbe !  sbp !
+sbtn @ sbget swap sbtn @ swap sbnm @ sbnl @ sbis and
+sbtl @ sbget swap sbtl @ swap sblb @ sbll @ sbis and
+0= if 0 lit else
+sbp @ sbe @ = if 1 lit else
+sbe @ sbp @ - 4 lit u< if 0 lit else
+	sbp @ sble@ sbcn !  sbp @ 4 lit + sbca !
+	sbca @ sbcn @ + sbe @ u> if 0 lit else
+	sbca @ sbcn @ + sbe @ = if 2 lit else 3 lit then then
+then then then ;
+: sbvf
+sbvn !  sbvv !  over + sbe !  sbp !  sbp @ sbca !
+sbtn @ sbget swap sbtn @ swap sbnm @ sbnl @ sbis and
+sbtl @ sbget swap sbtl @ swap sblb @ sbll @ sbis and
+sbe @ sbp @ - 3 lit u< 0= and
+0= if 0 lit else
+	sbp @ c@ sbtk !  sbp @ 1 lit + c@ sbp @ 2 lit + c@ 8 lit lshift or sbt !  sbp @ 3 lit + sbtv !
+	sbtv @ sbt @ + dup sbseq @ 8 lit sbcp  8 lit + dup sbexp @ 8 lit sbcp  8 lit + dup sbpk !  7A0 lit + sbsg !
+	sbsg @ CED lit + sbe @ =  sbt @ 101 lit u< and
+	\ the value: none empty; an id 32 bytes, each word below the modulus
+	sbtk @ 0= if sbt @ 0= and then
+	sbtk @ 1 lit = if sbt @ 20 lit = and  8 lit 0 lit do sbtv @ i 2 lit lshift + sble@ 78000001 lit u< and loop then
+	\ in force: after now, at most 30 days off
+	sbexp @ 4 lit + @ 0=  sbexp @ @ sbvn @ u> and  sbexp @ @ sbvn @ - 278D01 lit u< and  and
+	\ the owner's: the key hashes to the value
+	dup if sbpk @ sbw @ wkid  sbw @ sbh @ wkcan  sbh @ sbvv @ 20 lit sbsame and then
+	dup if drop sbpk @ sbca @ sbsg @ sbca @ - "tab-subname" B lit sbsg @ dilver then
+then ;

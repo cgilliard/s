@@ -1,0 +1,51 @@
+\ node/wsub_test.fam — node/wsub.fam against tabminer's subnames.rs
+\ (node/wsub_vectors.fam, written by miner/src/fam_sub_vectors.rs): the
+\ owner's certificate naming the holder and its "none" byte for byte, the
+\ query and the answer, reading them back, and the checks of a
+\ certificate (sound; another owner; expired; its signature changed).
+\ Prints "wsub: N as expected, M not".
+\ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam crypto/kyber.fam
+\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wmsg.fam node/wsub.fam node/wsub_vectors.fam
+
+: stpas variable ;  : stfai variable ;  : sth variable ;  : stpk variable ;  : stsk variable ;  : stc variable ;
+: stn variable ;  : sta variable ;  : stb variable ;  : stv variable ;  : stcl variable ;  : stal variable ;
+: stchk  swap if drop stpas @ 1 lit + stpas ! else "wsub: " puts puts 0A lit putc stfai @ 1 lit + stfai ! then ;   \ ( flag str -- )
+: stw variable ;
+: sthsh  stw !  sth @ 20 lit shake256  sth @ stw @ 20 lit sbsame ;     \ ( src len want -- flag )
+: stflip  dup c@ 1 lit xor swap c! ;
+
+sxbufs sxset  wkinit sbinit
+20 lit alloc sth !  7A0 lit alloc stpk !  FC0 lit alloc stsk !  2000 lit alloc stc !  2000 lit alloc stn !
+2100 lit alloc sta !  2100 lit alloc stb !  20 lit alloc stv !
+sxso @ stpk @ stsk @ dilkey  stpk @ mgpk !  stsk @ mgsk !
+stpk @ sbw @ wkid  sbw @ stv @ wkcan
+sbnm @ "example" scpy drop  7 lit sbnl !  sblb @ "ex1" scpy drop  3 lit sbll !
+
+\ the certificates
+1 lit sbkd !  sxt @ sbval @ 20 lit sbcp  sxseq @ sbseq @ 8 lit sbcp  sxexp @ sbexp @ 8 lit sbcp
+stc @ sbcert stcl !
+stcl @ sxcl @ = "the certificate's length" stchk
+stc @ stcl @ sxhc @ sthsh "the certificate naming the holder" stchk
+0 lit sbkd !  sbseq @ @ 1 lit + sbseq @ !
+stn @ sbcert dup sxnl @ = "the none certificate's length" stchk
+stn @ swap sxhn @ sthsh "the none certificate" stchk
+sxseq @ sbseq @ 8 lit sbcp
+
+\ the query and the answer
+sbnm @ sbnl @ sblb @ sbll @ sta @ sbqry  dup sxql @ =  swap sta @ sxq @ rot sbsame and "the query" stchk
+stc @ stcl @ sta @ sbans stal !
+stal @ sxal @ =  sta @ stal @ sxha @ sthsh and "the answer" stchk
+sxq @ sxql @ sbpq  sbnl @ 7 lit = and  sbll @ 3 lit = and "the query read" stchk
+sta @ stal @ sbpa 2 lit = "the answer read: a certificate" stchk
+sbcn @ stcl @ =  sbca @ stc @ stcl @ sbsame and "its certificate" stchk
+sbca @ sbcn @ stv @ sxnow @ sbvf "the certificate holds" stchk
+sbtk @ 1 lit =  sbtv @ sxt @ 20 lit sbsame and "it names the holder" stchk
+sbca @ sbcn @ sxt @ sxnow @ sbvf 0= "for another owner, refused" stchk
+sbca @ sbcn @ stv @ sxexp @ @ sbvf 0= "at its expiry, refused" stchk
+sbca @ sbcn @ + 10 lit - stflip  sbca @ sbcn @ stv @ sxnow @ sbvf 0= "its signature changed, refused" stchk  sbca @ sbcn @ + 10 lit - stflip
+sbca @ 20 lit + stflip  sbca @ sbcn @ stv @ sxnow @ sbvf 0= "its value changed, refused" stchk  sbca @ 20 lit + stflip
+0 lit sta @ stal @ + c!  sta @ stal @ 1 lit + sbpa 3 lit = "an answer with more after: a delegation, not taken" stchk
+0 lit 0 lit sta @ sbans sta @ swap sbpa 1 lit = "an answer with none" stchk
+stc @ stcl @ sta @ sbans stal !  sblb @ "ex2" scpy drop  sta @ stal @ sbpa 0= "an answer for another label, refused" stchk
+
+"wsub: " puts stpas @ . " as expected, " puts stfai @ . " not" puts 0A lit putc

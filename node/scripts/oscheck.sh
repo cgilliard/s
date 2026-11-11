@@ -782,6 +782,12 @@ uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wmsg_test.fam | tr ' ' '\n' | sed
 ./tools/fam --user -o "$T/twm.bin" $uses src/user/node/wmsg_test.fam > "$T/twm.build" 2>&1 || fail wmsg "build: $(head -c 300 "$T/twm.build")"
 sh scripts/mkimage.sh "$T/twm.img" bin/kernel init="$T/twm.bin":4096 2> "$T/twm.mk" || fail wmsg "mkimage: $(cat "$T/twm.mk")"
 expect wmsg 124 '^wmsg: 54 as expected, 0 not' 60 ./tools/q32 "$T/twm.img"
+# Sub-name certificates (node/wsub.fam): signed, a query and an answer
+# read, certificates checked and refused, as tabminer's subnames.rs.
+uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wsub_test.fam | tr ' ' '\n' | sed '/^$/d; s|^|src/user/|' | tr '\n' ' ')
+./tools/fam --user -o "$T/tsb.bin" $uses src/user/node/wsub_test.fam > "$T/tsb.build" 2>&1 || fail wsub "build: $(head -c 300 "$T/tsb.build")"
+sh scripts/mkimage.sh "$T/tsb.img" bin/kernel init="$T/tsb.bin":4096 2> "$T/tsb.mk" || fail wsub "mkimage: $(cat "$T/tsb.mk")"
+expect wsub 124 '^wsub: 18 as expected, 0 not' 60 ./tools/q32 "$T/tsb.img"
 
 # The wallet (docs/GUI_WALLET.md, phase 1), driven as wm drives it
 # (src/user/tests/walletrun.fam: requests on a pipe, each answer printed):

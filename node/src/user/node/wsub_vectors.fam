@@ -1,0 +1,47 @@
+\ node/wsub_vectors.fam — tabminer's values for node/wsub.fam
+\ (docs/SUBNAME_CERT.md; docs/GUI_WALLET.md, phase 3).  Written by
+\ miner/src/fam_sub_vectors.rs (`cargo test --release --features dev --lib
+\ write_fam_sub_vectors -- --ignored`); not to be edited.  Read by
+\ node/wsub_test.fam.
+\
+\ The owner's Dilithium seed at sxso, the holder's id at sxt; the name
+\ "example", the label "ex1"; seq and expiry at sxseq, sxexp (8 bytes
+\ each), sxnow a time before it.  SHAKE256-256 of the certificate naming
+\ the holder (sxhc, sxcl bytes), of the "none" one (sxhn, sxnl bytes),
+\ of the answer bearing the first (sxha, sxal bytes); the query's bytes
+\ at sxq (sxql).
+
+: sxp variable ;  : sxso variable ;  : sxt variable ;  : sxseq variable ;  : sxexp variable ;  : sxnow variable ;
+: sxhc variable ;  : sxcl variable ;  : sxhn variable ;  : sxnl variable ;  : sxha variable ;  : sxal variable ;
+: sxq variable ;  : sxql variable ;
+: sxc  sxp @ c!  sxp @ 1 lit + sxp ! ;
+: sxbufs
+sxso @ 0= if
+	20 lit alloc sxso !  20 lit alloc sxt !  8 lit alloc sxseq !  8 lit alloc sxexp !  20 lit alloc sxhc !
+	20 lit alloc sxhn !  20 lit alloc sxha !  40 lit alloc sxq !
+then ;
+
+: sxset
+sxso @ sxp !
+7 lit sxc A lit sxc D lit sxc 10 lit sxc 13 lit sxc 16 lit sxc 19 lit sxc 1C lit sxc 1F lit sxc 22 lit sxc 25 lit sxc 28 lit sxc 2B lit sxc 2E lit sxc 31 lit sxc 34 lit sxc 37 lit sxc 3A lit sxc 3D lit sxc 40 lit sxc 43 lit sxc 46 lit sxc 49 lit sxc 4C lit sxc
+4F lit sxc 52 lit sxc 55 lit sxc 58 lit sxc 5B lit sxc 5E lit sxc 61 lit sxc 64 lit sxc
+sxt @ sxp !
+96 lit sxc 44 lit sxc BD lit sxc 2F lit sxc 3B lit sxc D7 lit sxc 68 lit sxc 47 lit sxc B0 lit sxc EB lit sxc 4B lit sxc 7 lit sxc 1C lit sxc 90 lit sxc 93 lit sxc 6D lit sxc 77 lit sxc C lit sxc AD lit sxc 69 lit sxc AF lit sxc 53 lit sxc 45 lit sxc 63 lit sxc
+CA lit sxc 61 lit sxc 4C lit sxc 55 lit sxc 6A lit sxc 2C lit sxc AA lit sxc 6F lit sxc
+sxseq @ sxp !
+7 lit sxc 0 lit sxc 0 lit sxc 0 lit sxc 8B lit sxc 1 lit sxc 0 lit sxc 0 lit sxc
+sxexp @ sxp !
+20 lit sxc 92 lit sxc 5B lit sxc 65 lit sxc 0 lit sxc 0 lit sxc 0 lit sxc 0 lit sxc
+sxhc @ sxp !
+A0 lit sxc 8E lit sxc 95 lit sxc 4C lit sxc B5 lit sxc EC lit sxc 33 lit sxc 90 lit sxc E0 lit sxc 52 lit sxc A lit sxc 31 lit sxc BB lit sxc 67 lit sxc 3D lit sxc DF lit sxc 90 lit sxc 31 lit sxc 21 lit sxc 6C lit sxc 6A lit sxc DF lit sxc 68 lit sxc 17 lit sxc
+84 lit sxc CA lit sxc 27 lit sxc C9 lit sxc 7D lit sxc E1 lit sxc 15 lit sxc BA lit sxc
+sxhn @ sxp !
+2D lit sxc 95 lit sxc 46 lit sxc C9 lit sxc 38 lit sxc 91 lit sxc 56 lit sxc 3 lit sxc 7B lit sxc DD lit sxc 5B lit sxc 18 lit sxc C4 lit sxc D5 lit sxc 60 lit sxc 54 lit sxc 5 lit sxc 13 lit sxc 76 lit sxc C7 lit sxc 1A lit sxc 2E lit sxc A4 lit sxc C5 lit sxc
+DD lit sxc 71 lit sxc 74 lit sxc 3F lit sxc 5 lit sxc E9 lit sxc C0 lit sxc F lit sxc
+sxha @ sxp !
+7C lit sxc 89 lit sxc E2 lit sxc D3 lit sxc D1 lit sxc 17 lit sxc 40 lit sxc 32 lit sxc BE lit sxc E1 lit sxc C7 lit sxc 8E lit sxc 48 lit sxc 6B lit sxc E2 lit sxc 1B lit sxc 62 lit sxc F lit sxc 9 lit sxc E3 lit sxc 5E lit sxc 7 lit sxc 97 lit sxc A6 lit sxc
+F lit sxc 54 lit sxc FE lit sxc B3 lit sxc 6A lit sxc C lit sxc FD lit sxc 52 lit sxc
+sxq @ sxp !
+7 lit sxc 65 lit sxc 78 lit sxc 61 lit sxc 6D lit sxc 70 lit sxc 6C lit sxc 65 lit sxc 3 lit sxc 65 lit sxc 78 lit sxc 31 lit sxc
+14CC lit sxcl !  14AC lit sxnl !  14DC lit sxal !  C lit sxql !  6553F100 lit sxnow !
+;
