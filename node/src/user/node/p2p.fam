@@ -364,6 +364,16 @@ dup prec B8 lit + @ 5 lit u< if drop 0 lit else
 then ;
 
 \ pwait ( ns -- type | 0 )
+\ paux  a GetAux answered: the block's aux leaves (cons.fam keeps them,
+\ "A" || id), if held; not while a block's store transaction is open.
+: paux
+pnest @ 0= if
+	stfd @ 0 lit txbegin stx !
+	41 lit kb @ c!  prx @ D lit + kb @ 1 lit + 20 lit bcopy
+	F lit wbeg  prx @ D lit + 20 lit wbs
+	21 lit ptp @ 200 lit sget 200 lit = if ptp @ 200 lit + ptp !  prply then
+	stx @ txabort drop
+then ;
 : pwait
 prdy if
 	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
@@ -385,6 +395,7 @@ prdy if
 			dup 42 lit = if pimage then
 			dup B lit = if phfrom then
 			dup 5 lit = if phloc then
+			dup E lit = prn @ 2D lit = and if paux then
 		then
 		pfk @ 0< if drop 0 lit else
 		dup 2 lit = if

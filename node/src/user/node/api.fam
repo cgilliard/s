@@ -10,6 +10,8 @@
 \ mode 600; POST /v1/token makes a new one.
 \
 \   GET  /v1/status                      height, tip, work, peers, pool
+\   GET  /v1/consensus                   the message layer's mode and relays
+\                                        (cons.fam): the sets in force
 \   GET  /v1/header/<height|id>[?raw]    a header, decoded (or its bytes)
 \   GET  /v1/block/<height|id>[?raw]     a block kept (the last 1,008)
 \   GET  /v1/outputs?from=<p>&count=<n>  outputs in position order (1,000)
@@ -602,6 +604,31 @@ else atipr then ;
 	else drop then
 loop ;
 
+\ acons  the message layer's mode as the chain decides it (cons.fam):
+\ the tip it was made at, the epoch (height / 144), the blocks into it;
+\ the set in force ("current") and, for the epoch's first five blocks,
+\ the one before ("previous", else null): each its mode ("init",
+\ "onion"), the winning file's hash (null: none won) and, in onion mode,
+\ its relays sorted by id ({"id","address"}); and "running", what the
+\ window ending at the tip decides (the next boundary's, so far).
+: ajset
+"{" a" "mode" akey dup @ if aqt "onion" a" aqt else aqt "init" a" aqt then acom
+"hash" akey dup 8 lit + cxnz if dup 8 lit + adig else "null" a" then acom
+"relays" akey "[" a"
+dup 4 lit + @ ?dup if 0 lit do
+	i if acom then
+	dup 30 lit + i CXREL * +  "{" a" "id" akey dup adig acom "address" akey aqt 20 lit + a" aqt "}" a"
+loop then
+"]" a" "}" a" drop ;
+: acons
+cxinit
+abegin "{" a"
+"height" akey cxht @ FFFFFFFF lit = if 0 lit else cxht @ then anum acom
+"epoch" akey cxb @ 90 lit / anum acom  "into" akey cxin @ anum acom
+"current" akey cxcur @ ajset acom
+"previous" akey cxprv @ 28 lit + @ if cxprv @ ajset else "null" a" then acom
+"running" akey cxscr @ 28 lit + @ if cxscr @ ajset else "null" a" then
+"}" a" "200 OK" asend ;
 : aroute
 apost @ if
 	apath @ "/v1/tx" streq if atx else
@@ -617,8 +644,9 @@ else
 	"/v1/proof/output/" apre if aproof else
 	apath @ "/v1/fees" streq if afees else
 	apath @ "/v1/mempool" streq if amempool else
-	apath @ "/v1/tip" streq if atip else anotf
-	then then then then then then then then then then then
+	apath @ "/v1/tip" streq if atip else
+	apath @ "/v1/consensus" streq if acons else anotf
+	then then then then then then then then then then then then
 then ;
 
 \ aone  the connection in acfd: its request read, checked, answered.

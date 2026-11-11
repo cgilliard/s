@@ -221,6 +221,7 @@ jobs:
           - prooftest
           - nametest
           - msgtest
+          - constest
     defaults:
       run:
         working-directory: node

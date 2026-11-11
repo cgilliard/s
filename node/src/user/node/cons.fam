@@ -1,0 +1,310 @@
+\ cons.fam — the network's consensus.txt (docs/ONION.md: consensus.txt,
+\ Commitment and propagation), as tabminer's consensus.rs and the parts of
+\ chain.rs and node.rs that follow it: which mode the message layer is in
+\ (init: the seeds are the rendezvous points; onion: the relays the file
+\ lists), for the API to tell wallets (/v1/consensus).
+\
+\ A block votes by its aux leaves: 16 of 32 bytes whose SHA-256 tree (all
+\ zero: a zero root) is the header's aux (bytes 108..140); leaf 0 is the
+\ SHA-256 of a consensus.txt, or zero.  The leaves are asked of the current
+\ peer (GetAux, 14: our token, the block's id; Aux, 15: the id, the 512
+\ bytes), checked against the header, kept ("A" || id); the node serves
+\ them (p2p.fam's paux).  A file voted for is fetched by the chunked
+\ transfer (kind 4, its id each word of the hash & 0x3fffffff), checked by
+\ its SHA-256, kept ("C" || hash || part, 896 bytes a part; part FF its
+\ length), valid or not.
+\
+\ The decision at a boundary B (a multiple of 144): the votes of the 144
+\ blocks ending at B (leaf 0 not zero) counted, most first, ties to the
+\ highest height voting; the first whose file is held and parses wins; none,
+\ init mode.  In force from B: the decision at B, and for its first five
+\ blocks (B+0..B+4, B > 0) the one before (the window ending at B-144) too,
+\ preferred until B+2.
+\
+\ cxinit  the buffers (once).
+\ cxrun  a turn: leaves wanted (the windows ending at B, B-144 and the
+\ tip) asked for, a few at a time; the decisions made; a file wanted
+\ fetched.  From nstep, every ten seconds or when the tip moved.
+\ cxset ( a n set -- ok )  a file parsed into a set (below); not ok: an
+\ invalid file.
+\ A set: +0 mode (0 init, 1 onion), +4 its relays (n), +8 the file's hash
+\ (32; zero: no file won), +28 valid (1); then the relays, sorted by id,
+\ CXREL bytes each: the id (32), the address ("host:port", NUL-ended).
+\ cxcur, cxprv: the sets in force (cxprv's +28 zero when none), cxht the
+\ tip they were made at.
+
+:M CXREL 140 lit ;                             \ a relay: id 32, address 288
+:M CXMAX 40 lit ;                              \ relays kept, 64 at most
+:M CXSET 5030 lit ;                            \ 48 + 64 relays
+:M CXFMAX 10000 lit ;                          \ a file's bytes we take: 64 KiB
+
+: cxlv variable ;  : cxtb variable ;  : cxrt variable ;  : cxm variable ;  : cxrl variable ;  : cxrd variable ;
+: cxcur variable ;  : cxprv variable ;  : cxtmp variable ;  : cxht variable ;  : cxat variable ;  : cxfb variable ;
+: cxvt variable ;  : cxvn variable ;  : cxwant variable ;  : cxe variable ;  : cxh variable ;  : cxi variable ;
+: cxp variable ;  : cxend variable ;  : cxw0 variable ;  : cxw1 variable ;  : cxok variable ;  : cxs variable ;
+: cxln variable ;  : cxle variable ;  : cxnw variable ;  : cxid variable ;  : cxst variable ;  : cxasks variable ;
+: cxfill  -rot ?dup if 0 lit do 2dup i + c! loop then 2drop ;      \ ( a n b -- )
+: cxscr variable ;  : cxfail variable ;  : cxfat variable ;
+: cxinit
+cxlv @ 0= if
+	wkinit
+	200 lit alloc cxlv !  200 lit alloc cxtb !  20 lit alloc cxrt !  CXSET alloc cxcur !  CXSET alloc cxprv !
+	CXSET alloc cxtmp !  CXFMAX 10 lit + alloc cxfb !  90 lit 28 lit * alloc cxvt !  20 lit alloc cxwant !
+	20 lit alloc cxid !  80 lit alloc cxw0 !
+	CXSET alloc cxscr !  20 lit alloc cxfail !  cxfail @ 20 lit 0 lit cxfill  0 lit cxfat !
+	cxcur @ CXSET 0 lit cxfill  cxprv @ CXSET 0 lit cxfill  FFFFFFFF lit cxht !  0 lit cxat !
+then ;
+
+\ cxroot ( leaves dst -- )  the aux root of 16 leaves.
+: cxroot
+cxrd !  cxrl !
+0 lit  200 lit 0 lit do cxrl @ i + c@ or loop 0= if cxrd @ 20 lit 0 lit cxfill else
+	cxrl @ cxtb @ 200 lit bcopy  10 lit cxm !
+	begin cxm @ 1 lit u> while
+		cxm @ 1 lit rshift 0 lit do cxtb @ i 6 lit lshift + 40 lit sha256  h2d @ cxtb @ i 5 lit lshift + 20 lit bcopy loop
+		cxm @ 1 lit rshift cxm !
+	repeat
+	cxtb @ cxrd @ 20 lit bcopy
+then ;
+
+\ ── The store: leaves by block, files by hash, in the node's transaction ──
+: cxakey  41 lit kb @ c!  kb @ 1 lit + 20 lit bcopy  21 lit ;          \ ( id -- klen )
+: cxckey  43 lit kb @ c!  swap kb @ 1 lit + 20 lit bcopy  kb @ 21 lit + c!  22 lit ;   \ ( hash part -- klen )
+\ cxheld ( id -- flag )  its leaves held, read to cxlv.
+: cxheld  stfd @ 0 lit txbegin stx !  cxakey cxlv @ 200 lit sget 200 lit =  stx @ txabort drop ;
+\ cxfile ( hash -- n | -1 )  a file held, read to cxfb.
+: cxfh variable ;
+: cxfile
+cxfh !  stfd @ 0 lit txbegin stx !
+cxfh @ FF lit cxckey cxtb @ 4 lit sget 4 lit = if
+	cxtb @ @ dup CXFMAX u> if drop FFFFFFFF lit else
+		dup 37F lit + 380 lit / ?dup if 0 lit do cxfh @ i cxckey  cxfb @ i 380 lit * +  380 lit sget drop loop then
+	then
+else FFFFFFFF lit then
+stx @ txabort drop ;
+\ cxkeep ( a n hash -- )  a file kept, in parts.
+: cxkeep  cxfh !
+stfd @ 1 lit txbegin stx !
+dup cxtb @ !  cxfh @ FF lit cxckey cxtb @ 4 lit sput
+dup 37F lit + 380 lit / ?dup if 0 lit do
+	over i 380 lit * +  over i 380 lit * - 380 lit umin
+	cxfh @ i cxckey -rot sput
+loop then 2drop
+stx @ txcommit drop ;
+
+\ cxask ( e -- ok )  the leaves of header e asked of the current peer
+\ (four tries, half a second each), checked against its aux, kept.
+: cxask
+cxe !  cxe @ hid cxid @ 20 lit bcopy  0 lit cxok !  0 lit cxi !
+begin cxok @ 0=  cxi @ 4 lit u< and while
+	E lit wbeg wtok  cxid @ 20 lit wbs  wsend  cxi @ 1 lit + cxi !
+	begin cxok @ if 0 lit else 1DCD6500 lit pwait then ?dup while
+		F lit =  prn @ 225 lit = and  prx @ 5 lit + cxid @ 20 lit d8= and if
+			prx @ 25 lit + cxrt @ cxroot
+			cxrt @ cxe @ hhdr 6C lit + 20 lit d8= if
+				stfd @ 1 lit txbegin stx !  cxid @ cxakey prx @ 25 lit + 200 lit sput  stx @ txcommit drop
+				-1 lit cxok !
+			then
+		then
+	repeat
+repeat
+cxok @ ;
+
+\ ── Parsing (consensus.rs's File::parse) ──
+\ cxutf ( a n -- ok )  well-formed UTF-8.
+: cxu variable ;
+: cxutf
+-1 lit cxok !  0 lit cxu !
+?dup if 0 lit do
+	dup i + c@
+	cxu @ if
+		C0 lit and 80 lit = 0= if 0 lit cxok ! then  cxu @ 1 lit - cxu !
+	else
+		dup 80 lit u< if drop else dup E0 lit and C0 lit = if C2 lit u< if 0 lit cxok ! then 1 lit cxu ! else
+		dup F0 lit and E0 lit = if drop 2 lit cxu ! else
+		dup F8 lit and F0 lit = if F5 lit u< 0= if 0 lit cxok ! then 3 lit cxu ! else drop 0 lit cxok ! then then then then
+	then
+loop then drop
+cxu @ if 0 lit cxok ! then  cxok @ ;
+: cxws  dup 9 lit - 5 lit u<  swap 20 lit = or ;          \ ( c -- flag )  white space
+\ cxwords  the words of the line cxp..cxle into cxw0 (start, length; four
+\ kept), cxnw how many.
+: cxwords
+0 lit cxnw !
+cxp @ begin dup cxle @ u< while
+	dup c@ cxws if 1 lit + else
+		dup begin dup cxle @ u<  over c@ cxws 0= and while 1 lit + repeat
+		cxnw @ 4 lit u< if over cxw0 @ cxnw @ 3 lit lshift + !  2dup swap - cxw0 @ cxnw @ 3 lit lshift + 4 lit + ! then
+		cxnw @ 1 lit + cxnw !  nip
+	then
+repeat drop ;
+: cxwd  3 lit lshift cxw0 @ + dup @ swap 4 lit + @ ;     \ ( k -- a n )  word k
+: cxis  dup strlen 2 lit pick = if swap d8= else 2drop drop 0 lit then ;   \ ( a n s -- flag )  the word is s
+\ cxhex ( a dst -- ok )  64 hex digits to 32 bytes.
+: cxhd  dup 30 lit - A lit u< if 30 lit - else 20 lit or dup 61 lit - 6 lit u< if 57 lit - else drop 100 lit then then ;   \ ( c -- v )
+: cxhex
+-1 lit cxok !
+20 lit 0 lit do
+	over i 1 lit lshift + c@ cxhd  2 lit pick i 1 lit lshift + 1 lit + c@ cxhd
+	over FF lit u> over FF lit u> or if 0 lit cxok ! then
+	swap 4 lit lshift or  over i + c!
+loop 2drop cxok @ ;
+\ cxcanon ( a -- ok )  32 bytes a canonical digest: each word below p.
+: cxcanon  -1 lit  8 lit 0 lit do over i 2 lit lshift + le@ 78000001 lit u< and loop nip ;
+\ cxaddr ( a n -- ok )  host:port: the port digits (a u16), the host 1 to
+\ 253 of A-Z a-z 0-9 . -
+: cxcp variable ;
+: cxaddr
+0 lit cxcp !  2dup ?dup if 0 lit do dup i + c@ 3A lit = if i 1 lit + cxcp ! then loop then drop
+cxcp @ 0= if 2drop 0 lit else
+	-1 lit cxok !  0 lit cxu !
+	\ the port: one digit at least, at most 65535
+	over cxcp @ +  over cxcp @ -  dup 0= if 0 lit cxok ! then
+	?dup if 0 lit do dup i + c@ 30 lit - dup A lit u< if cxu @ A lit * + 1FFFFF lit umin cxu ! else drop 0 lit cxok ! then loop then drop
+	cxu @ 10000 lit u< cxok @ and cxok !
+	\ the host
+	drop cxcp @ 1 lit -  dup 1 lit - FD lit u< cxok @ and cxok !
+	?dup if 0 lit do
+		dup i + c@  dup 41 lit - 1A lit u< over 61 lit - 1A lit u< or over 30 lit - A lit u< or over 2E lit = or swap 2D lit = or
+		cxok @ and cxok !
+	loop then drop
+	cxok @
+then ;
+\ cxlt ( a b -- flag )  32 bytes a before b.
+: cxlt  0 lit  20 lit 0 lit do dup 0= if drop over i + c@ over i + c@ - then loop nip nip 0< ;
+: cxrec  CXREL * 30 lit + cxs @ + ;                    \ ( k -- a )  relay k of the set at cxs
+\ cxrel  the relay line (words 1, 2) into the set at cxs, in order; not
+\ ok (cxok) on a bad or repeated id, a bad address, too many to keep.
+: cxk variable ;  : cxal variable ;
+: cxrel
+1 lit cxwd  dup 40 lit = if drop cxid @ cxhex else
+	dup 3E lit = if cxw0 @ 40 lit + swap bcopy  0 lit cxw0 @ 7E lit + c!  cxw0 @ 40 lit + cxtb @ wkdec dup if cxtb @ cxid @ wkcan then
+	else 2drop 0 lit then
+then
+cxid @ cxcanon and
+2 lit cxwd  dup cxal !  cxaddr and  cxal @ 11F lit u< and
+cxs @ 4 lit + @ CXMAX u< and
+\ not one already listed
+dup if cxs @ 4 lit + @ ?dup if 0 lit do i cxrec cxid @ 20 lit d8= if drop 0 lit then loop then then
+dup cxok @ and cxok !
+if
+	\ its place: after those with a lower id
+	0 lit cxk !  cxs @ 4 lit + @ ?dup if 0 lit do i cxrec cxid @ cxlt if i 1 lit + cxk ! then loop then
+	cxs @ 4 lit + @ cxk @ - ?dup if 0 lit do
+		cxs @ 4 lit + @ i - 1 lit - cxrec  dup CXREL + CXREL bcopy
+	loop then
+	cxk @ cxrec CXREL 0 lit cxfill
+	cxid @ cxk @ cxrec 20 lit bcopy  2 lit cxwd drop cxk @ cxrec 20 lit + cxal @ bcopy
+	cxs @ 4 lit + dup @ 1 lit + swap !
+then ;
+\ cxset ( a n set -- ok )  a file parsed into the set (File::parse's rules).
+: cxnx variable ;
+: cxset
+cxs !  cxln !  cxp !
+cxs @ 30 lit 0 lit cxfill  -1 lit cxok !  0 lit cxst !
+cxln @ CXFMAX u> if 0 lit cxok ! then
+cxok @ if cxp @ cxln @ cxutf cxok @ and cxok ! then
+cxp @ cxln @ + cxend !
+begin cxok @  cxp @ cxend @ u< and while
+	\ the line, to its newline; the comment cut off
+	cxp @ begin dup cxend @ u<  over c@ A lit <> and while 1 lit + repeat
+	dup cxend @ u< if dup 1 lit + else dup then cxnx !
+	cxp @ begin 2dup u>  over c@ 23 lit <> and while 1 lit + repeat nip cxle !
+	cxwords
+	cxnw @ if
+		cxst @ 0= if
+			0 lit cxwd "mode" cxis  cxnw @ 2 lit = and 0= if 0 lit cxok ! else
+			1 lit cxwd "init" cxis if 1 lit cxst ! else
+			1 lit cxwd "onion" cxis if 2 lit cxst !  1 lit cxs @ ! else 0 lit cxok ! then then then
+		else cxst @ 2 lit = if
+			0 lit cxwd "relay" cxis if cxnw @ 3 lit = if cxrel else 0 lit cxok ! then then
+		then then
+	then
+	cxnx @ cxp !
+repeat
+cxst @ 0= if 0 lit cxok ! then
+cxst @ 2 lit =  cxs @ 4 lit + @ 3 lit u< and if 0 lit cxok ! then
+cxok @ dup if 1 lit cxs @ 28 lit + ! then ;
+
+\ ── The decision (consensus.rs's decide over chain.rs's votes) ──
+\ cxnz ( a -- flag )  32 bytes not all zero.
+: cxnz  0 lit  20 lit 0 lit do over i + c@ or loop nip 0= 0= ;
+\ cxtally ( hash h -- )  a vote counted: 40 bytes an entry, the hash, the
+\ count, the highest height voting.
+: cxtally
+cxi !  -1 lit cxk !
+cxvn @ ?dup if 0 lit do dup cxvt @ i 28 lit * + 20 lit d8= if i cxk ! then loop then
+cxk @ 0< if
+	cxvn @ 90 lit u< if cxvn @ cxk !  dup cxvt @ cxk @ 28 lit * + 20 lit bcopy  0 lit cxvt @ cxk @ 28 lit * + 20 lit + !  cxvn @ 1 lit + cxvn ! then
+then
+drop
+cxk @ 0< 0= if cxvt @ cxk @ 28 lit * + 20 lit +  dup @ 1 lit + over !  cxi @ swap 4 lit + ! then ;
+\ cxdec ( E set -- )  the decision of the window ending at E into the set;
+\ the first voted file not held, the most voted, wanted (cxwant).
+: cxds variable ;  : cxwin variable ;  : cxbest variable ;
+: cxdec
+cxds !  cxe !  0 lit cxvn !
+cxe @ 1 lit +  cxe @ 8F lit u< if 0 lit else cxe @ 8F lit - then do
+	i hat ?dup if
+		dup hhdr 6C lit + cxnz if hid cxheld if cxlv @ cxnz if cxlv @ i cxtally then then else drop then
+	then
+loop
+0 lit cxwin !
+cxvn @ ?dup if 0 lit do
+	cxwin @ 0= if
+		\ the most votes left, ties to the highest height
+		-1 lit cxbest !
+		cxvn @ 0 lit do
+			cxvt @ i 28 lit * + 20 lit + @ if
+				cxbest @ 0< if i cxbest ! else
+					cxvt @ i 28 lit * + 20 lit + @  cxvt @ cxbest @ 28 lit * + 20 lit + @
+					2dup u> if 2drop i cxbest ! else = if
+						cxvt @ i 28 lit * + 24 lit + @  cxvt @ cxbest @ 28 lit * + 24 lit + @ u> if i cxbest ! then
+					then then
+				then
+			then
+		loop
+		cxbest @ 0< 0= if
+			cxvt @ cxbest @ 28 lit * +  0 lit over 20 lit + !
+			dup cxfile dup 0< if drop cxwant @ cxnz 0= if cxwant @ 20 lit bcopy else drop then else
+				cxfb @ swap cxtmp @ cxset if cxtmp @ 8 lit + 20 lit bcopy  cxtmp @ cxds @ CXSET bcopy  -1 lit cxwin ! else drop then
+			then
+		then
+	then
+loop then
+cxwin @ 0= if cxds @ 30 lit 0 lit cxfill  1 lit cxds @ 28 lit + ! then ;
+
+\ ── A turn ──
+: cxb variable ;  : cxin variable ;
+\ cxfetch  the file wanted, by the chunked transfer from the current peer;
+\ one that will not come passed over for ten minutes.
+: cxfetch
+8 lit 0 lit do cxwant @ i 2 lit lshift + le@ 3FFFFFFF lit and  cxid @ i 2 lit lshift + ! loop
+4 lit 0 lit cxid @ pfetch
+over if
+	dup CXFMAX u> 0=  if 2dup sha256  h2d @ cxwant @ 20 lit d8= else 0 lit then
+	if 2dup cxwant @ cxkeep  vrb @ if nhead "consensus: a file voted for, fetched and kept" puts 0A lit putc then
+	else cxwant @ cxfail @ 20 lit bcopy  secs 258 lit + cxfat ! then
+	drop free
+else 2drop  cxwant @ cxfail @ 20 lit bcopy  secs 258 lit + cxfat ! then ;
+: cxrun
+cxinit
+myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
+	myh @ dup cxh !  cxht !  secs cxat !
+	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
+	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
+	0 lit cxasks !
+	cxh @ 1 lit +
+	cxb @  cxb @ cxin @ 5 lit u< and if 11F lit else 8F lit then  2dup u< if 2drop 0 lit else - then
+	do
+		i hat ?dup if
+			dup hhdr 6C lit + cxnz  over hid cxheld 0= and  cxasks @ 10 lit u< and if cxask drop cxasks @ 1 lit + cxasks ! else drop then
+		then
+	loop
+	\ the decisions in force; the running window's for the files it wants
+	cxwant @ 20 lit 0 lit cxfill
+	cxb @ cxcur @ cxdec
+	cxb @  cxin @ 5 lit u< and if cxb @ 90 lit - cxprv @ cxdec else 0 lit cxprv @ 28 lit + ! then
+	cxh @ cxscr @ cxdec
+	cxwant @ cxnz  cxwant @ cxfail @ 20 lit d8= secs cxfat @ - 0< and 0= and if cxfetch then
+then ;
