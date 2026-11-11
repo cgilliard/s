@@ -1,0 +1,257 @@
+\ crypto/kyber.fam — Kyber (ML-KEM-768, FIPS 203) as tabminer's
+\ miner/src/mlkem.rs: the key encapsulation of the message layer
+\ (docs/ONION.md), by which a sender and the holder of an encapsulation key
+\ agree a 32-byte secret.  Plain fam: q = 3329, so a product of two
+\ coefficients fits a word and `*` and `%` do.  A module
+\ (`\ uses: crypto/keccak.fam crypto/kyber.fam`).
+\
+\ Sizes: encapsulation key 1,184 bytes, decapsulation key 2,400,
+\ ciphertext 1,088, shared secret 32.
+\
+\ kykey ( d z ek dk -- )  the key pair of the two 32-byte seeds.
+\ kyenc ( ek m ss ct -- ok )  encapsulated to ek with the 32 bytes of
+\ randomness at m: the secret at ss, the ciphertext at ct; not ok (and
+\ nothing written) for a malformed key.
+\ kydec ( dk ct ss -- )  the secret of a ciphertext; one not made for the
+\ key yields an unrelated secret (implicit rejection), never an error.
+\ kyekok ( ek -- flag )  whether ek is well formed (every coefficient
+\ below q).
+
+: kyrdy variable ;  : kyz variable ;  : kygm variable ;
+: kyp variable ;  : kyk variable ;  : kyl variable ;  : kys variable ;  : kyzt variable ;
+: kyf variable ;  : kyg variable ;  : kyh variable ;  : kya0 variable ;  : kya1 variable ;  : kyb0 variable ;
+: kyb1 variable ;  : kyd variable ;  : kyn variable ;  : kyq variable ;  : kysr variable ;  : kyo variable ;
+: kyw variable ;  : kyac variable ;  : kybt variable ;  : kyv variable ;  : kyw2 variable ;  : kyp2 variable ;
+: kyw3 variable ;  : kyi variable ;  : kyj variable ;
+\ the buffers: three-polynomial vectors (kvs, kve, kvt, kvk), polynomials
+\ (kyqa, kyqt, kyqc, kyqv), bytes
+: kvs variable ;  : kve variable ;  : kvt variable ;  : kvk variable ;
+: kyqa variable ;  : kyqt variable ;  : kyqc variable ;  : kyqv variable ;
+: kyb variable ;  : kyxb variable ;  : kyin variable ;  : kypr variable ;  : kyg2 variable ;  : kyre variable ;
+: kyct variable ;  : kym2 variable ;  : kyek variable ;  : kydk variable ;  : kyzz variable ;  : kydd variable ;
+: kymm variable ;  : kyss variable ;  : kyc2 variable ;  : kyrr variable ;  : kyco variable ;
+
+:M KQ D01 lit ;
+: kyc  2 lit lshift + ;                                    \ ( p i -- a )  coefficient i
+: kyvp  A lit lshift + ;                                   \ ( v i -- p )  polynomial i of a vector
+: kym  * KQ % ;                                            \ ( a b -- a*b mod q )
+: kyadd  + dup KQ u< 0= if KQ - then ;                     \ ( a b -- a+b mod q )
+: kysub  - dup 0< if KQ + then ;                           \ ( a b -- a-b mod q )
+: kycp  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;   \ ( src dst n -- )
+: kyzero  ?dup if 0 lit do 0 lit over i + c! loop then drop ;       \ ( a n -- )
+
+\ kybr7 ( i -- r )  the 7 bits of i reversed; kypow ( e -- 17^e mod q ).
+: kybr7  kyv !  0 lit  7 lit 0 lit do 1 lit lshift kyv @ i rshift 1 lit and or loop ;
+: kypow  1 lit swap ?dup if 0 lit do 11 lit kym loop then ;
+
+\ kyinit  the tables (ζ^BitRev7(i) and ζ^(2·BitRev7(i)+1)) and buffers,
+\ once.
+: kyinit
+kyrdy @ 0= if
+	200 lit alloc kyz !  200 lit alloc kygm !
+	80 lit 0 lit do i kybr7 dup kypow kyz @ i kyc !  1 lit lshift 1 lit + kypow kygm @ i kyc ! loop
+	C00 lit alloc kvs !  C00 lit alloc kve !  C00 lit alloc kvt !  C00 lit alloc kvk !
+	400 lit alloc kyqa !  400 lit alloc kyqt !  400 lit alloc kyqc !  400 lit alloc kyqv !
+	10 lit alloc kyb !  200 lit alloc kyxb !  480 lit alloc kyin !  80 lit alloc kypr !  40 lit alloc kyg2 !
+	180 lit alloc kyre !  440 lit alloc kyc2 !  20 lit alloc kym2 !
+	-1 lit kyrdy !
+then ;
+
+\ kyntt ( p -- )  the NTT in place; kyintt ( p -- ) its inverse (the
+\ factor 1/128, 3303, included).
+: kyntt
+kyp !  1 lit kyk !  80 lit kyl !
+begin kyl @ 2 lit u< 0= while
+	0 lit kys !
+	begin kys @ 100 lit u< while
+		kyz @ kyk @ kyc @ kyzt !  kyk @ 1 lit + kyk !
+		kys @ kyl @ + kys @ do
+			kyzt @ kyp @ i kyl @ + kyc @ kym
+			kyp @ i kyc @ over kysub kyp @ i kyl @ + kyc !
+			kyp @ i kyc @ kyadd kyp @ i kyc !
+		loop
+		kys @ kyl @ 1 lit lshift + kys !
+	repeat
+	kyl @ 1 lit rshift kyl !
+repeat ;
+: kyintt
+kyp !  7F lit kyk !  2 lit kyl !
+begin kyl @ 81 lit u< while
+	0 lit kys !
+	begin kys @ 100 lit u< while
+		kyz @ kyk @ kyc @ kyzt !  kyk @ 1 lit - kyk !
+		kys @ kyl @ + kys @ do
+			kyp @ i kyc @
+			dup kyp @ i kyl @ + kyc @ kyadd kyp @ i kyc !
+			kyp @ i kyl @ + kyc @ swap kysub kyzt @ kym kyp @ i kyl @ + kyc !
+		loop
+		kys @ kyl @ 1 lit lshift + kys !
+	repeat
+	kyl @ 1 lit lshift kyl !
+repeat
+100 lit 0 lit do kyp @ i kyc dup @ CE7 lit kym swap ! loop ;
+
+\ kymul ( f g h -- )  h = f times g in the NTT domain (h may be f or g);
+\ kypadd ( a b h -- ) h = a + b; kypsub ( a b h -- ) h = a - b.
+: kymul
+kyh !  kyg !  kyf !
+80 lit 0 lit do
+	kyf @ i 1 lit lshift kyc dup @ kya0 !  4 lit + @ kya1 !
+	kyg @ i 1 lit lshift kyc dup @ kyb0 !  4 lit + @ kyb1 !
+	kya0 @ kyb0 @ kym  kya1 @ kyb1 @ kym kygm @ i kyc @ kym  kyadd  kyh @ i 1 lit lshift kyc !
+	kya0 @ kyb1 @ kym  kya1 @ kyb0 @ kym  kyadd  kyh @ i 1 lit lshift 1 lit + kyc !
+loop ;
+: kypadd  kyh !  kyg !  kyf !  100 lit 0 lit do kyf @ i kyc @ kyg @ i kyc @ kyadd kyh @ i kyc ! loop ;
+: kypsub  kyh !  kyg !  kyf !  100 lit 0 lit do kyf @ i kyc @ kyg @ i kyc @ kysub kyh @ i kyc ! loop ;
+\ kymacc ( a b acc -- )  acc = acc + a times b.
+: kyacv variable ;
+: kymacc  kyacv !  kyqt @ kymul  kyacv @ kyqt @ kyacv @ kypadd ;
+
+\ kysmp ( rho j i dst -- )  a uniform polynomial in the NTT domain:
+\ SHAKE128 of rho and the bytes j, i, three bytes making two candidates
+\ below q.
+: kyput  dup KQ u< kyn @ 100 lit u< and if kyd @ kyn @ kyc !  kyn @ 1 lit + kyn ! else drop then ;   \ ( d -- )
+: kysmp
+kyd !  kyb @ 1 lit + c!  kyb @ c!
+A8 lit 1F lit kcinit  20 lit kcabs  kyb @ 2 lit kcabs
+0 lit kyn !
+begin kyn @ 100 lit u< while
+	kyxb @ 1F8 lit kcsqz
+	A8 lit 0 lit do
+		kyxb @ i 3 lit * + kyq !
+		kyq @ c@  kyq @ 1 lit + c@ F lit and 8 lit lshift or  kyput
+		kyq @ 1 lit + c@ 4 lit rshift  kyq @ 2 lit + c@ 4 lit lshift or  kyput
+	loop
+repeat ;
+
+\ kyprf ( s b -- )  128 bytes of SHAKE256(s || b) at kypr (s 32 bytes).
+: kyprf  kyin @ 20 lit + c!  kyin @ 20 lit kycp  kyin @ 21 lit kypr @ 80 lit shake256 ;
+\ kycbd ( dst -- )  the centered binomial polynomial (eta 2) of the 128
+\ bytes at kypr.
+: kycbd
+kyd !
+100 lit 0 lit do
+	kypr @ i 1 lit rshift + c@  i 1 lit and if 4 lit rshift then
+	dup 1 lit and over 1 lit rshift 1 lit and +
+	swap dup 2 lit rshift 1 lit and swap 3 lit rshift 1 lit and +
+	kysub kyd @ i kyc !
+loop ;
+\ kynoise ( s b dst -- )  kyprf then kycbd.
+: kynoise  -rot kyprf kycbd ;
+
+\ kybe ( p d dst -- dst' )  the 256 coefficients of d bits each, least
+\ significant first; kybd ( src d p -- src' ) the reverse, 12-bit ones
+\ reduced mod q.
+: kybe
+kyo !  kyw !  kyp !  0 lit kyac !  0 lit kybt !
+100 lit 0 lit do
+	kyp @ i kyc @ kybt @ lshift kyac @ or kyac !  kybt @ kyw @ + kybt !
+	begin kybt @ 7 lit u> while
+		kyac @ kyo @ c!  kyo @ 1 lit + kyo !  kyac @ 8 lit rshift kyac !  kybt @ 8 lit - kybt !
+	repeat
+loop
+kyo @ ;
+: kybd
+kyp !  kyw !  kysr !  0 lit kyac !  0 lit kybt !  0 lit kyn !
+begin kyn @ 100 lit u< while
+	kysr @ c@ kybt @ lshift kyac @ or kyac !  kybt @ 8 lit + kybt !  kysr @ 1 lit + kysr !
+	begin kybt @ kyw @ u< 0=  kyn @ 100 lit u< and while
+		kyac @ 1 lit kyw @ lshift 1 lit - and  kyw @ C lit = if KQ % then  kyp @ kyn @ kyc !
+		kyac @ kyw @ rshift kyac !  kybt @ kyw @ - kybt !  kyn @ 1 lit + kyn !
+	repeat
+repeat
+kysr @ ;
+
+\ kycmp ( p d -- )  each coefficient compressed to d bits; kydcp ( p d
+\ -- ) decompressed.
+: kycmp  kyw2 !  kyp2 !  100 lit 0 lit do kyp2 @ i kyc dup @ kyw2 @ lshift 680 lit + KQ / 1 lit kyw2 @ lshift 1 lit - and swap ! loop ;
+: kydcp  kyw2 !  kyp2 !  100 lit 0 lit do kyp2 @ i kyc dup @ KQ * 1 lit kyw2 @ 1 lit - lshift + kyw2 @ rshift swap ! loop ;
+
+\ K-PKE (FIPS 203, section 5).
+\ kpkey ( d -- )  from the seed d: t at kvt (three polynomials, the NTT
+\ domain), rho at kyg2, the secret s at kvs.
+: kpkey
+kyin @ 20 lit kycp  3 lit kyin @ 20 lit + c!  kyin @ 21 lit kyg2 @ sha3512
+3 lit 0 lit do kyg2 @ 20 lit + i kvs @ i kyvp kynoise  kvs @ i kyvp kyntt loop
+3 lit 0 lit do kyg2 @ 20 lit + i 3 lit + kve @ i kyvp kynoise  kve @ i kyvp kyntt loop
+3 lit 0 lit do
+	i kyi !  kve @ kyi @ kyvp kvt @ kyi @ kyvp 400 lit kycp
+	3 lit 0 lit do
+		i kyj !  kyg2 @ kyj @ kyi @ kyqa @ kysmp  kyqa @ kvs @ kyj @ kyvp kvt @ kyi @ kyvp kymacc
+	loop
+loop ;
+\ kpenc ( ek m r ct -- )  m (32 bytes) encrypted to ek with the
+\ randomness r: the ciphertext at ct.
+: kpenc
+kyct !  kyrr !  kymm !  kyek !
+3 lit 0 lit do kyek @ i 180 lit * + C lit kvt @ i kyvp kybd drop loop
+3 lit 0 lit do kyrr @ i kvs @ i kyvp kynoise  kvs @ i kyvp kyntt loop
+3 lit 0 lit do kyrr @ i 3 lit + kve @ i kyvp kynoise loop
+kyrr @ 6 lit kyqv @ kynoise
+3 lit 0 lit do
+	i kyi !  kyqc @ 400 lit kyzero
+	3 lit 0 lit do
+		i kyj !  kyek @ 480 lit + kyi @ kyj @ kyqa @ kysmp  kyqa @ kvs @ kyj @ kyvp kyqc @ kymacc
+	loop
+	kyqc @ kyintt  kyqc @ kve @ kyi @ kyvp kyqc @ kypadd
+	kyqc @ A lit kycmp  kyqc @ A lit kyct @ kyi @ 140 lit * + kybe drop
+loop
+kyqc @ 400 lit kyzero
+3 lit 0 lit do kvt @ i kyvp kvs @ i kyvp kyqc @ kymacc loop
+kyqc @ kyintt  kyqc @ kyqv @ kyqc @ kypadd
+kymm @ 1 lit kyqa @ kybd drop  kyqa @ 1 lit kydcp  kyqc @ kyqa @ kyqc @ kypadd
+kyqc @ 4 lit kycmp  kyqc @ 4 lit kyct @ 3C0 lit + kybe drop ;
+\ kpdec ( ct m -- )  decrypted with the secret at kvk: m, 32 bytes.
+: kpdec
+kymm !  kyct !
+kyct @ 3C0 lit + 4 lit kyqv @ kybd drop  kyqv @ 4 lit kydcp
+kyqc @ 400 lit kyzero
+3 lit 0 lit do
+	i kyi !
+	kyct @ kyi @ 140 lit * + A lit kyqa @ kybd drop  kyqa @ A lit kydcp  kyqa @ kyntt
+	kvk @ kyi @ kyvp kyqa @ kyqc @ kymacc
+loop
+kyqc @ kyintt  kyqv @ kyqc @ kyqv @ kypsub
+kyqv @ 1 lit kycmp  kyqv @ 1 lit kymm @ kybe drop ;
+
+\ ML-KEM (FIPS 203, section 6).
+: kykey
+kyinit
+kydk !  kyek !  kyzz !  kydd !
+kydd @ kpkey
+3 lit 0 lit do kvt @ i kyvp C lit kyek @ i 180 lit * + kybe drop loop
+kyg2 @ kyek @ 480 lit + 20 lit kycp
+3 lit 0 lit do kvs @ i kyvp C lit kydk @ i 180 lit * + kybe drop loop
+kyek @ kydk @ 480 lit + 4A0 lit kycp
+kyek @ 4A0 lit kydk @ 920 lit + sha3256
+kyzz @ kydk @ 940 lit + 20 lit kycp ;
+: kyekok
+kyinit
+kyek !  -1 lit
+3 lit 0 lit do
+	i kyj !
+	kyek @ i 180 lit * + C lit kyqa @ kybd drop  kyqa @ C lit kyre @ kybe drop
+	180 lit 0 lit do kyre @ i + c@  kyek @ kyj @ 180 lit * + i + c@ = and loop
+loop ;
+: kyenc
+kyinit
+kyct !  kyss !  kymm !  kyek !
+kyek @ kyekok 0= if 0 lit else
+	kymm @ kyin @ 20 lit kycp  kyek @ 4A0 lit kyin @ 20 lit + sha3256  kyin @ 40 lit kyg2 @ sha3512
+	kyg2 @ kyss @ 20 lit kycp  kyg2 @ 20 lit + kyrr !
+	kyek @ kymm @ kyrr @ kyct @ kpenc  -1 lit
+then ;
+: kydec
+kyinit
+kyss !  kyct !  kydk !
+3 lit 0 lit do kydk @ i 180 lit * + C lit kvk @ i kyvp kybd drop loop
+kyct @ kym2 @ kpdec
+\ (K, r) = G(m' || h); c' = the encryption of m' again (at kyc2); then
+\ K' = J(z || c) at kypr (after: the encryption's noise uses kypr)
+kym2 @ kyin @ 20 lit kycp  kydk @ 920 lit + kyin @ 20 lit + 20 lit kycp  kyin @ 40 lit kyg2 @ sha3512
+kyct @ kyco !  kydk @ 480 lit + kym2 @ kyg2 @ 20 lit + kyc2 @ kpenc
+kydk @ 940 lit + kyin @ 20 lit kycp  kyco @ kyin @ 20 lit + 440 lit kycp  kyin @ 460 lit kypr @ 20 lit shake256
+\ the mask: all ones if c' differs from c (no branch on the comparison)
+0 lit  440 lit 0 lit do kyc2 @ i + c@ kyco @ i + c@ xor or loop
+0= 0= FF lit and kyv !
+20 lit 0 lit do kyg2 @ i + c@ kyv @ FF lit xor and  kypr @ i + c@ kyv @ and or  kyss @ i + c! loop ;

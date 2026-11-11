@@ -769,6 +769,12 @@ expect chacha 124 '^chacha: 29 as expected, 0 not' 60 ./tools/q32 "$T/tcc.img"
 ./tools/fam --user -o "$T/tdl.bin" src/user/crypto/keccak.fam src/user/crypto/dilithium.fam src/user/crypto/dilithium_vectors.fam src/user/crypto/dilithium_test.fam > "$T/tdl.build" 2>&1 || fail dilithium "build: $(head -c 300 "$T/tdl.build")"
 sh scripts/mkimage.sh "$T/tdl.img" bin/kernel init="$T/tdl.bin":1024 2> "$T/tdl.mk" || fail dilithium "mkimage: $(cat "$T/tdl.mk")"
 expect dilithium 124 '^dilithium: 108 as expected, 0 not' 60 ./tools/q32 "$T/tdl.img"
+# Kyber (ML-KEM-768, the message layer's key encapsulation): keys,
+# encapsulations, decapsulations (tampered ciphertexts among them) and the
+# key check as tabminer's mlkem.rs.
+./tools/fam --user -o "$T/tky.bin" src/user/crypto/keccak.fam src/user/crypto/kyber.fam src/user/crypto/kyber_vectors.fam src/user/crypto/kyber_test.fam > "$T/tky.build" 2>&1 || fail kyber "build: $(head -c 300 "$T/tky.build")"
+sh scripts/mkimage.sh "$T/tky.img" bin/kernel init="$T/tky.bin":1024 2> "$T/tky.mk" || fail kyber "mkimage: $(cat "$T/tky.mk")"
+expect kyber 124 '^kyber: 50 as expected, 0 not' 60 ./tools/q32 "$T/tky.img"
 
 # The wallet (docs/GUI_WALLET.md, phase 1), driven as wm drives it
 # (src/user/tests/walletrun.fam: requests on a pipe, each answer printed):

@@ -1,0 +1,50 @@
+\ crypto/kyber_test.fam — crypto/kyber.fam against tabminer
+\ (crypto/kyber_vectors.fam, written by miner/src/fam_kyber_vectors.rs):
+\ for each case the key pair of its seeds (the keys' hashes tabminer's),
+\ the encapsulation (the ciphertext's hash and the secret tabminer's), the
+\ decapsulation of the ciphertext as made and tampered with (implicit
+\ rejection: tabminer's secret), and the key check on the key as made and
+\ with a coefficient out of range (encapsulation refused when it is
+\ malformed).  Prints each case's times (ms: key generation,
+\ encapsulation, decapsulation), then "kyber: N as expected, M not".
+\ uses: crypto/keccak.fam crypto/kyber.fam crypto/kyber_vectors.fam
+
+: ktpas variable ;  : ktfai variable ;  : ktek variable ;  : ktdk variable ;  : ktct variable ;  : ktss variable ;
+: kth variable ;  : ktt variable ;  : ktb0 variable ;  : ktb1 variable ;
+: ktchk  swap if drop ktpas @ 1 lit + ktpas ! else "kyber: " puts puts 0A lit putc ktfai @ 1 lit + ktfai ! then ;   \ ( flag str -- )
+: ktsame  FFFFFFFF lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+\ ktclk ( -- t )  the time register's low word (10 MHz on QEMU's virt board).
+: ktclk
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+: ktms  ktclk ktt @ - 2710 lit / ;                    \ ( -- ms )  since ktt
+\ kthsh ( src len want -- flag )  SHAKE256-256 of src against want.
+: ktw variable ;
+: kthsh  ktw !  kth @ 20 lit shake256  kth @ ktw @ 20 lit ktsame ;
+
+kxbufs
+4A0 lit alloc ktek !  960 lit alloc ktdk !  440 lit alloc ktct !  20 lit alloc ktss !  20 lit alloc kth !
+kxn 0 lit do
+	i kxset
+	ktclk ktt !  kxd @ kxz @ ktek @ ktdk @ kykey  ktms
+	ktek @ 4A0 lit kxhe @ kthsh "the encapsulation key" ktchk
+	ktdk @ 960 lit kxhd @ kthsh "the decapsulation key" ktchk
+	ktclk ktt !  ktek @ kxm @ ktss @ ktct @ kyenc  ktms swap
+	"the encapsulation refused" ktchk
+	ktct @ 440 lit kxhc @ kthsh "the ciphertext" ktchk
+	ktss @ kxss @ 20 lit ktsame "the secret encapsulated" ktchk
+	0 lit ktss @ !  ktclk ktt !  ktdk @ ktct @ ktss @ kydec  ktms
+	ktss @ kxss @ 20 lit ktsame "the secret decapsulated" ktchk
+	ktct @ kxta @ + dup c@ kxtx @ xor swap c!
+	ktdk @ ktct @ ktss @ kydec  ktss @ kxts @ 20 lit ktsame "the tampered ciphertext's secret" ktchk
+	ktek @ kyekok "the key as made" ktchk
+	ktek @ c@ ktb0 !  ktek @ 1 lit + c@ ktb1 !
+	FF lit ktek @ c!  ktb1 @ F lit or ktek @ 1 lit + c!
+	ktek @ kyekok kxbad @ = "the key made malformed" ktchk
+	ktek @ kxm @ ktss @ ktct @ kyenc 0= 0= kxbad @ = "the malformed key's encapsulation" ktchk
+	ktb0 @ ktek @ c!  ktb1 @ ktek @ 1 lit + c!
+	"kyber: case " puts i . " (ms: " puts rot . " " puts swap . " " puts . ")" puts 0A lit putc
+loop
+"kyber: " puts ktpas @ . " as expected, " puts ktfai @ . " not" puts 0A lit putc

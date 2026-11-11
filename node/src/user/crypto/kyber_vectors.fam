@@ -1,0 +1,166 @@
+\ crypto/kyber_vectors.fam — tabminer's values for crypto/kyber.fam
+\ (docs/GUI_WALLET.md, phase 3).  Written by miner/src/fam_kyber_vectors.rs
+\ (`cargo test --release --features dev --lib write_fam_kyber_vectors --
+\ --ignored`); not to be edited.  Read by crypto/kyber_test.fam.
+\
+\ kxn ( -- n )  the cases; kxset ( i -- )  case i: the seeds at kxd and
+\ kxz, the encapsulation's randomness at kxm, SHAKE256-256 of the
+\ encapsulation key, decapsulation key and ciphertext at kxhe kxhd kxhc,
+\ the shared secret at kxss; the ciphertext's byte kxta xored with kxtx
+\ decapsulates to the secret at kxts; the encapsulation key with its
+\ first coefficient made 4095 is well formed or not as kxbad says (-1,
+\ 0).
+
+: kxp variable ;  : kxd variable ;  : kxz variable ;  : kxm variable ;  : kxhe variable ;
+: kxhd variable ;  : kxhc variable ;  : kxss variable ;  : kxts variable ;  : kxta variable ;
+: kxtx variable ;  : kxbad variable ;
+: kxc  kxp @ c!  kxp @ 1 lit + kxp ! ;
+: kxbufs
+kxd @ 0= if
+	20 lit alloc kxd !  20 lit alloc kxz !  20 lit alloc kxm !  20 lit alloc kxhe !  20 lit alloc kxhd !
+	20 lit alloc kxhc !  20 lit alloc kxss !  20 lit alloc kxts !
+then ;
+
+: kxq0
+kxd @ kxp !
+E5 lit kxc 82 lit kxc B7 lit kxc D7 lit kxc 5E lit kxc 6C lit kxc 80 lit kxc B0 lit kxc 5A lit kxc E3 lit kxc 92 lit kxc A1 lit kxc FC lit kxc 9F lit kxc 71 lit kxc 53 lit kxc B1 lit kxc 23 lit kxc 90 lit kxc FD lit kxc 99 lit kxc 93 lit kxc 3 lit kxc 68 lit kxc
+CC lit kxc 67 lit kxc A7 lit kxc 68 lit kxc BA lit kxc EB lit kxc C8 lit kxc A0 lit kxc
+kxz @ kxp !
+1C lit kxc DA lit kxc CB lit kxc 87 lit kxc 40 lit kxc C0 lit kxc B8 lit kxc 7C lit kxc 4A lit kxc 37 lit kxc 95 lit kxc 75 lit kxc F1 lit kxc 87 lit kxc B3 lit kxc 67 lit kxc CB lit kxc FA lit kxc 3B lit kxc 30 lit kxc B lit kxc F5 lit kxc 91 lit kxc B1 lit kxc
+9 lit kxc F7 lit kxc 98 lit kxc 16 lit kxc E9 lit kxc CB lit kxc E8 lit kxc F0 lit kxc
+kxm @ kxp !
+42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc
+42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc
+kxhe @ kxp !
+2F lit kxc EF lit kxc A lit kxc A1 lit kxc 5B lit kxc C8 lit kxc 93 lit kxc 2B lit kxc AF lit kxc D2 lit kxc BC lit kxc 4D lit kxc 43 lit kxc 64 lit kxc 42 lit kxc 78 lit kxc 9D lit kxc 95 lit kxc F lit kxc 3 lit kxc ED lit kxc 46 lit kxc D9 lit kxc D6 lit kxc
+43 lit kxc 64 lit kxc 26 lit kxc 61 lit kxc F4 lit kxc 31 lit kxc A9 lit kxc 7E lit kxc
+kxhd @ kxp !
+BA lit kxc 9E lit kxc 7B lit kxc 76 lit kxc EA lit kxc 1E lit kxc F lit kxc FC lit kxc 4E lit kxc C8 lit kxc 2B lit kxc F3 lit kxc 50 lit kxc B7 lit kxc 96 lit kxc 1D lit kxc 4 lit kxc A3 lit kxc 1C lit kxc 97 lit kxc B6 lit kxc BD lit kxc B4 lit kxc 62 lit kxc
+33 lit kxc 5 lit kxc BA lit kxc 55 lit kxc 3C lit kxc 55 lit kxc 1F lit kxc CF lit kxc
+kxhc @ kxp !
+85 lit kxc 22 lit kxc 64 lit kxc B1 lit kxc 38 lit kxc 9 lit kxc 48 lit kxc F7 lit kxc C6 lit kxc 15 lit kxc A7 lit kxc ED lit kxc 57 lit kxc 9F lit kxc C7 lit kxc 90 lit kxc CD lit kxc 3A lit kxc DD lit kxc 6D lit kxc D lit kxc F lit kxc 21 lit kxc 2E lit kxc
+E5 lit kxc 3E lit kxc 33 lit kxc EA lit kxc 2 lit kxc 2 lit kxc BA lit kxc 5D lit kxc
+kxss @ kxp !
+A3 lit kxc 5C lit kxc E1 lit kxc E0 lit kxc 11 lit kxc 8F lit kxc EF lit kxc D3 lit kxc E6 lit kxc 2F lit kxc 7 lit kxc 19 lit kxc 8D lit kxc B9 lit kxc CE lit kxc 1F lit kxc 79 lit kxc BE lit kxc D8 lit kxc 7B lit kxc 4B lit kxc 32 lit kxc C8 lit kxc 61 lit kxc
+F0 lit kxc 9A lit kxc A3 lit kxc 5B lit kxc A9 lit kxc 65 lit kxc C1 lit kxc FB lit kxc
+kxts @ kxp !
+D lit kxc 61 lit kxc C1 lit kxc 42 lit kxc B4 lit kxc 2 lit kxc 48 lit kxc 60 lit kxc 36 lit kxc B7 lit kxc 85 lit kxc F4 lit kxc 6B lit kxc 62 lit kxc B4 lit kxc 38 lit kxc CB lit kxc CD lit kxc F7 lit kxc 93 lit kxc CC lit kxc 8B lit kxc A1 lit kxc 2 lit kxc
+6 lit kxc 70 lit kxc 14 lit kxc 77 lit kxc A8 lit kxc AE lit kxc 47 lit kxc 2A lit kxc
+0 lit kxta !  1 lit kxtx !  0 lit kxbad !
+;
+: kxq1
+kxd @ kxp !
+3E lit kxc 58 lit kxc 48 lit kxc DB lit kxc 62 lit kxc 46 lit kxc 13 lit kxc F7 lit kxc AC lit kxc 14 lit kxc 44 lit kxc 57 lit kxc CC lit kxc 13 lit kxc 75 lit kxc F0 lit kxc 6 lit kxc FA lit kxc 8C lit kxc B9 lit kxc 53 lit kxc E7 lit kxc 67 lit kxc DC lit kxc
+9E lit kxc 74 lit kxc 28 lit kxc D0 lit kxc F lit kxc 5D lit kxc AD lit kxc 8B lit kxc
+kxz @ kxp !
+1 lit kxc 2D lit kxc D6 lit kxc C2 lit kxc F0 lit kxc 91 lit kxc 8B lit kxc 9E lit kxc B6 lit kxc 18 lit kxc 24 lit kxc 74 lit kxc EB lit kxc 86 lit kxc D8 lit kxc 48 lit kxc F6 lit kxc 59 lit kxc 74 lit kxc 75 lit kxc 9D lit kxc 59 lit kxc CE lit kxc 15 lit kxc
+1A lit kxc 39 lit kxc 6D lit kxc EE lit kxc E4 lit kxc CA lit kxc 10 lit kxc D1 lit kxc
+kxm @ kxp !
+42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc
+42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc 42 lit kxc
+kxhe @ kxp !
+78 lit kxc 2D lit kxc CF lit kxc 8D lit kxc 12 lit kxc AD lit kxc FB lit kxc 66 lit kxc 85 lit kxc 79 lit kxc 59 lit kxc F4 lit kxc 15 lit kxc 34 lit kxc C lit kxc CC lit kxc 6E lit kxc FC lit kxc 9C lit kxc FE lit kxc 1 lit kxc 94 lit kxc 24 lit kxc 30 lit kxc
+68 lit kxc C4 lit kxc DB lit kxc B5 lit kxc A0 lit kxc D5 lit kxc 65 lit kxc CE lit kxc
+kxhd @ kxp !
+C lit kxc D2 lit kxc 25 lit kxc 25 lit kxc FA lit kxc 99 lit kxc AC lit kxc 57 lit kxc 8F lit kxc A6 lit kxc 39 lit kxc 71 lit kxc EC lit kxc 56 lit kxc 25 lit kxc 7D lit kxc 9A lit kxc E3 lit kxc 84 lit kxc 63 lit kxc 1E lit kxc 1E lit kxc 6D lit kxc DD lit kxc
+D8 lit kxc 34 lit kxc 6 lit kxc 6A lit kxc 5A lit kxc FF lit kxc 55 lit kxc 79 lit kxc
+kxhc @ kxp !
+CA lit kxc FC lit kxc EB lit kxc 58 lit kxc A8 lit kxc 6C lit kxc 81 lit kxc 77 lit kxc 12 lit kxc 9A lit kxc 68 lit kxc C1 lit kxc 20 lit kxc 4D lit kxc 87 lit kxc AE lit kxc 73 lit kxc 9D lit kxc D3 lit kxc 4E lit kxc CA lit kxc CC lit kxc A7 lit kxc 4B lit kxc
+59 lit kxc F9 lit kxc 40 lit kxc 1F lit kxc F5 lit kxc 54 lit kxc 40 lit kxc 78 lit kxc
+kxss @ kxp !
+46 lit kxc 10 lit kxc 8F lit kxc 70 lit kxc 43 lit kxc C lit kxc BE lit kxc 84 lit kxc 42 lit kxc 38 lit kxc B0 lit kxc 5 lit kxc B3 lit kxc 2A lit kxc EE lit kxc D8 lit kxc 5E lit kxc 87 lit kxc C6 lit kxc 6E lit kxc B2 lit kxc CA lit kxc 45 lit kxc BE lit kxc
+CB lit kxc B1 lit kxc 35 lit kxc D7 lit kxc CE lit kxc DA lit kxc 36 lit kxc 18 lit kxc
+kxts @ kxp !
+4F lit kxc 85 lit kxc 8E lit kxc 80 lit kxc 8F lit kxc 54 lit kxc A1 lit kxc 6 lit kxc 47 lit kxc 1E lit kxc B1 lit kxc 16 lit kxc 19 lit kxc B8 lit kxc 4 lit kxc B9 lit kxc 69 lit kxc D2 lit kxc 9C lit kxc 64 lit kxc 32 lit kxc D0 lit kxc 7E lit kxc C2 lit kxc
+AC lit kxc C3 lit kxc 4C lit kxc 77 lit kxc D2 lit kxc D5 lit kxc BC lit kxc FB lit kxc
+0 lit kxta !  1 lit kxtx !  0 lit kxbad !
+;
+: kxq2
+kxd @ kxp !
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+kxz @ kxp !
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+kxm @ kxp !
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc 0 lit kxc
+kxhe @ kxp !
+76 lit kxc 1F lit kxc C1 lit kxc C7 lit kxc AF lit kxc 52 lit kxc 80 lit kxc 8C lit kxc 96 lit kxc D5 lit kxc FF lit kxc A lit kxc F7 lit kxc B2 lit kxc 71 lit kxc A0 lit kxc 1C lit kxc 92 lit kxc 25 lit kxc AB lit kxc CD lit kxc 12 lit kxc 2E lit kxc 3E lit kxc
+DD lit kxc 97 lit kxc 9B lit kxc BF lit kxc 25 lit kxc E3 lit kxc B3 lit kxc 6 lit kxc
+kxhd @ kxp !
+1A lit kxc 7D lit kxc A6 lit kxc 8F lit kxc C0 lit kxc 78 lit kxc 25 lit kxc 9B lit kxc C2 lit kxc AF lit kxc B0 lit kxc BC lit kxc 80 lit kxc 4E lit kxc 3A lit kxc 73 lit kxc 1D lit kxc 8E lit kxc DA lit kxc 4A lit kxc 42 lit kxc 13 lit kxc 2F lit kxc 37 lit kxc
+37 lit kxc 5 lit kxc D8 lit kxc EF lit kxc EC lit kxc 2B lit kxc 5C lit kxc F9 lit kxc
+kxhc @ kxp !
+98 lit kxc 58 lit kxc 9A lit kxc A4 lit kxc 78 lit kxc 23 lit kxc A7 lit kxc 88 lit kxc 60 lit kxc AF lit kxc 3A lit kxc 7 lit kxc 74 lit kxc 38 lit kxc 23 lit kxc FC lit kxc 30 lit kxc 62 lit kxc 54 lit kxc 40 lit kxc 2 lit kxc 48 lit kxc 66 lit kxc 72 lit kxc
+8E lit kxc D0 lit kxc 5B lit kxc B8 lit kxc EB lit kxc B9 lit kxc F1 lit kxc C1 lit kxc
+kxss @ kxp !
+B4 lit kxc D2 lit kxc 9C lit kxc D5 lit kxc 5B lit kxc AB lit kxc 43 lit kxc E1 lit kxc 65 lit kxc 54 lit kxc B7 lit kxc 4B lit kxc 90 lit kxc 98 lit kxc CD lit kxc FC lit kxc E5 lit kxc 83 lit kxc 99 lit kxc 6C lit kxc 96 lit kxc 8B lit kxc CD lit kxc 2C lit kxc
+FD lit kxc 1A lit kxc D9 lit kxc 45 lit kxc 5E lit kxc 35 lit kxc 1F lit kxc BF lit kxc
+kxts @ kxp !
+6C lit kxc 3E lit kxc 6A lit kxc 5F lit kxc 59 lit kxc D8 lit kxc C0 lit kxc A0 lit kxc AB lit kxc 46 lit kxc 94 lit kxc E3 lit kxc EA lit kxc DD lit kxc A lit kxc 8 lit kxc 81 lit kxc 10 lit kxc 42 lit kxc A7 lit kxc 7F lit kxc 38 lit kxc A0 lit kxc 94 lit kxc
+55 lit kxc E3 lit kxc 97 lit kxc B6 lit kxc 34 lit kxc 45 lit kxc 38 lit kxc DF lit kxc
+43F lit kxta !  80 lit kxtx !  0 lit kxbad !
+;
+: kxq3
+kxd @ kxp !
+0 lit kxc 1 lit kxc 2 lit kxc 3 lit kxc 4 lit kxc 5 lit kxc 6 lit kxc 7 lit kxc 8 lit kxc 9 lit kxc A lit kxc B lit kxc C lit kxc D lit kxc E lit kxc F lit kxc 10 lit kxc 11 lit kxc 12 lit kxc 13 lit kxc 14 lit kxc 15 lit kxc 16 lit kxc 17 lit kxc
+18 lit kxc 19 lit kxc 1A lit kxc 1B lit kxc 1C lit kxc 1D lit kxc 1E lit kxc 1F lit kxc
+kxz @ kxp !
+FF lit kxc FE lit kxc FD lit kxc FC lit kxc FB lit kxc FA lit kxc F9 lit kxc F8 lit kxc F7 lit kxc F6 lit kxc F5 lit kxc F4 lit kxc F3 lit kxc F2 lit kxc F1 lit kxc F0 lit kxc EF lit kxc EE lit kxc ED lit kxc EC lit kxc EB lit kxc EA lit kxc E9 lit kxc E8 lit kxc
+E7 lit kxc E6 lit kxc E5 lit kxc E4 lit kxc E3 lit kxc E2 lit kxc E1 lit kxc E0 lit kxc
+kxm @ kxp !
+3 lit kxc A lit kxc 11 lit kxc 18 lit kxc 1F lit kxc 26 lit kxc 2D lit kxc 34 lit kxc 3B lit kxc 42 lit kxc 49 lit kxc 50 lit kxc 57 lit kxc 5E lit kxc 65 lit kxc 6C lit kxc 73 lit kxc 7A lit kxc 81 lit kxc 88 lit kxc 8F lit kxc 96 lit kxc 9D lit kxc A4 lit kxc
+AB lit kxc B2 lit kxc B9 lit kxc C0 lit kxc C7 lit kxc CE lit kxc D5 lit kxc DC lit kxc
+kxhe @ kxp !
+42 lit kxc BC lit kxc B5 lit kxc A1 lit kxc 67 lit kxc FA lit kxc 33 lit kxc 4 lit kxc 49 lit kxc 61 lit kxc 2D lit kxc BD lit kxc 81 lit kxc 87 lit kxc 5 lit kxc 6A lit kxc 75 lit kxc 18 lit kxc F7 lit kxc 87 lit kxc DD lit kxc 2 lit kxc EF lit kxc D1 lit kxc
+B1 lit kxc C6 lit kxc B6 lit kxc 53 lit kxc 29 lit kxc F0 lit kxc F8 lit kxc 6E lit kxc
+kxhd @ kxp !
+94 lit kxc 47 lit kxc 9F lit kxc 26 lit kxc D2 lit kxc 2B lit kxc FF lit kxc C7 lit kxc 5B lit kxc 99 lit kxc E3 lit kxc 2B lit kxc 1 lit kxc FA lit kxc 29 lit kxc 9D lit kxc 6B lit kxc 54 lit kxc CC lit kxc 8F lit kxc D0 lit kxc A5 lit kxc 28 lit kxc 7 lit kxc
+A7 lit kxc F7 lit kxc D7 lit kxc 1A lit kxc A5 lit kxc 58 lit kxc 80 lit kxc 51 lit kxc
+kxhc @ kxp !
+53 lit kxc AB lit kxc 8B lit kxc 7D lit kxc B5 lit kxc 75 lit kxc AF lit kxc 24 lit kxc A0 lit kxc 48 lit kxc 9E lit kxc 27 lit kxc FA lit kxc 44 lit kxc 9B lit kxc C7 lit kxc B0 lit kxc AE lit kxc 7D lit kxc 1E lit kxc 7 lit kxc 1C lit kxc 49 lit kxc FC lit kxc
+AB lit kxc 33 lit kxc 54 lit kxc CE lit kxc 13 lit kxc F5 lit kxc 7B lit kxc 3B lit kxc
+kxss @ kxp !
+97 lit kxc AF lit kxc 87 lit kxc 7C lit kxc 7C lit kxc A1 lit kxc AC lit kxc D lit kxc 6E lit kxc 8 lit kxc BA lit kxc 65 lit kxc 96 lit kxc E1 lit kxc FE lit kxc 81 lit kxc 96 lit kxc 32 lit kxc E5 lit kxc A0 lit kxc BF lit kxc 6 lit kxc 49 lit kxc E3 lit kxc
+F lit kxc 75 lit kxc 9A lit kxc AD lit kxc 80 lit kxc 88 lit kxc 66 lit kxc 67 lit kxc
+kxts @ kxp !
+BE lit kxc BA lit kxc 76 lit kxc FE lit kxc 62 lit kxc 51 lit kxc D7 lit kxc 5D lit kxc F5 lit kxc B2 lit kxc ED lit kxc A7 lit kxc 79 lit kxc 7D lit kxc EF lit kxc 3B lit kxc FF lit kxc 39 lit kxc E4 lit kxc 9C lit kxc 9C lit kxc DE lit kxc E8 lit kxc 56 lit kxc
+90 lit kxc 45 lit kxc A9 lit kxc E4 lit kxc 13 lit kxc A9 lit kxc 64 lit kxc 12 lit kxc
+3C0 lit kxta !  10 lit kxtx !  0 lit kxbad !
+;
+: kxq4
+kxd @ kxp !
+FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc
+FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc
+kxz @ kxp !
+5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc
+5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc 5A lit kxc
+kxm @ kxp !
+FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc
+FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc FF lit kxc
+kxhe @ kxp !
+B1 lit kxc D0 lit kxc 2C lit kxc FF lit kxc 8C lit kxc 27 lit kxc FC lit kxc DA lit kxc CE lit kxc 6F lit kxc 51 lit kxc CE lit kxc 18 lit kxc 4C lit kxc A6 lit kxc 3D lit kxc 1C lit kxc FB lit kxc 3B lit kxc EC lit kxc 1 lit kxc 13 lit kxc D5 lit kxc 8 lit kxc
+EC lit kxc B6 lit kxc 84 lit kxc 67 lit kxc F4 lit kxc E5 lit kxc DA lit kxc 9F lit kxc
+kxhd @ kxp !
+F7 lit kxc 4C lit kxc 6F lit kxc 21 lit kxc D8 lit kxc 91 lit kxc 47 lit kxc E2 lit kxc D0 lit kxc 2 lit kxc D4 lit kxc 87 lit kxc 45 lit kxc BD lit kxc A6 lit kxc ED lit kxc CB lit kxc 2F lit kxc A5 lit kxc 15 lit kxc DB lit kxc F4 lit kxc DC lit kxc 7A lit kxc
+E0 lit kxc 12 lit kxc C0 lit kxc BA lit kxc F lit kxc 5E lit kxc BB lit kxc 2A lit kxc
+kxhc @ kxp !
+2D lit kxc 2 lit kxc 14 lit kxc 2 lit kxc 4D lit kxc 58 lit kxc 7D lit kxc A4 lit kxc 97 lit kxc D4 lit kxc 40 lit kxc 2F lit kxc A5 lit kxc 81 lit kxc 4B lit kxc 1 lit kxc 58 lit kxc BC lit kxc C6 lit kxc 6F lit kxc E1 lit kxc B9 lit kxc 56 lit kxc 20 lit kxc
+0 lit kxc 84 lit kxc B6 lit kxc B lit kxc 92 lit kxc 5D lit kxc B5 lit kxc 16 lit kxc
+kxss @ kxp !
+E8 lit kxc EE lit kxc 7D lit kxc 2C lit kxc CA lit kxc 2 lit kxc B2 lit kxc 83 lit kxc 88 lit kxc F lit kxc 34 lit kxc D2 lit kxc 1C lit kxc 11 lit kxc 22 lit kxc 4F lit kxc C0 lit kxc 46 lit kxc A lit kxc 4 lit kxc BF lit kxc EF lit kxc 57 lit kxc 1F lit kxc
+A9 lit kxc 9D lit kxc F8 lit kxc 7F lit kxc F4 lit kxc B1 lit kxc 4 lit kxc C8 lit kxc
+kxts @ kxp !
+4B lit kxc E6 lit kxc E2 lit kxc 77 lit kxc 67 lit kxc B1 lit kxc B7 lit kxc 78 lit kxc E2 lit kxc AD lit kxc 1A lit kxc 63 lit kxc 89 lit kxc EA lit kxc 4 lit kxc 34 lit kxc EE lit kxc 5 lit kxc 1F lit kxc DC lit kxc B lit kxc B5 lit kxc 76 lit kxc C5 lit kxc
+78 lit kxc C6 lit kxc 19 lit kxc AB lit kxc 95 lit kxc 10 lit kxc F6 lit kxc A8 lit kxc
+1F4 lit kxta !  1 lit kxtx !  0 lit kxbad !
+;
+: kxn  5 lit ;
+: kxset
+dup 0 lit = if kxq0 then
+dup 1 lit = if kxq1 then
+dup 2 lit = if kxq2 then
+dup 3 lit = if kxq3 then
+dup 4 lit = if kxq4 then
+drop ;
