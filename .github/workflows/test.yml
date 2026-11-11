@@ -197,6 +197,7 @@ jobs:
           - windowtest
           - snaptest
           - wallettest
+          - paytest
     defaults:
       run:
         working-directory: node
