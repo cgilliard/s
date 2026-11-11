@@ -22,6 +22,8 @@ mod fam_xmss_vectors;
 #[cfg(test)]
 mod fam_slate_vectors;
 #[cfg(test)]
+mod fam_name_vectors;
+#[cfg(test)]
 mod fam_wkeys_vectors;
 #[cfg(test)]
 mod fam_proof_vectors;

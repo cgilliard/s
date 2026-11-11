@@ -1,0 +1,158 @@
+\ wname_test.fam — wname.fam against tabminer (docs/GUI_WALLET.md, phase
+\ 2): /lib/wname is miner/src/fam_name_vectors.rs's wname_vectors.bin.
+\ Names' rules, hashes and keys; a registration from a nonce (the owner
+\ key, its hash, the salt, the commit, the memo, the record, its leaf
+\ value, the commit and reveal operations and their digests); an update
+\ to a fresh key signed by the old (its message, the operation, its
+\ digest); two transactions carrying them, signed (their bytes and ids);
+\ trie proofs, members and absent names (an empty slot, another's leaf),
+\ each refused once a sibling or the state root is changed.  A program
+\ after the wallet's modules and wname.fam.  Prints "wname: N as
+\ expected, M not".
+
+: ztp variable ;  : ztf variable ;  : zv variable ;  : zx variable ;  : zb variable ;  : zc variable ;  : zd variable ;
+: zn variable ;  : zi variable ;  : zrec variable ;  : zrn variable ;  : zk1 variable ;  : zk2 variable ;  : zout variable ;
+: zks variable ;  : zlv variable ;  : zps variable ;  : zop variable ;  : zopn variable ;  : zm variable ;  : zgn variable ;
+: zga variable ;  : zown variable ;  : zsal variable ;  : zcom variable ;  : zmem variable ;  : zsalc variable ;  : zownc variable ;
+: zn1 variable ;  : zr2 variable ;  : zr2n variable ;  : zcop variable ;  : zcopn variable ;  : zrop variable ;  : zropn variable ;
+: zuop variable ;  : zuopn variable ;  : zleaf variable ;  : zval variable ;  : zmem2 variable ;  : zok variable ;
+: zread
+0 lit open  dup 0< if "wname: no /lib/wname" puts 0A lit putc then
+8000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  8000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+: zchk  swap if drop ztp @ 1 lit + ztp ! else "wname: " puts puts " (" puts zi @ u. ")" puts 0A lit putc ztf @ 1 lit + ztf ! then ;   \ ( flag str -- )
+\ zblob ( -- a n )  the blob at zx, zx past it; zskip ( n -- a ) n bytes;
+\ zword ( -- x ) a word.
+: zblob  zx @ 4 lit + zx @ @  dup 3 lit + 3 lit invert and zx @ 4 lit + + zx ! ;
+: zskip  zx @ swap over + zx ! ;
+: zword  zx @ @  zx @ 4 lit + zx ! ;
+\ zcan= ( m a -- flag )  a digest (Montgomery) is the 32 canonical bytes at a.
+: zcan=  swap zd @ wkcan  zd @ swap 20 lit wssame ;
+\ zgot ( a n -- flag )  the next blob is those n bytes.
+: zgot  zgn !  zga !  zblob zgn @ =  swap zga @ zgn @ wssame and ;
+\ zbl ( -- a n )  the next blob, its place kept.
+: zbl  zblob ;
+
+\ The proofs' cases: the records registered (zregs, zregn), each case's
+\ fields into wname's proof variables.
+: zregs variable ;  : zregn variable ;  : zcn variable ;  : zcl variable ;  : zmb variable ;  : zsv variable ;
+\ zfind ( name n -- rec | 0 )  a registered record by name.
+: zfind
+zcl !  zcn !  0 lit
+zregn @ ?dup if 0 lit do
+	zregs @ i 2 lit lshift + @  dup c@ zcl @ =  over 1 lit + zcn @ zcl @ wssame and if nip else drop then
+loop then ;
+
+: zmain
+wninit wnpini
+200 lit alloc zb !  20 lit alloc zc !  20 lit alloc zd !  100 lit alloc zrec !  4 lit xksize alloc zk1 !  4 lit xksize alloc zk2 !
+40 lit alloc zout !  10 lit alloc zks !  10 lit alloc zlv !  10 lit alloc zps !  1000 lit alloc zop !
+20 lit alloc zown !  20 lit alloc zsal !  20 lit alloc zcom !  20 lit alloc zmem !  20 lit alloc zsalc !  20 lit alloc zownc !
+20 lit alloc zval !  20 lit alloc zmem2 !  40 lit alloc zregs !  20 lit alloc zsv !
+"/lib/wname" zread drop zv !
+zv @ zx !
+40 lit zskip wkmast
+\ names
+zword 0 lit do
+	i zi !
+	zblob zn ! zm !
+	zword 0= 0= dup zm @ zn @ wnok 0= 0= = "a name judged wrongly" zchk
+	if
+		zm @ zn @ zc @ wnhash  zc @ 20 lit zskip zcan= "a name's hash" zchk
+		zm @ zn @ zb @ wnkey  zb @ 10 lit zskip 10 lit wssame "a name's key" zchk
+	then
+loop
+\ a registration with nonce 1
+0 lit zi !
+10 lit zskip zn1 !  zn1 @ wknon
+zown @ wnown  zown @ zownc @ wkcan
+wnpub @ 34 lit zskip 31 lit wssame "the owner key" zchk
+zown @ 20 lit zskip zcan= "the owner hash" zchk
+zsal @ wnsalt  zsal @ zsalc @ wkcan  zsal @ 20 lit zskip zcan= "the salt" zchk
+20 lit zskip zval @ 20 lit bcopy
+zmem @ wnmemo
+"example" 7 lit zc @ wnhash  zc @ zsal @ zown @ zcom @ wncom
+zcom @ 20 lit zskip zcan= "the commit" zchk
+zmem @ 20 lit zskip 20 lit wssame "the name memo" zchk
+"example" 7 lit zownc @ zval @ zmem @ zrec @ wnrec zrn !
+zrec @ zrn @ zgot "the record" zchk
+zrec @ zc @ rvalue  zc @ 20 lit zskip zcan= "its leaf value" zchk
+zcom @ zd @ wkcan  zd @ zmem @ zop @ wncop zopn !
+zx @ 4 lit + zcop !  zx @ @ zcopn !
+zop @ zopn @ zgot "the commit operation" zchk
+zop @ zc @ wnopd  zc @ 20 lit zskip zcan= "its digest" zchk
+zrec @ zsalc @ 8 lit zskip zop @ wnrop zopn !
+zx @ 4 lit + zrop !  zx @ @ zropn !
+zop @ zopn @ zgot "the reveal operation" zchk
+zop @ zc @ wnopd  zc @ 20 lit zskip zcan= "its digest" zchk
+\ an update to nonce 2's key, signed by nonce 1's at the leaf
+10 lit zskip wknon
+zc @ wnown  zc @ zownc @ wkcan  zmem2 @ wnmemo
+zblob zr2n ! zr2 !
+\ the new record's value, from the record (after its name and owner)
+"example" 7 lit zownc @ zr2 @ 28 lit + zmem2 @ zrec @ wnrec zrn !
+zrec @ zr2 @ zrn @ wssame zrn @ zr2n @ = and "the new record" zchk
+zrec @ zc @ wnupdm  zc @ 20 lit zskip zcan= "the update message" zchk
+zword zleaf !
+zn1 @ wknon  zc @ wnown
+zrec @ zleaf @ zop @ wnuop zopn !
+zx @ 4 lit + zuop !  zx @ @ zuopn !
+zop @ zopn @ zgot "the update operation" zchk
+zop @ zc @ wnopd  zc @ 20 lit zskip zcan= "its digest" zchk
+\ two transactions carrying them: an input, change
+zx @ 4 lit zk1 @ xkgen  zk1 @ zb @ xkpub  20 lit zskip drop
+zx @ zb @ 40 lit + 8 lit bcopy  8 lit zskip drop
+zword zlv @ !
+zx @ zps @ 8 lit bcopy  8 lit zskip drop
+zx @ 4 lit zk2 @ xkgen  zk2 @ zb @ 80 lit + xkpub  20 lit zskip drop
+zb @ 80 lit + zx @ zx @ 8 lit + zout @ wsmkout  1C lit zskip drop
+zk1 @ zks @ !
+2 lit 0 lit do
+	i zi !
+	wcbeg  zb @ zb @ 40 lit + wcin+  zout @ wcout+
+	i 0= if zcop @ zcopn @ wcop+ else zrop @ zropn @ wcop+  zuop @ zuopn @ wcop+ then
+	zks @ zlv @ zps @ wctx  wctb @ swap zgot "a transaction carrying operations" zchk
+	zc @ wcbody  zc @ 20 lit zskip zcan= "its id" zchk
+loop
+\ trie proofs
+20 lit zskip wnpor @ dle
+zword zregn !
+zregn @ ?dup if 0 lit do zblob drop zregs @ i 2 lit lshift + ! loop then
+zword 0 lit do
+	i zi !
+	zblob zcl ! zcn !
+	zword zm !
+	10 lit zskip wnpk @ 10 lit bcopy
+	zword wnpt !
+	10 lit zskip wnptk @ 10 lit bcopy
+	20 lit zskip wnptv @ dle
+	zword wnpn !
+	wnpn @ ?dup if 0 lit do 20 lit zskip wnps @ i 5 lit lshift + dle loop then
+	20 lit zskip wnpsr @ dle
+	\ the key is the name's
+	zcn @ zcl @ zb @ wnkey  zb @ wnpk @ 10 lit wssame "a proof's key is not its name's" zchk
+	zm @ if
+		zcn @ zcl @ zfind ?dup if zc @ rvalue else zc @ 8 lit wzero then
+		zc @ wnmem "a member's proof refused" zchk
+		wnabs 0= "a member taken for absent" zchk
+		\ a sibling changed, then the state root
+		wnpn @ if
+			wnps @ dup @ 1 lit xor swap !  zc @ wnmem 0= "a member's changed sibling taken" zchk  wnps @ dup @ 1 lit xor swap !
+		then
+		wnpsr @ dup @ 1 lit xor swap !  zc @ wnmem 0= "a member under another root taken" zchk  wnpsr @ dup @ 1 lit xor swap !
+	else
+		wnabs "an absent name's proof refused" zchk
+		wnpt @ if wnptv @ wnmem 0= "another's leaf taken for this name's" zchk then
+		wnpn @ if
+			wnps @ dup @ 1 lit xor swap !  wnabs 0= "an absent proof with a changed sibling taken" zchk  wnps @ dup @ 1 lit xor swap !
+		then
+		wnpsr @ dup @ 1 lit xor swap !  wnabs 0= "an absent proof under another root taken" zchk  wnpsr @ dup @ 1 lit xor swap !
+	then
+loop
+"wname: " puts ztp @ u. " as expected, " puts ztf @ u. " not" puts 0A lit putc ;
+zmain
+0 lit exit

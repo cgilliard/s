@@ -1,0 +1,186 @@
+\ wname.fam — names for the wallet (docs/GUI_WALLET.md, phase 2;
+\ docs/NAMES.md), as tabminer's names.rs, name_trie.rs and wallet.rs: a
+\ name's rules and key; a registration's owner key, salt, commit and memo
+\ from a nonce; the operations (commit, reveal, update) as a transaction
+\ carries them and their digests; a transaction of the wallet's carrying
+\ operations (inputs, change, the operations) signed; a name's trie proof
+\ checked against a state root.  After wkeys.fam, xsign.fam and
+\ wslate.fam; state.fam's words for names (nhash, keyof, rvalue,
+\ opdigest, tlhash, kbit, kprefix, dfl) with buffers of its own (wninit:
+\ the wallet loads no connect.fam, whose stinit allocates them).  Digests
+\ are Montgomery words unless said canonical (bytes, as a block or the
+\ API carries them).
+\
+\ wninit  the buffers (once).
+\ wnok ( a n -- flag )  1 to 32 characters of a-z, 0-9, _.
+\ wnkey ( a n k -- )  k (4 words, least significant first) = its key.
+\ wnhash ( a n c -- )  c = its hash.
+\ wnown ( c -- )  c = the owner hash of the nonce in wkn (its key in wnxk,
+\ its public key, 49 bytes, at wnpub).
+\ wnsalt ( c -- )  c = the commit salt of the nonce in wkn.
+\ wnmemo ( dst -- )  the name memo of the nonce in wkn: 32 canonical
+\ bytes (the output memo, then zeros: a memo slot of amount zero).
+\ wncom ( nh salt owner c -- )  c = the commit hash.
+\ wnrec ( name n owner value memo dst -- len )  a record's bytes (owner,
+\ value and memo canonical, 32 bytes each).
+\ wnupdm ( rec c -- )  c = the message an update to rec is signed over.
+\ wncop ( commit memo dst -- n )  a commit operation's bytes (the commit
+\ canonical; the memo its 20 bytes).
+\ wnrop ( rec salt pos dst -- n )  a reveal's (salt canonical; pos the
+\ commit's position, 8 bytes).
+\ wnuop ( rec leaf dst -- n )  an update's, signed by the key in wnxk
+\ (wnown of the current owner's nonce first) at the leaf.
+\ wnopd ( op c -- )  c = an operation's digest (as the body has it).
+\ A transaction carrying operations: wcbeg; wcin+ ( pk amt -- ) an input;
+\ wcout+ ( out -- ) an output (60 bytes); wcop+ ( op n -- ) an
+\ operation; wcbody ( c -- ) its id; wctx ( keys leaves poss -- n ) it
+\ signed at wctb (keys: XMSS keys' addresses, leaves: words, poss:
+\ 8-byte positions, one each per input).
+\ A proof (the caller sets wnpk the key, wnpt the terminal: 0 none, 1 a
+\ leaf with key wnptk and value wnptv; wnpn siblings at wnps, from the
+\ terminal up; wnpor the outputs half's root, wnpsr the state root):
+\ wnmem ( value -- flag ) the key holds value; wnabs ( -- flag ) it is
+\ absent.
+
+: wnb variable ;  : wnd variable ;  : wnxk variable ;  : wnpub variable ;  : wnks variable ;  : wnent variable ;
+: wna1 variable ;  : wna2 variable ;  : wna3 variable ;  : wna4 variable ;  : wna5 variable ;  : wna6 variable ;
+: wninit
+wsinit xkinit
+wnb @ 0= if
+	60 lit alloc wnb !  20 lit alloc wnd !  4 lit xksize alloc wnxk !  34 lit alloc wnpub !  20 lit alloc wnks !  8 lit alloc wnent !
+	\ state.fam's, as stinit would
+	nel @ 0= if 80 lit alloc nel !  80 lit alloc nin !  10 lit alloc nkey !  60 lit alloc ob ! then
+	tha @ 0= if 40 lit alloc tha !  40 lit alloc thb ! then
+	tz @ 0= if 10 lit alloc tz !  10 lit alloc tmpk !  10 lit alloc tkp ! then
+	dflt @ 0= if
+		520 lit alloc dflt !  dflt @ 8 lit wzero
+		28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
+	then
+then ;
+
+: wnok  name-ok ;
+: wnhash  nhash ;
+: wnkey  wna1 !  wnd @ nhash  wnd @ wna1 @ keyof ;
+: wnown
+wna1 !
+33 lit wnd @ wkwith  wnd @ wnks @ wkcan
+wnks @ 4 lit wnxk @ xkgen  wnxk @ wnpub @ xkpub
+wnpub @ wna1 @ wkpkh ;
+: wnsalt  34 lit swap wkwith ;
+: wnmemo  dup wkmemo  14 lit + C lit 0 lit do 0 lit over i + c! loop drop ;
+: wncom
+wna4 !  wna3 !  wna2 !  wna1 !
+wna1 @ wnb @ 8 lit wcopy  wna2 @ wnb @ 20 lit + 8 lit wcopy  wna3 @ wnb @ 40 lit + 8 lit wcopy
+wnb @ 18 lit 7 lit wna4 @ hdom ;
+: wnrec
+wna6 !  wna5 !  wna4 !  wna3 !  wna2 !  wna1 !
+wna2 @ wna6 @ c!  wna1 @ wna6 @ 1 lit + wna2 @ bcopy
+wna3 @ wna6 @ 1 lit + wna2 @ + 20 lit bcopy
+wna4 @ wna6 @ 21 lit + wna2 @ + 20 lit bcopy
+wna5 @ wna6 @ 41 lit + wna2 @ + 20 lit bcopy
+wna2 @ 61 lit + ;
+: wnuc variable ;
+: wnupdm  wnuc !  wnd @ rvalue  wnd @ 8 lit A lit wnuc @ hdom ;
+\ The operations' bytes.
+: wncop
+wna3 !  wna2 !  wna1 !
+1 lit wna3 @ c!  wna1 @ wna3 @ 1 lit + 20 lit bcopy  wna2 @ wna3 @ 21 lit + 14 lit bcopy  35 lit ;
+: wnrl  c@ 61 lit + ;                           \ ( rec -- len )
+: wnrop
+wna4 !  wna3 !  wna2 !  wna1 !
+2 lit wna4 @ c!  wna1 @ wna4 @ 1 lit + wna1 @ wnrl bcopy
+wna3 @ wna4 @ 1 lit + wna1 @ wnrl + 5 lit bcopy
+wna2 @ wna4 @ 6 lit + wna1 @ wnrl + 20 lit bcopy
+wna1 @ wnrl 26 lit + ;
+: wnuop
+wna3 !  wna2 !  wna1 !
+3 lit wna3 @ c!  wna1 @ wna3 @ 1 lit + wna1 @ wnrl bcopy
+wnpub @ wna3 @ 1 lit + wna1 @ wnrl + 31 lit bcopy
+wna1 @ wnb @ wnupdm
+wnxk @ wnb @ 8 lit wna2 @ wna3 @ 32 lit + wna1 @ wnrl + xksign
+wna1 @ wnrl 32 lit + 908 lit + ;
+: wnopd  swap dup c@ wnent @ !  1 lit + wnent @ 4 lit + !  wnent @ swap opdigest ;
+
+\ ── A transaction carrying operations ──
+
+: wcin variable ;  : wcnin variable ;  : wcout variable ;  : wcnout variable ;  : wcops variable ;  : wcopt variable ;
+: wcnop variable ;  : wcend variable ;  : wctb variable ;  : wcbb variable ;  : wch variable ;  : wcp variable ;
+: wcks variable ;  : wclv variable ;  : wcps variable ;
+: wcbeg
+wcin @ 0= if 400 lit alloc wcin !  200 lit alloc wcout !  4000 lit alloc wcops !  80 lit alloc wcopt !
+	8000 lit alloc wctb !  800 lit alloc wcbb !  20 lit alloc wch ! then
+0 lit wcnin !  0 lit wcnout !  0 lit wcnop !  0 lit wcend ! ;
+: wcin+  wcin @ wcnin @ 39 lit * + 31 lit + 8 lit bcopy  wcin @ wcnin @ 39 lit * + 31 lit bcopy  wcnin @ 1 lit + wcnin ! ;
+: wcout+  wcout @ wcnout @ 3C lit * + 3C lit bcopy  wcnout @ 1 lit + wcnout ! ;
+: wcop+
+wna2 !  wna1 !
+wcend @ wcopt @ wcnop @ 3 lit lshift + !  wna2 @ wcopt @ wcnop @ 3 lit lshift + 4 lit + !
+wna1 @ wcops @ wcend @ + wna2 @ bcopy  wcend @ wna2 @ + wcend !  wcnop @ 1 lit + wcnop ! ;
+: wcopa  3 lit lshift wcopt @ + @ wcops @ + ;   \ ( i -- a )
+: wcopn  3 lit lshift wcopt @ + 4 lit + @ ;     \ ( i -- n )
+\ wcbody ( c -- )  the body hash (transaction.rs's body_elements): the
+\ counts, each input's key and amount, each output's commitment, amount,
+\ zeros and memo slot, each operation's digest.
+: wcbody
+wcbb @ vp !  wcnin @ v,  wcnout @ v,  wcnop @ v,  0 lit v,  4 lit 0 lit do 0 lit v, loop
+wcnin @ ?dup if 0 lit do
+	wcin @ i 39 lit * +  dup vd,  dup 20 lit + 4 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  31 lit + vamount  0 lit v,
+loop then
+wcnout @ ?dup if 0 lit do
+	wcout @ i 3C lit * +
+	dup wch @ wsocom  wch @ vp @ 8 lit wcopy  vp @ 20 lit + vp !
+	dup 20 lit + vamount  5 lit 0 lit do 0 lit v, loop
+	dup 28 lit + 5 lit 0 lit do dup i 2 lit lshift + le@ v, loop drop  20 lit + vamount
+loop then
+wcnop @ ?dup if 0 lit do
+	vp @ wcp !  i wcopa wcp @ wnopd  wcp @ 20 lit + vp !
+loop then
+wcbb @ vp @ wcbb @ - 2 lit rshift 3 lit 3 lit pick hdom drop ;
+: wctx
+wcps !  wclv !  wcks !
+wch @ wcbody  wch @ wnb @ 8 lit wcopy
+wctb @ wcp !  wcnin @ wcp @ wkle!  wcp @ 4 lit + wcp !
+wcnin @ ?dup if 0 lit do
+	wcin @ i 39 lit * +  dup wcp @ 39 lit bcopy  wcp @ 39 lit + wcp !
+	wcps @ i 3 lit lshift + wcp @ 8 lit bcopy  wcp @ 8 lit + wcp !
+	wcks @ i 2 lit lshift + @ wnb @ 8 lit wclv @ i 2 lit lshift + @ wcp @ xksign
+	30 lit + c@ 44 lit + 5 lit lshift 8 lit + wcp @ + wcp !
+loop then
+0 lit wcp @ wkle!  wcnout @ wcp @ 4 lit + wkle!  wcp @ 8 lit + wcp !
+wcout @ wcp @ wcnout @ 3C lit * bcopy  wcp @ wcnout @ 3C lit * + wcp !
+wcnop @ wcp @ wkle!  wcp @ 4 lit + wcp !
+wcops @ wcp @ wcend @ bcopy  wcp @ wcend @ + wcp !
+wcp @ wctb @ - ;
+
+\ ── A name's trie proof ──
+
+: wnpk variable ;  : wnpt variable ;  : wnptk variable ;  : wnptv variable ;  : wnps variable ;  : wnpn variable ;
+: wnpor variable ;  : wnpsr variable ;  : wnq1 variable ;  : wnq2 variable ;  : wnr variable ;
+: wnpini
+wnpk @ 0= if 10 lit alloc wnpk !  10 lit alloc wnptk !  20 lit alloc wnptv !  F00 lit alloc wnps !  20 lit alloc wnpor !
+	20 lit alloc wnpsr !  10 lit alloc wnq1 !  10 lit alloc wnq2 !  20 lit alloc wnr ! then ;
+\ wnroot ( c -- )  c = the root the proof implies for wnpk's path.
+: wnroot
+wna1 !
+wnpt @ 0= if
+	wnpn @ if wna1 @ 8 lit wzero else 27 lit dfl wna1 @ 8 lit wcopy then
+else wnptk @ wnptv @ wna1 @ tlhash then
+wnpn @ ?dup if 0 lit do
+	wnpn @ 1 lit - i - wna2 !
+	wnps @ i 5 lit lshift + wna3 !
+	wnpk @ wna2 @ kbit if wna3 @ wna1 @ wna1 @ compress else wna1 @ wna3 @ wna1 @ compress then
+loop then ;
+\ wnstok ( -- flag )  the implied root, with the outputs half's, the state
+\ root; the path no deeper than a key.
+: wnstok  wnr @ wnroot  wnpor @ wnr @ wnr @ compress  wnr @ wnpsr @ d=  wnpn @ 79 lit u< and ;
+: wnkeq  -1 lit 4 lit 0 lit do 2 lit pick i w@ 2 lit pick i w@ = and loop nip nip ;   \ ( a b -- flag )
+: wnmem
+wna5 !
+wnpt @ 1 lit =  wnptk @ wnpk @ wnkeq and  wnptv @ wna5 @ d= and
+dup if drop wnstok then ;
+: wnabs
+wnpt @ 0= if -1 lit else
+	wnptk @ wnpk @ wnkeq 0=
+	wnptk @ wnpn @ wnq1 @ kprefix  wnpk @ wnpn @ wnq2 @ kprefix  wnq1 @ wnq2 @ wnkeq and
+then
+dup if drop wnstok then ;
