@@ -26,6 +26,12 @@ decide.
    node's pool through the API and are relayed by the node to its peers
    from its address, as everyone's are; tabminer in onion mode hands
    them to a relay over a circuit instead.
+5. **Slates two ways** (2026-11-10): at each step (send, receive,
+   finalize) the window offers copy and paste (the slate as text, as
+   certificates are passed around) or a file in the user's home. Files
+   reach the home through a **Files** utility of their own, a third
+   icon in the dock beside the terminal and the wallet, not through the
+   wallet: the wallet never takes uploads itself.
 
 ## What is fixed already
 
@@ -125,7 +131,7 @@ is written).
   two pipes, its errors nowhere, and relays: each text frame from the
   window a line on the wallet's input (any newline in it made a space),
   each line the wallet writes a text frame. One JSON object a frame and a
-  line, at most 3,800 bytes. Either side closing ends the other: the
+  line, at most 16 KiB (an answered slate as text is about 7,600 bytes). Either side closing ends the other: the
   window closed, the wallet's input ends and it exits; the wallet gone,
   wm closes the WebSocket. Logging out, or the session idle past its
   time, closes it as it does the terminals. One wallet window a session
@@ -143,16 +149,21 @@ is written).
   `"ok":false` and `"error"` (a sentence to show). Answers may come out
   of order. Amounts are strings in coins as tabminer prints them (up to
   ten decimal places): a 64-bit amount does not fit a JavaScript number.
-  Files are paths in the user's home.
+  Files are paths in the user's home. A slate goes either way, chosen
+  in the window at each step: as a file (`slate`, its name; binary, or
+  text if its name ends `.txt` or it came as text, as tabminer's), or
+  as text to copy and paste (`text`: base64 between `-----BEGIN TAB
+  SLATE-----` and its END line, 64 characters a line, as tabminer's
+  `to_text`; an answer in the form its slate came).
 
   | op | asks | answers |
   |---|---|---|
   | `overview` | | `confirmed`, `pending`, `unverified`, `reserved`, `locked`; `height`, the tip; `node`, its state |
   | `receive` | | `address` (`tab1…`); `name`, a name pointing at it, if any |
-  | `answer` | `slate`, a file sent by a payer | `slate`, the answer written; `amount` |
+  | `answer` | `slate`, a file sent by a payer, or `text`, it pasted | `slate`, the answer written, or `text`, to copy back; `amount` |
   | `fees` | | `speeds`: each a `speed` (`block`, `hour`, `day`, `economy`), its `rate` as `/v1/fees` gives it, `wait` in seconds |
-  | `send` | `to` (an address or `@name`), `amount`, `speed`, `slate`, the file to write | `slate`; `fee` |
-  | `finalize` | `slate`, the recipient's answer | `tx`, the transaction sent to the pool; `fee` |
+  | `send` | `to` (an address or `@name`), `amount`, `speed`; `slate`, the file to write, or `text`: true | `slate`, or `text`, the slate to copy; `fee` |
+  | `finalize` | `slate`, the recipient's answer as a file, or `text`, pasted | `tx`, the transaction sent to the pool; `fee` |
   | `activity` | | `items`: each `tx`, `kind` (`sent`, `received`, `burn`), `amount`, `state` (`pending`, `confirmed`, `cancelled`), `height` (0 unconfirmed) |
   | `cancel` | `tx` | `tx`, the replacement |
   | `bump` | `tx`, `speed` | `tx`, the replacement |

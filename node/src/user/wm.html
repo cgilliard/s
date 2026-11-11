@@ -47,6 +47,7 @@ body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42)}
 .wf{display:flex;flex-direction:column;gap:5px;margin:6px 0 14px;max-width:440px}
 .wf label{color:#8a8f98;font-size:12px}
 .wf input,.wf select{background:#0e0f13;color:#ddd;border:1px solid #3a3f4b;border-radius:5px;padding:5px 7px;font:inherit}
+.warea{width:100%;height:7em;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box}
 .wgo{align-self:flex-start;background:#2f5d8a;color:#fff;border:0;border-radius:5px;padding:5px 12px;cursor:pointer;font:inherit}
 .wgo:hover{background:#3a72a8}
 .werr{color:#ff7b72}
@@ -272,6 +273,11 @@ function wbad(p,m){if(m.ok)return false;el('div','werr',p).textContent='Error: '
 function wfield(f,label,type){el('label','',f).textContent=label;var i=el(type=='select'?'select':'input','',f);if(type!='select')i.type=type;return i}
 function wbtn(f,label,fn){var b=el('button','wgo',f);b.textContent=label;b.onclick=fn;return b}
 function wh(p,s){el('div','wh',p).textContent=s}
+function wsel(f,label,opts){var s=wfield(f,label,'select');opts.forEach(function(o){var e=el('option','',s);e.value=o[0];e.textContent=o[1]});return s}
+function warea(f,label,ro){el('label','',f).textContent=label;var t=el('textarea','warea',f);if(ro)t.readOnly=true;return t}
+function wcopy(f,t){wbtn(f,'Copy',function(){t.select();if(navigator.clipboard)navigator.clipboard.writeText(t.value);else document.execCommand('copy')})}
+var WHOW=[['paste','Copy and paste'],['file','A file in your home']];
+function wmodes(f,draw){var md=wsel(f,'How',WHOW),c=null;var go=function(){if(c)c.remove();c=el('div','',f);draw(c,md.value)};md.onchange=go;go();return md}
 function wwait(s){return s<3600?Math.round(s/60)+' min':(s<86400?Math.round(s/3600)+' h':Math.round(s/86400)+' days')}
 function wshow(w,t){
 w.tab=t;w.tabs.forEach(function(b){if(b.tab==t)b.classList.add('on');else b.classList.remove('on')});
@@ -292,18 +298,35 @@ wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);
 else if(t=='receive'){
 var a=el('div','',p);
 wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This wallet');wrow(a,'Address',m.address);if(m.name)wrow(a,'Name',m.name)});
-var f=el('div','wf',p);wh(f,'Answer a slate file');
-var s=wfield(f,'Slate file (in your home)','text'),o=el('div','wv',f);
-wbtn(f,'Answer',function(){wask(w,'answer',{slate:s.value},function(m){o.textContent=m.ok?'Answered: '+m.slate+' ('+m.amount+'); send it back to the payer':'Error: '+m.error})});
+var f=el('div','wf',p);wh(f,'Answer a slate from the payer');
+wmodes(f,function(c,how){
+if(how=='paste'){
+var t=warea(c,'The slate (paste it here)'),o=el('div','wv',c),r;
+wbtn(c,'Answer',function(){wask(w,'answer',{text:t.value},function(m){if(!m.ok){o.textContent='Error: '+m.error;return}o.textContent='Answered ('+m.amount+'); copy the answer back to the payer';r.value=m.text})});
+r=warea(c,'The answer',true);wcopy(c,r);
+}else{
+var s=wfield(c,'Slate file (in your home)','text'),o=el('div','wv',c);
+wbtn(c,'Answer',function(){wask(w,'answer',{slate:s.value},function(m){o.textContent=m.ok?'Answered: '+m.slate+' ('+m.amount+'); send it back to the payer':'Error: '+m.error})});
+}});
 }
 else if(t=='send'){
-var f=el('div','wf',p);wh(f,'Pay by slate file');
-var to=wfield(f,'To (an address or a @name)','text'),am=wfield(f,'Amount','text'),sp=wfield(f,'Speed','select'),sl=wfield(f,'Slate file to write','text'),o=el('div','wv',f);
+var f=el('div','wf',p);wh(f,'Pay by slate');
+var to=wfield(f,'To (an address or a @name)','text'),am=wfield(f,'Amount','text'),sp=wfield(f,'Speed','select');
 wask(w,'fees',{},function(m){if(m.ok)m.speeds.forEach(function(x){var e=el('option','',sp);e.value=x.speed;e.textContent=x.speed+': '+x.rate+', about '+wwait(x.wait)})});
-wbtn(f,'Make the slate',function(){wask(w,'send',{to:to.value,amount:am.value,speed:sp.value,slate:sl.value},function(m){o.textContent=m.ok?'Written: '+m.slate+' (fee '+m.fee+'); give it to the recipient, then finalize their answer':'Error: '+m.error})});
-var g=el('div','wf',p);wh(g,'Finalize an answered slate');
-var fs=wfield(g,'Answered slate file','text'),fo=el('div','wv',g);
-wbtn(g,'Finalize',function(){wask(w,'finalize',{slate:fs.value},function(m){fo.textContent=m.ok?'Sent: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
+wmodes(f,function(c,how){
+var sl=how=='file'?wfield(c,'Slate file to write (in your home)','text'):null,o=el('div','wv',c),r;
+wbtn(c,'Make the slate',function(){
+var a={to:to.value,amount:am.value,speed:sp.value};if(sl)a.slate=sl.value;else a.text=true;
+wask(w,'send',a,function(m){if(!m.ok){o.textContent='Error: '+m.error;return}
+if(sl)o.textContent='Written: '+m.slate+' (fee '+m.fee+'); give it to the recipient, then finalize their answer';
+else{o.textContent='Fee '+m.fee+'; copy the slate to the recipient, then finalize their answer';r.value=m.text}})});
+if(!sl){r=warea(c,'The slate',true);wcopy(c,r)}
+});
+var g=el('div','wf',p);wh(g,'Finalize the recipient answer');
+wmodes(g,function(c,how){
+var fs=how=='file'?wfield(c,'Answered slate file (in your home)','text'):warea(c,'The answer (paste it here)'),fo=el('div','wv',c);
+wbtn(c,'Finalize',function(){var a=how=='file'?{slate:fs.value}:{text:fs.value};wask(w,'finalize',a,function(m){fo.textContent=m.ok?'Sent: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
+});
 }
 else if(t=='activity')wask(w,'activity',{},function(m){
 if(wbad(p,m))return;

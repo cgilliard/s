@@ -432,6 +432,67 @@ FFFFFFFF lit orec @ 18 lit + !  FFFFFFFF lit orec @ 1C lit + !  wnk @ orec @ 29 
 6F lit okey @ c!  ecom @ okey @ 1 lit + 20 lit bcopy
 okey @ 21 lit orec @ 30 lit wsetk ;
 
+\ ── Slates as text (as tabminer's, docs/GUI_WALLET.md): base64 of the
+\ slate's bytes between "-----BEGIN TAB SLATE-----" and its END line, 64
+\ characters a line ──
+
+: bjs variable ;  : bbp variable ;  : bcol variable ;  : bsn variable ;  : bsv variable ;  : bsrc variable ;
+: bacc variable ;  : bscnt variable ;  : bdst variable ;  : bdn variable ;  : bpad variable ;
+\ bput ( c -- )  a byte of the text: into the answer (bjs), else at bbp.
+: bput  bjs @ if jc else bbp @ c!  bbp @ 1 lit + bbp ! then ;
+\ bnl  a line's end: escaped in the answer.
+: bnl  bjs @ if 5C lit jc 6E lit jc else A lit bput then ;
+: bmark  ?dup if 0 lit do dup i + c@ bput loop then drop ;   \ ( s n -- )
+: b64c  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" + c@ ;   \ ( v -- c )
+: bchar  bput  bcol @ 1 lit + dup bcol !  40 lit = if bnl 0 lit bcol ! then ;
+\ b64out ( a n -- )  a slate's bytes as text: each group of three bytes
+\ four characters, a short last group padded with '='.
+: bln variable ;  : bsbad variable ;
+: b64out
+bsn !  bsrc !  0 lit bcol !
+"-----BEGIN TAB SLATE-----" 19 lit bmark bnl
+bsn @ 2 lit + 3 lit / ?dup if 0 lit do
+	bsn @ i 3 lit * - 3 lit umin bln !
+	bsrc @ i 3 lit * + bsv !
+	bsv @ c@ 10 lit lshift
+	bln @ 1 lit u> if bsv @ 1 lit + c@ 8 lit lshift or then
+	bln @ 2 lit u> if bsv @ 2 lit + c@ or then
+	bacc !
+	4 lit 0 lit do
+		i bln @ u> if 3D lit bchar else bacc @ 12 lit i 6 lit * - rshift 3F lit and b64c bchar then
+	loop
+loop then
+bcol @ if bnl then
+"-----END TAB SLATE-----" 17 lit bmark bnl ;
+\ b64v ( c -- v | -1 )  a base64 character's value ('=' 0).
+: b64v
+dup 41 lit - 1A lit u< if 41 lit - else dup 61 lit - 1A lit u< if 61 lit - 1A lit + else
+dup 30 lit - A lit u< if 30 lit - 34 lit + else dup 2B lit = if drop 3E lit else
+dup 2F lit = if drop 3F lit else 3D lit = if 0 lit else FFFFFFFF lit then then then then then then ;
+\ b64in ( text dst -- n | -1 )  the slate's bytes from text holding one
+\ between its markers, whatever surrounds it (whitespace skipped).
+: b64in
+bdst !  "-----BEGIN TAB SLATE-----" jfind dup if
+	0 lit bdn !  0 lit bacc !  0 lit bscnt !  0 lit bpad !  0 lit bsbad !
+	begin dup c@ dup 0= 0= swap 2D lit <> and while
+		dup c@ 20 lit u> if
+			dup c@ 3D lit = if bpad @ 1 lit + bpad ! then
+			dup c@ b64v dup 0< if
+				\ not base64: the rest passed over
+				2drop 1 lit bsbad !  ""
+			else
+				bacc @ 6 lit lshift or bacc !  bscnt @ 1 lit + bscnt !
+				bscnt @ 4 lit = if
+					bacc @ 10 lit rshift bdst @ bdn @ + c!  bacc @ 8 lit rshift bdst @ bdn @ + 1 lit + c!  bacc @ bdst @ bdn @ + 2 lit + c!
+					bdn @ 3 lit + bpad @ - bdn !  0 lit bscnt !  0 lit bacc !  0 lit bpad !
+				then
+				1 lit +
+			then
+		else 1 lit + then
+	repeat
+	c@ 2D lit =  bsbad @ 0= and  bscnt @ 0= and if bdn @ else FFFFFFFF lit then
+else drop FFFFFFFF lit then ;
+
 \ wrget ( key klen buf n -- vlen )  one record, read in a snapshot.
 : wrget  wf2 !  wf1 !  wkl !  wgk !  wfd @ 0 lit txbegin  dup wgk @ wkl @ wf1 @ wf2 @ txget  swap txabort drop ;
 \ jhex ( a n -- )  n bytes written in hex.
@@ -440,26 +501,59 @@ okey @ 21 lit orec @ 30 lit wsetk ;
 : a8.  dup @ swap 4 lit + @ wamt ;                     \ ( a -- )  in coins, written
 : fpath variable ;  : fout variable ;  : fpn variable ;
 
+\ A slate in: slin ( line -- n | -1 ) its bytes at sbin, pasted ("text",
+\ tmode 1) or from a file ("slate", tmode 0; the file binary or text,
+\ ftxt 1 if text); -1 none given, or not one.  A slate out: sout ( a n
+\ path -- ok ) to a file, text if the slate came as text or the name ends
+\ ".txt", else its bytes; stext ( a n -- ) as text, written in the answer.
+: sbin variable ;  : ttxt variable ;  : tout variable ;  : tmode variable ;  : ftxt variable ;
+: slin
+0 lit ftxt !
+dup "'text':'" ttxt @ 2400 lit jstr if
+	drop 1 lit tmode !  ttxt @ sbin @ b64in
+else
+	0 lit tmode !
+	"'slate':'" fpath @ 100 lit jstr 0= if FFFFFFFF lit else
+		fpath @ fread dup 0< 0= if
+			0 lit over fbuf @ + c!
+			fbuf @ "-----BEGIN TAB SLATE-----" jfind if
+				drop 1 lit ftxt !  fbuf @ sbin @ b64in
+			else fbuf @ sbin @ 2 lit pick bcopy then
+		then
+	then
+then ;
+: stext  1 lit bjs !  b64out  0 lit bjs ! ;
+: sop variable ;  : soa variable ;  : son variable ;
+\ stxt? ( path -- flag )  a name ending ".txt".
+: stxt?  dup strlen dup 3 lit u> if + 4 lit - ".txt" streq else 2drop 0 lit then ;
+: sout
+sop !  son !  soa !
+ftxt @ tmode @ or  sop @ stxt? or if
+	0 lit bjs !  tout @ bbp !  soa @ son @ b64out  sop @ tout @ bbp @ tout @ - fwrite
+else sop @ soa @ son @ fwrite then ;
 \ oanswer ( line -- )  a payer's slate (stage 1) answered: this wallet's
 \ output added and recorded, its receipt signed, the answer written to
 \ the file's name and ".received" (as tabminer's receive).
 : oanswer
 have @ 0= if drop nowal else
-"'slate':'" fpath @ 100 lit jstr 0= if "no slate file" jerr else
-fpath @ fread fpn !  fpn @ 0< if "the slate file cannot be read" jerr else
-fbuf @ fpn @ wsparse 0= if "not a slate" jerr else
+slin fpn !  fpn @ 0< if "no slate given, or not one" jerr else
+sbin @ fpn @ wsparse 0= if "not a slate" jerr else
 wsstg @ 1 lit <> if "not a slate to answer" jerr else
 wsnout @ wschg @ <> if "the slate is answered already" jerr else
 	waddr!
 	wbeg  wsa @ 49 lit + 1 lit wnew  wend
 	if
 		onew @ wsk @ wpk @ wsans fpn !
-		fout @ fpath @ scpy ".received" scpy drop
-		fout @ wsbuf @ fpn @ fwrite if
-			jok ",'slate':'" jo fout @ jraw "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
-		else "the answer cannot be written" jerr then
+		tmode @ if
+			jok ",'text':'" jo wsbuf @ fpn @ stext "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
+		else
+			fout @ fpath @ scpy ".received" scpy drop
+			wsbuf @ fpn @ fout @ sout if
+				jok ",'slate':'" jo fout @ jraw "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
+			else "the answer cannot be written" jerr then
+		then
 	else "the wallet could not be written" jerr then
-then then then then then then ;
+then then then then then ;
 
 \ The fees: /v1/fees's rates (a byte) for a block, an hour, a day, and
 \ economy.
@@ -533,7 +627,8 @@ orec @ wknon  kseed @ wkkey  kseed @ 4 lit xk @ xkgen  xk @ swap xkpub ;
 have @ 0= if drop nowal else
 dup "'amount':'" wtmp @ 40 lit jstr  wtmp @ samt @ jcoins and 0= if drop "not an amount" jerr else
 samt @ sdust @ a8lt if drop "the amount is below the dust limit" jerr else
-dup "'slate':'" fpath @ 100 lit jstr 0= if drop "no slate file" jerr else
+dup "'text':true" jfind 0= 0= tmode !  0 lit ftxt !  0 lit fpath @ c!  dup "'slate':'" fpath @ 100 lit jstr drop
+tmode @ fpath @ c@ or 0= if drop "no slate file, nor text asked for" jerr else
 "'speed':'" wtmp @ 20 lit jstr drop
 "/v1/fees" hget ?dup if wtmp @ frate else A lit then srate !
 wsels
@@ -569,9 +664,11 @@ sdone @ 2 lit = if "not enough confirmed coins" jerr else
 		spick @ 0 lit do  i selent pkb @ wpkof  pkb @ i selent 20 lit + wsaddin  loop
 		pend @ 4 lit + @ if onew @ wsaddout then
 		pend @ 4 lit + @ wsfix fpn !
-		fpath @ wsbuf @ fpn @ fwrite if
+		tmode @ if
+			jok ",'text':'" jo wsbuf @ fpn @ stext "','fee':'" jo sfee @ a8. "'}" jo jend
+		else wsbuf @ fpn @ fpath @ sout if
 			jok ",'slate':'" jo fpath @ jraw "','fee':'" jo sfee @ a8. "'}" jo jend
-		else "the slate cannot be written" jerr then
+		else "the slate cannot be written" jerr then then
 	else "the wallet could not be written" jerr then
 then
 then then then then ;
@@ -592,9 +689,8 @@ dup 7 lit = if drop "an output is zero or below the dust limit" else dup 8 lit =
 then then then then then then then then jerr ;
 : ofinal
 have @ 0= if drop nowal else
-"'slate':'" fpath @ 100 lit jstr 0= if "no slate file" jerr else
-fpath @ fread fpn !  fpn @ 0< if "the slate file cannot be read" jerr else
-fbuf @ fpn @ wsparse 0= if "not a slate" jerr else
+slin fpn !  fpn @ 0< if "no slate given, or not one" jerr else
+sbin @ fpn @ wsparse 0= if "not a slate" jerr else
 73 lit okey @ c!  wsa @ 8 lit + okey @ 1 lit + 20 lit bcopy
 okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr else
 	pend @ @ fnin !  0 lit fbad !
@@ -650,7 +746,7 @@ okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr 
 			then
 		then
 	then then
-then then then then then ;
+then then then then ;
 
 \ hexs ( a n dst -- )  n bytes in hex, a string at dst.
 : hxd  F lit and dup A lit u< if 30 lit + else 57 lit + then ;
@@ -813,7 +909,7 @@ icnt @ lp @ - dup if dup 0 lit do ibuf @ lp @ + i + c@ ibuf @ i + c! loop then
 icnt ! ;
 
 wsinit  b39load drop  xkinit
-1004 lit alloc ibuf !  1000 lit alloc obuf !  1000 lit alloc idb !  20 lit alloc opb !
+4004 lit alloc ibuf !  4400 lit alloc obuf !  1000 lit alloc idb !  20 lit alloc opb !
 100 lit alloc pw !  100 lit alloc rec !  60 lit alloc plain !  20 lit alloc wkey !  40 lit alloc salt2 !
 100 lit alloc wphr !  1000 lit alloc wtmp !  8 lit alloc wcnt !  7A0 lit alloc wpk !  FC0 lit alloc wsk !  50 lit alloc waddr !
 HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntmp !
@@ -822,7 +918,7 @@ HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntm
 8 lit alloc sfrom !  48 lit alloc ntip !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
 8 lit alloc sa4 !  8 lit alloc sa5 !
 0 lit lh !  0 lit nodeok !
-FMAX alloc fbuf !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
+FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
 8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
@@ -832,7 +928,7 @@ FMAX alloc fbuf !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk
 \ a line when one comes; the node every 4 s while none does
 begin
 	pfd @ 1 lit EE6B2800 lit poll 0 lit > if
-		0 lit ibuf @ icnt @ + FFF lit icnt @ - read  dup 0 lit > if icnt @ + icnt !  lines  1 lit else drop 0 lit then
+		0 lit ibuf @ icnt @ + 3FFF lit icnt @ - read  dup 0 lit > if icnt @ + icnt !  lines  1 lit else drop 0 lit then
 	else wtick 1 lit then
 while repeat
 bye

@@ -15,7 +15,11 @@
 # and relays it to tabminer, mining meanwhile, until the node's pool is
 # empty: it is in a block.
 # B's confirmed balance is then 1.5; A's every output's but B's; A's
-# activity shows the payment, B's the output it received.
+# activity shows the payment, B's the output it received.  The slate files
+# are text (.txt: base64 between markers, as tabminer writes them).  Then
+# by copy and paste: A makes a slate as text in its answer, B answers it
+# pasted (its answer, text too, about 7,600 characters, too long to type
+# back into the console: finalizing from pasted text is the window's).
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/wallettest.sh
@@ -92,7 +96,7 @@ miner
 {
 	echo 'echo {"op":"unlock","password":"wpw"} > /s.req'
 	echo 'echo {"id":5,"op":"fees"} >> /s.req'
-	echo 'echo {"id":6,"op":"send","to":"","amount":"1.5","speed":"hour","slate":"/p.slate"} >> /s.req'
+	echo 'echo {"id":6,"op":"send","to":"","amount":"1.5","speed":"hour","slate":"/p.slate.txt"} >> /s.req'
 	echo 'wallet < /s.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":6,' 600 "A's slate"
@@ -101,14 +105,14 @@ wait_for "$T/os.out" '^\{"id":6,' 600 "A's slate"
 	echo 'cd /b'
 	echo 'echo {"op":"unlock","password":"bpw"} > /b/r.req'
 	echo 'echo {"id":7,"op":"create"} >> /b/r.req'
-	echo 'echo {"id":8,"op":"answer","slate":"/p.slate"} >> /b/r.req'
+	echo 'echo {"id":8,"op":"answer","slate":"/p.slate.txt"} >> /b/r.req'
 	echo 'wallet < /b/r.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":8,' 600 "B's answer"
 {
 	echo 'cd /'
 	echo 'echo {"op":"unlock","password":"wpw"} > /f.req'
-	echo 'echo {"id":9,"op":"finalize","slate":"/p.slate.received"} >> /f.req'
+	echo 'echo {"id":9,"op":"finalize","slate":"/p.slate.txt.received"} >> /f.req'
 	echo 'wallet < /f.req'
 } >&3
 wait_for "$T/os.out" '^\{"id":9,' 600 "A's finalize"
@@ -134,6 +138,24 @@ wait_for "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "t
 	echo 'cd /'
 } >&3
 wait_for "$T/os.out" '^\{"id":13,' 600 "the wallets after the payment"
+
+echo "wallettest.sh: a slate by copy and paste: A makes one as text, B answers it pasted"
+{
+	echo 'echo {"op":"unlock","password":"wpw"} > /t.req'
+	echo 'echo {"id":14,"op":"send","to":"","amount":"0.25","speed":"hour","text":true} >> /t.req'
+	echo 'wallet < /t.req'
+} >&3
+wait_for "$T/os.out" '^\{"id":14,' 600 "A's slate as text"
+# the text pasted in B's request, its newlines as JSON's
+txt=$(grep '^{"id":14,' "$T/os.out" | tail -1 | sed 's/.*"text":"\([^"]*\)".*/\1/')
+{
+	echo 'cd /b'
+	echo 'echo {"op":"unlock","password":"bpw"} > /b/t.req'
+	echo "echo {\"id\":15,\"op\":\"answer\",\"text\":\"$txt\"} >> /b/t.req"
+	echo 'wallet < /b/t.req'
+	echo 'cd /'
+} >&3
+wait_for "$T/os.out" '^\{"id":15,' 600 "B's answer as text"
 grep -E '^\{"(id|op|event)"' "$T/os.out"
 
 settotal > "$T/total2"
@@ -156,9 +178,9 @@ check('an address', answer(3)['address'].startswith('tab1') and len(answer(3)['a
 check('run again, unlocked from its records: the same', answer(4)['confirmed'] == want)
 # the payment
 check(f'the fees: {[s["rate"] for s in answer(5)["speeds"]]}', answer(5)['ok'] and len(answer(5)['speeds']) == 4)
-check(f'A sent by file: fee {answer(6).get("fee")}', answer(6)['ok'] and answer(6)['slate'] == '/p.slate')
+check(f'A sent by file (a text one, .txt): fee {answer(6).get("fee")}', answer(6)['ok'] and answer(6)['slate'] == '/p.slate.txt')
 check('B created', answer(7)['ok'])
-check('B answered', answer(8)['ok'] and answer(8)['slate'] == '/p.slate.received' and answer(8)['amount'] == '1.5000000000')
+check('B answered', answer(8)['ok'] and answer(8)['slate'] == '/p.slate.txt.received' and answer(8)['amount'] == '1.5000000000')
 check(f'A finalized: {answer(9).get("tx", answer(9).get("error"))}', answer(9)['ok'] and len(answer(9)['tx']) == 64)
 total = int(sys.argv[4])
 paid = 15 * 10**9
@@ -167,5 +189,13 @@ check(f'B confirmed 1.5', answer(12)['confirmed'] == '1.5000000000')
 check(f'A confirmed every output but B\'s: {a // 10**10}.{a % 10**10:010d}', answer(10)['confirmed'] == f'{a // 10**10}.{a % 10**10:010d}')
 check('A\'s activity: the payment sent, confirmed', any(i['kind'] == 'sent' and i['tx'] == answer(9)['tx'] and i['amount'] == '1.5000000000' and i['state'] == 'confirmed' for i in answer(11)['items']))
 check('B\'s activity: the output received, confirmed', any(i['kind'] == 'received' and i['amount'] == '1.5000000000' and i['state'] == 'confirmed' for i in answer(13)['items']))
+# by copy and paste: the texts decode to slates, stage 1 then 2
+import base64
+def slate_of(text):
+    b = text.split('-----BEGIN TAB SLATE-----')[1].split('-----END TAB SLATE-----')[0]
+    return base64.b64decode(''.join(b.split()))
+s1 = slate_of(answer(14)['text']); s2 = slate_of(answer(15)['text'])
+check(f'A\'s slate as text: {len(answer(14)["text"])} characters, stage 1', answer(14)['ok'] and s1[:8] == b'tabslt05' and s1[72] == 1)
+check(f'B\'s answer as text, pasted: {len(answer(15)["text"])} characters, stage 2, 0.25', answer(15)['ok'] and answer(15)['amount'] == '0.2500000000' and s2[:8] == b'tabslt05' and s2[72] == 2 and s2[8:40] == s1[8:40])
 EOF
 echo "wallettest.sh: the wallet found the miner's coins through the node, and paid another wallet by file"
