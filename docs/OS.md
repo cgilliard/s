@@ -986,6 +986,9 @@ kernel too much to add at the end.
       its windows for `wm [port [idle]]`'s idle seconds (1,800 unless
       given; wm's second argument was the terminals' program, which is
       now each user's shell).
+    - Files (the dock's third icon, 2026-11-10): the session user's
+      home to and from the browser, plain files of 64 KiB at most, by
+      name (`/files`: `docs/GUI_WALLET.md`, Files).
     - The page travels in plain HTTP: reach it from the host only.
     - Checked: wm_1/4, `wsc.py` (the form, 403, a wrong password, the
       cookie, a terminal as root, its password found hashed, logout

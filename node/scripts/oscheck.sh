@@ -1070,7 +1070,11 @@ done
 # closing it; on the page, its window from the dock (no wallet yet; one
 # created, its words shown; a second click focusing it, not a second
 # window), the Receive screen's address, its program ending when its
-# window closes.
+# window closes.  Files (the home to and from the browser): refused
+# without a session; uploaded, listed with its size, downloaded the same,
+# deleted; a bad name, a missing file, past 64 KiB refused; 40 KiB taken;
+# on the page, its window from the dock, a file uploaded through its
+# picker (its name made safe) and deleted from its row.
 cat > "$T/wsc.py" <<'WSCEOF'
 import socket, base64, hashlib, os, sys, time, struct
 port = int(sys.argv[1])
@@ -1159,6 +1163,43 @@ out = b""; send(b'{"op":"overview","id":7}', 1)
 print("overview", pump(b'"}') and out.startswith(b'{"id":7,"ok":'))
 lo = post(b"/logout", b"", cookie)
 print("wallet logout", b"Location: /" in lo and pump(b"[close]", 30))
+# Files: the home to and from the browser (the session's cookie needed);
+# names checked; 64 KiB at most; uploaded, listed, downloaded, deleted
+import json
+def req(method, path, body=b"", ck=b""):
+    r = http(method + b" " + path + b" HTTP/1.0\r\n" + ck + b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    head, _, rest = r.partition(b"\r\n\r\n")
+    return int(head.split(b" ")[1]) if head.startswith(b"HTTP/") else 0, rest
+print("files refused", req(b"GET", b"/files")[0])
+good = post(b"/login", b"name=root&password=wm%21pw")
+ck = [l for l in good.split(b"\r\n") if l.startswith(b"Set-Cookie: wm=")]
+cookie = b"Cookie: " + ck[0][12:].split(b";")[0] + b"\r\n" if ck else b""
+data = os.urandom(300)
+st, b = req(b"POST", b"/files?name=t1.slate", data, cookie)
+print("files upload", st == 200 and json.loads(b)["ok"])
+st, b = req(b"GET", b"/files", b"", cookie)
+ls = json.loads(b)["files"] if st == 200 else []
+print("files list", any(f["name"] == "t1.slate" and f["size"] == 300 for f in ls) and not any(f["name"].startswith(".") for f in ls))
+st, b = req(b"GET", b"/files?name=t1.slate", b"", cookie)
+print("files download", st == 200 and b == data)
+print("files bad name", req(b"POST", b"/files?name=.x", b"a", cookie)[0] == 400 and req(b"GET", b"/files?name=a/b", b"", cookie)[0] == 400)
+print("files missing", req(b"GET", b"/files?name=nope", b"", cookie)[0] == 404)
+big = os.urandom(40960)
+st, b = req(b"POST", b"/files?name=big.bin", big, cookie)
+st2, b2 = req(b"GET", b"/files?name=big.bin", b"", cookie)
+print("files big", st == 200 and st2 == 200 and b2 == big)
+c = socket.create_connection(("127.0.0.1", port), timeout=60)
+c.sendall(b"POST /files?name=huge.bin HTTP/1.0\r\n" + cookie + b"Content-Length: 70000\r\n\r\n")
+r = b""
+while True:
+    d = c.recv(65536)
+    if not d: break
+    r += d
+print("files too large", r.split(b"\r\n")[0] == b"HTTP/1.0 413 Payload Too Large")
+st, b = req(b"DELETE", b"/files?name=t1.slate", b"", cookie)
+st2, b2 = req(b"GET", b"/files", b"", cookie)
+print("files delete", st == 200 and st2 == 200 and not any(f["name"] == "t1.slate" for f in json.loads(b2)["files"]))
+req(b"DELETE", b"/files?name=big.bin", b"", cookie)
 WSCEOF
 cat > "$T/page.js" <<'PAGEEOF'
 // Run the page wm serves: its script, with a small stub DOM; the dock's
@@ -1194,6 +1235,9 @@ const port = process.argv[2];
   globalThis.window = globalThis;
   const WSS = []; const RW = globalThis.WebSocket; globalThis.WebSocket = class extends RW { constructor(u) { super(u, { headers: { Cookie: cookie } }); WSS.push(this); } };
   globalThis.location = { protocol: 'http:', host: `127.0.0.1:${port}` };
+  // the page's fetches (Files) relative to wm, with the session's cookie
+  const RF = globalThis.fetch;
+  globalThis.fetch = (u, o = {}) => RF(u.startsWith('/') ? `http://127.0.0.1:${port}${u}` : u, { ...o, headers: { ...(o.headers || {}), Cookie: cookie } });
   new Function(js)();
   const all = (e, c, out = []) => { if (e.classList && e.classList.has(c)) out.push(e); e.kids.forEach((k) => all(k, c, out)); return out; };
   const desk = byId.desk, tasks = byId.tasks;
@@ -1303,6 +1347,22 @@ const port = process.argv[2];
     if (!gone) await new Promise((r) => setTimeout(r, 1000));
   }
   console.log('wallet ended', gone);
+  // Files: its window from the dock (once: a second click focuses it); a
+  // file uploaded through its picker (the name made safe) and listed;
+  // deleted from its row, gone from the listing
+  const fil = () => all(desk, 'fil');
+  byId.newf.onclick();
+  console.log('files window', await wait(() => fil().length === 1 && /Your home/.test(text(fil()[0])), 60000));
+  byId.newf.onclick();
+  console.log('files once', fil().length === 1 && all(tasks, 'task').filter((k) => k.textContent === 'Files').length === 1);
+  const pick = () => { const f = []; const walk = (e) => { if (e.tag === 'input' && e.type === 'file') f.push(e); e.kids.forEach(walk); }; walk(fil()[0]); return f[0]; };
+  const inp = pick();
+  inp.files = [new File([new Uint8Array([1, 2, 3, 4, 5])], 'my slate.txt')];
+  inp.onchange();
+  console.log('files uploaded', await wait(() => /my_slate\.txt\s+5 B/.test(text(fil()[0])), 60000));
+  const row = (e) => { let r = null; const walk = (x) => { if (x.className === 'wrow' && /my_slate\.txt/.test(text(x))) r = x; x.kids.forEach(walk); }; walk(e); return r; };
+  all(row(fil()[0]), 'wgo').find((b) => b.textContent === 'Delete').onclick();
+  console.log('files deleted', await wait(() => /Your home/.test(text(fil()[0])) && !/my_slate/.test(text(fil()[0])), 60000));
   process.exit(0);
 })();
 PAGEEOF
@@ -1322,14 +1382,16 @@ for n in 1 4; do
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
 		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$' \
-			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet closed true$' '^wallet ended true$' \
+			'^files window true$' '^files once true$' '^files uploaded true$' '^files deleted true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
 	fi
 	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^login form HTTP/1.0 200 OK True$' '^tty refused HTTP/1.0 403 Forbidden$' '^bad True$' '^cookie True$' \
 		'^page HTTP/1.0 200 OK True$' '^upgrade HTTP/1.1 101 Switching Protocols True$' '^prompt True$' '^ls True' '^hashed True$' \
 		'^ping True$' '^exit True$' '^logout True$' '^after HTTP/1.0 403 Forbidden$' \
 		'^wallet refused HTTP/1.0 403 Forbidden$' '^wallet upgrade HTTP/1.1 101 Switching Protocols True$' '^unlock True$' \
-		'^overview True$' '^wallet logout True$'; do
+		'^overview True$' '^wallet logout True$' '^files refused 403$' '^files upload True$' '^files list True$' '^files download True$' \
+		'^files bad name True$' '^files missing True$' '^files big True$' '^files too large True$' '^files delete True$'; do
 		grep -q -- "$pat" "$T/wsc_$n.out" || { fail "wm_$n" "no /$pat/: $(head -c 400 "$T/wsc_$n.out")"; break; }
 	done
 done

@@ -33,7 +33,7 @@ body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42)}
 .bfg{background:#ddd}
 .bd{font-weight:bold}
 .f0{color:#2e3436}.f1{color:#cc3333}.f2{color:#4e9a06}.f3{color:#c4a000}.f4{color:#3465a4}.f5{color:#a656a8}.f6{color:#06989a}.f7{color:#d3d7cf}.f8{color:#555753}.f9{color:#ef4040}.f10{color:#8ae234}.f11{color:#fce94f}.f12{color:#729fcf}.f13{color:#ad7fa8}.f14{color:#34e2e2}.f15{color:#eeeeec}
-.wal{flex:1;display:flex;flex-direction:column;min-height:0;background:#15171c;color:#ddd;outline:none}
+.wal,.fil{flex:1;display:flex;flex-direction:column;min-height:0;background:#15171c;color:#ddd;outline:none}
 .wnav{flex:none;display:flex;align-items:center;gap:2px;padding:6px 8px 0;background:#1c1f26}
 .wtab{border:0;border-radius:6px 6px 0 0;background:transparent;color:#aaa;padding:6px 12px;cursor:pointer;font:inherit}
 .wtab:hover{color:#fff}
@@ -47,6 +47,7 @@ body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42)}
 .wf{display:flex;flex-direction:column;gap:5px;margin:6px 0 14px;max-width:440px}
 .wf label{color:#8a8f98;font-size:12px}
 .wf input,.wf select{background:#0e0f13;color:#ddd;border:1px solid #3a3f4b;border-radius:5px;padding:5px 7px;font:inherit}
+.flink{color:#79c0ff;margin:0 8px}
 .warea{width:100%;height:7em;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box}
 .wgo{align-self:flex-start;background:#2f5d8a;color:#fff;border:0;border-radius:5px;padding:5px 12px;cursor:pointer;font:inherit}
 .wgo:hover{background:#3a72a8}
@@ -61,12 +62,16 @@ body{background:#1d2b3a linear-gradient(135deg,#1d3557,#2b2d42)}
 <svg width=34 height=34 viewBox='0 0 24 24'><path d='M3.5 8h15a1.5 1.5 0 0 1 1.5 1.5v8.5a1.5 1.5 0 0 1-1.5 1.5h-13.5a1.5 1.5 0 0 1-1.5-1.5z' fill='#222' stroke='#bbb' stroke-width=1.2 />
 <path d='M3.5 8.5v-1a2.5 2.5 0 0 1 2.5-2.5h10' fill=none stroke='#bbb' stroke-width=1.2 stroke-linecap=round />
 <rect x=14 y=11.5 width=6 height=4 rx=1.2 fill='#2a2a2a' stroke='#e3b341' stroke-width=1.2 /><circle cx=16.3 cy=13.5 r=0.9 fill='#e3b341' /></svg>
+</button>
+<button class=app id=newf title='Files'>
+<svg width=34 height=34 viewBox='0 0 24 24'><path d='M3 6.5a1.5 1.5 0 0 1 1.5-1.5h4.5l2 2h8.5a1.5 1.5 0 0 1 1.5 1.5v9.5a1.5 1.5 0 0 1-1.5 1.5h-15a1.5 1.5 0 0 1-1.5-1.5z' fill='#222' stroke='#bbb' stroke-width=1.2 stroke-linejoin=round />
+<path d='M12 10v6M9.5 12.5l2.5-2.5 2.5 2.5' stroke='#79c0ff' stroke-width=1.6 fill=none stroke-linecap=round stroke-linejoin=round /></svg>
 </button></div>
 <div id=desk></div>
 <div id=bar><div id=tasks></div><span id=clock></span><form method=post action=/logout id=out><button class=task title='Log out'>Log out</button></form></div>
 <script>
 var desk=document.getElementById('desk'),tasks=document.getElementById('tasks'),wins=[],z=1,n=0;
-var wsbase=(location.protocol=='https:'?'wss://':'ws://')+location.host,wsurl=wsbase+'/tty',walw=null;
+var wsbase=(location.protocol=='https:'?'wss://':'ws://')+location.host,wsurl=wsbase+'/tty',walw=null,filw=null;
 var ESC=String.fromCharCode(27),CUR=String.fromCharCode(9608),NL=String.fromCharCode(10);
 function el(g,c,p){var e=document.createElement(g);if(c)e.className=c;if(p)p.appendChild(e);return e}
 function topw(){var b=null;wins.forEach(function(o){if(!o.min&&(!b||o.z>b.z))b=o});return b}
@@ -80,7 +85,7 @@ function minw(w){w.min=true;w.d.style.display='none';w.k.classList.remove('on');
 function maxw(w){w.d.classList.toggle('max');focusw(w)}
 function closew(w){
 var i=wins.indexOf(w);if(i<0)return;
-wins.splice(i,1);if(w==walw)walw=null;if(w.ws.readyState<2)w.ws.close();w.d.remove();w.k.remove();focusw(topw());
+wins.splice(i,1);if(w==walw)walw=null;if(w==filw)filw=null;if(w.ws.readyState<2)w.ws.close();w.d.remove();w.k.remove();focusw(topw());
 }
 function newrow(C){var r={t:[],a:[],h:null};for(var i=0;i<C;i++){r.t.push(' ');r.a.push(0)}return r}
 function Term(){
@@ -376,7 +381,43 @@ w.done=1;w.unl=false;w.lockmsg='[no wallet: the server has none free]';wshow(w,w
 wins.push(w);focusw(w);wshow(w,w.tab);
 return w;
 }
+function fsize(n){return n<1024?n+' B':(n<1048576?(n/1024).toFixed(1)+' KiB':(n/1048576).toFixed(1)+' MiB')}
+function fname(s){var t=s.replace(/[^A-Za-z0-9._-]/g,'_').replace(/^[.]+/,'').slice(0,64);return t||'file'}
+function fshow(w){
+if(w.b)w.b.remove();
+var p=w.b=el('div','wbody',w.t);
+var f=el('div','wf',p);wh(f,'Upload files to your home');
+var inp=el('input','',f);inp.type='file';inp.multiple=true;var o=el('div','wv',f);
+inp.onchange=function(){
+var fl=Array.prototype.slice.call(inp.files||[]),k=0;
+var next=function(){
+if(k>=fl.length){fshow(w);if(o.textContent)el('div','wv',w.b).textContent=o.textContent;return}
+var x=fl[k++],nm=fname(x.name);
+fetch('/files?name='+nm,{method:'POST',body:x,credentials:'same-origin'}).then(function(r){return r.json()}).then(function(m){o.textContent=m.ok?'Uploaded: '+nm:'Error: '+m.error;next()}).catch(function(){o.textContent='Error: '+nm+' not uploaded';next()});
+};
+next();
+};
+wh(p,'Your home');
+var l=el('div','',p);
+fetch('/files',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(m){
+if(!m.files.length){el('div','',l).textContent='No files yet.';return}
+m.files.forEach(function(x){
+var r=wrow(l,x.name,fsize(x.size)),a=el('a','flink',r);
+a.href='/files?name='+encodeURIComponent(x.name);a.download=x.name;a.textContent='Download';
+wbtn(r,'Delete',function(){fetch('/files?name='+encodeURIComponent(x.name),{method:'DELETE',credentials:'same-origin'}).then(function(){fshow(w)}).catch(function(){fshow(w)})});
+});
+}).catch(function(){el('div','werr',l).textContent='Error: the files cannot be listed'});
+}
+function openfil(){
+if(filw){focusw(filw);return filw}
+var w=filw=frame('Files',540,420);w.ws={readyState:3,close:function(){}};
+w.t=el('div','fil',w.d);w.t.tabIndex=0;
+w.t.onfocus=function(){if(topw()!=w)focusw(w)};
+wins.push(w);focusw(w);fshow(w);
+return w;
+}
 document.getElementById('newt').onclick=function(){openw()};
+document.getElementById('newf').onclick=function(){openfil()};
 document.getElementById('neww').onclick=function(){openwal()};
 function tick(){var d=new Date();document.getElementById('clock').textContent=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}
 tick();setInterval(tick,10000);

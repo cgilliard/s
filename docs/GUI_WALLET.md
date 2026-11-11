@@ -176,6 +176,28 @@ is written).
   `amount`, `state`) when one arrives or changes state; `scan` (`height`,
   `of`) as a scan goes; `locked` when the wallet locks itself.
 
+## Files
+
+A slate file (or any other) reaches the user's home through the
+**Files** window, the dock's third icon, never through the wallet
+(decision 5; built 2026-11-10). wm serves it, as the session's user,
+the cookie needed as for `/tty` and `/wallet` (403 without):
+- `GET /files`: the home's plain files, `{"files":[{"name","size"}]}`
+  (no directory; nothing whose name starts with a dot, so not the
+  wallet's `.wallet`).
+- `POST /files?name=NAME`: the body (64 KiB at most; 413 past it) saved
+  as NAME, the session's user's and group's, mode 600, replacing one of
+  that name. One upload at a time (503 while another's body comes).
+- `GET /files?name=NAME`: the file, to save (`Content-Disposition:
+  attachment`); 404 if there is none.
+- `DELETE /files?name=NAME` (or `POST /files/delete?name=NAME`): removed.
+
+A name is 1 to 64 of `a-z A-Z 0-9 . _ -`, not starting with a dot: a
+file in the home itself, never elsewhere (400 otherwise; the window
+makes a picked file's name safe, other characters `_`). The OS has no
+`stat` yet, so wm cannot check whose a file is: the home is the user's
+(mode 700), and an upload is made theirs.
+
 ## What it does
 
 As tabminer's wallet commands, in screens:
