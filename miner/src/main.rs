@@ -181,6 +181,10 @@ const HELP: &str = "commands:
                             recipient to `receive`, then `finalize` its answer
   receive FILE [OUT]        answer a slate: add your output (writes OUT, default FILE.received)
   finalize FILE             sign an answered slate and pool the transaction
+                            (slates as files or text: a FILE named *.txt is written
+                            as text, `-BEGIN TAB SLATE-` and base64, which any of the
+                            three reads too, an answer in the form its slate came;
+                            FILE `-` is the terminal: printed, or pasted to its END)
   cancel ID [FEE]           abandon a pending slate (freeing its inputs), or replace
                             an unconfirmed payment with one paying its inputs back
                             (FEE as for send, at least the smallest replacement)
@@ -1818,7 +1822,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 );
                 return Ok(());
             }
-            if let Err(e) = std::fs::write(target, slate.to_bytes()) {
+            if let Err(e) = write_slate(target, &slate, false) {
                 // Not written: nothing to answer, so its inputs are freed.
                 ctx.wallet()?.cancel_slate(&slate.id)?;
                 return Err(format!("{target}: {e}").into());
@@ -1826,7 +1830,7 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             println!(
                 "slate {} written to {}: {} coins plus {} fee from {} inputs; send it to the recipient",
                 &slate.id_hex()[..16],
-                target,
+                if target == "-" { "the terminal, above" } else { target },
                 fmt_coins(amount as u128),
                 fmt_coins(slate.fee as u128),
                 slate.inputs.len()
@@ -1834,23 +1838,25 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
         }
         "receive" => {
             let (file, out) = match args {
+                [file] if *file == "-" => ("-".to_string(), "-".to_string()),
                 [file] => (file.to_string(), format!("{file}.received")),
                 [file, out] => (file.to_string(), out.to_string()),
                 _ => return Err("usage: receive FILE [OUT]".into()),
             };
-            if out == file {
+            if out == file && file != "-" {
                 return Err("the answered slate must not overwrite the one received".into());
             }
             let file = file.as_str();
             let out = out.as_str();
+            let text = slate_is_text(file);
             let mut slate = read_slate(file)?;
             ctx.wallet()?.receive_slate(&mut slate)?;
-            std::fs::write(out, slate.to_bytes())?;
+            write_slate(out, &slate, text)?;
             println!(
                 "receiving {} coins (fee {}); answered slate written to {}; return it to the sender",
                 fmt_coins(slate.amount as u128),
                 fmt_coins(slate.fee as u128),
-                out
+                if out == "-" { "the terminal, above" } else { out }
             );
         }
         "finalize" => {
@@ -3387,9 +3393,44 @@ fn relay_lines(address: &str, listen: SocketAddr) -> Vec<String> {
     lines
 }
 
+/// A slate from FILE, binary or text; `-`: pasted at the prompt, read up
+/// to its END line.
 fn read_slate(file: &str) -> AnyResult<Slate> {
+    if file == "-" {
+        println!("paste the slate; it ends at its END line");
+        let mut text = String::new();
+        let stdin = std::io::stdin();
+        while !Slate::text_ends(&text) {
+            if stdin.lock().read_line(&mut text)? == 0 {
+                break;
+            }
+        }
+        return Slate::from_text(&text).ok_or_else(|| "no slate between BEGIN and END markers".into());
+    }
     let bytes = std::fs::read(Path::new(file))?;
-    Slate::from_bytes(&bytes).ok_or_else(|| format!("{file} is not a slate").into())
+    Slate::from_file_bytes(&bytes).ok_or_else(|| format!("{file} is not a slate").into())
+}
+
+/// Writes a slate: to FILE as text if its name ends in .txt (or `as_text`),
+/// else as bytes; `-`: printed as text.
+fn write_slate(file: &str, slate: &Slate, as_text: bool) -> std::io::Result<()> {
+    if file == "-" {
+        print!("{}", slate.to_text());
+        return Ok(());
+    }
+    if as_text || file.ends_with(".txt") {
+        std::fs::write(file, slate.to_text())
+    } else {
+        std::fs::write(file, slate.to_bytes())
+    }
+}
+
+/// Whether a slate file holds text (an answer is written as its slate came).
+fn slate_is_text(file: &str) -> bool {
+    file == "-"
+        || std::fs::read(file).is_ok_and(|b| {
+            core::str::from_utf8(&b).is_ok_and(|t| t.contains(&format!("-----BEGIN {}-----", tabminer::wallet::SLATE_MARKER)))
+        })
 }
 
 /// Searches nonces on every thread from a time-based start until one meets

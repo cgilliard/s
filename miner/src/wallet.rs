@@ -105,6 +105,8 @@ const FORMAT: u8 = 8;
 /// Upper bound only, reserved as address space; the file grows as needed.
 const MAP_SIZE: usize = 64 << 30;
 const SLATE_MAGIC: &[u8; 8] = b"tabslt05";
+/// A slate's text markers: `-----BEGIN TAB SLATE-----` and its end.
+pub const SLATE_MARKER: &str = "TAB SLATE";
 
 const DOM_MASTER: u32 = 0x30;
 const DOM_TAG: u32 = 0x31;
@@ -496,6 +498,44 @@ impl Slate {
         }
         let receipt = if stage == 2 { Some(Receipt::read(&mut r)?) } else { None };
         r.is_empty().then_some(Slate { id, stage, amount, fee, inputs, outputs, change, sender, receipt })
+    }
+
+    /// The slate as text to paste, as a payment proof's: base64 between
+    /// markers, 64 characters a line.
+    pub fn to_text(&self) -> String {
+        let b64 = crate::proofs::base64_encode(&self.to_bytes());
+        let mut out = format!("-----BEGIN {SLATE_MARKER}-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            out.push_str(core::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str(&format!("-----END {SLATE_MARKER}-----\n"));
+        out
+    }
+
+    /// A slate from text holding one between its markers, whatever
+    /// surrounds it.
+    pub fn from_text(text: &str) -> Option<Slate> {
+        let begin = format!("-----BEGIN {SLATE_MARKER}-----");
+        let end = format!("-----END {SLATE_MARKER}-----");
+        let body = &text[text.find(&begin)? + begin.len()..];
+        let b64: String = body[..body.find(&end)?].chars().filter(|c| !c.is_whitespace()).collect();
+        Slate::from_bytes(&crate::proofs::base64_decode(&b64)?)
+    }
+
+    /// A slate from a file's bytes: as text if they hold its begin marker,
+    /// else as they are.
+    pub fn from_file_bytes(bytes: &[u8]) -> Option<Slate> {
+        let text = core::str::from_utf8(bytes).ok().filter(|t| t.contains(&format!("-----BEGIN {SLATE_MARKER}-----")));
+        match text {
+            Some(t) => Slate::from_text(t),
+            None => Slate::from_bytes(bytes),
+        }
+    }
+
+    /// Whether `text` holds a slate's end marker: a paste is complete.
+    pub fn text_ends(text: &str) -> bool {
+        text.contains(&format!("-----END {SLATE_MARKER}-----"))
     }
 
     /// The unsigned transaction a stage-2 slate describes.
@@ -3890,6 +3930,39 @@ mod tests {
         assert!((8..16).contains(&tx.inputs[0].signature.index));
         let mut pool = Mempool::new(DEFAULT_CAPACITY);
         assert!(pool.insert(tx, &u, &names, &rtxn, 1).is_ok());
+    }
+
+    /// A slate as text (base64 between markers, as a proof's): the same
+    /// slate back, at either stage, whatever surrounds it; a file's bytes
+    /// read in either form; text cut short or not base64 refused.
+    #[test]
+    fn slates_as_text() {
+        let dir = TempDir::new("slate-text");
+        let (env, u) = utxo(&dir);
+        let (alice, _) = Wallet::open(&dir.0.join("alice")).unwrap();
+        let (bob, _) = Wallet::open(&dir.0.join("bob")).unwrap();
+        let coin = alice.receive(60_000_000).unwrap();
+        land(&env, &u, &alice, &[&coin]);
+        let rtxn = env.read_txn().unwrap();
+        let mut slate = alice.send(10_000_000, None, false, &u, &rtxn).unwrap();
+        for stage in 1..=2 {
+            if stage == 2 {
+                bob.receive_slate(&mut slate).unwrap();
+            }
+            let text = slate.to_text();
+            assert!(text.starts_with("-----BEGIN TAB SLATE-----\n") && text.ends_with("-----END TAB SLATE-----\n"));
+            assert!(text.lines().all(|l| l.len() <= 64 || l.starts_with("-----")));
+            assert!(Slate::text_ends(&text));
+            assert_eq!(Slate::from_text(&text).as_ref(), Some(&slate));
+            // pasted among other words, its lines' ends changed
+            let pasted = format!("here it is:\r\n{}\r\nthanks", text.replace('\n', "\r\n"));
+            assert_eq!(Slate::from_text(&pasted).as_ref(), Some(&slate));
+            assert_eq!(Slate::from_file_bytes(text.as_bytes()).as_ref(), Some(&slate));
+            assert_eq!(Slate::from_file_bytes(&slate.to_bytes()).as_ref(), Some(&slate));
+            let cut = &text[..text.len() / 2];
+            assert!(!Slate::text_ends(cut) && Slate::from_text(cut).is_none());
+            assert!(Slate::from_text(&text.replacen('A', "*", 1)).is_none() || !text.contains('A'));
+        }
     }
 
     /// Whatever arrives as a slate, cut short or with bits flipped, is
