@@ -1,4 +1,5 @@
 #!/bin/sh
+# slow: one job each in .github/workflows/test.yml (node-slow).
 # msgtest.sh — the message layer in init mode (docs/ONION.md;
 # docs/GUI_WALLET.md, phase 3): payments with no file between tabminer's
 # wallet and the OS's, through a relay that is the network's one seed.
