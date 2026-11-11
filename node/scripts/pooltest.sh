@@ -23,9 +23,9 @@ N=src/user/node
 [ -f bin/kernel ] || { echo "pooltest.sh: run scripts/build.sh first" >&2; exit 1; }
 rm -rf "$T"; mkdir -p "$T"
 
-./tools/fam --user -o "$T/trl.bin" $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
-	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam $N/pool.fam \
-	$N/p2p.fam $N/api.fam $N/sync.fam $N/relay_test.fam
+./tools/fam --user -o "$T/trl.bin" src/user/crypto/sha256.fam $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
+	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam $N/wkeys.fam $N/pool.fam \
+	$N/p2p.fam $N/cons.fam $N/api.fam $N/sync.fam $N/relay_test.fam
 sh scripts/mkimage.sh "$T/rl.img" bin/kernel init="$T/trl.bin":24576 akjv.txt.gz=../resources/akjv.txt.gz:0 \
 	chainver=$N/chainver_dev.bin:0 devchain=$N/devchain.bin:0
 dd if=/dev/zero of="$T/rl.disk" bs=1 count=0 seek=268435456 2>/dev/null
