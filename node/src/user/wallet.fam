@@ -102,6 +102,13 @@ else drop then
 
 \ jok  an answer begun: its id, ok; jerr ( s -- ) an error answered.
 : jok  "{'id':" jo idb @ jraw ",'ok':true" jo ;
+\ jsafe ( s -- )  text from elsewhere made safe in an answer: its quotes and
+\ backslashes (jo would close the string on them) turned to backticks.
+: jsafe
+begin dup c@ while
+	dup c@ dup 27 lit = over 22 lit = or swap 5C lit = or if 60 lit over c! then
+	1 lit +
+repeat drop ;
 : jerr  "{'id':" jo idb @ jraw ",'ok':false,'error':'" jo jo "'}" jo jend ;
 : op?  opb @ swap streq ;                                    \ ( s -- flag )
 
@@ -339,7 +346,7 @@ repeat drop
 wtx @ txabort drop ;
 : wpage
 0 lit scnt !
-ppath @ "/v1/outputs?from=" scpy  sfrom @ @ sfrom @ 4 lit + @ rot dstr "&count=1000" scpy drop
+ppath @ "/v1/outputs?from=" scpy  sfrom @ @ sfrom @ 4 lit + @ rot dstr "&count=1000" scpy 0 lit over c! drop
 ppath @ hget dup scur !
 if
 	wbeg
@@ -388,7 +395,7 @@ have @ if
 		"'tip':'" jfind ntip @ 40 lit bcopy  0 lit ntip @ 40 lit + c!
 		ntip @ ltip @ streq 0= if
 			wscan if
-				ltip @ ntip @ scpy drop
+				ltip @ ntip @ scpy 0 lit over c! drop
 				"{'event':'tip','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw "'}" jo jend
 			then
 		then
@@ -476,6 +483,11 @@ okey @ 21 lit orec @ 30 lit wsetk ;
 \ slate's bytes between "-----BEGIN TAB SLATE-----" and its END line, 64
 \ characters a line ──
 
+: bmb variable ;  : bme variable ;
+\ bslate, boffer: the markers b64out writes and b64in looks for, a
+\ slate's or a name offer's (-----BEGIN TAB NAME OFFER-----, as tabminer's).
+: bslate  "-----BEGIN TAB SLATE-----" bmb !  "-----END TAB SLATE-----" bme ! ;
+: boffer  "-----BEGIN TAB NAME OFFER-----" bmb !  "-----END TAB NAME OFFER-----" bme ! ;
 : bjs variable ;  : bbp variable ;  : bcol variable ;  : bsn variable ;  : bsv variable ;  : bsrc variable ;
 : bacc variable ;  : bscnt variable ;  : bdst variable ;  : bdn variable ;  : bpad variable ;
 \ bput ( c -- )  a byte of the text: into the answer (bjs), else at bbp.
@@ -490,7 +502,7 @@ okey @ 21 lit orec @ 30 lit wsetk ;
 : bln variable ;  : bsbad variable ;
 : b64out
 bsn !  bsrc !  0 lit bcol !
-"-----BEGIN TAB SLATE-----" 19 lit bmark bnl
+bmb @ dup strlen bmark bnl
 bsn @ 2 lit + 3 lit / ?dup if 0 lit do
 	bsn @ i 3 lit * - 3 lit umin bln !
 	bsrc @ i 3 lit * + bsv !
@@ -503,7 +515,7 @@ bsn @ 2 lit + 3 lit / ?dup if 0 lit do
 	loop
 loop then
 bcol @ if bnl then
-"-----END TAB SLATE-----" 17 lit bmark bnl ;
+bme @ dup strlen bmark bnl ;
 \ b64v ( c -- v | -1 )  a base64 character's value ('=' 0).
 : b64v
 dup 41 lit - 1A lit u< if 41 lit - else dup 61 lit - 1A lit u< if 61 lit - 1A lit + else
@@ -512,7 +524,7 @@ dup 2F lit = if drop 3F lit else 3D lit = if 0 lit else FFFFFFFF lit then then t
 \ b64in ( text dst -- n | -1 )  the slate's bytes from text holding one
 \ between its markers, whatever surrounds it (whitespace skipped).
 : b64in
-bdst !  "-----BEGIN TAB SLATE-----" jfind dup if
+bdst !  bmb @ jfind dup if
 	0 lit bdn !  0 lit bacc !  0 lit bscnt !  0 lit bpad !  0 lit bsbad !
 	begin dup c@ dup 0= 0= swap 2D lit <> and while
 		dup c@ 20 lit u> if
@@ -556,6 +568,7 @@ else drop FFFFFFFF lit then ;
 \ n -- ) as text, written in the answer.
 : sbin variable ;  : ttxt variable ;  : tout variable ;  : tmode variable ;
 : slin
+bslate
 dup "'text':'" ttxt @ 2400 lit jstr if
 	drop 1 lit tmode !  ttxt @ sbin @ b64in
 else
@@ -566,10 +579,10 @@ else
 		then
 	then
 then ;
-: stext  1 lit bjs !  b64out  0 lit bjs ! ;
+: stext  bslate  1 lit bjs !  b64out  0 lit bjs ! ;
 : sop variable ;  : soa variable ;  : son variable ;
 : sout
-sop !  son !  soa !
+sop !  son !  soa !  bslate
 0 lit bjs !  tout @ bbp !  soa @ son @ b64out  sop @ tout @ bbp @ tout @ - fwrite ;
 \ oanswer ( line -- )  a payer's slate (stage 1) answered: this wallet's
 \ output added and recorded, its receipt signed, the answer written to
@@ -587,7 +600,7 @@ wsnout @ wschg @ <> if "the slate is answered already" jerr else
 		tmode @ if
 			jok ",'text':'" jo wsbuf @ fpn @ stext "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
 		else
-			fout @ fpath @ scpy ".received" scpy drop
+			fout @ fpath @ scpy ".received" scpy 0 lit over c! drop
 			wsbuf @ fpn @ fout @ sout if
 				jok ",'slate':'" jo fout @ jraw "','amount':'" jo wsa @ 49 lit + a8. "'}" jo jend
 			else "the answer cannot be written" jerr then
@@ -600,7 +613,7 @@ then then then then then ;
 : frk variable ;
 \ frate ( body speed -- rate )  a speed's rate (10, the floor, if unknown).
 : frate
-frk @ "'" scpy swap scpy "':{'rate':" scpy drop
+frk @ "'" scpy swap scpy "':{'rate':" scpy 0 lit over c! drop
 frk @ jfind ?dup if jnum drop nlo @ else A lit then ;
 : ofees
 "/v1/fees" hget ?dup 0= if "the node is not reached" jerr else
@@ -787,7 +800,7 @@ okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr 
 				wend drop
 				jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo pend @ 10 lit + a8. "'}" jo jend
 			else
-				?dup if "'reason':'" wtmp @ 100 lit jstr drop "the node refused it: " wtmp @ 100 lit + swap scpy wtmp @ scpy drop wtmp @ 100 lit + jerr
+				?dup if "'reason':'" wtmp @ 100 lit jstr drop wtmp @ jsafe "the node refused it: " wtmp @ 100 lit + swap scpy wtmp @ scpy 0 lit over c! drop wtmp @ 100 lit + jerr
 				else "the node is not reached" jerr then
 			then
 		then
@@ -933,7 +946,7 @@ sdone @ 2 lit = if 2 lit else
 			drop  wsd @ wcbody  wsd @ ecb @ wkcan
 			wbeg wspend+ wend drop  0 lit
 		else
-			?dup if "'reason':'" wcwhy @ 100 lit jstr drop 5 lit else 6 lit then
+			?dup if "'reason':'" wcwhy @ 100 lit jstr drop wcwhy @ jsafe 5 lit else 6 lit then
 		then
 	then then
 then ;
@@ -941,7 +954,7 @@ then ;
 : wcerr
 dup 2 lit = if drop "not enough confirmed coins" jerr else dup 3 lit = if drop "an input has signed all it may" jerr else
 dup 4 lit = if drop "the wallet could not be written" jerr else
-5 lit = if wtmp @ "the node refused it: " scpy wcwhy @ scpy drop wtmp @ jerr else "the node is not reached" jerr then
+5 lit = if wtmp @ "the node refused it: " scpy wcwhy @ scpy 0 lit over c! drop wtmp @ jerr else "the node is not reached" jerr then
 then then then ;
 : wspeed  "'speed':'" wtmp @ 20 lit jstr drop  "/v1/fees" hget ?dup if wtmp @ frate else A lit then srate ! ;   \ ( line -- )
 
@@ -1014,7 +1027,7 @@ else waddr! wpk @ wsd @ wkid  wsd @ nval @ wkcan -1 lit then ;
 : wcfind
 0 lit nfnd !  0 lit sfrom @ !  0 lit sfrom @ 4 lit + !
 begin
-	ppath @ "/v1/commits?from=" scpy  sfrom @ @ sfrom @ 4 lit + @ rot dstr "&count=1000" scpy drop
+	ppath @ "/v1/commits?from=" scpy  sfrom @ @ sfrom @ 4 lit + @ rot dstr "&count=1000" scpy 0 lit over c! drop
 	ppath @ hget dup scur !  0 lit scnt !
 	if
 		begin scur @ "'position':" jfind ?dup while
@@ -1035,7 +1048,7 @@ nfnd @ ;
 : nlok variable ;  : nlfnd variable ;  : nlown variable ;  : nlval variable ;  : nlmem variable ;
 : nlook
 0 lit nlok !  0 lit nlfnd !  wnpini
-ppath @ "/v1/name/" scpy nname @ scpy drop
+ppath @ "/v1/name/" scpy nname @ scpy 0 lit over c! drop
 ppath @ hget ?dup if
 	scur !
 	nname @ nlen @ wnpk @ wnkey
@@ -1064,6 +1077,22 @@ ppath @ hget ?dup if
 	nlok !
 then
 nlfnd @ nlok @ ;
+
+\ nadopt  after nlook found the name: an update pending whose new owner the
+\ chain has is taken (its nonce and value the record's, a fresh key's
+\ leaves); nownc the current owner's again.
+: nadopt
+nrecb @ 34 lit + c@ if
+	nlown @ nownc @ 20 lit wssame 0= if
+		nrecb @ 58 lit + nderive
+		nlown @ nownc @ 20 lit wssame if
+			nrecb @ 58 lit + nrecb @ 10 lit bcopy  nrecb @ 68 lit + nrecb @ 10 lit + 20 lit bcopy
+			2 lit nrecb @ 30 lit + c!  4 lit 0 lit do 0 lit nrecb @ 31 lit + i + c! loop
+			wbeg nmput wend drop
+		then
+		nrecb @ nderive
+	then
+then ;
 
 \ oncommit ( line -- )  a name committed to (its value given, or this
 \ wallet's id): a nonce, the commit and memo it makes, carried in a
@@ -1119,6 +1148,7 @@ nrecb @ 32 lit + c@ 8 lit u< 0= if drop "its owner key has signed all it may" je
 	nrecb @ nderive
 	nlook 0= if drop "the node does not answer for it" jerr else
 	0= if "the name is not on chain" jerr else
+	nadopt
 	nlown @ nownc @ 20 lit wssame 0= if "the wallet is not its owner on chain" jerr else
 		\ the leaf, recorded used before the signature
 		nrecb @ 31 lit + c@ nrecb @ 32 lit + c@ + 7 lit and  nrecb @ 33 lit + c@ if 8 lit + then nmlv !
@@ -1140,7 +1170,7 @@ then then then then then ;
 \ onlook ( line -- )  a name looked up, checked against the state root.
 : onlook
 dup nname? 0= if drop "not a valid name" jerr else
-drop nlook 0= if drop "the node's answer does not hold" jerr else
+drop nlook 0= if drop "the answer of the node does not hold" jerr else
 	jok ",'found':" jo
 	if
 		"true,'owner':'" jo nlown @ 20 lit jhex "','value':'" jo nlval @ 20 lit jhex "'" jo
@@ -1151,6 +1181,56 @@ then then ;
 
 \ onames  the wallet's names: each its state (committed, ready, revealed,
 \ owned; a pending update's new owner taken once the chain has it).
+\ onoffer ( line -- )  a name asked for from its owner: a record under a
+\ fresh key of this wallet's (its value given, or this wallet's id), kept
+\ as offered (stage 3), given as text for the owner's name-transfer.
+: onoffer
+have @ 0= if drop nowal else
+dup nname? 0= if drop "not a valid name" jerr else
+nmget if drop "the wallet already has that name" jerr else
+nvalue 0= if "a value is 64 hex digits" jerr else
+	nrecb @ NRECN 0 lit do 0 lit over i + c! loop drop
+	4 lit 0 lit do nrecb @ i 2 lit lshift + wrfp loop
+	nrecb @ nderive
+	nname @ nlen @ nownc @ nval @ nmem @ nrb @ wnrec nrl !
+	nval @ nrecb @ 10 lit + 20 lit bcopy  3 lit nrecb @ 30 lit + c!
+	wbeg nmput wend 0= if "the wallet could not be written" jerr else
+		boffer 1 lit bjs !  jok ",'text':'" jo nrb @ nrl @ b64out "'}" jo jend  0 lit bjs !
+	then
+then then then then ;
+
+\ nofb  the offer onxfer signs over (nlook takes nrb).
+: nofb variable ;
+\ onxfer ( line -- )  a name of this wallet's signed over to an offer
+\ (pasted, "text"): an update to the offer's record by the current owner
+\ key at its next leaf (recorded used first); the name leaves the wallet
+\ when the chain has it (stage 4).
+: onxfer
+have @ 0= if drop nowal else
+dup "'text':'" ttxt @ 2400 lit jstr 0= if drop "no offer given" jerr else
+wspeed
+boffer  ttxt @ nofb @ b64in  bslate  dup 0< if drop "no name offer in it" jerr else
+nrl !  nofb @ c@ dup nlen !  1 lit - 20 lit u< 0= if "not a name offer" jerr else
+nofb @ 1 lit + nname @ nlen @ bcopy  0 lit nname @ nlen @ + c!
+nmget 0= if "this wallet has no such name" jerr else
+nrecb @ 32 lit + c@ 8 lit u< 0= if "its owner key has signed all it may" jerr else
+	nrecb @ nderive
+	nlook 0= if drop "the node does not answer for it" jerr else
+	0= if "the name is not on chain" jerr else
+	nadopt
+	nlown @ nownc @ 20 lit wssame 0= if "the wallet is not its owner on chain" jerr else
+		nrecb @ 31 lit + c@ nrecb @ 32 lit + c@ + 7 lit and  nrecb @ 33 lit + c@ if 8 lit + then nmlv !
+		nrecb @ 32 lit + dup c@ 1 lit + swap c!  4 lit nrecb @ 30 lit + c!
+		wbeg nmput wend 0= if "the wallet could not be written" jerr else
+			nrecb @ nderive
+			nofb @ nmlv @ nopb @ wnuop wcon !  nopb @ wco !  0 lit wcx !  0 lit 0 lit samt @ a8set
+			wcarry ?dup if wcerr else
+				jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo sfee @ a8. "','name':'" jo nname @ jraw "'}" jo jend
+			then
+		then
+	then then then
+then then then then then then ;
+
 : nanm variable ;  : nkl variable ;  : ntx variable ;
 : onames
 have @ 0= if nowal else
@@ -1174,8 +1254,10 @@ have @ 0= if nowal else
 			else "committed','ready':12" jo then
 		else
 			nrecb @ nderive  nlook drop if
-				nlown @ nownc @ 20 lit wssame if "owned" else "revealed" then jo
-			else "revealed" jo then
+				nadopt
+				nlown @ nownc @ 20 lit wssame if "owned" else
+				nrecb @ 30 lit + c@ 3 lit = if "offered" else nrecb @ 30 lit + c@ 4 lit = if "transferred" else "revealed" then then then jo
+			else nrecb @ 30 lit + c@ 3 lit = if "offered" else "revealed" then jo then
 			"','ready':0" jo
 		then
 		"}" jo
@@ -1326,9 +1408,11 @@ else drop "locked" jerr then ;
 "name-reveal" op? if onreveal else
 "name-update" op? if onupdate else
 "name-lookup" op? if onlook else
+"name-offer" op? if onoffer else
+"name-transfer" op? if onxfer else
 "cancel" op? "bump" op? or if drop "not built yet" jerr else
 drop "unknown op" jerr
-then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ hline ( line -- )  a line read: only the first may unlock.
 : hline
@@ -1349,7 +1433,7 @@ repeat
 icnt @ lp @ - dup if dup 0 lit do ibuf @ lp @ + i + c@ ibuf @ i + c! loop then
 icnt ! ;
 
-wsinit  b39load drop  xkinit  wpinit  wninit
+wsinit  b39load drop  xkinit  wpinit  wninit  bslate
 4004 lit alloc ibuf !  4400 lit alloc obuf !  1000 lit alloc idb !  20 lit alloc opb !
 100 lit alloc pw !  100 lit alloc rec !  60 lit alloc plain !  20 lit alloc wkey !  40 lit alloc salt2 !
 100 lit alloc wphr !  1000 lit alloc wtmp !  8 lit alloc wcnt !  7A0 lit alloc wpk !  FC0 lit alloc wsk !  50 lit alloc waddr !
@@ -1361,7 +1445,7 @@ HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntm
 500 lit alloc ppth !  3000 lit alloc pftxt !  2000 lit alloc pbin !  20 lit alloc vroot !  50 lit alloc waddr2 !
 20 lit alloc bben !  20 lit alloc bnon !  104 lit alloc bpur !  40 lit alloc bburn !  100 lit alloc wcwhy !  0 lit wcx !  0 lit wcon !
 NRECN alloc nrecb !  44 lit alloc nname !  20 lit alloc nown !  20 lit alloc nownc !  20 lit alloc nsalt !  20 lit alloc nsaltc !
-20 lit alloc nnh !  20 lit alloc ncom !  20 lit alloc ncomc !  20 lit alloc nmem !  1000 lit alloc nopb !  100 lit alloc nrb !
+20 lit alloc nnh !  20 lit alloc ncom !  20 lit alloc ncomc !  20 lit alloc nmem !  1000 lit alloc nopb !  100 lit alloc nrb !  100 lit alloc nofb !
 20 lit alloc nval !  8 lit alloc ncpos !  20 lit alloc nlown !  20 lit alloc nlval !  20 lit alloc nlmem !  PREC alloc prec !  800 lit alloc lnd !  0 lit nlnd !
 0 lit lh !  0 lit nodeok !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !

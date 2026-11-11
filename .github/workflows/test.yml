@@ -198,6 +198,8 @@ jobs:
           - snaptest
           - wallettest
           - paytest
+          - prooftest
+          - nametest
     defaults:
       run:
         working-directory: node

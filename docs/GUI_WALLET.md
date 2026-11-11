@@ -179,6 +179,8 @@ is written).
   | `name-reveal` | `name`, `speed` | `tx`; `fee` |
   | `name-update` | `name`, `value`, `speed` | `tx`; `fee` |
   | `name-lookup` | `name` | `found` (true or false); `owner`, `value`, `address` (the value as an address, if it is one), checked against the node's state root |
+  | `name-offer` | `name`, `value` (optional: this wallet's id) | `text`: the offer (`-----BEGIN TAB NAME OFFER-----`), a record under a fresh key of this wallet's, for the name's owner to sign over |
+  | `name-transfer` | `text`, an offer pasted; `speed` | `tx`; `fee`; `name`: the name leaves this wallet when the chain has the transfer |
 
   Phase 2's (2026-11-11): activity's `sent` and `burn` items take a
   `proof` request; names are tabminer's (`docs/NAMES.md`), a reveal at
@@ -295,10 +297,20 @@ memos faster than every output in order.
    transaction mined; `cancel` and `bump` not yet); 4 a tabminer wallet
    and this one paying each other on the recursive dev network (slate
    files carried between the host and the OS: not yet).
-2. **Payments and names in full:** proofs of payment, burns, names and
-   sub-names.
+2. **Payments and names in full:** proofs of payment, burns, names
+   (commit, reveal, update, look up, offer and transfer: offers are text,
+   `-----BEGIN TAB NAME OFFER-----`, as tabminer's since 2026-11-11).
+   Done 2026-11-11, each checked against tabminer on the recursive dev
+   network in both directions: `scripts/prooftest.sh` (proofs and
+   burns) and `scripts/nametest.sh` (names: registered, looked up and
+   proven absent, updated, each name transferred to the other wallet);
+   an update's new key is the record's once the chain has it. The Names
+   tab's offer and transfer screens are not built yet. Sub-names move to
+   phase 3: they are served by a name's sub-name
+   server through the message layer's rendezvous points
+   (`docs/SUBNAMES.md`), never on chain.
 3. **Online payments:** the message layer, so `send` to an address or a
-   name needs no file.
+   name needs no file; sub-names with it.
 
 Each phase ends with tests as the node's: vectors from tabminer for every
 primitive, then a tabminer wallet and this one paying each other on the

@@ -18,7 +18,9 @@
 # - names: the wallet registers famwallet (commit, the reveal 12 blocks
 #   on) and tabminer finds it pointing at the wallet; tabminer registers
 #   tabname and the wallet finds it (its proof checked), and proves
-#   nosuchname absent; the wallet updates famwallet, both see the value.
+#   nosuchname absent; the wallet updates famwallet, both see the value;
+#   transfers by offers as text: famwallet to tabminer, tabname to the
+#   wallet.
 # No wait has a deadline: each fails only when nothing under its directory
 # has changed for its idle window (scripts/waitlib.sh's rule).
 # Needs tabminer built with the dev networks:
@@ -27,8 +29,15 @@
 set -e
 cd "$(dirname "$0")/.."
 MINER=../miner/target/release/tabminer
-T=tmp/paytest
-PA=${PAYTEST_PORT:-37493}; WP=${PAYTEST_WM:-37394}
+# PART: payments (paytest.sh), proofs (prooftest.sh), names (nametest.sh):
+# one each, a CI job each; each its own directory and ports.
+PART=${PART:-payments}
+case $PART in
+	payments) T=tmp/paytest; PA=37493; WP=37394; HP=37386 ;;
+	proofs) T=tmp/prooftest; PA=37497; WP=37396; HP=37387 ;;
+	names) T=tmp/nametest; PA=37499; WP=37398; HP=37388 ;;
+	*) echo "paytest.sh: PART is payments, proofs or names" >&2; exit 1 ;;
+esac
 [ -x "$MINER" ] || { echo "paytest.sh: build tabminer first: (cd ../miner && cargo build --release --features dev)" >&2; exit 1; }
 [ -f bin/img ] || { echo "paytest.sh: run scripts/build.sh first" >&2; exit 1; }
 rm -rf "$T"; mkdir -p "$T"
@@ -49,7 +58,7 @@ wait_for "$T/a/tabminer.log" 'is the tip at height 3$' 600 "tabminer's first 3 b
 
 echo "paytest.sh: the node following it, wm serving"
 mkfifo "$T/in"
-./tools/q32 --net --hostfwd=tcp::$WP-:80 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
+./tools/q32 --net --hostfwd=tcp::$WP-:80,hostfwd=tcp::$HP-:3738 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
@@ -63,9 +72,9 @@ wait_for "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 
 wait_for "$T/os.out" 'wm: port 80' 60 "wm"
 
 echo "paytest.sh: the two wallets paying each other"
-python3 - "$WP" "$T" <<'EOF' || { wdump; exit 1; }
-import base64, hashlib, json, os, re, socket, struct, sys, time
-port, T = int(sys.argv[1]), sys.argv[2]
+python3 -u - "$WP" "$T" "$PART" "$HP" <<'EOF' || { wdump; exit 1; }
+import base64, hashlib, json, os, re, socket, struct, sys, time, urllib.request
+port, T, part, api = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
 G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 fifo = open(f'{T}/a.in', 'w')
 def tab(cmd):
@@ -75,7 +84,8 @@ def aout():
 def progress():
     return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(T) for f in fs if f.endswith(('.out', '.log')))
 def blocks():
-    return aout().count('is the tip at height')
+    # its log: with its prompt open, tabminer writes these there only
+    return open(f'{T}/a/tabminer.log', errors='replace').read().count('is the tip at height')
 def wait(what, cond, idle=300):
     # The miner mines throughout, so its logs always grow: a wait fails
     # when nothing new comes for the idle window, or when 30 blocks pass
@@ -142,7 +152,10 @@ def pumpone():
         if len(buf) < hl + n: break
         op = buf[0] & 15; p = buf[hl:hl + n]; buf = buf[hl + n:]
         if op == 1:
-            msgs.append(json.loads(p))
+            try:
+                msgs.append(json.loads(p))
+            except ValueError:
+                print('paytest: not JSON from the wallet: ' + p.decode(errors='replace')[:2000]); raise
 nid = [0]
 def ask(op, **a):
     nid[0] += 1; i = nid[0]
@@ -174,105 +187,136 @@ check('tabminer finalized the answer and pooled it', aout().count('pooled; broad
 got = wait('the 2.5 confirmed in the wallet', lambda: (time.sleep(3), confirmed() == '2.5000000000')[1])
 check('the wallet holds 2.5 confirmed', got)
 
-# the wallet pays tabminer 1
-p = ask('send', to='', amount='1', speed='hour', text=True)
-check(f'the wallet made a slate as text: fee {p.get("fee", p.get("error"))}', p['ok'] and p['text'].startswith('-----BEGIN TAB SLATE-----'))
-open(f'{T}/s2.slate', 'w').write(p['text'])
-tab(f'receive {T}/s2.slate {T}/s2.answer')
-wait('tabminer\'s answer', lambda: os.path.exists(f'{T}/s2.answer') and os.path.getsize(f'{T}/s2.answer') > 0 and 'return it to the sender' in aout())
-s2 = open(f'{T}/s2.answer').read()
-check(f'tabminer answered in text ({len(s2)} characters)', s2.startswith('-----BEGIN TAB SLATE-----'))
-f = ask('finalize', text=s2)
-check(f'the wallet finalized it pasted: {f.get("tx", f.get("error"))}', f['ok'] and len(f['tx']) == 64)
-fee = int(p['fee'].replace('.', ''))
-want = 25 * 10**9 - 10**10 - fee
-want = f'{want // 10**10}.{want % 10**10:010d}'
-def tab_has():
-    tab('outputs'); time.sleep(3)
-    return re.search(r'\b1\.0000000000  confirmed', aout()) is not None
-check('tabminer holds the 1 confirmed', wait('the 1 confirmed at tabminer', tab_has))
-check(f'the wallet holds 2.5 - 1 - fee = {want}', wait('the wallet\'s change confirmed', lambda: (time.sleep(3), confirmed() == want)[1]))
-acts = ask('activity')['items']
-check('its activity: received 2.5, sent 1, both confirmed',
-      any(i['kind'] == 'received' and i['amount'] == '2.5000000000' and i['state'] == 'confirmed' for i in acts)
-      and any(i['kind'] == 'sent' and i['amount'] == '1.0000000000' and i['tx'] == f['tx'] and i['state'] == 'confirmed' for i in acts))
+if part in ('payments', 'proofs'):
+    # the wallet pays tabminer 1
+    p = ask('send', to='', amount='1', speed='hour', text=True)
+    check(f'the wallet made a slate as text: fee {p.get("fee", p.get("error"))}', p['ok'] and p['text'].startswith('-----BEGIN TAB SLATE-----'))
+    open(f'{T}/s2.slate', 'w').write(p['text'])
+    tab(f'receive {T}/s2.slate {T}/s2.answer')
+    wait('tabminer\'s answer', lambda: os.path.exists(f'{T}/s2.answer') and os.path.getsize(f'{T}/s2.answer') > 0 and 'return it to the sender' in aout())
+    s2 = open(f'{T}/s2.answer').read()
+    check(f'tabminer answered in text ({len(s2)} characters)', s2.startswith('-----BEGIN TAB SLATE-----'))
+    f = ask('finalize', text=s2)
+    check(f'the wallet finalized it pasted: {f.get("tx", f.get("error"))}', f['ok'] and len(f['tx']) == 64)
+    fee = int(p['fee'].replace('.', ''))
+    want = 25 * 10**9 - 10**10 - fee
+    want = f'{want // 10**10}.{want % 10**10:010d}'
+    def tab_has():
+        tab('outputs'); time.sleep(3)
+        return re.search(r'\b1\.0000000000  confirmed', aout()) is not None
+    check('tabminer holds the 1 confirmed', wait('the 1 confirmed at tabminer', tab_has))
+    check(f'the wallet holds 2.5 - 1 - fee = {want}', wait('the wallet\'s change confirmed', lambda: (time.sleep(3), confirmed() == want)[1]))
+    acts = ask('activity')['items']
+    check('its activity: received 2.5, sent 1, both confirmed',
+          any(i['kind'] == 'received' and i['amount'] == '2.5000000000' and i['state'] == 'confirmed' for i in acts)
+          and any(i['kind'] == 'sent' and i['amount'] == '1.0000000000' and i['tx'] == f['tx'] and i['state'] == 'confirmed' for i in acts))
 
-# proofs (docs/PROOFS.md): each side's checked by the other
-pp = ask('proof', tx=f['tx'])
-check(f'the wallet proves its payment {"" if pp["ok"] else pp}', pp['ok'] and pp['proof'].startswith('-----BEGIN TAB PAYMENT PROOF-----'))
-open(f'{T}/fp.txt', 'w').write(pp['proof'])
-n0 = aout().count('payment proof holds') + aout().count('does not hold')
-tab(f'verify-proof {T}/fp.txt')
-wait('tabminer checking the wallet\'s proof', lambda: aout().count('payment proof holds') + aout().count('does not hold') > n0)
-check('tabminer finds it holds: 1 coin to its own address', re.search(r'payment proof holds: 1\.0000000000 coins from an unnamed sender', aout()) is not None)
-tid = re.findall(r'transaction ([0-9a-f]{16}) pooled', aout())[0]
-tab(f'payment-proof {tid} {T}/tp.txt')
-wait('tabminer\'s proof of its payment', lambda: os.path.exists(f'{T}/tp.txt') and 'proof written to' in aout())
-v = ask('verify', text=open(f'{T}/tp.txt').read())
-check(f'the wallet finds tabminer\'s proof holds: {v}', v['ok'] and v['valid'] and v['kind'] == 'payment' and v['amount'] == '2.5000000000' and v['to'] == addr)
-# burns: the wallet's, checked by tabminer; tabminer's (for the wallet), checked by the wallet
-bw = ask('burn', amount='0.5', purpose='credit', speed='hour')
-check(f'the wallet burns 0.5 for itself: {bw.get("tx", bw.get("error"))}', bw['ok'])
-bp = wait('the burn in a block, its proof', lambda: (time.sleep(3), (lambda r: r if r['ok'] else None)(ask('proof', tx=bw['tx'])))[1])
-open(f'{T}/fb.txt', 'w').write(bp['proof'])
-n0 = aout().count('proof of burn holds') + aout().count('does not hold')
-tab(f'verify-proof {T}/fb.txt')
-wait('tabminer checking the wallet\'s burn', lambda: aout().count('proof of burn holds') + aout().count('does not hold') > n0)
-check('tabminer finds the burn holds: 0.5 for the wallet, purpose credit', f'proof of burn holds: 0.5000000000 coins burned for {addr}, purpose "credit"' in aout())
-tab(f'burn 0.25 grant {addr}')
-bid = wait('tabminer\'s burn', lambda: (lambda m: m.group(1) if m else None)(re.search(r'burn-proof ([0-9a-f]{16}) once', aout())))
-def tab_burn_proof():
-    tab(f'burn-proof {bid} {T}/tb.txt'); time.sleep(3)
-    return os.path.exists(f'{T}/tb.txt')
-wait('tabminer\'s burn in a block, its proof', tab_burn_proof)
-v = ask('verify', text=open(f'{T}/tb.txt').read())
-check(f'the wallet finds tabminer\'s burn holds, for it: {v}', v['ok'] and v['valid'] and v['kind'] == 'burn' and v['amount'] == '0.2500000000' and v['for'] == addr)
-t = open(f'{T}/tb.txt').read().replace('-----BEGIN TAB BURN PROOF-----', '-----BEGIN TAB PAYMENT PROOF-----').replace('-----END TAB BURN PROOF-----', '-----END TAB PAYMENT PROOF-----')
-v = ask('verify', text=t)
-check(f'a burn passed off as a payment refused: {v.get("error", v.get("reason"))}', not v['ok'] or not v['valid'])
+if part == 'proofs':
+    # proofs (docs/PROOFS.md): each side's checked by the other
+    pp = ask('proof', tx=f['tx'])
+    check(f'the wallet proves its payment {"" if pp["ok"] else pp}', pp['ok'] and pp['proof'].startswith('-----BEGIN TAB PAYMENT PROOF-----'))
+    open(f'{T}/fp.txt', 'w').write(pp['proof'])
+    n0 = aout().count('payment proof holds') + aout().count('does not hold')
+    tab(f'verify-proof {T}/fp.txt')
+    wait('tabminer checking the wallet\'s proof', lambda: aout().count('payment proof holds') + aout().count('does not hold') > n0)
+    check('tabminer finds it holds: 1 coin to its own address', re.search(r'payment proof holds: 1\.0000000000 coins from an unnamed sender', aout()) is not None)
+    tid = re.findall(r'transaction ([0-9a-f]{16}) pooled', aout())[0]
+    tab(f'payment-proof {tid} {T}/tp.txt')
+    wait('tabminer\'s proof of its payment', lambda: os.path.exists(f'{T}/tp.txt') and 'proof written to' in aout())
+    v = ask('verify', text=open(f'{T}/tp.txt').read())
+    check(f'the wallet finds tabminer\'s proof holds: {v}', v['ok'] and v['valid'] and v['kind'] == 'payment' and v['amount'] == '2.5000000000' and v['to'] == addr)
+    # burns: the wallet's, checked by tabminer; tabminer's (for the wallet), checked by the wallet
+    bw = ask('burn', amount='0.5', purpose='credit', speed='hour')
+    check(f'the wallet burns 0.5 for itself: {bw.get("tx", bw.get("error"))}', bw['ok'])
+    bp = wait('the burn in a block, its proof', lambda: (time.sleep(3), (lambda r: r if r['ok'] else None)(ask('proof', tx=bw['tx'])))[1])
+    open(f'{T}/fb.txt', 'w').write(bp['proof'])
+    n0 = aout().count('proof of burn holds') + aout().count('does not hold')
+    tab(f'verify-proof {T}/fb.txt')
+    wait('tabminer checking the wallet\'s burn', lambda: aout().count('proof of burn holds') + aout().count('does not hold') > n0)
+    check('tabminer finds the burn holds: 0.5 for the wallet, purpose credit', f'proof of burn holds: 0.5000000000 coins burned for {addr}, purpose "credit"' in aout())
+    tab(f'burn 0.25 grant {addr}')
+    bid = wait('tabminer\'s burn', lambda: (lambda m: m.group(1) if m else None)(re.search(r'burn-proof ([0-9a-f]{16}) once', aout())))
+    def tab_burn_proof():
+        tab(f'burn-proof {bid} {T}/tb.txt'); time.sleep(3)
+        return os.path.exists(f'{T}/tb.txt')
+    wait('tabminer\'s burn in a block, its proof', tab_burn_proof)
+    v = ask('verify', text=open(f'{T}/tb.txt').read())
+    check(f'the wallet finds tabminer\'s burn holds, for it: {v}', v['ok'] and v['valid'] and v['kind'] == 'burn' and v['amount'] == '0.2500000000' and v['for'] == addr)
+    t = open(f'{T}/tb.txt').read().replace('-----BEGIN TAB BURN PROOF-----', '-----BEGIN TAB PAYMENT PROOF-----').replace('-----END TAB BURN PROOF-----', '-----END TAB PAYMENT PROOF-----')
+    v = ask('verify', text=t)
+    check(f'a burn passed off as a payment refused: {v.get("error", v.get("reason"))}', not v['ok'] or not v['valid'])
 
-# names (docs/NAMES.md): the wallet's, looked up by tabminer; tabminer's, by the wallet
-c = ask('name-commit', name='famwallet', speed='hour')
-check(f'the wallet commits to famwallet: {c.get("tx", c.get("error"))}', c['ok'])
-def named(state):
-    def f():
+if part == 'names':
+    # names (docs/NAMES.md): the wallet's, looked up by tabminer; tabminer's, by the wallet
+    c = ask('name-commit', name='famwallet', speed='hour')
+    check(f'the wallet commits to famwallet: {c.get("tx", c.get("error"))}', c['ok'])
+    seen = {}
+    def named_any(name, state):
+        def f():
+            time.sleep(3)
+            r = ask('names')
+            it = [i for i in r.get('items', []) if i['name'] == name]
+            now = it[0] if it else r
+            if seen.get(name) != now:
+                seen[name] = now
+                print(f'paytest: (names: {name} {now})')
+                try:
+                    print('paytest: (the node: ' + urllib.request.urlopen(f'http://127.0.0.1:{api}/v1/name/{name}', timeout=30).read().decode()[:1500] + ')')
+                except Exception as e:
+                    print(f'paytest: (the node: {e})')
+            return it[0] if it and it[0]['state'] == state else None
+        return f
+    def named(state):
+        return named_any('famwallet', state)
+    wait('the commit 12 blocks old', named('ready'))
+    r = ask('name-reveal', name='famwallet', speed='hour')
+    check(f'the wallet reveals it: {r.get("tx", r.get("error"))}', r['ok'])
+    wait('the name the wallet\'s on chain', named('owned'))
+    def tab_name(name, has):
+        def f():
+            n0 = aout().count(f'value ') + aout().count('is not registered')
+            tab(f'name {name}'); time.sleep(3)
+            return has in aout()
+        return f
+    check('tabminer finds famwallet pointing at the wallet', wait('tabminer looking famwallet up', tab_name('famwallet', f'      {addr}')))
+    tab('name-commit tabname')
+    wait('tabminer\'s commit', lambda: 'committed to tabname' in aout())
+    def tab_reveal():
+        tab('name-reveal tabname'); time.sleep(5)
+        return 'revealing tabname' in aout()
+    wait('tabminer revealing tabname', tab_reveal)
+    def fam_found():
         time.sleep(3)
-        it = [i for i in ask('names')['items'] if i['name'] == 'famwallet']
-        return it[0] if it and it[0]['state'] == state else None
-    return f
-wait('the commit 12 blocks old', named('ready'))
-r = ask('name-reveal', name='famwallet', speed='hour')
-check(f'the wallet reveals it: {r.get("tx", r.get("error"))}', r['ok'])
-wait('the name the wallet\'s on chain', named('owned'))
-def tab_name(name, has):
-    def f():
-        n0 = aout().count(f'value ') + aout().count('is not registered')
-        tab(f'name {name}'); time.sleep(3)
-        return has in aout()
-    return f
-check('tabminer finds famwallet pointing at the wallet', wait('tabminer looking famwallet up', tab_name('famwallet', f'      {addr}')))
-tab('name-commit tabname')
-wait('tabminer\'s commit', lambda: 'committed to tabname' in aout())
-def tab_reveal():
-    tab('name-reveal tabname'); time.sleep(5)
-    return 'revealing tabname' in aout()
-wait('tabminer revealing tabname', tab_reveal)
-def fam_found():
-    time.sleep(3)
-    l = ask('name-lookup', name='tabname')
-    return l if l['ok'] and l['found'] else None
-l = wait('the wallet finding tabname', fam_found)
-check(f'the wallet finds tabname, checked against the state root: {l["address"][:16]}...', l['address'].startswith('tab1') and l['address'] != addr)
-l = ask('name-lookup', name='nosuchname')
-check('the wallet finds no nosuchname, its absence proven', l['ok'] and not l['found'])
-nv = '00' * 31 + '07'
-u = ask('name-update', name='famwallet', value=nv, speed='hour')
-check(f'the wallet updates famwallet: {u.get("tx", u.get("error"))}', u['ok'])
-def fam_value():
-    time.sleep(3)
-    l = ask('name-lookup', name='famwallet')
-    return l if l['ok'] and l['found'] and l['value'] == nv else None
-wait('the update on chain', fam_value)
-check('tabminer sees the new value', wait('tabminer looking famwallet up again', tab_name('famwallet', f'value {nv}')))
+        l = ask('name-lookup', name='tabname')
+        return l if l['ok'] and l['found'] else None
+    l = wait('the wallet finding tabname', fam_found)
+    check(f'the wallet finds tabname, checked against the state root: {l["address"][:16]}...', l['address'].startswith('tab1') and l['address'] != addr)
+    l = ask('name-lookup', name='nosuchname')
+    check('the wallet finds no nosuchname, its absence proven', l['ok'] and not l['found'])
+    nv = '00' * 31 + '07'
+    u = ask('name-update', name='famwallet', value=nv, speed='hour')
+    check(f'the wallet updates famwallet: {u.get("tx", u.get("error"))}', u['ok'])
+    def fam_value():
+        time.sleep(3)
+        l = ask('name-lookup', name='famwallet')
+        return l if l['ok'] and l['found'] and l['value'] == nv else None
+    wait('the update on chain', fam_value)
+    check('tabminer sees the new value', wait('tabminer looking famwallet up again', tab_name('famwallet', f'value {nv}')))
+    # transfers (offers as text): famwallet to tabminer, tabname to the wallet
+    tab(f'name-offer famwallet {T}/off1.txt')
+    wait('tabminer\'s offer', lambda: os.path.exists(f'{T}/off1.txt') and 'the offer for famwallet written' in aout())
+    o1 = open(f'{T}/off1.txt').read()
+    check('tabminer\'s offer is text', o1.startswith('-----BEGIN TAB NAME OFFER-----'))
+    x = ask('name-transfer', text=o1, speed='hour')
+    check(f'the wallet signs famwallet over: {x.get("tx", x.get("error"))}', x['ok'] and x['name'] == 'famwallet')
+    check('tabminer holds famwallet', wait('the transfer to tabminer', tab_name('famwallet', "(this wallet's)")))
+    o2 = ask('name-offer', name='tabname')
+    check('the wallet offers for tabname, as text', o2['ok'] and o2['text'].startswith('-----BEGIN TAB NAME OFFER-----'))
+    open(f'{T}/off2.txt', 'w').write(o2['text'])
+    n0 = aout().count('transferring tabname')
+    tab(f'name-transfer {T}/off2.txt')
+    wait('tabminer signing tabname over', lambda: aout().count('transferring tabname') > n0 or 'Error' in aout()[-300:])
+    check('tabminer transfers tabname', aout().count('transferring tabname') > n0)
+    wait('tabname the wallet\'s', named_any('tabname', 'owned'))
 EOF
-echo "paytest.sh: tabminer's wallet and the OS's paid each other, both ways, by slates as text"
+echo "paytest.sh ($PART): done"
