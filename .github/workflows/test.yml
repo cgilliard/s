@@ -138,10 +138,13 @@ jobs:
       - name: Install QEMU (Linux)
         if: runner.os == 'Linux'
         run: |
-          # an independent mirror on x64 (Azure's copy of the archive can be down)
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then
-            echo http://mirrors.edge.kernel.org/ubuntu/ | sudo tee /etc/apt/apt-mirrors.txt
-          fi
+          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # the mirror list and every source naming an ubuntu.com host
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+          done
           sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
       - name: Install QEMU (macOS)
         if: runner.os == 'macOS'
@@ -170,10 +173,13 @@ jobs:
           shared-key: node
       - run: cargo build --release --features dev
       - run: |
-          # an independent mirror on x64 (Azure's copy of the archive can be down)
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then
-            echo http://mirrors.edge.kernel.org/ubuntu/ | sudo tee /etc/apt/apt-mirrors.txt
-          fi
+          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # the mirror list and every source naming an ubuntu.com host
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+          done
           sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
       - name: the OS's image, built from the seed
         working-directory: node
@@ -221,10 +227,13 @@ jobs:
           path: .
       - run: chmod +x ../miner/target/release/tabminer
       - run: |
-          # an independent mirror on x64 (Azure's copy of the archive can be down)
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then
-            echo http://mirrors.edge.kernel.org/ubuntu/ | sudo tee /etc/apt/apt-mirrors.txt
-          fi
+          # an independent mirror, kernel.org's (Ubuntu's own servers can be down):
+          # the mirror list and every source naming an ubuntu.com host
+          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.edge.kernel.org/ubuntu-ports/; fi
+          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+          done
           sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
       # (its own limit below the job's, so a stall fails the step and the
       # logs below are printed: a cancelled job prints nothing)
