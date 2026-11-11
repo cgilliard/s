@@ -1,0 +1,61 @@
+\ wproof_test.fam — wproof.fam against tabminer (docs/GUI_WALLET.md, phase
+\ 2): /lib/wproof is miner/src/fam_proof_vectors.rs's wproof_vectors.bin,
+\ proofs tabminer's own types made (a named sender's payment, an unnamed
+\ one's, a burn; each altered: another root, the amount, the receipt's
+\ signature, the slate's id, the secret, a burn's purpose, a burn's key
+\ hash), each with the state root it is checked against and tabminer's
+\ verdict, and bytes that do not parse.  For each: parsed or refused as
+\ tabminer does; checked with tabminer's verdict; its text decoded to the
+\ same bytes, and the bytes encoded to the same text; the three good ones
+\ built again from their parts.  A program after crypto/keccak and
+\ dilithium and the node's arith, poseidon2, difficulty, pow, state,
+\ xmss, xsign, wkeys, wslate and wproof.  Prints "wproof: N as expected,
+\ M not".
+
+: ztp variable ;  : ztf variable ;  : zv variable ;  : zx variable ;  : zb variable ;  : zc variable ;  : zr variable ;
+: zt2 variable ;  : zba variable ;  : zbn variable ;  : zta variable ;  : ztn variable ;  : zk variable ;
+: zread
+0 lit open  dup 0< if "wproof: no /lib/wproof" puts 0A lit putc then
+40000 lit alloc
+0 lit begin
+	2 lit pick  2 lit pick 2 lit pick +  40000 lit 3 lit pick -  read
+	dup 0 lit > while +
+repeat drop
+rot close drop ;
+: zchk  swap if drop ztp @ 1 lit + ztp ! else "wproof: case " puts zk @ u. ": " puts puts 0A lit putc ztf @ 1 lit + ztf ! then ;   \ ( flag str -- )
+\ zblob ( -- a n )  the blob at zx, zx past it.
+: zblob  zx @ 4 lit + zx @ @  dup 3 lit + 3 lit invert and zx @ 4 lit + + zx ! ;
+
+: zmain
+wpinit
+4000 lit alloc zb !  4000 lit alloc zt2 !  "/lib/wproof" zread drop zv !
+zv @ 4 lit + zx !
+zv @ @ 0 lit do
+	i zk !
+	zx @ @ zc !  zx @ 4 lit + zr !  zx @ 24 lit + zx !
+	zblob zbn ! zba !  zblob ztn ! zta !
+	zc @ FFFFFFFF lit = if
+		zba @ zbn @ wpparse 0= "bytes that do not parse taken" zchk
+	else
+		zba @ zbn @ wpparse "a proof not parsed" zchk
+		zr @ wpchk zc @ = "the check differs from tabminer's" zchk
+		\ the text: decoded, encoded
+		zta @ zt2 @ ztn @ bcopy  0 lit zt2 @ ztn @ + c!
+		zt2 @ zb @ wpfrom zbn @ =  zb @ zba @ zbn @ wssame and "its text not decoded to its bytes" zchk
+		zba @ zbn @ zb @ wptext ztn @ =  zb @ zta @ ztn @ wssame and "its bytes not encoded to its text" zchk
+		\ the good ones built again from their parts
+		i 3 lit u< if
+			zba @ c@ zba @ 1 lit + le@ zba @ 5 lit + zba @ D lit + zba @ 2D lit + zba @ 35 lit + wphdr
+			zba @ 49 lit + wppath
+			zba @ c@ 1 lit = if
+				zba @ WPCL + c@ zba @ WPCL + 1 lit + zba @ WPCL + 21 lit + zba @ WPCL + 41 lit + zba @ WPCL + 41 lit + 7A0 lit + wppay
+			else
+				zba @ WPCL + zba @ WPCL + 20 lit + zba @ WPCL + 41 lit + zba @ WPCL + 40 lit + c@ wpburn
+			then
+			zbn @ =  wpb @ zba @ zbn @ wssame and "not built again from its parts" zchk
+		then
+	then
+loop
+"wproof: " puts ztp @ u. " as expected, " puts ztf @ u. " not" puts 0A lit putc ;
+zmain
+0 lit exit

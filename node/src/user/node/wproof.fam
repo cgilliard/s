@@ -1,0 +1,198 @@
+\ wproof.fam — payment proofs and proofs of burn (docs/PROOFS.md,
+\ docs/GUI_WALLET.md phase 2), as tabminer's miner/src/proofs.rs: that an
+\ output was made in a block, by its path to that block's state root, and
+\ whose it is: a payment's receipt (the recipient's Dilithium signature of
+\ the output, the slate and the sender), or a burn's preimage (its
+\ beneficiary, nonce and purpose, whose hash is the memo).  After wkeys.fam
+\ and wslate.fam, with crypto/dilithium.fam loaded first.  Amounts and
+\ positions are 8 bytes, little-endian, passed by address.
+\
+\ A proof's bytes: its format (1 a payment, 2 a burn), the height (4), the
+\ position (8), the key hash (32), the amount (8), the memo (20), the path
+\ (40 siblings of 32, the leaf's first); a payment's then its sender (0
+\ and the sender's address, 32, or 1 and the unnamed sender's secret,
+\ 32), the slate's id (32), the receipt's key (1,952) and signature
+\ (3,309); a burn's its beneficiary (32), nonce (32), the purpose's length
+\ (1) and purpose.  As text: base64 between "-----BEGIN TAB PAYMENT
+\ PROOF-----" (or BURN) and its END line, 64 characters a line.
+\
+\ wpinit  the buffers (once).
+\ wpparse ( a n -- flag )  a proof decoded (Proof::from_bytes's rules):
+\ wpa, wpn, wpfmt.
+\ wpchk ( root -- code )  the parsed proof checked against a block's state
+\ root (32 canonical bytes): 0 it holds, 1 the output is not in that
+\ block's state, 2 the receipt does not hold, 3 not that burn.
+\ wpleaf ( c -- )  c (8 Montgomery words) = its output's leaf.
+\ wphdr ( fmt height pos keyhash amt memo -- )  a proof begun at wpb;
+\ wppath ( path -- ) its 1,280 bytes of siblings; then wppay ( kind
+\ sender slateid rkey rsig -- n ), kind 0 the sender's address, 1 its
+\ secret, or wpburn ( ben nonce purpose plen -- n ): its length.
+\ wpbmemo ( ben nonce purpose plen dst -- )  a burn's memo (20 canonical
+\ bytes) at dst.
+\ wptext ( a n dst -- n' )  a proof's text (its marker by its format).
+\ wpfrom ( text dst -- n | -1 )  a proof's bytes from text holding one
+\ between its markers, whatever surrounds it (the format the marker's).
+
+: wpa variable ;  : wpn variable ;  : wpfmt variable ;  : wpb variable ;  : wpbn variable ;  : wpt variable ;
+: wpd1 variable ;  : wpd2 variable ;  : wpm variable ;  : wps variable ;  : wplo variable ;  : wphi variable ;
+: wpok variable ;  : wpr variable ;
+:M WPCL 549 lit ;                             \ where the claim begins
+: wpinit
+wsinit
+wpb @ 0= if 2000 lit alloc wpb !  400 lit alloc wpt !  20 lit alloc wpd1 !  20 lit alloc wpd2 !  80 lit alloc wpm !
+	200 lit alloc wps !  20 lit alloc wpr ! then ;
+
+\ wpparse: lengths, then each element canonical.
+: wpparse
+wpn !  wpa !  -1 lit wpok !
+wpn @ WPCL 1 lit + u< if 0 lit wpok ! then
+wpok @ if
+	wpa @ c@ dup wpfmt !  1 lit - 2 lit u< wpok @ and wpok !
+	wpa @ D lit + 8 lit wscanw  wpa @ 35 lit + 5 lit wscanw and  wpa @ 49 lit + 140 lit wscanw and  wpok @ and wpok !
+then
+wpok @ if
+	wpfmt @ 1 lit = if
+		wpa @ WPCL + c@ dup 1 lit u> if drop 0 lit wpok ! else
+			0= if wpa @ WPCL + 1 lit + 8 lit wscanw wpok @ and wpok ! then
+		then
+		wpn @ 1A17 lit = wpok @ and wpok !
+	else
+		wpn @ WPCL 41 lit + u< if 0 lit wpok ! else
+			wpa @ WPCL + 8 lit wscanw wpok @ and wpok !
+			wpa @ WPCL + 40 lit + c@ WPCL + 41 lit + wpn @ = wpok @ and wpok !
+		then
+	then
+then
+wpok @ ;
+
+\ wpleaf: compress(compress(commitment, slot), height): the slot the
+\ memo's five words and the amount's three limbs.
+: wpleaf
+wpr !
+wpa @ D lit + wpd1 @ wsocom
+5 lit 0 lit do wpa @ 35 lit + i 2 lit lshift + le@ tom wpt @ i w! loop
+wpt @ 14 lit + vp !  wpa @ 2D lit + vamount
+wpd1 @ wpt @ wpd2 @ compress
+wpt @ 8 lit wzero  wpa @ 1 lit + le@ tom wpt @ !
+wpd2 @ wpt @ wpr @ compress ;
+\ wpwalk ( c -- )  c, the leaf, walked up the path to the root its
+\ position's bits say: the sibling on the left where a bit is 1.
+: wpwalk
+wpr !
+wpa @ 5 lit + le@ wplo !  wpa @ 9 lit + le@ wphi !
+28 lit 0 lit do
+	wpa @ 49 lit + i 5 lit lshift + wpt @ dle
+	wplo @ 1 lit and if wpt @ wpr @ wpr @ compress else wpr @ wpt @ wpr @ compress then
+	wplo @ 1 lit rshift wphi @ 1F lit lshift or wplo !  wphi @ 1 lit rshift wphi !
+loop ;
+\ wpsend ( -- a )  the sender the receipt names (32 canonical bytes): the
+\ address, or the unnamed sender's secret's tag.
+: wpsend
+wpa @ WPCL + c@ if wpa @ WPCL + 1 lit + wpd2 @ wstag  wpd2 @ wps @ wkcan  wps @ else wpa @ WPCL + 1 lit + then ;
+\ wpbmemo: hash_domain 22 of the beneficiary, the nonce and the purpose,
+\ three bytes an element; its first five elements.
+: wpben variable ;  : wpnon variable ;  : wppur variable ;  : wpln variable ;  : wpdst variable ;
+: wpbmemo
+wpdst !  wpln !  wppur !  wpnon !  wpben !
+wpben @ wps @ 20 lit bcopy  wpnon @ wps @ 20 lit + 20 lit bcopy  wppur @ wps @ 40 lit + wpln @ bcopy
+wps @ 40 lit wpln @ + wkpack  wkb @ swap 16 lit wpd2 @ hdom
+wpd2 @ wpt @ wkcan  wpt @ wpdst @ 14 lit bcopy ;
+: wpchk
+wpd1 @ dle  wpd1 @ wpm @ 8 lit wcopy
+wpr @ wpleaf  wpr @ wpwalk
+wpa @ 9 lit + le@ 100 lit u<  wpr @ wpm @ d= and 0= if 1 lit else
+	wpfmt @ 1 lit = if
+		\ the receipt's message: the commitment, amount, memo, slate id, sender
+		wpa @ D lit + wpd1 @ wsocom  wpd1 @ wpm @ wkcan
+		wpa @ 2D lit + wpm @ 20 lit + 8 lit bcopy  wpa @ 35 lit + wpm @ 28 lit + 14 lit bcopy
+		wpa @ WPCL + 21 lit + wpm @ 3C lit + 20 lit bcopy  wpsend wpm @ 5C lit + 20 lit bcopy
+		wpa @ WPCL + 41 lit + wpm @ 7C lit "tab-receipt" B lit wpa @ WPCL + 41 lit + 7A0 lit + dilver
+		if 0 lit else 2 lit then
+	else
+		wpa @ WPCL + wpa @ WPCL + 20 lit + wpa @ WPCL + 41 lit + wpa @ WPCL + 40 lit + c@ wpm @ wpbmemo
+		-1 lit 20 lit 0 lit do wpa @ D lit + i + c@ 0= and loop
+		wpm @ wpa @ 35 lit + 14 lit wssame and if 0 lit else 3 lit then
+	then
+then ;
+
+\ Building, at wpb.
+: wpf variable ;  : wph variable ;  : wpps variable ;  : wpkh variable ;  : wpam variable ;  : wpmm variable ;
+: wphdr
+wpmm !  wpam !  wpkh !  wpps !  wph !  wpf !
+wpf @ wpb @ c!  wph @ wpb @ 1 lit + wkle!  wpps @ wpb @ 5 lit + 8 lit bcopy  wpkh @ wpb @ D lit + 20 lit bcopy
+wpam @ wpb @ 2D lit + 8 lit bcopy  wpmm @ wpb @ 35 lit + 14 lit bcopy  49 lit wpbn ! ;
+: wppath  wpb @ 49 lit + 500 lit bcopy  WPCL wpbn ! ;
+: wpkd variable ;  : wpsd variable ;  : wpsl variable ;  : wprk variable ;  : wprs variable ;
+: wppay
+wprs !  wprk !  wpsl !  wpsd !  wpkd !
+wpkd @ wpb @ WPCL + c!  wpsd @ wpb @ WPCL + 1 lit + 20 lit bcopy  wpsl @ wpb @ WPCL + 21 lit + 20 lit bcopy
+wprk @ wpb @ WPCL + 41 lit + 7A0 lit bcopy  wprs @ wpb @ WPCL + 41 lit + 7A0 lit + CED lit bcopy
+1A17 lit dup wpbn ! ;
+: wpburn
+wpln !  wppur !  wpnon !  wpben !
+wpben @ wpb @ WPCL + 20 lit bcopy  wpnon @ wpb @ WPCL + 20 lit + 20 lit bcopy
+wpln @ wpb @ WPCL + 40 lit + c!  wppur @ wpb @ WPCL + 41 lit + wpln @ bcopy
+WPCL 41 lit + wpln @ + dup wpbn ! ;
+
+\ Text: base64, 64 characters a line, between the format's markers.
+: wpq variable ;  : wpc variable ;  : wpv variable ;  : wpi variable ;  : wpz variable ;  : wpx variable ;  : wpy variable ;
+: wpput  wpq @ c!  wpq @ 1 lit + wpq ! ;                 \ ( c -- )
+: wpstr  begin dup c@ ?dup while wpput 1 lit + repeat drop ;   \ ( s -- )
+: wpmark  wpz @ 1 lit = if "TAB PAYMENT PROOF" else "TAB BURN PROOF" then ;
+: wp64c  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" + c@ ;   \ ( v -- c )
+: wpch  wpput  wpc @ 1 lit + dup wpc !  40 lit = if A lit wpput  0 lit wpc ! then ;
+: wptext
+wpq !  wpn !  wpa !  wpq @ wpx !  wpa @ c@ wpz !  0 lit wpc !
+"-----BEGIN " wpstr wpmark wpstr "-----" wpstr A lit wpput
+wpn @ 2 lit + 3 lit / ?dup if 0 lit do
+	wpn @ i 3 lit * - 3 lit umin wpi !
+	wpa @ i 3 lit * + wpy !
+	wpy @ c@ 10 lit lshift
+	wpi @ 1 lit u> if wpy @ 1 lit + c@ 8 lit lshift or then
+	wpi @ 2 lit u> if wpy @ 2 lit + c@ or then
+	wpv !
+	4 lit 0 lit do
+		i wpi @ u> if 3D lit wpch else wpv @ 12 lit i 6 lit * - rshift 3F lit and wp64c wpch then
+	loop
+loop then
+wpc @ if A lit wpput then
+"-----END " wpstr wpmark wpstr "-----" wpstr A lit wpput
+wpq @ wpx @ - ;
+\ wpfind ( text key -- a | 0 )  just past the first key in the text.
+: wpkey variable ;
+: wpfind
+wpkey !  0 lit wpv !
+begin dup c@ wpv @ 0= and while
+	dup wpkey @ dup strlen wssame if dup wpkey @ strlen + wpv ! then
+	1 lit +
+repeat drop wpv @ ;
+\ wp64v ( c -- v | -1 )  a base64 character's value ('=' 0).
+: wp64v
+dup 41 lit - 1A lit u< if 41 lit - else dup 61 lit - 1A lit u< if 61 lit - 1A lit + else
+dup 30 lit - A lit u< if 30 lit - 34 lit + else dup 2B lit = if drop 3E lit else
+dup 2F lit = if drop 3F lit else 3D lit = if 0 lit else FFFFFFFF lit then then then then then then ;
+\ wpdec ( a dst -- n | -1 )  base64 from a up to the next '-' (whitespace
+\ passed over) into dst.
+: wpdn variable ;  : wpcnt variable ;  : wppad variable ;  : wpbad variable ;
+: wpdec
+wpx !  0 lit wpdn !  0 lit wpv !  0 lit wpcnt !  0 lit wppad !  0 lit wpbad !
+begin dup c@ dup 0= 0= swap 2D lit <> and while
+	dup c@ 20 lit u> if
+		dup c@ 3D lit = if wppad @ 1 lit + wppad ! then
+		dup c@ wp64v dup 0< if 2drop 1 lit wpbad !  "" else
+			wpv @ 6 lit lshift or wpv !  wpcnt @ 1 lit + wpcnt !
+			wpcnt @ 4 lit = if
+				wpv @ 10 lit rshift wpx @ wpdn @ + c!  wpv @ 8 lit rshift wpx @ wpdn @ + 1 lit + c!  wpv @ wpx @ wpdn @ + 2 lit + c!
+				wpdn @ 3 lit + wppad @ - wpdn !  0 lit wpcnt !  0 lit wpv !  0 lit wppad !
+			then
+			1 lit +
+		then
+	else 1 lit + then
+repeat
+c@ 2D lit =  wpbad @ 0= and  wpcnt @ 0= and if wpdn @ else FFFFFFFF lit then ;
+: wpfrom
+wpx !  wpq !
+wpq @ "-----BEGIN TAB PAYMENT PROOF-----" wpfind ?dup if wpx @ wpdec  1 lit wpz ! else
+	wpq @ "-----BEGIN TAB BURN PROOF-----" wpfind ?dup if wpx @ wpdec  2 lit wpz ! else FFFFFFFF lit 0 lit wpz ! then
+then
+dup 0< 0= if dup 0= if drop FFFFFFFF lit else wpx @ c@ wpz @ <> if drop FFFFFFFF lit then then then ;

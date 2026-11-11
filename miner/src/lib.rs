@@ -23,6 +23,8 @@ mod fam_xmss_vectors;
 mod fam_slate_vectors;
 #[cfg(test)]
 mod fam_wkeys_vectors;
+#[cfg(test)]
+mod fam_proof_vectors;
 pub mod field;
 #[rustfmt::skip]
 pub mod genesis;
