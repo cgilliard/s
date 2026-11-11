@@ -26,9 +26,10 @@
 \ the encapsulation's 32 random bytes, nonce the AEAD's 12.  0: to's
 \ Kyber key is malformed.
 \ mgopen ( obj n dk now -- ok )  a payload object opened with the Kyber
-\ secret dk: mgkind, the sender's announce at mgfrom, the inner bytes at
-\ mgin (mgil of them).  Not ok: not a payload, not sealed to dk, or the
-\ sender's announce or signature not holding (a sender must be named).
+\ secret dk: mgkind, the inner bytes at mgin (mgil of them); a named
+\ sender's announce at mgfrom, a route back at mgrtp (each 0 when not
+\ there).  Not ok: not a payload, not sealed to dk, or a named sender's
+\ announce or signature not holding.
 
 : mgb variable ;  : mgc variable ;  : mgd variable ;  : mgn variable ;  : mgx variable ;  : mgw variable ;
 : mgk variable ;  : mgm variable ;  : mgt variable ;  : mgo variable ;  : mgi variable ;  : mgl variable ;
@@ -98,39 +99,64 @@ mgva @ 7C0 lit + kyekok and
 mgva @ C6C lit + le@ 0= 0=  mgva @ C68 lit + le@ mgvt @ u> or  and
 dup if drop mgva @ 20 lit + mgva @ MGSP "tab-announce" C lit mgva @ MGSP + dilver then ;
 
-\ mgseal: the object is 02 | to | ct | nonce | blen | body; the plain
-\ text kind | flags (2: the sender named) | announce | signature | inner.
-: mgseal
-mgo !  mgx !  mgm !  mgil !  mgin !  mgkind !  mgt !
+\ mgsealx ( id ek kind inner n m nonce dst -- len )  inner (n bytes) of
+\ kind sealed to the id at id, its Kyber key at ek: the payload object at
+\ dst, len bytes (0: the key malformed).  mgflg: bit 0 the route at mgrt
+\ (1,232 bytes) inside, for an answer; bit 1 the sender named (its
+\ announce mgcar and signature, mgsk).  The object is 02 | to | ct |
+\ nonce | blen | body; the plain text kind | flags | [route] | [announce |
+\ signature] | inner.  mgseal ( to kind inner n m nonce dst -- len ) the
+\ named seal to the announce at to (init mode's).
+: mgflg variable ;  : mgrt variable ;  : mgrtp variable ;  : mghd variable ;  : mgq variable ;  : mgek2 variable ;
+:M MGRTL 4D0 lit ;                             \ a route's bytes
+: mgsealx
+mgo !  mgx !  mgm !  mgil !  mgin !  mgkind !  mgek2 !  mgt !
 mgt @ mgo @ 1 lit + 20 lit kycp  2 lit mgo @ c!
-mgt @ 7C0 lit + mgm @ mgss @ mgo @ 21 lit + kyenc 0= if 0 lit else
+mgek2 @ mgm @ mgss @ mgo @ 21 lit + kyenc 0= if 0 lit else
 	mgx @ mgo @ 461 lit + C lit kycp
-	mgkind @ mgpl @ c!  2 lit mgpl @ 1 lit + c!  mgcar @ mgpl @ 2 lit + MGAN kycp
-	mgin @ mgpl @ 2654 lit + mgil @ kycp
-	\ what is signed: the clear part, the head, the inner bytes
-	mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + MGHEAD kycp
-	mgin @ mgsm @ MGAAD + MGHEAD + mgil @ kycp
-	mgsk @ mgsm @ MGAAD MGHEAD + mgil @ + "tab-payload" B lit mgpl @ MGHEAD + dilsign
-	2654 lit mgil @ + mgl !
+	mgkind @ mgpl @ c!  mgflg @ mgpl @ 1 lit + c!  2 lit mghd !
+	mgflg @ 1 lit and if mgrt @ mgpl @ mghd @ + MGRTL kycp  mghd @ MGRTL + mghd ! then
+	mgflg @ 2 lit and if mgcar @ mgpl @ mghd @ + MGAN kycp  mghd @ MGAN + mghd ! then
+	mgflg @ 2 lit and if CED lit else 0 lit then mghd @ + mgq !
+	mgin @ mgpl @ mgq @ + mgil @ kycp
+	\ a named sender signs the clear part, the head, the inner bytes
+	mgflg @ 2 lit and if
+		mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + mghd @ kycp
+		mgin @ mgsm @ MGAAD + mghd @ + mgil @ kycp
+		mgsk @ mgsm @ MGAAD mghd @ + mgil @ + "tab-payload" B lit mgpl @ mghd @ + dilsign
+	then
+	mgq @ mgil @ + mgl !
 	mgss @ mgo @ 461 lit + mgo @ 1 lit + MGAAD mgpl @ mgl @ mgo @ 471 lit + aeseal
 	mgl @ 10 lit + dup mgo @ 46D lit + wkle!
 	471 lit +
 then ;
+: mgseal
+mgo !  mgx !  mgm !  mgil !  mgin !  mgkind !  mgt !  2 lit mgflg !
+mgt @  mgt @ 7C0 lit +  mgkind @ mgin @ mgil @ mgm @ mgx @ mgo @ mgsealx ;
 
+\ mgopen: the flags any of 0 to 3; a route at mgrtp, a named sender's
+\ announce at mgfrom (0 when not there; a named one's checked).
 : mgopen
-mgt !  mgk !  mgn !  mgo !
+mgt !  mgk !  mgn !  mgo !  0 lit mgrtp !  0 lit mgfrom !
 mgn @ 471 lit u< if 0 lit else mgo @ c@ 2 lit <> if 0 lit else
 mgo @ 46D lit + le@ dup mgl !  471 lit + mgn @ <> if 0 lit else
-mgl @ 2664 lit u< if 0 lit else
+mgl @ 12 lit u< if 0 lit else
 	mgk @ mgo @ 21 lit + mgss @ kydec
 	mgss @ mgo @ 461 lit + mgo @ 1 lit + MGAAD mgo @ 471 lit + mgl @ 10 lit - mgpl @ aeopen 0= if 0 lit else
-	mgpl @ 1 lit + c@ 2 lit <> if 0 lit else
-		mgpl @ c@ mgkind !  mgpl @ 2 lit + mgfrom !
-		mgpl @ 2654 lit + mgin !  mgl @ 10 lit - 2654 lit - mgil !
-		mgfrom @ mgt @ mgavf 0= if 0 lit else
-			mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + MGHEAD kycp
-			mgin @ mgsm @ MGAAD + MGHEAD + mgil @ kycp
-			mgfrom @ 20 lit + mgsm @ MGAAD MGHEAD + mgil @ + "tab-payload" B lit mgpl @ MGHEAD + dilver
+	mgl @ 10 lit - mgl !
+	mgpl @ 1 lit + c@ dup mgflg !  3 lit u> if 0 lit else
+		mgpl @ c@ mgkind !  2 lit mghd !
+		mgflg @ 1 lit and if mgpl @ mghd @ + mgrtp !  mghd @ MGRTL + mghd ! then
+		mgflg @ 2 lit and if mgpl @ mghd @ + mgfrom !  mghd @ MGAN + mghd ! then
+		mghd @  mgflg @ 2 lit and if CED lit + then  mgq !
+		mgq @ mgl @ u> if 0 lit else
+			mgpl @ mgq @ + mgin !  mgl @ mgq @ - mgil !
+			mgflg @ 2 lit and 0= if -1 lit else
+			mgfrom @ mgt @ mgavf 0= if 0 lit else
+				mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + mghd @ kycp
+				mgin @ mgsm @ MGAAD + mghd @ + mgil @ kycp
+				mgfrom @ 20 lit + mgsm @ MGAAD mghd @ + mgil @ + "tab-payload" B lit mgpl @ mghd @ + dilver
+			then then
 		then
 	then then
 then then then then ;

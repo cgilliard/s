@@ -1,0 +1,106 @@
+\ node/wonion_test.fam — node/wonion.fam (and wmsg.fam's routes) against
+\ tabminer's channel.rs, circuit.rs and onion.rs (node/wonion_vectors.fam,
+\ written by miner/src/fam_onion_vectors.rs): the link and circuit-hop
+\ handshakes from both sides (the keys each end gets; a tampered reply or
+\ another relay refused), a frame each way and an acknowledgement (made and
+\ opened), relay cells sealed to each of three hops and sent back by each
+\ (opened by the client, the sending hop found), a payload carrying a route
+\ and the answer along it (made, opened), and rendezvous points by weight.
+\ Prints "wonion: N as expected, M not".
+\ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam crypto/kyber.fam
+\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wmsg.fam node/wonion.fam node/wonion_vectors.fam
+
+: otpas variable ;  : otfai variable ;  : otix variable ;  : oth variable ;  : otw variable ;
+: otrpk variable ;  : otrsk variable ;  : otrid variable ;  : othl variable ;  : otdk variable ;  : otrp variable ;
+: otrk variable ;  : otk variable ;  : otz8 variable ;  : otf variable ;  : otfl variable ;  : otbuf variable ;  : otb1 variable ;
+: otb2 variable ;  : othops variable ;  : otrel variable ;  : otbody variable ;  : otp variable ;  : otq variable ;
+: otoek variable ;  : otodk variable ;  : otrid2 variable ;  : otapk variable ;  : otask variable ;  : otaek variable ;
+: otadk variable ;  : otann variable ;  : otrt variable ;  : otin variable ;  : otobj variable ;  : otol variable ;  : otx variable ;
+: otchk  swap if drop otpas @ 1 lit + otpas ! else "wonion: " puts puts 0A lit putc otfai @ 1 lit + otfai ! then ;   \ ( flag str -- )
+: othsh  otw !  oth @ 20 lit shake256  oth @ otw @ 20 lit oxsame ;     \ ( src len want -- flag )
+: otflip  dup c@ 1 lit xor swap c! ;
+\ othdr ( kind seq ack -- )  a frame's header at oxfh: the channel ovchan.
+: othdr  oxfh @ 21 lit oxzero  ovchan @ oxfh @ 8 lit oxcp  oxfh @ 11 lit + oxle!  oxfh @ 9 lit + oxle!  oxfh @ 8 lit + c! ;
+
+ovbufs ovset  wkinit mginit kyinit oxinit
+20 lit alloc oth !  7A0 lit alloc otrpk !  FC0 lit alloc otrsk !  20 lit alloc otrid !  4C1 lit alloc othl !  960 lit alloc otdk !
+18CD lit alloc otrp !  40 lit alloc otrk !  40 lit alloc otk !  8 lit alloc otz8 !  otz8 @ 8 lit oxzero  200 lit alloc otf !
+200 lit alloc otbuf !  200 lit alloc otb1 !  80 lit alloc otb2 !  F0 lit alloc othops !  80 lit alloc otrel !  370 lit alloc otbody !
+400 lit alloc otp !  400 lit alloc otq !  4A0 lit alloc otoek !  960 lit alloc otodk !  20 lit alloc otrid2 !  7A0 lit alloc otapk !
+FC0 lit alloc otask !  4A0 lit alloc otaek !  960 lit alloc otadk !  1970 lit alloc otann !  4D0 lit alloc otrt !  100 lit alloc otin !
+10000 lit alloc otobj !  4 lit alloc otx !
+
+\ ── the handshakes ──
+ovrs @ otrpk @ otrsk @ dilkey  otrpk @ oxb @ wkid  oxb @ otrid @ wkcan
+ovks @ ovch @ othl @ otdk @ oxhello
+othl @ 4C1 lit ovhh @ othsh "the hello" otchk
+0 lit ovchan @ othl @ otrpk @ otrsk @ ovm @ otrp @ otrk @ oxresp
+otrp @ 18CD lit ovrh @ othsh "the relay's reply" otchk
+0 lit ovchan @ othl @ otrp @ otrid @ otdk @ otk @ oxfin "the reply holds" otchk
+otk @ ovko @ 20 lit oxsame  otk @ 20 lit + ovki @ 20 lit oxsame and "the participant's keys" otchk
+otrk @ ovki @ 20 lit oxsame  otrk @ 20 lit + ovko @ 20 lit oxsame and "the relay's keys, crossed" otchk
+otrp @ 1800 lit + otflip  0 lit ovchan @ othl @ otrp @ otrid @ otdk @ otbuf @ oxfin 0= "a reply signed wrongly, refused" otchk  otrp @ 1800 lit + otflip
+0 lit ovchan @ othl @ otrp @ ovrs @ otdk @ otbuf @ oxfin 0= "another relay than listed, refused" otchk
+1 lit otz8 @ othl @ otrpk @ otrsk @ ovm @ otrp @ otbuf @ oxresp
+otrp @ 18CD lit ovcrh @ othsh "a circuit hop's reply" otchk
+1 lit otz8 @ othl @ otrp @ otrid @ otdk @ otb2 @ oxfin
+otb2 @ ovcko @ 20 lit oxsame and  otb2 @ 20 lit + ovcki @ 20 lit oxsame and "the hop's keys" otchk
+
+\ ── frames ──
+12C lit 0 lit do i 7 lit * 1 lit + otb1 @ i + c! loop
+64 lit 0 lit do i 3 lit * 2 lit + otb2 @ i + c! loop
+0 lit 1 lit 1 lit othdr  otb1 @ 12C lit otk @ otf @ oxseal otfl !
+otfl @ ovf1l @ =  otf @ otfl @ ovf1 @ othsh and "the participant's frame" otchk
+otf @ otfl @ otrk @ 20 lit + otbuf @ oxopen 12C lit =  otbuf @ otb1 @ 12C lit oxsame and "the relay opens it" otchk
+1 lit 1 lit 2 lit othdr  otb1 @ 0 lit otrk @ otf @ oxseal otfl !
+otfl @ ova1l @ =  otf @ otfl @ ova1 @ othsh and "the relay's acknowledgement" otchk
+0 lit 1 lit 2 lit othdr  otb2 @ 64 lit otrk @ otf @ oxseal otfl !
+otfl @ ovr1l @ =  otf @ otfl @ ovr1 @ othsh and "the relay's frame" otchk
+otf @ otfl @ otk @ 20 lit + otbuf @ oxopen 64 lit =  otbuf @ otb2 @ 64 lit oxsame and "the participant opens it" otchk
+otf @ 30 lit + otflip  otf @ otfl @ otk @ 20 lit + otbuf @ oxopen 0< "a changed frame, refused" otchk
+
+\ ── cells: three hops
+\ othk ( base -- )  the hops' keys, counts zero, at othops; the relays'
+\ backward layers at otrel.
+: othk  othops @ F0 lit oxzero  otrel @ 80 lit oxzero
+3 lit 0 lit do 20 lit 0 lit do j 10 lit * i + 1 lit + othops @ j OXHOP * + i + c!  j 10 lit * i + 65 lit + dup othops @ j OXHOP * + OXLAY + i + c!  otrel @ j OXLAY * + i + c! loop loop ;
+othk
+36B lit 0 lit do i 5 lit * 3 lit + otbody @ i + c! loop
+othops @ 0 lit otbody @ otp @ oxsealf  otp @ OXPAY ovs0 @ othsh "the cell to hop 0" otchk
+othops @ 1 lit otbody @ otp @ oxsealf  otp @ OXPAY ovs1 @ othsh "the cell to hop 1" otchk
+othops @ 2 lit otbody @ otp @ oxsealf  otp @ OXPAY ovs2 @ othsh "the cell to hop 2" otchk
+\ back: hop t originates, the hops before it pass; the client opens
+3 lit 0 lit do
+	i otix !
+	otrel @ otix @ OXLAY * + otbody @ otp @ oxorig
+	otix @ ?dup if 0 lit do otrel @ otix @ 1 lit - i - OXLAY * + otp @ oxpass loop then
+	otp @ OXPAY  otix @ 0= if ovb0 @ else otix @ 1 lit = if ovb1 @ else ovb2 @ then then othsh "a cell back" otchk
+	otp @ otq @ OXPAY oxcp
+	othops @ 3 lit otq @ oxopenb otix @ =  otq @ 10 lit + otbody @ 36B lit oxsame and "the client finds its hop and body" otchk
+loop
+
+\ ── a route and the answer along it ──
+ovqd @ ovqz @ otoek @ otodk @ kykey
+otoek @ otrid2 @ oxrid  otrid2 @ ovrid @ 20 lit oxsame "the reply id" otchk
+ovas @ otapk @ otask @ dilkey  ovad @ ovaz @ otaek @ otadk @ kykey
+otapk @ mgpk !  otask @ mgsk !  otaek @ mgek !  otann @ ovseq @ ovexp @ otz8 @ mgann
+otrid @ otrt @ 20 lit oxcp  ovtk @ otrt @ 20 lit + 10 lit oxcp  otoek @ otrt @ 30 lit + 4A0 lit oxcp
+C8 lit 0 lit do i B lit * 5 lit + otin @ i + c! loop
+1 lit mgflg !  otrt @ mgrt !
+otann @  otann @ 7C0 lit +  1 lit otin @ C8 lit ovpm @ ovpn @ otobj @ mgsealx otol !
+otol @ ovpl @ =  otobj @ otol @ ovph @ othsh and "the payload with a route" otchk
+otobj @ otol @ otadk @ ovnow @ mgopen  mgfrom @ 0= and  mgrtp @ otrt @ 4D0 lit oxsame and
+mgil @ C8 lit = and  mgin @ otin @ C8 lit oxsame and "its recipient opens it: unnamed, the route inside" otchk
+96 lit 0 lit do i D lit * 7 lit + otin @ i + c! loop
+0 lit mgflg !
+otrid2 @ otoek @ 1 lit otin @ 96 lit ovpm @ ovpn @ otobj @ mgsealx otol !
+otol @ oval @ =  otobj @ otol @ ovah @ othsh and "the answer along the route" otchk
+otobj @ otol @ otodk @ ovnow @ mgopen  mgil @ 96 lit = and  mgin @ otin @ 96 lit oxsame and "the sender opens it with its one-time key" otchk
+
+\ ── rendezvous points by weight ──
+ovwn 0 lit do
+	i ovw
+	ovwid @ ovwe @ ovwr @ 7 lit otx @ oxpts 3 lit =  otx @ ovwx @ 3 lit oxsame and "a rendezvous case" otchk
+loop
+
+"wonion: " puts otpas @ . " as expected, " puts otfai @ . " not" puts 0A lit putc

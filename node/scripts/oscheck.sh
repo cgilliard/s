@@ -788,6 +788,14 @@ uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wsub_test.fam | tr ' ' '\n' | sed
 ./tools/fam --user -o "$T/tsb.bin" $uses src/user/node/wsub_test.fam > "$T/tsb.build" 2>&1 || fail wsub "build: $(head -c 300 "$T/tsb.build")"
 sh scripts/mkimage.sh "$T/tsb.img" bin/kernel init="$T/tsb.bin":4096 2> "$T/tsb.mk" || fail wsub "mkimage: $(cat "$T/tsb.mk")"
 expect wsub 124 '^wsub: 18 as expected, 0 not' 60 ./tools/q32 "$T/tsb.img"
+# Onion mode's pieces (node/wonion.fam): the link and circuit-hop
+# handshakes, frames, relay cells each way through three hops, a payload
+# with a route and the answer along it, rendezvous points by weight, as
+# tabminer's channel.rs, circuit.rs and onion.rs.
+uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wonion_test.fam | tr ' ' '\n' | sed '/^$/d; s|^|src/user/|' | tr '\n' ' ')
+./tools/fam --user -o "$T/twon.bin" $uses src/user/node/wonion_test.fam > "$T/twon.build" 2>&1 || fail wonion "build: $(head -c 300 "$T/twon.build")"
+sh scripts/mkimage.sh "$T/twon.img" bin/kernel init="$T/twon.bin":4096 2> "$T/twon.mk" || fail wonion "mkimage: $(cat "$T/twon.mk")"
+expect wonion 124 '^wonion: 35 as expected, 0 not' 60 ./tools/q32 "$T/twon.img"
 
 # The wallet (docs/GUI_WALLET.md, phase 1), driven as wm drives it
 # (src/user/tests/walletrun.fam: requests on a pipe, each answer printed):

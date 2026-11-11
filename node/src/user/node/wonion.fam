@@ -1,0 +1,230 @@
+\ wonion.fam — onion mode's pieces (docs/ONION.md: Onion mode), as tabminer's
+\ channel.rs, circuit.rs and onion.rs: the handshake that opens a link to a
+\ relay or adds a hop to a circuit (the participant's side; the relay's
+\ too, for the tests), the frames a link carries, the layers each hop
+\ puts on and takes off a relay cell, a route's reply id, and the
+\ rendezvous points chosen by weight.  After wmsg.fam, crypto/chacha.fam,
+\ crypto/keccak.fam, crypto/dilithium.fam and crypto/kyber.fam.
+\
+\ oxinit  the buffers (once).
+\ oxhello ( seed challenge hello dk -- )  a hello (1,217 bytes): 0, the
+\ challenge (32), a fresh Kyber key from the 64-byte seed (its secret to
+\ dk, 2,400 bytes).
+\ oxfin ( dom chan hello reply expect dk keys -- ok )  the relay's reply
+\ checked (its key the expected id's, its signature over the transcript)
+\ and opened: the keys (64 bytes: this end's sending, then receiving).
+\ dom 0 a link (chan the channel, 8 bytes), 1 a circuit's hop (chan 0).
+\ oxresp ( dom chan hello pk sk m reply keys -- )  the relay's side: its
+\ reply (6,349 bytes) and keys (its sending, then receiving).
+\ oxseal ( body n key dst -- len )  a frame of the header at oxfh (chan 8,
+\ kind 1, seq 8, ack 8, sack 8: 33 bytes): the header, the body sealed;
+\ the nonce kind and seq.  oxopen ( frame len key dst -- n | -1 ) its
+\ body opened.
+\ A layer (oxlay bytes): its key (32), its count (8).  oxsealf ( hops t
+\ body dst -- ) the client's cell (1,019 bytes) carrying body (875) to hop
+\ t; hops the circuit's hops, each a forward layer then a backward one.
+\ oxopenb ( hops nh p -- j | -1 )  a cell coming back: each hop's layer
+\ taken off until one's tag holds; the hop, the body at p+16.  oxorig (
+\ layer body dst -- ) and oxpass ( layer p -- ): a hop's side, back.
+\ oxrid ( ek dst -- )  the reply id of a one-time Kyber key.
+\ oxpts ( id epoch relays n dst -- m )  the rendezvous points of id (32
+\ canonical bytes) among n relays (32 bytes each): the heaviest three
+\ (or n), heaviest first, as bytes at dst.
+
+:M OXHELLO 4C1 lit ;                           \ 1 + 32 + 1,184
+:M OXREPLY 18CD lit ;                          \ 1,952 + 1,088 + 3,309
+:M OXPAY 3FB lit ;                             \ a cell's payload: 1,019
+:M OXN 3EB lit ;                               \ 1,019 - 16
+:M OXBODY 36B lit ;                            \ a relay body: 875
+:M OXLAY 28 lit ;                              \ a layer: key 32, count 8
+:M OXHOP 50 lit ;                              \ a hop: forward, backward
+
+: oxb variable ;  : oxth variable ;  : oxsh variable ;  : oxid variable ;  : oxnc variable ;  : oxblkb variable ;
+: oxfh variable ;  : oxst variable ;  : oxy variable ;  : oxx variable ;  : oxfil variable ;  : oxrk variable ;
+: oxl variable ;  : oxtg variable ;  : oxwb variable ;
+: oxinit
+oxb @ 0= if
+	60 lit alloc oxb !  20 lit alloc oxth !  20 lit alloc oxsh !  20 lit alloc oxid !  10 lit alloc oxnc !
+	40 lit alloc oxblkb !  30 lit alloc oxfh !  1000 lit alloc oxst !  400 lit alloc oxy !  400 lit alloc oxx !
+	40 lit alloc oxfil !  80 lit alloc oxrk !  20 lit alloc oxtg !  60 lit alloc oxwb !
+then ;
+: oxcp  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;      \ ( src dst n -- )
+: oxzero  ?dup if 0 lit do 0 lit over i + c! loop then drop ;            \ ( a n -- )
+: oxsame  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;   \ ( a b n -- flag )
+: oxle!  4 lit 0 lit do over i 3 lit lshift rshift over i + c! loop 2drop ;   \ ( x a -- )
+
+\ ── The handshake (channel.rs) ──
+: oxdom variable ;  : oxch variable ;  : oxhl variable ;  : oxpk variable ;  : oxct variable ;  : oxd variable ;
+\ oxtr  the transcript at oxth: SHAKE256 of the domain's label, chan,
+\ hello, the relay's key, the ciphertext.
+: oxtr
+88 lit 1F lit kcinit
+oxdom @ if "tab-circuit" else "tab-channel" then B lit kcabs
+oxch @ 8 lit kcabs  oxhl @ OXHELLO kcabs  oxpk @ 7A0 lit kcabs  oxct @ 440 lit kcabs
+oxth @ 20 lit kcsqz ;
+\ oxkeys ( shared dst -- )  SHAKE256("tab-channel-keys", shared, th): 64 bytes.
+: oxkeys  oxd !  88 lit 1F lit kcinit  "tab-channel-keys" 10 lit kcabs  20 lit kcabs  oxth @ 20 lit kcabs  oxd @ 40 lit kcsqz ;
+: oxsd variable ;
+: oxhello
+oxd !  oxhl !  oxch !  oxsd !
+oxinit  0 lit oxhl @ c!  oxch @ oxhl @ 1 lit + 20 lit oxcp
+oxsd @  oxsd @ 20 lit +  oxhl @ 21 lit +  oxd @ kykey ;
+: oxexp variable ;  : oxdk variable ;  : oxko variable ;  : oxrp variable ;
+: oxfin
+oxko !  oxdk !  oxexp !  oxrp !  oxhl !  oxch !  oxdom !
+oxrp @ oxpk !  oxrp @ 7A0 lit + oxct !
+\ the key is the expected id's
+oxpk @ oxb @ wkid  oxb @ oxid @ wkcan  oxid @ oxexp @ 20 lit oxsame
+dup if
+	oxtr
+	drop oxpk @ oxth @ 20 lit "tab-channel-relay" 11 lit oxrp @ BE0 lit + dilver
+	dup if oxdk @ oxct @ oxsh @ kydec  oxsh @ oxko @ oxkeys then
+then ;
+: oxsk variable ;  : oxm variable ;
+: oxresp
+oxko !  oxrp !  oxm !  oxsk !  oxpk !  oxhl !  oxch !  oxdom !
+oxpk @ oxrp @ 7A0 lit oxcp
+oxhl @ 21 lit + oxm @ oxsh @ oxrp @ 7A0 lit + kyenc drop
+oxrp @ oxpk !  oxrp @ 7A0 lit + oxct !  oxtr
+oxsk @ oxth @ 20 lit "tab-channel-relay" 11 lit oxrp @ BE0 lit + dilsign
+\ the relay's keys are the initiator's crossed: its sending is their receiving
+oxsh @ oxb @ oxkeys  oxb @ 20 lit + oxko @ 20 lit oxcp  oxb @ oxko @ 20 lit + 20 lit oxcp ;
+
+\ ── Frames (channel.rs's Frame): header 33 bytes, the AEAD's associated
+\ data; the nonce the kind, three zeros, n (8) ──
+: oxfnonce  swap  oxnc @ C lit oxzero  oxnc @ c!  oxnc @ 4 lit + 8 lit oxcp ;   \ ( kind np -- )
+: oxdst variable ;  : oxfk variable ;  : oxfn variable ;  : oxfb variable ;
+: oxseal
+oxdst !  oxfk !  oxfn !  oxfb !
+oxfh @ oxdst @ 21 lit oxcp
+oxfh @ 8 lit + c@  oxfh @ 9 lit + oxfnonce
+oxfk @ oxnc @ oxdst @ 21 lit oxfb @ oxfn @ oxdst @ 21 lit + aeseal
+oxfn @ 31 lit + ;
+: oxopen
+oxdst !  oxfk !  oxfn !  oxfb !
+oxfn @ 31 lit u< if FFFFFFFF lit else
+	oxfb @ 8 lit + c@  oxfb @ 9 lit + oxfnonce
+	oxfk @ oxnc @ oxfb @ 21 lit oxfb @ 21 lit + oxfn @ 31 lit - oxdst @ aeopen
+	if oxfn @ 31 lit - else FFFFFFFF lit then
+then ;
+
+\ ── The layers (circuit.rs's Layer) ──
+\ oxnon ( layer d -- )  the nonce at oxnc: d, three zeros, the count.
+: oxnon  oxnc @ C lit oxzero  oxnc @ c!  20 lit + oxnc @ 4 lit + 8 lit oxcp ;
+\ oxks ( layer n dst -- )  its keystream, n bytes (the counter from 1).
+: oxkn variable ;  : oxkd variable ;
+: oxks  oxkd !  oxkn !  dup 0 lit oxnon  oxkd @ oxkn @ oxzero  oxnc @ 1 lit oxkd @ oxkd @ oxkn @ chacha20 ;
+\ oxblk ( layer d -- )  its block at counter 0, nonce d, at oxblkb.
+: oxblk  over swap oxnon  oxblkb @ 40 lit oxzero  oxnc @ 0 lit oxblkb @ oxblkb @ 40 lit chacha20 ;
+\ oxtag ( layer d src n dst -- )  Poly1305 of n bytes under the block's first 32.
+: oxtgs variable ;  : oxtgn variable ;
+: oxtag  oxtg !  oxtgn !  oxtgs !  oxblk  oxtgs @ oxtgn @ oxblkb @ oxtg @ poly1305 ;
+\ oxinc ( layer -- )  its count, one more.
+: oxinc  20 lit + dup @ 1 lit + dup rot tuck ! swap 0= if 4 lit + dup @ 1 lit + swap ! else drop then ;
+\ oxwide ( layer p enc -- )  LIONESS over p (1,019 bytes): L its first 32,
+\ R the rest.  stream: R ^= ChaCha20(k ^ L); hash: L ^= SHAKE256(k, R).
+: oxwl variable ;  : oxwp variable ;
+: oxwst  oxwb @ 20 lit 0 lit do over i + c@ oxwp @ i + c@ xor over i + c! loop 2drop
+oxwb @ oxwb @ 20 lit + C lit oxzero  oxwb @ 20 lit + 0 lit oxwp @ 20 lit + dup 3DB lit chacha20 ;   \ ( k -- )
+: oxwh  88 lit 1F lit kcinit  20 lit kcabs  oxwp @ 20 lit + 3DB lit kcabs  oxwb @ 20 lit kcsqz
+20 lit 0 lit do oxwp @ i + dup c@ oxwb @ i + c@ xor swap c! loop ;            \ ( k -- )
+: oxwide
+oxwl !  oxwp !  oxl !
+4 lit 0 lit do oxl @ i 2 lit + oxblk  oxblkb @ oxrk @ i 5 lit lshift + 20 lit oxcp loop
+oxwl @ if
+	oxrk @ oxwst  oxrk @ 20 lit + oxwh  oxrk @ 40 lit + oxwst  oxrk @ 60 lit + oxwh
+else
+	oxrk @ 60 lit + oxwh  oxrk @ 40 lit + oxwst  oxrk @ 20 lit + oxwh  oxrk @ oxwst
+then ;
+
+\ The client's forward cell (circuit.rs's seal_for): the keystreams S_j
+\ (1,019 bytes) of hops 0..t at oxst; the filler the hops before t will
+\ have appended; what hop t receives (its inner tag, the body, the end
+\ that makes it end in the filler) under its layer and tag; then each hop
+\ before, its layer and tag over that.
+: oxhs variable ;  : oxt variable ;  : oxbd variable ;  : oxp variable ;  : oxk variable ;
+: oxhop  OXHOP * oxhs @ + ;                            \ ( j -- forward layer )
+: oxS  A lit lshift oxst @ + ;                         \ ( j -- its keystream )
+: oxsealf
+oxp !  oxbd !  oxt !  oxhs !
+oxt @ 1 lit + 0 lit do i oxhop OXPAY i oxS oxks loop
+\ the filler
+0 lit oxk !
+oxt @ ?dup if 0 lit do
+	oxfil @ oxk @ + 10 lit oxzero  oxk @ 10 lit + oxk !
+	oxk @ 0 lit do oxfil @ i + dup c@  j oxS OXPAY oxk @ - + i + c@ xor swap c! loop
+loop then
+\ what hop t receives, then its layer and tag
+oxy @ OXN oxzero  oxbd @ oxy @ 10 lit + OXBODY oxcp
+oxk @ ?dup if 0 lit do oxfil @ i + c@  oxt @ oxS OXN oxk @ - + i + c@ xor  oxy @ OXN oxk @ - + i + c! loop then
+oxt @ oxhop 1 lit oxy @ 10 lit + OXN 10 lit - oxy @ oxtag
+OXN 0 lit do oxy @ i + c@ oxt @ oxS i + c@ xor oxx @ i + c! loop
+oxt @ oxhop 0 lit oxx @ OXN oxp @ oxtag  oxx @ oxp @ 10 lit + OXN oxcp
+\ each hop before
+oxt @ ?dup if 0 lit do
+	oxt @ 1 lit - i - oxk !
+	OXN 0 lit do oxp @ i + c@ oxk @ oxS i + c@ xor oxx @ i + c! loop
+	oxk @ oxhop 0 lit oxx @ OXN oxp @ oxtag  oxx @ oxp @ 10 lit + OXN oxcp
+loop then
+oxt @ 1 lit + 0 lit do i oxhop oxinc loop ;
+\ oxopenb: each hop's backward layer off, its count on, until its tag holds.
+: oxnh variable ;  : oxj variable ;
+: oxopenb
+oxp !  oxnh !  oxhs !  -1 lit oxj !
+oxnh @ ?dup if 0 lit do
+	oxj @ 0< if
+		i oxhop OXLAY + dup oxp @ 0 lit oxwide
+		dup 0 lit oxp @ 10 lit + OXN oxtg @ oxtag  oxinc
+		oxtg @ oxp @ 10 lit oxsame if i oxj ! then
+	then
+loop then
+oxj @ ;
+\ A hop's side: originating (the tag over the body and zeros, the layer)
+\ and passing (the layer) a cell going back.
+: oxorig
+oxp !  oxbd !  oxl !
+oxp @ OXPAY oxzero  oxbd @ oxp @ 10 lit + OXBODY oxcp
+oxl @ 0 lit oxp @ 10 lit + OXN oxp @ oxtag
+oxl @ oxp @ -1 lit oxwide  oxl @ oxinc ;
+: oxpass  over swap -1 lit oxwide  oxinc ;
+
+\ oxrid: hash_domain(23, the Kyber key's bytes packed).
+: oxrd variable ;
+: oxrid  oxrd !  4A0 lit 17 lit oxb @ mghb  oxb @ oxrd @ wkcan ;
+
+\ oxpts (onion.rs's rendezvous_relays): each relay weighed by the first 8
+\ bytes (a 64-bit number) of hash_domain(21, id, epoch, the relay's id);
+\ the three heaviest kept, heaviest first, an equal weight to the higher
+\ index.
+: oxpd2 variable ;  : oxwc variable ;  : oxtw variable ;  : oxpid variable ;  : oxpe variable ;  : oxprl variable ;  : oxpn variable ;
+: oxpm variable ;  : oxwh2 variable ;  : oxwl2 variable ;
+\ oxabove ( e -- flag )  the weight oxwh2/oxwl2 of relay i above entry e.
+: oxwi variable ;
+: oxabove
+dup @ oxwh2 @ 2dup = if 2drop
+	dup 4 lit + @ oxwl2 @ 2dup = if 2drop 8 lit + @ oxwi @ u< else u< nip then
+else u< nip then ;
+: oxpts
+oxpd2 !  oxpn !  oxprl !  oxpe !  oxpid !
+oxwc @ 0= if 20 lit alloc oxwc !  30 lit alloc oxtw ! then
+0 lit oxpm !
+oxpn @ ?dup if 0 lit do
+	i oxwi !
+	8 lit 0 lit do oxpid @ i 2 lit lshift + le@ tom oxx @ i w! loop
+	oxpe @ tom oxx @ 8 lit w!
+	8 lit 0 lit do oxprl @ oxwi @ 5 lit lshift + i 2 lit lshift + le@ tom oxx @ i 9 lit + w! loop
+	oxx @ 11 lit 15 lit oxwc @ hdom
+	oxwc @ 1 lit w@ fromm oxwh2 !  oxwc @ 0 lit w@ fromm oxwl2 !
+	\ its place among the kept (three at most), heaviest first
+	oxpm @ oxk !
+	oxpm @ ?dup if 0 lit do oxk @ oxpm @ = if oxtw @ i C lit * + oxabove if i oxk ! then then loop then
+	oxk @ 3 lit u< if
+		oxpm @ 3 lit u< if oxpm @ 1 lit + oxpm ! then
+		oxpm @ 1 lit - oxk @ - ?dup if 0 lit do
+			oxtw @ oxpm @ 2 lit - i - C lit * +  dup C lit + C lit oxcp
+		loop then
+		oxwh2 @ oxtw @ oxk @ C lit * + !  oxwl2 @ oxtw @ oxk @ C lit * + 4 lit + !  oxwi @ oxtw @ oxk @ C lit * + 8 lit + !
+	then
+loop then
+oxpm @ ?dup if 0 lit do oxtw @ i C lit * + 8 lit + @ oxpd2 @ i + c! loop then
+oxpm @ ;

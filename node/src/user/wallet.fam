@@ -1709,6 +1709,8 @@ then then then then then then then ;
 \ sent back to it; a recipient's answer (stage 2) to a payment this
 \ wallet sent that id, finalized.
 : wmgot
+\ (in init mode every sender is named; one that is not is passed over)
+mgfrom @ if
 \ a query for a sub-name of ours (not while resolving one of our own)
 mgkind @ 2 lit =  wmrs @ 0= and  mnss @ 0= and if
 	mgin @ mgil @ sbpq if wmquery then
@@ -1741,6 +1743,7 @@ mgkind @ 1 lit =  mgil @ 8000 lit u< and if
 			then
 		then
 	then
+then
 then ;
 \ wmrun  the message layer's turn in the loop: datagrams, the clock, the
 \ height and tip from the node, the send's end told; an owner that has
