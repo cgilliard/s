@@ -13,6 +13,7 @@
 \   GET  /v1/header/<height|id>[?raw]    a header, decoded (or its bytes)
 \   GET  /v1/block/<height|id>[?raw]     a block kept (the last 1,008)
 \   GET  /v1/outputs?from=<p>&count=<n>  outputs in position order (1,000)
+\   GET  /v1/commits?from=<p>&count=<n>  name commits, the same (a reveal's)
 \   GET  /v1/spent?from=<height>         positions spent, block by block
 \   GET  /v1/name/<name>                 a record and its proof
 \   GET  /v1/proof/output/<position>[?at=<height>]
@@ -312,6 +313,33 @@ stx @ txcommit drop
 "]" a" acom "next" akey alast @ alasth @ au64 "}" a"
 "200 OK" asend ;
 
+\ acommits  the name commits unspent, in position order, as aoutputs:
+\ each its position, its hash (the commit, canonical) and its height (a
+\ wallet finds its own by hash: a reveal names the commit's position).
+: acommits
+"from=" aqv ?dup if a40 else 0 lit 0 lit then afromh ! afrom !
+"count=" 64 lit anarg 3E8 lit 2dup u> if swap then drop acnt !
+abegin "{" a" "commits" akey "[" a"
+afrom @ alast !  afromh @ alasth !
+stfd @ 0 lit txbegin stx !
+afrom @ afromh @ or if
+	63 lit  afrom @ 1 lit -  afrom @ if afromh @ else afromh @ 1 lit - then  kpos
+else 63 lit kb @ c! 1 lit then
+0 lit an !
+begin
+	an @ acnt @ u< if knext dup 6 lit = if drop kb2 @ c@ 63 lit = else drop 0 lit then else drop 0 lit then
+while
+	kb2 @ kb @ 6 lit bcopy  6 lit sbuf @ 24 lit sget drop
+	an @ if acom then
+	kb @ 2 lit + 4 lit be@ kb @ 1 lit + c@
+	over 1 lit + dup alast !  0= if dup 1 lit + else dup then alasth !
+	"{" a" "position" akey au64 acom "hash" akey sbuf @ adig acom "height" akey sbuf @ 20 lit + @ anum "}" a"
+	an @ 1 lit + an !  6 lit
+repeat
+stx @ txcommit drop
+"]" a" acom "next" akey alast @ alasth @ au64 "}" a"
+"200 OK" asend ;
+
 \ aspent  the positions each block kept spent: inputs, commits revealed
 \ and swept.
 : aspent
@@ -583,13 +611,14 @@ else
 	"/v1/header/" apre if aheader else
 	"/v1/block/" apre if ablock else
 	apath @ "/v1/outputs" streq if aoutputs else
+	apath @ "/v1/commits" streq if acommits else
 	apath @ "/v1/spent" streq if aspent else
 	"/v1/name/" apre if aname else
 	"/v1/proof/output/" apre if aproof else
 	apath @ "/v1/fees" streq if afees else
 	apath @ "/v1/mempool" streq if amempool else
 	apath @ "/v1/tip" streq if atip else anotf
-	then then then then then then then then then then
+	then then then then then then then then then then then
 then ;
 
 \ aone  the connection in acfd: its request read, checked, answered.

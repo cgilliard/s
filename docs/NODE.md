@@ -307,6 +307,9 @@ reads the node though only root can read the token
     order (commitment, memo slot, height), for wallets to scan. The
     chain carries no keys or addresses (`docs/PRIVACY.md`), so a
     wallet finds its own by scanning, as tabminer's does.
+  - `GET /v1/commits?from=<position>&count=<n>`: the name commits not
+    yet revealed, the same way (position, hash, height): a wallet finds
+    its commit by hash, as a reveal names the commit's position.
   - `GET /v1/spent?from=<height>`: what was spent since a height, so a
     wallet can keep its balance current.
   - `GET /v1/name/<name>`: a name's record and its proof against the
