@@ -13,6 +13,9 @@
 #   `receive`s it (a file) and writes its answer, the wallet finalizes it
 #   pasted; once mined, tabminer holds a confirmed output of 1 and the
 #   wallet 2.5 - 1 - its fee;
+# - bump and cancel, tabminer stopped (SIGSTOP) while the wallet replaces:
+#   a burn bumped, then landed; another cancelled, its coins back less the
+#   cancel's fee, to the base unit;
 # - proofs of payment each way: the wallet's checked by tabminer's
 #   verify-proof, tabminer's by the wallet; a burn each way, the same;
 # - names: the wallet registers famwallet (commit, the reveal 12 blocks
@@ -20,7 +23,7 @@
 #   tabname and the wallet finds it (its proof checked), and proves
 #   nosuchname absent; the wallet updates famwallet, both see the value;
 #   transfers by offers as text: famwallet to tabminer, tabname to the
-#   wallet.
+#   wallet (its offer written to a file in its home, then given again).
 # No wait has a deadline: each fails only when nothing under its directory
 # has changed for its idle window (scripts/waitlib.sh's rule).
 # Needs tabminer built with the dev networks:
@@ -72,9 +75,9 @@ wait_for "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 
 wait_for "$T/os.out" 'wm: port 80' 60 "wm"
 
 echo "paytest.sh: the two wallets paying each other"
-python3 -u - "$WP" "$T" "$PART" "$HP" <<'EOF' || { wdump; exit 1; }
+python3 -u - "$WP" "$T" "$PART" "$HP" "$AP" <<'EOF' || { wdump; exit 1; }
 import base64, hashlib, json, os, re, socket, struct, sys, time, urllib.request
-port, T, part, api = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+port, T, part, api, apid = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
 G = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 fifo = open(f'{T}/a.in', 'w')
 def tab(cmd):
@@ -212,6 +215,44 @@ if part in ('payments', 'proofs'):
           and not any(i['kind'] == 'received' and i['amount'] == want for i in acts)
           and any(i['kind'] == 'sent' and i['amount'] == '1.0000000000' and i['tx'] == f['tx'] and i['state'] == 'confirmed' for i in acts))
 
+if part == 'payments':
+    # bump and cancel (docs/FEES.md): tabminer stopped (SIGSTOP) while the
+    # wallet sends and replaces, so nothing is mined between; each
+    # replacement then lands, the coins counted to the base unit
+    import signal
+    def units(a):
+        w, f = a.split('.'); return int(w) * 10**10 + int(f)
+    def coins(u):
+        return f'{u // 10**10}.{u % 10**10:010d}'
+    def in_acts(tx):
+        return [i for i in ask('activity')['items'] if i['tx'] == tx]
+    have = units(want)
+    os.kill(apid, signal.SIGSTOP)
+    try:
+        b = ask('burn', amount='0.5', purpose='bumped', speed='hour')
+        check(f'the wallet burns 0.5: {b.get("tx", b.get("error"))}', b['ok'])
+        bb = ask('bump', tx=b['tx'], speed='block')
+        check(f'the wallet bumps it: fee {b["fee"]} then {bb.get("fee", bb.get("error"))}', bb['ok'] and bb['tx'] != b['tx'] and units(bb['fee']) > units(b['fee']))
+        check('its activity: the bump pending in the burn\'s place', [i['state'] for i in in_acts(bb['tx'])] == ['pending'] and not in_acts(b['tx']))
+    finally:
+        os.kill(apid, signal.SIGCONT)
+    have -= 5 * 10**9 + units(bb['fee'])
+    check(f'the bump lands: the wallet holds {coins(have)}', wait('the bump in a block', lambda: (time.sleep(3), confirmed() == coins(have))[1]))
+    check('its activity: the bump confirmed', [i['state'] for i in in_acts(bb['tx'])] == ['confirmed'])
+    os.kill(apid, signal.SIGSTOP)
+    try:
+        c = ask('burn', amount='0.25', purpose='cancelled', speed='hour')
+        check(f'the wallet burns 0.25: {c.get("tx", c.get("error"))}', c['ok'])
+        cc = ask('cancel', tx=c['tx'])
+        check(f'the wallet cancels it: fee {cc.get("fee", cc.get("error"))}', cc['ok'] and cc['tx'] != c['tx'])
+        check('its activity: the burn gone', not in_acts(c['tx']))
+        k = ask('bump', tx=c['tx'])
+        check(f'a cancelled burn is not bumped: {k.get("error")}', not k['ok'])
+    finally:
+        os.kill(apid, signal.SIGCONT)
+    have -= units(cc['fee'])
+    check(f'the cancel lands: the wallet holds {coins(have)}', wait('the cancel in a block', lambda: (time.sleep(3), confirmed() == coins(have))[1]))
+
 if part == 'proofs':
     # proofs (docs/PROOFS.md): each side's checked by the other
     pp = ask('proof', tx=f['tx'])
@@ -311,8 +352,12 @@ if part == 'names':
     x = ask('name-transfer', text=o1, speed='hour')
     check(f'the wallet signs famwallet over: {x.get("tx", x.get("error"))}', x['ok'] and x['name'] == 'famwallet')
     check('tabminer holds famwallet', wait('the transfer to tabminer', tab_name('famwallet', "(this wallet's)")))
+    of = ask('name-offer', name='tabname', file='tabname.offer')
+    check(f'the wallet offers for tabname, to a file in its home: {of.get("file", of.get("error"))}', of['ok'] and of['file'] == 'tabname.offer')
     o2 = ask('name-offer', name='tabname')
-    check('the wallet offers for tabname, as text', o2['ok'] and o2['text'].startswith('-----BEGIN TAB NAME OFFER-----'))
+    check('asked again, the wallet gives the same offer as text', o2['ok'] and o2['text'].startswith('-----BEGIN TAB NAME OFFER-----'))
+    ns = [i['state'] for i in ask('names')['items'] if i['name'] == 'tabname']
+    check(f'tabname offered in the wallet: {ns}', ns == ['offered'])
     open(f'{T}/off2.txt', 'w').write(o2['text'])
     n0 = aout().count('transferring tabname')
     tab(f'name-transfer {T}/off2.txt')

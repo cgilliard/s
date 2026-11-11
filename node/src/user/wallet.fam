@@ -731,6 +731,19 @@ sdone @ 2 lit = if "not enough confirmed coins" jerr else
 then
 then then then then ;
 
+\ The sent records, "x" || a transaction's id (33 bytes): what cancel and
+\ bump re-sign.  +0 its inputs (n), +4 1 if it has change, +8 its fee
+\ (8), +10 its size, +18 the change's commitment, +38 the inputs'
+\ commitments, 32 bytes each (28 at most: under the store's 1 KiB).
+\ wxput ( n -- )  the record of the transaction ecb written, in the
+\ writer's transaction: n inputs (their commitments at xsrc, xst apart),
+\ +4 to +37 as the caller set them.
+: xrec variable ;  : xsrc variable ;  : xst variable ;  : xid variable ;  : xout variable ;  : xsz variable ;
+: wxput
+dup xrec @ !  ?dup if 0 lit do xsrc @ xst @ i * + xrec @ 38 lit + i 5 lit lshift + 20 lit bcopy loop then
+78 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit xrec @ 38 lit xrec @ @ 5 lit lshift + wsetk ;
+: xzero  xrec @ 38 lit 0 lit do 0 lit over i + c! loop drop ;
+
 \ ofinal ( line -- )  the recipient's answer finalized: tabminer's checks
 \ against the payment's record (wsfin); each input's next leaf recorded as
 \ used, committed, before any signature is made; the transaction signed
@@ -800,6 +813,8 @@ okey @ 21 lit pend @ 878 lit wrget 0< if "not a payment this wallet began" jerr 
 				FFFFFFFF lit prec @ 94 lit + !  FFFFFFFF lit prec @ 98 lit + !
 				wsouts @ wschg @ 3C lit * + prec @ A0 lit + 3C lit bcopy  wsrc @ prec @ DC lit + 148D lit bcopy
 				70 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit prec @ PRECN wsetk  wrcpt+
+				xzero  pend @ 4 lit + @ xrec @ 4 lit + !  pend @ 10 lit + xrec @ 8 lit + 8 lit bcopy  ftx @ xrec @ 10 lit + !
+				pend @ 58 lit + xrec @ 18 lit + 20 lit bcopy  pend @ 78 lit + xsrc !  20 lit xst !  fnin @ wxput  70 lit okey @ c!
 				wend drop
 				jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo pend @ 10 lit + a8. "'}" jo jend
 			else
@@ -939,8 +954,8 @@ repeat
 sdone @ 2 lit = if 2 lit else
 	stot @ sneed @ schg @ a8sub
 	schg @ sdust @ a8lt if sfee @ schg @ sfee @ a8add  0 lit 0 lit schg @ a8set then
-	0 lit bchg !
-	schg @ @ schg @ 4 lit + @ or if wbeg  schg @ 2 lit wnew  wend drop  1 lit bchg ! then
+	0 lit bchg !  xzero
+	schg @ @ schg @ 4 lit + @ or if wbeg  schg @ 2 lit wnew  wend drop  1 lit bchg !  ecom @ xrec @ 18 lit + 20 lit bcopy then
 	sel @ wib !  40 lit wist !  spick @ win !
 	wcbeg
 	win @ 0 lit do  i wicom pkb @ wpkof  pkb @ i wicom 20 lit + wcin+  loop
@@ -951,7 +966,13 @@ sdone @ 2 lit = if 2 lit else
 		"POST" "/v1/tx" wctb @ ftx @ hask
 		hcode @ C8 lit = if
 			drop  wsd @ wcbody  wsd @ ecb @ wkcan
-			wbeg wspend+ wend drop  0 lit
+			wbeg wspend+
+			\ a payment's or burn's (no operation): its sent record, for cancel and bump
+			wcon @ 0= if
+				bchg @ xrec @ 4 lit + !  sfee @ xrec @ 8 lit + 8 lit bcopy  ftx @ xrec @ 10 lit + !
+				sel @ xsrc !  40 lit xst !  win @ wxput
+			then
+			wend drop  0 lit
 		else
 			?dup if "'reason':'" wcwhy @ 100 lit jstr drop wcwhy @ jsafe 5 lit else 6 lit then
 		then
@@ -1191,31 +1212,56 @@ then then ;
 \ owned; a pending update's new owner taken once the chain has it).
 \ onoffer ( line -- )  a name asked for from its owner: a record under a
 \ fresh key of this wallet's (its value given, or this wallet's id), kept
-\ as offered (stage 3), given as text for the owner's name-transfer.
-: onoffer
-have @ 0= if drop nowal else
-dup nname? 0= if drop "not a valid name" jerr else
-nmget if drop "the wallet already has that name" jerr else
-nvalue 0= if "a value is a tab1 address or 64 hex digits" jerr else
+\ as offered (stage 3), given as text for the owner's name-transfer, or
+\ written to the file in "file".  Asked again while offered, the same
+\ offer again.
+\ nofnew ( line -- code )  a new offer's record kept, the offer at nrb (nrl
+\ bytes): 0, or 1 not a value, 2 not written.  nofold ( line -- 0 ) an
+\ offered name's offer made again.
+: ofile variable ;
+: nofnew
+nvalue 0= if 1 lit else
 	nrecb @ NRECN 0 lit do 0 lit over i + c! loop drop
 	4 lit 0 lit do nrecb @ i 2 lit lshift + wrfp loop
 	nrecb @ nderive
 	nname @ nlen @ nownc @ nval @ nmem @ nrb @ wnrec nrl !
 	nval @ nrecb @ 10 lit + 20 lit bcopy  3 lit nrecb @ 30 lit + c!
-	wbeg nmput wend 0= if "the wallet could not be written" jerr else
-		boffer 1 lit bjs !  jok ",'text':'" jo nrb @ nrl @ b64out "'}" jo jend  0 lit bjs !
-	then
-then then then then ;
+	wbeg nmput wend 0= if 2 lit else 0 lit then
+then ;
+: nofold  drop  nrecb @ 10 lit + nval @ 20 lit bcopy  nrecb @ nderive  nname @ nlen @ nownc @ nval @ nmem @ nrb @ wnrec nrl !  0 lit ;
+: onoffer
+have @ 0= if drop nowal else
+dup nname? 0= if drop "not a valid name" jerr else
+dup "'file':'" fpath @ 100 lit jstr ofile !
+nmget if nrecb @ 30 lit + c@ 3 lit = if nofold else drop 3 lit then else nofnew then
+?dup if
+	dup 1 lit = if drop "a value is a tab1 address or 64 hex digits" jerr else
+	2 lit = if "the wallet could not be written" jerr else "the wallet already has that name" jerr then then
+else
+	ofile @ if
+		boffer 0 lit bjs !  tout @ bbp !  nrb @ nrl @ b64out  bslate
+		fpath @ tout @ bbp @ tout @ - fwrite if jok ",'file':'" jo fpath @ jraw "'}" jo jend else "the offer cannot be written" jerr then
+	else boffer 1 lit bjs !  jok ",'text':'" jo nrb @ nrl @ b64out "'}" jo jend  0 lit bjs !  bslate then
+then then then ;
 
 \ nofb  the offer onxfer signs over (nlook takes nrb).
 : nofb variable ;
+\ tfile ( line -- line ok )  the request's text at ttxt: pasted ("text"),
+\ or read from the file in "file".
+: tfile
+dup "'text':'" ttxt @ 2400 lit jstr if -1 lit else
+dup "'file':'" fpath @ 100 lit jstr if
+	fpath @ fread dup 0< over 23FF lit u> or if drop 0 lit else
+		fbuf @ ttxt @ 2 lit pick bcopy  ttxt @ + 0 lit swap c!  -1 lit
+	then
+else 0 lit then then ;
 \ onxfer ( line -- )  a name of this wallet's signed over to an offer
-\ (pasted, "text"): an update to the offer's record by the current owner
+\ (pasted, "text", or a file's, "file"): an update to the offer's record by the current owner
 \ key at its next leaf (recorded used first); the name leaves the wallet
 \ when the chain has it (stage 4).
 : onxfer
 have @ 0= if drop nowal else
-dup "'text':'" ttxt @ 2400 lit jstr 0= if drop "no offer given" jerr else
+tfile 0= if drop "no offer given, or its file not read" jerr else
 wspeed
 boffer  ttxt @ nofb @ b64in  bslate  dup 0< if drop "no name offer in it" jerr else
 nrl !  nofb @ c@ dup nlen !  1 lit - 20 lit u< 0= if "not a name offer" jerr else
@@ -1334,6 +1380,125 @@ begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit
 repeat drop
 wtx @ txabort drop ;
 
+\ Cancel and bump (as tabminer's cancel_sent and bump_sent, docs/FEES.md):
+\ a payment or burn not yet in a block, re-signed from the same inputs at
+\ their next leaves.  A replacement pays what it replaces and 10 base
+\ units a byte of its own size more (the pool's rule), or the speed's
+\ rate on its size if more.
+\ xload ( line -- code )  the transaction in "tx" (its id at xid): 0 and
+\ its records at prec and xrec, or why not.
+: xload
+"'tx':'" wtmp @ 50 lit jstr  wtmp @ strlen 40 lit = and 0= if 1 lit else
+wtmp @ xid @ 20 lit jhexb
+70 lit okey @ c!  xid @ okey @ 1 lit + 20 lit bcopy
+okey @ 21 lit prec @ PRECN wrget 0< if 2 lit else
+prec @ 98 lit + @ FFFFFFFF lit <> if 3 lit else
+78 lit okey @ c!  okey @ 21 lit xrec @ 400 lit wrget 0< if 4 lit else 0 lit
+then then then then ;
+: xerr
+dup 1 lit = if drop "no transaction id" jerr else dup 2 lit = if drop "no payment or burn with that id" jerr else
+3 lit = if "it is in a block already" jerr else "the wallet kept no record of its inputs (sent before cancel and bump were built)" jerr then
+then then ;
+\ xfee ( base -- )  sfee = the larger of base + 10 a byte of xsz and
+\ srate a byte of xsz.
+: xfee
+xsz @ A lit * 0 lit wtmp @ a8set  wtmp @ sfee @ a8add
+xsz @ srate @ * 0 lit wtmp @ a8set  sfee @ wtmp @ a8lt if wtmp @ sfee @ 8 lit bcopy then ;
+\ xins  a transaction begun (wcbeg) with the record's inputs, their sum at
+\ stot; wib, wist, win for winp.
+: xins
+wcbeg  0 lit 0 lit stot @ a8set
+xrec @ @ 0 lit do
+	xrec @ 38 lit + i 5 lit lshift + pkb @ wpkof
+	stot @ orec @ 10 lit + stot @ a8add  pkb @ orec @ 10 lit + wcin+
+loop
+xrec @ 38 lit + wib !  20 lit wist !  xrec @ @ win ! ;
+\ xpost ( -- code )  the transaction signed (its leaves recorded first)
+\ and posted: wcarry's codes (0 done, its id at ecb; 3, 4, 5, 6).
+: xpost
+winp if 3 lit else
+wleaf+ 0= if 4 lit else
+	fka @ flv @ fps @ wctx ftx !
+	"POST" "/v1/tx" wctb @ ftx @ hask
+	hcode @ C8 lit = if drop  wsd @ wcbody  wsd @ ecb @ wkcan  0 lit
+	else ?dup if "'reason':'" wcwhy @ 100 lit jstr drop wcwhy @ jsafe 5 lit else 6 lit then then
+then then ;
+\ xforget ( c -- )  an output made for a replacement that was not sent.
+: xforget  wbeg  6F lit okey @ c!  okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop  wend drop ;
+\ xdrop  in the writer's transaction: the replaced transaction's sent
+\ record and its change's output record (it will not land).
+: xdrop
+78 lit okey @ c!  xid @ okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
+xrec @ 4 lit + @ if 6F lit okey @ c!  xrec @ 18 lit + okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop then ;
+\ ocancel ( line -- )  "tx" replaced by its inputs paid back to a new
+\ output of this wallet's: the payment (or burn) and its records go.
+: ocancel
+have @ 0= if drop nowal else
+dup xload ?dup if nip xerr else
+	wspeed
+	xrec @ @ 949 lit * 4C lit + xsz !  xrec @ 8 lit + xfee
+	xins
+	sfee @ stot @ a8lt 0= if "its inputs hold too little for that fee" jerr else
+	stot @ sfee @ schg @ a8sub
+	schg @ sdust @ a8lt if "what would come back is below the dust limit" jerr else
+	wbeg  schg @ 2 lit wnew  wend 0= if "the wallet could not be written" jerr else
+		ecom @ xout @ 20 lit bcopy  onew @ wcout+
+		xpost ?dup if xout @ xforget wcerr else
+			wbeg
+			70 lit okey @ c!  xid @ okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
+			6 lit 0 lit do i rpkey  wtx @ okey @ 22 lit txdel drop loop
+			xdrop
+			wend drop
+			jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo sfee @ a8. "'}" jo jend
+		then
+	then then then
+then then ;
+\ obump ( line -- )  "tx" replaced by the same outputs but its change,
+\ which pays the higher fee (below the dust limit, the change goes to the
+\ fee whole): the payment's records move to the replacement.
+: bchg2 variable ;
+: obump
+have @ 0= if drop nowal else
+dup xload ?dup if nip xerr else
+xrec @ 4 lit + @ 0= if drop "it has no change to pay a higher fee from: cancel it instead" jerr else
+	wspeed
+	xrec @ 10 lit + @ xsz !  xrec @ 8 lit + xfee
+	sfee @ xrec @ 8 lit + samt @ a8sub
+	xins
+	6F lit okey @ c!  xrec @ 18 lit + okey @ 1 lit + 20 lit bcopy  okey @ 21 lit orec @ 30 lit wrget drop
+	orec @ 10 lit + stot @ 8 lit bcopy
+	stot @ samt @ a8lt if "its change holds too little for that fee: cancel it instead" jerr else
+	stot @ samt @ schg @ a8sub  0 lit bchg2 !  -1 lit fcode !
+	schg @ sdust @ a8lt if
+		xrec @ 8 lit + stot @ sfee @ a8add
+	else
+		wbeg  schg @ 2 lit wnew  wend 0= if 0 lit fcode ! else ecom @ xout @ 20 lit bcopy  onew @ wcout+  1 lit bchg2 ! then
+	then
+	fcode @ 0= if "the wallet could not be written" jerr else
+		prec @ A0 lit + xout @ 20 lit + 3C lit bcopy  xout @ 20 lit + wcout+
+		xpost ?dup if bchg2 @ if xout @ xforget then wcerr else
+			wbeg
+			\ the payment's record and its receipt's parts, moved to the new id
+			sfee @ prec @ 8 lit + 8 lit bcopy
+			70 lit okey @ c!  ecb @ okey @ 1 lit + 20 lit bcopy  okey @ 21 lit prec @ PRECN wsetk
+			xid @ okey @ 1 lit + 20 lit bcopy  wtx @ okey @ 21 lit txdel drop
+			6 lit 0 lit do
+				xid @ okey @ 1 lit + 20 lit bcopy  i rpkey  okey @ 22 lit pftxt @ RPART wgetk
+				dup 0 lit > if
+					wtx @ okey @ 22 lit txdel drop
+					ecb @ okey @ 1 lit + 20 lit bcopy  i rpkey  okey @ 22 lit rot pftxt @ swap wsetk
+				else drop then
+			loop
+			xdrop
+			\ its own sent record: the same inputs, the new change
+			bchg2 @ xrec @ 4 lit + !  sfee @ xrec @ 8 lit + 8 lit bcopy  ftx @ xrec @ 10 lit + !
+			xout @ xrec @ 18 lit + 20 lit bcopy  xrec @ 38 lit + xsrc !  20 lit xst !  xrec @ @ wxput
+			wend drop
+			jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo sfee @ a8. "'}" jo jend
+		then
+	then then
+then then then ;
+
 \ ── The requests ──
 
 : tried variable ;
@@ -1419,9 +1584,10 @@ else drop "locked" jerr then ;
 "name-lookup" op? if onlook else
 "name-offer" op? if onoffer else
 "name-transfer" op? if onxfer else
-"cancel" op? "bump" op? or if drop "not built yet" jerr else
+"cancel" op? if ocancel else
+"bump" op? if obump else
 drop "unknown op" jerr
-then then then then then then then then then then then then then then then then then then then then then then then ;
+then then then then then then then then then then then then then then then then then then then then then then then then ;
 
 \ hline ( line -- )  a line read: only the first may unlock.
 : hline
@@ -1459,7 +1625,7 @@ NRECN alloc nrecb !  44 lit alloc nname !  20 lit alloc nown !  20 lit alloc now
 0 lit lh !  0 lit nodeok !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
-8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  20 lit alloc sid !  20 lit alloc ssec !
+8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
 440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
 : pfd variable ;  8 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !

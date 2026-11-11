@@ -164,26 +164,28 @@ is written).
   | `fees` | | `speeds`: each a `speed` (`block`, `hour`, `day`, `economy`), its `rate` as `/v1/fees` gives it, `wait` in seconds |
   | `send` | `to` (an address or `@name`), `amount`, `speed`; `slate`, the file to write, or `text`: true | `slate`, or `text`, the slate to copy; `fee` |
   | `finalize` | `slate`, the recipient's answer as a file, or `text`, pasted | `tx`, the transaction sent to the pool; `fee` |
-  | `activity` | | `items`: each `tx`, `kind` (`sent`, `received`, `burn`), `amount`, `state` (`pending`, `confirmed`, `cancelled`), `height` (0 unconfirmed) |
-  | `cancel` | `tx` | `tx`, the replacement |
-  | `bump` | `tx`, `speed` | `tx`, the replacement |
+  | `activity` | | `items`: each `tx`, `kind` (`sent`, a payment or burn; `received`, change left out), `amount`, `state` (`pending`, `confirmed`; a received output since spent, `spent`), `height` (0 unconfirmed) |
+  | `cancel` | `tx`, a payment or burn not yet in a block; `speed` | `tx`, the replacement (its inputs paid back to a new output of this wallet's); `fee`; the payment's records go |
+  | `bump` | `tx`, the same; `speed` | `tx`, the replacement (the same outputs, the change paying the higher fee; below the dust limit, the change goes to the fee whole); `fee`; the payment's records move to it |
   | `create` | | `words`, the new phrase (shown once) |
   | `phrase` | `password`, typed again | `words` |
   | `restore` | `words`, `passphrase` | nothing more; a scan follows |
   | `scan` | | nothing more; `scan` events follow |
   | `proof` | `tx`, a payment's or burn's id | `proof`, its text (`-----BEGIN TAB PAYMENT PROOF-----` or BURN), once its output is in a block |
-  | `verify` | `text`, a proof pasted | `valid` (true or false), `reason`, `kind` (`payment`, `burn`), `amount`, `height`; `to` (a payment's recipient) or `for` (a burn's beneficiary), an address |
+  | `verify` | `text`, a proof pasted | `valid` (true or false), `reason`, `kind` (`payment`, `burn`), `amount`, `height`; `to` (a payment's recipient), or `purpose` and `for` (a burn's, its beneficiary an address) |
   | `burn` | `amount`, `purpose` (255 bytes at most), `for` (an address; this wallet's if none), `speed` | `tx`; `fee` |
-  | `names` | | `items`: each `name`, `state` (`committed`, `ready`, `revealed`, `owned`), `value`, `ready` (blocks until it may be revealed) |
-  | `name-commit` | `name`, `value` (64 hex digits, optional), `speed` | `tx`; `fee`; `ready`, blocks until the reveal |
+  | `names` | | `items`: each `name`, `state` (`committed`, `ready`, `revealed`, `owned`, `offered`, `transferred`), `value`, `ready` (blocks until it may be revealed) |
+  | `name-commit` | `name`, `value` (a `tab1…` address or 64 hex digits; optional: this wallet's id), `speed` | `tx`; `fee`; `ready`, blocks until the reveal |
   | `name-reveal` | `name`, `speed` | `tx`; `fee` |
   | `name-update` | `name`, `value`, `speed` | `tx`; `fee` |
   | `name-lookup` | `name` | `found` (true or false); `owner`, `value`, `address` (the value as an address, if it is one), checked against the node's state root |
-  | `name-offer` | `name`, `value` (optional: this wallet's id) | `text`: the offer (`-----BEGIN TAB NAME OFFER-----`), a record under a fresh key of this wallet's, for the name's owner to sign over |
-  | `name-transfer` | `text`, an offer pasted; `speed` | `tx`; `fee`; `name`: the name leaves this wallet when the chain has the transfer |
+  | `name-offer` | `name`, `value` (optional: this wallet's id); `file`, to write it there | `text`: the offer (`-----BEGIN TAB NAME OFFER-----`), a record under a fresh key of this wallet's, for the name's owner to sign over; or `file`, written. Asked again while the name is offered, the same offer |
+  | `name-transfer` | `text`, an offer pasted, or `file`, one in the home; `speed` | `tx`; `fee`; `name`: the name leaves this wallet when the chain has the transfer |
 
-  Phase 2's (2026-11-11): activity's `sent` and `burn` items take a
-  `proof` request; names are tabminer's (`docs/NAMES.md`), a reveal at
+  Phase 2's (2026-11-11): activity's `sent` items take a `proof`
+  request, and while pending `cancel` and `bump` (payments and burns
+  sent since these were built: the wallet keeps a sent transaction's
+  inputs and change, "x" records, for them); names are tabminer's (`docs/NAMES.md`), a reveal at
   least 12 blocks after its commit.
 - **Events,** unasked, with `"event"` in place of an id: `tip`
   (`height`, `hash`) when the tip moves; `payment` (`tx`, `kind`,
@@ -294,7 +296,7 @@ memos faster than every output in order.
    recorded as used before any signature; the transaction to the node),
    `activity`, `fees`, the overview in tabminer's five sums (done
    2026-11-10: wallettest's two wallets in the OS pay each other, the
-   transaction mined; `cancel` and `bump` not yet); 4 a tabminer wallet
+   transaction mined; `cancel` and `bump` came with phase 2); 4 a tabminer wallet
    and this one paying each other on the recursive dev network (slate
    files carried between the host and the OS: not yet).
 2. **Payments and names in full:** proofs of payment, burns, names
@@ -305,7 +307,12 @@ memos faster than every output in order.
    burns) and `scripts/nametest.sh` (names: registered, looked up and
    proven absent, updated, each name transferred to the other wallet);
    an update's new key is the record's once the chain has it. The Names
-   tab's offer and transfer screens are not built yet. Sub-names move to
+   tab's offer and transfer screens (paste or a file in the home) and
+   activity's `cancel` and `bump` (as tabminer's: a replacement pays
+   what it replaces and 10 base units a byte more) came the same day,
+   checked by `scripts/paytest.sh` (tabminer stopped while the wallet
+   replaces, then each replacement landed) and `scripts/nametest.sh`.
+   Sub-names move to
    phase 3: they are served by a name's sub-name
    server through the message layer's rendezvous points
    (`docs/SUBNAMES.md`), never on chain.
