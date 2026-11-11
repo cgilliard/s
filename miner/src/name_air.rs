@@ -904,6 +904,33 @@ impl OpWitness {
     }
 }
 
+/// At least the rows `op` takes in a name segment ([`OpWitness::rows`]),
+/// known before its witness is: the trie walked at its full depth and a
+/// reveal's split at its longest. A block's planner keeps the operations
+/// it takes, with its sweeps ([`SWEEP_ROWS`] each), below the segment's
+/// rows.
+pub fn op_rows_bound(op: &NameOp) -> usize {
+    match op {
+        NameOp::Commit { .. } => COMMIT_ROWS,
+        NameOp::Reveal { .. } => REVEAL_ROWS_BOUND,
+        NameOp::Update { pubkey, .. } => update_rows_bound(pubkey.height()),
+    }
+}
+
+/// A trie walk at the full depth.
+const WALK_ROWS_BOUND: usize = 1 + 2 * (1 + KEY_BITS) + 1;
+/// The rows a commit takes.
+pub const COMMIT_ROWS: usize = 1 + 2 + 2 + OUTPUT_WALK_ROWS + 3 + 1;
+/// At least the rows a reveal takes.
+pub const REVEAL_ROWS_BOUND: usize = 1 + 4 * 4 + 2 * 2 + WALK_ROWS_BOUND + KEY_BITS + 3 + 2 + 2 + 2 + OUTPUT_WALK_ROWS + 2 + 1;
+/// At least the rows an update signed by a key of `height` takes.
+pub const fn update_rows_bound(height: usize) -> usize {
+    1 + 4 * 4 + 2 * 2 + WALK_ROWS_BOUND + 1 + xmss_fragment::rows(height) + 2 + 2 + 1
+}
+
+/// The rows a sweep takes ([`OpWitness::rows`]).
+pub const SWEEP_ROWS: usize = 1 + 2 + 2 + 1 + OUTPUT_WALK_ROWS + 1;
+
 /// The first bit at which two keys differ (they must differ).
 fn first_difference(a: Key, b: Key) -> usize {
     (a ^ b).leading_zeros() as usize - (128 - KEY_BITS)
@@ -1939,6 +1966,9 @@ mod tests {
     fn block(w: &World, height: u32, ops: &[NameOp], sweeps: &[u64]) -> NamePublic {
         let mut wtxn = w.env.write_txn().unwrap();
         let witness = NameWitness::collect(&w.utxo, &w.names, &mut wtxn, height, ops, sweeps).unwrap();
+        // the planner's bound holds
+        let bound = sweeps.len() * SWEEP_ROWS + ops.iter().map(op_rows_bound).sum::<usize>();
+        assert!(witness.num_rows() <= bound, "{} rows over the bound {bound}", witness.num_rows());
         let root_out = w.utxo.root(&wtxn).unwrap();
         let pos_out = w.utxo.next_position(&wtxn).unwrap();
         wtxn.commit().unwrap();
@@ -2371,6 +2401,16 @@ mod tests {
         let failures: Vec<String> =
             verdicts.iter().filter(|(_, v)| *v != Cheat::Rejected).map(|(what, v)| format!("{what}: {v:?}")).collect();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn a_block_at_every_cap_fits_the_mainnet_segment() {
+        use crate::names::{MAX_COMMITS, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES};
+        let rows = MAX_COMMITS * COMMIT_ROWS
+            + MAX_REVEALS * REVEAL_ROWS_BOUND
+            + MAX_UPDATES * update_rows_bound(crate::xmss::MAX_HEIGHT)
+            + MAX_SWEEPS * SWEEP_ROWS;
+        assert!(rows < 1 << NAME_LOG_ROWS, "{rows} rows");
     }
 
     #[test]

@@ -110,6 +110,12 @@ Consensus caps, per block, by count:
 | update | 8 |
 | sweep | 16 |
 
+A block at every cap fits mainnet's name segment (2^15 rows; a test
+checks it). The recursive dev network's segment is 2^11 rows, about one
+update, so its miner takes name operations only while a bound on their
+rows (each trie walk at full depth) fits, leaving the rest pooled for the
+next block.
+
 The commit cap is the one that shapes the system: every reveal needs a
 commit, so at most 1 new name a block over time, 144 a day, 52,560 a year, which at about a kilobyte each (record
 and tree nodes) is about 53 MB a year of disk at saturation, and about

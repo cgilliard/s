@@ -186,6 +186,12 @@ impl AggregatorParams {
         1 << self.segment_log_n
     }
 
+    /// Rows in a name segment: a block's name operations and sweeps take
+    /// fewer.
+    pub fn name_rows(&self) -> usize {
+        1 << self.name_log_n
+    }
+
     /// The work segment's setup: its window table committed (once per
     /// process).
     pub fn work_setup(&self) -> &'static crate::pow_air::WorkSetup {

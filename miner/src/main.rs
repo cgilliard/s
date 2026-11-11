@@ -222,8 +222,9 @@ const HELP: &str = "commands:
                             change a name's value, rotating its owner key
   name-offer NAME FILE [VALUE]
                             write a record for NAME under a key of yours, for its owner
-                            to sign over with name-transfer
-  name-transfer FILE [FEE]  sign a name over to the record in FILE
+                            to sign over with name-transfer: an offer, as text
+                            (-----BEGIN TAB NAME OFFER-----); FILE `-` prints it
+  name-transfer FILE [FEE]  sign a name over to the offer in FILE (`-`: pasted)
   names                     this wallet's names and pending commits
   name NAME                 look a name up on chain
   subname issuer ADDRESS…   let up to 3 issuers (tab1… addresses or @NAMEs) sign
@@ -2170,8 +2171,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 _ => return Err("usage: name-offer NAME FILE [VALUE]".into()),
             };
             let record = ctx.wallet()?.name_offer(name.as_bytes(), parse_value(value)?)?;
-            std::fs::write(file, record.to_bytes())?;
-            println!("record for {name} written to {file}; give it to the name's owner to sign over");
+            let text = offer_text(&record);
+            if file == "-" {
+                print!("{text}");
+                println!("the offer for {name}, above; give it to the name's owner to sign over");
+            } else {
+                std::fs::write(file, text)?;
+                println!("the offer for {name} written to {file}; give it to the name's owner to sign over");
+            }
         }
         "name-transfer" => {
             let (file, fee) = match args {
@@ -2179,7 +2186,20 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 [file, fee] => (*file, Some(*fee)),
                 _ => return Err("usage: name-transfer FILE [FEE]".into()),
             };
-            let record = tabminer::names::Record::from_bytes(&std::fs::read(file)?).ok_or("not a name record")?;
+            let text = if file == "-" {
+                println!("paste the offer; it ends at its END line");
+                let mut text = String::new();
+                let stdin = std::io::stdin();
+                while !text.contains(&format!("-----END {OFFER_MARKER}-----")) {
+                    if stdin.lock().read_line(&mut text)? == 0 {
+                        break;
+                    }
+                }
+                text
+            } else {
+                String::from_utf8_lossy(&std::fs::read(file)?).into_owned()
+            };
+            let record = offer_from_text(&text).ok_or("no name offer between BEGIN and END markers")?;
             let name = String::from_utf8_lossy(&record.name).into_owned();
             let (op, last) = ctx.wallet()?.name_transfer(record)?;
             carry(ctx, vec![op], fee)?;
@@ -3391,6 +3411,32 @@ fn relay_lines(address: &str, listen: SocketAddr) -> Vec<String> {
     lines
 }
 
+/// A name offer's text markers: `-----BEGIN TAB NAME OFFER-----` and its end.
+const OFFER_MARKER: &str = "TAB NAME OFFER";
+
+/// A name offer (the record the offering wallet wants signed over to it)
+/// as text: base64 between markers, 64 characters a line, as slates and
+/// proofs are passed around.
+fn offer_text(record: &tabminer::names::Record) -> String {
+    let b64 = tabminer::proofs::base64_encode(&record.to_bytes());
+    let mut out = format!("-----BEGIN {OFFER_MARKER}-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(core::str::from_utf8(line).unwrap());
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {OFFER_MARKER}-----\n"));
+    out
+}
+
+/// A name offer from text holding one between its markers.
+fn offer_from_text(text: &str) -> Option<tabminer::names::Record> {
+    let begin = format!("-----BEGIN {OFFER_MARKER}-----");
+    let end = format!("-----END {OFFER_MARKER}-----");
+    let body = &text[text.find(&begin)? + begin.len()..];
+    let b64: String = body[..body.find(&end)?].chars().filter(|c| !c.is_whitespace()).collect();
+    tabminer::names::Record::from_bytes(&tabminer::proofs::base64_decode(&b64)?)
+}
+
 /// A slate from FILE (text: slates have no other form); `-`: pasted at
 /// the prompt, read up to its END line.
 fn read_slate(file: &str) -> AnyResult<Slate> {
@@ -3563,6 +3609,12 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
                 let ins: usize = chosen.iter().map(|t| t.inputs.len()).sum();
                 let outs: usize = 1 + chosen.iter().map(|t| t.outputs.len()).sum::<usize>();
                 let names: usize = chosen.iter().flat_map(|t| t.ops.iter()).map(|op| op.block_op().size()).sum();
+                // the name segment holds them all, with the sweeps
+                let name_rows = sweeps.len() * tabminer::name_air::SWEEP_ROWS
+                    + chosen.iter().flat_map(|t| t.ops.iter()).map(tabminer::name_air::op_rows_bound).sum::<usize>();
+                if name_rows >= agg.name_rows() {
+                    return false;
+                }
                 let items = |t: usize| {
                     if t == 0 {
                         (vec![tabminer::block_air::ROWS_PER_OUTPUT], false)
