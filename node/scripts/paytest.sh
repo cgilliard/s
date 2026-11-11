@@ -109,7 +109,7 @@ while b"\r\n\r\n" not in h:
 check('the wallet\'s WebSocket', b" 101 " in h.split(b"\r\n")[0])
 buf = b""; msgs = []
 def wsend(obj):
-    data = json.dumps(obj).encode(); m = os.urandom(4); n = len(data)
+    data = json.dumps(obj, separators=(",", ":")).encode(); m = os.urandom(4); n = len(data)
     hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0xFE]) + struct.pack(">H", n))
     s.sendall(hdr + m + bytes(b ^ m[i & 3] for i, b in enumerate(data)))
 def pumpone():
@@ -139,7 +139,8 @@ def ask(op, **a):
         return next((m for m in msgs if m.get('id') == i), None)
     return wait(f'the wallet\'s answer to {op}', got)
 wait('the wallet unlocked', lambda: pumpone() or any(m.get('op') == 'unlock' for m in msgs))
-check('a wallet made', ask('create')['ok'])
+c = ask('create')
+check(f'a wallet made {"" if c["ok"] else c}', c['ok'])
 addr = ask('receive')['address']
 check(f'its address {addr[:16]}...', addr.startswith('tab1'))
 def confirmed():
