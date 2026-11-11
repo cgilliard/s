@@ -296,8 +296,9 @@ pub(super) struct State {
     previous: Option<RelaySet>,
     /// Whether `current` is tried first: from the switch's third block.
     prefer_current: bool,
-    /// Tests: sets given by hand rather than followed from the chain.
-    #[cfg(test)]
+    /// Tests (and dev builds' `--test-relays`): sets given by hand rather
+    /// than followed from the chain.
+    #[cfg(any(test, feature = "dev"))]
     pinned: bool,
     /// Sends that may be tried again in the other mode while a switch
     /// between modes lasts: by tag and recipient.
@@ -381,7 +382,7 @@ impl State {
             into: 0,
             previous: None,
             prefer_current: true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev"))]
             pinned: false,
             fallback: Vec::new(),
             retry: Vec::new(),
@@ -469,14 +470,15 @@ impl State {
         self.onion_sets().into_iter().flat_map(|s| s.iter()).find(|r| r.id == *id)
     }
 
-    /// Tests: relays as if an onion-mode file were in force, alone.
-    #[cfg(test)]
+    /// Tests (and dev builds' `--test-relays`): relays as if an onion-mode
+    /// file were in force, alone.
+    #[cfg(any(test, feature = "dev"))]
     pub(super) fn set_relays(&mut self, relays: Vec<consensus::Relay>) {
         self.set_sets(Some(relays), None, true, 0);
     }
 
     /// Tests: the sets in force given by hand, `current` under `epoch`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev"))]
     pub(super) fn set_sets(&mut self, current: RelaySet, previous: Option<RelaySet>, prefer_current: bool, epoch: u32) {
         self.current = current;
         self.epoch = epoch;
@@ -496,7 +498,7 @@ impl State {
     /// the set before stands through every grace period, with the same
     /// file when it did not change.
     pub(super) fn set_epoch(&mut self, epoch: &consensus::Epoch, block_time: Duration, now: Instant) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dev"))]
         if self.pinned {
             return;
         }

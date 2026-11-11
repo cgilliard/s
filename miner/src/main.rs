@@ -104,6 +104,9 @@ options:
   --peer ADDR       a peer to contact, host:port; may repeat
   --seed HOST:PORT  an extra seed node to resolve; may repeat
   --no-seeds        do not contact the built-in seed nodes (for a local network)
+  --test-relays FILE  (dev builds, dev networks) the relays of FILE, an
+                    onion-mode consensus.txt, stand as if it were in force: for
+                    tests of onion mode that cannot wait for a boundary
   --relay           relay for others on the message layer (docs/ONION.md); prints
                     this node's `relay` line for consensus.txt at startup. The
                     relay's key is derived from the wallet's phrase, apart from
@@ -342,6 +345,10 @@ struct Args {
     max_channels: usize,
     /// Run without a wallet; implies `no_mine`.
     no_wallet: bool,
+    /// Dev builds: a consensus file whose relays stand as if it were in
+    /// force (`--test-relays`), for tests of onion mode on a dev network.
+    #[cfg_attr(not(feature = "dev"), allow(dead_code))]
+    test_relays: Option<String>,
     /// Where the wallet's password is read from with `no_prompt`.
     password_file: Option<PathBuf>,
     debug_unchecked: bool,
@@ -390,6 +397,7 @@ fn parse_args() -> Result<Args, String> {
         max_hops: tabminer::node::MAX_HOPS,
         max_channels: tabminer::node::MAX_CHANNELS,
         no_wallet: false,
+        test_relays: None,
         password_file: None,
         debug_unchecked: false,
         debug_fill: None,
@@ -442,6 +450,8 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seeds.push(value()?),
             "--no-seeds" => a.no_seeds = true,
             "--relay" => a.relay = true,
+            #[cfg(feature = "dev")]
+            "--test-relays" => a.test_relays = Some(value()?),
             "--max-sessions" => a.max_sessions = number(value()?)?.max(1) as usize,
             "--max-hops" => a.max_hops = number(value()?)?.max(1) as usize,
             "--max-channels" => a.max_channels = number(value()?)?.max(1) as usize,
@@ -912,6 +922,21 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     config.identity = wallet.as_ref().filter(|w| !w.address_off()).map(|w| w.identity_key());
     config.wallet = wallet.is_some();
     let (mut node, events) = Node::bind(Arc::clone(&chain), Arc::clone(&mempool), config)?;
+    // Dev builds on a dev network: the relays of a file as if it were in
+    // force, for tests of onion mode that cannot wait for a boundary.
+    #[cfg(feature = "dev")]
+    if let Some(file) = &args.test_relays {
+        if !matches!(args.network, Network::Dev | Network::DevRecursive) {
+            return Err("--test-relays is for the dev networks only".into());
+        }
+        let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+        let parsed = tabminer::consensus::File::parse(&bytes).map_err(|e| format!("{file}: {e}"))?;
+        if parsed.relays.is_empty() {
+            return Err(format!("{file}: not an onion-mode file").into());
+        }
+        log::line(&format!("message layer: the relays of {file} stand as if in force (a test)"));
+        let _ = events.send(tabminer::node::Event::TestRelays(parsed.relays));
+    }
     let notes = node.take_notes();
     let stats = node.stats();
     let syncing = node.syncing();

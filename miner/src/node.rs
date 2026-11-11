@@ -381,8 +381,9 @@ pub enum Event {
     /// channel opened for it if need be.
     #[cfg(test)]
     TestChannel(SocketAddr, Digest, Vec<u8>),
-    /// Tests: relays as if an onion-mode file listed them.
-    #[cfg(test)]
+    /// Tests (and dev builds' `--test-relays`): relays as if an onion-mode
+    /// file listed them.
+    #[cfg(any(test, feature = "dev"))]
     TestRelays(Vec<consensus::Relay>),
     /// Tests: a circuit through these relays, and data for its hops once
     /// it is built.
@@ -1113,7 +1114,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     let key = self.channel_to(addr, id, now).unwrap();
                     self.channel_send(key, &body, now).unwrap();
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "dev"))]
                 Ok(Event::TestRelays(relays)) => self.rv.set_relays(relays),
                 #[cfg(test)]
                 Ok(Event::TestQuiet) => self.quiet = true,
