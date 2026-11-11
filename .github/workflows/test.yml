@@ -138,15 +138,17 @@ jobs:
       - name: Install QEMU (Linux)
         if: runner.os == 'Linux'
         run: |
-          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
-          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
-          # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
-          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
-          done
-          sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+          # the runner's own mirror first; if it fails, an independent one
+          # (kernel.org's on x64, Berkeley OCF's on arm64), over IPv4
+          A="sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3"
+          if ! { $A update && $A install -y qemu-system-misc xxd; }; then
+            if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
+            echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+            done
+            $A update && $A install -y qemu-system-misc xxd
+          fi
       - name: Install QEMU (macOS)
         if: runner.os == 'macOS'
         run: brew install qemu
@@ -174,15 +176,17 @@ jobs:
           shared-key: node
       - run: cargo build --release --features dev
       - run: |
-          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
-          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
-          # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
-          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
-          done
-          sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+          # the runner's own mirror first; if it fails, an independent one
+          # (kernel.org's on x64, Berkeley OCF's on arm64), over IPv4
+          A="sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3"
+          if ! { $A update && $A install -y qemu-system-misc xxd; }; then
+            if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
+            echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+            done
+            $A update && $A install -y qemu-system-misc xxd
+          fi
       - name: the OS's image, built from the seed
         working-directory: node
         run: sh scripts/build.sh
@@ -233,15 +237,17 @@ jobs:
           path: .
       - run: chmod +x ../miner/target/release/tabminer
       - run: |
-          # an independent mirror (Ubuntu's own servers can be down): kernel.org's
-          # on x64, Berkeley OCF's on arm64 (kernel.org has no ubuntu-ports):
-          # the mirror list and every source naming an ubuntu.com host
-          if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
-          echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-            if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
-          done
-          sudo apt-get update && sudo apt-get install -y qemu-system-misc xxd
+          # the runner's own mirror first; if it fails, an independent one
+          # (kernel.org's on x64, Berkeley OCF's on arm64), over IPv4
+          A="sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3"
+          if ! { $A update && $A install -y qemu-system-misc xxd; }; then
+            if [ "$(dpkg --print-architecture)" = amd64 ]; then M=http://mirrors.edge.kernel.org/ubuntu/; else M=http://mirrors.ocf.berkeley.edu/ubuntu-ports/; fi
+            echo "$M" | sudo tee /etc/apt/apt-mirrors.txt
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [ -f "$f" ]; then sudo sed -i -E "s#mirror\+file:/etc/apt/apt-mirrors.txt|https?://[a-z0-9.-]*ubuntu\.com/ubuntu(-ports)?/?#$M#g" "$f"; fi
+            done
+            $A update && $A install -y qemu-system-misc xxd
+          fi
       # (its own limit below the job's, so a stall fails the step and the
       # logs below are printed: a cancelled job prints nothing)
       - run: sh scripts/${{ matrix.script }}.sh
