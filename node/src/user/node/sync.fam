@@ -211,6 +211,8 @@ nlok @ ;
 : nsync  ( depth -- code )
 nS !  0 lit ncode !
 pping 0= if FFFFFFFF lit nfail else "the peer is at height " nsay pst-h nsayn then
+\ a chain with no block yet: nothing to sync from (-10; asked again later)
+ncode @ 0= pst-h 0= and if FFFFFFF6 lit nfail then
 ncode @ 0= if pst @ 14 lit + mygen @ 20 lit d8= 0= if FFFFFFFE lit nfail then then
 \ headers, quick-checked
 ncode @ 0= if
