@@ -51,7 +51,8 @@
 : ptx variable ;  : ptp variable ;  : prx variable ;  : prn variable ;  : pent variable ;  : pfrom variable ;
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
-: pidle variable ;  : pnew variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
+: pidle variable ;  : pnew variable ;  : psrtt variable ;  : pq0 variable ;  : pt0 variable ;  : pfirst variable ;
+: psv variable ;  : psobj variable ;  : pslen variable ;  : pscnt variable ;  : psmap variable ;  : pskind variable ;  : pspart variable ;  : psid variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;  : myold variable ;
@@ -107,7 +108,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
 600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
-BF40 lit alloc phb !  40 lit alloc pgot !
+BF40 lit alloc phb !  40 lit alloc pgot !  2DC6C0 lit psrtt !  20 lit alloc psid !  0 lit psv !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
 padd puse
 \ our tokens' key and our nonce: random
@@ -500,6 +501,15 @@ then
 0 lit prcv !
 wsend ;
 
+\ The round trip to peers, smoothed as TCP's (7/8 of the last and 1/8 of
+\ the new), in ticks (10 MHz), 300 ms to start with: an ask is repeated
+\ after three of them (300 ms at least, 4 s at most: poll's limit), and a
+\ fetch moves on only after nothing new for 30 s or twenty round trips,
+\ however slow the link (a satellite's 600 ms and more): never on a clock
+\ of its own.  What came is kept for the next peer.
+: prtt+  psrtt @ 7 lit * + 3 lit rshift  1 lit max psrtt ! ;     \ ( sample -- )
+: pwns  psrtt @ CB7355 lit umin 12C lit *  11E1A300 lit max  EE6B2800 lit umin ;   \ ( -- ns )  three round trips
+: pidl  psrtt @ 14 lit *  11E1A300 lit max ;                  \ ( -- ticks )  30 s, or twenty round trips
 \ pchunk  the Chunk in prx, if it is of the object being fetched.
 : pchunk
 prx @ 5 lit + pcp !
@@ -517,26 +527,39 @@ pcp @ pid @ 20 lit d8= and if
 		dup if drop pci @ pmap @ + c@ 0= then
 		if
 			pcp @ 28 lit + pobj @ pci @ A lit lshift + pcn @ bcopy  1 lit pci @ pmap @ + c!  1 lit pnew !  prcv @ 1 lit + prcv !
+			pfirst @ 0= if 1 lit pfirst !  ticks pq0 @ - prtt+ then
 		then
 	then
 then ;
 : pdone  -1 lit pcnt @ 0 lit do i pmap @ + c@ 0= 0= and loop ;
 
-: pfetch  ( kind part id -- a n | 0 0 )
-pid ! ppart ! pkind !  0 lit pobj !  0 lit plen !  0 lit pidle !
+: pfetch
+pid ! ppart ! pkind !  0 lit pobj !  0 lit plen !
+\ an object begun from another peer: continued, what came kept
+psv @ if
+	pskind @ pkind @ =  pspart @ ppart @ = and  psid @ pid @ 20 lit d8= and if
+		psobj @ pobj !  pslen @ plen !  pscnt @ pcnt !  psmap @ pmap !
+	else psobj @ free  psmap @ free then
+	0 lit psv !
+then
+ticks pt0 !
 begin
-	pobj @ if pdone 0= else -1 lit then  pidle @ 1E lit u< and
+	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and
 while
-	preq  0 lit pnew !
+	preq  ticks pq0 !  0 lit pfirst !  0 lit pnew !
 	\ until what was asked for has come (then the next ask at once), or
-	\ 300 ms pass with nothing (one lost: asked for again)
+	\ a few round trips pass with nothing (one lost: asked for again)
 	begin
 		prcv @ pask @ u<  pobj @ if pdone 0= and then
-		if 11E1A300 lit pwait else 0 lit then
+		if pwns pwait else 0 lit then
 	?dup while 9 lit = if pchunk then repeat
-	pnew @ if 0 lit pidle ! else pidle @ 1 lit + pidle ! then
+	pnew @ if ticks pt0 ! then
 repeat
 pobj @ if
-	pmap @ free
-	pdone if pobj @ plen @ else pobj @ free 0 lit 0 lit then
+	pdone if pmap @ free pobj @ plen @ else
+		\ kept for the next peer asked for the same object
+		pobj @ psobj !  plen @ pslen !  pcnt @ pscnt !  pmap @ psmap !
+		pkind @ pskind !  ppart @ pspart !  pid @ psid @ 20 lit bcopy  1 lit psv !
+		0 lit 0 lit
+	then
 else 0 lit 0 lit then ;

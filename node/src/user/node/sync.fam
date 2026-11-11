@@ -41,14 +41,19 @@ hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
 \ header the entry's: the bytes the same).
 : nft variable ;  : btf variable ;
+: nwhy variable ;
 : nblock
-ticks nft !
+ticks nft !  1 lit nwhy !
 dup hid 0 lit 0 lit rot pfetch nbn ! nblk !
 nblk @ if
-	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= else drop 0 lit then
+	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= dup 0= if 3 lit nwhy ! then else drop 2 lit nwhy ! 0 lit then
 	dup 0= if nblk @ free 0 lit nblk ! then
 else drop 0 lit then
 ticks nft @ - btf ! ;
+\ nwhy.  why the last block was not fetched.
+: nwhy.
+nwhy @ 1 lit = if " (nothing came)" else nwhy @ 2 lit = if " (too short to hold a header)" else
+" (its header is not the one held: another block came)" then then puts ;
 
 \ nsay ( s -- )  "node: s", if vrb.
 : nsay  vrb @ if nhead puts else drop then ;
@@ -367,7 +372,7 @@ myh @ hbest hheight u< nfl @ 0= and if
 					vrb @ if nhead "height " puts myh @ u. nbrk 0A lit putc then
 				then
 				nblk @ free 0 lit nblk !
-			else drop "block not fetched: " nsay i nsayn 1 lit nfl ! then
+			else drop vrb @ if nhead "block not fetched: " puts i u. nwhy. 0A lit putc then 1 lit nfl ! then
 		then
 	loop
 then
