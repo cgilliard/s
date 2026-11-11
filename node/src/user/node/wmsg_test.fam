@@ -1,0 +1,80 @@
+\ node/wmsg_test.fam — node/wmsg.fam against tabminer's onion.rs
+\ (node/wmsg_vectors.fam, written by miner/src/fam_msg_vectors.rs): two
+\ participants' announces (a session's and the carried ones) byte for
+\ byte, the announce object's id, the checks of an announce (sound; expired;
+\ its signature changed), A's payload to B byte for byte and its id, B
+\ opening it (kind, inner bytes, sender), the payload refused when changed
+\ anywhere or opened with another key, and the rendezvous indexes.
+\ Prints the seal's and open's times (ms), then "wmsg: N as expected, M
+\ not".
+\ uses: crypto/sha512.fam crypto/sha256.fam crypto/bip39.fam crypto/chacha.fam crypto/keccak.fam crypto/dilithium.fam crypto/kyber.fam
+\ uses: node/arith.fam node/poseidon2.fam node/difficulty.fam node/pow.fam node/state.fam node/xmss.fam node/xsign.fam node/wkeys.fam node/wmsg.fam node/wmsg_vectors.fam
+
+: mtpas variable ;  : mtfai variable ;  : mtt variable ;  : mth variable ;  : mtz variable ;
+: mapk variable ;  : mask variable ;  : maek variable ;  : madk variable ;
+: mbpk variable ;  : mbsk variable ;  : mbek variable ;  : mbdk variable ;
+: mtann variable ;  : mtbc variable ;  : mtobj variable ;  : mtin variable ;  : mtol variable ;  : mtix variable ;
+: mtchk  swap if drop mtpas @ 1 lit + mtpas ! else "wmsg: " puts puts 0A lit putc mtfai @ 1 lit + mtfai ! then ;   \ ( flag str -- )
+: mtclk
+1301C1FF ,   \ addi sp,sp,-4
+F32710C0 ,   \ rdtime a5
+2320F100 ,   \ sw a5,0(sp)
+;
+: mtms  mtclk mtt @ - 2710 lit / ;
+: mtw variable ;
+: mthsh  mtw !  mth @ 20 lit shake256  mth @ mtw @ 20 lit dlsame ;     \ ( src len want -- flag )
+: mtflip  dup c@ 1 lit xor swap c! ;                                    \ ( a -- )
+\ mtbad ( a what -- )  the object changed at a: B must refuse it.
+: mtbad  swap dup mtflip  mtobj @ mtol @ mbdk @ mxnow @ mgopen 0= rot mtchk  mtflip ;
+
+mxbufs mxset  wkinit mginit kyinit
+7A0 lit alloc mapk !  FC0 lit alloc mask !  4A0 lit alloc maek !  960 lit alloc madk !
+7A0 lit alloc mbpk !  FC0 lit alloc mbsk !  4A0 lit alloc mbek !  960 lit alloc mbdk !
+1970 lit alloc mtann !  1970 lit alloc mtbc !  10000 lit alloc mtobj !  200 lit alloc mtin !  20 lit alloc mth !
+8 lit alloc mtz !  10 lit alloc mtix !  0 lit mtz @ !  0 lit mtz @ 4 lit + !
+mxsa @ mapk @ mask @ dilkey  mxda @ mxza @ maek @ madk @ kykey
+mxsb @ mbpk @ mbsk @ dilkey  mxdb @ mxzb @ mbek @ mbdk @ kykey
+
+\ A's announces
+mapk @ mgpk !  mask @ mgsk !  maek @ mgek !
+1 lit mtann @ c!  mtann @ 1 lit + mxseq @ mxexp @ mxnon @ mgann
+mtann @ 1 lit + MGAN mxha @ mthsh "A's session announce" mtchk
+mtann @ MGAN 1 lit + mtobj @ mgoid  mtobj @ mxia @ 20 lit dlsame "its object's id" mtchk
+mtann @ 1 lit + mxnow @ mgavf "it holds" mtchk
+mtann @ 1 lit + mxexp @ @ mgavf 0= "it is expired at its expiry" mtchk
+mtann @ 1 lit + 1000 lit + mtflip  mtann @ 1 lit + mxnow @ mgavf 0= "its signature changed, refused" mtchk  mtann @ 1 lit + 1000 lit + mtflip
+mtann @ 1 lit + 30 lit + mtflip  mtann @ 1 lit + mxnow @ mgavf 0= "its key changed, refused" mtchk  mtann @ 1 lit + 30 lit + mtflip
+mgcar @ mxseq @ mxexp @ mtz @ mgann  mgcar @ MGAN mxhca @ mthsh "A's carried announce" mtchk
+\ B's carried announce, by B's keys
+mbpk @ mgpk !  mbsk @ mgsk !  mbek @ mgek !
+mtbc @ mxseq @ mxexp @ mtz @ mgann  mtbc @ MGAN mxhcb @ mthsh "B's carried announce" mtchk
+mapk @ mgpk !  mask @ mgsk !  maek @ mgek !
+
+\ A's payload to B
+mxil @ 0 lit do i 5 lit * 3 lit + mtin @ i + c! loop
+mtclk mtt !  mtbc @ 1 lit mtin @ mxil @ mxm @ mxn @ mtobj @ mgseal mtol !  mtms
+mtol @ mxol @ = "the payload's length" mtchk
+mtobj @ mtol @ mxho @ mthsh "the payload object" mtchk
+mtobj @ mtol @ mth @ mgoid  mth @ mxio @ 20 lit dlsame "its id" mtchk
+mtclk mtt !  mtobj @ mtol @ mbdk @ mxnow @ mgopen  mtms swap "B opens it" mtchk
+mgkind @ 1 lit = "its kind" mtchk
+mgil @ mxil @ =  mgin @ mtin @ mxil @ dlsame and "its inner bytes" mtchk
+mgfrom @ mgcar @ MGAN dlsame "its sender, A" mtchk
+mtobj @ mtol @ madk @ mxnow @ mgopen 0= "A's key does not open it" mtchk
+mtobj @ mtol @ mbdk @ mxexp @ @ mgopen 0= "at A's expiry, refused" mtchk
+mtobj @ 1 lit + "its recipient changed" mtbad
+mtobj @ 30 lit + "its ciphertext changed" mtbad
+mtobj @ 462 lit + "its nonce changed" mtbad
+mtobj @ 46D lit + "its length changed" mtbad
+mtobj @ 600 lit + "its body changed" mtbad
+mtobj @ mtol @ + 1 lit - "its tag changed" mtbad
+mtobj @ "its tag byte changed" mtbad
+
+\ the rendezvous indexes
+mxrn 0 lit do
+	i mxr
+	mxid @ mxe @ mxnn @ mtix @ mgidx  dup mxk @ =  swap mtix @ mxix @ rot dlsame and "a rendezvous case" mtchk
+loop
+
+"wmsg: seal " puts swap . " ms, open " puts . " ms" puts 0A lit putc
+"wmsg: " puts mtpas @ . " as expected, " puts mtfai @ . " not" puts 0A lit putc

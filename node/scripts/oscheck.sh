@@ -775,6 +775,13 @@ expect dilithium 124 '^dilithium: 108 as expected, 0 not' 60 ./tools/q32 "$T/tdl
 ./tools/fam --user -o "$T/tky.bin" src/user/crypto/keccak.fam src/user/crypto/kyber.fam src/user/crypto/kyber_vectors.fam src/user/crypto/kyber_test.fam > "$T/tky.build" 2>&1 || fail kyber "build: $(head -c 300 "$T/tky.build")"
 sh scripts/mkimage.sh "$T/tky.img" bin/kernel init="$T/tky.bin":1024 2> "$T/tky.mk" || fail kyber "mkimage: $(cat "$T/tky.mk")"
 expect kyber 124 '^kyber: 50 as expected, 0 not' 60 ./tools/q32 "$T/tky.img"
+# The message layer's objects (node/wmsg.fam): announces, a sealed
+# payload, object ids, opening and refusing, rendezvous indexes, as
+# tabminer's onion.rs.
+uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wmsg_test.fam | tr ' ' '\n' | sed '/^$/d; s|^|src/user/|' | tr '\n' ' ')
+./tools/fam --user -o "$T/twm.bin" $uses src/user/node/wmsg_test.fam > "$T/twm.build" 2>&1 || fail wmsg "build: $(head -c 300 "$T/twm.build")"
+sh scripts/mkimage.sh "$T/twm.img" bin/kernel init="$T/twm.bin":4096 2> "$T/twm.mk" || fail wmsg "mkimage: $(cat "$T/twm.mk")"
+expect wmsg 124 '^wmsg: 54 as expected, 0 not' 60 ./tools/q32 "$T/twm.img"
 
 # The wallet (docs/GUI_WALLET.md, phase 1), driven as wm drives it
 # (src/user/tests/walletrun.fam: requests on a pipe, each answer printed):

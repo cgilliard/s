@@ -1,0 +1,136 @@
+\ wmsg.fam — the message layer's objects (docs/ONION.md, init mode;
+\ docs/GUI_WALLET.md, phase 3), as tabminer's onion.rs: object ids,
+\ rendezvous points, a participant's announce (its Dilithium key and a
+\ Kyber key, signed), and payloads sealed to an announce's Kyber key with
+\ the sender's announce and signature inside.  After wkeys.fam (hdom, the
+\ ids), crypto/chacha.fam, crypto/dilithium.fam and crypto/kyber.fam.
+\
+\ mginit  the buffers (once).
+\ mghb ( a n dom c -- )  c (8 Montgomery words) = hash_domain(dom, the n
+\ bytes at a packed three a word), the bytes streamed (objects reach 64
+\ KiB).
+\ mgoid ( a n dst -- )  the 32 canonical bytes of an object's id
+\ (domain 19).
+\ mgidx ( id epoch n dst -- m )  the rendezvous indexes of id (32
+\ canonical bytes) in epoch among n nodes: m bytes at dst (3, or n when
+\ fewer), H(id, epoch, k) mod n for k from 0 on, repeats skipped.
+\ mgann ( dst seq exp nonce -- )  an announce (6,501 bytes at dst) of
+\ the Kyber key at mgek by the Dilithium key mgpk/mgsk: seq, exp and
+\ nonce point at 8-byte values.
+\ mgavf ( a now -- ok )  an announce sound at unix time now: its id the
+\ key's hash, its Kyber key well formed, not expired, its signature
+\ holding.
+\ mgseal ( to kind inner n m nonce dst -- len )  inner (n bytes) of kind
+\ sealed to the announce at to: the payload object (tag 2) at dst, len
+\ bytes; the sender's announce mgcar (nonce 0) and signature inside; m
+\ the encapsulation's 32 random bytes, nonce the AEAD's 12.  0: to's
+\ Kyber key is malformed.
+\ mgopen ( obj n dk now -- ok )  a payload object opened with the Kyber
+\ secret dk: mgkind, the sender's announce at mgfrom, the inner bytes at
+\ mgin (mgil of them).  Not ok: not a payload, not sealed to dk, or the
+\ sender's announce or signature not holding (a sender must be named).
+
+: mgb variable ;  : mgc variable ;  : mgd variable ;  : mgn variable ;  : mgx variable ;  : mgw variable ;
+: mgk variable ;  : mgm variable ;  : mgt variable ;  : mgo variable ;  : mgi variable ;  : mgl variable ;
+: mgpk variable ;  : mgsk variable ;  : mgek variable ;  : mgcar variable ;  : mgpl variable ;  : mgsm variable ;
+: mgss variable ;  : mgkind variable ;  : mgfrom variable ;  : mgin variable ;  : mgil variable ;  : mgh variable ;
+:M MGAN 1965 lit ;                             \ an announce's bytes (6,501)
+:M MGSP C78 lit ;                              \ its signed part (id .. nonce)
+:M MGAAD 46C lit ;                             \ a payload's clear part: to, ct, nonce
+:M MGHEAD 1967 lit ;                           \ kind, flags, the sender's announce
+:M MGMAX 10000 lit ;                           \ an object's bytes at most
+
+: mginit
+mgb @ 0= if
+	60 lit alloc mgb !  20 lit alloc mgh !  20 lit alloc mgss !
+	MGMAX 40 lit + alloc mgpl !  MGMAX 1000 lit + alloc mgsm !  MGAN alloc mgcar !
+then ;
+
+\ mghb: eight words (24 bytes) at a time into the sponge, as hdom.
+: mgword  0 lit  3 lit 0 lit do mgn @ if mgx @ c@ i 3 lit lshift lshift or  mgx @ 1 lit + mgx !  mgn @ 1 lit - mgn ! then loop ;   \ ( -- w )
+: mghb
+mgc !  mgd !  mgn !  mgx !
+mgn @ 2 lit + 3 lit / mgw !
+p2s @ 10 lit wzero  mgd @ tom p2s @ 8 lit w!
+mgw @ 3FFFFFFF lit and tom p2s @ 9 lit w!  mgw @ 1E lit rshift tom p2s @ A lit w!
+mgw @ 0= if p2s @ perm16 then
+begin mgw @ while
+	mgw @ 8 lit umin
+	dup 0 lit do p2s @ i w@ mgword tom f+ p2s @ i w! loop
+	p2s @ perm16
+	mgw @ swap - mgw !
+repeat
+p2s @ mgc @ 8 lit wcopy ;
+: mgod variable ;
+: mgoid  mgod !  13 lit mgb @ mghb  mgb @ mgod @ wkcan ;
+
+\ mgidx: the rendezvous hash of id, epoch and k; its first 8 bytes as a
+\ 64-bit value, reduced mod n.
+: mgidx
+mgo !  mgn !  mgw !  mgx !  0 lit mgm !  0 lit mgk !
+mgn @ 3 lit umin mgt !
+begin mgm @ mgt @ u< while
+	8 lit 0 lit do mgx @ i 2 lit lshift + le@ tom mgb @ i w! loop
+	mgw @ tom mgb @ 8 lit w!  mgk @ tom mgb @ 9 lit w!
+	mgb @ A lit 14 lit mgb @ 40 lit + hdom
+	\ (h1 mod n)(2^32 mod n) + h0 mod n, mod n
+	mgb @ 40 lit + 1 lit w@ fromm mgn @ %  FFFFFFFF lit mgn @ % 1 lit + mgn @ % *
+	mgb @ 40 lit + 0 lit w@ fromm mgn @ % +  mgn @ %
+	0 lit  mgm @ ?dup if 0 lit do over mgo @ i + c@ = or loop then
+	if drop else mgo @ mgm @ + c!  mgm @ 1 lit + mgm ! then
+	mgk @ 1 lit + mgk !
+repeat
+mgm @ ;
+
+\ mgann: the signed part, then the signature over it ("tab-announce").
+: mgann
+mgt !  mgw !  mgx !  mgo !
+mgpk @ mgb @ wkid  mgb @ mgo @ wkcan
+mgpk @ mgo @ 20 lit + 7A0 lit kycp
+mgek @ mgo @ 7C0 lit + 4A0 lit kycp
+mgx @ mgo @ C60 lit + 8 lit kycp  mgw @ mgo @ C68 lit + 8 lit kycp  mgt @ mgo @ C70 lit + 8 lit kycp
+mgsk @ mgo @ MGSP "tab-announce" C lit mgo @ MGSP + dilsign ;
+: mgva variable ;  : mgvt variable ;
+: mgavf
+mgvt !  mgva !
+mgva @ 20 lit + mgb @ wkid  mgb @ mgh @ wkcan  mgh @ mgva @ 20 lit dlsame
+mgva @ 7C0 lit + kyekok and
+mgva @ C6C lit + le@ 0= 0=  mgva @ C68 lit + le@ mgvt @ u> or  and
+dup if drop mgva @ 20 lit + mgva @ MGSP "tab-announce" C lit mgva @ MGSP + dilver then ;
+
+\ mgseal: the object is 02 | to | ct | nonce | blen | body; the plain
+\ text kind | flags (2: the sender named) | announce | signature | inner.
+: mgseal
+mgo !  mgx !  mgm !  mgil !  mgin !  mgkind !  mgt !
+mgt @ mgo @ 1 lit + 20 lit kycp  2 lit mgo @ c!
+mgt @ 7C0 lit + mgm @ mgss @ mgo @ 21 lit + kyenc 0= if 0 lit else
+	mgx @ mgo @ 461 lit + C lit kycp
+	mgkind @ mgpl @ c!  2 lit mgpl @ 1 lit + c!  mgcar @ mgpl @ 2 lit + MGAN kycp
+	mgin @ mgpl @ 2654 lit + mgil @ kycp
+	\ what is signed: the clear part, the head, the inner bytes
+	mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + MGHEAD kycp
+	mgin @ mgsm @ MGAAD + MGHEAD + mgil @ kycp
+	mgsk @ mgsm @ MGAAD MGHEAD + mgil @ + "tab-payload" B lit mgpl @ MGHEAD + dilsign
+	2654 lit mgil @ + mgl !
+	mgss @ mgo @ 461 lit + mgo @ 1 lit + MGAAD mgpl @ mgl @ mgo @ 471 lit + aeseal
+	mgl @ 10 lit + dup mgo @ 46D lit + wkle!
+	471 lit +
+then ;
+
+: mgopen
+mgt !  mgk !  mgn !  mgo !
+mgn @ 471 lit u< if 0 lit else mgo @ c@ 2 lit <> if 0 lit else
+mgo @ 46D lit + le@ dup mgl !  471 lit + mgn @ <> if 0 lit else
+mgl @ 2664 lit u< if 0 lit else
+	mgk @ mgo @ 21 lit + mgss @ kydec
+	mgss @ mgo @ 461 lit + mgo @ 1 lit + MGAAD mgo @ 471 lit + mgl @ 10 lit - mgpl @ aeopen 0= if 0 lit else
+	mgpl @ 1 lit + c@ 2 lit <> if 0 lit else
+		mgpl @ c@ mgkind !  mgpl @ 2 lit + mgfrom !
+		mgpl @ 2654 lit + mgin !  mgl @ 10 lit - 2654 lit - mgil !
+		mgfrom @ mgt @ mgavf 0= if 0 lit else
+			mgo @ 1 lit + mgsm @ MGAAD kycp  mgpl @ mgsm @ MGAAD + MGHEAD kycp
+			mgin @ mgsm @ MGAAD + MGHEAD + mgil @ kycp
+			mgfrom @ 20 lit + mgsm @ MGAAD MGHEAD + mgil @ + "tab-payload" B lit mgpl @ MGHEAD + dilver
+		then
+	then then
+then then then then ;

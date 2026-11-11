@@ -1,0 +1,354 @@
+\ node/wmsg_vectors.fam — tabminer's values for node/wmsg.fam (docs/ONION.md,
+\ init mode; docs/GUI_WALLET.md, phase 3).  Written by
+\ miner/src/fam_msg_vectors.rs (`cargo test --release --features dev --lib
+\ write_fam_msg_vectors -- --ignored`); not to be edited.  Read by
+\ node/wmsg_test.fam.
+\
+\ Two participants, A and B: Dilithium seeds at mxsa, mxsb; Kyber seeds
+\ (d, z) at mxda mxza, mxdb mxzb.  mxseq, mxexp, mxnon (8 bytes each):
+\ A's session announce (nonce mxnon) hashes (SHAKE256-256) to mxha, its
+\ object (tag 1) has the id mxia; the carried announces (nonce 0) of A
+\ and B hash to mxhca, mxhcb.  A's payload to B: kind 1, the inner bytes
+\ byte j 5j+3 (mxil of them), the encapsulation's randomness mxm, the
+\ nonce mxn: its object is mxol bytes, hashing to mxho, its id mxio.
+\ mxnow: a time before expiry.  mxrn ( -- n )  the rendezvous cases;
+\ mxr ( i -- )  case i: the id at mxid, the epoch mxe, the nodes mxnn,
+\ the indexes at mxix (mxk of them).
+
+: mxp variable ;  : mxsa variable ;  : mxsb variable ;  : mxda variable ;  : mxza variable ;
+: mxdb variable ;  : mxzb variable ;  : mxseq variable ;  : mxexp variable ;  : mxnon variable ;
+: mxha variable ;  : mxia variable ;  : mxhca variable ;  : mxhcb variable ;  : mxil variable ;
+: mxm variable ;  : mxn variable ;  : mxol variable ;  : mxho variable ;  : mxio variable ;
+: mxnow variable ;  : mxid variable ;  : mxe variable ;  : mxnn variable ;  : mxix variable ;  : mxk variable ;
+: mxc  mxp @ c!  mxp @ 1 lit + mxp ! ;
+: mxbufs
+mxsa @ 0= if
+	20 lit alloc mxsa !  20 lit alloc mxsb !  20 lit alloc mxda !  20 lit alloc mxza !  20 lit alloc mxdb !
+	20 lit alloc mxzb !  8 lit alloc mxseq !  8 lit alloc mxexp !  8 lit alloc mxnon !  20 lit alloc mxha !
+	20 lit alloc mxia !  20 lit alloc mxhca !  20 lit alloc mxhcb !  20 lit alloc mxm !  C lit alloc mxn !
+	20 lit alloc mxho !  20 lit alloc mxio !  20 lit alloc mxid !  10 lit alloc mxix !
+then ;
+
+: mxset
+mxsa @ mxp !
+1 lit mxc 2 lit mxc 3 lit mxc 4 lit mxc 5 lit mxc 6 lit mxc 7 lit mxc 8 lit mxc 9 lit mxc A lit mxc B lit mxc C lit mxc D lit mxc E lit mxc F lit mxc 10 lit mxc 11 lit mxc 12 lit mxc 13 lit mxc 14 lit mxc 15 lit mxc 16 lit mxc 17 lit mxc 18 lit mxc
+19 lit mxc 1A lit mxc 1B lit mxc 1C lit mxc 1D lit mxc 1E lit mxc 1F lit mxc 20 lit mxc
+mxsb @ mxp !
+80 lit mxc 83 lit mxc 86 lit mxc 89 lit mxc 8C lit mxc 8F lit mxc 92 lit mxc 95 lit mxc 98 lit mxc 9B lit mxc 9E lit mxc A1 lit mxc A4 lit mxc A7 lit mxc AA lit mxc AD lit mxc B0 lit mxc B3 lit mxc B6 lit mxc B9 lit mxc BC lit mxc BF lit mxc C2 lit mxc C5 lit mxc
+C8 lit mxc CB lit mxc CE lit mxc D1 lit mxc D4 lit mxc D7 lit mxc DA lit mxc DD lit mxc
+mxda @ mxp !
+0 lit mxc 5 lit mxc A lit mxc F lit mxc 14 lit mxc 19 lit mxc 1E lit mxc 23 lit mxc 28 lit mxc 2D lit mxc 32 lit mxc 37 lit mxc 3C lit mxc 41 lit mxc 46 lit mxc 4B lit mxc 50 lit mxc 55 lit mxc 5A lit mxc 5F lit mxc 64 lit mxc 69 lit mxc 6E lit mxc 73 lit mxc
+78 lit mxc 7D lit mxc 82 lit mxc 87 lit mxc 8C lit mxc 91 lit mxc 96 lit mxc 9B lit mxc
+mxza @ mxp !
+11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc
+11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc 11 lit mxc
+mxdb @ mxp !
+FF lit mxc FE lit mxc FD lit mxc FC lit mxc FB lit mxc FA lit mxc F9 lit mxc F8 lit mxc F7 lit mxc F6 lit mxc F5 lit mxc F4 lit mxc F3 lit mxc F2 lit mxc F1 lit mxc F0 lit mxc EF lit mxc EE lit mxc ED lit mxc EC lit mxc EB lit mxc EA lit mxc E9 lit mxc E8 lit mxc
+E7 lit mxc E6 lit mxc E5 lit mxc E4 lit mxc E3 lit mxc E2 lit mxc E1 lit mxc E0 lit mxc
+mxzb @ mxp !
+22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc
+22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc 22 lit mxc
+mxseq @ mxp !
+78 lit mxc 56 lit mxc 34 lit mxc 12 lit mxc 8B lit mxc 1 lit mxc 0 lit mxc 0 lit mxc
+mxexp @ mxp !
+0 lit mxc D2 lit mxc 49 lit mxc 6B lit mxc 0 lit mxc 0 lit mxc 0 lit mxc 0 lit mxc
+mxnon @ mxp !
+88 lit mxc 77 lit mxc 66 lit mxc 55 lit mxc 44 lit mxc 33 lit mxc 22 lit mxc 11 lit mxc
+mxha @ mxp !
+FD lit mxc F7 lit mxc 86 lit mxc 73 lit mxc 26 lit mxc E6 lit mxc 66 lit mxc 55 lit mxc 27 lit mxc 6A lit mxc 42 lit mxc E6 lit mxc B0 lit mxc 96 lit mxc 59 lit mxc FF lit mxc 7C lit mxc 66 lit mxc 20 lit mxc A9 lit mxc DD lit mxc 7C lit mxc 6F lit mxc EF lit mxc
+39 lit mxc 83 lit mxc 75 lit mxc C2 lit mxc FE lit mxc 32 lit mxc 3E lit mxc D5 lit mxc
+mxia @ mxp !
+A0 lit mxc 79 lit mxc C lit mxc 65 lit mxc CB lit mxc 13 lit mxc 1D lit mxc 1F lit mxc 6D lit mxc 44 lit mxc D0 lit mxc 20 lit mxc 38 lit mxc A3 lit mxc 9C lit mxc 3E lit mxc 10 lit mxc 27 lit mxc AE lit mxc 6D lit mxc A0 lit mxc 65 lit mxc E1 lit mxc 6C lit mxc
+64 lit mxc 53 lit mxc E2 lit mxc 13 lit mxc 8D lit mxc 86 lit mxc CF lit mxc 4C lit mxc
+mxhca @ mxp !
+99 lit mxc 76 lit mxc 26 lit mxc 86 lit mxc D0 lit mxc 4E lit mxc 95 lit mxc 65 lit mxc F1 lit mxc 49 lit mxc E2 lit mxc 4D lit mxc C2 lit mxc EB lit mxc 95 lit mxc 24 lit mxc A1 lit mxc A8 lit mxc EE lit mxc 83 lit mxc 4F lit mxc 90 lit mxc 33 lit mxc 4C lit mxc
+D5 lit mxc D0 lit mxc 76 lit mxc 41 lit mxc BE lit mxc 61 lit mxc DC lit mxc 89 lit mxc
+mxhcb @ mxp !
+E9 lit mxc 19 lit mxc A1 lit mxc 7B lit mxc ED lit mxc 5F lit mxc 36 lit mxc 97 lit mxc BC lit mxc C2 lit mxc E6 lit mxc FF lit mxc F1 lit mxc F lit mxc B8 lit mxc 9A lit mxc CE lit mxc C8 lit mxc 23 lit mxc 8 lit mxc 73 lit mxc 15 lit mxc 6E lit mxc B7 lit mxc
+B3 lit mxc 3D lit mxc 2 lit mxc F3 lit mxc 3E lit mxc 41 lit mxc 9 lit mxc CF lit mxc
+mxm @ mxp !
+7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc
+7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc 7 lit mxc
+mxn @ mxp !
+9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc 9 lit mxc
+mxho @ mxp !
+71 lit mxc 85 lit mxc 6F lit mxc F5 lit mxc 75 lit mxc 90 lit mxc 81 lit mxc B7 lit mxc 25 lit mxc 7E lit mxc E5 lit mxc 29 lit mxc 69 lit mxc FE lit mxc 4A lit mxc BB lit mxc BF lit mxc 6B lit mxc EB lit mxc 49 lit mxc 46 lit mxc 6D lit mxc D5 lit mxc BA lit mxc
+62 lit mxc 42 lit mxc 9D lit mxc F6 lit mxc C3 lit mxc CC lit mxc 2D lit mxc 1E lit mxc
+mxio @ mxp !
+72 lit mxc 7E lit mxc 8C lit mxc 42 lit mxc BA lit mxc F9 lit mxc ED lit mxc 62 lit mxc D0 lit mxc DE lit mxc 74 lit mxc 75 lit mxc 18 lit mxc 52 lit mxc 9B lit mxc 1 lit mxc 63 lit mxc 78 lit mxc C1 lit mxc F lit mxc 3E lit mxc 5D lit mxc 1 lit mxc A lit mxc
+F7 lit mxc 72 lit mxc 82 lit mxc 68 lit mxc BE lit mxc BE lit mxc 4 lit mxc 15 lit mxc
+12C lit mxil !  2C01 lit mxol !  6553F100 lit mxnow !
+;
+: mxr0
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+0 lit mxc
+0 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr1
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc
+0 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr2
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+2 lit mxc 1 lit mxc 0 lit mxc
+0 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr3
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+2 lit mxc 0 lit mxc 1 lit mxc
+0 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr4
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+8 lit mxc 4 lit mxc 7 lit mxc
+0 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxr5
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+0 lit mxc
+1 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr6
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc
+1 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr7
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+1 lit mxc 2 lit mxc 0 lit mxc
+1 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr8
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc 4 lit mxc
+1 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr9
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+4 lit mxc 5 lit mxc 0 lit mxc
+1 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxr10
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+0 lit mxc
+3039 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr11
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+0 lit mxc 1 lit mxc
+3039 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr12
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+0 lit mxc 1 lit mxc 2 lit mxc
+3039 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr13
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+2 lit mxc 1 lit mxc 0 lit mxc
+3039 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr14
+mxid @ mxp !
+45 lit mxc F lit mxc F lit mxc 1A lit mxc FD lit mxc EF lit mxc C0 lit mxc 60 lit mxc F2 lit mxc 56 lit mxc C9 lit mxc 6F lit mxc D6 lit mxc 7E lit mxc 0 lit mxc 72 lit mxc 3F lit mxc A9 lit mxc 97 lit mxc 2D lit mxc E0 lit mxc 65 lit mxc 5A lit mxc 70 lit mxc
+A7 lit mxc A5 lit mxc 4F lit mxc A lit mxc BA lit mxc 33 lit mxc 22 lit mxc 3F lit mxc
+mxix @ mxp !
+3 lit mxc 7 lit mxc 0 lit mxc
+3039 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxr15
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc
+0 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr16
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc
+0 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr17
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 2 lit mxc 0 lit mxc
+0 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr18
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc 2 lit mxc 4 lit mxc
+0 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr19
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 2 lit mxc 5 lit mxc
+0 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxr20
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc
+1 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr21
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc
+1 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr22
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 2 lit mxc 0 lit mxc
+1 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr23
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+1 lit mxc 0 lit mxc 2 lit mxc
+1 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr24
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+7 lit mxc 8 lit mxc 5 lit mxc
+1 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxr25
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc
+3039 lit mxe !  1 lit mxnn !  1 lit mxk !
+;
+: mxr26
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc 1 lit mxc
+3039 lit mxe !  2 lit mxnn !  2 lit mxk !
+;
+: mxr27
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+2 lit mxc 0 lit mxc 1 lit mxc
+3039 lit mxe !  3 lit mxnn !  3 lit mxk !
+;
+: mxr28
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+0 lit mxc 3 lit mxc 1 lit mxc
+3039 lit mxe !  5 lit mxnn !  3 lit mxk !
+;
+: mxr29
+mxid @ mxp !
+B3 lit mxc 13 lit mxc 69 lit mxc 1A lit mxc D9 lit mxc 2C lit mxc 7E lit mxc 2C lit mxc C4 lit mxc D9 lit mxc BF lit mxc 6A lit mxc 9D lit mxc F2 lit mxc B1 lit mxc 40 lit mxc 56 lit mxc 8 lit mxc 93 lit mxc 59 lit mxc 11 lit mxc 53 lit mxc DA lit mxc 62 lit mxc
+7D lit mxc FB lit mxc 3E lit mxc D lit mxc B9 lit mxc E4 lit mxc C7 lit mxc 49 lit mxc
+mxix @ mxp !
+2 lit mxc 3 lit mxc 8 lit mxc
+3039 lit mxe !  9 lit mxnn !  3 lit mxk !
+;
+: mxrn  1E lit ;
+: mxr
+dup 0 lit = if mxr0 then
+dup 1 lit = if mxr1 then
+dup 2 lit = if mxr2 then
+dup 3 lit = if mxr3 then
+dup 4 lit = if mxr4 then
+dup 5 lit = if mxr5 then
+dup 6 lit = if mxr6 then
+dup 7 lit = if mxr7 then
+dup 8 lit = if mxr8 then
+dup 9 lit = if mxr9 then
+dup A lit = if mxr10 then
+dup B lit = if mxr11 then
+dup C lit = if mxr12 then
+dup D lit = if mxr13 then
+dup E lit = if mxr14 then
+dup F lit = if mxr15 then
+dup 10 lit = if mxr16 then
+dup 11 lit = if mxr17 then
+dup 12 lit = if mxr18 then
+dup 13 lit = if mxr19 then
+dup 14 lit = if mxr20 then
+dup 15 lit = if mxr21 then
+dup 16 lit = if mxr22 then
+dup 17 lit = if mxr23 then
+dup 18 lit = if mxr24 then
+dup 19 lit = if mxr25 then
+dup 1A lit = if mxr26 then
+dup 1B lit = if mxr27 then
+dup 1C lit = if mxr28 then
+dup 1D lit = if mxr29 then
+drop ;

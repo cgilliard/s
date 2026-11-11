@@ -20,6 +20,8 @@ mod fam_dilithium_vectors;
 #[cfg(test)]
 mod fam_kyber_vectors;
 #[cfg(test)]
+mod fam_msg_vectors;
+#[cfg(test)]
 mod fam_xmss_vectors;
 #[cfg(test)]
 mod fam_slate_vectors;
