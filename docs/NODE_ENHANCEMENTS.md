@@ -546,3 +546,46 @@ transactions confirmed first, nothing valid lost from every pool at
 once, the node answering pings and the API throughout, memory within
 its budget; the rate each sustains recorded in `docs/NODE.md`. Then the
 same at twice the rate, to see what gives first.
+
+## 16. An option to build the 64 MB dataset, for faster proof-of-work checks
+
+Today the node holds no dataset: it computes each of a header's 128
+items from the seed file (255 Poseidon2 permutations each), about 2.2 s
+a header on one hart (`docs/NODE.md`, Proof-of-work), so 5.3 minutes
+for a fast sync's 145 headers and 2.2 s of every new block (item 4).
+With the dataset (2^20 items of 64 bytes, as tabminer builds it) a
+header is 128 item reads and the 64 windows of the seed file: a few
+milliseconds.
+
+An option (in `/etc/node/config`, off by default) to build the dataset
+and check headers from it:
+
+- **The seed file stays required.** Each access still reads its window
+  of the file directly, so the dataset speeds the check without
+  replacing the file (`docs/NODE.md`, The seed file); the node keeps
+  the whole file either way.
+- **Where it lives.** 64 MB is half of the node's 128 MiB budget, so on
+  the disk, in the store's region or a file of its own, read 64 bytes at
+  a time (128 reads a header), not in memory; or in memory for a node
+  given more, the budget raised for that node only.
+- **Building it.** 2^20 items × 255 permutations ≈ 267 million
+  permutations: about 3 hours on one hart at 41 µs each, shared across
+  harts (each item is independent), done in the background, a few items
+  at a time between the loop's other work (item 4), the node checking
+  headers from the seed file until it is complete, and resumed after a
+  restart rather than started again.
+- **Or taken from tabminer.** tabminer saves the dataset it builds; the
+  node could take that file (copied into its disk or fetched from a
+  peer) instead of computing it, checked the way tabminer checks a
+  saved one (sampled items against items computed from the seed file)
+  before use.
+- **Kept correct.** A dataset item read from disk that is wrong (a bad
+  sector, a changed file) must not make the node accept or refuse a
+  header tabminer would not: a sampled check at start, a header refused
+  from the dataset checked again from the seed file before it is
+  refused, and the dataset rebuilt when it fails.
+
+**Tests:** the same headers checked both ways, with the same verdicts
+(oscheck's proof-of-work vectors, and a header with each byte changed);
+a dataset with one item changed caught; the build interrupted and
+resumed; the time per header with each, recorded in `docs/NODE.md`.
