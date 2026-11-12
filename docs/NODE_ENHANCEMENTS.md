@@ -613,12 +613,23 @@ The password typed at the console is the only one the user has. It:
 - **unlocks the wallet:** `login` derives the wallet's key from it (as
   wm does today from its form) and hands key and user to wm for the
   session, so the wallet needs no password of its own;
-- **is asked again only to view the recovery phrase,** at the console
-  (`wallet phrase`), never in the page: the phrase is the one thing that
-  gives the whole wallet away, and a stolen session cookie or a
-  malicious page then cannot reach it. The page's Settings says where
-  to find it. (Changing the password, `passwd`, asks the old one too, as
-  any `passwd` does, and re-encrypts the phrase in the same step.)
+- **is asked again only to view the recovery phrase,** in the page's
+  own tab for it (Recovery phrase): the password typed there, the
+  phrase shown until the tab is left. The phrase is the one thing that
+  gives the whole wallet away, so a stolen session cookie or a
+  malicious page holding the session still cannot reach it without the
+  password. Wrong tries slowed (each check takes the key's derivation,
+  about 1.4 s, and a few wrong ones in a row add a wait). Changing the
+  password (`passwd`) asks the old one too, as any `passwd` does, and
+  re-encrypts the phrase in the same step.
+
+**The phrase at the first login.** The first time the desktop opens
+after the password is made (the first boot, item 7), the wallet has just
+been created and the page shows its phrase straight away, with no
+password asked (it was typed moments ago): written down, the user says
+so ("I have written it down"), and the desktop follows. Until then the
+phrase stays on screen; leaving without confirming shows it again at the
+next login. After that, only the tab shows it, behind the password.
 
 ### The desktop by a one-time link
 
@@ -658,10 +669,10 @@ The check exists: `crypto/passwd.fam`'s `pwfind` (a user's line of
 and wm use. What a program run by a user lacks is the right to use it:
 only root reads `/etc/passwd`, and only root writes `/proc/self/user`.
 
-- **The recovery phrase needs nothing new.** `wallet phrase`, run as
-  the user, derives the key from the password typed and decrypts the
-  phrase (ChaCha20-Poly1305): the tag checking is the password checked.
-  No `/etc/passwd`, no root.
+- **The recovery phrase needs nothing new.** The wallet process, run
+  as the user, derives the key from the password the page sends and
+  decrypts the phrase (ChaCha20-Poly1305): the tag checking is the
+  password checked. No `/etc/passwd`, no root.
 - **`su` and a user's own `passwd` need root:** a **setuid bit.** A
   file marked so, and owned by root, runs as root (the kernel, at
   `spawn`, sets the process's user to the file's owner; `chmod` sets the
@@ -680,7 +691,8 @@ page opened with that token gets the desktop as that user, unlocked; the
 same token a second time, no token, or a wrong one gets nothing; a
 request with another `Host`, or a WebSocket from another `Origin`,
 refused; the link's port the one forwarded; `su` to another user and
-back, refused with a wrong password; `wallet phrase` refused with a
-wrong password; a user's `passwd` changing their password and the
+back, refused with a wrong password; the first desktop showing the
+phrase until confirmed, then not again; the Recovery phrase tab showing
+it with the password and refusing a wrong one; a user's `passwd` changing their password and the
 wallet still opening with the new one; a program without the setuid
 mark refused `/etc/passwd` as now.
