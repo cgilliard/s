@@ -523,6 +523,28 @@ kernel too much to add at the end.
    opened all of memory to user mode; an empty slot's entry is now off.
    And hart 0 never enabled software interrupts, so a thread there was
    neither stopped when its process ended nor told to reload its PMP.
+
+   Threads with variables of their own (2026-11-12, for the node's
+   worker: `docs/NODE_ENHANCEMENTS.md`, item 4). A fam variable is
+   `s10 + 0x1000 + 4 × slot`, computed when used, so a thread whose
+   `s10` points elsewhere has variables of its own with no change to
+   the compiler. `pthread ( entry arg bytes -- tid )` (`lib/user.fam`,
+   its code from `ptcode[ ... ]tcode`) makes such a thread: from the
+   caller's `alloc`, a block laid out as a program's memory (return
+   ids, a copy of the caller's variables, a copy of its arguments, a
+   heap of `bytes` for its own `alloc` and its data stack, loop frames),
+   and its first act sets `s10`, `s11`, `gp` and `sp` there. So any fam
+   word runs on it beside the caller, each with its own buffers once
+   the thread makes its own (a copied variable holding a buffer's
+   address still points at the caller's). What both see goes through
+   memory from `malloc`, shared as the heap is; for that, `malloc`'s
+   own state moved from variables to 11 cells it reaches through one
+   (`mst`), which every copy shares. A process's end still ends every
+   thread. Checked (`scripts/oscheck.sh`'s `pthreads`, on 1 and 4
+   harts): four such threads each setting one variable to its own
+   number and finding it unchanged after yielding, the caller's still
+   as it was, while all count into shared memory under a lock and take
+   and free heap blocks.
 7. **Descriptors, the console, init and a shell.** `open`, `read`,
    `write`, `close`, `pipe`, `poll`; `/dev/console` and `/dev/null`;
    `/proc`'s basics; `init`, a first shell on the console, and `ps`.

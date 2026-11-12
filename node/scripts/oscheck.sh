@@ -321,6 +321,28 @@ tcode[ 3E8 lit 0 lit do mtx lock cnt @ 1 lit + cnt ! mtx unlock loop 7 lit texit
 "joined: " puts u. " count: " puts cnt @ u. 0A lit putc bye'
 uimage thr bin/kernel init=tthr:256
 for n in 1 4; do expect "threads_$n" 124 'joined: 28 count: 4000' 10 ./tools/q32 --smp=$n "$T/thr.img"; done
+# Threads with variables of their own (pthread): four, each setting the
+# same variable v to its own number and finding it still so after
+# yielding, while main's stays 5 (each starts with the caller's copy: 5);
+# meanwhile counting into memory from malloc (shared) under a lock, and
+# taking and freeing heap blocks (the heap's state shared).
+usrc tpth ': v variable ;  : sh variable ;  : tids variable ;  : tc variable ;  : mine variable ;
+5 lit v !  10 lit malloc sh !  0 lit sh @ !  0 lit sh @ 4 lit + !  0 lit sh @ 8 lit + !  10 lit alloc tids !
+: terr  sh @ lock  sh @ 8 lit + dup @ 1 lit + swap !  sh @ unlock ;
+ptcode[ mine !
+v @ 5 lit <> if terr then
+1F4 lit 0 lit do
+	mine @ v !  yield  v @ mine @ <> if terr then
+	40 lit malloc ?dup if free else terr then
+	sh @ lock  sh @ 4 lit + dup @ 1 lit + swap !  sh @ unlock
+loop
+10 lit alloc 0= if terr then
+mine @ texit ]tcode tc !
+4 lit 0 lit do tc @ i 1 lit + 2000 lit pthread i 2 lit lshift tids @ + ! loop
+0 lit 4 lit 0 lit do i 2 lit lshift tids @ + @ join + loop
+"joined: " puts u. " count: " puts sh @ 4 lit + @ u. " errors: " puts sh @ 8 lit + @ u. " v: " puts v @ u. 0A lit putc bye'
+uimage pth bin/kernel init=tpth:512
+for n in 1 4; do expect "pthreads_$n" 124 'joined: 10 count: 2000 errors: 0 v: 5' 10 ./tools/q32 --smp=$n "$T/pth.img"; done
 usrc tspawn ': st variable ;
 "child" spawn dup "spawned " puts u. 0A lit putc
 st wait "waited " puts u. " status " puts st @ u. 0A lit putc

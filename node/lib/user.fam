@@ -219,15 +219,19 @@ until ;
 
 : max  2dup u< if swap then drop ;
 
-: freelist variable ;        \ the first free block (0: empty)
-: mlk variable ;             \ its lock: threads share the heap
 : fb variable ;  : fp variable ;  : mcur variable ;  : mneed variable ;
-: mbytes variable ;          \ the bytes mapped in arenas
-\ The arenas, (first byte, byte past) in 4 pairs: variables are handed out
-\ in order, so these 8 cells are one table (arena).  0: an empty pair.
-: mar0 variable ;  : mar1 variable ;  : mar2 variable ;  : mar3 variable ;
-: mar4 variable ;  : mar5 variable ;  : mar6 variable ;  : mar7 variable ;
-: arena  3 lit lshift mar0 + ;               \ ( i -- pair )
+\ The heap's own state is in 11 cells at mst (made at the start, below),
+\ not in variables: a thread with variables of its own (pthread) shares
+\ the heap, so it must share these too (its copy of mst points at the
+\ same cells; fb, fp, mcur and mneed are used under the lock only, so
+\ each thread's own copies serve).
+: mst variable ;
+: freelist  mst @ ;          \ the first free block (0: empty)
+: mlk  mst @ 4 lit + ;       \ its lock: threads share the heap
+: mbytes  mst @ 8 lit + ;    \ the bytes mapped in arenas
+\ The arenas, (first byte, byte past) in 4 pairs, one table.  0: an empty
+\ pair.
+: arena  3 lit lshift mst @ C lit + + ;      \ ( i -- pair )
 
 \ astart? ( a -- flag )  a is an arena's first byte.
 : astart?  0 lit swap 4 lit 0 lit do dup i arena @ = rot or swap loop drop ;
@@ -333,7 +337,8 @@ mlk unlock ;
 
 \ tcode[ ... ]tcode ( -- entry )  a thread's code, compiled where it is but
 \ jumped over; its address left for `thread`.  It runs on its own stacks
-\ (the variables and malloc's heap are shared), begins with the thread's
+\ (the variables and malloc's heap are shared; pthread's, below, has
+\ variables of its own), begins with the thread's
 \ argument on the data stack, and ends with texit(0) if it does not end
 \ itself.  A thread allocates with malloc, never alloc: alloc moves gp, and
 \ each thread's gp is its own copy of its parent's.
@@ -350,6 +355,56 @@ mlk unlock ;
 ;
 :M ]tcode  0 lit texit skip] ;
 
+\ ptcode[ ... ]tcode ( -- entry )  as tcode[, for pthread: a thread with
+\ variables of its own.  Its first act takes, from the block pthread
+\ made (a0), its argument and its heap, and puts its return ids,
+\ variables and data stack there.
+:M ptcode[
+97020000 ,   \ auipc t0,0x0
+93824201 ,   \ addi t0,t0,20              ( the entry, past the jump )
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+[skip
+83230500 ,   \ lw t2,0(a0)                ( its argument )
+83214500 ,   \ lw gp,4(a0)                ( its heap )
+130D0500 ,   \ addi s10,a0,0              ( its return ids and variables )
+B7120000 ,   \ lui t0,0x1
+B30D5D00 ,   \ add s11,s10,t0
+33015C40 ,   \ sub sp,s8,t0               ( its data stack, below the loop frames )
+1301C1FF ,   \ addi sp,sp,-4
+23207100 ,   \ sw t2,0(sp)                ( the argument, onto it )
+;
+
+\ pthread ( entry arg bytes -- tid )  a thread (entry from ptcode[) with
+\ variables of its own: a copy of the caller's, as they are now, so it
+\ starts with every value the caller has, and what either then sets the
+\ other does not see.  So any fam word may run on it beside the caller,
+\ each with its own buffers, once the thread has made its own of those
+\ it uses (a copied variable that holds a buffer's address still points
+\ at the caller's).  What both are to see goes through memory from
+\ malloc (shared, as the heap is) whose address arg carries.  Its block,
+\ from the caller's alloc: return ids (4 KiB), the variables (16 KiB),
+\ the arguments (args) copied, then bytes for its own alloc and its data
+\ stack, then 4 KiB of loop frames.  The block is not given back when the
+\ thread ends (alloc has no free): for threads that last.  -12 if the
+\ caller's heap has not the room; else thread's result.  The caller is
+\ the program's first thread or one from pthread (not from thread,
+\ whose alloc is not its own).
+: pta variable ;  : ptl variable ;  : ptb variable ;  : ptn variable ;
+\ pcopy ( src dst n -- )  n bytes, a multiple of 4.
+: pcopy  2 lit rshift ?dup if 0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop then 2drop ;
+: pthread
+ptn ! pta !
+s10@ 5000 lit + @ 7 lit + FFFFFFFC lit and ptl !
+6000 lit ptl @ + ptn @ + F lit + FFFFFFF0 lit and  dup alloc  dup ptb !
+if
+	s10@ 1000 lit + ptb @ 1000 lit + 4000 lit pcopy
+	s10@ 5000 lit + ptb @ 5000 lit + ptl @ pcopy
+	pta @ ptb @ !
+	ptb @ 5000 lit + ptl @ + ptb @ 4 lit + !
+	ptb @ +  ptb @ thread
+else 2drop FFFFFFF4 lit then ;
+
 \ The start: the stacks and the heap in the memory given (a0, a1).
 130D0500 ,   \ addi s10,a0,0              ( return ids from the start )
 B7120000 ,   \ lui t0,0x1
@@ -362,3 +417,5 @@ B3816200 ,   \ add gp,t0,t1               ( and the heap past them )
 138C0500 ,   \ addi s8,a1,0               ( loop frames, down from the end )
 B7120000 ,   \ lui t0,0x1
 33815540 ,   \ sub sp,a1,t0               ( the data stack, down from 4 KiB below it )
+\ the heap's state (mst, above), zeroed
+2C lit alloc mst !  B lit 0 lit do 0 lit mst @ i 2 lit lshift + ! loop
