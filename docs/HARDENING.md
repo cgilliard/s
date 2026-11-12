@@ -1,44 +1,18 @@
 # Hardening backlog
 
-Gaps found in the review of 2026-10-31 and not yet closed. Each entry says
-where the problem is, why it matters, and the fix as far as it was thought
-through. Items are grouped by area and ordered by how much they matter
-within the group. The fixes already made from that review (miner size and
-timestamp rules, request tokens, per-host peer limits, strike policy, slate
-checks, fee policy, dust, blind rows, the dataset checksum) are in the
-history and the README; this file holds what is left.
-
-## Progress
-
-Closed in batches since the design docs were built (bb8738c); 56 entries
-then, 28 now. Most that remain are accepted, for launch, or tests; some were narrowed rather than removed, and a few narrower ones added:
-
-| Batch | Area | Commit |
-|---|---|---|
-| 1 | Pool and chain: conflicts by position, reorg relocation, pool kept across restarts, `resend`, unchecked-data marker, wrap-height assert | c00641b |
-| 2 | Wallet: password-locked phrase, 0700 directory, cancel undoes name ops, orphaned rewards, payments found after a gap | c00641b |
-| 3 | Side channels: constant-time ML-DSA signing, hedged relay key, hourly Kyber rotation | bf39007 |
-| 4 | Networking and sync: non-blocking snapshot changes, slow vs unserving peers, fast-sync fallback, clock skew, header retry, serving limits, peer groups | 23f0a39 |
-| 5 | Message layer: failing guards replaced, key-mismatched relays avoided, handshake rate, idle hops and cell budgets, keepalives both ways between relays, delivery acknowledgements, wide-block backward layers (protocol 7) | 10b5007 |
-| 6 | Wallet and chain: relay keeps only `relay.key`, leaf reuse after a rollback caught from the pool, slate outputs shown as unverified, batched part commits | 28846da |
-| 7 | Tests: proofs through `Chain::connect` with the real verifier (stale, tampered, other body), proof tests in the default release suite, zero-knowledge openings counted, fast sync over a lossy network and after a late first peer, garbage datagrams, recovered-output spends through the pool, malformed slates | 84792e7 |
-| 8 | CI and what it found: tests on Linux, macOS and Windows (x64, arm64), release with overflow checks, a debug build, the dev feature, the slow tests and the chain constants one job each; binary tests through the prompt (`miner/tests/wallet.rs`: a payment, a name, sub-names through the switch to onion mode, exit while mining, reorganizations); the name circuit's position in 30-bit limbs; Windows (OS randomness, LF checkouts, LMDB without TLS); the miner waits on verified headers only, never a claim; an init-mode "no delegation" not cached; outputs lost to a reorganization hidden, then forgotten; headers ahead of their parent no fault; first pings retried; fast sync and the message layer over lossy and reordering networks; a restored wallet beside its original; fast sync's edge cases (a manifest that does not fit the proof, no snapshot served with and without a peer keeping every block, a reorganization past the snapshot, a heavier branch below the floor), which found an abandoned snapshot falling through to a replay from genesis and such a branch holding the node off its own chain (now set aside, its peers not struck, an announcer asked for the block it announced); crash injection at each step of a payment (`TABMINER_CRASH_AT`, `dev` builds), the change record now written with the reservation, and a send waiting for the wallet's rendezvous session so the answer is not lost after a start | 4830361 on |
-| 9 | Scale: `--debug-fill-outputs` (a set of any size made behind genesis, staged a part at a time) and `--debug-genesis-outputs` (its genesis alone, to fast-sync it); a full block on a large set and a fresh node fast-syncing it, as binary tests (`miner/tests/scale.rs`) at 2M outputs every push and 170M nightly on every platform but Windows arm64 (`scale.yml`), timings as `SCALE` lines; found a peer at its serving limit taken for one that does not serve the snapshot (dense parts), now counted slow, and a miner calling its blocks lost when its node took over a minute to apply them (it waits for the verdict now, and hears of a refusal that leaves no record); a miner thread ended for good by a pooled transaction its own last block had spent, before the node revalidated the pool (now a fresh start, and any error restarts the miner); the fill spaces its outputs (one in five by default) and block application is timed phase by phase (`applied in` lines, `SCALE … apply_<phase>_secs`) | 37d5c94 on |
-
-Still to do, as code: the untested paths listed below (the rest of
-fast sync's, and of the network's). CI (`.github/workflows/test.yml`) runs the suite in release
-with overflow checks on five platforms, a debug build and the `dev`
-feature on Linux, and each test marked slow (the proving round trips,
-the multi-node and binary tests, the chain constants) as a job of its
-own; the proof tests that take seconds are skipped in debug builds.
+Known gaps not yet closed, as a fresh list (2026-11-12): what has been
+fixed is in the history (the review of 2026-10-31 and the batches since,
+up to `adf2c3f`), not here. Each entry says where the problem is, why it
+matters, and the fix as far as it was thought through. Items are grouped
+by area and ordered by how much they matter within the group.
 
 Not code, or for launch: the independent circuit review, the soundness
 conjecture, a checkpoint per release, seeds, genesis regeneration, the
 small-VPS and full-size sync tests. Accepted as they are: no coinbase
 maturity, PBKDF2, unrecoverable policy outputs, file slates' recipients,
 name parts checked at the end (a design change), side blocks stored
-before their proofs, the shared leaf/node hash domain, IPv4 only. Open but not
-planned: pricing unnamed slates (a fee or proof of work per slate).
+before their proofs, the shared leaf/node hash domain, IPv4 only. Open but
+not planned: pricing unnamed slates (a fee or proof of work per slate).
 
 ## Consensus and chain
 
@@ -84,13 +58,7 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
 - **Untested paths.** No test for: the `drop_carry` path; a deferred
   move or restart while parts are with the applier; the header batch
   retry; clock-skew logging; strikes leading to a ban at node level;
-  peers-file poisoning; NAT. (Tested: loss and reordering, a fast
-  sync and the message layer with a tenth of datagrams lost or almost a
-  third delivered after the next; a manifest that does not fit the
-  snapshot block's proof; no peer serving the snapshot, with a peer
-  keeping every block (validated from genesis) and without (kept
-  trying); a reorganization past the snapshot during the sync; a heavier
-  branch forking below the floor after the install.)
+  peers-file poisoning; NAT.
 
 ## Wallet
 
@@ -148,13 +116,6 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   in that window is (the sender's slate stays pending until cancelled).
   Fix: a rendezvous point holds messages for a session whose datagrams
   stopped until the new one takes over, or end-to-end acknowledgements.
-- **Tested through the binary** (`miner/tests/wallet.rs`): a
-  reorganization's lost rewards and payments; a restored wallet finding
-  and spending beside its original; a crash after the inputs are
-  reserved, while the answer is signed, and after it is signed but
-  before the pool has it (`cancel` frees the first two, `resend` sends
-  the third).
-
 ## Proof system
 
 - **The circuit has not been independently reviewed.** Fast sync trusts
@@ -166,109 +127,19 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   but not mint unseen. This is the largest remaining trust gap. `block_air.rs` (SMT
   empty-leaf handling on insert, XMSS digit decomposition, carry between
   segments) was only spot-checked in the review.
-- **Audited for unintended freedom (2026-11-04), not yet attacked rule
-  by rule.** `stark::freedom_audit` takes each audited row of an honest
-  trace, computes the exact Jacobian of every constraint and lookup of
-  its row pairs with respect to its cells, and tests each direction in
-  its null space at random distances: the ways several cells can change
-  together unseen (a missing bit, range or sum check shows as an exact
-  one). `stark::run_audit` shifts each column along each run of one row
-  type, for registers carried with neither end pinned. Every production
-  circuit passes (`*::has_no_unintended_freedom`; the block circuit over
-  plain spends and a reward, a transaction split over three segments,
-  and the four policy spends; the name circuit over commits, reveals,
-  updates and sweeps). What remains free is by design: a permutation on
-  a pass or load row (the hash machine does not use it, and a replaced
-  permutation on an active chain step is caught,
-  `a_replaced_permutation_is_caught_where_it_is_used`), a value with its
-  zero-test inverse, and registers left on the padding rows (unseen by
-  the public values and lookups). Limits: freedoms that span rows of
-  different types.
-  The audit finds witnesses that are not unique; the next two steps test
-  what the rules mean.
-- **Attacked rule by rule, and checked against the chain (2026-11-04).**
-  Each rule the witness generator enforces goes through
-  `stark::refuse`, which a test-only lenient switch turns off, so the
-  generator writes the trace a cheating prover would (collecting the
-  witness too, for plain inputs). `broken_rules_are_rejected_by_the_constraints`:
-  fifteen witnesses that break a rule (amounts, commitments, memos, a
-  signature over another message, a signer outside the policy or counted
-  twice, a wrong preimage, an absolute or relative lock not passed, a
-  covenant's outputs, a stale eltoo state, a double spend in a segment,
-  outputs over an occupied position, a resumed transaction skipping an
-  input under the honest statement) are all rejected by the constraints;
-  honest multisig, covenant and eltoo spends are accepted. Rules across
-  segments are the node program's (every boundary field chained, both
-  ends pinned, the balance), tested in `root_program_accepts_and_rejects`.
-  `the_circuit_agrees_with_the_chain_on_random_blocks`: random blocks,
-  packed at random segment sizes, end where the native set does (root,
-  lists, position, sums), and random breakages the chain rejects
-  (a stranger's signature, another output's position, an inflated input,
-  an output changed after signing, a double spend) are rejected by the
-  constraints; 440 blocks over eleven seeds (`TABMINER_DIFF_SEED`).
-  Names, the same way (the witness collected leniently too):
-  `broken_name_rules_are_rejected_by_the_constraints` rejects a reveal
-  too early, too late, with another salt, against an ordinary output or
-  another name's commit, a sweep of a live commit, and an update signed
-  by another key, keeping the owner, or changing the name, and a second
-  registration of a name; honest reveals
-  and updates are accepted. In a block segment, a name operation changed
-  or dropped after signing is rejected, and the freedom audit covers a
-  transaction carrying operations. Limits: each attack checks the trace
-  a cheater would naturally write, not every trace for it (the freedom
-  audit covers the rest locally). A second registration of a name (the
-  registry's refusal skipped too) is rejected by the constraints.
-- **Fuzzed (2026-11-04).** `fuzz_segment_witnesses` and
-  `fuzz_name_witnesses` make random changes inside block and name
-  witnesses (a block's later segments rebuilt to follow, traces written
-  leniently): none gives the same block body, or the same name
-  operations, another outcome. The proof verifiers (block segment, state
-  tree, XMSS with and without zero knowledge, the VM's tables) take
-  mutated proof bytes: refused every time, never a panic, and distinct
-  bytes never decode to the same proof. Nineteen decoders of untrusted
-  bytes (datagrams, blocks, headers, bodies, transactions, fast sync's
-  manifests and parts, onion cells, objects and announces, sub-name
-  delegations and answers, slates, payment proofs, names, policies, XMSS
-  keys and signatures, the block proof container, `consensus.txt`) never
-  panic, and what they decode encodes back to the same bytes; the
-  datagram decoder took runs of chunk indexes out of order, overlapping
-  or past the end, now refused. Every push runs them short; `fuzz.yml`
-  runs them fifty times as long nightly under a fresh seed
-  (`TABMINER_FUZZ_SCALE`, `TABMINER_FUZZ_SEED`). A trace fuzzer (random
-  cells) was not built: random values cannot meet constraints that tie
-  cells together, which the freedom audit solves for instead.
-  `fuzz_reorganizations` grows a random tree of blocks (spends, outputs,
-  name commits, reveals and updates; a sixth broken by a wrong state root
-  or an inflated output) and feeds it in random order, parents often
-  after children, to a chain keeping every undo record and one keeping
-  four: after every block, the state equals a fresh replay of the branch
-  to the tip (root, counter, unspent, names, supply equal to issuance),
-  no invalid block is ever the tip, and the archive's tip is the most
-  work of the complete valid branches. 1,250 blocks over five seeds,
-  reorganizations up to 25 blocks deep, clean.
-  Random mutation rarely sets one field of a large proof to one chosen
-  value: the XMSS test's fuzz took many runs to set a zk proof's first
-  table height to 64 or more, which overflowed a shift in the verifier's
-  shape check (a panic with overflow checks; release wrapped, then
-  refused). So the verifiers are also swept (`codec::sweep_fields`):
-  every `u32` the decoder reads (counts, lengths, heights, indices,
-  flags, found by recording the reads, not by describing the format) set
-  in turn to 0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 2^31, `u32::MAX` and
-  one either side of its own value, on every proof `fuzz_proof` fuzzes
-  and on a real chain proof (`chain_proofs_cover_history`). The sweep
-  found absent Merkle trees' heights unchecked (another encoding of the
-  same proof verified), now required zero. A read-through of the
-  decoders and verifiers (`codec`, `stark`, `fri`, `merkle`,
-  `block_proof`, the chain proof's path in `aggregate`) for untrusted
-  values reaching arithmetic, allocation or indexing before a bound found
-  a decoder panic in release: no queries but FRI rounds claimed, an
-  exhausted iterator unwrapped (`a_proof_without_queries_is_refused`),
-  now refused; and, minor, preallocation from an untrusted query count,
-  an unchecked `u128` sum of untrusted amounts in the direct block proof,
-  an `expect` on a zero inverse at the quotient point and an unguarded
-  shift in `merkle::verify`, all fixed. The sweep changes one field at a
-  time; failures that need several fields changed together, as the
-  queries one did, are left to reading and to random mutation.
+- **What the circuit audits leave.** The freedom audit
+  (`stark::freedom_audit`, `run_audit`), the rule-by-rule attacks
+  (`stark::refuse`, `broken_rules_are_rejected_by_the_constraints`,
+  `broken_name_rules_are_rejected_by_the_constraints`), the comparison
+  with the chain on random blocks and the fuzzers are done and run in CI;
+  their limits are what is open:
+  1. Freedoms that span rows of different types are not searched (the
+     audit works within a row type's row pairs).
+  2. Each attack checks the trace a cheater would naturally write, not
+     every trace for it.
+  3. The verifiers' field sweep changes one `u32` at a time; failures
+     that need several fields changed together are left to reading and
+     random mutation.
 - **Zero knowledge is argued, not simulated.** `zero_knowledge_tables`
   checks that two proofs differ and counts what a real proof opens of a
   column against the blinding rows; `zero_knowledge_configurations_blind_enough`
@@ -288,18 +159,10 @@ planned: pricing unnamed slates (a fee or proof of work per slate).
   every relay is everyone's guard, rendezvous point and last hop: the
   privacy fixes take effect with tens of relays, not three.
 
-Found while building it (2026-11-01).
 
-- **ML-DSA signing is constant-time as far as checked.** `mldsa.rs`:
-  reductions, `centered`, `decompose`, `make_hint` and the norms are
-  branchless (mask arithmetic, divisions by constants), every check of an
-  attempt runs in full and the attempt is accepted or rejected once; the
-  relay key, which signs whatever anyone asks, signs in FIPS 204's hedged
-  mode (fresh randomness per signature), the wallet's identity key
-  deterministically. The x86-64 code (rustc 1.95, release) has no
-  hardware divide in ML-DSA, ML-KEM, Keccak or ChaCha, and the one
-  data-dependent branch in an attempt is the final accept/reject, with
-  the maxima as `cmov`. What remains:
+- **ML-DSA signing is constant-time as far as checked** (x86-64, rustc
+  1.95: branchless reductions, no hardware divide, the relay key signing
+  in FIPS 204's hedged mode). What remains:
   1. **riscv64 not inspected.** Check the generated code there once
      (`cargo rustc --release --lib -- --emit asm`, look for `div`/`rem`
      in `mldsa`/`mlkem` and for branches in `SecretKey::sign`).
@@ -315,6 +178,29 @@ Found while building it (2026-11-01).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
+- **A dead relay takes 30 s to notice, however fast the link.** A
+  channel is taken for dead after a frame goes unacknowledged 30 s
+  (`channel.rs`, `DEAD_AFTER`), a circuit after a keepalive goes
+  unanswered 30 s (`node/participant.rs`, `DEAD_AFTER`; the fam wallet's
+  `wopart.fam` the same), chosen so a satellite link (600 ms and more a
+  round trip, seconds under load) is not mistaken for a dead one
+  (`docs/ONION.md`, Timeouts). The same 30 s applies on a LAN or in a
+  datacenter, where a few seconds would do. Meanwhile every recipient
+  whose session runs through the dead relay is unreachable: a sender told
+  "offline" now keeps asking for 60 s (`OFFLINE_WAIT`, 2026-11-12), which
+  hides the gap from the user but does not shorten it, and the recipient's
+  own sends wait the same 30 s on a dead circuit.
+  Fix: derive "dead" from each link's measured round trip, which the
+  channel already keeps (RFC 6298: `srtt`, `rttvar`, the resend timeout):
+  dead after about ten resend timeouts unanswered, bounded to between
+  5 s and 30 s, so a fast link notices in about 5 s and a satellite keeps
+  its full allowance; for circuits, the keepalive's own round trip
+  measured the same way (it crosses three hops, so its own estimate,
+  not the first channel's). Both tabminer and the fam wallet, and tests
+  that stop a relay on a fast link (`standing_circuits_are_replaced_and_rebuilt`,
+  `an_idle_participant_is_quiet_and_learns_of_a_dead_hop`) then expect
+  recovery within the bound rather than after 30 s. Keep the sender's
+  60 s window as a backstop.
 - **Flow control is a budget, not a window.** `node/circuits.rs`: a
   hop ends a circuit whose client sends more than 1024 cells at once or
   128 a second after, and drops hops idle for an hour; cells toward the
