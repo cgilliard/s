@@ -30,6 +30,13 @@
 \ from the owner whose id (32 canonical bytes) is value: the issuer the
 \ key's hash, in force (and at most 30 days off), a well-formed value,
 \ the signature holding; its type at sbtk, its value at sbtv.
+\ sbbun ( a n -- ok )  a bundle as onion mode publishes and fetches it
+\ (GET_CERT's answer; a certificate sent to its holder): its name and
+\ label at sbnm/sbnl, sblb/sbll, its certificate at sbca (sbcn bytes); one
+\ with a delegation after is refused, as sbpa's code 3.
+\ sbpt ( dst -- )  the point id of the full name sblb.sbnm, whose
+\ rendezvous points hold its certificate in onion mode (subnames.rs's
+\ Cert::point: hash_domain(25, "label.name" packed)), 32 bytes.
 
 : sbnm variable ;  : sbnl variable ;  : sblb variable ;  : sbll variable ;  : sbkd variable ;  : sbval variable ;
 : sbseq variable ;  : sbexp variable ;  : sbca variable ;  : sbcn variable ;  : sbtk variable ;  : sbtv variable ;
@@ -86,6 +93,19 @@ sbe @ sbp @ - 4 lit u< if 0 lit else
 	sbca @ sbcn @ + sbe @ u> if 0 lit else
 	sbca @ sbcn @ + sbe @ = if 2 lit else 3 lit then then
 then then then ;
+: sbbun
+over + sbe !  sbp !
+sbe @ sbp @ - 4 lit u< if 0 lit else
+	sbp @ sble@ sbcn !  sbp @ 4 lit + dup sbca !  sbp !
+	sbca @ sbcn @ + sbe @ = if
+		sbnm @ sbget swap sbnl !  sblb @ sbget swap sbll !  and
+	else 0 lit then
+then ;
+: sbfb variable ;
+: sbpt
+sbfb @ 0= if 80 lit alloc sbfb ! then
+sblb @ sbfb @ sbll @ sbcp  2E lit sbfb @ sbll @ + c!  sbnm @ sbfb @ sbll @ + 1 lit + sbnl @ sbcp
+sbfb @ sbll @ sbnl @ + 1 lit + 19 lit sbh @ mghb  sbh @ swap wkcan ;
 : sbvf
 sbvn !  sbvv !  over + sbe !  sbp !  sbp @ sbca !
 sbtn @ sbget swap sbtn @ swap sbnm @ sbnl @ sbis and

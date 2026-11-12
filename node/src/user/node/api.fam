@@ -624,7 +624,7 @@ loop then
 cxinit
 abegin "{" a"
 "height" akey cxht @ FFFFFFFF lit = if 0 lit else cxht @ then anum acom
-"epoch" akey cxb @ 90 lit / anum acom  "into" akey cxin @ anum acom
+"epoch" akey cxpinned @ if 0 lit else cxb @ 90 lit / then anum acom  "into" akey cxin @ anum acom
 "current" akey cxcur @ ajset acom
 "previous" akey cxprv @ 28 lit + @ if cxprv @ ajset else "null" a" then acom
 "running" akey cxscr @ 28 lit + @ if cxscr @ ajset else "null" a" then

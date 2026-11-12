@@ -1,0 +1,642 @@
+\ wopart.fam — the wallet's part in onion mode (docs/ONION.md: Onion mode),
+\ as tabminer's node/channels.rs, node/circuits.rs and node/participant.rs
+\ for a participant (never a relay): links to the relays it uses first in
+\ its circuits (a handshake, then frames: sealed, acknowledged, sent again
+\ until they are), circuits of three relays built hop by hop (CREATE, then
+\ EXTEND), a standing circuit to its rendezvous point holding its session
+\ there (SESSION, ANNOUNCE) and taking what is delivered to it (DELIVER,
+\ RECEIVED), and an outbound circuit for each send (ROUTE, GET_ANNOUNCE,
+\ SEND, NOTICE; the answer back down it) or each answer to an unnamed
+\ sender (REPLY).  After wnet.fam (its socket, records, pings and tokens:
+\ each relay is a record there), wmsg.fam and wonion.fam.
+\
+\ owinit  the buffers (once).
+\ owrels ( ids addrs n epoch -- )  the relays in force: n of them, ids (32
+\ bytes each, sorted) and addresses (owaddr: 0x60 bytes each, "host:port");
+\ each made a wnet record (looked up by dns.fam if a name).
+\ owtick  the clock's work: links (hellos again, frames again, keepalives,
+\ the dead closed), circuits (built, timed out), the standing session,
+\ the send.
+\ owin  a datagram wnet passed on (a Handshake, 21, or a Frame, 22), in
+\ mnrb (mnrn bytes) from record mnk.
+\ owsend ( to kind inner n -- ok )  inner sent to the id at to, unnamed,
+\ with a route for the answer; owrply ( route kind inner n -- ok ) an
+\ answer along a route.  The end in owst: 1 delivered, 2 failed (why at
+\ owwhy); an answer to a send in owans (opened: mg*).
+\ owrcv  a payload delivered to us, opened (mg*; a route at mgrtp).
+\ owlive ( -- flag )  the standing session live.
+
+:M OWCH 4 lit ;                                \ links
+:M OWCHR A0 lit ;                              \ a link's record
+:M OWIF 20 lit ;                               \ frames in flight a link
+:M OWIFS 450 lit ;                             \ an in-flight slot
+:M OWCC 2 lit ;                                \ circuits: standing, outbound
+:M OWCCR 140 lit ;                             \ a circuit's record
+:M OWMSG 12000 lit ;                           \ a message reassembled, at most
+:M OWRN 10 lit ;                               \ relays kept
+
+\ ── State ──
+: owch variable ;  : owhel variable ;  : owdk variable ;  : owrep variable ;  : owifb variable ;
+: owcc variable ;  : owchl variable ;  : owcdk variable ;  : owcre variable ;  : owmsgb variable ;
+: owrid variable ;  : owrk variable ;  : owrn variable ;  : owep variable ;  : owdg variable ;  : owcell variable ;
+: owfr variable ;  : owbody variable ;  : owtmp variable ;  : owpts variable ;  : owst variable ;  : owwhy variable ;
+: owgot variable ;  : owgn variable ;  : owwhyb variable ;  : owrcv variable ;  : owans variable ;  : owz8 variable ;  : owext variable ;
+: owos variable ;  : owot variable ;  : owoin variable ;  : owoil variable ;  : owokind variable ;  : owotk variable ;
+: owoek variable ;  : owodk variable ;  : owort variable ;  : owoobj variable ;  : owool variable ;  : owooid variable ;
+: owot0 variable ;  : owoat variable ;  : owoff variable ;  : owrid2 variable ;  : owrrt variable ;  : owrpb variable ;
+: owslive variable ;  : owsans variable ;  : owssent variable ;  : owsasked variable ;  : owsoff variable ;
+: owsrb variable ;  : owswh variable ;  : owsfl variable ;  : owann variable ;  : owsnon variable ;
+: owinit
+oxinit
+owch @ 0= if
+	OWCH OWCHR * alloc owch !  OWCH 4C1 lit * alloc owhel !  OWCH 960 lit * alloc owdk !  OWCH 18D0 lit * alloc owrep !
+	OWCH OWIF * OWIFS * alloc owifb !
+	OWCC OWCCR * alloc owcc !  OWCC 4C1 lit * alloc owchl !  OWCC 960 lit * alloc owcdk !  OWCC 18D0 lit * alloc owcre !
+	OWCC OWMSG * alloc owmsgb !
+	OWRN 20 lit * alloc owrid !  OWRN 4 lit * alloc owrk !
+	20 lit alloc owot !  10000 lit alloc owoin !  10 lit alloc owotk !  4A0 lit alloc owoek !  960 lit alloc owodk !
+	4D0 lit alloc owort !  10000 lit alloc owoobj !  20 lit alloc owooid !  20 lit alloc owrid2 !  4D0 lit alloc owrrt !
+	10100 lit alloc owrpb !  1968 lit alloc owann !  0 lit owos !  0 lit owsrb !  0 lit owswh !  0 lit owsfl !  500 lit alloc owdg !  400 lit alloc owcell !
+	80 lit alloc owwhyb !  500 lit alloc owfr !  500 lit alloc owext !  370 lit alloc owbody !  200 lit alloc owtmp !  10 lit alloc owpts !  8 lit alloc owz8 !
+	owch @ OWCH OWCHR * oxzero  owcc @ OWCC OWCCR * oxzero  owz8 @ 8 lit oxzero
+	0 lit owrn !  0 lit owst !  0 lit owrcv !  0 lit owans !  0 lit owgot !
+then ;
+: owc  OWCHR * owch @ + ;                              \ ( c -- rec )  link c
+: owcf  swap owc + ;                                   \ ( c off -- a )
+: owci  OWCCR * owcc @ + ;                             \ ( i -- rec )  circuit i
+: owcif  swap owci + ;                                 \ ( i off -- a )
+: owrel  5 lit lshift owrid @ + ;                      \ ( r -- id )  relay r's id
+
+\ ── The relays in force ──
+\ owdots ( s -- ip ok )  a dotted IPv4 address (to a ':' or NUL).
+: owx variable ;  : owy variable ;
+: owdots
+0 lit swap  -1 lit owy !
+4 lit 0 lit do
+	0 lit owx !  dup c@ 30 lit - A lit u< 0= if 0 lit owy ! then
+	begin dup c@ 30 lit - A lit u< while dup c@ 30 lit - owx @ A lit * + owx !  1 lit + repeat
+	swap 8 lit lshift owx @ FF lit and or swap
+	i 3 lit < if dup c@ 2E lit = if 1 lit + else 0 lit owy ! then then
+loop
+drop owy @ ;
+: owrids variable ;  : owrad variable ;
+: owrels
+owep !  owrn !  owrad !  owrids !
+owinit  owrn @ OWRN umin owrn !
+owrids @ owrid @ owrn @ 5 lit lshift oxcp
+owrn @ ?dup if 0 lit do
+	\ its address: a record of wnet's (made if not there yet)
+	owrad @ i 60 lit * + owtmp @ swap scpy 0 lit swap c!
+	owtmp @ begin dup c@ dup 0= 0= swap 3A lit <> and while 1 lit + repeat
+	dup c@ if 0 lit over c! 1 lit + atoi else drop E99 lit then
+	owtmp @ owdots 0= if drop owtmp @ A000203 lit 35 lit dlook then
+	swap 2dup mnwho dup 0< if drop mnseed mnnp @ 1 lit - else nip nip then
+	owrk @ i 2 lit lshift + !
+loop then ;
+: owrec  2 lit lshift owrk @ + @ ;                     \ ( r -- k )  relay r's wnet record
+
+\ ── Links (channels.rs; channel.rs's Channel) ──
+\ A link's record: +0 the relay (an index into owrid), +4 its state (0
+\ none, 1 hello sent, 2 open), +8 the channel's number (8), +10 when the
+\ hello went (ms), +14 how many times, +18 the reply's fragments come (a
+\ bit each), +1C our sending key, +3C our receiving key, +5C the next
+\ sequence number to send, +60 the next to receive, +64 acknowledgements
+\ sent, +68 when last heard, +6C when last sent.  Frames in flight: OWIF
+\ slots a link, each +0 its sequence (0: free), +4 first sent, +8 last
+\ sent, +C tries, +10 the wait before the next, +14 its length, +18 the
+\ datagram's frame.  +70 the smoothed round trip (ms; 0 none measured
+\ yet), +74 its variation: a frame's first wait follows them (RFC 6298, as
+\ channel.rs: 1 s before one is measured, 0.4 to 5 s), doubling each try.
+\ owrtt ( c ms -- )  a round trip measured (a frame acknowledged that was
+\ sent once).  owrto ( c -- ms )  a new frame's wait.
+: owrc variable ;  : owrm variable ;
+: owrtt
+1 lit max owrm !  owrc !
+owrc @ 70 lit owcf @ 0= if
+	owrm @ owrc @ 70 lit owcf !  owrm @ 1 lit rshift owrc @ 74 lit owcf !
+else
+	owrc @ 70 lit owcf @ owrm @ - dup 0< if 0 lit swap - then
+	owrc @ 74 lit owcf @ 3 lit * + 2 lit rshift owrc @ 74 lit owcf !
+	owrc @ 70 lit owcf @ 7 lit * owrm @ + 3 lit rshift owrc @ 70 lit owcf !
+then ;
+: owrto
+dup 70 lit owcf @ ?dup if swap 74 lit owcf @ 2 lit lshift + 190 lit max 1388 lit umin else drop 3E8 lit then ;
+: owhl  4C1 lit * owhel @ + ;                          \ ( c -- hello )
+: owdkc  960 lit * owdk @ + ;                          \ ( c -- dk )
+: owrp  18D0 lit * owrep @ + ;                         \ ( c -- reply )
+: owslot  swap OWIF * + OWIFS * owifb @ + ;                 \ ( c s -- slot )
+: owdk2 variable ;
+\ owdgo ( c a n -- )  a frame's bytes sent to the link's relay (type 22).
+: owdgo  rot owc @ owrec owdk2 !  16 lit mnhd  mnwn  owdk2 @ mnout ;
+\ owhdr ( c kind seq -- )  a frame's header at oxfh: the link's channel,
+\ the kind, seq, the next we expect as ack, no sack.
+: owhc variable ;
+: owhdr
+oxfh @ 21 lit oxzero  oxfh @ 9 lit + oxle!  oxfh @ 8 lit + c!
+dup owhc !  8 lit owcf oxfh @ 8 lit oxcp  owhc @ 60 lit owcf @ oxfh @ 11 lit + oxle! ;
+\ owhsend ( c -- )  the hello in two Handshake datagrams (type 21): the
+\ relay's token, ours, the channel, stage 1, the fragment, of 2, its bytes.
+: owhk variable ;
+: owhsend
+dup owc @ owrec owhk !
+2 lit 0 lit do
+	15 lit mnhd  owhk @ 8 lit mnf 8 lit mnwn  mnback @ 8 lit mnwn  dup 8 lit owcf 8 lit mnwn
+	1 lit mnwb  i mnwb  2 lit mnwb
+	i if 4C1 lit 480 lit - else 480 lit then  dup mnw16
+	over owhl i 480 lit * + swap mnwn
+	owhk @ mnout
+loop
+dup 10 lit owcf mnms swap !  14 lit owcf dup @ 1 lit + swap ! ;
+\ owopen ( r -- c | -1 )  a link to relay r: the one there, else one begun.
+: owoc variable ;
+: owopen
+-1 lit owoc !
+OWCH 0 lit do owoc @ 0<  i 4 lit owcf @ and  i owc @ 2 lit pick = and if i owoc ! then loop
+owoc @ 0< if
+	OWCH 0 lit do owoc @ 0<  i 4 lit owcf @ 0= and if i owoc ! then loop
+	owoc @ 0< 0= if
+		owoc @ owc OWCHR oxzero
+		dup owoc @ owc !  1 lit owoc @ 4 lit owcf !
+		owoc @ 8 lit owcf 8 lit mnrand
+		1 lit owoc @ 5C lit owcf !  1 lit owoc @ 60 lit owcf !  mnms owoc @ 68 lit owcf !  mnms owoc @ 6C lit owcf !
+		owtmp @ 60 lit mnrand
+		owtmp @ owtmp @ 40 lit + owoc @ owhl owoc @ owdkc oxhello
+		owoc @ OWIF 0 lit do 0 lit over i owslot ! loop drop
+		0 lit owoc @ 10 lit owcf !  0 lit owoc @ 14 lit owcf !
+	then
+then
+drop owoc @ ;
+\ owhsin  a Handshake read (from record mnk): a fragment of a relay's reply
+\ to one of our hellos; the reply whole, checked and opened: the keys.
+: owhch variable ;
+: owhsin
+mnrn @ 20 lit u< 0=  5 lit mnrx mnback @ 8 lit oxsame and  1D lit mnrx c@ 2 lit = and  1F lit mnrx c@ 6 lit = and if
+	-1 lit owhch !
+	OWCH 0 lit do
+		i 4 lit owcf @ 1 lit =  i owc @ owrec mnk @ = and  i 8 lit owcf 15 lit mnrx 8 lit oxsame and if i owhch ! then
+	loop
+	owhch @ 0< 0=  1E lit mnrx c@ 6 lit u< and if
+		20 lit mnrx mnu16  1E lit mnrx c@ 480 lit *  2dup + 18CD lit u> if 2drop else
+			22 lit mnrx  owhch @ owrp rot +  rot oxcp
+			owhch @ 18 lit owcf dup @ 1 lit 1E lit mnrx c@ lshift or swap !
+			owhch @ 18 lit owcf @ 3F lit = if
+				0 lit owhch @ 8 lit owcf  owhch @ owhl  owhch @ owrp  owhch @ owc @ owrel  owhch @ owdkc  owtmp @ oxfin if
+					owtmp @ owhch @ 1C lit owcf 40 lit oxcp  2 lit owhch @ 4 lit owcf !  mnms owhch @ 68 lit owcf !
+				else 0 lit owhch @ 4 lit owcf ! then
+			then
+		then
+	then
+then ;
+\ owsend1 ( c body n -- ok )  a data frame: sealed, kept in flight, sent;
+\ not ok: the window full or the link not open.
+: owsc variable ;  : owsb variable ;  : owsn variable ;  : owss variable ;
+: owsend1
+owsn !  owsb !  owsc !  -1 lit owss !
+owsc @ 4 lit owcf @ 2 lit = if
+	OWIF 0 lit do owss @ 0<  owsc @ i owslot @ 0= and if i owss ! then loop
+then
+owss @ 0< if 0 lit else
+	owsc @ 0 lit owsc @ 5C lit owcf @ owhdr
+	owsb @ owsn @ owsc @ 1C lit owcf  owsc @ owss @ owslot 18 lit + oxseal
+	owsc @ owss @ owslot  owsc @ 5C lit owcf @ over !  mnms over 4 lit + !  mnms over 8 lit + !  1 lit over C lit + !
+	owsc @ owrto over 10 lit + !  14 lit + !
+	owsc @  owsc @ owss @ owslot 18 lit +  owsc @ owss @ owslot 14 lit + @  owdgo
+	owsc @ 5C lit owcf dup @ 1 lit + swap !  mnms owsc @ 6C lit owcf !
+	-1 lit
+then ;
+\ owack ( c -- )  an acknowledgement: kind 1, our count of them as its seq.
+: owack
+dup 64 lit owcf dup @ 1 lit + dup rot !
+over 1 lit rot owhdr
+dup owbody @ 0 lit  rot 1C lit owcf  owfr @ oxseal
+owfr @ swap owdgo ;
+
+\ ── Circuits (circuits.rs; circuit.rs) ──
+\ A circuit's record: +0 its state (0 none, 1 being built, 2 ready, 3
+\ dead), +4 its link, +8 its number, +C hops built, +10 its path (three
+\ relays), +1C the hop being added asked for, +20 the reply's bytes come
+\ (CREATED), +24 when begun, +28 the message being reassembled (bytes),
+\ +2C its command, +30 when last heard, +34 its use (1 standing, 2 out),
+\ +40 its hops (forward and backward layers each).
+: owchel  4C1 lit * owchl @ + ;                        \ ( i -- hello )
+: owcdkc  960 lit * owcdk @ + ;                        \ ( i -- dk )
+: owcrep  18D0 lit * owcre @ + ;                       \ ( i -- reply )
+: owmsg  OWMSG * owmsgb @ + ;                          \ ( i -- buffer )
+: owhops  40 lit owcif ;                               \ ( i -- hops )
+: owpath  2 lit lshift 10 lit + owcif @ ;              \ ( i h -- relay )
+\ the message a circuit's last hop sent, for the participant (owproc)
+: owpend variable ;  : owpi variable ;  : owpcmd variable ;  : owpn variable ;
+\ owcbeg ( i r0 r1 r2 use -- ok )  circuit i begun along r0 r1 r2.
+: owcb variable ;
+: owcbeg
+4 lit pick owcb !
+owcb @ owci OWCCR oxzero  owcb @ 34 lit owcif !
+owcb @ 18 lit owcif !  owcb @ 14 lit owcif !  dup owcb @ 10 lit owcif !
+owopen dup owcb @ 4 lit owcif !  0< if drop 0 lit else
+	owcb @ 8 lit owcif 4 lit mnrand  owcb @ 8 lit owcif dup @ 7FFFFFFF lit and swap !
+	1 lit owcb @ owci !  mnms owcb @ 24 lit owcif !  mnms owcb @ 30 lit owcif !
+	drop -1 lit
+then ;
+\ owcell ( i cmd -- )  a cell begun at owcell: the circuit's number, cmd.
+: owcell!  owcell @ 400 lit oxzero  owcell @ 4 lit + c!  8 lit owcif @ owcell @ oxle! ;
+\ owcreate ( i -- )  a hello for the first hop, in CREATE cells (more, len,
+\ 1,016 bytes of it a cell).
+: owcr variable ;
+: owcreate
+owcr !
+owtmp @ 60 lit mnrand  owtmp @ owtmp @ 40 lit + owcr @ owchel owcr @ owcdkc oxhello
+2 lit 0 lit do
+	owcr @ 1 lit owcell!
+	i 0= 1 lit and owcell @ 5 lit + c!
+	i if 4C1 lit 3F8 lit - else 3F8 lit then  dup owcell @ 6 lit + c!  dup 8 lit rshift owcell @ 7 lit + c!
+	owcr @ owchel i 3F8 lit * +  owcell @ 8 lit +  rot oxcp
+	owcr @ 4 lit owcif @ owcell @ 400 lit owsend1 drop
+loop
+-1 lit owcr @ 1C lit owcif ! ;
+\ owcsend ( i cmd data n -- ok )  a message to the circuit's last hop:
+\ bodies of cmd, more, len and up to 871 bytes, as many as a power of two
+\ (16 at least for a payment's: commands 6 to 20), each a RELAY cell.
+: owci2 variable ;  : owcm variable ;  : owcd variable ;  : owcn variable ;  : owcnc variable ;  : owcok variable ;
+: owcsend
+owcn !  owcd !  owcm !  owci2 !  -1 lit owcok !
+owcn @ 366 lit + 367 lit / 1 lit max  1 lit begin 2dup u> while 1 lit lshift repeat nip
+owcm @ 6 lit - F lit u< if 10 lit max then  owcnc !
+owcnc @ 0 lit do
+	owbody @ 36B lit oxzero  owcm @ owbody @ c!  i 1 lit + owcnc @ u< 1 lit and owbody @ 1 lit + c!
+	owcn @ i 367 lit * -  dup 0< if drop 0 lit then  367 lit umin
+	dup owbody @ 2 lit + c!  dup 8 lit rshift owbody @ 3 lit + c!
+	?dup if owcd @ i 367 lit * + owbody @ 4 lit + rot oxcp then
+	owci2 @ 3 lit owcell!
+	owci2 @ owhops  owci2 @ C lit owcif @ 1 lit -  owbody @  owcell @ 5 lit + oxsealf
+	owci2 @ 4 lit owcif @ owcell @ 400 lit owsend1 owcok @ and owcok !
+loop
+owcok @ ;
+\ owextend ( i -- )  the next hop asked for through the last: EXTEND, its
+\ id and a hello.
+: owex variable ;
+: owextend
+owex !
+owtmp @ 60 lit mnrand  owtmp @ owtmp @ 40 lit + owex @ owchel owex @ owcdkc oxhello
+owex @ owex @ C lit owcif @ owpath owrel  owext @ 20 lit oxcp
+owex @ owchel owext @ 20 lit + 4C1 lit oxcp
+owex @ 1 lit owext @ 4E1 lit owcsend drop
+-1 lit owex @ 1C lit owcif ! ;
+\ owhop ( i reply -- ok )  the hop being added: its reply checked against
+\ the relay the path names, its keys the circuit's.
+: owhi variable ;
+: owhop
+swap owhi !
+1 lit owz8 @ rot owhi @ owchel swap owhi @ dup C lit owcif @ owpath owrel owhi @ owcdkc owtmp @ oxfin
+dup if
+	owhi @ owhops owhi @ C lit owcif @ OXHOP * +  dup OXHOP oxzero
+	owtmp @ over 20 lit oxcp  owtmp @ 20 lit + swap OXLAY + 20 lit oxcp
+	owhi @ C lit owcif dup @ 1 lit + swap !  0 lit owhi @ 1C lit owcif !  mnms owhi @ 30 lit owcif !
+	owhi @ C lit owcif @ 3 lit = if 2 lit owhi @ owci ! then
+else 3 lit owhi @ owci ! then ;
+\ owcellin ( c cell -- )  a cell from link c: its circuit's.  CREATED: the
+\ first hop's reply (pieces); RELAY: the layers off, the piece of a
+\ message from the hop that sent it (EXTENDED while building: the next
+\ hop's reply; the last hop's otherwise, for owproc); DESTROY: dead.
+: owcc2 variable ;  : owcl variable ;  : owcj variable ;
+: owcellin
+owcl !  -1 lit owcc2 !
+OWCC 0 lit do
+	i owci @ dup 1 lit = swap 2 lit = or  i 4 lit owcif @ 2 lit pick = and  i 8 lit owcif @ owcl @ le@ = and if i owcc2 ! then
+loop drop
+owcc2 @ 0< 0= if
+	mnms owcc2 @ 30 lit owcif !
+	owcl @ 4 lit + c@
+	dup 2 lit =  owcc2 @ C lit owcif @ 0= and if
+		owcl @ 6 lit + c@ owcl @ 7 lit + c@ 8 lit lshift or  3F8 lit umin
+		owcc2 @ 20 lit owcif @ over + 18CD lit u> if drop else
+			owcl @ 8 lit + owcc2 @ owcrep owcc2 @ 20 lit owcif @ + 2 lit pick oxcp
+			owcc2 @ 20 lit owcif dup @ rot + swap !
+			owcl @ 5 lit + c@ 0= if
+				owcc2 @ 20 lit owcif @ 18CD lit = if owcc2 @ owcc2 @ owcrep owhop drop else 3 lit owcc2 @ owci ! then
+				0 lit owcc2 @ 20 lit owcif !
+			then
+		then
+	then
+	dup 3 lit = if
+		owcc2 @ owhops  owcc2 @ C lit owcif @  owcl @ 5 lit + oxopenb dup owcj !
+		0< if 3 lit owcc2 @ owci ! else
+			\ the piece: cmd, more, len, data
+			owcl @ 15 lit + c@  owcc2 @ 28 lit owcif @ if dup owcc2 @ 2C lit owcif @ <> if 3 lit owcc2 @ owci ! then then
+			owcc2 @ 2C lit owcif !
+			owcl @ 17 lit + c@ owcl @ 18 lit + c@ 8 lit lshift or 367 lit umin
+			owcc2 @ 28 lit owcif @ over + OWMSG u> if drop 3 lit owcc2 @ owci ! else
+				owcl @ 19 lit + owcc2 @ owmsg owcc2 @ 28 lit owcif @ + 2 lit pick oxcp
+				owcc2 @ 28 lit owcif dup @ rot + swap !
+				owcl @ 16 lit + c@ 0= if
+					\ a message whole: EXTENDED while building, else the participant's
+					owcc2 @ 2C lit owcif @ 2 lit =  owcc2 @ owci @ 1 lit = and if
+						owcc2 @ 28 lit owcif @ 18CD lit = if owcc2 @ owcc2 @ owmsg owhop drop else 3 lit owcc2 @ owci ! then
+					else
+						-1 lit owpend !  owcc2 @ owpi !  owcc2 @ 2C lit owcif @ owpcmd !  owcc2 @ 28 lit owcif @ owpn !
+					then
+					0 lit owcc2 @ 28 lit owcif !
+				then
+			then
+		then
+	then
+	4 lit = if 3 lit owcc2 @ owci ! then
+then ;
+\ owclose ( i -- )  a circuit given up: DESTROY to its first hop.
+: owclose
+dup owci @ 2 lit = over owci @ 1 lit = or if dup 4 lit owcell!  dup 4 lit owcif @ owcell @ 400 lit owsend1 drop then
+3 lit swap owci ! ;
+
+\ owfrin  a Frame read (from record mnk): its link's; opened; what it
+\ acknowledges dropped from flight; a data frame in order taken (its cell
+\ to owcellin) and acknowledged.
+: owfc variable ;  : owfn variable ;
+: owfrin
+-1 lit owfc !
+mnrn @ 36 lit u< 0= if
+	OWCH 0 lit do
+		i 4 lit owcf @ 2 lit =  i owc @ owrec mnk @ = and  i 8 lit owcf 5 lit mnrx 8 lit oxsame and if i owfc ! then
+	loop
+then
+owfc @ 0< 0= if
+	5 lit mnrx  mnrn @ 5 lit -  owfc @ 3C lit owcf  owfr @ oxopen dup owfn !
+	0< 0= if
+		mnms owfc @ 68 lit owcf !
+		\ acknowledged: every frame below its ack
+		OWIF 0 lit do owfc @ i owslot @ ?dup if 16 lit mnrx le@ u< if
+			owfc @ i owslot C lit + @ 1 lit = if owfc @  mnms owfc @ i owslot 8 lit + @ -  owrtt then
+			0 lit owfc @ i owslot !
+		then then loop
+		D lit mnrx c@ 0= if
+			E lit mnrx le@ owfc @ 60 lit owcf @ = if
+				owfc @ 60 lit owcf dup @ 1 lit + swap !
+				owfn @ 400 lit = if owfc @ owfr @ owcellin then
+			then
+			owfc @ owack
+		then
+	then
+then ;
+\ owin  a datagram wnet passed on: a Handshake or a Frame.
+: owin  4 lit mnrx c@ dup 15 lit = if owhsin then 16 lit = if owfrin then ;
+
+\ ── The participant (participant.rs) ──
+\ owrand ( n -- r )  a random number below n.
+: owrand  owtmp @ 4 lit mnrand owtmp @ @ 7FFFFFFF lit and swap % ;
+\ owother ( a b -- r )  a random relay, neither a nor b.
+: owoa variable ;  : owob2 variable ;
+: owother  owob2 !  owoa !  begin owrn @ owrand dup owoa @ = over owob2 @ = or while drop repeat ;
+\ owmine ( r -- flag )  r one of our points.
+: owmine  0 lit  owpts @ 3 lit + c@ ?dup if 0 lit do over owpts @ i + c@ = or loop then nip ;
+\ owpoints  our points (owpts: the count at +3), for our id in the epoch.
+: owpoints  mnid @ owep @ owrid @ owrn @ owpts @ oxpts  owpts @ 3 lit + c! ;
+
+\ The standing session.  owslive: live; owsheld: the seq the point holds;
+\ owsans/owssent: when last answered and when last asked (SESSION);
+\ owsoff: when we last announced; owsrb: no rebuild before; owswh, owsfl:
+\ which of our points, failures at it.
+: owspt variable ;  : owgd variable ;  : owmd variable ;
+\ owsbuild  the standing circuit begun: our point (the which-th, by
+\ weight), a first and a middle relay apart from it.
+: owsbuild
+0 lit owslive !  0 lit owsasked !  0 lit owsoff !
+owpoints  owpts @ 3 lit + c@  owrn @ 3 lit u< 0= and if
+	owpts @ owswh @ owpts @ 3 lit + c@ % + c@ owspt !
+	owspt @ dup owother owgd !  owgd @ owspt @ owother owmd !
+	0 lit owgd @ owmd @ owspt @ 1 lit owcbeg 0= if mnms BB8 lit + owsrb ! then
+else mnms BB8 lit + owsrb ! then ;
+\ owsfail ( wait -- )  the standing circuit given up, rebuilt after wait
+\ ms; two failures in a row at a point, the next point.
+: owsfail
+mnms + owsrb !  0 lit owslive !  0 lit owsasked !
+0 lit owci @ dup 1 lit = swap 2 lit = or if 0 lit owclose then
+owsfl @ 1 lit + dup owsfl !  2 lit u< 0= if 0 lit owsfl !  owswh @ 1 lit + owswh ! then ;
+\ owsess  SESSION: our id, to our point.
+: owsess  0 lit 4 lit mnid @ 20 lit owcsend drop  mnms owssent !  -1 lit owsasked ! ;
+\ owstick  the standing circuit built when there is none (or it died);
+\ ready: SESSION every 3 s until live, then every 15 minutes; one
+\ unanswered for 30 s, the circuit given up.
+: owstick
+0 lit owci @ dup 0= swap 3 lit = or if
+	0 lit owslive !  mnms owsrb @ - 0< 0= if owsbuild then
+else 0 lit owci @ 1 lit = if
+	mnms 0 lit 24 lit owcif @ - EA60 lit u< 0= if BB8 lit owsfail then
+else
+	owsasked @  mnms owssent @ - 7530 lit u< 0= and if BB8 lit owsfail else
+		owsasked @ 0=  mnms owssent @ -  owslive @ if DBBA0 lit else BB8 lit then u< 0= and if owsess then
+	then
+then then ;
+\ The outbound circuit, for a send or an answer.  owos: 0 idle, 1 its
+\ circuit being built (a send), 2 the recipient's announce asked for, 3
+\ the payload offered (SEND), 4 delivered, waiting for the answer, 5 an
+\ answer offered (REPLY), 6 its circuit being built (an answer).
+\ owodone  the outbound circuit closed, the send over.
+: owodone  1 lit owclose  0 lit owos ! ;
+\ owofail ( why -- )  the send failed.
+: owofail  owwhy !  2 lit owst !  owodone ;
+\ owdlv ( i buf n -- )  DELIVER on circuit i: a payload acknowledged
+\ first (RECEIVED, its id); then opened, ours on the standing circuit
+\ (owrcv), an answer to our send on the outbound one (owans).
+: owdi variable ;  : owdb variable ;  : owdn variable ;
+: owdlv
+owdn !  owdb !  owdi !
+owdb @ c@ 2 lit =  owdn @ 471 lit u< 0= and if
+	owdb @ owdn @ owtmp @ mgoid  owdi @ E lit owtmp @ 20 lit owcsend drop
+	owdi @ 0= if
+		owdb @ 1 lit + mnid @ 20 lit oxsame if
+			owdb @ owdn @ mndk @ mnunix mgopen
+			dup 0= mnms mnodt @ - 927C0 lit u< and if drop owdb @ owdn @ mnodk @ mnunix mgopen then
+			if -1 lit owrcv ! then
+		then
+	else
+		owdb @ 1 lit + owrid2 @ 20 lit oxsame if
+			owdb @ owdn @ owodk @ mnunix mgopen if -1 lit owans !  owodone then
+		then
+	then
+then ;
+
+\ owobuild ( -- ok )  the outbound circuit begun: its last relay none of
+\ our points (any, if all are), a first and a middle apart from it; a
+\ one-time Kyber key and a token for the route back.
+: owol variable ;
+: owobuild
+owpoints  owrn @ owrand owol !
+8 lit 0 lit do owol @ owmine if owrn @ owrand owol ! then loop
+owol @ dup owother owgd !  owgd @ owol @ owother owmd !
+owtmp @ 40 lit mnrand  owtmp @ owtmp @ 20 lit + owoek @ owodk @ kykey  owoek @ owrid2 @ oxrid
+owotk @ 10 lit mnrand
+owol @ owrel owort @ 20 lit oxcp  owotk @ owort @ 20 lit + 10 lit oxcp  owoek @ owort @ 30 lit + 4A0 lit oxcp
+1 lit owgd @ owmd @ owol @ 2 lit owcbeg ;
+\ owsend: as tabminer's onion send, the sender unnamed, a route inside.
+: owsend
+owos @ if 2drop 2drop 0 lit else
+	dup owoil !  owoin @ swap oxcp  owokind !  owot @ 20 lit oxcp
+	0 lit owoff !  0 lit owst !  0 lit owans !  mnms owot0 !
+	owobuild if 1 lit owos !  -1 lit else "no relay to begin a circuit through" owofail 0 lit then
+then ;
+\ owrply: an answer to an unnamed sender, along its route (REPLY).
+: owrply
+owos @ if 2drop 2drop 0 lit else
+	dup owoil !  owoin @ swap oxcp  owokind !  owrrt @ 4D0 lit oxcp
+	0 lit owst !  mnms owot0 !
+	owobuild if 6 lit owos !  -1 lit else "no relay to begin a circuit through" owofail 0 lit then
+then ;
+\ owfetch ( point -- ok )  a sub-name's certificate asked for
+\ (GET_CERT, docs/SUBNAME_CERT.md) over an outbound circuit, by its full
+\ name's point id (32 bytes); owgot then: 1 a bundle at owoin (owgn
+\ bytes), 2 none held, 3 refused or malformed (owst 2: failed).
+: owfetch
+owos @ if drop 0 lit else
+	owot @ 20 lit oxcp  0 lit owst !  0 lit owgot !  mnms owot0 !
+	owobuild if 7 lit owos !  -1 lit else "no relay to begin a circuit through" owofail 0 lit then
+then ;
+\ owpub ( a n -- ok )  a bundle published at our point (PUBLISH_CERT on
+\ the standing circuit; the point passes it to the full name's points).
+: owpba variable ;  : owpbn variable ;
+: owpub  owslive @ if owpbn !  owpba !  0 lit 12 lit owpba @ owpbn @ owcsend else 2drop 0 lit then ;
+\ owomsg ( cmd buf n -- )  a message on the outbound circuit.
+: owmc variable ;  : owmb variable ;  : owmn variable ;
+: owomsg
+owmn !  owmb !  owmc !
+\ the announce asked for: checked, the payload sealed to it and offered
+owmc @ 6 lit =  owos @ 2 lit = and if
+	owmn @ 1965 lit =  owmb @ owot @ 20 lit oxsame and  owmb @ mnunix mgavf and if
+		1 lit mgflg !  owort @ mgrt !  owtmp @ 2C lit mnrand
+		owmb @  owmb @ 7C0 lit +  owokind @ owoin @ owoil @ owtmp @ owtmp @ 20 lit + owoobj @ mgsealx dup owool !
+		if
+			owoobj @ owool @ owooid @ mgoid
+			1 lit 8 lit owoobj @ owool @ owcsend drop  3 lit owos !
+		else "the recipient's Kyber key is malformed" owofail then
+	else "the recipient's announce does not hold" owofail then
+then
+owmc @ A lit =  owmn @ 21 lit = and if
+	owmb @ 20 lit + c@
+	\ a lookup's answer: offline (asked again once, in 3 s), or refused
+	owos @ 2 lit =  owmb @ owot @ 20 lit oxsame and if
+		dup 1 lit =  owoff @ 0= and if mnms BB8 lit + owoff ! else
+			dup 1 lit = if "the recipient is offline" else "the point refused the lookup" then owofail
+		then
+	then
+	\ a certificate's: none held (offline), or refused
+	owos @ 8 lit =  owmb @ owot @ 20 lit oxsame and if
+		dup 1 lit = if 2 lit else 3 lit then owgot !  owodone
+	then
+	\ the payload's or the answer's: forwarded, or not
+	owos @ dup 3 lit = swap 5 lit = or  owmb @ owooid @ 20 lit oxsame and if
+		dup 0= if
+			1 lit owst !  owos @ 3 lit =  owokind @ 1 lit = and if 4 lit owos !  mnms owoat ! else owodone then
+		else dup 1 lit = if "the recipient is offline" else "the point refused it" then owofail then
+	then
+	drop
+then
+\ a certificate asked for: its bundle, at owoin (owgn bytes)
+owmc @ 14 lit =  owos @ 8 lit = and if
+	owmn @ 10000 lit u< if owmb @ owoin @ owmn @ oxcp  owmn @ owgn !  1 lit owgot ! else 3 lit owgot ! then  owodone
+then
+owmc @ 9 lit = if 1 lit owmb @ owmn @ owdlv then ;
+\ owotick  the send's steps on time: the circuit ready (ROUTE, then
+\ GET_ANNOUNCE; or the answer: REPLY, its relay, token and the payload
+\ sealed to the route's key); a lookup asked again; 120 s for it all
+\ (docs/ONION.md, timeouts).
+: owotick
+owos @ if
+	1 lit owci @ 3 lit = if "the circuit failed" owofail else
+	owos @ 1 lit =  1 lit owci @ 2 lit = and if
+		1 lit C lit owotk @ 10 lit owcsend drop
+		1 lit 7 lit owot @ 20 lit owcsend drop  2 lit owos !
+	then
+	owos @ 6 lit =  1 lit owci @ 2 lit = and if
+		owrrt @ 30 lit + owtmp @ oxrid  0 lit mgflg !  owtmp @ 40 lit + 2C lit mnrand
+		owtmp @  owrrt @ 30 lit +  owokind @ owoin @ owoil @ owtmp @ 40 lit + owtmp @ 60 lit + owoobj @ mgsealx dup owool !
+		if
+			owoobj @ owool @ owooid @ mgoid
+			owrrt @ owrpb @ 30 lit oxcp  owoobj @ owrpb @ 30 lit + owool @ oxcp
+			1 lit D lit owrpb @ owool @ 30 lit + owcsend drop  5 lit owos !
+		else "the route's Kyber key is malformed" owofail then
+	then
+	owos @ 7 lit =  1 lit owci @ 2 lit = and if
+		1 lit 13 lit owot @ 20 lit owcsend drop  8 lit owos !
+	then
+	owos @ 2 lit =  owoff @ and  mnms owoff @ - 0< 0= and if
+		1 lit 7 lit owot @ 20 lit owcsend drop  FFFFFFFF lit owoff !
+	then
+	owos @ 4 lit = if mnms owoat @ - 2BF20 lit u< 0= if owodone then
+	else owos @ if mnms owot0 @ - 1D4C0 lit u< 0= if owwhyb @ "no answer within 120 s (step " scpy owos @ snum " circuit " scpy 1 lit owci @ snum
+		" hops " scpy 1 lit C lit owcif @ snum " link " scpy 1 lit 4 lit owcif @ 4 lit owcf @ snum ")" scpy 0 lit swap c!  owwhyb @ owofail then then then
+	then
+then ;
+
+\ owsmsg ( cmd buf n -- )  a message on the standing circuit: the session's
+\ state (live, or our announce with its nonce), a refusal, a delivery.
+: owsmsg
+owmn !  owmb !  owmc !
+owmc @ 5 lit =  owmn @ 30 lit = and  owmb @ mnid @ 20 lit oxsame and if
+	0 lit owsasked !  mnms owsans !  0 lit owsfl !
+	owmb @ 28 lit + mnseq @ 8 lit oxsame if -1 lit owslive ! else
+		\ forgotten by a point that held us: a new key
+		owslive @  owmb @ 28 lit + mnz8 @ 8 lit oxsame and if mnnewk then
+		0 lit owslive !
+		mnms owsoff @ - BB8 lit u< 0= if
+			mnpk @ mgpk !  mnsk @ mgsk !  mnek @ mgek !  owann @ mnseq @ mnexp @ owmb @ 20 lit + mgann
+			0 lit 6 lit owann @ 1965 lit owcsend drop  mnms owsoff !
+		then
+	then
+then
+owmc @ A lit =  owmn @ 21 lit = and  owmb @ mnid @ 20 lit oxsame and  owmb @ 20 lit + c@ and if EA60 lit owsfail then
+owmc @ 9 lit = if 0 lit owmb @ owmn @ owdlv then ;
+\ owproc  the message a circuit's last hop completed, to its handler.
+: owproc
+owpend @ if
+	0 lit owpend !
+	owpcmd @ owpi @ owmsg owpn @  owpi @ if owomsg else owsmsg then
+then ;
+
+\ ── The clock ──
+\ owlink ( c -- )  a link's upkeep: the hello again (each second, eight
+\ times); frames again past their wait (doubling to 5 s; 12 tries or 30 s:
+\ dead); a keepalive after 25 s quiet; dead after 120 s unheard.
+: owlc variable ;  : owdead variable ;
+: owlink
+owlc !  0 lit owdead !
+owlc @ 4 lit owcf @ 1 lit = if
+	mnms owlc @ 10 lit owcf @ - 3E8 lit u< 0= if
+		owlc @ 14 lit owcf @ 8 lit u< 0= if -1 lit owdead ! else
+			owlc @ owc @ owrec 10 lit mnf @ if owlc @ owhsend else mnms owlc @ 10 lit owcf !  owlc @ 14 lit owcf dup @ 1 lit + swap ! then
+		then
+	then
+then
+owlc @ 4 lit owcf @ 2 lit = if
+	OWIF 0 lit do
+		owlc @ i owslot  dup @ if
+			mnms over 8 lit + @ -  over 10 lit + @ u< 0= if
+				dup C lit + @ C lit u< 0=  mnms 2 lit pick 4 lit + @ - 7530 lit u< 0= or if -1 lit owdead ! else
+					owlc @ over 18 lit + 2 lit pick 14 lit + @ owdgo
+					dup C lit + dup @ 1 lit + swap !  dup 10 lit + dup @ 1 lit lshift 1388 lit umin swap !  mnms over 8 lit + !
+				then
+			then
+		then drop
+	loop
+	0 lit  OWIF 0 lit do owlc @ i owslot @ or loop 0=  mnms owlc @ 6C lit owcf @ - 61A8 lit u< 0= and if owlc @ owbody @ 0 lit owsend1 drop then
+	mnms owlc @ 68 lit owcf @ - 1D4C0 lit u< 0= if -1 lit owdead ! then
+then
+owdead @ if
+	0 lit owlc @ 4 lit owcf !
+	OWCC 0 lit do i 4 lit owcif @ owlc @ =  i owci @ 0= 0= and if 3 lit i owci ! then loop
+then ;
+\ owcirc ( i -- )  a circuit's building: CREATE once its link is open, then
+\ EXTEND for each hop after; 60 s for it all.
+: owcirc
+dup owci @ 1 lit = if
+	dup 1C lit owcif @ 0= if
+		dup 4 lit owcif @ 4 lit owcf @ 2 lit = if
+			dup C lit owcif @ 0= if dup owcreate else dup owextend then
+		then
+	then
+	mnms over 24 lit owcif @ - EA60 lit u< 0= if 3 lit over owci ! then
+then drop ;
+: owtick
+owinit
+owrn @ 3 lit u< 0= if
+	OWCH 0 lit do i 4 lit owcf @ if i owlink then loop
+	OWCC 0 lit do i owcirc loop
+	owstick  owotick
+then ;
+: owlive  owslive @  0 lit owci @ 2 lit = and ;

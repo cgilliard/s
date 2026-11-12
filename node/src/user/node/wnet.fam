@@ -12,7 +12,9 @@
 \
 \ mninit ( -- )  the socket and buffers (once).
 \ mnseed ( ip port -- )  a seed added; the caller adds them sorted as
-\ tabminer sorts its seed list (as "host:port" text).
+\ tabminer sorts its seed list (as "host:port" text), then sets mnscnt, how
+\ many are seeds (the rendezvous points of init mode among them); records
+\ after them are onion mode's relays (wopart.fam), pinged alike.
 \ mnkeys ( pk sk -- )  the participant's Dilithium key (its id derived);
 \ a Kyber key made fresh.
 \ mntick ( -- )  the clock's work, at least every second: pings, the
@@ -69,9 +71,9 @@ rot 10 lit rshift +  swap mnkx @ !  mnkx @ 4 lit + ! ;
 : mnfd variable ;  : mnsb variable ;  : mnrb variable ;  : mnrn variable ;  : mnsp variable ;  : mnfrom variable ;
 : mnback variable ;  : mnid variable ;  : mnpk variable ;  : mnsk variable ;  : mnek variable ;  : mndk variable ;
 : mnodk variable ;  : mnodt variable ;  : mnseq variable ;  : mnexp variable ;  : mnkt variable ;  : mnz8 variable ;
-: mnpt variable ;  : mnnp variable ;  : mnmine variable ;  : mnep variable ;  : mnht variable ;  : mngen variable ;  : mntip variable ;
-: mnrcv variable ;  : mnst variable ;  : mnwhy variable ;  : mnao variable ;  : mnaid variable ;  : mnk variable ;
-:M MNPN 8 lit ;                                \ seeds at most
+: mnscnt variable ;  : mnpt variable ;  : mnnp variable ;  : mnmine variable ;  : mnep variable ;  : mnht variable ;  : mngen variable ;  : mntip variable ;
+: mnext variable ;  : mnimode variable ;  : mnrcv variable ;  : mnst variable ;  : mnwhy variable ;  : mnao variable ;  : mnaid variable ;  : mnk variable ;
+:M MNPN 18 lit ;                               \ seeds and relays at most
 :M MNPR 60 lit ;                               \ a seed's record
 :M MNAO 1968 lit ;                             \ room for an announce object
 :M MNAOL 1966 lit ;                            \ its bytes: the tag, the announce
@@ -252,10 +254,10 @@ then ;
 : mnpick
 mnpdst !  mnpid !  mnpdst @ MNPN 0 lit do 0 lit over i + c! loop drop
 mnht @ 90 lit / mnep !
-mnnp @ if
-	mnpid @ mnep @ mnnp @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
+mnscnt @ if
+	mnpid @ mnep @ mnscnt @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
 	mnep @ if mnht @ 90 lit % 5 lit u< if
-		mnpid @ mnep @ 1 lit - mnnp @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
+		mnpid @ mnep @ 1 lit - mnscnt @ mnrb @ mgidx ?dup if 0 lit do 1 lit mnpdst @ mnrb @ i + c@ + c! loop then
 	then then
 then ;
 : mnbeg
@@ -343,17 +345,20 @@ mnrn @ 5 lit u< 0=  mnrb @ @ 31424154 lit = and if
 		dup 11 lit =  mnrn @ 35 lit = and if mnstate then
 		dup 13 lit =  mnrn @ 39 lit = and if mnoff then
 		dup 14 lit =  mnrn @ 26 lit = and if mnnote then
+		\ onion mode's (a Handshake, a Frame): left for wopart.fam (owin)
+		dup 15 lit = over 16 lit = or if -1 lit mnext ! then
 		drop
 	then
 then ;
-\ mnin  every datagram waiting, until a payload for us is opened.
+\ mnin  every datagram waiting, until a payload for us is opened, or one
+\ of onion mode's comes (mnext: left in mnrb for owin).
 : mnpe variable ;
 : mnin
-0 lit mnrcv !
+0 lit mnrcv !  0 lit mnext !
 begin
 	mnfd @ mnpe @ !  1 lit mnpe @ 4 lit + !
 	\ (1 ns: a look, not a wait; 0 would wait for good)
-	mnrcv @ 0=  mnpe @ 1 lit 1 lit poll 0 lit > and
+	mnrcv @ 0=  mnext @ 0= and  mnpe @ 1 lit 1 lit poll 0 lit > and
 while
 	mnfd @ mnrb @ 500 lit mnfrom @ recvfrom dup mnrn !  0 lit > if mnone then
 repeat ;
@@ -372,8 +377,8 @@ mnnp @ ?dup if 0 lit do
 			i mnping  i 1C lit mnf @ 1 lit lshift 7D0 lit max 7530 lit umin i 1C lit mnf !
 		then
 	then
-	\ our session at our points
-	i mnmy  i 10 lit mnf @ and  mnms i 40 lit mnf @ - 0< 0= and if
+	\ our session at our points (init mode's, when in force)
+	i mnmy  i 10 lit mnf @ and  mnimode @ and  mnms i 40 lit mnf @ - 0< 0= and if
 		i 44 lit mnf @  mnms i 30 lit mnf @ - 15F90 lit u< 0= and if mnnewk then
 		i 34 lit mnf @  i 38 lit mnf @ 0= and  mnms i 34 lit mnf @ - BB8 lit u< 0= and  i 48 lit mnf @ and if i mnping then
 		mnms i 34 lit mnf @ -  i 44 lit mnf @ i 38 lit mnf @ and if 7530 lit else BB8 lit then  u< 0= if
@@ -404,5 +409,5 @@ mnsb @ 0= if
 	"/proc/time" 0 lit open dup mnpbuf @ 20 lit read mnpbuf @ + 0 lit swap c! close drop  mnpbuf @ atoi mnux0 !
 	1 lit socket mnfd !
 	mnrb @ 2 lit mnrand  mnfd @ 1 lit 0 lit  mnrb @ c@ mnrb @ 1 lit + c@ 8 lit lshift or 3FFF lit and A000 lit +  net drop
-	0 lit mnnp !  0 lit mnss !  0 lit mnst !  0 lit mndon !  0 lit mnhave !  0 lit mnht !
+	0 lit mnnp !  0 lit mnscnt !  -1 lit mnimode !  0 lit mnext !  0 lit mnss !  0 lit mnst !  0 lit mndon !  0 lit mnhave !  0 lit mnht !
 then ;

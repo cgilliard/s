@@ -787,7 +787,7 @@ expect wmsg 124 '^wmsg: 54 as expected, 0 not' 60 ./tools/q32 "$T/twm.img"
 uses=$(sed -n 's|^\\ uses: *||p' src/user/node/wsub_test.fam | tr ' ' '\n' | sed '/^$/d; s|^|src/user/|' | tr '\n' ' ')
 ./tools/fam --user -o "$T/tsb.bin" $uses src/user/node/wsub_test.fam > "$T/tsb.build" 2>&1 || fail wsub "build: $(head -c 300 "$T/tsb.build")"
 sh scripts/mkimage.sh "$T/tsb.img" bin/kernel init="$T/tsb.bin":4096 2> "$T/tsb.mk" || fail wsub "mkimage: $(cat "$T/tsb.mk")"
-expect wsub 124 '^wsub: 18 as expected, 0 not' 60 ./tools/q32 "$T/tsb.img"
+expect wsub 124 '^wsub: 21 as expected, 0 not' 60 ./tools/q32 "$T/tsb.img"
 # Onion mode's pieces (node/wonion.fam): the link and circuit-hop
 # handshakes, frames, relay cells each way through three hops, a payload
 # with a route and the answer along it, rendezvous points by weight, as
@@ -830,14 +830,14 @@ cat > "$T/wreq" <<'WREQEOF'
 {"id":15,"op":"restore","words":"  Abandon abandon ABANDON abandon abandon abandon abandon abandon abandon abandon abandon about ","passphrase":"TREZOR"}
 {"id":16,"op":"phrase","password":"rpw"}
 WREQEOF
-sh scripts/mkimage.sh "$T/twr.img" bin/kernel init="$T/twr.bin":1024 wallet=bin/user/wallet:6144 bip39=../resources/bip39-english.txt:0 wreq="$T/wreq":0 2> "$T/twr.mk" || fail wallet "mkimage: $(cat "$T/twr.mk")"
+sh scripts/mkimage.sh "$T/twr.img" bin/kernel init="$T/twr.bin":1024 wallet=bin/user/wallet:8192 bip39=../resources/bip39-english.txt:0 wreq="$T/wreq":0 2> "$T/twr.mk" || fail wallet "mkimage: $(cat "$T/twr.mk")"
 rm -f "$T/twr.disk"; dd if=/dev/zero of="$T/twr.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect wallet 124 '^walletrun: done' 120 ./tools/q32 --disk="$T/twr.disk" "$T/twr.img"
 W="$T/wallet.out"
 for pat in '^w: {"op":"unlock","ok":true,"wallet":false}$' '^w: {"id":1,"ok":false,"error":"no wallet yet: create or restore one"}$' \
 	'^w: {"id":2,"ok":true,"words":"\([a-z]\{3,8\} \)\{11\}[a-z]\{3,8\}"}$' '^w: {"id":3,"ok":true,"address":"tab1[02-9ac-hj-np-z]\{58\}"}$' \
 	'^w: {"id":4,"ok":false,"error":"there is a wallet already"}$' '^w: {"id":5,"ok":false,"error":"not the password"}$' \
-	'^w: {"id":7,"ok":false,"error":"unlocked already"}$' '^w: {"id":8,"ok":true,"confirmed":"0.0000000000","pending":"0.0000000000","unverified":"0.0000000000","reserved":"0.0000000000","locked":"0.0000000000","height":0,"node":"not reached","reach":0}$' \
+	'^w: {"id":7,"ok":false,"error":"unlocked already"}$' '^w: {"id":8,"ok":true,"confirmed":"0.0000000000","pending":"0.0000000000","unverified":"0.0000000000","reserved":"0.0000000000","locked":"0.0000000000","height":0,"node":"not reached","reach":0,"mode":"init"}$' \
 	'^w: {"op":"unlock","ok":false,"error":"the wallet is sealed under another password than the session"}$' \
 	'^w: {"id":9,"ok":false,"error":"locked"}$' '^w: {"op":"unlock","ok":true,"wallet":true}$' \
 	'^w: {"id":11,"ok":false,"error":"there is a wallet already"}$' \
@@ -1413,7 +1413,7 @@ const port = process.argv[2];
   process.exit(0);
 })();
 PAGEEOF
-sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet:6144 bip39=../resources/bip39-english.txt:0 sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
+sh scripts/mkimage.sh "$T/wm.img" bin/kernel init=bin/user/sh wm=bin/user/wm runas=bin/user/runas wallet=bin/user/wallet:8192 bip39=../resources/bip39-english.txt:0 sh=bin/user/sh ls=bin/user/ls mkdir=bin/user/mkdir echo=bin/user/echo ps=bin/user/ps vi=bin/user/vi cat=bin/user/cat 2> "$T/wm.mk" || fail wm "mkimage: $(cat "$T/wm.mk")"
 for n in 1 4; do
 	N=$((N + 1))
 	WP=$((TP + 2 + n))

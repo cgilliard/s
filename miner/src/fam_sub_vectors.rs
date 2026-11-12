@@ -36,15 +36,16 @@ fn generate() -> String {
          \\ each), sxnow a time before it.  SHAKE256-256 of the certificate naming\n\
          \\ the holder (sxhc, sxcl bytes), of the \"none\" one (sxhn, sxnl bytes),\n\
          \\ of the answer bearing the first (sxha, sxal bytes); the query's bytes\n\
-         \\ at sxq (sxql).\n\n\
+         \\ at sxq (sxql); the full name's point id (onion mode's certificates\n\
+         \\ are held at its rendezvous points) at sxpt.\n\n\
          : sxp variable ;  : sxso variable ;  : sxt variable ;  : sxseq variable ;  : sxexp variable ;  : sxnow variable ;\n\
          : sxhc variable ;  : sxcl variable ;  : sxhn variable ;  : sxnl variable ;  : sxha variable ;  : sxal variable ;\n\
-         : sxq variable ;  : sxql variable ;\n\
+         : sxq variable ;  : sxql variable ;  : sxpt variable ;\n\
          : sxc  sxp @ c!  sxp @ 1 lit + sxp ! ;\n\
          : sxbufs\n\
          sxso @ 0= if\n\
          \t20 lit alloc sxso !  20 lit alloc sxt !  8 lit alloc sxseq !  8 lit alloc sxexp !  20 lit alloc sxhc !\n\
-         \t20 lit alloc sxhn !  20 lit alloc sxha !  40 lit alloc sxq !\n\
+         \t20 lit alloc sxhn !  20 lit alloc sxha !  40 lit alloc sxq !  20 lit alloc sxpt !\n\
          then ;\n\n",
     );
     let so: [u8; 32] = core::array::from_fn(|i| (3 * i + 7) as u8);
@@ -68,6 +69,7 @@ fn generate() -> String {
     bytes(&mut o, "sxhn", &shake256(&nb, 32));
     bytes(&mut o, "sxha", &shake256(&a, 32));
     bytes(&mut o, "sxq", &q);
+    bytes(&mut o, "sxpt", &digest_to_bytes(&Cert::point(name, label)));
     o.push_str(&format!(
         "{:X} lit sxcl !  {:X} lit sxnl !  {:X} lit sxal !  {:X} lit sxql !  {NOW:X} lit sxnow !\n;\n",
         cb.len(),

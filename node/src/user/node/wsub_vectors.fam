@@ -9,16 +9,17 @@
 \ each), sxnow a time before it.  SHAKE256-256 of the certificate naming
 \ the holder (sxhc, sxcl bytes), of the "none" one (sxhn, sxnl bytes),
 \ of the answer bearing the first (sxha, sxal bytes); the query's bytes
-\ at sxq (sxql).
+\ at sxq (sxql); the full name's point id (onion mode's certificates
+\ are held at its rendezvous points) at sxpt.
 
 : sxp variable ;  : sxso variable ;  : sxt variable ;  : sxseq variable ;  : sxexp variable ;  : sxnow variable ;
 : sxhc variable ;  : sxcl variable ;  : sxhn variable ;  : sxnl variable ;  : sxha variable ;  : sxal variable ;
-: sxq variable ;  : sxql variable ;
+: sxq variable ;  : sxql variable ;  : sxpt variable ;
 : sxc  sxp @ c!  sxp @ 1 lit + sxp ! ;
 : sxbufs
 sxso @ 0= if
 	20 lit alloc sxso !  20 lit alloc sxt !  8 lit alloc sxseq !  8 lit alloc sxexp !  20 lit alloc sxhc !
-	20 lit alloc sxhn !  20 lit alloc sxha !  40 lit alloc sxq !
+	20 lit alloc sxhn !  20 lit alloc sxha !  40 lit alloc sxq !  20 lit alloc sxpt !
 then ;
 
 : sxset
@@ -43,5 +44,8 @@ sxha @ sxp !
 F lit sxc 54 lit sxc FE lit sxc B3 lit sxc 6A lit sxc C lit sxc FD lit sxc 52 lit sxc
 sxq @ sxp !
 7 lit sxc 65 lit sxc 78 lit sxc 61 lit sxc 6D lit sxc 70 lit sxc 6C lit sxc 65 lit sxc 3 lit sxc 65 lit sxc 78 lit sxc 31 lit sxc
+sxpt @ sxp !
+F1 lit sxc FC lit sxc 82 lit sxc 31 lit sxc 9F lit sxc 2C lit sxc D2 lit sxc 1E lit sxc 68 lit sxc C lit sxc 32 lit sxc 19 lit sxc 78 lit sxc BE lit sxc E7 lit sxc 3A lit sxc 6F lit sxc 3C lit sxc 7E lit sxc 59 lit sxc 3C lit sxc 11 lit sxc D0 lit sxc 54 lit sxc
+C2 lit sxc 65 lit sxc 1 lit sxc 1F lit sxc 5A lit sxc 13 lit sxc 59 lit sxc 39 lit sxc
 14CC lit sxcl !  14AC lit sxnl !  14DC lit sxal !  C lit sxql !  6553F100 lit sxnow !
 ;

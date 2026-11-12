@@ -1,3 +1,8 @@
-\ echo.fam — its arguments, spaced, then a newline.
-1 lit begin dup arg ?dup while over 1 lit u> if 20 lit putc then puts 1 lit + repeat drop
-0A lit putc bye
+\ echo.fam — its arguments, spaced, then a newline; with -n first, no
+\ newline (a long line written in pieces: the console takes lines of 63
+\ bytes at most).
+: enl variable ;
+-1 lit enl !  1 lit
+dup arg ?dup if "-n" streq if 0 lit enl !  1 lit + then then
+dup begin dup arg ?dup while over 3 lit pick u> if 20 lit putc then puts 1 lit + repeat 2drop
+enl @ if 0A lit putc then bye

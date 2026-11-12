@@ -101,6 +101,7 @@ dup c@ dup 0= swap 23 lit = or if drop else
 		dup "window" streq if mlv @ atoi 10 lit max mhc !  1 lit mkn ! then
 		dup "peer" streq if mlv @ madd  1 lit mkn ! then
 		dup "seed" streq if mlv @ mseed  1 lit mkn ! then
+		dup "test-relays" streq if 100 lit alloc dup cxpin !  mlv @ scpy 0 lit swap c!  1 lit mkn ! then
 		dup "resolver" streq if
 			mlv @ maddr if mip @ mres !  mport @ mrpt ! else nhead "config: the resolver not IP:PORT" puts 0A lit putc then
 			1 lit mkn !
@@ -141,6 +142,7 @@ mnname @ "main" streq if 0 lit nnet ! else
 		nhead "no network " puts mnname @ puts " (main, devrec)" puts 0A lit putc 1 lit exit
 	then
 then
+nnet @ 0=  cxpin @ and if nhead "config: test-relays is for the dev network only; passed over" puts 0A lit putc  0 lit cxpin ! then
 40 lit alloc mpa !  0 lit mpn !
 argn mpf @ - 8 lit u> if musage then
 argn mpf @ u> if

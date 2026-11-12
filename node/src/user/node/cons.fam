@@ -276,6 +276,24 @@ cxwin @ 0= if cxds @ 30 lit 0 lit cxfill  1 lit cxds @ 28 lit + ! then ;
 
 \ ── A turn ──
 : cxb variable ;  : cxin variable ;
+\ The dev network's test pin (main.fam's config "test-relays PATH"): the
+\ file's relays in force alone, under epoch 0, as tabminer's
+\ --test-relays; nothing decided from the chain meanwhile.
+: cxpin variable ;  : cxpinned variable ;
+: cxpinit
+cxpinned @ 0= if
+	cxpin @ 0 lit open dup 0< if drop
+		nhead "consensus: the test relays' file not there" puts 0A lit putc  0 lit cxpin !
+	else
+		dup cxfb @ CXFMAX read  swap close drop
+		dup 0 lit > if
+			cxfb @ over cxcur @ cxset if
+				cxfb @ swap sha256  h2d @ cxcur @ 8 lit + 20 lit bcopy  -1 lit cxpinned !
+				vrb @ if nhead "consensus: the test relays stand as if in force" puts 0A lit putc then
+			else drop nhead "consensus: the test relays' file does not parse" puts 0A lit putc  0 lit cxpin ! then
+		else drop 0 lit cxpin ! then
+	then
+then ;
 \ cxfetch  the file wanted, by the chunked transfer from the current peer;
 \ one that will not come passed over for ten minutes.
 : cxfetch
@@ -289,6 +307,9 @@ over if
 else 2drop  cxwant @ cxfail @ 20 lit bcopy  secs 258 lit + cxfat ! then ;
 : cxrun
 cxinit
+cxpin @ if
+	cxpinit  myh @ cxht !  myh @ 90 lit / 90 lit * cxb !  myh @ cxb @ - cxin !  0 lit cxprv @ 28 lit + !
+else
 myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
 	myh @ dup cxh !  cxht !  secs cxat !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
@@ -307,4 +328,5 @@ myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
 	cxb @  cxin @ 5 lit u< and if cxb @ 90 lit - cxprv @ cxdec else 0 lit cxprv @ 28 lit + ! then
 	cxh @ cxscr @ cxdec
 	cxwant @ cxnz  cxwant @ cxfail @ 20 lit d8= secs cxfat @ - 0< and 0= and if cxfetch then
+then
 then ;

@@ -44,7 +44,10 @@ sbca @ sbcn @ sxt @ sxnow @ sbvf 0= "for another owner, refused" stchk
 sbca @ sbcn @ stv @ sxexp @ @ sbvf 0= "at its expiry, refused" stchk
 sbca @ sbcn @ + 10 lit - stflip  sbca @ sbcn @ stv @ sxnow @ sbvf 0= "its signature changed, refused" stchk  sbca @ sbcn @ + 10 lit - stflip
 sbca @ 20 lit + stflip  sbca @ sbcn @ stv @ sxnow @ sbvf 0= "its value changed, refused" stchk  sbca @ 20 lit + stflip
+sta @ C lit + stal @ C lit - sbbun  sbnl @ 7 lit = and  sbll @ 3 lit = and  sbcn @ stcl @ = and "a bundle as published, read" stchk
+stb @ sbpt  stb @ sxpt @ 20 lit sbsame "the full name's point" stchk
 0 lit sta @ stal @ + c!  sta @ stal @ 1 lit + sbpa 3 lit = "an answer with more after: a delegation, not taken" stchk
+sta @ C lit + stal @ B lit - sbbun 0= "a bundle with more after: a delegation, not taken" stchk
 0 lit 0 lit sta @ sbans sta @ swap sbpa 1 lit = "an answer with none" stchk
 stc @ stcl @ sta @ sbans stal !  sblb @ "ex2" scpy drop  sta @ stal @ sbpa 0= "an answer for another label, refused" stchk
 
