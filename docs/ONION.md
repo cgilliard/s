@@ -722,6 +722,13 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      a recipient whose point holds a stale session waits up to 40 s on
      that point rather than 12 s. These are relay rules, not consensus;
      mixed versions work, an older relay keeping its tighter limits.
+     A sender told "offline" asks again every 3 s for 60 s from the
+     first (2026-11-12; one retry after 3 s before): a recipient whose
+     point, or a hop to it, stopped notices only after the 30 s above,
+     then builds around it and holds its session again, and a sender
+     giving up sooner called it offline though it came back moments
+     later (`node::tests::standing_circuits_are_replaced_and_rebuilt`
+     failed so on CI). The fam wallet (`wopart.fam`) does the same.
 5. **Docs.** Done (2026-11-01): the README's "Message layer" section
    and payments by address or `@name`; the message layer's cryptography,
    what each party learns and its gaps in `miner/SECURITY.md`; the gaps

@@ -396,9 +396,10 @@ pub enum Event {
     /// for the whole timeout.
     #[cfg(test)]
     TestExpireIdle,
-    /// Tests: keepalives and circuit replacement sooner.
+    /// Tests: keepalives and circuit replacement sooner, and how long a
+    /// send keeps asking after an "offline".
     #[cfg(test)]
-    TestTiming(Duration, Duration),
+    TestTiming(Duration, Duration, Duration),
     /// Tests: the relay lists in force given by hand (`None` for init
     /// mode): the current one, the one before while a switch lasts, and
     /// whether the current one is tried first.
@@ -1123,7 +1124,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 #[cfg(test)]
                 Ok(Event::TestServes(owners)) => self.part.test_owners = Some(owners),
                 #[cfg(test)]
-                Ok(Event::TestTiming(keepalive, rotate)) => self.part.set_timing(keepalive, rotate),
+                Ok(Event::TestTiming(keepalive, rotate, offline)) => self.part.set_timing(keepalive, rotate, offline),
                 #[cfg(test)]
                 Ok(Event::TestEpoch(current, previous, prefer, epoch)) => {
                     self.rv.set_sets(current, previous, prefer, epoch)
@@ -5770,7 +5771,7 @@ mod tests {
         }
         let hour = Duration::from_secs(3600);
         for n in [p, q] {
-            nodes[n].1.send(Event::TestTiming(hour, hour)).unwrap();
+            nodes[n].1.send(Event::TestTiming(hour, hour, Duration::from_secs(3))).unwrap();
         }
         let live = |secs: u64| {
             let deadline = Instant::now() + guard(secs);
@@ -7083,7 +7084,7 @@ mod tests {
             n.1.send(Event::TestRelays(list.clone())).unwrap();
         }
         for n in [p, q] {
-            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3))).unwrap();
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3), Duration::from_secs(60))).unwrap();
         }
         let live = |secs: u64| {
             let deadline = Instant::now() + guard(secs);
@@ -7138,14 +7139,17 @@ mod tests {
         let points: Vec<Digest> = onion::rendezvous_relays(&id(5), 0, &ids).into_iter().map(|i| ids[i]).collect();
         let hop = (0..4).find(|&i| !points.contains(&id(i as u8 + 1))).unwrap();
         for n in [p, q] {
-            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600))).unwrap();
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600), Duration::from_secs(60))).unwrap();
         }
         nodes[hop].1.send(Event::Stop).unwrap();
         handles[hop].take().unwrap().join().unwrap();
         let stopped = Instant::now();
-        // Circuits through it die; p notices (10 s after an unanswered
-        // keepalive, sent every second here), builds around it. Until it
-        // notices, a circuit through the stopped relay still looks live.
+        // Circuits through it die; p notices (DEAD_AFTER, 30 s, after an
+        // unanswered keepalive, sent every second here), builds around
+        // it. Until it notices, a circuit through the stopped relay still
+        // looks live, and q, sending meanwhile, is told "offline": it asks
+        // again every 3 s for up to 60 s (OFFLINE_WAIT), until p's session
+        // is held again.
         std::thread::sleep(Duration::from_secs(13));
         live(90);
         eprintln!("p live again {:?} after the relay stopped", stopped.elapsed());

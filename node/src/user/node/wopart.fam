@@ -43,7 +43,7 @@
 : owgot variable ;  : owgn variable ;  : owwhyb variable ;  : owrcv variable ;  : owans variable ;  : owz8 variable ;  : owext variable ;
 : owos variable ;  : owot variable ;  : owoin variable ;  : owoil variable ;  : owokind variable ;  : owotk variable ;
 : owoek variable ;  : owodk variable ;  : owort variable ;  : owoobj variable ;  : owool variable ;  : owooid variable ;
-: owot0 variable ;  : owoat variable ;  : owoff variable ;  : owrid2 variable ;  : owrrt variable ;  : owrpb variable ;
+: owot0 variable ;  : owoat variable ;  : owoff variable ;  : owofs variable ;  : owrid2 variable ;  : owrrt variable ;  : owrpb variable ;
 : owslive variable ;  : owsans variable ;  : owssent variable ;  : owsasked variable ;  : owsoff variable ;
 : owsrb variable ;  : owswh variable ;  : owsfl variable ;  : owann variable ;  : owsnon variable ;
 : owinit
@@ -469,7 +469,7 @@ owol @ owrel owort @ 20 lit oxcp  owotk @ owort @ 20 lit + 10 lit oxcp  owoek @ 
 : owsend
 owos @ if 2drop 2drop 0 lit else
 	dup owoil !  owoin @ swap oxcp  owokind !  owot @ 20 lit oxcp
-	0 lit owoff !  0 lit owst !  0 lit owans !  mnms owot0 !
+	0 lit owoff !  0 lit owofs !  0 lit owst !  0 lit owans !  mnms owot0 !
 	owobuild if 1 lit owos !  -1 lit else "no relay to begin a circuit through" owofail 0 lit then
 then ;
 \ owrply: an answer to an unnamed sender, along its route (REPLY).
@@ -509,9 +509,12 @@ owmc @ 6 lit =  owos @ 2 lit = and if
 then
 owmc @ A lit =  owmn @ 21 lit = and if
 	owmb @ 20 lit + c@
-	\ a lookup's answer: offline (asked again once, in 3 s), or refused
+	\ a lookup's answer: offline (asked again every 3 s for 60 s from the
+	\ first: the recipient's session may be moving, its point a relay that
+	\ stopped, which it notices only after 30 s), or refused
 	owos @ 2 lit =  owmb @ owot @ 20 lit oxsame and if
-		dup 1 lit =  owoff @ 0= and if mnms BB8 lit + owoff ! else
+		dup 1 lit = if owofs @ 0= if mnms owofs ! then then
+		dup 1 lit =  mnms owofs @ - EA60 lit u< and if mnms BB8 lit + owoff ! else
 			dup 1 lit = if "the recipient is offline" else "the point refused the lookup" then owofail
 		then
 	then
@@ -556,7 +559,7 @@ owos @ if
 		1 lit 13 lit owot @ 20 lit owcsend drop  8 lit owos !
 	then
 	owos @ 2 lit =  owoff @ and  mnms owoff @ - 0< 0= and if
-		1 lit 7 lit owot @ 20 lit owcsend drop  FFFFFFFF lit owoff !
+		1 lit 7 lit owot @ 20 lit owcsend drop  0 lit owoff !
 	then
 	owos @ 4 lit = if mnms owoat @ - 2BF20 lit u< 0= if owodone then
 	else owos @ if mnms owot0 @ - 1D4C0 lit u< 0= if owwhyb @ "no answer within 120 s (step " scpy owos @ snum " circuit " scpy 1 lit owci @ snum

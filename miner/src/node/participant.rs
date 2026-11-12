@@ -104,10 +104,19 @@ const AVOID: Duration = Duration::from_secs(300);
 const WRONG_KEY_AVOID: Duration = Duration::from_secs(3600);
 /// A send not answered by then fails; it waits as long for a circuit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(120);
-/// After a first "offline" for a send, how long before asking again: a
+/// After an "offline" for a send, how long before asking again: a
 /// recipient's sessions move (rebuilt around a relay that stopped, or to
 /// a new point), and a lookup between two can find none.
 const OFFLINE_RETRY: Duration = Duration::from_secs(3);
+/// How long after the first "offline" a send keeps asking: a recipient
+/// whose point, or a hop to it, stopped notices only after
+/// [`DEAD_AFTER`], then builds a circuit and holds its session again.
+#[cfg(not(test))]
+const OFFLINE_WAIT: Duration = Duration::from_secs(60);
+/// In tests, one more ask (as tests sending to nobody expect a prompt
+/// "offline"); a test of sessions moving sets it (`set_timing`).
+#[cfg(test)]
+const OFFLINE_WAIT: Duration = OFFLINE_RETRY;
 const MAX_SENDS: usize = 64;
 /// A broadcast unanswered by then is tried on another circuit.
 const BROADCAST_WAIT: Duration = Duration::from_secs(15);
@@ -204,8 +213,8 @@ struct Job {
     /// The return route the payload carries, and the one-time key its
     /// answer is sealed to.
     route: Option<(onion::Route, crate::mlkem::SecretKey)>,
-    /// Told "offline" once already: the next time is final.
-    retried: bool,
+    /// Told "offline" first then: asked again until [`OFFLINE_WAIT`] on.
+    offline_since: Option<Instant>,
 }
 
 /// A circuit for one send or one broadcast, carrying no session of ours.
@@ -291,6 +300,8 @@ pub(super) struct Participant {
     /// [`onion::KEEPALIVE_SECS`] and [`ROTATE_EVERY`], shorter in tests.
     keepalive: Duration,
     rotate_every: Duration,
+    /// [`OFFLINE_WAIT`], set by tests.
+    offline_wait: Duration,
     /// Relays whose channel failed lately, and when.
     /// Relays not chosen as hops until a time.
     avoid: std::collections::HashMap<Digest, Instant>,
@@ -322,6 +333,7 @@ impl Default for Participant {
             test_owners: None,
             keepalive: KEEPALIVE,
             rotate_every: ROTATE_EVERY,
+            offline_wait: OFFLINE_WAIT,
             avoid: std::collections::HashMap::new(),
             guards: None,
         }
@@ -331,9 +343,10 @@ impl Default for Participant {
 impl Participant {
     /// Tests: keepalives and rotation sooner.
     #[cfg(test)]
-    pub(super) fn set_timing(&mut self, keepalive: Duration, rotate_every: Duration) {
+    pub(super) fn set_timing(&mut self, keepalive: Duration, rotate_every: Duration, offline_wait: Duration) {
         self.keepalive = keepalive;
         self.rotate_every = rotate_every;
+        self.offline_wait = offline_wait;
     }
 
     /// A time to replace a circuit built now: two to four hours on.
@@ -1399,17 +1412,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             self.finish_outbound(handle, job.out.group, "sent", now);
                         }
                     } else if code == NOTICE_OFFLINE
-                        && !self.part.jobs[j].retried
+                        && now.duration_since(self.part.jobs[j].offline_since.unwrap_or(now)) < self.part.offline_wait
                         && now.duration_since(self.part.jobs[j].started) + OFFLINE_RETRY < SEND_TIMEOUT
                     {
                         // Its sessions may be moving: asked again shortly,
-                        // its announce looked up afresh.
+                        // its announce looked up afresh, until
+                        // OFFLINE_WAIT after the first "offline".
                         let job = &mut self.part.jobs[j];
-                        job.retried = true;
+                        let first = job.offline_since.is_none();
+                        job.offline_since.get_or_insert(now);
                         job.out.recipient = None;
                         job.stage = Stage::Retry(now + OFFLINE_RETRY);
                         let to = job.out.to;
-                        self.chatter(&format!("onion: {} offline for now; asking again", onion::short(&to)));
+                        if first {
+                            self.chatter(&format!("onion: {} offline for now; asking again", onion::short(&to)));
+                        }
                     } else {
                         let why = match code {
                             NOTICE_OFFLINE => "offline: none of its rendezvous points holds a session for it",
@@ -1520,7 +1537,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.jobs.len() >= MAX_SENDS {
             return self.rv.note(Note::Failed { tag: out.tag, to: out.to, why: "too many sends in progress".into() });
         }
-        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None, retried: false });
+        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None, offline_since: None });
         self.progress_onion_sends(now);
     }
 
