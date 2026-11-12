@@ -793,3 +793,50 @@ port refused with its message; two instances by `--name` on one host
 (with item 3); the forwarded ports reaching the node (a ping on the p2p
 port, `/v1/status` on the API); a SIGTERM during a sync leaving a store
 that opens at the last committed block.
+
+## 20. Every panel refreshed together, on each new block
+
+The wallet's tabs and panels refresh at different times, because
+everything is polled: the wallet asks the node's `/v1/status` every 4 s
+(`wallet.fam`'s `wtick`), scans when the tip has moved and sends the
+page a `tip` event, but the page only shows the new height from it
+(`wm.html`: the status line); each panel's contents are fetched when it
+is opened or asked for, so the balance, Activity, names and proofs can
+each be as of a different block, and a block takes up to 4 s to be
+noticed at all.
+
+The one thing a wallet needs to wait on is a new block: everything it
+shows changes only with one (or with its own requests, which answer for
+themselves).
+
+- **The node: waiting for a block.** It has one already: `GET
+  /v1/tip?after=<id>` answers when the tip moves from `id`, or after
+  30 s with the tip unchanged (`api.fam`'s `atip`, `awake`; 8 waiting at
+  most). To check and extend: more waiters (a wallet and a page each,
+  several accounts), a reorganization answered as a move (the tip
+  changed, maybe lower), and (item 4) answered promptly while the node
+  connects the next block.
+- **The wallet: a thread that waits for blocks.** A thread (with
+  variables of its own: `pthread`, `docs/OS.md`) whose loop is
+  `/v1/tip?after=<last>`: on a new tip it hands the block to the
+  wallet's main loop (shared memory and `wake`, the main loop's poll
+  woken by a pipe), which scans it and then refreshes everything at
+  once. The 4 s poll goes; the main loop stays free for the page's
+  requests and the message layer while the thread waits.
+- **The page: one update per block.** On each block the wallet sends
+  one event carrying, or followed by, everything the panels show
+  (balance, Activity, names, provable payments, the overview), all as
+  of that block, and every panel redraws from it, whichever tab is
+  open. A panel opened later shows the latest it was sent, so no tab
+  shows a different block from another. The `tip` event and per-panel
+  fetches merge into this (with item 9's status model: "synced to
+  height N").
+- **Between blocks:** a payment sent or received off-chain (an online
+  slate, a message) is the wallet's own event and updates its panels at
+  once, as now; only chain state waits for the block.
+
+**Tests:** in oscheck's wallet tests (no timing), a block mined: one
+update event from the wallet with every panel's values at the new
+height, no further request needed; two blocks in quick succession:
+both seen, in order; a reorganization: the update at the new tip, the
+lost payment gone from Activity.
