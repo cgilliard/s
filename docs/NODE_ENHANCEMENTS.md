@@ -220,3 +220,80 @@ Before building more of the setup, work out how it should go:
 
 Whatever is chosen, the **Create a wallet** button goes: the wallet is
 there when the window opens.
+
+## 8. The wallet's window: payments by address first
+
+The window (`wm.html`, built into `wm.fam` by `scripts/wmpage.py`) has
+the tabs Overview, Receive, Send, Activity, Proofs, Names and Settings,
+and puts paying by slate (copy and paste, or a file in your home) beside
+paying online. Paying by address, online, is what most users want; the
+slate flows are for when the recipient is offline or unreachable.
+
+**First, `wm.html` is behind `wm.fam`.** The phase 2 and 3 screens (online
+sends, name offers and transfers, sub-names) were written straight into
+`wm.fam`'s string literals and never brought back to `wm.html`, so
+running `wmpage.py` after editing `wm.html` would drop them silently.
+Bring `wm.html` up to date from `wm.fam` (and make `wmpage.py` refuse to
+overwrite a `wm.fam` whose page differs from what `wm.html` would give,
+unless told to) before changing the layout.
+
+The layout:
+
+- **Overview:** the balance; this wallet's address to receive at, with a
+  copy button; its names beside the address (from the Names tab's "Your
+  names"); the node's state.
+- **Send:** online, to an address, `@name` or `@label.name`.
+- **Activity**, **Proofs**, **Names** (registering, offers and transfers,
+  sub-names; no longer "Your names"), **Settings**: as now.
+- **Burn:** a tab of its own (it is under Send now).
+- **Slates**, under an **Advanced** tab: paying by slate, answering one,
+  finalizing an answer, each by copy and paste or a file in your home
+  (the Receive tab's and Send tab's slate sections today). The Receive
+  tab goes: its address moves to Overview.
+
+## 9. The wallet's status: one model
+
+The strip beside the tabs (`w.st`) shows whatever came last: "Tip N" on
+each block, "Scanned N of M" during a scan; the content area shows
+"Unlocking...", "Locked: ..." or "[no wallet: the server has none
+free]" in place of a tab. Each is right when shown, but together they
+read as noise: a tip that moves while nothing else does, a scan's
+progress replaced by the next tip, a lock message where a tab should be.
+
+Work out one model of what the wallet is doing, and show it in one
+place:
+
+- **The wallet's state:** no wallet, locked, unlocking, scanning (to
+  height N of M), syncing (the node behind), ready; and online in init
+  or onion mode, or not reachable (no session at a rendezvous point).
+- **Work in progress:** item 5's spinners, listed (an online send
+  waiting on the recipient, a sub-name resolving).
+- **What shows where:** the state in the strip, words a user knows
+  ("Ready", "Catching up: 1,204 of 1,310 blocks"), not the raw tip; the
+  tip and the node's details in Overview's node section; errors where
+  the action was taken, and in Activity.
+
+## 10. Activity: every entry read as a user
+
+Activity lists sent and received payments, burns and name operations,
+and the wallet's events (each `wmev` and `'event':'message'` text in
+`wallet.fam`: about twenty, such as "answered a slate of 2.5 coins from
+a payer; it is paid once the payer sends it", "the slate reached a
+rendezvous point of the recipient; waiting for the answer", "the
+message was not delivered: ..."). Many were written for tests and
+debugging.
+
+- **Each message read as a user would:** whether it says what happened
+  and what, if anything, to do; in plain words (no "rendezvous point",
+  "slate" or "stage" where the user does not need them); one style
+  throughout; and whether it belongs in Activity at all (a transient
+  step may only update the entry it belongs to, its spinner, item 5).
+- **One entry per thing:** an online send is one entry that moves
+  through its steps (sent, reached the recipient, answered, finalized,
+  confirmed, or failed and why), not a message per step.
+- **What is missing:** for instance a received online payment as an
+  entry from the moment it is answered (not only once mined), a
+  sub-name given or withdrawn, a certificate held, a name offer
+  received or taken, a payment cancelled or bumped, the wallet going
+  online or offline, a failed resolve; and each entry's details on a
+  click (the transaction, the fee, the proof).
