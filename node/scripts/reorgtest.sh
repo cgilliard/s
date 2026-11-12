@@ -147,12 +147,17 @@ dones=$(grep -c "\[$PID\] done" "$T/os.out")
 echo "echo 1 > /proc/$PID/kill" >&3
 ended() { [ "$(grep -c "\[$PID\] done" "$T/os.out")" -gt "$dones" ]; }
 wait_while_busy 30 "the node ending" ended
-apis=$(grep -c '^node: .* the API on port' "$T/os.out")
+# (the API comes up at once; the pool is taken back once the node has
+# resumed from its store: waited for by its line, "resumed at height")
+res=$(grep -c '^node: .* resumed at height' "$T/os.out" || true)
+kept=$(grep -c '^node: .* kept from before taken back' "$T/os.out" || true)
 echo "node -n devrec 10.0.2.2:$PA &" >&3
-started() { [ "$(grep -c '^node: .* the API on port' "$T/os.out")" -gt "$apis" ]; }
-wait_while_busy 300 "the node serving again" started
+resumed() { [ "$(grep -c '^node: .* resumed at height' "$T/os.out")" -gt "$res" ]; }
+wait_while_busy 300 "the node resuming" resumed
 if [ "$held" -gt 0 ]; then
-	grep -E "^node: .* the pool: $held of $held kept from before taken back" "$T/os.out" \
+	taken() { [ "$(grep -c '^node: .* kept from before taken back' "$T/os.out")" -gt "$kept" ]; }
+	wait_while_busy 120 "the pool taken back after the restart" taken
+	grep -E '^node: .* kept from before taken back' "$T/os.out" | tail -1 | grep -q " the pool: $held of $held kept" \
 		|| { echo "reorgtest.sh: the pool not taken back after the restart ($held held before)" >&2; exit 1; }
 fi
 echo "reorgtest.sh: the node resumed, reorganized onto the longer branch, took the burn back into its pool, and kept its pool across a restart"
