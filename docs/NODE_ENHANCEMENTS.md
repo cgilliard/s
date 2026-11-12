@@ -594,41 +594,93 @@ resumed; the time per header with each, recorded in `docs/NODE.md`.
 
 Today `init` keeps a root shell on the console (or runs `login` when
 `/etc/init` says so), and wm's page asks for a name and password before
-the desktop (`docs/GUI_WALLET.md`, Logging in). Instead:
+the desktop (`docs/GUI_WALLET.md`, Logging in). Instead, one login at
+the console, one password, and a link that opens the desktop once.
 
-- **The console logs in.** `login` on the console at every boot, so
-  nothing runs as root unasked. A first login needs a password to
-  exist: a default root password (printed, and required to change at
-  the first login, as `passwd` does), or a first boot that asks for one
-  at the console before anything else (the same first run as item 7's
-  wallet setup), or another mechanism; to decide.
-- **wm is not a login.** After logging in at the console, the user is
-  shown a link, `http://127.0.0.1:8080/?<token>`: a token made at random
-  for that login, which wm takes in place of a name and password and
-  ties to that user (the desktop, its terminals and the wallet run as
-  them). The link printed again on request (a command), and a new
-  token at each login, the old one no longer taken. wm's login form
-  (`wm-login.html`) goes; a page opened with no token or a stale one
-  says to log in at the console.
-- **The wallet's password.** Today the wallet's key comes from the
-  login password that wm keeps for the session (`docs/GUI_WALLET.md`).
-  With no password typed into wm, the wallet needs another way to be
-  unlocked: its own password asked in the page, or the console's login
-  handing it on. To decide with item 7.
-- **The port forwarded by default.** `scripts/node.sh` forwards the
-  host's `127.0.0.1:8080` to wm's port 80 unless told otherwise (an
-  option for another host port, and for none), bound to localhost only
-  since the page travels in plain HTTP. The host port is passed into
-  the guest (the boot's configuration, or QEMU's firmware configuration)
-  so the link printed carries the port that actually reaches wm. With
-  more than one node on a host (item 3), each its own port.
-- **`su`.** `su [NAME]` at a terminal: the password of NAME (root by
-  default) asked and checked against `/etc/passwd`, then NAME's shell
-  until it exits, back to the first user. Built on what `login` and
-  `runas` already do (`/proc/self/user`), with root not asked.
+### The console logs in
 
-**Tests:** in oscheck, a boot that logs in at the console and prints
-the link; the page opened with that token gets the desktop as that user,
-with no token or a wrong or old one gets nothing; the link's port the
-one forwarded; `su` to another user and back, refused with a wrong
-password.
+`login` on the console at every boot, so nothing runs as root unasked.
+A first login needs a password to exist: a default root password
+(printed, and required to change at the first login), or a first boot
+that asks for one at the console before anything else (the same first
+run as item 7's wallet setup); to decide.
+
+### One password: the user's login
+
+The password typed at the console is the only one the user has. It:
+
+- **logs them in** at the console;
+- **unlocks the wallet:** `login` derives the wallet's key from it (as
+  wm does today from its form) and hands key and user to wm for the
+  session, so the wallet needs no password of its own;
+- **is asked again only to view the recovery phrase,** at the console
+  (`wallet phrase`), never in the page: the phrase is the one thing that
+  gives the whole wallet away, and a stolen session cookie or a
+  malicious page then cannot reach it. The page's Settings says where
+  to find it. (Changing the password, `passwd`, asks the old one too, as
+  any `passwd` does, and re-encrypts the phrase in the same step.)
+
+### The desktop by a one-time link
+
+After the console login, the user is shown
+`http://127.0.0.1:8080/?<token>`:
+
+1. **The token:** 128 bits or more from the kernel's random source,
+   made for that login and given to wm with the wallet's key.
+2. **Used once:** the first request carrying it swaps it for a session
+   cookie and redirects to plain `/`; the token is spent. The same URL
+   again (browser history, a copy, anyone else) gets "log in at the
+   console". wm's login form (`wm-login.html`) goes.
+3. **The session:** the cookie serves reloads and new tabs until logout
+   or 30 minutes idle; then cookie and wallet key are dropped from
+   memory, and a console login gives a new link.
+4. **Other web pages in the same browser** can send requests to
+   `127.0.0.1:8080`, a WebSocket included, and the session holds an
+   unlocked wallet. So wm sets the cookie `HttpOnly; SameSite=Strict`,
+   refuses a request whose `Host` is not exactly `127.0.0.1:<port>` (DNS
+   rebinding), and refuses a WebSocket whose `Origin` is not its own
+   page.
+
+### The port forwarded by default
+
+`scripts/node.sh` forwards the host's `127.0.0.1:8080` to wm's port 80
+unless told otherwise (an option for another host port, and for none),
+bound to localhost only since the page travels in plain HTTP. The host
+port is passed into the guest (the boot's configuration, or QEMU's
+firmware configuration) so the printed link carries the port that
+actually reaches wm. With more than one node on a host (item 3), each
+its own port.
+
+### Checking a password
+
+The check exists: `crypto/passwd.fam`'s `pwfind` (a user's line of
+`/etc/passwd`) and `pwok` (a password against its hash), which `login`
+and wm use. What a program run by a user lacks is the right to use it:
+only root reads `/etc/passwd`, and only root writes `/proc/self/user`.
+
+- **The recovery phrase needs nothing new.** `wallet phrase`, run as
+  the user, derives the key from the password typed and decrypts the
+  phrase (ChaCha20-Poly1305): the tag checking is the password checked.
+  No `/etc/passwd`, no root.
+- **`su` and a user's own `passwd` need root:** a **setuid bit.** A
+  file marked so, and owned by root, runs as root (the kernel, at
+  `spawn`, sets the process's user to the file's owner; `chmod` sets the
+  mark, root only). Only `su` and `passwd` have it, each written to
+  trust nothing from its caller but the typed password.
+- **`su [NAME]`:** NAME's password (root by default) asked and checked
+  (`pwfind`, `pwok`), then NAME's shell until it exits, back to the
+  first user; root is not asked.
+- **`passwd`** with no name: the user's own, the old password asked
+  first; `passwd NAME` stays root's.
+
+### Tests
+
+In oscheck: a boot that logs in at the console and prints the link; the
+page opened with that token gets the desktop as that user, unlocked; the
+same token a second time, no token, or a wrong one gets nothing; a
+request with another `Host`, or a WebSocket from another `Origin`,
+refused; the link's port the one forwarded; `su` to another user and
+back, refused with a wrong password; `wallet phrase` refused with a
+wrong password; a user's `passwd` changing their password and the
+wallet still opening with the new one; a program without the setuid
+mark refused `/etc/passwd` as now.
