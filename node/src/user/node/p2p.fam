@@ -56,6 +56,12 @@
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
 : pyld variable ;  : pyd variable ;  : pyt0 variable ;
+\ pxw: the caller of pwait serves the API (sync.fam's vwait, cwait, nidle,
+\ nstep, and pfetch with pyld): only then is its listener (pxfd) watched.
+\ A wait that does not serve it (headers, a Ping, a block's aux leaves)
+\ would otherwise be woken at once, again and again, by a connection no
+\ one takes, and give up for want of what it waits for.
+: pxw variable ;
 \ What the node is doing, for its status (api.fam's /v1/status): 0
 \ nothing in particular, 1 fetching block pacth, 2 connecting it
 \ (sync.fam's nblock and nconnect).
@@ -116,7 +122,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
-600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  0 lit pyld !  0 lit pyd !  0 lit pact !  0 lit pacth !  10 lit alloc pfrom !
+600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  0 lit pyld !  0 lit pyd !  0 lit pxw !  0 lit pact !  0 lit pacth !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !  2DC6C0 lit psrtt !  20 lit alloc psid !  0 lit psv !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
@@ -146,14 +152,15 @@ then ;
 : d8=  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ = and loop nip nip ;
 
 \ prdy ( ns -- flag )  a datagram waiting within ns; or, sooner, the
-\ descriptor in pxfd (if any: the API's listener) readable, pxrdy set, or
+\ descriptor in pxfd (if any, and pxw set: the API's listener) readable,
+\ pxrdy set, or
 \ the one in pyfd (if any: the verifier's verdicts, sync.fam's vwait),
 \ pyrdy set.
 \ pent1 ( fd -- k )  an entry for fd: its index.
 : pent1  pnk @ 3 lit lshift pent @ +  tuck !  1 lit swap 4 lit + !  pnk @ dup 1 lit + pnk ! ;
 : prdy
 0 lit pnk !  pfd @ pent1 drop  0 lit pxi !  0 lit pyi !
-pxfd @ if pxfd @ pent1 pxi ! then  pyfd @ if pyfd @ pent1 pyi ! then
+pxfd @ pxw @ and if pxfd @ pent1 pxi ! then  pyfd @ if pyfd @ pent1 pyi ! then
 pent @ pnk @ rot poll 0 lit > if
 	pxi @ if pxi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pxrdy ! then
 	pyi @ if pyi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pyrdy ! then
@@ -574,7 +581,7 @@ while
 	\ (pyld) a connection to the API waits
 	begin
 		prcv @ pask @ u<  pobj @ if pdone 0= and then  pyd @ 0= and
-		if pwns pwait  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
+		if pyld @ pxw !  pwns pwait  0 lit pxw !  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
 	?dup while 9 lit = if pchunk then repeat
 	pnew @ if ticks pt0 ! then
 repeat

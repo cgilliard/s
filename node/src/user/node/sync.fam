@@ -59,7 +59,7 @@ repeat ;
 : nidle
 ntime + nidt !
 begin ntime nidt @ u< while
-	3B9ACA00 lit pwait drop  pkeep  stx @ nfsv !  aaccept awake  nfsv @ stx !
+	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  pkeep  stx @ nfsv !  aaccept awake  nfsv @ stx !
 repeat ;
 
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
@@ -129,7 +129,7 @@ then ;
 : vwait
 vjr @ pyfd !  0 lit pyrdy !  1 lit pnest !
 begin vjw @ if pyrdy @ 0= else 0 lit then while
-	3B9ACA00 lit pwait drop
+	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
 	pxrdy @ if stx @ vsav !  aaccept  vsav @ stx ! then
 repeat
 0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
@@ -168,6 +168,10 @@ dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
 \ bout (in the body, the node's), bnout, sfirst, sfirsth.
 : cwon variable ;  : cwj variable ;  : cwjr variable ;  : cwjw variable ;  : cwvr variable ;  : cwvw variable ;
 : cwk variable ;  : cwb variable ;  : cwm variable ;  : cwp1 variable ;  : cwp2 variable ;
+\ cwcv: the bytes the verifier's buffers took on the node (main.fam
+\ measures them): the worker's heap is that and 1 MiB (the state's
+\ buffers, about 300 KiB, and its data stack).
+: cwcv variable ;
 \ cwinit  on the worker: its own buffers.
 : cwinit
 0 lit p2s !  0 lit dva !  0 lit mrb !  0 lit mcb !  0 lit pws !
@@ -183,13 +187,15 @@ sninit  cvp @ cvinit ;
 : cwait
 cwvr @ pyfd !  0 lit pyrdy !  1 lit pnest !
 begin pyrdy @ 0= while
-	3B9ACA00 lit pwait drop
+	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
 	pxrdy @ if stx @ vsav !  aaccept awake  vsav @ stx ! then
 repeat
 0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
 cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;
-\ cwstart  the worker started (cwon), its heap 3 MiB (it says how much
-\ it took).
+\ cwstart  the worker started (cwon), its heap the verifier's buffers
+\ and 1 MiB.  Before taking any job it says whether every buffer was had
+\ (alloc gives 0 when the heap is short, and nothing would notice until
+\ the first store through it): if not, the node does the work itself.
 : cwstart
 0 lit cwon !
 38 lit malloc cwj !  10 lit alloc cwk !  10 lit alloc cwb !  10 lit alloc cwm !
@@ -199,7 +205,13 @@ cwp1 @ pipe 0< 0=  cwp2 @ pipe 0< 0= and cwj @ 0= 0= and if
 	stfd @ cwj @ 10 lit + !
 	ptcode[ drop
 		cwinit
-		vrb @ if nhead "the worker: its heap " puts 0 lit alloc s10@ - A lit rshift u. " KiB of 3,072 used" puts 0A lit putc then
+		\ every buffer had: the last ones made (cvinit's), and room left
+		cvb @ 0= 0=  tsib @ 0= 0= and  dirty @ 0= 0= and  10000 lit alloc 0= 0= and
+		dup if
+			vrb @ if nhead "the worker: its heap " puts 0 lit alloc s10@ - A lit rshift u. " KiB used of " puts cwcv @ 100000 lit + A lit rshift u. " KiB" puts 0A lit putc then
+		then
+		cwb @ !  cwvw @ cwb @ 4 lit write drop
+		cwb @ @ 0= if 0 lit texit then
 		begin cwjr @ cwk @ 4 lit read 4 lit = while
 			cwj @ 10 lit + @ stfd !
 			cwk @ @
@@ -218,7 +230,11 @@ cwp1 @ pipe 0< 0=  cwp2 @ pipe 0< 0= and cwj @ 0= 0= and if
 			cwb @ !  cwvw @ cwb @ 4 lit write drop
 		repeat
 	]tcode
-	0 lit 300000 lit pthread 0< 0= cwon !
+	0 lit cwcv @ 100000 lit + pthread 0< 0= if
+		\ its word: every buffer had, or not
+		cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ cwon ! then
+		cwon @ 0= vrb @ and if nhead "the worker could not have its buffers" puts 0A lit putc then
+	then
 then ;
 
 \ nconf ( from -- flag )  hconf, the work checked by nodev.
@@ -572,7 +588,7 @@ ntime nrat @ u< 0= if
 	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann then loop
 then ;
 : nstep
-3B9ACA00 lit pwait drop
+-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
 pkeep
 nahead dup 0< if drop else
 	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop

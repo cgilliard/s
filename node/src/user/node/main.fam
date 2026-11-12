@@ -183,7 +183,9 @@ mcfn @ ?dup if 0 lit do mcpa @ i 2 lit lshift + @ mfone loop then
 msdn @ ?dup if 0 lit do msds @ i 2 lit lshift + @ mfone loop then ;
 
 "/lib/akjv.txt.gz" mfile powinit
-nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop cvinit
+nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop
+\ (what the verifier's buffers take, measured: the worker needs as much)
+0 lit alloc cwcv !  cvinit  0 lit alloc cwcv @ - cwcv !
 \ mtree ( -- fd )  /var/node, made if missing.
 : mtree  "/var/node" TREE CREATE or 2 lit or open  dup 0< if nhead "no store (a disk is needed): " puts . 0A lit putc 1 lit exit then ;
 
