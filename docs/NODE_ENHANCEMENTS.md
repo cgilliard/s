@@ -458,3 +458,48 @@ interruption (the new tip mined on, a payment that completes), not how
 quickly. Then the real thing by hand: a laptop on each platform (Linux,
 macOS, Windows) closed and opened during a sync, during mining and
 during an online payment.
+
+## 14. Large blocks, and fast sync of a large set of outputs
+
+The chains the node is tested on are small: oscheck's state test is
+312 blocks of a few outputs, its snapshot test a few parts, and the
+dev networks' blocks are mostly empty. Mainnet allows blocks of 2 MB
+(`ChainParams::max_block_size`), and the set of unspent outputs only
+grows. Neither has been tried at size, on the node or on tabminer, and
+the node has a fixed 128 MiB of memory. Known limits to check:
+
+- **The dirty groups** a block touches are kept in a sorted list of
+  16,384 at most (`docs/NODE.md`, step 5: "fine for now"): a full block,
+  or a disconnect of several, may pass it.
+- **One block's work inline** (item 4): the state, its manifest and
+  snapshot parts and the store's commit, all growing with the block.
+- **The body fetched in chunks** and held whole before it is checked;
+  a 2 MB body next to the store's cache and the API in 128 MiB.
+- **Fast sync's parts:** up to 16,384 unspent outputs each, every part
+  checked and installed, then the whole against S's state root. With
+  millions of outputs, that is hundreds of parts: their fetch (retries,
+  a peer that stops serving midway, parts from several peers), the
+  memory held between parts, the time, and a restart partway through
+  (resumed or started again, never a half-installed state taken as
+  whole).
+- **Serving them:** the node building the snapshot parts it serves
+  (every block's manifest, whole every 64th) and answering parts of a
+  large set without stalling its loop.
+- **tabminer too:** its block assembly, connect and snapshot at the
+  same sizes, and its memory with the set at, say, 10 and 100 million
+  outputs.
+
+**Tests:** a generator for a chain of full blocks (the most outputs,
+spends and names a block takes) on the dev network, and for a state of
+millions of unspent outputs; then, on both the node and tabminer:
+
+1. A sync of a run of full blocks: every root matching tabminer's,
+   memory under the budget, and (with item 4) the node answering
+   throughout.
+2. Full blocks disconnected and connected again (a reorganization of
+   several).
+3. A fast sync from a snapshot of the large set, from tabminer and from
+   another fam node, with one restart in the middle and one peer that
+   stops serving.
+4. The numbers recorded (time per block, per part, peak memory) in
+   `docs/NODE.md`, so a regression shows.
