@@ -1265,10 +1265,21 @@ disk_read:
 # The other harts all leave 0x80000000 (where they started, and where the
 # image will be written) on their way to wait at 0x87FF1F00, each marking
 # its mailbox as it goes; under QEMU, with more harts than the host has
-# cores, one may take a while to be run at all.  So wait until 100 ms pass
-# with no new mark before anything is written there.
+# cores, one may take a while to be run at all, and one that runs only
+# after the image is written there runs a half-written image and is lost.
+# So wait for all of them: as many as the device tree QEMU puts at
+# 0x87E00000 has cpu@ nodes (the kernel's fdtharts), up to 960 (harts past
+# the mailboxes make no mark), for 60 s at most against a hang.  With no
+# device tree, until 100 ms pass with no new mark (a slow host can make
+# that too short; QEMU always gives one).
 settle:
+        jal     t6, fdt_harts           # a4 = the harts, 0 if no tree
+        li      t0, 960
+        bleu    a4, t0, 5f
+        mv      a4, t0
+5:      addi    a4, a4, -1              # marks to wait for (hart 0 makes none)
         li      t5, MTIME
+        lw      a5, 0(t5)               # when the wait began
         lw      t6, 0(t5)               # since the last new mark
         li      a2, 0                   # marks seen
 1:      li      t0, 0x87FF1000
@@ -1280,7 +1291,14 @@ settle:
         addi    a3, a3, 1
 3:      addi    t0, t0, 4
         bltu    t0, t1, 2b
-        beq     a3, a2, 4f
+        bltz    a4, 6f                  # no tree: the quiet rule
+        bgeu    a3, a4, 7f              # every hart marked
+        lw      t4, 0(t5)
+        sub     t4, t4, a5
+        li      t3, TICK * 60
+        bltu    t4, t3, 1b
+7:      ret
+6:      beq     a3, a2, 4f
         mv      a2, a3
         lw      t6, 0(t5)
 4:      lw      t4, 0(t5)
@@ -1288,6 +1306,73 @@ settle:
         li      t3, TICK / 10
         bltu    t4, t3, 1b
         ret
+
+# fdt_harts (returns through t6): a4 = the cpu@ nodes of the device tree
+# at 0x87E00000 (big-endian tokens: 1 begin node, its name NUL-ended and
+# padded to 4; 3 a property, its length, name offset and value padded to 4;
+# 9 the end), or 0 when there is no tree there.  t0..t4 used.
+fdt_harts:
+        li      a4, 0
+        li      t0, 0x87E00000
+        mv      t3, t0
+        jal     t2, fdt_be
+        li      t1, 0xD00DFEED
+        bne     t4, t1, 9f
+        addi    t3, t0, 8
+        jal     t2, fdt_be              # off_dt_struct
+        add     t0, t0, t4
+1:      mv      t3, t0
+        jal     t2, fdt_be
+        li      t1, 9
+        beq     t4, t1, 9f
+        li      t1, 1
+        bne     t4, t1, 3f
+        addi    t0, t0, 4               # a node: is its name cpu@...?
+        lbu     t1, 0(t0)
+        li      t3, 0x63
+        bne     t1, t3, 2f
+        lbu     t1, 1(t0)
+        li      t3, 0x70
+        bne     t1, t3, 2f
+        lbu     t1, 2(t0)
+        li      t3, 0x75
+        bne     t1, t3, 2f
+        lbu     t1, 3(t0)
+        li      t3, 0x40
+        bne     t1, t3, 2f
+        addi    a4, a4, 1
+2:      lbu     t1, 0(t0)               # past the name and its NUL, to 4
+        addi    t0, t0, 1
+        bnez    t1, 2b
+        addi    t0, t0, 3
+        andi    t0, t0, -4
+        j       1b
+3:      li      t1, 3
+        bne     t4, t1, 4f
+        addi    t3, t0, 4               # a property: past its value
+        jal     t2, fdt_be
+        addi    t4, t4, 3
+        andi    t4, t4, -4
+        addi    t0, t0, 12
+        add     t0, t0, t4
+        j       1b
+4:      addi    t0, t0, 4               # anything else: one token
+        j       1b
+9:      jr      t6
+
+# fdt_be (returns through t2): t4 = the big-endian word at t3.  t1 used.
+fdt_be:
+        lbu     t4, 0(t3)
+        slli    t4, t4, 8
+        lbu     t1, 1(t3)
+        or      t4, t4, t1
+        slli    t4, t4, 8
+        lbu     t1, 2(t3)
+        or      t4, t4, t1
+        slli    t4, t4, 8
+        lbu     t1, 3(t3)
+        or      t4, t4, t1
+        jr      t2
 
 # a0 = time (MTIME's low word).
 now:
