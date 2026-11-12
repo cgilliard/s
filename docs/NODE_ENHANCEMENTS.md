@@ -794,7 +794,7 @@ port refused with its message; two instances by `--name` on one host
 port, `/v1/status` on the API); a SIGTERM during a sync leaving a store
 that opens at the last committed block.
 
-## 20. Every panel refreshed together, on each new block
+## 20. Waiting instead of polling: blocks, transactions, payments
 
 The wallet's tabs and panels refresh at different times, because
 everything is polled: the wallet asks the node's `/v1/status` every 4 s
@@ -812,10 +812,7 @@ themselves).
 - **The node: waiting for a block.** It has one already: `GET
   /v1/tip?after=<id>` answers when the tip moves from `id`, or after
   30 s with the tip unchanged (`api.fam`'s `atip`, `awake`; 8 waiting at
-  most). To check and extend: more waiters (a wallet and a page each,
-  several accounts), a reorganization answered as a move (the tip
-  changed, maybe lower), and (item 4) answered promptly while the node
-  connects the next block.
+  most). It stays, and becomes a case of the events below.
 - **The wallet: a thread that waits for blocks.** A thread (with
   variables of its own: `pthread`, `docs/OS.md`) whose loop is
   `/v1/tip?after=<last>`: on a new tip it hands the block to the
@@ -835,8 +832,74 @@ themselves).
   slate, a message) is the wallet's own event and updates its panels at
   once, as now; only chain state waits for the block.
 
+### Everything else that is polled, or never noticed
+
+Besides blocks, what a wallet waits on today it learns only by asking
+again, or not at all:
+
+| What | Today | With a hook |
+|---|---|---|
+| A sent transaction's fate in the node: pooled, **dropped** (evicted for a better fee, expired after 14 days, conflicted by another spend), **replaced** (a bump or cancel), **mined** at a height, back in the pool after a reorganization | `POST /v1/tx`'s answer, then nothing until a block's scan shows it mined; a dropped transaction is never noticed, and the payment looks pending for good | told at once: "dropped from the pool: fee below the minimum; bump it?" |
+| Confirmations | counted at each scan | from the block events |
+| The node's state: syncing, synced, no peers, the store full | `/v1/status` when asked | told when it changes (item 9's status model) |
+| Fee estimates | `/v1/fees` when the Send tab asks | sent with each block, and when the pool's minimum moves |
+| The message layer's mode and relays (`/v1/consensus`, every 10 s: `wmcons`) | polled | changes only at a block: from the block events |
+
+**One mechanism in the node: an event stream.** Rather than an
+endpoint to wait on per thing, the node numbers what happens and keeps
+the recent events in a ring (a few thousand):
+
+- **`GET /v1/events?after=<n>`:** the events numbered after `n`, at
+  once if there are any, else waiting until one comes (or 30 s, an
+  empty answer); a wallet keeps one such request open and loses
+  nothing between them. `after` older than the ring holds answers
+  "reset": the wallet asks for the state afresh (`/v1/status`, a scan)
+  and goes on from the newest.
+- **The events:** `block` (connected: height, id) and `undone` (a
+  reorganization), `tx` (an id and its new state: pooled, dropped and
+  why, replaced by which, mined at which height, back in the pool),
+  `status` (syncing, synced, peers, a problem), `fees` (the pool's
+  minimum moved).
+- **Filtering:** `?tx=<id>,<id>` for the events of those transactions
+  only (with blocks and status always), so a wallet is not woken for
+  every transaction the node sees.
+- **No more waiting connections than needed:** one per wallet (and the
+  page has none: it hears from its wallet), each held by the node at
+  the cost of a socket, so the 8 waiting requests become a limit sized
+  to the wallets a machine runs, refused with a clear answer past it.
+
+### The wallet's events to the page
+
+The wallet already pushes to the page over its WebSocket, but as text
+(`'event':'message'`, a line in Activity): the page cannot tell a
+payment's progress from any other line. Instead structured events, each
+naming the payment (its Activity entry's id) and its new state, so the
+page can show a notification and update that entry in place:
+
+- **An online payment:** sent, reached the recipient's point, answered
+  (the slate back), finalized, in the node's pool, mined, confirmed (n),
+  or failed and why (the recipient offline, no answer in time, refused,
+  dropped from the pool).
+- **A payment received:** offered (an online slate in), answered, seen
+  mined, confirmed.
+- **Names:** committed, the reveal's window open, revealed, registered;
+  a renewal due.
+- **The wallet's own state:** scanning (to a height), synced, the node
+  unreachable.
+
+The message layer is already event driven in the wallet (`poll` on its
+socket); the node's events come by the block thread's request (now
+`/v1/events` rather than `/v1/tip`). With item 5's spinners and item
+9's status model, these are what the UI shows: a payment's line moving
+from "sent" to "confirmed" by itself, and a notification when it does.
+
 **Tests:** in oscheck's wallet tests (no timing), a block mined: one
 update event from the wallet with every panel's values at the new
 height, no further request needed; two blocks in quick succession:
 both seen, in order; a reorganization: the update at the new tip, the
-lost payment gone from Activity.
+lost payment gone from Activity. In the node's API test: `/v1/events`
+answering a block, a transaction pooled, then evicted by a better-paying
+one (its `dropped` event, with why), and replaced by a bump; a request
+waiting while nothing happens answered when something does; `after`
+past the ring answered "reset". In the wallet: an online payment's
+events in order from sent to confirmed, and a dropped one's.
