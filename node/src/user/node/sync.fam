@@ -52,6 +52,16 @@ while
 	2drop  stx @ nfsv !  aaccept awake  nfsv @ stx !
 repeat ;
 
+\ nidle ( s -- )  s seconds of serving only: peers' requests (pwait; each
+\ peer pinged when its time comes, pkeep) and the API; nothing fetched.
+\ For a node waiting to sync (main.fam): no peer yet, or none ahead.
+: nidt variable ;
+: nidle
+ntime + nidt !
+begin ntime nidt @ u< while
+	3B9ACA00 lit pwait drop  pkeep  stx @ nfsv !  aaccept awake  nfsv @ stx !
+repeat ;
+
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
 \ header the entry's: the bytes the same).
 : nft variable ;  : btf variable ;
@@ -223,8 +233,11 @@ then
 nlok @ if nstat  -1 lit sprchk !  vrb @ if nhead "resumed at height " puts myh @ u. ", the headers loaded in " puts ticks nt0 @ - nsec " s" puts 0A lit putc then then
 nlok @ ;
 
+\ nswr: set once nsync has begun writing the store (the snapshot's parts),
+\ so a sync that stops after must start again on a fresh tree.
+: nswr variable ;
 : nsync  ( depth -- code )
-nS !  0 lit ncode !
+nS !  0 lit ncode !  0 lit nswr !
 pping 0= if FFFFFFFF lit nfail else "the peer is at height " nsay pst-h nsayn then
 \ a chain with no block yet: nothing to sync from (-10; asked again later)
 ncode @ 0= pst-h 0= and if FFFFFFF6 lit nfail then
@@ -266,6 +279,7 @@ ncode @ 0= if
 then
 \ the parts, then the whole
 ncode @ 0= if
+	1 lit nswr !
 	snr @ snn @ + ?dup if 0 lit do
 		ncode @ 0= if
 			3 lit i nid @ nfetch over if

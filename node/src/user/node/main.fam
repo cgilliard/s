@@ -12,8 +12,11 @@
 \ given, mainnet's seeds (tabminer's, tabernacle1/2.root.sx:3737, or the
 \ configuration's), and for devrec 10.0.2.2:3747 (the host seen from
 \ QEMU's user-mode network); and more as they tell of them (GetPeers).
-\ It syncs from the first that answers on its chain, then serves for good: its peers, the API (TCP 3738,
-\ the token in /etc/node/token) and its image to tabernacles (UDP 3737).
+\ It serves from the start, whatever its height: its peers, the API (TCP
+\ 3738, the token in /etc/node/token) and its image to tabernacles (UDP
+\ 3737); meanwhile it syncs from the first that answers on its chain, and
+\ while none can (no peer found, none with a block yet, a sync stopped)
+\ tries again every 30 s: it never exits for want of a peer or a block.
 \ Its state is the tree /var/node: at a start, if it holds a chain, the
 \ node resumes from its tip (its headers loaded, then whatever the peer
 \ has since caught up to, by nstep, once the peer answers); if not, the
@@ -163,10 +166,21 @@ mpn @ 0= if
 		msdn @ 0 lit do msds @ i 2 lit lshift + @ mhost if mpush then loop
 	then
 then
-mpn @ 0= if nhead "no peers: none given, and none found" puts 0A lit putc 1 lit exit then
-mpa @ @ mip !  mpa @ 4 lit + @ mport !
+\ none found (the seeds' names not resolving, say): served all the same,
+\ looked for again every 30 s (mfind); the socket's first peer then a
+\ placeholder (0.0.0.0:0), never asked
+mpn @ if mpa @ @ mip !  mpa @ 4 lit + @ mport ! else
+	nhead "no peers yet: none given, and none found; looking again every 30 s while serving" puts 0A lit putc
+	0 lit mip !  0 lit mport !
+then
 \ mrest  the peers given after the first added (peer 0 is pinit's).
 : mrest  mpn @ 1 lit u> if mpn @ 1 lit do mpa @ i 3 lit lshift + dup @ swap 4 lit + @ padd drop loop then ;
+\ mfind  the configuration's peers and seeds looked up again, each found
+\ and new added (mpn counting them): for a node that found none at start.
+: mfone  ( s -- )  mhost if mip @ mport @ pwho 0< if mip @ mport @ padd drop  mpn @ 1 lit + mpn ! then then ;
+: mfind
+mcfn @ ?dup if 0 lit do mcpa @ i 2 lit lshift + @ mfone loop then
+msdn @ ?dup if 0 lit do msds @ i 2 lit lshift + @ mfone loop then ;
 
 "/lib/akjv.txt.gz" mfile powinit
 nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop cvinit
@@ -187,11 +201,17 @@ mdc @ dup 60 lit + prinit
 1 lit vrb !
 \ the verifier, a process of its own, so the node serves while it checks
 vinit  vjw @ if nhead "verifying in nodev (a process of its own)" puts else nhead "nodev not started: verifying here" puts then 0A lit putc
+\ the network and the API at once, whatever the height (a store with no
+\ chain yet: genesis's, height 0), so the node answers from its first
+\ second while it syncs, or waits for a peer or a block (docs/
+\ NODE_ENHANCEMENTS.md, items 4 and 6)
+mip @ mport @ mudp @ pinit  mrest
+mapi @ ainit
+nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
 nload if
 	\ resumed: the peer asked, and caught up to if ahead; if it does not
 	\ answer yet, nstep goes on asking
-	mip @ mport @ mudp @ pinit  mrest
-	pping if
+	mip @ if pping else 0 lit then if
 		nhead "the peer " puts mpeer " is at height " puts pst-h u. 0A lit putc
 		pst-h myh @ u> if ncatch then
 	else nhead "no answer from " puts mpeer " yet; asking it again as we serve" puts 0A lit putc then
@@ -204,33 +224,35 @@ else
 	\ afresh: the tree made again (whatever a sync cut short, before its
 	\ first block, left in it gone)
 	stfd @ close drop  "/var/node" remove drop  mtree stfd !
-	mip @ mport @ mudp @ pinit  mrest
-	\ from each given in turn while none answers, or each is on another
-	\ chain (a seed serving images only, say)
-	\ (each at height 0, no block yet: asked again every 30 s until one has)
+	\ from each peer in turn (those given or found, and any that pinged
+	\ us) while none answers, or each is on another chain (a seed serving
+	\ images only, say), or has no block yet; then, while serving, again
+	\ every 30 s, whatever stopped it: a node never gives up for want of a
+	\ peer or a block
 	begin
+		mpn @ 0= if mfind then
 		FFFFFFFF lit
-		mpn @ 0 lit do
-			dup FFFFFFFF lit =  over FFFFFFFE lit = or  over FFFFFFF6 lit = or if
+		pnp @ 0 lit do
+			dup FFFFFFFF lit =  over FFFFFFFE lit = or  over FFFFFFF6 lit = or  i prec @ 0= 0= and if
 				drop  i puse  i prec @ mip !  i prec 4 lit + @ mport !
 				nhead "syncing from " puts mpeer 0A lit putc
 				90 lit nsync
 			then
 		loop
-		dup FFFFFFF6 lit =
+		?dup
 	while
-		drop  nhead "nothing to sync yet: the chain has no block past its genesis; asking again in 30 s" puts 0A lit putc
-		1E lit 0 lit do 3B9ACA00 lit sleep loop
+		dup FFFFFFF6 lit = if
+			nhead "nothing to sync yet: the chain has no block past its genesis; asking again in 30 s" puts
+		else
+			nhead "the sync stopped: " puts dup .
+			"  (-1 no answer, -2 another chain, -3 headers, -4 a proof of work, -5 a block not fetched, -6 a chain proof, -7 a part, -8 the state, -9 a block after S); trying again in 30 s" puts
+		then 0A lit putc  drop
+		\ the store written to (a snapshot's parts): made afresh
+		nswr @ if stfd @ close drop  "/var/node" remove drop  mtree stfd ! then
+		1E lit nidle
 	repeat
-	?dup if
-		nhead "the sync stopped: " puts .
-		"  (-1 no answer, -2 another chain, -3 headers, -4 a proof of work, -5 a block not fetched, -6 a chain proof, -7 a part, -8 the state, -9 a block after S, -10 no block yet)" puts 0A lit putc
-		1 lit exit
-	then
 	nhead "synced, height " puts myh @ u. 0A lit putc
 then
 \ the pool kept from before (pool.fam's qload), against the state now
 qload  qln @ if nhead "the pool: " puts qlok @ u. " of " puts qln @ u. " kept from before taken back" puts 0A lit putc then
-mapi @ ainit
-nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
 begin E10 lit aserve 0 lit until

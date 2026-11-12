@@ -152,6 +152,19 @@ What it takes:
    block takes), synced while a probe pings and asks the API: no answer
    later than the bound.
 
+Progress:
+
+- (2026-11-12) Threads with variables of their own (`pthread`,
+  `docs/OS.md`), for the worker that will connect blocks: one process,
+  each thread with its own copy of fam's variables.
+- (2026-11-12) The API answered while a block, a snapshot's manifest or
+  part, or a relayed transaction is fetched (`sync.fam`'s `nfetch`:
+  `pfetch` stops when a connection waits and goes on after), and
+  `/v1/status` says what the node is doing (`activity`). Checked by
+  `scripts/stalltest.sh`, timing-free: a proxy holds a block's chunks,
+  and the API, asked meanwhile, must say the node is fetching it.
+- (2026-11-12) The API from the start (item 6).
+
 ## 5. The wallet shows what is in progress
 
 The wallet's page (`wm.html`) sends a request (`wask`) and shows nothing
@@ -196,6 +209,16 @@ second (peers, images, its tip), and a wallet on a node still at height
 and the p2p replies from a node started alone on a fresh chain, then
 from two seeds started together before any block is mined, the first
 block then reaching both.
+
+**Done (2026-11-12), but for the two-seed test:** the node starts its
+socket and API before anything else (`main.fam`), whatever its height;
+a first sync that stops for any reason is tried again every 30 s while
+serving (`sync.fam`'s `nidle`; the store made afresh if the sync had
+written to it), and a node that found no peer looks for the
+configuration's peers and seeds again each time (`mfind`), taking any
+peer that pinged it meanwhile. Checked by `scripts/stalltest.sh`: the
+node started before the miner's first block answers `/v1/status` at
+height 0, then syncs on its next try.
 
 ## 7. How the wallet is set up
 

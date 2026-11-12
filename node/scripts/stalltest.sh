@@ -72,35 +72,50 @@ EOF
 XP=$!
 wait_for "$T/proxy.out" '^proxy: up' 30 "the proxy"
 
-echo "stalltest.sh: the miner mining 4 blocks"
-minera
-wait_for "$T/a.out" 'is the tip at height 4$' 600 "the miner's 4 blocks"
-stop $AP; AP=
+echo "stalltest.sh: the node started while the chain has no block yet"
 minera --no-mine
-
-echo "stalltest.sh: the node syncing through the proxy"
 mkfifo "$T/in"
 ./tools/q32 --net --hostfwd=tcp::$HP-:3738 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
 echo "node -n devrec 10.0.2.2:$PX &" >&3
-wait_for "$T/os.out" '^node: .* the API on port' 900 "the node's sync and its API"
+wait_for "$T/os.out" '^node: .* nothing to sync yet' 900 "the node waiting for a block"
+python3 - "$HP" <<'EOF2'
+import json, sys, urllib.request
+with urllib.request.urlopen(f'http://127.0.0.1:{sys.argv[1]}/v1/status', timeout=120) as r:
+    s = json.loads(r.read())
+print(f'host: the status before any block: height {s["height"]}, activity {s.get("activity")}')
+if s['height'] != 0:
+    sys.exit('stalltest.sh: the status before any block is not at height 0')
+EOF2
 
-echo "stalltest.sh: chunks held; the miner mining block 5"
+echo "stalltest.sh: the miner mining 4 blocks; the node syncing through the proxy"
+stop $AP; AP=
+minera
+wait_for "$T/a.out" 'is the tip at height 4$' 600 "the miner's 4 blocks"
+stop $AP; AP=
+minera --no-mine
+# (the node syncs on its next try, maybe while the miner still mines, and
+# follows it from there: waited for at the miner's last block)
+H=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a.out" | tail -1)
+wait_for "$T/os.out" "^node: .* (synced, height $H\$|height $H  \\()" 900 "the node's sync to $H"
+N=$((H + 1))
+
+echo "stalltest.sh: chunks held; the miner mining block $N (and on)"
 touch "$T/hold"
 stop $AP; AP=
 minera
-wait_while_busy 600 "the node asking for block 5's chunks" test -e "$T/held"
-python3 - "$HP" <<'EOF'
+wait_while_busy 600 "the node asking for block $N's chunks" test -e "$T/held"
+python3 - "$HP" "$N" <<'EOF2'
 import json, sys, urllib.request
 with urllib.request.urlopen(f'http://127.0.0.1:{sys.argv[1]}/v1/status', timeout=120) as r:
     s = json.loads(r.read())
 print(f'host: the status while the chunks are held: activity {s.get("activity")}, block {s.get("activity_height")}, height {s["height"]}')
-if s.get('activity') != 'fetching' or s.get('activity_height') != 5:
-    sys.exit('stalltest.sh: the API was not answered while the node fetched block 5')
-EOF
+if s.get('activity') != 'fetching' or s.get('activity_height') != int(sys.argv[2]):
+    sys.exit(f'stalltest.sh: the API was not answered while the node fetched block {sys.argv[2]}')
+EOF2
 rm "$T/hold"
-wait_for "$T/os.out" '^node: .* height 5  \(' 600 "the node connecting block 5"
-grep -E '^node: .* height 5  \(' "$T/os.out"
-echo "stalltest.sh: the API answered while the node fetched a block"
+wait_for "$T/os.out" "^node: .* height $N  \\(" 600 "the node connecting block $N"
+grep -E "^node: .* height $N  \\(" "$T/os.out"
+echo "stalltest.sh: the API answered before any block, and while the node fetched one"
