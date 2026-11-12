@@ -172,3 +172,51 @@ answering for that time.
 - **The wallet itself answering meanwhile:** its long work cut into
   steps between which it reads its WebSocket, as item 4 for the node,
   so the page can show the spinner and stay usable rather than freeze.
+
+## 6. A node at height 0 (the seeds)
+
+Run as a seed, a node may start before the chain has a block past its
+genesis, or with no peer that has one. Today (`main.fam`), a node with
+no chain in its store syncs first and only then starts the API:
+
+- While every peer is at height 0 it says "nothing to sync yet" and
+  sleeps 30 s between tries; a plain sleep serves nothing, so for that
+  time no ping, no peer list and no image is answered, and there is no
+  API at all.
+- With no peer (none given, none of the seeds' names resolving) it
+  exits; a first sync that stops (no peer answering, another chain, a
+  bad block) exits too.
+
+What it should do: start the API and serve the network at once, at
+whatever height it has (0 with only the genesis); keep asking its peers,
+and taking new ones, from the loop rather than before it; and never exit
+for want of a peer or a block. A seed is then useful from its first
+second (peers, images, its tip), and a wallet on a node still at height
+0 sees "height 0, syncing" rather than no node. To check: `/v1/status`
+and the p2p replies from a node started alone on a fresh chain, then
+from two seeds started together before any block is mined, the first
+block then reaching both.
+
+## 7. How the wallet is set up
+
+The OS is for running the node and its wallet, but the wallet comes to
+exist only when a user opens its window and presses **Create a wallet**
+(or restores from a phrase in Settings). Until then the machine has no
+keys, so nothing can be paid to it, and its message layer has no id.
+Before building more of the setup, work out how it should go:
+
+- **When the key is made.** At the OS's first boot or install (with the
+  user's account, `adduser`), at the node's first start, or at the
+  wallet's first open; and what the user is shown and asked to write
+  down (the 12 words), and when.
+- **Who it belongs to.** One wallet a machine, or one per user account
+  (wm's sessions are per user); what a second user sees.
+- **Restoring.** A machine set up from an existing phrase rather than a
+  new one: at install, or later in Settings, and what happens to a key
+  already made.
+- **Locking.** Whether the wallet is unlocked with the user's login
+  (wm's), with a password of its own, or not at all on a machine only
+  its owner reaches.
+
+Whatever is chosen, the **Create a wallet** button goes: the wallet is
+there when the window opens.
