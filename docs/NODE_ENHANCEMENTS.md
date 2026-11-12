@@ -175,8 +175,16 @@ Progress:
   keeps the last block's parts between blocks. Its heap: 1.8 of 3 MiB.
   Checked by `reorgtest.sh` (blocks connected, the node killed and
   resumed, four blocks undone onto a heavier branch) and `stalltest.sh`.
-  Left: a fast sync's snapshot parts, installed inline; the pool's
-  rebuild after a block; long API answers.
+- (2026-11-12) A fast sync's snapshot by the worker too: its manifest,
+  S's chain proof, each part and the whole (`nsnman`, `nsver`,
+  `nspart`, `nsfin`), the snapshot's state the worker's from first to
+  last. Found on the way: the pool reads what `sconnect` leaves of the
+  block (`bout`, `bnout`, `sfirst`; `qconfs`, `qmvblk`), which were the
+  worker's copies; the worker now hands them back.
+  Left: the pool's recheck after a block (`qcheck`, `qreturn`); API
+  requests answered one at a time; blocks' chunks not served to peers
+  while the worker has a job (`pnest`, kept from the single thread); the
+  short waits for headers and a first ping.
 
 ## 5. The wallet shows what is in progress
 

@@ -157,8 +157,15 @@ dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
 \ mix).  Jobs come on a pipe (a word: 1 connect, 2 undo), their verdict
 \ back on another.  If it cannot be started (cwon 0) the work is done
 \ here, as before.
-\ cwj: +0 the header entry, +4 the body, +8 its length, +C sprchk, +10
-\ the store (stfd), +14 to +20 the times (btb, bts, btp, btc).
+\ Besides, a fast sync's snapshot: its manifest (3: snman, the parts'
+\ count back at +24), S's chain proof (5: sverify), each part (6:
+\ snpart), the whole (7: snfin); the snapshot's state is then the
+\ worker's, from the manifest to the last part.
+\ cwj: +0 the header entry (or the first argument), +4 the body (the
+\ second), +8 its length (the third), +C sprchk, +10 the store (stfd),
+\ +14 to +20 the times (btb, bts, btp, btc), +24 the parts' count, +28
+\ to +34 what a connected block leaves for the pool (qconfs, qmvblk):
+\ bout (in the body, the node's), bnout, sfirst, sfirsth.
 : cwon variable ;  : cwj variable ;  : cwjr variable ;  : cwjw variable ;  : cwvr variable ;  : cwvw variable ;
 : cwk variable ;  : cwb variable ;  : cwm variable ;  : cwp1 variable ;  : cwp2 variable ;
 \ cwinit  on the worker: its own buffers.
@@ -168,7 +175,7 @@ dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
 pwtext @ pwlen @ powinit
 cwj @ 10 lit + @ stin0
 400 lit alloc pin !  40 lit alloc pcs !  40 lit alloc ppub !  40 lit alloc ptmp !  CC lit alloc ppar !
-cvp @ cvinit ;
+sninit  cvp @ cvinit ;
 \ cwput ( kind -- )  a job to the worker (its memory set first).
 : cwput  cwm @ !  cwjw @ cwm @ 4 lit write drop ;
 \ cwait ( -- code )  the worker's verdict, the network and the API served
@@ -185,7 +192,7 @@ cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;
 \ it took).
 : cwstart
 0 lit cwon !
-24 lit malloc cwj !  10 lit alloc cwk !  10 lit alloc cwb !  10 lit alloc cwm !
+38 lit malloc cwj !  10 lit alloc cwk !  10 lit alloc cwb !  10 lit alloc cwm !
 10 lit alloc cwp1 !  10 lit alloc cwp2 !
 cwp1 @ pipe 0< 0=  cwp2 @ pipe 0< 0= and cwj @ 0= 0= and if
 	cwp1 @ @ cwjr !  cwp1 @ 4 lit + @ cwjw !  cwp2 @ @ cwvr !  cwp2 @ 4 lit + @ cwvw !
@@ -195,12 +202,19 @@ cwp1 @ pipe 0< 0=  cwp2 @ pipe 0< 0= and cwj @ 0= 0= and if
 		vrb @ if nhead "the worker: its heap " puts 0 lit alloc s10@ - A lit rshift u. " KiB of 3,072 used" puts 0A lit putc then
 		begin cwjr @ cwk @ 4 lit read 4 lit = while
 			cwj @ 10 lit + @ stfd !
-			cwk @ @ 1 lit = if
+			cwk @ @
+			dup 1 lit = if
 				cwj @ C lit + @ sprchk !  cwj @ @ swk !
 				cwj @ @ cwj @ 4 lit + @ cwj @ 8 lit + @ sconnect
 				0 lit swk !
 				btb @ cwj @ 14 lit + !  bts @ cwj @ 18 lit + !  btp @ cwj @ 1C lit + !  btc @ cwj @ 20 lit + !
-			else sundo 0 lit then
+				bout @ cwj @ 28 lit + !  bnout @ cwj @ 2C lit + !  sfirst @ cwj @ 30 lit + !  sfirsth @ cwj @ 34 lit + !
+			else dup 2 lit = if sundo 0 lit
+			else dup 3 lit = if cwj @ @ cwj @ 4 lit + @ cwj @ 8 lit + @ snman  snr @ snn @ + cwj @ 24 lit + !
+			else dup 5 lit = if cwj @ @ cwj @ 4 lit + @ cwj @ 8 lit + @ sverify
+			else dup 6 lit = if cwj @ @ cwj @ 4 lit + @ cwj @ 8 lit + @ snpart
+			else cwj @ @ snfin then then then then then
+			nip
 			cwb @ !  cwvw @ cwb @ 4 lit write drop
 		repeat
 	]tcode
@@ -225,10 +239,23 @@ cwon @ if
 	sprchk @ cwj @ C lit + !  stfd @ cwj @ 10 lit + !
 	1 lit cwput  cwait
 	cwj @ 14 lit + @ btb !  cwj @ 18 lit + @ bts !  cwj @ 1C lit + @ btp !  cwj @ 20 lit + @ btc !
+	\ what the pool reads of the block (qconfs, qmvblk), as sconnect left it
+	cwj @ @ bh !  cwj @ 28 lit + @ bout !  cwj @ 2C lit + @ bnout !  cwj @ 30 lit + @ sfirst !  cwj @ 34 lit + @ sfirsth !
 else
 	2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !
 then
 0 lit pact ! ;
+\ cwjob ( a b c kind -- r )  a job of three arguments by the worker,
+\ the node serving meanwhile.
+: cwkd variable ;
+: cwjob  cwkd !  cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !  stfd @ cwj @ 10 lit + !  cwkd @ cwput cwait ;
+\ The fast sync's snapshot, by the worker if there is one (nsnp: the
+\ parts' count after the manifest).
+: nsnp variable ;
+: nsnman  cwon @ if 3 lit cwjob cwj @ 24 lit + @ nsnp ! else snman snr @ snn @ + nsnp ! then ;   \ ( m n hS -- code )
+: nsver  cwon @ if 5 lit cwjob else sverify then ;          \ ( hS body n -- flag )
+: nspart  cwon @ if 6 lit cwjob else snpart then ;         \ ( i p n -- code )
+: nsfin  cwon @ if 0 lit 0 lit 7 lit cwjob else snfin then ;   \ ( hS -- code )
 \ nundo  sundo, by the worker if there is one.
 : nundo  cwon @ if stfd @ cwj @ 10 lit + !  2 lit cwput  cwait drop else sundo then ;
 
@@ -342,31 +369,31 @@ ncode @ 0= if
 	nS @ hat dup nblock 0= if drop FFFFFFFB lit nfail else
 		hid nid !
 		2 lit 0 lit nid @ nfetch ?dup if
-			nS @ hat hhdr snman if FFFFFFF8 lit nfail then
+			nS @ hat hhdr nsnman if FFFFFFF8 lit nfail then
 		else drop FFFFFFFB lit nfail then
 	then
 then
 ncode @ 0= if
 	"S's block and its snapshot's manifest fetched; checking its chain proof" nsay vrb @ if 0A lit putc then
 	nS @ 1 lit - hat hhdr shdr
-	nS @ hat hhdr  nblk @ CC lit +  nbn @ CC lit -  sverify 0= if FFFFFFFA lit nfail else
-		"S's chain proof checked (it covers every block before S); snapshot parts: " nsay snr @ snn @ + nsayn
+	nS @ hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsver 0= if FFFFFFFA lit nfail else
+		"S's chain proof checked (it covers every block before S); snapshot parts: " nsay nsnp @ nsayn
 	then
 then
 \ the parts, then the whole
 ncode @ 0= if
 	1 lit nswr !
-	snr @ snn @ + ?dup if 0 lit do
+	nsnp @ ?dup if 0 lit do
 		ncode @ 0= if
 			3 lit i nid @ nfetch over if
-				2dup i -rot snpart if FFFFFFF9 lit nfail else "snapshot part " nsay i 1 lit + nsayn then drop free
+				2dup i -rot nspart if FFFFFFF9 lit nfail else "snapshot part " nsay i 1 lit + nsayn then drop free
 			else 2drop FFFFFFFB lit nfail then
 		then
 	loop then
 then
 \ (the headers to S saved first: once snfin sets the tip, a start finds
 \ them all)
-ncode @ 0= if nS @ nsave  nS @ hat hhdr snfin if FFFFFFF8 lit nfail else "the snapshot's state checked against S" nsay vrb @ if 0A lit putc then then then
+ncode @ 0= if nS @ nsave  nS @ hat hhdr nsfin if FFFFFFF8 lit nfail else "the snapshot's state checked against S" nsay vrb @ if 0A lit putc then then then
 nblk @ ?dup if free 0 lit nblk ! then
 \ the blocks after S, each with its proof
 ncode @ 0= if
