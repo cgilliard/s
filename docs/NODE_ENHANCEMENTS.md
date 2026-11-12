@@ -246,10 +246,11 @@ The layout:
 - **Activity**, **Proofs**, **Names** (registering, offers and transfers,
   sub-names; no longer "Your names"), **Settings**: as now.
 - **Burn:** a tab of its own (it is under Send now).
-- **Slates**, under an **Advanced** tab: paying by slate, answering one,
-  finalizing an answer, each by copy and paste or a file in your home
-  (the Receive tab's and Send tab's slate sections today). The Receive
-  tab goes: its address moves to Overview.
+- **Advanced:** every slate flow, in one tab: paying by slate,
+  answering one, finalizing an answer, each by copy and paste or a file
+  in your home (the Receive tab's and Send tab's slate sections today).
+  Most users never use slates, so none of them appears elsewhere. The
+  Receive tab goes: its address moves to Overview.
 
 ## 9. The wallet's status: one model
 
