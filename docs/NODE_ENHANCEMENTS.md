@@ -1,9 +1,11 @@
 # Node enhancements
 
 Work planned for the fam OS node (`node/`) and its wallet, beyond what
-`docs/NODE.md` and `docs/GUI_WALLET.md` describe as built.
+`docs/NODE.md` and `docs/GUI_WALLET.md` describe as built. Item 1 is a
+requirement before any `consensus.txt` lists more than 16 relays; the
+rest are in no particular order.
 
-## 1. As many relays as tabminer takes
+## 1. As many relays as tabminer takes (required past 16 relays)
 
 tabminer reads a `consensus.txt` of up to 8,192 relays and 1 MiB
 (`consensus::MAX_RELAYS`, `MAX_CONSENSUS`). The fam node and its wallet
@@ -57,3 +59,57 @@ What it takes:
    `wonion_vectors.fam`). `onitest.sh` with more than 16 relays pinned
    would need that many tabminer relays; 20 is enough to cross today's
    limit.
+
+## 2. The node in place of `server.py`
+
+The fam node already serves the image it booted (`docs/TABERNACLE.md`,
+"The node serving its image"; `docs/NODE.md`, step 9): `p2p.fam` answers
+`Ping`, `GetPeers`, `GetImages` and `GetImage` as `server.py` does, from
+`/dev/image`, and `scripts/imagetest.sh` boots a tabernacle from a node
+with no `server.py` anywhere. What `server.py` still does that the node
+does not, before the seeds can run a node alone:
+
+- **More than one version.** `server.py` serves several images
+  (`VERSION=FILE ...`), so tabernacles built for an older image still
+  boot while the network moves to a newer one. The node serves only the
+  version it booted. It should keep the images of other versions it has
+  (fetched from peers, as tabernacle fetches, or put on its disk) and
+  serve each, so an upgrade does not strand the tabernacles of the old
+  version.
+- **Validation.** `server.py` checks nothing ("tabernacle checks what it
+  gets"); a node serving images it did not boot must check each before
+  serving it: its size and Gimli-Hash against what a tabernacle for that
+  version expects (the values `build.sh` patches in), so a node never
+  hands out an image that every tabernacle will then refuse.
+- **Peers to hand out.** `server.py --peer` lists fixed addresses; the
+  node hands out the peers that answered it. On a seed that is what is
+  wanted, but it should be checked at scale: enough peers, and ones that
+  serve the image.
+- **Tried on a seed.** Run a node on a seed in place of `server.py`, with
+  tabernacles booting from it alone, from it and other nodes, and with a
+  peer serving a corrupted image (the case `server.py` was tried with,
+  `docs/TABERNACLE.md`), before `server.py` becomes only the backup.
+
+## 3. More than one node on a host
+
+`scripts/makenode.sh` and `scripts/node.sh` default to one node:
+the disk `node/data/node.img`, the built-in seeds, and QEMU's defaults
+for the MAC and the forwarded ports. `--disk`, `--mac` and `--hostfwd`
+exist, but running several nodes means choosing each by hand, and a
+mistake (two nodes on one disk, or on one forwarded port) fails late and
+unclearly. What it takes:
+
+- **An instance name.** `makenode.sh --name=N` and `node.sh --name=N`:
+  the disk `node/data/N/node.img`, a MAC derived from the name, and the
+  node's ports forwarded to host ports given once (`--port=P`: UDP P for
+  the p2p port, TCP P+1 for wm, P+2 for the API, as the node's
+  `api-port`), written to
+  `node/data/N/config` by `makenode.sh` so `node.sh --name=N` needs
+  nothing else. With no name, today's defaults.
+- **Refuse a clash at start.** `node.sh` takes a lock on the instance's
+  directory (QEMU locks the disk too, but its message is unclear) and
+  checks that its host ports are free before booting.
+- **A test.** Two or three instances from `makenode.sh`, booted together
+  and syncing from each other (no test runs more than one fam node
+  today: `peertest.sh` runs one with two tabminers).
+
