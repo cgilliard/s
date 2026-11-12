@@ -589,3 +589,46 @@ and check headers from it:
 (oscheck's proof-of-work vectors, and a header with each byte changed);
 a dataset with one item changed caught; the build interrupted and
 resumed; the time per header with each, recorded in `docs/NODE.md`.
+
+## 17. Logging in at the console; the desktop by a link
+
+Today `init` keeps a root shell on the console (or runs `login` when
+`/etc/init` says so), and wm's page asks for a name and password before
+the desktop (`docs/GUI_WALLET.md`, Logging in). Instead:
+
+- **The console logs in.** `login` on the console at every boot, so
+  nothing runs as root unasked. A first login needs a password to
+  exist: a default root password (printed, and required to change at
+  the first login, as `passwd` does), or a first boot that asks for one
+  at the console before anything else (the same first run as item 7's
+  wallet setup), or another mechanism; to decide.
+- **wm is not a login.** After logging in at the console, the user is
+  shown a link, `http://127.0.0.1:8080/?<token>`: a token made at random
+  for that login, which wm takes in place of a name and password and
+  ties to that user (the desktop, its terminals and the wallet run as
+  them). The link printed again on request (a command), and a new
+  token at each login, the old one no longer taken. wm's login form
+  (`wm-login.html`) goes; a page opened with no token or a stale one
+  says to log in at the console.
+- **The wallet's password.** Today the wallet's key comes from the
+  login password that wm keeps for the session (`docs/GUI_WALLET.md`).
+  With no password typed into wm, the wallet needs another way to be
+  unlocked: its own password asked in the page, or the console's login
+  handing it on. To decide with item 7.
+- **The port forwarded by default.** `scripts/node.sh` forwards the
+  host's `127.0.0.1:8080` to wm's port 80 unless told otherwise (an
+  option for another host port, and for none), bound to localhost only
+  since the page travels in plain HTTP. The host port is passed into
+  the guest (the boot's configuration, or QEMU's firmware configuration)
+  so the link printed carries the port that actually reaches wm. With
+  more than one node on a host (item 3), each its own port.
+- **`su`.** `su [NAME]` at a terminal: the password of NAME (root by
+  default) asked and checked against `/etc/passwd`, then NAME's shell
+  until it exits, back to the first user. Built on what `login` and
+  `runas` already do (`/proc/self/user`), with root not asked.
+
+**Tests:** in oscheck, a boot that logs in at the console and prints
+the link; the page opened with that token gets the desktop as that user,
+with no token or a wrong or old one gets nothing; the link's port the
+one forwarded; `su` to another user and back, refused with a wrong
+password.
