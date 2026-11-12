@@ -300,7 +300,9 @@ reads the node though only root can read the token
   `/dev/random`.
 
 - **Reading:**
-  - `GET /v1/status`: height, tip, work, sync progress, peers, version.
+  - `GET /v1/status`: height, tip, work, sync progress, peers, version,
+    and what the node is doing (`activity`: `fetching` or `connecting`
+    block `activity_height`, else `idle`).
   - `GET /v1/header/<height|id>`, `GET /v1/block/<height|id>`: a block,
     decoded, or raw with `?raw`.
   - `GET /v1/outputs?from=<position>&count=<n>`: outputs in position
