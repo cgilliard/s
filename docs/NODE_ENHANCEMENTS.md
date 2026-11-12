@@ -203,23 +203,14 @@ The OS is for running the node and its wallet, but the wallet comes to
 exist only when a user opens its window and presses **Create a wallet**
 (or restores from a phrase in Settings). Until then the machine has no
 keys, so nothing can be paid to it, and its message layer has no id.
-Before building more of the setup, work out how it should go:
 
-- **When the key is made.** At the OS's first boot or install (with the
-  user's account, `adduser`), at the node's first start, or at the
-  wallet's first open; and what the user is shown and asked to write
-  down (the 12 words), and when.
-- **Who it belongs to.** One wallet a machine, or one per user account
-  (wm's sessions are per user); what a second user sees.
-- **Restoring.** A machine set up from an existing phrase rather than a
-  new one: at install, or later in Settings, and what happens to a key
-  already made.
-- **Locking.** Whether the wallet is unlocked with the user's login
-  (wm's), with a password of its own, or not at all on a machine only
-  its owner reaches.
-
-Whatever is chosen, the **Create a wallet** button goes: the wallet is
-there when the window opens.
+Decided: the wallet is made at the first boot, at the console, with the
+user's account (item 17, The first boot): restored from a phrase typed
+there, or made new and its 12 words shown there to be written down. It
+belongs to that account, and is unlocked by its login (no password of
+its own). The **Create a wallet** button goes: the wallet is there when
+the window opens. Still to settle: what a second account (`adduser`)
+gets, a wallet of its own or none.
 
 ## 8. The wallet's window: payments by address first
 
@@ -597,13 +588,31 @@ Today `init` keeps a root shell on the console (or runs `login` when
 the desktop (`docs/GUI_WALLET.md`, Logging in). Instead, one login at
 the console, one password, and a link that opens the desktop once.
 
-### The console logs in
+### The first boot
 
-`login` on the console at every boot, so nothing runs as root unasked.
-A first login needs a password to exist: a default root password
-(printed, and required to change at the first login), or a first boot
-that asks for one at the console before anything else (the same first
-run as item 7's wallet setup); to decide.
+After `scripts/node.sh` starts a fresh disk, the console asks, before
+anything else:
+
+1. **Set password:** the password of the machine's user account (a
+   fixed name, as `ubuntu` on Ubuntu; the name to choose), typed twice.
+   The account is an ordinary user, not root, and root gets **no
+   password**: it cannot log in, and administration goes through `sudo`
+   (item 18), as on most systems now.
+2. **Recover a wallet?** Yes: the 12 words typed at the console,
+   checked (the checksum), and the wallet rescans the chain once the
+   node has synced. No: a new phrase made and its 12 words shown,
+   written down, and confirmed ("I have written them down") before
+   going on. Either way the phrase is stored encrypted under the
+   password from step 1, so the wallet is ready before wm starts.
+3. **The link:** the account logged in, and
+   `http://127.0.0.1:8080/?<token>` shown (The desktop by a one-time
+   link, below).
+
+### Later boots and logins
+
+`login` on the console at every boot, so nothing runs as root unasked:
+the account's name and password, then a new link. No setup questions;
+the wallet unlocks from that login.
 
 ### One password: the user's login
 
@@ -619,17 +628,11 @@ The password typed at the console is the only one the user has. It:
   gives the whole wallet away, so a stolen session cookie or a
   malicious page holding the session still cannot reach it without the
   password. Wrong tries slowed (each check takes the key's derivation,
-  about 1.4 s, and a few wrong ones in a row add a wait). Changing the
-  password (`passwd`) asks the old one too, as any `passwd` does, and
-  re-encrypts the phrase in the same step.
-
-**The phrase at the first login.** The first time the desktop opens
-after the password is made (the first boot, item 7), the wallet has just
-been created and the page shows its phrase straight away, with no
-password asked (it was typed moments ago): written down, the user says
-so ("I have written it down"), and the desktop follows. Until then the
-phrase stays on screen; leaving without confirming shows it again at the
-next login. After that, only the tab shows it, behind the password.
+  about 1.4 s, and a few wrong ones in a row add a wait). The page never
+  shows the phrase unasked: a new one is shown once, at the console, at
+  the first boot. Changing the password (`passwd`) asks the old one too,
+  as any `passwd` does, and re-encrypts the phrase in the same step;
+- **is the one `sudo` asks** (item 18).
 
 ### The desktop by a one-time link
 
@@ -673,26 +676,63 @@ only root reads `/etc/passwd`, and only root writes `/proc/self/user`.
   as the user, derives the key from the password the page sends and
   decrypts the phrase (ChaCha20-Poly1305): the tag checking is the
   password checked. No `/etc/passwd`, no root.
-- **`su` and a user's own `passwd` need root:** a **setuid bit.** A
+- **`su`, `sudo` and a user's own `passwd` need root:** a **setuid bit.** A
   file marked so, and owned by root, runs as root (the kernel, at
   `spawn`, sets the process's user to the file's owner; `chmod` sets the
-  mark, root only). Only `su` and `passwd` have it, each written to
+  mark, root only). Only `su`, `sudo` (item 18) and `passwd` have it, each written to
   trust nothing from its caller but the typed password.
-- **`su [NAME]`:** NAME's password (root by default) asked and checked
-  (`pwfind`, `pwok`), then NAME's shell until it exits, back to the
-  first user; root is not asked.
+- **`su NAME`:** NAME's password asked and checked (`pwfind`, `pwok`),
+  then NAME's shell until it exits, back to the first user; root is not
+  asked. Root has no password, so `su` cannot become root: `sudo -s`
+  does.
 - **`passwd`** with no name: the user's own, the old password asked
   first; `passwd NAME` stays root's.
 
 ### Tests
 
-In oscheck: a boot that logs in at the console and prints the link; the
+In oscheck: a first boot that sets the password, makes a wallet (and
+one that recovers a given phrase, the same address as tabminer's from
+it) and prints the link; root refused at `login`; a later boot that
+logs in at the console and prints a new link; the
 page opened with that token gets the desktop as that user, unlocked; the
 same token a second time, no token, or a wrong one gets nothing; a
 request with another `Host`, or a WebSocket from another `Origin`,
 refused; the link's port the one forwarded; `su` to another user and
-back, refused with a wrong password; the first desktop showing the
-phrase until confirmed, then not again; the Recovery phrase tab showing
+back, refused with a wrong password; the Recovery phrase tab showing
 it with the password and refusing a wrong one; a user's `passwd` changing their password and the
 wallet still opening with the new one; a program without the setuid
 mark refused `/etc/passwd` as now.
+
+## 18. `sudo`
+
+Root has no password (item 17): it cannot log in, and `su` cannot
+become it. Administration goes through `sudo`, as on most systems now:
+
+- **`sudo COMMAND [ARGS...]`:** the caller's own password asked and
+  checked (`pwfind`, `pwok`), then COMMAND run as root, waited for, its
+  status `sudo`'s. **`sudo -s`:** a root shell.
+- **Who may:** the members of an `admin` group (`/etc/group`); the
+  account made at the first boot is one, an account from `adduser` is
+  not unless added. Anyone else refused, and the refusal logged.
+- **How:** setuid (item 17, Checking a password): `sudo` is owned by
+  root and marked, so it runs as root, reads `/etc/passwd` and
+  `/etc/group`, and becomes root's child for COMMAND (as `runas` does).
+  It trusts nothing from its caller but the typed password: the
+  command run by its full path or looked up in a fixed path, not the
+  caller's.
+- **Remembered for a while:** after a right password, the same user on
+  the same terminal is not asked again for 5 minutes, as `sudo`
+  usually does; `sudo -k` forgets it.
+- **Wrong tries:** each check takes the password's derivation (about
+  1.4 s), three wrong ones end `sudo` with a wait, and every refusal is
+  logged.
+- **A lost password:** with no root password, nothing on the machine
+  resets it. The way back is a new disk (`scripts/makenode.sh`) and the
+  wallet recovered from its phrase at the first boot; said in the docs
+  where the password is set.
+
+**Tests:** in oscheck, the first account's `sudo` running a command as
+root (`id` showing root) with the right password, refused with a wrong
+one; a second account, not in `admin`, refused with its right one; the
+5 minutes taken (a second `sudo` not asking), and `sudo -k` asking
+again; `sudo -s` and exit back to the user.
