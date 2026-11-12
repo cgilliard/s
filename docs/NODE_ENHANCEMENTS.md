@@ -503,3 +503,46 @@ millions of unspent outputs; then, on both the node and tabminer:
    stops serving.
 4. The numbers recorded (time per block, per part, peak memory) in
    `docs/NODE.md`, so a regression shows.
+
+## 15. A full mempool: 15 to 20 transactions a second
+
+Neither the node nor tabminer has been run with a steady stream of
+transactions. At 15 to 20 a second, a 600 s block interval sees 9,000
+to 12,000 transactions, far more than a 2 MB block takes, so the pools
+fill and stay full: the fee policy (`docs/FEES.md`: the rolling
+minimum, the protected oldest, the aged reserve, eviction of the
+lowest-paying) works all the time, not only at the edges. To check:
+
+- **Keeping up.** Every transaction arriving is decoded and its
+  signatures checked (Dilithium; the node's `pool.fam`, `xverify` per
+  input) before it is taken or refused. On the node, inside its one
+  loop (item 4) on an emulated 32-bit CPU: whether it checks 20 a second
+  at all, and what it drops, delays or stops answering when it cannot.
+  Refusing cheaply first (the fee below the minimum, an input already
+  spent in the pool, a duplicate) before any signature.
+- **The sizes.** tabminer's pool holds 64 MiB (`DEFAULT_CAPACITY`); the
+  node's 512 transactions and 4 MiB (`QSLOTS`, `QBYTES`), so it is full
+  in under a minute and evicts from then on. Its eviction, the
+  minimum fee it then reports, and its fee estimates should agree
+  with tabminer's closely enough that a wallet on either pays a fee
+  that confirms.
+- **Relay.** Each transaction announced to and fetched by every peer:
+  the bandwidth, the duplicates, and that a transaction one node evicted
+  is not fetched again from the next peer straight away (a loop).
+- **Blocks meanwhile.** A new block removes hundreds of transactions
+  and makes others invalid (their inputs spent): the pool's rebuild at
+  that size, and on a reorganization the transactions returned to it.
+  tabminer's block assembly from a full pool, the template refreshed
+  without stalling mining.
+- **The wallet.** A payment made while the pool is full: its fee
+  estimate, a bump (replace by fee) when it does not confirm, and its
+  status shown correctly while it waits (item 9).
+
+**Tests:** a generator on the dev network (many wallets, or one with
+many outputs, spending at a set rate with varied fees) feeding tabminer
+and a fam node, several of each, for an hour or more. Checked: every
+node's pool consistent with the fee policy, the highest-paying
+transactions confirmed first, nothing valid lost from every pool at
+once, the node answering pings and the API throughout, memory within
+its budget; the rate each sustains recorded in `docs/NODE.md`. Then the
+same at twice the rate, to see what gives first.
