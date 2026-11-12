@@ -113,3 +113,62 @@ unclearly. What it takes:
   and syncing from each other (no test runs more than one fam node
   today: `peertest.sh` runs one with two tabminers).
 
+
+## 4. Nothing blocks the node's loop
+
+The node is one loop (`main.fam`: `aserve`, the network, sync and the
+API in turn), so whatever runs inline stops everything else: peers go
+unanswered, the API times out, and a large block freezes the node for as
+long as it takes. Proof checking already runs elsewhere: `nodev`
+(`vmain.fam`), a process of its own, with the node serving the network
+and the API while it waits (`sync.fam`'s `vwait`). The rest of a block
+runs inline:
+
+- **A header's proof of work.** The work is over the 1.29 MB seed file;
+  the dev network's logs show 4 to 10 s per header (`the best's work
+  checked in 9.85 s`), and a sync checks many.
+- **A block's body.** Fetched in chunks, the node waiting on them.
+- **The state.** Its spends, outputs and names applied, the manifest
+  and snapshot parts written, in one store transaction: grows with the
+  block's size.
+- **The store's commit**, and pruning.
+- Likely others: a snapshot's install in fast sync, a pool rebuilt after
+  a reorganization, a large API answer written at once.
+
+What it takes:
+
+1. **Find every place.** Time each step of a block and of every request
+   (the node's log already times a block's steps: `fetch`, `body`,
+   `state`, `proof`, `store`), and a probe that pings the node and asks
+   the API throughout a sync of large blocks: the longest it goes
+   unanswered is the measure. Fix every step over, say, 100 ms.
+2. **Move work out or cut it up.** Pure computation goes to `nodev` (or
+   a second worker) as proofs did: the proof of work first. Work on the
+   store is cut into steps of bounded size the loop takes in turn (the
+   block's outputs a few hundred at a time), with the state readable as
+   of the last block meanwhile (transactions of their own, as `vwait`
+   already keeps the API's).
+3. **A test.** A chain of large blocks (the most outputs and names a
+   block takes), synced while a probe pings and asks the API: no answer
+   later than the bound.
+
+## 5. The wallet shows what is in progress
+
+The wallet's page (`wm.html`) sends a request (`wask`) and shows nothing
+until the answer comes: a long one (an online send, which waits on the
+recipient; `@label.name` resolving; a rescan; a name commit or reveal;
+the first sync after unlocking) looks stuck, and a button pressed again
+sends it twice. The wallet process blocks too while it works (a
+Dilithium signature, a slate, a rescan), so its WebSocket stops
+answering for that time.
+
+- **A spinner on each request in progress:** on its button (disabled
+  meanwhile, so it is not sent twice) from the request until its answer,
+  and on its line in Activity for the long ones until their final event
+  (an online send until finalized or failed, a resolve until paid).
+- **Progress where it is known:** a rescan's height of the tip, the
+  blocks a name commit has left before its reveal, the step of an online
+  send (sent, reached the recipient's point, answered, finalized).
+- **The wallet itself answering meanwhile:** its long work cut into
+  steps between which it reads its WebSocket, as item 4 for the node,
+  so the page can show the spinner and stay usable rather than freeze.
