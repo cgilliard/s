@@ -296,4 +296,31 @@ debugging.
   sub-name given or withdrawn, a certificate held, a name offer
   received or taken, a payment cancelled or bumped, the wallet going
   online or offline, a failed resolve; and each entry's details on a
-  click (the transaction, the fee, the proof).
+  click (the transaction, the fee). Proofs are not shown here: item 11.
+
+## 11. Proofs: the payments that have one, in the Proofs tab
+
+Payment proofs (`docs/PROOFS.md`) belong in the Proofs tab, not as an
+action on an Activity entry. The tab today checks a proof given to it;
+it should also list this wallet's own, below that, scrolling:
+
+- **What can be listed.** A proof is made against the state as it stood
+  at the paying block, which a node rebuilds only within its undo window
+  (1,008 blocks, about a week, by default; any block on an archive
+  node). So the wallet makes and keeps a proof when the payment confirms;
+  once made, checking it needs only the header, for good. The list is
+  every sent payment and burn with a proof kept, newest first; each
+  shows its amount, recipient (or the burn's purpose), date, and its
+  proof to copy or save, as text or a file in your home.
+- **One not made yet.** A payment confirmed while the wallet was offline
+  has no proof until the wallet makes one, and can be made only while
+  its block is in the node's undo window. List those first, with how
+  long is left ("can be proven for 5 more days"), made at once when the
+  wallet is online; one past its window is listed as no longer provable,
+  and why.
+- **Check the fam node's side.** That the fam wallet makes and keeps the
+  proof at confirmation as tabminer's does (`wrcpt+` keeps the receipt;
+  the path is the node's), what the fam node's undo window is, and that
+  a proof the fam wallet makes checks in tabminer's `proof verify` and
+  the other way round.
+
