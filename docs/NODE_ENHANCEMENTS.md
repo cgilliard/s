@@ -736,3 +736,60 @@ root (`id` showing root) with the right password, refused with a wrong
 one; a second account, not in `admin`, refused with its right one; the
 5 minutes taken (a second `sudo` not asking), and `sudo -k` asking
 again; `sudo -s` and exit back to the user.
+
+## 19. `node.sh` as a node program, not a QEMU wrapper
+
+`scripts/node.sh`'s options are QEMU's: `--disk`, `--mac`,
+`--hostfwd=udp::3737-:3737`, `--smp`, a boot program's path. To run a
+node a user has to know QEMU's networking, the guest's ports and which
+to forward; the defaults leave the node unreachable (nothing forwarded,
+so no peer can reach it and the host cannot reach its API or wm) and on
+one hart. It should read like `tabminer`: options about the node, QEMU
+an implementation detail.
+
+- **Options in the node's terms**, mapped to QEMU and to the guest's
+  `/etc/node/config` by the script:
+
+  | Option | Default | What it does |
+  |---|---|---|
+  | `--name=N` | none | the instance (item 3): its directory, disk, MAC, ports, config |
+  | `--network=mainnet\|dev\|dev-recursive` | mainnet | as tabminer's |
+  | `--p2p-port=P` | 3737 | UDP P on the host to the node's p2p port, so peers can reach it; `--no-listen` for outbound only |
+  | `--api-port=P` | 3738 | the node's API on the host's `127.0.0.1:P`; `--api-bind=ADDR` to expose it |
+  | `--wm-port=P` | 8080 | the desktop on `127.0.0.1:P` (item 17), passed in for the link |
+  | `--peer=HOST:PORT`, `--seed=...`, `--no-seeds` | the built-in seeds | as now and as tabminer's |
+  | `--threads=N` | the host's cores, up to the kernel's limit | harts (QEMU's `-smp`) |
+  | `--datadir=DIR` | `node/data` (or `~/.famnode` once installed) | where instances live |
+
+  `--hostfwd`, `--mac` and the boot program stay, as advanced options.
+- **A config file on the host** (`DIR/N/config`, as item 3), the same
+  options one a line, so a node started once is started again with
+  `node.sh --name=N` or nothing; command-line options override it.
+- **Checked before booting:** QEMU present and new enough, the image
+  built (or fetched, item 2), the ports free (a tabminer on 3737 is the
+  common clash: a clear message naming the port and `--p2p-port`), the
+  instance not already running (item 3).
+- **A clean stop.** Ctrl-C (or SIGTERM) today kills QEMU at once,
+  possibly mid-write of the store. Instead the script asks the node to
+  stop (the guest's `/proc/halt` after the node commits, e.g. through
+  the API or the console), waits for QEMU to exit, and kills it only if
+  it does not within a bound. Item 13's mid-write kill test covers the
+  case where this cannot happen.
+- **Its output:** the console is the user's (item 17's login), so the
+  script's own lines are short and few: the instance, the ports, where
+  the log is; the node's log written to `DIR/N/node.log` as well as the
+  console, rather than lost in the console's scroll.
+- **Help and errors** worded for a node's user (`--help` listing the
+  options above, not QEMU's), and a `--version`.
+- **Maybe a name of its own:** `famnode` (installed, or a symlink) in
+  place of `scripts/node.sh`; the script kept for development.
+
+Not a daemon: the node runs in the foreground of its terminal, as now;
+a user who wants it in the background uses their system's means
+(`systemd`, `tmux`).
+
+**Tests:** `node.sh --help` and a bad option; a start with a taken
+port refused with its message; two instances by `--name` on one host
+(with item 3); the forwarded ports reaching the node (a ping on the p2p
+port, `/v1/status` on the API); a SIGTERM during a sync leaving a store
+that opens at the last committed block.
