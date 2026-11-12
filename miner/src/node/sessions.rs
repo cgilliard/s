@@ -74,7 +74,7 @@ const MAX_OBJECT_DOWNLOADS_PER_PEER: usize = 4;
 /// Sessions a relay holds by default; more are refused (`--max-sessions`).
 pub const MAX_SESSIONS: usize = 10_000;
 /// How long a sender waits on one rendezvous point before the next.
-const POINT_TIMEOUT: Duration = Duration::from_secs(8);
+const POINT_TIMEOUT: Duration = Duration::from_secs(40);
 /// Sends in progress at once.
 const MAX_SENDS: usize = 64;
 /// Notes queued for the wallet; more are dropped.

@@ -79,8 +79,8 @@ senders already try the points in turn, and a lookup at one without the
 session costs a hop or two more. Three times fewer circuits, sessions and
 announces held, at the cost of a moment unreachable while that circuit is
 rebuilt. A dead hop is noticed when the relays' channel to it fails:
-within about 40 s on the side that sends the channel's keepalives (a
-frame unanswered for 15 s), within two minutes on the side that only
+within about 55 s on the side that sends the channel's keepalives (a
+frame unanswered for 30 s), within two minutes on the side that only
 listens (two minutes of silence), then rebuilt at once. Shortening the
 relays' own channel timeouts would bring that down, at a cost shared by
 every circuit over the channel.

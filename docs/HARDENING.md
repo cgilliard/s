@@ -323,7 +323,7 @@ Found while building it (2026-11-01).
   would pace rather than cut.
 - **A lost acknowledgement duplicates a payload.** A recipient's point
   reports a delivery offline when `Received` does not come back within
-  5 s, and the sender's point tries the recipient's next point; if the
+  30 s, and the sender's point tries the recipient's next point; if the
   payload did arrive, the recipient may get it twice. Harmless for
   slates: a stage-1 slate is answered twice, the sender finalizes the
   first answer and refuses the second, whose output `prune` removes.

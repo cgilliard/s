@@ -118,14 +118,24 @@ const NO_CERT: u8 = 13;
 const DELEGATION_EVERY: Duration = Duration::from_secs(10);
 
 /// How long a return route is kept.
-const ROUTE_LIFETIME: Duration = Duration::from_secs(120);
+const ROUTE_LIFETIME: Duration = Duration::from_secs(300);
 /// Return routes a relay keeps; more are refused.
 const MAX_ROUTES: usize = 10_000;
 
 /// How long a recipient's point waits for `Received` after a `Deliver`.
+/// Generous: a recipient on a slow link (a satellite's, a second's round
+/// trip under load) or a slow machine (the fam OS, every cell's layers in
+/// software) is alive, and failing its payment costs far more than a stale
+/// session's wait does (`docs/ONION.md`, timeouts).
+#[cfg(not(test))]
+const ACK_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const ACK_WAIT: Duration = Duration::from_secs(5);
 /// How long a sender's rendezvous point waits on one of the recipient's:
 /// longer than [`ACK_WAIT`].
+#[cfg(not(test))]
+const ASK_TIMEOUT: Duration = Duration::from_secs(40);
+#[cfg(test)]
 const ASK_TIMEOUT: Duration = Duration::from_secs(12);
 /// Questions out to other rendezvous points at once.
 const MAX_ASKS: usize = 4096;

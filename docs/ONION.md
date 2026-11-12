@@ -514,13 +514,13 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
    channel gives up, and keep a spare circuit to each point.
 
    Done (2026-11-01), but for the spare circuit (`node/participant.rs`):
-   a keepalive unanswered for 10 s marks the circuit dead and it is built
+   a keepalive unanswered for 30 s (10 s until 2026-11-11) marks the circuit dead and it is built
    again at once (around the dead hop, by chance of the random hops); each
    standing circuit is replaced after a random two to four hours, the new
    one built and the session moved onto it (the point holds one session
    per id, so the new circuit's announce takes it over) before the old
    one is closed, without a new Kyber key. A dead hop is still noticed
-   only at the next keepalive, up to 30 s and 10 more; a spare circuit
+   only at the next keepalive, up to 30 s and 30 more; a spare circuit
    per point would cut that to nothing and is left for later.
 8. **Traffic analysis.** Padding cells and cover traffic, a tag per
    layer against tagging, and a minimum number of relays (and of
@@ -643,9 +643,10 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      sequence number, everything received below `ack` and a 64-bit
      bitmap past it, the body sealed under the nonce `0 ‖ seq` (ack-only
      frames under `1 ‖ n`), at most 1,178 bytes of body per datagram. A
-     frame is resent as the very bytes first sent, after 0.4 s doubling
-     to 5 s; a frame unacknowledged 15 s after it was first sent (or after
-     twelve tries) ends the channel; at most 64 are
+     frame is resent as the very bytes first sent, after a wait that
+     follows the measured round trip (1 s before one is measured, 0.4 s
+     at least) doubling to 5 s; a frame unacknowledged 30 s after it was
+     first sent (or after twelve tries) ends the channel (see Timeouts); at most 64 are
      in flight, none past the oldest unacknowledged by 64 or more;
      bodies are delivered in order; the initiator keeps the channel alive
      every 30 s, and two minutes of silence ends it. A relay takes no
@@ -667,7 +668,7 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      Messages span cells (999 bytes each). Circuit numbers are per
      channel, the opener's half and the other's half apart. A channel
      that closes ends every circuit over it, and each hop passes the
-     `Destroy` on; a circuit not built in 30 s is given up.
+     `Destroy` on; a circuit not built in 60 s is given up.
    - 4d. Done (2026-11-01): `node/rendezvous.rs`. At the last hop of a
      participant's circuit: `Session(id)` answered by `SessionState(id,
      nonce, seq)`, the nonce this relay's SipHash of the circuit and the
@@ -676,7 +677,7 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      `GetAnnounce(id)` answered by `Announce` or `Notice(offline)`;
      `Send(payload)` answered by `Notice(forwarded or offline)`, the
      recipient getting `Deliver(payload)` down its circuit and answering
-     `Received(object)` (forwarded is reported only then, within 5 s;
+     `Received(object)` (forwarded is reported only then, within 30 s;
      hardening, 2026-11-02, protocol 7). Between
      rendezvous points, `Rendezvous` cells on circuit number 0 of their
      mutual channel, taken only from a listed relay: `Lookup(id)` →
@@ -684,7 +685,7 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      `Result(forwarded or offline)`. A sender's point asks the
      recipient's points in the order the id gives them, answering at
      once when it is one of them and holds the session, and moves to
-     the next on offline or after 12 s; a relay serves sessions only for
+     the next on offline or after 40 s; a relay serves sessions only for
      ids whose points include it.
    - 4e. Done (2026-11-01): `node/participant.rs`. While an onion-mode
      file is in force a node with a wallet keeps a circuit to each of its
@@ -697,11 +698,30 @@ Smaller gaps, and the details of these, are in `docs/HARDENING.md`
      after 3 s; a point that refuses is left for a minute. A send goes
      over a live circuit picked at random: `GetAnnounce` unless the
      wallet gave the recipient's announce, then `Send`, and the wallet
-     is told delivered or why not (30 s at most, waiting for a circuit
+     is told delivered or why not (120 s at most, waiting for a circuit
      included). Delivered payloads are opened as in init mode. Back in
      init mode the circuits are closed and the init-mode sessions come
      back. The wallet's side (`send` to an address or `@name`, answering
      and finalizing) is unchanged: the node picks the mode.
+   - **Timeouts** (2026-11-11). Two kinds, set apart. A deadline on an
+     operation fails a participant that is slow but alive, so it is
+     generous: a recipient's point waits 30 s for `Received`, a sender's
+     point 40 s on each of the recipient's points (init mode's sender as
+     long), a circuit has 60 s to be built, a send 120 s, a delivered
+     payload's circuit is held 180 s for the answer and a return route
+     kept 300 s, a handshake's pieces 30 s. A liveness check moves
+     traffic off a dead link, so it follows the link instead of growing:
+     the channel's resend wait tracks the round trip (RFC 6298), and a
+     channel or circuit is taken for dead after 30 s unanswered. The
+     earlier values (5, 12, 8, 30, 30, 60, 120, 10 s; resends from a
+     fixed 0.4 s; dead after 15 s and 10 s) were set for datacenter
+     links: a geostationary satellite's round trip is 600 ms or more,
+     a second under load, and the fam OS takes about 330 ms per cell in
+     software, so a 16-cell payload's `Received` came after 5 s and the
+     payment failed though the recipient was there. The cost: a send to
+     a recipient whose point holds a stale session waits up to 40 s on
+     that point rather than 12 s. These are relay rules, not consensus;
+     mixed versions work, an older relay keeping its tighter limits.
 5. **Docs.** Done (2026-11-01): the README's "Message layer" section
    and payments by address or `@name`; the message layer's cryptography,
    what each party learns and its gaps in `miner/SECURITY.md`; the gaps

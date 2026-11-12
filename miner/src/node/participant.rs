@@ -89,7 +89,7 @@ const REBUILD_WAIT: Duration = Duration::from_secs(3);
 /// Random hops before the rendezvous point.
 const HOPS: usize = 2;
 /// A keepalive unanswered this long means the circuit is dead.
-const DEAD_AFTER: Duration = Duration::from_secs(10);
+const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// A circuit is replaced after this, plus up to as much again at random.
 const ROTATE_EVERY: Duration = Duration::from_secs(2 * 3600);
 /// An old circuit is closed once the session is live on its replacement,
@@ -103,7 +103,7 @@ const AVOID: Duration = Duration::from_secs(300);
 /// list the stale one, so it is not struck, only left alone.
 const WRONG_KEY_AVOID: Duration = Duration::from_secs(3600);
 /// A send not answered by then fails; it waits as long for a circuit.
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// After a first "offline" for a send, how long before asking again: a
 /// recipient's sessions move (rebuilt around a relay that stopped, or to
 /// a new point), and a lookup between two can find none.
@@ -120,7 +120,7 @@ const MAX_OUTBOUND: usize = 8;
 /// A ready outbound circuit unused this long is replaced.
 const OUTBOUND_IDLE: Duration = Duration::from_secs(600);
 /// How long a delivered payload's circuit is held open for its answer.
-const ANSWER_WAIT: Duration = Duration::from_secs(60);
+const ANSWER_WAIT: Duration = Duration::from_secs(180);
 /// How long an outbound circuit is kept, after a step of a group, for the
 /// group's next step; then closed.
 const KEEP_FOR_GROUP: Duration = Duration::from_secs(30);

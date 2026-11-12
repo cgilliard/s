@@ -28,12 +28,12 @@ const HANDSHAKE_RETRY: Duration = Duration::from_secs(1);
 /// Hellos sent before an opening is given up.
 const HANDSHAKE_TRIES: u32 = 8;
 /// An opening waits this long for the relay to answer our ping first.
-const PING_WAIT: Duration = Duration::from_secs(10);
+const PING_WAIT: Duration = Duration::from_secs(30);
 /// Channels held at once, either end, by default (`--max-channels`).
 pub const MAX_CHANNELS: usize = 4096;
 /// Handshake messages being reassembled at once, and for how long.
 const MAX_REASSEMBLY: usize = 1024;
-const REASSEMBLY_TIME: Duration = Duration::from_secs(10);
+const REASSEMBLY_TIME: Duration = Duration::from_secs(30);
 /// Bodies held for a channel still opening.
 const MAX_WAITING: usize = 256;
 /// Channels a relay holds from one IP address. A handshake already needs

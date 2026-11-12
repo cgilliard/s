@@ -26,7 +26,7 @@ use crate::pow::Digest;
 use crate::wallet::random_bytes;
 
 /// A circuit not built by then is given up.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hops a relay serves at once by default (`--max-hops`).
 pub const MAX_HOPS: usize = 16_384;
 /// Circuits a participant's channel may carry: a participant keeps three

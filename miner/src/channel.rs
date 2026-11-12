@@ -54,17 +54,22 @@ pub const MAX_BODY: usize = 1232 - FRAME_OVERHEAD;
 /// The datagram's magic and type, the channel number, the frame's kind,
 /// sequence and acknowledgements, and the tag.
 pub const FRAME_OVERHEAD: usize = 5 + 8 + 1 + 8 + 8 + 8 + TAG_LEN;
-/// First wait for an acknowledgement; it doubles with each resend.
-pub const RTO: Duration = Duration::from_millis(400);
+/// First wait for an acknowledgement, before the round trip is measured;
+/// then it follows the round trip (RFC 6298: the smoothed time and four
+/// times its variation), never under [`MIN_RTO`]; it doubles with each
+/// resend. A geostationary satellite's round trip is 600 ms or more, so a
+/// fixed short wait would send every frame twice.
+pub const RTO: Duration = Duration::from_secs(1);
+const MIN_RTO: Duration = Duration::from_millis(400);
 const MAX_RTO: Duration = Duration::from_secs(5);
 /// Sends of one frame before the channel is given up.
 pub const MAX_TRIES: u32 = 12;
 /// A frame unacknowledged this long after it was first sent ends the
 /// channel, however many tries that took: the other end is gone, and the
-/// circuits over the channel are better built elsewhere at once. About six
-/// tries; at a tenth of datagrams lost each way, a live channel is taken
-/// for dead once in some twenty thousand frames.
-pub const DEAD_AFTER: Duration = Duration::from_secs(15);
+/// circuits over the channel are better built elsewhere at once. About
+/// eight tries; long enough for a slow, lossy link (a satellite's, a
+/// round trip of a second under load) to be told from a dead one.
+pub const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// An initiator sends a keepalive after this long without sending: under
 /// the 30 s a home router may keep a quiet UDP mapping, so a participant's
 /// channel to its guard keeps its NAT open (`docs/SCALING.md`).
@@ -369,6 +374,9 @@ pub struct Channel {
     acks: u64,
     pub last_heard: Instant,
     last_sent: Instant,
+    /// The smoothed round trip and its variation, once measured.
+    srtt: Option<Duration>,
+    rttvar: Duration,
 }
 
 impl Channel {
@@ -388,6 +396,8 @@ impl Channel {
             recv_buf: BTreeMap::new(),
             acks: 0,
             last_heard: now,
+            srtt: None,
+            rttvar: Duration::ZERO,
             last_sent: now,
         }
     }
@@ -425,7 +435,7 @@ impl Channel {
         let (ack, sack) = self.acks();
         let mut f = Frame { chan: self.chan, kind: KIND_DATA, seq, ack, sack, sealed: Vec::new() };
         f.sealed = chacha20poly1305::seal(&self.send_key, &nonce(KIND_DATA, seq), &f.header(), body);
-        self.in_flight.insert(seq, InFlight { frame: f.clone(), first: now, sent: now, tries: 1, rto: RTO });
+        self.in_flight.insert(seq, InFlight { frame: f.clone(), first: now, sent: now, tries: 1, rto: self.rto() });
         self.last_sent = now;
         f
     }
@@ -459,6 +469,30 @@ impl Channel {
         Ok(self.fill(now))
     }
 
+    /// The wait for a new frame's acknowledgement.
+    fn rto(&self) -> Duration {
+        match self.srtt {
+            Some(srtt) => (srtt + 4 * self.rttvar).clamp(MIN_RTO, MAX_RTO),
+            None => RTO,
+        }
+    }
+
+    /// A round trip measured: a frame acknowledged that was sent once
+    /// (Karn's rule: a resent one's could be either send's).
+    fn sample(&mut self, rtt: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(rtt);
+                self.rttvar = rtt / 2;
+            }
+            Some(srtt) => {
+                let diff = if srtt > rtt { srtt - rtt } else { rtt - srtt };
+                self.rttvar = (self.rttvar * 3 + diff) / 4;
+                self.srtt = Some((srtt * 7 + rtt) / 8);
+            }
+        }
+    }
+
     /// An ack-only frame.
     fn ack_frame(&mut self) -> Frame {
         self.acks += 1;
@@ -481,8 +515,17 @@ impl Channel {
         }
         self.last_heard = now;
         // What the other end has: everything below `ack`, and the bitmap.
-        self.in_flight
-            .retain(|&s, _| s >= f.ack && !(s > f.ack && s - f.ack - 1 < 64 && f.sack >> (s - f.ack - 1) & 1 == 1));
+        let mut rtt = None;
+        self.in_flight.retain(|&s, fl| {
+            let keep = s >= f.ack && !(s > f.ack && s - f.ack - 1 < 64 && f.sack >> (s - f.ack - 1) & 1 == 1);
+            if !keep && fl.tries == 1 {
+                rtt = Some(now.saturating_duration_since(fl.sent));
+            }
+            keep
+        });
+        if let Some(rtt) = rtt {
+            self.sample(rtt);
+        }
         let mut out = Received::default();
         if f.kind == KIND_DATA {
             if f.seq >= self.recv_next && f.seq < self.recv_next + WINDOW {
@@ -543,6 +586,38 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resend_wait_follows_the_round_trip() {
+        let (mut i, mut r, now) = open_pair(false);
+        assert_eq!(i.rto(), RTO, "1 s before a round trip is measured");
+        // A satellite's round trip: 800 ms each time.
+        let mut t = now;
+        for _ in 0..8 {
+            let f = i.send(b"x", t).unwrap().remove(0);
+            t += Duration::from_millis(400);
+            let back = r.receive(&f, t).unwrap().send;
+            t += Duration::from_millis(400);
+            for b in back {
+                i.receive(&b, t).unwrap();
+            }
+        }
+        let rto = i.rto();
+        assert!(rto >= Duration::from_millis(800) && rto <= Duration::from_secs(2), "{rto:?}");
+        // No resend before the wait: none at 700 ms after a send.
+        i.send(b"y", t).unwrap();
+        assert!(i.poll(t + Duration::from_millis(700)).unwrap().is_empty());
+        // A fast link's wait is never under the floor.
+        let (mut i, mut r, now) = open_pair(false);
+        for k in 0..8 {
+            let t = now + Duration::from_millis(k * 10);
+            let f = i.send(b"x", t).unwrap().remove(0);
+            for b in r.receive(&f, t).unwrap().send {
+                i.receive(&b, t + Duration::from_millis(1)).unwrap();
+            }
+        }
+        assert_eq!(i.rto(), MIN_RTO);
+    }
 
     fn relay(tag: u8) -> (mldsa::SecretKey, Digest) {
         let k = mldsa::keygen(&[tag; 32]);
