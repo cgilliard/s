@@ -933,7 +933,10 @@ wlb @ ! ;
 : wread
 dup 1C lit + @ wlb !
 dup 8 lit + @  wlb @ 4 lit + wlb @ @ +  43FC lit wlb @ @ -  read
-dup 0 lit > if wlb @ @ + wlb @ !  wlines drop else drop 0 lit 0 lit 8 lit wsend cclose then ;
+dup 0 lit > if wlb @ @ + wlb @ !  wlines drop else
+	\ (told on the console: a program that ended, or a line past the buffer)
+	"wm: a window's program " puts  wlb @ @ 43FC lit u< 0= if "wrote a line too long; its window closed" else "ended; its window closed" then puts 0A lit putc
+	drop 0 lit 0 lit 8 lit wsend cclose then ;
 
 \ accept1  a client taken (if all the slots are busy, answered 503 and
 \ closed at once: a WebSocket's handshake then fails, its window says so).

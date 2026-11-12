@@ -173,7 +173,11 @@ def pumpone():
     except socket.timeout:
         return
     if not d:
-        print('onitest: the wallet closed'); sys.exit(1)
+        print('onitest: the wallet closed; its last messages:')
+        for m in msgs[-3:]:
+            print(f'  {str(m)[:300]}')
+        print(f'  (unparsed: {buf[-200:]!r})')
+        sys.exit(1)
     buf += d
     while len(buf) >= 2:
         n = buf[1] & 127; hl = 2

@@ -935,6 +935,7 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
             return Err(format!("{file}: not an onion-mode file").into());
         }
         log::line(&format!("message layer: the relays of {file} stand as if in force (a test)"));
+        TEST_RELAYS.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = events.send(tabminer::node::Event::TestRelays(parsed.relays));
     }
     let notes = node.take_notes();
@@ -3137,7 +3138,7 @@ fn resolve_subname(ctx: &Ctx, label: &str, name: &str, group: u64) -> AnyResult<
         return id_of(&b);
     }
     let missing = || format!("{label}.{name} does not exist: {name}'s owner has issued no certificate for it");
-    let onion = ctx.chain.consensus_epoch()?.current.mode == tabminer::consensus::Mode::Onion;
+    let onion = ctx.chain.consensus_epoch()?.current.mode == tabminer::consensus::Mode::Onion || test_relays_pinned();
     let started = std::time::Instant::now();
     let mut wait = Waiter::new(ctx);
     let tag = lookup_tag();
@@ -3343,6 +3344,19 @@ fn on_cert(ctx: &Ctx, bytes: &[u8]) {
         }
         Took::Ignored(why) => log::line(&format!("sub-name {full}: a certificate ignored: {why}")),
     }
+}
+
+/// Set when `--test-relays` pinned a relay file (dev builds): the wallet
+/// then takes onion mode as in force, as the node does, so a sub-name is
+/// looked up at its points rather than asked of its owner.
+#[cfg(feature = "dev")]
+static TEST_RELAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn test_relays_pinned() -> bool {
+    #[cfg(feature = "dev")]
+    return TEST_RELAYS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "dev"))]
+    false
 }
 
 /// The tag a send of slate `id` goes under: its first eight bytes.
