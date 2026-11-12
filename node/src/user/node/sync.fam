@@ -144,6 +144,69 @@ dup FFFFFFFE lit = if drop htg @ fullpow else nip then ;
 : vproof
 vjw @ if 2 lit vw  ppub @ 40 lit vput  bnpr @ vw  bpr @ bnpr @ vput  vwait else FFFFFFFE lit then
 dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
+\ The worker: a thread with variables of its own (pthread, docs/OS.md)
+\ that connects and undoes blocks (sconnect, its chain proof checked
+\ there too, and sundo), the store's writes and commit with them, while
+\ the node serves (cwait: peers, the API).  It shares nothing with the
+\ node but the job (cwj, from malloc) and the store: the node only reads
+\ the chain's tree meanwhile (its own transactions, as of the last
+\ commit), and writes it only while the worker is idle.  cwinit makes its
+\ own buffers (sconnect's and sundo's, found by tracing what they reach)
+\ but for the tables that are only read (the squares, dflt's empty
+\ subtrees, the chain's constants, the verifier's program, genesis's
+\ mix).  Jobs come on a pipe (a word: 1 connect, 2 undo), their verdict
+\ back on another.  If it cannot be started (cwon 0) the work is done
+\ here, as before.
+\ cwj: +0 the header entry, +4 the body, +8 its length, +C sprchk, +10
+\ the store (stfd), +14 to +20 the times (btb, bts, btp, btc).
+: cwon variable ;  : cwj variable ;  : cwjr variable ;  : cwjw variable ;  : cwvr variable ;  : cwvw variable ;
+: cwk variable ;  : cwb variable ;  : cwm variable ;  : cwp1 variable ;  : cwp2 variable ;
+\ cwinit  on the worker: its own buffers.
+: cwinit
+0 lit p2s !  0 lit dva !  0 lit mrb !  0 lit mcb !  0 lit pws !
+10 lit alloc et1 !  10 lit alloc et2 !  10 lit alloc et3 !  10 lit alloc lgt !  10 lit alloc lgp !
+pwtext @ pwlen @ powinit
+cwj @ 10 lit + @ stin0
+400 lit alloc pin !  40 lit alloc pcs !  40 lit alloc ppub !  40 lit alloc ptmp !  CC lit alloc ppar !
+cvp @ cvinit ;
+\ cwput ( kind -- )  a job to the worker (its memory set first).
+: cwput  cwm @ !  cwjw @ cwm @ 4 lit write drop ;
+\ cwait ( -- code )  the worker's verdict, the network and the API served
+\ meanwhile (as vwait: not blocks' chunks or snapshots, pnest).
+: cwait
+cwvr @ pyfd !  0 lit pyrdy !  1 lit pnest !
+begin pyrdy @ 0= while
+	3B9ACA00 lit pwait drop
+	pxrdy @ if stx @ vsav !  aaccept awake  vsav @ stx ! then
+repeat
+0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
+cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;
+\ cwstart  the worker started (cwon), its heap 3 MiB (it says how much
+\ it took).
+: cwstart
+0 lit cwon !
+24 lit malloc cwj !  10 lit alloc cwk !  10 lit alloc cwb !  10 lit alloc cwm !
+10 lit alloc cwp1 !  10 lit alloc cwp2 !
+cwp1 @ pipe 0< 0=  cwp2 @ pipe 0< 0= and cwj @ 0= 0= and if
+	cwp1 @ @ cwjr !  cwp1 @ 4 lit + @ cwjw !  cwp2 @ @ cwvr !  cwp2 @ 4 lit + @ cwvw !
+	stfd @ cwj @ 10 lit + !
+	ptcode[ drop
+		cwinit
+		vrb @ if nhead "the worker: its heap " puts 0 lit alloc s10@ - A lit rshift u. " KiB of 3,072 used" puts 0A lit putc then
+		begin cwjr @ cwk @ 4 lit read 4 lit = while
+			cwj @ 10 lit + @ stfd !
+			cwk @ @ 1 lit = if
+				cwj @ C lit + @ sprchk !  cwj @ @ swk !
+				cwj @ @ cwj @ 4 lit + @ cwj @ 8 lit + @ sconnect
+				0 lit swk !
+				btb @ cwj @ 14 lit + !  bts @ cwj @ 18 lit + !  btp @ cwj @ 1C lit + !  btc @ cwj @ 20 lit + !
+			else sundo 0 lit then
+			cwb @ !  cwvw @ cwb @ 4 lit write drop
+		repeat
+	]tcode
+	0 lit 300000 lit pthread 0< 0= cwon !
+then ;
+
 \ nconf ( from -- flag )  hconf, the work checked by nodev.
 : nconf
 -1 lit swap  hbest
@@ -152,9 +215,22 @@ begin dup hheight 2 lit pick u< 0= over hheight and while
 	dup hparent @ he htarget  dup vpow 0= if rot drop 0 lit -rot then
 	hparent @ he
 repeat 2drop ;
-\ nconnect ( e body n -- code )  sconnect, the proof checked by nodev,
-\ for header entry e (its work and id kept with it: swk).
-: nconnect  2 lit pick dup swk !  20 lit + @ pacth !  2 lit pact !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !  0 lit pact ! ;
+\ nconnect ( e body n -- code )  sconnect for header entry e (its work and
+\ id kept with it: swk), by the worker, which checks the proof too; with
+\ none, here, the proof checked by nodev.
+: nconnect
+2 lit pick 20 lit + @ pacth !  2 lit pact !
+cwon @ if
+	cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !
+	sprchk @ cwj @ C lit + !  stfd @ cwj @ 10 lit + !
+	1 lit cwput  cwait
+	cwj @ 14 lit + @ btb !  cwj @ 18 lit + @ bts !  cwj @ 1C lit + @ btp !  cwj @ 20 lit + @ btc !
+else
+	2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !
+then
+0 lit pact ! ;
+\ nundo  sundo, by the worker if there is one.
+: nundo  cwon @ if stfd @ cwj @ 10 lit + !  2 lit cwput  cwait drop else sundo then ;
 
 \ nsave ( n -- )  the main chain's headers 1 to n held into the store,
 \ with their work (a transaction a 1,024): after a fast sync's snapshot,
@@ -383,7 +459,7 @@ myh @ if mytip @ hfind dup 0< if drop else
 	myh @ nfk @ u> if
 		vrb @ if nhead "reorganizing: our " puts myh @ nfk @ - u. " blocks above " puts nfk @ u. " leave for the best branch" puts 0A lit putc then
 		begin myh @ nfk @ u> nfl @ 0= and while
-			nundo? if sundo nstat  1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
+			nundo? if nundo nstat  1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
 			else
 				vrb @ if nhead "cannot undo block " puts myh @ u. " (none is kept for a fast sync's start and below): a new sync is needed" puts 0A lit putc then
 				1 lit nfl !

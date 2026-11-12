@@ -164,6 +164,19 @@ Progress:
   `scripts/stalltest.sh`, timing-free: a proxy holds a block's chunks,
   and the API, asked meanwhile, must say the node is fetching it.
 - (2026-11-12) The API from the start (item 6).
+- (2026-11-12) A worker thread (`sync.fam`'s `cwstart`) connects and
+  undoes blocks: the body decoded and its commitment checked, the state,
+  the chain proof (checked there, not by `nodev`), the store's writes and
+  commit, while the node serves (`cwait`). It makes its own copy of
+  every buffer `sconnect` and `sundo` reach (traced: 286 words, some 80
+  buffers; `cwinit`), sharing only tables that are read (the squares,
+  the empty subtrees' hashes, the chain's constants, the verifier's
+  program, genesis's mix); undoing is the worker's too, as the manifest
+  keeps the last block's parts between blocks. Its heap: 1.8 of 3 MiB.
+  Checked by `reorgtest.sh` (blocks connected, the node killed and
+  resumed, four blocks undone onto a heavier branch) and `stalltest.sh`.
+  Left: a fast sync's snapshot parts, installed inline; the pool's
+  rebuild after a block; long API answers.
 
 ## 5. The wallet shows what is in progress
 

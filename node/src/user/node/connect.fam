@@ -207,13 +207,9 @@ sprop
 stx @ txcommit drop
 ub @ free ;
 
-: stinit  ( fd -- )
-\ The heap reserved, first: one arena of 32 MiB, mapped once and kept
-\ (free never unmaps the last). A process has 4 map slots, and malloc's
-\ arenas grow from 64 KiB, so small allocations first would leave them
-\ full at half a MiB, and every buffer past that refused (a snapshot's
-\ part not served, a block not taken).
-2000000 lit malloc ?dup if free then
+\ stin0 ( fd -- )  stinit but for the heap's reserve: the state's buffers
+\ (made again by sync.fam's worker, cwinit, for its own).
+: stin0
 stfd !  p2init dvinit
 100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !  400 lit alloc rtb !  0 lit rtn !  0 lit rtall !  minit
 520 lit alloc dflt !  2000 lit alloc lvs !
@@ -229,3 +225,11 @@ stfd !  p2init dvinit
 tz @ 4 lit wzero  dflt @ 8 lit wzero
 28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
 0 lit serr ! ;
+: stinit  ( fd -- )
+\ The heap reserved, first: one arena of 32 MiB, mapped once and kept
+\ (free never unmaps the last). A process has 4 map slots, and malloc's
+\ arenas grow from 64 KiB, so small allocations first would leave them
+\ full at half a MiB, and every buffer past that refused (a snapshot's
+\ part not served, a block not taken).
+2000000 lit malloc ?dup if free then
+stin0 ;

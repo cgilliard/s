@@ -201,6 +201,8 @@ mdc @ dup 60 lit + prinit
 1 lit vrb !
 \ the verifier, a process of its own, so the node serves while it checks
 vinit  vjw @ if nhead "verifying in nodev (a process of its own)" puts else nhead "nodev not started: verifying here" puts then 0A lit putc
+\ the worker, a thread that connects blocks while the node serves
+cwstart  cwon @ 0= if nhead "the worker not started: blocks connected here" puts 0A lit putc then
 \ the network and the API at once, whatever the height (a store with no
 \ chain yet: genesis's, height 0), so the node answers from its first
 \ second while it syncs, or waits for a peer or a block (docs/
