@@ -232,7 +232,9 @@ abegin "{" a"
 "peers" akey  0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then  anum acom
 "pool" akey "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum "}" a" acom
 "version" akey aqt "fam-node 0.1" a" aqt acom
-"protocol" akey A lit anum "}" a"
+"protocol" akey A lit anum acom
+"activity" akey aqt  pact @ 1 lit = if "fetching" else pact @ 2 lit = if "connecting" else "idle" then then a" aqt acom
+"activity_height" akey pacth @ anum "}" a"
 "200 OK" asend ;
 
 : aheader

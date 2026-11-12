@@ -38,13 +38,28 @@ stfd @ 0 lit txbegin stx !  62 lit mget myold !  68 lit mget  stx @ txcommit dro
 myold @ if myh @ 3EF lit - myold @ max myh @ 3EF lit u< if drop myold @ then myold ! then
 hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
 
+\ nfetch ( kind part id -- a n | 0 0 )  pfetch, the API answered while it
+\ fetches: each time a connection waits, pfetch stops (pyld), the API
+\ answers it (in transactions of its own: stx kept, as vwait does) and
+\ the waiting requests whose tip moved, and the fetch goes on.
+: nfkd variable ;  : nfpt variable ;  : nfid variable ;  : nfsv variable ;
+: nfetch
+nfid ! nfpt ! nfkd !
+begin
+	-1 lit pyld !  nfkd @ nfpt @ nfid @ pfetch  0 lit pyld !
+	over 0= pyd @ and
+while
+	2drop  stx @ nfsv !  aaccept awake  nfsv @ stx !
+repeat ;
+
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
 \ header the entry's: the bytes the same).
 : nft variable ;  : btf variable ;
 : nwhy variable ;
 : nblock
 ticks nft !  1 lit nwhy !
-dup hid 0 lit 0 lit rot pfetch nbn ! nblk !
+1 lit pact !  dup 20 lit + @ pacth !
+dup hid 0 lit 0 lit rot nfetch nbn ! nblk !  0 lit pact !
 nblk @ if
 	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= dup 0= if 3 lit nwhy ! then else drop 2 lit nwhy ! 0 lit then
 	dup 0= if nblk @ free 0 lit nblk ! then
@@ -129,7 +144,7 @@ begin dup hheight 2 lit pick u< 0= over hheight and while
 repeat 2drop ;
 \ nconnect ( e body n -- code )  sconnect, the proof checked by nodev,
 \ for header entry e (its work and id kept with it: swk).
-: nconnect  2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk ! ;
+: nconnect  2 lit pick dup swk !  20 lit + @ pacth !  2 lit pact !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !  0 lit pact ! ;
 
 \ nsave ( n -- )  the main chain's headers 1 to n held into the store,
 \ with their work (a transaction a 1,024): after a fast sync's snapshot,
@@ -237,7 +252,7 @@ then
 ncode @ 0= if
 	nS @ hat dup nblock 0= if drop FFFFFFFB lit nfail else
 		hid nid !
-		2 lit 0 lit nid @ pfetch ?dup if
+		2 lit 0 lit nid @ nfetch ?dup if
 			nS @ hat hhdr snman if FFFFFFF8 lit nfail then
 		else drop FFFFFFFB lit nfail then
 	then
@@ -253,7 +268,7 @@ then
 ncode @ 0= if
 	snr @ snn @ + ?dup if 0 lit do
 		ncode @ 0= if
-			3 lit i nid @ pfetch over if
+			3 lit i nid @ nfetch over if
 				2dup i -rot snpart if FFFFFFF9 lit nfail else "snapshot part " nsay i 1 lit + nsayn then drop free
 			else 2drop FFFFFFFB lit nfail then
 		then
@@ -405,7 +420,7 @@ loop drop nk @ ;
 begin pdeq ?dup while
 	dup nrid @ 20 lit bcopy  20 lit + @ nrk !
 	nrid @ nrm @ dle  nrm @ qfind 0< if
-		pcur @ nrc !  nrk @ puse  1 lit 0 lit nrid @ pfetch  nrc @ puse
+		pcur @ nrc !  nrk @ puse  1 lit 0 lit nrid @ nfetch  nrc @ puse
 		?dup if
 			2dup qadmit  "pool: " puts dup . 20 lit putc nrid @ nhex 0A lit putc
 			dup FFFFFFFF lit = if nrk @ pstrike then   \ bytes that do not decode

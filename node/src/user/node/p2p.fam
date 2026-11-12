@@ -41,7 +41,11 @@
 \ order: how many arrived without a gap.
 \ pfetch ( kind part id -- a n | 0 0 )  an object: a block (kind 0), the
 \ manifest (2) or part `part` (3) of the snapshot after block id
-\ (canonical words); malloc'd.
+\ (canonical words); malloc'd.  With pyld set, it stops early when a
+\ connection to the API waits (pxrdy), pyd then set, what came kept: the
+\ caller answers it and asks again for the same object, which goes on
+\ (its wait for chunks too: pt0 kept, pyt0), so a fetch never holds the
+\ API up (sync.fam's nfetch).
 \ pwait ( ns -- type | 0 )  the next datagram from the peer, in prx (Pings
 \ answered, Pongs taken, meanwhile).
 \ Our status (myh, mytip, mywork, mygen) is the caller's to keep.
@@ -51,6 +55,11 @@
 : ptx variable ;  : ptp variable ;  : prx variable ;  : prn variable ;  : pent variable ;  : pfrom variable ;
 : phb variable ;  : phh variable ;  : pgot variable ;  : prnd variable ;
 : pobj variable ;  : plen variable ;  : pcnt variable ;  : pmap variable ;  : pkind variable ;  : ppart variable ;  : pid variable ;
+: pyld variable ;  : pyd variable ;  : pyt0 variable ;
+\ What the node is doing, for its status (api.fam's /v1/status): 0
+\ nothing in particular, 1 fetching block pacth, 2 connecting it
+\ (sync.fam's nblock and nconnect).
+: pact variable ;  : pacth variable ;
 : pidle variable ;  : pnew variable ;  : psrtt variable ;  : pq0 variable ;  : pt0 variable ;  : pfirst variable ;
 : psv variable ;  : psobj variable ;  : pslen variable ;  : pscnt variable ;  : psmap variable ;  : pskind variable ;  : pspart variable ;  : psid variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
@@ -107,7 +116,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
-600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  10 lit alloc pfrom !
+600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  0 lit pyld !  0 lit pyd !  0 lit pact !  0 lit pacth !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !  2DC6C0 lit psrtt !  20 lit alloc psid !  0 lit psv !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
@@ -554,19 +563,22 @@ psv @ if
 	else psobj @ free  psmap @ free then
 	0 lit psv !
 then
-ticks pt0 !
+\ (after a stop for the API, the wait for chunks goes on from where it was)
+pyd @ if pyt0 @ else ticks then pt0 !  0 lit pyd !
 begin
-	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and
+	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and  pyd @ 0= and
 while
 	preq  ticks pq0 !  0 lit pfirst !  0 lit pnew !
 	\ until what was asked for has come (then the next ask at once), or
-	\ a few round trips pass with nothing (one lost: asked for again)
+	\ a few round trips pass with nothing (one lost: asked for again), or
+	\ (pyld) a connection to the API waits
 	begin
-		prcv @ pask @ u<  pobj @ if pdone 0= and then
-		if pwns pwait else 0 lit then
+		prcv @ pask @ u<  pobj @ if pdone 0= and then  pyd @ 0= and
+		if pwns pwait  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
 	?dup while 9 lit = if pchunk then repeat
 	pnew @ if ticks pt0 ! then
 repeat
+pt0 @ pyt0 !
 pobj @ if
 	pdone if pmap @ free pobj @ plen @ else
 		\ kept for the next peer asked for the same object

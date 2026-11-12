@@ -217,6 +217,7 @@ jobs:
           - reorgtest
           - peertest
           - blocktest
+          - stalltest
           - striketest
           - windowtest
           - snaptest
