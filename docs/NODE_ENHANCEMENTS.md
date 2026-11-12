@@ -324,3 +324,89 @@ it should also list this wallet's own, below that, scrolling:
   a proof the fam wallet makes checks in tabminer's `proof verify` and
   the other way round.
 
+
+## 12. Wallet usability, from a review of the window
+
+A read of the wallet window as it is (`wm.fam`'s page; `wm.html` is
+behind, item 8) and of the wallet behind it, 2026-11-12. Items 5 and
+7 to 11 are not repeated here.
+
+### Big ones
+
+1. **The wallet runs only while its window is open.** wm starts a
+   `wallet` process for each `/wallet` WebSocket, and it exits when the
+   connection closes (its input ends). Close the browser tab or log out
+   and the wallet stops: it cannot be paid online, its standing session
+   at its rendezvous point drops, and it stops publishing its sub-names.
+   On an OS meant to run a node and its wallet, the wallet should be a
+   service that keeps running, the window a view of it (with item 7).
+2. **A dropped connection makes the window vanish.** When the WebSocket
+   closes after it was up, the page closes the wallet window, with no
+   message and no reconnecting. It should say so and reconnect. (A local
+   `onitest.sh` run lost the wallet this way, with no word of why.)
+3. **Nothing irreversible is confirmed.** Burn, Send online, signing a
+   name over and Cancel each go on one click. Show what will happen
+   first: the amount, the fee, the total and the recipient, and a button
+   to confirm.
+4. **A name is paid without showing whom it resolves to.** For `@name`
+   and `@label.name` the user never sees the address before the coins
+   go. Show it in the confirmation (3).
+5. **An online send's result is lost.** "Paid ..." or "Error ..." goes
+   only to the strip beside the tabs, and the next block's "Tip N"
+   replaces it. It belongs on the send's Activity entry (item 10) and
+   where the send was made.
+
+### Clarity
+
+6. **Five balances, none explained:** Confirmed, Pending, Unverified,
+   Reserved, Locked. A user wants what is available to spend and what
+   is on its way; the rest belongs in details, each with a line saying
+   what it means.
+7. **Amounts are raw:** ten decimals, no unit, no thousands separators,
+   and no total of amount and fee anywhere.
+8. **Activity's rows are raw:** the kind, the amount, the state, the
+   height and the transaction id's first 16 hex digits. No date, no
+   counterparty (address or name), no fee.
+9. **The speed menu gives a bare rate** ("hour: 10, about 60 min"),
+   without saying what 10 is. Show the fee this payment would pay.
+10. **Names use jargon.** The value is "a tab1 address or 64 hex
+    digits" (the confusion of an id and an address, met in a live test);
+    it should default to this wallet's address. A name's value is listed
+    as 16 raw hex digits.
+11. **Overview's "Online" line** is jargon and ungrammatical
+    ("reachable at 1 rendezvous points").
+12. **Settings is unclear.** "Show the phrase" asks for "Password"
+    without saying which one; Restore sits just below with no warning
+    that it replaces this wallet; "Scan again" is under Restore, with no
+    word of what it does; a phrase shown stays on the screen.
+
+### Behavior
+
+13. **Any event redraws Overview or Activity:** an open proof closes,
+    the scroll goes back to the top, and a form being typed in is wiped
+    when the unlock event comes.
+14. **Some speeds cannot be chosen:** Bump always pays for "block",
+    Reveal and Update for "hour", while Commit has a menu.
+15. **A name is revealed by hand:** the user must come back 12 blocks
+    later and press Reveal. The wallet could reveal it when ready, if
+    the user agreed at the commit.
+16. **The sub-name form takes the name as free text;** it should offer
+    the names this wallet owns that point at it. Its heading ("answered
+    while online") is wrong in onion mode, where the certificate is
+    published.
+17. **No "send all", and no balance beside the amount;** fields are
+    checked only once submitted.
+18. **Enter submits nothing,** and labels are not tied to their fields
+    (clicking a label does not focus its field; screen readers).
+19. **Copy says nothing:** it should show "Copied".
+20. **"[no wallet: the server has none free]" is cryptic:** it means
+    every wallet slot is taken.
+21. **Burn's success message points at Activity for its proof,** which
+    item 11 moves to the Proofs tab.
+
+### Smaller
+
+22. **No QR code** for the address.
+23. **The full transaction id is never shown,** and an Activity entry
+    has no details to open.
+24. **No recent recipients or address book.**
