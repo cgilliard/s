@@ -411,3 +411,50 @@ behind, item 8) and of the wallet behind it, 2026-11-12. Items 5 and
 23. **The full transaction id is never shown,** and an Activity entry
     has no details to open.
 24. **No recent recipients or address book.**
+
+## 13. A laptop asleep, and other interruptions (node and tabminer)
+
+Neither the fam node nor tabminer has been tried on a machine that
+sleeps, loses its network or changes it, and both keep state that
+assumes time runs on and peers stay where they were: links dead after
+30 s, sessions and circuits, rendezvous routes, a mining template, the
+wallet's WebSocket. To try each, for both, and fix what does not come
+back by itself:
+
+- **Sleep and wake** (a laptop's lid closed, low power, hibernation),
+  for a minute, an hour and a day. After waking: peers found again,
+  sync to the new tip, mining on the new tip (not a stale template; and
+  the mining policy's pause only on verified headers), the onion
+  session and circuits rebuilt, the wallet's page reconnecting, payments
+  in flight finished or failed with a clear message rather than hanging.
+- **The clock.** The node's date (`wnet.fam`'s `mnunix`) is the date at
+  its start plus the time register's elapsed time, and the register may
+  stop while the host sleeps: to check whether the node's date falls
+  behind by the time asleep, and what then depends on it (block
+  timestamps accepted or mined, the consensus file's timing, a slate's
+  expiry). `mnms` also assumes it is called at least every 400 s (the
+  32-bit register wraps): to check across a sleep. tabminer: what uses
+  `Instant` (which may or may not count time asleep, by platform) and
+  what uses the system clock. The host's clock stepped by NTP, either
+  way, too.
+- **Low power without sleep:** a throttled CPU on battery, so the
+  proof of work and proofs run several times slower; nothing should time
+  out because of it (the timeouts in `ONION.md` already allow for slow
+  links, not for a slow machine).
+- **The network:** cable out and back, Wi-Fi to another network (a new
+  address, a new NAT whose mappings are gone), offline for a long time,
+  a captive portal. Peers and the wallet's sessions should come back
+  without a restart.
+- **Power lost or killed mid-write:** the store (the node's and
+  tabminer's) opened cleanly afterwards at the last committed block,
+  the wallet's keys and records intact.
+- **The disk full:** a clear message and a stop, not a corrupt store.
+
+**Tests:** a sleep can be simulated by stopping the process (QEMU or
+tabminer) with `SIGSTOP` and resuming it with `SIGCONT` after a while,
+the network by a namespace taken down and up, a mid-write kill by
+`SIGKILL` during a sync. Each test checks the state reached after the
+interruption (the new tip mined on, a payment that completes), not how
+quickly. Then the real thing by hand: a laptop on each platform (Linux,
+macOS, Windows) closed and opened during a sync, during mining and
+during an online payment.
