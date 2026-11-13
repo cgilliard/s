@@ -2723,7 +2723,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return Some(Arc::clone(&self.served_lite.front().unwrap().1));
         }
         let bytes = self.chain.block_bytes(id).ok()??;
-        let lite = Arc::new(Block::from_bytes(&bytes).ok()?.lite_bytes());
+        #[allow(unused_mut)]
+        let mut lite = Block::from_bytes(&bytes).ok()?.lite_bytes();
+        // A liar for the fam node's litetest.sh: a byte of the proof's hash
+        // changed, so the lite block is not the one its header commits to.
+        #[cfg(feature = "dev")]
+        if std::env::var_os("TABMINER_TEST_LIE_LITE").is_some() {
+            let n = lite.len();
+            lite[n - 32] ^= 1;
+        }
+        let lite = Arc::new(lite);
         self.served_lite.push_front((*id, Arc::clone(&lite)));
         self.served_lite.truncate(SERVED_CACHE);
         Some(lite)

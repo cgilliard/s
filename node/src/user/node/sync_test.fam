@@ -44,6 +44,12 @@ tdc @ dup 60 lit + prinit
 20 lit alloc dup mywork ! 8 lit wzero  0 lit myh !
 20 lit alloc tcr !
 A000202 lit 925F lit E99 lit pinit
+\ a second peer, if the image has one (/lib/peer2: its port in decimal):
+\ litetest.sh's, which serves lite blocks that are not the block's; the
+\ sync then said as it goes, its refusals with it
+"/lib/peer2" 0 lit open dup 0< if drop else
+	dup tcr @ 10 lit read drop close drop  A000202 lit tcr @ atoi padd pgiven drop  1 lit vrb !
+then
 4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
 0= if
 	\ the state root, the tip's

@@ -195,7 +195,23 @@ As tabminer (`node.rs:10-56`), within the machine's limits:
      it.
    No block before it is replayed.
 3. **Bodies after that**, each block applied as above, then follow
-   the tip.
+   the tip. In batches of up to 16 (`sync.fam`'s `nbatch`): only the
+   last block's chain proof is checked, attesting the others, so those
+   are fetched **lite** (`GetChunks` kind 6, tabminer's
+   `Block::lite_bytes`): the block without its proof, the proof's
+   32-byte hash in its place, all its body commitment needs (a body
+   commits to its proof only through that hash), so a few KB rather
+   than a proof's 200 or so. Each is checked against its header's
+   commitment as it comes, so a peer sending one that is not the
+   block's is caught and banned as for any body; the batch's last is
+   fetched whole (again if it came lite, a batch cut short by its
+   bytes); if a batch's proof fails, the block-by-block check fetches
+   each whole before its proof. A lite block is refused wherever its
+   proof must be checked. A body kept lite is not served as a block
+   (NotHeld), and the node answers NotHeld for kind 6, which it does
+   not make (that hashes the proof): the asker takes the block whole.
+   `scripts/litetest.sh`: a peer serving lite blocks that are not the
+   block's, refused, the batch had from the other.
 
 Proof-of-work over a long header chain is settled by
 the work in the chain proof (below): each block's chain proof attests to its parent's
@@ -259,7 +275,8 @@ half-applied one.
   - GetPeers, Peers;
   - GetHeaders, Headers, GetHeadersFrom;
   - Inv, TxInv;
-  - GetChunks, Chunk (blocks, transactions, manifests, parts);
+  - GetChunks, Chunk (blocks, lite blocks, transactions, manifests,
+    parts);
   - GetProof, Proof;
   - GetAux, Aux.
   Requests carry the token from the peer's Pong. The node keeps about 8

@@ -247,6 +247,7 @@ jobs:
         script:
           - storetest
           - synctest
+          - litetest
           - pooltest
           - apitest
           - imagetest

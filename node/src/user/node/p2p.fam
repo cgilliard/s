@@ -299,8 +299,10 @@ prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
 	then then then
 	\ not held (a transaction not in the pool, a body or a snapshot not
 	\ kept, looked for: not while the worker holds the store): said, so
-	\ the asker tries another peer now (NotHeld, 25)
-	dup 0=  pgkd @ 4 lit u< and  pnest @ 0= pgkd @ 1 lit = or and if pnhs then
+	\ the asker tries another peer now (NotHeld, 25); a lite block (6)
+	\ never (making one hashes its proof: tabminer serves them), so the
+	\ asker takes it whole
+	dup 0=  pgkd @ 4 lit u< and  pnest @ 0= pgkd @ 1 lit = or and  over 0= pgkd @ 6 lit = and or if pnhs then
 	if
 		prx @ 2E lit + pgo @ + c@  dup 2 lit lshift 2F lit + pgo @ + prn @ u> if drop 0 lit then
 		?dup if 0 lit do

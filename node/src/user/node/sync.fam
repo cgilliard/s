@@ -66,10 +66,20 @@ repeat ;
 \ header the entry's: the bytes the same).
 : nft variable ;  : btf variable ;
 : nwhy variable ;
+\ nblite: the block asked for lite (tabminer's Kind::Lite: without its
+\ proof, its hash in place), as a batch's blocks but its last are (their
+\ proofs attested by the last's); nbgot: what came was lite.  A peer that
+\ does not hold it lite (a fam node: NotHeld) is asked for it whole.
+: nblite variable ;  : nbgot variable ;
 : nblock
 ticks nft !  1 lit nwhy !
 1 lit pact !  dup 20 lit + @ pacth !
-dup hid 0 lit 0 lit rot nfetch nbn ! nblk !  0 lit pact !
+nblite @ nbgot !
+dup hid  nblite @ if 6 lit else 0 lit then  0 lit rot nfetch nbn ! nblk !
+nblk @ 0=  nbgot @ and  pnh @ and if
+	0 lit nbgot !  dup hid 0 lit 0 lit rot nfetch nbn ! nblk !
+then
+0 lit pact !
 nblk @ if
 	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= dup 0= if 3 lit nwhy ! then else drop 2 lit nwhy ! 0 lit then
 	dup 0= if nblk @ free 0 lit nblk ! then
@@ -90,24 +100,28 @@ ticks nft @ - btf ! ;
 : nsil variable ;
 : nsil?  1 lit swap lshift nsil @ and 0= 0= ;   \ ( k -- flag )
 : nsil!  1 lit swap lshift nsil @ or nsil ! ;   \ ( k -- )
-: nsvt variable ;  : npnx variable ;  : npe variable ;  : npb variable ;  : npn variable ;  : nsvb variable ;  : nsvn variable ;
+: nsvt variable ;  : npnx variable ;  : npe variable ;  : npb variable ;  : npn variable ;  : nsvb variable ;  : nsvn variable ;  : nsvl variable ;
 \ npdrop  a block fetched ahead and not used, dropped.
 : npdrop  npb @ ?dup if free then  0 lit npb !  0 lit npe ! ;
-\ npfetch  npnx's block fetched into npb/npn, nblk and nbn kept.
+\ npfetch  npnx's block fetched into npb/npn, nblk and nbn kept; lite if
+\ npgl is set (a batch's next slot not its last), npgot what came.
+: npgl variable ;  : npgot variable ;
 : npfetch
 npnx @ ?dup if
-	npdrop  nblk @ nsvb !  nbn @ nsvn !
+	npdrop  nblk @ nsvb !  nbn @ nsvn !  nbgot @ nsvl !
 	pcur @ dup npsv ! npks !  npk @ ?dup if 1 lit - dup npks ! puse then
-	dup nblock if npe !  nblk @ npb !  nbn @ npn ! else drop  nwhy @ 1 lit = if npks @ nsil! then then
+	npgl @ nblite !
+	dup nblock if npe !  nblk @ npb !  nbn @ npn !  nbgot @ npgot ! else drop  nwhy @ 1 lit = if npks @ nsil! then then
+	0 lit nblite !
 	npk @ if npsv @ puse then
-	nsvb @ nblk !  nsvn @ nbn !
+	nsvb @ nblk !  nsvn @ nbn !  nsvl @ nbgot !
 then
-0 lit npnx !  0 lit npk ! ;
+0 lit npnx !  0 lit npk !  0 lit npgl ! ;
 \ nbget ( e -- flag )  entry e's block into nblk/nbn: the one fetched ahead
 \ if it is e's (its fetch then took no time here), else fetched now.
 : nbget
-dup npe @ =  npb @ 0= 0= and if
-	drop  npb @ nblk !  npn @ nbn !  0 lit npb !  0 lit npe !  0 lit btf !  -1 lit
+dup npe @ =  npb @ 0= 0= and  npgot @ 0= and if
+	drop  npb @ nblk !  npn @ nbn !  0 lit npb !  0 lit npe !  0 lit btf !  0 lit nbgot !  -1 lit
 else npdrop nblock then ;
 \ nwhy.  why the last block was not fetched.
 : nwhy.
@@ -358,9 +372,10 @@ cwon @ if stfd @ cwj @ 10 lit + !  2 lit cwput  cwait drop else sundo then ;
 : nsvk variable ;  : nqj variable ;  : nqt variable ;  : nqb variable ;  : nqg variable ;  : nqm variable ;
 :M NQMAX 10 lit ;                       \ blocks a batch
 :M NQBY 800000 lit ;                    \ bytes a batch holds at most (8 MiB)
-\ A slot (14 bytes): the block (header and body, malloc'd), its length,
-\ the output counter before it (lo, hi), the peer it came from.
-: nqs  14 lit * nq @ + ;                 \ ( j -- a )
+\ A slot (18 bytes): the block (header and body, malloc'd), its length,
+\ the output counter before it (lo, hi), the peer it came from, and
+\ whether it came lite (without its proof: every slot but the last).
+: nqs  18 lit * nq @ + ;                 \ ( j -- a )
 : nqh  nqa @ + ;                         \ ( j -- height )
 \ nrnd ( n -- r )  0 to n-1, at random (xorshift).
 : nrnd
@@ -390,8 +405,8 @@ npc @ 0= if pcur @ npl @ !  1 lit npc ! then ;
 \ nbfrom ( e k -- flag )  entry e's block from peer k into nblk/nbn (the
 \ one fetched ahead if it is e's), nqsnd who sent it.
 : nbfrom
-over npe @ =  npb @ 0= 0= and if
-	2drop  npb @ nblk !  npn @ nbn !  0 lit npb !  0 lit npe !  npks @ nqsnd !  -1 lit
+over npe @ =  npb @ 0= 0= and  npgot @ nblite @ 0= and 0= and if
+	2drop  npb @ nblk !  npn @ nbn !  npgot @ nbgot !  0 lit npb !  0 lit npe !  npks @ nqsnd !  -1 lit
 else
 	npdrop  dup nqsnd !  pcur @ nsvk !  puse  nblock  nsvk @ puse
 then ;
@@ -422,23 +437,29 @@ nip  0 lit pact ! ;
 \ for one fetched beside the last's check) and checking bodies (nsbody,
 \ the next block fetched meanwhile), said with the batch.
 : nqtf variable ;  : nqtc variable ;  : nqt1 variable ;
+\ nqfull: slot j fetched whole whatever its place (nqbyb, its proof to
+\ check); else lite but for the batch's last.
+: nqfull variable ;
 : nqget
 nqj !  0 lit nqok !
 npc @ 0 lit do nqok @ 0= if
 	nqj @ i + npeer nqk !
+	nqj @ 1 lit + nqm @ u<  nqfull @ 0= and nblite !
 	nqk @ nsil? 0= if
 		ticks nqt1 !  nqj @ nqh hat nqk @ nbfrom  ticks nqt1 @ - nqtf @ + nqtf !
 		dup 0= if nwhy @ 1 lit = if nqk @ nsil! then then
 	else 0 lit then
 	if
-		nqj @ 1 lit + nqm @ u< if nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk ! then
+		nqj @ 1 lit + nqm @ u< if
+			nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk !  nqj @ 2 lit + nqm @ u< npgl !
+		then
 		ticks nqt1 !  nqj @ nqh hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsbody  ticks nqt1 @ - nqtc @ + nqtc !
 		swap ?dup if
 			vrb @ if nhead "block " puts nqj @ nqh u. " from peer " puts nqsnd @ pshow " refused: " puts . "; asked of another" puts 0A lit putc else drop then
 			drop  nqsnd @ pisseed 0= if nqsnd @ pban then  nblk @ free  0 lit nblk !
 		else
 			nqj @ nqs nqt !
-			nblk @ nqt @ !  nbn @ nqt @ 4 lit + !  ncl @ nqt @ 8 lit + !  nch @ nqt @ C lit + !  nqsnd @ nqt @ 10 lit + !
+			nblk @ nqt @ !  nbn @ nqt @ 4 lit + !  ncl @ nqt @ 8 lit + !  nch @ nqt @ C lit + !  nqsnd @ nqt @ 10 lit + !  nbgot @ nqt @ 14 lit + !
 			nqby @ nbn @ + nqby !  0 lit nblk !
 			\ the counter after it (40 bits)
 			ncl @ over + dup ncl @ u< if nch @ 1 lit + nch ! then ncl !  drop
@@ -446,7 +467,13 @@ npc @ 0 lit do nqok @ 0= if
 		then
 	then
 then loop
+0 lit nblite !
 nqok @ ;
+\ nqwhole ( j -- )  slot j emptied for its block to be fetched whole: the
+\ output counter set back to before it, its bytes not counted.
+: nqwhole
+nqs nqt !  nqt @ 8 lit + @ ncl !  nqt @ C lit + @ nch !
+nqby @ nqt @ 4 lit + @ - nqby !  nqt @ @ free  0 lit nqt @ !  0 lit nqt @ 14 lit + ! ;
 \ nqfill ( -- flag )  the batch's slots filled, from nqn to nqm, or fewer
 \ once it holds NQBY bytes (nqm then cut to them).
 : nqfill
@@ -454,6 +481,9 @@ nqok @ ;
 begin nqok @ nqn @ nqm @ u< and while
 	nqby @ NQBY u< 0= if nqn @ nqm ! else nqn @ nqget drop then
 repeat
+\ its last block whole, for its proof: fetched again if it came lite (a
+\ batch cut short by its bytes ends on one)
+nqok @ nqm @ and if nqm @ 1 lit - dup nqs 14 lit + @ if dup nqwhole dup nqn ! nqget drop else drop then then
 npdrop  nqok @ ;
 \ ndone ( h -- )  block h connected: ncatch's bookkeeping (mode 1), our
 \ status, the line.
@@ -478,11 +508,24 @@ then nip ;
 \ nqbyb ( j -- )  slots j to the batch's end connected as before, each
 \ one's proof checked; one refused stops the run (nrcd, nrbad), its
 \ sender banned.
+: nqbcl variable ;  : nqbch variable ;  : nqbn variable ;
+\ nqfull1 ( j -- ok )  slot j's block whole, fetched so if it came lite
+\ (its proof to be checked): the batch's counters as they were after.
+: nqfull1
+dup nqs 14 lit + @ if
+	ncl @ nqbcl !  nch @ nqbch !  nqn @ nqbn !
+	dup nqwhole  -1 lit nqfull !  nqget  0 lit nqfull !  npdrop
+	nqbcl @ ncl !  nqbch @ nch !  nqbn @ nqn !
+else drop -1 lit then ;
 : nqbyb
 begin dup nqm @ u< nrcd @ 0= and while
+	\ not had whole from any peer: stopped there, no one banned for it
+	dup nqfull1 0= if FFFFFFFD lit nrcd !  dup nqh nrbad ! then
+	nrcd @ if else
 	dup -1 lit nqcon ?dup if
 		nrcd !  dup nqh nrbad !  dup nqs 10 lit + @ dup pisseed if drop else pban then
 	else 1 lit + then
+	then
 repeat drop
 nrcd @ 0= if nqa @ nqm @ + nqa !  0 lit nqn !  0 lit nqby ! then ;
 \ nqatt ( g -- ok )  slots 0 to g-1, attested, connected without their
@@ -502,7 +545,7 @@ nqok @ ;
 : nqgg variable ;
 : nqshift
 nqgg @ nqm @ u< if
-	nqm @ 1 lit - nqs nq @ 14 lit bcopy  0 lit nqm @ 1 lit - nqs !
+	nqm @ 1 lit - nqs nq @ 18 lit bcopy  0 lit nqm @ 1 lit - nqs !
 	nqa @ nqm @ 1 lit - + nqa !  1 lit nqn !  nq @ 4 lit + @ nqby !
 else nqa @ nqm @ + nqa !  0 lit nqn !  0 lit nqby ! then ;
 \ nbatch  one batch: filled, its last proof checked, connected (or
@@ -906,7 +949,7 @@ nrelay  nrean  qpersist  cxrun ;
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;
 
-: ninit  NQMAX 14 lit * alloc dup nq ! NQMAX 5 lit * wzero  40 lit alloc npl !  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk !  20 lit alloc nrid !  20 lit alloc nrm ! ;
+: ninit  NQMAX 18 lit * alloc dup nq ! NQMAX 6 lit * wzero  40 lit alloc npl !  40 lit alloc nbuf !  E0 lit alloc nhb !  0 lit nblk !  20 lit alloc nrid !  20 lit alloc nrm ! ;
 
 \ aserve ( s -- )  (api.fam's)
 : aserve
