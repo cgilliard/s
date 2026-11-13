@@ -193,10 +193,16 @@ Progress:
   multi-threaded TCG itself.
   Left: the pool's recheck after a block (`qcheck`, `qreturn`); API
   requests answered one at a time; blocks' chunks not served to peers
-  while the worker has a job (`pnest`, kept from the single thread). The
-  short waits for headers and a first ping, and the node's upkeep
-  (pings, relay, the API's long polls) stopping while it works:
-  `docs/TIMING_FIXES.md`.
+  while the worker has a job (`pnest`, kept from the single thread).
+- (2026-11-13, `docs/TIMING_FIXES.md` items 2, 3, 7 and 16) The short
+  waits for headers and a first ping are waits to a deadline through
+  others' datagrams (`pwaitc`); the node's upkeep (pings, relay, the
+  API's long polls: `pkeep`, `nrelay`, `awake`) goes on while it waits
+  on the worker, `nodev` or a fetch; each API request has a deadline and
+  its writes do not block; the loop sleeps to its next deadline
+  (`nnext`), not a fixed turn. Still left from the list above: the
+  pool's recheck, API requests one at a time, chunks not served while
+  the worker has a job.
 
 ## 5. The wallet shows what is in progress
 
@@ -218,6 +224,16 @@ answering for that time.
 - **The wallet itself answering meanwhile:** its long work cut into
   steps between which it reads its WebSocket, as item 4 for the node,
   so the page can show the spinner and stay usable rather than freeze.
+
+Progress (2026-11-13, `docs/TIMING_FIXES.md` item 15): the wallet tells
+the page as things happen, so the progress is known: an online send's
+steps (`payment` events with `step`: sent, delivered, unanswered,
+undelivered, finalized, answered), a payment's fate (pooled, replaced
+and by which, evicted, mined, conflicted, back), a name's (its commit
+old enough to reveal, revealed, owned, offered, transferred), a scan's
+height. The page shows each in the strip (one line, the last). Left:
+the spinners and disabled buttons, progress on the Activity entry
+rather than the strip, and the wallet's own long work in steps.
 
 ## 6. A node at height 0 (the seeds)
 
@@ -283,6 +299,12 @@ running `wmpage.py` after editing `wm.html` would drop them silently.
 Bring `wm.html` up to date from `wm.fam` (and make `wmpage.py` refuse to
 overwrite a `wm.fam` whose page differs from what `wm.html` would give,
 unless told to) before changing the layout.
+**Done (2026-11-13, 4e96e9c), but for the refusal:** the two had parted
+both ways (these screens only in `wm.fam`, TIMING_FIXES' phase 4 events
+only in `wm.html`, never served: oscheck's wallet check failed on it);
+`wm.html` now holds both and `wm.fam` is made from it. `wmpage.py`
+refuses a `//` comment (the page is joined into one line), not yet a
+`wm.fam` edited by hand.
 
 The layout:
 
@@ -323,6 +345,11 @@ place:
 
 The node's own states (not reached, starting, syncing, no peers) are
 item 22.
+
+Progress (2026-11-13): the strip no longer shows "Tip N": a block event
+shows "Synced to height N", the node unreached "Cannot reach the node;
+trying again in N s", and item 5's steps. Still one line, whatever came
+last; the model above is not built.
 
 ## 10. Activity: every entry read as a user
 
@@ -405,7 +432,8 @@ behind, item 8) and of the wallet behind it, 2026-11-12. Items 5 and
 5. **An online send's result is lost.** "Paid ..." or "Error ..." goes
    only to the strip beside the tabs, and the next block's "Tip N"
    replaces it. It belongs on the send's Activity entry (item 10) and
-   where the send was made.
+   where the send was made. (2026-11-13: the send's steps now come as
+   events, item 5, but still only to the strip, replaced by the next.)
 
 ### Clarity
 
@@ -435,12 +463,18 @@ behind, item 8) and of the wallet behind it, 2026-11-12. Items 5 and
 
 13. **Any event redraws Overview or Activity:** an open proof closes,
     the scroll goes back to the top, and a form being typed in is wiped
-    when the unlock event comes.
+    when the unlock event comes. (2026-11-13: a block event redraws
+    the open panel from the event's own values, no request, and the
+    node's, names' and payments' events only set the strip; a payment
+    event and a message still redraw Activity whole, the unlock event
+    the window.)
 14. **Some speeds cannot be chosen:** Bump always pays for "block",
     Reveal and Update for "hour", while Commit has a menu.
 15. **A name is revealed by hand:** the user must come back 12 blocks
     later and press Reveal. The wallet could reveal it when ready, if
-    the user agreed at the commit.
+    the user agreed at the commit. (2026-11-13: the wallet tells when
+    it is ready, a `name` event "reveal it now"; the reveal is still by
+    hand.)
 16. **The sub-name form takes the name as free text;** it should offer
     the names this wallet owns that point at it. Its heading ("answered
     while online") is wrong in onion mode, where the certificate is
@@ -508,6 +542,17 @@ interruption (the new tip mined on, a payment that completes), not how
 quickly. Then the real thing by hand: a laptop on each platform (Linux,
 macOS, Windows) closed and opened during a sync, during mining and
 during an online payment.
+
+Progress (2026-11-13, `docs/TIMING_FIXES.md`): the groundwork, not the
+item. A peer is given up by its silence (channels 30 s, peers 65 s),
+never by a short floor: a slow or throttled machine, or a peer busy
+for seconds, is not taken for dead (`a_busy_relay_keeps_its_channel`,
+`busy_relays_keep_the_standing_circuits`); a node stopping says so
+(goodbye) and one killed is noticed by its silence
+(`a_node_killed_is_noticed_by_its_silence`); a relay's goodbye takes it
+out of new paths at once. Pauses by `SIGSTOP` run in imagetest and
+paytest (tabminer stopped and resumed). Not tried: sleep and wake, the
+clock across a sleep, the network changing, power lost, a full disk.
 
 ## 14. Large blocks, and fast sync of a large set of outputs
 
@@ -970,6 +1015,12 @@ the batch would fail and be bisected).
 blocks after S and `ncatch`), `connect.fam`'s `sbody` and `sbproof`,
 `proofs.fam`'s `spar`, `p2p.fam`'s `pban` and the seeds' addresses
 (`psdadd`, `pisseed`). Left: the forged-branch test, a large-block try.
+**Lite blocks (2026-11-13):** a batch's blocks but its last are fetched
+without their proof (`Kind::Lite`: the header, the body up to its proof,
+the proof's 32-byte hash, which the body commitment binds), so a batch
+moves about a proof's size per block less (16 blocks: 24.3 s to 5.6 s on
+the dev network); a lie in a lite block fails the commitment, its sender
+banned, the block asked of another (`litetest.sh`). Protocol version 1.
 
 ## 22. The wallet tells what the node is doing
 
@@ -1004,3 +1055,14 @@ the Overview, nothing in the strip.
   then syncing then ready; the node stopped under an open wallet:
   "cannot connect", and back to ready when it returns; a long sync with
   the wallet open the whole time, its state right at each step.
+
+Progress (2026-11-13, `docs/TIMING_FIXES.md` items 4 and 15): the
+connection is done. Each request to the node has a 12 s deadline; the
+block thread waits on `/v1/events` and, the node not reached, tries
+again after 5 s, doubling to 30 s, the page told "Cannot reach the node;
+trying again in N s", then "The node reached again"; a busy or stopped
+node no longer freezes the window. The node sends `status` events
+(synced, syncing with its best header's height, no peers). Left: the
+wallet showing them (Overview still says "synced" whenever the node
+answers, `wovf`'s `nodeok`), "starting", the catch-up's progress, and
+what the wallet does meanwhile (no scan, sends refused with the reason).
