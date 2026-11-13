@@ -55,6 +55,15 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
   every node and seed has IPv4; an IPv6-only host cannot run a node. Still to do once the chain is
   live: hard-code a checkpoint or an `assumevalid` header hash per
   release.
+- **Sync peer usage: tabminer and the fam node not reviewed together.**
+  Which peers each asks for headers, blocks, snapshot parts and proofs,
+  and how the load is spread: tabminer samples live peers at random
+  (`PeerTable::sample`), seeds among them, and never bans a seed; the fam
+  node fetches from one peer at a time, its catch-up by batches (NODE_
+  ENHANCEMENTS item 21) from up to 16 at random, peers that are not seeds
+  first. To review both: the same rules (seeds last, random among the
+  rest, a failed or slow peer replaced), and the seeds not carrying
+  every node's sync. Tabminer left as it is until then.
 - **Untested paths.** No test for: the `drop_carry` path; a deferred
   move or restart while parts are with the applier; the header batch
   retry; clock-skew logging; strikes leading to a ban at node level;
