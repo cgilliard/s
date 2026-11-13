@@ -17,8 +17,12 @@
 #   another version (each followed by a Ping, whose Pong must come first).
 # - A second machine runs the tabernacle (scripts/node.sh) with an empty
 #   disk and the node as its only seed: it fetches the image from the node,
-#   checks it against its hash and runs it.  The miner is started again and
-#   the node it booted syncs from it too.
+#   checks it against its hash and runs it.  It starts once the node has
+#   answered Pings promptly for 6 s: a header the miner announced before
+#   it was paused holds the node's one loop ~5 s for its proof of work, and
+#   a tabernacle gives a peer 3 s.  The miner is resumed (a second could
+#   not listen on the port the paused one holds) and the node the
+#   tabernacle booted syncs from it too.
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/imagetest.sh
@@ -131,6 +135,29 @@ send(66, bytes(8) + struct.pack('<IB', 0, 1) + struct.pack('<HH', 0, 4))
 pong_next('another token: nothing')
 EOF
 
+# the node idle: 6 s of Pongs, each within half a second
+python3 - "$HP" <<'EOF' || { echo "imagetest.sh: the node never answered promptly for 6 s" >&2; wdump; exit 1; }
+import socket, sys, time
+node = ('127.0.0.1', int(sys.argv[1]))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(0.5)
+start = since = time.time()
+while time.time() - since < 6:
+    if time.time() - start > 300:
+        sys.exit(1)
+    sent = time.time()
+    s.sendto(b'TAB1\x01' + bytes(140), node)
+    try:
+        while True:
+            d, a = s.recvfrom(2048)
+            if a == node and d[4] == 2:
+                break
+    except socket.timeout:
+        since = time.time()
+    time.sleep(max(0, 0.25 - (time.time() - sent)))
+print(f'host: the node answering promptly, after {time.time() - start - 6:.1f} s')
+EOF
+
 echo "imagetest.sh: a tabernacle booting from the node"
 sh scripts/node.sh --disk="$T/booted.disk" --no-seeds --seed=10.0.2.2:$HP --mac=52:54:00:12:34:57 \
 	"$T/tabernacle" < /dev/null > "$T/booted.out" 2>&1 &
@@ -140,7 +167,7 @@ grep '^tabernacle:' "$T/booted.out"
 grep -q "^tabernacle: fetching from 10.0.2.2:$HP" "$T/booted.out" && ! grep -q '^tabernacle: \(bad\|wrong\|no\)' "$T/booted.out" \
 	&& grep -q '^kernel: ' "$T/booted.out" || { echo "imagetest.sh: the tabernacle did not boot from the node" >&2; exit 1; }
 grep '^kernel: ' "$T/booted.out" | head -1
-mine
+kill -CONT $MP
 wait_for "$T/booted.out" '^api: listening|^sync: -' 900 "the booted node's sync"
 grep -E '^sync:' "$T/booted.out"
 grep -q '^api: listening' "$T/booted.out" || { echo "imagetest.sh: the booted node did not sync" >&2; exit 1; }
