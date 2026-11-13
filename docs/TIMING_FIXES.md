@@ -656,3 +656,9 @@ understood is ignored.
     a hand-driven peer announcing a transaction, then answering the
     node's request NotHeld: not asked again in 3 s, where one never
     answered (the control) is asked again at least twice.
+    **A node killed, against stopped gracefully:** beside
+    `a_node_stopping_tells_its_channels_and_peers` (told: the channel
+    closed within 5 s), `a_node_killed_is_noticed_by_its_silence`
+    (`Event::TestKill`, no goodbye; slow, a CI job of its own): the
+    channel still held 5 s on, given up by the channel's silence (19 s
+    here), the peer not live after its 65 s.

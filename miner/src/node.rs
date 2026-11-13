@@ -398,6 +398,10 @@ pub enum Event {
     /// Tests: keep no standing circuits.
     #[cfg(test)]
     TestQuiet,
+    /// Tests: the node gone without a word (no goodbye), as a crash or a
+    /// cable pulled.
+    #[cfg(test)]
+    TestKill,
     /// Tests: the node's loop busy this long, taking nothing meanwhile
     /// (datagrams queue for it, as behind a long block's checking).
     #[cfg(test)]
@@ -1174,6 +1178,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::TestQuiet) => self.quiet = true,
                 #[cfg(test)]
                 Ok(Event::TestStall(d)) => std::thread::sleep(d),
+                #[cfg(test)]
+                Ok(Event::TestKill) => break,
                 #[cfg(test)]
                 Ok(Event::TestExpireIdle) => self.channels.expire_idle = true,
                 #[cfg(test)]
@@ -5796,6 +5802,58 @@ mod tests {
         wait_for("a taking b for gone", 5, &|| {
             stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b && !p.live && !p.handshaken)
         });
+        tx_a.send(Event::Stop).unwrap();
+        h_a.join().unwrap();
+    }
+
+    /// The same, b killed (no goodbye: a crash, a cable pulled): a hears
+    /// nothing, so keeps the channel past the moment it would have been
+    /// told, then gives it up by its own timer (30 s at most), and takes b
+    /// for not live after its silence (65 s).
+    #[test]
+    #[ignore = "slow: one job each in .github/workflows/test.yml"]
+    fn a_node_killed_is_noticed_by_its_silence() {
+        let (a, b) = (open("kill-a"), open("kill-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut cfg = config(vec![], &a.dir);
+        cfg.relay = true;
+        cfg.identity = Some(key(1));
+        cfg.relay_key = cfg.identity.clone();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), cfg).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let stats_a = node_a.stats();
+        let sink_a = Arc::clone(&node_a.channels.sink);
+        let h_a = std::thread::spawn(move || node_a.run());
+        let mut cfg = config(vec![addr_a], &b.dir);
+        cfg.relay = true;
+        cfg.identity = Some(key(2));
+        cfg.relay_key = cfg.identity.clone();
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cfg).unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+        let h_b = std::thread::spawn(move || node_b.run());
+        let wait_for = |what: &str, secs: u64, ok: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + guard(secs);
+            while !ok() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let b_live = || stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b && p.handshaken && p.live);
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"hello".to_vec())).unwrap();
+        wait_for("b's body at a", 10, &|| sink_a.lock().unwrap().len() == 1);
+        wait_for("b a peer of a", 15, &b_live);
+        wait_for("a's channel counted", 5, &|| stats_a.lock().unwrap().channels == 1);
+        tx_b.send(Event::TestKill).unwrap();
+        h_b.join().unwrap();
+        let killed = Instant::now();
+        // not told: still held where a goodbye closed it (within 5 s)
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(stats_a.lock().unwrap().channels, 1, "a closed b's channel as if told");
+        wait_for("a giving b's channel up by its timer", 60, &|| stats_a.lock().unwrap().channels == 0);
+        eprintln!("the channel given up {:?} after b was killed", killed.elapsed());
+        wait_for("a taking b for not live", 120, &|| !b_live());
+        eprintln!("b not live {:?} after it was killed", killed.elapsed());
         tx_a.send(Event::Stop).unwrap();
         h_a.join().unwrap();
     }

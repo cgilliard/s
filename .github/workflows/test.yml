@@ -106,6 +106,7 @@ jobs:
           - test: node::tests::an_idle_participant_is_quiet_and_learns_of_a_dead_hop
           - test: node::tests::sessions_come_back_after_the_relay_restarts
           - test: node::tests::standing_circuits_are_replaced_and_rebuilt
+          - test: node::tests::a_node_killed_is_noticed_by_its_silence
           - test: node::tests::a_false_claim_of_work_does_not_stall_the_sync
           - test: node::tests::a_false_claim_of_work_at_a_low_height_does_not_stall_the_sync
           - test: node::tests::a_switch_of_relays_keeps_messages_flowing
