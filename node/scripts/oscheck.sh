@@ -859,7 +859,7 @@ W="$T/wallet.out"
 for pat in '^w: {"op":"unlock","ok":true,"wallet":false}$' '^w: {"id":1,"ok":false,"error":"no wallet yet: create or restore one"}$' \
 	'^w: {"id":2,"ok":true,"words":"\([a-z]\{3,8\} \)\{11\}[a-z]\{3,8\}"}$' '^w: {"id":3,"ok":true,"address":"tab1[02-9ac-hj-np-z]\{58\}"}$' \
 	'^w: {"id":4,"ok":false,"error":"there is a wallet already"}$' '^w: {"id":5,"ok":false,"error":"not the password"}$' \
-	'^w: {"id":7,"ok":false,"error":"unlocked already"}$' '^w: {"id":8,"ok":true,"confirmed":"0.0000000000","pending":"0.0000000000","unverified":"0.0000000000","reserved":"0.0000000000","locked":"0.0000000000","height":0,"node":"not reached","reach":0,"points":0,"mode":"init"}$' \
+	'^w: {"id":7,"ok":false,"error":"unlocked already"}$' '^w: {"id":8,"ok":true,"confirmed":"0.0000000000","pending":"0.0000000000","unverified":"0.0000000000","reserved":"0.0000000000","locked":"0.0000000000","height":0,"node":"not reached","reach":0,"points":0,"mode":"init","watch":"events"}$' \
 	'^w: {"op":"unlock","ok":false,"error":"the wallet is sealed under another password than the session"}$' \
 	'^w: {"id":9,"ok":false,"error":"locked"}$' '^w: {"op":"unlock","ok":true,"wallet":true}$' \
 	'^w: {"id":11,"ok":false,"error":"there is a wallet already"}$' \
