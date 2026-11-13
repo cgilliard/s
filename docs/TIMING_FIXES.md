@@ -577,9 +577,18 @@ understood is ignored.
     reached, asked again after 5 s doubling to 30 s. Without a thread
     (no pipe, no room) the 4 s poll stays. The overview says which
     (`watch`: `events`, `poll`); `paytest.sh` checks `events` and a
-    block told to the page with nothing asked. Left: the wallet's
-    events to the page (one update per block), and the node's
-    unreachability shown with its next try.
+    block told to the page with nothing asked.
+    **One update a block done (2026-11-13):** the wallet sends a `block`
+    event (height, hash, and the overview, activity and names as their
+    requests answer, as of that block) once the tip moves, after the
+    request at hand is answered; the page redraws the open panel among
+    those three from it, only its list (a form's typing kept), with no
+    request; a panel opened later asks as before. `node` events say the
+    node unreachable (with the seconds to the next try, shown on the
+    status line) and reached again. `paytest.sh` checks the event's
+    panels (the 2.5 received in the activity, the balance), and
+    `wallettest.sh` its shape. Left: a payment's progress as events
+    (sent, answered, mined, confirmed; failed and why), and names'.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
     **The node's part done (2026-11-13):** its deadlines on the

@@ -464,7 +464,9 @@ else wscan then
 nodeok @ if wssv then
 nodeok @ ;
 \ wtick  the node asked for its tip; when it moved, the set scanned again
-\ (wscn2: what is new) and the tip told (an event).
+\ (wscn2: what is new) and the block to be told (wnewb: the main loop
+\ sends the block event, wblkev, once the request at hand is answered).
+: wnewb variable ;
 : wtick
 have @ if
 	"/v1/status" hget ?dup if
@@ -477,7 +479,7 @@ have @ if
 		ntip @ ltip @ streq 0= if
 			wscn2 if
 				ltip @ ntip @ scpy 0 lit over c! drop
-				"{'event':'tip','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw "'}" jo jend
+				-1 lit wnewb !
 			then
 		then
 	else 0 lit nodeok ! then
@@ -512,7 +514,7 @@ wbp @ pipe 0< 0= if
 				0 lit wbf !
 				"'next':" jfind ?dup if jnum drop nlo @ wbn ! then
 			else
-				-1 lit wbf !  2 lit wbsig
+				-1 lit wbf !  wbb @ wbsig
 				wbb @ 0 lit do 3B9ACA00 lit sleep loop
 				wbb @ 1 lit lshift 1E lit umin wbb !
 			then
@@ -520,12 +522,20 @@ wbp @ pipe 0< 0= if
 	]tcode
 	0 lit HMAX 10000 lit + pthread 0< 0= if -1 lit wbon ! then
 then ;
-\ wbread  what the block thread said: something happened (the node
-\ asked, the set scanned: wtick), or the node not reached.
+\ wbread  what the block thread said: something happened (1: the node
+\ asked, the set scanned, wtick; reached again, an event), or the node
+\ not reached (the seconds to its next try: an event, the page saying
+\ so).
+: wbsv variable ;
 : wbread
 wbp @ @ wbm @ 10 lit read  dup 0 lit > if
-	0 lit swap 0 lit do wbm @ i + c@ 1 lit = or loop
-	if wtick else 0 lit nodeok ! then
+	0 lit wbsv !
+	0 lit swap 0 lit do wbm @ i + c@ dup 1 lit = if drop -1 lit or else wbsv ! then loop
+	if
+		nodeok @ 0=  wtick  nodeok @ and if "{'event':'node','state':'reached'}" jo jend then
+	else
+		0 lit nodeok !  "{'event':'node','state':'unreachable','retry':" jo wbsv @ 0 lit wdec "}" jo jend
+	then
 else drop then ;
 : wsum.  dup @ swap 4 lit + @ wamt ;                      \ ( acc -- )  written
 
@@ -1416,10 +1426,10 @@ nrecb @ 32 lit + c@ 8 lit u< 0= if "its owner key has signed all it may" jerr el
 then then then then then then ;
 
 : nanm variable ;  : nkl variable ;  : ntx variable ;
-: onames
-have @ 0= if nowal else
-	wtick
-	jok ",'items':[" jo  0 lit nanm !
+\ wnamf  the names' field ('items': 16 at most), for onames and the
+\ block event (wblkev).
+: wnamf
+	"'items':[" jo  0 lit nanm !
 	6E lit okey @ c!  1 lit nkl !
 	begin
 		wfd @ 0 lit txbegin ntx !  ntx @ okey @ nkl @ okn @ txnext  ntx @ txabort drop
@@ -1446,8 +1456,8 @@ have @ 0= if nowal else
 		then
 		"}" jo
 	repeat drop
-	"]}" jo jend
-then ;
+	"]" jo ;
+: onames  have @ 0= if nowal else wtick  jok "," jo wnamf "}" jo jend then ;
 
 \ hexs ( a n dst -- )  n bytes in hex, a string at dst.
 : hxd  F lit and dup A lit u< if 30 lit + else 57 lit + then ;
@@ -1458,9 +1468,10 @@ swap ?dup if 0 lit do over i + c@ dup 4 lit rshift hxd 2 lit pick c!  hxd over 1
 \ finds their output in the set), outputs received (by their commitment;
 \ change left out, spent ones marked).
 : anum variable ;
-: oact
-have @ 0= if nowal else
-	jok ",'items':[" jo  0 lit anum !
+\ wactf  the activity's field ('items': 16 at most), for oact and the
+\ block event.
+: wactf
+	"'items':[" jo  0 lit anum !
 	wfd @ 0 lit txbegin wtx !
 	70 lit okey @ c!  1 lit
 	begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 70 lit = else 0 lit then  anum @ 10 lit u< and while
@@ -1482,8 +1493,8 @@ have @ 0= if nowal else
 		21 lit
 	repeat drop
 	wtx @ txabort drop
-	"]}" jo jend
-then ;
+	"]" jo ;
+: oact  have @ 0= if nowal else jok "," jo wactf "}" jo jend then ;
 
 \ wsums  the balance in tabminer's five sums (wallet.rs's Balance), 8
 \ bytes each: sa1 confirmed (unspent, in the set), sa2 pending (unspent,
@@ -2160,16 +2171,24 @@ then ;
 \ ── The requests ──
 
 : tried variable ;
-: oview
-wtick  wsums
-jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'" jo sa4 @ wsum.  "','reserved':'" jo sa3 @ wsum.
+\ wovf  the overview's fields, for oview and the block event.
+: wovf
+wsums
+"'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'" jo sa4 @ wsum.  "','reserved':'" jo sa3 @ wsum.
 "','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo
 "','reach':" jo wonline @ if wmonion @ if owlive else mnlive then else 0 lit then 0 lit wdec
 ",'points':" jo wmonion @ if owrn @ 3 lit u< 0= if OWS else 0 lit then else 0 lit  mnnp @ ?dup if 0 lit do i mnmy if 1 lit + then loop then then 0 lit wdec
 ",'mode':'" jo wmonion @ if "onion" else "init" then jo
 \ how it follows the node: its events (the block thread), or asking
 \ every 4 s (the thread not started)
-"','watch':'" jo wbon @ if "events" else "poll" then jo "'" jo  "}" jo jend ;
+"','watch':'" jo wbon @ if "events" else "poll" then jo "'" jo ;
+: oview  wtick jok "," jo wovf "}" jo jend ;
+\ wblkev  the block event (docs/TIMING_FIXES.md, item 15): one a block,
+\ with everything the panels show as of it (the overview, the activity,
+\ the names), so the page redraws them from it whichever is open.
+: wblkev
+"{'event':'block','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw
+"','overview':{" jo wovf "},'activity':{" jo wactf "},'names':{" jo wnamf "}}" jo jend ;
 \ oscan  the whole set scanned again now; the tip and the scan told.
 : oscan
 have @ 0= if nowal else
@@ -2310,6 +2329,7 @@ begin
 	mnfd @ pfd @ 10 lit + !  1 lit pfd @ 14 lit + !
 	pfd @  wonline @ if 3 lit 3B9ACA00 lit else 2 lit EE6B2800 lit then  poll drop
 	wbon @ if pfd @ C lit + @ 10 lit rshift if wbread then then
+	wnewb @ have @ and if 0 lit wnewb !  wblkev then
 	pfd @ 4 lit + @ 10 lit rshift if
 		0 lit ibuf @ icnt @ + 3FFF lit icnt @ - read  dup 0 lit > if icnt @ + icnt !  lines  1 lit else drop 0 lit then
 	else 1 lit then
@@ -2319,6 +2339,7 @@ begin
 	else
 		wbon @ 0=  pfd @ 4 lit + @ 10 lit rshift 0= and if wtick then
 	then
+	wnewb @ have @ and if 0 lit wnewb !  wblkev then
 while repeat
 \ leaving: the relays told (their channels to us gone)
 wonline @ wmonion @ and if owbye then

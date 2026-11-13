@@ -288,7 +288,7 @@ function wwait(s){return s<3600?Math.round(s/60)+' min':(s<86400?Math.round(s/36
 function wshow(w,t){
 w.tab=t;w.tabs.forEach(function(b){if(b.tab==t)b.classList.add('on');else b.classList.remove('on')});
 if(w.b)w.b.remove();
-var p=w.b=el('div','wbody',w.t);
+var p=w.b=el('div','wbody',w.t);w.lv=null;
 if(!w.unl){el('div','',p).textContent=w.lockmsg||'Unlocking...';return}
 if(w.none&&t!='settings'){
 wh(p,'No wallet yet');el('div','',p).textContent='Create one here, or restore one from its phrase in Settings.';
@@ -296,11 +296,10 @@ var co=el('div','wv',p);
 wbtn(p,'Create a wallet',function(){wask(w,'create',{},function(m){if(wbad(co,m))return;w.none=false;co.textContent='Write these words down, in order: '+m.words})});
 return;
 }
-if(t=='overview')wask(w,'overview',{},function(m){
-if(wbad(p,m))return;
+if(t=='overview'){var lv=w.lv={tab:t,el:p,draw:function(m){
 wh(p,'Balance');wrow(p,'Confirmed',m.confirmed);wrow(p,'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.reserved);wrow(p,'Locked',m.locked);
 wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);
-});
+}};wask(w,'overview',{},function(m){if(wbad(p,m))return;lv.draw(m)})}
 else if(t=='receive'){
 var a=el('div','',p);
 wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This wallet');wrow(a,'Address',m.address);if(m.name)wrow(a,'Name',m.name)});
@@ -338,8 +337,7 @@ var ba=wfield(b,'Amount','text'),bp=wfield(b,'Purpose','text'),bf=wfield(b,'For 
 wspeeds(w,bs);
 wbtn(b,'Burn',function(){wask(w,'burn',{amount:ba.value,purpose:bp.value,for:bf.value,speed:bs.value},function(m){bo.textContent=m.ok?'Burned: '+m.tx+' (fee '+m.fee+'); its proof is in Activity once it is in a block':'Error: '+m.error})});
 }
-else if(t=='activity')wask(w,'activity',{},function(m){
-if(wbad(p,m))return;
+else if(t=='activity'){var lv=w.lv={tab:t,el:p,draw:function(m){
 if(!m.items.length)el('div','',p).textContent='Nothing yet.';
 m.items.forEach(function(x){
 var r=wrow(p,x.kind,x.amount+'  '+x.state+(x.height?' at '+x.height:'')+'  '+x.tx.slice(0,16));
@@ -355,7 +353,7 @@ wask(w,'proof',{tx:x.tx},function(m){if(wbad(pf,m))return;var t=warea(pf,'The pr
 });
 }
 });
-});
+}};wask(w,'activity',{},function(m){if(wbad(p,m))return;lv.draw(m)})}
 else if(t=='proofs'){
 var f=el('div','wf',p);wh(f,'Check a proof');
 var pt=warea(f,'The proof (paste it here)'),po=el('div','',f);
@@ -366,9 +364,9 @@ if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);
 })});
 }
 else if(t=='names'){
-var a=el('div','',p);wh(a,'Your names');
-wask(w,'names',{},function(m){
-if(wbad(a,m))return;
+var a=el('div','',p);
+var lv=w.lv={tab:t,el:a,draw:function(m){
+wh(a,'Your names');
 if(!m.items.length)el('div','',a).textContent='None yet.';
 m.items.forEach(function(x){
 var r=wrow(a,x.name,x.state+(x.value?'  '+x.value.slice(0,16):'')+(x.state=='committed'?'  ready in '+x.ready+' blocks':''));
@@ -376,7 +374,8 @@ var ro=el('div','wv',a);
 if(x.state=='ready')wbtn(r,'Reveal',function(){wask(w,'name-reveal',{name:x.name,speed:'hour'},function(m){ro.textContent=m.ok?'Revealed: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
 if(x.state=='owned'){var uv=wfield(r,'New value','text');wbtn(r,'Update',function(){wask(w,'name-update',{name:x.name,value:uv.value,speed:'hour'},function(m){ro.textContent=m.ok?'Updated: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})})}
 });
-});
+}};
+wask(w,'names',{},function(m){if(wbad(a,m))return;lv.draw(m)});
 var f=el('div','wf',p);wh(f,'Register a name');
 var nn=wfield(f,'Name','text'),nv=wfield(f,'Value (64 hex digits; optional)','text'),ns=wfield(f,'Speed','select'),no=el('div','wv',f);
 wspeeds(w,ns);
@@ -401,7 +400,12 @@ wbtn(g,'Scan again',function(){wask(w,'scan',{},function(m){go.textContent=m.ok?
 }
 function wmsg(w,m){
 if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.ok?'':'Locked: '+(m.error||'');wshow(w,w.tab);return}
-if(m.event=='tip'){w.st.textContent='Tip '+m.height;return}
+// one event a block (docs/TIMING_FIXES.md, item 15): the open panel among
+// overview, activity and names redrawn from it, no request; the node's
+// reachability when it changes
+if(m.event=='block'){w.st.textContent='Synced to height '+m.height;var lv=w.lv;
+if(w.unl&&lv&&lv.tab==w.tab&&m[lv.tab]){var c=lv.el;while(c.firstChild)c.removeChild(c.firstChild);lv.draw(m[lv.tab])}return}
+if(m.event=='node'){w.st.textContent=m.state=='unreachable'?'Cannot reach the node; trying again in '+m.retry+' s':'The node reached again';return}
 if(m.event=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}
 if(m.event){if(w.unl&&(w.tab=='overview'||w.tab=='activity'))wshow(w,w.tab);return}
 var cb=w.q[m.id];if(cb){delete w.q[m.id];cb(m)}

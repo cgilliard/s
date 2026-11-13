@@ -197,10 +197,17 @@ check('tabminer finalized the answer and pooled it', aout().count('pooled; broad
 got = wait('the 2.5 confirmed in the wallet', lambda: (time.sleep(3), confirmed() == '2.5000000000')[1])
 check('the wallet holds 2.5 confirmed', got)
 # It follows the node by its events (docs/TIMING_FIXES.md, item 15): the
-# block thread, and a block told the page with nothing asked meanwhile.
+# block thread, and a block told the page with nothing asked meanwhile,
+# carrying every panel as of it (the overview's balance, the activity
+# with the 2.5 received, the names).
 check('the wallet follows the node by its events', ask('overview')['watch'] == 'events')
-n0 = len([m for m in msgs if m.get('event') == 'tip'])
-wait('a block told, nothing asked', lambda: pumpone() or len([m for m in msgs if m.get('event') == 'tip']) > n0)
+n0 = len([m for m in msgs if m.get('event') == 'block'])
+wait('a block told, nothing asked', lambda: pumpone() or len([m for m in msgs if m.get('event') == 'block']) > n0)
+b = [m for m in msgs if m.get('event') == 'block'][-1]
+check(f'the block event at {b["height"]}: the overview, the activity, the names as of it',
+      b['overview']['height'] == b['height'] and b['overview']['confirmed'] == '2.5000000000'
+      and any(x['kind'] == 'received' and x['amount'] == '2.5000000000' for x in b['activity']['items'])
+      and isinstance(b['names']['items'], list))
 
 if part in ('payments', 'proofs'):
     # the wallet pays tabminer 1

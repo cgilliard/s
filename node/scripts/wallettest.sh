@@ -169,7 +169,9 @@ def check(what, cond):
         sys.exit(1)
 check('restored', answer(1)['ok'])
 check(f'the confirmed balance is every output\'s: {want}', answer(2)['confirmed'] == want and total > 0)
-check('the tip told, with its hash', any(l.get('event') == 'tip' and len(l.get('hash', '')) == 64 for l in lines))
+check('the block told, with its hash and every panel as of it (docs/TIMING_FIXES.md, item 15)',
+      any(l.get('event') == 'block' and len(l.get('hash', '')) == 64 and l['overview']['height'] == l['height']
+          and isinstance(l['activity']['items'], list) and isinstance(l['names']['items'], list) for l in lines))
 check('an address', answer(3)['address'].startswith('tab1') and len(answer(3)['address']) == 62)
 check('run again, unlocked from its records: the same', answer(4)['confirmed'] == want)
 # the payment

@@ -191,8 +191,12 @@ is written).
   sent since these were built: the wallet keeps a sent transaction's
   inputs and change, "x" records, for them); names are tabminer's (`docs/NAMES.md`), a reveal at
   least 12 blocks after its commit.
-- **Events,** unasked, with `"event"` in place of an id: `tip`
-  (`height`, `hash`) when the tip moves; `payment` (`tx`, `kind`,
+- **Events,** unasked, with `"event"` in place of an id: `block`
+  (`height`, `hash`, and `overview`, `activity` and `names`, each what
+  that request answers, as of the block: the page redraws the open panel
+  from it, `docs/TIMING_FIXES.md` item 15) once a block, when the tip
+  moves; `node` (`state`: `unreachable`, with `retry`, the seconds to the
+  next try; `reached`) when the node stops or starts answering; `payment` (`tx`, `kind`,
   `amount`, `state`) when one arrives or changes state; `scan` (`height`,
   `of`) as a scan goes; `locked` when the wallet locks itself.
 
