@@ -555,8 +555,10 @@ loop
 abod @ 0= if "no transaction" "400 Bad Request" afail else
 	abod @ abn @ qadmit
 	dup 0= if
-		drop  qid @ ab32 @ ycanon  ab32 @ FFFFFFFF lit pann
-		"api: tx 0 " puts ab32 @ nhex 0A lit putc
+		drop  qid @ ab32 @ ycanon
+		"api: tx 0 " puts ab32 @ nhex " pooled; announced to" puts
+		-1 lit pnlog !  ab32 @ FFFFFFFF lit pann  0 lit pnlog !
+		pnann @ 0= if " no peer (none has answered our ping yet)" puts then 0A lit putc
 		abegin "{" a" "accepted" akey "true" a" acom "id" akey ab32 @ adig "}" a" "200 OK" asend
 	else
 		"api: tx " puts dup . 0A lit putc

@@ -818,10 +818,14 @@ loop then nah @ ;
 \ each minute: a peer that missed the first (silent then, restarted, a
 \ datagram lost) asks for it now; one that has it does nothing.
 : nrat variable ;
+: nrc2 variable ;
 : nrean
 ntime nrat @ u< 0= if
-	ntime 3C lit + nrat !
-	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann then loop
+	ntime 3C lit + nrat !  0 lit nrc2 !
+	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann  nrc2 @ 1 lit + nrc2 ! then loop
+	vrb @ nrc2 @ and if
+		nhead "the pool's " puts nrc2 @ u. " transactions announced again, to " puts pnann @ u. " peers" puts 0A lit putc
+	then
 then ;
 : nstep
 -1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !

@@ -28,7 +28,7 @@
 \ pping ( -- flag )  a Ping to the current peer until its Pong (a few
 \ seconds): its status in pst.
 \ pann ( id k -- )  TxInv (id: 32 canonical bytes) to every peer that
-\ answered but k.
+\ answered but k; pnann how many, each named on the line if pnlog.
 \ pkeep  each peer pinged when its time comes, as tabminer does: every
 \ (and, while fewer than PPEERS answer, more asked for: pdisc)
 \ 30 s while it answers; one that has not answered within 35 s again
@@ -226,6 +226,10 @@ if -1 lit else
 		then
 	then
 then ;
+\ pshow ( k -- )  peer k's address.
+: pshow
+prec dup @  dup 18 lit rshift u. 2E lit putc  dup 10 lit rshift FF lit and u. 2E lit putc
+dup 8 lit rshift FF lit and u. 2E lit putc  FF lit and u. 3A lit putc  4 lit + @ u. ;
 \ pgive  the GetChunks in prx, if it carries our token: the chunks of a
 \ pooled transaction (kind 1), a block on our chain (kind 0), or a
 \ snapshot's manifest (kind 2) or part (kind 3, its index before the id).
@@ -235,6 +239,13 @@ prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
 	prn @ 2F lit pgo @ + u< if drop 0 lit else
 	dup 1 lit = if
 		drop  prx @ E lit + pidm @ dle  pidm @ qfind dup 0< if drop 0 lit else qslot dup @ pgb !  4 lit + @ pgn !  -1 lit then
+		\ a transaction of our pool fetched: who asked (the step a peer
+		\ takes after our TxInv, docs/HARDENING.md's peer table)
+		vrb @ if
+			nhead "transaction " puts prx @ E lit + nhex " asked for by " puts
+			pfk @ 0< if "an address not among our peers" puts else pfk @ pshow then
+			dup 0= if " (not in our pool)" puts then 0A lit putc
+		then
 	else dup 0= if
 		drop  pnest @ 0= if pblock if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
 	else
@@ -292,10 +303,6 @@ prx @ 11 lit + c@  dup 2 lit lshift 12 lit + prn @ =  rot and if
 	loop then
 else drop then ;
 
-\ pshow ( k -- )  peer k's address.
-: pshow
-prec dup @  dup 18 lit rshift u. 2E lit putc  dup 10 lit rshift FF lit and u. 2E lit putc
-dup 8 lit rshift FF lit and u. 2E lit putc  FF lit and u. 3A lit putc  4 lit + @ u. ;
 
 \ plearn ( ip port -- k | -1 )  an address added if new and there is
 \ room (its index, else -1): pinged by pkeep from then on.
@@ -486,9 +493,14 @@ loop then
 pdisc ;
 
 \ pann ( id k -- )
+: pnann variable ;  : pnlog variable ;
 : pann
+0 lit pnann !
 pnp @ ?dup if 0 lit do
-	dup i = 0=  i prec 8 lit + @ and if  A lit wbeg  over 20 lit wbs  i psend  then
+	dup i = 0=  i prec 8 lit + @ and if
+		A lit wbeg  over 20 lit wbs  i psend  pnann @ 1 lit + pnann !
+		pnlog @ if 20 lit putc i pshow then
+	then
 loop then 2drop ;
 
 : pping
