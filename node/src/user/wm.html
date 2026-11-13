@@ -405,6 +405,7 @@ if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.
 // reachability when it changes
 if(m.event=='block'){w.st.textContent='Synced to height '+m.height;var lv=w.lv;
 if(w.unl&&lv&&lv.tab==w.tab&&m[lv.tab]){var c=lv.el;while(c.firstChild)c.removeChild(c.firstChild);lv.draw(m[lv.tab])}return}
+if(m.event=='payment'&&m.step){w.st.textContent='Slate '+m.slate.slice(0,16)+': '+({sent:'sent; waiting for the recipient',delivered:'at a point of the recipient; waiting for the answer',unanswered:'not answered yet; its coins stay reserved until it is, or you cancel it',undelivered:'not delivered; cancelled, its coins free again',finalized:'answered and sent to the network',answered:'a payment to you answered; it is paid once the payer sends it'}[m.step]||m.step);if(w.unl&&w.tab=='activity')wshow(w,'activity');return}
 if(m.event=='payment'){w.st.textContent='Payment '+m.tx.slice(0,16)+': '+(m.state=='replaced'?'replaced by '+m.by.slice(0,16):m.state=='mined'?'in block '+m.height:m.state=='evicted'?'dropped from the pool (a better fee took its place): bump it':m.state=='conflicted'?'dropped: its coins were spent otherwise':m.state);if(w.unl&&w.tab=='activity')wshow(w,'activity');return}
 if(m.event=='node'){w.st.textContent=m.state=='unreachable'?'Cannot reach the node; trying again in '+m.retry+' s':'The node reached again';return}
 if(m.event=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}

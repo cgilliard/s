@@ -199,7 +199,11 @@ is written).
   next try; `reached`) when the node stops or starts answering; `payment`
   (`tx`, `state`: what the node says became of a payment not yet landed,
   four watched at most: `pooled`, `replaced` with `by`, `evicted`,
-  `mined` with `height`, `conflicted`, `back`) when it changes; `scan` (`height`,
+  `mined` with `height`, `conflicted`, `back`) when it changes, or
+  (`slate`, `step`) an online payment's steps: the payer's `sent`,
+  `delivered` (at a point of the recipient's), `unanswered` (its coins
+  kept reserved), `undelivered` (cancelled, its coins free), `finalized`;
+  the payee's `answered`; `scan` (`height`,
   `of`) as a scan goes; `locked` when the wallet locks itself.
 
 ## Files

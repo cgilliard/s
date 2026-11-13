@@ -598,9 +598,14 @@ understood is ignored.
     watches the new list (a bumped one leaves it). The page says it on
     the status line ("dropped from the pool ...: bump it") and redraws
     Activity. `paytest.sh`: the burn replaced by its bump, the bump
-    mined, the cancelled burn replaced by its cancel. Left: an online
-    payment's steps (sent, at the recipient's point, answered,
-    finalized; failed and why) and names' as events.
+    mined, the cancelled burn replaced by its cancel.
+    **An online payment's steps done (2026-11-13):** `payment` events by
+    the slate's id beside the messages saying them: the payer's sent,
+    delivered, unanswered (its coins reserved), undelivered (cancelled),
+    finalized; the payee's answered. The page shows each on the status
+    line. `msgtest.sh` and `onitest.sh` check them (the 2.5 answered;
+    the 1 sent, then finalized, by one slate). Left: names' steps as
+    events (committed, the reveal's window open, registered).
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
     **The node's part done (2026-11-13):** its deadlines on the

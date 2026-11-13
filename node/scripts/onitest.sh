@@ -234,6 +234,13 @@ def fin():
     return next((m for m in events('message') if 'tx' in m or (m.get('ok') is False and 'error' in m)), None)
 f = wait('the wallet finalizing A\'s answer', fin)
 check(f'A answered along the route, the wallet finalized it: {f.get("tx", f.get("error"))}', f.get('ok') and len(f.get('tx', '')) == 64)
+# its steps as events (docs/TIMING_FIXES.md, item 15): the 2.5 answered,
+# the 1 sent then finalized, by the same slate
+wait('the finalized step told', lambda: pumpone() or any(m.get('step') == 'finalized' for m in events('payment')))
+ps = [m for m in events('payment') if 'step' in m]
+sent = [m['slate'] for m in ps if m['step'] == 'sent']
+check(f'the steps told: {[m["step"] for m in ps]}', any(m['step'] == 'answered' for m in ps) and len(sent) == 1
+      and len(sent[0]) == 64 and [m['step'] for m in ps if m['slate'] == sent[0]][-1] == 'finalized')
 fee = int(p['fee'].replace('.', ''))
 want = 25 * 10**9 - 10**10 - fee
 want = f'{want // 10**10}.{want % 10**10:010d}'
