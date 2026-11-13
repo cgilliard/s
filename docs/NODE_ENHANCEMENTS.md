@@ -149,8 +149,61 @@ What it takes:
    of the last block meanwhile (transactions of their own, as `vwait`
    already keeps the API's).
 3. **A test.** A chain of large blocks (the most outputs and names a
-   block takes), synced while a probe pings and asks the API: no answer
-   later than the bound.
+   block takes; item 14's generator, the node's side of tabminer's
+   `scale.yml`), synced with the probe on: its numbers show what still
+   holds the loop. No test asserts a bound (that would be a timing test):
+   a test checks responsiveness as `stalltest.sh` does, with something
+   held up on purpose and the API asked meanwhile.
+
+**The root cause, and the plan (2026-11-13).** Every hold found so far
+was a step of the one loop: the consensus scan (4 to 6 s every 10 s on a
+live node, the wallet's Overview waiting on it), a header batch's checks,
+a wait for a peer that does not watch the API. Fixing each in turn leaves
+the next; the node serves only when the loop comes round. So serving is
+taken off the loop, in two steps, and the loop keeps the work (sync, the
+worker's blocks, the consensus scan, the pool):
+
+1. **The API on a thread of its own** (first: the wallet's lag). Its own
+   TCP listener and buffers (as the worker's, `cwinit`: every buffer the
+   handlers reach, copied), the store read in snapshots (a read
+   transaction on the last commit, as now). What it cannot read from the
+   store, the loop publishes (fam threads copy variables at their start
+   and never see them change: anything shared lives in malloc'd memory):
+   - **a view** under a lock, rewritten by the loop when it changes: the
+     height, tip and work, the best header's height, peers, the pool's
+     count and bytes, the activity, the probe's stall, the reveal wait,
+     the consensus file in force; then `/v1/status` and `/v1/consensus`
+     read it;
+   - **the event ring** (`events.fam`) in shared memory, an event written
+     whole before its number is published; `/v1/events` and `/v1/tip`
+     wait on it in the thread, woken by a byte on a pipe the loop writes
+     at each event (as the wallet's block thread is);
+   - **the pool's summary** for `/v1/fees` and `/v1/mempool`, copied into
+     the view when the pool changes;
+   - **headers** from the store (the main chain's are kept there);
+     a side branch's header, held in memory only, is not found;
+   - **`POST /v1/tx`** handed to the loop on a pipe (the pool is the
+     loop's to change), its verdict back on another: the only request
+     that still waits on the loop.
+   Without the thread (its heap short), the API stays in the loop, as
+   now.
+2. **Peers served on that thread too** (what a seed needs: headers,
+   blocks, lite blocks, snapshot parts, the image to tabernacles, to
+   many at once, whatever the loop is doing). The one UDP socket read by
+   the serving thread, which answers requests and passes the loop the
+   datagrams it waits for (answers to its own requests: headers, chunks,
+   pongs) on a pipe; the peer table shared under the lock.
+
+**Tests:** the loop held on purpose (a test hook), and meanwhile the API
+answers `/v1/status`, a page of outputs and an event (no clock: asked
+while it is held, answered); then, with step 2, a peer's blocks served
+while the loop is held. The probe's numbers show what still holds the
+loop, never asserted.
+
+The small fixes stay worth having (they save work and bandwidth): the
+consensus scan only when the height changes or something is missing
+(`cons.fam`'s `cxneed`, 2026-11-13); next, its leaves asked for without
+waiting, and its votes counted as blocks come rather than recounted.
 
 Progress:
 
@@ -203,6 +256,17 @@ Progress:
   (`nnext`), not a fixed turn. Still left from the list above: the
   pool's recheck, API requests one at a time, chunks not served while
   the worker has a job.
+- (2026-11-13) The probe (step 1): the node times its own loop, from
+  each point the API can be answered (`aaccept`, or a wait watching its
+  listener) to the next (`p2p.fam`'s `pmark`); each hold over a second
+  is logged ("the loop held N ms (height, activity)"), the longest given
+  by `/v1/status` (`stall_ms`, `stall_height`, `stall_activity`). For
+  finding stalls, never asserted.
+- (2026-11-13) Blocks' chunks and snapshots served while the worker
+  connects a block (`cwait` no longer sets `pnest`: the worker writes in
+  its own transaction, so a block is read from the last commit, as the
+  API reads). `vwait` keeps it: there the loop's own transaction may be
+  open.
 
 ## 5. The wallet shows what is in progress
 

@@ -48,6 +48,13 @@
 \ cxnp, cxnu: a peer that did not answer GetAux, not asked again until
 \ then (10 minutes, as tabminer's); cxbad: a turn's asking stopped at it.
 : cxnp variable ;  : cxnu variable ;  : cxbad variable ;
+\ cxneed: the last turn left something missing (leaves asked for, a
+\ winning file not held), so the next
+\ comes 10 s on at the same height; with nothing missing, only a new
+\ height brings one (docs/NODE_ENHANCEMENTS.md, item 4: a turn reads
+\ the window's leaves and recounts it, 4 to 6 s on a live node, and
+\ every 10 s it held the loop for nothing).
+: cxneed variable ;
 : cxinit
 cxlv @ 0= if
 	wkinit
@@ -313,7 +320,7 @@ cxinit
 cxpin @ if
 	cxpinit  myh @ cxht !  myh @ 90 lit / 90 lit * cxb !  myh @ cxb @ - cxin !  0 lit cxprv @ 28 lit + !
 else
-myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
+myh @ cxht @ = 0=  cxneed @  secs cxat @ - A lit u< 0= and  or if
 	myh @ dup cxh !  cxht !  secs cxat !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
 	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
@@ -341,5 +348,7 @@ myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
 	cxb @  cxin @ 5 lit u< and if cxb @ 90 lit - cxprv @ cxdec else 0 lit cxprv @ 28 lit + ! then
 	cxh @ cxscr @ cxdec
 	cxwant @ cxnz  cxwant @ cxfail @ 20 lit d8= secs cxfat @ - 0< and 0= and if cxfetch then
+	\ (a peer passed over is not asked meanwhile: no reason to come back)
+	cxasks @ 0= 0=  cxbad @ 0= and  cxwant @ cxnz or  cxneed !
 then
 then ;
