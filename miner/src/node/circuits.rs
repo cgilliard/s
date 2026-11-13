@@ -444,6 +444,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             circuit::Forward::Pass => {
                 match h.next {
                     Some(next) => {
+                        #[cfg(test)]
+                        if self.drop_forward.borrow_mut().as_mut().is_some_and(|f| f()) {
+                            return;
+                        }
                         cell.circ = next.1;
                         self.send_cell(next, cell, now);
                     }
@@ -472,6 +476,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// Originates a relay message back toward the client.
     pub(super) fn hop_reply(&mut self, link: Link, cmd: u8, msg: &[u8], now: Instant) {
+        #[cfg(test)]
+        if self.drop_reply.borrow_mut().as_mut().is_some_and(|f| f(cmd)) {
+            return;
+        }
         let Some(h) = self.circuits.hops.get_mut(&link) else { return };
         h.last_used = now;
         let cells: Vec<Cell> = circuit::relay_bodies(cmd, msg)

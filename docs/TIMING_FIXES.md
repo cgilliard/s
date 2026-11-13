@@ -662,3 +662,14 @@ understood is ignored.
     (`Event::TestKill`, no goodbye; slow, a CI job of its own): the
     channel still held 5 s on, given up by the channel's silence (19 s
     here), the peer not live after its 65 s.
+    **A cell lost (channels resend frames, so a cell is lost only by a
+    hop):** two test hooks, a point's reply dropped by its command
+    (`drop_reply`) and a cell a hop passes on dropped (`drop_forward`),
+    each armed when the sessions are live and disarming itself.
+    `a_lost_session_state_is_asked_again`: each point loses one
+    SESSION_STATE; p's sessions stay up, no standing circuit given up,
+    a message through. `a_lost_relay_cell_costs_a_circuit_not_a_message`:
+    each relay loses the next cell it passes on (the onion's layers then
+    out of step past it, so the circuit ends); q's message sent then
+    still reaches p, q never told it failed. Every fault of this list
+    now has its test; the random-loss tests stay, as a soak.

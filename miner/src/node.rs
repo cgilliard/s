@@ -709,6 +709,15 @@ pub struct Node<V: ProofVerifier> {
     /// injected by kind, rather than at random).
     #[cfg(test)]
     drop_out: std::cell::RefCell<Option<DropFilter>>,
+    /// Tests: a reply this node makes at the end of a circuit (as a
+    /// rendezvous point), by its command, dropped when this says so: one
+    /// SESSION_STATE lost, say.
+    #[cfg(test)]
+    drop_reply: std::cell::RefCell<Option<Box<dyn FnMut(u8) -> bool + Send>>>,
+    /// Tests: a relay cell this node passes on (a hop between two others)
+    /// dropped when this says so (by count: cells are sealed here).
+    #[cfg(test)]
+    drop_forward: std::cell::RefCell<Option<Box<dyn FnMut() -> bool + Send>>>,
     last_channel_poll: Instant,
 }
 
@@ -1098,6 +1107,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             held: std::cell::RefCell::new(None),
             #[cfg(test)]
             drop_out: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            drop_reply: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            drop_forward: std::cell::RefCell::new(None),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
@@ -7679,6 +7692,157 @@ mod tests {
         }
         for n in nodes {
             n.4.join().unwrap();
+        }
+    }
+
+    /// Six nodes in onion mode for the cell faults: four relays, p (whose
+    /// sessions are watched) and q (who sends to p), keepalives each
+    /// second, no rotation. Each relay drops, when its flag is armed, one
+    /// reply of `reply_cmd` at the end of a circuit, or (if `forward`) one
+    /// cell it passes on; the flag disarms itself.
+    #[allow(clippy::type_complexity)]
+    fn cell_fault_net(
+        name: &str,
+        reply_cmd: Option<u8>,
+        forward: bool,
+    ) -> (
+        Vec<(SocketAddr, SyncSender<Event>, Receiver<Note>, Arc<Mutex<Stats>>)>,
+        Vec<std::thread::JoinHandle<()>>,
+        Vec<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("{name}-{i}"))).collect();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let (mut nodes, mut handles, mut armed) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 4;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let flag = Arc::new(AtomicBool::new(false));
+            if let Some(cmd) = reply_cmd {
+                let f = Arc::clone(&flag);
+                *node.drop_reply.borrow_mut() = Some(Box::new(move |c: u8| c == cmd && f.swap(false, Ordering::SeqCst)));
+            }
+            if forward {
+                let f = Arc::clone(&flag);
+                *node.drop_forward.borrow_mut() = Some(Box::new(move || f.swap(false, Ordering::SeqCst)));
+            }
+            armed.push(flag);
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats));
+            handles.push(std::thread::spawn(move || node.run()));
+        }
+        let mut list: Vec<consensus::Relay> =
+            (0..4).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        list.sort_by_key(|r| digest_to_bytes(&r.id));
+        for n in &nodes {
+            n.1.send(Event::TestRelays(list.clone())).unwrap();
+        }
+        for n in [4, 5] {
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600), Duration::from_secs(60))).unwrap();
+        }
+        (nodes, handles, armed)
+    }
+
+    /// p's three sessions live, within `secs`.
+    fn cell_fault_live(stats: &Arc<Mutex<Stats>>, secs: u64) {
+        let deadline = Instant::now() + guard(secs);
+        loop {
+            let s = stats.lock().unwrap().rendezvous.clone();
+            if s.len() == 3 && s.iter().all(|(_, l)| *l) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "p: {s:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// q's message `round` to p, delivered (q's own failure panics).
+    fn cell_fault_message(nodes: &[(SocketAddr, SyncSender<Event>, Receiver<Note>, Arc<Mutex<Stats>>)], tag: u64, round: &str) {
+        let key = crate::mldsa::keygen(&[5; 32]);
+        let out = Outbound {
+            tag,
+            to: crate::address::id_of(key.public_key()),
+            kind: crate::onion::KIND_SLATE,
+            inner: round.as_bytes().to_vec(),
+            recipient: None,
+            reply: None,
+            group: 0,
+        };
+        nodes[5].1.send(Event::Send(out)).unwrap();
+        let deadline = Instant::now() + guard(60);
+        loop {
+            match nodes[4].2.recv_timeout(Duration::from_millis(200)) {
+                Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
+                _ => {}
+            }
+            if let Ok(Note::Failed { why, .. }) = nodes[5].2.try_recv() {
+                panic!("{round}: {why}");
+            }
+            assert!(Instant::now() < deadline, "{round}: nothing arrived");
+        }
+    }
+
+    /// One SESSION_STATE lost at each of p's points (its keepalive's answer,
+    /// dropped once there): p asks again while unanswered
+    /// (docs/TIMING_FIXES.md item 12), so its sessions stay up, no standing
+    /// circuit given up, and a message still reaches it.
+    #[test]
+    fn a_lost_session_state_is_asked_again() {
+        let (nodes, handles, armed) = cell_fault_net("lostss", Some(circuit::SESSION_STATE), false);
+        cell_fault_live(&nodes[4].3, 30);
+        cell_fault_message(&nodes, 1, "before");
+        let lost = nodes[4].3.lock().unwrap().standing_lost;
+        for a in armed.iter().take(4) {
+            a.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // the next keepalives (each second) at every point: answers lost
+        let deadline = Instant::now() + guard(20);
+        while armed.iter().take(4).any(|a| a.load(std::sync::atomic::Ordering::SeqCst)) {
+            assert!(Instant::now() < deadline, "not every point asked again");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        cell_fault_live(&nodes[4].3, 20);
+        assert_eq!(nodes[4].3.lock().unwrap().standing_lost, lost, "a standing circuit given up for one lost answer");
+        cell_fault_message(&nodes, 2, "after");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// One relay cell lost at a hop between two others (each relay drops
+    /// the next cell it passes on): the circuits it breaks are built
+    /// again, and q's message, sent then, reaches p without q told it
+    /// failed.
+    #[test]
+    fn a_lost_relay_cell_costs_a_circuit_not_a_message() {
+        let (nodes, handles, armed) = cell_fault_net("lostcell", None, true);
+        cell_fault_live(&nodes[4].3, 30);
+        cell_fault_message(&nodes, 1, "before");
+        for a in armed.iter().take(4) {
+            a.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        cell_fault_message(&nodes, 2, "a cell lost on the way");
+        assert!(
+            armed.iter().take(4).any(|a| !a.load(std::sync::atomic::Ordering::SeqCst)),
+            "no relay passed on a cell to lose"
+        );
+        cell_fault_live(&nodes[4].3, 60);
+        cell_fault_message(&nodes, 3, "after");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
