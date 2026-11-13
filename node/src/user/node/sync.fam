@@ -416,16 +416,21 @@ nip  0 lit pact ! ;
 \ peer, else the next, and so on; the next slot's block fetched while
 \ the worker checks this one.  A body its header does not commit to: its
 \ sender banned (a seed only passed over).
+\ nqtf, nqtc: a batch's time waiting for blocks to come (nbfrom; none
+\ for one fetched beside the last's check) and checking bodies (nsbody,
+\ the next block fetched meanwhile), said with the batch.
+: nqtf variable ;  : nqtc variable ;  : nqt1 variable ;
 : nqget
 nqj !  0 lit nqok !
 npc @ 0 lit do nqok @ 0= if
 	nqj @ i + npeer nqk !
 	nqk @ nsil? 0= if
-		nqj @ nqh hat nqk @ nbfrom dup 0= if nwhy @ 1 lit = if nqk @ nsil! then then
+		ticks nqt1 !  nqj @ nqh hat nqk @ nbfrom  ticks nqt1 @ - nqtf @ + nqtf !
+		dup 0= if nwhy @ 1 lit = if nqk @ nsil! then then
 	else 0 lit then
 	if
 		nqj @ 1 lit + nqm @ u< if nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk ! then
-		nqj @ nqh hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsbody
+		ticks nqt1 !  nqj @ nqh hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsbody  ticks nqt1 @ - nqtc @ + nqtc !
 		swap ?dup if
 			vrb @ if nhead "block " puts nqj @ nqh u. " from peer " puts nqsnd @ pshow " refused: " puts . "; asked of another" puts 0A lit putc else drop then
 			drop  nqsnd @ pisseed 0= if nqsnd @ pban then  nblk @ free  0 lit nblk !
@@ -504,7 +509,7 @@ else nqa @ nqm @ + nqa !  0 lit nqn !  0 lit nqby ! then ;
 : nbatch
 ntop @ nqa @ - 1 lit + NQMAX umin nqm !
 nqm @ 1 lit - nqh npick
-ticks nt0 !
+ticks nt0 !  0 lit nqtf !  0 lit nqtc !
 nqfill 0= if
 	nqn @ nqh nrbad !  1 lit nrcd !
 else
@@ -512,7 +517,7 @@ else
 	nqm @ 1 lit - nsbpr
 	vrb @ if
 		nhead "blocks " puts nqa @ u. " to " puts nqm @ 1 lit - nqh u. ": fetched and checked in " puts nqtb @ nsec
-		" s, the last one's proof in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
+		" s (waiting for blocks " puts nqtf @ nsec " s, checking bodies " puts nqtc @ nsec " s), the last one's proof in " puts ticks nt0 @ - nsec " s" puts 0A lit putc
 	then
 	if
 		\ attested: connected, the last held for the next batch's proof
