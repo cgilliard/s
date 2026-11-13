@@ -59,7 +59,7 @@ exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
 echo "node -n devrec 10.0.2.2:$PA &" >&3
 tip=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a/tabminer.log" | tail -1)
-wait_for "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "the node at the miner's tip ($tip)"
+wait_own "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "the node at the miner's tip ($tip)"
 wait_for "$T/os.out" '^node: .* the API on port' 120 "the node's API"
 {
 	echo 'mkdir /etc'
@@ -137,7 +137,7 @@ done
 stop $AP; AP=
 miner --no-mine
 tip=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a/tabminer.log" | tail -1)
-wait_for "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "the node at the miner's tip ($tip)"
+wait_own "$T/os.out" "^node: .* (synced, height $tip\$|height $tip  \\()" 900 "the node at the miner's tip ($tip)"
 {
 	echo 'echo {"op":"unlock","password":"wpw"} > /o.req'
 	echo 'echo {"id":10,"op":"overview"} >> /o.req'

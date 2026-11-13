@@ -73,7 +73,7 @@ wait_for "$T/os.out" '^\$ ' 60 "the shell"
 	echo 'echo root:paypw:0:0:/:sh > /etc/passwd'
 	echo 'wm 80 &'
 } >&3
-wait_for "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 "the node in sync"
+wait_own "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 "the node in sync"
 wait_for "$T/os.out" 'wm: port 80' 60 "wm"
 
 echo "paytest.sh: the two wallets paying each other"

@@ -55,7 +55,7 @@ QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
 echo "node -n devrec 10.0.2.2:$PA &" >&3
-wait_for "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 "the node in sync"
+wait_own "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 "the node in sync"
 
 python3 -u - "$T" "$HP" "$(sha256sum "$T/consensus.txt" | cut -c1-64)" <<'EOF' || { wdump; exit 1; }
 import json, os, sys, time, urllib.request

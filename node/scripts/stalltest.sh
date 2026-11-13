@@ -120,7 +120,7 @@ minera --no-mine
 # (the node syncs on its next try, maybe while the miner still mines, and
 # follows it from there: waited for at the miner's last block)
 H=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a.out" | tail -1)
-wait_for "$T/os.out" "^node: .* (synced, height $H\$|height $H  \\()" 900 "the node's sync to $H"
+wait_own "$T/os.out" "^node: .* (synced, height $H\$|height $H  \\()" 900 "the node's sync to $H"
 rm "$T/chatter"
 grep -q '^proxy: chattering' "$T/proxy.out" || { echo "stalltest.sh: the proxy never chattered" >&2; exit 1; }
 ! grep -q 'the sync stopped: -3' "$T/os.out" || { echo "stalltest.sh: the headers' waits ended at others' datagrams (the sync stopped -3)" >&2; exit 1; }

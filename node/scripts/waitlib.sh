@@ -48,6 +48,19 @@ wait_for() {
 	done
 }
 
+# wait_own FILE REGEX IDLE WHAT — wait_for, but only FILE's growth counts
+# as progress: for a step whose program says what it is doing (the
+# node's verbose lines while it syncs), so that a stall there fails
+# rather than waiting on other programs' logs (a miner logging every
+# block kept prooftest waiting out its job's 60 minutes on a node that
+# never synced).
+wait_own() {
+	wo_prev=${WPROGRESS:-}
+	WPROGRESS="wc -c < '$1' 2>/dev/null || echo 0"
+	wait_for "$@"
+	WPROGRESS=$wo_prev
+}
+
 # wait_while_busy IDLE WHAT CONDITION... — until CONDITION (a command)
 # succeeds; fails as wait_for does.
 wait_while_busy() {
