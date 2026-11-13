@@ -4304,7 +4304,8 @@ mod tests {
         t += 600;
         let b4 = mine(&a, 4, t);
         tx_a.send(Event::Mined(b4.clone())).unwrap();
-        assert!(wait_for_tip(&b.chain, &b4.header, 20), "b did not receive the relayed block");
+        // A lost announce (one datagram) is made good by the next status.
+        assert!(wait_for_tip(&b.chain, &b4.header, net::PING_INTERVAL.as_secs() + 20), "b did not receive the relayed block");
         assert_eq!(a.chain.tip().unwrap().unwrap(), b4.header);
 
         // A transaction spending block 1's output, submitted on a, reaches
@@ -4347,7 +4348,7 @@ mod tests {
             t,
         );
         tx_a.send(Event::Mined(b5.clone())).unwrap();
-        assert!(wait_for_tip(&b.chain, &b5.header, 20), "b did not receive block 5");
+        assert!(wait_for_tip(&b.chain, &b5.header, net::PING_INTERVAL.as_secs() + 20), "b did not receive block 5");
         std::thread::sleep(Duration::from_millis(200));
         assert!(!pool_a.lock().unwrap().contains(&txid));
         assert!(!pool_b.lock().unwrap().contains(&txid));
@@ -4423,7 +4424,7 @@ mod tests {
         let b3 = mine(&a, 3, t);
         tx_a.send(Event::Mined(b3.clone())).unwrap();
         blocks.push(b3.clone());
-        assert!(wait_for_tip(&b.chain, &b3.header, 20), "b did not sync");
+        assert!(wait_for_tip(&b.chain, &b3.header, net::PING_INTERVAL.as_secs() + 20), "b did not sync");
         let settled = |chain: &Chain<AcceptAllProofs>, want: consensus::Hash, secs: u64| {
             let deadline = Instant::now() + guard(secs);
             while Instant::now() < deadline {
@@ -4460,7 +4461,11 @@ mod tests {
             t += 600;
             let block = mine(&a, tag, t);
             tx_a.send(Event::Mined(block.clone())).unwrap();
-            assert!(wait_for_tip(&b.chain, &block.header, 20), "b did not receive block {tag}");
+            // An announce is one datagram, not sent again: lost (seen once,
+            // on Windows: block 6 announced, never asked for), b learns of
+            // the block from a's next status, a ping interval on.
+            let wait = net::PING_INTERVAL.as_secs() + 20;
+            assert!(wait_for_tip(&b.chain, &block.header, wait), "b did not receive block {tag}");
             if tag < 6 {
                 std::thread::sleep(Duration::from_millis(300));
                 assert_eq!(b.chain.consensus_votes(consensus::WINDOW).unwrap().counts[0].0, hash, "at block {tag}");
