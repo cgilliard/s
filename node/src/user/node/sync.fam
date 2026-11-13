@@ -178,8 +178,10 @@ vjw @ if 1 lit vw  dup CC lit vput  htg @ 20 lit vput  vwait else FFFFFFFE lit t
 dup FFFFFFFE lit = if drop htg @ fullpow else nip then ;
 \ vproof ( -- flag )  the chain proof of the block sconn1 left (ppub, bpr).
 : vproof
+blite @ if 0 lit else
 vjw @ if 2 lit vw  ppub @ 40 lit vput  bnpr @ vw  bpr @ bnpr @ vput  vwait else FFFFFFFE lit then
-dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then ;
+dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then
+then ;
 \ The worker: a thread with variables of its own (pthread, docs/OS.md)
 \ that connects and undoes blocks (sconnect, its chain proof checked
 \ there too, and sundo), the store's writes and commit with them, while

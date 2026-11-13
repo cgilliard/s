@@ -228,6 +228,8 @@ prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and pbk @ 0= and if -1 lit else
 	pidm @ hfind dup 0< if drop 0 lit else
 		he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if
 			stfd @ 0 lit txbegin stx !  dup hheight ybody  stx @ txcommit drop
+			\ kept lite (its proof never fetched): not held as a block
+			ylite @ over and if drop free 0 lit 0 lit then
 			dup if
 				pbl ! pbsrc !
 				pbb @ ?dup if free then

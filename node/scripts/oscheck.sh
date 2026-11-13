@@ -186,9 +186,9 @@ rm -f "$T/st.disk"
 # refused for its body commitment, and with a header committing to it, for
 # its proof.
 ./tools/fam --user -o "$T/tpr.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/proofs_test.fam > "$T/tpr.build" 2>&1 || fail proofs "build: $(head -c 300 "$T/tpr.build")"
-sh scripts/mkimage.sh "$T/pr.img" bin/kernel init="$T/tpr.bin":16384 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$ND/chainver_dev.bin:0 devchain=$ND/devchain.bin:0 2> "$T/pr.mk" || fail proofs "mkimage: $(cat "$T/pr.mk")"
+sh scripts/mkimage.sh "$T/pr.img" bin/kernel init="$T/tpr.bin":16384 akjv.txt.gz=../resources/akjv.txt.gz:0 chainver=$ND/chainver_dev.bin:0 devchain=$ND/devchain.bin:0 devlite=$ND/devlite.bin:0 2> "$T/pr.mk" || fail proofs "mkimage: $(cat "$T/pr.mk")"
 rm -f "$T/pr.disk"; dd if=/dev/zero of="$T/pr.disk" bs=1 count=0 seek=268435456 2>/dev/null
-expect proofs 124 '^proofs: 8 as expected, 0 not' 120 ./tools/q32 --disk="$T/pr.disk" "$T/pr.img"
+expect proofs 124 '^proofs: 32 as expected, 0 not' 120 ./tools/q32 --disk="$T/pr.disk" "$T/pr.img"
 rm -f "$T/pr.disk"
 # A snapshot (step 6): the state after block 150 of the state test's chain
 # as tabminer serves it (/lib/statesnap): a changed manifest, a changed part

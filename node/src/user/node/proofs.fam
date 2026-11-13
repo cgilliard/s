@@ -92,4 +92,4 @@ spar @ ?dup if ppar @ CC lit bcopy -1 lit else sh @ 1 lit - khdr ppar @ CC lit s
 	ptmp @ ppub @ 20 lit + 8 lit wcopy
 	-1 lit
 else 0 lit then ;
-: sproof  ( -- flag )  sstmt if ppub @ bpr @ bnpr @ cvverify else 0 lit then ;
+: sproof  ( -- flag )  sstmt blite @ 0= and if ppub @ bpr @ bnpr @ cvverify else 0 lit then ;

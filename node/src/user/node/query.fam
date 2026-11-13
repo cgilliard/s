@@ -60,9 +60,12 @@ ydep @ ytag @ ;
 
 : ykey  ( name len k -- )  -rot ytmp @ nhash  ytmp @ swap keyof ;
 
+\ (ylite: the body kept is a lite block's, without its proof: the top
+\ bit of its length)
+: ylite variable ;
 : ybody  ( h -- a n | 0 0 )
 dup FFFF lit kbody sbuf @ 4 lit sget 4 lit = if
-	sbuf @ @ dup malloc  ( h n a )
+	sbuf @ @ dup 0< ylite !  7FFFFFFF lit and  dup malloc  ( h n a )
 	over 3FF lit + A lit rshift 0 lit do
 		2 lit pick i kbody  over i A lit lshift + 400 lit sget drop
 	loop

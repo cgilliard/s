@@ -43,7 +43,7 @@ dup 20 lit + @ sbuf @ !  CC lit + kid sbuf @ 4 lit sput ;
 \ bdrop ( h -- )  block h's body, if kept, dropped.
 : bdrop
 dup FFFF lit kbody sbuf @ 4 lit sget 4 lit = if
-	sbuf @ @ 3FF lit + A lit rshift ?dup if 0 lit do dup i kbody sdel loop then
+	sbuf @ @ 7FFFFFFF lit and 3FF lit + A lit rshift ?dup if 0 lit do dup i kbody sdel loop then
 	FFFF lit kbody sdel
 else drop then ;
 \ sudrop ( d -- )  block d's undo record and the records of the outputs
@@ -128,7 +128,8 @@ stxo @ if
 			dup up @ + up !  urem @ swap - urem !  uk @ 1 lit + uk !
 		repeat
 		\ the body, kept for 1,008 blocks
-		bbn @ sbuf @ !  sh @ FFFF lit kbody sbuf @ 4 lit sput
+		\ (its length's top bit: a lite body, kept so: query.fam's ybody)
+		bbn @ blite @ if 80000000 lit or then sbuf @ !  sh @ FFFF lit kbody sbuf @ 4 lit sput
 		\ the first body kept, once (meta 62: what our status says we hold
 		\ from, sync.fam's nstat)
 		62 lit mget 0= if sh @ 62 lit mput then
@@ -152,7 +153,7 @@ then
 bops @ free
 bcode @ ;
 
-: sconnect  ( h body n -- code )  sconn1  spend @ if ppub @ bpr @ bnpr @ cvverify else -1 lit then  sconn2 ;
+: sconnect  ( h body n -- code )  sconn1  spend @ if blite @ if 0 lit else ppub @ bpr @ bnpr @ cvverify then else -1 lit then  sconn2 ;
 
 \ snew ( -- n )  the outputs the parsed block makes: its outputs and its
 \ names' operations of type 1 (sconn1's sinc, and snames').
@@ -179,7 +180,7 @@ bparse
 bcode @ 0= if
 	sfirst @ sctr !  sfirsth @ sctrh !
 	snew ?dup if 0 lit do sinc loop then
-	sstmt if ppub @ bpr @ bnpr @ cvverify else 0 lit then
+	sstmt blite @ 0= and if ppub @ bpr @ bnpr @ cvverify else 0 lit then
 else 0 lit then
 bops @ ?dup if free then  0 lit bops !  0 lit spar ! ;
 

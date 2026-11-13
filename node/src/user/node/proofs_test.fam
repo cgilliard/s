@@ -7,6 +7,11 @@
 \ constants, genesis, then the blocks).  Each block connects; block 4 with
 \ a byte of its proof changed is refused first, changing nothing: for its
 \ body commitment, and with a header committing to it, for its proof.
+\ Before each, the same block without its proof (/lib/devlite: tabminer's
+\ Block::lite_bytes, net::Kind::Lite): taken for a lite block, its
+\ commitment the header's; with its proof's hash changed, another; and
+\ connected where its proof must be checked, refused for it, changing
+\ nothing (a peer answering a block with a lite one).
 
 : tpas variable ;  : tfai variable ;  : ctn variable ;  : tbuf variable ;  : thdr variable ;
 : ep variable ;  : ecode variable ;  : eh variable ;  : en variable ;  : eb variable ;
@@ -22,6 +27,10 @@ repeat drop
 rot close drop ;
 
 : vok  if tpas @ 1 lit + tpas ! else tfai @ 1 lit + tfai ! then ;
+: lp variable ;  : lh variable ;  : ln variable ;  : lb variable ;
+: lentry  lp @ 4 lit + lh !  lp @ D0 lit + @ ln !  lp @ D4 lit + lb !  lb @ ln @ + 3 lit + FFFFFFFC lit and lp ! ;
+\ lcom ( body n -- flag )  the commitment it makes the header's (lh).
+: lcom  0 lit bcode !  bparse  thdr @ 2C lit + bcommit  thdr @ 2C lit + dfrom  thdr @ 2C lit + lh @ 2C lit + 8 lit wcmp 0= ;
 : entry  ep @ @ ecode !  ep @ 4 lit + eh !  ep @ D0 lit + @ en !  ep @ D4 lit + eb !  eb @ en @ + 3 lit + FFFFFFFC lit and ep ! ;
 
 "/lib/akjv.txt.gz" rdfile powinit  400 lit pwitems !
@@ -30,8 +39,14 @@ rot close drop ;
 "/lib/devchain" rdfile drop  dup @ ctn !  4 lit + dup 60 lit + prinit
 "/lib/devchain" rdfile drop 4 lit + 60 lit + CC lit + ep !
 -1 lit sprchk !  0 lit tpas !  0 lit tfai !  10000 lit alloc tbuf !  CC lit alloc thdr !
+"/lib/devlite" rdfile drop 4 lit + lp !
 ctn @ 0 lit do
-	entry
+	entry  lentry
+	lb @ ln @ lcom vok  blite @ vok
+	lb @ tbuf @ ln @ bcopy  tbuf @ ln @ + 20 lit - dup c@ 1 lit xor swap c!
+	tbuf @ ln @ lcom 0= vok
+	lh @ lb @ ln @ sconnect dup FFFFFFEF lit = vok
+	dup FFFFFFEF lit <> if "lite block " puts i 1 lit + u. " got " puts dup . 0A lit putc then drop
 	i 3 lit = if
 		eb @ tbuf @ en @ bcopy  tbuf @ en @ + 64 lit - dup c@ 1 lit xor swap c!
 		\ as it is: its header commits to another body

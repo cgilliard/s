@@ -365,6 +365,12 @@ then ;
 : bp variable ;  : bq variable ;  : bcode variable ;
 : bnin variable ;  : bin variable ;  : bnout variable ;  : bout variable ;
 : bnops variable ;  : bops variable ;  : bnsw variable ;  : bsw variable ;  : bnpr variable ;  : bpr variable ;
+\ blite: the body bparse read was a lite block's (tabminer's Kind::Lite:
+\ the proof's hash, 32 bytes, in place of a proof of another length); bpr
+\ is then the hash, bnpr the proof's length.  Its commitment is the
+\ block's; its proof cannot be checked (sconnect, sbproof, sproof,
+\ vproof refuse it).
+: blite variable ;
 : bset variable ;  : bmask variable ;  : bcnt variable ;
 
 : bfail  bcode @ 0= if bcode ! else drop then ;   \ ( code -- )  the first error stands
@@ -457,7 +463,8 @@ bnops @ bcnt @ u> if bbad 0 lit bnops ! then
 	1 lit +
 repeat drop
 bpos bsw ! bnsw !
-bu32 dup bnpr !  btake bpr !
+bu32 dup bnpr !
+dup 20 lit <>  bleft 20 lit = and dup blite ! if drop 20 lit btake dup 8 lit bcanon bpr ! else btake bpr ! then
 bcode @ 0= if bvalid then
 bcode @ 0= bp @ bq @ <> and if bbad then ;
 
@@ -500,12 +507,15 @@ bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + dup @ 2 lit = if
 	rpos pos@ over 3FFFFFFF lit and v,  swap 1E lit rshift swap 2 lit lshift or v,
 else drop then loop then
 bnsw @ bsw @ vpos
-\ the proof's hash: hash_domain 0x13 of its length and its bytes packed
-bnpr @ 3 lit / 2 lit + 2 lit lshift malloc pb !
-bnpr @ P 2dup u< 0= if - else drop then tom pb @ !
-bnpr @ if bpr @ bnpr @ pb @ 4 lit + pack3 then
-pb @ bnpr @ 2 lit + 3 lit / 1 lit + 13 lit vp @ hdom  vp @ 20 lit + vp !
-pb @ free
+\ the proof's hash: hash_domain 0x13 of its length and its bytes packed;
+\ a lite block's, as it carries it
+blite @ if bpr @ vd, else
+	bnpr @ 3 lit / 2 lit + 2 lit lshift malloc pb !
+	bnpr @ P 2dup u< 0= if - else drop then tom pb @ !
+	bnpr @ if bpr @ bnpr @ pb @ 4 lit + pack3 then
+	pb @ bnpr @ 2 lit + 3 lit / 1 lit + 13 lit vp @ hdom  vp @ 20 lit + vp !
+	pb @ free
+then
 vb @ vp @ vb @ - 2 lit rshift 12 lit 3 lit pick hdom drop
 vb @ free ;
 
