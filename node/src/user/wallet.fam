@@ -1442,6 +1442,25 @@ nrecb @ 32 lit + c@ 8 lit u< 0= if "its owner key has signed all it may" jerr el
 then then then then then then ;
 
 : nanm variable ;  : nkl variable ;  : ntx variable ;
+: wqa variable ;  : wqd variable ;
+\ wqcp ( a dst -- )  the string at a, to its closing quote (64 at most).
+: wqcp
+wqd !  wqa !  0 lit
+begin wqa @ over + c@ dup 22 lit <> over and  2 lit pick 40 lit u< and while  wqd @ 2 lit pick + c!  1 lit + repeat
+drop  wqd @ + 0 lit swap c! ;
+\ Names' steps (docs/TIMING_FIXES.md, item 15): each block event's names
+\ against the last one's (wnt; wnamf notes each at wnc while wnev), a
+\ name whose state changed told after it: {"event":"name","name",
+\ "state"} (ready: the reveal's window open; revealed; owned; offered;
+\ transferred).  The first block after a start only notes them.
+: wnt variable ;  : wntn variable ;  : wnc variable ;  : wncn variable ;  : wnev variable ;  : wntok variable ;  : wnsp variable ;
+\ wnnote  the name just written and its state (at wnsp), noted.
+: wnnote
+wncn @ 10 lit u< if
+	wnc @ wncn @ 60 lit * +  dup nname @ scpy 0 lit swap c!
+	wnsp @ swap 44 lit + wqcp
+	wncn @ 1 lit + wncn !
+then ;
 \ wnamf  the names' field ('items': 16 at most), for onames and the
 \ block event (wblkev).
 : wnamf
@@ -1456,7 +1475,7 @@ then then then then then then ;
 		okn @ okey @ nkl @ bcopy
 		nmget drop
 		nanm @ if "," jo then  nanm @ 1 lit + nanm !
-		"{'name':'" jo nname @ jraw "','value':'" jo nrecb @ 10 lit + 20 lit jhex "','state':'" jo
+		"{'name':'" jo nname @ jraw "','value':'" jo nrecb @ 10 lit + 20 lit jhex "','state':'" jo  opos @ wnsp !
 		nrecb @ 30 lit + c@ 0= if
 			nrecb @ nderive
 			wcfind if
@@ -1470,9 +1489,19 @@ then then then then then then ;
 			else nrecb @ 30 lit + c@ 3 lit = if "offered" else "revealed" then jo then
 			"','ready':0" jo
 		then
+		wnev @ if wnnote then
 		"}" jo
 	repeat drop
 	"]" jo ;
+\ wnfind ( name -- state | 0 )  its state at the last block event.
+: wnfind  wntn @ ?dup if 0 lit swap 0 lit do over wnt @ i 60 lit * + streq if drop wnt @ i 60 lit * + 44 lit + then loop nip else drop 0 lit then ;
+\ wnemit  the names whose state changed told; the states now the last.
+: wnemit
+wncn @ ?dup if 0 lit do
+	wnc @ i 60 lit * +  dup wnfind  ?dup if over 44 lit + streq 0= else -1 lit then
+	wntok @ and if "{'event':'name','name':'" jo dup jraw "','state':'" jo 44 lit + jraw "'}" jo jend else drop then
+loop then
+wnc @ wnt @ wncn @ 60 lit * bcopy  wncn @ wntn !  -1 lit wntok ! ;
 : onames  have @ 0= if nowal else wtick  jok "," jo wnamf "}" jo jend then ;
 
 \ hexs ( a n dst -- )  n bytes in hex, a string at dst.
@@ -2217,8 +2246,10 @@ wsums
 \ with everything the panels show as of it (the overview, the activity,
 \ the names), so the page redraws them from it whichever is open.
 : wblkev
+-1 lit wnev !  0 lit wncn !
 "{'event':'block','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw
-"','overview':{" jo wovf "},'activity':{" jo wactf "},'names':{" jo wnamf "}}" jo jend ;
+"','overview':{" jo wovf "},'activity':{" jo wactf "},'names':{" jo wnamf "}}" jo jend
+0 lit wnev !  wnemit ;
 \ wpshare  the payments not yet landed (wplist: lnd) watched by the block
 \ thread, the first four: their ids in hex at wbsh, then their count.
 : wpshare
@@ -2234,12 +2265,6 @@ then ;
 \ (pooled, replaced and "by", evicted, mined and "height", conflicted,
 \ back), so a dropped payment is told rather than pending for good.
 : wtxm variable ;  : wtxc variable ;  : wtxi variable ;  : wtxs variable ;  : wtxb variable ;
-: wqa variable ;  : wqd variable ;
-\ wqcp ( a dst -- )  the string at a, to its closing quote (64 at most).
-: wqcp
-wqd !  wqa !  0 lit
-begin wqa @ over + c@ dup 22 lit <> over and  2 lit pick 40 lit u< and while  wqd @ 2 lit pick + c!  1 lit + repeat
-drop  wqd @ + 0 lit swap c! ;
 \ wtxev ( a -- )  the transaction's event at a, told.
 : wtxev
 dup "'id':'" jfind wtxi @ wqcp
@@ -2385,6 +2410,7 @@ FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 li
 8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmevb !  48 lit alloc wpsb !  60 lit alloc wmhk !  -1 lit wmpi !  0 lit wmpt !  0 lit wmpl !  200 lit alloc wmrids !  600 lit alloc wmrads !  20 lit alloc wmapid !  0 lit wmapn !  0 lit wmonion !  0 lit wmcat !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  50 lit alloc wmuk !  50 lit alloc wmk2 !  30 lit alloc wmur !  1A00 lit alloc wmab !  1800 lit alloc wmcb !  1000 lit alloc wmrq !  20 lit alloc wmrv !  20 lit alloc wmme !  0 lit wmrs !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
 440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
+600 lit alloc wnt !  600 lit alloc wnc !  0 lit wntn !  0 lit wncn !  0 lit wnev !  0 lit wntok !
 48 lit alloc wtxi !  20 lit alloc wtxs !  48 lit alloc wtxb !  0 lit wtxm !  0 lit wtxc !  0 lit wpdirty !  0 lit wtxchk !
 : pfd variable ;  18 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
 wbstart

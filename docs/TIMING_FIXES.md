@@ -604,8 +604,13 @@ understood is ignored.
     delivered, unanswered (its coins reserved), undelivered (cancelled),
     finalized; the payee's answered. The page shows each on the status
     line. `msgtest.sh` and `onitest.sh` check them (the 2.5 answered;
-    the 1 sent, then finalized, by one slate). Left: names' steps as
-    events (committed, the reveal's window open, registered).
+    the 1 sent, then finalized, by one slate).
+    **Names' steps done (2026-11-13):** each block event's names against
+    the last one's, a name whose state changed told after it (`name`:
+    ready, the reveal's window open; revealed; owned; offered;
+    transferred); the first block after a start only notes them. The
+    page says it on the status line. `nametest.sh`: famwallet told
+    ready, then owned. Not done of item 15: a renewal due.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
     **The node's part done (2026-11-13):** its deadlines on the

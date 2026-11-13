@@ -203,7 +203,9 @@ is written).
   (`slate`, `step`) an online payment's steps: the payer's `sent`,
   `delivered` (at a point of the recipient's), `unanswered` (its coins
   kept reserved), `undelivered` (cancelled, its coins free), `finalized`;
-  the payee's `answered`; `scan` (`height`,
+  the payee's `answered`; `name` (`name`, `state`: `ready`, the reveal's
+  window open; `revealed`; `owned`; `offered`; `transferred`) when a block
+  changes a name's state; `scan` (`height`,
   `of`) as a scan goes; `locked` when the wallet locks itself.
 
 ## Files

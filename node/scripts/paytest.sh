@@ -341,6 +341,11 @@ if part == 'names':
     r = ask('name-reveal', name='famwallet', speed='hour')
     check(f'the wallet reveals it: {r.get("tx", r.get("error"))}', r['ok'])
     wait('the name the wallet\'s on chain', named('owned'))
+    # its steps as events (docs/TIMING_FIXES.md, item 15): the reveal's
+    # window open, then owned, each told when a block moved it
+    def name_told(state):
+        return lambda: pumpone() or any(m.get('event') == 'name' and m.get('name') == 'famwallet' and m.get('state') == state for m in msgs)
+    check('famwallet told ready, then owned', wait('famwallet\'s ready event', name_told('ready')) and wait('famwallet\'s owned event', name_told('owned')))
     def tab_name(name, has):
         def f():
             n0 = aout().count(f'value ') + aout().count('is not registered')
