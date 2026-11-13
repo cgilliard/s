@@ -47,7 +47,7 @@ A000202 lit 925F lit E99 lit pinit
 4 lit nsync dup "sync: " puts . "  height " puts myh @ u. "  S " puts nS @ u. 0A lit putc
 0= if
 	\ the wallet's node
-	A000202 lit 9260 lit padd puse  pping  0 lit puse
+	A000202 lit 9260 lit padd pgiven puse  pping  0 lit puse
 	if "wallet peer: answered" else "wallet peer: no answer" then puts 0A lit putc
 	\ up to ten minutes: following, relaying; until a transaction pooled
 	\ has left the pool

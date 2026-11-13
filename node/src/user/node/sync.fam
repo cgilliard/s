@@ -820,6 +820,7 @@ loop then nah @ ;
 : nrat variable ;
 : nrc2 variable ;
 : nrean
+pfresh @ if 0 lit nrat !  0 lit pfresh ! then
 ntime nrat @ u< 0= if
 	ntime 3C lit + nrat !  0 lit nrc2 !
 	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann  nrc2 @ 1 lit + nrc2 ! then loop

@@ -174,10 +174,10 @@ mpn @ if mpa @ @ mip !  mpa @ 4 lit + @ mport ! else
 	0 lit mip !  0 lit mport !
 then
 \ mrest  the peers given after the first added (peer 0 is pinit's).
-: mrest  mpn @ 1 lit u> if mpn @ 1 lit do mpa @ i 3 lit lshift + dup @ swap 4 lit + @ padd drop loop then ;
+: mrest  mpn @ 1 lit u> if mpn @ 1 lit do mpa @ i 3 lit lshift + dup @ swap 4 lit + @ padd pgiven drop loop then ;
 \ mfind  the configuration's peers and seeds looked up again, each found
 \ and new added (mpn counting them): for a node that found none at start.
-: mfone  ( s -- )  mhost if mip @ mport @ pwho 0< if mip @ mport @ padd drop  mpn @ 1 lit + mpn ! then then ;
+: mfone  ( s -- )  mhost if mip @ mport @ pwho 0< if mip @ mport @ padd pgiven drop  mpn @ 1 lit + mpn ! then then ;
 : mfind
 mcfn @ ?dup if 0 lit do mcpa @ i 2 lit lshift + @ mfone loop then
 msdn @ ?dup if 0 lit do msds @ i 2 lit lshift + @ dup mhost if mip @ mport @ psdadd then mfone loop then ;

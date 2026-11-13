@@ -72,7 +72,7 @@
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
 : myh variable ;  : mytip variable ;  : mywork variable ;  : mygen variable ;  : myold variable ;
 : pnest variable ;  : pgkd variable ;  : pgo variable ;  : pbk variable ;  : pbpt variable ;  : pbid variable ;  : pbb variable ;  : pbn variable ;  : pbl variable ;  : pbsrc variable ;
-: pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
+: pfresh variable ;  : pkey variable ;  : pkd variable ;  : pko variable ;  : pifd variable ;  : pisz variable ;  : pver variable ;  : pisent variable ;
 
 :M PWIN 20 lit ;                              \ chunks in flight: 32, tabminer's least window
                                               \ (the kernel queues 64 datagrams a UDP socket)
@@ -113,12 +113,51 @@ A lit 0 lit w64  A lit 0 lit w64 ;
 \ it is banned); its strikes (B8) and when the last was (BC)
 : psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
 : puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
-: padd  pnp @ prec  tuck 4 lit + !  !  0 lit pnp @ prec 8 lit + !  pnp @ prec 4C lit + 0 lit swap !  pnp @ prec A4 lit + 7 lit wzero  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+\ pset ( ip port k -- )  record k made afresh for the address: not
+\ answered, no status, pinged at once; when it was made (C, in secs; the
+\ top bit: given, pgiven).
+: psa variable ;
+: pset  prec dup psa !  C0 lit 2 lit rshift wzero  psa @ 4 lit + !  psa @ !  secs psa @ C lit + ! ;
+: padd  pnp @ pset  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
+\ pgiven ( k -- k )  peer k given (the configuration's, the command
+\ line's, a seed): it never gives its place to another (plearn).
+: pgiven  dup prec C lit + dup @ 80000000 lit or swap ! ;
 \ pwho ( ip port -- k | -1 )
 : pwho
 FFFFFFFF lit pfk !
 pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! then  loop then
 2drop pfk @ ;
+\ The seeds' addresses (main.fam adds them, psdadd), so that a node asks
+\ other peers first and the seeds only to make up the number (sync.fam's
+\ batches).  pisseed ( k -- flag )  peer k one of them.
+: psd variable ;  : psdn variable ;
+: psdadd  ( ip port -- )
+psd @ 0= if 40 lit alloc psd ! then
+psdn @ 8 lit u< if  psd @ psdn @ 3 lit lshift + tuck 4 lit + !  !  psdn @ 1 lit + psdn !  else 2drop then ;
+: pisseed
+prec 0 lit swap  psdn @ ?dup if 0 lit do
+	dup @ psd @ i 3 lit lshift + @ =  over 4 lit + @ psd @ i 3 lit lshift + 4 lit + @ = and if nip -1 lit swap then
+loop then drop ;
+\ A peer learnt (pinged us, or named in a Peers) takes a place in the
+\ table: as tabminer's, at most 4 a host (an address behind NAT, a node
+\ there on a new port at each start), and when the host or the table is
+\ full, the entry silent longest gives way to it, if silent a minute (two
+\ pings unanswered) and not given; else it is not taken.
+\ psince ( k -- s )  when peer k last answered, or was made if never.
+: psince  dup prec AC lit + @ ?dup if nip else prec C lit + @ 7FFFFFFF lit and then ;
+\ pstale ( ip -- k | -1 )  the entry of host ip (any host if 0) silent
+\ longest, if a minute at least and not given (nor a seed).
+: pstb variable ;  : psts variable ;
+: pstale
+FFFFFFFF lit pstb !
+pnp @ ?dup if 0 lit do
+	dup 0=  over i prec @ = or  i prec C lit + @ 80000000 lit and 0= and  i pisseed 0= and
+	secs i psince - 3C lit u< 0= and if
+		pstb @ 0<  i psince psts @ u< or if i pstb !  i psince psts ! then
+	then
+loop then drop pstb @ ;
+\ phostn ( ip -- n )  the entries of host ip.
+: phostn  0 lit swap  pnp @ ?dup if 0 lit do dup i prec @ = if swap 1 lit + swap then loop then drop ;
 
 : pinit  ( ip port lport -- )
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
@@ -126,7 +165,7 @@ pnp @ ?dup if 0 lit do  over i prec @ =  over i prec 4 lit + @ = and if i pfk ! 
 10 lit alloc mtok !  10 lit alloc mnon !
 BF40 lit alloc phb !  40 lit alloc pgot !  2DC6C0 lit psrtt !  20 lit alloc psid !  0 lit psv !
 PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
-padd puse
+padd pgiven puse
 \ our tokens' key and our nonce: random
 p2init  20 lit alloc pkey !  20 lit alloc pkd !  20 lit alloc pko !
 "/dev/random" 0 lit open dup pkey @ 20 lit read drop dup mnon @ 8 lit read drop close drop
@@ -306,7 +345,21 @@ else drop then ;
 
 \ plearn ( ip port -- k | -1 )  an address added if new and there is
 \ room (its index, else -1): pinged by pkeep from then on.
-: plearn  2dup pwho 0<  pnp @ PPEERS u< and if padd else 2drop FFFFFFFF lit then ;
+: plk variable ;
+: plearn
+2dup pwho 0< if
+	FFFFFFFF lit plk !
+	\ the host full: its longest silent entry, if any, in its place
+	over phostn 4 lit u< 0= if over pstale plk ! then
+	\ the table full: any silent entry
+	plk @ 0<  pnp @ PPEERS u< 0= and  2 lit pick phostn 4 lit u< and if 0 lit pstale plk ! then
+	plk @ 0< 0= if
+		vrb @ if nhead "peer " puts plk @ pshow " silent a minute: its place to another" puts 0A lit putc then
+		plk @ pset  plk @  plk @ pcur @ = if plk @ puse then
+	else
+		2 lit pick phostn 4 lit u<  pnp @ PPEERS u< and if padd else 2drop FFFFFFFF lit then
+	then
+else 2drop FFFFFFFF lit then ;
 \ ppeerin  the Peers in prx: each address added (plearn).  As a peer sees
 \ them: a loopback one from a peer at QEMU's host address (10.0.2.2) is
 \ that host's, as the guest reaches it; other loopback ones, ours
@@ -384,17 +437,6 @@ then drop ;
 : pban
 5 lit over prec B8 lit + !  secs over prec BC lit + !  secs E10 lit + over prec B4 lit + !
 vrb @ if nhead "peer " puts dup pshow " banned for an hour" puts 0A lit putc then drop ;
-\ The seeds' addresses (main.fam adds them, psdadd), so that a node asks
-\ other peers first and the seeds only to make up the number (sync.fam's
-\ batches).  pisseed ( k -- flag )  peer k one of them.
-: psd variable ;  : psdn variable ;
-: psdadd  ( ip port -- )
-psd @ 0= if 40 lit alloc psd ! then
-psdn @ 8 lit u< if  psd @ psdn @ 3 lit lshift + tuck 4 lit + !  !  psdn @ 1 lit + psdn !  else 2drop then ;
-: pisseed
-prec 0 lit swap  psdn @ ?dup if 0 lit do
-	dup @ psd @ i 3 lit lshift + @ =  over 4 lit + @ psd @ i 3 lit lshift + 4 lit + @ = and if nip -1 lit swap then
-loop then drop ;
 \ pbanned ( k -- flag )  banned and its hour not up (once up, its strikes
 \ forgotten).
 : pbanned
@@ -439,6 +481,9 @@ prdy if
 		pfk @ 0< if drop 0 lit else
 		dup 2 lit = if
 			prx @ 5 lit + mnon @ 8 lit d8= if
+				\ its first answer: our pool announced again (sync.fam's
+				\ nrean), as tabminer announces its pool to a new peer
+				pfk @ prec 8 lit + @ 0= if -1 lit pfresh ! then
 				prx @ 5 lit + pfk @ prec 18 lit + 8C lit bcopy  prx @ 11 lit + pfk @ prec 10 lit + 8 lit bcopy
 				1 lit pfk @ prec 8 lit + !  pfk @ pcur @ = if 1 lit pok ! then
 				secs pfk @ prec AC lit + !
