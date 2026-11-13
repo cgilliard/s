@@ -323,6 +323,8 @@ pub(super) struct Participant {
     kept: Vec<(u64, u64, Instant)>,
     /// Outbound circuits built since start.
     built: u64,
+    /// Standing circuits given up since start (dead, refused, or gone).
+    standing_lost: u64,
     /// The epoch whose new points this node, as a sub-name issuer, has
     /// republished the delegations naming it at.
     republished: Option<u32>,
@@ -363,6 +365,7 @@ impl Default for Participant {
             fetches: Vec::new(),
             kept: Vec::new(),
             built: 0,
+            standing_lost: 0,
             republished: None,
             carried: None,
             pushes: Vec::new(),
@@ -405,6 +408,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Outbound circuits built since start.
     pub(super) fn outbound_built(&self) -> u64 {
         self.part.built
+    }
+
+    /// Standing circuits given up since start.
+    pub(super) fn standing_lost(&self) -> u64 {
+        self.part.standing_lost
     }
 
     /// Whether our own transactions go out over a circuit: in onion mode,
@@ -1252,6 +1260,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         let mut refused_at: Option<Digest> = None;
         for s in self.part.standing.iter_mut().filter(|s| s.circuit == Some(handle)) {
+            self.part.standing_lost += 1;
             if at_end {
                 refused_at = Some(s.point);
             }

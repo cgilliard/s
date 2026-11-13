@@ -398,6 +398,10 @@ pub enum Event {
     /// Tests: keep no standing circuits.
     #[cfg(test)]
     TestQuiet,
+    /// Tests: the node's loop busy this long, taking nothing meanwhile
+    /// (datagrams queue for it, as behind a long block's checking).
+    #[cfg(test)]
+    TestStall(Duration),
     /// Tests: close the channels that carry no circuit now, as if idle
     /// for the whole timeout.
     #[cfg(test)]
@@ -520,6 +524,8 @@ pub struct Stats {
     pub circuits: (usize, usize),
     /// Outbound circuits of ours built since start.
     pub outbound_built: u64,
+    /// Our standing circuits given up since start.
+    pub standing_lost: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1167,6 +1173,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 #[cfg(test)]
                 Ok(Event::TestQuiet) => self.quiet = true,
                 #[cfg(test)]
+                Ok(Event::TestStall(d)) => std::thread::sleep(d),
+                #[cfg(test)]
                 Ok(Event::TestExpireIdle) => self.channels.expire_idle = true,
                 #[cfg(test)]
                 Ok(Event::TestForgetChannels) => self.channels.forget(),
@@ -1617,6 +1625,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             channels: self.channels.count(),
             circuits: self.circuits.counts(),
             outbound_built: self.outbound_built(),
+            standing_lost: self.standing_lost(),
         };
     }
 
@@ -5503,6 +5512,63 @@ mod tests {
         h_b.join().unwrap();
     }
 
+    #[test]
+    fn a_busy_relay_keeps_its_channel() {
+        // A relay whose loop is busy for 10 s (a long block's checking, a
+        // loaded machine) answers nothing meanwhile, then everything: its
+        // channel must not be taken for dead (docs/TIMING_FIXES.md: a 5 s
+        // floor did, on a loaded runner), and must carry on after.
+        let (a, b) = (open("busy-a"), open("busy-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let start = |f: &Fixture, tag: u8| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = true;
+            cfg.identity = Some(key(tag));
+            cfg.relay_key = cfg.identity.clone();
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let sink = Arc::clone(&node.channels.sink);
+            let stats = node.stats();
+            (addr, tx, sink, stats, std::thread::spawn(move || node.run()))
+        };
+        let (addr_a, tx_a, sink_a, _, h_a) = start(&a, 1);
+        let (_, tx_b, _, stats_b, h_b) = start(&b, 2);
+        let wait_for = |what: &str, secs: u64, ok: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + guard(secs);
+            while !ok() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"before".to_vec())).unwrap();
+        wait_for("the first body", 10, &|| sink_a.lock().unwrap().len() == 1);
+        wait_for("b's channel counted", 5, &|| stats_b.lock().unwrap().channels == 1);
+        // a busy 10 s, b sending a body each second meanwhile: its frames
+        // unanswered past where a 5 s floor gave the channel up (7.5 s)
+        tx_a.send(Event::TestStall(Duration::from_secs(10))).unwrap();
+        let busy = Instant::now();
+        let mut n = 0;
+        while busy.elapsed() < Duration::from_secs(11) {
+            if n < 10 {
+                tx_b.send(Event::TestChannel(addr_a, id(1), format!("busy {n}").into_bytes())).unwrap();
+                n += 1;
+            }
+            assert_eq!(stats_b.lock().unwrap().channels, 1, "b's channel given up after {:?}", busy.elapsed());
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        // a, free again, has them all, and the channel carries on
+        wait_for("the bodies sent while a was busy", 10, &|| sink_a.lock().unwrap().len() == 11);
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"after".to_vec())).unwrap();
+        wait_for("a body after", 10, &|| sink_a.lock().unwrap().iter().any(|(_, _, b)| b == b"after"));
+        assert_eq!(stats_b.lock().unwrap().channels, 1, "the same channel, not a new one");
+        for tx in [tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+    }
+
     /// A relay that lost a channel (a restart) tells the other end at its
     /// next frame, which closes at once rather than after its own timeout
     /// (20 s in tests); a new channel then carries on.
@@ -7421,6 +7487,97 @@ mod tests {
         }
         for n in nodes {
             n.4.join().unwrap();
+        }
+    }
+
+    /// Relays busy for 10 s (every hop of a participant's standing
+    /// circuits: their loops taking nothing, then all of it) are not taken
+    /// for dead: no standing circuit is given up (docs/TIMING_FIXES.md,
+    /// a 5 s floor did), the sessions are live again, and a message gets
+    /// through after.
+    #[test]
+    fn busy_relays_keep_the_standing_circuits() {
+        use crate::onion;
+        let fixtures: Vec<Fixture> = (0..6).map(|i| open(&format!("busyrv-{i}"))).collect();
+        let mut handles = Vec::new();
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut nodes = Vec::new();
+        for (i, f) in fixtures.iter().enumerate() {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = i < 4;
+            cfg.identity = Some(key(i as u8 + 1));
+            cfg.relay_key = cfg.relay.then(|| cfg.identity.clone()).flatten();
+            let (mut node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let notes = node.take_notes().unwrap();
+            let stats = node.stats();
+            nodes.push((addr, tx, notes, stats));
+            handles.push(std::thread::spawn(move || node.run()));
+        }
+        let mut list: Vec<consensus::Relay> =
+            (0..4).map(|i| consensus::Relay { id: id(i as u8 + 1), addr: nodes[i].0.to_string() }).collect();
+        list.sort_by_key(|r| digest_to_bytes(&r.id));
+        let (p, q) = (4usize, 5usize);
+        for n in &nodes {
+            n.1.send(Event::TestRelays(list.clone())).unwrap();
+        }
+        // keepalives each second (asks then go unanswered while the relays
+        // are busy), no rotation
+        for n in [p, q] {
+            nodes[n].1.send(Event::TestTiming(Duration::from_secs(1), Duration::from_secs(3600), Duration::from_secs(60))).unwrap();
+        }
+        let live = |secs: u64| {
+            let deadline = Instant::now() + guard(secs);
+            loop {
+                let s = nodes[p].3.lock().unwrap().rendezvous.clone();
+                if s.len() == 3 && s.iter().all(|(_, l)| *l) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "p: {s:?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let mut tag = 0u64;
+        let mut message = |round: &str| {
+            tag += 1;
+            let out = Outbound {
+                tag,
+                to: id(5),
+                kind: onion::KIND_SLATE,
+                inner: round.as_bytes().to_vec(),
+                recipient: None,
+                reply: None,
+                group: 0,
+            };
+            nodes[q].1.send(Event::Send(out)).unwrap();
+            let deadline = Instant::now() + guard(40);
+            loop {
+                match nodes[p].2.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Note::Received(o)) if o.inner == round.as_bytes() => break,
+                    _ => {}
+                }
+                if let Ok(Note::Failed { why, .. }) = nodes[q].2.try_recv() {
+                    panic!("{round}: {why}");
+                }
+                assert!(Instant::now() < deadline, "{round}: nothing arrived");
+            }
+        };
+        live(30);
+        message("before");
+        let lost = nodes[p].3.lock().unwrap().standing_lost;
+        for n in nodes.iter().take(4) {
+            n.1.send(Event::TestStall(Duration::from_secs(10))).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(11));
+        live(20);
+        assert_eq!(nodes[p].3.lock().unwrap().standing_lost, lost, "a standing circuit given up while its relays were busy");
+        message("after");
+        for n in &nodes {
+            n.1.send(Event::Stop).unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
         }
     }
 

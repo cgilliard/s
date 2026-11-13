@@ -637,3 +637,14 @@ understood is ignored.
 17. The drop filter by message kind and a test per fault (section 7);
     the racing tests made to wait on conditions; the same timer values
     in tests as in production wherever a test decides on one.
+    **A stall fault (2026-11-13), first:** the drop filter tests a dead
+    peer, never a busy one, and a busy one taken for dead was what items
+    11 and 12's 5 s floors did. `Event::TestStall(d)` holds a node's
+    loop (datagrams queue for it, as behind a long block's checking);
+    `a_busy_relay_keeps_its_channel` (a relay busy 10 s, a body sent to
+    it each second: the channel kept, every body delivered after, the
+    same channel on) and `busy_relays_keep_the_standing_circuits` (every
+    relay busy 10 s: no standing circuit given up, `Stats::standing_lost`,
+    the sessions live again, a message through). Both fail with the 5 s
+    floors (the channel given up at 9 s; all three circuits) and pass
+    with 30 s.
