@@ -79,6 +79,24 @@ wait_os() {
 	WPROGRESS=$wo_prev
 }
 
+# wait_blocks FILE REGEX LOG N WHAT — until REGEX is in FILE; fails once
+# LOG (a miner's output) has told N more blocks than when the wait began
+# without it: a step that should take a block or two, bounded by the
+# chain's own clock, which a busy log cannot stretch (pooltest on CI
+# waited out its job for a transaction never mined, the miner's log
+# growing all the while); or when nothing under $T has grown for 600 s.
+wait_blocks() {
+	wk_0=$(grep -c 'is the tip at height' "$3" 2>/dev/null || true); wk_last=$(wprogress); wk_idle=0
+	until grep -qE "$2" "$1" 2>/dev/null; do
+		wk_n=$(grep -c 'is the tip at height' "$3" 2>/dev/null || true)
+		[ $((wk_n - wk_0)) -lt "$4" ] || { echo "$WNAME: $5: not in $4 blocks" >&2; wdump; exit 1; }
+		[ "$wk_idle" -lt 600 ] || { echo "$WNAME: $5: nothing new for 600 s" >&2; wdump; exit 1; }
+		sleep 2
+		wk_now=$(wprogress)
+		if [ "$wk_now" != "$wk_last" ]; then wk_last=$wk_now; wk_idle=0; else wk_idle=$((wk_idle + 2)); fi
+	done
+}
+
 # wait_while_busy IDLE WHAT CONDITION... — until CONDITION (a command)
 # succeeds; fails as wait_for does.
 wait_while_busy() {

@@ -60,9 +60,9 @@ grep -E "^(sync|wallet peer):" "$T/node.out"
 grep -q '^wallet peer: answered' "$T/node.out" || { echo "pooltest.sh: no sync or no wallet peer" >&2; exit 1; }
 # The wallet's node takes the node for a live peer once the node answers
 # its Ping, and logs the peer then.
-wait_for "$T/wallet/tabminer.log" 'peer 127\.0\.0\.1:[0-9]+ \(height' 60 "the wallet's node taking the node for a peer"
+wait_own "$T/wallet/tabminer.log" 'peer 127\.0\.0\.1:[0-9]+ \(height' 60 "the wallet's node taking the node for a peer"
 echo "burn 1 pooltest" >&3
-wait_for "$T/node.out" '^left the pool:' 600 "the transaction mined"
+wait_blocks "$T/node.out" '^left the pool:' "$T/miner.out" 20 "the transaction mined"
 kill $QP; wait $QP 2>/dev/null || true; QP=
 grep -E "^(pool|left the pool):" "$T/node.out"
 grep -q '^pool: 0 ' "$T/node.out" || { echo "pooltest.sh: the node did not pool the transaction" >&2; exit 1; }
