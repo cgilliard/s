@@ -47,6 +47,37 @@ mod tests {
     const STATE40_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/statechain40.bin");
     const NET_MAIN_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/net_main.bin");
     const NET_DEVREC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/net_devrec.bin");
+    const DEVCHAIN_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/devchain.bin");
+    const DEVLITE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/user/node/devlite.bin");
+
+    /// The blocks of `devchain.bin` without their proofs, as tabminer serves
+    /// them (`Block::lite_bytes`, `net::Kind::Lite`), for the fam node's
+    /// proofs test: a count, then per block as `devchain.bin` has them (a
+    /// zero verdict, the header, the lite body's length, the lite body,
+    /// word padded).
+    fn generate_devlite() -> Vec<u8> {
+        let chain = std::fs::read(DEVCHAIN_PATH).expect("node/src/user/node/devchain.bin");
+        let n = u32::from_le_bytes(chain[..4].try_into().unwrap());
+        let mut at = 4 + 24 * 4 + crate::block::HEADER_SIZE;
+        let mut out = n.to_le_bytes().to_vec();
+        for _ in 0..n {
+            at += 4;
+            let header = &chain[at..at + crate::block::HEADER_SIZE];
+            at += crate::block::HEADER_SIZE;
+            let len = u32::from_le_bytes(chain[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            let mut bytes = header.to_vec();
+            bytes.extend_from_slice(&chain[at..at + len]);
+            at = (at + len).div_ceil(4) * 4;
+            let lite = crate::block::Block::from_bytes(&bytes).expect("a block of devchain.bin").lite_bytes();
+            out.extend_from_slice(&0i32.to_le_bytes());
+            out.extend_from_slice(&lite[..crate::block::HEADER_SIZE]);
+            out.extend_from_slice(&((lite.len() - crate::block::HEADER_SIZE) as u32).to_le_bytes());
+            out.extend_from_slice(&lite[crate::block::HEADER_SIZE..]);
+            out.resize(out.len().div_ceil(4) * 4, 0);
+        }
+        out
+    }
 
     /// A network as the fam node takes it (its `-n`): the parameters
     /// (words, little-endian: the dataset's log2 items, parents, accesses;
@@ -1656,6 +1687,8 @@ mod tests {
         assert!(file == state, "the fam node's 40-bit state chain is stale: run write_fam_vectors");
         let file = std::fs::read(POOL_PATH).expect("node/src/user/node/pool.bin");
         assert!(file == generate_pool(), "the fam node's pool test is stale: run write_fam_vectors");
+        let file = std::fs::read(DEVLITE_PATH).expect("node/src/user/node/devlite.bin");
+        assert!(file == generate_devlite(), "the fam node's lite blocks are stale: run write_fam_vectors");
         let (main, devrec) = generate_networks();
         let file = std::fs::read(NET_MAIN_PATH).expect("node/src/user/node/net_main.bin");
         assert!(file == main, "the fam node's mainnet file is stale: run write_fam_vectors");
@@ -1677,6 +1710,7 @@ mod tests {
         let (state, _) = generate_state(FIRST40);
         std::fs::write(STATE40_PATH, state).unwrap();
         std::fs::write(POOL_PATH, generate_pool()).unwrap();
+        std::fs::write(DEVLITE_PATH, generate_devlite()).unwrap();
         let (main, devrec) = generate_networks();
         std::fs::write(NET_MAIN_PATH, main).unwrap();
         std::fs::write(NET_DEVREC_PATH, devrec).unwrap();
