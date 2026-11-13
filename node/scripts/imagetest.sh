@@ -47,7 +47,7 @@ dd if=/dev/zero of="$T/booted.disk" bs=1 count=0 seek=268435456 2>/dev/null
 
 MP=; QP=; BP=
 # node.sh's QEMU stopped first: a shell runs its trap only once its child ends.
-trap 'st=$?; [ -n "$BP" ] && pkill -P $BP 2>/dev/null; for p in $BP $QP $MP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; rm -f "$T"/*.gh*.* "$T"/*.new.* "$T"/*.in.*; exit $st' EXIT
+trap 'st=$?; [ -n "$BP" ] && pkill -P $BP 2>/dev/null; [ -n "$MP" ] && kill -CONT $MP 2>/dev/null; for p in $BP $QP $MP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; rm -f "$T"/*.gh*.* "$T"/*.new.* "$T"/*.in.*; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
 mine() {
 	TABMINER_THREADS=${TABMINER_THREADS:-8} "$MINER" mine --network dev-recursive --data "$T/miner" --no-seeds \
@@ -66,7 +66,9 @@ QP=$!
 wait_for "$T/node.out" '^api: listening|^sync: -' 900 "the sync"
 grep -E '^sync:' "$T/node.out"
 grep -q '^api: listening' "$T/node.out" || { echo "imagetest.sh: the node did not sync" >&2; exit 1; }
-kill $MP; wait $MP 2>/dev/null || true; MP=
+# paused, not stopped: a tabminer stopped says goodbye (a node then
+# drops it from its peers, and GetPeers below would not list it)
+kill -STOP $MP
 
 python3 - "$HP" "$T/node.img" <<'EOF'
 import os, socket, struct, sys
