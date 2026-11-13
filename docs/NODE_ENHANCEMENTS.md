@@ -947,3 +947,57 @@ one (its `dropped` event, with why), and replaced by a bump; a request
 waiting while nothing happens answered when something does; `after`
 past the ring answered "reset". In the wallet: an online payment's
 events in order from sent to confirmed, and a dropped one's.
+
+## 21. Catching up by batches: one proof checked for many blocks
+
+Catching up after a fast sync (the 144 blocks after S) or after time
+offline, the node connects each block with its chain proof checked:
+about 2.5 s of 4 to 5 s a block on mainnet, so 144 blocks take ten
+minutes, most of it proofs. A block's chain proof covers every block
+before it, so checking only the last of a run would attest the rest;
+but the blocks between would then be connected on their own proof of
+work's quick check and their state roots alone, and those a forger
+writes: spends with no signature, a payment that never was. Not to be
+done until the risks below are answered:
+
+- **What a forger can do.** Mine one block at the current difficulty
+  (the last of the run's work is checked in full) on top of forged ones.
+  The forged state is undone when the last proof fails, but meanwhile:
+  (1) the wallet could see a payment or a confirmation that is not real;
+  (2) the node does and undoes the whole run's work, once for every block
+  the forger can afford.
+- **Batches of n blocks** (n to settle: 16, 32?). The batch's blocks are
+  connected, then the last one's proof checked: passed, the batch is
+  accepted; failed, the batch is undone to its start.
+- **Finding the bad block and who sent it.** A failed batch is checked
+  again block by block (each proof, as today), so the first bad block is
+  found, and blocks before it kept. Each block's sender is recorded as it
+  is fetched (several peers may serve one batch); the sender of the bad
+  block is banned (`pstrike`, at once rather than by strikes: a valid
+  proof of work on an invalid block is deliberate), and a peer that
+  announced the branch it is on is struck too.
+- **Nothing unchecked shown.** Until a batch's proof passes, the node's
+  status, the API's reads and the wallet stay at the last checked block:
+  the store's commits for the batch kept apart (a transaction for the
+  batch, or a mark of the last checked height the API reads at), so the
+  wallet never sees a forged payment.
+- **Nothing unchecked relayed or announced**: the tip announced only once
+  its batch is checked; blocks of a batch not served to peers until then.
+- **Only while catching up.** At the tip, each new block is checked on
+  its own, as now (one block a batch).
+- **Tolerance.** How many failed batches before the node falls back to
+  checking every proof for a while (a forger with hash power could keep
+  it busy); and whether a batch is fetched from more than one peer, so a
+  single bad peer costs one batch.
+
+Meanwhile, the safer speedups: the next block fetched while one is
+connected (item 4, 2026-11-12), the node given several harts
+(`node.sh`, 2026-11-12), and proofs checked in parallel on those harts,
+each block's still checked (the state applied in order, the proofs of
+several blocks at once): close to a batch's speed with nothing taken on
+trust.
+
+**Tests:** a run of forged blocks ending in one with real work (on the
+dev network: a peer serving them), the batch undone, the bad block found
+and its sender banned, the wallet never shown the forged state; and a
+clean catch-up's time against block by block.

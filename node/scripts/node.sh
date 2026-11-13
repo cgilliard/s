@@ -12,7 +12,8 @@
 #   --no-seeds        not the built-in seeds (SEEDS), only those given
 #   --mac=ADDR        the virtio-net MAC (give each node on a host its own)
 #   --hostfwd=SPEC    expose a guest port, e.g. udp::3737-:3737
-#   --smp=N           N harts (default 1)
+#   --smp=N           N harts (default: the host's cores, 4 at most; the
+#                     node's worker and verifier then run beside it)
 #   TABERNACLE        the boot program (default node/bin/tabernacle, as
 #                     scripts/build.sh leaves it)
 #
@@ -32,7 +33,11 @@ EXTRA=""
 NO_SEEDS=0
 MAC=""
 HOSTFWD=""
-SMP=1
+# harts: the host's cores, 4 at most (idle harts sleep: wfi)
+SMP=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+case "$SMP" in ''|*[!0-9]*) SMP=1 ;; esac
+[ "$SMP" -gt 4 ] && SMP=4
+[ "$SMP" -lt 1 ] && SMP=1
 TAB="$ROOT/bin/tabernacle"
 
 for arg in "$@"; do
@@ -43,7 +48,7 @@ for arg in "$@"; do
 		--mac=*) MAC=",mac=${arg#--mac=}" ;;
 		--hostfwd=*) HOSTFWD=",hostfwd=${arg#--hostfwd=}" ;;
 		--smp=*) SMP="${arg#--smp=}" ;;
-		--help|-h) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		--help|-h) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		--*) echo "node.sh: unknown option: $arg" >&2; exit 1 ;;
 		*) TAB="$arg" ;;
 	esac

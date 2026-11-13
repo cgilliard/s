@@ -75,6 +75,29 @@ nblk @ if
 	dup 0= if nblk @ free 0 lit nblk ! then
 else drop 0 lit then
 ticks nft @ - btf ! ;
+\ The next block fetched while the worker connects this one: the loops
+\ that connect blocks set npnx to the next block's entry before nconnect,
+\ which, once the worker has the job, fetches that block (npfetch) into
+\ npb/npn (npe its entry) while it waits; nbget then takes it rather than
+\ fetching it again.  The fetch is the network's time (a round trip a
+\ window of chunks), the connection the worker's: so they overlap.
+: nsvt variable ;  : npnx variable ;  : npe variable ;  : npb variable ;  : npn variable ;  : nsvb variable ;  : nsvn variable ;
+\ npdrop  a block fetched ahead and not used, dropped.
+: npdrop  npb @ ?dup if free then  0 lit npb !  0 lit npe ! ;
+\ npfetch  npnx's block fetched into npb/npn, nblk and nbn kept.
+: npfetch
+npnx @ ?dup if
+	npdrop  nblk @ nsvb !  nbn @ nsvn !
+	dup nblock if npe !  nblk @ npb !  nbn @ npn ! else drop then
+	nsvb @ nblk !  nsvn @ nbn !
+then
+0 lit npnx ! ;
+\ nbget ( e -- flag )  entry e's block into nblk/nbn: the one fetched ahead
+\ if it is e's (its fetch then took no time here), else fetched now.
+: nbget
+dup npe @ =  npb @ 0= 0= and if
+	drop  npb @ nblk !  npn @ nbn !  0 lit npb !  0 lit npe !  0 lit btf !  -1 lit
+else npdrop nblock then ;
 \ nwhy.  why the last block was not fetched.
 : nwhy.
 nwhy @ 1 lit = if " (nothing came)" else nwhy @ 2 lit = if " (too short to hold a header)" else
@@ -253,14 +276,18 @@ repeat 2drop ;
 cwon @ if
 	cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !
 	sprchk @ cwj @ C lit + !  stfd @ cwj @ 10 lit + !
-	1 lit cwput  cwait
+	1 lit cwput
+	\ the next block fetched meanwhile, if the caller named it (npnx)
+	\ (its fetch's time is its own: this block's, as nbrk shows it, kept)
+	btf @ nsvt !  npfetch  nsvt @ btf !  2 lit pact !  cwj @ @ 20 lit + @ pacth !
+	cwait
 	cwj @ 14 lit + @ btb !  cwj @ 18 lit + @ bts !  cwj @ 1C lit + @ btp !  cwj @ 20 lit + @ btc !
 	\ what the pool reads of the block (qconfs, qmvblk), as sconnect left it
 	cwj @ @ bh !  cwj @ 28 lit + @ bout !  cwj @ 2C lit + @ bnout !  cwj @ 30 lit + @ sfirst !  cwj @ 34 lit + @ sfirsth !
 else
 	2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !
 then
-0 lit pact ! ;
+0 lit npnx !  0 lit pact ! ;
 \ cwjob ( a b c kind -- r )  a job of three arguments by the worker,
 \ the node serving meanwhile.
 : cwkd variable ;
@@ -417,12 +444,14 @@ ncode @ 0= if
 	nH @ nS @ u> if
 		nH @ 1 lit + nS @ 1 lit + do
 			ncode @ 0= if
-				i hat dup nblock if
+				i hat dup nbget if
+					i nH @ u< if i 1 lit + hat npnx ! then
 					hhdr nblk @ CC lit + nbn @ CC lit - nconnect if FFFFFFF7 lit nfail else vrb @ if nhead "block " puts i u. " of " puts nH @ u. " connected" puts nbrk 0A lit putc then then
 					nblk @ free 0 lit nblk !
 				else drop FFFFFFFB lit nfail then
 			then
 		loop
+		npdrop
 	then
 	nstat
 then
@@ -513,7 +542,8 @@ then then
 myh @ hbest hheight u< nfl @ 0= and if
 	hbest hheight 1 lit + myh @ 1 lit + do
 		nfl @ 0= if
-			i hat dup nblock if
+			i hat dup nbget if
+				i hbest hheight u< if i 1 lit + hat npnx ! then
 				hhdr nblk @ CC lit + nbn @ CC lit - nconnect ?dup if
 					vrb @ if nhead "block " puts i u. " refused: " puts dup . "; its branch set aside" puts 0A lit putc then drop
 					i hat hmark  pcur @ pstrike  1 lit nfl !
@@ -525,6 +555,7 @@ myh @ hbest hheight u< nfl @ 0= and if
 			else drop vrb @ if nhead "block not fetched: " puts i u. nwhy. 0A lit putc then 1 lit nfl ! then
 		then
 	loop
+	npdrop
 then
 \ the pool: out what the new blocks spent or settled otherwise, onto the
 \ shelf; back from the shelf what is valid again (the blocks undone)

@@ -389,15 +389,78 @@ nodeok @ if
 	wbeg  sgen @ wtmp @ !  "gen" wtmp @ 4 lit wset  0 lit wtmp @ c!  "scan" wtmp @ 1 lit wset  wend drop
 then
 nodeok @ ;
+\ The scan made incremental (2026-11-12): a full scan of the whole set, a
+\ page of 1,000 outputs at a time each checked for ours (wone: a key
+\ derived and a commitment hashed), took seconds and more, and the wallet,
+\ one loop, answered nothing meanwhile: every new block froze the window.
+\ Now each scan keeps where it got to (the height and tip the status gave,
+\ "sh" and "st"; the position after the last output seen, "sp"), and the
+\ next takes only what is new: the outputs from that position on (the new
+\ blocks' outputs: positions only grow along a chain) and the positions
+\ spent since that height (/v1/spent), ours among them marked spent.  A
+\ full scan instead if nothing is kept, the kept tip is not the node's
+\ block at its height any more (a reorganization: positions may have
+\ moved), or it is past the node's window of spends (1,008 blocks).
+: wsht variable ;  : wspp variable ;  : wstp variable ;  : wslo variable ;  : wshi variable ;
+\ wsrd ( -- flag )  the last scan's point, if kept: wsht, wspp, wstp.
+: wsrd
+"sh" wtmp @ 4 lit wget 4 lit = dup if wtmp @ @ wsht ! then
+"sp" wspp @ 8 lit wget 8 lit = and
+"st" wstp @ 40 lit wget 40 lit = and  0 lit wstp @ 40 lit + c! ;
+\ wssv  this scan's point kept: the status's height and tip, the position
+\ after the last output seen (sfrom).
+: wssv  wbeg  lh @ wtmp @ !  "sh" wtmp @ 4 lit wset  "sp" sfrom @ 8 lit wset  "st" ntip @ 40 lit wset  wend drop ;
+\ wstok ( -- flag )  the kept tip still the node's block at its height.
+: wstok
+ppath @ "/v1/header/" scpy  wsht @ 0 lit rot dstr drop
+ppath @ hget ?dup if "'id':'" jfind ?dup if wstp @ 40 lit wssame else 0 lit then else 0 lit then ;
+\ wsmk ( lo hi -- )  ours at that position, if any, marked spent.
+: wsmk
+wshi ! wslo !
+6F lit okey @ c!  1 lit
+begin wtx @ okey @ rot okn @ txnext dup 21 lit = if okn @ c@ 6F lit = else 0 lit then while
+	drop  okn @ okey @ 21 lit bcopy
+	okey @ 21 lit orec @ 30 lit wgetk drop
+	orec @ 18 lit + @ wslo @ =  orec @ 1C lit + @ wshi @ = and  orec @ 24 lit + c@ 2 lit <> and if
+		2 lit orec @ 24 lit + c!  okey @ 21 lit orec @ 30 lit wsetk
+	then
+	21 lit
+repeat drop ;
+\ wspos  the positions spent since the kept height (/v1/spent): ours
+\ among them marked spent.
+: wspos
+ppath @ "/v1/spent?from=" scpy  wsht @ 1 lit + 0 lit rot dstr drop
+ppath @ hget dup scur ! if
+	wbeg
+	begin scur @ "'positions':[" jfind ?dup while
+		scur !
+		begin scur @ c@ 5D lit <> scur @ c@ 0= 0= and while
+			scur @ jnum scur !  nlo @ nhi @ wsmk
+			scur @ c@ 2C lit = if scur @ 1 lit + scur ! then
+		repeat
+	repeat
+	wend drop
+then ;
+\ wscn2 ( -- ok )  the scan, incremental when it can be (above).
+: wscn2
+wsrd if wstok  lh @ wsht @ - 3E0 lit u< and else 0 lit then
+if
+	"gen" wtmp @ 4 lit wget 4 lit = if wtmp @ @ else 0 lit then sgen !
+	wspp @ sfrom @ 8 lit bcopy  1 lit nodeok !  wplist
+	begin wpage dup 0= if hres @ 0= if 0 lit nodeok ! then then 3E8 lit u< until
+	nodeok @ if wspos then
+else wscan then
+nodeok @ if wssv then
+nodeok @ ;
 \ wtick  the node asked for its tip; when it moved, the set scanned again
-\ and the tip told (an event).
+\ (wscn2: what is new) and the tip told (an event).
 : wtick
 have @ if
 	"/v1/status" hget ?dup if
 		dup "'height':" jfind jnum drop nlo @ lh !
 		"'tip':'" jfind ntip @ 40 lit bcopy  0 lit ntip @ 40 lit + c!
 		ntip @ ltip @ streq 0= if
-			wscan if
+			wscn2 if
 				ltip @ ntip @ scpy 0 lit over c! drop
 				"{'event':'tip','height':" jo lh @ 0 lit wdec ",'hash':'" jo ltip @ jraw "'}" jo jend
 			then
@@ -2153,7 +2216,7 @@ wsinit  b39load drop  xkinit  wpinit  wninit  bslate
 HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntmp !
 24 lit alloc okey !  24 lit alloc okn !  30 lit alloc orec !  20 lit alloc ecom !  14 lit alloc emem !  8 lit alloc eamt !
 8 lit alloc epos !  4 lit alloc eh !  40 lit alloc ecb !  4 lit xksize alloc xk !  34 lit alloc wxpk !  20 lit alloc kseed !
-8 lit alloc sfrom !  48 lit alloc ntip !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
+8 lit alloc sfrom !  8 lit alloc wspp !  48 lit alloc wstp !  48 lit alloc ntip !  48 lit alloc ltip !  0 lit ltip @ c!  8 lit alloc sa1 !  8 lit alloc sa2 !  8 lit alloc sa3 !
 8 lit alloc sa4 !  8 lit alloc sa5 !
 500 lit alloc ppth !  3000 lit alloc pftxt !  2000 lit alloc pbin !  20 lit alloc vroot !  50 lit alloc waddr2 !
 20 lit alloc bben !  20 lit alloc bnon !  104 lit alloc bpur !  40 lit alloc bburn !  100 lit alloc wcwhy !  0 lit wcx !  0 lit wcon !
