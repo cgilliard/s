@@ -961,7 +961,7 @@ waiting while nothing happens answered when something does; `after`
 past the ring answered "reset". In the wallet: an online payment's
 events in order from sent to confirmed, and a dropped one's.
 
-## 21. Catching up: one proof checked for the run, before any block is applied
+## 21. Catching up by batches: one proof checked for 16 blocks, before they are applied
 
 Catching up after a fast sync (the 144 blocks after S) or after time
 offline, the node connects each block with its chain proof checked:
@@ -972,65 +972,83 @@ Neither every header's full proof of work (2.2 s each, natively) nor
 every block's proof is needed. A block's chain proof binds its parent's
 header (its hash is among the proof's public values, NODE.md's "the
 chain proof binds the headers"), attests its parent's work (the true
-`mix`), and is recursive: block T's proof attests every header before
-it, the work and the state root in each included. The header sync has
-linked S to T by their parents' ids, each header's quick proof of work
-checked (two permutations), and T's full proof of work checked natively
-(the tip's, as the fast sync does today: 5.3 s on mainnet). So once T's
-proof passes, every header from S to T is the true one, with its work,
-and connecting a block between needs only the checks made today besides
-its proof: its body matches its header's commitment, and applying it
-gives its header's state root. The root commits to every output and
-name, so a body that lands on an attested root gives the true state: no
-forged spend or payment can be shown. The proof is checked first, so no
-block is applied, shown, announced or served before it is attested, and
-nothing is ever undone.
+`mix`), and is recursive: block B's proof attests B and every block
+before it, and the work of every header before B. The header sync has
+linked the headers by their parents' ids, each one's quick proof of
+work checked (two permutations), and the tip's full proof of work
+checked natively (as the fast sync does today: 5.3 s on mainnet). So
+once B's proof passes, connecting a block up to B needs only the checks
+made today besides its proof: its body matches its header's commitment,
+and applying it gives its header's state root. The root commits to
+every output and name, so a body that lands on an attested root gives
+the true state: no forged spend or payment can be shown. The proof is
+checked first, so no block is applied, shown, announced or served
+before it is attested, and nothing is ever undone.
 
-**A run** (from the node's height H to T, the best header's height when
-the run starts; only when T - H is 2 or more):
-0. **T's work:** checked in full natively if it is not already (T is
-   the best header when the run starts; the tip's work is checked by the
-   header sync, a later one as it arrives).
-1. **The bodies:** fetched H+1 to T (as now, the next while one is
-   handled), each one's commitment checked against its header (its
-   sender banned at once if it does not match), its outputs counted, and
-   kept on disk under keys of their own (not the kept bodies' 'b', so
-   none is served).
-2. **T's proof, once** (about 2.5 s). Its public values need the output
-   counter before T: the counter at H (S's from the snapshot, or the
-   state's) plus what step 1 counted (each block's outputs and its
-   names' operations of type 1, as `sconn1` and `sverify` count), and
-   T−1's header readable where `sstmt` reads it.
-3. **The blocks connected,** H+1 to T from disk, in order: parsed, the
+**An honest block cannot be spoiled by the peer serving it.** The
+header's body commitment covers the chain proof too (`bcommit` packs
+`bpr`), so a wrong body or a wrong proof for an honest header fails the
+commitment check as it is fetched: its sender banned, the block fetched
+from another, no proof checked. A batch's proof fails only on a branch
+that is itself invalid; a peer can lead the node onto one only by its
+headers, and the branch's tip needs a full proof of work at the current
+difficulty to be the best header: a real block's work for each try.
+
+**A batch** (n blocks, n = 16: 144 blocks are 9 proofs, about 23 s
+against 6 minutes; 32 would save about 10 s more, but show progress in
+steps twice as long and download twice as much of a bad branch):
+1. **The bodies:** fetched (as now, the next while one is handled),
+   each one's commitment checked against its header, its outputs
+   counted, kept on disk under keys of their own (not the kept bodies'
+   'b', so none is served). Each one's sender recorded.
+2. **The proof of the batch's last block B,** once. Its public values
+   need the output counter before B: the counter at the batch's start
+   (S's from the snapshot, or the state's) plus what step 1 counted
+   (each block's outputs and its names' operations of type 1, as
+   `sconn1` and `sverify` count), and B−1's header readable where
+   `sstmt` reads it.
+3. **The blocks connected** from disk, in order, up to B−1: parsed, the
    state changed and its root compared, stored; no proof, no commitment
-   again. Each is shown, announced and served as it is connected.
+   again. Each is shown, announced and served as it is connected. B's
+   validity is attested but its own work is not (its proof attests its
+   parent's), so B is held and connected as the first block of the next
+   batch, whose proof covers its work; the last batch ends at the tip,
+   whose work is checked in full, and the tip is connected with it.
 
-**If T's proof fails,** T is invalid: whoever served T is banned
-(`pstrike` at once: a full proof of work on an invalid block is
-deliberate), and the run is connected as today, each block's proof
-checked, which finds any bad block before T. The cost is the one 2.5 s
-check, and the forger a real block's work for T (the headers before it
-cost little: only their quick proof of work is checked before T's proof,
-and it is that proof that refuses them). No
-tolerance to tune: the worst case is today's speed. **If a root does not
-match in step 3** (a fault of ours: the proof passed on other data),
-the run stops there and the rest is connected as today. Blocks arriving
-during a run, and every block at the tip, are checked one by one as now.
+**A batch whose proof fails:** a block in it is invalid. Bisected:
+the proof of the middle block checked, then of the half's middle,
+and so on (each proof attests everything before it), so the first bad
+block is found in four proofs for 16 (about 10 s); the blocks before it
+connected; the bad block and every header after it on its branch marked
+invalid, so the best header falls back to the honest branch. Banned at
+once (`pstrike`; nothing honest is refused, as above): the peers that
+gave the branch's headers, and the senders of its bodies (an honest node
+serves only bodies of blocks it has connected). The next batch is fetched
+and checked as usual, so a few bad peers cost a few batches, then are
+gone. **If a root does not match in step 3** (a fault of ours: the proof
+passed on other data), the batch stops there and is connected block by
+block, each proof checked as today.
 
-Expected: about 1.3 s a block (the body about 1 s, the state, the store)
-and one proof: about 3 minutes for 144 blocks against 8. The bodies'
-commitments could later be checked on several harts (item 4's
-measurements first).
+**Only while catching up:** a batch is formed when 2 or more blocks are
+behind; a shorter last batch as the tip is reached; every block at the
+tip checked on its own, as now.
 
-**Disk:** a run's bodies are small on mainnet; at 2 MB blocks, 144 of
-them are 288 MB, to try with item 14's large blocks.
+Expected: about 1.3 s a block (the body about 1 s, the state, the
+store) and 2.5 s a batch: about 3.5 minutes for 144 blocks against 8.
+The bodies' commitments could later be checked on several harts (item
+4's measurements first).
 
-**Tests:** a clean catch-up, one proof checked, its time against block
-by block; T forged (real work, a bad proof): its sender banned, the run
-connected block by block, the wallet never moved; a wrong body for a
-block between: refused in step 1, its sender banned; the counter right
-across blocks with name operations (wrong, T's proof would fail and the
-run fall back).
+**Disk:** a batch's bodies are small on mainnet; at 2 MB blocks, 16 of
+them are 32 MB, to try with item 14's large blocks.
+
+**Tests:** a clean catch-up, a proof a batch, its time against block by
+block; a branch forged from its fifth block (its tip with real work): the
+batch bisected to the fifth, the four before connected, the headers'
+peer and the bodies' senders banned, the honest branch followed after,
+the wallet never shown the forged state; a wrong body or proof for an
+honest block: refused as fetched, its sender banned, fetched from
+another; the counter right across blocks with name operations (wrong,
+the batch would fail and be bisected).
 
 ## 22. The wallet tells what the node is doing
 
