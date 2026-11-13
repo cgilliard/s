@@ -558,7 +558,6 @@ klk @ unlock sret ;
 : rngpos  variable ;           \ bytes of them handed out
 : rngbusy variable ;           \ a request is out
 : rngirq  variable ;           \ its interrupt (0: polled)
-: rngat   variable ;           \ when the request out went (mtime)
 
 \ rngfind ( -- base | 0 )  the virtio-mmio slot holding an entropy device.
 : rngfind
@@ -596,7 +595,7 @@ rngav @ RNGQN 1 lit - and 1 lit lshift rngq @ 44 lit + + 0 lit swap h!
 fence
 rngav @ 1 lit + dup rngav ! rngq @ 42 lit + h!
 fence
-1 lit rngbusy !  mtime@ rngat !
+1 lit rngbusy !
 0 lit rngk @ 50 lit + ! ;
 
 \ rngdone? ( -- flag )  the request out answered; rngtake  its bytes ready.
@@ -611,23 +610,6 @@ dup 100 lit u> if drop 100 lit then rnglen !  0 lit rngpos !  0 lit rngbusy ! ;
 : krngirq
 rngk @ 60 lit + @ rngk @ 64 lit + !
 klk @ lock rngbusy @ if rngdone? if rngtake then then rngbuf @ fwake klk @ unlock ;
-
-\ rpoll  hart 0's timed look at the request out (at its user-mode ticks,
-\ and while idle, as npoll): answered, its bytes taken and the readers
-\ woken; unanswered a second, the device told again.  A reader waits for
-\ the interrupt, and one lost (seen in oscheck: the wallet's create asleep
-\ on /dev/random for minutes, until another read asked the device) no
-\ longer leaves it asleep for good.
-: rpoll
-rngirq @ if
-	klk @ lock
-	rngbusy @ if
-		rngdone? if rngtake rngbuf @ fwake else
-			mtime@ rngat @ - 989680 lit u< 0= if mtime@ rngat !  0 lit rngk @ 50 lit + ! then
-		then
-	then
-	klk @ unlock
-then ;
 
 \ rngread ( -- n )  read on /dev/random, under klk: the bytes ready, up to
 \ what was asked; none, and the call waits for the device.  The next
@@ -2086,7 +2068,7 @@ A8 lit kpr @ if A0 lit kpr @ 4 lit + mepc!  0 lit area@ E0 lit + ! then ;
 mcause@
 dup 80000007 lit = if drop ktick mpp@ 0= if
 	area@ C4 lit + dup @ 1 lit + swap !  cproc 50 lit + dup @ 1 lit + swap !
-	mhartid@ 0= if cpoll npoll rpoll then
+	mhartid@ 0= if cpoll npoll then
 	tstop
 then else
 dup 80000003 lit = if drop kipi hipiok else
@@ -2223,7 +2205,7 @@ else
 		trun
 		mhartid@ hcur harr @  0 lit mhartid@ hcur harr !  tafter
 	else
-		mhartid@ 0= kready @ and if cpoll npoll rpoll then
+		mhartid@ 0= kready @ and if cpoll npoll then
 		kei wfi kdi
 	then
 then ;

@@ -299,6 +299,7 @@ return;
 if(t=='overview'){var lv=w.lv={tab:t,el:p,draw:function(m){
 wh(p,'Balance');wrow(p,'Confirmed',m.confirmed);wrow(p,'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.reserved);wrow(p,'Locked',m.locked);
 wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);
+wrow(p,'Online',m.reach?'reachable: sessions at '+m.reach+' of '+m.points+' rendezvous points':'not reachable yet'+(m.points?' (0 of '+m.points+' rendezvous points)':''));
 }};wask(w,'overview',{},function(m){if(wbad(p,m))return;lv.draw(m)})}
 else if(t=='receive'){
 var a=el('div','',p);
@@ -315,6 +316,7 @@ wbtn(c,'Answer',function(){wask(w,'answer',{slate:s.value},function(m){o.textCon
 }});
 }
 else if(t=='send'){
+var on=el('div','wf',p);wh(on,'Pay online (the recipient online too)');var oto=wfield(on,'To (an address, a @name or a @label.name)','text'),oam=wfield(on,'Amount','text'),osp=wfield(on,'Speed','select'),oo=el('div','wv',on);wspeeds(w,osp);wbtn(on,'Send online',function(){wask(w,'send-online',{to:oto.value,amount:oam.value,speed:osp.value},function(m){oo.textContent=!m.ok?'Error: '+m.error:m.resolving?'Asking the name owner for the sub-name; then the slate goes':'Sent (fee '+m.fee+'); waiting for the recipient, who answers by itself'})});
 var f=el('div','wf',p);wh(f,'Pay by slate');
 var to=wfield(f,'To (an address or a @name)','text'),am=wfield(f,'Amount','text'),sp=wfield(f,'Speed','select');
 wask(w,'fees',{},function(m){if(m.ok)m.speeds.forEach(function(x){var e=el('option','',sp);e.value=x.speed;e.textContent=x.speed+': '+x.rate+', about '+wwait(x.wait)})});
@@ -341,10 +343,10 @@ else if(t=='activity'){var lv=w.lv={tab:t,el:p,draw:function(m){
 if(!m.items.length)el('div','',p).textContent='Nothing yet.';
 m.items.forEach(function(x){
 var r=wrow(p,x.kind,x.amount+'  '+x.state+(x.height?' at '+x.height:'')+'  '+x.tx.slice(0,16));
-if(x.state=='pending'){
+if(x.state=='pending'&&x.kind=='sent'){
 var re=function(m){if(m.ok)wshow(w,'activity');else el('div','werr',p).textContent='Error: '+m.error};
 wbtn(r,'Cancel',function(){wask(w,'cancel',{tx:x.tx},re)});
-wbtn(r,'Bump',function(){wask(w,'bump',{tx:x.tx,speed:'hour'},re)});
+wbtn(r,'Bump',function(){wask(w,'bump',{tx:x.tx,speed:'block'},re)});
 }
 if(x.kind=='sent'||x.kind=='burn'){
 wbtn(r,'Proof',function(){
@@ -359,8 +361,8 @@ var f=el('div','wf',p);wh(f,'Check a proof');
 var pt=warea(f,'The proof (paste it here)'),po=el('div','',f);
 wbtn(f,'Check',function(){wask(w,'verify',{text:pt.value},function(m){
 po.textContent='';if(wbad(po,m))return;
-wrow(po,'Valid',m.valid?'yes':'no');wrow(po,'Reason',m.reason);wrow(po,'Kind',m.kind);wrow(po,'Amount',m.amount);wrow(po,'Height',m.height);
-if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);
+wrow(po,'Valid',m.valid?'yes':'no');wrow(po,'Result',m.reason);wrow(po,'Kind',m.kind);wrow(po,'Amount',m.amount);wrow(po,'Height',m.height);
+if(m.to)wrow(po,'To',m.to);if(m.for)wrow(po,'For',m.for);if(m.purpose!=null)wrow(po,'Purpose',m.purpose);
 })});
 }
 else if(t=='names'){
@@ -372,14 +374,16 @@ m.items.forEach(function(x){
 var r=wrow(a,x.name,x.state+(x.value?'  '+x.value.slice(0,16):'')+(x.state=='committed'?'  ready in '+x.ready+' blocks':''));
 var ro=el('div','wv',a);
 if(x.state=='ready')wbtn(r,'Reveal',function(){wask(w,'name-reveal',{name:x.name,speed:'hour'},function(m){ro.textContent=m.ok?'Revealed: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})});
+if(x.state=='offered')wbtn(r,'Show the offer',function(){wask(w,'name-offer',{name:x.name},function(m){if(wbad(ro,m))return;ro.textContent='';var t=warea(ro,'The offer for '+x.name,true);t.value=m.text;wcopy(ro,t)})});
 if(x.state=='owned'){var uv=wfield(r,'New value','text');wbtn(r,'Update',function(){wask(w,'name-update',{name:x.name,value:uv.value,speed:'hour'},function(m){ro.textContent=m.ok?'Updated: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})})}
 });
 }};
 wask(w,'names',{},function(m){if(wbad(a,m))return;lv.draw(m)});
 var f=el('div','wf',p);wh(f,'Register a name');
-var nn=wfield(f,'Name','text'),nv=wfield(f,'Value (64 hex digits; optional)','text'),ns=wfield(f,'Speed','select'),no=el('div','wv',f);
+var nn=wfield(f,'Name','text'),nv=wfield(f,'Value (a tab1 address or 64 hex digits; optional)','text'),ns=wfield(f,'Speed','select'),no=el('div','wv',f);
 wspeeds(w,ns);
 wbtn(f,'Commit',function(){wask(w,'name-commit',{name:nn.value,value:nv.value,speed:ns.value},function(m){no.textContent=m.ok?'Committed: '+m.tx+' (fee '+m.fee+'); it may be revealed in '+m.ready+' blocks':'Error: '+m.error})});
+var oa=el('div','wf',p);wh(oa,'Ask for a name (an offer to its owner)');var on=wfield(oa,'Name','text'),ov=wfield(oa,'Value (a tab1 address or 64 hex digits; optional)','text');wmodes(oa,function(c,how){var of=how=='file'?wfield(c,'Offer file to write (in your home)','text'):null,oo=el('div','wv',c),r;wbtn(c,'Make the offer',function(){var a={name:on.value,value:ov.value};if(of)a.file=of.value;wask(w,'name-offer',a,function(m){if(!m.ok){oo.textContent='Error: '+m.error;return}if(of)oo.textContent='Written: '+m.file+'; give it to the name owner, who signs it over';else{oo.textContent='Copy the offer to the name owner, who signs it over';r.value=m.text}})});if(!of){r=warea(c,'The offer',true);wcopy(c,r)}});var xa=el('div','wf',p);wh(xa,'Sign a name over (to an offer)');var xs=wfield(xa,'Speed','select');wspeeds(w,xs);wmodes(xa,function(c,how){var xf=how=='file'?wfield(c,'Offer file (in your home)','text'):warea(c,'The offer (paste it here)'),xo=el('div','wv',c);wbtn(c,'Transfer',function(){var a=how=='file'?{file:xf.value}:{text:xf.value};a.speed=xs.value;wask(w,'name-transfer',a,function(m){xo.textContent=m.ok?'Transferring '+m.name+': '+m.tx+' (fee '+m.fee+'); it leaves this wallet once in a block':'Error: '+m.error})})});var sa=el('div','wf',p);wh(sa,'Sub-names you give (answered while online)');var sl=el('div','',sa);wask(w,'subnames',{},function(m){if(wbad(sl,m))return;if(!m.items.length)el('div','',sl).textContent='None yet.';m.items.forEach(function(x){var r=wrow(sl,x.sub,x.holder);if(x.holder!='none')wbtn(r,'Withdraw',function(){var q=x.sub.split('.');wask(w,'subname-del',{label:q[0],name:q[1]},function(m){if(m.ok)wshow(w,'names');else el('div','werr',sl).textContent='Error: '+m.error})})})});var sbl=wfield(sa,'Label','text'),sbn=wfield(sa,'Name (one of yours, pointing at this wallet)','text'),sbt=wfield(sa,'To (an address or a @name)','text'),sbo=el('div','wv',sa);wbtn(sa,'Give',function(){wask(w,'subname-set',{label:sbl.value,name:sbn.value,to:sbt.value},function(m){if(m.ok)wshow(w,'names');else sbo.textContent='Error: '+m.error})});
 var g=el('div','wf',p);wh(g,'Look up a name');
 var ln=wfield(g,'Name','text'),lo=el('div','',g);
 wbtn(g,'Look up',function(){wask(w,'name-lookup',{name:ln.value},function(m){
@@ -400,9 +404,9 @@ wbtn(g,'Scan again',function(){wask(w,'scan',{},function(m){go.textContent=m.ok?
 }
 function wmsg(w,m){
 if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.ok?'':'Locked: '+(m.error||'');wshow(w,w.tab);return}
-// one event a block (docs/TIMING_FIXES.md, item 15): the open panel among
-// overview, activity and names redrawn from it, no request; the node's
-// reachability when it changes
+/* one event a block (docs/TIMING_FIXES.md, item 15): the open panel among
+overview, activity and names redrawn from it, no request; the node's
+reachability when it changes */
 if(m.event=='block'){w.st.textContent='Synced to height '+m.height;var lv=w.lv;
 if(w.unl&&lv&&lv.tab==w.tab&&m[lv.tab]){var c=lv.el;while(c.firstChild)c.removeChild(c.firstChild);lv.draw(m[lv.tab])}return}
 if(m.event=='payment'&&m.step){w.st.textContent='Slate '+m.slate.slice(0,16)+': '+({sent:'sent; waiting for the recipient',delivered:'at a point of the recipient; waiting for the answer',unanswered:'not answered yet; its coins stay reserved until it is, or you cancel it',undelivered:'not delivered; cancelled, its coins free again',finalized:'answered and sent to the network',answered:'a payment to you answered; it is paid once the payer sends it'}[m.step]||m.step);if(w.unl&&w.tab=='activity')wshow(w,'activity');return}
@@ -410,6 +414,7 @@ if(m.event=='payment'){w.st.textContent='Payment '+m.tx.slice(0,16)+': '+(m.stat
 if(m.event=='name'){w.st.textContent='Name '+m.name+': '+({ready:'its commit old enough: reveal it now',revealed:'revealed',owned:'registered, yours',offered:'offered',transferred:'transferred'}[m.state]||m.state);return}
 if(m.event=='node'){w.st.textContent=m.state=='unreachable'?'Cannot reach the node; trying again in '+m.retry+' s':'The node reached again';return}
 if(m.event=='scan'){w.st.textContent='Scanned '+m.height+' of '+m.of;return}
+if(m.event=='message')w.st.textContent=m.text||(m.ok?'Paid: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error);
 if(m.event){if(w.unl&&(w.tab=='overview'||w.tab=='activity'))wshow(w,w.tab);return}
 var cb=w.q[m.id];if(cb){delete w.q[m.id];cb(m)}
 }

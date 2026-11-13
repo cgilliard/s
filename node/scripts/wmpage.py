@@ -12,6 +12,11 @@ svg = open('src/user/wm-icon.svg').read().strip().replace('"', "'")
 icon = 'data:image/svg+xml,' + urllib.parse.quote(svg, safe=':/=,.')
 fam = open('src/user/wm.fam').read()
 for path, word in (('src/user/wm.html', ': page'), ('src/user/wm-login.html', ': lpage')):
+    # A // comment would end the joined page's script where it stands (all
+    # of it one line): /* */ only.
+    for k, l in enumerate(open(path).read().split('\n'), 1):
+        if '//' in l.replace('://', ''):
+            sys.exit('wmpage.py: %s:%d: a // comment (use /* */)' % (path, k))
     html = ''.join(l.strip() for l in open(path).read().split('\n'))
     # The page's icon as a data URL, its quotes made single and the rest
     # percent-encoded (no spaces, quotes or backslashes left), for href=ICON.
