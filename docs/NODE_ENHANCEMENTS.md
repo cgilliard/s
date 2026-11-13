@@ -181,6 +181,16 @@ Progress:
   last. Found on the way: the pool reads what `sconnect` leaves of the
   block (`bout`, `bnout`, `sfirst`; `qconfs`, `qmvblk`), which were the
   worker's copies; the worker now hands them back.
+- (2026-11-12) The next block fetched while the worker connects one
+  (`npfetch`, `nbget`). A mainnet catch-up (the 144 blocks after a fast
+  sync's S) went from about 4.5 s a block to 3.3 s, the fetch hidden.
+  More harts were slower, not faster: 8 min on one, 8 min 50 s on two,
+  10 min 45 s on four, the worker's proof checks 20 to 50% slower beside
+  idle harts. `node.sh` stays at one hart until that is understood:
+  suspects are the kernel's lock (one for the whole scheduler), PMP
+  reloads by software interrupt on every hart running the process when
+  `malloc` maps or unmaps (the fetches allocate per block), and QEMU's
+  multi-threaded TCG itself.
   Left: the pool's recheck after a block (`qcheck`, `qreturn`); API
   requests answered one at a time; blocks' chunks not served to peers
   while the worker has a job (`pnest`, kept from the single thread); the
