@@ -160,6 +160,9 @@ pub enum Kind {
     /// [`crate::onion::Object::id_of`] and served only to whom it was
     /// offered.
     Object,
+    /// A block without its proof ([`crate::block::Block::lite_bytes`]),
+    /// named by its id: served, for the fam node's batches.
+    Lite,
 }
 
 impl Kind {
@@ -174,6 +177,7 @@ impl Kind {
             }
             Kind::Consensus => w.0.push(4),
             Kind::Object => w.0.push(5),
+            Kind::Lite => w.0.push(6),
         }
     }
 
@@ -185,6 +189,7 @@ impl Kind {
             3 => Some(Kind::Part(r.u32()?)),
             4 => Some(Kind::Consensus),
             5 => Some(Kind::Object),
+            6 => Some(Kind::Lite),
             _ => None,
         }
     }

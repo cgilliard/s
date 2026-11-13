@@ -141,7 +141,8 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long headers with more work than the tip hold the miner back while
 /// the tip does not move: blocks that do not come are not waited for.
 const CATCH_UP_PATIENCE: Duration = Duration::from_secs(10);
-/// Recently served block serializations kept in memory.
+/// Recently served block serializations kept in memory (and as many lite
+/// blocks: `served_lite`).
 const SERVED_CACHE: usize = 4;
 /// Datagrams and local events queued for the node's loop: about 10 MB.
 const EVENT_QUEUE: usize = 8192;
@@ -574,6 +575,9 @@ pub struct Node<V: ProofVerifier> {
     outcomes: Receiver<Outcome>,
     applier: Option<std::thread::JoinHandle<()>>,
     served: VecDeque<(Digest, Arc<Vec<u8>>)>,
+    /// Recently served lite blocks ([`Block::lite_bytes`]): making one
+    /// hashes its proof, so not again for each window of chunks asked.
+    served_lite: VecDeque<(Digest, Arc<Vec<u8>>)>,
     served_snapshots: VecDeque<((Kind, Digest), Shared)>,
     /// Chunks each peer may still be served: a bucket refilled at
     /// [`SERVE_RATE`] a second up to [`SERVE_BURST`], and when last
@@ -1018,6 +1022,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             outcomes,
             applier: Some(applier),
             served: VecDeque::new(),
+            served_lite: VecDeque::new(),
             served_snapshots: VecDeque::new(),
             serve_budget: HashMap::new(),
             mode: Mode::Normal,
@@ -1926,6 +1931,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Part(_) => net::MAX_PART,
             Kind::Consensus => consensus::MAX_CONSENSUS,
             Kind::Object => crate::onion::MAX_OBJECT,
+            // served, never fetched here
+            Kind::Lite => self.chain.params().max_block_size,
         };
         let len = if kind == Kind::Block { self.sizes.get(&id).copied() } else { None };
         let mut d = Download::new(kind, id, from, max_len, len, self.path_to(&from), now);
@@ -2686,6 +2693,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     _ => return self.send(to, &Message::NotHeld { kind, id }),
                 },
             },
+            Kind::Lite => match self.lite_bytes(&id) {
+                Some(b) => b,
+                None => return self.send(to, &Message::NotHeld { kind, id }),
+            },
             Kind::Manifest | Kind::Part(_) => match self.snapshot_bytes(kind, &id) {
                 Some(b) => b,
                 None => return self.send(to, &Message::NotHeld { kind, id }),
@@ -2701,6 +2712,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.send(to, &msg);
             }
         }
+    }
+
+    /// Block `id` without its proof ([`Block::lite_bytes`]), if we hold the
+    /// block: made once and kept a while, the most recent first.
+    fn lite_bytes(&mut self, id: &Digest) -> Option<Arc<Vec<u8>>> {
+        if let Some(pos) = self.served_lite.iter().position(|(i, _)| i == id) {
+            let entry = self.served_lite.remove(pos).unwrap();
+            self.served_lite.push_front(entry);
+            return Some(Arc::clone(&self.served_lite.front().unwrap().1));
+        }
+        let bytes = self.chain.block_bytes(id).ok()??;
+        let lite = Arc::new(Block::from_bytes(&bytes).ok()?.lite_bytes());
+        self.served_lite.push_front((*id, Arc::clone(&lite)));
+        self.served_lite.truncate(SERVED_CACHE);
+        Some(lite)
     }
 
     fn handle_chunk(
@@ -2786,7 +2812,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             self.file_failed.insert(from);
                         }
                     },
-                    Kind::Manifest | Kind::Part(_) | Kind::Object => {}
+                    Kind::Manifest | Kind::Part(_) | Kind::Object | Kind::Lite => {}
                 }
                 self.start_downloads(now);
             }
@@ -3349,6 +3375,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Kind::Tx => MAX_TX_SIZE,
             Kind::Consensus => consensus::MAX_CONSENSUS,
             Kind::Object => crate::onion::MAX_OBJECT,
+            Kind::Lite => self.chain.params().max_block_size,
         };
         let mut d = Download::new(kind, id, from, max_len, None, self.path_to(&from), now);
         let indexes = d.request(now);
@@ -3966,7 +3993,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
                 true
             }
-            Kind::Tx | Kind::Consensus | Kind::Object => true,
+            Kind::Tx | Kind::Consensus | Kind::Object | Kind::Lite => true,
         }
     }
 
@@ -7630,6 +7657,72 @@ mod tests {
         assert!(receive(|m| matches!(m, Message::Chunk { .. })).is_none(), "served without the token");
         sock.send_to(&ask(st.token).encode(), addr_a).unwrap();
         assert!(receive(|m| matches!(m, Message::Chunk { .. })).is_some(), "not served with the token");
+        tx_a.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+    }
+
+    /// A node serves a block it holds without its proof (`Kind::Lite`): the
+    /// chunks make the lite block, whose commitment is the header's; one
+    /// it does not hold is answered NotHeld.
+    #[test]
+    fn a_block_is_served_lite() {
+        let a = open("lite-a");
+        a.chain.apply_block(&mine(&a, 1, T0 + 600), unix_now()).unwrap();
+        let tip = a.chain.tip().unwrap().unwrap();
+        let block = Block::from_bytes(&a.chain.block_bytes(&tip.hash()).unwrap().unwrap()).unwrap();
+        let genesis = a.chain.header_at(0).unwrap().unwrap().hash();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let ha = std::thread::spawn(move || node_a.run());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut buf = [0u8; 2048];
+        let mut receive_all = |want: &dyn Fn(&Message) -> bool| -> Vec<Message> {
+            let deadline = Instant::now() + guard(2);
+            let mut got = Vec::new();
+            while Instant::now() < deadline {
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && let Some(m) = Message::decode(&buf[..n])
+                    && want(&m)
+                {
+                    got.push(m);
+                } else if !got.is_empty() {
+                    break;
+                }
+            }
+            got
+        };
+        let status = Status {
+            nonce: 5,
+            version: PROTOCOL_VERSION,
+            token: 0,
+            genesis,
+            height: 0,
+            oldest: 1,
+            tip: genesis,
+            work: U256::ZERO,
+            min_fee: 0,
+            pool_fee: 0,
+        };
+        sock.send_to(&Message::Ping(status).encode(), addr_a).unwrap();
+        let Some(Message::Pong(st)) = receive_all(&|m| matches!(m, Message::Pong(_))).pop() else { panic!("no pong") };
+        let want = block.lite_bytes();
+        let chunks = want.len().div_ceil(net::CHUNK_BYTES) as u16;
+        let ask = Message::GetChunks { kind: Kind::Lite, id: tip.hash(), indexes: (0..chunks).collect(), token: st.token };
+        sock.send_to(&ask.encode(), addr_a).unwrap();
+        let mut got = vec![0u8; want.len()];
+        for m in receive_all(&|m| matches!(m, Message::Chunk { kind: Kind::Lite, .. })) {
+            let Message::Chunk { len, index, data, .. } = m else { unreachable!() };
+            assert_eq!(len as usize, want.len());
+            let at = index as usize * net::CHUNK_BYTES;
+            got[at..at + data.len()].copy_from_slice(&data);
+        }
+        assert_eq!(got, want, "the chunks make the lite block");
+        assert_eq!(Block::lite_commitment(&got), Some((block.header, block.header.body_commitment)));
+        assert!(got.len() < block.to_bytes().len(), "smaller than the block");
+        let none = Message::GetChunks { kind: Kind::Lite, id: genesis.map(|x| x + crate::poseidon2::Fp::ONE), indexes: vec![0], token: st.token };
+        sock.send_to(&none.encode(), addr_a).unwrap();
+        assert!(!receive_all(&|m| matches!(m, Message::NotHeld { kind: Kind::Lite, .. })).is_empty(), "NotHeld for a block not held");
         tx_a.send(Event::Stop).unwrap();
         ha.join().unwrap();
     }

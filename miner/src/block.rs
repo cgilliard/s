@@ -309,6 +309,12 @@ impl Body {
     /// Commitment to inputs, outputs, name operations (by digest, plus the
     /// positions reveals spend), sweeps and proof.
     pub fn commitment(&self) -> Digest {
+        self.commitment_with(&self.proof_hash())
+    }
+
+    /// [`Body::commitment`] with the proof's hash given: what a lite block
+    /// ([`Block::lite_bytes`]) carries in place of the proof.
+    pub fn commitment_with(&self, proof_hash: &Digest) -> Digest {
         let positions = |v: &mut Vec<Fp>, ps: &[u64]| {
             v.push(Fp::from_u64(ps.len() as u64));
             for &p in ps {
@@ -333,7 +339,7 @@ impl Body {
         let spends: Vec<u64> = self.ops.iter().filter_map(BlockNameOp::spends).collect();
         positions(&mut v, &spends);
         positions(&mut v, &self.sweeps);
-        v.extend_from_slice(&self.proof_hash());
+        v.extend_from_slice(proof_hash);
         hash_domain(DOM_BODY, &v)
     }
 
@@ -428,6 +434,37 @@ impl Block {
     /// Whether the header commits to this body.
     pub fn body_commitment_matches(&self) -> bool {
         self.header.body_commitment == self.body.commitment()
+    }
+
+    /// The block without its proof (`net::Kind::Lite`): its bytes up to and
+    /// with the proof's length, then the proof's hash (32 bytes) in place
+    /// of the proof. All its body commitment needs: the fam node fetches
+    /// so the blocks of a batch whose proofs the batch's last block's chain
+    /// proof attests (`docs/NODE.md`), a few KB rather than the proof's
+    /// 200 or so each.
+    pub fn lite_bytes(&self) -> Vec<u8> {
+        let mut out = self.to_bytes();
+        out.truncate(out.len() - self.body.proof.len());
+        out.extend_from_slice(&digest_to_bytes(&self.body.proof_hash()));
+        out
+    }
+
+    /// A lite block's header and the body commitment its bytes make (the
+    /// proof's hash as given), or `None` if malformed: the header commits
+    /// to it if the lite block is the block's.
+    pub fn lite_commitment(bytes: &[u8]) -> Option<(Header, Digest)> {
+        if bytes.len() < HEADER_SIZE + 4 + 32 {
+            return None;
+        }
+        let header = Header::from_bytes(&bytes[..HEADER_SIZE])?;
+        let (body, hash) = bytes[HEADER_SIZE..].split_at(bytes.len() - HEADER_SIZE - 32);
+        // The body as if its proof were empty: the same parse, the length
+        // field made 0 (its true length is in the hash).
+        let mut b = body.to_vec();
+        let n = b.len();
+        b[n - 4..].copy_from_slice(&0u32.to_le_bytes());
+        let body = Body::from_bytes(&b).ok()?;
+        Some((header, body.commitment_with(&digest_from_bytes(hash)?)))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -727,6 +764,34 @@ mod tests {
         let mut other = block.clone();
         other.body.proof[0] ^= 1;
         assert!(!other.body_commitment_matches());
+    }
+
+    /// A lite block (the proof's hash in place of the proof) makes the body
+    /// commitment its header commits to; a wrong proof hash, an altered
+    /// body or a short one does not.
+    #[test]
+    fn lite_block_commits_as_the_block() {
+        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 3000] };
+        let mut h = header();
+        h.body_commitment = body.commitment();
+        let block = Block { header: h, body };
+        let lite = block.lite_bytes();
+        assert_eq!(lite.len(), block.to_bytes().len() - 3000 + 32);
+        assert_eq!(Block::lite_commitment(&lite), Some((block.header, block.header.body_commitment)));
+        // the proof's hash changed: another commitment
+        let mut bad = lite.clone();
+        let n = bad.len();
+        bad[n - 32] ^= 1;
+        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Some(block.header.body_commitment));
+        // an output's amount changed: another commitment
+        let mut bad = lite.clone();
+        bad[HEADER_SIZE + 4 + 2 * POSITION_SIZE + 4 + 32 + 20] ^= 1;
+        assert_ne!(Block::lite_commitment(&bad).map(|(_, c)| c), Some(block.header.body_commitment));
+        // cut short, or the hash's bytes not canonical: malformed
+        assert_ne!(Block::lite_commitment(&lite[..lite.len() - 1]).map(|(_, c)| c), Some(block.header.body_commitment));
+        let mut bad = lite.clone();
+        bad[n - 4..].copy_from_slice(&[0xff; 4]);
+        assert_eq!(Block::lite_commitment(&bad), None);
     }
 
     /// The header, body and block decoders, fuzzed: no input makes them
