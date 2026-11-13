@@ -3,9 +3,11 @@
 \ for a participant (never a relay): links to the relays it uses first in
 \ its circuits (a handshake, then frames: sealed, acknowledged, sent again
 \ until they are), circuits of three relays built hop by hop (CREATE, then
-\ EXTEND), a standing circuit to its rendezvous point holding its session
-\ there (SESSION, ANNOUNCE) and taking what is delivered to it (DELIVER,
-\ RECEIVED), and an outbound circuit for each send (ROUTE, GET_ANNOUNCE,
+\ EXTEND), a standing circuit to each of its three rendezvous points
+\ holding its session there (SESSION, ANNOUNCE) and taking what is
+\ delivered to it (DELIVER, RECEIVED): a sender reaches it through any of
+\ them that is up, each circuit built again on its own; and an outbound
+\ circuit for each send (ROUTE, GET_ANNOUNCE,
 \ SEND, NOTICE; the answer back down it) or each answer to an unnamed
 \ sender (REPLY).  After wnet.fam (its socket, records, pings and tokens:
 \ each relay is a record there), wmsg.fam and wonion.fam.
@@ -24,13 +26,15 @@
 \ answer along a route.  The end in owst: 1 delivered, 2 failed (why at
 \ owwhy); an answer to a send in owans (opened: mg*).
 \ owrcv  a payload delivered to us, opened (mg*; a route at mgrtp).
-\ owlive ( -- flag )  the standing session live.
+\ owlive ( -- n )  how many of the standing sessions are live (of OWS).
 
 :M OWCH 4 lit ;                                \ links
 :M OWCHR A0 lit ;                              \ a link's record
 :M OWIF 20 lit ;                               \ frames in flight a link
 :M OWIFS 450 lit ;                             \ an in-flight slot
-:M OWCC 2 lit ;                                \ circuits: standing, outbound
+:M OWS 3 lit ;                                 \ standing circuits: one a point
+:M OWO 3 lit ;                                 \ the outbound circuit's index
+:M OWCC 4 lit ;                                \ circuits: the standing, the outbound
 :M OWCCR 140 lit ;                             \ a circuit's record
 :M OWMSG 12000 lit ;                           \ a message reassembled, at most
 :M OWRN 10 lit ;                               \ relays kept
@@ -45,7 +49,7 @@
 : owoek variable ;  : owodk variable ;  : owort variable ;  : owoobj variable ;  : owool variable ;  : owooid variable ;
 : owot0 variable ;  : owoat variable ;  : owoff variable ;  : owofs variable ;  : owrid2 variable ;  : owrrt variable ;  : owrpb variable ;
 : owslive variable ;  : owsans variable ;  : owssent variable ;  : owsasked variable ;  : owsoff variable ;
-: owsrb variable ;  : owswh variable ;  : owsfl variable ;  : owann variable ;  : owsnon variable ;
+: owsrb variable ;  : owann variable ;  : owsnon variable ;
 : owinit
 oxinit
 owch @ 0= if
@@ -56,7 +60,11 @@ owch @ 0= if
 	OWRN 20 lit * alloc owrid !  OWRN 4 lit * alloc owrk !
 	20 lit alloc owot !  10000 lit alloc owoin !  10 lit alloc owotk !  4A0 lit alloc owoek !  960 lit alloc owodk !
 	4D0 lit alloc owort !  10000 lit alloc owoobj !  20 lit alloc owooid !  20 lit alloc owrid2 !  4D0 lit alloc owrrt !
-	10100 lit alloc owrpb !  1968 lit alloc owann !  0 lit owos !  0 lit owsrb !  0 lit owswh !  0 lit owsfl !  500 lit alloc owdg !  400 lit alloc owcell !
+	10100 lit alloc owrpb !  1968 lit alloc owann !  0 lit owos !  500 lit alloc owdg !
+	OWS 2 lit lshift alloc owslive !  OWS 2 lit lshift alloc owsans !  OWS 2 lit lshift alloc owssent !
+	OWS 2 lit lshift alloc owsasked !  OWS 2 lit lshift alloc owsoff !  OWS 2 lit lshift alloc owsrb !
+	owslive @ OWS 2 lit lshift oxzero  owsans @ OWS 2 lit lshift oxzero  owssent @ OWS 2 lit lshift oxzero
+	owsasked @ OWS 2 lit lshift oxzero  owsoff @ OWS 2 lit lshift oxzero  owsrb @ OWS 2 lit lshift oxzero  400 lit alloc owcell !
 	80 lit alloc owwhyb !  500 lit alloc owfr !  500 lit alloc owext !  370 lit alloc owbody !  200 lit alloc owtmp !  10 lit alloc owpts !  8 lit alloc owz8 !
 	owch @ OWCH OWCHR * oxzero  owcc @ OWCC OWCCR * oxzero  owz8 @ 8 lit oxzero
 	0 lit owrn !  0 lit owst !  0 lit owrcv !  0 lit owans !  0 lit owgot !
@@ -389,47 +397,52 @@ then ;
 \ owpoints  our points (owpts: the count at +3), for our id in the epoch.
 : owpoints  mnid @ owep @ owrid @ owrn @ owpts @ oxpts  owpts @ 3 lit + c! ;
 
-\ The standing session.  owslive: live; owsheld: the seq the point holds;
-\ owsans/owssent: when last answered and when last asked (SESSION);
-\ owsoff: when we last announced; owsrb: no rebuild before; owswh, owsfl:
-\ which of our points, failures at it.
-: owspt variable ;  : owgd variable ;  : owmd variable ;
-\ owsbuild  the standing circuit begun: our point (the which-th, by
-\ weight), a first and a middle relay apart from it.
+\ The standing sessions, one a point: circuit i (below OWS) to our point
+\ i.  Each an array of OWS words: owslive live; owsans/owssent when last
+\ answered and when last asked (SESSION); owsasked a SESSION unanswered;
+\ owsoff when we last announced; owsrb no rebuild before.
+: ows  2 lit lshift swap @ + ;                         \ ( var i -- a )  slot i's word
+: owgd variable ;  : owmd variable ;  : owsp variable ;  : owspt variable ;
+\ owsbuild ( i -- )  standing circuit i begun: to our point i, a first
+\ and a middle relay apart from it.
 : owsbuild
-0 lit owslive !  0 lit owsasked !  0 lit owsoff !
-owpoints  owpts @ 3 lit + c@  owrn @ 3 lit u< 0= and if
-	owpts @ owswh @ owpts @ 3 lit + c@ % + c@ owspt !
+owsp !  0 lit owslive owsp @ ows !  0 lit owsasked owsp @ ows !  0 lit owsoff owsp @ ows !
+owpoints  owsp @ owpts @ 3 lit + c@ u<  owrn @ 3 lit u< 0= and if
+	owpts @ owsp @ + c@ owspt !
 	owspt @ dup owother owgd !  owgd @ owspt @ owother owmd !
-	0 lit owgd @ owmd @ owspt @ 1 lit owcbeg 0= if mnms BB8 lit + owsrb ! then
-else mnms BB8 lit + owsrb ! then ;
-\ owsfail ( wait -- )  the standing circuit given up, rebuilt after wait
-\ ms; two failures in a row at a point, the next point.
+	owsp @ owgd @ owmd @ owspt @ 1 lit owcbeg 0= if mnms BB8 lit + owsrb owsp @ ows ! then
+else mnms BB8 lit + owsrb owsp @ ows ! then ;
+\ owsfail ( i wait -- )  standing circuit i given up, built again after
+\ wait ms; our other points keep theirs meanwhile.
 : owsfail
-mnms + owsrb !  0 lit owslive !  0 lit owsasked !
-0 lit owci @ dup 1 lit = swap 2 lit = or if 0 lit owclose then
-owsfl @ 1 lit + dup owsfl !  2 lit u< 0= if 0 lit owsfl !  owswh @ 1 lit + owswh ! then ;
-\ owsess  SESSION: our id, to our point.
-: owsess  0 lit 4 lit mnid @ 20 lit owcsend drop  mnms owssent !  -1 lit owsasked ! ;
-\ owstick  the standing circuit built when there is none (or it died);
+mnms + over owsrb swap ows !  0 lit over owslive swap ows !  0 lit over owsasked swap ows !
+dup owci @ dup 1 lit = swap 2 lit = or if owclose else drop then ;
+\ owsess ( i -- )  SESSION on standing circuit i: our id, to its point.
+: owsess  dup 4 lit mnid @ 20 lit owcsend drop  mnms over owssent swap ows !  -1 lit swap owsasked swap ows ! ;
+\ owsagain  every session asked again within 3 s (a new key: each point
+\ to have its announce).
+: owsagain  OWS 0 lit do 0 lit owslive i ows ! loop ;
+\ owstick  each standing circuit built when there is none (or it died);
 \ ready: SESSION every 3 s until live, then every 15 minutes; one
 \ unanswered for 30 s, the circuit given up.
 : owstick
-0 lit owci @ dup 0= swap 3 lit = or if
-	0 lit owslive !  mnms owsrb @ - 0< 0= if owsbuild then
-else 0 lit owci @ 1 lit = if
-	mnms 0 lit 24 lit owcif @ - EA60 lit u< 0= if BB8 lit owsfail then
-else
-	owsasked @  mnms owssent @ - 7530 lit u< 0= and if BB8 lit owsfail else
-		owsasked @ 0=  mnms owssent @ -  owslive @ if DBBA0 lit else BB8 lit then u< 0= and if owsess then
-	then
-then then ;
+OWS 0 lit do
+	i owci @ dup 0= swap 3 lit = or if
+		0 lit owslive i ows !  mnms owsrb i ows @ - 0< 0= if i owsbuild then
+	else i owci @ 1 lit = if
+		mnms i 24 lit owcif @ - EA60 lit u< 0= if i BB8 lit owsfail then
+	else
+		owsasked i ows @  mnms owssent i ows @ - 7530 lit u< 0= and if i BB8 lit owsfail else
+			owsasked i ows @ 0=  mnms owssent i ows @ -  owslive i ows @ if DBBA0 lit else BB8 lit then u< 0= and if i owsess then
+		then
+	then then
+loop ;
 \ The outbound circuit, for a send or an answer.  owos: 0 idle, 1 its
 \ circuit being built (a send), 2 the recipient's announce asked for, 3
 \ the payload offered (SEND), 4 delivered, waiting for the answer, 5 an
 \ answer offered (REPLY), 6 its circuit being built (an answer).
 \ owodone  the outbound circuit closed, the send over.
-: owodone  1 lit owclose  0 lit owos ! ;
+: owodone  OWO owclose  0 lit owos ! ;
 \ owofail ( why -- )  the send failed.
 : owofail  owwhy !  2 lit owst !  owodone ;
 \ owdlv ( i buf n -- )  DELIVER on circuit i: a payload acknowledged
@@ -440,7 +453,7 @@ then then ;
 owdn !  owdb !  owdi !
 owdb @ c@ 2 lit =  owdn @ 471 lit u< 0= and if
 	owdb @ owdn @ owtmp @ mgoid  owdi @ E lit owtmp @ 20 lit owcsend drop
-	owdi @ 0= if
+	owdi @ OWO <> if
 		owdb @ 1 lit + mnid @ 20 lit oxsame if
 			owdb @ owdn @ mndk @ mnunix mgopen
 			dup 0= mnms mnodt @ - 927C0 lit u< and if drop owdb @ owdn @ mnodk @ mnunix mgopen then
@@ -464,7 +477,7 @@ owol @ dup owother owgd !  owgd @ owol @ owother owmd !
 owtmp @ 40 lit mnrand  owtmp @ owtmp @ 20 lit + owoek @ owodk @ kykey  owoek @ owrid2 @ oxrid
 owotk @ 10 lit mnrand
 owol @ owrel owort @ 20 lit oxcp  owotk @ owort @ 20 lit + 10 lit oxcp  owoek @ owort @ 30 lit + 4A0 lit oxcp
-1 lit owgd @ owmd @ owol @ 2 lit owcbeg ;
+OWO owgd @ owmd @ owol @ 2 lit owcbeg ;
 \ owsend: as tabminer's onion send, the sender unnamed, a route inside.
 : owsend
 owos @ if 2drop 2drop 0 lit else
@@ -488,10 +501,14 @@ owos @ if drop 0 lit else
 	owot @ 20 lit oxcp  0 lit owst !  0 lit owgot !  mnms owot0 !
 	owobuild if 7 lit owos !  -1 lit else "no relay to begin a circuit through" owofail 0 lit then
 then ;
-\ owpub ( a n -- ok )  a bundle published at our point (PUBLISH_CERT on
-\ the standing circuit; the point passes it to the full name's points).
-: owpba variable ;  : owpbn variable ;
-: owpub  owslive @ if owpbn !  owpba !  0 lit 12 lit owpba @ owpbn @ owcsend else 2drop 0 lit then ;
+\ owpub ( a n -- ok )  a bundle published at one of our points (PUBLISH_
+\ CERT on a live standing circuit; the point passes it to the full
+\ name's points).
+: owpba variable ;  : owpbn variable ;  : owpbi variable ;
+: owpub
+owpbn !  owpba !  -1 lit owpbi !
+OWS 0 lit do owpbi @ 0<  owslive i ows @ and  i owci @ 2 lit = and if i owpbi ! then loop
+owpbi @ 0< if 0 lit else owpbi @ 12 lit owpba @ owpbn @ owcsend then ;
 \ owomsg ( cmd buf n -- )  a message on the outbound circuit.
 : owmc variable ;  : owmb variable ;  : owmn variable ;
 : owomsg
@@ -503,7 +520,7 @@ owmc @ 6 lit =  owos @ 2 lit = and if
 		owmb @  owmb @ 7C0 lit +  owokind @ owoin @ owoil @ owtmp @ owtmp @ 20 lit + owoobj @ mgsealx dup owool !
 		if
 			owoobj @ owool @ owooid @ mgoid
-			1 lit 8 lit owoobj @ owool @ owcsend drop  3 lit owos !
+			OWO 8 lit owoobj @ owool @ owcsend drop  3 lit owos !
 		else "the recipient's Kyber key is malformed" owofail then
 	else "the recipient's announce does not hold" owofail then
 then
@@ -534,62 +551,64 @@ then
 owmc @ 14 lit =  owos @ 8 lit = and if
 	owmn @ 10000 lit u< if owmb @ owoin @ owmn @ oxcp  owmn @ owgn !  1 lit owgot ! else 3 lit owgot ! then  owodone
 then
-owmc @ 9 lit = if 1 lit owmb @ owmn @ owdlv then ;
+owmc @ 9 lit = if OWO owmb @ owmn @ owdlv then ;
 \ owotick  the send's steps on time: the circuit ready (ROUTE, then
 \ GET_ANNOUNCE; or the answer: REPLY, its relay, token and the payload
 \ sealed to the route's key); a lookup asked again; 120 s for it all
 \ (docs/ONION.md, timeouts).
 : owotick
 owos @ if
-	1 lit owci @ 3 lit = if "the circuit failed" owofail else
-	owos @ 1 lit =  1 lit owci @ 2 lit = and if
-		1 lit C lit owotk @ 10 lit owcsend drop
-		1 lit 7 lit owot @ 20 lit owcsend drop  2 lit owos !
+	OWO owci @ 3 lit = if "the circuit failed" owofail else
+	owos @ 1 lit =  OWO owci @ 2 lit = and if
+		OWO C lit owotk @ 10 lit owcsend drop
+		OWO 7 lit owot @ 20 lit owcsend drop  2 lit owos !
 	then
-	owos @ 6 lit =  1 lit owci @ 2 lit = and if
+	owos @ 6 lit =  OWO owci @ 2 lit = and if
 		owrrt @ 30 lit + owtmp @ oxrid  0 lit mgflg !  owtmp @ 40 lit + 2C lit mnrand
 		owtmp @  owrrt @ 30 lit +  owokind @ owoin @ owoil @ owtmp @ 40 lit + owtmp @ 60 lit + owoobj @ mgsealx dup owool !
 		if
 			owoobj @ owool @ owooid @ mgoid
 			owrrt @ owrpb @ 30 lit oxcp  owoobj @ owrpb @ 30 lit + owool @ oxcp
-			1 lit D lit owrpb @ owool @ 30 lit + owcsend drop  5 lit owos !
+			OWO D lit owrpb @ owool @ 30 lit + owcsend drop  5 lit owos !
 		else "the route's Kyber key is malformed" owofail then
 	then
-	owos @ 7 lit =  1 lit owci @ 2 lit = and if
-		1 lit 13 lit owot @ 20 lit owcsend drop  8 lit owos !
+	owos @ 7 lit =  OWO owci @ 2 lit = and if
+		OWO 13 lit owot @ 20 lit owcsend drop  8 lit owos !
 	then
 	owos @ 2 lit =  owoff @ and  mnms owoff @ - 0< 0= and if
-		1 lit 7 lit owot @ 20 lit owcsend drop  0 lit owoff !
+		OWO 7 lit owot @ 20 lit owcsend drop  0 lit owoff !
 	then
 	owos @ 4 lit = if mnms owoat @ - 2BF20 lit u< 0= if owodone then
-	else owos @ if mnms owot0 @ - 1D4C0 lit u< 0= if owwhyb @ "no answer within 120 s (step " scpy owos @ snum " circuit " scpy 1 lit owci @ snum
-		" hops " scpy 1 lit C lit owcif @ snum " link " scpy 1 lit 4 lit owcif @ 4 lit owcf @ snum ")" scpy 0 lit swap c!  owwhyb @ owofail then then then
+	else owos @ if mnms owot0 @ - 1D4C0 lit u< 0= if owwhyb @ "no answer within 120 s (step " scpy owos @ snum " circuit " scpy OWO owci @ snum
+		" hops " scpy OWO C lit owcif @ snum " link " scpy OWO 4 lit owcif @ 4 lit owcf @ snum ")" scpy 0 lit swap c!  owwhyb @ owofail then then then
 	then
 then ;
 
-\ owsmsg ( cmd buf n -- )  a message on the standing circuit: the session's
-\ state (live, or our announce with its nonce), a refusal, a delivery.
+\ owsmsg ( cmd buf n -- )  a message on standing circuit owpi: its
+\ session's state (live, or our announce with its nonce), a refusal (that
+\ point asked again in a minute), a delivery.
 : owsmsg
 owmn !  owmb !  owmc !
 owmc @ 5 lit =  owmn @ 30 lit = and  owmb @ mnid @ 20 lit oxsame and if
-	0 lit owsasked !  mnms owsans !  0 lit owsfl !
-	owmb @ 28 lit + mnseq @ 8 lit oxsame if -1 lit owslive ! else
-		\ forgotten by a point that held us: a new key
-		owslive @  owmb @ 28 lit + mnz8 @ 8 lit oxsame and if mnnewk then
-		0 lit owslive !
-		mnms owsoff @ - BB8 lit u< 0= if
+	0 lit owsasked owpi @ ows !  mnms owsans owpi @ ows !
+	owmb @ 28 lit + mnseq @ 8 lit oxsame if -1 lit owslive owpi @ ows ! else
+		\ forgotten by a point that held us: a new key, announced at
+		\ every point (each asked again)
+		owslive owpi @ ows @  owmb @ 28 lit + mnz8 @ 8 lit oxsame and if mnnewk owsagain then
+		0 lit owslive owpi @ ows !
+		mnms owsoff owpi @ ows @ - BB8 lit u< 0= if
 			mnpk @ mgpk !  mnsk @ mgsk !  mnek @ mgek !  owann @ mnseq @ mnexp @ owmb @ 20 lit + mgann
-			0 lit 6 lit owann @ 1965 lit owcsend drop  mnms owsoff !
+			owpi @ 6 lit owann @ 1965 lit owcsend drop  mnms owsoff owpi @ ows !
 		then
 	then
 then
-owmc @ A lit =  owmn @ 21 lit = and  owmb @ mnid @ 20 lit oxsame and  owmb @ 20 lit + c@ and if EA60 lit owsfail then
-owmc @ 9 lit = if 0 lit owmb @ owmn @ owdlv then ;
+owmc @ A lit =  owmn @ 21 lit = and  owmb @ mnid @ 20 lit oxsame and  owmb @ 20 lit + c@ and if owpi @ EA60 lit owsfail then
+owmc @ 9 lit = if owpi @ owmb @ owmn @ owdlv then ;
 \ owproc  the message a circuit's last hop completed, to its handler.
 : owproc
 owpend @ if
 	0 lit owpend !
-	owpcmd @ owpi @ owmsg owpn @  owpi @ if owomsg else owsmsg then
+	owpcmd @ owpi @ owmsg owpn @  owpi @ OWO = if owomsg else owsmsg then
 then ;
 
 \ ── The clock ──
@@ -642,4 +661,4 @@ owrn @ 3 lit u< 0= if
 	OWCC 0 lit do i owcirc loop
 	owstick  owotick
 then ;
-: owlive  owslive @  0 lit owci @ 2 lit = and ;
+: owlive  0 lit OWS 0 lit do owslive i ows @  i owci @ 2 lit = and if 1 lit + then loop ;

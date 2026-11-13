@@ -358,7 +358,7 @@ then
 "lse;co.textContent='Write these words down, in order: '+m.words})});return;}if(t=='overview')wask(w," wr
 "'overview',{},function(m){if(wbad(p,m))return;wh(p,'Balance');wrow(p,'Confirmed',m.confirmed);wrow(p" wr
 ",'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.reserved);wrow(p,'Locked" wr
-"',m.locked);wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);wrow(p,'Online',m.reach?'reachable at '+m.reach+' rendezvous points':'not reachable yet');});else if(t=='receive'){var " wr
+"',m.locked);wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);wrow(p,'Online',m.reach?'reachable: sessions at '+m.reach+' of '+m.points+' rendezvous points':'not reachable yet'+(m.points?' (0 of '+m.points+' rendezvous points)':''));});else if(t=='receive'){var " wr
 "a=el('div','',p);wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This wallet');wrow(a,'Add" wr
 "ress',m.address);if(m.name)wrow(a,'Name',m.name)});var f=el('div','wf',p);wh(f,'Answer a slate from " wr
 "the payer');wmodes(f,function(c,how){if(how=='paste'){var t=warea(c,'The slate (paste it here)'),o=e" wr

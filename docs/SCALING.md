@@ -73,7 +73,8 @@ A participant learns of a dead hop from the `Destroy` (17 to 20 s in the
 test with channels' test timings, `an_idle_participant_is_quiet_and_
 learns_of_a_dead_hop`, which also counts the frames it sends idle).
 
-**2. One standing session, not three.** A participant keeps a session at
+**2. One standing session, not three (reversed 2026-11-13).** A
+participant kept a session at
 one of its three points, the first that is alive, rather than all three;
 senders already try the points in turn, and a lookup at one without the
 session costs a hop or two more. Three times fewer circuits, sessions and
@@ -85,10 +86,21 @@ listens (two minutes of silence), then rebuilt at once. Shortening the
 relays' own channel timeouts would bring that down, at a cost shared by
 every circuit over the channel.
 
-Done: `node/participant.rs`. The session is at the first of the three
-points; it moves to the next when that point fails twice running, a
-circuit failing as it reaches the point or the point refusing (a
-circuit failing at a hop on the way is not the point's doing). Outbound
+Built, then reversed: it broke what rendezvous points are for, that a
+participant is reached while any one of its three points is up. With
+one session, a point that died left the participant unreachable for one
+to two and a half minutes (the dead hop noticed, then two failed
+rebuilds before the session moved), and a sender whose last relay could
+not reach that one point could never pay it, all three up; a point that
+refused the session kept it forever (the refusal never counted as a
+failure). A participant again holds a session at each of its three
+points (`node/participant.rs`), and a sender's last relay asks them in a
+random order (`node/rendezvous.rs`'s `start_ask`), any that holds a
+session answering. The load returns to three circuits and announces a
+participant, but changes 1 and 3 took most of what this one saved: the
+keepalives ride the guards' channels (shared), each circuit's `Session`
+comes every 10 to 20 minutes, and the announces are on disk; a relay's
+caps fill three times sooner, the ceiling above about a third. Outbound
 circuits still avoid all three points.
 
 **3. Announces on disk.** A point needs a session's announce only to
@@ -153,7 +165,7 @@ constant, the file's size limit (1 MiB, about 10,000 lines) with it.
 
 1. Guards (`docs/PRIVACY.md`, fix 3) and the guard channel's keepalive;
    the 3-hop `Session` keepalive down to every 10 to 20 minutes.
-2. One standing session per participant.
+2. One standing session per participant (reversed: one at each point).
 3. Announces in the relay's database; the caps as settings.
 4. Idle channels between relays closed.
 5. Tests: a participant whose hop dies learns of it by `Destroy` and

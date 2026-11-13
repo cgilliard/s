@@ -422,8 +422,8 @@ behind, item 8) and of the wallet behind it, 2026-11-12. Items 5 and
     digits" (the confusion of an id and an address, met in a live test);
     it should default to this wallet's address. A name's value is listed
     as 16 raw hex digits.
-11. **Overview's "Online" line** is jargon and ungrammatical
-    ("reachable at 1 rendezvous points").
+11. **Overview's "Online" line** is jargon ("reachable: sessions at 3
+    of 3 rendezvous points" since 2026-11-13, a session at each point).
 12. **Settings is unclear.** "Show the phrase" asks for "Password"
     without saying which one; Restore sits just below with no warning
     that it replaces this wallet; "Scan again" is under Restore, with no

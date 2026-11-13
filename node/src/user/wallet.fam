@@ -1850,11 +1850,11 @@ then ;
 \ wmpubs  the publishing: begun when the standing session comes up and
 \ every six hours, one certificate a pass (each a signature) while live.
 : wmpubs
-wmonion @ owslive @ and if
+wmonion @ owlive 0= 0= and if
 	wmpl @ 0=  mnms wmpt @ - 1499700 lit u< 0= or  wmpt @ 0= or if mnms wmpt !  0 lit wmpi ! then
 	wmpi @ 0< 0= if wmpub1 if wmpi @ 1 lit + wmpi ! else -1 lit wmpi ! then then
 then
-wmonion @ owslive @ and wmpl ! ;
+wmonion @ owlive 0= 0= and wmpl ! ;
 \ wmgcert  a certificate fetched for @label.name: the same full name, sound
 \ against the owner's value on chain, naming an id: paid (wmpay).
 : wmgcert
@@ -2101,7 +2101,8 @@ then ;
 wtick  wsums
 jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverified':'" jo sa4 @ wsum.  "','reserved':'" jo sa3 @ wsum.
 "','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo
-"','reach':" jo wonline @ if wmonion @ if owlive 1 lit and else mnlive then else 0 lit then 0 lit wdec
+"','reach':" jo wonline @ if wmonion @ if owlive else mnlive then else 0 lit then 0 lit wdec
+",'points':" jo wmonion @ if owrn @ 3 lit u< 0= if OWS else 0 lit then else 0 lit  mnnp @ ?dup if 0 lit do i mnmy if 1 lit + then loop then then 0 lit wdec
 ",'mode':'" jo wmonion @ if "onion" else "init" then jo "'" jo  "}" jo jend ;
 \ oscan  the whole set scanned again now; the tip and the scan told.
 : oscan

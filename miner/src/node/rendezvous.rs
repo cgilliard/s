@@ -75,9 +75,11 @@
 //! expires. `GetDelegation` asks the owner's points in turn, as a
 //! lookup does, until one holds it.
 //!
-//! A sender's rendezvous point asks the recipient's points in the order
-//! their id gives, itself first if it is one, until one holds a session;
-//! it answers the sender when one does, or when none did.
+//! A sender's rendezvous point asks the recipient's points in a random
+//! order, itself first if it is one, until one holds a session (each of
+//! them holds one: any that is up will do); it answers the sender when
+//! one does, or when none did. A point whose channel closes is passed
+//! over at once.
 //!
 //! A payload counts as forwarded only once the recipient's node answers
 //! the `Deliver` with `Received` (within [`ACK_WAIT`]): a payload sent
@@ -96,6 +98,7 @@ use crate::net::{NOTICE_FORWARDED, NOTICE_OFFLINE, NOTICE_REFUSED, NOTICE_REJECT
 use crate::onion::{self, Announce, Object};
 use crate::poseidon2::{digest_from_bytes, digest_to_bytes};
 use crate::pow::Digest;
+use crate::wallet::random_bytes;
 use crate::subnames::{Bundle, Delegation};
 
 /// Messages between rendezvous points.
@@ -429,6 +432,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     let _ = self.channel_send(key, &c.to_bytes(), now);
                 }
             }
+        }
+    }
+
+    /// A channel closed: questions waiting on it go to the recipient's
+    /// next point at once, not after [`ASK_TIMEOUT`].
+    pub(super) fn asks_channel_closed(&mut self, key: (SocketAddr, u64), now: Instant) {
+        let stuck: Vec<usize> =
+            (0..self.rdv.asks.len()).filter(|&i| self.rdv.asks[i].asked.is_some_and(|(k, _)| k == key)).collect();
+        for i in stuck.into_iter().rev() {
+            self.rdv.asks[i].asked = None;
+            self.ask_next(i, now);
         }
     }
 
@@ -801,7 +815,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             };
             return self.hop_reply(client, circuit::NOTICE, &result(&subject, NOTICE_REFUSED), now);
         }
-        let left = self.points_of(&to);
+        // The recipient's points in a random order (each holds its
+        // session: any that is up will do), this relay first if it is one
+        // (asked for nothing); a later epoch's or list's after them.
+        let mut left = self.points_of(&to);
+        let n = left.len().min(onion::RENDEZVOUS);
+        for k in (1..n).rev() {
+            let r = random_bytes::<4>().map(u32::from_le_bytes).unwrap_or(0) as usize % (k + 1);
+            left.swap(k, r);
+        }
+        if let Some(me) = self.my_id()
+            && let Some(j) = left.iter().position(|p| *p == me)
+        {
+            let p = left.remove(j);
+            left.insert(0, p);
+        }
         self.rdv.asks.push(Ask { client, to, what, left, asked: None });
         let i = self.rdv.asks.len() - 1;
         self.ask_next(i, now);

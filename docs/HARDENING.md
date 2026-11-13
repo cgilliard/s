@@ -201,23 +201,21 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
-- **Rendezvous points: three, but one session; the wallet's count reads
-  as the points'.** In onion mode every id has three points (the three
-  heaviest relays; with three relays listed, all of them). Since
-  `docs/SCALING.md` a participant holds one standing circuit, to one of
-  them (tabminer's `participant.rs`, the fam wallet's `wopart.fam`
-  `owsbuild`), not one to each as ONION.md's "Standing circuits" still
-  says; after two failures at its point the session moves to the next
-  (`point_failed`, `owsfail`). A sender's last relay asks every point of
-  the recipient, so a sender never guesses wrong. The wallet's "reachable
-  at 1 rendezvous points" is that one live session (`owlive`), not the
-  count of points. In init mode the points are the seeds, `min(3, n)`:
-  two on mainnet. To review: ONION.md brought in line; whether one session
-  is failover enough (a point that dies leaves the id unreachable until
-  it is noticed, 30 s, and two rebuilds fail, the entry below), or a
-  session at a second point is worth its keepalives; the wallet to say
-  "reachable (session at 1 of 3 points)" and which; a test with the
-  session's point killed and a payment landing after the move.
+- **A relay closes a channel still handshaking, silently.** tabminer's
+  `node/channels.rs`: a channel a relay answered is closed when no frame
+  is accepted within `UNUSED_TIMEOUT` (15 s; 3 s in tests) from its first
+  hello, though frames refused only for coming before the auth, a hello
+  repeated, and the auth itself all show the initiator is there; and the
+  initiator is not told, so it resends until its own timeout (30 s; 20 s
+  in tests) and logs "the other end stopped answering". At 10% loss the
+  handshake's resends reach the window: the cause of the intermittent
+  `messages_meet_over_a_lossy_network` (sessions not up within 60 s). To
+  do: the auth, a repeated hello and a frame refused for want of the
+  auth count as use; a frame for a channel a relay no longer knows
+  answered with a notice so the other end closes at once; a test holding
+  the auth back past the window. (Its cost is lower with a session at
+  every point, 2026-11-13: one stalled circuit no longer leaves the
+  participant unreachable.)
 - **A dead relay takes 30 s to notice, however fast the link.** A
   channel is taken for dead after a frame goes unacknowledged 30 s
   (`channel.rs`, `DEAD_AFTER`), a circuit after a keepalive goes

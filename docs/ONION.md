@@ -268,9 +268,12 @@ may share relays.
 
 **Standing circuits.** Building a circuit costs a round trip per hop, so
 none is built per payment. Each participant keeps a circuit to each of
-its three rendezvous points, through two relays chosen at random (since
-`docs/SCALING.md`, to the first of them only, the first hop a guard, and
-its keepalive every 10 to 20 minutes):
+its three rendezvous points, through two relays chosen at random (the
+first hop a guard, `docs/PRIVACY.md`; its keepalive every 10 to 20
+minutes, `docs/SCALING.md`), and a session over each: a sender reaches
+it through any of the three that is up. A sender's last relay asks the
+recipient's points in a random order, passing over one whose channel
+fails, until one holds a session:
 
 ```
 participant → r1 → r2 → rendezvous point

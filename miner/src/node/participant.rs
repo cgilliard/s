@@ -1,10 +1,11 @@
 //! Onion mode's participant (`docs/ONION.md`): the wallet's node keeps a
-//! circuit standing to one of its rendezvous points, holds its session
-//! over it, and receives over it (`docs/SCALING.md`: one session, not
-//! three; senders try the recipient's points in turn, so a session at the
-//! first is found first, and at another a hop or two later). The point is
-//! the first of the three, the next taken when one fails twice running
-//! (a circuit failing as it reaches the point, or the point refusing).
+//! circuit standing to each of its three rendezvous points, holds a
+//! session over each, and receives over any of them. A sender's last
+//! relay asks the points in a random order until one holds a session, so
+//! the wallet is reached while any one of its points is up; a circuit
+//! that fails (as it reaches its point, or later), or a point that
+//! refuses the session, affects that point alone, its circuit built again
+//! on its own.
 //!
 //! Each circuit runs through two listed relays chosen at random (fewer
 //! when the file lists too few others) to the point, which the id names.
@@ -79,8 +80,6 @@ use crate::wallet::random_bytes;
 
 const KEEPALIVE: Duration = Duration::from_secs(onion::CIRCUIT_KEEPALIVE_SECS);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(onion::CIRCUIT_SESSION_TIMEOUT_SECS);
-/// Failures in a row at a point before the session moves to the next.
-const POINT_FAILS: u32 = 2;
 const SESSION_RETRY: Duration = Duration::from_secs(3);
 const REFUSED_RETRY: Duration = Duration::from_secs(60);
 const ROTATE_AFTER: Duration = Duration::from_secs(onion::ANNOUNCE_LIFETIME_SECS / 2);
@@ -259,10 +258,6 @@ pub(super) struct Participant {
     /// new relay list), closed once the new points' sessions are live or
     /// after [`RETIRE_WAIT`]: we stay reachable throughout.
     leaving: Vec<(u64, Instant)>,
-    /// Which of our points holds the session, and how many times in a row
-    /// it failed.
-    which: usize,
-    fails: u32,
     /// The id the standing circuits hold sessions for: on a new address
     /// every one is replaced, even to the same point, so that no point
     /// sees one circuit move from the old id to the new.
@@ -314,8 +309,6 @@ impl Default for Participant {
         Participant {
             standing: Vec::new(),
             leaving: Vec::new(),
-            which: 0,
-            fails: 0,
             standing_id: None,
             outbound: Vec::new(),
             short_list: false,
@@ -666,11 +659,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let all: Vec<Digest> = self.own_points_of(&id, now).into_iter().filter(|p| Some(*p) != relay).collect();
         let new_id = self.part.standing_id.is_some_and(|s| s != id);
         self.part.standing_id = Some(id);
-        if new_id {
-            (self.part.which, self.part.fails) = (0, 0);
-        }
-        // One session: at the point in turn (`docs/SCALING.md`).
-        let points: Vec<Digest> = all.get(self.part.which % all.len().max(1)).copied().into_iter().collect();
+        // A session at every one of our points (`docs/ONION.md`): a sender
+        // reaches us through any of them that is up, each one's circuit
+        // rebuilt on its own when it fails.
+        let points: Vec<Digest> = all;
         if new_id || points.iter().ne(self.part.standing.iter().map(|s| &s.point)) {
             let mut old = std::mem::take(&mut self.part.standing);
             if new_id {
@@ -980,19 +972,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.rv.note(Note::Delegation { tag: f.tag, owner: f.owner, result });
     }
 
-    /// Our point did not take the circuit (it failed adding the point, the
-    /// last hop), or refused our session: twice in a row, and the session
-    /// moves to the next point. A circuit failing at a hop on the way
-    /// says nothing of the point.
-    fn point_failed(&mut self) {
-        self.part.fails += 1;
-        if self.part.fails >= POINT_FAILS {
-            self.part.fails = 0;
-            self.part.which += 1;
-            self.log("onion: our rendezvous point keeps failing; trying the next");
-        }
-    }
-
     /// A relay whose channel failed: not a hop for a while.
     pub(super) fn avoid_relay(&mut self, id: Digest, now: Instant) {
         self.avoid_relay_for(id, now, AVOID);
@@ -1209,17 +1188,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             s.next = None;
             s.rotate_at = Some(now + Duration::from_secs(60));
         }
-        let mut failed = false;
+        let mut refused_at: Option<Digest> = None;
         for s in self.part.standing.iter_mut().filter(|s| s.circuit == Some(handle)) {
-            failed |= at_end;
+            if at_end {
+                refused_at = Some(s.point);
+            }
             rotate |= s.was_live;
             s.circuit = None;
             s.ready = false;
             s.was_live = false;
-            s.wait = Some(now + REBUILD_WAIT);
+            // Not before a later wait already set (a point that refused
+            // our session is asked again only after REFUSED_RETRY).
+            let t = now + REBUILD_WAIT;
+            s.wait = Some(s.wait.map_or(t, |w| w.max(t)));
         }
-        if failed {
-            self.point_failed();
+        if let Some(p) = refused_at {
+            self.log(&format!("onion: our rendezvous point {} did not take the circuit", onion::short(&p)));
         }
         if rotate {
             self.rotate(now);
@@ -1440,13 +1424,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     && let Some(i) = standing
                     && self.rv.me.as_ref().is_some_and(|m| m.id == subject)
                 {
-                    // Our point refused or rejected our session: the next.
+                    // Our point refused or rejected our session: asked
+                    // again later; our other points hold theirs meanwhile.
                     self.log(&format!(
                         "onion: {} would not hold our session",
                         onion::short(&self.part.standing[i].point)
                     ));
                     self.part.standing[i].wait = Some(now + REFUSED_RETRY);
-                    self.part.fails = POINT_FAILS - 1;
                     self.close_circuit(handle, "refused", now);
                 }
             }
@@ -1503,7 +1487,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         s.unanswered = None;
         s.held = seq;
         if seq == me.seq {
-            self.part.fails = 0;
             let s = &mut self.part.standing[i];
             if !s.was_live {
                 s.was_live = true;

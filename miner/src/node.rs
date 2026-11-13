@@ -5548,13 +5548,17 @@ mod tests {
         let (p, q) = (3usize, 4usize);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(60);
         while !(live(p) && live(q)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(live(p) && live(q), "sessions never came up ({loss} lost, {reorder} reordered)");
+        // A session at each of the three points (three relays: all of them).
+        for n in [p, q] {
+            assert_eq!(nodes[n].3.lock().unwrap().rendezvous.len(), 3);
+        }
         // Sends `out` from `from`, again whenever a send fails or nothing
         // arrives, for up to `secs`: what `to` received, if anything. The
         // reasons sends failed are kept.
@@ -5648,7 +5652,7 @@ mod tests {
         let (p, q) = (3usize, 4usize);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
@@ -5773,18 +5777,20 @@ mod tests {
         for n in [p, q] {
             nodes[n].1.send(Event::TestTiming(hour, hour, Duration::from_secs(3))).unwrap();
         }
-        let live = |secs: u64| {
+        // Every session of p's live, but at `gone` (a relay stopped, which
+        // may be one of its three points).
+        let live = |secs: u64, gone: Option<SocketAddr>| {
             let deadline = Instant::now() + guard(secs);
             loop {
                 let s = nodes[p].3.lock().unwrap().rendezvous.clone();
-                if s.len() == 1 && s[0].1 {
+                if s.len() == 3 && s.iter().filter(|(a, _)| Some(*a) != gone).all(|(_, l)| *l) {
                     return;
                 }
                 assert!(Instant::now() < deadline, "p: {s:?}");
                 std::thread::sleep(Duration::from_millis(100));
             }
         };
-        live(30);
+        live(30, None);
         // Idle: only keepalive frames on its channels (one each per
         // `channel::KEEPALIVE`, at most three channels: its guards).
         std::thread::sleep(Duration::from_secs(3));
@@ -5810,7 +5816,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         eprintln!("p heard {:?} after its hop stopped", stopped.elapsed());
-        live(60);
+        live(60, Some(nodes[middle].0));
         // And it is reached there.
         let out =
             Outbound { tag: 1, to: id(5), kind: 1, inner: b"after".to_vec(), recipient: None, reply: None, group: 0 };
@@ -5939,7 +5945,7 @@ mod tests {
         let (id_p, id_q) = (id(p as u8 + 1), id(q as u8 + 1));
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
@@ -6061,7 +6067,7 @@ mod tests {
         let (old, new, id_q) = (id(p as u8 + 1), id(99), id(q as u8 + 1));
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(p) && live(q)) && Instant::now() < deadline {
@@ -6309,7 +6315,10 @@ mod tests {
             n.1.send(Event::TestRelays(listed.clone())).unwrap();
         }
         let deadline = Instant::now() + guard(30);
-        let live = || nodes[3].3.lock().unwrap().rendezvous.iter().filter(|(_, l)| *l).count() == 1;
+        let live = || {
+            let s = nodes[3].3.lock().unwrap().rendezvous.clone();
+            !s.is_empty() && s.iter().all(|(_, l)| *l)
+        };
         while !live() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -6383,7 +6392,7 @@ mod tests {
         let (owner, server, resolver) = (3usize, 4usize, 5usize);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
@@ -6527,7 +6536,7 @@ mod tests {
         let (owner, holder, resolver) = (3usize, 4usize, 5usize);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(owner) && live(holder) && live(resolver)) && Instant::now() < deadline {
@@ -6669,7 +6678,7 @@ mod tests {
         epoch(false, true, 0);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(owner) && live(server) && live(resolver)) && Instant::now() < deadline {
@@ -6771,7 +6780,7 @@ mod tests {
         epoch(false, true, 0);
         let live = |n: usize| {
             let s = nodes[n].3.lock().unwrap().clone();
-            s.rendezvous.len() == 1 && s.rendezvous.iter().all(|(_, l)| *l)
+            !s.rendezvous.is_empty() && s.rendezvous.iter().all(|(_, l)| *l)
         };
         let deadline = Instant::now() + guard(30);
         while !(live(holder) && live(resolver)) && Instant::now() < deadline {
@@ -6904,34 +6913,44 @@ mod tests {
         let epoch = |current: &Vec<consensus::Relay>, previous: Option<&Vec<consensus::Relay>>, prefer: bool| {
             epoch_in(current, previous, prefer, 0)
         };
-        // One session (`docs/SCALING.md`), at the first point of the list
-        // preferred. List a alone.
+        // A session at each point (`docs/ONION.md`); during a switch, at
+        // each point of both lists.
+        let both = |x: Vec<Digest>, y: Vec<Digest>| {
+            let mut v = x;
+            for p in y {
+                if !v.contains(&p) {
+                    v.push(p);
+                }
+            }
+            v
+        };
+        // List a alone.
         epoch(&a, None, true);
-        live_at(&points(&a, id(5))[..1]);
+        live_at(&points(&a, id(5)));
         message("under a");
         // The switch to b: both stand, a tried first, then b.
         epoch(&b, Some(&a), false);
-        live_at(&points(&a, id(5))[..1]);
+        live_at(&both(points(&a, id(5)), points(&b, id(5))));
         message("switching, a first");
         epoch(&b, Some(&a), true);
-        live_at(&points(&b, id(5))[..1]);
+        live_at(&both(points(&b, id(5)), points(&a, id(5))));
         message("switching, b first");
         // The switch is over: b alone.
         epoch(&b, None, true);
-        live_at(&points(&b, id(5))[..1]);
+        live_at(&points(&b, id(5)));
         message("under b");
         // A new epoch with b unchanged (`docs/SUBNAMES.md`): the points
         // move all the same, through the same grace period. The first
-        // epoch where p's first point moves, to see the session follow.
-        let e = (1..).find(|&e| points_in(&b, id(5), e)[0] != points(&b, id(5))[0]).unwrap();
+        // epoch where p's points change, to see the sessions follow.
+        let e = (1..).find(|&e| points_in(&b, id(5), e) != points(&b, id(5))).unwrap();
         epoch_in(&b, Some(&b), false, e);
-        live_at(&points_in(&b, id(5), e - 1)[..1]);
+        live_at(&both(points_in(&b, id(5), e - 1), points_in(&b, id(5), e)));
         message("a new epoch, the old one first");
         epoch_in(&b, Some(&b), true, e);
-        live_at(&points_in(&b, id(5), e)[..1]);
+        live_at(&both(points_in(&b, id(5), e), points_in(&b, id(5), e - 1)));
         message("a new epoch, the new one first");
         epoch_in(&b, None, true, e);
-        live_at(&points_in(&b, id(5), e)[..1]);
+        live_at(&points_in(&b, id(5), e));
         message("the new epoch alone");
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
@@ -7028,9 +7047,10 @@ mod tests {
         for n in 0..5 {
             set(n, Some(&list), Some(None), false);
         }
-        // The seed's session, and one onion session (`docs/SCALING.md`).
-        live(p, 2);
-        live(r, 1);
+        // The seed's session, and an onion session at each of the three
+        // points (three relays: all of them).
+        live(p, 4);
+        live(r, 3);
         message_to(p, "switching, init first");
         // r is reachable only by onion mode: the sender tries init first,
         // the seed has no session for r, and the send goes by onion mode.
@@ -7042,7 +7062,7 @@ mod tests {
         for n in 0..5 {
             set(n, Some(&list), None, true);
         }
-        live(p, 1);
+        live(p, 3);
         message_to(p, "onion");
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
@@ -7090,7 +7110,7 @@ mod tests {
             let deadline = Instant::now() + guard(secs);
             loop {
                 let s = nodes[p].3.lock().unwrap().rendezvous.clone();
-                if s.len() == 1 && s.iter().all(|(_, l)| *l) {
+                if s.len() == 3 && s.iter().all(|(_, l)| *l) {
                     return;
                 }
                 assert!(Instant::now() < deadline, "p: {s:?}");

@@ -11,7 +11,7 @@
 # A), and at the OS's node (the configuration's test-relays, the same file
 # as the OS reaches them: 10.0.2.2).  The script drives the OS's wallet over
 # wm's WebSocket:
-# - the wallet in onion mode, its standing circuit's session live;
+# - the wallet in onion mode, a session live at each of its three points;
 # - A pays the wallet 2.5 by its address: the slate up an outbound circuit
 #   of A's, the wallet answering it along its route, A finalizing; once
 #   mined, the wallet holds 2.5 confirmed;
@@ -211,8 +211,9 @@ def confirmed():
 def reach():
     time.sleep(3)
     o = ask('overview')
-    return o if o.get('mode') == 'onion' and o.get('reach', 0) >= 1 else None
-check('the wallet in onion mode, its standing session live', wait('the wallet\'s standing session', reach))
+    # a session at each of its three points (three relays: all of them)
+    return o if o.get('mode') == 'onion' and o.get('points') == 3 and o.get('reach', 0) == 3 else None
+check('the wallet in onion mode, its sessions live at its three points', wait('the wallet\'s standing sessions', reach))
 def events(kind):
     return [m for m in msgs if m.get('event') == kind]
 

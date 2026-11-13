@@ -313,6 +313,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             self.destroy_hop(prev, true, false, now);
         }
         self.circuits.creating.retain(|l, _| l.0 != key);
+        self.asks_channel_closed(key, now);
     }
 
     /// Ends the hop entered at `prev`, telling the previous side, the
