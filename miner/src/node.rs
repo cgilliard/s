@@ -4659,6 +4659,72 @@ mod tests {
         hb.join().unwrap();
     }
 
+    /// A batch of headers lost on the way (the first `Headers` its peer
+    /// sends, dropped: docs/TIMING_FIXES.md item 17, a fault made to
+    /// happen rather than left to random loss): the fresh node asks again
+    /// and fast-syncs to the peer's tip, the peer kept.
+    #[test]
+    fn a_lost_header_batch_is_asked_again() {
+        let a = open("lostbatch-a");
+        let now = unix_now();
+        let mut t = T0;
+        for tag in 1..=12u8 {
+            t += 600;
+            let inputs = if tag >= 3 { vec![tag as u64 - 3] } else { vec![] };
+            let body = Body {
+                outputs: vec![Output::new(&pk(tag), claim(&a, &inputs)).block_output()],
+                inputs,
+                proof: vec![tag; 2500],
+                ..Default::default()
+            };
+            let block = mine_body(&a, body, t);
+            a.chain.apply_block(&block, now).unwrap();
+        }
+        let a_tip = a.chain.tip().unwrap().unwrap();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        // the first Headers dropped, its heights noted; whether they were
+        // sent again after
+        let seen: Arc<Mutex<(Option<Vec<u32>>, bool)>> = Arc::new(Mutex::new((None, false)));
+        let s = Arc::clone(&seen);
+        *node_a.drop_out.borrow_mut() = Some(Box::new(move |m: &Message| {
+            let Message::Headers(hs) = m else { return false };
+            let heights: Vec<u32> = hs.iter().map(|h| h.height).collect();
+            let mut s = s.lock().unwrap();
+            match &s.0 {
+                None => {
+                    s.0 = Some(heights);
+                    true
+                }
+                Some(lost) => {
+                    if heights.iter().any(|h| lost.contains(h)) {
+                        s.1 = true;
+                    }
+                    false
+                }
+            }
+        }));
+        let b = open("lostbatch-b");
+        let mut cb = config(vec![addr_a], &b.dir);
+        cb.sync_point = Some(4);
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let stats_b = node_b.stats();
+        let ha = std::thread::spawn(move || node_a.run());
+        let hb = std::thread::spawn(move || node_b.run());
+        let t0 = Instant::now();
+        assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not sync to a's tip after a lost batch");
+        eprintln!("synced {:?} after the start, a batch lost on the way", t0.elapsed());
+        let (lost, again) = seen.lock().unwrap().clone();
+        assert!(lost.is_some() && again, "the lost headers ({lost:?}) not sent again");
+        assert_eq!(b.chain.state_root().unwrap(), a.chain.state_root().unwrap());
+        let peers = stats_b.lock().unwrap().peers.clone();
+        assert!(peers.iter().any(|p| p.addr == addr_a && p.live), "a not kept as a live peer: {peers:?}");
+        tx_a.send(Event::Stop).unwrap();
+        tx_b.send(Event::Stop).unwrap();
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
     /// A fresh node whose peer answers only after 10 s starts from genesis
     /// meanwhile, and goes back to fast sync when the peer appears: it ends
     /// on a snapshot, not a replay.

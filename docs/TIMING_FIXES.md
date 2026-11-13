@@ -648,3 +648,7 @@ understood is ignored.
     the sessions live again, a message through). Both fail with the 5 s
     floors (the channel given up at 9 s; all three circuits) and pass
     with 30 s.
+    **One header batch lost:** `a_lost_header_batch_is_asked_again`, the
+    first `Headers` the peer sends dropped (`drop_out`), its heights
+    noted: they are sent again, and the fresh node fast-syncs (about
+    4 s), its peer kept live.
