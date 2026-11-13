@@ -29,15 +29,19 @@ wdump() {
 
 # wait_for FILE REGEX IDLE WHAT — until REGEX (extended) is in FILE; fails
 # when nothing under $T has grown for IDLE seconds, or when FILE itself is
-# still empty after IDLE seconds (a QEMU that never started printing, while
-# miners mining elsewhere under $T kept the other logs growing: a CI run
-# waited out its whole 50 minutes so).
+# still empty after IDLE seconds, and at least WEMPTY (300 s by default):
+# a QEMU that never started printing, while miners mining elsewhere under
+# $T kept the other logs growing (a CI run waited out its whole 50 minutes
+# so). Not the step's own window alone: a QEMU started beside a miner
+# proving on every core printed nothing for the shell's 60 s on CI
+# (nametest at e70b01d), though it boots in under a second idle.
 wait_for() {
 	wf_last=$(wprogress); wf_idle=0; wf_empty=0
+	wf_elim=${WEMPTY:-300}; [ "$3" -le "$wf_elim" ] || wf_elim=$3
 	until grep -qE "$2" "$1" 2>/dev/null; do
 		[ "$wf_idle" -lt "$3" ] || { echo "$WNAME: $4: nothing new for $3 s" >&2; wdump; exit 1; }
 		if [ -s "$1" ]; then wf_empty=0; else wf_empty=$((wf_empty + 2)); fi
-		[ "$wf_empty" -le "$3" ] || { echo "$WNAME: $4: $1 still empty after $3 s" >&2; wdump; exit 1; }
+		[ "$wf_empty" -le "$wf_elim" ] || { echo "$WNAME: $4: $1 still empty after $wf_elim s" >&2; wdump; exit 1; }
 		sleep 2
 		wf_now=$(wprogress)
 		if [ "$wf_now" != "$wf_last" ]; then wf_last=$wf_now; wf_idle=0; else wf_idle=$((wf_idle + 2)); fi
