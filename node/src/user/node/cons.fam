@@ -45,6 +45,9 @@
 : cxln variable ;  : cxle variable ;  : cxnw variable ;  : cxid variable ;  : cxst variable ;  : cxasks variable ;
 : cxfill  -rot ?dup if 0 lit do 2dup i + c! loop then 2drop ;      \ ( a n b -- )
 : cxscr variable ;  : cxfail variable ;  : cxfat variable ;
+\ cxnp, cxnu: a peer that did not answer GetAux, not asked again until
+\ then (10 minutes, as tabminer's); cxbad: a turn's asking stopped at it.
+: cxnp variable ;  : cxnu variable ;  : cxbad variable ;
 : cxinit
 cxlv @ 0= if
 	wkinit
@@ -314,12 +317,22 @@ myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
 	myh @ dup cxh !  cxht !  secs cxat !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
 	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
-	0 lit cxasks !
+	0 lit cxasks !  0 lit cxbad !
+	pcur @ cxnp @ =  secs cxnu @ - 0< and if -1 lit cxbad ! then
 	cxh @ 1 lit +
 	cxb @  cxb @ cxin @ 5 lit u< and if 11F lit else 8F lit then  2dup u< if 2drop 0 lit else - then
 	do
 		i hat ?dup if
-			dup hhdr 6C lit + cxnz  over hid cxheld 0= and  cxasks @ 10 lit u< and if cxask drop cxasks @ 1 lit + cxasks ! else drop then
+			dup hhdr 6C lit + cxnz  over hid cxheld 0= and  cxasks @ 10 lit u< and  cxbad @ 0= and if
+				\ one that does not answer: the turn stops there, and that
+				\ peer is passed over for the leaves a while (it may not
+				\ keep them), not asked again and again each ten seconds
+				cxask 0= if
+					-1 lit cxbad !  pcur @ cxnp !  secs 258 lit + cxnu !
+					vrb @ if nhead "peer " puts pcur @ pshow " did not answer for a block's aux leaves; not asked for them for 10 minutes" puts 0A lit putc then
+				then
+				cxasks @ 1 lit + cxasks !
+			else drop then
 		then
 	loop
 	\ the decisions in force; the running window's for the files it wants

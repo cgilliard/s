@@ -418,7 +418,12 @@ understood is ignored.
    every 10 ms and the miner's answers 100 ms late.
 3. The fam node: upkeep while working (`pkeep`, `nrelay`, `awake` from
    `cwait`, `vwait` and between a batch's blocks); `cxask` one ask a
-   turn, failures remembered.
+   turn, failures remembered. **Done (2026-11-13):** `pkeep` (pings,
+   discovery) in `cwait`, `vwait` and each round of `pfetch` (a batch's
+   blocks all go through `cwait`), `awake` in both waits; a turn of
+   `cxrun` stops at the first peer that does not answer GetAux, passed
+   over for it ten minutes. `nrelay` stays in `nstep` (it fetches, and a
+   fetch cannot nest in one): TxInvs wait in their queue (16) meanwhile.
 4. The fam node: the ban's own field; "passed over" 600 s; a batch's
    silent peer dropped for the run, give-up after a few seconds without
    progress, no duplicate retry.

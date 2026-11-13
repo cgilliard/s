@@ -158,7 +158,9 @@ then ;
 vjr @ pyfd !  0 lit pyrdy !  1 lit pnest !
 begin vjw @ if pyrdy @ 0= else 0 lit then while
 	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
-	pxrdy @ if stx @ vsav !  aaccept  vsav @ stx ! then
+	\ the peers kept (pings) and the API's long polls answered meanwhile
+	pkeep
+	stx @ vsav !  pxrdy @ if aaccept then  awake  vsav @ stx !
 repeat
 0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
 vjw @ if
@@ -219,7 +221,10 @@ sninit  cvp @ cvinit ;
 cwvr @ pyfd !  0 lit pyrdy !  1 lit pnest !
 begin pyrdy @ 0= while
 	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
-	pxrdy @ if stx @ vsav !  aaccept awake  vsav @ stx ! then
+	\ the peers kept (pings: a long job must not leave them unanswered,
+	\ docs/TIMING_FIXES.md) and the API's long polls answered meanwhile
+	pkeep
+	stx @ vsav !  pxrdy @ if aaccept then  awake  vsav @ stx !
 repeat
 0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
 cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;

@@ -675,6 +675,8 @@ pyd @ if pyt0 @ else ticks then pt0 !  0 lit pyd !  0 lit prtx !
 begin
 	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and  pyd @ 0= and
 while
+	\ the other peers kept meanwhile (pings), a fetch lasting minutes
+	pkeep
 	preq  ticks pq0 !  0 lit pfirst !  0 lit pnew !
 	\ until what was asked for has come (then the next ask at once), or
 	\ a few round trips pass with nothing (one lost: asked for again), or
