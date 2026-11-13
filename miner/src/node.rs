@@ -2375,6 +2375,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 if self.request_ok(&addr, token) && self.peers.get(&addr).is_some() {
                     self.peers.gone(&addr);
                     self.log(&format!("peer {addr} is shutting down; not asked anything until it answers again"));
+                    // A relay going: left out of new paths now (while enough
+                    // others remain), not found out by a handshake 30 s
+                    // unanswered, or a hop's, each path that tries it.
+                    let gone: Vec<Digest> = self
+                        .rv
+                        .onion_sets()
+                        .iter()
+                        .flat_map(|s| s.iter())
+                        .filter(|r| r.addr.parse::<SocketAddr>().ok() == Some(addr))
+                        .map(|r| r.id)
+                        .collect();
+                    let now = Instant::now();
+                    for id in gone {
+                        self.avoid_relay(id, now);
+                    }
                 }
             }
         }
