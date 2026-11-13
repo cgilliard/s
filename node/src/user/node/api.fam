@@ -640,7 +640,7 @@ abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
 0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then
 0= if ENOPEERS else hbest hheight myh @ 1 lit + u> if ESYNCING else ESYNCED then then
 dup aest @ = if drop else
-	dup aest !  EVSTAT myh @ rot 0 lit 0 lit evwrite  hbest hheight evn @ evat 10 lit + !  evpub
+	dup aest !  EVSTAT myh @ rot 0 lit 0 lit evput  hbest hheight evn @ evat 10 lit + !
 then ;
 
 \ aev1 ( a -- )  an event's object.
@@ -670,15 +670,15 @@ dup 4 lit + @ EVTX = aenf @ and if
 	0 lit aenf @ 0 lit do over 10 lit + aef @ i 5 lit lshift + 20 lit d8= or loop nip
 else drop -1 lit then ;
 \ aereset ( -- flag )  aeaf not among the numbers kept.
-: aereset  aeaf @ evnow u>  aeaf @ 1 lit + evlow u< or ;
+: aereset  aeaf @ evn @ u>  aeaf @ 1 lit + evlow u< or ;
 \ aehas ( -- flag )  a wanted event after aeaf.
-: aehas  0 lit  evnow aeaf @ u> if evnow aeaf @ - 0 lit do aeaf @ i + 1 lit + evat aem or loop then ;
+: aehas  0 lit  evn @ aeaf @ u> if evn @ aeaf @ - 0 lit do aeaf @ i + 1 lit + evat aem or loop then ;
 \ aevans  the events after aeaf wanted (aenf, aef), 64 at most, answered.
 : aevans
 abegin "{" a"
-aereset if "reset" akey "true" a" acom "next" akey evnow anum else
+aereset if "reset" akey "true" a" acom "next" akey evn @ anum else
 	"events" akey "[" a"  0 lit aek !  aeaf @ aenx !
-	evnow aeaf @ - ?dup if 0 lit do
+	evn @ aeaf @ - ?dup if 0 lit do
 		aek @ 40 lit u< if
 			aeaf @ i + 1 lit + dup aenx !  evat dup aem if aek @ if acom then aev1  aek @ 1 lit + aek ! else drop then
 		then
@@ -701,7 +701,7 @@ then
 aereset aehas or  "wait=" aqv ?dup if c@ 30 lit = else 0 lit then or if aevans else
 	FFFFFFFF lit AEW 0 lit do aew @ i AEWSZ * + @ 0= if drop i then loop
 	dup 0< if drop "too many waiting" "503 Service Unavailable" afail else
-		AEWSZ * aew @ +  acfd @ over !  secs 1E lit + over 4 lit + !  evnow over 8 lit + !  aenf @ over C lit + !
+		AEWSZ * aew @ +  acfd @ over !  secs 1E lit + over 4 lit + !  evn @ over 8 lit + !  aenf @ over C lit + !
 		aef @ swap 10 lit + 20 lit wcopy  0 lit acfd !
 	then
 then ;
@@ -713,7 +713,7 @@ AEW 0 lit do
 		dup 8 lit + @ aeaf !  dup C lit + @ aenf !  dup 10 lit + aef @ 20 lit wcopy
 		aereset aehas or  secs 2 lit pick 4 lit + @ u< 0= or if
 			dup @ acfd !  0 lit swap !  aevans
-		else evnow swap 8 lit + ! then
+		else evn @ swap 8 lit + ! then
 	else drop then
 loop ;
 
@@ -809,7 +809,7 @@ abod @ ?dup if free 0 lit abod ! then ;
 10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
-evinit  AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
+AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
 A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
 54 lit alloc aerrs !
 "does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !

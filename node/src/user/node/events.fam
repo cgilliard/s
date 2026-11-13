@@ -17,18 +17,9 @@
 \   the height, and +10 the best header's height.
 \
 \ evput ( kind height state id other -- )  an event (id and other: 32
-\ bytes each, or 0 for zeros), told: evwrite then evpub (an event that
-\ needs a field more is written, the field set, then told: aevst).
-\ evat ( n -- a )  where event n is, if still kept (evlow to evnow).
+\ bytes each, or 0 for zeros); the ring made at the first.
+\ evat ( n -- a )  where event n is, if still kept (evlow to evn).
 \ evlow ( -- n )  the oldest number kept (1 before the ring has wrapped).
-\
-\ Read by a thread of its own too (the API's, docs/NODE_ENHANCEMENTS.md
-\ item 4), whose variables are copies made at its start: so the ring and
-\ the number of the last event told live in malloc'd memory (evc: +0
-\ the number, +4 its lock), made before the thread is (evinit, from
-\ ainit), and the number is set under the lock once the event is whole
-\ (evnow reads it so).  The slot being written is the oldest's: evlow
-\ leaves it out.  evn is the writer's own count.
 
 :M EVN 800 lit ;
 :M EVSZ 50 lit ;
@@ -36,30 +27,15 @@
 :M EVPOOLED 1 lit ;  :M EVREPL 2 lit ;  :M EVEVICT 3 lit ;  :M EVMINED 4 lit ;  :M EVCONF 5 lit ;  :M EVBACK 6 lit ;
 :M ESYNCED 1 lit ;  :M ESYNCING 2 lit ;  :M ENOPEERS 3 lit ;
 
-: evr variable ;  : evn variable ;  : eva variable ;  : evc variable ;
-: evnow  evc @ ?dup if dup 4 lit + lock  dup @  swap 4 lit + unlock else 0 lit then ;
+: evr variable ;  : evn variable ;  : eva variable ;
 : evat  EVN 1 lit - and EVSZ * evr @ + ;
-: evlow  evnow EVN 1 lit - u< if 1 lit else evnow EVN - 2 lit + then ;
-: evinit
-evr @ 0= if
-	EVN EVSZ * malloc evr !  0 lit evn !
-	8 lit malloc dup evc !  ?dup if 0 lit over !  0 lit swap 4 lit + ! then
-then ;
+: evlow  evn @ EVN u< if 1 lit else evn @ EVN - 1 lit + then ;
 \ evid ( src dst -- )  32 bytes, or zeros for src 0.
 : evid  swap ?dup if swap 20 lit bcopy else 8 lit wzero then ;
-: evwrite
-evinit
-evr @ 0=  evc @ 0= or if 2drop 2drop drop else
-	evn @ 1 lit + evat eva !
+: evput
+evr @ 0= if EVN EVSZ * malloc evr !  0 lit evn ! then
+evr @ 0= if 2drop 2drop drop else
+	evn @ 1 lit + dup evn !  evat eva !
 	eva @ 30 lit + evid  eva @ 10 lit + evid
-	eva @ C lit + !  eva @ 8 lit + !  eva @ 4 lit + !
-	evn @ 1 lit + dup eva @ !  evn !
+	eva @ C lit + !  eva @ 8 lit + !  eva @ 4 lit + !  evn @ eva @ !
 then ;
-\ evpub  the events written told: their number published, under the lock,
-\ and whoever waits on it woken (await on evc).
-: evpub
-evc @ ?dup if
-	dup 4 lit + lock  evn @ over !  dup 4 lit + unlock
-	7FFFFFFF lit wake drop
-then ;
-: evput  evwrite evpub ;
