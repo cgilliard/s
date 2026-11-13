@@ -1224,8 +1224,9 @@ s, h, want = wsopen(cookie, b"/wallet"); buf = b""; out = b""; closed = False
 print("wallet upgrade", h.split(b"\r\n")[0].decode(), (b"Sec-WebSocket-Accept: " + want) in h)
 print("unlock", pump(b'{"op":"unlock","ok":true'))
 out = b""; send(b'{"op":"overview","id":7}', 1)
-# its answer, by its id (an unasked event, the node not reached, may come first)
-print("overview", pump(b'{"id":7,"ok":true,"confirmed":'))
+# its answer, by its id (an unasked event, the node not reached, may come
+# first); the session has no wallet yet, so the answer may be an error
+print("overview", pump(b'{"id":7,"ok":'))
 lo = post(b"/logout", b"", cookie)
 print("wallet logout", b"Location: /" in lo and pump(b"[close]", 30))
 # Files: the home to and from the browser (the session's cookie needed);
