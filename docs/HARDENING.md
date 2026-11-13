@@ -250,6 +250,19 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
 - **A real 170M-output fast sync**: the nightly `scale.yml` measures one
   on GitHub's runners (one peer, so bound by its 8 MB/s serving limit);
   the seeds' VPS still to be measured the same way.
+- **The fam node's heap reserve is a guess** (`connect.fam`'s `stinit`,
+  from `adf2c3f`): 32 MiB `malloc`ed and freed at start, so its arena
+  holds the heap within a process's 4 map slots (small arenas from
+  64 KiB would fill them at about half a MiB). With no MMU it is physical
+  memory, kept for good (the last arena is never unmapped): of about
+  121 MiB free in the 128 MiB machine, the node's start region 24, this
+  32, the store's cache 16, `nodev` 8, each wallet 8, leaving about 33
+  with one wallet. It fits (paytest, onitest), but was never measured.
+  Fix: the node's peak heap measured (a fast sync with a snapshot, a
+  full block, a full pool, the worker's copy of the state's buffers),
+  the reserve that and a margin; or the reserve folded into the start
+  region, which takes no map slot. Likely a few MiB, the rest back to
+  the store's cache and wallets.
 ## Features deferred
 
 - Cover for the address a transaction is first sent from, in init mode:
