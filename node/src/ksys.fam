@@ -2265,8 +2265,17 @@ loop
 \ nothing has used by the time hstart reads it): its nodes named cpu@...;
 \ 0 if there is none there.  fbe@ ( a -- u )  a big-endian word.
 : fbe@  dup c@ 18 lit lshift over 1 lit + c@ 10 lit lshift or over 2 lit + c@ 8 lit lshift or swap 3 lit + c@ or ;
+\ fdtat ( -- a | 0 )  where the device tree is: QEMU puts it in the last
+\ 2 MiB of RAM, on a 2 MiB boundary, so it is looked for from 128 MiB's
+\ place up, 2 MiB at a time, to 2 GiB: every place below it is RAM, so
+\ nothing past the end is read (a machine with no device tree and more
+\ than 128 MiB would be: QEMU's virt machine always has one).  0: none.
+: fdtat
+87E00000 lit
+begin dup fbe@ D00DFEED lit <>  over FFE00000 lit u< and while 200000 lit + repeat
+dup fbe@ D00DFEED lit = 0= if drop 0 lit then ;
 : fdtharts
-87E00000 lit dup fbe@ D00DFEED lit <> if drop 0 lit else
+fdtat dup 0= if else
 	dup 8 lit + fbe@ +  0 lit swap
 	begin dup fbe@ dup 9 lit <> while
 		dup 1 lit = if
@@ -2362,11 +2371,16 @@ area@ mhartid@ harea harr !
 hstart
 gp@ 10000 lit + FFF lit + FFFFF000 lit and
 87F00000 lit pginit
+\ RAM past 128 MiB, if the machine has more (QEMU's -m: the device tree
+\ at its end, fdtat): from 0x88000000 up to the device tree, added to the
+\ table (pgfree: pginit would start it afresh); the MiB below 0x88000000
+\ stays tabernacle's (it is moved there, the node's seeds beside it)
+fdtat dup 88000000 lit u> if 88000000 lit swap over - C lit rshift pgfree else drop then
 ptinit kcinit 40 lit alloc kpb !  40 lit alloc kvb !
 mtime@ 1 lit or rndseed !     \ the lottery's draws: not from 0, which xorshift never leaves
 fence 1 lit kready !
 "kernel: " puts nharts @ u. nharts @ 1 lit = if " hart, " else " harts, " then puts
-pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB)" puts
+pgfree# dup u. " pages free (" puts 8 lit rshift u. " MiB of " puts fdtat ?dup if 200000 lit + 80000000 lit - 14 lit rshift else 80 lit then u. ")" puts
 0A lit putc
 blkfind if                    \ a disk: the store, found or made, and its interrupt
 	0 lit stmount  fsinit

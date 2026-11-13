@@ -13,6 +13,7 @@
 #   --mac=ADDR        the virtio-net MAC (give each node on a host its own)
 #   --hostfwd=SPEC    expose a guest port, e.g. udp::3737-:3737
 #   --smp=N           N harts (default 1: more are slower for now)
+#   --mem=N           N MiB of RAM (default 128, the least the OS needs)
 #   TABERNACLE        the boot program (default node/bin/tabernacle, as
 #                     scripts/build.sh leaves it)
 #
@@ -36,6 +37,7 @@ HOSTFWD=""
 # a mainnet catch-up of 144 blocks took 8 min on 1, 8 min 50 s on 2,
 # 10 min 45 s on 4)
 SMP=1
+MEM=128
 TAB="$ROOT/bin/tabernacle"
 
 for arg in "$@"; do
@@ -46,6 +48,7 @@ for arg in "$@"; do
 		--mac=*) MAC=",mac=${arg#--mac=}" ;;
 		--hostfwd=*) HOSTFWD=",hostfwd=${arg#--hostfwd=}" ;;
 		--smp=*) SMP="${arg#--smp=}" ;;
+		--mem=*) MEM="${arg#--mem=}" ;;
 		--help|-h) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		--*) echo "node.sh: unknown option: $arg" >&2; exit 1 ;;
 		*) TAB="$arg" ;;
@@ -114,7 +117,7 @@ for s in $SEEDS; do n=$((n + 1)); done
 } > "$SEEDFILE" || exit 1
 
 qemu-system-riscv32 \
-	-machine virt -m 128M -cpu "$CPU" -smp "$SMP" -nographic -bios none \
+	-machine virt -m "${MEM}M" -cpu "$CPU" -smp "$SMP" -nographic -bios none \
 	-global virtio-mmio.force-legacy=true \
 	-device loader,file="$TAB",addr=0x80000000 \
 	-device loader,file="$SEEDFILE",addr=0x87FFF000,force-raw=on \
