@@ -15,17 +15,25 @@ pin @ @ close drop  pout @ 4 lit + @ close drop  0 lit an ! ;
 : wstop  pin @ 4 lit + @ close drop  pid @ st @ wait drop  pout @ @ close drop ;
 \ wnl ( -- i )  where the first newline of what was read is (an: none).
 : wnl  0 lit begin dup an @ u< if dup ab @ + c@ A lit <> else 0 lit then while 1 lit + repeat ;
-\ wline  the wallet's next line, printed ("(it ended)" if it ended first).
-: wline
+\ wev ( -- flag )  the line at ab an event ({"ev...): unasked, not an
+\ answer (the block thread's word that no node is reached comes when it
+\ comes, docs/TIMING_FIXES.md item 15), so not taken for one.
+: wev  ab @ c@ 7B lit =  ab @ 1 lit + c@ 22 lit = and  ab @ 2 lit + c@ 65 lit = and  ab @ 3 lit + c@ 76 lit = and ;
+\ wline1 ( -- event? )  the wallet's next line, printed unless an event
+\ ("(it ended)" if it ended first).
+: wline1
 begin wnl an @ = while
 	pout @ @ ab @ an @ + FFF lit an @ - read
 	dup 0 lit > if an @ + an ! else
 		drop ab @ an @ + "(it ended)" scpy A lit over c! 1 lit + ab @ - an !
 	then
 repeat
-wnl  0 lit over ab @ + c!  "w: " puts ab @ puts 0A lit putc
+wnl  0 lit over ab @ + c!  wev dup 0= if "w: " puts ab @ puts 0A lit putc then
+swap
 an @ over 1 lit + - ?dup if 0 lit do ab @ over 1 lit + + i + c@ ab @ i + c! loop then
 an @ swap 1 lit + - an ! ;
+\ wline  the wallet's next answer, printed (its events passed over).
+: wline  begin wline1 0= until ;
 
 : ls variable ;  : le variable ;  : nl variable ;
 \ isdash ( a -- flag )  the line at a is "---".
