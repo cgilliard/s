@@ -567,8 +567,19 @@ understood is ignored.
     at once or waiting (30 s; 16 requests), `reset` for a number not
     kept; tested in `apitest.sh` (the blocks, the state, a transaction
     pooled then mined while waited for, a filter, a reset). No `fees`
-    event: the fam pool's minimum does not move yet. Left: the wallet's
-    block thread and its events to the page.
+    event: the fam pool's minimum does not move yet.
+    **The wallet's block thread done (2026-11-13):** `wallet.fam`'s
+    `wbstart`, a thread with variables and buffers of its own, keeps a
+    `/v1/events` request open (44 s answer window) and writes to a pipe
+    the main loop polls: something happened (a block connected or
+    undone, the node's state, a reset, the node back), and the loop asks
+    and scans (`wtick`) as before, no longer every 4 s; or the node not
+    reached, asked again after 5 s doubling to 30 s. Without a thread
+    (no pipe, no room) the 4 s poll stays. The overview says which
+    (`watch`: `events`, `poll`); `paytest.sh` checks `events` and a
+    block told to the page with nothing asked. Left: the wallet's
+    events to the page (one update per block), and the node's
+    unreachability shown with its next try.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
     **The node's part done (2026-11-13):** its deadlines on the

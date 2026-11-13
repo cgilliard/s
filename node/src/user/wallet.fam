@@ -252,10 +252,12 @@ ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ jc  ndn @ 1 lit - i - A lit = if 2E
 \ freezes the wallet, docs/TIMING_FIXES.md).
 : hcode variable ;  : hmeth variable ;  : hbd variable ;  : hbn variable ;  : hpe variable ;
 \ hready ( -- flag )  the node's socket readable within 12 s (three of
-\ poll's 4 s at most).
+\ poll's 4 s at most; hwn of them if more: the block thread's 44 s, the
+\ node holding its request 30 s).
+: hwn variable ;
 : hready
 hpe @ 0= if 8 lit alloc hpe ! then
-0 lit  3 lit 0 lit do dup 0= if
+0 lit  hwn @ 3 lit max 0 lit do dup 0= if
 	hs @ hpe @ !  1 lit hpe @ 4 lit + !
 	hpe @ 1 lit EE6B2800 lit poll 0 lit > if drop -1 lit then
 then loop ;
@@ -480,6 +482,51 @@ have @ if
 		then
 	else 0 lit nodeok ! then
 then ;
+\ ── The block thread (docs/TIMING_FIXES.md, item 15) ──
+\ A thread with variables of its own (pthread, docs/OS.md) waits on the
+\ node's events, GET /v1/events?after=<n>, answered when something
+\ happens or after 30 s with nothing, and tells the main loop by a byte
+\ on a pipe (wbp) that it polls: 1 when a block was connected or undone,
+\ the node's state changed, the events were reset (the node started
+\ again), or the node answers after not doing so; the main loop then
+\ asks the node and scans (wtick), no longer every 4 s.  2 when the node
+\ is not reached (44 s here), asked again after 5 s, doubling to 30 s.
+\ Its own buffers (a copied variable still points at the caller's).
+\ Not started (no pipe, no room): the 4 s poll as before (wbon 0).
+: wbp variable ;  : wbn variable ;  : wbb variable ;  : wbf variable ;  : wbpath variable ;  : wbon variable ;  : wbm variable ;
+\ wbsig ( c -- )  c to the main loop.
+: wbsig  wbm @ c!  wbp @ 4 lit + @ wbm @ 1 lit write drop ;
+: wbstart
+8 lit alloc wbp !  10 lit alloc wbm !  0 lit wbon !
+wbp @ pipe 0< 0= if
+	ptcode[ drop
+		HMAX alloc hbuf !  200 lit alloc hreq !  8 lit alloc hpe !  20 lit alloc ntmp !  40 lit alloc wbpath !  4 lit alloc wbm !
+		B lit hwn !  0 lit wbn !  5 lit wbb !  0 lit wbf !
+		begin
+			wbpath @ "/v1/events?after=" scpy  wbn @ 0 lit rot dstr drop
+			wbpath @ hget ?dup if
+				5 lit wbb !
+				dup "'reset':true" jfind  over "'kind':'block'" jfind or  over "'kind':'undone'" jfind or
+				over "'kind':'status'" jfind or  wbf @ or
+				if 1 lit wbsig then
+				0 lit wbf !
+				"'next':" jfind ?dup if jnum drop nlo @ wbn ! then
+			else
+				-1 lit wbf !  2 lit wbsig
+				wbb @ 0 lit do 3B9ACA00 lit sleep loop
+				wbb @ 1 lit lshift 1E lit umin wbb !
+			then
+		0 lit until
+	]tcode
+	0 lit HMAX 10000 lit + pthread 0< 0= if -1 lit wbon ! then
+then ;
+\ wbread  what the block thread said: something happened (the node
+\ asked, the set scanned: wtick), or the node not reached.
+: wbread
+wbp @ @ wbm @ 10 lit read  dup 0 lit > if
+	0 lit swap 0 lit do wbm @ i + c@ 1 lit = or loop
+	if wtick else 0 lit nodeok ! then
+else drop then ;
 : wsum.  dup @ swap 4 lit + @ wamt ;                      \ ( acc -- )  written
 
 : nowal  "no wallet yet: create or restore one" jerr ;
@@ -2119,7 +2166,10 @@ jok ",'confirmed':'" jo sa1 @ wsum.  "','pending':'" jo sa2 @ wsum.  "','unverif
 "','locked':'" jo sa5 @ wsum.  "','height':" jo lh @ 0 lit wdec  ",'node':'" jo nodeok @ if "synced" else "not reached" then jo
 "','reach':" jo wonline @ if wmonion @ if owlive else mnlive then else 0 lit then 0 lit wdec
 ",'points':" jo wmonion @ if owrn @ 3 lit u< 0= if OWS else 0 lit then else 0 lit  mnnp @ ?dup if 0 lit do i mnmy if 1 lit + then loop then then 0 lit wdec
-",'mode':'" jo wmonion @ if "onion" else "init" then jo "'" jo  "}" jo jend ;
+",'mode':'" jo wmonion @ if "onion" else "init" then jo
+\ how it follows the node: its events (the block thread), or asking
+\ every 4 s (the thread not started)
+"','watch':'" jo wbon @ if "events" else "poll" then jo "'" jo  "}" jo jend ;
 \ oscan  the whole set scanned again now; the tip and the scan told.
 : oscan
 have @ 0= if nowal else
@@ -2246,23 +2296,28 @@ FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 li
 8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmevb !  60 lit alloc wmhk !  -1 lit wmpi !  0 lit wmpt !  0 lit wmpl !  200 lit alloc wmrids !  600 lit alloc wmrads !  20 lit alloc wmapid !  0 lit wmapn !  0 lit wmonion !  0 lit wmcat !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  50 lit alloc wmuk !  50 lit alloc wmk2 !  30 lit alloc wmur !  1A00 lit alloc wmab !  1800 lit alloc wmcb !  1000 lit alloc wmrq !  20 lit alloc wmrv !  20 lit alloc wmme !  0 lit wmrs !  20 lit alloc sid !  20 lit alloc ssec !
 20 lit alloc ssnd !  34 lit alloc pkb !  10 lit alloc nb !  14 lit alloc wmb !  40 lit alloc onew !
 440 lit 40 lit * alloc fkeys !  100 lit alloc fka !  100 lit alloc flv !  200 lit alloc fps !  39 lit 40 lit * alloc pins !
-: pfd variable ;  10 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
+: pfd variable ;  18 lit alloc pfd !  0 lit pfd @ !  1 lit pfd @ 4 lit + !
+wbstart
 0 lit icnt !  0 lit unl !  0 lit tried !  0 lit have !  0 lit wonline !  0 lit wmtried !  0 lit mnfd !  FFFFFFFF lit wfd !  obuf @ opos !
-\ a line when one comes; the node every 4 s while none does; once the
-\ wallet is open, the message layer's socket too, and its turn each
-\ second
+\ a line when one comes; the block thread's word (wbread: the node asked
+\ when something happened there), or without the thread the node every
+\ 4 s; once the wallet is open, the message layer's socket too, and its
+\ turn each second.  (Without the thread its pipe's place is the
+\ console's again.)
 begin
 	have @ wmtried @ 0= and nodeok @ and if wmstart then
-	0 lit pfd @ !  1 lit pfd @ 4 lit + !  mnfd @ pfd @ 8 lit + !  1 lit pfd @ C lit + !
-	pfd @  wonline @ if 2 lit 3B9ACA00 lit else 1 lit EE6B2800 lit then  poll drop
+	0 lit pfd @ !  1 lit pfd @ 4 lit + !  wbon @ if wbp @ @ else 0 lit then pfd @ 8 lit + !  1 lit pfd @ C lit + !
+	mnfd @ pfd @ 10 lit + !  1 lit pfd @ 14 lit + !
+	pfd @  wonline @ if 3 lit 3B9ACA00 lit else 2 lit EE6B2800 lit then  poll drop
+	wbon @ if pfd @ C lit + @ 10 lit rshift if wbread then then
 	pfd @ 4 lit + @ 10 lit rshift if
 		0 lit ibuf @ icnt @ + 3FFF lit icnt @ - read  dup 0 lit > if icnt @ + icnt !  lines  1 lit else drop 0 lit then
 	else 1 lit then
 	wonline @ if
 		wmrun
-		mnms wmlast @ - FA0 lit u< 0= if mnms wmlast !  wtick then
+		wbon @ 0= if mnms wmlast @ - FA0 lit u< 0= if mnms wmlast !  wtick then then
 	else
-		pfd @ 4 lit + @ 10 lit rshift 0= if wtick then
+		wbon @ 0=  pfd @ 4 lit + @ 10 lit rshift 0= and if wtick then
 	then
 while repeat
 \ leaving: the relays told (their channels to us gone)

@@ -196,6 +196,11 @@ wait('tabminer\'s finalize', lambda: aout().count('pooled; broadcasting it') > n
 check('tabminer finalized the answer and pooled it', aout().count('pooled; broadcasting it') > n0)
 got = wait('the 2.5 confirmed in the wallet', lambda: (time.sleep(3), confirmed() == '2.5000000000')[1])
 check('the wallet holds 2.5 confirmed', got)
+# It follows the node by its events (docs/TIMING_FIXES.md, item 15): the
+# block thread, and a block told the page with nothing asked meanwhile.
+check('the wallet follows the node by its events', ask('overview')['watch'] == 'events')
+n0 = len([m for m in msgs if m.get('event') == 'tip'])
+wait('a block told, nothing asked', lambda: pumpone() or len([m for m in msgs if m.get('event') == 'tip']) > n0)
 
 if part in ('payments', 'proofs'):
     # the wallet pays tabminer 1
