@@ -968,12 +968,16 @@ offline, the node connects each block with its chain proof checked:
 about 2.5 s of 3.3 s a block on mainnet (with the next block fetched
 meanwhile), so 144 blocks take eight minutes, most of it proofs.
 
-A block's chain proof binds its parent's header (its hash is among the
-proof's public values, NODE.md's "the chain proof binds the headers"),
-and it is recursive: block T's proof attests every header before it,
-each state root in them included. The header sync has already linked
-S to T by their parents' ids and checked each one's full proof of work.
-So once T's proof passes, every header from S to T is the true one,
+Neither every header's full proof of work (2.2 s each, natively) nor
+every block's proof is needed. A block's chain proof binds its parent's
+header (its hash is among the proof's public values, NODE.md's "the
+chain proof binds the headers"), attests its parent's work (the true
+`mix`), and is recursive: block T's proof attests every header before
+it, the work and the state root in each included. The header sync has
+linked S to T by their parents' ids, each header's quick proof of work
+checked (two permutations), and T's full proof of work checked natively
+(the tip's, as the fast sync does today: 5.3 s on mainnet). So once T's
+proof passes, every header from S to T is the true one, with its work,
 and connecting a block between needs only the checks made today besides
 its proof: its body matches its header's commitment, and applying it
 gives its header's state root. The root commits to every output and
@@ -984,6 +988,9 @@ nothing is ever undone.
 
 **A run** (from the node's height H to T, the best header's height when
 the run starts; only when T - H is 2 or more):
+0. **T's work:** checked in full natively if it is not already (T is
+   the best header when the run starts; the tip's work is checked by the
+   header sync, a later one as it arrives).
 1. **The bodies:** fetched H+1 to T (as now, the next while one is
    handled), each one's commitment checked against its header (its
    sender banned at once if it does not match), its outputs counted, and
@@ -1002,7 +1009,9 @@ the run starts; only when T - H is 2 or more):
 (`pstrike` at once: a full proof of work on an invalid block is
 deliberate), and the run is connected as today, each block's proof
 checked, which finds any bad block before T. The cost is the one 2.5 s
-check, and every forged header costs its sender a real block's work. No
+check, and the forger a real block's work for T (the headers before it
+cost little: only their quick proof of work is checked before T's proof,
+and it is that proof that refuses them). No
 tolerance to tune: the worst case is today's speed. **If a root does not
 match in step 3** (a fault of ours: the proof passed on other data),
 the run stops there and the rest is connected as today. Blocks arriving
