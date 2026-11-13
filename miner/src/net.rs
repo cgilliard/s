@@ -73,7 +73,7 @@ use crate::names::{NAME_PART_RECORDS, Record};
 use crate::pow::Digest;
 
 pub const MAGIC: [u8; 4] = *b"TAB1";
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 1;
 /// Largest datagram sent: the IPv6 minimum MTU less its headers, well
 /// within what IPv4 paths carry unfragmented in practice.
 pub const MAX_DATAGRAM: usize = 1232;

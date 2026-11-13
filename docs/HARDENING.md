@@ -238,7 +238,7 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
 ## Deployment and operations
 
 - **Seeds** need the current binary at every format change (now protocol
-  10, chain format 14, wallet format 8, slate format `tabslt05`), started
+  1, chain format 14, wallet format 8, slate format `tabslt05`), started
   with `--relay`, and wiped data directories. Fresh nodes cannot sync
   until then.
 - **Genesis regeneration at launch**, with `--hashrate` set to the

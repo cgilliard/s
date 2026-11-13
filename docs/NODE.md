@@ -253,7 +253,7 @@ half-applied one.
 ## The network
 
 - **Peers:** tabminer's protocol (`net.rs`): UDP, IPv4, magic `TAB1`,
-  protocol version 10, datagrams of at most 1,232 bytes, chunks of
+  protocol version 1, datagrams of at most 1,232 bytes, chunks of
   1,024. The node uses messages 1 to 15:
   - Ping, Pong (the status: height, tip, work, minimum fee);
   - GetPeers, Peers;

@@ -99,7 +99,7 @@ pkey @ pkd @ pko @ compress  pko @ mtok @ 8 lit bcopy ;
 \ wstatus ( nonce -- )  our status, with the nonce at its address and
 \ mtok's token (ptokn for whom it goes to).
 : wstatus
-8 lit wbs  A lit w32  mtok @ 8 lit wbs  mygen @ 20 lit wbs
+8 lit wbs  1 lit w32  mtok @ 8 lit wbs  mygen @ 20 lit wbs
 \ the oldest block whose body (and snapshot) we keep: tabminer asks a
 \ peer for a block or a snapshot only from there up (myold: sync.fam's
 \ nstat; none kept, our height and one)
