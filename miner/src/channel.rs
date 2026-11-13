@@ -69,16 +69,19 @@ pub const MAX_TRIES: u32 = 12;
 /// circuits over the channel are better built elsewhere at once. Until a
 /// round trip is measured; then [`DEAD_RTOS`] resend timeouts of the
 /// channel's own, between [`MIN_DEAD`] and this: a LAN or a datacenter
-/// notices in about 5 s, a satellite (a round trip of a second and more
-/// under load) keeps its full allowance (`docs/TIMING_FIXES.md`).
+/// notices in 30 s too, the floor (`docs/TIMING_FIXES.md`).
 pub const DEAD_AFTER: Duration = Duration::from_secs(30);
 const DEAD_RTOS: u32 = 10;
-const MIN_DEAD: Duration = Duration::from_secs(5);
+/// The floor, as before TIMING_FIXES 11: 5 s took a peer busy a few
+/// seconds for dead (a fam node checking a header's proof of work holds
+/// its loop ~5 s; eight nodes in one test on a loaded Windows runner,
+/// relays_learn_nothing_of_the_sender, lost live channels so).
+const MIN_DEAD: Duration = DEAD_AFTER;
 /// Sends of a frame, all unanswered and nothing heard meanwhile, before
 /// the channel is taken for dead under [`DEAD_AFTER`]: eight losses in a
 /// row at 10% each way is one frame in six hundred thousand. A frame's
 /// resends are at most a quarter of the window apart, so on a LAN the
-/// eighth goes about 7.5 s after the first.
+/// eighth goes within the floor.
 const DEAD_TRIES: u32 = 8;
 
 /// An initiator sends a keepalive after this long without sending: under
@@ -823,7 +826,7 @@ mod tests {
     }
 
     /// A channel's death follows its measured round trip: a fast link's
-    /// in 5 s (the floor), a satellite's after ten of its resend timeouts,
+    /// in 30 s (the floor), a satellite's after ten of its resend timeouts,
     /// and one not yet measured after the full 30 s.
     #[test]
     fn a_dead_channel_is_noticed_from_its_round_trip() {
@@ -833,12 +836,12 @@ mod tests {
         assert_eq!(i.dead_after(), DEAD_AFTER);
         i.send(b"lost", now).unwrap();
         let mut t = now;
-        while t < now + MIN_DEAD * 3 {
+        while t < now + Duration::from_secs(19) {
             t += Duration::from_millis(100);
             assert!(i.poll(t).is_ok(), "{:?}", t - now);
         }
-        // A fast link (1 ms): the floor, 5 s, nothing heard meanwhile and
-        // eight sends unanswered (resent at most 1.25 s apart).
+        // A fast link (1 ms): no longer given up early; the floor is the
+        // full 30 s (resends at most 7.5 s apart).
         let (mut i, mut r, now) = open_pair(false);
         let mut t = now;
         for _ in 0..8 {
@@ -855,9 +858,11 @@ mod tests {
             if i.poll(t).is_err() {
                 break t - start;
             }
-            assert!(t - start < DEAD_AFTER, "not given up");
+            assert!(t - start <= DEAD_AFTER + Duration::from_secs(1), "not given up");
         };
-        assert!(dead >= MIN_DEAD && dead < Duration::from_secs(10), "{dead:?}");
+        // Not before the floor's own silence check: the channel's silence
+        // timeout (TIMEOUT, 20 s, from before item 11) ends it first.
+        assert!(dead >= TIMEOUT, "died after {dead:?}");
         // A satellite (800 ms): ten resend timeouts, past the floor.
         let (mut i, mut r, now) = open_pair(false);
         let mut t = now;
@@ -872,7 +877,7 @@ mod tests {
         }
         let allowed = i.dead_after();
         assert_eq!(allowed, (i.rto() * DEAD_RTOS).clamp(MIN_DEAD, DEAD_AFTER));
-        assert!(allowed > MIN_DEAD * 2, "{allowed:?}");
+        assert_eq!(allowed, DEAD_AFTER);
     }
 
     #[test]

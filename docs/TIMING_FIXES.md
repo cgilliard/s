@@ -514,6 +514,12 @@ understood is ignored.
     sends (one in six hundred thousand at that loss). tabminer's
     `channel.rs` and the fam wallet's `owlink` alike. Test:
     `a_dead_channel_is_noticed_from_its_round_trip`.
+    **The floor back to 30 s (2026-11-13):** 5 s took a busy end for a
+    dead one: eight nodes in one process on a loaded Windows runner
+    (`relays_learn_nothing_of_the_sender`) closed channels whose other
+    end went on sending, and a fam node holds its loop ~5 s checking a
+    header's proof of work. A dead channel is noticed at 30 s again,
+    as before; the checks every poll and the capped resends stay.
 12. A circuit's from its own round trip (SESSION to SESSION_STATE), a
     re-ask at a third of the window, any cell as activity; rebuild
     backoff per point. **Done (2026-11-13), tabminer:** each standing
@@ -527,6 +533,9 @@ understood is ignored.
     row at its point to 60 s, back to 3 s once its session is live. The
     fam wallet's standing sessions (`owstick`: 3 s until live, 15 minutes
     after, 30 s unanswered) are not changed yet.
+    **The floor back to 30 s (2026-11-13),** as item 11's: a dead
+    circuit is given up at 30 s again; the re-asks while unanswered,
+    anything down it counting, and the rebuild backoff stay.
 13. A peer not live after two missed pongs; tabminer's chunk retries up
     to 5 s with backoff; the node's per peer. **Done (2026-11-13):** a
     peer silent 65 s (two pings unanswered, `LIVE_SILENCE`) is not live

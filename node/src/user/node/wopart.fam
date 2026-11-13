@@ -657,9 +657,9 @@ then
 owlc @ 4 lit owcf @ 2 lit = if
 	\ the window a frame may go unanswered (as tabminer's channel.rs):
 	\ 30 s until the round trip is measured, then ten resend waits,
-	\ 5 s to 30 s; under 30 s only with nothing heard meanwhile and eight
+	\ 30 s at least (5 s took a busy end for dead); under 30 s only with nothing heard meanwhile and eight
 	\ sends, each at most a quarter of the window apart
-	owlc @ 70 lit owcf @ if owlc @ owrto A lit * 1388 lit max 7530 lit umin else 7530 lit then owda !
+	owlc @ 70 lit owcf @ if owlc @ owrto A lit * 7530 lit max 7530 lit umin else 7530 lit then owda !
 	OWIF 0 lit do
 		owlc @ i owslot  dup @ if
 			mnms over 4 lit + @ -  dup 7530 lit u< 0=  swap owda @ u< 0=

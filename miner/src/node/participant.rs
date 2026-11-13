@@ -91,11 +91,12 @@ const HOPS: usize = 2;
 /// once the circuit's own window has passed ([`DEAD_RTTS`] of its measured
 /// round trip, [`MIN_DEAD`] at least) with [`DEAD_ASKS`] asks unanswered,
 /// re-asked meanwhile a quarter of the window apart: one lost cell does
-/// not end a live circuit, and a dead one on a fast path is noticed in
-/// seconds (`docs/TIMING_FIXES.md`).
+/// not end a live circuit (`docs/TIMING_FIXES.md`).
 const DEAD_AFTER: Duration = Duration::from_secs(30);
 const DEAD_RTTS: u32 = 20;
-const MIN_DEAD: Duration = Duration::from_secs(5);
+/// The floor, as before TIMING_FIXES 12: 5 s took a busy relay for a
+/// dead one (see channel.rs's).
+const MIN_DEAD: Duration = DEAD_AFTER;
 const DEAD_ASKS: u32 = 3;
 /// A standing circuit's rebuild waits double after each failure in a row
 /// at its point, from [`REBUILD_WAIT`] to this.
