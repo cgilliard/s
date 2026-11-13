@@ -259,8 +259,6 @@ abegin "{" a"
 "protocol" akey 1 lit anum acom
 "activity" akey aqt  pact @ 1 lit = if "fetching" else pact @ 2 lit = if "connecting" else "idle" then then a" aqt acom
 "activity_height" akey pacth @ anum acom
-\ the loop's longest stall since the start (p2p.fam's pmark), in ms
-"stall_ms" akey plg @ 2710 lit / anum acom "stall_height" akey plgh @ anum acom "stall_activity" akey plga @ anum acom
 "reveal" akey nmin @ anum "}" a"
 "200 OK" asend ;
 
@@ -802,7 +800,7 @@ then
 abod @ ?dup if free 0 lit abod ! then ;
 
 \ aaccept  a connection to the API, if one waits (pxrdy), answered.
-: aaccept  pmark  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
+: aaccept  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
 
 : ainit  ( port -- )
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !

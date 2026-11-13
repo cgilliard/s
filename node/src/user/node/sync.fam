@@ -238,21 +238,17 @@ sninit  cvp @ cvinit ;
 \ cwput ( kind -- )  a job to the worker (its memory set first).
 : cwput  cwm @ !  cwjw @ cwm @ 4 lit write drop ;
 \ cwait ( -- code )  the worker's verdict, the network and the API served
-\ meanwhile: blocks' chunks and snapshots too (not pnest, as vwait sets
-\ it: the worker writes in a transaction of its own, so a block is read
-\ here from the store's last commit, as the API reads; stx kept, as for
-\ the API).  Before 2026-11-13 a peer syncing from this node got
-\ nothing while it connected a block: most of the time in a catch-up.
+\ meanwhile (as vwait: not blocks' chunks or snapshots, pnest).
 : cwait
-cwvr @ pyfd !  0 lit pyrdy !
+cwvr @ pyfd !  0 lit pyrdy !  1 lit pnest !
 begin pyrdy @ 0= while
-	stx @ vsav !  -1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  vsav @ stx !
+	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
 	\ the peers kept (pings: a long job must not leave them unanswered,
 	\ docs/TIMING_FIXES.md) and the API's long polls answered meanwhile
 	pkeep
 	stx @ vsav !  pxrdy @ if aaccept then  awake  vsav @ stx !
 repeat
-0 lit pyfd !  0 lit pyrdy !
+0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
 cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;
 \ cwstart  the worker started (cwon), its heap the verifier's buffers
 \ and 1 MiB.  Before taking any job it says whether every buffer was had
@@ -884,11 +880,6 @@ begin pdeq ?dup while
 	then
 repeat ;
 
-\ nslow ( name -- )  a step of nstep that took a second or more since
-\ nst0, told by name (docs/NODE_ENHANCEMENTS.md, item 4: which step
-\ holds the loop, beside pmark's how long).
-: nst0 variable ;
-: nslow  ticks nst0 @ -  dup 989680 lit u< 0= vrb @ and if nhead swap puts " took " puts 2710 lit / u. " ms" puts 0A lit putc else 2drop then ;
 \ nstep  a turn of following, up to a second: the peers kept (pkeep);
 \ the answering peer furthest ahead of us, by its last Pong or
 \ announcement (Inv), made the current and caught up to (so a block
@@ -942,7 +933,6 @@ nnx @ nnow @ -  dup 1 lit u< if drop 1 lit then  3B9ACA00 lit * ;
 : nstep
 -1 lit pxw !  nnext pwait drop  0 lit pxw !
 pkeep
-ticks nst0 !
 nahead dup 0< if drop else
 	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop
 	ncatch
@@ -954,11 +944,7 @@ nahead dup 0< if drop else
 		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
 	then
 then
-"following the peers" nslow
-ticks nst0 !  nrelay  "relaying transactions" nslow
-ticks nst0 !  nrean  "announcing the pool again" nslow
-ticks nst0 !  qpersist  "saving the pool" nslow
-ticks nst0 !  cxrun  "the consensus file's votes" nslow ;
+nrelay  nrean  qpersist  cxrun ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;

@@ -196,26 +196,12 @@ then ;
 \ pxrdy set, or
 \ the one in pyfd (if any: the verifier's verdicts, sync.fam's vwait),
 \ pyrdy set.
-\ The loop's longest stall (docs/NODE_ENHANCEMENTS.md, item 4): the time
-\ the API could not be answered, from the last point it could (aaccept,
-\ or a wait watching its listener: prdy with pxw) to the next.  Its
-\ longest (plg, ticks), the height and activity then (plgh, plga), for
-\ /v1/status; each over a second told, so a sync's log lists where the
-\ loop held.  plt: the gap's start (0: none yet).
-: plt variable ;  : plg variable ;  : plgh variable ;  : plga variable ;
-: pmark
-plt @ if
-	ticks plt @ -
-	dup 989680 lit u< 0= vrb @ and if nhead "the loop held " puts dup 2710 lit / u. " ms (height " puts myh @ u. ", activity " puts pact @ u. ")" puts 0A lit putc then
-	dup plg @ u> if plg !  myh @ plgh !  pact @ plga ! else drop then
-then
-ticks plt ! ;
 \ pent1 ( fd -- k )  an entry for fd: its index.
 : pent1  pnk @ 3 lit lshift pent @ +  tuck !  1 lit swap 4 lit + !  pnk @ dup 1 lit + pnk ! ;
 : prdy
 0 lit pnk !  pfd @ pent1 drop  0 lit pxi !  0 lit pyi !
-pxfd @ pxw @ and if pxfd @ pent1 pxi !  pmark then  pyfd @ if pyfd @ pent1 pyi ! then
-pent @ pnk @ rot poll  pxfd @ pxw @ and if ticks plt ! then  0 lit > if
+pxfd @ pxw @ and if pxfd @ pent1 pxi ! then  pyfd @ if pyfd @ pent1 pyi ! then
+pent @ pnk @ rot poll 0 lit > if
 	pxi @ if pxi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pxrdy ! then
 	pyi @ if pyi @ 3 lit lshift pent @ + 4 lit + @ 10 lit rshift 0= 0= pyrdy ! then
 	pent @ 4 lit + @ 10 lit rshift 0= 0=
