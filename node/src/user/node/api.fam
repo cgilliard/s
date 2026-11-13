@@ -79,6 +79,23 @@ then ;
 : h,  ahp @ c!  ahp @ 1 lit + ahp ! ;
 : h"  begin dup c@ ?dup while h, 1 lit + repeat drop ;
 : hcrlf  D lit h, A lit h, ;
+\ adl: the deadline (ticks) of what the connection is doing now: its
+\ header (5 s), its body (10 s), the response (10 s), so one client,
+\ slow or gone, holds the node that long at most (docs/TIMING_FIXES.md).
+: adl variable ;
+\ awr ( a n -- )  bytes to the connection as it takes them: 512 at a time
+\ once it has room (poll's 4: a TCP write waits until all of it is
+\ queued), given up at adl.
+: awa variable ;  : awn variable ;
+: awr
+awn ! awa !
+begin awn @ 0 lit >  ticks adl @ - 0< and while
+	acfd @ aent @ !  4 lit aent @ 4 lit + !
+	aent @ 1 lit 3B9ACA00 lit poll 0 lit > if
+		acfd @ awa @ awn @ 200 lit umin write
+		dup 0 lit > if dup awa @ + awa !  awn @ swap - awn ! else drop 0 lit awn ! then
+	then
+repeat ;
 \ asend ( status -- )  the response, its status line ("200 OK"), headers
 \ and the body built at ao; the connection closed.
 : asend
@@ -86,8 +103,9 @@ aop @ ao @ - ablen !
 arq @ ahp !  "HTTP/1.0 " h"  h"  hcrlf
 aoct @ if "Content-Type: application/octet-stream" else "Content-Type: application/json" then h"  hcrlf
 "Content-Length: " h"  ahp @ ablen @ snum ahp !  hcrlf hcrlf
-acfd @ arq @ ahp @ arq @ - write drop
-ablen @ if acfd @ ao @ ablen @ write drop then
+ticks 5F5E100 lit + adl !
+arq @ ahp @ arq @ - awr
+ablen @ if ao @ ablen @ awr then
 acfd @ close drop  0 lit acfd ! ;
 \ afail ( message status -- )  {"error": message}.
 : afail  swap abegin "{" a" "error" akey aqt a" aqt "}" a" asend ;
@@ -108,11 +126,12 @@ acfd @ close drop  0 lit acfd ! ;
 		then
 	loop
 then ;
-\ areq ( -- ok )  the header read (8 KiB at most, 2 s a read at most).
+\ areq ( -- ok )  the header read (8 KiB at most, 2 s a read at most, 5 s
+\ in all: a byte every 1.9 s no longer holds the node for hours).
 : areq
-0 lit arn !
+0 lit arn !  ticks 2FAF080 lit + adl !
 begin
-	ardy if acfd @ arq @ arn @ + 1FFF lit arn @ - read else 0 lit then
+	ardy ticks adl @ - 0< and if acfd @ arq @ arn @ + 1FFF lit arn @ - read else 0 lit then
 	dup 0 lit > if arn @ + arn !  ahend arn @ 1FFF lit = or else drop -1 lit then
 until
 arn @ 0 lit > if ahend else 0 lit then ;
@@ -170,7 +189,8 @@ apost !
 			aclen @ malloc abod !
 			arn @ ahe @ - aclen @ 2dup u> if swap then drop
 			dup abn !  arq @ ahe @ + abod @ rot bcopy
-			begin abn @ aclen @ u< if ardy else 0 lit then while
+			ticks 5F5E100 lit + adl !
+			begin abn @ aclen @ u< if ardy ticks adl @ - 0< and else 0 lit then while
 				acfd @ abod @ abn @ + aclen @ abn @ - read
 				dup 0 lit > if abn @ + abn ! else drop aclen @ 1 lit + abn ! then
 			repeat

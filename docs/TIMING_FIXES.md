@@ -453,7 +453,11 @@ understood is ignored.
    the circuit goes (`rendezvous_link_gone`); a delegation newer than the
    one held but within `DELEGATION_EVERY` held back and applied after
    (`delegation_pending`), as certificates were.
-7. The API: a deadline per request and non-blocking writes.
+7. The API: a deadline per request and non-blocking writes. **Done
+   (2026-11-13):** the header read within 5 s in all, the body within
+   10 s, the response written 512 bytes at a time once the socket has
+   room (a TCP write waits until all of it is queued) and given up 10 s
+   after it began (`adl`, `awr`).
 
 **Phase 2: tell instead of wait** (section 3)
 8. Goodbye on shutdown (DESTROY, CLOSE, going away), both.
