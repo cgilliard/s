@@ -285,6 +285,8 @@ function wcopy(f,t){wbtn(f,'Copy',function(){t.select();if(navigator.clipboard)n
 var WHOW=[['paste','Copy and paste'],['file','A file in your home']];
 function wmodes(f,draw){var md=wsel(f,'How',WHOW),c=null;var go=function(){if(c)c.remove();c=el('div','',f);draw(c,md.value)};md.onchange=go;go();return md}
 function wwait(s){return s<3600?Math.round(s/60)+' min':(s<86400?Math.round(s/3600)+' h':Math.round(s/86400)+' days')}
+/* lvput: a panel drawn afresh, whichever came first, its answer or a block event (each once drew onto the other: the content twice) */
+function lvput(lv,m){var c=lv.el;while(c.firstChild)c.removeChild(c.firstChild);lv.draw(m)}
 function wshow(w,t){
 w.tab=t;w.tabs.forEach(function(b){if(b.tab==t)b.classList.add('on');else b.classList.remove('on')});
 if(w.b)w.b.remove();
@@ -300,7 +302,7 @@ if(t=='overview'){var lv=w.lv={tab:t,el:p,draw:function(m){
 wh(p,'Balance');wrow(p,'Confirmed',m.confirmed);wrow(p,'Pending',m.pending);wrow(p,'Unverified',m.unverified);wrow(p,'Reserved',m.reserved);wrow(p,'Locked',m.locked);
 wh(p,'Node');wrow(p,'Tip',m.height);wrow(p,'State',m.node);
 wrow(p,'Online',m.reach?'reachable: sessions at '+m.reach+' of '+m.points+' rendezvous points':'not reachable yet'+(m.points?' (0 of '+m.points+' rendezvous points)':''));
-}};wask(w,'overview',{},function(m){if(wbad(p,m))return;lv.draw(m)})}
+}};wask(w,'overview',{},function(m){if(wbad(p,m))return;lvput(lv,m)})}
 else if(t=='receive'){
 var a=el('div','',p);
 wask(w,'receive',{},function(m){if(wbad(a,m))return;wh(a,'This wallet');wrow(a,'Address',m.address);if(m.name)wrow(a,'Name',m.name)});
@@ -355,7 +357,7 @@ wask(w,'proof',{tx:x.tx},function(m){if(wbad(pf,m))return;var t=warea(pf,'The pr
 });
 }
 });
-}};wask(w,'activity',{},function(m){if(wbad(p,m))return;lv.draw(m)})}
+}};wask(w,'activity',{},function(m){if(wbad(p,m))return;lvput(lv,m)})}
 else if(t=='proofs'){
 var f=el('div','wf',p);wh(f,'Check a proof');
 var pt=warea(f,'The proof (paste it here)'),po=el('div','',f);
@@ -378,7 +380,7 @@ if(x.state=='offered')wbtn(r,'Show the offer',function(){wask(w,'name-offer',{na
 if(x.state=='owned'){var uv=wfield(r,'New value','text');wbtn(r,'Update',function(){wask(w,'name-update',{name:x.name,value:uv.value,speed:'hour'},function(m){ro.textContent=m.ok?'Updated: '+m.tx+' (fee '+m.fee+')':'Error: '+m.error})})}
 });
 }};
-wask(w,'names',{},function(m){if(wbad(a,m))return;lv.draw(m)});
+wask(w,'names',{},function(m){if(wbad(a,m))return;lvput(lv,m)});
 var f=el('div','wf',p);wh(f,'Register a name');
 var nn=wfield(f,'Name','text'),nv=wfield(f,'Value (a tab1 address or 64 hex digits; optional)','text'),ns=wfield(f,'Speed','select'),no=el('div','wv',f);
 wspeeds(w,ns);
@@ -408,7 +410,7 @@ if(m.op=='unlock'&&m.id==null){w.unl=!!m.ok;w.none=m.wallet===false;w.lockmsg=m.
 overview, activity and names redrawn from it, no request; the node's
 reachability when it changes */
 if(m.event=='block'){w.st.textContent='Synced to height '+m.height;var lv=w.lv;
-if(w.unl&&lv&&lv.tab==w.tab&&m[lv.tab]){var c=lv.el;while(c.firstChild)c.removeChild(c.firstChild);lv.draw(m[lv.tab])}return}
+if(w.unl&&lv&&lv.tab==w.tab&&m[lv.tab])lvput(lv,m[lv.tab]);return}
 if(m.event=='payment'&&m.step){w.st.textContent='Slate '+m.slate.slice(0,16)+': '+({sent:'sent; waiting for the recipient',delivered:'at a point of the recipient; waiting for the answer',unanswered:'not answered yet; its coins stay reserved until it is, or you cancel it',undelivered:'not delivered; cancelled, its coins free again',finalized:'answered and sent to the network',answered:'a payment to you answered; it is paid once the payer sends it'}[m.step]||m.step);if(w.unl&&w.tab=='activity')wshow(w,'activity');return}
 if(m.event=='payment'){w.st.textContent='Payment '+m.tx.slice(0,16)+': '+(m.state=='replaced'?'replaced by '+m.by.slice(0,16):m.state=='mined'?'in block '+m.height:m.state=='evicted'?'dropped from the pool (a better fee took its place): bump it':m.state=='conflicted'?'dropped: its coins were spent otherwise':m.state);if(w.unl&&w.tab=='activity')wshow(w,'activity');return}
 if(m.event=='name'){w.st.textContent='Name '+m.name+': '+({ready:'its commit old enough: reveal it now',revealed:'revealed',owned:'registered, yours',offered:'offered',transferred:'transferred'}[m.state]||m.state);return}
