@@ -48,9 +48,9 @@ const HELLOS_PER_SEC: f64 = 1.0;
 /// A channel a relay answered that carries no frame by then is closed: its
 /// initiator gave up, or never meant to use it.
 #[cfg(not(test))]
-const UNUSED_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const UNUSED_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
-const UNUSED_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const UNUSED_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A channel that carries no circuit and has moved nothing but keepalives
 /// for this long is closed (`docs/SCALING.md`): channels between relays
@@ -62,6 +62,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STAGE_HELLO: u8 = 1;
 const STAGE_REPLY: u8 = 2;
 const STAGE_AUTH: u8 = 3;
+/// `ChannelGone` replies a second, at most.
+const GONE_PER_SEC: f64 = 64.0;
 
 /// An open channel and what its handshake left to do.
 struct Open {
@@ -110,6 +112,9 @@ pub(super) struct Channels {
     idle_check: Option<Instant>,
     /// Handshakes each host may still open, and when last refilled.
     hellos: HashMap<std::net::IpAddr, (f64, Instant)>,
+    /// `ChannelGone` replies we may still send, and when last refilled
+    /// ([`GONE_PER_SEC`]): no flood of them at a forged source address.
+    gone: (f64, Option<Instant>),
     /// Tests: what the channels delivered, with the other end's address
     /// and proven id.
     #[cfg(test)]
@@ -127,6 +132,14 @@ impl Channels {
 
     pub(super) fn count(&self) -> usize {
         self.open.len()
+    }
+
+    /// Tests: every channel dropped without telling the other ends.
+    #[cfg(test)]
+    pub(super) fn forget(&mut self) {
+        self.open.clear();
+        self.pending.clear();
+        self.to.clear();
     }
 
     /// The proven id of the other end of channel `key`: `Some(None)` for a
@@ -350,9 +363,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             return;
         }
         // A hello for a channel answered already: the same reply again.
+        // Its initiator is still there, so the unused timer starts over.
         if stage == STAGE_HELLO
-            && let Some(o) = self.channels.open.get(&(addr, chan))
+            && let Some(o) = self.channels.open.get_mut(&(addr, chan))
         {
+            o.opened = now;
             if let Some(reply) = o.reply.clone() {
                 for m in fragments(chan, STAGE_REPLY, &reply, self.token_for(&addr)) {
                     self.send_with(addr, m, back);
@@ -481,7 +496,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn on_auth(&mut self, addr: SocketAddr, chan: u64, auth: &[u8]) {
         let Some(o) = self.channels.open.get_mut(&(addr, chan)) else { return };
         match o.ch.authenticate(auth) {
-            Ok(id) => self.log(&format!("channel: {chan:016x} from relay {} at {addr} open", crate::onion::short(&id))),
+            Ok(id) => {
+                // Proven: from here the idle timer decides, not the unused one.
+                o.used = true;
+                self.log(&format!("channel: {chan:016x} from relay {} at {addr} open", crate::onion::short(&id)))
+            }
             Err(e) => self.chatter(&format!("channel: a bad auth from {addr}: {e}")),
         }
     }
@@ -489,10 +508,19 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A frame for one of our channels.
     pub(super) fn on_frame(&mut self, addr: SocketAddr, f: Frame, now: Instant) {
         let key = (addr, f.chan);
-        let Some(o) = self.channels.open.get_mut(&key) else { return };
+        let Some(o) = self.channels.open.get_mut(&key) else {
+            return self.channel_unknown(addr, f.chan, now);
+        };
         let got = match o.ch.receive(&f, now) {
             Ok(got) => got,
-            Err(e) => return self.chatter(&format!("channel: {:016x} from {addr}: {e}", f.chan)),
+            Err(e) => {
+                // A frame under this channel's keys before its auth: the
+                // initiator is there and its auth on the way.
+                if e == ChannelError::NotAuthenticated {
+                    o.opened = now;
+                }
+                return self.chatter(&format!("channel: {:016x} from {addr}: {e}", f.chan));
+            }
         };
         // The relay acknowledges only once it has our auth.
         o.auth = None;
@@ -502,6 +530,33 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for body in got.delivered {
             self.on_channel_body(key, peer, body, now);
         }
+    }
+
+    /// A frame for a channel we do not have: the sender told
+    /// (`ChannelGone`), within [`GONE_PER_SEC`], so it closes its side now
+    /// rather than after its own timeout.
+    pub(super) fn channel_unknown(&mut self, addr: SocketAddr, chan: u64, now: Instant) {
+        let (tokens, at) = &mut self.channels.gone;
+        let since = at.map_or(Duration::from_secs(1), |t| now.duration_since(t));
+        *tokens = (*tokens + since.as_secs_f64() * GONE_PER_SEC).min(GONE_PER_SEC);
+        *at = Some(now);
+        if *tokens < 1.0 {
+            return;
+        }
+        *tokens -= 1.0;
+        self.chatter(&format!("channel: {chan:016x} from {addr}: not ours; telling it"));
+        self.send(addr, &Message::ChannelGone { chan });
+    }
+
+    /// The other end says it no longer has channel `chan`: closed at once,
+    /// without holding it against the relay (it is there, and said so).
+    pub(super) fn on_channel_gone(&mut self, addr: SocketAddr, chan: u64, now: Instant) {
+        let key = (addr, chan);
+        let Some(o) = self.channels.open.remove(&key) else { return };
+        self.channels.to.retain(|_, k| *k != key);
+        let who = o.ch.peer.map_or("a participant".to_string(), |id| crate::onion::short(&id));
+        self.log(&format!("channel: {chan:016x} with {who} at {addr} closed: {}", ChannelError::Gone));
+        self.channel_closed(key, now);
     }
 
     /// A body a channel delivered, in order: a cell of a circuit.

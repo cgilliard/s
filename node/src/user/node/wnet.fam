@@ -345,8 +345,9 @@ mnrn @ 5 lit u< 0=  mnrb @ @ 31424154 lit = and if
 		dup 11 lit =  mnrn @ 35 lit = and if mnstate then
 		dup 13 lit =  mnrn @ 39 lit = and if mnoff then
 		dup 14 lit =  mnrn @ 26 lit = and if mnnote then
-		\ onion mode's (a Handshake, a Frame): left for wopart.fam (owin)
-		dup 15 lit = over 16 lit = or if -1 lit mnext ! then
+		\ onion mode's (a Handshake, a Frame, a ChannelGone): left for
+		\ wopart.fam (owin)
+		dup 15 lit = over 16 lit = or  over 17 lit = or if -1 lit mnext ! then
 		drop
 	then
 then ;

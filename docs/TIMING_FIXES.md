@@ -400,7 +400,13 @@ understood is ignored.
 1. tabminer channels: the unused timer from the last activity (the auth,
    a hello again, a frame refused before the auth); the unknown-channel
    notice; no `AVOID` on such a close. Test: the auth held back past
-   the window. (The lossy flake.)
+   the window. (The lossy flake.) **Done (2026-11-13):** `ChannelGone`
+   (message type 23), answered within 64 a second to a frame on a
+   channel not held, the sender closing at once without avoiding the
+   relay; the fam wallet's links too (`owgone`); tests
+   `a_channel_waits_for_an_auth_held_back` and
+   `a_channel_the_other_end_lost_is_closed_at_once`, with a drop filter
+   by message kind (`Node::drop_out`, section 7's first step).
 2. The fam node: others' datagrams no longer count as timeouts (`pwait`
    says whose; `pfetch`, `phdrs`, `pping`, `cxask` wait to a deadline);
    Karn's rule in `pfetch`; RTT per peer.

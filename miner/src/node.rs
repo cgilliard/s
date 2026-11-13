@@ -401,6 +401,9 @@ pub enum Event {
     /// for the whole timeout.
     #[cfg(test)]
     TestExpireIdle,
+    /// Tests: every channel forgotten without a word, as a restart would.
+    #[cfg(test)]
+    TestForgetChannels,
     /// Tests: keepalives and circuit replacement sooner, and how long a
     /// send keeps asking after an "offline".
     #[cfg(test)]
@@ -688,6 +691,10 @@ pub struct Node<V: ProofVerifier> {
     reorder: std::cell::Cell<(u64, u64)>,
     #[cfg(test)]
     held: std::cell::RefCell<Option<(SocketAddr, Vec<u8>)>>,
+    /// Tests: outgoing messages this says to drop are not sent (a fault
+    /// injected by kind, rather than at random).
+    #[cfg(test)]
+    drop_out: std::cell::RefCell<Option<DropFilter>>,
     last_channel_poll: Instant,
 }
 
@@ -742,6 +749,10 @@ fn enlarge_buffers(socket: &UdpSocket) {
 /// Re-requests the window of downloads that stalled; returns the requests
 /// to send and the downloads to give up: no progress after
 /// [`net::MAX_RETRIES`] retries, or, for a block, crawling.
+/// Tests: which outgoing messages to drop.
+#[cfg(test)]
+pub(crate) type DropFilter = Box<dyn FnMut(&Message) -> bool + Send>;
+
 /// A message's name, for the log.
 fn message_name(m: &Message) -> &'static str {
     match m {
@@ -756,7 +767,7 @@ fn message_name(m: &Message) -> &'static str {
         Message::GetChunks { .. } => "GetChunks",
         Message::Chunk { .. } => "Chunk",
         Message::GetAux { .. } | Message::Aux { .. } => "Aux",
-        Message::Frame(_) | Message::Handshake { .. } => "a channel's frame",
+        Message::Frame(_) | Message::Handshake { .. } | Message::ChannelGone { .. } => "a channel's frame",
         _ => "a message-layer message",
     }
 }
@@ -1068,6 +1079,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             reorder: std::cell::Cell::new((0, 0x2545_f491_4f6c_dd1d)),
             #[cfg(test)]
             held: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            drop_out: std::cell::RefCell::new(None),
             last_channel_poll: now,
         };
         if node.config.sync_point.is_some() && node.chain.tip().ok().flatten().is_some_and(|t| t.height == 0) {
@@ -1148,6 +1161,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 Ok(Event::TestQuiet) => self.quiet = true,
                 #[cfg(test)]
                 Ok(Event::TestExpireIdle) => self.channels.expire_idle = true,
+                #[cfg(test)]
+                Ok(Event::TestForgetChannels) => self.channels.forget(),
                 #[cfg(test)]
                 Ok(Event::TestServes(owners)) => self.part.test_owners = Some(owners),
                 #[cfg(test)]
@@ -1298,6 +1313,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         chance(&self.loss)
     }
 
+    /// Tests: whether `drop_out` drops this message.
+    #[cfg(test)]
+    fn dropped(&self, msg: &Message) -> bool {
+        self.drop_out.borrow_mut().as_mut().is_some_and(|f| f(msg))
+    }
+
     /// Sends a datagram as encoded. Tests: one in `reorder` is held back
     /// and goes after the next.
     fn send_bytes(&self, addr: SocketAddr, bytes: &[u8]) {
@@ -1361,7 +1382,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// Sends a message, giving a request the token its receiver gave us.
     fn send(&self, addr: SocketAddr, msg: &Message) {
         #[cfg(test)]
-        if self.lost() {
+        if self.lost() || self.dropped(msg) {
             return;
         }
         let bytes = match msg.token() {
@@ -1376,7 +1397,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// carried.
     fn send_with(&self, addr: SocketAddr, msg: Message, token: u64) {
         #[cfg(test)]
-        if self.lost() {
+        if self.lost() || self.dropped(&msg) {
             return;
         }
         self.send_bytes(addr, &msg.with_token(token).encode());
@@ -1978,6 +1999,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Message::Chunk { kind: Kind::Object, id, .. } => self.rv.downloads.get(id).is_some_and(|d| d.from == addr),
             // Frames are sealed: one that is not ours does not open.
             Message::Frame(f) => self.channels.knows(&addr, f.chan),
+            // Only about a channel we have with that address.
+            Message::ChannelGone { chan } => self.channels.knows(&addr, *chan),
             _ => false,
         };
         if !matches!(msg, Message::Ping(_) | Message::Pong(_))
@@ -1992,6 +2015,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     None => "not in our peer table (it has not pinged us)".to_string(),
                 },
             };
+            // A frame for a channel we do not have (we closed it, or
+            // restarted): the other end is told, not left to time out.
+            if let Message::Frame(f) = &msg {
+                return self.channel_unknown(addr, f.chan, now);
+            }
             let text = format!("{addr} sent {}, not heard: {state}", message_name(&msg));
             self.log_every(addr, "unheard", &text, now);
             return;
@@ -2260,6 +2288,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 }
             }
             Message::Frame(f) => self.on_frame(addr, f, now),
+            Message::ChannelGone { chan } => self.on_channel_gone(addr, chan, now),
         }
     }
 
@@ -5333,6 +5362,102 @@ mod tests {
     /// relay and stays anonymous; a relay opens one to a relay and proves
     /// its id; bodies arrive in order. A wrong id, or a node that does not
     /// relay, gets no channel.
+    /// A relay's auth held back past the unused window (3 s in tests),
+    /// its frames refused meanwhile for want of it: the channel is kept,
+    /// each refused frame and hello again showing the initiator is there,
+    /// and opens once the auth comes; before, it was closed at 3 s without
+    /// a word and the bodies lost. No timing race: the auth is dropped by
+    /// kind until a set time, and what is asserted is that the bodies come.
+    #[test]
+    fn a_channel_waits_for_an_auth_held_back() {
+        let (a, b) = (open("held-auth-a"), open("held-auth-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        // Past the window (the channel closed there before), short of the
+        // frames' resends spacing out past it (1, 2, 4 s).
+        let release = Instant::now() + super::channels::UNUSED_TIMEOUT + Duration::from_secs(1);
+        let start = |f: &Fixture, tag: u8, hold: bool| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = true;
+            cfg.identity = Some(key(tag));
+            cfg.relay_key = cfg.identity.clone();
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            if hold {
+                *node.drop_out.borrow_mut() = Some(Box::new(move |m: &Message| {
+                    matches!(m, Message::Handshake { stage: 3, .. }) && Instant::now() < release
+                }));
+            }
+            let addr = node.local_addr().unwrap();
+            let sink = Arc::clone(&node.channels.sink);
+            (addr, tx, sink, std::thread::spawn(move || node.run()))
+        };
+        let (addr_a, tx_a, sink_a, h_a) = start(&a, 1, false);
+        let (_, tx_b, _, h_b) = start(&b, 2, true);
+        for k in 0..5 {
+            tx_b.send(Event::TestChannel(addr_a, id(1), format!("held {k}").into_bytes())).unwrap();
+        }
+        let deadline = Instant::now() + guard(30);
+        while sink_a.lock().unwrap().len() < 5 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let got: Vec<(Option<Digest>, Vec<u8>)> = sink_a.lock().unwrap().iter().map(|(_, p, b)| (*p, b.clone())).collect();
+        let want: Vec<(Option<Digest>, Vec<u8>)> = (0..5).map(|k| (Some(id(2)), format!("held {k}").into_bytes())).collect();
+        assert_eq!(got, want);
+        for tx in [tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+    }
+
+    /// A relay that lost a channel (a restart) tells the other end at its
+    /// next frame, which closes at once rather than after its own timeout
+    /// (20 s in tests); a new channel then carries on.
+    #[test]
+    fn a_channel_the_other_end_lost_is_closed_at_once() {
+        let (a, b) = (open("gone-a"), open("gone-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let start = |f: &Fixture, tag: u8| {
+            let mut cfg = config(vec![], &f.dir);
+            cfg.relay = true;
+            cfg.identity = Some(key(tag));
+            cfg.relay_key = cfg.identity.clone();
+            let (node, tx) = Node::bind(Arc::clone(&f.chain), pool(), cfg).unwrap();
+            let addr = node.local_addr().unwrap();
+            let sink = Arc::clone(&node.channels.sink);
+            let stats = node.stats();
+            (addr, tx, sink, stats, std::thread::spawn(move || node.run()))
+        };
+        let (addr_a, tx_a, sink_a, _, h_a) = start(&a, 1);
+        let (_, tx_b, _, stats_b, h_b) = start(&b, 2);
+        let wait_for = |what: &str, secs: u64, ok: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + guard(secs);
+            while !ok() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"first".to_vec())).unwrap();
+        wait_for("the first body", 10, &|| sink_a.lock().unwrap().len() == 1);
+        wait_for("b's channel counted", 5, &|| stats_b.lock().unwrap().channels == 1);
+        tx_a.send(Event::TestForgetChannels).unwrap();
+        // b's next frame (its keepalive, 5 s in tests, or a body) is
+        // answered ChannelGone; b closes within the round trip, far short
+        // of its 20 s.
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"lost".to_vec())).unwrap();
+        wait_for("b closing the lost channel", 5, &|| stats_b.lock().unwrap().channels == 0);
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"again".to_vec())).unwrap();
+        wait_for("a body over a new channel", 10, &|| {
+            sink_a.lock().unwrap().iter().any(|(_, _, b)| b == b"again")
+        });
+        for tx in [tx_a, tx_b] {
+            tx.send(Event::Stop).unwrap();
+        }
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+    }
+
     #[test]
     fn channels_open_between_nodes() {
         let (a, b, c, d) = (open("ch-relay-a"), open("ch-relay-b"), open("ch-participant"), open("ch-plain"));

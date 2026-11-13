@@ -383,8 +383,20 @@ owfc @ 0< 0= if
 		then
 	then
 then ;
-\ owin  a datagram wnet passed on: a Handshake or a Frame.
-: owin  4 lit mnrx c@ dup 15 lit = if owhsin then 16 lit = if owfrin then ;
+\ owgone  ChannelGone (type 23, from record mnk): the relay no longer has
+\ that channel (it closed it, or restarted): the link and its circuits
+\ given up at once, not after 30 s of frames unanswered.
+: owgone
+mnrn @ D lit = if
+	OWCH 0 lit do
+		i 4 lit owcf @  i owc @ owrec mnk @ = and  i 8 lit owcf 5 lit mnrx 8 lit oxsame and if
+			0 lit i 4 lit owcf !
+			OWCC 0 lit do i 4 lit owcif @ j =  i owci @ 0= 0= and if 3 lit i owci ! then loop
+		then
+	loop
+then ;
+\ owin  a datagram wnet passed on: a Handshake, a Frame or a ChannelGone.
+: owin  4 lit mnrx c@ dup 15 lit = if owhsin then dup 16 lit = if owfrin then 17 lit = if owgone then ;
 
 \ ── The participant (participant.rs) ──
 \ owrand ( n -- r )  a random number below n.

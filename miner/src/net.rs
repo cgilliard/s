@@ -134,6 +134,7 @@ const T_OFFER: u8 = 19;
 const T_NOTICE: u8 = 20;
 const T_HANDSHAKE: u8 = 21;
 const T_FRAME: u8 = 22;
+const T_CHANNEL_GONE: u8 = 23;
 /// Bytes of a handshake message per `Handshake` datagram.
 pub const HANDSHAKE_FRAGMENT: usize = 1152;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
@@ -453,6 +454,11 @@ pub enum Message {
         token: u64,
     },
     Frame(crate::channel::Frame),
+    /// A frame came for a channel this node does not have (closed, or
+    /// lost in a restart): the other end closes its side at once rather
+    /// than waiting out its timeout. Only the channel's 64-bit number
+    /// vouches for it, which only the two ends and the path between see.
+    ChannelGone { chan: u64 },
 }
 
 /// A payload was handed down the recipient's live session.
@@ -653,6 +659,10 @@ impl Message {
                 w.0.push(T_FRAME);
                 f.put(&mut w);
             }
+            Message::ChannelGone { chan } => {
+                w.0.push(T_CHANNEL_GONE);
+                w.u64(*chan);
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -784,6 +794,7 @@ impl Message {
                 Message::Handshake { chan, stage, index, count, data: r.take(n)?.to_vec(), back, token }
             }
             T_FRAME => Message::Frame(crate::channel::Frame::get(&mut r)?),
+            T_CHANNEL_GONE => Message::ChannelGone { chan: r.u64()? },
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -2255,6 +2266,7 @@ mod tests {
                 sack: 6,
                 sealed: vec![7u8; crate::channel::MAX_BODY + 16],
             }),
+            Message::ChannelGone { chan: 0x0123_4567_89ab_cdef },
         ]
     }
 

@@ -105,6 +105,9 @@ pub enum ChannelError {
     Full,
     /// Closed by this end: nothing used it for a while.
     Idle,
+    /// The other end said it no longer has the channel (it closed it, or
+    /// restarted): `ChannelGone`.
+    Gone,
 }
 
 impl std::fmt::Display for ChannelError {
@@ -115,6 +118,7 @@ impl std::fmt::Display for ChannelError {
             ChannelError::BadSignature => "the signature does not hold",
             ChannelError::Decrypt => "a frame that does not open",
             ChannelError::NotAuthenticated => "not authenticated yet",
+            ChannelError::Gone => "the other end no longer has it",
             ChannelError::Dead => "the other end stopped answering",
             ChannelError::Full => "too much queued",
             ChannelError::Idle => "idle",
