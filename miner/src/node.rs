@@ -125,6 +125,8 @@ pub const LOOKAHEAD: usize = 32;
 /// written at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(600);
 const MAX_TX_DOWNLOADS: usize = 32;
+/// Pooled transactions announced to a new peer at most (`announce_pool_to`).
+const MAX_POOL_CATCHUP: usize = 256;
 const MAX_TX_PER_PEER: usize = 4;
 /// Header batches asked ahead of the best header, each of a different
 /// peer: [`MAX_HEADERS`] headers apiece, so about a thousand in flight.
@@ -2068,6 +2070,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 self.peers.seen(addr, now);
                 if new {
                     self.log(&format!("peer {addr} (height {})", st.height));
+                    // It missed the first announcements of what we pool.
+                    let n = self.announce_pool_to(addr, &st);
+                    if n > 0 {
+                        self.log(&format!("{n} pooled transactions announced to {addr}"));
+                    }
                 }
                 self.consider(addr, &st, now);
             }
@@ -2968,6 +2975,30 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// A peer whose admission minimum it pays less than is passed over,
     /// unless it is one of the aged reserve's candidates here: a peer
     /// admits those whatever its minimum, if it has room for them.
+    /// A peer new to us (or back on a new address): the transactions we
+    /// already pool announced to it, since it missed their first
+    /// announcement; those it would take (its pool's fee, as
+    /// `announce_transaction`), the best paying first, [`MAX_POOL_CATCHUP`]
+    /// at most.
+    fn announce_pool_to(&self, addr: SocketAddr, st: &net::Status) -> usize {
+        let ids: Vec<Digest> = {
+            let pool = self.mempool.lock().unwrap();
+            let mut v: Vec<(u128, Digest)> = pool
+                .entries()
+                .filter(|e| {
+                    pool.is_protected(&e.txid) || e.fee as u128 >= st.pool_fee as u128 * e.size as u128
+                })
+                .map(|e| (((e.fee as u128) << 32) / e.size.max(1) as u128, e.txid))
+                .collect();
+            v.sort_by(|a, b| b.0.cmp(&a.0));
+            v.into_iter().take(MAX_POOL_CATCHUP).map(|(_, id)| id).collect()
+        };
+        for id in &ids {
+            self.send(addr, &Message::TxInv(*id));
+        }
+        ids.len()
+    }
+
     fn announce_transaction(&self, txid: Digest, except: Option<SocketAddr>) -> usize {
         let mut peers = self.peers.sample(net::MAX_PEERS, except, Instant::now());
         {

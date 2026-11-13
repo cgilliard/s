@@ -1226,6 +1226,11 @@ pub const MAX_PEERS: usize = 64;
 /// carrier's NAT), while the network-group limit below keeps one party
 /// from surrounding a node.
 pub const MAX_PER_HOST: usize = 4;
+/// A host's entry silent this long (two pings unanswered) gives its place
+/// to a new address of the same host: a node there restarted, behind NAT,
+/// on a new port, is taken at once rather than when the old entry times
+/// out.
+pub const HOST_STALE: Duration = Duration::from_secs(60);
 /// Most peer entries one network group (a /16) may hold: an attacker with addresses in one network cannot fill the
 /// table and surround the node.
 pub const MAX_PER_GROUP: usize = 8;
@@ -1384,9 +1389,19 @@ impl Peers {
         }
         if !seed
             && !addr.ip().is_loopback()
-            && (self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
-                || self.map.values().filter(|p| !p.seed && group(p.addr.ip()) == group(addr.ip())).count()
-                    >= MAX_PER_GROUP)
+            && self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
+        {
+            // The host's longest silent entry gives way, if one is silent.
+            match self.stale_of_host(addr, Instant::now()) {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => return false,
+            }
+        }
+        if !seed
+            && !addr.ip().is_loopback()
+            && self.map.values().filter(|p| !p.seed && group(p.addr.ip()) == group(addr.ip())).count() >= MAX_PER_GROUP
         {
             return false;
         }
@@ -1644,6 +1659,20 @@ impl Peers {
         unanswered
     }
 
+    /// The entry of `addr`'s host (not a seed) silent longest, if silent
+    /// for [`HOST_STALE`] at least since it last answered (or, never having
+    /// answered, since its first ping). One never pinged yet does not give
+    /// way: addresses from peer lists cannot push each other out.
+    fn stale_of_host(&self, addr: SocketAddr, now: Instant) -> Option<SocketAddr> {
+        self.map
+            .values()
+            .filter(|p| p.addr.ip() == addr.ip() && !p.seed)
+            .filter_map(|p| p.last_seen.or(p.first_ping).map(|t| (t, p.addr)))
+            .filter(|(t, _)| now.saturating_duration_since(*t) >= HOST_STALE)
+            .min_by_key(|(t, _)| *t)
+            .map(|(_, a)| a)
+    }
+
     /// Why `add` would not take `addr` now, if it would not; the entries
     /// in its way are named.
     pub fn refusal(&self, addr: &SocketAddr) -> Option<String> {
@@ -1663,9 +1692,11 @@ impl Peers {
             v.join(", ")
         };
         if !addr.ip().is_loopback() {
-            if self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST {
+            if self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST
+                && self.stale_of_host(*addr, Instant::now()).is_none()
+            {
                 return Some(format!(
-                    "its host has {MAX_PER_HOST} entries already: {}",
+                    "its host has {MAX_PER_HOST} entries already, none silent for a minute: {}",
                     list(&|p| p.addr.ip() == addr.ip())
                 ));
             }
@@ -2371,6 +2402,29 @@ mod tests {
         assert!(peers.get(&a).unwrap().rtt.is_none(), "a ping sent more than once times nothing");
         assert!(due(&mut peers, 89).is_empty());
         assert_eq!(due(&mut peers, 90), vec![2]);
+    }
+
+    #[test]
+    fn a_new_port_of_a_host_replaces_its_silent_entry() {
+        // Four nodes behind one NAT, one restarted on a new port: the old
+        // port, silent a minute, gives way at once; a live one never does.
+        let now = Instant::now();
+        let ago = |s: u64| now.checked_sub(Duration::from_secs(s)).unwrap();
+        let mut peers = Peers::new();
+        let host = |port: u16| -> SocketAddr { format!("10.9.0.2:{port}").parse().unwrap() };
+        for port in 1..=MAX_PER_HOST as u16 {
+            assert!(peers.add(host(port), false));
+            peers.seen(host(port), ago(10));
+        }
+        assert!(peers.refusal(&host(100)).is_some());
+        assert!(!peers.add(host(100), false));
+        peers.seen(host(3), ago(HOST_STALE.as_secs() + 30));
+        peers.seen(host(2), ago(HOST_STALE.as_secs() + 5));
+        assert!(peers.refusal(&host(100)).is_none());
+        assert!(peers.add(host(100), false));
+        assert!(peers.get(&host(3)).is_none(), "the longest silent goes");
+        assert!(peers.get(&host(2)).is_some());
+        assert!(peers.get(&host(1)).is_some() && peers.get(&host(4)).is_some());
     }
 
     #[test]
