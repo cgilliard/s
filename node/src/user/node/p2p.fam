@@ -66,7 +66,7 @@
 \ nothing in particular, 1 fetching block pacth, 2 connecting it
 \ (sync.fam's nblock and nconnect).
 : pact variable ;  : pacth variable ;
-: pidle variable ;  : pnew variable ;  : psrtt variable ;  : pq0 variable ;  : pt0 variable ;  : pfirst variable ;
+: pidle variable ;  : pnew variable ;  : prtx variable ;  : pq0 variable ;  : pt0 variable ;  : pfirst variable ;
 : psv variable ;  : psobj variable ;  : pslen variable ;  : pscnt variable ;  : psmap variable ;  : pskind variable ;  : pspart variable ;  : psid variable ;  : pxfd variable ;  : pxrdy variable ;  : pyfd variable ;  : pyrdy variable ;  : pxi variable ;  : pyi variable ;  : pnk variable ;
 : ptab variable ;  : pnp variable ;  : pcur variable ;  : pfk variable ;
 : pinq variable ;  : pinh variable ;  : pint variable ;  : pidm variable ;  : pgb variable ;  : pgn variable ;
@@ -106,7 +106,7 @@ pkey @ pkd @ pko @ compress  pko @ mtok @ 8 lit bcopy ;
 myh @ w32  myold @ ?dup 0= if myh @ 1 lit + then w32  mytip @ 20 lit wbs  mywork @ 20 lit wbs
 A lit 0 lit w64  A lit 0 lit w64 ;
 
-: prec  C0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
+: prec  D0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
 \ then (pkeep's, in secs) when to ping it next (A4), the wait after that
 \ (A8), when it last answered (AC), whether said lost (B0); until when its
 \ claims are passed over (B4: it claimed a height it did not deliver, or
@@ -117,7 +117,7 @@ A lit 0 lit w64  A lit 0 lit w64 ;
 \ answered, no status, pinged at once; when it was made (C, in secs; the
 \ top bit: given, pgiven).
 : psa variable ;
-: pset  prec dup psa !  C0 lit 2 lit rshift wzero  psa @ 4 lit + !  psa @ !  secs psa @ C lit + ! ;
+: pset  prec dup psa !  D0 lit 2 lit rshift wzero  psa @ 4 lit + !  psa @ !  secs psa @ C lit + ! ;
 : padd  pnp @ pset  pnp @ dup 1 lit + pnp ! ;   \ ( ip port -- k )
 \ pgiven ( k -- k )  peer k given (the configuration's, the command
 \ line's, a seed): it never gives its place to another (plearn).
@@ -163,8 +163,8 @@ loop then drop pstb @ ;
 1 lit socket pfd !  pfd @ swap 1 lit swap 0 lit swap net drop   \ bound to lport
 600 lit alloc ptx !  800 lit alloc prx !  20 lit alloc pbid !  0 lit pbb !  20 lit alloc pent !  0 lit pxfd !  0 lit pxrdy !  0 lit pyld !  0 lit pyd !  0 lit pxw !  0 lit pact !  0 lit pacth !  10 lit alloc pfrom !
 10 lit alloc mtok !  10 lit alloc mnon !
-BF40 lit alloc phb !  40 lit alloc pgot !  2DC6C0 lit psrtt !  20 lit alloc psid !  0 lit psv !
-PPEERS C0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
+BF40 lit alloc phb !  40 lit alloc pgot !  20 lit alloc psid !  0 lit psv !
+PPEERS D0 lit * alloc ptab !  0 lit pnp !  240 lit alloc pinq !  0 lit pinh !  0 lit pint !  20 lit alloc pidm !
 padd pgiven puse
 \ our tokens' key and our nonce: random
 p2init  20 lit alloc pkey !  20 lit alloc pkd !  20 lit alloc pko !
@@ -455,8 +455,14 @@ pnest @ 0= if
 	21 lit ptp @ 200 lit sget 200 lit = if ptp @ 200 lit + ptp !  prply then
 	stx @ txabort drop
 then ;
+\ pfgn: set when pwait read a datagram but returns 0 (another peer's, or
+\ one it dealt with itself), so that a wait for the current peer goes on
+\ (pwaitc) rather than taking it for its time run out.
+: pfgn variable ;  : pwdl variable ;
 : pwait
+0 lit pfgn !
 prdy if
+	-1 lit pfgn !
 	pfd @ prx @ 800 lit pfrom @ recvfrom prn !
 	pfrom @ @ pfrom @ 4 lit + @ 2dup pwho drop ptokn
 	prn @ 5 lit u< prx @ @ 31424154 lit <> or  pfk @ 0< 0= if pfk @ pbanned or then if 0 lit else
@@ -498,6 +504,18 @@ prdy if
 		then
 	then
 else 0 lit then ;
+\ pwaitc ( ns -- type | 0 )  pwait for the current peer: its message,
+\ or 0 once ns have passed with none (others' datagrams dealt with
+\ meanwhile, not ending the wait), or at once when the API or the
+\ worker wakes it (pxrdy, pyrdy).
+: pwaitc
+1 lit rshift 32 lit / ticks + pwdl !       \ ns / 100 (ns may pass 2^31)
+0 lit
+begin
+	drop
+	pwdl @ ticks - dup 0 lit > if 64 lit * pwait else drop 0 lit 0 lit pfgn ! then
+	dup 0=  pfgn @ and  pwdl @ ticks - 0 lit > and
+while repeat ;
 
 \ pkeep
 : pkt variable ;  : pdn variable ;  : pdk variable ;
@@ -548,12 +566,16 @@ pnp @ ?dup if 0 lit do
 	then
 loop then 2drop ;
 
+: ppt0 variable ;
 : pping
 0 lit pok !
 8 lit 0 lit do
 	pok @ 0= if
 		pip @ ppt @ ptokn  1 lit wbeg  mnon @ wstatus  wsend
-		A lit 0 lit do pok @ 0= if 5F5E100 lit pwait drop then loop
+		ticks ppt0 !
+		begin pok @ 0=  ticks ppt0 @ - 989680 lit u< and while
+			989680 lit ticks ppt0 @ - - 64 lit * pwaitc drop
+		repeat
 	then
 loop pok @ ;
 : pst-h  pst @ 34 lit + @ ;                   \ ( -- h )  the peer's height
@@ -566,7 +588,7 @@ begin
 	pgap  dup 3C lit u<  over phh @ + pst-h 1 lit + u< and  prnd @ 4 lit u< and
 while
 	B lit wbeg wtok  phh @ + w32 wsend  prnd @ 1 lit + prnd !
-	begin 1DCD6500 lit pwait ?dup while
+	begin 1DCD6500 lit pwaitc ?dup while
 		6 lit = if
 			prx @ 5 lit + c@ ?dup if 0 lit do
 				prx @ 6 lit + i CC lit * +  dup 20 lit + le@ phh @ -
@@ -608,9 +630,14 @@ wsend ;
 \ fetch moves on only after nothing new for 30 s or twenty round trips,
 \ however slow the link (a satellite's 600 ms and more): never on a clock
 \ of its own.  What came is kept for the next peer.
-: prtt+  psrtt @ 7 lit * + 3 lit rshift  1 lit max psrtt ! ;     \ ( sample -- )
-: pwns  psrtt @ CB7355 lit umin 12C lit *  11E1A300 lit max  EE6B2800 lit umin ;   \ ( -- ns )  three round trips
-: pidl  psrtt @ 14 lit *  11E1A300 lit max ;                  \ ( -- ticks )  30 s, or twenty round trips
+\ Each peer's own (its record's C0: up to 16 serve a batch, and a
+\ satellite's is not a datacenter's), 300 ms until measured.  A round
+\ that asks again for what did not come gives no sample (Karn's rule:
+\ the chunk may answer the first ask), prtx.
+: psrt  pcur @ prec C0 lit + @ ?dup 0= if 2DC6C0 lit then ;       \ ( -- ticks )
+: prtt+  psrt 7 lit * + 3 lit rshift  1 lit max  pcur @ prec C0 lit + ! ;     \ ( sample -- )
+: pwns  psrt CB7355 lit umin 12C lit *  11E1A300 lit max  EE6B2800 lit umin ;   \ ( -- ns )  three round trips
+: pidl  psrt 14 lit *  11E1A300 lit max ;                  \ ( -- ticks )  30 s, or twenty round trips
 \ pchunk  the Chunk in prx, if it is of the object being fetched.
 : pchunk
 prx @ 5 lit + pcp !
@@ -628,7 +655,7 @@ pcp @ pid @ 20 lit d8= and if
 		dup if drop pci @ pmap @ + c@ 0= then
 		if
 			pcp @ 28 lit + pobj @ pci @ A lit lshift + pcn @ bcopy  1 lit pci @ pmap @ + c!  1 lit pnew !  prcv @ 1 lit + prcv !
-			pfirst @ 0= if 1 lit pfirst !  ticks pq0 @ - prtt+ then
+			pfirst @ 0= if 1 lit pfirst !  prtx @ 0= if ticks pq0 @ - prtt+ then then
 		then
 	then
 then ;
@@ -644,7 +671,7 @@ psv @ if
 	0 lit psv !
 then
 \ (after a stop for the API, the wait for chunks goes on from where it was)
-pyd @ if pyt0 @ else ticks then pt0 !  0 lit pyd !
+pyd @ if pyt0 @ else ticks then pt0 !  0 lit pyd !  0 lit prtx !
 begin
 	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and  pyd @ 0= and
 while
@@ -654,8 +681,10 @@ while
 	\ (pyld) a connection to the API waits
 	begin
 		prcv @ pask @ u<  pobj @ if pdone 0= and then  pyd @ 0= and
-		if pyld @ pxw !  pwns pwait  0 lit pxw !  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
+		if pyld @ pxw !  pwns pwaitc  0 lit pxw !  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
 	?dup while 9 lit = if pchunk then repeat
+	\ the next round asks again for what did not come: no sample from it
+	prcv @ pask @ u< prtx !
 	pnew @ if ticks pt0 ! then
 repeat
 pt0 @ pyt0 !

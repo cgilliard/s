@@ -98,7 +98,7 @@ stx @ txcommit drop ;
 cxe !  cxe @ hid cxid @ 20 lit bcopy  0 lit cxok !  0 lit cxi !
 begin cxok @ 0=  cxi @ 4 lit u< and while
 	E lit wbeg wtok  cxid @ 20 lit wbs  wsend  cxi @ 1 lit + cxi !
-	begin cxok @ if 0 lit else 1DCD6500 lit pwait then ?dup while
+	begin cxok @ if 0 lit else 1DCD6500 lit pwaitc then ?dup while
 		F lit =  prn @ 225 lit = and  prx @ 5 lit + cxid @ 20 lit d8= and if
 			prx @ 25 lit + cxrt @ cxroot
 			cxrt @ cxe @ hhdr 6C lit + 20 lit d8= if

@@ -409,7 +409,13 @@ understood is ignored.
    by message kind (`Node::drop_out`, section 7's first step).
 2. The fam node: others' datagrams no longer count as timeouts (`pwait`
    says whose; `pfetch`, `phdrs`, `pping`, `cxask` wait to a deadline);
-   Karn's rule in `pfetch`; RTT per peer.
+   Karn's rule in `pfetch`; RTT per peer. **Done (2026-11-13):** `pwaitc`
+   (a wait for the current peer to a deadline in ticks, others'
+   datagrams dealt with on the way; still woken by the API and the
+   worker); the round trip in each peer's record (`C0`; the record now
+   `D0` bytes); no sample from a round that asks again. Test:
+   `stalltest.sh` syncs with another address chattering at the node
+   every 10 ms and the miner's answers 100 ms late.
 3. The fam node: upkeep while working (`pkeep`, `nrelay`, `awake` from
    `cwait`, `vwait` and between a batch's blocks); `cxask` one ask a
    turn, failures remembered.

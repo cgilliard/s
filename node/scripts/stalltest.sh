@@ -9,6 +9,11 @@
 # API is asked for the status, and must answer that the node is fetching
 # block 5 (a node that did not answer until the fetch gave up would say
 # otherwise).  Then the chunks go through and the node connects block 5.
+# Before that, the sync to 4 runs with another address chattering at the
+# node (junk datagrams every 10 ms) and the miner's answers 100 ms late:
+# the node's waits for its peer must not end at others' datagrams
+# (docs/TIMING_FIXES.md, Phase 1 item 2; they did, and the headers' rounds
+# ran out: the sync stopped -3).
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/stalltest.sh
@@ -37,22 +42,35 @@ stop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null || true; }
 # The proxy: datagrams from the node (the first address other than the
 # miner's to send) to the miner and back; while $T/hold exists, the
 # miner's Chunks (type 9) kept back, $T/held written at the first; once
-# it is gone, those kept sent on.
+# it is gone, those kept sent on.  While $T/chatter exists, the miner's
+# datagrams reach the node 100 ms late, and a second socket (another
+# peer, to the node) sends it a junk datagram every 10 ms.
 python3 -u - "$PX" "$PA" "$T" > "$T/proxy.out" 2>&1 <<'EOF' &
-import os, select, socket, sys
+import os, select, socket, sys, time
 px, pa, t = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 miner = ('127.0.0.1', pa)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('127.0.0.1', px))
-node, kept = None, []
+other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+other.bind(('127.0.0.1', 0))
+node, kept, late, chat, chats = None, [], [], 0.0, 0
 print('proxy: up', flush=True)
 while True:
+    now = time.monotonic()
+    chatter = os.path.exists(f'{t}/chatter')
+    while late and (late[0][0] <= now or not chatter):
+        s.sendto(late.pop(0)[1], node)
+    if chatter and node is not None and now >= chat:
+        other.sendto(b'TAB1\x63', node)
+        chat, chats = now + 0.01, chats + 1
+        if chats % 1000 == 1:
+            print(f'proxy: chattering ({chats})', flush=True)
     if kept and not os.path.exists(f'{t}/hold'):
         for d in kept:
             s.sendto(d, node)
         print(f'proxy: {len(kept)} chunks let through', flush=True)
         kept = []
-    if not select.select([s], [], [], 0.2)[0]:
+    if not select.select([s], [], [], 0.005 if chatter else 0.2)[0]:
         continue
     d, a = s.recvfrom(2048)
     if a == miner:
@@ -63,6 +81,8 @@ while True:
                 open(f'{t}/held', 'w').close()
                 print('proxy: holding chunks', flush=True)
             kept.append(d)
+        elif chatter:
+            late.append((time.monotonic() + 0.1, d))
         else:
             s.sendto(d, node)
     else:
@@ -90,7 +110,8 @@ if s['height'] != 0:
     sys.exit('stalltest.sh: the status before any block is not at height 0')
 EOF2
 
-echo "stalltest.sh: the miner mining 4 blocks; the node syncing through the proxy"
+echo "stalltest.sh: the miner mining 4 blocks; the node syncing through the proxy, another address chattering at it"
+touch "$T/chatter"
 stop $AP; AP=
 minera
 wait_for "$T/a.out" 'is the tip at height 4$' 600 "the miner's 4 blocks"
@@ -100,6 +121,9 @@ minera --no-mine
 # follows it from there: waited for at the miner's last block)
 H=$(sed -n 's/.* is the tip at height \([0-9]*\)$/\1/p' "$T/a.out" | tail -1)
 wait_for "$T/os.out" "^node: .* (synced, height $H\$|height $H  \\()" 900 "the node's sync to $H"
+rm "$T/chatter"
+grep -q '^proxy: chattering' "$T/proxy.out" || { echo "stalltest.sh: the proxy never chattered" >&2; exit 1; }
+! grep -q 'the sync stopped: -3' "$T/os.out" || { echo "stalltest.sh: the headers' waits ended at others' datagrams (the sync stopped -3)" >&2; exit 1; }
 N=$((H + 1))
 
 echo "stalltest.sh: chunks held; the miner mining block $N (and on)"
