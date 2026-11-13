@@ -956,9 +956,6 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     ) {
         // Only from a listed relay that proved its id.
         let listed = peer.is_some_and(|p| self.rv.listed(&p).is_some());
-        if !self.config.relay || !listed {
-            return;
-        }
         let Some((more, part)) = circuit::handshake_piece(cell) else { return };
         let r = self.rdv.incoming.entry(key).or_default();
         let msg = match r.add(circuit::RENDEZVOUS, more, part) {
@@ -967,6 +964,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Err(_) => return,
         };
         let Some((&kind, body)) = msg.split_first() else { return };
+        // Not served here (not a relay, or the asker not one we list):
+        // refused at once, so it asks the next point rather than waiting
+        // ASK_TIMEOUT (40 s) for nothing.
+        if !self.config.relay || !listed {
+            let subject = match kind {
+                LOOKUP if body.len() == 32 => digest_from_bytes(body),
+                FORWARD => Some(Object::id_of(body)),
+                _ => None,
+            };
+            if let Some(s) = subject {
+                for c in rendezvous_cells(RESULT, &result(&s, NOTICE_REFUSED)) {
+                    let _ = self.channel_send(key, &c.to_bytes(), now);
+                }
+            }
+            return;
+        }
         match kind {
             LOOKUP => {
                 let Some(id) = (body.len() == 32).then(|| digest_from_bytes(body)).flatten() else { return };

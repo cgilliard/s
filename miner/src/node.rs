@@ -2021,7 +2021,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             // Frames are sealed: one that is not ours does not open.
             Message::Frame(f) => self.channels.knows(&addr, f.chan),
             // Only about a channel we have with that address.
-            Message::ChannelGone { chan } => self.channels.knows(&addr, *chan),
+            Message::ChannelGone { chan } => {
+                self.channels.knows(&addr, *chan) || self.channels.opening(&addr, *chan)
+            }
             _ => false,
         };
         if !matches!(msg, Message::Ping(_) | Message::Pong(_))

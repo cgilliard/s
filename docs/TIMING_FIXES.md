@@ -471,7 +471,20 @@ understood is ignored.
    (`owbye`). The fam node itself has no goodbye: it is stopped with its
    machine. Test: `a_node_stopping_tells_its_channels_and_peers`.
 9. DESTROY for unknown circuits and dropped CREATEs; "next hop
-   unreachable"; handshake refused with why; rendezvous REFUSED.
+   unreachable"; handshake refused with why; rendezvous REFUSED. **Done
+   (2026-11-13), but for the reason in a DESTROY:** a relay cell on a hop
+   not held answered DESTROY (never a DESTROY with one); a CREATE at a
+   node that does not relay, or without its key, answered DESTROY; a
+   hello refused (channels full, its host's four, too many lately, no
+   key) answered `ChannelGone`, the initiator failing that handshake at
+   once (the relay avoided a while) rather than after eight hellos; and a
+   rendezvous LOOKUP or FORWARD from an asker not listed, or at a node
+   that does not relay, answered RESULT REFUSED, the asker trying the
+   next point at once. Left: "next hop unreachable" in a DESTROY. A
+   circuit failing as a hop is added already avoids that hop
+   (`drop_mine`); for one already built, the DESTROY is made again at
+   each hop on its way back, so which hop failed would need more than a
+   byte.
 10. "Not held" for chunks and aux leaves, both.
 
 **Phase 3: measure instead of guess**

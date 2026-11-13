@@ -369,7 +369,12 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A hop handshake for a circuit through us.
     fn on_create(&mut self, link: Link, cell: &Cell, now: Instant) {
-        if !self.config.relay || self.circuits.hops.contains_key(&link) {
+        // Not a relay: told at once (DESTROY), not left to its 60 s build
+        // timeout. A hop already made: its CREATED went; nothing more.
+        if !self.config.relay {
+            return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
+        }
+        if self.circuits.hops.contains_key(&link) {
             return;
         }
         let Some((more, part)) = circuit::handshake_piece(cell) else { return };
@@ -388,7 +393,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         {
             return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
         }
-        let (Some(key), Ok(m)) = (self.config.relay_key.as_ref(), random_bytes::<32>()) else { return };
+        let (Some(key), Ok(m)) = (self.config.relay_key.as_ref(), random_bytes::<32>()) else {
+            return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
+        };
         match channel::respond_keys(Domain::Circuit, 0, &hello, key, &m) {
             Ok(((out, inn, _), reply)) => {
                 let keys = HopKeys { forward: Layer::new(inn), backward: Layer::new(out) };
@@ -416,7 +423,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     /// A relay cell from the previous hop: ours to read, or to pass on.
     fn on_forward(&mut self, link: Link, mut cell: Cell, now: Instant) {
-        let Some(h) = self.circuits.hops.get_mut(&link) else { return };
+        // A hop we do not have (ended, or lost in a restart): the sender
+        // told, so its circuit ends now rather than at its session's next
+        // keepalive (15 minutes) or its send's timeout. A DESTROY is never
+        // answered, so no two relays can trade them.
+        let Some(h) = self.circuits.hops.get_mut(&link) else {
+            return self.send_cell(link, Cell::new(link.1, circuit::DESTROY), now);
+        };
         h.last_used = now;
         let (tokens, at) = &mut h.budget;
         *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * HOP_CELLS_PER_SEC).min(HOP_BURST);

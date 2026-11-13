@@ -130,6 +130,11 @@ impl Channels {
         self.open.contains_key(&(*addr, chan))
     }
 
+    /// Whether a handshake of ours with `addr` on `chan` is under way.
+    pub(super) fn opening(&self, addr: &SocketAddr, chan: u64) -> bool {
+        self.pending.contains_key(&(*addr, chan))
+    }
+
     pub(super) fn count(&self) -> usize {
         self.open.len()
     }
@@ -406,16 +411,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     fn on_hello(&mut self, addr: SocketAddr, chan: u64, hello: &[u8], back: u64, now: Instant) {
+        // A refusal says so (ChannelGone), so the initiator gives up now
+        // rather than after its eight hellos.
         if self.channels.open.len() >= self.config.max_channels {
             self.chatter(&format!("channel: refusing {addr}: {} channels open", self.config.max_channels));
-            return;
+            return self.channel_unknown(addr, chan, now);
         }
         if self.channels.open.keys().filter(|k| k.0.ip() == addr.ip()).count() >= MAX_PER_HOST {
             self.chatter(&format!("channel: refusing {addr}: {MAX_PER_HOST} channels from its host"));
-            return;
+            return self.channel_unknown(addr, chan, now);
         }
         if self.config.relay_key.is_none() {
-            return;
+            return self.channel_unknown(addr, chan, now);
         }
         if self.channels.hellos.len() > 4 * self.config.max_channels {
             self.channels.hellos.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(60));
@@ -426,7 +433,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         *at = now;
         if *tokens < 1.0 {
             self.chatter(&format!("channel: refusing {addr}: too many handshakes from its host lately"));
-            return;
+            return self.channel_unknown(addr, chan, now);
         }
         *tokens -= 1.0;
         let Some(key) = self.config.relay_key.as_ref() else { return };
@@ -557,6 +564,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// without holding it against the relay (it is there, and said so).
     pub(super) fn on_channel_gone(&mut self, addr: SocketAddr, chan: u64, now: Instant) {
         let key = (addr, chan);
+        // A handshake of ours the relay refused (full, or too many from
+        // our host): given up now, the relay left out of paths a while.
+        if let Some(p) = self.channels.pending.remove(&key) {
+            self.channels.to.retain(|_, k| *k != key);
+            self.avoid_relay(p.opening.expect, now);
+            self.log(&format!("channel: {} at {addr} refused the handshake", crate::onion::short(&p.opening.expect)));
+            return self.channel_closed(key, now);
+        }
         let Some(o) = self.channels.open.remove(&key) else { return };
         self.channels.to.retain(|_, k| *k != key);
         let who = o.ch.peer.map_or("a participant".to_string(), |id| crate::onion::short(&id));
