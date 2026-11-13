@@ -111,6 +111,35 @@ ticks 5F5E100 lit + adl !
 arq @ ahp @ arq @ - awr
 ablen @ if ao @ ablen @ awr then
 acfd @ close drop  0 lit acfd ! ;
+
+\ ── Answers the loop publishes (docs/NODE_ENHANCEMENTS.md, item 4) ──
+\
+\ What only the loop can read (its height and tip, the pool, the
+\ consensus scan's state, its peers) it renders itself into shared
+\ memory, under a lock, for the API's thread to send as it is: the thread
+\ never reads the loop's structures while they change.  apb: +0 the lock;
+\ slot k at apoff(k): +0 its length, +4 its body (cut to apcap(k)).
+\ Slots: 0 /v1/status, 1 /v1/tip, 2 /v1/consensus, 3 /v1/fees,
+\ 4 /v1/mempool.  apv: the events' number at the last publish of 1, 3
+\ and 4 (a block or a transaction's change is an event); apcx: the
+\ consensus scan's turn (cxat) at the last of 2.
+: apb variable ;  : apv variable ;  : apcx variable ;
+:M APSIZE 10930 lit ;
+: apoff  dup 0= if drop 10 lit else dup 1 lit = if drop 414 lit else dup 2 lit = if drop 518 lit else 3 lit = if 851C lit else 8920 lit then then then then ;
+: apcap  dup 0= if drop 400 lit else dup 1 lit = if drop 100 lit else dup 3 lit = if drop 400 lit else drop 8000 lit then then then ;
+\ apput ( k -- )  the body built at ao, into slot k.
+: apput
+apb @ if
+	apb @ lock
+	dup apoff apb @ +  swap apcap  aop @ ao @ - umin
+	2dup swap !  ao @ rot 4 lit + rot bcopy
+	apb @ unlock
+else drop then ;
+\ apget ( k -- )  slot k's body at ao, as if built there.
+: apget
+abegin  apb @ lock
+apoff apb @ +  dup 4 lit + ao @ rot @  dup aop @ + aop !  bcopy
+apb @ unlock ;
 \ afail ( message status -- )  {"error": message}.
 : afail  swap abegin "{" a" "error" akey aqt a" aqt "}" a" asend ;
 : anotf  "not found" "404 Not Found" afail ;
@@ -247,8 +276,8 @@ dup hhdr ah !
 "mix" akey ah @ 8C lit + adig acom
 "nonce" akey ah @ AC lit + adig "}" a" ;
 
-: astatus
-abegin "{" a"
+: asbody
+"{" a"
 "height" akey myh @ anum acom
 "tip" akey mytip @ adig acom
 "work" akey mywork @ adig acom
@@ -261,8 +290,8 @@ abegin "{" a"
 "activity_height" akey pacth @ anum acom
 \ the loop's longest stall since the start (p2p.fam's pmark), in ms
 "stall_ms" akey plg @ 2710 lit / anum acom "stall_height" akey plgh @ anum acom "stall_activity" akey plga @ anum acom
-"reveal" akey nmin @ anum "}" a"
-"200 OK" asend ;
+"reveal" akey nmin @ anum "}" a" ;
+: astatus  abegin asbody 0 lit apput  0 lit apget "200 OK" asend ;
 
 : aheader
 apath @ B lit + aid dup 0= if drop "no such header" "404 Not Found" afail else
@@ -552,16 +581,16 @@ then ;
 \ afees  as tabminer's `fees`: for a simple payment (2,513 bytes), the
 \ rates for a block, an hour, a day; economy, the minimum, waiting at
 \ most the pool's bytes over the aged reserve (179,500 a block) in blocks.
-: afees
-abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "payment_size" akey 9D1 lit anum acom
+: afbody
+"{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "payment_size" akey 9D1 lit anum acom
 "estimates" akey "{" a" "block" akey 258 lit afe acom "hour" akey E10 lit afe acom "day" akey 15180 lit afe "}" a" acom
 "economy" akey "{" a" "rate" akey A lit anum acom "blocks" akey qbytes @ 9D1 lit + 2BD2B lit + 2BD2C lit / anum "}" a" acom
 "confirmations" akey qcrn @ anum
-"}" a"
-"200 OK" asend ;
+"}" a" ;
+: afees  abegin afbody 3 lit apput  3 lit apget "200 OK" asend ;
 
-: amempool
-abegin "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum acom "transactions" akey "[" a"
+: ambody
+"{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum acom "transactions" akey "[" a"
 0 lit an !
 QSLOTS 0 lit do
 	i qused if
@@ -571,8 +600,8 @@ QSLOTS 0 lit do
 		"fee" akey ae @ 8 lit + dup @ swap 4 lit + @ au64 acom "size" akey ae @ 4 lit + @ anum "}" a"
 	then
 loop
-"]" a" "}" a"
-"200 OK" asend ;
+"]" a" "}" a" ;
+: amempool  abegin ambody 4 lit apput  4 lit apget "200 OK" asend ;
 
 \ awhy ( code -- s )  what a pool's refusal means (qadmit's codes).
 : awhy  0 lit swap - dup 15 lit u< if 2 lit lshift aerrs @ + @ else drop "refused" then ;
@@ -718,7 +747,8 @@ AEW 0 lit do
 loop ;
 
 \ atipr  the tip, answered.
-: atipr  abegin "{" a" "height" akey myh @ anum acom "tip" akey mytip @ adig "}" a"  "200 OK" asend ;
+: atbody  "{" a" "height" akey myh @ anum acom "tip" akey mytip @ adig "}" a" ;
+: atipr  abegin atbody 1 lit apput  1 lit apget "200 OK" asend ;
 \ A request waiting for the tip (8 at most): its connection, until when
 \ (secs: the monotonic clock, not the date), the tip it knew.
 : atip
@@ -761,15 +791,26 @@ dup 4 lit + @ ?dup if 0 lit do
 	dup 30 lit + i CXREL * +  "{" a" "id" akey dup adig acom "address" akey aqt 20 lit + a" aqt "}" a"
 loop then
 "]" a" "}" a" drop ;
-: acons
+: acbody
 cxinit
-abegin "{" a"
+"{" a"
 "height" akey cxht @ FFFFFFFF lit = if 0 lit else cxht @ then anum acom
 "epoch" akey cxpinned @ if 0 lit else cxb @ 90 lit / then anum acom  "into" akey cxin @ anum acom
 "current" akey cxcur @ ajset acom
 "previous" akey cxprv @ 28 lit + @ if cxprv @ ajset else "null" a" then acom
 "running" akey cxscr @ 28 lit + @ if cxscr @ ajset else "null" a" then
-"}" a" "200 OK" asend ;
+"}" a" ;
+: acons  abegin acbody 2 lit apput  2 lit apget "200 OK" asend ;
+\ appub  the loop's answers published: the status at every turn (it is
+\ small, and its peers and stall move without an event); the tip, the
+\ fees and the pool when an event came since; the consensus when the
+\ scan has run since.
+: appub
+apb @ if
+	abegin asbody 0 lit apput
+	evnow apv @ <> if evnow apv !  abegin atbody 1 lit apput  abegin afbody 3 lit apput  abegin ambody 4 lit apput then
+	cxat @ apcx @ <> if cxat @ apcx !  abegin acbody 2 lit apput then
+then ;
 : aroute
 apost @ if
 	apath @ "/v1/tx" streq if atx else
@@ -802,14 +843,15 @@ then
 abod @ ?dup if free 0 lit abod ! then ;
 
 \ aaccept  a connection to the API, if one waits (pxrdy), answered.
-: aaccept  pmark  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
+: aaccept  pmark  appub  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
 
 : ainit  ( port -- )
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
 10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
-evinit  AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
+evinit  APSIZE malloc dup apb !  ?dup if APSIZE 2 lit rshift wzero then  FFFFFFFF lit apv !  FFFFFFFF lit apcx !
+AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
 A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
 54 lit alloc aerrs !
 "does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !
