@@ -516,7 +516,17 @@ understood is ignored.
     `a_dead_channel_is_noticed_from_its_round_trip`.
 12. A circuit's from its own round trip (SESSION to SESSION_STATE), a
     re-ask at a third of the window, any cell as activity; rebuild
-    backoff per point.
+    backoff per point. **Done (2026-11-13), tabminer:** each standing
+    circuit's round trip measured from an ask answered at its first
+    sending (Karn's rule), smoothed; given up at 30 s unanswered, or once
+    its window (twenty round trips, 5 to 30 s) has passed with three asks
+    unanswered, asked again a quarter of the window apart meanwhile (it
+    waited for the next keepalive, minutes, so one lost cell ended a
+    live circuit at 30 s); anything coming down the circuit counts as an
+    answer; and its rebuild waits 3 s, doubling with each failure in a
+    row at its point to 60 s, back to 3 s once its session is live. The
+    fam wallet's standing sessions (`owstick`: 3 s until live, 15 minutes
+    after, 30 s unanswered) are not changed yet.
 13. A peer not live after two missed pongs; tabminer's chunk retries up
     to 5 s with backoff; the node's per peer.
 14. Send budgets per step, each from the round trip with a floor; the

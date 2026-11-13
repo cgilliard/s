@@ -87,8 +87,19 @@ const ROTATE_AFTER: Duration = Duration::from_secs(onion::ANNOUNCE_LIFETIME_SECS
 const REBUILD_WAIT: Duration = Duration::from_secs(3);
 /// Random hops before the rendezvous point.
 const HOPS: usize = 2;
-/// A keepalive unanswered this long means the circuit is dead.
+/// A keepalive unanswered this long means the circuit is dead. Under it,
+/// once the circuit's own window has passed ([`DEAD_RTTS`] of its measured
+/// round trip, [`MIN_DEAD`] at least) with [`DEAD_ASKS`] asks unanswered,
+/// re-asked meanwhile a quarter of the window apart: one lost cell does
+/// not end a live circuit, and a dead one on a fast path is noticed in
+/// seconds (`docs/TIMING_FIXES.md`).
 const DEAD_AFTER: Duration = Duration::from_secs(30);
+const DEAD_RTTS: u32 = 20;
+const MIN_DEAD: Duration = Duration::from_secs(5);
+const DEAD_ASKS: u32 = 3;
+/// A standing circuit's rebuild waits double after each failure in a row
+/// at its point, from [`REBUILD_WAIT`] to this.
+const MAX_REBUILD_WAIT: Duration = Duration::from_secs(60);
 /// A circuit is replaced after this, plus up to as much again at random.
 const ROTATE_EVERY: Duration = Duration::from_secs(2 * 3600);
 /// An old circuit is closed once the session is live on its replacement,
@@ -171,8 +182,14 @@ struct Standing {
     /// Not before then: a circuit to build again, or a refusal.
     wait: Option<Instant>,
     was_live: bool,
-    /// Since when a keepalive has gone unanswered.
+    /// Since when a keepalive has gone unanswered, and how many asks.
     unanswered: Option<Instant>,
+    asks: u32,
+    /// The circuit's round trip, ask to answer, smoothed (an ask answered
+    /// at its first sending only).
+    rtt: Option<Duration>,
+    /// Failures in a row at this point: the rebuild's wait doubles.
+    fails: u32,
     /// The wait before the next keepalive, drawn when the last went.
     interval: Duration,
     /// When the circuit is to be replaced.
@@ -187,6 +204,17 @@ struct Standing {
 }
 
 impl Standing {
+    /// How long an ask may go unanswered before the circuit is given up:
+    /// [`DEAD_AFTER`] until the round trip is measured.
+    fn dead_after(&self) -> Duration {
+        self.rtt.map_or(DEAD_AFTER, |r| (r * DEAD_RTTS).clamp(MIN_DEAD, DEAD_AFTER))
+    }
+
+    /// The wait before building its circuit again after a failure.
+    fn rebuild_wait(&self) -> Duration {
+        (REBUILD_WAIT * (1 << self.fails.min(5))).min(MAX_REBUILD_WAIT)
+    }
+
     fn live(&self, seq: u64, now: Instant) -> bool {
         self.ready && self.held == seq && self.answered.is_some_and(|t| now.duration_since(t) < SESSION_TIMEOUT)
     }
@@ -695,6 +723,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                             wait: None,
                             was_live: false,
                             unanswered: None,
+                            asks: 0,
+                            rtt: None,
+                            fails: 0,
                             interval: KEEPALIVE,
                             rotate_at: None,
                             next: None,
@@ -755,8 +786,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 continue;
             }
             // A keepalive unanswered: a hop is gone, or the point.
-            if s.unanswered.is_some_and(|t| now.duration_since(t) >= DEAD_AFTER)
-                || (s.was_live && !s.live(seq, now) && s.held == seq)
+            let dead_after = s.dead_after();
+            if s.unanswered.is_some_and(|t| {
+                let waited = now.duration_since(t);
+                waited >= DEAD_AFTER || waited >= dead_after && s.asks >= DEAD_ASKS
+            }) || (s.was_live && !s.live(seq, now) && s.held == seq)
             {
                 lost.push(h);
                 continue;
@@ -768,11 +802,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 s.published = true;
                 publish.push(h);
             }
-            let wait = if s.live(seq, now) { s.interval } else { SESSION_RETRY };
+            // An ask unanswered is asked again a quarter of the window on
+            // (a lost cell), not at the next keepalive minutes later.
+            let wait = if s.unanswered.is_some() {
+                (dead_after / 4).max(Duration::from_secs(1))
+            } else if s.live(seq, now) {
+                s.interval
+            } else {
+                SESSION_RETRY
+            };
             if s.asked.is_none_or(|t| now.duration_since(t) >= wait) {
                 s.asked = Some(now);
                 s.interval = jitter(keepalive);
+                if s.unanswered.is_none() {
+                    s.asks = 0;
+                }
                 s.unanswered.get_or_insert(now);
+                s.asks += 1;
                 ask.push(h);
             }
         }
@@ -1200,8 +1246,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             s.ready = false;
             s.was_live = false;
             // Not before a later wait already set (a point that refused
-            // our session is asked again only after REFUSED_RETRY).
-            let t = now + REBUILD_WAIT;
+            // our session is asked again only after REFUSED_RETRY); the
+            // wait doubles with each failure in a row at this point.
+            let t = now + s.rebuild_wait();
+            s.fails += 1;
             s.wait = Some(s.wait.map_or(t, |w| w.max(t)));
         }
         if let Some(p) = refused_at {
@@ -1240,6 +1288,14 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     pub(super) fn onion_message(&mut self, handle: u64, cmd: u8, msg: &[u8], now: Instant) -> bool {
         let standing = self.part.standing.iter().position(|s| s.circuit == Some(handle));
+        // Anything from the far end proves the circuit's path: an ask
+        // unanswered is not a dead circuit while it carries this.
+        if let Some(i) = standing
+            && self.part.standing[i].unanswered.is_some()
+        {
+            self.part.standing[i].unanswered = Some(now);
+            self.part.standing[i].asks = 0;
+        }
         let job = self.part.jobs.iter().any(|j| j.circuit == Some(handle))
             || self.part.outbound.iter().any(|o| o.handle == handle);
         // A circuit being replaced is still ours: what comes down it while
@@ -1485,11 +1541,21 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     fn on_standing_state(&mut self, i: usize, handle: u64, nonce: u64, seq: u64, now: Instant) {
         let Some(me) = self.rv.me.as_ref() else { return };
         let s = &mut self.part.standing[i];
+        // The circuit's round trip, from an ask answered at its first
+        // sending (Karn's rule: a re-asked one may answer the first).
+        if s.asks == 1
+            && let Some(t) = s.asked
+        {
+            let sample = now.saturating_duration_since(t);
+            s.rtt = Some(s.rtt.map_or(sample, |r| (r * 7 + sample) / 8));
+        }
         s.answered = Some(now);
         s.unanswered = None;
+        s.asks = 0;
         s.held = seq;
         if seq == me.seq {
             let s = &mut self.part.standing[i];
+            s.fails = 0;
             if !s.was_live {
                 s.was_live = true;
                 let point = s.point;
