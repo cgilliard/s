@@ -575,8 +575,8 @@ then
 owmc @ 9 lit = if OWO owmb @ owmn @ owdlv then ;
 \ owotick  the send's steps on time: the circuit ready (ROUTE, then
 \ GET_ANNOUNCE; or the answer: REPLY, its relay, token and the payload
-\ sealed to the route's key); a lookup asked again; 120 s for it all
-\ (docs/ONION.md, timeouts).
+\ sealed to the route's key); a lookup asked again; 240 s for it all, as
+\ tabminer's SEND_TIMEOUT (docs/TIMING_FIXES.md).
 : owotick
 owos @ if
 	OWO owci @ 3 lit = if "the circuit failed" owofail else
@@ -600,7 +600,7 @@ owos @ if
 		OWO 7 lit owot @ 20 lit owcsend drop  0 lit owoff !
 	then
 	owos @ 4 lit = if mnms owoat @ - 2BF20 lit u< 0= if owodone then
-	else owos @ if mnms owot0 @ - 1D4C0 lit u< 0= if owwhyb @ "no answer within 120 s (step " scpy owos @ snum " circuit " scpy OWO owci @ snum
+	else owos @ if mnms owot0 @ - 3A980 lit u< 0= if owwhyb @ "no answer within 240 s (step " scpy owos @ snum " circuit " scpy OWO owci @ snum
 		" hops " scpy OWO C lit owcif @ snum " link " scpy OWO 4 lit owcif @ 4 lit owcf @ snum ")" scpy 0 lit swap c!  owwhyb @ owofail then then then
 	then
 then ;

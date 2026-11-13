@@ -539,7 +539,15 @@ understood is ignored.
     `NotHeld` too (item 10 had missed its own table). The fam node's
     round trips were made per peer in item 2.
 14. Send budgets per step, each from the round trip with a floor; the
-    120 s as the outer bound.
+    120 s as the outer bound. **Done (2026-11-13), simpler than planned:**
+    with items 9 and 11 a dead hop on an outbound circuit is now told
+    (DESTROY) or noticed in seconds, and the job moves to a fresh
+    circuit, so what remained was the budget: a send's whole is 240 s (it
+    was 120 s, under the worst lookup alone: three points at 40 s), in
+    tabminer and the fam wallet; and a lookup unanswered 130 s is taken
+    for a stalled circuit and asked again over a fresh one, once. Not a
+    delivery: its payload may already have reached the recipient, and a
+    slate sent twice is answered twice.
 
 **Phase 4: notify instead of poll** (section 2)
 15. The node's event stream (`/v1/events`), the wallet's block thread,

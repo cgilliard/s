@@ -115,7 +115,16 @@ const AVOID: Duration = Duration::from_secs(300);
 /// list the stale one, so it is not struck, only left alone.
 const WRONG_KEY_AVOID: Duration = Duration::from_secs(3600);
 /// A send not answered by then fails; it waits as long for a circuit.
-const SEND_TIMEOUT: Duration = Duration::from_secs(120);
+/// A send's whole budget: a lookup may ask the recipient's three points
+/// (`ASK_TIMEOUT`, 40 s, each at worst), a delivery wait on each (30 s),
+/// and a circuit be built and a stalled lookup redone; it was 120 s, under
+/// the lookup's own worst (`docs/TIMING_FIXES.md`).
+const SEND_TIMEOUT: Duration = Duration::from_secs(240);
+/// A lookup with no answer this long (the three points' asks and a
+/// margin): its circuit has stalled, and the lookup is asked again on a
+/// fresh one, once. Not a delivery: its payload may have reached the
+/// recipient, and a slate sent twice is answered twice.
+const STEP_WAIT: Duration = Duration::from_secs(130);
 /// After an "offline" for a send, how long before asking again: a
 /// recipient's sessions move (rebuilt around a relay that stopped, or to
 /// a new point), and a lookup between two can find none.
@@ -244,6 +253,10 @@ struct Job {
     route: Option<(onion::Route, crate::mlkem::SecretKey)>,
     /// Told "offline" first then: asked again until [`OFFLINE_WAIT`] on.
     offline_since: Option<Instant>,
+    /// Its stage, and since when (a stage changing starts the clock).
+    step: (std::mem::Discriminant<Stage>, Instant),
+    /// A stalled lookup was asked again on a fresh circuit already.
+    restepped: bool,
 }
 
 /// A circuit for one send or one broadcast, carrying no session of ours.
@@ -1588,7 +1601,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         if self.part.jobs.len() >= MAX_SENDS {
             return self.rv.note(Note::Failed { tag: out.tag, to: out.to, why: "too many sends in progress".into() });
         }
-        self.part.jobs.push(Job { out, circuit: None, stage: Stage::Waiting, started: now, route: None, offline_since: None });
+        self.part.jobs.push(Job {
+            out,
+            circuit: None,
+            stage: Stage::Waiting,
+            started: now,
+            route: None,
+            offline_since: None,
+            step: (std::mem::discriminant(&Stage::Waiting), now),
+            restepped: false,
+        });
         self.progress_onion_sends(now);
     }
 
@@ -1624,6 +1646,24 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     }
                     None => self.part.jobs[i].stage = Stage::Waiting,
                 }
+            }
+            // The stage's clock; a lookup stalled past STEP_WAIT asked
+            // again on a fresh circuit, once.
+            let d = std::mem::discriminant(&self.part.jobs[i].stage);
+            if self.part.jobs[i].step.0 != d {
+                self.part.jobs[i].step = (d, now);
+            }
+            if matches!(self.part.jobs[i].stage, Stage::Lookup)
+                && !self.part.jobs[i].restepped
+                && now.duration_since(self.part.jobs[i].step.1) >= STEP_WAIT
+            {
+                let j = &mut self.part.jobs[i];
+                j.restepped = true;
+                j.stage = Stage::Waiting;
+                if let Some(h) = j.circuit.take() {
+                    self.release_outbound(h, "its lookup stalled", now);
+                }
+                self.chatter("onion: a lookup stalled; asking again over a fresh circuit");
             }
             if now.duration_since(self.part.jobs[i].started) >= SEND_TIMEOUT {
                 let why = match self.part.jobs[i].stage {
