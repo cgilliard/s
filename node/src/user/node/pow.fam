@@ -144,20 +144,23 @@ AC lit + 20 lit pwid @ 44 lit + pack3
 pwid @ 1C lit rot hash ;
 
 \ quickpow ( h t -- flag )  the result from the header's claimed mix meets t.
-: quickpow
-over pwhh @ powhash
+\ qpcore ( h t -- flag )  the same with pwhh already the header's powhash
+\ (headers.fam's hacc gives it blockid's, a hash a header saved).
+: qpcore
 over 8C lit + pwm @ dtom
 pwhh @ rot AC lit + pwseed
 pwm @ pws @ pwo @ compress  pwo @ dfrom
 pwo @ swap meets ;
+: quickpow  over pwhh @ powhash qpcore ;
 
 \ fullpow ( h t -- flag )  quickpow, and the true mix the claimed one and its
-\ result meeting t.
-: fullpow
-2dup quickpow if
-	over pwhh @ powhash
+\ result meeting t.  fpcore ( h t -- flag )  the same with pwhh already the
+\ header's powhash (qpcore leaves it so: no second powhash).
+: fpcore
+2dup qpcore if
 	pwhh @ 2 lit pick AC lit + pwo @ pwr @ hashmix
 	pwo @ dfrom  pwr @ dfrom
 	pwo @ rot 8C lit + 8 lit wcmp 0=
 	pwr @ rot meets and
 else 2drop 0 lit then ;
+: fullpow  over pwhh @ powhash fpcore ;

@@ -179,7 +179,11 @@ then
 \ if trusted
 hc @ 0= if
 	hpar @ he htarget
-	htrust @ 0= if hh @ htg @ hquick @ if quickpow else fullpow then 0= if -7 lit hc ! then then
+	\ the header's powhash blockid made above (pwid +4), not made again
+	htrust @ 0= if
+		pwid @ 4 lit + pwhh @ 8 lit wcopy
+		hh @ htg @ hquick @ if qpcore else fpcore then 0= if -7 lit hc ! then
+	then
 then
 hc @ 0= if hstore then
 hc @ ;
