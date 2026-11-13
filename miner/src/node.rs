@@ -769,6 +769,7 @@ fn message_name(m: &Message) -> &'static str {
         Message::GetAux { .. } | Message::Aux { .. } => "Aux",
         Message::Frame(_) | Message::Handshake { .. } | Message::ChannelGone { .. } => "a channel's frame",
         Message::Goodbye { .. } => "Goodbye",
+        Message::NotHeld { .. } => "NotHeld",
         _ => "a message-layer message",
     }
 }
@@ -781,7 +782,7 @@ fn stalled(
     let mut requests = Vec::new();
     let mut abandoned = Vec::new();
     for d in downloads.values_mut() {
-        if d.kind == Kind::Block && d.too_slow(now) {
+        if d.not_held || d.kind == Kind::Block && d.too_slow(now) {
             abandoned.push(d.id);
             continue;
         }
@@ -2020,6 +2021,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Message::Chunk { kind: Kind::Object, id, .. } => self.rv.downloads.get(id).is_some_and(|d| d.from == addr),
             // Frames are sealed: one that is not ours does not open.
             Message::Frame(f) => self.channels.knows(&addr, f.chan),
+            // Only about what we are fetching from that address.
+            Message::NotHeld { kind, id } => {
+                let downloads = if *kind == Kind::Tx { &self.tx_downloads } else { &self.downloads };
+                downloads.get(id).is_some_and(|d| d.from == addr && d.kind == *kind)
+            }
             // Only about a channel we have with that address.
             Message::ChannelGone { chan } => {
                 self.channels.knows(&addr, *chan) || self.channels.opening(&addr, *chan)
@@ -2312,6 +2318,17 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Message::Frame(f) => self.on_frame(addr, f, now),
             Message::ChannelGone { chan } => self.on_channel_gone(addr, chan, now),
+            Message::NotHeld { kind, id } => {
+                let downloads = if kind == Kind::Tx { &mut self.tx_downloads } else { &mut self.downloads };
+                if let Some(d) = downloads.get_mut(&id)
+                    && d.from == addr
+                    && d.kind == kind
+                {
+                    d.not_held = true;
+                    self.chatter(&format!("{addr} does not hold {}; asking another peer", short(&id)));
+                    self.retry_downloads(now);
+                }
+            }
             Message::Goodbye { token } => {
                 // Only from that address: it carries the token we gave it.
                 if self.request_ok(&addr, token) && self.peers.get(&addr).is_some() {
@@ -2645,7 +2662,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let bytes: Arc<Vec<u8>> = match kind {
             Kind::Tx => match self.mempool.lock().unwrap().get(&id) {
                 Some(tx) => Arc::new(tx.to_bytes()),
-                None => return,
+                None => return self.send(to, &Message::NotHeld { kind, id }),
             },
             Kind::Block => match self.served.iter().position(|(i, _)| *i == id) {
                 Some(pos) => {
@@ -2660,16 +2677,16 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                         self.served.truncate(SERVED_CACHE);
                         bytes
                     }
-                    _ => return,
+                    _ => return self.send(to, &Message::NotHeld { kind, id }),
                 },
             },
             Kind::Manifest | Kind::Part(_) => match self.snapshot_bytes(kind, &id) {
                 Some(b) => b,
-                None => return,
+                None => return self.send(to, &Message::NotHeld { kind, id }),
             },
             Kind::Consensus => match self.chain.consensus_file_by_id(&id) {
                 Ok(Some(b)) => Arc::new(b),
-                _ => return,
+                _ => return self.send(to, &Message::NotHeld { kind, id }),
             },
             Kind::Object => return self.serve_object(to, &id, indexes),
         };

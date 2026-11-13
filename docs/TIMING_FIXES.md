@@ -485,7 +485,18 @@ understood is ignored.
    (`drop_mine`); for one already built, the DESTROY is made again at
    each hop on its way back, so which hop failed would need more than a
    byte.
-10. "Not held" for chunks and aux leaves, both.
+10. "Not held" for chunks and aux leaves, both. **Done (2026-11-13), for
+    chunks:** `NotHeld` (type 25: the kind, the id), from tabminer's
+    `serve_chunks` and the fam node's `pgive` for a transaction not in
+    the pool, a body or snapshot not kept (the fam node not while its
+    worker holds the store, when it cannot look), a consensus file not
+    held; on it the asker's download from that peer is given up at once
+    (tabminer: the stall's path, so a block's peer is passed over and a
+    snapshot's marked unserved; the fam node: `pfetch` ends, the batch
+    asks its next peer). Not for aux leaves: they are named by the
+    block's id, which a block's download shares; tabminer asks for them
+    apart from everything else, and the fam node's `cxrun` stops at a
+    peer that does not answer (item 3).
 
 **Phase 3: measure instead of guess**
 11. A channel's death from its round trip (about ten resend timeouts,

@@ -270,6 +270,10 @@ then ;
 : pshow
 prec dup @  dup 18 lit rshift u. 2E lit putc  dup 10 lit rshift FF lit and u. 2E lit putc
 dup 8 lit rshift FF lit and u. 2E lit putc  FF lit and u. 3A lit putc  4 lit + @ u. ;
+\ prply  the datagram at ptx to whoever sent the one in prx.
+: prply  pfrom @ @ pfrom @ 4 lit + @ wsendto ;
+\ pnhs  NotHeld (25) for the GetChunks in prx: its kind (and part), its id.
+: pnhs  19 lit wbeg  prx @ D lit + 1 lit pgo @ + wbs  prx @ E lit + pgo @ + 20 lit wbs  prply ;
 \ pgive  the GetChunks in prx, if it carries our token: the chunks of a
 \ pooled transaction (kind 1), a block on our chain (kind 0), or a
 \ snapshot's manifest (kind 2) or part (kind 3, its index before the id).
@@ -291,6 +295,10 @@ prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
 	else
 		2 lit - 2 lit u<  pnest @ 0= and if psnap if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
 	then then then
+	\ not held (a transaction not in the pool, a body or a snapshot not
+	\ kept, looked for: not while the worker holds the store): said, so
+	\ the asker tries another peer now (NotHeld, 25)
+	dup 0=  pgkd @ 4 lit u< and  pnest @ 0= pgkd @ 1 lit = or and if pnhs then
 	if
 		prx @ 2E lit + pgo @ + c@  dup 2 lit lshift 2F lit + pgo @ + prn @ u> if drop 0 lit then
 		?dup if 0 lit do
@@ -308,8 +316,6 @@ pint @ 10 lit u< prn @ 25 lit u< 0= and if
 then ;
 : pdeq  pint @ if pinh @ 24 lit * pinq @ +  pinh @ 1 lit + F lit and pinh !  pint @ 1 lit - pint ! else 0 lit then ;
 
-\ prply  the datagram at ptx to whoever sent the one in prx.
-: prply  pfrom @ @ pfrom @ 4 lit + @ wsendto ;
 \ ppeers  Peers: those that answered us, as they are reached from here.
 : ppeers
 4 lit wbeg  ptp @ 0 lit w8  0 lit
@@ -668,9 +674,16 @@ pcp @ pid @ 20 lit d8= and if
 	then
 then ;
 : pdone  -1 lit pcnt @ 0 lit do i pmap @ + c@ 0= 0= and loop ;
+\ pnheld  a NotHeld in prx for the object being fetched: the fetch given
+\ up at once (pnh), the peer not waited for.
+: pnh variable ;
+: pnheld
+prx @ 5 lit + c@ pkind @ =
+pkind @ 3 lit = if prx @ 6 lit + le@ ppart @ = and  prx @ A lit + else prx @ 6 lit + then
+pid @ 20 lit d8= and if -1 lit pnh ! then ;
 
 : pfetch
-pid ! ppart ! pkind !  0 lit pobj !  0 lit plen !
+pid ! ppart ! pkind !  0 lit pobj !  0 lit plen !  0 lit pnh !
 \ an object begun from another peer: continued, what came kept
 psv @ if
 	pskind @ pkind @ =  pspart @ ppart @ = and  psid @ pid @ 20 lit d8= and if
@@ -681,7 +694,7 @@ then
 \ (after a stop for the API, the wait for chunks goes on from where it was)
 pyd @ if pyt0 @ else ticks then pt0 !  0 lit pyd !  0 lit prtx !
 begin
-	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and  pyd @ 0= and
+	pobj @ if pdone 0= else -1 lit then  ticks pt0 @ - pidl u< and  pyd @ 0= and  pnh @ 0= and
 while
 	\ the other peers kept meanwhile (pings), a fetch lasting minutes
 	pkeep
@@ -690,9 +703,9 @@ while
 	\ a few round trips pass with nothing (one lost: asked for again), or
 	\ (pyld) a connection to the API waits
 	begin
-		prcv @ pask @ u<  pobj @ if pdone 0= and then  pyd @ 0= and
+		prcv @ pask @ u<  pobj @ if pdone 0= and then  pyd @ 0= and  pnh @ 0= and
 		if pyld @ pxw !  pwns pwaitc  0 lit pxw !  pyld @ pxrdy @ and if 1 lit pyd ! then else 0 lit then
-	?dup while 9 lit = if pchunk then repeat
+	?dup while dup 19 lit = if pnheld then 9 lit = if pchunk then repeat
 	\ the next round asks again for what did not come: no sample from it
 	prcv @ pask @ u< prtx !
 	pnew @ if ticks pt0 ! then

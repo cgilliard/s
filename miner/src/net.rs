@@ -136,6 +136,7 @@ const T_HANDSHAKE: u8 = 21;
 const T_FRAME: u8 = 22;
 const T_CHANNEL_GONE: u8 = 23;
 const T_GOODBYE: u8 = 24;
+const T_NOT_HELD: u8 = 25;
 /// Bytes of a handshake message per `Handshake` datagram.
 pub const HANDSHAKE_FRAGMENT: usize = 1152;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
@@ -465,6 +466,11 @@ pub enum Message {
     /// the receiver gave the sender, so nobody else can send it for that
     /// address.
     Goodbye { token: u64 },
+    /// Chunks were asked for an object this node does not hold (a body it
+    /// pruned or never had, a transaction gone from its pool, a snapshot
+    /// no longer kept): the asker tries another peer now rather than
+    /// after its retries.
+    NotHeld { kind: Kind, id: Digest },
 }
 
 /// A payload was handed down the recipient's live session.
@@ -673,6 +679,11 @@ impl Message {
                 w.0.push(T_GOODBYE);
                 w.u64(*token);
             }
+            Message::NotHeld { kind, id } => {
+                w.0.push(T_NOT_HELD);
+                kind.put(&mut w);
+                w.digest(id);
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -806,6 +817,7 @@ impl Message {
             T_FRAME => Message::Frame(crate::channel::Frame::get(&mut r)?),
             T_CHANNEL_GONE => Message::ChannelGone { chan: r.u64()? },
             T_GOODBYE => Message::Goodbye { token: r.u64()? },
+            T_NOT_HELD => Message::NotHeld { kind: Kind::get(&mut r)?, id: r.digest()? },
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -966,6 +978,8 @@ pub struct Download {
     pub last_progress: Instant,
     pub last_request: Instant,
     pub retries: u32,
+    /// The peer said it does not hold the object: given up at once.
+    pub not_held: bool,
     pub started: Instant,
     path: PeerPath,
     /// Chunks arrived since the window last grew, and whether the window
@@ -1016,6 +1030,7 @@ impl Download {
             last_progress: now,
             last_request: now,
             retries: 0,
+            not_held: false,
             started: now,
             path,
             delivered: 0,
@@ -2281,6 +2296,7 @@ mod tests {
             }),
             Message::ChannelGone { chan: 0x0123_4567_89ab_cdef },
             Message::Goodbye { token: 0xfedc_ba98_7654_3210 },
+            Message::NotHeld { kind: Kind::Part(7), id: digest(8) },
         ]
     }
 
