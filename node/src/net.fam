@@ -528,6 +528,12 @@ tsfl @ 2 lit and if
 	dup cst @ 3 lit = if dup ciss @ over cnxt !  dup 12 lit 0 lit ntcpout  dup cnxt @ 1 lit + over cnxt ! then
 	drop
 else
+	\ bytes for a socket whose descriptors are closed: no one will read
+	\ them, so the connection is reset, as TCP does.  (Kept and never
+	\ read, they filled its ring; the window then stayed 0 and the
+	\ sender's write waited for good: the node's API, answering a request
+	\ its wallet had given up on, 2026-11-13.)
+	dup cflg @ 1 lit and  tsn @ 0= 0= and if creset FFFFFF98 lit cdead else
 	tsfl @ 10 lit and if dup cack then
 	dup crcv @ tsseq @ -  dup tsn @ u> 0= if
 		dup tsd @ + tsd !  tsn @ swap - tsn !
@@ -536,6 +542,7 @@ else
 	else drop then
 	tsn @ tsfl @ 1 lit and or if dup 10 lit 0 lit ntcpout then
 	tout
+	then
 then ;
 
 \ ntcpin ( ip t -- )  a TCP segment (t its header) to us.

@@ -1009,7 +1009,7 @@ expect tcp_lossy 124 '^connect 0 wrote 409600 read 17 got 409600 intact$' 20 ./t
 has tcp_lossy '^tcp 0 retransmits [1-9]'
 # TCP to this machine (docs/OS.md, loopback): a listener, a connection to
 # 127.0.0.1 and one to 10.0.2.15 accepted, written each way.
-usrc tloop ': b variable ;  : l variable ;  : c variable ;  : a variable ;  : sp  20 lit putc ;
+usrc tloop ': b variable ;  : l variable ;  : c variable ;  : a variable ;  : w variable ;  : sp  20 lit putc ;
 : once
 2 lit socket c !  c @ 2 lit rot E9A lit net "connect " puts . sp
 l @ accept a !  "accept " puts a @ 0< . sp
@@ -1020,12 +1020,22 @@ c @ b @ 100 lit read dup "reply " puts . sp b @ + 0 lit swap c! b @ puts 0A lit 
 c @ close drop  a @ close drop ;
 100 lit alloc b !
 2 lit socket l !  l @ 1 lit 0 lit E9A lit net "bind " puts . sp  l @ 3 lit 0 lit 0 lit net "listen " puts . 0A lit putc
-7F000001 lit once  A00020F lit once  bye'
-uimage loop bin/kernel init=tloop
+\ a connection its client closed without reading: 64 KiB written to it
+\ is refused (the client's side resets it, -104), not waited on for good
+\ (kept and never read, the bytes filled its ring and the window stayed
+\ 0: the node, answering a request its wallet had given up on, hung so)
+: late
+2 lit socket c !  c @ 2 lit 7F000001 lit E9A lit net drop
+l @ accept a !  c @ close drop
+a @ w @ 10000 lit write "late write " puts . 0A lit putc
+a @ close drop ;
+7F000001 lit once  A00020F lit once  10000 lit alloc w !  late  bye'
+uimage loop bin/kernel init=tloop:1024
 for n in 1 4; do
 	expect "tcp_loop_$n" 124 'kernel: init ended: 0' 6 ./tools/q32 --smp=$n --net "$T/loop.img"
 	[ "$(grep -c '^connect 0 accept 0 write 10 read 10 hello loop reply 4 back$' "$T/tcp_loop_$n.out")" = 2 ] \
 		|| fail "tcp_loop_$n" "$(head -c 300 "$T/tcp_loop_$n.out")"
+	has "tcp_loop_$n" '^late write -104$'
 done
 kill $EP
 
