@@ -2424,7 +2424,10 @@ begin
 	have @ wmtried @ 0= and nodeok @ and if wmstart then
 	0 lit pfd @ !  1 lit pfd @ 4 lit + !  wbon @ if wbp @ @ else 0 lit then pfd @ 8 lit + !  1 lit pfd @ C lit + !
 	mnfd @ pfd @ 10 lit + !  1 lit pfd @ 14 lit + !
-	pfd @  wonline @ if 3 lit 3B9ACA00 lit else 2 lit EE6B2800 lit then  poll drop
+	\ online: until the message layer's turn, a second at most, sooner if
+	\ a link's frame is due again (ownext); else the 4 s that the block
+	\ thread's word or a line cuts short
+	pfd @  wonline @ if 3 lit  wmonion @ if ownext else 3E8 lit then F4240 lit * else 2 lit EE6B2800 lit then  poll drop
 	wbon @ if pfd @ C lit + @ 10 lit rshift if wbread then then
 	wnewb @ have @ and if 0 lit wnewb !  wblkev then
 	pfd @ 4 lit + @ 10 lit rshift if

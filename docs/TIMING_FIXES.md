@@ -622,8 +622,16 @@ understood is ignored.
     the announcing, the message layer's check, a waiting request's end;
     a second at least, 4 at most (a wait is one word of nanoseconds),
     a datagram or the API waking it sooner. `nidle`, before a sync,
-    keeps its second. Left: the wallet's loop, with item 15's block
-    thread.
+    keeps its second.
+    **The wallet's part done (2026-11-13):** offline, its loop waits
+    for a line or the block thread's word (item 15), the 4 s poll only
+    without the thread. Online in onion mode, it waits until a link's
+    frame is due again (`ownext`: its last send and resend wait, a
+    hello each second), a second at most: a resend goes when due, not
+    at the next second, and a timer not counted is no later than
+    before. The message layer's other timers (some 70, in `wopart.fam`
+    and `wnet.fam`) still run on that second: a wait longer than it
+    would need every one counted, for one wakeup a second saved.
 
 **Phase 5: tests**
 17. The drop filter by message kind and a test per fault (section 7);

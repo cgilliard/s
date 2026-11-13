@@ -687,6 +687,26 @@ owdead @ if
 then ;
 \ owcirc ( i -- )  a circuit's building: CREATE once its link is open, then
 \ EXTEND for each hop after; 60 s for it all.
+\ ownext ( -- ms )  how long until a frame on a link is due again (its
+\ last send and its resend wait) or a hello is (each second): 1000 at
+\ most, the wallet's wait while online (docs/TIMING_FIXES.md, item 16),
+\ so a resend goes when due, not at the next second.  Never longer than
+\ the second it waited before, so a timer not counted here is no later.
+: ownx variable ;  : ownk variable ;
+\ ownmin ( due -- )  the wait to due (none if past), if the least yet.
+: ownmin  mnms -  dup 0< if drop 0 lit then  ownx @ umin ownx ! ;
+: ownext
+3E8 lit ownx !
+owch @ if
+	OWCH 0 lit do
+		i ownk !
+		i 4 lit owcf @ 1 lit = if i 10 lit owcf @ 3E8 lit + ownmin then
+		i 4 lit owcf @ 2 lit = if
+			OWIF 0 lit do ownk @ i owslot dup @ if dup 8 lit + @ swap 10 lit + @ + ownmin else drop then loop
+		then
+	loop
+then
+ownx @ ;
 : owcirc
 dup owci @ 1 lit = if
 	dup 1C lit owcif @ 0= if
