@@ -24,6 +24,12 @@ wprogress() {
 wdump() {
 	for f in $(find "$T" -type f \( -name '*.out' -o -name '*.log' \) | sort); do
 		echo "== $f (last 40 lines)" >&2; tail -40 "$f" >&2
+		# the OS's console: what is not the node's verbose lines too (the
+		# shell's, wm's, the kernel's), which the node's would push out of
+		# the last 40 (wm's start or its error, early on)
+		if [ "$(basename "$f")" = os.out ]; then
+			echo "== $f (not the node's lines, last 40)" >&2; grep -v '^node: ' "$f" | tail -40 >&2
+		fi
 	done
 }
 
@@ -57,6 +63,18 @@ wait_for() {
 wait_own() {
 	wo_prev=${WPROGRESS:-}
 	WPROGRESS="wc -c < '$1' 2>/dev/null || echo 0"
+	wait_for "$@"
+	WPROGRESS=$wo_prev
+}
+
+# wait_os FILE REGEX IDLE WHAT — wait_for in the OS's console, only
+# its lines that are not the node's counting as progress: for what the
+# OS's other programs say (wm serving), which the node's verbose lines
+# would otherwise keep waiting for (prooftest on CI: wm never said it
+# served, and the node's lines kept the 60 s window from running out).
+wait_os() {
+	wo_prev=${WPROGRESS:-}
+	WPROGRESS="grep -vc '^node: ' '$1' 2>/dev/null || echo 0"
 	wait_for "$@"
 	WPROGRESS=$wo_prev
 }

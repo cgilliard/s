@@ -68,7 +68,7 @@ wait_for "$T/os.out" '^\$ ' 60 "the shell"
 	echo 'wm 80 &'
 } >&3
 wait_own "$T/os.out" '^node: .* (synced, height [0-9]+$|height [0-9]+  \()' 900 "the node in sync"
-wait_for "$T/os.out" 'wm: port 80' 60 "wm"
+wait_os "$T/os.out" 'wm: port 80' 60 "wm"
 
 echo "msgtest.sh: the wallets paying each other online, through the relay"
 python3 -u - "$WP" "$T" "messages" "$HP" "$AP" <<'EOF' || { wdump; exit 1; }
