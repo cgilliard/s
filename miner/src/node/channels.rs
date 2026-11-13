@@ -134,6 +134,11 @@ impl Channels {
         self.open.len()
     }
 
+    /// Every open channel's other end and number.
+    pub(super) fn keys(&self) -> Vec<(SocketAddr, u64)> {
+        self.open.keys().copied().collect()
+    }
+
     /// Tests: every channel dropped without telling the other ends.
     #[cfg(test)]
     pub(super) fn forget(&mut self) {

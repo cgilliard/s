@@ -484,6 +484,13 @@ prdy if
 			dup B lit = if phfrom then
 			dup 5 lit = if phloc then
 			dup E lit = prn @ 2D lit = and if paux then
+			\ Goodbye (24, our token: from that address): the peer is
+			\ shutting down; not answering until its next Pong, so it is
+			\ neither announced to nor asked meanwhile
+			dup 18 lit = prn @ D lit = and  pfk @ 0< 0= and if
+				0 lit pfk @ prec 8 lit + !  1 lit pfk @ prec B0 lit + !
+				vrb @ if nhead "peer " puts pfk @ pshow " is shutting down" puts 0A lit putc then
+			then
 		then
 		pfk @ 0< if drop 0 lit else
 		dup 2 lit = if

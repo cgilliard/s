@@ -135,6 +135,7 @@ const T_NOTICE: u8 = 20;
 const T_HANDSHAKE: u8 = 21;
 const T_FRAME: u8 = 22;
 const T_CHANNEL_GONE: u8 = 23;
+const T_GOODBYE: u8 = 24;
 /// Bytes of a handshake message per `Handshake` datagram.
 pub const HANDSHAKE_FRAGMENT: usize = 1152;
 /// Siblings per `Proof` message: a 40-level path takes two datagrams.
@@ -459,6 +460,11 @@ pub enum Message {
     /// than waiting out its timeout. Only the channel's 64-bit number
     /// vouches for it, which only the two ends and the path between see.
     ChannelGone { chan: u64 },
+    /// The sender is shutting down: drop it from the peer table now
+    /// rather than after `PEER_TIMEOUT` of silence. It carries the token
+    /// the receiver gave the sender, so nobody else can send it for that
+    /// address.
+    Goodbye { token: u64 },
 }
 
 /// A payload was handed down the recipient's live session.
@@ -663,6 +669,10 @@ impl Message {
                 w.0.push(T_CHANNEL_GONE);
                 w.u64(*chan);
             }
+            Message::Goodbye { token } => {
+                w.0.push(T_GOODBYE);
+                w.u64(*token);
+            }
         }
         debug_assert!(w.0.len() <= MAX_DATAGRAM, "datagram of {} bytes", w.0.len());
         w.finish()
@@ -795,6 +805,7 @@ impl Message {
             }
             T_FRAME => Message::Frame(crate::channel::Frame::get(&mut r)?),
             T_CHANNEL_GONE => Message::ChannelGone { chan: r.u64()? },
+            T_GOODBYE => Message::Goodbye { token: r.u64()? },
             _ => return None,
         };
         r.is_empty().then_some(msg)
@@ -848,7 +859,8 @@ impl Message {
             | Message::Session { token, .. }
             | Message::GetAnnounce { token, .. }
             | Message::Offer { token, .. }
-            | Message::Handshake { token, .. } => Some(*token),
+            | Message::Handshake { token, .. }
+            | Message::Goodbye { token } => Some(*token),
             _ => None,
         }
     }
@@ -864,7 +876,8 @@ impl Message {
             | Message::Session { token, .. }
             | Message::GetAnnounce { token, .. }
             | Message::Offer { token, .. }
-            | Message::Handshake { token, .. } => *token = t,
+            | Message::Handshake { token, .. }
+            | Message::Goodbye { token } => *token = t,
             _ => {}
         }
         self
@@ -2267,6 +2280,7 @@ mod tests {
                 sealed: vec![7u8; crate::channel::MAX_BODY + 16],
             }),
             Message::ChannelGone { chan: 0x0123_4567_89ab_cdef },
+            Message::Goodbye { token: 0xfedc_ba98_7654_3210 },
         ]
     }
 

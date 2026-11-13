@@ -946,6 +946,24 @@ fn run(args: &Args, mining: bool) -> AnyResult<()> {
     let listening = format!("listening on {}", node.local_addr()?);
     log::line(&listening);
     let node_thread = std::thread::Builder::new().name("node".into()).spawn(move || node.run())?;
+    // SIGINT or SIGTERM: the node says goodbye (its channels' other ends
+    // and its peers told, `Node::goodbye`) before the process ends, rather
+    // than vanishing for the network to find out by silence.
+    #[cfg(unix)]
+    {
+        stop_signal::catch();
+        let events = events.clone();
+        std::thread::Builder::new().name("signals".into()).spawn(move || {
+            while !stop_signal::caught() {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            log::line("stopping (a signal): telling channels and peers");
+            events.send(Event::Stop).ok();
+            std::thread::sleep(Duration::from_millis(500));
+            log::line("tabminer stopped");
+            std::process::exit(0);
+        })?;
+    }
     let tip = chain.tip()?.ok_or("no genesis")?;
     let tip_line = format!("tip at height {} ({})", tip.height, short(&tip.hash()));
     log::line(&tip_line);
@@ -3954,4 +3972,36 @@ fn mine(ctx: &Ctx, dataset: &Dataset, blocks: u64, jobs: usize, delay: Duration)
         }
     }
     Ok(())
+}
+
+/// SIGINT and SIGTERM noted (`caught`), for a goodbye before the process
+/// ends; std links the C library on Unix, so `signal` needs no crate.
+#[cfg(unix)]
+mod stop_signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CAUGHT: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_signal(_: i32) {
+        CAUGHT.store(true, Ordering::Relaxed);
+    }
+
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+
+    pub fn catch() {
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        // SAFETY: the handler only stores to an atomic, which is
+        // async-signal-safe.
+        unsafe {
+            signal(SIGINT, on_signal);
+            signal(SIGTERM, on_signal);
+        }
+    }
+
+    pub fn caught() -> bool {
+        CAUGHT.load(Ordering::Relaxed)
+    }
 }

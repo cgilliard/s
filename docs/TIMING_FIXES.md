@@ -460,7 +460,16 @@ understood is ignored.
    after it began (`adl`, `awr`).
 
 **Phase 2: tell instead of wait** (section 3)
-8. Goodbye on shutdown (DESTROY, CLOSE, going away), both.
+8. Goodbye on shutdown (DESTROY, CLOSE, going away), both. **Done
+   (2026-11-13):** tabminer, stopping (`quit`, or SIGINT/SIGTERM on Unix,
+   caught without a crate), sends `ChannelGone` on every channel (the
+   other end closes it, and every circuit through it both ways, at once:
+   no DESTROY of its own needed) and `Goodbye` (type 24, the token the
+   receiver gave it) to every live peer, which drops it from its table;
+   the fam node takes a `Goodbye` (the peer not answering, lost, until
+   its next Pong) and the fam wallet tells its links' relays on exit
+   (`owbye`). The fam node itself has no goodbye: it is stopped with its
+   machine. Test: `a_node_stopping_tells_its_channels_and_peers`.
 9. DESTROY for unknown circuits and dropped CREATEs; "next hop
    unreachable"; handshake refused with why; rendezvous REFUSED.
 10. "Not held" for chunks and aux leaves, both.

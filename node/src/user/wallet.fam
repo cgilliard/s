@@ -2263,4 +2263,6 @@ begin
 		pfd @ 4 lit + @ 10 lit rshift 0= if wtick then
 	then
 while repeat
+\ leaving: the relays told (their channels to us gone)
+wonline @ wmonion @ and if owbye then
 bye

@@ -397,6 +397,13 @@ mnrn @ D lit = if
 		then
 	loop
 then ;
+\ owbye  leaving: each open link's relay told its channel is gone
+\ (ChannelGone), so it closes it and the circuits through it at once
+\ rather than when it finds the wallet silent.
+: owbye
+OWCH 0 lit do
+	i 4 lit owcf @ 2 lit = if 17 lit mnhd  i 8 lit owcf 8 lit mnwn  i owc @ owrec mnout then
+loop ;
 \ owin  a datagram wnet passed on: a Handshake, a Frame or a ChannelGone.
 : owin  4 lit mnrx c@ dup 15 lit = if owhsin then dup 16 lit = if owfrin then 17 lit = if owgone then ;
 

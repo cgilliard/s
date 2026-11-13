@@ -768,6 +768,7 @@ fn message_name(m: &Message) -> &'static str {
         Message::Chunk { .. } => "Chunk",
         Message::GetAux { .. } | Message::Aux { .. } => "Aux",
         Message::Frame(_) | Message::Handshake { .. } | Message::ChannelGone { .. } => "a channel's frame",
+        Message::Goodbye { .. } => "Goodbye",
         _ => "a message-layer message",
     }
 }
@@ -1185,7 +1186,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     }
                 }
                 Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) => {}
-                Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                    self.goodbye(Instant::now());
+                    break;
+                }
             }
             while let Ok(outcome) = self.outcomes.try_recv() {
                 self.on_outcome(outcome);
@@ -1290,6 +1294,23 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
 
     fn log(&self, msg: &str) {
         crate::log::line(&format!("net: {msg}"));
+    }
+
+    /// Shutting down: each channel's other end told it is gone (it closes
+    /// at once, and with it every circuit through it, both ways), and each
+    /// peer that we are going (it drops us now), rather than all of them
+    /// finding out by silence, 30 s to 3 minutes later. A restart or an
+    /// upgrade is then not a crash to the network (`docs/TIMING_FIXES.md`).
+    fn goodbye(&mut self, now: Instant) {
+        let chans = self.channels.keys();
+        for &(addr, chan) in &chans {
+            self.send(addr, &Message::ChannelGone { chan });
+        }
+        let peers: Vec<SocketAddr> = self.peers.live(now).map(|p| p.addr).collect();
+        for &addr in &peers {
+            self.send(addr, &Message::Goodbye { token: 0 });
+        }
+        self.log(&format!("going: {} channels and {} peers told", chans.len(), peers.len()));
     }
 
     /// `log`, at most once each [`LOG_EVERY`] for the same peer and kind
@@ -2289,6 +2310,13 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             }
             Message::Frame(f) => self.on_frame(addr, f, now),
             Message::ChannelGone { chan } => self.on_channel_gone(addr, chan, now),
+            Message::Goodbye { token } => {
+                // Only from that address: it carries the token we gave it.
+                if self.request_ok(&addr, token) && self.peers.get(&addr).is_some() {
+                    self.peers.remove(&addr);
+                    self.log(&format!("peer {addr} is shutting down; dropped from the peer table"));
+                }
+            }
         }
     }
 
@@ -5456,6 +5484,51 @@ mod tests {
         }
         h_a.join().unwrap();
         h_b.join().unwrap();
+    }
+
+    /// A node stopping says goodbye: a relay it had a channel to closes
+    /// it at once, and a peer drops it from its table, rather than after
+    /// 20 s (a channel's timeout in tests) and 180 s of silence.
+    #[test]
+    fn a_node_stopping_tells_its_channels_and_peers() {
+        let (a, b) = (open("bye-a"), open("bye-b"));
+        let key = |tag: u8| crate::mldsa::keygen(&[tag; 32]);
+        let id = |tag: u8| crate::address::id_of(key(tag).public_key());
+        let mut cfg = config(vec![], &a.dir);
+        cfg.relay = true;
+        cfg.identity = Some(key(1));
+        cfg.relay_key = cfg.identity.clone();
+        let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), cfg).unwrap();
+        let addr_a = node_a.local_addr().unwrap();
+        let stats_a = node_a.stats();
+        let sink_a = Arc::clone(&node_a.channels.sink);
+        let h_a = std::thread::spawn(move || node_a.run());
+        let mut cfg = config(vec![addr_a], &b.dir);
+        cfg.relay = true;
+        cfg.identity = Some(key(2));
+        cfg.relay_key = cfg.identity.clone();
+        let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cfg).unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+        let h_b = std::thread::spawn(move || node_b.run());
+        let wait_for = |what: &str, secs: u64, ok: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + guard(secs);
+            while !ok() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let b_peer_of_a =
+            || stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b && p.handshaken && p.live);
+        tx_b.send(Event::TestChannel(addr_a, id(1), b"hello".to_vec())).unwrap();
+        wait_for("b's body at a", 10, &|| sink_a.lock().unwrap().len() == 1);
+        wait_for("b a peer of a", 15, &b_peer_of_a);
+        wait_for("a's channel counted", 5, &|| stats_a.lock().unwrap().channels == 1);
+        tx_b.send(Event::Stop).unwrap();
+        h_b.join().unwrap();
+        wait_for("a closing b's channel", 5, &|| stats_a.lock().unwrap().channels == 0);
+        wait_for("a dropping b", 5, &|| !stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b));
+        tx_a.send(Event::Stop).unwrap();
+        h_a.join().unwrap();
     }
 
     #[test]
