@@ -248,8 +248,17 @@ ndn @ 0 lit do ntmp @ ndn @ 1 lit - i - + c@ jc  ndn @ 1 lit - i - A lit = if 2E
 
 \ hask ( method path body n -- body | 0 )  a request (a body of n bytes
 \ unless n is 0) answered: its body, NUL-ended; the status in hcode (0:
-\ the node not reached).
-: hcode variable ;  : hmeth variable ;  : hbd variable ;  : hbn variable ;
+\ the node not reached, or silent 12 s: a node busy or stopped no longer
+\ freezes the wallet, docs/TIMING_FIXES.md).
+: hcode variable ;  : hmeth variable ;  : hbd variable ;  : hbn variable ;  : hpe variable ;
+\ hready ( -- flag )  the node's socket readable within 12 s (three of
+\ poll's 4 s at most).
+: hready
+hpe @ 0= if 8 lit alloc hpe ! then
+0 lit  3 lit 0 lit do dup 0= if
+	hs @ hpe @ !  1 lit hpe @ 4 lit + !
+	hpe @ 1 lit EE6B2800 lit poll 0 lit > if drop -1 lit then
+then loop ;
 : hask
 hbn !  hbd !  hpath !  hmeth !  0 lit hn !  0 lit hres !  0 lit hcode !
 2 lit socket hs !
@@ -259,7 +268,7 @@ hs @ 2 lit 7F000001 lit E9A lit net 0< 0= if
 	wcrlf hreq @ -
 	hs @ hreq @ rot write drop
 	hbn @ if hs @ hbd @ hbn @ write drop then
-	begin hs @ hbuf @ hn @ + HMAX 1 lit - hn @ - read  dup 0 lit > while hn @ + hn ! repeat drop
+	begin hready if hs @ hbuf @ hn @ + HMAX 1 lit - hn @ - read else 0 lit 0 lit hn ! then  dup 0 lit > while hn @ + hn ! repeat drop
 	0 lit hbuf @ hn @ + c!
 	hn @ C lit u< 0= if
 		hbuf @ 9 lit + c@ 30 lit - 64 lit *  hbuf @ A lit + c@ 30 lit - A lit * +  hbuf @ B lit + c@ 30 lit - + hcode !
@@ -457,6 +466,8 @@ nodeok @ ;
 : wtick
 have @ if
 	"/v1/status" hget ?dup if
+		\ answered: reached, whether the tip moved or not
+		1 lit nodeok !
 		dup "'height':" jfind jnum drop nlo @ lh !
 		"'tip':'" jfind ntip @ 40 lit bcopy  0 lit ntip @ 40 lit + c!
 		ntip @ ltip @ streq 0= if
@@ -2044,7 +2055,10 @@ mnst @ if
 		wmkind @ 1 lit = if "the slate reached a rendezvous point of the recipient; waiting for the answer" wmev then
 		wmkind @ 3 lit = if "the query reached a rendezvous point of the owner of the name; waiting for its answer" wmev then
 	else
-		wmkind @ 1 lit = if wmcanc then
+		\ a slate whose payload was offered may still reach the recipient
+		\ (a point slow to answer): kept, not cancelled; one never offered
+		\ went nowhere: cancelled, its coins free again
+		wmkind @ 1 lit = if mnofd @ if "the slate may still reach the recipient: its coins stay reserved until it answers or you cancel it" wmev else wmcanc then then
 		wmkind @ 3 lit = if 0 lit wmrs ! then
 		wtmp @ "the message was not delivered: " scpy mnwhy @ scpy 0 lit over c! drop  wtmp @ jsafe wtmp @ wmev
 	then

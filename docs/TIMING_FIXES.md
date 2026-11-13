@@ -436,7 +436,15 @@ understood is ignored.
 5. The fam wallet: a deadline on `hask`; `nodeok` on any answer; the
    init-mode send 40 s a point with a resend, no cancel on "did not
    answer"; hellos counted once sent; the build timeout through
-   `owsfail`; idle links closed before the relay's 300 s.
+   `owsfail`; idle links closed before the relay's 300 s. **Done
+   (2026-11-13):** `hask` gives up after 12 s silent (`hready`, poll);
+   `nodeok` set by any status answered; a point given 40 s, its lookup
+   asked again each 3 s (not the offer: a payload twice), and a slate
+   whose payload was offered kept reserved when no point answered (it
+   may still arrive) rather than cancelled; the Pong waited for 30 s on
+   its own, the eight tries for hellos sent; a build's 60 s through
+   `owsfail` (DESTROY, the 3 s wait) or `owclose`; a link no circuit uses
+   closed after 240 s without a body (`+78`).
 6. tabminer: `RETIRE_WAIT` closes on live only (or the new one
    failing); OFFLINE at once on link gone; delegations queued.
 7. The API: a deadline per request and non-blocking writes.

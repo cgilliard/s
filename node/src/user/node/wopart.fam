@@ -109,7 +109,8 @@ loop then ;
 \ hello went (ms), +14 how many times, +18 the reply's fragments come (a
 \ bit each), +1C our sending key, +3C our receiving key, +5C the next
 \ sequence number to send, +60 the next to receive, +64 acknowledgements
-\ sent, +68 when last heard, +6C when last sent.  Frames in flight: OWIF
+\ sent, +68 when last heard, +6C when last sent, +78 when a body (a cell,
+\ not a keepalive) last went or came.  Frames in flight: OWIF
 \ slots a link, each +0 its sequence (0: free), +4 first sent, +8 last
 \ sent, +C tries, +10 the wait before the next, +14 its length, +18 the
 \ datagram's frame.  +70 the smoothed round trip (ms; 0 none measured
@@ -166,7 +167,7 @@ owoc @ 0< if
 		owoc @ owc OWCHR oxzero
 		dup owoc @ owc !  1 lit owoc @ 4 lit owcf !
 		owoc @ 8 lit owcf 8 lit mnrand
-		1 lit owoc @ 5C lit owcf !  1 lit owoc @ 60 lit owcf !  mnms owoc @ 68 lit owcf !  mnms owoc @ 6C lit owcf !
+		1 lit owoc @ 5C lit owcf !  1 lit owoc @ 60 lit owcf !  mnms owoc @ 68 lit owcf !  mnms owoc @ 6C lit owcf !  mnms owoc @ 78 lit owcf !
 		owtmp @ 60 lit mnrand
 		owtmp @ owtmp @ 40 lit + owoc @ owhl owoc @ owdkc oxhello
 		owoc @ OWIF 0 lit do 0 lit over i owslot ! loop drop
@@ -210,6 +211,7 @@ owss @ 0< if 0 lit else
 	owsc @ owrto over 10 lit + !  14 lit + !
 	owsc @  owsc @ owss @ owslot 18 lit +  owsc @ owss @ owslot 14 lit + @  owdgo
 	owsc @ 5C lit owcf dup @ 1 lit + swap !  mnms owsc @ 6C lit owcf !
+	owsn @ if mnms owsc @ 78 lit owcf ! then
 	-1 lit
 then ;
 \ owack ( c -- )  an acknowledgement: kind 1, our count of them as its seq.
@@ -377,7 +379,7 @@ owfc @ 0< 0= if
 		D lit mnrx c@ 0= if
 			E lit mnrx le@ owfc @ 60 lit owcf @ = if
 				owfc @ 60 lit owcf dup @ 1 lit + swap !
-				owfn @ 400 lit = if owfc @ owfr @ owcellin then
+				owfn @ 400 lit = if mnms owfc @ 78 lit owcf !  owfc @ owfr @ owcellin then
 			then
 			owfc @ owack
 		then
@@ -627,13 +629,21 @@ then ;
 \ owlink ( c -- )  a link's upkeep: the hello again (each second, eight
 \ times); frames again past their wait (doubling to 5 s; 12 tries or 30 s:
 \ dead); a keepalive after 25 s quiet; dead after 120 s unheard.
+\ owlbusy ( c -- flag )  a circuit building or ready on link c.
+: owlbusy  0 lit  OWCC 0 lit do i 4 lit owcif @ 2 lit pick =  i owci @ dup 1 lit = swap 2 lit = or and or loop nip ;
 : owlc variable ;  : owdead variable ;
 : owlink
 owlc !  0 lit owdead !
 owlc @ 4 lit owcf @ 1 lit = if
 	mnms owlc @ 10 lit owcf @ - 3E8 lit u< 0= if
 		owlc @ 14 lit owcf @ 8 lit u< 0= if -1 lit owdead ! else
-			owlc @ owc @ owrec 10 lit mnf @ if owlc @ owhsend else mnms owlc @ 10 lit owcf !  owlc @ 14 lit owcf dup @ 1 lit + swap ! then
+			\ the hello once the relay's record answered our ping (its
+			\ token); meanwhile only the wait for that counts (30 s, as
+			\ tabminer's PING_WAIT), not the hellos' eight tries
+			owlc @ owc @ owrec 10 lit mnf @ if owlc @ owhsend else
+				mnms owlc @ 10 lit owcf !
+				mnms owlc @ 68 lit owcf @ - 7530 lit u< 0= if -1 lit owdead ! then
+			then
 		then
 	then
 then
@@ -651,6 +661,11 @@ owlc @ 4 lit owcf @ 2 lit = if
 	0 lit  OWIF 0 lit do owlc @ i owslot @ or loop 0=  mnms owlc @ 6C lit owcf @ - 61A8 lit u< 0= and if owlc @ owbody @ 0 lit owsend1 drop then
 	mnms owlc @ 68 lit owcf @ - 1D4C0 lit u< 0= if -1 lit owdead ! then
 then
+\ a link no circuit uses, no body on it for 240 s: closed before the
+\ relay closes it as idle (300 s), rather than reused after and failing
+owlc @ 4 lit owcf @ 2 lit =  mnms owlc @ 78 lit owcf @ - 3A980 lit u< 0= and  owlc @ owlbusy 0= and if
+	0 lit owlc @ 4 lit owcf !
+then
 owdead @ if
 	0 lit owlc @ 4 lit owcf !
 	OWCC 0 lit do i 4 lit owcif @ owlc @ =  i owci @ 0= 0= and if 3 lit i owci ! then loop
@@ -664,7 +679,9 @@ dup owci @ 1 lit = if
 			dup C lit owcif @ 0= if dup owcreate else dup owextend then
 		then
 	then
-	mnms over 24 lit owcif @ - EA60 lit u< 0= if 3 lit over owci ! then
+	\ 60 s: given up, its hops told (DESTROY); a standing one built again
+	\ after owsfail's wait, not at once
+	mnms over 24 lit owcif @ - EA60 lit u< 0= if dup OWS u< if dup BB8 lit owsfail else dup owclose then then
 then drop ;
 : owtick
 owinit

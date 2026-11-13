@@ -220,6 +220,9 @@ then ;
 \ known: a reply), the payload sealed to it and offered there; the
 \ point's Notice says whether it was forwarded.  Eight seconds a step;
 \ then the next point ──
+\ mnofd: the payload offered at a point at least once in this send;
+\ mnsl: when the step's datagram last went (the lookup again each 3 s).
+: mnofd variable ;  : mnsl variable ;
 : mnsnt variable ;  : mnss variable ;  : mnsto variable ;  : mnsj variable ;  : mnst0 variable ;  : mnsk3 variable ;  : mnhave variable ;
 : mnra variable ;  : mnsin variable ;  : mnsil variable ;  : mnskd variable ;  : mntps variable ;  : mnnx variable ;
 \ mnss: 0 idle, 1 asking for the announce, 2 offered the payload.
@@ -235,9 +238,10 @@ dup if mnpo @ mnpl @ mnpid2 @ mgoid  -1 lit mnhave ! then  0= 0= ;
 12 lit mnhd  mnsk3 @ 8 lit mnf 8 lit mnwn  mnsto @ 20 lit mnwn  mnback @ 8 lit mnwn  mnsk3 @ mnout
 1 lit mnss !  -1 lit mnsk3 @ 48 lit mnf ! ;
 : mnoffer
+-1 lit mnofd !
 13 lit mnhd  mnsk3 @ 8 lit mnf 8 lit mnwn  mnpid2 @ 20 lit mnwn  mnpl @ mnw32  mnback @ 8 lit mnwn  mnsk3 @ mnout
 2 lit mnss !  -1 lit mnsk3 @ 48 lit mnf ! ;
-: mnstep  -1 lit mnsnt !  mnss @ 2 lit = if mnoffer else mnlook then ;
+: mnstep  -1 lit mnsnt !  mnms mnsl !  mnss @ 2 lit = if mnoffer else mnlook then ;
 \ mnnext  the next of the recipient's points from mnsj: asked for the
 \ announce, or offered the payload; none left, failed.
 : mnnext
@@ -261,7 +265,7 @@ mnscnt @ if
 	then then
 then ;
 : mnbeg
-0 lit mnst !  0 lit mnwhy !  0 lit mnsj !
+0 lit mnst !  0 lit mnwhy !  0 lit mnsj !  0 lit mnofd !
 mnsto @ mntps @ mnpick  mnnext ;
 : mnsend
 mnss @ if 2drop 2drop 0 lit else
@@ -393,7 +397,11 @@ mndon @  mnms mndt @ - 190 lit u< 0= and if
 	mndr @ 1 lit + dup mndr !  8 lit u> if 0 lit mndon !  mnss @ 1 lit = if mnnext then else mndask then
 then
 mnss @  mnsnt @ 0= and  mnsk3 @ 10 lit mnf @ and if mnstep then
-mnss @  mnms mnst0 @ - 1F40 lit u< 0= and if "a point did not answer" mnwhy !  mnnext then ;
+\ a lookup unanswered asked again each 3 s (one datagram lost does not
+\ skip the point); a point given 40 s, as tabminer's POINT_TIMEOUT (it may
+\ wait 30 s itself on a slow recipient before its notice)
+mnss @ 1 lit =  mnsnt @ and  mnms mnsl @ - BB8 lit u< 0= and if mnstep then
+mnss @  mnms mnst0 @ - 9C40 lit u< 0= and if "a point did not answer" mnwhy !  mnnext then ;
 
 \ ── The start ──
 : mnpbuf variable ;
