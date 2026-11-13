@@ -426,7 +426,13 @@ understood is ignored.
    fetch cannot nest in one): TxInvs wait in their queue (16) meanwhile.
 4. The fam node: the ban's own field; "passed over" 600 s; a batch's
    silent peer dropped for the run, give-up after a few seconds without
-   progress, no duplicate retry.
+   progress, no duplicate retry. **Done (2026-11-13):** "passed over" in
+   the record's `C4`, the ban keeping `B4`; kept at a minute, not 600 s
+   (the node often has one or two peers: passing over its only one ten
+   minutes would stall it); a peer that sends nothing for a block (a
+   prefetch included) is skipped for the rest of the run (`nsil`), so
+   it is asked once, not once a slot; and `pfetch` gives up after 24
+   round trips, 10 to 30 s, rather than 30 s at least.
 5. The fam wallet: a deadline on `hask`; `nodeok` on any answer; the
    init-mode send 40 s a point with a resend, no cancel on "did not
    answer"; hellos counted once sent; the build timeout through

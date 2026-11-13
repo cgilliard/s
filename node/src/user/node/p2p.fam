@@ -108,9 +108,10 @@ A lit 0 lit w64  A lit 0 lit w64 ;
 
 : prec  D0 lit * ptab @ + ;                     \ ( k -- a )  ip, port, answered, 0, token (8), status (8C),
 \ then (pkeep's, in secs) when to ping it next (A4), the wait after that
-\ (A8), when it last answered (AC), whether said lost (B0); until when its
-\ claims are passed over (B4: it claimed a height it did not deliver, or
-\ it is banned); its strikes (B8) and when the last was (BC)
+\ (A8), when it last answered (AC), whether said lost (B0); until when it
+\ is banned (B4); its strikes (B8) and when the last was (BC); its round
+\ trip (C0, ticks; 0 none yet); until when its claims are passed over (C4:
+\ it claimed a height it did not deliver)
 : psend  prec dup @ swap 4 lit + @ wsendto ;    \ ( k -- )  the datagram at ptx to peer k
 : puse  dup pcur !  prec  dup @ pip !  dup 4 lit + @ ppt !  dup 10 lit + ptok !  18 lit + pst ! ;
 \ pset ( ip port k -- )  record k made afresh for the address: not
@@ -627,9 +628,9 @@ wsend ;
 \ The round trip to peers, smoothed as TCP's (7/8 of the last and 1/8 of
 \ the new), in ticks (10 MHz), 300 ms to start with: an ask is repeated
 \ after three of them (300 ms at least, 4 s at most: poll's limit), and a
-\ fetch moves on only after nothing new for 30 s or twenty round trips,
-\ however slow the link (a satellite's 600 ms and more): never on a clock
-\ of its own.  What came is kept for the next peer.
+\ fetch moves on after nothing new for 24 round trips, 10 s at least and
+\ 30 s at most (a satellite's 600 ms and more keeps its 30 s; a batch
+\ tries its next peer sooner on a fast link).  What came is kept for the next peer.
 \ Each peer's own (its record's C0: up to 16 serve a batch, and a
 \ satellite's is not a datacenter's), 300 ms until measured.  A round
 \ that asks again for what did not come gives no sample (Karn's rule:
@@ -637,7 +638,7 @@ wsend ;
 : psrt  pcur @ prec C0 lit + @ ?dup 0= if 2DC6C0 lit then ;       \ ( -- ticks )
 : prtt+  psrt 7 lit * + 3 lit rshift  1 lit max  pcur @ prec C0 lit + ! ;     \ ( sample -- )
 : pwns  psrt CB7355 lit umin 12C lit *  11E1A300 lit max  EE6B2800 lit umin ;   \ ( -- ns )  three round trips
-: pidl  psrt 14 lit *  11E1A300 lit max ;                  \ ( -- ticks )  30 s, or twenty round trips
+: pidl  psrt 18 lit *  5F5E100 lit max  11E1A300 lit umin ;   \ ( -- ticks )  24 round trips, 10 to 30 s
 \ pchunk  the Chunk in prx, if it is of the object being fetched.
 : pchunk
 prx @ 5 lit + pcp !

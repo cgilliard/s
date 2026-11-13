@@ -84,6 +84,12 @@ ticks nft @ - btf ! ;
 \ npk: the peer to fetch it from, plus one (0: the current); npks the
 \ peer it came from.
 : npk variable ;  : npks variable ;  : npsv variable ;
+\ nsil: the peers (a bit each, by index) that sent nothing when asked for
+\ a block in this run (nrun): not asked again in it, rather than once
+\ for each block the batch is still missing.
+: nsil variable ;
+: nsil?  1 lit swap lshift nsil @ and 0= 0= ;   \ ( k -- flag )
+: nsil!  1 lit swap lshift nsil @ or nsil ! ;   \ ( k -- )
 : nsvt variable ;  : npnx variable ;  : npe variable ;  : npb variable ;  : npn variable ;  : nsvb variable ;  : nsvn variable ;
 \ npdrop  a block fetched ahead and not used, dropped.
 : npdrop  npb @ ?dup if free then  0 lit npb !  0 lit npe ! ;
@@ -92,7 +98,7 @@ ticks nft @ - btf ! ;
 npnx @ ?dup if
 	npdrop  nblk @ nsvb !  nbn @ nsvn !
 	pcur @ dup npsv ! npks !  npk @ ?dup if 1 lit - dup npks ! puse then
-	dup nblock if npe !  nblk @ npb !  nbn @ npn ! else drop then
+	dup nblock if npe !  nblk @ npb !  nbn @ npn ! else drop  nwhy @ 1 lit = if npks @ nsil! then then
 	npk @ if npsv @ puse then
 	nsvb @ nblk !  nsvn @ nbn !
 then
@@ -362,6 +368,7 @@ dup D lit lshift xor  dup 11 lit rshift xor  dup 5 lit lshift xor  dup nrs !
 loop then drop ;
 : npok  ( h k -- flag )
 dup prec 8 lit + @  over prec B0 lit + @ 0= and  over pbanned 0= and
+over nsil? 0= and  over prec C4 lit + @ secs swap - 0< 0= and
 over prec 4C lit + @ 3 lit pick u< 0= and  swap prec 50 lit + @ nqa @ u> 0= and  nip ;
 : npick
 0 lit npc !
@@ -406,7 +413,10 @@ nip  0 lit pact ! ;
 nqj !  0 lit nqok !
 npc @ 0 lit do nqok @ 0= if
 	nqj @ i + npeer nqk !
-	nqj @ nqh hat nqk @ nbfrom if
+	nqk @ nsil? 0= if
+		nqj @ nqh hat nqk @ nbfrom dup 0= if nwhy @ 1 lit = if nqk @ nsil! then then
+	else 0 lit then
+	if
 		nqj @ 1 lit + nqm @ u< if nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk ! then
 		nqj @ nqh hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsbody
 		swap ?dup if
@@ -516,7 +526,7 @@ then ;
 \ nqclr  the batch's blocks left freed.
 : nqclr  NQMAX 0 lit do i nqs @ ?dup if free then  0 lit i nqs ! loop  0 lit nqn !  npdrop ;
 : nrun  ( top mode -- code )
-nmode !  ntop !  0 lit nrcd !  0 lit nrbad !
+nmode !  ntop !  0 lit nrcd !  0 lit nrbad !  0 lit nsil !
 nstat  myh @ 1 lit + nqa !  0 lit nqn !  0 lit nqby !
 stfd @ 0 lit txbegin stx !  70 lit mget ncl !  71 lit mget nch !  stx @ txcommit drop
 begin nqa @ ntop @ u> 0= nrcd @ 0= and while nbatch repeat
@@ -815,7 +825,7 @@ repeat ;
 : nahead
 FFFFFFFF lit nah !  myh @ nahh !
 pnp @ ?dup if 0 lit do
-	i prec 8 lit + @  i prec B0 lit + @ 0= and  secs i prec B4 lit + @ - 0< 0= and  i pbanned 0= and if
+	i prec 8 lit + @  i prec B0 lit + @ 0= and  secs i prec C4 lit + @ - 0< 0= and  i pbanned 0= and if
 		i prec 4C lit + @ nahh @ u> if i nah !  i prec 4C lit + @ nahh ! then
 	then
 loop then nah @ ;
@@ -840,7 +850,10 @@ nahead dup 0< if drop else
 	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop
 	ncatch
 	nchg @ 0= if
-		secs 3C lit + pcur @ prec B4 lit + !
+		\ (its own field: B4 is the ban's, which this must not shorten;
+		\ a minute, not tabminer's ten: the node often has one or two
+		\ peers, and passing over its only one would stall it)
+		secs 3C lit + pcur @ prec C4 lit + !
 		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
 	then
 then
