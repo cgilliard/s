@@ -28,8 +28,8 @@ else swap 30 lit + over c! 1 lit + then ;
 argn 2 lit u< if "usage: adduser NAME" eputs 0A lit eputc 1 lit exit then
 1 lit arg ok? 0= if "adduser: a name is 1 to 31 of a-z, 0-9, _ and -" eputs 0A lit eputc 1 lit exit then
 1 lit arg pwfind if "adduser: there is a user " eputs 1 lit arg eputs 0A lit eputc 1 lit exit then
-"password: " puts p1 @ pwget 0< if 1 lit exit then
-"again: " puts p2 @ pwget 0< if 1 lit exit then
+"password: " p1 @ pwget 0< if 1 lit exit then
+"again: " p2 @ pwget 0< if 1 lit exit then
 p1 @ p2 @ streq 0= if "adduser: they differ; no user made" eputs 0A lit eputc 1 lit exit then
 p1 @ c@ 0= if "adduser: empty; no user made" eputs 0A lit eputc 1 lit exit then
 \ the line: NAME:FIELD:N:N:/home/NAME:sh, after the others

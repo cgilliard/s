@@ -38,7 +38,7 @@ t @ rot scpy 20 lit over c! 1 lit + swap scpy 0 lit swap c!
 80 lit alloc nm !  80 lit alloc pw !  100 lit alloc t !  100 lit alloc nf !
 begin
 	"login: " puts nm @ rdl 0< if bye then
-	"password: " puts pw @ pwget drop
+	"password: " pw @ pwget drop
 	found? if
 		"/proc/self/user" 2 lit pwfld 3 lit pwfld put
 		"/proc/self/cwd" 1 lit open dup 0< 0= if dup 4 lit pwfld dup strlen write drop close drop else drop then

@@ -7,8 +7,8 @@
 80 lit alloc p1 !  80 lit alloc p2 !  100 lit alloc nf !
 argn 2 lit u< if "usage: passwd NAME" eputs 0A lit eputc 1 lit exit then
 1 lit arg pwfind 0= if "passwd: no such user: " eputs 1 lit arg eputs 0A lit eputc 1 lit exit then
-"new password: " puts p1 @ pwget 0< if 1 lit exit then
-"again: " puts p2 @ pwget 0< if 1 lit exit then
+"new password: " p1 @ pwget 0< if 1 lit exit then
+"again: " p2 @ pwget 0< if 1 lit exit then
 p1 @ p2 @ streq 0= if "passwd: they differ; unchanged" eputs 0A lit eputc 1 lit exit then
 p1 @ c@ 0= if "passwd: empty; unchanged" eputs 0A lit eputc 1 lit exit then
 p1 @ nf @ pwmake
