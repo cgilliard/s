@@ -1712,6 +1712,18 @@ impl Peers {
             .map(|(_, a)| a)
     }
 
+    /// `addr` said it is shutting down: not live, nor asked anything,
+    /// until it answers a ping again (a restart, mostly: its entry kept,
+    /// and saved, for that); pruned as any silent peer if it does not.
+    pub fn gone(&mut self, addr: &SocketAddr) {
+        if let Some(p) = self.map.get_mut(addr) {
+            p.handshaken = false;
+            p.status = None;
+            p.pending = None;
+            p.first_pings = 0;
+        }
+    }
+
     /// Why `add` would not take `addr` now, if it would not; the entries
     /// in its way are named.
     pub fn refusal(&self, addr: &SocketAddr) -> Option<String> {

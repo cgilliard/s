@@ -2332,8 +2332,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Message::Goodbye { token } => {
                 // Only from that address: it carries the token we gave it.
                 if self.request_ok(&addr, token) && self.peers.get(&addr).is_some() {
-                    self.peers.remove(&addr);
-                    self.log(&format!("peer {addr} is shutting down; dropped from the peer table"));
+                    self.peers.gone(&addr);
+                    self.log(&format!("peer {addr} is shutting down; not asked anything until it answers again"));
                 }
             }
         }
@@ -5506,8 +5506,9 @@ mod tests {
     }
 
     /// A node stopping says goodbye: a relay it had a channel to closes
-    /// it at once, and a peer drops it from its table, rather than after
-    /// 20 s (a channel's timeout in tests) and 180 s of silence.
+    /// it at once, and a peer stops taking it for live (keeping its entry
+    /// for its return), rather than after 20 s (a channel's timeout in
+    /// tests) and 180 s of silence.
     #[test]
     fn a_node_stopping_tells_its_channels_and_peers() {
         let (a, b) = (open("bye-a"), open("bye-b"));
@@ -5545,7 +5546,10 @@ mod tests {
         tx_b.send(Event::Stop).unwrap();
         h_b.join().unwrap();
         wait_for("a closing b's channel", 5, &|| stats_a.lock().unwrap().channels == 0);
-        wait_for("a dropping b", 5, &|| !stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b));
+        // Kept (it may be restarting), but no longer live or asked anything.
+        wait_for("a taking b for gone", 5, &|| {
+            stats_a.lock().unwrap().peers.iter().any(|p| p.addr == addr_b && !p.live && !p.handshaken)
+        });
         tx_a.send(Event::Stop).unwrap();
         h_a.join().unwrap();
     }
