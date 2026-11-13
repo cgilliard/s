@@ -4659,6 +4659,74 @@ mod tests {
         hb.join().unwrap();
     }
 
+    /// A peer that announced a transaction and then says it does not hold
+    /// it (NotHeld) is not asked again: the fetch ends at once
+    /// (docs/TIMING_FIXES.md items 10 and 17). The control: one never
+    /// answered is asked again within the same time.
+    #[test]
+    fn a_not_held_answer_ends_the_fetch() {
+        let c = open("notheld-c");
+        let genesis = c.chain.header_at(0).unwrap().unwrap().hash();
+        let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![], &c.dir)).unwrap();
+        let addr_c = node_c.local_addr().unwrap();
+        let hc = std::thread::spawn(move || node_c.run());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        const OUR_TOKEN: u64 = 77;
+        let status = |nonce: u64, token: u64| Status {
+            nonce,
+            version: PROTOCOL_VERSION,
+            token,
+            genesis,
+            height: 0,
+            oldest: 1,
+            tip: genesis,
+            work: U256::ZERO,
+            min_fee: 0,
+            pool_fee: 0,
+        };
+        let mut buf = [0u8; 2048];
+        // c's messages for `secs`, its pings answered with our token
+        let mut listen = |secs: u64| -> Vec<Message> {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            let mut got = Vec::new();
+            while Instant::now() < deadline {
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && let Some(m) = Message::decode(&buf[..n])
+                {
+                    if let Message::Ping(st) = &m {
+                        sock.send_to(&Message::Pong(status(st.nonce, OUR_TOKEN)).encode(), addr_c).unwrap();
+                    }
+                    got.push(m);
+                }
+            }
+            got
+        };
+        let say = |m: Message| sock.send_to(&m.encode(), addr_c).unwrap();
+        let asks = |got: &[Message], id: &Digest| {
+            got.iter().filter(|m| matches!(m, Message::GetChunks { kind: Kind::Tx, id: i, .. } if i == id)).count()
+        };
+        say(Message::Ping(status(5, 0)));
+        listen(1);
+        let held_not = [crate::poseidon2::Fp::new(1); crate::poseidon2::DIGEST];
+        let unanswered = [crate::poseidon2::Fp::new(2); crate::poseidon2::DIGEST];
+        // announced, asked for, answered NotHeld: not asked again
+        say(Message::TxInv(held_not));
+        let deadline = Instant::now() + guard(5);
+        while asks(&listen(1), &held_not) == 0 {
+            assert!(Instant::now() < deadline, "the announced transaction not asked for");
+        }
+        say(Message::NotHeld { kind: Kind::Tx, id: held_not });
+        let after = listen(3);
+        assert_eq!(asks(&after, &held_not), 0, "asked again after NotHeld");
+        // the control: announced and never answered, asked again meanwhile
+        say(Message::TxInv(unanswered));
+        let got = listen(3);
+        assert!(asks(&got, &unanswered) >= 2, "a fetch never answered not asked again in 3 s: {}", asks(&got, &unanswered));
+        tx_c.send(Event::Stop).unwrap();
+        hc.join().unwrap();
+    }
+
     /// A batch of headers lost on the way (the first `Headers` its peer
     /// sends, dropped: docs/TIMING_FIXES.md item 17, a fault made to
     /// happen rather than left to random loss): the fresh node asks again

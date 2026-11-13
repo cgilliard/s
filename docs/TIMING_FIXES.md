@@ -652,3 +652,7 @@ understood is ignored.
     first `Headers` the peer sends dropped (`drop_out`), its heights
     noted: they are sent again, and the fresh node fast-syncs (about
     4 s), its peer kept live.
+    **A peer answering "not held":** `a_not_held_answer_ends_the_fetch`,
+    a hand-driven peer announcing a transaction, then answering the
+    node's request NotHeld: not asked again in 3 s, where one never
+    answered (the control) is asked again at least twice.
