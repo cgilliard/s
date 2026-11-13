@@ -866,8 +866,10 @@ pnp @ ?dup if 0 lit do
 	i prec A4 lit + @ nnmin  i prec C4 lit + @ nnmin  i prec B4 lit + @ nnmin
 loop then
 pdn @ nnmin  nrat @ nnmin  cxat @ A lit + nnmin
-AEW 0 lit do aew @ i AEWSZ * + dup @ if 4 lit + @ nnmin else drop then loop
-8 lit 0 lit do awt @ i 28 lit * + dup @ if 4 lit + @ nnmin else drop then loop
+\ (the API's tables only once ainit made them: a node's test program
+\ without the API, relay_test, read address 0 here and was killed)
+aew @ if AEW 0 lit do aew @ i AEWSZ * + dup @ if 4 lit + @ nnmin else drop then loop then
+awt @ if 8 lit 0 lit do awt @ i 28 lit * + dup @ if 4 lit + @ nnmin else drop then loop then
 nnx @ nnow @ -  dup 1 lit u< if drop 1 lit then  3B9ACA00 lit * ;
 : nstep
 -1 lit pxw !  nnext pwait drop  0 lit pxw !

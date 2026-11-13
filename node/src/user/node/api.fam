@@ -729,15 +729,19 @@ if
 else atipr then ;
 \ awake  the waiting requests whose tip moved, or whose time is up,
 \ answered; the node's state (aevst) and the events' waiting (aewake).
+\ (all of it only once ainit made the API's tables: a node's test
+\ program without the API, relay_test, waits through cwait and vwait too)
 : awake
-aevst aewake
-8 lit 0 lit do
-	awt @ i 28 lit * + dup @ if
-		dup 8 lit + mytip @ 20 lit d8= 0=  secs 2 lit pick 4 lit + @ u< 0= or if
-			dup @ acfd !  0 lit swap !  atipr
+awt @ if
+	aevst aewake
+	8 lit 0 lit do
+		awt @ i 28 lit * + dup @ if
+			dup 8 lit + mytip @ 20 lit d8= 0=  secs 2 lit pick 4 lit + @ u< 0= or if
+				dup @ acfd !  0 lit swap !  atipr
+			else drop then
 		else drop then
-	else drop then
-loop ;
+	loop
+then ;
 
 \ acons  the message layer's mode as the chain decides it (cons.fam):
 \ the tip it was made at, the epoch (height / 144), the blocks into it;
