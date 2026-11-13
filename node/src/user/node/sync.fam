@@ -619,6 +619,10 @@ nlok @ ;
 \ nswr: set once nsync has begun writing the store (the snapshot's parts),
 \ so a sync that stops after must start again on a fresh tree.
 : nswr variable ;
+\ nhdt: the date for a batch of headers' rule (read once a batch, not a
+\ header: /proc/time is a file); nhf, nhc: the header sync's time
+\ fetching and checking, said when it ends.
+: nhdt variable ;  : nhf variable ;  : nhc variable ;  : nht variable ;
 : nsync  ( depth -- code )
 nS !  0 lit ncode !  0 lit nswr !
 pping 0= if FFFFFFFF lit nfail else "the peer is at height " nsay pst-h nsayn then
@@ -627,15 +631,19 @@ ncode @ 0= pst-h 0= and if FFFFFFF6 lit nfail then
 ncode @ 0= if pst @ 14 lit + mygen @ 20 lit d8= 0= if FFFFFFFE lit nfail then then
 \ headers, quick-checked
 ncode @ 0= if
-	-1 lit hquick !  1 lit
+	-1 lit hquick !  1 lit  0 lit nhf !  0 lit nhc !
 	begin dup pst-h u> 0= ncode @ 0= and while
-		ncompact  dup phdrs ?dup if
-			0 lit do phb @ i CC lit * +  ntime 0 lit hacc  1 lit u> if FFFFFFFD lit nfail then loop
+		ncompact  ticks nht !  dup phdrs  ticks nht @ - nhf @ + nhf !
+		?dup if
+			ticks nht !  ntime nhdt !
+			0 lit do phb @ i CC lit * +  nhdt @ 0 lit hacc  1 lit u> if FFFFFFFD lit nfail then loop
+			ticks nht @ - nhc @ + nhc !
 			hbest hheight 1 lit + max
 			"headers to " nsay hbest hheight nsayn
 		else FFFFFFFD lit nfail then
 	repeat drop
 	0 lit hquick !
+	vrb @ if nhead "headers: fetched in " puts nhf @ nsec " s, checked in " puts nhc @ nsec " s" puts 0A lit putc then
 then
 \ S, and the full proof of work from it up
 ncode @ 0= if
@@ -722,8 +730,9 @@ begin hbest hheight pst-h u< nfl @ 0= and while
 	hbest hheight 1 lit +  nstp @ 1 lit -  over 1 lit - umin  -
 	0 lit nbk !
 	ncompact  dup phdrs ?dup if
+		ntime nhdt !
 		0 lit do nfl @ 0= nbk @ 0= and if
-			phb @ i CC lit * + ntime 0 lit hacc
+			phb @ i CC lit * + nhdt @ 0 lit hacc
 			dup FFFFFFFE lit = i 0= and if
 				drop  1 lit nbk !
 				dup 1 lit = if 1 lit nfl ! else nstp @ 1 lit lshift nstp ! then

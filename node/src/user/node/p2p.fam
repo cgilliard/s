@@ -599,13 +599,17 @@ loop pok @ ;
 
 \ phdrs ( h -- n )
 : pgap  0 lit begin dup 3C lit u< if dup pgot @ + c@ else 0 lit then while 1 lit + repeat ;   \ ( -- g )
+\ pwant ( -- n )  the headers a batch can hold from phh: 60, or to the
+\ peer's height.  A round ends once they are all in, not after half a
+\ second with nothing more (that wait was most of a header sync's time).
+: pwant  pst-h 1 lit + phh @ - 3C lit umin ;
 : phdrs
 phh !  pgot @ 10 lit wzero  0 lit prnd !
 begin
 	pgap  dup 3C lit u<  over phh @ + pst-h 1 lit + u< and  prnd @ 4 lit u< and
 while
 	B lit wbeg wtok  phh @ + w32 wsend  prnd @ 1 lit + prnd !
-	begin 1DCD6500 lit pwaitc ?dup while
+	begin pgap pwant u< if 1DCD6500 lit pwaitc else 0 lit then ?dup while
 		6 lit = if
 			prx @ 5 lit + c@ ?dup if 0 lit do
 				prx @ 6 lit + i CC lit * +  dup 20 lit + le@ phh @ -
