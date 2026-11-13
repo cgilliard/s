@@ -1015,6 +1015,18 @@ steps twice as long and download twice as much of a bad branch):
    batch, whose proof covers its work; the last batch ends at the tip,
    whose work is checked in full, and the tip is connected with it.
 
+**The peers serving a batch:** up to 16, one block from each, chosen at
+random among the live peers at or above the batch's height (as
+tabminer's `PeerTable::sample`: a partial shuffle, not the table's
+first), peers that are not seeds first, seeds only to make up the
+number (or when no other answers). One bad peer then serves at most one
+block of a batch, the seeds are spared the load of every catch-up, and
+no peer can count on serving a given block. A block whose peer does not
+answer in time is asked of another of the batch's peers. (Neither the
+node nor tabminer has this rule yet: the node fetches from one peer at
+a time; tabminer samples live peers at random, seeds among them, and
+never bans a seed, which here is only passed over for the batch.)
+
 **A batch whose proof fails:** a block in it is invalid. Bisected:
 the proof of the middle block checked, then of the half's middle,
 and so on (each proof attests everything before it), so the first bad
