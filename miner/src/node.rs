@@ -7855,6 +7855,7 @@ mod tests {
         grow(&a, &[] as &[&Chain<AcceptAllProofs>], 3..=12);
         grow(&c, &[] as &[&Chain<AcceptAllProofs>], 103..=114);
         let a_tip = a.chain.tip().unwrap().unwrap();
+        let c_tip = c.chain.tip().unwrap().unwrap();
         let (node_a, tx_a) = Node::bind(Arc::clone(&a.chain), pool(), config(vec![], &a.dir)).unwrap();
         let b = open("floor-b");
         let mut cb = config(vec![node_a.local_addr().unwrap()], &b.dir);
@@ -7867,7 +7868,11 @@ mod tests {
         assert!(b.chain.floor().unwrap().is_some_and(|f| f > 2));
         let (node_c, tx_c) = Node::bind(Arc::clone(&c.chain), pool(), config(vec![addr_b], &c.dir)).unwrap();
         let hc = std::thread::spawn(move || node_c.run());
-        wait_for("b heard of c's branch", 30, || b.chain.best_header().is_ok_and(|h| h.height == 14));
+        // c's tip's header stored at b: what stays once b, finding the
+        // branch forks below its floor, sets it aside (its best header is
+        // c's only until then, a moment now that a says it does not hold
+        // c's blocks, NotHeld, and b fetches them from c at once).
+        wait_for("b heard of c's branch", 30, || b.chain.header_by_hash(&c_tip.hash()).is_ok_and(|h| h.is_some()));
         std::thread::sleep(Duration::from_secs(3));
         assert_eq!(b.chain.tip().unwrap().unwrap(), a_tip, "b reorganized below its floor");
         assert_eq!(a.chain.tip().unwrap().unwrap(), a_tip, "a reorganized past its undo window");
