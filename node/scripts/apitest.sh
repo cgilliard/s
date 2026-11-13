@@ -13,7 +13,9 @@
 #   new token (401: that alone needs the token); and sends its transaction.
 # - On the host, a client (below) reads every endpoint without the token,
 #   sends the other transaction without it; waits for the tip to move (long
-#   polling); waits until both transactions are mined (the pool empty, the
+#   polling); reads the events (GET /v1/events: the blocks, the state, the
+#   transaction pooled; a filter, a reset) and waits on them, a request at
+#   a time, until the transaction is mined; waits until both are mined (the pool empty, the
 #   miner's log saying it took both from the node); makes a new token, the
 #   old one refused after.
 # - Past paths (/v1/proof/output/<position>?at=<height>): the wallet's
@@ -37,7 +39,7 @@ rm -rf "$T"; mkdir -p "$T"
 
 ./tools/fam --user -o "$T/tapi.bin" src/user/crypto/sha256.fam $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
 	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
-	$N/wkeys.fam $N/pool.fam $N/p2p.fam $N/cons.fam $N/api.fam $N/sync.fam $N/api_test.fam
+	$N/wkeys.fam $N/events.fam $N/pool.fam $N/p2p.fam $N/cons.fam $N/api.fam $N/sync.fam $N/api_test.fam
 ./tools/fam --user -o "$T/apicli.bin" $N/apicli.fam
 
 MP=; WP=; QP=
@@ -161,6 +163,39 @@ t0 = time.time()
 tip = j('/v1/status')['tip']
 moved = j(f'/v1/tip?after={tip}', timeout=60)
 check(f'the tip waited for: height {moved["height"]} after {time.time() - t0:.0f} s', moved['tip'] != tip or time.time() - t0 >= 25)
+# The events (docs/TIMING_FIXES.md, item 15): from the start, the blocks
+# the node connected, its state and our transaction pooled; another's
+# filter not woken by ours; a number past the newest a reset; then, one
+# request waiting at a time, until ours is mined.
+txid = r['id']
+evs, nx = [], 0
+while True:
+    e = j(f'/v1/events?after={nx}', timeout=60)
+    evs += e['events']
+    nx = e['next']
+    if len(e['events']) < 64:
+        break
+st = j('/v1/status')
+check(f'events from the start: {len(evs)}, numbered in order', [x['n'] for x in evs] == sorted(x['n'] for x in evs) and evs[-1]['n'] == nx)
+check('a block event for every height up to the tip, each its id', all(any(x['kind'] == 'block' and x['height'] == k for x in evs) for k in range(h - 1, h + 1))
+      and all(x['id'] == j(f'/v1/header/{x["height"]}')['id'] for x in evs if x['kind'] == 'block'))
+check('the node\'s state: synced', any(x['kind'] == 'status' and x['state'] == 'synced' for x in evs))
+check('our transaction pooled', any(x['kind'] == 'tx' and x['id'] == txid and x['state'] == 'pooled' for x in evs))
+other = j(f'/v1/events?after=0&tx={"0" * 64}')
+check('another\'s filter: blocks and the state, no transaction', all(x['kind'] != 'tx' for x in other['events']) and len(other['events']) > 0)
+check('a number past the newest: a reset', j(f'/v1/events?after={nx + 1000}').get('reset') is True)
+mined, t0 = None, time.time()
+while mined is None and time.time() - t0 < 900:
+    e = j(f'/v1/events?after={nx}&tx={txid}', timeout=60)
+    check('no reset while waiting', not e.get('reset'))
+    for x in e['events']:
+        if x['kind'] == 'tx' and x['id'] == txid:
+            print(f'host: (our transaction: {x["state"]})')
+            if x['state'] == 'mined':
+                mined = x
+    nx = e['next']
+check(f'our transaction\'s event: mined at {mined and mined["height"]}, a block of the chain', mined is not None
+      and j(f'/v1/block/{mined["height"]}')['header']['height'] == mined['height'])
 # Until both are mined: waited for as long as the miner is getting on
 # (its log growing), failed after 300 s with nothing new.
 last, idle = os.path.getsize(minerlog), 0

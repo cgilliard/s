@@ -292,8 +292,11 @@ begin dup hheight 2 lit pick u< 0= over hheight and while
 repeat 2drop ;
 \ nconnect ( e body n -- code )  sconnect for header entry e (its work and
 \ id kept with it: swk), by the worker, which checks the proof too; with
-\ none, here, the proof checked by nodev.
+\ none, here, the proof checked by nodev.  Connected: its event
+\ (events.fam).
+: nevb variable ;
 : nconnect
+2 lit pick nevb !
 2 lit pick 20 lit + @ pacth !  2 lit pact !
 cwon @ if
 	cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !
@@ -309,7 +312,8 @@ cwon @ if
 else
 	2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !
 then
-0 lit npnx !  0 lit pact ! ;
+0 lit npnx !  0 lit pact !
+dup 0= if EVBLK nevb @ hheight 0 lit nevb @ hid 0 lit evput then ;
 \ cwjob ( a b c kind -- r )  a job of three arguments by the worker,
 \ the node serving meanwhile.
 : cwkd variable ;
@@ -321,8 +325,11 @@ then
 : nsver  cwon @ if 5 lit cwjob else sverify then ;          \ ( hS body n -- flag )
 : nspart  cwon @ if 6 lit cwjob else snpart then ;         \ ( i p n -- code )
 : nsfin  cwon @ if 0 lit 0 lit 7 lit cwjob else snfin then ;   \ ( hS -- code )
-\ nundo  sundo, by the worker if there is one.
-: nundo  cwon @ if stfd @ cwj @ 10 lit + !  2 lit cwput  cwait drop else sundo then ;
+\ nundo  sundo, by the worker if there is one; its event (events.fam),
+\ the tip's height and id before.
+: nundo
+EVUNDO myh @ 0 lit mytip @ 0 lit evput
+cwon @ if stfd @ cwj @ 10 lit + !  2 lit cwput  cwait drop else sundo then ;
 
 \ The blocks after our tip, by batches (docs/NODE_ENHANCEMENTS.md, item
 \ 21): up to 16 at a time fetched (each from one of up to 16 peers taken

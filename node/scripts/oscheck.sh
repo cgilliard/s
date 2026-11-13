@@ -215,14 +215,14 @@ rm -f "$T/mf.disk"
 # pool after each; proofs of outputs and names (step 8) as tabminer's; and
 # XMSS signatures of
 # other heights, verified and refused.
-./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
+./tools/fam --user -o "$T/tpo.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/xmss.fam $ND/tx.fam $ND/events.fam $ND/pool.fam $ND/pool_test.fam > "$T/tpo.build" 2>&1 || fail pool "build: $(head -c 300 "$T/tpo.build")"
 sh scripts/mkimage.sh "$T/po.img" bin/kernel init="$T/tpo.bin":16384 pool=$ND/pool.bin:0 2> "$T/po.mk" || fail pool "mkimage: $(cat "$T/po.mk")"
 rm -f "$T/po.disk"; dd if=/dev/zero of="$T/po.disk" bs=1 count=0 seek=268435456 2>/dev/null
 expect pool 124 '^pool: 102 as tabminer, 0 not' 120 ./tools/q32 --disk="$T/po.disk" "$T/po.img"
 rm -f "$T/po.disk"
 # The pool's fee estimates (pool.fam's qest, qsugg, qrate), as tabminer's
 # estimates_follow_what_confirmed has them (fees_test.fam).
-./tools/fam --user -o "$T/tfe.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/serve.fam $ND/snap.fam $ND/xmss.fam $ND/tx.fam $ND/pool.fam $ND/fees_test.fam > "$T/tfe.build" 2>&1 || fail fees "build: $(head -c 300 "$T/tfe.build")"
+./tools/fam --user -o "$T/tfe.bin" $ND/arith.fam $ND/poseidon2.fam $ND/difficulty.fam $ND/pow.fam $ND/headers.fam $ND/chainver.fam $ND/state.fam $ND/proofs.fam $ND/manifest.fam $ND/connect.fam $ND/query.fam $ND/serve.fam $ND/snap.fam $ND/xmss.fam $ND/tx.fam $ND/events.fam $ND/pool.fam $ND/fees_test.fam > "$T/tfe.build" 2>&1 || fail fees "build: $(head -c 300 "$T/tfe.build")"
 sh scripts/mkimage.sh "$T/fe.img" bin/kernel init="$T/tfe.bin":8192 2> "$T/fe.mk" || fail fees "mkimage: $(cat "$T/fe.mk")"
 expect fees 124 '^fees: 11 as expected, 0 not' 60 ./tools/q32 "$T/fe.img"
 # XMSS signing (docs/GUI_WALLET.md, phase 1): keys from seeds and signatures

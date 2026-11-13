@@ -1,0 +1,41 @@
+\ events.fam — the node's events (docs/TIMING_FIXES.md, section 2 and
+\ item 15), after headers.fam and before pool.fam: what happens, numbered
+\ from 1, the last EVN kept in a ring for GET /v1/events?after=<n>
+\ (api.fam), so a wallet waits for them rather than asking again.
+\
+\ An event is EVSZ bytes: +0 its number, +4 its kind, +8 a height, +C a
+\ state (the kind's), +10 an id (32 bytes), +30 another (32 bytes).
+\ - EVBLK, a block connected: its height and id (sync.fam's nconnect).
+\ - EVUNDO, a block undone: its height and id (nundo).
+\ - EVTX, a transaction: its id and its state (pool.fam): EVPOOLED;
+\   EVREPL replaced (+30: by which); EVEVICT evicted for one paying more;
+\   EVMINED mined (the height: its first output in that block); EVCONF
+\   out of the pool otherwise (an input spent by another, an operation
+\   failing now); EVBACK back in the pool after blocks were undone.
+\ - EVSTAT, the node's state when it changes (api.fam's aevst): ESYNCED,
+\   ESYNCING (behind its best header by more than a block), ENOPEERS;
+\   the height, and +10 the best header's height.
+\
+\ evput ( kind height state id other -- )  an event (id and other: 32
+\ bytes each, or 0 for zeros); the ring made at the first.
+\ evat ( n -- a )  where event n is, if still kept (evlow to evn).
+\ evlow ( -- n )  the oldest number kept (1 before the ring has wrapped).
+
+:M EVN 800 lit ;
+:M EVSZ 50 lit ;
+:M EVBLK 1 lit ;  :M EVUNDO 2 lit ;  :M EVTX 3 lit ;  :M EVSTAT 4 lit ;
+:M EVPOOLED 1 lit ;  :M EVREPL 2 lit ;  :M EVEVICT 3 lit ;  :M EVMINED 4 lit ;  :M EVCONF 5 lit ;  :M EVBACK 6 lit ;
+:M ESYNCED 1 lit ;  :M ESYNCING 2 lit ;  :M ENOPEERS 3 lit ;
+
+: evr variable ;  : evn variable ;  : eva variable ;
+: evat  EVN 1 lit - and EVSZ * evr @ + ;
+: evlow  evn @ EVN u< if 1 lit else evn @ EVN - 1 lit + then ;
+\ evid ( src dst -- )  32 bytes, or zeros for src 0.
+: evid  swap ?dup if swap 20 lit bcopy else 8 lit wzero then ;
+: evput
+evr @ 0= if EVN EVSZ * malloc evr !  0 lit evn ! then
+evr @ 0= if 2drop 2drop drop else
+	evn @ 1 lit + dup evn !  evat eva !
+	eva @ 30 lit + evid  eva @ 10 lit + evid
+	eva @ C lit + !  eva @ 8 lit + !  eva @ 4 lit + !  evn @ eva @ !
+then ;

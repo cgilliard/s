@@ -226,6 +226,12 @@ qbytes @ over 4 lit + @ - qbytes !  qnum @ 1 lit - qnum !
 \ The shelf: QSHELF (a power of two) entries of 8 bytes, the bytes (0
 \ empty) and their length, filled in turn from qshh.
 :M QSHELF 100 lit ;
+\ qback: set while qreturn offers the shelf again (its events EVBACK).
+: qback variable ;
+\ qcan ( m buf -- buf )  a transaction's id (Montgomery words) canonical,
+\ as the API shows ids, for its event (qev1, qev2: 32 bytes each).
+: qev1 variable ;  : qev2 variable ;
+: qcan  tuck ycanon ;
 : qsh variable ;  : qshh variable ;  : qout variable ;  : qbk variable ;
 : qmv variable ;  : qnmv variable ;
 \ qshelve ( k -- )  slot k's transaction taken out, onto the shelf.
@@ -323,9 +329,11 @@ qok qncf @ and if
 then
 qok if qevict 0= if FFFFFFF3 lit qfl then then
 qok if
-	qncf @ ?dup if 0 lit do qcf @ i w@ qdrop loop then
-	qnvic @ ?dup if 0 lit do qvic @ i w@ qdrop loop then
+	\ the events (events.fam): those it replaces, those evicted for it, it
+	qncf @ ?dup if 0 lit do EVTX 0 lit EVREPL qcf @ i w@ qslot 10 lit + qev1 @ qcan  qid @ qev2 @ qcan evput  qcf @ i w@ qdrop loop then
+	qnvic @ ?dup if 0 lit do EVTX 0 lit EVEVICT qvic @ i w@ qslot 10 lit + qev1 @ qcan 0 lit evput  qvic @ i w@ qdrop loop then
 	2dup qadd
+	EVTX 0 lit qback @ if EVBACK else EVPOOLED then qid @ qev1 @ qcan 0 lit evput
 then
 2drop qcode @ ;
 
@@ -443,13 +451,19 @@ QSLOTS 0 lit do
 		0 lit qcode !  0 lit qncf !
 		tnall ?dup if 0 lit do qok if i qholds 0= if FFFFFFF7 lit qfl then then loop then
 		qok tnops @ 0= 0= and if qops then
-		qok 0= if qka @ qnote  qka @ qshelve then
+		\ out: mined if its first output was in the block (qconfs), else
+		\ conflicted (events.fam)
+		qok 0= if
+			EVTX qht @ 1 lit -  qka @ 2 lit lshift qctm @ + @ if EVMINED else EVCONF then
+			qka @ qslot 10 lit + qev1 @ qcan 0 lit evput
+			qka @ qnote  qka @ qshelve
+		then
 	then
 loop
 stx @ txcommit drop ;
 
 : qinit
-QSLOTS 6 lit lshift alloc dup qbase !  QSLOTS 4 lit lshift wzero
+QSLOTS 6 lit lshift alloc dup qbase !  QSLOTS 4 lit lshift wzero  20 lit alloc qev1 !  20 lit alloc qev2 !
 QSHELF 3 lit lshift alloc dup qsh !  QSHELF 1 lit lshift wzero  0 lit qshh !
 A000 lit malloc qmv !  0 lit qnmv !
 0 lit qbytes !  0 lit qnum !  0 lit qord !
@@ -500,12 +514,13 @@ qnmv @ if 2dup tparse if
 then then ;
 
 : qreturn
-0 lit qbk !
+0 lit qbk !  -1 lit qback !
 QSHELF 0 lit do
 	qsh @ i 3 lit lshift +  dup @ if
 		dup @ over 4 lit + @  qmove  qadmit 0= if  dup @ free  0 lit swap !  qbk @ 1 lit + qbk ! else drop then
 	else drop then
-loop ;
+loop
+0 lit qback ! ;
 
 \ ── Kept across restarts (as tabminer saves its pool, confirmations too) ──
 \

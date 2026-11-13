@@ -561,6 +561,14 @@ understood is ignored.
 **Phase 4: notify instead of poll** (section 2)
 15. The node's event stream (`/v1/events`), the wallet's block thread,
     the wallet's events to the page, the node's status as events.
+    **The node's part done (2026-11-13):** `events.fam`, a ring of the
+    last 2,048 events (block, undone, a transaction's state, the node's
+    state on a change), `GET /v1/events?after=<n>[&tx=<ids>]` answering
+    at once or waiting (30 s; 16 requests), `reset` for a number not
+    kept; tested in `apitest.sh` (the blocks, the state, a transaction
+    pooled then mined while waited for, a filter, a reset). No `fees`
+    event: the fam pool's minimum does not move yet. Left: the wallet's
+    block thread and its events to the page.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
 

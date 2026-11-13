@@ -73,7 +73,7 @@ N=src/user/node
 echo "Building $N → bin/user/node (user mode)" >&2
 ./tools/fam --user -o bin/user/node src/user/crypto/sha256.fam $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/headers.fam \
 	$N/chainver.fam $N/state.fam $N/proofs.fam $N/manifest.fam $N/connect.fam $N/query.fam $N/serve.fam $N/snap.fam $N/xmss.fam $N/tx.fam \
-	$N/wkeys.fam $N/pool.fam $N/p2p.fam $N/cons.fam $N/api.fam $N/sync.fam $N/dns.fam $N/main.fam || { echo "build.sh: the node did not build" >&2; exit 1; }
+	$N/wkeys.fam $N/events.fam $N/pool.fam $N/p2p.fam $N/cons.fam $N/api.fam $N/sync.fam $N/dns.fam $N/main.fam || { echo "build.sh: the node did not build" >&2; exit 1; }
 # nodev, its verifier: a process of its own (src/user/node/vmain.fam).
 echo "Building $N/vmain.fam → bin/user/nodev (user mode)" >&2
 ./tools/fam --user -o bin/user/nodev $N/arith.fam $N/poseidon2.fam $N/difficulty.fam $N/pow.fam $N/chainver.fam \

@@ -28,6 +28,9 @@
 \                                        a day; pool.fam's qsugg), economy
 \   GET  /v1/mempool                     what the pool holds
 \   GET  /v1/tip?after=<id>              when the tip is not <id> (30 s at most)
+\   GET  /v1/events?after=<n>[&tx=<ids>] the events after n, or when one comes
+\                                        (30 s at most): blocks, transactions,
+\                                        the node's state (below, aevents)
 \   POST /v1/tx                          a transaction's bytes: pooled, relayed
 \   POST /v1/token                       a new token
 \
@@ -607,6 +610,107 @@ agen
 abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
 "200 OK" asend ;
 
+\ ── Events (events.fam; docs/TIMING_FIXES.md, item 15) ──
+\
+\ GET /v1/events?after=<n>[&tx=<id>,<id>]: the events numbered after n
+\ (64 at most), at once if there are any, else when one comes or after
+\ 30 s (none), as {"events": [...], "next": the last number read}; each
+\ {"n", "kind", ...}: a block's ("block", "undone") "height" and "id"; a
+\ transaction's ("tx") "id" and "state" (pooled; replaced, and "by";
+\ evicted; mined, and "height"; conflicted; back); the node's ("status")
+\ "state" (synced, syncing, "no peers"), "height" and "headers".  With
+\ tx (4 at most), only those transactions' besides blocks and status.  n
+\ before the oldest kept (EVN), or past the newest (the node started
+\ again): {"reset": true, "next"}, the wallet reading the state afresh.
+\ AEW requests wait at most: past them, 503.
+:M AEW 10 lit ;
+\ a waiting request: +0 its connection, +4 until (s), +8 after, +C its
+\ filter's count, +10 the ids (4 of 32 bytes)
+:M AEWSZ 98 lit ;
+: aew variable ;  : aeaf variable ;  : aenf variable ;  : aef variable ;  : aek variable ;
+: aest variable ;  : aea variable ;  : aenx variable ;  : aep variable ;
+
+\ aevst  the node's state, an event when it changes: no peers, syncing
+\ (behind its best header by more than a block), synced.
+: aevst
+0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then
+0= if ENOPEERS else hbest hheight myh @ 1 lit + u> if ESYNCING else ESYNCED then then
+dup aest @ = if drop else
+	dup aest !  EVSTAT myh @ rot 0 lit 0 lit evput  hbest hheight evn @ evat 10 lit + !
+then ;
+
+\ aev1 ( a -- )  an event's object.
+: aevbh  "height" akey aea @ 8 lit + @ anum acom "id" akey aea @ 10 lit + adig ;
+: aevtxs  ( state -- s )
+dup EVPOOLED = if drop "pooled" else dup EVREPL = if drop "replaced" else
+dup EVEVICT = if drop "evicted" else dup EVMINED = if drop "mined" else
+EVCONF = if "conflicted" else "back" then then then then then ;
+: aevtx
+"id" akey aea @ 10 lit + adig acom "state" akey aqt aea @ C lit + @ aevtxs a" aqt
+aea @ C lit + @ EVREPL = if acom "by" akey aea @ 30 lit + adig then
+aea @ C lit + @ EVMINED = if acom "height" akey aea @ 8 lit + @ anum then ;
+: aevs
+"state" akey aqt aea @ C lit + @ dup ESYNCED = if drop "synced" else ESYNCING = if "syncing" else "no peers" then then a" aqt acom
+"height" akey aea @ 8 lit + @ anum acom "headers" akey aea @ 10 lit + @ anum ;
+: aev1
+aea !
+"{" a" "n" akey aea @ @ anum acom "kind" akey aqt
+aea @ 4 lit + @ dup EVBLK = if drop "block" a" aqt acom aevbh else
+dup EVUNDO = if drop "undone" a" aqt acom aevbh else
+EVTX = if "tx" a" aqt acom aevtx else "status" a" aqt acom aevs then then then
+"}" a" ;
+\ aem ( a -- flag )  event a wanted: not a transaction's, no filter, or
+\ one of its ids.
+: aem
+dup 4 lit + @ EVTX = aenf @ and if
+	0 lit aenf @ 0 lit do over 10 lit + aef @ i 5 lit lshift + 20 lit d8= or loop nip
+else drop -1 lit then ;
+\ aereset ( -- flag )  aeaf not among the numbers kept.
+: aereset  aeaf @ evn @ u>  aeaf @ 1 lit + evlow u< or ;
+\ aehas ( -- flag )  a wanted event after aeaf.
+: aehas  0 lit  evn @ aeaf @ u> if evn @ aeaf @ - 0 lit do aeaf @ i + 1 lit + evat aem or loop then ;
+\ aevans  the events after aeaf wanted (aenf, aef), 64 at most, answered.
+: aevans
+abegin "{" a"
+aereset if "reset" akey "true" a" acom "next" akey evn @ anum else
+	"events" akey "[" a"  0 lit aek !  aeaf @ aenx !
+	evn @ aeaf @ - ?dup if 0 lit do
+		aek @ 40 lit u< if
+			aeaf @ i + 1 lit + dup aenx !  evat dup aem if aek @ if acom then aev1  aek @ 1 lit + aek ! else drop then
+		then
+	loop then
+	"]" a" acom "next" akey aenx @ anum
+then
+"}" a" "200 OK" asend ;
+\ aevents  GET /v1/events: answered, or waiting (AEW at most).
+: aevents
+"after=" aqv ?dup if atoi else 0 lit then aeaf !
+0 lit aenf !
+"tx=" aqv ?dup if
+	aep !
+	begin aenf @ 4 lit u< if aep @ aef @ aenf @ 5 lit lshift + 20 lit ahexb else 0 lit then while
+		aenf @ 1 lit + aenf !  aep @ 40 lit + dup c@ 2C lit = if 1 lit + then aep !
+	repeat
+then
+aereset aehas or if aevans else
+	FFFFFFFF lit AEW 0 lit do aew @ i AEWSZ * + @ 0= if drop i then loop
+	dup 0< if drop "too many waiting" "503 Service Unavailable" afail else
+		AEWSZ * aew @ +  acfd @ over !  ntime 1E lit + over 4 lit + !  evn @ over 8 lit + !  aenf @ over C lit + !
+		aef @ swap 10 lit + 20 lit wcopy  0 lit acfd !
+	then
+then ;
+\ aewake  the waiting requests with a wanted event, or whose time is up,
+\ answered; the others' after moved past what they did not want.
+: aewake
+AEW 0 lit do
+	aew @ i AEWSZ * + dup @ if
+		dup 8 lit + @ aeaf !  dup C lit + @ aenf !  dup 10 lit + aef @ 20 lit wcopy
+		aereset aehas or  ntime 2 lit pick 4 lit + @ u< 0= or if
+			dup @ acfd !  0 lit swap !  aevans
+		else evn @ swap 8 lit + ! then
+	else drop then
+loop ;
+
 \ atipr  the tip, answered.
 : atipr  abegin "{" a" "height" akey myh @ anum acom "tip" akey mytip @ adig "}" a"  "200 OK" asend ;
 \ A request waiting for the tip (8 at most): its connection, until when
@@ -619,8 +723,10 @@ if
 		28 lit * awt @ +  acfd @ over !  ntime 1E lit + over 4 lit + !  ab32 @ swap 8 lit + 20 lit bcopy  0 lit acfd !
 	then
 else atipr then ;
-\ awake  the waiting requests whose tip moved, or whose time is up, answered.
+\ awake  the waiting requests whose tip moved, or whose time is up,
+\ answered; the node's state (aevst) and the events' waiting (aewake).
 : awake
+aevst aewake
 8 lit 0 lit do
 	awt @ i 28 lit * + dup @ if
 		dup 8 lit + mytip @ 20 lit d8= 0=  ntime 2 lit pick 4 lit + @ u< 0= or if
@@ -670,8 +776,9 @@ else
 	apath @ "/v1/fees" streq if afees else
 	apath @ "/v1/mempool" streq if amempool else
 	apath @ "/v1/tip" streq if atip else
+	apath @ "/v1/events" streq if aevents else
 	apath @ "/v1/consensus" streq if acons else anotf
-	then then then then then then then then then then then then
+	then then then then then then then then then then then then then
 then ;
 
 \ aone  the connection in acfd: its request read, checked, answered.
@@ -692,6 +799,7 @@ abod @ ?dup if free 0 lit abod ! then ;
 10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
+AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
 A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
 54 lit alloc aerrs !
 "does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !

@@ -335,7 +335,18 @@ reads the node though only root can read the token
     The answer says accepted, or which rule it broke.
 - **Waiting:** `GET /v1/tip?after=<id>` returns when the tip moves
   (long polling), so a GUI can update without asking again and again.
-  A WebSocket for events can come later; the framing is wm's.
+- **Events:** `GET /v1/events?after=<n>[&tx=<id>,<id>]` (events.fam;
+  `docs/TIMING_FIXES.md`, item 15): what happened after event n, at
+  once if anything did, else when something does (30 s at most): a
+  block connected or undone (height, id), a transaction pooled,
+  replaced (by which), evicted, mined (at a height), conflicted or back
+  in the pool, and the node's state when it changes (synced, syncing,
+  no peers). Up to 64 an answer with `next`, the number to ask after;
+  the last 2,048 are kept, and a number older than that, or past the
+  newest (the node restarted), answers `reset`, the wallet reading the
+  state afresh. With `tx`, only those transactions' (4 at most), blocks
+  and the state always. 16 requests wait at most (503 past them). The
+  fam pool has no rolling minimum yet, so no `fees` event.
 
 The API holds nothing secret but the token. A wallet's keys never
 reach the node.
