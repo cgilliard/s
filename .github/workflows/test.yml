@@ -52,10 +52,43 @@ jobs:
           workspaces: miner
       - run: cargo test --all
 
+  # The test binaries the slow jobs run, compiled once (each slow job
+  # compiled tabminer itself, about 3 minutes, forty times over): the
+  # library's tests without and with the dev networks, the wallet and
+  # scale tests, and the tabminer binary the wallet tests run (at the
+  # path compiled into them, CARGO_BIN_EXE_tabminer; every runner checks
+  # out to the same path, and the tests' files are read from the checkout).
+  slow-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: miner
+          shared-key: slow
+      - run: |
+          mkdir -p ../slowbin
+          exe() { cargo test --release --no-run --message-format=json "$@" | jq -r 'select(.profile.test == true and .executable != null) | .executable'; }
+          cp "$(exe --lib)" ../slowbin/lib
+          cp "$(exe --lib --features dev)" ../slowbin/lib-dev
+          cp "$(exe --test wallet --features dev)" ../slowbin/wallet
+          cp "$(exe --test scale --features dev)" ../slowbin/scale
+          # the wallet tests' binary, with the dev networks
+          cp target/release/tabminer ../slowbin/tabminer
+          ls -l ../slowbin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slow-build
+          path: slowbin/
+          retention-days: 3
+
   # The tests marked #[ignore = "slow: …"], each in its own job so they
   # run side by side. A test marked slow must be listed here.
   slow:
     name: slow ${{ matrix.test }}
+    needs: slow-build
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -85,34 +118,37 @@ jobs:
           - test: node::tests::a_switch_between_modes_falls_back
           - test: node::tests::messages_meet_over_a_lossy_network
           - test: node::tests::messages_meet_over_a_reordering_network
-          - { test: aggregate::tests::dev_recursive_chain_constants, features: dev }
+          - { test: aggregate::tests::dev_recursive_chain_constants, bin: lib-dev }
           # The circuits' soundness audits (stark::freedom_audit, run_audit).
           - test: block_air::tests::the_block_circuit_has_no_unintended_freedom
           - test: block_air::tests::a_replaced_permutation_is_caught_where_it_is_used
           - test: name_air::tests::has_no_unintended_freedom
           - test: block_air::tests::the_circuit_agrees_with_the_chain_on_random_blocks
           # The binary through its prompt (miner/tests/wallet.rs).
-          - { test: sub_names_resolve_in_both_modes, features: dev, target: --test wallet }
-          - { test: a_payment_goes_through_the_prompt, features: dev, target: --test wallet }
-          - { test: a_name_is_registered_through_the_prompt, features: dev, target: --test wallet }
-          - { test: exit_while_mining_ends_the_process, features: dev, target: --test wallet }
-          - { test: a_reorganization_takes_lost_rewards_out_of_the_wallet, features: dev, target: --test wallet }
-          - { test: a_reorganization_takes_a_lost_payment_out_of_the_wallet, features: dev, target: --test wallet }
-          - { test: a_restored_wallet_finds_and_spends_beside_its_original, features: dev, target: --test wallet }
-          - { test: a_crash_at_each_step_of_a_payment_loses_nothing, features: dev, target: --test wallet }
-          - { test: miners_keep_going_through_a_reorganization_that_strands_transactions, features: dev, target: --test wallet }
+          - { test: sub_names_resolve_in_both_modes, bin: wallet }
+          - { test: a_payment_goes_through_the_prompt, bin: wallet }
+          - { test: a_name_is_registered_through_the_prompt, bin: wallet }
+          - { test: exit_while_mining_ends_the_process, bin: wallet }
+          - { test: a_reorganization_takes_lost_rewards_out_of_the_wallet, bin: wallet }
+          - { test: a_reorganization_takes_a_lost_payment_out_of_the_wallet, bin: wallet }
+          - { test: a_restored_wallet_finds_and_spends_beside_its_original, bin: wallet }
+          - { test: a_crash_at_each_step_of_a_payment_loses_nothing, bin: wallet }
+          - { test: miners_keep_going_through_a_reorganization_that_strands_transactions, bin: wallet }
           # At scale (miner/tests/scale.rs), with 2,000,000 outputs here;
           # 170,000,000 nightly on every platform but Windows arm64 (scale.yml).
-          - { test: a_full_block_applies_on_a_large_state, features: dev, target: --test scale, nocapture: --nocapture }
-          - { test: a_fresh_node_fast_syncs_a_large_state, features: dev, target: --test scale, nocapture: --nocapture }
+          - { test: a_full_block_applies_on_a_large_state, bin: scale, nocapture: --nocapture }
+          - { test: a_fresh_node_fast_syncs_a_large_state, bin: scale, nocapture: --nocapture }
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          workspaces: miner
-          shared-key: slow
-      - run: cargo test --release ${{ matrix.target || '--lib' }} --features "${{ matrix.features }}" -- --ignored --exact ${{ matrix.test }} ${{ matrix.nocapture }}
+          name: slow-build
+          path: slowbin
+      - run: |
+          chmod +x ../slowbin/*
+          mkdir -p target/release && cp ../slowbin/tabminer target/release/tabminer
+      # (run from miner/, as cargo test runs them)
+      - run: ../slowbin/${{ matrix.bin || 'lib' }} --ignored --exact ${{ matrix.test }} ${{ matrix.nocapture }}
 
   # The fam compiler (node/): rebuilt from the 168-byte seed under QEMU
   # (scripts/build.sh checks the rebuilt fam0 against the seed), then its
