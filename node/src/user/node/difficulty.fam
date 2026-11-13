@@ -110,12 +110,27 @@ dvb @ dvo @ 8 lit wcopy ;
 
 : wsat+  dup dvu ! 8 lit wadd if dvu @ 8 lit 0 lit do FFFFFFFF lit over i w! loop drop then ;   \ ( a b c -- )
 
+\ bwork ( t out -- )  out = (2^256 - 1 - t) / (t + 1) + 1, saturating:
+\ tabminer's work for a target.  The division normalized: t + 1 shifted
+\ up under the dividend, then a step a bit of the quotient (a few at
+\ the dev networks' targets, a few dozen at a hard one), not 256 as
+\ wdivmod's (half a header's checking, measured).
+: bws variable ;
 : bwork  ( t out -- )
 dvinit dvo !
 dup dva @ 8 lit wcopy  dvb @ 8 lit wzero  1 lit dvb @ 0 lit w!
-dva @ dvb @ dva @ wsat+                       \ t + 1
-dvc @ 8 lit wcopy  8 lit 0 lit do dvc @ i w@ invert dvc @ i w! loop   \ ~t
-dvc @ dva @ dvd @ dve @ 8 lit wdivmod
+dva @ dvb @ dva @ wsat+                       \ d = t + 1
+dvc @ 8 lit wcopy  8 lit 0 lit do dvc @ i w@ invert dvc @ i w! loop   \ the remainder from ~t
+dvd @ 8 lit wzero                             \ the quotient
+dvc @ 8 lit wbits  dva @ 8 lit wbits -  dup 0< if drop else
+	bws !
+	dva @ dve @ 8 lit bws @ wshl              \ d, its top bit under the dividend's
+	bws @ 1 lit + 0 lit do
+		dvd @ dvd @ 8 lit 1 lit wshl
+		dvc @ dve @ 8 lit wcmp 0< 0= if  dvc @ dve @ dvc @ 8 lit wsub drop  dvd @ @ 1 lit or dvd @ !  then
+		dve @ dve @ 8 lit 1 lit wshr
+	loop
+then
 dvd @ dvb @ dvo @ wsat+ ;
 
 : meets  ( digest t -- flag )
