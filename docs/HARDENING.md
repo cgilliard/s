@@ -187,20 +187,23 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
-- **Rendezvous points: fewer than three, and the wallet's count unclear.**
-  ONION.md gives an id three points, but `rendezvous_indexes` takes
-  `min(3, n)`: in init mode n is the seeds, two on mainnet, so every id
-  has two points, and a sender that cannot reach either cannot pay it.
-  The fam wallet's "reachable at N rendezvous points" counts the live
-  sessions among them (`mnlive`), so 1 means one of its two points holds
-  no session: the payer computes the same two and tries both, so a
-  payment still lands at the one that is live, but there is no failover
-  left. Seen on mainnet (2026-11-12) with one of two live; why the other
-  session was down not looked into. To do: a third seed (or onion mode's
-  relays) so that every id has three points; the wallet to say "1 of 2"
-  (how many points, how many live) and why one is not (no answer, a
-  session refused); a test with a point down, the payment landing at
-  another.
+- **Rendezvous points: three, but one session; the wallet's count reads
+  as the points'.** In onion mode every id has three points (the three
+  heaviest relays; with three relays listed, all of them). Since
+  `docs/SCALING.md` a participant holds one standing circuit, to one of
+  them (tabminer's `participant.rs`, the fam wallet's `wopart.fam`
+  `owsbuild`), not one to each as ONION.md's "Standing circuits" still
+  says; after two failures at its point the session moves to the next
+  (`point_failed`, `owsfail`). A sender's last relay asks every point of
+  the recipient, so a sender never guesses wrong. The wallet's "reachable
+  at 1 rendezvous points" is that one live session (`owlive`), not the
+  count of points. In init mode the points are the seeds, `min(3, n)`:
+  two on mainnet. To review: ONION.md brought in line; whether one session
+  is failover enough (a point that dies leaves the id unreachable until
+  it is noticed, 30 s, and two rebuilds fail, the entry below), or a
+  session at a second point is worth its keepalives; the wallet to say
+  "reachable (session at 1 of 3 points)" and which; a test with the
+  session's point killed and a payment landing after the move.
 - **A dead relay takes 30 s to notice, however fast the link.** A
   channel is taken for dead after a frame goes unacknowledged 30 s
   (`channel.rs`, `DEAD_AFTER`), a circuit after a keepalive goes
