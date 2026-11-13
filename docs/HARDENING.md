@@ -201,44 +201,11 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
-- **A relay closes a channel still handshaking, silently.** tabminer's
-  `node/channels.rs`: a channel a relay answered is closed when no frame
-  is accepted within `UNUSED_TIMEOUT` (15 s; 3 s in tests) from its first
-  hello, though frames refused only for coming before the auth, a hello
-  repeated, and the auth itself all show the initiator is there; and the
-  initiator is not told, so it resends until its own timeout (30 s; 20 s
-  in tests) and logs "the other end stopped answering". At 10% loss the
-  handshake's resends reach the window: the cause of the intermittent
-  `messages_meet_over_a_lossy_network` (sessions not up within 60 s). To
-  do: the auth, a repeated hello and a frame refused for want of the
-  auth count as use; a frame for a channel a relay no longer knows
-  answered with a notice so the other end closes at once; a test holding
-  the auth back past the window. (Its cost is lower with a session at
-  every point, 2026-11-13: one stalled circuit no longer leaves the
-  participant unreachable.)
-- **A dead relay takes 30 s to notice, however fast the link.** A
-  channel is taken for dead after a frame goes unacknowledged 30 s
-  (`channel.rs`, `DEAD_AFTER`), a circuit after a keepalive goes
-  unanswered 30 s (`node/participant.rs`, `DEAD_AFTER`; the fam wallet's
-  `wopart.fam` the same), chosen so a satellite link (600 ms and more a
-  round trip, seconds under load) is not mistaken for a dead one
-  (`docs/ONION.md`, Timeouts). The same 30 s applies on a LAN or in a
-  datacenter, where a few seconds would do. Meanwhile every recipient
-  whose session runs through the dead relay is unreachable: a sender told
-  "offline" now keeps asking for 60 s (`OFFLINE_WAIT`, 2026-11-12), which
-  hides the gap from the user but does not shorten it, and the recipient's
-  own sends wait the same 30 s on a dead circuit.
-  Fix: derive "dead" from each link's measured round trip, which the
-  channel already keeps (RFC 6298: `srtt`, `rttvar`, the resend timeout):
-  dead after about ten resend timeouts unanswered, bounded to between
-  5 s and 30 s, so a fast link notices in about 5 s and a satellite keeps
-  its full allowance; for circuits, the keepalive's own round trip
-  measured the same way (it crosses three hops, so its own estimate,
-  not the first channel's). Both tabminer and the fam wallet, and tests
-  that stop a relay on a fast link (`standing_circuits_are_replaced_and_rebuilt`,
-  `an_idle_participant_is_quiet_and_learns_of_a_dead_hop`) then expect
-  recovery within the bound rather than after 30 s. Keep the sender's
-  60 s window as a backstop.
+- **Timers: liveness, waits, polling.** A relay closing a channel still
+  handshaking without telling the other end (the lossy onion tests'
+  flake), a dead relay taking 30 s however fast the link, and the rest
+  of an audit of every timer in tabminer and the fam node and wallet:
+  `docs/TIMING_FIXES.md`.
 - **Flow control is a budget, not a window.** `node/circuits.rs`: a
   hop ends a circuit whose client sends more than 1024 cells at once or
   128 a second after, and drops hops idle for an hour; cells toward the
