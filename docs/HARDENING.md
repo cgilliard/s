@@ -69,6 +69,20 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
   retry; clock-skew logging; strikes leading to a ban at node level;
   peers-file poisoning; NAT.
 
+- **The fam node checks a body's commitment slowly: about 1 s a block.**
+  A batch of 16 (NODE_ENHANCEMENTS item 21) spends about 17 s fetching
+  and checking its bodies against their headers, against 2 s for its one
+  chain proof (mainnet, 2026-11-13). The commitment is consensus's
+  Poseidon2 (`Body::commitment`, `proof_hash`): the body's roughly 205 KB
+  chain proof packed 3 bytes a field element (about 70,000) and absorbed 8
+  at a time, about 8,700 permutations, at about 41 µs each under QEMU
+  (0.35 s), the packing and Montgomery conversion in fam words besides
+  (`state.fam`'s `bcommit`, `pow.fam`'s `pack3`). To do: time the parts;
+  one assembly-level word that packs, converts and absorbs straight into
+  the sponge (as `perm16`), with no 270 KB buffer (about half the time
+  expected); bodies checked on several harts once the multi-hart slowdown
+  (item 4) is understood.
+
 ## Wallet
 
 - **Unnamed slates share one answering limit.** A wallet answers at most
