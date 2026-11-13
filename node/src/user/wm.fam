@@ -969,6 +969,9 @@ dup @ 0< if drop else
 dup @ cfd !  dup 4 lit + @ 3 lit = if fsread else
 dup 4 lit + @ if  dup 14 lit + @ ?dup if 1 lit - wtouch then  wsread else request then then
 then then then ;
+\ wmnum ( n dst -- dst' )  n in decimal at dst; wmlb: wm's line said whole.
+: wmlb variable ;
+: wmnum  over A lit u< if swap 30 lit + over c! 1 lit + else over A lit / swap wmnum swap A lit % 30 lit + over c! 1 lit + then ;
 
 \ The reaper's stacks first: the kernel wants them in the memory it gave
 \ (64 KiB, the heap a part of it); the rest (the clients' buffers, 17 KiB
@@ -993,7 +996,12 @@ NC 1 lit lshift 1 lit + dup 3 lit lshift alloc pe !  2 lit lshift alloc pm !
 2 lit socket dup lsn ! 0< if "wm: no socket" eputs 0A lit eputc 1 lit exit then
 lsn @ 1 lit 0 lit port @ net ?dup if "wm: cannot bind: " eputs . 0A lit eputc 1 lit exit then
 lsn @ 3 lit 0 lit 0 lit net drop
-"wm: port " puts port @ u. ", sessions idle " puts idle @ u. " s at most" puts 0A lit putc
+\ that it serves, in one write: in pieces, another's output (the shell's
+\ prompt) landed inside it on the console ("wm: port $ 80"), and what
+\ waits for the line never saw it
+80 lit alloc wmlb !
+wmlb @ "wm: port " scpy  port @ swap wmnum  ", sessions idle " scpy  idle @ swap wmnum  " s at most" scpy
+A lit over c!  1 lit +  wmlb @ -  1 lit wmlb @ rot write drop
 begin
 	entries
 	pe @ np @ EE6B2800 lit poll drop
