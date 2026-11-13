@@ -203,6 +203,29 @@ Progress:
   (`nnext`), not a fixed turn. Still left from the list above: the
   pool's recheck, API requests one at a time, chunks not served while
   the worker has a job.
+- (2026-11-13) The probe (step 1): the node times its own loop, from
+  each point the API can be answered (`aaccept`, or a wait watching its
+  listener) to the next (`p2p.fam`'s `pmark`); each hold over a second
+  is logged ("the loop held N ms (height, activity)"), the longest given
+  by `/v1/status` (`stall_ms`, `stall_height`, `stall_activity`), and
+  `nstep`'s steps over a second are named (`nslow`: following the peers,
+  relaying, announcing the pool, saving it, the consensus scan). For
+  finding stalls, never asserted; it changes nothing the node does.
+  Its first numbers, a fresh mainnet node: 6.2 s saving the headers to
+  S (`nsave`, on the loop); 3.4 to 5.1 s of every 10 s in the consensus
+  scan once synced; about 10 s for each page of 1,000 outputs a scan
+  asks for from the host (the answer written 512 bytes at a time).
+- (2026-11-13) A hang found with it, in the kernel: the node answering
+  a request its wallet had given up on (12 s) wrote to a connection the
+  wallet had closed; the closed side kept the bytes, unread, until its
+  ring was full, its window stayed 0, and the node's write waited for
+  good (a scan's page of outputs is far more than the 12 KiB the two
+  rings hold): the node served nothing more, the wallet "cannot reach
+  the node". Bytes for a socket whose descriptors are closed now reset
+  the connection (`net.fam`'s `cother`), so the write is refused
+  (oscheck's `tcp_loop`). Not covered: a peer on another machine that
+  goes silent with its window at 0 (no persist timer, no deadline on a
+  write under way).
 
 ## 5. The wallet shows what is in progress
 

@@ -880,6 +880,11 @@ begin pdeq ?dup while
 	then
 repeat ;
 
+\ nslow ( name -- )  a step of nstep that took a second or more since
+\ nst0, told by name (docs/NODE_ENHANCEMENTS.md, item 4: which step
+\ holds the loop, beside pmark's how long).
+: nst0 variable ;
+: nslow  ticks nst0 @ -  dup 989680 lit u< 0= vrb @ and if nhead swap puts " took " puts 2710 lit / u. " ms" puts 0A lit putc else 2drop then ;
 \ nstep  a turn of following, up to a second: the peers kept (pkeep);
 \ the answering peer furthest ahead of us, by its last Pong or
 \ announcement (Inv), made the current and caught up to (so a block
@@ -933,6 +938,7 @@ nnx @ nnow @ -  dup 1 lit u< if drop 1 lit then  3B9ACA00 lit * ;
 : nstep
 -1 lit pxw !  nnext pwait drop  0 lit pxw !
 pkeep
+ticks nst0 !
 nahead dup 0< if drop else
 	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop
 	ncatch
@@ -944,7 +950,11 @@ nahead dup 0< if drop else
 		vrb @ if nhead "peer " puts pcur @ pshow " brought nothing to its height " puts pst-h u. "; passed over for a minute" puts 0A lit putc then
 	then
 then
-nrelay  nrean  qpersist  cxrun ;
+"following the peers" nslow
+ticks nst0 !  nrelay  "relaying transactions" nslow
+ticks nst0 !  nrean  "announcing the pool again" nslow
+ticks nst0 !  qpersist  "saving the pool" nslow
+ticks nst0 !  cxrun  "the consensus file's votes" nslow ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;
