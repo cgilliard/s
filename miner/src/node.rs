@@ -786,7 +786,7 @@ fn stalled(
             abandoned.push(d.id);
             continue;
         }
-        let wait = retry(&d.from);
+        let wait = net::retry_backoff(retry(&d.from), d.retries);
         if now.duration_since(d.last_progress) < wait || now.duration_since(d.last_request) < wait {
             continue;
         }
@@ -2025,6 +2025,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             Message::NotHeld { kind, id } => {
                 let downloads = if *kind == Kind::Tx { &self.tx_downloads } else { &self.downloads };
                 downloads.get(id).is_some_and(|d| d.from == addr && d.kind == *kind)
+                    || self.snap_downloads.get(&(*kind, *id)).is_some_and(|d| d.from == addr)
             }
             // Only about a channel we have with that address.
             Message::ChannelGone { chan } => {
@@ -2327,6 +2328,11 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     d.not_held = true;
                     self.chatter(&format!("{addr} does not hold {}; asking another peer", short(&id)));
                     self.retry_downloads(now);
+                } else if let Some(d) = self.snap_downloads.get_mut(&(kind, id))
+                    && d.from == addr
+                {
+                    d.not_held = true;
+                    self.chatter(&format!("{addr} does not hold the snapshot's {}; asking another peer", short(&id)));
                 }
             }
             Message::Goodbye { token } => {
@@ -3791,11 +3797,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         let mut abandoned = Vec::new();
         let mut requests = Vec::new();
         for (&(kind, id), d) in self.snap_downloads.iter_mut() {
+            if d.not_held {
+                abandoned.push((kind, id, d.from, false));
+                continue;
+            }
             if d.too_slow(now) {
                 abandoned.push((kind, id, d.from, true));
                 continue;
             }
-            let wait = self.peers.retry(&d.from);
+            let wait = net::retry_backoff(self.peers.retry(&d.from), d.retries);
             if now.duration_since(d.last_progress) < wait || now.duration_since(d.last_request) < wait {
                 continue;
             }

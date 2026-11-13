@@ -320,7 +320,7 @@ then ;
 : ppeers
 4 lit wbeg  ptp @ 0 lit w8  0 lit
 pnp @ ?dup if 0 lit do
-	i prec 8 lit + @ if
+	i prec 8 lit + @  i prec B0 lit + @ 0= and if
 		i prec @  dup 18 lit rshift w8  dup 10 lit rshift w8  dup 8 lit rshift w8  w8  i prec 4 lit + @ w16  1 lit +
 	then
 loop then
@@ -561,8 +561,11 @@ pnp @ ?dup if 0 lit do
 				i prec A8 lit + @ 1 lit lshift  dup 2 lit u< if drop 2 lit then  dup 1E lit u> if drop 1E lit then
 			then
 			dup i prec A8 lit + !  pkt @ + i prec A4 lit + !
-			pkt @ i prec AC lit + @ - B4 lit u> i prec B0 lit + @ 0= and if
-				1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 180 s, still asking" puts 0A lit putc then
+			\ lost: silent 65 s (two pings unanswered and a little more, as
+			\ tabminer's LIVE_SILENCE): not announced to, advertised or
+			\ followed, though asked still
+			pkt @ i prec AC lit + @ - 41 lit u> i prec B0 lit + @ 0= and if
+				1 lit i prec B0 lit + !  vrb @ if nhead "peer " puts i pshow " lost: silent 65 s, still asking" puts 0A lit putc then
 			then
 		then
 	then
@@ -574,7 +577,7 @@ pdisc ;
 : pann
 0 lit pnann !
 pnp @ ?dup if 0 lit do
-	dup i = 0=  i prec 8 lit + @ and if
+	dup i = 0=  i prec 8 lit + @ and  i prec B0 lit + @ 0= and if
 		A lit wbeg  over 20 lit wbs  i psend  pnann @ 1 lit + pnann !
 		pnlog @ if 20 lit putc i pshow then
 	then

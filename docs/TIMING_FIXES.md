@@ -528,7 +528,16 @@ understood is ignored.
     fam wallet's standing sessions (`owstick`: 3 s until live, 15 minutes
     after, 30 s unanswered) are not changed yet.
 13. A peer not live after two missed pongs; tabminer's chunk retries up
-    to 5 s with backoff; the node's per peer.
+    to 5 s with backoff; the node's per peer. **Done (2026-11-13):** a
+    peer silent 65 s (two pings unanswered, `LIVE_SILENCE`) is not live
+    in tabminer, nor picked for anything, though kept until
+    `PEER_TIMEOUT`; the fam node marks it lost at 65 s too, and no longer
+    announces to or advertises a lost peer; tabminer's chunk retry
+    ceiling 5 s (was 1 s), each retry without progress doubling the wait
+    to eight times (eight retries about 5 s on a LAN, not 0.8 s), blocks
+    and snapshot parts alike; and a snapshot part's download takes
+    `NotHeld` too (item 10 had missed its own table). The fam node's
+    round trips were made per peer in item 2.
 14. Send budgets per step, each from the round trip with a floor; the
     120 s as the outer bound.
 

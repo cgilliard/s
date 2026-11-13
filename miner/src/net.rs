@@ -917,7 +917,16 @@ pub const RETRY: Duration = Duration::from_millis(400);
 /// The bounds of a measured retry wait: the smoothed round trip plus four
 /// times its variation (RFC 6298).
 pub const MIN_RETRY: Duration = Duration::from_millis(100);
-pub const MAX_RETRY: Duration = Duration::from_secs(1);
+/// 5 s: a satellite's round trip under load passes a second, and a wait
+/// under it takes every slow answer for a loss (it was 1 s).
+pub const MAX_RETRY: Duration = Duration::from_secs(5);
+
+/// The wait before retry `retries + 1` without progress: `base`, doubling
+/// with each retry to eight times it, so that eight retries span a few
+/// seconds on a LAN (about 5 s) rather than under one.
+pub fn retry_backoff(base: Duration, retries: u32) -> Duration {
+    base * (1u32 << retries.min(3))
+}
 /// Retries without progress before a download is abandoned.
 pub const MAX_RETRIES: u32 = 8;
 /// A block download averaging under this many bytes a second after
@@ -1253,6 +1262,9 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const FIRST_PING_RETRY: Duration = Duration::from_secs(2);
 /// A peer silent for this long is dropped (unless it is a seed).
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+/// A peer silent this long (two pings unanswered and a little more) is
+/// no longer taken for live.
+pub const LIVE_SILENCE: Duration = Duration::from_secs(65);
 /// How long a peer a block download failed from, or that did not back its
 /// claimed work with headers, is passed over.
 pub const FETCH_BACKOFF: Duration = Duration::from_secs(600);
@@ -1613,10 +1625,14 @@ impl Peers {
     /// Peers that proved their address by answering our ping, heard from
     /// within the timeout: the only ones counted, told of blocks and peers,
     /// or believed.
+    /// Peers heard within [`LIVE_SILENCE`]: two pings unanswered (one each
+    /// [`PING_INTERVAL`]) and it is not taken for live, nor picked for
+    /// blocks, headers or channels, though kept in the table until
+    /// [`PEER_TIMEOUT`].
     pub fn live(&self, now: Instant) -> impl Iterator<Item = &Peer> {
         self.map
             .values()
-            .filter(move |p| p.handshaken && p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TIMEOUT))
+            .filter(move |p| p.handshaken && p.last_seen.is_some_and(|t| now.duration_since(t) < LIVE_SILENCE))
     }
 
     pub fn live_count(&self, now: Instant) -> usize {
@@ -2077,10 +2093,20 @@ mod tests {
             peers.rtt_sample(&a, Duration::from_millis(10));
         }
         assert_eq!(peers.retry(&a), MIN_RETRY);
+        // A satellite's loaded round trip, 3 s: waited for, not taken for
+        // a loss (the ceiling was 1 s); past the ceiling, the ceiling.
         for _ in 0..50 {
             peers.rtt_sample(&a, Duration::from_secs(3));
         }
+        assert!(peers.retry(&a) >= Duration::from_secs(3) && peers.retry(&a) < MAX_RETRY, "{:?}", peers.retry(&a));
+        for _ in 0..50 {
+            peers.rtt_sample(&a, Duration::from_secs(6));
+        }
         assert_eq!(peers.retry(&a), MAX_RETRY);
+        // Each retry without progress doubles the wait, to eight times it.
+        let base = Duration::from_millis(100);
+        let waits: Vec<Duration> = (0..6).map(|r| retry_backoff(base, r)).collect();
+        assert_eq!(waits.iter().map(|w| w.as_millis()).collect::<Vec<_>>(), vec![100, 200, 400, 800, 800, 800]);
     }
 
     #[test]
