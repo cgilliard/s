@@ -253,11 +253,18 @@ if part == 'payments':
         bb = ask('bump', tx=b['tx'], speed='block')
         check(f'the wallet bumps it: fee {b["fee"]} then {bb.get("fee", bb.get("error"))}', bb['ok'] and bb['tx'] != b['tx'] and units(bb['fee']) > units(b['fee']))
         check('its activity: the bump pending in the burn\'s place', [i['state'] for i in in_acts(bb['tx'])] == ['pending'] and not in_acts(b['tx']))
+        # the node's word on it (docs/TIMING_FIXES.md, item 15): the burn
+        # replaced by its bump, told to the page
+        def told(tx, state, **kw):
+            return lambda: pumpone() or any(m.get('event') == 'payment' and m.get('tx') == tx and m.get('state') == state
+                                            and all(m.get(k) == v for k, v in kw.items()) for m in msgs)
+        check('the burn told replaced by its bump', wait('the burn\'s payment event', told(b['tx'], 'replaced', by=bb['tx'])))
     finally:
         os.kill(apid, signal.SIGCONT)
     have -= 5 * 10**9 + units(bb['fee'])
     check(f'the bump lands: the wallet holds {coins(have)}', wait('the bump in a block', lambda: (time.sleep(3), confirmed() == coins(have))[1]))
     check('its activity: the bump confirmed', [i['state'] for i in in_acts(bb['tx'])] == ['confirmed'])
+    check('the bump told mined', wait('the bump\'s payment event', told(bb['tx'], 'mined')))
     os.kill(apid, signal.SIGSTOP)
     try:
         c = ask('burn', amount='0.25', purpose='cancelled', speed='hour')
@@ -265,6 +272,7 @@ if part == 'payments':
         cc = ask('cancel', tx=c['tx'])
         check(f'the wallet cancels it: fee {cc.get("fee", cc.get("error"))}', cc['ok'] and cc['tx'] != c['tx'])
         check('its activity: the burn gone', not in_acts(c['tx']))
+        check('the burn told replaced by its cancel', wait('the cancelled burn\'s payment event', told(c['tx'], 'replaced', by=cc['tx'])))
         k = ask('bump', tx=c['tx'])
         check(f'a cancelled burn is not bumped: {k.get("error")}', not k['ok'])
     finally:

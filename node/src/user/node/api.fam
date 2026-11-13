@@ -28,7 +28,8 @@
 \                                        a day; pool.fam's qsugg), economy
 \   GET  /v1/mempool                     what the pool holds
 \   GET  /v1/tip?after=<id>              when the tip is not <id> (30 s at most)
-\   GET  /v1/events?after=<n>[&tx=<ids>] the events after n, or when one comes
+\   GET  /v1/events?after=<n>[&tx=<ids>][&wait=0]
+\                                        the events after n, or when one comes
 \                                        (30 s at most): blocks, transactions,
 \                                        the node's state (below, aevents)
 \   POST /v1/tx                          a transaction's bytes: pooled, relayed
@@ -622,6 +623,7 @@ abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
 \ tx (4 at most), only those transactions' besides blocks and status.  n
 \ before the oldest kept (EVN), or past the newest (the node started
 \ again): {"reset": true, "next"}, the wallet reading the state afresh.
+\ With wait=0, answered at once even with none.
 \ AEW requests wait at most: past them, 503.
 :M AEW 10 lit ;
 \ a waiting request: +0 its connection, +4 until (s), +8 after, +C its
@@ -692,7 +694,9 @@ then
 		aenf @ 1 lit + aenf !  aep @ 40 lit + dup c@ 2C lit = if 1 lit + then aep !
 	repeat
 then
-aereset aehas or if aevans else
+\ wait=0: answered at once, events or none (a wallet's main loop asking
+\ what became of its transactions, never held)
+aereset aehas or  "wait=" aqv ?dup if c@ 30 lit = else 0 lit then or if aevans else
 	FFFFFFFF lit AEW 0 lit do aew @ i AEWSZ * + @ 0= if drop i then loop
 	dup 0< if drop "too many waiting" "503 Service Unavailable" afail else
 		AEWSZ * aew @ +  acfd @ over !  secs 1E lit + over 4 lit + !  evn @ over 8 lit + !  aenf @ over C lit + !

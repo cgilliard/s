@@ -345,7 +345,7 @@ reads the node though only root can read the token
   the last 2,048 are kept, and a number older than that, or past the
   newest (the node restarted), answers `reset`, the wallet reading the
   state afresh. With `tx`, only those transactions' (4 at most), blocks
-  and the state always. 16 requests wait at most (503 past them). The
+  and the state always. With `wait=0`, answered at once, events or none. 16 requests wait at most (503 past them). The
   fam pool has no rolling minimum yet, so no `fees` event.
 
 The API holds nothing secret but the token. A wallet's keys never

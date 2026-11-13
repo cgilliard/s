@@ -196,8 +196,10 @@ is written).
   that request answers, as of the block: the page redraws the open panel
   from it, `docs/TIMING_FIXES.md` item 15) once a block, when the tip
   moves; `node` (`state`: `unreachable`, with `retry`, the seconds to the
-  next try; `reached`) when the node stops or starts answering; `payment` (`tx`, `kind`,
-  `amount`, `state`) when one arrives or changes state; `scan` (`height`,
+  next try; `reached`) when the node stops or starts answering; `payment`
+  (`tx`, `state`: what the node says became of a payment not yet landed,
+  four watched at most: `pooled`, `replaced` with `by`, `evicted`,
+  `mined` with `height`, `conflicted`, `back`) when it changes; `scan` (`height`,
   `of`) as a scan goes; `locked` when the wallet locks itself.
 
 ## Files

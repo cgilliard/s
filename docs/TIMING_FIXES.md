@@ -587,8 +587,20 @@ understood is ignored.
     node unreachable (with the seconds to the next try, shown on the
     status line) and reached again. `paytest.sh` checks the event's
     panels (the 2.5 received in the activity, the balance), and
-    `wallettest.sh` its shape. Left: a payment's progress as events
-    (sent, answered, mined, confirmed; failed and why), and names'.
+    `wallettest.sh` its shape.
+    **A payment's fate done (2026-11-13):** the wallet watches its
+    payments not yet landed (the first four) through the node's events:
+    the block thread asks with their ids (`tx=`) and wakes the main
+    loop on theirs too, which reads them (`/v1/events?wait=0`, the
+    node's new way to answer at once) and tells the page a `payment`
+    event: pooled, replaced by which, evicted, mined at a height,
+    conflicted, back. A payment made or replaced reads them first, then
+    watches the new list (a bumped one leaves it). The page says it on
+    the status line ("dropped from the pool ...: bump it") and redraws
+    Activity. `paytest.sh`: the burn replaced by its bump, the bump
+    mined, the cancelled burn replaced by its cancel. Left: an online
+    payment's steps (sent, at the recipient's point, answered,
+    finalized; failed and why) and names' as events.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
     **The node's part done (2026-11-13):** its deadlines on the
