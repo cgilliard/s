@@ -571,6 +571,17 @@ understood is ignored.
     block thread and its events to the page.
 16. Loops sleep to their next deadline (the wallet's poll, the node's
     `nstep`), not a fixed second; `secs` rather than the date.
+    **The node's part done (2026-11-13):** its deadlines on the
+    monotonic `secs`, not the date (`/proc/time`, a file opened each
+    time, and moved by a clock set): `aserve`, `nidle`, the pool's
+    announcing again, the API's waiting requests; the date stays for
+    headers' timestamps. `nstep` waits (`nnext`) to the first thing
+    due: a peer's ping or the end of its pass-over or ban, discovery,
+    the announcing, the message layer's check, a waiting request's end;
+    a second at least, 4 at most (a wait is one word of nanoseconds),
+    a datagram or the API waking it sooner. `nidle`, before a sync,
+    keeps its second. Left: the wallet's loop, with item 15's block
+    thread.
 
 **Phase 5: tests**
 17. The drop filter by message kind and a test per fault (section 7);

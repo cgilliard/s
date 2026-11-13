@@ -57,8 +57,8 @@ repeat ;
 \ For a node waiting to sync (main.fam): no peer yet, or none ahead.
 : nidt variable ;
 : nidle
-ntime + nidt !
-begin ntime nidt @ u< while
+secs + nidt !
+begin secs nidt @ u< while
 	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  pkeep  stx @ nfsv !  aaccept awake  nfsv @ stx !
 repeat ;
 
@@ -843,15 +843,34 @@ loop then nah @ ;
 : nrc2 variable ;
 : nrean
 pfresh @ if 0 lit nrat !  0 lit pfresh ! then
-ntime nrat @ u< 0= if
-	ntime 3C lit + nrat !  0 lit nrc2 !
+secs nrat @ u< 0= if
+	secs 3C lit + nrat !  0 lit nrc2 !
 	QSLOTS 0 lit do i qused if i qslot 10 lit + nrm @ ycanon  nrm @ FFFFFFFF lit pann  nrc2 @ 1 lit + nrc2 ! then loop
 	vrb @ nrc2 @ and if
 		nhead "the pool's " puts nrc2 @ u. " transactions announced again, to " puts pnann @ u. " peers" puts 0A lit putc
 	then
 then ;
+\ nnext ( -- ns )  nstep's wait (docs/TIMING_FIXES.md, item 16): to the
+\ first thing due, not a fixed second: a peer's ping (A4), the end of its
+\ pass-over (C4) or ban (B4), discovery (pdn), the pool announced again
+\ (nrat), the message layer's check (cxat and 10 s), a waiting API
+\ request's end; a second at least (the clock's unit, as before) and 4
+\ at most (a wait is one word of nanoseconds; what this misses is that
+\ late at most).  A datagram or the API wakes it sooner.
+: nnx variable ;  : nnow variable ;
+\ nnmin ( s -- )  s, unless past, the first due if before the others.
+: nnmin  dup nnow @ - 0< if drop else dup nnx @ - 0< if nnx ! else drop then then ;
+: nnext
+secs nnow !  nnow @ 4 lit + nnx !
+pnp @ ?dup if 0 lit do
+	i prec A4 lit + @ nnmin  i prec C4 lit + @ nnmin  i prec B4 lit + @ nnmin
+loop then
+pdn @ nnmin  nrat @ nnmin  cxat @ A lit + nnmin
+AEW 0 lit do aew @ i AEWSZ * + dup @ if 4 lit + @ nnmin else drop then loop
+8 lit 0 lit do awt @ i 28 lit * + dup @ if 4 lit + @ nnmin else drop then loop
+nnx @ nnow @ -  dup 1 lit u< if drop 1 lit then  3B9ACA00 lit * ;
 : nstep
--1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
+-1 lit pxw !  nnext pwait drop  0 lit pxw !
 pkeep
 nahead dup 0< if drop else
 	dup pcur @ <> if dup puse  vrb @ if nhead "following peer " puts dup pshow 0A lit putc then then drop
@@ -873,8 +892,8 @@ nrelay  nrean  qpersist  cxrun ;
 
 \ aserve ( s -- )  (api.fam's)
 : aserve
-ntime + aend !
-begin ntime aend @ u< while
+secs + aend !
+begin secs aend @ u< while
 	nstep
 	aaccept
 	awake
