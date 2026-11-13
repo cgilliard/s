@@ -1635,6 +1635,9 @@ dup xload ?dup if nip xerr else
 			6 lit 0 lit do i rpkey  wtx @ okey @ 22 lit txdel drop loop
 			xdrop
 			wend drop
+			\ replaced: what became of it read now (its "replaced" event), as
+			\ for a bump; the block thread's wait asks with the list it had
+			-1 lit wpdirty !
 			jok ",'tx':'" jo ecb @ 20 lit jhex "','fee':'" jo sfee @ a8. "'}" jo jend
 		then
 	then then then

@@ -1454,7 +1454,11 @@ for n in 1 4; do
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
 		for pat in '^windows true$' '^prompt true$' '^focused true$' '^ls true$' '^minimize true$' '^restore true$' '^maximize true$' '^exit true$' '^closed true$' '^full true$' '^reopened true$' '^reaped true$' '^ansi true$' '^altscreen true$' '^vi true$' '^vi back true$' '^vi wrote true$' \
 			'^wallet true$' '^wallet created true$' '^wallet running true$' '^wallet once true$' '^wallet receive true$' '^wallet proofs true$' '^wallet names true$' '^wallet closed true$' '^wallet ended true$' \
-			'^files window true$' '^files once true$' '^files uploaded true$' '^files deleted true$'; do grep -q -- "$pat" "$T/page_$n.out" || fail "wm_$n" "page script: $(head -c 300 "$T/page_$n.out")"; done
+			'^files window true$' '^files once true$' '^files uploaded true$' '^files deleted true$'; do
+			# the check that failed, and the script's lines not "true" (the
+			# screens it printed, the last 600 bytes of them)
+			grep -q -- "$pat" "$T/page_$n.out" || { fail "wm_$n" "page script: no /$pat/; $(grep -v ' true$' "$T/page_$n.out" | tail -c 600)"; break; }
+		done
 	fi
 	exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
 	for pat in '^login form HTTP/1.0 200 OK True$' '^tty refused HTTP/1.0 403 Forbidden$' '^bad True$' '^cookie True$' \

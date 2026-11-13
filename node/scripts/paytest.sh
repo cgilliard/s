@@ -25,7 +25,10 @@
 #   transfers by offers as text: famwallet to tabminer, tabname to the
 #   wallet (its offer written to a file in its home, then given again).
 # No wait has a deadline: each fails only when nothing under its directory
-# has changed for its idle window (scripts/waitlib.sh's rule).
+# has changed for its idle window (scripts/waitlib.sh's rule), or blocks
+# pass without it.  But while tabminer is stopped no blocks come and the
+# node's lines still do, so those waits (the wallet told of its own
+# replacement, seconds) fail after 120 s.
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/paytest.sh
@@ -91,12 +94,12 @@ def progress():
 def blocks():
     # its log: with its prompt open, tabminer writes these there only
     return open(f'{T}/a/tabminer.log', errors='replace').read().count('is the tip at height')
-def wait(what, cond, idle=300):
+def wait(what, cond, idle=300, most=None):
     # The miner mines throughout, so its logs always grow: a wait fails
     # when nothing new comes for the idle window, or when 30 blocks pass
     # without what it waits for (blocks are the clock here).
     last, still, b0 = progress(), 0, blocks()
-    told = b0
+    told, t0 = b0, time.time()
     while True:
         r = cond()
         if r:
@@ -108,6 +111,8 @@ def wait(what, cond, idle=300):
             print(f'paytest: ({what}: {told - b0} blocks so far)')
         if blocks() > b0 + 30:
             print(f'paytest: {what}: not in 30 blocks'); sys.exit(1)
+        if most is not None and time.time() - t0 > most:
+            print(f'paytest: {what}: not in {most} s (tabminer stopped)'); sys.exit(1)
         now = progress()
         if now != last:
             last, still = now, 0
@@ -258,7 +263,7 @@ if part == 'payments':
         def told(tx, state, **kw):
             return lambda: pumpone() or any(m.get('event') == 'payment' and m.get('tx') == tx and m.get('state') == state
                                             and all(m.get(k) == v for k, v in kw.items()) for m in msgs)
-        check('the burn told replaced by its bump', wait('the burn\'s payment event', told(b['tx'], 'replaced', by=bb['tx'])))
+        check('the burn told replaced by its bump', wait('the burn\'s payment event', told(b['tx'], 'replaced', by=bb['tx']), most=120))
     finally:
         os.kill(apid, signal.SIGCONT)
     have -= 5 * 10**9 + units(bb['fee'])
@@ -272,7 +277,7 @@ if part == 'payments':
         cc = ask('cancel', tx=c['tx'])
         check(f'the wallet cancels it: fee {cc.get("fee", cc.get("error"))}', cc['ok'] and cc['tx'] != c['tx'])
         check('its activity: the burn gone', not in_acts(c['tx']))
-        check('the burn told replaced by its cancel', wait('the cancelled burn\'s payment event', told(c['tx'], 'replaced', by=cc['tx'])))
+        check('the burn told replaced by its cancel', wait('the cancelled burn\'s payment event', told(c['tx'], 'replaced', by=cc['tx']), most=120))
         k = ask('bump', tx=c['tx'])
         check(f'a cancelled burn is not bumped: {k.get("error")}', not k['ok'])
     finally:
