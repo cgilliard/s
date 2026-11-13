@@ -638,7 +638,7 @@ then ;
 \ dead); a keepalive after 25 s quiet; dead after 120 s unheard.
 \ owlbusy ( c -- flag )  a circuit building or ready on link c.
 : owlbusy  0 lit  OWCC 0 lit do i 4 lit owcif @ 2 lit pick =  i owci @ dup 1 lit = swap 2 lit = or and or loop nip ;
-: owlc variable ;  : owdead variable ;
+: owlc variable ;  : owdead variable ;  : owda variable ;
 : owlink
 owlc !  0 lit owdead !
 owlc @ 4 lit owcf @ 1 lit = if
@@ -655,12 +655,20 @@ owlc @ 4 lit owcf @ 1 lit = if
 	then
 then
 owlc @ 4 lit owcf @ 2 lit = if
+	\ the window a frame may go unanswered (as tabminer's channel.rs):
+	\ 30 s until the round trip is measured, then ten resend waits,
+	\ 5 s to 30 s; under 30 s only with nothing heard meanwhile and eight
+	\ sends, each at most a quarter of the window apart
+	owlc @ 70 lit owcf @ if owlc @ owrto A lit * 1388 lit max 7530 lit umin else 7530 lit then owda !
 	OWIF 0 lit do
 		owlc @ i owslot  dup @ if
+			mnms over 4 lit + @ -  dup 7530 lit u< 0=  swap owda @ u< 0=
+			mnms owlc @ 68 lit owcf @ - owda @ u< 0= and  2 lit pick C lit + @ 8 lit u< 0= and  or if -1 lit owdead ! then
 			mnms over 8 lit + @ -  over 10 lit + @ u< 0= if
-				dup C lit + @ C lit u< 0=  mnms 2 lit pick 4 lit + @ - 7530 lit u< 0= or if -1 lit owdead ! else
+				dup C lit + @ C lit u< 0= if -1 lit owdead ! else
 					owlc @ over 18 lit + 2 lit pick 14 lit + @ owdgo
-					dup C lit + dup @ 1 lit + swap !  dup 10 lit + dup @ 1 lit lshift 1388 lit umin swap !  mnms over 8 lit + !
+					dup C lit + dup @ 1 lit + swap !
+					dup 10 lit + dup @ 1 lit lshift 1388 lit umin  owda @ 2 lit rshift 190 lit max umin swap !  mnms over 8 lit + !
 				then
 			then
 		then drop

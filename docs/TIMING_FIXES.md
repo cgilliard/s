@@ -500,7 +500,20 @@ understood is ignored.
 
 **Phase 3: measure instead of guess**
 11. A channel's death from its round trip (about ten resend timeouts,
-    5-30 s), checked every poll; the same in the wallet's links.
+    5-30 s), checked every poll; the same in the wallet's links. **Done
+    (2026-11-13):** a frame unanswered 30 s still ends the channel; under
+    that, once its window has passed (ten resend timeouts of the
+    channel's measured round trip, 5 to 30 s; 30 s before one is
+    measured), with nothing at all heard from the other end meanwhile
+    and eight sends of it, its resends capped at a quarter of the window
+    so that the eight fit: a LAN notices a dead relay in about 7.5 s, a
+    satellite keeps its allowance. Checked every poll, not only when a
+    resend falls due. Time alone was not enough: in the lossy test (10%
+    each way) a frame alone in flight, resent 5 s apart, went five sends
+    unanswered among thousands, so the rule asks for silence and eight
+    sends (one in six hundred thousand at that loss). tabminer's
+    `channel.rs` and the fam wallet's `owlink` alike. Test:
+    `a_dead_channel_is_noticed_from_its_round_trip`.
 12. A circuit's from its own round trip (SESSION to SESSION_STATE), a
     re-ask at a third of the window, any cell as activity; rebuild
     backoff per point.
