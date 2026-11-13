@@ -319,6 +319,9 @@ place:
   tip and the node's details in Overview's node section; errors where
   the action was taken, and in Activity.
 
+The node's own states (not reached, starting, syncing, no peers) are
+item 22.
+
 ## 10. Activity: every entry read as a user
 
 Activity lists sent and received payments, burns and name operations,
@@ -958,56 +961,95 @@ waiting while nothing happens answered when something does; `after`
 past the ring answered "reset". In the wallet: an online payment's
 events in order from sent to confirmed, and a dropped one's.
 
-## 21. Catching up by batches: one proof checked for many blocks
+## 21. Catching up: one proof checked for the run, before any block is applied
 
 Catching up after a fast sync (the 144 blocks after S) or after time
 offline, the node connects each block with its chain proof checked:
-about 2.5 s of 4 to 5 s a block on mainnet, so 144 blocks take ten
-minutes, most of it proofs. A block's chain proof covers every block
-before it, so checking only the last of a run would attest the rest;
-but the blocks between would then be connected on their own proof of
-work's quick check and their state roots alone, and those a forger
-writes: spends with no signature, a payment that never was. Not to be
-done until the risks below are answered:
+about 2.5 s of 3.3 s a block on mainnet (with the next block fetched
+meanwhile), so 144 blocks take eight minutes, most of it proofs.
 
-- **What a forger can do.** Mine one block at the current difficulty
-  (the last of the run's work is checked in full) on top of forged ones.
-  The forged state is undone when the last proof fails, but meanwhile:
-  (1) the wallet could see a payment or a confirmation that is not real;
-  (2) the node does and undoes the whole run's work, once for every block
-  the forger can afford.
-- **Batches of n blocks** (n to settle: 16, 32?). The batch's blocks are
-  connected, then the last one's proof checked: passed, the batch is
-  accepted; failed, the batch is undone to its start.
-- **Finding the bad block and who sent it.** A failed batch is checked
-  again block by block (each proof, as today), so the first bad block is
-  found, and blocks before it kept. Each block's sender is recorded as it
-  is fetched (several peers may serve one batch); the sender of the bad
-  block is banned (`pstrike`, at once rather than by strikes: a valid
-  proof of work on an invalid block is deliberate), and a peer that
-  announced the branch it is on is struck too.
-- **Nothing unchecked shown.** Until a batch's proof passes, the node's
-  status, the API's reads and the wallet stay at the last checked block:
-  the store's commits for the batch kept apart (a transaction for the
-  batch, or a mark of the last checked height the API reads at), so the
-  wallet never sees a forged payment.
-- **Nothing unchecked relayed or announced**: the tip announced only once
-  its batch is checked; blocks of a batch not served to peers until then.
-- **Only while catching up.** At the tip, each new block is checked on
-  its own, as now (one block a batch).
-- **Tolerance.** How many failed batches before the node falls back to
-  checking every proof for a while (a forger with hash power could keep
-  it busy); and whether a batch is fetched from more than one peer, so a
-  single bad peer costs one batch.
+A block's chain proof binds its parent's header (its hash is among the
+proof's public values, NODE.md's "the chain proof binds the headers"),
+and it is recursive: block T's proof attests every header before it,
+each state root in them included. The header sync has already linked
+S to T by their parents' ids and checked each one's full proof of work.
+So once T's proof passes, every header from S to T is the true one,
+and connecting a block between needs only the checks made today besides
+its proof: its body matches its header's commitment, and applying it
+gives its header's state root. The root commits to every output and
+name, so a body that lands on an attested root gives the true state: no
+forged spend or payment can be shown. The proof is checked first, so no
+block is applied, shown, announced or served before it is attested, and
+nothing is ever undone.
 
-Meanwhile, the safer speedups: the next block fetched while one is
-connected (item 4, 2026-11-12), the node given several harts
-(`node.sh`, 2026-11-12), and proofs checked in parallel on those harts,
-each block's still checked (the state applied in order, the proofs of
-several blocks at once): close to a batch's speed with nothing taken on
-trust.
+**A run** (from the node's height H to T, the best header's height when
+the run starts; only when T - H is 2 or more):
+1. **The bodies:** fetched H+1 to T (as now, the next while one is
+   handled), each one's commitment checked against its header (its
+   sender banned at once if it does not match), its outputs counted, and
+   kept on disk under keys of their own (not the kept bodies' 'b', so
+   none is served).
+2. **T's proof, once** (about 2.5 s). Its public values need the output
+   counter before T: the counter at H (S's from the snapshot, or the
+   state's) plus what step 1 counted (each block's outputs and its
+   names' operations of type 1, as `sconn1` and `sverify` count), and
+   T−1's header readable where `sstmt` reads it.
+3. **The blocks connected,** H+1 to T from disk, in order: parsed, the
+   state changed and its root compared, stored; no proof, no commitment
+   again. Each is shown, announced and served as it is connected.
 
-**Tests:** a run of forged blocks ending in one with real work (on the
-dev network: a peer serving them), the batch undone, the bad block found
-and its sender banned, the wallet never shown the forged state; and a
-clean catch-up's time against block by block.
+**If T's proof fails,** T is invalid: whoever served T is banned
+(`pstrike` at once: a full proof of work on an invalid block is
+deliberate), and the run is connected as today, each block's proof
+checked, which finds any bad block before T. The cost is the one 2.5 s
+check, and every forged header costs its sender a real block's work. No
+tolerance to tune: the worst case is today's speed. **If a root does not
+match in step 3** (a fault of ours: the proof passed on other data),
+the run stops there and the rest is connected as today. Blocks arriving
+during a run, and every block at the tip, are checked one by one as now.
+
+Expected: about 1.3 s a block (the body about 1 s, the state, the store)
+and one proof: about 3 minutes for 144 blocks against 8. The bodies'
+commitments could later be checked on several harts (item 4's
+measurements first).
+
+**Disk:** a run's bodies are small on mainnet; at 2 MB blocks, 144 of
+them are 288 MB, to try with item 14's large blocks.
+
+**Tests:** a clean catch-up, one proof checked, its time against block
+by block; T forged (real work, a bad proof): its sender banned, the run
+connected block by block, the wallet never moved; a wrong body for a
+block between: refused in step 1, its sender banned; the counter right
+across blocks with name operations (wrong, T's proof would fail and the
+run fall back).
+
+## 22. The wallet tells what the node is doing
+
+The wallet's status says "synced" whenever the node answers
+(`nodeok`: the last request to the node had an answer), so it says
+"synced" all through a sync, even with the node at height 0 and a long
+chain ahead; and a node it cannot reach shows only as "not reached" on
+the Overview, nothing in the strip.
+
+- **The wallet started before the node is synced,** or before the node
+  is up (they start in any order): the states told apart and shown in
+  the strip (item 9's model):
+  - **cannot connect to the node:** no answer; tried again every few
+    seconds (5 s, then up to 30 s while it keeps failing), the time of
+    the next try shown; not an error in Activity each time;
+  - **the node starting:** it answers but has no tip yet (loading its
+    headers, finding peers);
+  - **the node syncing:** headers (its best header's height), the fast
+    sync's snapshot (parts of the total), then blocks ("Catching up:
+    block 1,204 of 1,310"), from `/v1/status` (its height, best header,
+    activity); the wallet's balance shown as of that height, marked not
+    final;
+  - **the node with no peers:** it answers, but has none to sync from;
+  - **ready:** the node at its best header and peers to hear from.
+- **What the wallet does meanwhile:** no scan until the node is synced
+  (or a scan to the node's height, again as it moves); sends refused
+  with the reason ("the node is still catching up"), not attempted.
+- **Tests:** the wallet started first, then the node: "cannot connect"
+  then syncing then ready; the node stopped under an open wallet:
+  "cannot connect", and back to ready when it returns; a long sync with
+  the wallet open the whole time, its state right at each step.
