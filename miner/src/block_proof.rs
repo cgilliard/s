@@ -57,7 +57,8 @@ pub struct NameProof {
 /// Proves a block's name segment padded to `2^log_n` rows.
 pub fn prove_name_padded(config: &StarkConfig, witness: &NameWitness, log_n: usize) -> NameProof {
     let (trace, public) = NameAir::generate_trace_padded(witness, log_n);
-    let proof = stark::prove(config, &NameAir, &trace, &public.to_values(), &mut name_transcript());
+    let air = NameAir { min_reveal: witness.min_reveal };
+    let proof = stark::prove(config, &air, &trace, &public.to_values(), &mut name_transcript());
     NameProof { public, proof }
 }
 
@@ -90,7 +91,8 @@ pub fn prove_block(config: &StarkConfig, segments: &[SegmentWitness], name: &Nam
         let handles: Vec<_> = segments.iter().map(|w| s.spawn(move || prove_segment(config, w))).collect();
         let np = s.spawn(move || {
             let (trace, public) = NameAir::generate_trace(name);
-            let proof = stark::prove(config, &NameAir, &trace, &public.to_values(), &mut name_transcript());
+            let air = NameAir { min_reveal: name.min_reveal };
+            let proof = stark::prove(config, &air, &trace, &public.to_values(), &mut name_transcript());
             NameProof { public, proof }
         });
         let proofs: Vec<SegmentProof> =
@@ -238,7 +240,12 @@ pub fn check_chaining(s: &BlockStatement<'_>, proofs: &[SegmentProof], name: &Na
 }
 
 /// Full verification of an encoded block proof against a statement.
-pub fn verify_block(config: &StarkConfig, s: &BlockStatement<'_>, proof: &[u8]) -> Result<(), AggregateError> {
+pub fn verify_block(
+    config: &StarkConfig,
+    names: &NameAir,
+    s: &BlockStatement<'_>,
+    proof: &[u8],
+) -> Result<(), AggregateError> {
     let (proofs, name) = decode(proof).ok_or(AggregateError::Malformed)?;
     check_chaining(s, &proofs, &name)?;
     for (i, sp) in proofs.iter().enumerate() {
@@ -246,7 +253,7 @@ pub fn verify_block(config: &StarkConfig, s: &BlockStatement<'_>, proof: &[u8]) 
             return Err(AggregateError::SegmentRejected { index: i });
         }
     }
-    if stark::verify(config, &NameAir, &name.public.to_values(), &name.proof, &mut name_transcript()).is_err() {
+    if stark::verify(config, names, &name.public.to_values(), &name.proof, &mut name_transcript()).is_err() {
         return Err(AggregateError::NameSegmentRejected);
     }
     Ok(())
@@ -259,11 +266,13 @@ pub const NAME_ROWS_LOG: usize = NAME_LOG_ROWS;
 #[derive(Clone, Copy, Debug)]
 pub struct StarkVerifier {
     pub config: StarkConfig,
+    /// The name circuit, for the chain's reveal window.
+    pub names: NameAir,
 }
 
 impl ProofVerifier for StarkVerifier {
     fn verify(&self, s: &BlockStatement<'_>, proof: &[u8]) -> bool {
-        verify_block(&self.config, s, proof).is_ok()
+        verify_block(&self.config, &self.names, s, proof).is_ok()
     }
 }
 
@@ -331,7 +340,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_garbage() {
-        let v = StarkVerifier { config: STARK };
+        let v = StarkVerifier { config: STARK, names: NameAir::MAINNET };
         let body = Body::default();
         let st = BlockStatement {
             height: 1,
@@ -345,9 +354,9 @@ mod tests {
         };
         assert!(!v.verify(&st, &[]));
         assert!(!v.verify(&st, &[1, 2, 3]));
-        let empty = NameWitness { root_in: EMPTY, pos_in: 0, height: 1, ops: vec![] };
+        let empty = NameWitness { root_in: EMPTY, pos_in: 0, height: 1, min_reveal: crate::names::MIN_REVEAL, ops: vec![] };
         let name = prove_name_padded(&STARK, &empty, 4);
-        assert_eq!(verify_block(&STARK, &st, &encode(&[], &name)), Err(AggregateError::NoSegments));
+        assert_eq!(verify_block(&STARK, &NameAir::MAINNET, &st, &encode(&[], &name)), Err(AggregateError::NoSegments));
     }
 
     /// A policy output (2-of-3 multisig) made in one proven block is spent
@@ -363,7 +372,7 @@ mod tests {
         let p = params();
         let seed = seed();
         let dataset = Dataset::generate(&seed);
-        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK }).unwrap();
+        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK, names: NameAir::MAINNET }).unwrap();
         let mut a = key(1);
         let mut bk = key(2);
         let c = key(3);
@@ -392,7 +401,7 @@ mod tests {
         };
         chain.init_genesis(&genesis).unwrap();
         let names_for = |segments: &[SegmentWitness], height: u32, wtxn: &heed::RwTxn| {
-            NameWitness {
+            NameWitness { min_reveal: crate::names::MIN_REVEAL,
                 root_in: chain.utxo().root(wtxn).unwrap(),
                 pos_in: chain.utxo().next_position(wtxn).unwrap(),
                 height,
@@ -484,7 +493,7 @@ mod tests {
         let p = params();
         let seed = seed();
         let dataset = Dataset::generate(&seed);
-        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK }).unwrap();
+        let chain = Chain::open(&dir.0, 64 << 20, p, seed, StarkVerifier { config: STARK, names: NameAir::MAINNET }).unwrap();
 
         // Genesis pays A, B and D.
         let mut a = key(1);
@@ -533,7 +542,7 @@ mod tests {
             UnsignedTransaction::new(vec![], vec![Output::new(&miner, 60)]).sign(|_, _, _| Err::<Sig, ()>(())).unwrap();
         let txs = [tx, tx_d, reward];
         let empty_names = |segments: &[SegmentWitness], height: u32, wtxn: &heed::RwTxn| {
-            NameWitness {
+            NameWitness { min_reveal: crate::names::MIN_REVEAL,
                 root_in: chain.utxo().root(wtxn).unwrap(),
                 pos_in: chain.utxo().next_position(wtxn).unwrap(),
                 height,
@@ -612,12 +621,12 @@ mod tests {
         let mut cross = proofs.clone();
         cross[1].proof = proofs[0].proof.clone();
         assert_eq!(
-            verify_block(&STARK, &st, &encode(&cross, &name)),
+            verify_block(&STARK, &NameAir::MAINNET, &st, &encode(&cross, &name)),
             Err(AggregateError::SegmentRejected { index: 1 })
         );
         let mut forged = name.clone();
         forged.proof = proofs[0].proof.clone();
-        assert_eq!(verify_block(&STARK, &st, &encode(&proofs, &forged)), Err(AggregateError::NameSegmentRejected));
+        assert_eq!(verify_block(&STARK, &NameAir::MAINNET, &st, &encode(&proofs, &forged)), Err(AggregateError::NameSegmentRejected));
 
         // Block 2 with a stale proof is rejected by the chain; a fresh one applies.
         let reward2 =

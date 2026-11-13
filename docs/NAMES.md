@@ -260,7 +260,7 @@ operation are not.
 | value | 32 bytes |
 | output positions | below `2^39` |
 | `KEY_BITS`, the deepest a name path can be | 120 |
-| `MIN_REVEAL`, `MAX_REVEAL` | 12, 288 blocks |
+| `MIN_REVEAL`, `MAX_REVEAL` | 12, 288 blocks (the dev networks 3, 288: `AggregatorParams::min_reveal`, so the node's scripts wait 3 blocks for a reveal) |
 | caps per block | 2 reveals, 1 commit, 8 updates, 16 sweeps |
 | `NAME_ROWS` | 2^15 |
 

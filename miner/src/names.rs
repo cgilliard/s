@@ -645,6 +645,8 @@ pub struct NameSet {
     /// hash of its records: what a snapshot's name parts are made of, kept
     /// as records change so taking a snapshot never reads them all.
     buckets: Database<U32<BigEndian>, Bytes>,
+    /// Blocks a commit waits before its reveal ([`NameSet::min_reveal`]).
+    min_reveal: u32,
 }
 
 /// Key bits that pick a record's bucket.
@@ -737,7 +739,22 @@ impl NameSet {
         let commits = env.create_database(wtxn, Some(&format!("{prefix}.commits")))?;
         let by_hash = env.create_database(wtxn, Some(&format!("{prefix}.commits_by_hash")))?;
         let buckets = env.create_database(wtxn, Some(&format!("{prefix}.buckets")))?;
-        Ok(NameSet { trie, records, commits, by_hash, buckets })
+        Ok(NameSet { trie, records, commits, by_hash, buckets, min_reveal: MIN_REVEAL })
+    }
+
+    /// Blocks a commit waits before its reveal on this chain's network
+    /// ([`MIN_REVEAL`] unless set: `AggregatorParams::min_reveal`).
+    pub fn min_reveal(&self) -> u32 {
+        self.min_reveal
+    }
+
+    pub fn set_min_reveal(&mut self, blocks: u32) {
+        self.min_reveal = blocks;
+    }
+
+    /// Whether a commit made at `commit_height` can be revealed at `height`.
+    pub fn in_window(&self, height: u32, commit_height: u32) -> bool {
+        in_window(height, commit_height, self.min_reveal)
     }
 
     pub fn trie(&self) -> &NameTrie {
@@ -1057,8 +1074,8 @@ impl From<Error> for ApplyError {
 pub const NAME_PART_RECORDS: usize = 4096;
 
 /// Whether a commit made at `commit_height` can be revealed at `height`.
-pub fn in_window(height: u32, commit_height: u32) -> bool {
-    height >= commit_height && (MIN_REVEAL..=MAX_REVEAL).contains(&(height - commit_height))
+pub fn in_window(height: u32, commit_height: u32, min_reveal: u32) -> bool {
+    height >= commit_height && (min_reveal..=MAX_REVEAL).contains(&(height - commit_height))
 }
 
 /// Whether a commit made at `commit_height` can be swept at `height`.
@@ -1178,7 +1195,7 @@ impl NameSet {
                 BlockNameOp::Reveal { record, commit: position } => {
                     let key = record.key().ok_or(ApplyError::BadName)?;
                     let commit = self.commit_at(wtxn, *position)?.ok_or(ApplyError::NoCommit)?;
-                    if !in_window(height, commit.height) {
+                    if !self.in_window(height, commit.height) {
                         return Err(ApplyError::Window(commit.height));
                     }
                     if self.record(wtxn, key)?.is_some() {

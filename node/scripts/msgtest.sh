@@ -227,7 +227,7 @@ def wstate(name, state):
         it = [i for i in ask('names').get('items', []) if i['name'] == name]
         return it[0] if it and it[0]['state'] == state else None
     return f
-wait('the wallet\'s commit 12 blocks old', wstate('famwal', 'ready'))
+wait('the wallet\'s commit old enough (3 blocks)', wstate('famwal', 'ready'))
 r = ask('name-reveal', name='famwal', speed='hour')
 check(f'the wallet reveals famwal: {r.get("tx", r.get("error"))}', r['ok'])
 def tab_reveal():

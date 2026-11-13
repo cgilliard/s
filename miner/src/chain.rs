@@ -1107,7 +1107,8 @@ impl<V: ProofVerifier> Chain<V> {
         })?;
         let mut wtxn = env.write_txn()?;
         let utxo = UtxoSet::open(&env, &mut wtxn, "utxo")?;
-        let names = NameSet::open(&env, &mut wtxn, "names").map_err(|e| ChainError::Name(ApplyError::Names(e)))?;
+        let mut names = NameSet::open(&env, &mut wtxn, "names").map_err(|e| ChainError::Name(ApplyError::Names(e)))?;
+        names.set_min_reveal(params.aggregator.min_reveal);
         let headers = env.create_database(&mut wtxn, Some("headers"))?;
         let bodies = env.create_database(&mut wtxn, Some("bodies"))?;
         let index = env.create_database(&mut wtxn, Some("index"))?;

@@ -75,7 +75,7 @@ use crate::codec::{Reader, Writer};
 use crate::mempool::{MAX_TX_SIZE, MIN_FEE_PER_BYTE, Policy, REPLACEMENT_FEE_PER_BYTE};
 use crate::mldsa;
 use crate::mlkem;
-use crate::names::{self, MIN_REVEAL, NameOp, NameSet, Record, commit_hash, name_hash};
+use crate::names::{self, NameOp, NameSet, Record, commit_hash, name_hash};
 use crate::policy::{Cond, CondWitness, Mode, Policy as SpendPolicy, Signer, rebind_message};
 use crate::poseidon2::{DIGEST, Fp, digest_to_bytes};
 use crate::proofs::{Burn, Claim, Receipt};
@@ -2732,7 +2732,8 @@ impl Wallet {
     }
 
     /// Reveals `name` from its commit, for a block at `height`, once the
-    /// commit is at least `wait` blocks old (at least [`MIN_REVEAL`]). A
+    /// commit is at least `wait` blocks old (at least the network's window,
+    /// [`NameSet::min_reveal`]). A
     /// commit found by a scan is matched to the name here. The name's
     /// record is then awaited on chain.
     pub fn name_reveal(&self, name: &[u8], wait: u32, registry: &NameSet, rtxn: &RoTxn, height: u32) -> Result<NameOp> {
@@ -2751,7 +2752,7 @@ impl Wallet {
             .commit_at(rtxn, position)
             .map_err(|e| WalletError::Name(e.to_string()))?
             .ok_or_else(|| WalletError::Name("the commit is not on chain yet".into()))?;
-        let wait = wait.max(MIN_REVEAL);
+        let wait = wait.max(registry.min_reveal());
         if height < commit.height.saturating_add(wait) {
             return Err(WalletError::Name(format!(
                 "the commit is {} blocks old; wait {} more",

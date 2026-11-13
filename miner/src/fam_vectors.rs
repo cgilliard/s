@@ -73,6 +73,8 @@ mod tests {
         w(p.schedule.block_time as u32);
         w(p.schedule.half_life as u32);
         w(p.schedule.from_first_block as u32);
+        // word 25 (0x19): the reveal window's start (`inwin`, `/v1/status`)
+        w(p.aggregator.min_reveal);
         for x in c.base.iter().chain(&c.step).chain(&c.plan_root) {
             w(*x);
         }
@@ -856,7 +858,10 @@ mod tests {
         use crate::poseidon2::DIGEST;
         type Digest = [Fp; DIGEST];
         use crate::pow::{PowParams, SeedText};
-        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
+        // mainnet's reveal window (MIN_REVEAL), the fam node's own until a
+        // network sets it (state.fam's nmin)
+        let aggregator = crate::aggregate::AggregatorParams { min_reveal: MIN_REVEAL, ..ChainParams::DEV.aggregator };
+        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, aggregator, ..ChainParams::DEV };
         let dir = std::env::temp_dir().join(format!("tabminer-famstate-{}-{first}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let chain = Chain::open(&dir, 1 << 30, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();
@@ -1123,7 +1128,10 @@ mod tests {
         use crate::pow::{PowParams, SeedText};
         use crate::transaction::{Key, Output, Transaction, UnsignedTransaction, pubkey_hash};
         type Digest = [Fp; DIGEST];
-        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, ..ChainParams::DEV };
+        // mainnet's reveal window (MIN_REVEAL), the fam node's own until a
+        // network sets it (state.fam's nmin)
+        let aggregator = crate::aggregate::AggregatorParams { min_reveal: MIN_REVEAL, ..ChainParams::DEV.aggregator };
+        let p = ChainParams { genesis_target: ChainParams::DEV.max_target, aggregator, ..ChainParams::DEV };
         let dir = std::env::temp_dir().join(format!("tabminer-fampool-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let chain = Chain::open(&dir, 256 << 20, p, SeedText::new(PowParams::DEV), AcceptAllProofs).unwrap();

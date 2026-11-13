@@ -2168,11 +2168,14 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
             };
             let op = ctx.wallet()?.name_commit(name.as_bytes(), value)?;
             carry(ctx, vec![op], fee)?;
-            println!("committed to {name}; reveal it with name-reveal {name} once the commit is 12 blocks old");
+            println!(
+                "committed to {name}; reveal it with name-reveal {name} once the commit is {} blocks old",
+                ctx.chain.names().min_reveal()
+            );
         }
         "name-reveal" => {
             let (name, wait, fee) = match args {
-                [name] => (*name, tabminer::names::MIN_REVEAL, None),
+                [name] => (*name, ctx.chain.names().min_reveal(), None),
                 [name, wait] => (*name, wait.parse().map_err(|_| "bad wait")?, None),
                 [name, wait, fee] => {
                     (*name, wait.parse().map_err(|_| "bad wait")?, Some(*fee))
@@ -2184,10 +2187,10 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 let rtxn = ctx.chain.env().read_txn()?;
                 ctx.wallet()?.name_reveal(name.as_bytes(), wait, ctx.chain.names(), &rtxn, height)?
             };
-            if wait <= tabminer::names::MIN_REVEAL {
+            let min = ctx.chain.names().min_reveal();
+            if wait <= min {
                 println!(
-                    "note: revealing at the minimum wait; a reorganization of {} blocks could let another take the name",
-                    tabminer::names::MIN_REVEAL
+                    "note: revealing at the minimum wait; a reorganization of {min} blocks could let another take the name"
                 );
             }
             carry(ctx, vec![op], fee)?;
@@ -2284,13 +2287,13 @@ fn command(ctx: &Ctx, cmd: &str, args: &[&str]) -> AnyResult<()> {
                 let status = match on_chain {
                     None => "not on chain yet".to_string(),
                     Some(p) => match ctx.chain.names().commit_at(&rtxn, p)? {
-                        Some(k) if height >= k.height + tabminer::names::MIN_REVEAL => {
+                        Some(k) if height >= k.height + ctx.chain.names().min_reveal() => {
                             format!("committed at block {}, ready to reveal", k.height)
                         }
                         Some(k) => format!(
                             "committed at block {}, ready in {} blocks",
                             k.height,
-                            k.height + tabminer::names::MIN_REVEAL - height
+                            k.height + ctx.chain.names().min_reveal() - height
                         ),
                         None => "not on chain yet".to_string(),
                     },

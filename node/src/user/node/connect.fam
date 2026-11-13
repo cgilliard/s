@@ -256,7 +256,7 @@ stfd !  p2init dvinit
 100 lit alloc ev !  10 lit alloc tk2 !  20 lit alloc nlv2 !
 tz @ 4 lit wzero  dflt @ 8 lit wzero
 28 lit 0 lit do i dfl i dfl i 1 lit + dfl compress loop
-0 lit serr ! ;
+0 lit serr !  C lit nmin ! ;
 : stinit  ( fd -- )
 \ The heap reserved, first: one arena of 32 MiB, mapped once and kept
 \ (free never unmaps the last). A process has 4 map slots, and malloc's

@@ -265,7 +265,20 @@ fn cap_const<F: Field>(domain: u32, len: u32) -> [F; RATE] {
 // Constraints
 // ---------------------------------------------------------------------------
 
-pub struct NameAir;
+/// The name segment's circuit, for a network's reveal window.
+#[derive(Clone, Copy, Debug)]
+pub struct NameAir {
+    /// Blocks a commit waits before its reveal (`AggregatorParams::min_reveal`).
+    pub min_reveal: u32,
+}
+
+impl NameAir {
+    pub const MAINNET: NameAir = NameAir { min_reveal: MIN_REVEAL };
+
+    pub fn of(params: &crate::aggregate::AggregatorParams) -> NameAir {
+        NameAir { min_reveal: params.min_reveal }
+    }
+}
 
 impl Air for NameAir {
     fn width(&self) -> usize {
@@ -667,8 +680,8 @@ impl Air for NameAir {
             b.assert_zero(leafc2 * (inp[RATE + i] - if i == 0 { l[R_CH] } else { F::ZERO }));
         }
         // win, win2: the commit's age against the window (or past it).
-        let min = F::from_u32(MIN_REVEAL);
-        let span = F::from_u32(MAX_REVEAL + 1 - MIN_REVEAL);
+        let min = F::from_u32(self.min_reveal);
+        let span = F::from_u32(MAX_REVEAL + 1 - self.min_reveal);
         b.assert_zero(win * (bits_v - (height - l[R_CH] - min - is_sweep * span)));
         b.assert_zero(win2 * (bits_v - (l[R_CH] + F::from_u32(MAX_REVEAL) - height)));
         // opd: the operation digest as the block lists it.
@@ -942,6 +955,8 @@ pub struct NameWitness {
     pub root_in: Digest,
     pub pos_in: u64,
     pub height: u32,
+    /// The network's reveal window ([`NameAir::min_reveal`]).
+    pub min_reveal: u32,
     pub ops: Vec<OpWitness>,
 }
 
@@ -992,11 +1007,11 @@ impl NameWitness {
                     let commit = match names.commit_at(wtxn, position)? {
                         Some(found) if found.hash == c || crate::stark::lenient() => found,
                         None if crate::stark::lenient() => {
-                            Commit { hash: c, height: height.saturating_sub(names::MIN_REVEAL) }
+                            Commit { hash: c, height: height.saturating_sub(names.min_reveal()) }
                         }
                         _ => return Err(ApplyError::NoCommit),
                     };
-                    if !names::in_window(height, commit.height) && !crate::stark::lenient() {
+                    if !names.in_window(height, commit.height) && !crate::stark::lenient() {
                         return Err(ApplyError::Window(commit.height));
                     }
                     let proof = names.prove(wtxn, &record.name)?;
@@ -1077,7 +1092,7 @@ impl NameWitness {
             let path = utxo.prove(wtxn, position)?.siblings;
             out.push(OpWitness::Sweep { commit: commit.hash, memo, height: commit.height, position, path });
         }
-        Ok(NameWitness { root_in, pos_in, height, ops: out })
+        Ok(NameWitness { root_in, pos_in, height, min_reveal: names.min_reveal(), ops: out })
     }
 
     /// Trace rows before padding.
@@ -1367,6 +1382,7 @@ struct Gen {
     b: HashTraceBuilder,
     r: Regs,
     height: u32,
+    min_reveal: u32,
 }
 
 impl Gen {
@@ -1729,7 +1745,7 @@ impl Gen {
                     "the commit is not the record's",
                 );
                 self.commit_leaf_rows();
-                self.window_row(T_WIN, height as i64 - *commit_height as i64 - MIN_REVEAL as i64);
+                self.window_row(T_WIN, height as i64 - *commit_height as i64 - self.min_reveal as i64);
                 self.window_row(T_WIN2, *commit_height as i64 + MAX_REVEAL as i64 - height as i64);
                 let cleaf = self.r.cleaf;
                 self.output_walk(*commit_position, path, &cleaf, &EMPTY);
@@ -1850,7 +1866,7 @@ impl NameAir {
             pos: w.pos_in,
             wpos: 0,
         };
-        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), r: regs, height: w.height };
+        let mut g = Gen { b: HashTraceBuilder::new(NUM_COLS), r: regs, height: w.height, min_reveal: w.min_reveal };
         for op in &w.ops {
             g.op(op);
         }
@@ -1976,7 +1992,7 @@ mod tests {
         assert_eq!(witness.num_rows(), trace.height() - (trace.height() - witness.num_rows()));
         let values = public.to_values();
         assert_eq!(NamePublic::from_values(&values), Some(public));
-        assert_eq!(check_constraints(&NameAir, &trace, &values), Ok(()), "height {height}");
+        assert_eq!(check_constraints(&NameAir::MAINNET, &trace, &values), Ok(()), "height {height}");
         if AUDIT.lock().unwrap().is_some() {
             use crate::hash_machine::{COL_LOAD, COL_PASS};
             let kinds: Vec<usize> = (HM_COLS..HM_COLS + NUM_TYPES).chain([COL_PASS, COL_LOAD]).collect();
@@ -1987,8 +2003,8 @@ mod tests {
                 let unused = row[COL_PASS] == Fp::ONE || row[COL_LOAD] == Fp::ONE;
                 !(unused && f.cells.iter().all(|(c, _)| *c < crate::poseidon2_air::NUM_COLS))
             };
-            let found = crate::stark::freedom_report(&NameAir, &trace, None, &values, &kinds, 4, keep);
-            let all = crate::stark::freedom_report(&NameAir, &trace, None, &values, &kinds, 4, |_| true).len();
+            let found = crate::stark::freedom_report(&NameAir::MAINNET, &trace, None, &values, &kinds, 4, keep);
+            let all = crate::stark::freedom_report(&NameAir::MAINNET, &trace, None, &values, &kinds, 4, |_| true).len();
             eprintln!(
                 "height {height}: {} rows, {all} freedoms, {} not an unused permutation",
                 trace.height(),
@@ -2025,7 +2041,7 @@ mod tests {
             }
             let mut bad = values.clone();
             bad[i] += Fp::ONE;
-            assert!(check_constraints(&NameAir, &trace, &bad).is_err(), "public {i} at height {height}");
+            assert!(check_constraints(&NameAir::MAINNET, &trace, &bad).is_err(), "public {i} at height {height}");
         }
         public
     }
@@ -2063,7 +2079,7 @@ mod tests {
             let mut witness = NameWitness::collect(&w.utxo, &w.names, &mut wtxn, height, ops, sweeps)?;
             edit(&mut witness);
             let (trace, public) = NameAir::generate_trace(&witness);
-            Ok::<_, ApplyError>(check_constraints(&NameAir, &trace, &public.to_values()))
+            Ok::<_, ApplyError>(check_constraints(&NameAir::MAINNET, &trace, &public.to_values()))
         }));
         crate::stark::LENIENT.with(|l| l.set(false));
         wtxn.abort();
@@ -2289,7 +2305,7 @@ mod tests {
             crate::stark::LENIENT.with(|l| l.set(false));
             match r {
                 Err(_) => no_trace += 1,
-                Ok((trace, public)) => match check_constraints(&NameAir, &trace, &public.to_values()) {
+                Ok((trace, public)) => match check_constraints(&NameAir::MAINNET, &trace, &public.to_values()) {
                     Err(_) => rejected += 1,
                     Ok(()) if public == honest[s] => same.push(format!("section {s}: {}", what.join(", "))),
                     // What is pinned from outside (the start, the operations
@@ -2415,7 +2431,7 @@ mod tests {
 
     #[test]
     fn layout_and_degree() {
-        assert_eq!(measure_degree(&NameAir, NUM_PUBLIC), 3);
+        assert_eq!(measure_degree(&NameAir::MAINNET, NUM_PUBLIC), 3);
         assert_eq!(NUM_PUBLIC, 57);
         println!("name segment: {NUM_COLS} columns");
     }
@@ -2576,7 +2592,7 @@ mod tests {
         let alice = Record::new(b"alice", o1, d(11), d(12)).unwrap();
         let salt = d(500);
         let c = commit_hash(&name_hash(&alice.elements().unwrap()), &salt, &o1);
-        let empty = NameWitness {
+        let empty = NameWitness { min_reveal: crate::names::MIN_REVEAL,
             root_in: w.utxo.root(&w.env.read_txn().unwrap()).unwrap(),
             pos_in: 5,
             height: 1,
@@ -2607,7 +2623,7 @@ mod tests {
             let t = std::time::Instant::now();
             let ok = crate::stark::verify(
                 &params.segment,
-                &NameAir,
+                &NameAir::MAINNET,
                 &p.public.to_values(),
                 &p.proof,
                 &mut name_transcript(),
@@ -2637,7 +2653,7 @@ mod tests {
         wtxn.abort();
         let (trace, public) = NameAir::generate_trace(&witness);
         let values = public.to_values();
-        assert_eq!(check_constraints(&NameAir, &trace, &values), Ok(()));
+        assert_eq!(check_constraints(&NameAir::MAINNET, &trace, &values), Ok(()));
         let width = NUM_COLS;
         let find = |ty: usize, nth: usize| {
             (0..trace.height()).filter(|&r| trace.values[r * width + ty] == Fp::ONE).nth(nth).unwrap()
@@ -2650,18 +2666,18 @@ mod tests {
         for bit in 0..CHAR_BITS {
             bad.values[r * width + C_CB + CHAR_BITS + bit] = Fp::new((38 >> bit) & 1);
         }
-        assert!(check_constraints(&NameAir, &bad, &values).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err());
         // Padding before the end of the name: zero then a letter.
         let mut bad = trace.clone();
         bad.values[r * width + C_LIVE + 2] = Fp::ZERO;
         bad.values[r * width + C_LIVE_INV + 2] = Fp::ZERO;
-        assert!(check_constraints(&NameAir, &bad, &values).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err());
         // A wrong key bit.
         let mut bad = trace.clone();
         let r = find(T_TLOAD, 0) + 1;
         let v = &mut bad.values[r * width + R_KB + 5];
         *v = Fp::ONE - *v;
-        assert!(check_constraints(&NameAir, &bad, &values).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err());
         // The window: pretend the commit is one block younger.
         let mut bad = trace.clone();
         let r = find(T_WIN, 0);
@@ -2671,16 +2687,16 @@ mod tests {
             }
         }
         bad.values[r * width + R_CH] += Fp::ONE;
-        assert!(check_constraints(&NameAir, &bad, &values).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err());
         // A different owner in the record than in the commit.
         let mut bad = trace.clone();
         let r = find(T_COMMIT, 2);
         bad.values[r * width + COL_DATA] += Fp::ONE;
-        assert!(check_constraints(&NameAir, &bad, &values).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &bad, &values).is_err());
         // Claiming a count that is not the operations'.
         let mut bad = values.clone();
         bad[PUB_COUNTS + 1] = Fp::new(2);
-        assert!(check_constraints(&NameAir, &trace, &bad).is_err());
+        assert!(check_constraints(&NameAir::MAINNET, &trace, &bad).is_err());
         // The witness generator refuses a reveal to a name already there,
         // and a wrong salt (its commit is not found).
         let mut wtxn = w.env.write_txn().unwrap();

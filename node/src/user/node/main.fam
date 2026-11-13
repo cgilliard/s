@@ -192,8 +192,8 @@ nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop
 "/var" mkdir drop
 mtree stinit  sninit  ninit  xinit tinit qinit yinit
 \ the network: its parameters, then its chain proof's constants and genesis
-nnet @ if "/lib/netdevrec" else "/lib/netmain" then mfile drop  dup mnet !  64 lit + mdc !
-mnet @ mdc @ 60 lit + mhc @ hinit
+nnet @ if "/lib/netdevrec" else "/lib/netmain" then mfile drop  dup mnet !  68 lit + mdc !
+mnet @ mdc @ 60 lit + mhc @ hinit  19 lit nw nmin !
 mhc @ 1 lit rshift nkeep !  mhc @ 1 lit rshift 800 lit umin nldn !
 mdc @ dup 60 lit + prinit
 \ our status: genesis, no work

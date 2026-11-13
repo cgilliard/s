@@ -254,7 +254,8 @@ abegin "{" a"
 "version" akey aqt "fam-node 0.1" a" aqt acom
 "protocol" akey A lit anum acom
 "activity" akey aqt  pact @ 1 lit = if "fetching" else pact @ 2 lit = if "connecting" else "idle" then then a" aqt acom
-"activity_height" akey pacth @ anum "}" a"
+"activity_height" akey pacth @ anum acom
+"reveal" akey nmin @ anum "}" a"
 "200 OK" asend ;
 
 : aheader

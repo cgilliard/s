@@ -25,18 +25,18 @@ rot close drop ;
 \ target 2^228; the easiest 2^248 - 1; the drift 7,200 s; the median of
 \ 11; the final height; 10 s blocks, a half-life of 300 s, from block 1.
 : tparams
-64 lit alloc dup tnet !
+68 lit alloc dup tnet !
 A lit over 0 lit w!  FE lit over 1 lit w!  40 lit over 2 lit w!
 dup 3 lit 2 lit lshift + 8 lit wzero  10 lit over A lit w!
 8 lit 0 lit do FFFFFFFF lit over i B lit + w! loop  FFFFFF lit over 12 lit w!
 1C20 lit over 13 lit w!  B lit over 14 lit w!  3279DB0 lit over 15 lit w!
-A lit over 16 lit w!  12C lit over 17 lit w!  1 lit swap 18 lit w! ;
+A lit over 16 lit w!  12C lit over 17 lit w!  1 lit over 18 lit w!  3 lit swap 19 lit w! ;
 
 "/lib/akjv.txt.gz" rdfile powinit
 "/lib/chainver" rdfile drop cvinit
 "/t-sync" TREE CREATE or 2 lit or open stinit  sninit  ninit  xinit tinit qinit yinit
 "/lib/devchain" rdfile drop 4 lit + tdc !
-tparams  tnet @ tdc @ 60 lit + 1000 lit hinit
+tparams  tnet @ tdc @ 60 lit + 1000 lit hinit  19 lit nw nmin !
 tdc @ dup 60 lit + prinit
 \ our status: genesis, no work
 20 lit alloc dup mygen !  0 lit he hid swap 8 lit wcopy

@@ -356,7 +356,8 @@ then ;
 : cleaf  -rot tom nin @ 8 lit w!  nin @ dle  nin @ 9 lit 8 lit 3 lit pick hdom drop ;
 : cget  63 lit -rot kpos sbuf @ 24 lit sget 24 lit = ;   \ ( lo hi -- flag )  the commit at a position, in sbuf
 \ inwin ( h ch -- flag ), expired ( h ch -- flag )
-: inwin  2dup u< if 2drop 0 lit else - dup C lit u< 0= swap 120 lit u> 0= and then ;
+: nmin variable ;   \ the window's start: the network's (word 19 of its file), 12 until set
+: inwin  2dup u< if 2drop 0 lit else - dup nmin @ u< 0= swap 120 lit u> 0= and then ;
 : expired  2dup u> if - 120 lit u> else 2drop 0 lit then ;
 
 \ ── The body (block.rs's Body::parse and validate) ──

@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use heed::RoTxn;
 
 use crate::name_trie::Key;
-use crate::names::{MAX_REVEAL, NameOp, NameSet, OpKind, commit_hash, count_ops, in_window, name_hash};
+use crate::names::{MAX_REVEAL, NameOp, NameSet, OpKind, commit_hash, count_ops, name_hash};
 use crate::pow::Digest;
 use crate::transaction::{Commitment, INPUT_SIZE, OUTPUT_SIZE, Transaction};
 use crate::utxo::{self, UtxoSet};
@@ -437,7 +437,7 @@ fn check_ops(tx: &Transaction, names: &NameSet, rtxn: &RoTxn, height: u32) -> Re
 fn reveals_open(tx: &Transaction, names: &NameSet, rtxn: &RoTxn, height: u32) -> bool {
     tx.ops.iter().all(|op| match op {
         NameOp::Reveal { commit, .. } => {
-            matches!(names.commit_at(rtxn, *commit), Ok(Some(c)) if in_window(height, c.height))
+            matches!(names.commit_at(rtxn, *commit), Ok(Some(c)) if names.in_window(height, c.height))
         }
         _ => true,
     })

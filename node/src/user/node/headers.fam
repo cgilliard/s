@@ -17,10 +17,11 @@
 \ the first a root (hroot).  hat finds only what is held (hbase the
 \ lowest height held but the two kept).  Not reentrant.
 \
-\ A network is 25 words: the dataset's log2 items, parents and accesses;
+\ A network is 26 words: the dataset's log2 items, parents and accesses;
 \ the genesis target (8 words); the easiest target (8 words); the drift; the
-\ median's window; the final height; the block time; the half-life; and
-\ whether the schedule starts at block 1.
+\ median's window; the final height; the block time; the half-life;
+\ whether the schedule starts at block 1; and the blocks a name's commit
+\ waits before its reveal (state.fam's nmin).
 \
 \ hinit ( net genesis cap -- )  the network, its genesis header (204 bytes,
 \ not checked), room for cap headers.
@@ -88,7 +89,7 @@ dup hcap !  HENT * malloc hent !               \ (malloc's: mapped as needed, no
 1 lit begin dup hcap @ 1 lit lshift u< while 1 lit lshift repeat htn !
 HTABN 2 lit lshift malloc dup htab ! HTABN wzero
 hcap @ 2 lit lshift malloc hmap !  FFFFFFFF lit hb1 !  0 lit hbase !
-swap 64 lit alloc dup hnet ! 19 lit wcopy
+swap 68 lit alloc dup hnet ! 1A lit wcopy
 1 lit 0 lit nw lshift pwitems !  1 lit nw pwpar !  2 lit nw pwacc !
 20 lit alloc htg !  54 lit alloc hsch !  14 lit nw 3 lit lshift alloc hts !  20 lit alloc hidb !  20 lit alloc hwk !
 0 lit he 33 lit wcopy

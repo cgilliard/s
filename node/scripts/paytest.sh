@@ -18,8 +18,8 @@
 #   cancel's fee, to the base unit;
 # - proofs of payment each way: the wallet's checked by tabminer's
 #   verify-proof, tabminer's by the wallet; a burn each way, the same;
-# - names: the wallet registers famwallet (commit, the reveal 12 blocks
-#   on) and tabminer finds it pointing at the wallet; tabminer registers
+# - names: the wallet registers famwallet (commit, the reveal 3 blocks
+#   on: dev-recursive's window) and tabminer finds it pointing at the wallet; tabminer registers
 #   tabname and the wallet finds it (its proof checked), and proves
 #   nosuchname absent; the wallet updates famwallet, both see the value;
 #   transfers by offers as text: famwallet to tabminer, tabname to the
@@ -317,7 +317,7 @@ if part == 'names':
         return f
     def named(state):
         return named_any('famwallet', state)
-    wait('the commit 12 blocks old', named('ready'))
+    wait('the commit old enough (3 blocks)', named('ready'))
     r = ask('name-reveal', name='famwallet', speed='hour')
     check(f'the wallet reveals it: {r.get("tx", r.get("error"))}', r['ok'])
     wait('the name the wallet\'s on chain', named('owned'))

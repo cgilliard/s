@@ -306,7 +306,7 @@ hs @ close drop  hres @ ;
 : okey variable ;  : orec variable ;  : wkl variable ;  : sgen variable ;
 : ecom variable ;  : emem variable ;  : eamt variable ;  : epos variable ;  : eh variable ;  : ecb variable ;
 : xk variable ;  : wxpk variable ;  : kseed variable ;  : scur variable ;  : scnt variable ;  : sfrom variable ;
-: ltip variable ;  : ntip variable ;  : lh variable ;  : nodeok variable ;  : okn variable ;  : ppath variable ;
+: ltip variable ;  : ntip variable ;  : lh variable ;  : nrev variable ;  : nodeok variable ;  : okn variable ;  : ppath variable ;
 \ wgetk ( key klen buf n -- vlen )  in the writer's transaction.
 : wgetk  wf2 !  wf1 !  wkl !  wgk !  wtx @ wgk @ wkl @ wf1 @ wf2 @ txget ;
 : wsetk  wf2 !  wf1 !  wkl !  wgk !  wtx @ wgk @ wkl @ wf1 @ wf2 @ txput drop ;
@@ -469,6 +469,8 @@ have @ if
 		\ answered: reached, whether the tip moved or not
 		1 lit nodeok !
 		dup "'height':" jfind jnum drop nlo @ lh !
+		\ the blocks a name's commit waits (the network's; 12 if not told)
+		dup "'reveal':" jfind ?dup if jnum drop nlo @ nrev ! then
 		"'tip':'" jfind ntip @ 40 lit bcopy  0 lit ntip @ 40 lit + c!
 		ntip @ ltip @ streq 0= if
 			wscn2 if
@@ -1235,7 +1237,7 @@ nrecb @ 30 lit + c@ if drop "that name is revealed already" jerr else
 	wspeed  wtick
 	nrecb @ nderive
 	wcfind 0= if "the commit is not in a block yet" jerr else
-	lh @ ncht @ C lit + u< if "the commit is under 12 blocks old: reveal it later" jerr else
+	lh @ ncht @ nrev @ + u< if "the commit is too young (the network's window): reveal it later" jerr else
 		nname @ nlen @ nownc @ nrecb @ 10 lit + nmem @ nrb @ wnrec drop
 		nrb @ nsaltc @ ncpos @ nopb @ wnrop wcon !  nopb @ wco !  0 lit wcx !  0 lit 0 lit samt @ a8set
 		wcarry ?dup if wcerr else
@@ -1385,8 +1387,8 @@ have @ 0= if nowal else
 		nrecb @ 30 lit + c@ 0= if
 			nrecb @ nderive
 			wcfind if
-				lh @ ncht @ C lit + u< if "committed','ready':" jo ncht @ C lit + lh @ - 0 lit wdec else "ready','ready':0" jo then
-			else "committed','ready':12" jo then
+				lh @ ncht @ nrev @ + u< if "committed','ready':" jo ncht @ nrev @ + lh @ - 0 lit wdec else "ready','ready':0" jo then
+			else "committed','ready':" jo nrev @ 0 lit wdec then
 		else
 			nrecb @ nderive  nlook drop if
 				nadopt
@@ -2238,7 +2240,7 @@ HMAX alloc hbuf !  200 lit alloc hreq !  100 lit alloc ppath !  20 lit alloc ntm
 NRECN alloc nrecb !  44 lit alloc nname !  20 lit alloc nown !  20 lit alloc nownc !  20 lit alloc nsalt !  20 lit alloc nsaltc !
 20 lit alloc nnh !  20 lit alloc ncom !  20 lit alloc ncomc !  20 lit alloc nmem !  1000 lit alloc nopb !  100 lit alloc nrb !  100 lit alloc nofb !
 20 lit alloc nval !  8 lit alloc ncpos !  20 lit alloc nlown !  20 lit alloc nlval !  20 lit alloc nlmem !  PREC alloc prec !  800 lit alloc lnd !  0 lit nlnd !
-0 lit lh !  0 lit nodeok !
+0 lit lh !  0 lit nodeok !  C lit nrev !
 FMAX 4 lit + alloc fbuf !  8000 lit alloc sbin !  2400 lit alloc ttxt !  2400 lit alloc tout !  0 lit bjs !  200 lit alloc fpath !  200 lit alloc fout !  40 lit alloc frk !  1000 lit alloc sel !
 8 lit alloc samt !  8 lit alloc sfee !  8 lit alloc sneed !  8 lit alloc stot !  8 lit alloc schg !
 8 lit alloc sdust !  5CDA lit 0 lit sdust @ a8set  880 lit alloc pend !  400 lit alloc xrec !  20 lit alloc xid !  60 lit alloc xout !  200 lit alloc wmevb !  60 lit alloc wmhk !  -1 lit wmpi !  0 lit wmpt !  0 lit wmpl !  200 lit alloc wmrids !  600 lit alloc wmrads !  20 lit alloc wmapid !  0 lit wmapn !  0 lit wmonion !  0 lit wmcat !  200 lit alloc wmsd !  20 lit alloc wmto !  20 lit alloc wmsid !  50 lit alloc wmuk !  50 lit alloc wmk2 !  30 lit alloc wmur !  1A00 lit alloc wmab !  1800 lit alloc wmcb !  1000 lit alloc wmrq !  20 lit alloc wmrv !  20 lit alloc wmme !  0 lit wmrs !  20 lit alloc sid !  20 lit alloc ssec !
