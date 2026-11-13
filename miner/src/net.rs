@@ -1274,6 +1274,10 @@ pub struct Peer {
     pub pending: Option<u64>,
     /// Pings sent before its first pong ([`FIRST_PING_RETRY`]).
     pub first_pings: u32,
+    /// When it was first pinged: one that never answers is dropped
+    /// [`PEER_TIMEOUT`] after, however often it was pinged again (each
+    /// retry moves `last_ping`).
+    pub first_ping: Option<Instant>,
     pub status: Option<Status>,
     /// Bad replies to our requests; dropped at [`MAX_STRIKES`].
     pub strikes: u32,
@@ -1405,6 +1409,7 @@ impl Peers {
                 last_ping: None,
                 pending: None,
                 first_pings: 0,
+                first_ping: None,
                 status: None,
                 strikes: 0,
                 last_strike: None,
@@ -1490,6 +1495,7 @@ impl Peers {
                     self.budget -= 1;
                 }
                 p.last_ping = Some(now);
+                p.first_ping.get_or_insert(now);
                 p.pending = Some(nonce);
                 true
             }
@@ -1592,6 +1598,7 @@ impl Peers {
                     _ => nonce(),
                 };
                 p.last_ping = Some(now);
+                p.first_ping.get_or_insert(now);
                 p.pending = Some(n);
                 out.push((p.addr, n));
             }
@@ -1599,12 +1606,14 @@ impl Peers {
         out
     }
 
-    /// Drops peers that have been silent for the timeout since their last
-    /// ping (or never answered), and peers with too many strikes. Seeds
-    /// stay.
-    pub fn prune(&mut self, now: Instant) {
+    /// Drops peers that have been silent for the timeout since they last
+    /// answered, or that never answered within it of their first ping, and
+    /// peers with too many strikes. Seeds stay.
+    /// Returns the addresses dropped for never answering.
+    pub fn prune(&mut self, now: Instant) -> Vec<SocketAddr> {
         self.banned.retain(|_, t| now.duration_since(*t) < BAN_TIME);
         let banned = &mut self.banned;
+        let mut unanswered = Vec::new();
         self.map.retain(|_, p| {
             if p.seed {
                 return true;
@@ -1613,15 +1622,62 @@ impl Peers {
                 banned.insert(ban_key(&p.addr), now);
                 return false;
             }
-            match (p.last_seen, p.last_ping) {
+            // One that never answered: from its first ping, not its last
+            // (retried every 30 s at most, it would never go), so that dead
+            // addresses do not hold a host's MAX_PER_HOST entries for good
+            // and shut out the address it is at now.
+            match (p.last_seen, p.first_ping) {
                 (Some(seen), _) => now.duration_since(seen) < PEER_TIMEOUT,
-                (None, Some(pinged)) => now.duration_since(pinged) < PEER_TIMEOUT,
+                (None, Some(pinged)) => {
+                    let keep = now.duration_since(pinged) < PEER_TIMEOUT;
+                    if !keep {
+                        unanswered.push(p.addr);
+                    }
+                    keep
+                }
                 (None, None) => true,
             }
         });
         // A banned host's other entries go with it.
         let banned = &self.banned;
         self.map.retain(|_, p| p.seed || !banned.contains_key(&ban_key(&p.addr)));
+        unanswered
+    }
+
+    /// Why `add` would not take `addr` now, if it would not; the entries
+    /// in its way are named.
+    pub fn refusal(&self, addr: &SocketAddr) -> Option<String> {
+        if self.map.contains_key(addr) {
+            return None;
+        }
+        if self.banned.get(&ban_key(addr)).is_some_and(|t| t.elapsed() < BAN_TIME) {
+            return Some("its host is banned".into());
+        }
+        let list = |f: &dyn Fn(&Peer) -> bool| -> String {
+            let v: Vec<String> = self
+                .map
+                .values()
+                .filter(|p| f(p))
+                .map(|p| format!("{}{}", p.addr, if p.handshaken { "" } else { " (never answered)" }))
+                .collect();
+            v.join(", ")
+        };
+        if !addr.ip().is_loopback() {
+            if self.map.values().filter(|p| p.addr.ip() == addr.ip()).count() >= MAX_PER_HOST {
+                return Some(format!(
+                    "its host has {MAX_PER_HOST} entries already: {}",
+                    list(&|p| p.addr.ip() == addr.ip())
+                ));
+            }
+            if self.map.values().filter(|p| !p.seed && group(p.addr.ip()) == group(addr.ip())).count() >= MAX_PER_GROUP
+            {
+                return Some(format!("its /16 has {MAX_PER_GROUP} entries already"));
+            }
+        }
+        if self.map.len() >= MAX_PEERS && !self.map.values().any(|p| !p.handshaken && !p.seed) {
+            return Some(format!("the table is full ({MAX_PEERS} answering peers)"));
+        }
+        None
     }
 
     /// Up to `n` live peers other than `exclude`, at random.
@@ -2315,6 +2371,31 @@ mod tests {
         assert!(peers.get(&a).unwrap().rtt.is_none(), "a ping sent more than once times nothing");
         assert!(due(&mut peers, 89).is_empty());
         assert_eq!(due(&mut peers, 90), vec![2]);
+    }
+
+    #[test]
+    fn a_dead_address_does_not_hold_its_hosts_entries() {
+        // A host behind NAT gets a new port each time a node there starts:
+        // addresses that never answer, retried every 30 s, still go
+        // PEER_TIMEOUT after their first ping, so the host's next address
+        // finds room among its MAX_PER_HOST entries.
+        let t0 = Instant::now();
+        let mut peers = Peers::new();
+        let host = |port: u16| -> SocketAddr { format!("10.9.0.1:{port}").parse().unwrap() };
+        for port in 1..=MAX_PER_HOST as u16 {
+            assert!(peers.add(host(port), false));
+        }
+        assert!(!peers.add(host(100), false));
+        let mut t = t0;
+        while t < t0 + PEER_TIMEOUT + Duration::from_secs(60) {
+            peers.due_for_ping(t, || 1);
+            peers.prune(t);
+            t += Duration::from_secs(10);
+        }
+        for port in 1..=MAX_PER_HOST as u16 {
+            assert!(peers.get(&host(port)).is_none(), "port {port} kept");
+        }
+        assert!(peers.add(host(100), false));
     }
 
     #[test]

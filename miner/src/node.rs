@@ -121,6 +121,9 @@ pub const MAX_PER_PEER: usize = 8;
 /// 2 MB block size limit.
 pub const LOOKAHEAD: usize = 32;
 /// Transactions fetched at once, and from one peer.
+/// A line about one peer's repeated trouble (`Node::log_every`) is
+/// written at most this often.
+const LOG_EVERY: Duration = Duration::from_secs(600);
 const MAX_TX_DOWNLOADS: usize = 32;
 const MAX_TX_PER_PEER: usize = 4;
 /// Header batches asked ahead of the best header, each of a different
@@ -537,6 +540,8 @@ pub struct Node<V: ProofVerifier> {
     downloads: HashMap<Digest, Download>,
     /// Transactions being fetched.
     tx_downloads: HashMap<Digest, Download>,
+    /// When a rate-limited line (`log_every`) was last written, by key.
+    logged: HashMap<(SocketAddr, &'static str), Instant>,
     /// Fetched blocks waiting for their parent's body, with who sent them
     /// and when.
     pending: HashMap<Digest, (Block, Option<SocketAddr>, Instant)>,
@@ -735,6 +740,25 @@ fn enlarge_buffers(socket: &UdpSocket) {
 /// Re-requests the window of downloads that stalled; returns the requests
 /// to send and the downloads to give up: no progress after
 /// [`net::MAX_RETRIES`] retries, or, for a block, crawling.
+/// A message's name, for the log.
+fn message_name(m: &Message) -> &'static str {
+    match m {
+        Message::Ping(_) => "Ping",
+        Message::Pong(_) => "Pong",
+        Message::GetPeers { .. } => "GetPeers",
+        Message::Peers(_) => "Peers",
+        Message::GetHeaders { .. } | Message::GetHeadersFrom { .. } => "GetHeaders",
+        Message::Headers(_) => "Headers",
+        Message::Inv(..) => "Inv (a block)",
+        Message::TxInv(_) => "TxInv (a transaction)",
+        Message::GetChunks { .. } => "GetChunks",
+        Message::Chunk { .. } => "Chunk",
+        Message::GetAux { .. } | Message::Aux { .. } => "Aux",
+        Message::Frame(_) | Message::Handshake { .. } => "a channel's frame",
+        _ => "a message-layer message",
+    }
+}
+
 fn stalled(
     downloads: &mut HashMap<Digest, Download>,
     now: Instant,
@@ -966,6 +990,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             peers,
             downloads: HashMap::new(),
             tx_downloads: HashMap::new(),
+            logged: HashMap::new(),
             pending: HashMap::new(),
             sources: HashMap::new(),
             sizes: HashMap::new(),
@@ -1250,6 +1275,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         crate::log::line(&format!("net: {msg}"));
     }
 
+    /// `log`, at most once each [`LOG_EVERY`] for the same peer and kind
+    /// of trouble (a peer that keeps sending what is not heard).
+    fn log_every(&mut self, addr: SocketAddr, kind: &'static str, msg: &str, now: Instant) {
+        if self.logged.get(&(addr, kind)).is_none_or(|t| now.duration_since(*t) >= LOG_EVERY) {
+            self.logged.insert((addr, kind), now);
+            self.log(msg);
+        }
+    }
+
     fn chatter(&self, msg: &str) {
         if self.config.verbose {
             crate::log::line(&format!("net: {msg}"));
@@ -1413,7 +1447,10 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         self.release_held();
         #[cfg(test)]
         self.note_state(now);
-        self.peers.prune(now);
+        for addr in self.peers.prune(now) {
+            self.log(&format!("{addr} never answered our pings; dropped from the peer table"));
+        }
+        self.logged.retain(|_, t| now.duration_since(*t) < LOG_EVERY);
         let (key, count) = (&self.nonce_key, &mut self.nonce_count);
         let due = self.peers.due_for_ping(now, || {
             *count += 1;
@@ -1891,7 +1928,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         // A transaction gone from its pool, or a slow link: no fault.
         for id in txs {
-            self.tx_downloads.remove(&id);
+            if let Some(d) = self.tx_downloads.remove(&id) {
+                self.log(&format!("gave up fetching transaction {} from {}", short(&id), d.from));
+            }
         }
         if blocks.is_empty() {
             return;
@@ -1944,6 +1983,15 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
             && !asked
             && !self.peers.handshaken(&addr)
         {
+            let state = match self.peers.get(&addr) {
+                Some(_) => "it has not answered our ping yet".to_string(),
+                None => match self.peers.refusal(&addr) {
+                    Some(why) => format!("not in our peer table: {why}"),
+                    None => "not in our peer table (it has not pinged us)".to_string(),
+                },
+            };
+            let text = format!("{addr} sent {}, not heard: {state}", message_name(&msg));
+            self.log_every(addr, "unheard", &text, now);
             return;
         }
         match msg {
@@ -1972,6 +2020,9 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 if self.peers.handshaken(&addr) {
                     self.peers.seen(addr, now);
                     self.peers.set_status(addr, st);
+                } else if let Some(why) = self.peers.refusal(&addr) {
+                    let text = format!("{addr} pinged us but is not taken as a peer: {why}");
+                    self.log_every(addr, "refused", &text, now);
                 } else {
                     self.peers.add(addr, false);
                 }
@@ -2126,6 +2177,8 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                 // against an old state, they would mostly fail.
                 let tip_work = self.chain.tip_work().unwrap_or(U256::ZERO);
                 if self.mode != Mode::Normal || self.peers.claimants(tip_work, now).next().is_some() {
+                    let text = format!("transaction {} from {addr} not fetched: we are catching up", short(&txid));
+                    self.log_every(addr, "txinv-behind", &text, now);
                     return;
                 }
                 let from_peer = self.tx_downloads.values().filter(|d| d.from == addr).count();
@@ -2133,6 +2186,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
                     && from_peer < MAX_TX_PER_PEER
                     && !self.mempool.lock().unwrap().contains(&txid)
                 {
+                    self.log(&format!("fetching transaction {} from {addr}", short(&txid)));
                     self.start_download(Kind::Tx, txid, addr, now);
                 }
             }
