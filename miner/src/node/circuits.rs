@@ -320,7 +320,7 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     /// next, or both (not the side the end came from).
     fn destroy_hop(&mut self, prev: Link, tell_prev: bool, tell_next: bool, now: Instant) {
         let Some(h) = self.circuits.hops.remove(&prev) else { return };
-        self.rendezvous_link_gone(&prev);
+        self.rendezvous_link_gone(&prev, now);
         if let Some(next) = h.next {
             self.circuits.by_next.remove(&next);
             if tell_next {

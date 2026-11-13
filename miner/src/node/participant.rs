@@ -92,8 +92,10 @@ const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// A circuit is replaced after this, plus up to as much again at random.
 const ROTATE_EVERY: Duration = Duration::from_secs(2 * 3600);
 /// An old circuit is closed once the session is live on its replacement,
-/// or after this.
-const RETIRE_WAIT: Duration = Duration::from_secs(30);
+/// or after this at most: long enough that a slow replacement does not
+/// leave the point without our session meanwhile (`docs/TIMING_FIXES.md`;
+/// it was 30 s, closing the old one whether or not the new was live).
+const RETIRE_WAIT: Duration = Duration::from_secs(300);
 /// A relay whose channel failed is not chosen as a hop for this long, while
 /// enough others are left.
 const AVOID: Duration = Duration::from_secs(300);

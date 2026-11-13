@@ -446,7 +446,13 @@ understood is ignored.
    `owsfail` (DESTROY, the 3 s wait) or `owclose`; a link no circuit uses
    closed after 240 s without a body (`+78`).
 6. tabminer: `RETIRE_WAIT` closes on live only (or the new one
-   failing); OFFLINE at once on link gone; delegations queued.
+   failing); OFFLINE at once on link gone; delegations queued. **Done
+   (2026-11-13):** the old circuit closed when the session is live on
+   the new one, or after 5 minutes (was 30 s whatever its state); a
+   delivery waiting on a recipient's circuit answered OFFLINE as soon as
+   the circuit goes (`rendezvous_link_gone`); a delegation newer than the
+   one held but within `DELEGATION_EVERY` held back and applied after
+   (`delegation_pending`), as certificates were.
 7. The API: a deadline per request and non-blocking writes.
 
 **Phase 2: tell instead of wait** (section 3)

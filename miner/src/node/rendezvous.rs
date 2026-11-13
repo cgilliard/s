@@ -303,6 +303,10 @@ pub(super) struct Rendezvous {
     /// dropped (a `subname del` then `subname set` in quick succession
     /// must not lose the second). One per point, the newest.
     cert_pending: HashMap<Digest, Vec<u8>>,
+    /// The same for delegations, by owner: a newer one within
+    /// [`DELEGATION_EVERY`] of the last is held back and applied once the
+    /// interval has passed, rather than refused and lost.
+    delegation_pending: HashMap<Digest, Vec<u8>>,
     /// Tests: names' values, instead of the chain's.
     #[cfg(test)]
     pub(super) test_names: Option<HashMap<Vec<u8>, Digest>>,
@@ -380,14 +384,26 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         for id in expired {
             self.drop_cert(&id);
         }
-        let due: Vec<Digest> = self
+        let due_certs: Vec<Digest> = self
             .rdv
             .cert_pending
             .keys()
             .filter(|p| self.rdv.certs.get(*p).is_none_or(|c| now.duration_since(c.updated) >= DELEGATION_EVERY))
             .copied()
             .collect();
-        for point in due {
+        let due: Vec<Digest> = self
+            .rdv
+            .delegation_pending
+            .keys()
+            .filter(|o| self.rdv.delegations.get(*o).is_none_or(|h| now.duration_since(h.updated) >= DELEGATION_EVERY))
+            .copied()
+            .collect();
+        for owner in due {
+            if let Some(bytes) = self.rdv.delegation_pending.remove(&owner) {
+                let _ = self.hold_delegation(&bytes, now);
+            }
+        }
+        for point in due_certs {
             if let Some(bytes) = self.rdv.cert_pending.remove(&point) {
                 let _ = self.hold_cert(&bytes, now);
             }
@@ -452,13 +468,22 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
     }
 
     /// A circuit through us ended: a session on it ends too.
-    pub(super) fn rendezvous_link_gone(&mut self, link: &Link) {
+    pub(super) fn rendezvous_link_gone(&mut self, link: &Link, now: Instant) {
         if let Some(id) = self.rdv.by_link.remove(link) {
             self.rdv.held.remove(&id);
             self.rdv.announces.remove(&id);
         }
         self.rdv.asks.retain(|a| a.client != *link);
         self.rdv.routes.retain(|_, (l, _)| l != link);
+        // A payload on its way down this circuit will not be acknowledged:
+        // offline now, not after ACK_WAIT (the sender's point tries the
+        // recipient's next point at once).
+        let gone: Vec<(Link, Digest)> = self.rdv.delivering.keys().filter(|(l, _)| l == link).copied().collect();
+        for k in gone {
+            if let Some((waiter, _)) = self.rdv.delivering.remove(&k) {
+                self.answer_delivery(waiter, &k.1, NOTICE_OFFLINE, now);
+            }
+        }
     }
 
     /// An answer along the return route `token`, if it is still here:
@@ -671,8 +696,18 @@ impl<V: ProofVerifier + Send + Sync + 'static> Node<V> {
         }
         match self.rdv.delegations.get(&owner) {
             Some(h) if h.seq == d.seq => return Ok(owner),
-            Some(h) if h.seq > d.seq || now.duration_since(h.updated) < DELEGATION_EVERY => {
-                return Err(NOTICE_REFUSED);
+            Some(h) if h.seq > d.seq => return Err(NOTICE_REFUSED),
+            Some(h) if now.duration_since(h.updated) < DELEGATION_EVERY => {
+                let newer = self
+                    .rdv
+                    .delegation_pending
+                    .get(&owner)
+                    .and_then(|p| Delegation::from_bytes(p))
+                    .is_none_or(|p| d.seq > p.seq);
+                if newer {
+                    self.rdv.delegation_pending.insert(owner, bytes.to_vec());
+                }
+                return Ok(owner);
             }
             None if self.rdv.delegations.len() >= self.config.max_sessions => return Err(NOTICE_REFUSED),
             _ => {}
