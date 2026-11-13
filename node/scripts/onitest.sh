@@ -117,7 +117,7 @@ def wait(what, cond, idle=300):
     # when nothing new comes for the idle window, or when 30 blocks pass
     # without what it waits for (blocks are the clock here).
     last, still, b0 = progress(), 0, blocks()
-    told = b0
+    told, t0 = b0, time.time()
     while True:
         r = cond()
         if r:
@@ -127,8 +127,11 @@ def wait(what, cond, idle=300):
         if blocks() >= told + 5:
             told = blocks()
             print(f'onitest: ({what}: {told - b0} blocks so far)')
-        if blocks() > b0 + 30:
-            print(f'onitest: {what}: not in 30 blocks'); sys.exit(1)
+        # 30 blocks, but never under 600 s: fast blocks (dev-recursive's
+        # 6 s) made that about 3 minutes, under a send's 240 s and its
+        # retry (docs/TIMING_FIXES.md, section 7)
+        if blocks() > b0 + 30 and time.time() - t0 >= 600:
+            print(f'onitest: {what}: not in 30 blocks (and 600 s)'); sys.exit(1)
         now = progress()
         if now != last:
             last, still = now, 0
@@ -267,9 +270,19 @@ def wstate(name, state):
 wait('the wallet\'s commit old enough (3 blocks)', wstate('famwal', 'ready'))
 r = ask('name-reveal', name='famwal', speed='hour')
 check(f'the wallet reveals famwal: {r.get("tx", r.get("error"))}', r['ok'])
+# asked once, its answer waited for (revealing, or an error: the commit not
+# old enough yet), and asked again only after that error and a new block:
+# never a second ask while a slow tabminer still works on the first
+rv = {}
 def tab_reveal():
-    tab('name-reveal tabname'); time.sleep(5)
-    return 'revealing tabname' in aout()
+    a = aout()
+    if 'revealing tabname' in a:
+        return True
+    if not rv or (a.count('error: ') > rv['errs'] and blocks() > rv['b']):
+        rv.update(errs=a.count('error: '), b=blocks())
+        tab('name-reveal tabname')
+    time.sleep(1)
+    return False
 wait('A revealing tabname', tab_reveal)
 wait('famwal the wallet\'s on chain', wstate('famwal', 'owned'))
 def found(name):

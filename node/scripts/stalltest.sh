@@ -131,13 +131,21 @@ touch "$T/hold"
 stop $AP; AP=
 minera
 wait_while_busy 600 "the node asking for block $N's chunks" test -e "$T/held"
+# Asked until it says so: the chunks stay held, so the node fetches block
+# $N throughout (its 30 s for the block given up, it asks again), and a
+# status read just as one fetch ends and the next starts is asked again
+# rather than failed.  An API not answered while the node fetches still
+# fails: each read has its 120 s.
 python3 - "$HP" "$N" <<'EOF2'
-import json, sys, urllib.request
-with urllib.request.urlopen(f'http://127.0.0.1:{sys.argv[1]}/v1/status', timeout=120) as r:
-    s = json.loads(r.read())
-print(f'host: the status while the chunks are held: activity {s.get("activity")}, block {s.get("activity_height")}, height {s["height"]}')
-if s.get('activity') != 'fetching' or s.get('activity_height') != int(sys.argv[2]):
-    sys.exit(f'stalltest.sh: the API was not answered while the node fetched block {sys.argv[2]}')
+import json, sys, time, urllib.request
+for i in range(20):
+    with urllib.request.urlopen(f'http://127.0.0.1:{sys.argv[1]}/v1/status', timeout=120) as r:
+        s = json.loads(r.read())
+    print(f'host: the status while the chunks are held: activity {s.get("activity")}, block {s.get("activity_height")}, height {s["height"]}')
+    if s.get('activity') == 'fetching' and s.get('activity_height') == int(sys.argv[2]):
+        sys.exit(0)
+    time.sleep(1)
+sys.exit(f'stalltest.sh: the status never said the node was fetching block {sys.argv[2]}')
 EOF2
 rm "$T/hold"
 wait_for "$T/os.out" "^node: .* height $N  \\(" 600 "the node connecting block $N"

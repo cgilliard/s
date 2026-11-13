@@ -4852,9 +4852,15 @@ mod tests {
         let mut cb = config(vec![addr_a], &b.dir);
         cb.sync_point = Some(4);
         let (node_b, tx_b) = Node::bind(Arc::clone(&b.chain), pool(), cb).unwrap();
+        let stats_b = node_b.stats();
         let hb = std::thread::spawn(move || node_b.run());
-        // a is bound but not running: b hears nothing and gives up waiting.
-        std::thread::sleep(Duration::from_secs(11));
+        // a is bound but not running: b hears nothing and gives up waiting
+        // (its 10 s alone), seen by its mode, not slept on.
+        let deadline = Instant::now() + guard(40);
+        while stats_b.lock().unwrap().mode != Some(Mode::Normal) {
+            assert!(Instant::now() < deadline, "b never gave up waiting for a peer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert_eq!(b.chain.tip().unwrap().unwrap().height, 0);
         let ha = std::thread::spawn(move || node_a.run());
         assert!(wait_for_tip(&b.chain, &a_tip, 60), "b did not sync once a answered");
@@ -5292,6 +5298,8 @@ mod tests {
             assert!(Instant::now() < deadline, "the liar never became a peer");
             std::thread::sleep(Duration::from_millis(100));
         }
+        // A window it must hold through, not a deadline: a slower machine
+        // only watches longer.
         let until = Instant::now() + net::HEADER_TIMEOUT + Duration::from_secs(2);
         while Instant::now() < until {
             assert!(!syncing.load(Ordering::Acquire), "c counts itself behind a bare claim");
@@ -6432,11 +6440,14 @@ mod tests {
         // Idle: only keepalive frames on its channels (one each per
         // `channel::KEEPALIVE`, at most three channels: its guards).
         std::thread::sleep(Duration::from_secs(3));
-        let before = nodes[p].5.load(Ordering::Relaxed);
+        let (before, from) = (nodes[p].5.load(Ordering::Relaxed), Instant::now());
         std::thread::sleep(Duration::from_secs(15));
         let sent = nodes[p].5.load(Ordering::Relaxed) - before;
-        let per_channel = 15 / crate::channel::KEEPALIVE.as_secs() + 1;
-        assert!(sent <= 3 * per_channel, "{sent} frames in 15 s idle");
+        // The bound from the window as it ran (a sleep can overrun on a
+        // loaded machine), not from the 15 s asked for.
+        let window = from.elapsed();
+        let per_channel = window.as_secs() / crate::channel::KEEPALIVE.as_secs() + 2;
+        assert!(sent <= 3 * per_channel, "{sent} frames in {window:?} idle");
         // The standing circuit's middle hop dies.
         let ids: Vec<Digest> = list.iter().map(|r| r.id).collect();
         let point = ids[crate::onion::rendezvous_relays(&id(5), 0, &ids)[0]];
@@ -7109,8 +7120,18 @@ mod tests {
         // One send's steps in a group share one outbound circuit: the
         // delegation, then the query, cost one circuit, not two.
         let built = || nodes[resolver].3.lock().unwrap().outbound_built;
-        std::thread::sleep(Duration::from_secs(2));
-        let before = built();
+        // Before: once no circuit has been built for 2 s (one still being
+        // built would otherwise count against the group).
+        let deadline = Instant::now() + guard(30);
+        let mut last = (built(), Instant::now());
+        while last.1.elapsed() < Duration::from_secs(2) {
+            assert!(Instant::now() < deadline, "circuits kept being built");
+            std::thread::sleep(Duration::from_millis(100));
+            if built() != last.0 {
+                last = (built(), Instant::now());
+            }
+        }
+        let before = last.0;
         nodes[resolver].1.send(Event::GetDelegation(500, id(4), 77)).unwrap();
         loop {
             if let Note::Delegation { tag: 500, result, .. } =
@@ -7122,7 +7143,7 @@ mod tests {
         }
         let a = ask(b"cool", 501, 77).expect("the bundle held");
         assert_eq!(a.cert.entry(), Entry::Id(id(9)));
-        std::thread::sleep(Duration::from_secs(2));
+        // Read at once: both steps are answered, so their circuits built.
         assert_eq!(built() - before, 1, "the query went over the delegation's circuit");
         assert_eq!(ask(b"nope", 101, 0), None);
         for (i, n) in nodes.iter().enumerate() {
@@ -7258,9 +7279,12 @@ mod tests {
         for n in nodes.iter().take(3) {
             n.1.send(Event::TestNames(names(id(9)))).unwrap();
         }
-        std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(fetch(b"cool"), None);
-        assert_eq!(fetch(b"site"), None);
+        // Each point takes the change on its next turn: asked until then.
+        let deadline = Instant::now() + guard(30);
+        while fetch(b"cool").is_some() || fetch(b"site").is_some() {
+            assert!(Instant::now() < deadline, "the old owner's certificates still counted");
+            std::thread::sleep(Duration::from_millis(500));
+        }
         for (i, n) in nodes.iter().enumerate() {
             if i != holder {
                 n.1.send(Event::Stop).unwrap();
@@ -7352,8 +7376,15 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
         // The grace period over: only the new points are asked.
         epoch(false, true, e);
-        std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(fetch().as_ref(), Some(&d), "the issuer carried it to the new points");
+        let deadline = Instant::now() + guard(30);
+        let got = loop {
+            if let Some(got) = fetch() {
+                break got;
+            }
+            assert!(Instant::now() < deadline, "the issuer never carried it to the new points");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert_eq!(got, d);
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
                 n.1.send(Event::Stop).unwrap();
@@ -7452,8 +7483,15 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
         // The grace period over: only the new points are asked.
         epoch(false, true, e);
-        std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(fetch().as_ref(), Some(&cool), "the holder carried it to the new points");
+        let deadline = Instant::now() + guard(30);
+        let got = loop {
+            if let Some(got) = fetch() {
+                break got;
+            }
+            assert!(Instant::now() < deadline, "the holder never carried it to the new points");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert_eq!(got, cool);
         for n in &nodes {
             n.1.send(Event::Stop).unwrap();
         }
@@ -8044,13 +8082,16 @@ mod tests {
         nodes[hop].1.send(Event::Stop).unwrap();
         handles[hop].take().unwrap().join().unwrap();
         let stopped = Instant::now();
-        // Circuits through it die; p notices (DEAD_AFTER, 30 s, after an
-        // unanswered keepalive, sent every second here), builds around
-        // it. Until it notices, a circuit through the stopped relay still
-        // looks live, and q, sending meanwhile, is told "offline": it asks
-        // again every 3 s for up to 60 s (OFFLINE_WAIT), until p's session
-        // is held again.
-        std::thread::sleep(Duration::from_secs(13));
+        // Circuits through it die: it says goodbye, so p and q leave it out
+        // of new paths at once, and p builds around it. Waited on: the
+        // goodbye taken (the relay no longer a live peer of either), not
+        // a sleep, so p's sessions are not read while still taken as live.
+        let hop_addr = nodes[hop].0;
+        let deadline = Instant::now() + guard(30);
+        while [p, q].iter().any(|&n| nodes[n].3.lock().unwrap().peers.iter().any(|x| x.addr == hop_addr && x.live)) {
+            assert!(Instant::now() < deadline, "the stopped relay still a live peer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
         live(90);
         eprintln!("p live again {:?} after the relay stopped", stopped.elapsed());
         message("around the stopped relay");
@@ -8133,7 +8174,7 @@ mod tests {
         let (_, tx_r, h_r) = start_relay(Some(addr_r));
         // p notices (its keepalive finds no announce held), reconnects
         // with a new key, and is reachable again.
-        let deadline = Instant::now() + Duration::from_secs(70);
+        let deadline = Instant::now() + guard(70);
         let mut back = None;
         while back.is_none() && Instant::now() < deadline {
             back = deliver(3, None);

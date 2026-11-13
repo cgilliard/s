@@ -109,8 +109,11 @@ def wait(what, cond, idle=300, most=None):
         if blocks() >= told + 5:
             told = blocks()
             print(f'paytest: ({what}: {told - b0} blocks so far)')
-        if blocks() > b0 + 30:
-            print(f'paytest: {what}: not in 30 blocks'); sys.exit(1)
+        # 30 blocks, but never under 600 s: fast blocks (dev-recursive's
+        # 6 s) made that about 3 minutes, under a send's 240 s and its
+        # retry (docs/TIMING_FIXES.md, section 7)
+        if blocks() > b0 + 30 and time.time() - t0 >= 600:
+            print(f'paytest: {what}: not in 30 blocks (and 600 s)'); sys.exit(1)
         if most is not None and time.time() - t0 > most:
             print(f'paytest: {what}: not in {most} s (tabminer stopped)'); sys.exit(1)
         now = progress()
@@ -360,9 +363,19 @@ if part == 'names':
     check('tabminer finds famwallet pointing at the wallet', wait('tabminer looking famwallet up', tab_name('famwallet', f'      {addr}')))
     tab('name-commit tabname')
     wait('tabminer\'s commit', lambda: 'committed to tabname' in aout())
+    # asked once, its answer waited for (revealing, or an error: the commit not
+    # old enough yet), and asked again only after that error and a new block:
+    # never a second ask while a slow tabminer still works on the first
+    rv = {}
     def tab_reveal():
-        tab('name-reveal tabname'); time.sleep(5)
-        return 'revealing tabname' in aout()
+        a = aout()
+        if 'revealing tabname' in a:
+            return True
+        if not rv or (a.count('error: ') > rv['errs'] and blocks() > rv['b']):
+            rv.update(errs=a.count('error: '), b=blocks())
+            tab('name-reveal tabname')
+        time.sleep(1)
+        return False
     wait('tabminer revealing tabname', tab_reveal)
     def fam_found():
         time.sleep(3)

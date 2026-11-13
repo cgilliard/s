@@ -83,6 +83,19 @@ served() {
 		sleep 0.1
 	done
 }
+# upon FILE PATTERN NAME — waits for PATTERN in a guest's output FILE
+# while the file grows: NAME fails only after 60 s with nothing new (a
+# slow machine only takes longer; a guest stuck is told, with its output,
+# rather than the checks after it failing on a server never up).
+upon() {
+	ul=-1; ui=0
+	until grep -q -- "$2" "$1" 2>/dev/null; do
+		un=$(wc -c < "$1" 2>/dev/null || echo 0)
+		if [ "$un" != "$ul" ]; then ul=$un; ui=0; else ui=$((ui + 1)); fi
+		[ "$ui" -ge 600 ] && { fail "$3" "no /$2/ in $1, nothing new for 60 s: $(tail -c 300 "$1")"; return 0; }
+		sleep 0.1
+	done
+}
 # boots NAME REGEX SECS CMD... — CMD run (its own process group, stdin
 # /dev/null) until its output matches REGEX (Perl's, multi-line), then
 # stopped; or after SECS with nothing new under $T.  Fails if it never
@@ -1033,7 +1046,7 @@ for n in 1 4; do
 	rm -f "$T/http.disk"; dd if=/dev/zero of="$T/http.disk" bs=1 count=0 seek=268435456 2>/dev/null
 	./tools/q32 --smp=$n --net --hostfwd=tcp::$HP-:80 --disk="$T/http.disk" "$T/http.img" < /dev/null > "$T/httpd_$n.out" 2>&1 &
 	QP=$!                          # q32 execs QEMU: this is QEMU
-	i=0; while [ $i -lt 120 ] && ! grep -q 'httpd: port 80' "$T/httpd_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	upon "$T/httpd_$n.out" 'httpd: port 80' "httpd_$n"
 	page=$(curl -s -m 30 "http://127.0.0.1:$HP/")
 	curl -s -m 60 -o "$T/big_$n.got" "http://127.0.0.1:$HP/big"
 	nf=$(curl -s -m 30 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/nosuch")
@@ -1446,9 +1459,9 @@ for n in 1 4; do
 	./tools/q32 --smp=$n --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < "$T/wm.in" > "$T/wm_$n.out" 2>&1 &
 	QP=$!
 	exec 5> "$T/wm.in"
-	i=0; while [ $i -lt 120 ] && ! grep -q '[$] ' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	upon "$T/wm_$n.out" '[$] ' "wm_$n"
 	printf '%s\n' 'mkdir /etc' 'echo root:wm!pw:0:0:/:sh > /etc/passwd' 'wm &' >&5
-	i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_$n.out"; do sleep 0.5; i=$((i + 1)); done
+	upon "$T/wm_$n.out" 'wm: port 80' "wm_$n"
 	lim 300 python3 "$T/wsc.py" $WP > "$T/wsc_$n.out" 2>&1
 	if command -v node > /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
 		lim 900 node "$T/page.js" $WP > "$T/page_$n.out" 2>&1
@@ -1509,9 +1522,9 @@ rm -f "$T/wm.disk" "$T/wm.in"; dd if=/dev/zero of="$T/wm.disk" bs=1 count=0 seek
 ./tools/q32 --net --hostfwd=tcp::$WP-:80 --disk="$T/wm.disk" "$T/wm.img" < "$T/wm.in" > "$T/wm_idle.out" 2>&1 &
 QP=$!
 exec 5> "$T/wm.in"
-i=0; while [ $i -lt 120 ] && ! grep -q '[$] ' "$T/wm_idle.out"; do sleep 0.5; i=$((i + 1)); done
+upon "$T/wm_idle.out" '[$] ' wm_idle
 printf '%s\n' 'mkdir /etc' 'echo root:pw:0:0:/:sh > /etc/passwd' 'wm 80 8 &' >&5
-i=0; while [ $i -lt 120 ] && ! grep -q 'wm: port 80' "$T/wm_idle.out"; do sleep 0.5; i=$((i + 1)); done
+upon "$T/wm_idle.out" 'wm: port 80' wm_idle
 lim 300 python3 "$T/idle.py" $WP > "$T/idle.out" 2>&1
 exec 5>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null
 for pat in '^idle True' '^after HTTP/1.0 403 Forbidden$'; do grep -q -- "$pat" "$T/idle.out" || { fail wm_idle "no /$pat/: $(head -c 400 "$T/idle.out")"; break; }; done

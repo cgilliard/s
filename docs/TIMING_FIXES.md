@@ -673,3 +673,22 @@ understood is ignored.
     out of step past it, so the circuit ends); q's message sent then
     still reaches p, q never told it failed. Every fault of this list
     now has its test; the random-loss tests stay, as a soak.
+    **The racing tests (2026-11-13):** tabminer's waited on conditions:
+    the delegation test's circuit count read once none has been built
+    for 2 s, not after a 2 s sleep, and at once after the query; the
+    sub-names' change of hands asked until it counts; both carries to new
+    points asked until found; the late peer's fast sync waits for b's
+    mode to turn Normal (it gave up waiting), not 11 s;
+    `standing_circuits_are_replaced_and_rebuilt` waits for the stopped
+    relay's goodbye to be taken (it failed in CI: a replacement built
+    through the stopped relay found it gone only by a 30 s handshake, a
+    path at a time; a relay's goodbye now puts it among those avoided);
+    the restart's 70 s through `guard`; the idle participant's frames
+    bounded by the window as it ran. The claim-of-work window stays: it
+    is one the node must hold through, not a deadline. The scripts:
+    stalltest asks the status until it says the node is fetching (the
+    chunks stay held); the name reveal asked once, again only after its
+    error and a new block; the 30-block limit never under 600 s;
+    oscheck's waits for a guest's prompt or server while its output
+    grows (`upon`), failing with that output. Left: `rawcons`'s sleeps,
+    which space its keystrokes into separate reads (what it tests).
