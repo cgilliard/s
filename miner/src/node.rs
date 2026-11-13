@@ -7125,18 +7125,23 @@ mod tests {
         // One send's steps in a group share one outbound circuit: the
         // delegation, then the query, cost one circuit, not two.
         let built = || nodes[resolver].3.lock().unwrap().outbound_built;
-        // Before: once no circuit has been built for 2 s (one still being
-        // built would otherwise count against the group).
-        let deadline = Instant::now() + guard(30);
-        let mut last = (built(), Instant::now());
-        while last.1.elapsed() < Duration::from_secs(2) {
-            assert!(Instant::now() < deadline, "circuits kept being built");
-            std::thread::sleep(Duration::from_millis(100));
-            if built() != last.0 {
-                last = (built(), Instant::now());
+        // The count once it has not moved for 2 s (the stats are published
+        // once a second, so a read at once may be a second old; and a
+        // circuit still being built would count against the group), past
+        // `from` if given.
+        let settled = |from: Option<u64>| {
+            let deadline = Instant::now() + guard(30);
+            let mut last = (built(), Instant::now());
+            while last.1.elapsed() < Duration::from_secs(2) || from.is_some_and(|f| last.0 <= f) {
+                assert!(Instant::now() < deadline, "the count never settled: {} built", last.0);
+                std::thread::sleep(Duration::from_millis(100));
+                if built() != last.0 {
+                    last = (built(), Instant::now());
+                }
             }
-        }
-        let before = last.0;
+            last.0
+        };
+        let before = settled(None);
         nodes[resolver].1.send(Event::GetDelegation(500, id(4), 77)).unwrap();
         loop {
             if let Note::Delegation { tag: 500, result, .. } =
@@ -7148,8 +7153,7 @@ mod tests {
         }
         let a = ask(b"cool", 501, 77).expect("the bundle held");
         assert_eq!(a.cert.entry(), Entry::Id(id(9)));
-        // Read at once: both steps are answered, so their circuits built.
-        assert_eq!(built() - before, 1, "the query went over the delegation's circuit");
+        assert_eq!(settled(Some(before)) - before, 1, "the query went over the delegation's circuit");
         assert_eq!(ask(b"nope", 101, 0), None);
         for (i, n) in nodes.iter().enumerate() {
             if i != owner {
