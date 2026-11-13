@@ -187,6 +187,20 @@ not planned: pricing unnamed slates (a fee or proof of work per slate).
      (`node/channels.rs`, 32 a host, unused ones closed after 15 s) slow
      the collection of samples; a rate per host would slow it more.
 
+- **Rendezvous points: fewer than three, and the wallet's count unclear.**
+  ONION.md gives an id three points, but `rendezvous_indexes` takes
+  `min(3, n)`: in init mode n is the seeds, two on mainnet, so every id
+  has two points, and a sender that cannot reach either cannot pay it.
+  The fam wallet's "reachable at N rendezvous points" counts the live
+  sessions among them (`mnlive`), so 1 means one of its two points holds
+  no session: the payer computes the same two and tries both, so a
+  payment still lands at the one that is live, but there is no failover
+  left. Seen on mainnet (2026-11-12) with one of two live; why the other
+  session was down not looked into. To do: a third seed (or onion mode's
+  relays) so that every id has three points; the wallet to say "1 of 2"
+  (how many points, how many live) and why one is not (no answer, a
+  session refused); a test with a point down, the payment landing at
+  another.
 - **A dead relay takes 30 s to notice, however fast the link.** A
   channel is taken for dead after a frame goes unacknowledged 30 s
   (`channel.rs`, `DEAD_AFTER`), a circuit after a keepalive goes
