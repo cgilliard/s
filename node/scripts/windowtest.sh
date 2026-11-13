@@ -80,5 +80,9 @@ grep -E '^node: .* loading 8 headers' "$T/os.out" > /dev/null || { echo "windowt
 more() { [ "$(heights)" -ge $((n + 2)) ]; }
 wait_while_busy 300 "blocks followed after resuming" more
 grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -2
-grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -1 | grep -qv 'proof 0\.00' || { echo "windowtest.sh: a block followed without its proof checked" >&2; exit 1; }
+# (one proof checked for each batch of blocks: the batch's line gives its
+# time, NODE_ENHANCEMENTS.md item 21)
+L=$(grep '^node: .* blocks [0-9]* to [0-9]*: ' "$T/os.out" | tail -1)
+echo "$L" | grep -q "the last one's proof in [0-9.]* s" && ! echo "$L" | grep -q "proof in 0\.00 s" \
+	|| { echo "windowtest.sh: a block followed without its proof checked" >&2; exit 1; }
 echo "windowtest.sh: headers moved to the store and served from it, and resumed from a window"

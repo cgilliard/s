@@ -66,12 +66,15 @@ then ;
 : bt0 variable ;  : btb variable ;  : bts variable ;  : btp variable ;  : btc variable ;
 : btick  ticks dup bt0 @ - rot ! bt0 ! ;          \ ( var -- )  the time since the last, into var
 
+\ snocm: if set, the body's commitment not checked again (sync.fam's
+\ batches: sbody checked it as the block was fetched).
+: snocm variable ;
 : spend variable ;  : stxo variable ;
 : sconn1  ( h body n -- )
 ticks bt0 !  0 lit rtn !  0 lit rtall !
 rot bh !  2dup bbn ! bbody !  0 lit bcode !  0 lit ndirty !
 2dup bparse nip
-bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
+bcode @ 0= snocm @ 0= and if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
 bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
 btb btick
 0 lit stxo !  0 lit spend !
@@ -150,6 +153,35 @@ bops @ free
 bcode @ ;
 
 : sconnect  ( h body n -- code )  sconn1  spend @ if ppub @ bpr @ bnpr @ cvverify else -1 lit then  sconn2 ;
+
+\ snew ( -- n )  the outputs the parsed block makes: its outputs and its
+\ names' operations of type 1 (sconn1's sinc, and snames').
+: snew  bnout @  bnops @ ?dup if 0 lit do bops @ i 3 lit lshift + @ 1 lit = if 1 lit + then loop then ;
+\ sbody ( h body n -- code n )  a fetched block's body checked against
+\ its header h, nothing else read: it decodes (-10, or the body's own
+\ rules), its commitment is h's (-11), it is not too large (-12); and
+\ the outputs it makes (snew), for the counter (sync.fam's batches).
+: sbody
+rot bh !  0 lit bcode !  0 lit bnops !
+2dup bparse nip
+bcode @ 0= if stmd @ bcommit  stmd @ dfrom  stmd @ bh @ 2C lit + 8 lit wcmp if FFFFFFF5 lit bfail then then
+bcode @ 0= if CC lit + 1E8480 lit u> if FFFFFFF4 lit bfail then else drop then
+bcode @  bcode @ 0= if snew else 0 lit then
+bops @ ?dup if free then  0 lit bops ! ;
+\ sbproof ( h body n lo hi par -- flag )  block h's chain proof checked
+\ before its parent is connected: the counter before it (lo, hi: 40
+\ bits), its parent's header par; the body checked by sbody first.
+\ Nothing of the state read or changed.
+: sbproof
+spar !  sfirsth !  sfirst !
+rot dup bh !  20 lit + @ sh !  0 lit bcode !  0 lit bnops !
+bparse
+bcode @ 0= if
+	sfirst @ sctr !  sfirsth @ sctrh !
+	snew ?dup if 0 lit do sinc loop then
+	sstmt if ppub @ bpr @ bnpr @ cvverify else 0 lit then
+else 0 lit then
+bops @ ?dup if free then  0 lit bops !  0 lit spar ! ;
 
 \ uevent ( p -- )  undoes one event of the names section.
 : uevent

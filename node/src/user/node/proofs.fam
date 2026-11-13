@@ -47,8 +47,12 @@ pgw @ swap AC lit + pgw @ 20 lit + pwr @ hashmix ;
 \ state's counters; 0 if the parent's header is missing.  sproof is it
 \ and the verifier run on them; sync.fam runs the verifier in another
 \ process (nodev) instead, the node serving meanwhile.
+\ spar: if set, the parent's header (204 bytes) sstmt takes rather than
+\ the store's (sync.fam's batches: a block's proof checked before its
+\ parent is connected).
+: spar variable ;
 : sstmt  ( -- flag )
-sh @ 1 lit - khdr ppar @ CC lit sget CC lit = if
+spar @ ?dup if ppar @ CC lit bcopy -1 lit else sh @ 1 lit - khdr ppar @ CC lit sget CC lit = then if
 	pin @ pvp !
 	sh @ pv,
 	ppar @ 4C lit + pvp @ dle 8 lit pvadv

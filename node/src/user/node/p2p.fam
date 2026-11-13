@@ -372,6 +372,22 @@ dup prec B8 lit + @ 5 lit u< 0= if
 else
 	vrb @ if nhead "peer " puts dup pshow " struck (" puts dup prec B8 lit + @ u. " of 5)" puts 0A lit putc then
 then drop ;
+\ pban ( k -- )  peer k banned for an hour at once (as 5 strikes): what
+\ it sent was deliberate (a body for a header it does not commit to).
+: pban
+5 lit over prec B8 lit + !  secs over prec BC lit + !  secs E10 lit + over prec B4 lit + !
+vrb @ if nhead "peer " puts dup pshow " banned for an hour" puts 0A lit putc then drop ;
+\ The seeds' addresses (main.fam adds them, psdadd), so that a node asks
+\ other peers first and the seeds only to make up the number (sync.fam's
+\ batches).  pisseed ( k -- flag )  peer k one of them.
+: psd variable ;  : psdn variable ;
+: psdadd  ( ip port -- )
+psd @ 0= if 40 lit alloc psd ! then
+psdn @ 8 lit u< if  psd @ psdn @ 3 lit lshift + tuck 4 lit + !  !  psdn @ 1 lit + psdn !  else 2drop then ;
+: pisseed
+prec 0 lit swap  psdn @ ?dup if 0 lit do
+	dup @ psd @ i 3 lit lshift + @ =  over 4 lit + @ psd @ i 3 lit lshift + 4 lit + @ = and if nip -1 lit swap then
+loop then drop ;
 \ pbanned ( k -- flag )  banned and its hour not up (once up, its strikes
 \ forgotten).
 : pbanned

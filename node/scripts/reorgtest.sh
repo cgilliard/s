@@ -85,7 +85,10 @@ wait_for "$T/os.out" '^node: .* resumed at height|^node: .* syncing from.*$' 120
 more() { [ "$(heights)" -gt "$n" ]; }
 wait_while_busy 300 "a block followed after resuming" more
 grep '^node: .* resumed at' "$T/os.out"
-grep '^node: .* height [0-9]*  (' "$T/os.out" | tail -1 | grep -qv 'proof 0\.00' \
+# (blocks are connected by batches, one proof checked for each: the
+# batch's line gives its time, NODE_ENHANCEMENTS.md item 21)
+grep '^node: .* blocks [0-9]* to [0-9]*: ' "$T/os.out" | tail -1 | grep -q "the last one's proof in [0-9.]* s" \
+	&& ! grep '^node: .* blocks [0-9]* to [0-9]*: ' "$T/os.out" | tail -1 | grep -q "proof in 0\.00 s" \
 	|| { echo "reorgtest.sh: a block followed after resuming without its proof checked" >&2; exit 1; }
 
 echo "reorgtest.sh: A's wallet burning a coin"

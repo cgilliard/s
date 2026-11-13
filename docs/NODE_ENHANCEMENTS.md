@@ -998,15 +998,16 @@ difficulty to be the best header: a real block's work for each try.
 against 6 minutes; 32 would save about 10 s more, but show progress in
 steps twice as long and download twice as much of a bad branch):
 1. **The bodies:** fetched (as now, the next while one is handled),
-   each one's commitment checked against its header, its outputs
-   counted, kept on disk under keys of their own (not the kept bodies'
-   'b', so none is served). Each one's sender recorded.
+   each one's commitment checked against its header (the worker's
+   `sbody`, the next block fetched meanwhile), its outputs counted, held
+   in memory (a batch is cut short at 8 MiB), so none is served. Each
+   one's sender recorded.
 2. **The proof of the batch's last block B,** once. Its public values
    need the output counter before B: the counter at the batch's start
    (S's from the snapshot, or the state's) plus what step 1 counted
    (each block's outputs and its names' operations of type 1, as
-   `sconn1` and `sverify` count), and B−1's header readable where
-   `sstmt` reads it.
+   `sconn1` and `sverify` count), and B−1's header given to `sstmt`
+   (`spar`) rather than read from the store (`sbproof`).
 3. **The blocks connected** from disk, in order, up to B−1: parsed, the
    state changed and its root compared, stored; no proof, no commitment
    again. Each is shown, announced and served as it is connected. B's
@@ -1031,11 +1032,15 @@ never bans a seed, which here is only passed over for the batch.)
 the proof of the middle block checked, then of the half's middle,
 and so on (each proof attests everything before it), so the first bad
 block is found in four proofs for 16 (about 10 s); the blocks before it
-connected; the bad block and every header after it on its branch marked
-invalid, so the best header falls back to the honest branch. Banned at
-once (`pstrike`; nothing honest is refused, as above): the peers that
-gave the branch's headers, and the senders of its bodies (an honest node
-serves only bodies of blocks it has connected). The next batch is fetched
+connected; from the bad block on, each block connected as before, its
+proof checked (so the verdict is always today's code's, and a fault in
+the batch's counting costs time, never a valid block); the block refused
+and every header after it on its branch marked invalid, so the best
+header falls back to the honest branch. Banned at once (`pban`; nothing
+honest is refused, as above): the block's sender (an honest node serves
+only bodies of blocks it has connected) and, for a failed proof, the
+peer that gave the branch's headers. Seeds are never banned (as
+tabminer): passed over for the batch. The next batch is fetched
 and checked as usual, so a few bad peers cost a few batches, then are
 gone. **If a root does not match in step 3** (a fault of ours: the proof
 passed on other data), the batch stops there and is connected block by
@@ -1050,8 +1055,10 @@ store) and 2.5 s a batch: about 3.5 minutes for 144 blocks against 8.
 The bodies' commitments could later be checked on several harts (item
 4's measurements first).
 
-**Disk:** a batch's bodies are small on mainnet; at 2 MB blocks, 16 of
-them are 32 MB, to try with item 14's large blocks.
+**Memory:** a batch's bodies are small on mainnet (about 250 KB a
+block, the chain proof most of it); a batch is cut short once it holds
+8 MiB, so 2 MB blocks make batches of four (item 14's large blocks to
+try it).
 
 **Tests:** a clean catch-up, a proof a batch, its time against block by
 block; a branch forged from its fifth block (its tip with real work): the
@@ -1061,6 +1068,11 @@ the wallet never shown the forged state; a wrong body or proof for an
 honest block: refused as fetched, its sender banned, fetched from
 another; the counter right across blocks with name operations (wrong,
 the batch would fail and be bisected).
+
+**Built (2026-11-13):** `sync.fam`'s `nrun` (both the fast sync's
+blocks after S and `ncatch`), `connect.fam`'s `sbody` and `sbproof`,
+`proofs.fam`'s `spar`, `p2p.fam`'s `pban` and the seeds' addresses
+(`psdadd`, `pisseed`). Left: the forged-branch test, a large-block try.
 
 ## 22. The wallet tells what the node is doing
 

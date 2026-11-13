@@ -163,7 +163,7 @@ then
 mpn @ 0= if
 	nnet @ if A000202 lit mip !  EA3 lit mport !  mpush else
 		msdn @ 0= if "tabernacle1.root.sx:3737" mseed  "tabernacle2.root.sx:3737" mseed then
-		msdn @ 0 lit do msds @ i 2 lit lshift + @ mhost if mpush then loop
+		msdn @ 0 lit do msds @ i 2 lit lshift + @ mhost if mpush  mip @ mport @ psdadd then loop
 	then
 then
 \ none found (the seeds' names not resolving, say): served all the same,
@@ -180,7 +180,7 @@ then
 : mfone  ( s -- )  mhost if mip @ mport @ pwho 0< if mip @ mport @ padd drop  mpn @ 1 lit + mpn ! then then ;
 : mfind
 mcfn @ ?dup if 0 lit do mcpa @ i 2 lit lshift + @ mfone loop then
-msdn @ ?dup if 0 lit do msds @ i 2 lit lshift + @ mfone loop then ;
+msdn @ ?dup if 0 lit do msds @ i 2 lit lshift + @ dup mhost if mip @ mport @ psdadd then mfone loop then ;
 
 "/lib/akjv.txt.gz" mfile powinit
 nnet @ if "/lib/chainverdev" else "/lib/chainver" then mfile drop
