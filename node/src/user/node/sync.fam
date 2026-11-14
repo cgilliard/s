@@ -717,7 +717,8 @@ ncode @ 0= if
 			\ the API's thread handed over answered, and the headers' height
 			\ published; a first sync's 2,400 headers were 20 s of the loop
 			\ with neither (a header asked of the loop waited them out)
-			-1 lit pxw !  0 lit pwait drop  0 lit pxw !  stx @ nfsv !  aaccept awake  nfsv @ stx !
+			\ (a wait of 1 ns: poll's 0 is no limit, and waited for a datagram)
+			-1 lit pxw !  1 lit pwait drop  0 lit pxw !  stx @ nfsv !  aaccept awake  nfsv @ stx !
 		else FFFFFFFD lit nfail then
 	repeat drop
 	0 lit hquick !
