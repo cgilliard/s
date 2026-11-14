@@ -230,17 +230,35 @@ dup A lit lshift dup pgn @ u< if
 	pgn @ over - dup 400 lit u> if drop 400 lit then  dup w16  swap pgb @ + swap wbs
 	pfk @ psend
 else 2drop then ;
-\ (Not while pnest is set: sync.fam's vwait, waiting on the verifier
+\ (Not while pnest is set: sync.fam's vproof, waiting on the verifier
 \ with a block's store transaction open.)
+\ pmine ( e -- flag )  header entry e is a block we have connected: our
+\ tip (mytip) or one below it on its branch.  Not hat's word: hat is the
+\ best header's branch, which is not ours from the moment a heavier
+\ branch's headers are held until our blocks above the fork are undone
+\ (sync.fam's ncatch: the headers fetched, the best's work checked, the
+\ blocks undone one by one, all with peers served).  A block or snapshot
+\ asked for by the other branch's id at a height we hold was served
+\ then: that header, and our own branch's body at its height.
+: pmine
+mytip @ hfind dup 0< if 2drop 0 lit else
+	he begin dup hheight 2 lit pick hheight u>  over hparent @ 0< 0= and while hparent @ he repeat
+	=
+then ;
+\ pidmine ( -- flag )  the block whose id is at pidm is not one of
+\ another branch than ours (one whose header is not held here: the
+\ store's word, zheight's, stands).
+: pidmine  pidm @ hfind dup 0< if drop -1 lit else he pmine then ;
 \ pblock ( -- flag )  pbb/pbn the block whose id is at prx+E (32 bytes),
-\ if it is on our chain at or below our tip: its header then its body
-\ (the store's, kept for 1,008 blocks), as a block is fetched.  The last
-\ one built is kept (pbid), as each GetChunks asks for a few chunks.
+\ if it is one we have connected (pmine), at or below our tip: its
+\ header then its body (the store's, kept for 1,008 blocks), as a block
+\ is fetched.  The last one built is kept (pbid), as each GetChunks asks
+\ for a few chunks.
 : pblock
 prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and pbk @ 0= and if -1 lit else
 	prx @ E lit + pidm @ 20 lit bcopy
 	pidm @ hfind dup 0< if drop 0 lit else
-		he dup hheight dup myh @ u> 0= swap hat 2 lit pick = and if
+		he dup hheight myh @ u> 0=  over pmine and if
 			stfd @ 0 lit txbegin stx !  dup hheight ybody  stx @ txcommit drop
 			\ kept lite (its proof never fetched): not held as a block
 			ylite @ over and if drop free 0 lit 0 lit then
@@ -259,13 +277,14 @@ prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and pbk @ 0= and if -1 lit else
 then ;
 \ psnap ( -- flag )  pbb/pbn the manifest (kind 2) or part (kind 3) of
 \ the snapshot after the block whose id is at prx+E (+4 for a part, its
-\ index first), if on our chain and kept (serve.fam); the last kept.
+\ index first), if on our chain (ours: pidmine) and kept (serve.fam);
+\ the last kept.
 : psnap
 prx @ E lit + pgo @ + pbid @ 20 lit d8=  pbb @ 0= 0= and  pbk @ pgkd @ = and
 pgkd @ 3 lit = if prx @ E lit + le@ pbpt @ = and then
 if -1 lit else
 	prx @ E lit + pgo @ + pidm @ 20 lit bcopy
-	pidm @ zheight dup 0< if
+	pidm @ zheight  pidmine 0= if drop FFFFFFFF lit then  dup 0< if
 		drop 0 lit  vrb @ if nhead "a snapshot asked for of a block not on our chain (or past our tip)" puts 0A lit putc then
 	else
 		dup pgkd @ 2 lit = if zman else prx @ E lit + le@ zpart then

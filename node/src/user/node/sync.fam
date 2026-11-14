@@ -765,6 +765,9 @@ ncode @ ;
 \ is another branch, ours or the old: the next turn goes back to it.  nk
 \ counts the blocks connected.
 : nfl variable ;  : nhb variable ;  : nstp variable ;  : nbk variable ;  : nfk variable ;  : nb0 variable ;  : nrl variable ;
+\ nte: our tip's header entry while our blocks are undone for the best
+\ branch (ncatch): on our old branch, not hat's.
+: nte variable ;
 \ nann  our tip announced (Inv: its header and its block's length) to
 \ every answering peer but the current, as tabminer relays a block it
 \ accepts: only ever the best header, whose work is checked in full
@@ -818,7 +821,7 @@ then
 0 lit nfl !
 \ our tip off the best branch: undone down to where it joins
 myh @ if mytip @ hfind dup 0< if drop else
-	he begin dup dup hheight hat <> over hparent @ 0< 0= and while hparent @ he repeat
+	he dup nte !  begin dup dup hheight hat <> over hparent @ 0< 0= and while hparent @ he repeat
 	dup dup hheight hat = if hheight nfk ! else
 		\ the fork below the headers held (a root reached): not followed
 		drop  myh @ nfk !  1 lit nfl !
@@ -827,7 +830,14 @@ myh @ if mytip @ hfind dup 0< if drop else
 	myh @ nfk @ u> if
 		vrb @ if nhead "reorganizing: our " puts myh @ nfk @ - u. " blocks above " puts nfk @ u. " leave for the best branch" puts 0A lit putc then
 		begin myh @ nfk @ u> nfl @ 0= and while
-			nundo? if nundo nstat  1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
+			nundo? if
+				nundo nstat
+				\ our tip: the undone block's parent, on our old branch until
+				\ the fork (nstat's is hat's, the best branch's block at that
+				\ height: not one we hold; told so to peers, and the next
+				\ undo's event named it for the block undone)
+				nte @ hparent @ dup 0< if drop else he dup nte !  dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy then
+				1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
 			else
 				vrb @ if nhead "cannot undo block " puts myh @ u. " (none is kept for a fast sync's start and below): a new sync is needed" puts 0A lit putc then
 				1 lit nfl !

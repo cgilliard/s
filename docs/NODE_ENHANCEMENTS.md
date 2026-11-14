@@ -250,6 +250,20 @@ Progress:
   another that says the same. Left of that list: the pool's recheck,
   API requests one at a time; and blocks are still not served while
   `nodev` checks a header's work (`vpow`'s `vwait`, 4 to 10 s each).
+- (2026-11-13) Only blocks we have connected are served (`p2p.fam`'s
+  `pmine`: our tip or one below it on its branch). `pblock` and
+  `zheight` asked `hat`, the best header's branch, which is not ours
+  from the moment a heavier branch's headers are held until our blocks
+  above the fork are undone: a block or a snapshot asked for then by
+  the other branch's id, at a height we hold, got that header with our
+  own branch's body (to the asker, a peer that lies). The window was
+  the headers' fetch; with blocks served while the worker has a job it
+  took in each undo. And while blocks are undone our tip is the undone
+  block's parent (`ncatch`'s `nte`), not `hat`'s block at that height:
+  peers were told a tip we did not hold, and each undo's event after
+  the first named the other branch's block. Not tested: `reorgtest.sh`
+  passes through the code, but nothing asks for a block during a
+  reorganization.
 
 ## 5. The wallet shows what is in progress
 
