@@ -87,16 +87,19 @@ then ;
 \ header (5 s), its body (10 s), the response (10 s), so one client,
 \ slow or gone, holds the node that long at most (docs/TIMING_FIXES.md).
 : adl variable ;
-\ awr ( a n -- )  bytes to the connection as it takes them: 512 at a time
-\ once it has room (poll's 4: a TCP write waits until all of it is
-\ queued), given up at adl.
+\ awr ( a n -- )  bytes to the connection as it takes them: 4 KiB at a
+\ time once it has room (poll's 4: a TCP write waits until all of it is
+\ queued, and the socket holds 8 KiB), given up at adl.  (512 at a time
+\ before 2026-11-13: a page of 1,000 outputs, 230 KiB, was 450 waits for
+\ room, each one a turn of the scheduler's behind the worker and nodev
+\ on the one hart.)
 : awa variable ;  : awn variable ;
 : awr
 awn ! awa !
 begin awn @ 0 lit >  ticks adl @ - 0< and while
 	acfd @ aent @ !  4 lit aent @ 4 lit + !
 	aent @ 1 lit 3B9ACA00 lit poll 0 lit > if
-		acfd @ awa @ awn @ 200 lit umin write
+		acfd @ awa @ awn @ 1000 lit umin write
 		dup 0 lit > if dup awa @ + awa !  awn @ swap - awn ! else drop 0 lit awn ! then
 	then
 repeat ;
