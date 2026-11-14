@@ -354,6 +354,13 @@ Progress:
   Left: the check itself (8.6 ms a header; the retarget's `wdivmod`, a
   bit a step over 128 bits, is one suspect, not measured: `bwork`'s
   division was half a header's checking before it was normalized).
+- (2026-11-13) Genesis's header answered by the API's thread (`agn`:
+  the loop's entry copied before the thread starts; it is not in the
+  store, so the thread handed it to the loop). The wallet asks for it
+  once as its message layer starts (`wmstart`), often while the node is
+  in its first sync: 8 s on a node waiting on a peer, now 0.01 s. A
+  header above the tip is still the loop's (the wallet's check of its
+  last scan's block, `wstok`, when the node is below it).
 
 ## 5. The wallet shows what is in progress
 

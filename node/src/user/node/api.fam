@@ -61,7 +61,7 @@
 \ parsed, by a pipe the loop polls where it polled the listener), which
 \ answers as before: a transaction (the pool is the loop's), a name and
 \ a proof (the state's buffers), the pool's list, a new token; and a
-\ header the store has not (above the tip, or genesis's).  The words
+\ header the store has not (above the tip).  The words
 \ that answer are the same on both: on the thread the loop's variables
 \ they read (myh, mytip, pact, qnum, stfd...) are its own copies, set
 \ from the view before each request (aload); athr says which side.
@@ -340,15 +340,18 @@ drop ahh @ ;
 \ ath ( h -- e | 0 )  on the thread: header h, at our tip or below, from
 \ the store as an entry at aeb (the header, its id at CC): the id is the
 \ next header's first field, or our tip's (nothing hashed here).  In the
-\ caller's transaction.
+\ caller's transaction.  Genesis's (not in the store: the network's own)
+\ from agn, the loop's entry copied before the thread began (atstart).
+: agn variable ;
 : ath
+dup 0= if drop agn @ else
 dup myh @ u> if drop 0 lit else
 	dup khdr aeb @ CC lit sget CC lit = if
 		dup myh @ = if drop  mytip @ aeb @ CC lit + 20 lit bcopy  aeb @ else
 			1 lit + khdr sbuf @ CC lit sget CC lit = if sbuf @ aeb @ CC lit + 20 lit bcopy  aeb @ else 0 lit then
 		then
 	else drop 0 lit then
-then ;
+then then ;
 \ atid ( s -- e | 0 )  aid on the thread: by height, or by id through
 \ the store's index of ids; in a transaction of its own.
 : atid
@@ -411,8 +414,8 @@ abegin "{" a"
 "200 OK" asend ;
 
 : aheader
-\ (one the thread does not find in the store, above our tip or genesis's:
-\ the loop's to answer, from the headers it holds)
+\ (one the thread does not find in the store, above our tip: the loop's
+\ to answer, from the headers it holds)
 apath @ B lit + aid dup 0= if drop  aloop 0= if "no such header" "404 Not Found" afail then else
 	abegin
 	"raw" aqv if -1 lit aoct !  hhdr ao @ CC lit bcopy  ao @ CC lit + aop ! else ajhdr then
@@ -1098,6 +1101,7 @@ begin
 : atstart
 0 lit athon !  0 lit athr !
 E0 lit malloc av !  10 lit alloc ahw !  44 lit alloc asp !  10 lit alloc ahl !  10 lit alloc ahr !
+EC lit alloc agn !  0 lit he agn @ EC lit bcopy
 av @ if
 	av @ 38 lit wzero
 	ahl @ pipe 0< 0=  ahr @ pipe 0< 0= and if
