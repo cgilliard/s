@@ -304,13 +304,44 @@ Progress:
   requires the thread. A request of the thread's that takes a second or
   more is told by the loop ("api: PATH took N ms on its thread": how
   long the answer took to make, and to write), for the pages of
-  outputs, about 10 s each on a syncing mainnet node and not yet
-  understood (written 4 KiB at a time now, not 512 bytes).
+  outputs, about 10 s each on a syncing mainnet node (the next entry:
+  the amounts' decimal, not the writes).
   Left: requests are still answered one at a time (a slow page holds
   the next, not the loop); what is handed over still waits for the
   loop; a block's header above the tip or by a branch's id is the
   loop's; while a block is fetched the view is as of the fetch's start
   (no wait there publishes).
+- (2026-11-13) **A page of outputs: 11 ms an amount, in the decimal.**
+  With the thread, the wallet's Overview still did not load during a
+  sync: its page of 1,000 outputs took 9 to 16 s, and with requests
+  answered one at a time the status waited behind each page. Not the
+  store (the thread reads the last commit in a transaction of its own,
+  and no reader waits for the writer) and not the socket ("its answer
+  made in 13042 ms; 183819 bytes written in 7 ms"): the time grew with
+  the count (10 outputs 0.1 s, 100 1 s, 1,000 10 s), was the same on an
+  idle node at the tip, and other reads of the store came back in 10
+  ms meanwhile. It was `au64`: an amount above 32 bits written a digit
+  at a time by `wdivmod`, 64 steps of the multi-word words a digit, 14
+  digits an amount. Now four digits a turn, the number in 16-bit limbs
+  divided by 10,000 with the machine's own division. On a node syncing
+  mainnet (asked from the host all through the catch-up): a page of
+  1,000 in 0.3 to 1.5 s where it took 7 to 17 s, the same bytes.
+- (2026-11-13) **The consensus' leaves: a turn's asked together, kept
+  in one transaction.** After a fresh sync the node fetches the voting
+  windows' aux leaves, 16 a turn, a turn every ten seconds until it
+  holds them all (so "the consensus file's votes took" several times a
+  block at first, then not at all). A turn asked for one, waited for
+  it, and kept it in a transaction of its own, 16 times: 3 to 6 s of
+  the loop a turn. Now the 16 are sent, the answers taken as they come
+  (half a second of silence ends the wait) and kept in one transaction;
+  a peer that sends none, or fewer than asked three turns running, is
+  passed over for ten minutes, as one that did not answer was. On the
+  same live node: no turn of a second or more, where every turn took 2
+  to 6.5 s. Memory: 8.7 KiB (the turn's answers).
+- (2026-11-13) The fees' and the consensus' answers are published once
+  at the start (`main.fam`, after `ainit`), not first by `nstep`: the
+  first request for either waited for the loop until the first sync
+  was over (19 s for the fees on a fresh node).
 
 ## 5. The wallet shows what is in progress
 

@@ -62,12 +62,14 @@
 \ cxgen: the scans made, counted (api.fam publishes its answer afresh
 \ after each).
 : cxgen variable ;
+\ (a turn's asks and answers: below, before cxsend)
+: cxab variable ;  : cxgot variable ;  : cxsh variable ;  : cxwk variable ;  : cxnm variable ;
 : cxinit
 cxlv @ 0= if
 	wkinit
 	200 lit alloc cxlv !  200 lit alloc cxtb !  20 lit alloc cxrt !  CXSET alloc cxcur !  CXSET alloc cxprv !
 	CXSET alloc cxtmp !  CXFMAX 10 lit + alloc cxfb !  90 lit 28 lit * alloc cxvt !  20 lit alloc cxwant !
-	20 lit alloc cxid !  80 lit alloc cxw0 !
+	20 lit alloc cxid !  80 lit alloc cxw0 !  2200 lit alloc cxab !  0 lit cxsh !
 	CXSET alloc cxscr !  20 lit alloc cxfail !  cxfail @ 20 lit 0 lit cxfill  0 lit cxfat !
 	cxcur @ CXSET 0 lit cxfill  cxprv @ CXSET 0 lit cxfill  FFFFFFFF lit cxht !  0 lit cxat !
 	20 lit alloc cxtp !  cxtp @ 20 lit 0 lit cxfill  cxwant @ 20 lit 0 lit cxfill  0 lit cxmiss !
@@ -110,23 +112,47 @@ dup 37F lit + 380 lit / ?dup if 0 lit do
 loop then 2drop
 stx @ txcommit drop ;
 
-\ cxask ( e -- ok )  the leaves of header e asked of the current peer
-\ (four tries, half a second each), checked against its aux, kept.
-: cxask
-cxe !  cxe @ hid cxid @ 20 lit bcopy  0 lit cxok !  0 lit cxi !
-begin cxok @ 0=  cxi @ 4 lit u< and while
-	E lit wbeg wtok  cxid @ 20 lit wbs  wsend  cxi @ 1 lit + cxi !
-	begin cxok @ if 0 lit else 1DCD6500 lit pwaitc then ?dup while
-		F lit =  prn @ 225 lit = and  prx @ 5 lit + cxid @ 20 lit d8= and if
-			prx @ 25 lit + cxrt @ cxroot
-			cxrt @ cxe @ hhdr 6C lit + 20 lit d8= if
-				stfd @ 1 lit txbegin stx !  cxid @ cxakey prx @ 25 lit + 200 lit sput  stx @ txcommit drop
-				-1 lit cxok !
+\ A turn's leaves, asked for all at once and kept in one transaction
+\ (2026-11-13; before, a block's asked for and waited for, then kept in
+\ a transaction of its own, 16 times: the loop held 3 to 5 s a turn).
+\ cxsend ( e -- )  the leaves of header e asked of the current peer.
+\ cxtake  an Aux of its (in prx): if the block is one whose header we
+\ hold, the leaves' root is that header's aux, and it is not among those
+\ taken this turn, kept in cxab (16 of 0x220: the id, the leaves).
+\ cxcoll  the answers awaited: until all asked for have come, or half a
+\ second passes with none (or the API or the worker wakes the wait:
+\ cxwk, the turn then not counted against the peer).
+\ cxputs  those taken, kept, in one transaction.
+: cxsend  hid cxid @ 20 lit bcopy  E lit wbeg wtok  cxid @ 20 lit wbs  wsend ;
+: cxtake
+prn @ 225 lit =  cxgot @ 10 lit u< and if
+	prx @ 5 lit + cxid @ 20 lit bcopy
+	cxid @ hfind dup 0< if drop else
+		he cxe !
+		prx @ 25 lit + cxrt @ cxroot
+		cxrt @ cxe @ hhdr 6C lit + 20 lit d8= if
+			0 lit cxgot @ ?dup if 0 lit do cxab @ i 220 lit * + cxid @ 20 lit d8= or loop then
+			0= if
+				cxid @ cxab @ cxgot @ 220 lit * + 20 lit bcopy
+				prx @ 25 lit +  cxab @ cxgot @ 220 lit * + 20 lit +  200 lit bcopy
+				cxgot @ 1 lit + cxgot !
 			then
 		then
-	repeat
-repeat
-cxok @ ;
+	then
+then ;
+: cxcoll
+0 lit cxwk !
+begin
+	cxgot @ cxasks @ u< if 1DCD6500 lit pwaitc else 0 lit then
+	dup 0= if pxrdy @ pyrdy @ or cxwk ! then
+	?dup
+while F lit = if cxtake then repeat ;
+: cxputs
+cxgot @ ?dup if
+	stfd @ 1 lit txbegin stx !
+	0 lit do cxab @ i 220 lit * + dup cxakey  swap 20 lit +  200 lit sput loop
+	stx @ txcommit drop
+then ;
 
 \ ── Parsing (consensus.rs's File::parse) ──
 \ cxutf ( a n -- ok )  well-formed UTF-8.
@@ -343,26 +369,36 @@ cxneed  secs cxat @ - A lit u< 0= and  or if
 	myh @ dup cxh !  cxht !  secs cxat !  mytip @ cxtp @ 20 lit bcopy  0 lit cxmiss !  cxgen @ 1 lit + cxgen !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
 	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
-	0 lit cxasks !  0 lit cxbad !
+	0 lit cxasks !  0 lit cxbad !  0 lit cxnm !
 	pcur @ cxnp @ =  secs cxnu @ - 0< and if -1 lit cxbad ! then
 	cxh @ 1 lit +
 	cxb @  cxb @ cxin @ 5 lit u< and if 11F lit else 8F lit then  2dup u< if 2drop 0 lit else - then
 	do
 		i hat ?dup if
 			dup hhdr 6C lit + cxnz  over hid cxheld 0= and if
-				cxasks @ 10 lit u<  cxbad @ 0= and if
-					\ one that does not answer: the turn stops there, and that
-					\ peer is passed over for the leaves a while (it may not
-					\ keep them), not asked again and again each ten seconds
-					cxask 0= if
-						-1 lit cxbad !  -1 lit cxmiss !  pcur @ cxnp !  secs 258 lit + cxnu !
-						vrb @ if nhead "peer " puts pcur @ pshow " did not answer for a block's aux leaves; not asked for them for 10 minutes" puts 0A lit putc then
-					then
-					cxasks @ 1 lit + cxasks !
-				else drop  -1 lit cxmiss ! then
+				cxnm @ 1 lit + cxnm !
+				cxasks @ 10 lit u<  cxbad @ 0= and if cxsend  cxasks @ 1 lit + cxasks ! else drop then
 			else drop then
 		then
 	loop
+	\ the answers; a peer that sent none, or fewer than asked three
+	\ turns running (it may not keep them), passed over for the leaves a
+	\ while, not asked again and again each ten seconds
+	0 lit cxgot !
+	cxasks @ if
+		cxcoll  cxputs
+		cxgot @ cxasks @ = if 0 lit cxsh ! else
+			cxwk @ 0= if
+				cxsh @ 1 lit + cxsh !
+				cxgot @ 0=  cxsh @ 3 lit u< 0= or if
+					0 lit cxsh !  pcur @ cxnp !  secs 258 lit + cxnu !
+					vrb @ if nhead "peer " puts pcur @ pshow " did not answer for blocks' aux leaves; not asked for them for 10 minutes" puts 0A lit putc then
+				then
+			then
+		then
+	then
+	\ (leaves still wanted: a scan again in ten seconds, cxneed)
+	cxnm @ cxgot @ u> if -1 lit cxmiss ! then
 	\ the decisions in force; the running window's for the files it wants
 	cxwant @ 20 lit 0 lit cxfill
 	cxb @ cxcur @ cxdec

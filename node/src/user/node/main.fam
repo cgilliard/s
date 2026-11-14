@@ -229,6 +229,9 @@ mip @ mport @ mudp @ pinit  mrest
 mapi @ ainit
 nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
 athon @ if nhead "the API answered by a thread of its own" puts else nhead "the API's thread not started: answered in the loop" puts then 0A lit putc
+\ the answers its thread gives whole (the fees', the consensus'), as they
+\ stand before the first sync: nstep makes them afresh, but only after it
+cxinit apubs
 nload if
 	\ resumed: the peer asked, and caught up to if ahead; if it does not
 	\ answer yet, nstep goes on asking

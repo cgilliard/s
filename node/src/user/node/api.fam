@@ -76,8 +76,8 @@
 
 : alfd variable ;  : acfd variable ;  : atk variable ;  : arq variable ;  : arn variable ;  : ahe variable ;
 : apath variable ;  : aqs variable ;  : apost variable ;  : abod variable ;  : abn variable ;  : aclen variable ;
-: ao variable ;  : aop variable ;  : aoct variable ;  : aent variable ;  : aw variable ;  : aten variable ;
-: aqw variable ;  : arw variable ;  : ab32 variable ;  : asib variable ;  : aauth variable ;  : apk variable ;
+: ao variable ;  : aop variable ;  : aoct variable ;  : aent variable ;
+: ab32 variable ;  : asib variable ;  : aauth variable ;  : apk variable ;
 : awt variable ;  : ah variable ;  : ae variable ;  : ahp variable ;  : ablen variable ;  : amp variable ;
 : amn variable ;  : amf variable ;  : afrom variable ;  : acnt variable ;  : an variable ;  : alast variable ;
 : afromh variable ;  : alasth variable ;  : al0 variable ;  : al1 variable ;  : al2 variable ;
@@ -119,14 +119,24 @@
 : adig  20 lit ahx" ;                            \ ( a -- )  32 bytes
 : acom  2C lit a, ;
 : abegin  ao @ aop !  0 lit aoct ! ;             \ a body begun at ao
-\ au64 ( lo hi -- )  a 64-bit number in decimal.
+\ au64 ( lo hi -- )  a 64-bit number in decimal.  Above 32 bits, four
+\ digits a turn: the number, in 16-bit limbs (aq3 the highest), divided by
+\ 10,000 with the machine's own division (adl1: a limb and the remainder
+\ carried into it), until 32 bits are left.  (wdivmod until 2026-11-13,
+\ a digit a turn, 64 steps of the multi-word words each: 11 ms an amount
+\ of 14 digits, so 11 s the wallet's page of 1,000 outputs, nearly all of
+\ what the page took.)
+: aq0 variable ;  : aq1 variable ;  : aq2 variable ;  : aq3 variable ;
+: adl1  swap 10 lit lshift over @ +  dup 2710 lit / rot !  2710 lit % ;   \ ( r limb -- r' )
 : au64
-aw @ 1 lit w! aw @ !
-aw @ 1 lit w@ 0= if aw @ @ anum else
+?dup 0= if anum else
+	dup 10 lit rshift aq3 !  FFFF lit and aq2 !  dup 10 lit rshift aq1 !  FFFF lit and aq0 !
 	0 lit
-	begin aw @ @ aw @ 1 lit w@ or while
-		aw @ aten @ aqw @ arw @ 2 lit wdivmod  arw @ @ 30 lit + swap 1 lit +  aqw @ aw @ 2 lit wcopy
+	begin aq3 @ aq2 @ or while
+		0 lit aq3 adl1 aq2 adl1 aq1 adl1 aq0 adl1
+		4 lit 0 lit do dup A lit % 30 lit + -rot  A lit /  swap 1 lit + swap loop drop
 	repeat
+	aq1 @ 10 lit lshift aq0 @ or anum
 	0 lit do a, loop
 then ;
 
@@ -1044,7 +1054,7 @@ then ;
 : atinit
 -1 lit athr !
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
-10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
+10 lit alloc aent !
 20 lit alloc ab32 !  10 lit alloc ahw !
 140 lit alloc awt !  AEW AEWSZ * alloc aew !  80 lit alloc aef !  40 lit EVSZ * alloc aecp !
 100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
@@ -1052,7 +1062,7 @@ then ;
 ao @ 0= 0=  atpb @ 0= 0= and  8000 lit alloc 0= 0= and
 dup if
 	awt @ 50 lit wzero  aew @ AEW AEWSZ * 2 lit rshift wzero
-	A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
+	0 lit acfd !  0 lit abod !
 then ;
 \ atone  the connection in acfd answered: the view taken (aload), the
 \ store's lock held through it; one that took a second or more left in
@@ -1106,12 +1116,12 @@ then ;
 
 : ainit  ( port -- )
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !
-10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
+10 lit alloc aent !
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
 AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
 40 lit EVSZ * alloc aecp !  evn drop
-A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
+0 lit acfd !  0 lit abod !
 54 lit alloc aerrs !
 "does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !
 "too large" aerrs @ 10 lit + !  "an output below the dust limit" aerrs @ 14 lit + !
