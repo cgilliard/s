@@ -8567,7 +8567,14 @@ mod tests {
         // c's only until then, a moment now that a says it does not hold
         // c's blocks, NotHeld, and b fetches them from c at once).
         wait_for("b heard of c's branch", 30, || b.chain.header_by_hash(&c_tip.hash()).is_ok_and(|h| h.is_some()));
-        std::thread::sleep(Duration::from_secs(3));
+        // And set aside: b's best header its tip again, c's blocks fetched
+        // and the one that would reorganize refused. (Three seconds were
+        // waited here, which a slow machine outran: on Windows a's next
+        // block was announced with c's branch still b's best header, so
+        // nothing was fetched for it; the branch set aside, the best fell
+        // back to the tip, not to a's header already held, and b took the
+        // block only at a's next status.)
+        wait_for("b set c's branch aside", 60, || b.chain.best_header().is_ok_and(|h| h == a_tip));
         assert_eq!(b.chain.tip().unwrap().unwrap(), a_tip, "b reorganized below its floor");
         assert_eq!(a.chain.tip().unwrap().unwrap(), a_tip, "a reorganized past its undo window");
         // a's next block still reaches b.
@@ -8580,7 +8587,8 @@ mod tests {
         let block = mine_body(&a, body, tip.timestamp + 600);
         let next = block.header;
         tx_a.send(Event::Mined(block)).unwrap();
-        assert!(wait_for_tip(&b.chain, &next, 30), "b stopped following a");
+        // (a lost announce, one datagram, is made good by a's next status)
+        assert!(wait_for_tip(&b.chain, &next, net::PING_INTERVAL.as_secs() + 20), "b stopped following a");
         for tx in [tx_a, tx_b, tx_c] {
             tx.send(Event::Stop).unwrap();
         }
