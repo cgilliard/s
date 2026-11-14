@@ -226,6 +226,16 @@ Progress:
   (oscheck's `tcp_loop`). Not covered: a peer on another machine that
   goes silent with its window at 0 (no persist timer, no deadline on a
   write under way).
+- (2026-11-13) The consensus scan only when its answer can differ
+  (`cons.fam`'s `cxrun`): at a new tip (its id, not only its height),
+  or ten seconds after a scan that left something it can now ask for
+  (`cxneed`: leaves wanted and not held, asked for or not, unless the
+  current peer is passed over for them; a file wanted, unless it is the
+  one that would not come). It ran every 10 s at the same tip, 3 to 5 s
+  each. On a live node: every 10 s for 2.5 minutes after the sync (the
+  windows' leaves, 16 a turn), then not again until the next block.
+  Next: more leaves a turn, and the votes counted as blocks come rather
+  than recounted.
 
 ## 5. The wallet shows what is in progress
 

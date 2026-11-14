@@ -24,7 +24,8 @@
 \ cxinit  the buffers (once).
 \ cxrun  a turn: leaves wanted (the windows ending at B, B-144 and the
 \ tip) asked for, a few at a time; the decisions made; a file wanted
-\ fetched.  From nstep, every ten seconds or when the tip moved.
+\ fetched.  From nstep: the scan itself when the tip moved, or ten
+\ seconds after one that left something missing (cxneed).
 \ cxset ( a n set -- ok )  a file parsed into a set (below); not ok: an
 \ invalid file.
 \ A set: +0 mode (0 init, 1 onion), +4 its relays (n), +8 the file's hash
@@ -48,6 +49,16 @@
 \ cxnp, cxnu: a peer that did not answer GetAux, not asked again until
 \ then (10 minutes, as tabminer's); cxbad: a turn's asking stopped at it.
 : cxnp variable ;  : cxnu variable ;  : cxbad variable ;
+\ When a turn's scan is due (docs/NODE_ENHANCEMENTS.md, item 4: a scan
+\ reads the windows' leaves and recounts them, 3 to 5 s on a live node,
+\ and every ten seconds at the same tip it held the loop for nothing).
+\ What a scan decides changes only with the tip or with what a scan
+\ itself fetches (leaves, a file), so: at a new tip (cxtp: its id, a
+\ reorganization may keep the height), or ten seconds after a scan that
+\ left something to fetch which can now be asked for (cxneed).
+\ cxmiss: the last scan left leaves wanted and not held, asked for or
+\ not (the 16 a turn asked, the peer passed over, none answering).
+: cxmiss variable ;  : cxtp variable ;
 : cxinit
 cxlv @ 0= if
 	wkinit
@@ -56,6 +67,7 @@ cxlv @ 0= if
 	20 lit alloc cxid !  80 lit alloc cxw0 !
 	CXSET alloc cxscr !  20 lit alloc cxfail !  cxfail @ 20 lit 0 lit cxfill  0 lit cxfat !
 	cxcur @ CXSET 0 lit cxfill  cxprv @ CXSET 0 lit cxfill  FFFFFFFF lit cxht !  0 lit cxat !
+	20 lit alloc cxtp !  cxtp @ 20 lit 0 lit cxfill  cxwant @ 20 lit 0 lit cxfill  0 lit cxmiss !
 then ;
 
 \ cxroot ( leaves dst -- )  the aux root of 16 leaves.
@@ -308,13 +320,24 @@ over if
 	else cxwant @ cxfail @ 20 lit bcopy  secs 258 lit + cxfat ! then
 	drop free
 else 2drop  cxwant @ cxfail @ 20 lit bcopy  secs 258 lit + cxfat ! then ;
+\ cxneed ( -- flag )  something the last scan missed can be asked for
+\ now: leaves, unless the current peer is passed over for them (another
+\ peer made the current, or its ten minutes over, and they are asked
+\ for again); a file, unless it is the one that would not come and its
+\ ten minutes are not over.  A file just fetched is still wanted until
+\ the next scan, which decides with it.
+: cxneed
+cxmiss @  pcur @ cxnp @ =  secs cxnu @ - 0< and 0=  and
+cxwant @ cxnz  cxwant @ cxfail @ 20 lit d8= secs cxfat @ - 0< and 0=  and
+or ;
 : cxrun
 cxinit
 cxpin @ if
 	cxpinit  myh @ cxht !  myh @ 90 lit / 90 lit * cxb !  myh @ cxb @ - cxin !  0 lit cxprv @ 28 lit + !
 else
-myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
-	myh @ dup cxh !  cxht !  secs cxat !
+myh @ cxht @ =  mytip @ cxtp @ 20 lit d8= and 0=
+cxneed  secs cxat @ - A lit u< 0= and  or if
+	myh @ dup cxh !  cxht !  secs cxat !  mytip @ cxtp @ 20 lit bcopy  0 lit cxmiss !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
 	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
 	0 lit cxasks !  0 lit cxbad !
@@ -323,15 +346,17 @@ myh @ cxht @ =  secs cxat @ - A lit u< and 0= if
 	cxb @  cxb @ cxin @ 5 lit u< and if 11F lit else 8F lit then  2dup u< if 2drop 0 lit else - then
 	do
 		i hat ?dup if
-			dup hhdr 6C lit + cxnz  over hid cxheld 0= and  cxasks @ 10 lit u< and  cxbad @ 0= and if
-				\ one that does not answer: the turn stops there, and that
-				\ peer is passed over for the leaves a while (it may not
-				\ keep them), not asked again and again each ten seconds
-				cxask 0= if
-					-1 lit cxbad !  pcur @ cxnp !  secs 258 lit + cxnu !
-					vrb @ if nhead "peer " puts pcur @ pshow " did not answer for a block's aux leaves; not asked for them for 10 minutes" puts 0A lit putc then
-				then
-				cxasks @ 1 lit + cxasks !
+			dup hhdr 6C lit + cxnz  over hid cxheld 0= and if
+				cxasks @ 10 lit u<  cxbad @ 0= and if
+					\ one that does not answer: the turn stops there, and that
+					\ peer is passed over for the leaves a while (it may not
+					\ keep them), not asked again and again each ten seconds
+					cxask 0= if
+						-1 lit cxbad !  -1 lit cxmiss !  pcur @ cxnp !  secs 258 lit + cxnu !
+						vrb @ if nhead "peer " puts pcur @ pshow " did not answer for a block's aux leaves; not asked for them for 10 minutes" puts 0A lit putc then
+					then
+					cxasks @ 1 lit + cxasks !
+				else drop  -1 lit cxmiss ! then
 			else drop then
 		then
 	loop
