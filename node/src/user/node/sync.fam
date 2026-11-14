@@ -713,6 +713,11 @@ ncode @ 0= if
 			ticks nht @ - nhc @ + nhc !
 			hbest hheight 1 lit + max
 			"headers to " nsay hbest hheight nsayn
+			\ between batches (60 headers, half a second of checking): what
+			\ the API's thread handed over answered, and the headers' height
+			\ published; a first sync's 2,400 headers were 20 s of the loop
+			\ with neither (a header asked of the loop waited them out)
+			-1 lit pxw !  0 lit pwait drop  0 lit pxw !  stx @ nfsv !  aaccept awake  nfsv @ stx !
 		else FFFFFFFD lit nfail then
 	repeat drop
 	0 lit hquick !

@@ -342,6 +342,18 @@ Progress:
   at the start (`main.fam`, after `ainit`), not first by `nstep`: the
   first request for either waited for the loop until the first sync
   was over (19 s for the fees on a fresh node).
+- (2026-11-13) **A first sync's headers: the loop comes round between
+  batches.** The 2,400 headers of a fresh mainnet node are 25 s of the
+  loop on one hart (fetched in 5 s, quick-checked in 20 s: 8.6 ms a
+  header), with no wait that serves: what the API's thread handed over
+  waited them out (a header asked of the loop: 24 s) and nothing was
+  published (the status said 0 headers until the last). Now, after
+  each batch of 60, the requests handed over are answered and the view
+  published (`nsync`). On the same live sync: a handed-over header or
+  the pool's list in 0.7 s at most, the status counting the headers up.
+  Left: the check itself (8.6 ms a header; the retarget's `wdivmod`, a
+  bit a step over 128 bits, is one suspect, not measured: `bwork`'s
+  division was half a header's checking before it was normalized).
 
 ## 5. The wallet shows what is in progress
 
