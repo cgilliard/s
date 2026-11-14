@@ -18,8 +18,13 @@
 \
 \ evput ( kind height state id other -- )  an event (id and other: 32
 \ bytes each, or 0 for zeros); the ring made at the first.
-\ evat ( n -- a )  where event n is, if still kept (evlow to evn).
+\ evat ( n -- a )  where event n is, if still kept (evlow to evn @).
 \ evlow ( -- n )  the oldest number kept (1 before the ring has wrapped).
+\ evn ( -- addr )  the newest event's number, and evh the lock an event
+\ is written under: two cells of their own (evmk, with the ring), not
+\ variables, so that a thread with variables of its own (the API's,
+\ api.fam: made after them) reads the same count, and copies events out
+\ under the lock, none half written or being written over.
 
 :M EVN 800 lit ;
 :M EVSZ 50 lit ;
@@ -27,15 +32,21 @@
 :M EVPOOLED 1 lit ;  :M EVREPL 2 lit ;  :M EVEVICT 3 lit ;  :M EVMINED 4 lit ;  :M EVCONF 5 lit ;  :M EVBACK 6 lit ;
 :M ESYNCED 1 lit ;  :M ESYNCING 2 lit ;  :M ENOPEERS 3 lit ;
 
-: evr variable ;  : evn variable ;  : eva variable ;
+: evr variable ;  : evh variable ;  : eva variable ;  : evk variable ;
+: evmk  evh @ 0= if 8 lit alloc dup evh !  2 lit wzero  EVN EVSZ * malloc evr ! then ;
+: evn  evmk  evh @ 4 lit + ;
 : evat  EVN 1 lit - and EVSZ * evr @ + ;
 : evlow  evn @ EVN u< if 1 lit else evn @ EVN - 1 lit + then ;
 \ evid ( src dst -- )  32 bytes, or zeros for src 0.
 : evid  swap ?dup if swap 20 lit bcopy else 8 lit wzero then ;
 : evput
-evr @ 0= if EVN EVSZ * malloc evr !  0 lit evn ! then
+evmk
 evr @ 0= if 2drop 2drop drop else
-	evn @ 1 lit + dup evn !  evat eva !
+	evh @ lock
+	evn @ 1 lit + dup evk !  evat eva !
 	eva @ 30 lit + evid  eva @ 10 lit + evid
-	eva @ C lit + !  eva @ 8 lit + !  eva @ 4 lit + !  evn @ eva @ !
+	eva @ C lit + !  eva @ 8 lit + !  eva @ 4 lit + !  evk @ eva @ !
+	\ its number last: an event counted is one written whole
+	evk @ evn !
+	evh @ unlock
 then ;

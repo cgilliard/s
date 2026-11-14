@@ -59,6 +59,9 @@
 \ cxmiss: the last scan left leaves wanted and not held, asked for or
 \ not (the 16 a turn asked, the peer passed over, none answering).
 : cxmiss variable ;  : cxtp variable ;
+\ cxgen: the scans made, counted (api.fam publishes its answer afresh
+\ after each).
+: cxgen variable ;
 : cxinit
 cxlv @ 0= if
 	wkinit
@@ -337,7 +340,7 @@ cxpin @ if
 else
 myh @ cxht @ =  mytip @ cxtp @ 20 lit d8= and 0=
 cxneed  secs cxat @ - A lit u< 0= and  or if
-	myh @ dup cxh !  cxht !  secs cxat !  mytip @ cxtp @ 20 lit bcopy  0 lit cxmiss !
+	myh @ dup cxh !  cxht !  secs cxat !  mytip @ cxtp @ 20 lit bcopy  0 lit cxmiss !  cxgen @ 1 lit + cxgen !
 	cxh @ 90 lit / 90 lit * cxb !  cxh @ cxb @ - cxin !
 	\ the leaves wanted: the windows ending at B (and B-144 while both stand) and the tip
 	0 lit cxasks !  0 lit cxbad !

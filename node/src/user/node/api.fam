@@ -56,6 +56,12 @@
 : amn variable ;  : amf variable ;  : afrom variable ;  : acnt variable ;  : an variable ;  : alast variable ;
 : afromh variable ;  : alasth variable ;  : al0 variable ;  : al1 variable ;  : al2 variable ;
 : aerrs variable ;  : ahh variable ;  : aend variable ;
+\ What the answers read of the loop's state, set by apub just before
+\ they are made: the best header's height (ahb), the peers answering
+\ (apc), the newest event's number (aevn).  Not read where they live
+\ (the header table, the peers' records, the ring's count) so that the
+\ same words answer on a thread that has only what the loop published.
+: ahb variable ;  : apc variable ;  : aevn variable ;
 
 \ ── The response ──
 
@@ -255,8 +261,8 @@ abegin "{" a"
 "height" akey myh @ anum acom
 "tip" akey mytip @ adig acom
 "work" akey mywork @ adig acom
-"headers" akey hbest hheight anum acom
-"peers" akey  0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then  anum acom
+"headers" akey ahb @ anum acom
+"peers" akey apc @ anum acom
 "pool" akey "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum "}" a" acom
 "version" akey aqt "fam-node 0.1" a" aqt acom
 "protocol" akey 1 lit anum acom
@@ -555,13 +561,14 @@ then ;
 \ afees  as tabminer's `fees`: for a simple payment (2,513 bytes), the
 \ rates for a block, an hour, a day; economy, the minimum, waiting at
 \ most the pool's bytes over the aged reserve (179,500 a block) in blocks.
-: afees
+\ afeesb  its body, at ao.
+: afeesb
 abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "payment_size" akey 9D1 lit anum acom
 "estimates" akey "{" a" "block" akey 258 lit afe acom "hour" akey E10 lit afe acom "day" akey 15180 lit afe "}" a" acom
 "economy" akey "{" a" "rate" akey A lit anum acom "blocks" akey qbytes @ 9D1 lit + 2BD2B lit + 2BD2C lit / anum "}" a" acom
 "confirmations" akey qcrn @ anum
-"}" a"
-"200 OK" asend ;
+"}" a" ;
+: afees  afeesb "200 OK" asend ;
 
 : amempool
 abegin "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum acom "transactions" akey "[" a"
@@ -636,6 +643,9 @@ abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
 :M AEWSZ 98 lit ;
 : aew variable ;  : aeaf variable ;  : aenf variable ;  : aef variable ;  : aek variable ;
 : aest variable ;  : aea variable ;  : aenx variable ;  : aep variable ;
+\ aecp: the events an answer holds (64), copied out of the ring under
+\ its lock; aerf: the answer is a reset.
+: aecp variable ;  : aerf variable ;
 
 \ aevst  the node's state, an event when it changes: no peers, syncing
 \ (behind its best header by more than a block), synced.
@@ -643,7 +653,9 @@ abegin "{" a" "token" akey aqt atk @ a" aqt "}" a"
 0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then
 0= if ENOPEERS else hbest hheight myh @ 1 lit + u> if ESYNCING else ESYNCED then then
 dup aest @ = if drop else
-	dup aest !  EVSTAT myh @ rot 0 lit 0 lit evput  hbest hheight evn @ evat 10 lit + !
+	\ (the best header's height in the id's place, given with the event:
+	\ set in the ring after, a reader could have the event without it)
+	dup aest !  ab32 @ 8 lit wzero  hbest hheight ab32 @ !  EVSTAT myh @ rot ab32 @ 0 lit evput
 then ;
 
 \ aev1 ( a -- )  an event's object.
@@ -672,20 +684,31 @@ EVTX = if "tx" a" aqt acom aevtx else "status" a" aqt acom aevs then then then
 dup 4 lit + @ EVTX = aenf @ and if
 	0 lit aenf @ 0 lit do over 10 lit + aef @ i 5 lit lshift + 20 lit d8= or loop nip
 else drop -1 lit then ;
-\ aereset ( -- flag )  aeaf not among the numbers kept.
-: aereset  aeaf @ evn @ u>  aeaf @ 1 lit + evlow u< or ;
-\ aehas ( -- flag )  a wanted event after aeaf.
-: aehas  0 lit  evn @ aeaf @ u> if evn @ aeaf @ - 0 lit do aeaf @ i + 1 lit + evat aem or loop then ;
-\ aevans  the events after aeaf wanted (aenf, aef), 64 at most, answered.
+\ aereset ( -- flag )  aeaf not among the numbers kept (to aevn, the
+\ newest this side knows of: apub).
+: aereset  aeaf @ aevn @ u>  aeaf @ 1 lit + evlow u< or ;
+\ aehas ( -- flag )  a wanted event after aeaf (none looked for when
+\ aeaf is not among those kept: aereset says so).
+: aehas  0 lit  aereset 0= if aevn @ aeaf @ u> if aevn @ aeaf @ - 0 lit do aeaf @ i + 1 lit + evat aem or loop then then ;
+\ aevans  the events after aeaf wanted (aenf, aef), 64 at most, answered:
+\ copied out of the ring under its lock (evh: none being written, or
+\ written over as the ring comes round), then told from the copies.
 : aevans
-abegin "{" a"
-aereset if "reset" akey "true" a" acom "next" akey evn @ anum else
-	"events" akey "[" a"  0 lit aek !  aeaf @ aenx !
-	evn @ aeaf @ - ?dup if 0 lit do
+evh @ lock
+aereset dup aerf !
+0= if
+	0 lit aek !  aeaf @ aenx !
+	aevn @ aeaf @ - ?dup if 0 lit do
 		aek @ 40 lit u< if
-			aeaf @ i + 1 lit + dup aenx !  evat dup aem if aek @ if acom then aev1  aek @ 1 lit + aek ! else drop then
+			aeaf @ i + 1 lit + dup aenx !  evat dup aem if aecp @ aek @ EVSZ * + EVSZ bcopy  aek @ 1 lit + aek ! else drop then
 		then
 	loop then
+then
+evh @ unlock
+abegin "{" a"
+aerf @ if "reset" akey "true" a" acom "next" akey aevn @ anum else
+	"events" akey "[" a"
+	aek @ ?dup if 0 lit do i if acom then aecp @ i EVSZ * + aev1 loop then
 	"]" a" acom "next" akey aenx @ anum
 then
 "}" a" "200 OK" asend ;
@@ -704,7 +727,7 @@ then
 aereset aehas or  "wait=" aqv ?dup if c@ 30 lit = else 0 lit then or if aevans else
 	FFFFFFFF lit AEW 0 lit do aew @ i AEWSZ * + @ 0= if drop i then loop
 	dup 0< if drop "too many waiting" "503 Service Unavailable" afail else
-		AEWSZ * aew @ +  acfd @ over !  secs 1E lit + over 4 lit + !  evn @ over 8 lit + !  aenf @ over C lit + !
+		AEWSZ * aew @ +  acfd @ over !  secs 1E lit + over 4 lit + !  aevn @ over 8 lit + !  aenf @ over C lit + !
 		aef @ swap 10 lit + 20 lit wcopy  0 lit acfd !
 	then
 then ;
@@ -716,7 +739,7 @@ AEW 0 lit do
 		dup 8 lit + @ aeaf !  dup C lit + @ aenf !  dup 10 lit + aef @ 20 lit wcopy
 		aereset aehas or  secs 2 lit pick 4 lit + @ u< 0= or if
 			dup @ acfd !  0 lit swap !  aevans
-		else evn @ swap 8 lit + ! then
+		else aevn @ swap 8 lit + ! then
 	else drop then
 loop ;
 
@@ -732,20 +755,31 @@ if
 		28 lit * awt @ +  acfd @ over !  secs 1E lit + over 4 lit + !  ab32 @ swap 8 lit + 20 lit bcopy  0 lit acfd !
 	then
 else atipr then ;
-\ awake  the waiting requests whose tip moved, or whose time is up,
-\ answered; the node's state (aevst) and the events' waiting (aewake).
+\ apub  what the answers read of the loop's state (ahb, apc, aevn), as
+\ it is now.
+: apub
+awt @ if
+	hbest hheight ahb !
+	0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then apc !
+	evn @ aevn !
+then ;
+\ atipw  the requests waiting for the tip whose tip moved, or whose time
+\ is up, answered.
+: atipw
+8 lit 0 lit do
+	awt @ i 28 lit * + dup @ if
+		dup 8 lit + mytip @ 20 lit d8= 0=  secs 2 lit pick 4 lit + @ u< 0= or if
+			dup @ acfd !  0 lit swap !  atipr
+		else drop then
+	else drop then
+loop ;
+\ awake  the node's state (aevst: an event when it changes), then the
+\ waiting requests answered: the events' (aewake), the tip's (atipw).
 \ (all of it only once ainit made the API's tables: a node's test
 \ program without the API, relay_test, waits through cwait and vwait too)
 : awake
 awt @ if
-	aevst aewake
-	8 lit 0 lit do
-		awt @ i 28 lit * + dup @ if
-			dup 8 lit + mytip @ 20 lit d8= 0=  secs 2 lit pick 4 lit + @ u< 0= or if
-				dup @ acfd !  0 lit swap !  atipr
-			else drop then
-		else drop then
-	loop
+	aevst apub aewake atipw
 then ;
 
 \ acons  the message layer's mode as the chain decides it (cons.fam):
@@ -764,7 +798,8 @@ dup 4 lit + @ ?dup if 0 lit do
 	dup 30 lit + i CXREL * +  "{" a" "id" akey dup adig acom "address" akey aqt 20 lit + a" aqt "}" a"
 loop then
 "]" a" "}" a" drop ;
-: acons
+\ aconsb  its body, at ao.
+: aconsb
 cxinit
 abegin "{" a"
 "height" akey cxht @ FFFFFFFF lit = if 0 lit else cxht @ then anum acom
@@ -772,7 +807,8 @@ abegin "{" a"
 "current" akey cxcur @ ajset acom
 "previous" akey cxprv @ 28 lit + @ if cxprv @ ajset else "null" a" then acom
 "running" akey cxscr @ 28 lit + @ if cxscr @ ajset else "null" a" then
-"}" a" "200 OK" asend ;
+"}" a" ;
+: acons  aconsb "200 OK" asend ;
 : aroute
 apost @ if
 	apath @ "/v1/tx" streq if atx else
@@ -805,7 +841,7 @@ then
 abod @ ?dup if free 0 lit abod ! then ;
 
 \ aaccept  a connection to the API, if one waits (pxrdy), answered.
-: aaccept  pmark  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd ! aone then then ;
+: aaccept  pmark  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd !  apub aone then then ;
 
 : ainit  ( port -- )
 2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
@@ -813,6 +849,7 @@ abod @ ?dup if free 0 lit abod ! then ;
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
 AEW AEWSZ * alloc dup aew !  AEW AEWSZ * 2 lit rshift wzero  80 lit alloc aef !
+40 lit EVSZ * alloc aecp !  evn drop
 A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
 54 lit alloc aerrs !
 "does not decode" aerrs @ 4 lit + !  "no inputs" aerrs @ 8 lit + !  "malformed" aerrs @ C lit + !
