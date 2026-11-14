@@ -216,6 +216,9 @@ mdc @ dup 60 lit + prinit
 1 lit vrb !
 \ the verifier, a process of its own, so the node serves while it checks
 vinit  vjw @ if nhead "verifying in nodev (a process of its own)" puts else nhead "nodev not started: verifying here" puts then 0A lit putc
+\ the events' ring and its count, before any thread is (each has its own
+\ variables from its start: they must already point at the one ring)
+evn drop
 \ the worker, a thread that connects blocks while the node serves
 cwstart  cwon @ 0= if nhead "the worker not started: blocks connected here" puts 0A lit putc then
 \ the network and the API at once, whatever the height (a store with no
@@ -225,6 +228,7 @@ cwstart  cwon @ 0= if nhead "the worker not started: blocks connected here" puts
 mip @ mport @ mudp @ pinit  mrest
 mapi @ ainit
 nhead "the API on port " puts mapi @ u. ", token " puts atk @ puts 0A lit putc
+athon @ if nhead "the API answered by a thread of its own" puts else nhead "the API's thread not started: answered in the loop" puts then 0A lit putc
 nload if
 	\ resumed: the peer asked, and caught up to if ahead; if it does not
 	\ answer yet, nstep goes on asking
@@ -240,7 +244,7 @@ else
 	then
 	\ afresh: the tree made again (whatever a sync cut short, before its
 	\ first block, left in it gone)
-	stfd @ close drop  "/var/node" remove drop  mtree stfd !
+	astlk  stfd @ close drop  "/var/node" remove drop  mtree stfd !  apub  astul
 	\ from each peer in turn (those given or found, and any that pinged
 	\ us) while none answers, or each is on another chain (a seed serving
 	\ images only, say), or has no block yet; then, while serving, again
@@ -265,7 +269,7 @@ else
 			"  (-1 no answer, -2 another chain, -3 headers, -4 a proof of work, -5 a block not fetched, -6 a chain proof, -7 a part, -8 the state, -9 a block after S); trying again in 30 s" puts
 		then 0A lit putc  drop
 		\ the store written to (a snapshot's parts): made afresh
-		nswr @ if stfd @ close drop  "/var/node" remove drop  mtree stfd ! then
+		nswr @ if astlk  stfd @ close drop  "/var/node" remove drop  mtree stfd !  apub  astul then
 		1E lit nidle
 	repeat
 	nhead "synced, height " puts myh @ u. 0A lit putc

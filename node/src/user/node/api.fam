@@ -42,7 +42,33 @@
 \ (name_trie::NameProof), with the outputs' root, which compressed with
 \ the trie's makes the state root.
 \
-\ ainit ( port -- )  the token, the listener.
+\ The API's thread (docs/NODE_ENHANCEMENTS.md, item 4).  The loop answers
+\ only when it comes round: a request waited behind whatever it was doing
+\ (headers saved, a batch, the pool's recheck), and behind the request
+\ before it.  So the listener is a thread's (atstart: pthread, variables
+\ of its own, its own buffers), which answers by itself what it can:
+\ - from the store, in read transactions of its own (as of the last
+\   commit, as the loop's answers were): headers, blocks, outputs,
+\   commits, the spent;
+\ - from what the loop publishes (the view, av: memory both see, under
+\   its lock; apub, at each change and each turn of a wait): the status,
+\   the tip, the events (the ring is events.fam's, read to the number
+\   published), and the consensus' and the fees' answers, whole, made by
+\   the loop when they change (apubs);
+\ - the long polls (tip, events), waiting in its own tables, the loop
+\   waking it by a byte on a pipe when the tip moves or an event comes.
+\ The rest it hands to the loop (ahand: the connection and the request,
+\ parsed, by a pipe the loop polls where it polled the listener), which
+\ answers as before: a transaction (the pool is the loop's), a name and
+\ a proof (the state's buffers), the pool's list, a new token; and a
+\ header the store has not (above the tip, or genesis's).  The words
+\ that answer are the same on both: on the thread the loop's variables
+\ they read (myh, mytip, pact, qnum, stfd...) are its own copies, set
+\ from the view before each request (aload); athr says which side.
+\ Without the thread (no room for it: athon 0) the loop answers all, as
+\ before.  One request at a time still, but not the loop's time.
+\
+\ ainit ( port -- )  the token, the listener, the thread.
 \ aserve ( s -- )  s seconds of the node's loop: its peers (as nserve),
 \ the API's requests, and those waiting for the tip (in sync.fam, after
 \ this: api.fam comes before it, so its verifier's wait serves the API).
@@ -62,6 +88,24 @@
 \ (the header table, the peers' records, the ring's count) so that the
 \ same words answer on a thread that has only what the loop published.
 : ahb variable ;  : apc variable ;  : aevn variable ;
+\ The view (av, E0 bytes from malloc): +0 its lock; +4 our height, +8
+\ tip, +28 work; +48 the best header's height, +4C the peers answering;
+\ +50 the pool's count, +54 bytes; +58 the activity, +5C its height;
+\ +60, +64, +68 the loop's longest stall; +6C the reveal wait; +70 the
+\ store; +74 the newest event; +78 the consensus' answer (malloc'd; 0:
+\ none yet), +7C its length; +80, +84 the fees'; +88 set when the thread
+\ has been woken and has not looked yet; +8C requests handed to the loop
+\ and not yet taken; +90 the store's lock (held by the thread through a
+\ request, by the loop while it makes the store afresh); +94 a request
+\ that took a second or more, for the loop to tell: its ticks, +98 those
+\ before its answer was sent, +9C the answer's bytes, +A0 its path (40).
+\ athon: the thread runs (the loop's word); athr: this is the thread.
+: av variable ;  : athon variable ;  : athr variable ;
+: ahpr variable ;  : ahpw variable ;  : awpr variable ;  : awpw variable ;  : ahw variable ;  : ahr variable ;
+: ahl variable ;  : ahok variable ;  : aeb variable ;  : atpe variable ;  : atpb variable ;
+: apn variable ;  : apo variable ;  : apb variable ;  : apw variable ;
+: apcg variable ;  : apch variable ;  : apf1 variable ;  : apf2 variable ;  : apf3 variable ;  : apf4 variable ;
+: at0 variable ;  : abt variable ;  : aslt variable ;  : aslb variable ;  : asln variable ;  : asp variable ;
 
 \ ── The response ──
 
@@ -112,7 +156,7 @@ repeat ;
 \ asend ( status -- )  the response, its status line ("200 OK"), headers
 \ and the body built at ao; the connection closed.
 : asend
-aop @ ao @ - ablen !
+aop @ ao @ - ablen !  ticks abt !
 arq @ ahp !  "HTTP/1.0 " h"  h"  hcrlf
 aoct @ if "Content-Type: application/octet-stream" else "Content-Type: application/json" then h"  hcrlf
 "Content-Length: " h"  ahp @ ablen @ snum ahp !  hcrlf hcrlf
@@ -123,6 +167,62 @@ acfd @ close drop  0 lit acfd ! ;
 \ afail ( message status -- )  {"error": message}.
 : afail  swap abegin "{" a" "error" akey aqt a" aqt "}" a" asend ;
 : anotf  "not found" "404 Not Found" afail ;
+
+\ ── Between the thread and the loop ──
+
+\ acpz ( src dst -- )  a string and its NUL; acpn ( src dst max -- )  its
+\ first max bytes at most, and a NUL.
+: acpz  over strlen 1 lit + bcopy ;
+: acpn  2 lit pick strlen umin  2dup + 0 lit swap c!  bcopy ;
+\ ahand  the request handed to the loop: its connection, the method, the
+\ token's verdict, the body (the loop frees it) and the path and query,
+\ in a block from malloc whose address goes down the pipe.  Eight
+\ waiting there at most (a socket each, of the kernel's 32): then 503.
+: ahbusy  "the node is busy" "503 Service Unavailable" afail ;
+: ahand
+apath @ strlen aqs @ strlen + 16 lit + malloc dup ahl !
+0= if ahbusy else
+	av @ lock  av @ 8C lit + @ dup 8 lit u< dup ahok ! if 1 lit + av @ 8C lit + ! else drop then  av @ unlock
+	ahok @ if
+		acfd @ ahl @ !  apost @ ahl @ 4 lit + !  aauth @ ahl @ 8 lit + !  abod @ ahl @ C lit + !  abn @ ahl @ 10 lit + !
+		apath @ ahl @ 14 lit + acpz  aqs @  ahl @ 14 lit + apath @ strlen + 1 lit +  acpz
+		ahl @ ahw @ !  ahpw @ ahw @ 4 lit write drop
+		0 lit acfd !  0 lit abod !
+	else ahl @ free  ahbusy then
+then ;
+\ aloop ( -- flag )  on the thread: the request handed to the loop.
+: aloop  athr @ dup if ahand then ;
+\ awkick  the thread woken (a byte on its pipe), unless it has been and
+\ has not looked yet (+88: it clears that before it looks).
+: awkick  av @ 88 lit + @ 0= if 1 lit av @ 88 lit + !  awpw @ "w" 1 lit write drop then ;
+\ apset ( off -- )  the body at ao published at the view's off (its
+\ bytes in a block of their own, the one before freed); apget ( off --
+\ flag ) the answer published there as the body at ao, if there is one.
+: apset
+apo !  aop @ ao @ - apn !
+apn @ 4 lit + malloc apb !
+apb @ if ao @ apb @ apn @ 3 lit + 2 lit rshift wcopy then
+av @ lock
+av @ apo @ + @
+apb @ av @ apo @ + !  apn @ av @ apo @ + 4 lit + !
+av @ unlock
+?dup if free then ;
+: apget
+apo !
+av @ lock
+av @ apo @ + @ ?dup if
+	ao @  av @ apo @ + 4 lit + @ dup apn !  3 lit + 2 lit rshift  wcopy  -1 lit
+else 0 lit then
+av @ unlock
+dup if abegin  ao @ apn @ + aop ! then ;
+\ aload  on the thread: its copies of what the answers read, from the view.
+: aload
+av @ lock
+av @ 4 lit + @ myh !  av @ 8 lit + mytip @ 8 lit wcopy  av @ 28 lit + mywork @ 8 lit wcopy
+av @ 48 lit + @ ahb !  av @ 4C lit + @ apc !  av @ 50 lit + @ qnum !  av @ 54 lit + @ qbytes !
+av @ 58 lit + @ pact !  av @ 5C lit + @ pacth !  av @ 60 lit + @ plg !  av @ 64 lit + @ plgh !  av @ 68 lit + @ plga !
+av @ 6C lit + @ nmin !  av @ 70 lit + @ stfd !  av @ 74 lit + @ aevn !
+av @ unlock ;
 
 \ ── The request ──
 
@@ -227,9 +327,35 @@ drop ahh @ ;
 \ anarg ( name default -- n )  a numeric parameter.
 : anarg  swap aqv ?dup if nip atoi then ;
 
+\ ath ( h -- e | 0 )  on the thread: header h, at our tip or below, from
+\ the store as an entry at aeb (the header, its id at CC): the id is the
+\ next header's first field, or our tip's (nothing hashed here).  In the
+\ caller's transaction.
+: ath
+dup myh @ u> if drop 0 lit else
+	dup khdr aeb @ CC lit sget CC lit = if
+		dup myh @ = if drop  mytip @ aeb @ CC lit + 20 lit bcopy  aeb @ else
+			1 lit + khdr sbuf @ CC lit sget CC lit = if sbuf @ aeb @ CC lit + 20 lit bcopy  aeb @ else 0 lit then
+		then
+	else drop 0 lit then
+then ;
+\ atid ( s -- e | 0 )  aid on the thread: by height, or by id through
+\ the store's index of ids; in a transaction of its own.
+: atid
+stfd @ 0 lit txbegin stx !
+dup strlen 40 lit = if
+	ab32 @ 20 lit ahexb if
+		ab32 @ kid sbuf @ 4 lit sget 4 lit = if
+			sbuf @ @ ath dup if dup CC lit + ab32 @ 20 lit d8= 0= if drop 0 lit then then
+		else 0 lit then
+	else 0 lit then
+else
+	dup c@ 30 lit - A lit u< if atoi ath else drop 0 lit then
+then
+stx @ txcommit drop ;
 \ aid ( s -- e | 0 )  a header entry by height (decimal) or id (hex).
 \ (Entries are addresses, above 2^31 in a process: 0 is none.)
-: aid
+: aidl
 dup strlen 40 lit = if
 	ab32 @ 20 lit ahexb if
 		\ held or the store's, and on our best branch
@@ -240,6 +366,7 @@ dup strlen 40 lit = if
 else
 	dup c@ 30 lit - A lit u< if atoi dup hbest hheight u> if drop 0 lit else phget then else drop 0 lit then
 then ;
+: aid  athr @ if atid else aidl then ;
 
 \ ── The answers ──
 
@@ -274,7 +401,9 @@ abegin "{" a"
 "200 OK" asend ;
 
 : aheader
-apath @ B lit + aid dup 0= if drop "no such header" "404 Not Found" afail else
+\ (one the thread does not find in the store, above our tip or genesis's:
+\ the loop's to answer, from the headers it holds)
+apath @ B lit + aid dup 0= if drop  aloop 0= if "no such header" "404 Not Found" afail then else
 	abegin
 	"raw" aqv if -1 lit aoct !  hhdr ao @ CC lit bcopy  ao @ CC lit + aop ! else ajhdr then
 	"200 OK" asend
@@ -568,7 +697,8 @@ abegin "{" a" "minimum" akey A lit anum acom "dust" akey 5CDA lit anum acom "pay
 "economy" akey "{" a" "rate" akey A lit anum acom "blocks" akey qbytes @ 9D1 lit + 2BD2B lit + 2BD2C lit / anum "}" a" acom
 "confirmations" akey qcrn @ anum
 "}" a" ;
-: afees  afeesb "200 OK" asend ;
+\ (on the thread: the answer the loop published, or the loop's to make)
+: afees  athr @ if 80 lit apget if "200 OK" asend else ahand then else afeesb "200 OK" asend then ;
 
 : amempool
 abegin "{" a" "count" akey qnum @ anum acom "bytes" akey qbytes @ anum acom "transactions" akey "[" a"
@@ -756,12 +886,36 @@ if
 	then
 else atipr then ;
 \ apub  what the answers read of the loop's state (ahb, apc, aevn), as
-\ it is now.
+\ it is now (apubc); and, with the thread, the view written (apubv: apw
+\ set if the tip moved or an event came), the thread woken then, and a
+\ request of its that took a second or more told (it writes nothing to
+\ the console itself: its lines would come in the middle of the loop's).
+: apubc
+hbest hheight ahb !
+0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then apc !
+evn @ aevn ! ;
+: apubv
+av @ lock
+av @ 4 lit + @ myh @ <>  av @ 8 lit + mytip @ 20 lit d8= 0= or  av @ 74 lit + @ aevn @ <> or  apw !
+myh @ av @ 4 lit + !  mytip @ av @ 8 lit + 8 lit wcopy  mywork @ av @ 28 lit + 8 lit wcopy
+ahb @ av @ 48 lit + !  apc @ av @ 4C lit + !  qnum @ av @ 50 lit + !  qbytes @ av @ 54 lit + !
+pact @ av @ 58 lit + !  pacth @ av @ 5C lit + !  plg @ av @ 60 lit + !  plgh @ av @ 64 lit + !  plga @ av @ 68 lit + !
+nmin @ av @ 6C lit + !  stfd @ av @ 70 lit + !  aevn @ av @ 74 lit + !
+av @ 94 lit + @ dup aslt ! if
+	av @ 98 lit + @ aslb !  av @ 9C lit + @ asln !  av @ A0 lit + asp @ 40 lit bcopy  0 lit av @ 94 lit + !
+then
+av @ unlock ;
 : apub
 awt @ if
-	hbest hheight ahb !
-	0 lit pnp @ ?dup if 0 lit do i prec 8 lit + @ if 1 lit + then loop then apc !
-	evn @ aevn !
+	apubc
+	athon @ if
+		apubv
+		apw @ if awkick then
+		aslt @ vrb @ and if
+			nhead "api: " puts asp @ puts " took " puts aslt @ 2710 lit / u. " ms on its thread (its answer made in " puts aslb @ 2710 lit / u.
+			" ms; " puts asln @ u. " bytes written in " puts aslt @ aslb @ - 2710 lit / u. " ms)" puts 0A lit putc
+		then
+	then
 then ;
 \ atipw  the requests waiting for the tip whose tip moved, or whose time
 \ is up, answered.
@@ -773,13 +927,15 @@ then ;
 		else drop then
 	else drop then
 loop ;
-\ awake  the node's state (aevst: an event when it changes), then the
-\ waiting requests answered: the events' (aewake), the tip's (atipw).
+\ awake  the node's state (aevst: an event when it changes), published
+\ (apub); then the waiting requests answered: the events' (aewake), the
+\ tip's (atipw), which with the thread are its own to answer (atmain).
 \ (all of it only once ainit made the API's tables: a node's test
 \ program without the API, relay_test, waits through cwait and vwait too)
 : awake
 awt @ if
-	aevst apub aewake atipw
+	aevst apub
+	athon @ 0= if aewake atipw then
 then ;
 
 \ acons  the message layer's mode as the chain decides it (cons.fam):
@@ -808,11 +964,30 @@ abegin "{" a"
 "previous" akey cxprv @ 28 lit + @ if cxprv @ ajset else "null" a" then acom
 "running" akey cxscr @ 28 lit + @ if cxscr @ ajset else "null" a" then
 "}" a" ;
-: acons  aconsb "200 OK" asend ;
+: acons  athr @ if 78 lit apget if "200 OK" asend else ahand then else aconsb "200 OK" asend then ;
+\ apubs  the answers the thread gives whole, made afresh when what they
+\ tell has changed: the consensus' after a scan (cons.fam's cxgen, or its
+\ height: the pinned sets'), the fees' when the pool or the tip has.
+\ From nstep (sync.fam), not from within a request: they are made at ao.
+: apubs
+athon @ if
+	cxlv @ if
+		cxgen @ apcg @ <>  cxht @ apch @ <> or if cxgen @ apcg !  cxht @ apch !  aconsb 78 lit apset then
+	then
+	qnum @ apf1 @ <>  qbytes @ apf2 @ <> or  qcrn @ apf3 @ <> or  myh @ apf4 @ <> or if
+		qnum @ apf1 !  qbytes @ apf2 !  qcrn @ apf3 !  myh @ apf4 !  afeesb 80 lit apset
+	then
+then ;
+\ astlk, astul  the store's lock, for the loop to make the store afresh
+\ (main.fam): no request of the thread's is reading it then.
+: astlk  athon @ if av @ 90 lit + lock then ;
+: astul  athon @ if av @ 90 lit + unlock then ;
+
+\ (aloop: on the thread, the loop's to answer)
 : aroute
 apost @ if
-	apath @ "/v1/tx" streq if atx else
-	apath @ "/v1/token" streq if atoken else anotf then then
+	apath @ "/v1/tx" streq if aloop 0= if atx then else
+	apath @ "/v1/token" streq if aloop 0= if atoken then else anotf then then
 else
 	apath @ "/v1/status" streq if astatus else
 	"/v1/header/" apre if aheader else
@@ -820,10 +995,10 @@ else
 	apath @ "/v1/outputs" streq if aoutputs else
 	apath @ "/v1/commits" streq if acommits else
 	apath @ "/v1/spent" streq if aspent else
-	"/v1/name/" apre if aname else
-	"/v1/proof/output/" apre if aproof else
+	"/v1/name/" apre if aloop 0= if aname then else
+	"/v1/proof/output/" apre if aloop 0= if aproof then else
 	apath @ "/v1/fees" streq if afees else
-	apath @ "/v1/mempool" streq if amempool else
+	apath @ "/v1/mempool" streq if aloop 0= if amempool then else
 	apath @ "/v1/tip" streq if atip else
 	apath @ "/v1/events" streq if aevents else
 	apath @ "/v1/consensus" streq if acons else anotf
@@ -840,11 +1015,97 @@ areq if aparse else 0 lit then
 then
 abod @ ?dup if free 0 lit abod ! then ;
 
-\ aaccept  a connection to the API, if one waits (pxrdy), answered.
-: aaccept  pmark  pxrdy @ if 0 lit pxrdy !  alfd @ accept dup 0< if drop else acfd !  apub aone then then ;
+\ ahtake  a request the thread handed over (ahand), answered here.
+: ahtake
+ahpr @ ahw @ 4 lit read 4 lit = if
+	ahw @ @ ahr !
+	av @ lock  av @ 8C lit + dup @ 1 lit - swap !  av @ unlock
+	ahr @ @ acfd !  ahr @ 4 lit + @ apost !  ahr @ 8 lit + @ aauth !  ahr @ C lit + @ abod !  ahr @ 10 lit + @ abn !
+	ahr @ 14 lit + apath @ acpz  ahr @ 14 lit + dup strlen + 1 lit + aqs @ acpz
+	ahr @ free
+	aauth @ 0=  apost @ and  apath @ "/v1/token" streq and if abegin "401 Unauthorized" asend else aroute then
+	abod @ ?dup if free 0 lit abod ! then
+then ;
+\ aaccept  a connection to the API, if one waits (pxrdy), answered; with
+\ the thread, what waits is a request it handed over.
+: aaccept
+pmark
+pxrdy @ if
+	0 lit pxrdy !  apub
+	athon @ if ahtake else alfd @ accept dup 0< if drop else acfd !  aone then then
+then ;
+
+\ ── The thread ──
+
+\ atinit ( -- ok )  on the thread: its own of every buffer its answers
+\ reach (the request's, the answer's 2.1 MiB, the numbers', the tables of
+\ those waiting, the events copied, the store's keys and values, our tip
+\ and work, a header's entry), and room left for its stack.
+: atinit
+-1 lit athr !
+2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
+10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
+20 lit alloc ab32 !  10 lit alloc ahw !
+140 lit alloc awt !  AEW AEWSZ * alloc aew !  80 lit alloc aef !  40 lit EVSZ * alloc aecp !
+100 lit alloc kb !  100 lit alloc kb2 !  400 lit alloc sbuf !
+20 lit alloc mytip !  20 lit alloc mywork !  120 lit alloc aeb !  20 lit alloc atpe !  20 lit alloc atpb !
+ao @ 0= 0=  atpb @ 0= 0= and  8000 lit alloc 0= 0= and
+dup if
+	awt @ 50 lit wzero  aew @ AEW AEWSZ * 2 lit rshift wzero
+	A lit aten @ !  0 lit aten @ 4 lit + !  0 lit acfd !  0 lit abod !
+then ;
+\ atone  the connection in acfd answered: the view taken (aload), the
+\ store's lock held through it; one that took a second or more left in
+\ the view for the loop to tell.
+: atone
+ticks at0 !  0 lit abt !  0 lit ablen !
+aload
+av @ 90 lit + lock  aone  av @ 90 lit + unlock
+ticks at0 @ - dup 989680 lit u< if drop else
+	av @ lock
+	av @ 94 lit + !  abt @ if abt @ at0 @ - else 0 lit then av @ 98 lit + !  ablen @ av @ 9C lit + !
+	apath @ av @ A0 lit + 3F lit acpn
+	av @ unlock
+then ;
+\ atmain  the thread's loop: a connection, the loop's byte (the tip
+\ moved, an event came) or a second (the waiting requests' time); the
+\ view taken, those waiting answered if they can be, a connection
+\ answered.
+: atmain
+begin
+	alfd @ atpe @ !  1 lit atpe @ 4 lit + !  awpr @ atpe @ 8 lit + !  1 lit atpe @ C lit + !
+	atpe @ 2 lit 3B9ACA00 lit poll drop
+	atpe @ C lit + @ 10 lit rshift if awpr @ atpb @ 10 lit read drop then
+	\ (cleared before the view is taken: a change after it wakes us again)
+	0 lit av @ 88 lit + !
+	aload  aewake atipw
+	atpe @ 4 lit + @ 10 lit rshift if alfd @ accept dup 0< if drop else acfd !  atone then then
+0 lit until ;
+\ atstart  the view, the two pipes (the requests handed over: ahpr the
+\ loop's end; the wake: awpw the loop's), the view written, the thread
+\ started: its first word down the requests' pipe says whether it had
+\ its buffers (athon).  Its block: 2.25 MiB of the node's own heap.
+: atstart
+0 lit athon !  0 lit athr !
+E0 lit malloc av !  10 lit alloc ahw !  44 lit alloc asp !  10 lit alloc ahl !  10 lit alloc ahr !
+av @ if
+	av @ 38 lit wzero
+	ahl @ pipe 0< 0=  ahr @ pipe 0< 0= and if
+		ahl @ @ ahpr !  ahl @ 4 lit + @ ahpw !  ahr @ @ awpr !  ahr @ 4 lit + @ awpw !
+		FFFFFFFF lit apcg !  FFFFFFFF lit apf1 !
+		apubc apubv
+		ptcode[ drop
+			atinit  dup ahw @ !  ahpw @ ahw @ 4 lit write drop
+			if atmain then
+		]tcode
+		0 lit 240000 lit pthread 0< 0= if
+			ahpr @ ahw @ 4 lit read 4 lit = if ahw @ @ if -1 lit athon ! then then
+		then
+	then
+then ;
 
 : ainit  ( port -- )
-2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !  220000 lit alloc ao !
+2000 lit alloc arq !  2000 lit alloc apath !  2000 lit alloc aqs !
 10 lit alloc aent !  8 lit alloc aw !  8 lit alloc aten !  8 lit alloc aqw !  8 lit alloc arw !
 20 lit alloc ab32 !  F00 lit alloc asib !  44 lit alloc atk !  10 lit alloc apk !
 140 lit alloc dup awt ! 50 lit wzero
@@ -871,4 +1132,8 @@ then
 2 lit socket alfd !
 alfd @ 1 lit 0 lit 3 lit pick net drop  drop
 alfd @ 3 lit 0 lit 0 lit net drop
-alfd @ pxfd ! ;
+\ the thread, if it can be had: the loop then polls what it hands over,
+\ and makes its answers (small: the largest the pool's list) in 256 KiB;
+\ without it, the listener and the 2.1 MiB a page of outputs takes
+atstart
+athon @ if 40000 lit alloc ao !  ahpr @ pxfd ! else 220000 lit alloc ao !  alfd @ pxfd ! then ;

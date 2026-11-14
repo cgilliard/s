@@ -95,6 +95,8 @@ wait_for "$T/node.out" '^api: listening|^sync: -' 900 "the sync"
 grep -E '^sync:' "$T/node.out"
 TOKEN=$(sed -n 's/^api: listening, token \([0-9a-f]*\)$/\1/p' "$T/node.out")
 [ ${#TOKEN} = 64 ] || { echo "apitest.sh: no API" >&2; exit 1; }
+# (the thread is what is tested: without it the loop answers all, as before it)
+grep -q '^api: answered by a thread of its own' "$T/node.out" || { echo "apitest.sh: the API's thread did not start" >&2; exit 1; }
 wait_for "$T/node.out" '^cli: done' 120 "the program in the OS"
 grep -E '^cli:' "$T/node.out"
 grep -q '^cli: status 200 {"height":' "$T/node.out" \

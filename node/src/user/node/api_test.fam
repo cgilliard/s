@@ -48,6 +48,7 @@ A000202 lit 925F lit E99 lit pinit
 0= if
 	E9A lit ainit
 	"api: listening, token " puts atk @ puts 0A lit putc
+	athon @ if "api: answered by a thread of its own" else "api: its thread not started: answered in the loop" then puts 0A lit putc
 	"apicli" spawn drop
 	258 lit aserve
 then

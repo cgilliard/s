@@ -36,7 +36,9 @@
 stfd @ 0 lit txbegin stx !  62 lit mget myold !  68 lit mget  stx @ txcommit drop  dup myh !
 \ the oldest body kept: the first, or the window's (1,008) start
 myold @ if myh @ 3EF lit - myold @ max myh @ 3EF lit u< if drop myold @ then myold ! then
-hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy ;
+hat dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy
+\ (told to the API's thread at once, with the events that came with it)
+apub ;
 
 \ nfetch ( kind part id -- a n | 0 0 )  pfetch, the API answered while it
 \ fetches: each time a connection waits, pfetch stops (pyld), the API
@@ -62,6 +64,9 @@ begin secs nidt @ u< while
 	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  pkeep  stx @ nfsv !  aaccept awake  nfsv @ stx !
 repeat ;
 
+\ (The activity, pact and pacth, is published as it is set, apub: the
+\ API's thread answers the status from what was last published, and the
+\ loop publishes otherwise only as it waits.)
 \ nblock ( e -- flag )  the block of entry e fetched into nblk/nbn (its
 \ header the entry's: the bytes the same).
 : nft variable ;  : btf variable ;
@@ -81,13 +86,13 @@ repeat ;
 : nwhole variable ;
 : nblock
 ticks nft !  1 lit nwhy !
-1 lit pact !  dup 20 lit + @ pacth !
+1 lit pact !  dup 20 lit + @ pacth !  apub
 nblite @ nbgot !
 dup hid  nblite @ if 6 lit else 0 lit then  0 lit rot nfetch nbn ! nblk !
 nblk @ 0=  nbgot @ and  pnh @ and if
 	0 lit nbgot !  dup hid 0 lit 0 lit rot nfetch nbn ! nblk !
 then
-0 lit pact !
+0 lit pact !  apub
 nblk @ if
 	nbn @ CC lit u< 0= if nblk @ swap hhdr CC lit d8= dup 0= if 3 lit nwhy ! then else drop 2 lit nwhy ! 0 lit then
 	dup 0= if nblk @ free 0 lit nblk ! then
@@ -331,14 +336,14 @@ repeat 2drop ;
 : nevb variable ;
 : nconnect
 2 lit pick nevb !
-2 lit pick 20 lit + @ pacth !  2 lit pact !
+2 lit pick 20 lit + @ pacth !  2 lit pact !  apub
 cwon @ if
 	cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !
 	sprchk @ cwj @ C lit + !  stfd @ cwj @ 10 lit + !  snocm @ cwj @ 44 lit + !
 	1 lit cwput
 	\ the next block fetched meanwhile, if the caller named it (npnx)
 	\ (its fetch's time is its own: this block's, as nbrk shows it, kept)
-	btf @ nsvt !  npfetch  nsvt @ btf !  2 lit pact !  cwj @ @ 20 lit + @ pacth !
+	btf @ nsvt !  npfetch  nsvt @ btf !  2 lit pact !  cwj @ @ 20 lit + @ pacth !  apub
 	cwait
 	cwj @ 14 lit + @ btb !  cwj @ 18 lit + @ bts !  cwj @ 1C lit + @ btp !  cwj @ 20 lit + @ btc !
 	\ what the pool reads of the block (qconfs, qmvblk), as sconnect left it
@@ -346,7 +351,7 @@ cwon @ if
 else
 	2 lit pick swk !  sconn1  spend @ if vproof else -1 lit then  sconn2  0 lit swk !
 then
-0 lit npnx !  0 lit pact !
+0 lit npnx !  0 lit pact !  apub
 dup 0= if EVBLK nevb @ hheight 0 lit nevb @ hid 0 lit evput then ;
 \ cwjob ( a b c kind -- r )  a job of three arguments by the worker,
 \ the node serving meanwhile.
@@ -439,14 +444,14 @@ else sbody then ;
 \ nsbpr ( j -- flag )  slot j's chain proof, before its parent is
 \ connected (sbproof, by the worker).
 : nsbpr
-dup nqs nqt !  nqh dup pacth !  2 lit pact !
+dup nqs nqt !  nqh dup pacth !  2 lit pact !  apub
 dup hat hhdr  nqt @ @ CC lit +  nqt @ 4 lit + @ CC lit -  nqt @ 8 lit + @  nqt @ C lit + @
 5 lit pick 1 lit - hat hhdr
 cwon @ if
 	cwj @ 40 lit + !  cwj @ 3C lit + !  cwj @ 38 lit + !  cwj @ 8 lit + !  cwj @ 4 lit + !  cwj @ !  stfd @ cwj @ 10 lit + !
 	9 lit cwput  cwait
 else sbproof then
-nip  0 lit pact ! ;
+nip  0 lit pact !  apub ;
 \ nqget ( j -- flag )  slot j fetched and its body checked: from its
 \ peer, else the next, and so on; the next slot's block fetched while
 \ the worker checks this one.  A body its header does not commit to: its
@@ -848,7 +853,7 @@ myh @ if mytip @ hfind dup 0< if drop else
 				\ the fork (nstat's is hat's, the best branch's block at that
 				\ height: not one we hold; told so to peers, and the next
 				\ undo's event named it for the block undone)
-				nte @ hparent @ dup 0< if drop else he dup nte !  dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy then
+				nte @ hparent @ dup 0< if drop else he dup nte !  dup hid mytip @ 8 lit wcopy  hwork mywork @ 8 lit wcopy  apub then
 				1 lit nuw !  1 lit nchg !  vrb @ if nhead "undone to height " puts myh @ u. 0A lit putc then
 			else
 				vrb @ if nhead "cannot undo block " puts myh @ u. " (none is kept for a fast sync's start and below): a new sync is needed" puts 0A lit putc then
@@ -982,7 +987,9 @@ then
 ticks nst0 !  nrelay  "relaying transactions" nslow
 ticks nst0 !  nrean  "announcing the pool again" nslow
 ticks nst0 !  qpersist  "saving the pool" nslow
-ticks nst0 !  cxrun  "the consensus file's votes" nslow ;
+ticks nst0 !  cxrun  "the consensus file's votes" nslow
+\ the answers the API's thread gives whole, made afresh if they changed
+ticks nst0 !  apubs  "the API's published answers" nslow ;
 
 \ nserve ( s -- )
 : nserve  0 lit do nstep loop ;

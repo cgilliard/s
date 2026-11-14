@@ -271,6 +271,46 @@ Progress:
   each block there (`stalltest.sh`'s log: the work 5 s, the worker's
   jobs 0.6 s), serving no block. Left: the pool's recheck, API requests
   one at a time.
+- (2026-11-13) **The API on a thread of its own** (`api.fam`'s
+  `atstart`; the root cause: the loop answers only when it comes round).
+  The listener is the thread's (`pthread`: its own variables, its own
+  buffers, the answer's 2.1 MiB with them), and it answers by itself:
+  - from the store, in read transactions of its own (the last commit,
+    as the loop's answers were): headers, blocks, outputs, commits, the
+    spent;
+  - from what the loop publishes into memory both see (the view, `av`,
+    under a lock; `apub`, at each change of the tip or the activity and
+    each turn of a wait): the status, the tip, the events (the ring's
+    count and a lock now in cells of their own, `events.fam`), and the
+    consensus' and the fees' answers whole, made by the loop when they
+    change (`apubs`, from `nstep`);
+  - the long polls (`/v1/tip`, `/v1/events`), waiting in its own
+    tables, woken by a byte on a pipe when the tip moves or an event
+    comes.
+  The rest it hands to the loop with the connection (`ahand`, a pipe
+  the loop polls where it polled the listener), which answers as
+  before: `POST /v1/tx` (the pool is the loop's), a name and a proof
+  (the state's buffers), the pool's list, a new token, and a header the
+  store has not (above the tip, or genesis's). The words that answer
+  are the same on both sides: on the thread the loop's variables they
+  read are its own copies, set from the view before each request
+  (`aload`). Without the thread (no room: said at the start) the loop
+  answers all, as before. Memory: the thread's block is 2.25 MiB and
+  the loop's answers now take 256 KiB, where the loop had 2.1 MiB: 0.4
+  MiB more.
+  On a booted node at height 0, its first sync waiting on a peer that
+  does not answer: the status in 0.05 s, where it took 7.8 s; a header
+  handed to the loop still its 7.7 s. `apitest.sh` passes and now
+  requires the thread. A request of the thread's that takes a second or
+  more is told by the loop ("api: PATH took N ms on its thread": how
+  long the answer took to make, and to write), for the pages of
+  outputs, about 10 s each on a syncing mainnet node and not yet
+  understood (written 4 KiB at a time now, not 512 bytes).
+  Left: requests are still answered one at a time (a slow page holds
+  the next, not the loop); what is handed over still waits for the
+  loop; a block's header above the tip or by a branch's id is the
+  loop's; while a block is fetched the view is as of the fetch's start
+  (no wait there publishes).
 
 ## 5. The wallet shows what is in progress
 
