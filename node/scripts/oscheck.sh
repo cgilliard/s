@@ -1021,7 +1021,7 @@ c @ close drop  a @ close drop ;
 100 lit alloc b !
 2 lit socket l !  l @ 1 lit 0 lit E9A lit net "bind " puts . sp  l @ 3 lit 0 lit 0 lit net "listen " puts . 0A lit putc
 \ a connection its client closed without reading: 64 KiB written to it
-\ is refused (the client's side resets it, -104), not waited on for good
+\ is refused (the side of the client resets it, -104), not waited on for good
 \ (kept and never read, the bytes filled its ring and the window stayed
 \ 0: the node, answering a request its wallet had given up on, hung so)
 : late
