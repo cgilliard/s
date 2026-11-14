@@ -15,6 +15,14 @@
 # reorganizes onto B's branch and the node, following A, must too: its
 # blocks above 6 undone, B's connected, up to B's tip; and the burn, mined
 # on no block of B's branch and its input unspent there, back in its pool.
+# And a third party: tabminer C (UDP 37475, A's data at 6, not mining),
+# whose only peer is the node (its UDP port forwarded from the host).  It
+# catches up from the node alone to where the node is on A's branch, and
+# then must follow it onto B's: the reorganization reaches it through the
+# node, every block of B's branch fetched from it.  For that the node
+# keeps its blocks whole (`node -b whole`): B's come to it in one batch,
+# and a batch's blocks but its last are otherwise kept without their
+# proofs, which no peer can be served.
 # Needs tabminer built with the dev networks:
 #   (cd ../miner && cargo build --release --features dev)
 # Usage: scripts/reorgtest.sh
@@ -23,13 +31,14 @@ cd "$(dirname "$0")/.."
 MINER=../miner/target/release/tabminer
 T=tmp/reorgtest
 PA=${REORGTEST_A:-37471}; PB=${REORGTEST_B:-37476}   # the two tabminers' UDP ports
+PC=${REORGTEST_C:-37475}; FWD=${REORGTEST_FWD:-37383}   # C's, and the node's as the host sees it
 [ -x "$MINER" ] || { echo "reorgtest.sh: build tabminer first: (cd ../miner && cargo build --release --features dev)" >&2; exit 1; }
 [ -f bin/img ] || { echo "reorgtest.sh: run scripts/build.sh first" >&2; exit 1; }
 rm -rf "$T"; mkdir -p "$T"
 dd if=/dev/zero of="$T/node.disk" bs=1 count=0 seek=268435456 2>/dev/null
 
-AP=; BP=; QP=
-trap 'st=$?; exec 3>&- 4>&- 2>/dev/null; for p in $QP $BP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
+AP=; BP=; CP=; QP=
+trap 'st=$?; exec 3>&- 4>&- 2>/dev/null; for p in $QP $CP $BP $AP; do kill $p 2>/dev/null; wait $p 2>/dev/null || true; done; exit $st' EXIT
 trap 'exit 130' INT; trap 'exit 143' TERM
 # minera [args...], minerb: the two tabminers, in the background
 minera() {
@@ -62,24 +71,25 @@ minera
 wait_for "$T/a.out" 'is the tip at height 6$' 600 "A's 6 blocks"
 stop $AP; AP=
 cp -r "$T/a" "$T/b"
+cp -r "$T/a" "$T/c"
 mkfifo "$T/a.in"
 minerp
 exec 4> "$T/a.in"
 
 echo "reorgtest.sh: the node syncing from A"
 mkfifo "$T/in"
-./tools/q32 --net --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
+./tools/q32 --net --hostfwd=udp::$FWD-:3737 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
-echo "node -n devrec 10.0.2.2:$PA &" >&3
+echo "node -n devrec -b whole 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* height [0-9]+  \(' 900 "the node following A"
 PID=$(sed -n 's/^\$* *\[\([0-9]*\)\]$/\1/p' "$T/os.out" | head -1)
 echo "reorgtest.sh: the node (pid $PID) killed, and run again"
 echo "echo 1 > /proc/$PID/kill" >&3
 wait_for "$T/os.out" "\[$PID\] done" 30 "the node ending"
 n=$(heights)
-echo "node -n devrec 10.0.2.2:$PA &" >&3
+echo "node -n devrec -b whole 10.0.2.2:$PA &" >&3
 wait_for "$T/os.out" '^node: .* resumed at height|^node: .* syncing from.*$' 120 "the node starting again"
 [ "$(grep -c 'syncing from' "$T/os.out")" = 1 ] || { echo "reorgtest.sh: the node synced again rather than resume" >&2; exit 1; }
 more() { [ "$(heights)" -gt "$n" ]; }
@@ -102,6 +112,11 @@ echo "quit" >&4; exec 4>&-
 wait $AP 2>/dev/null || true; AP=
 echo "reorgtest.sh: A stopped at $a; B mining its own branch from 6 until it outweighs A's"
 minerb
+# C, at 6, its only peer the node: it catches up to where the node is on
+# A's branch (the node's height final now, A stopped), from the node alone.
+"$MINER" mine --no-mine --network dev-recursive --data "$T/c" --no-seeds --listen 127.0.0.1:$PC \
+	--peer 127.0.0.1:$FWD --no-prompt >> "$T/c.out" 2>&1 &
+CP=$!
 # The heavier branch wins, not the longer: B's blocks may come at a lower
 # difficulty than A's did (a slower machine, longer gaps), so B mines
 # until its blocks above 6 hold a quarter more work than A's, each
@@ -126,6 +141,9 @@ grep -E 'mined .*\(work 2\^' "$T/b/tabminer.log" | tail -3
 # mined on B's branch.
 stop $BP; BP=
 minerb --no-mine
+n=$(sed -n 's/^node: .* height \([0-9]*\)  (.*/\1/p' "$T/os.out" | tail -1)
+wait_for "$T/c/tabminer.log" "block from 127\\.0\\.0\\.1:$FWD .* is the tip at height $n\$" 600 "C catching up to $n from the node"
+echo "reorgtest.sh: C at $n, on A's branch, from the node alone"
 echo "reorgtest.sh: A again, not mining, B its peer"
 minera --no-mine --peer 127.0.0.1:$PB
 wait_for "$T/a.out" 'reorganized onto' 300 "A reorganizing"
@@ -136,6 +154,15 @@ wait_for "$T/os.out" "^node: .* height $b  \\(" 600 "the node at B's tip ($b)"
 wait_for "$T/os.out" '^node: .* the pool: 1 held, .* 1 back' 120 "the burn back in the node's pool"
 grep -E '^node: .* (reorganizing|undone|height|refused|cannot|the pool)' "$T/os.out" | tail -14
 ! grep -qE '^node: .* (refused|cannot undo)' "$T/os.out" || { echo "reorgtest.sh: a block refused, or one not undone" >&2; exit 1; }
+# The reorganization reaches C through the node: C's tip B's (its id: B's
+# branch may be no higher than A's was), the block from the node, and
+# C's own blocks above 6 replaced.
+bid=$(sed -n 's/.*our block \([0-9a-f]\{16\}\) is the tip at height [0-9]*$/\1/p' "$T/b/tabminer.log" | tail -1)
+[ -n "$bid" ] || { echo "reorgtest.sh: B's tip not found in its log" >&2; exit 1; }
+wait_for "$T/c/tabminer.log" "(reorganized onto block from 127\\.0\\.0\\.1:$FWD $bid at height $b:|block from 127\\.0\\.0\\.1:$FWD $bid is the tip at height $b\$)" 600 "C at B's tip ($bid, height $b), from the node"
+grep -E "reorganized onto block from 127\\.0\\.0\\.1:$FWD " "$T/c/tabminer.log" | tail -1 | grep . \
+	|| { echo "reorgtest.sh: C at B's tip without a reorganization" >&2; exit 1; }
+echo "reorgtest.sh: C followed the node onto B's branch"
 # The pool kept across a restart: B stopped (and A not mining), so nothing
 # mines the burn; once the node has B's last block, what it holds is
 # final; killed and run again, it takes the same back.
@@ -154,7 +181,7 @@ wait_while_busy 30 "the node ending" ended
 # resumed from its store: waited for by its line, "resumed at height")
 res=$(grep -c '^node: .* resumed at height' "$T/os.out" || true)
 kept=$(grep -c '^node: .* kept from before taken back' "$T/os.out" || true)
-echo "node -n devrec 10.0.2.2:$PA &" >&3
+echo "node -n devrec -b whole 10.0.2.2:$PA &" >&3
 resumed() { [ "$(grep -c '^node: .* resumed at height' "$T/os.out")" -gt "$res" ]; }
 wait_while_busy 300 "the node resuming" resumed
 if [ "$held" -gt 0 ]; then

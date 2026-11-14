@@ -71,6 +71,14 @@ repeat ;
 \ proofs attested by the last's); nbgot: what came was lite.  A peer that
 \ does not hold it lite (a fam node: NotHeld) is asked for it whole.
 : nblite variable ;  : nbgot variable ;
+\ nwhole: every block fetched whole (main.fam's `blocks whole`, -b
+\ whole), for a node others fetch from, a seed: a block kept lite is
+\ served to no one, neither whole (its proof is not here) nor lite (none
+\ is made here), for the 1,008 blocks it is kept; a peer whose only
+\ source this node is would never have a batch's blocks but its last (a
+\ catch-up of two or more, a reorganization).  The price: a proof's size
+\ more a block, in a batch.
+: nwhole variable ;
 : nblock
 ticks nft !  1 lit nwhy !
 1 lit pact !  dup 20 lit + @ pacth !
@@ -454,14 +462,14 @@ nip  0 lit pact ! ;
 nqj !  0 lit nqok !
 npc @ 0 lit do nqok @ 0= if
 	nqj @ i + npeer nqk !
-	nqj @ 1 lit + nqm @ u<  nqfull @ 0= and nblite !
+	nqj @ 1 lit + nqm @ u<  nqfull @ 0= and  nwhole @ 0= and nblite !
 	nqk @ nsil? 0= if
 		ticks nqt1 !  nqj @ nqh hat nqk @ nbfrom  ticks nqt1 @ - nqtf @ + nqtf !
 		dup 0= if nwhy @ 1 lit = if nqk @ nsil! then then
 	else 0 lit then
 	if
 		nqj @ 1 lit + nqm @ u< if
-			nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk !  nqj @ 2 lit + nqm @ u< npgl !
+			nqj @ 1 lit + nqh hat npnx !  nqj @ 1 lit + npeer 1 lit + npk !  nqj @ 2 lit + nqm @ u<  nwhole @ 0= and npgl !
 		then
 		ticks nqt1 !  nqj @ nqh hat hhdr  nblk @ CC lit +  nbn @ CC lit -  nsbody  ticks nqt1 @ - nqtc @ + nqtc !
 		swap ?dup if

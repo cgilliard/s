@@ -1323,6 +1323,11 @@ Each step done when its test passes.
       `api-port` (3738), `window` (headers held), `peer IP:PORT` (again
       for more); the command line over it (`-n`, `-w`, peers); a key not
       understood is said. The scripts run `node -n devrec`.
+      `blocks whole` (2026-11-13; `-b whole`): every block fetched with
+      its proof, for a node others fetch blocks from (a seed). The
+      default, `lite`, fetches a batch's blocks but its last without
+      (`docs/NODE_ENHANCEMENTS.md`, item 21), and a block kept so is
+      served to no one.
     - Names (2026-11-09, `dns.fam`): a peer may be `NAME:PORT`, looked
       up with one A query over UDP to the resolver (QEMU's user-mode
       one, 10.0.2.3:53, or the configuration's `resolver IP:PORT`):

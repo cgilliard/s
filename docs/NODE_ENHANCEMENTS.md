@@ -1089,6 +1089,21 @@ the proof's 32-byte hash, which the body commitment binds), so a batch
 moves about a proof's size per block less (16 blocks: 24.3 s to 5.6 s on
 the dev network); a lie in a lite block fails the commitment, its sender
 banned, the block asked of another (`litetest.sh`). Protocol version 1.
+**What a lite block costs, and `blocks whole` (2026-11-13):** a block
+kept lite is served to no one for the 1,008 blocks it is kept: not
+whole (its proof is not here: `pblock`) and not lite (none is made
+here: `pgive`). A peer whose only source is this node never has a
+batch's blocks but its last: any catch-up of two blocks or more, any
+reorganization. Among tabminers it asks another; from fam nodes as the
+seeds it would not sync. So a node others fetch from sets `blocks
+whole` (`/etc/node/config`, or `node -b whole`: `sync.fam`'s `nwhole`)
+and fetches every block with its proof, a proof's size more a block in
+a batch. `reorgtest.sh` runs the node so, with a third party: tabminer
+C, whose only peer is the node, catches up from it and must follow it
+onto the heavier branch, every block of which came to the node in one
+batch. Left: lite blocks served as they are kept, and their proofs
+fetched after, so that the default serves too; the seeds' configuration
+(`makenode.sh`) saying `blocks whole`.
 
 ## 22. The wallet tells what the node is doing
 

@@ -1,7 +1,7 @@
 \ main.fam — the node (docs/NODE.md), the program /bin/node in the image
 \ (scripts/build.sh): the node's modules in order, then this.
 \
-\     node [-n main|devrec] [-w N] [IP:PORT ...]
+\     node [-n main|devrec] [-w N] [-b whole|lite] [IP:PORT ...]
 \
 \ The network: mainnet (main, the default) or the recursive dev network
 \ (devrec: tabminer's --network dev-recursive), its parameters, chain
@@ -25,7 +25,10 @@
 \ block S is 144 below the best header, as tabminer's.  Room for 16,384
 \ headers in memory (4.7 MB): when it fills, those below the newest half
 \ go to the store alone (sync.fam's ncompact), and a start loads the last
-\ 2,048 (nload).  `-w N` (for tests) holds N instead.
+\ 2,048 (nload).  `-w N` (for tests) holds N instead.  `-b whole`: every
+\ block fetched with its proof, for a node others fetch blocks from (a
+\ seed: sync.fam's nwhole); `-b lite`, the default, a batch's blocks but
+\ its last without.
 : mdc variable ;  : mnet variable ;  : mpt variable ;  : mip variable ;  : mport variable ;
 
 \ mfile ( path -- addr n )  a whole data file of at most 1.25 MiB, in memory.
@@ -57,12 +60,13 @@ mpt @ c@ 0= and ;
 \ genesis's header; and its verifier, /lib/chainver or /lib/chainverdev),
 \ the ports (UDP for peers, TCP for the API), the headers held, the peers.
 \ From /etc/node/config if there, lines "key value" (# a comment):
-\ network, port, api-port, window, peer (IP:PORT, again for more); then
-\ the command line: -n NETWORK, -w N, and peers, which replace the file's.
+\ network, port, api-port, window, blocks (whole or lite), peer (IP:PORT,
+\ again for more); then the command line: -n NETWORK, -w N, -b whole|lite,
+\ and peers, which replace the file's.
 : mpa variable ;  : mpn variable ;  : mpf variable ;  : mhc variable ;
 : mnname variable ;  : mudp variable ;  : mapi variable ;  : mcpa variable ;  : mcfn variable ;
 : mcb2 variable ;  : mls variable ;  : mle variable ;  : mlnx variable ;  : mlv variable ;  : mkn variable ;
-: musage  "usage: node [-n main|devrec] [-w N] [HOST:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit ;
+: musage  "usage: node [-n main|devrec] [-w N] [-b whole|lite] [HOST:PORT ...] (8 at most)" puts 0A lit putc 1 lit exit ;
 \ mpeer  the peer's address on the line.
 : mpeer
 mip @ 18 lit rshift u. 2E lit putc  mip @ 10 lit rshift FF lit and u. 2E lit putc
@@ -102,6 +106,10 @@ dup c@ dup 0= swap 23 lit = or if drop else
 		dup "port" streq if mlv @ atoi mudp !  1 lit mkn ! then
 		dup "api-port" streq if mlv @ atoi mapi !  1 lit mkn ! then
 		dup "window" streq if mlv @ atoi 10 lit max mhc !  1 lit mkn ! then
+		dup "blocks" streq if
+			mlv @ "whole" streq if -1 lit nwhole !  1 lit mkn ! else
+			mlv @ "lite" streq if 0 lit nwhole !  1 lit mkn ! then then
+		then
 		dup "peer" streq if mlv @ madd  1 lit mkn ! then
 		dup "seed" streq if mlv @ mseed  1 lit mkn ! then
 		dup "test-relays" streq if 100 lit alloc dup cxpin !  mlv @ scpy 0 lit swap c!  1 lit mkn ! then
@@ -137,7 +145,11 @@ mcfg
 begin argn mpf @ u> if mpf @ arg c@ 2D lit = else 0 lit then while
 	argn mpf @ 1 lit + u> 0= if musage then
 	mpf @ arg "-w" streq if mpf @ 1 lit + arg atoi 10 lit max mhc ! else
-	mpf @ arg "-n" streq if mpf @ 1 lit + arg mnname ! else musage then then
+	mpf @ arg "-n" streq if mpf @ 1 lit + arg mnname ! else
+	mpf @ arg "-b" streq if
+		mpf @ 1 lit + arg "whole" streq if -1 lit nwhole ! else
+		mpf @ 1 lit + arg "lite" streq if 0 lit nwhole ! else musage then then
+	else musage then then then
 	mpf @ 2 lit + mpf !
 repeat
 mnname @ "main" streq if 0 lit nnet ! else
@@ -146,6 +158,7 @@ mnname @ "main" streq if 0 lit nnet ! else
 	then
 then
 nnet @ 0=  cxpin @ and if nhead "config: test-relays is for the dev network only; passed over" puts 0A lit putc  0 lit cxpin ! then
+nwhole @ if nhead "blocks fetched whole, their proofs kept: served to peers (blocks whole)" puts 0A lit putc then
 40 lit alloc mpa !  0 lit mpn !
 argn mpf @ - 8 lit u> if musage then
 argn mpf @ u> if
