@@ -238,17 +238,23 @@ sninit  cvp @ cvinit ;
 \ cwput ( kind -- )  a job to the worker (its memory set first).
 : cwput  cwm @ !  cwjw @ cwm @ 4 lit write drop ;
 \ cwait ( -- code )  the worker's verdict, the network and the API served
-\ meanwhile (as vwait: not blocks' chunks or snapshots, pnest).
+\ meanwhile: blocks' chunks, snapshots and aux leaves too (pnest not set,
+\ as vwait sets it: no transaction of the loop's is open here, the worker
+\ writes in one of its own, so the loop reads the store's last commit, as
+\ the API does; stx kept all the same).  Before 2026-11-13 a peer syncing
+\ from this node got nothing while it connected a block, most of the
+\ time in a catch-up, and one asking for a block's leaves took the
+\ silence for a peer that does not keep them (ten minutes passed over).
 : cwait
-cwvr @ pyfd !  0 lit pyrdy !  1 lit pnest !
+cwvr @ pyfd !  0 lit pyrdy !
 begin pyrdy @ 0= while
-	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
+	stx @ vsav !  -1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  vsav @ stx !
 	\ the peers kept (pings: a long job must not leave them unanswered,
 	\ docs/TIMING_FIXES.md) and the API's long polls answered meanwhile
 	pkeep
 	stx @ vsav !  pxrdy @ if aaccept then  awake  vsav @ stx !
 repeat
-0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
+0 lit pyfd !  0 lit pyrdy !
 cwvr @ cwm @ 4 lit read 4 lit = if cwm @ @ else FFFFFFFE lit then ;
 \ cwstart  the worker started (cwon), its heap the verifier's buffers
 \ and 1 MiB.  Before taking any job it says whether every buffer was had

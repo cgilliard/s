@@ -247,10 +247,12 @@ prx @ E lit + pbid @ 20 lit d8= pbb @ 0= 0= and pbk @ 0= and if -1 lit else
 			dup if
 				pbl ! pbsrc !
 				pbb @ ?dup if free then
-				pbl @ CC lit + dup pbn !  malloc pbb !
-				dup hhdr pbb @ CC lit bcopy  drop
-				pbsrc @ pbb @ CC lit + pbl @ bcopy  pbsrc @ free
-				prx @ E lit + pbid @ 20 lit bcopy  0 lit pbk !  -1 lit
+				\ (no room for it, as in a catch-up holding a batch: not held)
+				pbl @ CC lit + dup pbn !  malloc dup pbb !  if
+					dup hhdr pbb @ CC lit bcopy  drop
+					pbsrc @ pbb @ CC lit + pbl @ bcopy  pbsrc @ free
+					prx @ E lit + pbid @ 20 lit bcopy  0 lit pbk !  -1 lit
+				else drop  pbsrc @ free  0 lit then
 			else 2drop drop 0 lit then
 		else drop 0 lit then
 	then
@@ -312,7 +314,7 @@ prx @ 5 lit + mtok @ 8 lit d8=  prn @ 2F lit u< 0= and if
 		2 lit - 2 lit u<  pnest @ 0= and if psnap if pbb @ pgb !  pbn @ pgn !  -1 lit else 0 lit then else 0 lit then
 	then then then
 	\ not held (a transaction not in the pool, a body or a snapshot not
-	\ kept, looked for: not while the worker holds the store): said, so
+	\ kept, looked for: not under pnest, where none is looked for): said, so
 	\ the asker tries another peer now (NotHeld, 25); a lite block (6)
 	\ never (making one hashes its proof: tabminer serves them), so the
 	\ asker takes it whole

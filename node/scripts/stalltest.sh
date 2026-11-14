@@ -9,6 +9,7 @@
 # API is asked for the status, and must answer that the node is fetching
 # block 5 (a node that did not answer until the fetch gave up would say
 # otherwise).  Then the chunks go through and the node connects block 5.
+# Last, a block served while the node connects one (below).
 # Before that, the sync to 4 runs with another address chattering at the
 # node (junk datagrams every 10 ms) and the miner's answers 100 ms late:
 # the node's waits for its peer must not end at others' datagrams
@@ -21,7 +22,7 @@ set -e
 cd "$(dirname "$0")/.."
 MINER=../miner/target/release/tabminer
 T=tmp/stalltest
-PA=${STALLTEST_A:-37491}; PX=${STALLTEST_PROXY:-37492}; HP=${STALLTEST_API:-37493}
+PA=${STALLTEST_A:-37491}; PX=${STALLTEST_PROXY:-37492}; HP=${STALLTEST_API:-37493}; PU=${STALLTEST_UDP:-37494}
 [ -x "$MINER" ] || { echo "stalltest.sh: build tabminer first: (cd ../miner && cargo build --release --features dev)" >&2; exit 1; }
 [ -f bin/img ] || { echo "stalltest.sh: run scripts/build.sh first" >&2; exit 1; }
 rm -rf "$T"; mkdir -p "$T"
@@ -95,7 +96,7 @@ wait_for "$T/proxy.out" '^proxy: up' 30 "the proxy"
 echo "stalltest.sh: the node started while the chain has no block yet"
 minera --no-mine
 mkfifo "$T/in"
-./tools/q32 --net --hostfwd=tcp::$HP-:3738 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
+./tools/q32 --net --hostfwd=tcp::$HP-:3738,hostfwd=udp::$PU-:3737 --disk="$T/node.disk" bin/img < "$T/in" > "$T/os.out" 2>&1 &
 QP=$!
 exec 3> "$T/in"
 wait_for "$T/os.out" '^\$ ' 60 "the shell"
@@ -150,4 +151,70 @@ EOF2
 rm "$T/hold"
 wait_for "$T/os.out" "^node: .* height $N  \\(" 600 "the node connecting block $N"
 grep -E "^node: .* height $N  \\(" "$T/os.out"
-echo "stalltest.sh: the API answered before any block, and while the node fetched one"
+# A block's chunks served while the worker connects one (sync.fam's
+# cwait).  No clock here either: the status says "connecting" only when
+# it is answered from that wait, so a chunk of our tip's block asked for
+# after a status that says the node is connecting block B, and had
+# before another that says the same, was served in it.  Tried at each
+# block the miner mines until it holds once (a round whose datagram is
+# lost, or whose block is connected before the chunk is asked for, is
+# only another round); a node that serves no block while it connects
+# never has one, and fails at the 12th block.
+echo "stalltest.sh: a block's chunk asked for while the node connects the miner's blocks"
+python3 - "$HP" "$PU" "$N" <<'EOF2'
+import json, os, socket, struct, sys, time, urllib.request
+hp, pu, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+node = ('127.0.0.1', pu)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+def status():
+    with urllib.request.urlopen(f'http://127.0.0.1:{hp}/v1/status', timeout=120) as r:
+        return json.loads(r.read())
+def answer(want):
+    # the node's datagram that want() takes, or None (2 s with none)
+    try:
+        while True:
+            d = s.recvfrom(2048)[0]
+            if d[:4] == b'TAB1' and want(d):
+                return d
+    except socket.timeout:
+        return None
+def pong(ours):
+    # the node's status, for a Ping with ours
+    for i in range(30):
+        nonce = os.urandom(8)
+        s.sendto(b'TAB1\x01' + nonce + ours, node)
+        d = answer(lambda d: d[4] == 2 and d[5:13] == nonce)
+        if d is not None:
+            return d[13:]
+    sys.exit('stalltest.sh: the node answered none of 30 Pings')
+def token():
+    # a peer's chunks are served, not a stranger's: pinged with the
+    # node's own status as ours (its genesis: a pinger on its chain is
+    # taken as a peer; never answering its Pings, we are not followed);
+    # its token for this address
+    return pong(pong(bytes(132)))[4:12]
+tok = token()
+rounds = asked = 0
+while True:
+    rounds += 1
+    s1 = status()
+    if s1['height'] > n + 12:
+        sys.exit(f'stalltest.sh: no chunk of a block served while the node connected one, in {rounds} rounds to height {s1["height"]} ({asked} asked for while it was connecting)')
+    if s1.get('activity') != 'connecting':
+        time.sleep(0.02)
+        continue
+    asked += 1
+    # GetChunks: of the block (kind 0) that is the node's tip, one run of
+    # chunks: the first
+    tip = bytes.fromhex(s1['tip'])
+    s.sendto(b'TAB1\x08' + tok + b'\x00' + tip + b'\x01' + struct.pack('<HH', 0, 1), node)
+    d = answer(lambda d: d[4] == 9 and d[5] == 0 and d[6:38] == tip)
+    s2 = status()
+    if d is not None and s2.get('activity') == 'connecting' and s2.get('activity_height') == s1.get('activity_height'):
+        print(f'host: a chunk of block {s1["height"]} served while the node connected block {s1["activity_height"]} (round {rounds}, the {asked}th asked for while it was connecting)')
+        sys.exit(0)
+    if d is None:
+        tok = token()
+EOF2
+echo "stalltest.sh: the API answered before any block and while the node fetched one; a block served while it connected one"

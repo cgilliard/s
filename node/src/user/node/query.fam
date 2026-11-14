@@ -66,10 +66,13 @@ ydep @ ytag @ ;
 : ybody  ( h -- a n | 0 0 )
 dup FFFF lit kbody sbuf @ 4 lit sget 4 lit = if
 	sbuf @ @ dup 0< ylite !  7FFFFFFF lit and  dup malloc  ( h n a )
-	over 3FF lit + A lit rshift 0 lit do
-		2 lit pick i kbody  over i A lit lshift + 400 lit sget drop
-	loop
-	rot drop swap
+	\ (no room for it: as one not kept)
+	dup if
+		over 3FF lit + A lit rshift 0 lit do
+			2 lit pick i kbody  over i A lit lshift + 400 lit sget drop
+		loop
+		rot drop swap
+	else drop 2drop 0 lit 0 lit then
 else drop 0 lit 0 lit then ;
 
 : yinit  2000 lit alloc ylv !  20 lit alloc ytmp !  10 lit alloc ykp !  54 lit alloc yterm !  20 lit alloc yhb ! ;

@@ -236,6 +236,20 @@ Progress:
   windows' leaves, 16 a turn), then not again until the next block.
   Next: more leaves a turn, and the votes counted as blocks come rather
   than recounted.
+- (2026-11-13) Blocks' chunks, snapshots and blocks' aux leaves served
+  while the worker has a job (`cwait` no longer sets `pnest`: the
+  worker writes in a transaction of its own and the loop has none open
+  there, so a peer's request reads the store's last commit, as the
+  API's do; `vwait` keeps it). A peer catching up from this node got
+  nothing while it connected a block, and one asking for a block's
+  leaves took the silence for a peer that does not keep them (passed
+  over for ten minutes). A block there is no memory to serve (a batch
+  of bodies held) is answered as not held (`ybody`, `pblock`). Checked
+  by `stalltest.sh`: a chunk of the tip's block, asked for after a
+  status that says the node is connecting a block and had before
+  another that says the same. Left of that list: the pool's recheck,
+  API requests one at a time; and blocks are still not served while
+  `nodev` checks a header's work (`vpow`'s `vwait`, 4 to 10 s each).
 
 ## 5. The wallet shows what is in progress
 
