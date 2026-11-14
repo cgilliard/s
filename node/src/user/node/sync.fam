@@ -144,9 +144,10 @@ nwhy @ 1 lit = if " (nothing came)" else nwhy @ 2 lit = if " (too short to hold 
 \ serves.  vinit starts it (its 0 reading the jobs' pipe, its 1 writing
 \ the verdicts'); vjw is 0 if it could not be, or once it is gone: the
 \ checks then run here, as before.  vwait serves the network while it
-\ works (Pings, peers, headers, images, pooled transactions; not blocks'
-\ chunks, which share the store's transaction a block's connection may
-\ hold open: pnest) and the API.
+\ works (Pings, peers, headers, images, pooled transactions, and blocks'
+\ chunks, snapshots and aux leaves, which read the store, but while a
+\ block's connection holds the store's transaction open: vproof sets
+\ pnest; a header's work, vpow, is checked with none open) and the API.
 \ nnet: the network (0 mainnet, 1 the recursive dev network: main.fam's
 \ -n), whose verifier nodev loads.
 : nnet variable ;
@@ -171,18 +172,20 @@ vp1 @ pipe 0< 0=  vp2 @ pipe 0< 0= and if
 	then
 then ;
 \ vwait ( -- flag | -2 )  nodev's verdict, the network served meanwhile,
-\ and the API (its requests read the store in transactions of their own:
-\ stx, which a block's connection may hold, kept for it); -2 if nodev is
-\ gone (the caller checks here).
+\ and the API (their requests read the store in transactions of their
+\ own: stx, which a block's connection may hold, kept for it); -2 if
+\ nodev is gone (the caller checks here).  Before 2026-11-13 it set
+\ pnest whoever called: no block served for the 4 to 10 s of each
+\ header's work, a node following the tip's longest wait.
 : vwait
-vjr @ pyfd !  0 lit pyrdy !  1 lit pnest !
+vjr @ pyfd !  0 lit pyrdy !
 begin vjw @ if pyrdy @ 0= else 0 lit then while
-	-1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !
+	stx @ vsav !  -1 lit pxw !  3B9ACA00 lit pwait drop  0 lit pxw !  vsav @ stx !
 	\ the peers kept (pings) and the API's long polls answered meanwhile
 	pkeep
 	stx @ vsav !  pxrdy @ if aaccept then  awake  vsav @ stx !
 repeat
-0 lit pyfd !  0 lit pyrdy !  0 lit pnest !
+0 lit pyfd !  0 lit pyrdy !
 vjw @ if
 	vjr @ vwk @ 4 lit read 4 lit = if vwk @ @ else 0 lit vjw ! FFFFFFFE lit then
 else FFFFFFFE lit then ;
@@ -193,7 +196,8 @@ dup FFFFFFFE lit = if drop htg @ fullpow else nip then ;
 \ vproof ( -- flag )  the chain proof of the block sconn1 left (ppub, bpr).
 : vproof
 blite @ if 0 lit else
-vjw @ if 2 lit vw  ppub @ 40 lit vput  bnpr @ vw  bpr @ bnpr @ vput  vwait else FFFFFFFE lit then
+\ (sconn1's transaction is open: nothing of the store served, pnest)
+vjw @ if 2 lit vw  ppub @ 40 lit vput  bnpr @ vw  bpr @ bnpr @ vput  1 lit pnest !  vwait  0 lit pnest !  else FFFFFFFE lit then
 dup FFFFFFFE lit = if drop ppub @ bpr @ bnpr @ cvverify then
 then ;
 \ The worker: a thread with variables of its own (pthread, docs/OS.md)
@@ -239,7 +243,7 @@ sninit  cvp @ cvinit ;
 : cwput  cwm @ !  cwjw @ cwm @ 4 lit write drop ;
 \ cwait ( -- code )  the worker's verdict, the network and the API served
 \ meanwhile: blocks' chunks, snapshots and aux leaves too (pnest not set,
-\ as vwait sets it: no transaction of the loop's is open here, the worker
+\ as vproof sets it: no transaction of the loop's is open here, the worker
 \ writes in one of its own, so the loop reads the store's last commit, as
 \ the API does; stx kept all the same).  Before 2026-11-13 a peer syncing
 \ from this node got nothing while it connected a block, most of the

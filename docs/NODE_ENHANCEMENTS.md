@@ -264,6 +264,13 @@ Progress:
   the first named the other branch's block. Not tested: `reorgtest.sh`
   passes through the code, but nothing asks for a block during a
   reorganization.
+- (2026-11-13) Blocks, snapshots and aux leaves served while `nodev`
+  checks a header's work (`vwait` no longer sets `pnest`; `vproof`
+  does, the one wait with the store's transaction open, and only
+  without the worker). A node following the tip spent 5 to 10 s of
+  each block there (`stalltest.sh`'s log: the work 5 s, the worker's
+  jobs 0.6 s), serving no block. Left: the pool's recheck, API requests
+  one at a time.
 
 ## 5. The wallet shows what is in progress
 
